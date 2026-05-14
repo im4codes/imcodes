@@ -3,7 +3,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
-import { cleanup, render, waitFor } from '@testing-library/preact';
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -135,6 +135,20 @@ function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
   };
 }
 
+function rectWithBottom(bottom: number): DOMRect {
+  return {
+    x: 0,
+    y: 0,
+    width: 0,
+    height: bottom,
+    top: 0,
+    right: 0,
+    bottom,
+    left: 0,
+    toJSON: () => ({}),
+  };
+}
+
 
 describe('SubSessionWindow metadata wiring', () => {
   const ws = {
@@ -149,6 +163,29 @@ describe('SubSessionWindow metadata wiring', () => {
     vi.clearAllMocks();
     timelineEventsMock = [];
     activeToolCallMock = false;
+  });
+
+  it('exposes the accent color as a CSS variable on the window root', () => {
+    const { container } = render(
+      <SubSessionWindow
+        sub={makeSubSession()}
+        ws={ws}
+        connected={true}
+        active={true}
+        accentColor="#34d399"
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    const root = container.querySelector('.subsession-window') as HTMLElement;
+    expect(root.style.getPropertyValue('--subsession-accent-color')).toBe('#34d399');
   });
 
   it('passes model, level, and quota metadata through for transport sub-sessions', async () => {
@@ -186,6 +223,39 @@ describe('SubSessionWindow metadata wiring', () => {
       expect(controls?.dataset.effort).toBe('high');
       expect(controls?.dataset.quota).toContain('5h 11%');
       expect(footer?.dataset.quota).toContain('5h 11%');
+    });
+  });
+
+  it('keeps the usage footer mounted for idle-looking agent sub-sessions without usage', async () => {
+    const sub = makeSubSession({
+      type: 'codex-sdk',
+      runtimeType: 'transport' as any,
+      state: 'stopped',
+      modelDisplay: undefined,
+      quotaLabel: undefined,
+      planLabel: undefined,
+    } as any);
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const footer = document.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
+      expect(footer?.dataset.state).toBe('stopped');
     });
   });
 
@@ -426,12 +496,14 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
   beforeEach(() => {
     cleanup();
     vi.clearAllMocks();
+    localStorage.clear();
     vi.useFakeTimers();
   });
 
   afterEach(() => {
     vi.useRealTimers();
     cleanup();
+    document.querySelectorAll('.tab-bar').forEach((node) => node.remove());
   });
 
   it('on mobile leaves the main controls area visible below the sub-session window', async () => {
@@ -589,6 +661,51 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       expect(panel?.style.left).toBe(`${window.innerWidth - 32}px`);
       expect(panel?.style.top).toBe(`${window.innerHeight - 100 - 480}px`);
     });
+  });
+
+  it('clamps upward drag to the session tab button bottom', async () => {
+    const tabBar = document.createElement('div');
+    tabBar.className = 'tab-bar';
+    const tabButton = document.createElement('button');
+    tabButton.setAttribute('role', 'tab');
+    tabButton.getBoundingClientRect = () => rectWithBottom(44);
+    tabBar.appendChild(tabButton);
+    document.body.appendChild(tabBar);
+    localStorage.setItem('rcc_subsession_sub-1', JSON.stringify({
+      geom: { x: 100, y: 120, w: 620, h: 480 },
+      viewMode: 'chat',
+    }));
+
+    const sub = makeSubSession();
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    const header = container.querySelector('.subsession-header') as HTMLElement | null;
+    expect(header).toBeTruthy();
+    fireEvent.mouseDown(header!, { clientX: 160, clientY: 130 });
+    fireEvent.mouseMove(document, { clientX: 160, clientY: -200 });
+    fireEvent.mouseUp(document);
+
+    await waitFor(() => {
+      const panel = container.querySelector('.subsession-window') as HTMLElement | null;
+      expect(panel?.style.top).toBe('44px');
+    });
+
+    tabBar.remove();
   });
 
   it('uses the taller default desktop height for new sub-session windows', async () => {

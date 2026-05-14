@@ -17,7 +17,7 @@ describe('resolveP2pRoundPlan', () => {
     expect(plan.rounds[0]?.timeoutMinutes).toBe(8);
   });
 
-  it('preserves legacy combo behavior when advanced config is absent', () => {
+  it('treats legacy combo roundsOverride as complete flow cycles', () => {
     const plan = resolveP2pRoundPlan({
       modeOverride: 'brainstorm>discuss',
       roundsOverride: 2,
@@ -25,8 +25,8 @@ describe('resolveP2pRoundPlan', () => {
     });
 
     expect(plan.advanced).toBe(false);
-    expect(plan.rounds).toHaveLength(2);
-    expect(plan.rounds.map((round) => round.modeKey)).toEqual(['brainstorm', 'discuss']);
+    expect(plan.rounds).toHaveLength(4);
+    expect(plan.rounds.map((round) => round.modeKey)).toEqual(['brainstorm', 'discuss', 'brainstorm', 'discuss']);
     expect(plan.rounds.every((round) => round.timeoutMinutes === 8)).toBe(true);
   });
 
@@ -180,5 +180,90 @@ describe('resolveP2pRoundPlan', () => {
         { sessionName: 'deck_proj_cli', agentType: 'codex' },
       ],
     })).toThrow(/eligible SDK-backed participant/i);
+  });
+
+  /*
+   * R3 v2 PR-μ — Workflow round summaries. The legacy combo system always
+   * ran a per-round summary; the previous workflow implementation only
+   * fired summary on `multi_dispatch` rounds AND lost the rich per-mode
+   * prompts. The new behaviour: ANY round with a non-empty
+   * `effectiveSummaryPrompt` (set by the workflow adapter) gets
+   * `synthesisStyle='initiator_summary'` so the orchestrator dispatches a
+   * summary hop on the initiator — including `single_main` rounds.
+   */
+  /*
+   * R3 v2 PR-τ — synthesisStyle is now LOCKED by `executionMode`:
+   *   - `single_main` → ALWAYS `synthesisStyle: 'none'` (no second hop;
+   *     the worker IS the initiator and there is no ensemble to
+   *     consolidate). Even an explicit `effectiveSummaryPrompt` does
+   *     NOT cause a synthesis hop to fire — the executor's single_main
+   *     branch ignores the flag, so leaving the flag set was just
+   *     stale UI noise. PR-τ removes that noise.
+   *   - `multi_dispatch` → ALWAYS `synthesisStyle: 'initiator_summary'`
+   *     so the parallel workers' isolated outputs always converge into
+   *     one authoritative paragraph. Falls back to a generic prompt
+   *     when no override / preset prompt is supplied.
+   */
+  it('R3 v2 PR-τ — single_main MUST have synthesisStyle=none even when effectiveSummaryPrompt is set', () => {
+    const round: P2pAdvancedRound = {
+      id: 'r1',
+      title: 'Implementation',
+      preset: 'implementation',
+      executionMode: 'single_main',
+      permissionScope: 'implementation',
+      effectiveSummaryPrompt: 'Write a detailed implementation summary…',
+    };
+    const plan = resolveP2pRoundPlan({ advancedRounds: [round], participants: [] });
+    expect(plan.rounds).toHaveLength(1);
+    const resolved = plan.rounds[0]!;
+    expect(resolved.synthesisStyle).toBe('none');
+    // summaryPrompt may still be populated so the FINAL-RUN synthesis
+    // (not the per-round synthesis hop) can pick it up via PR-μ's
+    // 3-tier resolution chain when this is the last round of a chain.
+    expect(resolved.summaryPrompt).toBe('Write a detailed implementation summary…');
+  });
+
+  it('R3 v2 PR-τ — single_main WITHOUT effectiveSummaryPrompt also keeps synthesisStyle=none', () => {
+    const round: P2pAdvancedRound = {
+      id: 'r1',
+      title: 'Implementation',
+      preset: 'implementation',
+      executionMode: 'single_main',
+      permissionScope: 'implementation',
+    };
+    const plan = resolveP2pRoundPlan({ advancedRounds: [round], participants: [] });
+    expect(plan.rounds[0]!.synthesisStyle).toBe('none');
+  });
+
+  it('R3 v2 PR-τ — multi_dispatch round MUST have synthesisStyle=initiator_summary even when no prompt was supplied', () => {
+    const round: P2pAdvancedRound = {
+      id: 'r1',
+      title: 'Discuss',
+      preset: 'custom',
+      executionMode: 'multi_dispatch',
+      permissionScope: 'analysis_only',
+      // No effectiveSummaryPrompt + 'custom' preset has no entry in
+      // SUMMARY_PROMPTS — exactly the case that previously fell through
+      // to `synthesisStyle: 'none'` and silently skipped the summary
+      // hop. PR-τ falls back to a generic prompt instead.
+    };
+    const plan = resolveP2pRoundPlan({ advancedRounds: [round], participants: [] });
+    expect(plan.rounds[0]!.synthesisStyle).toBe('initiator_summary');
+    expect(plan.rounds[0]!.summaryPrompt).toBeTruthy();
+    expect(plan.rounds[0]!.summaryPrompt).toMatch(/Synthesize/);
+  });
+
+  it('R3 v2 PR-τ — multi_dispatch round inherits the override summary prompt verbatim', () => {
+    const round: P2pAdvancedRound = {
+      id: 'r1',
+      title: 'Discuss',
+      preset: 'discussion',
+      executionMode: 'multi_dispatch',
+      permissionScope: 'analysis_only',
+      effectiveSummaryPrompt: 'Custom rich summary prompt for this round.',
+    };
+    const plan = resolveP2pRoundPlan({ advancedRounds: [round], participants: [] });
+    expect(plan.rounds[0]!.summaryPrompt).toBe('Custom rich summary prompt for this round.');
+    expect(plan.rounds[0]!.synthesisStyle).toBe('initiator_summary');
   });
 });

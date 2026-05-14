@@ -9,7 +9,7 @@ import { recordCost } from '../cost-tracker.js';
 import { formatLabel } from '../format-label.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
-import { FileBrowser } from './FileBrowser.js';
+import { FileBrowser, type FileBrowserPreviewRequest } from './FileBrowser.js';
 import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { FloatingPanel } from './FloatingPanel.js';
@@ -33,11 +33,13 @@ import {
   normalizeWindowGeometry,
   reserveWorkspaceBottom,
   shouldPersistGeometry,
+  viewportWorkspaceBelowSessionTabs,
   type WindowGeometry,
   type WorkspaceBounds,
 } from '../desktop-window-maximize.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
+import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
 
 type GetMaximizeBounds = () => WorkspaceBounds | null;
 
@@ -60,7 +62,10 @@ interface Props {
   onRestart: () => void;
   onRename: () => void;
   onSettings?: () => void;
+  onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
+  /** Open a file preview in the shared floating preview host. */
+  onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   zIndex: number;
   onFocus: () => void;
   /**
@@ -87,6 +92,7 @@ interface Props {
   detectedModelHint?: string;
   /** Whether this sub-session is participating in an active P2P discussion. */
   inP2p?: boolean;
+  accentColor?: string;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -110,12 +116,12 @@ const MIN_H = 200;
 const DESKTOP_VISIBLE_MARGIN = 32;
 
 function currentDesktopBounds(): WorkspaceBounds {
-  return reserveWorkspaceBottom({
-    x: 0,
-    y: 0,
-    w: Math.max(MIN_W, window.innerWidth),
-    h: Math.max(MIN_H, window.innerHeight),
-  });
+  return reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+    minW: MIN_W,
+    minH: MIN_H,
+  }));
 }
 
 function clampDesktopGeom(geom: WindowGeometry): WindowGeometry {
@@ -158,7 +164,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onTransportConfigSaved, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, detectedModelHint, inP2p,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onViewRepo, onTransportConfigSaved, onPreviewFile, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -429,7 +435,12 @@ export function SubSessionWindow({
         if (dir.includes('e')) w = Math.max(MIN_W, startG.w + dx);
         if (dir.includes('s')) h = Math.max(MIN_H, startG.h + dy);
         if (dir.includes('w')) { w = Math.max(MIN_W, startG.w - dx); x = startG.x + (startG.w - w); }
-        if (dir.includes('n')) { h = Math.max(MIN_H, startG.h - dy); y = startG.y + (startG.h - h); }
+        if (dir.includes('n')) {
+          const bounds = currentDesktopBounds();
+          const startBottom = startG.y + startG.h;
+          y = Math.max(bounds.y, Math.min(startG.y + dy, startBottom - MIN_H));
+          h = startBottom - y;
+        }
         return clampDesktopGeom({ x, y, w, h });
       });
     };
@@ -540,6 +551,7 @@ export function SubSessionWindow({
 
   const style: Record<string, string | number> = isMobile
     ? {
+        '--subsession-accent-color': accentColor,
         position: 'fixed',
         top: 'var(--sat, 0px)',
         left: 0,
@@ -548,7 +560,7 @@ export function SubSessionWindow({
         height: `calc(${vvh}px - var(--sat, 0px) - ${controlsHeight}px)`,
         zIndex,
       }
-    : { position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h, zIndex };
+    : { '--subsession-accent-color': accentColor, position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h, zIndex };
 
   return (
     <div
@@ -629,6 +641,8 @@ export function SubSessionWindow({
             onScrollBottomFn={onChatScrollBottomFn}
             ws={ws}
             workdir={sub.cwd ?? null}
+            onViewRepo={onViewRepo}
+            onPreviewFile={onPreviewFile}
             serverId={serverId}
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}
@@ -638,7 +652,7 @@ export function SubSessionWindow({
       </div>
 
       {/* Usage footer — shared component */}
-      {(lastUsage || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel || sessionInfo?.quotaMeta) && (
+      {!isShell && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}

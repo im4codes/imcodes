@@ -85,22 +85,50 @@ export function clearAllResend(): void {
 export type ResendDispatcher = (entry: ResendEntry) => Promise<unknown> | unknown;
 
 /**
+ * Optional callback invoked once at the end of `drainResend` when one or more
+ * entries were dropped because they exceeded `RESEND_EXPIRY_MS` (TTL).
+ *
+ * Added by audit 0419d1ac-1f4 (N-R6 / O4) so callers — typically the
+ * transport-session restore / launch path in `src/agent/session-manager.ts`
+ * — can emit a user-visible `assistant.text` summary telling the user that
+ * N queued messages timed out. Earlier behaviour only logged at `info`
+ * level; the user had no signal that their messages were lost.
+ *
+ * We pass a `count` rather than the entries themselves to keep the
+ * timeline emit lightweight (no leaking of original text into the summary).
+ * Callers needing per-entry diagnostics can read the existing `logger.info`
+ * trail.
+ */
+export type ResendExpireCallback = (info: { expiredCount: number }) => void;
+
+/**
  * Drain and dispatch. The internal queue is cleared BEFORE calling `dispatch`
  * so a dispatcher that wants to re-enqueue (e.g. still not really ready) can
  * do so safely. Expired entries are dropped. Failed dispatches are logged but
  * not retried — the next user action will resurface any real error.
  *
  * Returns the number of entries successfully dispatched.
+ *
+ * Optional `onExpired` callback runs once at the end of the drain if any
+ * entries were skipped for TTL (audit 0419d1ac-1f4). It is called only
+ * when `expiredCount > 0` and runs after every entry has been processed,
+ * keeping the timeline emit out of the per-entry inner loop.
  */
-export async function drainResend(sessionName: string, dispatch: ResendDispatcher): Promise<number> {
+export async function drainResend(
+  sessionName: string,
+  dispatch: ResendDispatcher,
+  onExpired?: ResendExpireCallback,
+): Promise<number> {
   const list = queues.get(sessionName);
   if (!list || list.length === 0) return 0;
   queues.delete(sessionName);
 
   const now = Date.now();
   let dispatched = 0;
+  let expiredCount = 0;
   for (const entry of list) {
     if (now - entry.queuedAt > RESEND_EXPIRY_MS) {
+      expiredCount += 1;
       logger.info(
         { sessionName, commandId: entry.commandId, ageMs: now - entry.queuedAt },
         'transport resend entry expired — dropping without redelivery',
@@ -119,6 +147,13 @@ export async function drainResend(sessionName: string, dispatch: ResendDispatche
         { err, sessionName, commandId: entry.commandId },
         'transport resend dispatch failed — dropping entry to avoid loops',
       );
+    }
+  }
+  if (expiredCount > 0 && onExpired) {
+    try {
+      onExpired({ expiredCount });
+    } catch (err) {
+      logger.warn({ err, sessionName, expiredCount }, 'drainResend: onExpired callback threw');
     }
   }
   return dispatched;

@@ -58,18 +58,22 @@ describe('timeline-store SQLite-preferred reads', () => {
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
 
-    vi.doMock('fs', async () => {
-      const actual = await vi.importActual<typeof import('fs')>('fs');
+    // `timelineStore.append` is now async (uses `fs/promises.appendFile`).
+    // Mock the promise-based module so the write rejects and the
+    // projection mirror call is skipped by the catch block in
+    // `appendOne`.
+    vi.doMock('fs/promises', async () => {
+      const actual = await vi.importActual<typeof import('fs/promises')>('fs/promises');
       return {
         ...actual,
-        appendFileSync: vi.fn(() => {
+        appendFile: vi.fn(async () => {
           throw new Error('append failed');
         }),
       };
     });
 
     const { timelineStore } = await import('../../src/daemon/timeline-store.js');
-    timelineStore.append({
+    await timelineStore.append({
       eventId: 'evt-fail',
       sessionId: 'append-failure',
       ts: 1,
@@ -112,8 +116,10 @@ describe('timeline-store SQLite-preferred reads', () => {
       },
     ], sessionId);
 
-    const events = await timelineStore.readPreferred(sessionId, { limit: 10 });
-    expect(events).toEqual([]);
+    await expect(timelineStore.readPreferred(sessionId, { limit: 10 })).rejects.toMatchObject({
+      reason: 'projection_unavailable',
+      source: 'main_sqlite',
+    });
     expect(projectionMocks.queryHistory).toHaveBeenCalledWith({
       sessionId,
       afterTs: undefined,
@@ -163,11 +169,15 @@ describe('timeline-store SQLite-preferred reads', () => {
       },
     ], sessionId);
 
-    const typed = await timelineStore.readByTypesPreferred(sessionId, ['assistant.text'], { limit: 10 });
-    expect(typed).toEqual([]);
+    await expect(timelineStore.readByTypesPreferred(sessionId, ['assistant.text'], { limit: 10 })).rejects.toMatchObject({
+      reason: 'projection_unavailable',
+      source: 'main_sqlite',
+    });
 
-    const completed = await timelineStore.readCompletedTextTail(sessionId, 10);
-    expect(completed).toEqual([]);
+    await expect(timelineStore.readCompletedTextTail(sessionId, 10)).rejects.toMatchObject({
+      reason: 'projection_unavailable',
+      source: 'main_sqlite',
+    });
   });
 
   it('returns null latest markers when the SQLite projection returns null', async () => {

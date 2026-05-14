@@ -125,6 +125,31 @@ describe('SessionPane', () => {
     expect(screen.getByText(/5h 11% 2h03m 4\/6 14:40/)).toBeDefined();
   });
 
+  it('renders UsageFooter for agent sessions even without usage or running state', () => {
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          state: 'stopped',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(screen.getByTestId('usage-footer').getAttribute('data-state')).toBe('stopped');
+  });
+
   it('passes detected model to UsageFooter when session metadata has no modelDisplay', () => {
     render(
       <SessionPane

@@ -31,6 +31,10 @@ function shouldProcessHistory(
   return true;
 }
 
+function shouldRequestSnapshotForReplay(msg: { truncated?: boolean; payloadTruncated?: boolean }): boolean {
+  return msg.truncated === true;
+}
+
 function makeEvent(overrides: Partial<TimelineEvent> & { seq: number; epoch: number }): TimelineEvent {
   return {
     eventId: `evt-${overrides.seq}`,
@@ -233,24 +237,14 @@ describe('timeline epoch mismatch handling', () => {
   });
 
   it('truncated replay should trigger snapshot request', () => {
-    let snapshotRequested = false;
-
-    const truncated = true;
-    if (truncated) {
-      snapshotRequested = true;
-    }
-
-    expect(snapshotRequested).toBe(true);
+    expect(shouldRequestSnapshotForReplay({ truncated: true })).toBe(true);
   });
 
   it('non-truncated replay should not trigger snapshot request', () => {
-    let snapshotRequested = false;
+    expect(shouldRequestSnapshotForReplay({ truncated: false })).toBe(false);
+  });
 
-    const truncated = false;
-    if (truncated) {
-      snapshotRequested = true;
-    }
-
-    expect(snapshotRequested).toBe(false);
+  it('payload truncation alone should not trigger snapshot repair', () => {
+    expect(shouldRequestSnapshotForReplay({ truncated: false, payloadTruncated: true })).toBe(false);
   });
 });

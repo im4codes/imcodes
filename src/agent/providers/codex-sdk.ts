@@ -1,5 +1,8 @@
-import { access } from 'node:fs/promises';
+import { access, copyFile, readFile, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
+import { homedir } from 'node:os';
+import { resolve, sep } from 'node:path';
+import { TextDecoder } from 'node:util';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import readline, { type Interface as ReadlineInterface } from 'node:readline';
 import { killProcessTree } from '../../util/kill-process-tree.js';
@@ -41,6 +44,58 @@ const COMPACT_HARD_TIMEOUT_MS = 120_000;
 const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
+
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function isCodexThreadHistoryUnreadableError(err: unknown): boolean {
+  const message = errorMessage(err).toLowerCase();
+  return (
+    message.includes('failed to read thread')
+    && (
+      message.includes('failed to load thread history')
+      || message.includes('thread-store internal error')
+      || message.includes('valid utf-8')
+    )
+  );
+}
+
+function extractCodexJsonlPath(message: string): string | null {
+  const match = /(?:^|\s)(\/[^\s:]+\.jsonl)(?::|\s|$)/.exec(message);
+  if (!match) return null;
+  const candidate = resolve(match[1]);
+  const sessionsRoot = resolve(homedir(), '.codex', 'sessions');
+  return candidate === sessionsRoot || candidate.startsWith(`${sessionsRoot}${sep}`) ? candidate : null;
+}
+
+function isValidUtf8(buffer: Buffer): boolean {
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function repairCodexJsonlText(text: string): { text: string; droppedLineCount: number } {
+  const repairedLines: string[] = [];
+  let droppedLineCount = 0;
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      JSON.parse(line);
+      repairedLines.push(line);
+    } catch {
+      droppedLineCount += 1;
+    }
+  }
+  return {
+    text: repairedLines.length > 0 ? `${repairedLines.join('\n')}\n` : '',
+    droppedLineCount,
+  };
+}
 
 function getCodexSdkContextInjectionMaxChars(): number {
   const raw = process.env.IMCODES_CODEX_SDK_CONTEXT_MAX_CHARS;
@@ -794,25 +849,57 @@ export class CodexSdkProvider implements TransportProvider {
     const baseInstructions = await resolveBaseInstructionsOverride(state.model);
 
     if (state.threadId) {
-      // Resume must carry the same `baseInstructions`: previously-broken
-      // threads were persisted with empty base_instructions, and codex's
-      // resolution priority (override > stored history > model default)
-      // means supplying it on resume is the only way to repair them
-      // mid-flight.
-      const result = await this.request('thread/resume', {
-        threadId: state.threadId,
-        ...this.sessionEnvironmentParams(state),
-        ...(state.model ? { model: state.model } : {}),
-        baseInstructions,
-      });
-      const resumedId = result?.thread?.id ?? state.threadId;
-      state.threadId = resumedId;
-      state.loaded = true;
-      this.threadToSession.set(resumedId, sessionId);
-      this.emitSessionInfo(sessionId, { resumeId: resumedId, ...(state.model ? { model: state.model } : {}) });
-      return;
+      try {
+        await this.resumeThread(sessionId, state, baseInstructions);
+        return;
+      } catch (err) {
+        if (!isCodexThreadHistoryUnreadableError(err)) throw err;
+
+        const repaired = await this.repairUnreadableThreadHistory(err).catch((repairErr) => {
+          logger.warn({ provider: this.id, sessionId, threadId: state.threadId, err: repairErr }, 'Codex SDK failed to repair unreadable thread history');
+          return false;
+        });
+        if (repaired) {
+          try {
+            await this.resumeThread(sessionId, state, baseInstructions);
+            return;
+          } catch (retryErr) {
+            logger.warn({ provider: this.id, sessionId, threadId: state.threadId, err: retryErr }, 'Codex SDK resume still failed after thread history repair');
+          }
+        }
+
+        const oldThreadId = state.threadId;
+        logger.warn({ provider: this.id, sessionId, threadId: oldThreadId, err }, 'Codex SDK stored thread history is unreadable; starting replacement thread');
+        if (oldThreadId) this.threadToSession.delete(oldThreadId);
+        state.threadId = undefined;
+        state.loaded = false;
+      }
     }
 
+    await this.startNewThread(sessionId, state, baseInstructions);
+  }
+
+  private async resumeThread(sessionId: string, state: CodexSdkSessionState, baseInstructions: string): Promise<void> {
+    if (!state.threadId) throw new Error('Codex SDK resume requested without a thread id');
+    // Resume must carry the same `baseInstructions`: previously-broken
+    // threads were persisted with empty base_instructions, and codex's
+    // resolution priority (override > stored history > model default)
+    // means supplying it on resume is the only way to repair them
+    // mid-flight.
+    const result = await this.request('thread/resume', {
+      threadId: state.threadId,
+      ...this.sessionEnvironmentParams(state),
+      ...(state.model ? { model: state.model } : {}),
+      baseInstructions,
+    });
+    const resumedId = result?.thread?.id ?? state.threadId;
+    state.threadId = resumedId;
+    state.loaded = true;
+    this.threadToSession.set(resumedId, sessionId);
+    this.emitSessionInfo(sessionId, { resumeId: resumedId, ...(state.model ? { model: state.model } : {}) });
+  }
+
+  private async startNewThread(sessionId: string, state: CodexSdkSessionState, baseInstructions: string): Promise<void> {
     const result = await this.request('thread/start', {
       cwd: state.cwd,
       ...this.sessionEnvironmentParams(state),
@@ -830,6 +917,23 @@ export class CodexSdkProvider implements TransportProvider {
     state.loaded = true;
     this.threadToSession.set(threadId, sessionId);
     this.emitSessionInfo(sessionId, { resumeId: threadId, ...(state.model ? { model: state.model } : {}) });
+  }
+
+  private async repairUnreadableThreadHistory(err: unknown): Promise<boolean> {
+    const message = errorMessage(err);
+    const filePath = extractCodexJsonlPath(message);
+    if (!filePath) return false;
+
+    const before = await readFile(filePath);
+    const hadInvalidUtf8 = !isValidUtf8(before);
+    const repaired = repairCodexJsonlText(before.toString('utf8'));
+    if (!hadInvalidUtf8 && repaired.droppedLineCount === 0) return false;
+
+    const backupPath = `${filePath}.invalid-history-${Date.now()}.bak`;
+    await copyFile(filePath, backupPath);
+    await writeFile(filePath, Buffer.from(repaired.text, 'utf8'));
+    logger.warn({ provider: this.id, filePath, backupPath, hadInvalidUtf8, droppedLineCount: repaired.droppedLineCount }, 'Codex SDK repaired unreadable thread history');
+    return true;
   }
 
   private sessionEnvironmentParams(state: CodexSdkSessionState): { env?: Record<string, string> } {
@@ -1258,11 +1362,11 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private normalizeError(err: unknown): ProviderError {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = errorMessage(err);
     if (/ENOENT|not found|spawn .*codex/i.test(message)) {
       return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND, `Codex binary not found: ${message}`, false, err);
     }
-    if (/resume|thread/i.test(message) && /not found|invalid|unknown/i.test(message)) {
+    if (isCodexThreadHistoryUnreadableError(err) || (/resume|thread/i.test(message) && /not found|invalid|unknown/i.test(message))) {
       return this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, message, true, err);
     }
     return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, false, err);

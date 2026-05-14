@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
@@ -7,9 +7,9 @@ import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '../../shared/p2p-config-events
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
 const MOCK_SESSIONS = [
-  { name: 'deck_proj_brain', agentType: 'claude-code', state: 'running', projectName: 'proj' },
-  { name: 'deck_proj_w1', agentType: 'codex', state: 'running', projectName: 'proj' },
-  { name: 'deck_proj_w2', agentType: 'gemini', state: 'idle', projectName: 'proj' },
+  { name: 'deck_proj_brain', agentType: 'claude-code', state: 'running', projectName: 'proj', projectDir: '/tmp/imcodes-parser-brain' },
+  { name: 'deck_proj_w1', agentType: 'codex', state: 'running', projectName: 'proj', projectDir: '/tmp/imcodes-parser-w1' },
+  { name: 'deck_proj_w2', agentType: 'gemini', state: 'idle', projectName: 'proj', projectDir: '/tmp/imcodes-parser-w2' },
 ];
 vi.mock('../../src/store/session-store.js', () => ({
   listSessions: () => MOCK_SESSIONS,
@@ -113,7 +113,7 @@ vi.mock('../../src/util/logger.js', () => ({
 }));
 
 vi.mock('../../src/util/imc-dir.js', () => ({
-  ensureImcDir: vi.fn().mockResolvedValue('/tmp/imc'),
+  ensureImcDir: vi.fn().mockImplementation(async () => process.env.IMCODES_TEST_REFS_DIR ?? '/tmp/imc'),
   imcSubDir: vi.fn((dir: string, sub: string) => `${dir}/.imc/${sub}`),
 }));
 
@@ -250,10 +250,22 @@ describe('parseAtTokens', () => {
 // ── Structured WS field routing (no inline @@tokens) ──────────────────────────
 
 describe('structured P2P routing via WS fields', () => {
+  // Audit:N-H2 / N4 — `getP2pWorkflowCapabilities` MUST be supplied so the
+  // daemon static policy reflects the dangerous capabilities required by
+  // the test's advanced launch (which uses preset 'implementation'). Without
+  // it, fail-closed fallback returns `[]` and compile rejects the implementation
+  // node — that is the desired production behavior.
   const mockServerLink = {
     send: vi.fn(),
     sendTimelineEvent: vi.fn(),
     getServerId: vi.fn(() => 'srv-main'),
+    getP2pWorkflowCapabilities: vi.fn(() => [
+      'p2p.workflow.v1',
+      'p2p.workflow.openspec-artifacts.v1',
+      'p2p.workflow.implementation.v1',
+    ]),
+    getHelloEpoch: vi.fn(() => 1),
+    getHelloSentAt: vi.fn(() => 1_700_000_000_000),
     daemonVersion: '0.1.0',
   };
 
@@ -281,10 +293,11 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(startP2pRun).toHaveBeenCalledTimes(1);
-    const [{ targets }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [{ targets, rounds }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(targets).toEqual([
       { session: 'deck_proj_w1', mode: 'brainstorm>discuss' },
     ]);
+    expect(rounds).toBeUndefined();
   });
 
   it('config mode still uses per-session configured modes', async () => {
@@ -555,8 +568,53 @@ describe('structured P2P routing via WS fields', () => {
     expect((ackCall![2] as Record<string, unknown>).status).toBe('accepted');
   });
 
+  it('rewrites #N:(~/.imcodes upload path) references into project refs for sandboxed agents', async () => {
+    const originalHome = process.env.HOME;
+    const originalRefsDir = process.env.IMCODES_TEST_REFS_DIR;
+    const homeDir = await mkdtemp(join(tmpdir(), 'imcodes-parser-home-'));
+    const uploadDir = join(homeDir, '.imcodes', 'uploads');
+    const sourcePath = join(uploadDir, 'image.png');
+    const refsDir = join(homeDir, 'project-refs');
 
-  it('auto-appends the selected i18n language instruction for p2p runs', async () => {
+    await mkdir(uploadDir, { recursive: true });
+    await mkdir(refsDir, { recursive: true });
+    await writeFile(sourcePath, 'fake image bytes', 'utf8');
+    process.env.HOME = homeDir;
+    process.env.IMCODES_TEST_REFS_DIR = refsDir;
+
+    try {
+      handleWebCommand({
+        type: 'session.send',
+        sessionName: 'deck_proj_w2',
+        text: `#1:(${sourcePath}) please inspect #1`,
+        commandId: 'cmd-attachment-path-rewrite',
+      }, mockServerLink as any);
+
+      await vi.waitFor(() => {
+        expect(sendKeysDelayedEnter).toHaveBeenCalled();
+      });
+
+      const sentText = vi.mocked(sendKeysDelayedEnter).mock.calls.at(-1)?.[1] as string;
+      expect(sentText).toContain(`#1:(${refsDir}/`);
+      expect(sentText).toContain('image.png)');
+      expect(sentText).toContain('please inspect #1');
+      expect(sentText).not.toContain(sourcePath);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalRefsDir === undefined) delete process.env.IMCODES_TEST_REFS_DIR;
+      else process.env.IMCODES_TEST_REFS_DIR = originalRefsDir;
+      await rm(homeDir, { recursive: true, force: true });
+    }
+  });
+
+
+  it('R3 v2 PR-ν — passes p2pLocale through to startP2pRun without polluting extraPrompt', async () => {
+    // R3 v2 PR-ν changed the language hint plumbing: it is now a structured
+    // `run.locale` field (resolved through `buildP2pLanguageInstruction` at
+    // prompt-build time) instead of a verbose mutation of `extraPrompt`. The
+    // command handler MUST forward `p2pLocale` unchanged on the run options
+    // and MUST NOT inject the legacy 79-char English line into extraPrompt.
     handleWebCommand({
       type: 'session.send',
       sessionName: 'deck_proj_brain',
@@ -569,9 +627,14 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(startP2pRun).toHaveBeenCalledOnce();
-    expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]).toHaveLength(1);
-    const [{ extraPrompt }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(extraPrompt).toContain("Use the user's selected i18n language (Chinese (Simplified)) for the discussion.");
+    const [opts] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    // Locale is forwarded as a first-class field.
+    expect(opts.locale).toBe('zh-CN');
+    // extraPrompt is NOT polluted with the legacy English instruction.
+    const extraPrompt = opts.extraPrompt as string | undefined;
+    if (typeof extraPrompt === 'string' && extraPrompt.length > 0) {
+      expect(extraPrompt).not.toMatch(/Use the user's selected i18n language/);
+    }
   });
 
   it('forwards advanced p2p options through the structured session.send path', async () => {
@@ -604,18 +667,32 @@ describe('structured P2P routing via WS fields', () => {
 
     expect(startP2pRun).toHaveBeenCalledOnce();
     expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]).toHaveLength(1);
-    expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]).toMatchObject({
+    // Audit:V-1 / N-H1 — old top-level advanced fields are materialized through
+    // `prepareAdvancedWorkflowLaunch`, then forwarded as the typed `advanced`
+    // discriminated union so the orchestrator surfaces capabilitySnapshot/policy
+    // on the run state. The compiled rounds end up under `advanced.advancedRounds`,
+    // and the legacy `advancedPresetKey` is set to 'openspec' to mark the
+    // compiled-from-envelope path inside the orchestrator's resolveP2pRoundPlan.
+    const startCall = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    expect(startCall).toMatchObject({
       initiatorSession: 'deck_proj_brain',
       targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
       userText: 'run advanced p2p',
       advancedPresetKey: 'openspec',
-      advancedRounds,
-      advancedRunTimeoutMs: 45 * 60_000,
-      contextReducer: {
-        mode: 'clone_sdk_session',
-        templateSession: 'deck_proj_brain',
+      advanced: {
+        kind: 'envelope_compiled',
+        advancedRunTimeoutMs: 45 * 60_000,
+        contextReducer: {
+          mode: 'clone_sdk_session',
+          templateSession: 'deck_proj_brain',
+        },
       },
     });
+    // Sanity: the bound workflow must be present so the orchestrator can store
+    // capabilitySnapshot / currentDaemonPolicy on the P2pRun.
+    expect(startCall?.advanced?.bound).toBeDefined();
+    // The compiled rounds match the input shape (single 'implementation' round).
+    expect(startCall?.advanced?.advancedRounds).toHaveLength(1);
   });
 
   it('forwards the selected i18n locale to the P2P run for final-summary prompting', async () => {

@@ -5,9 +5,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, act } from '@testing-library/preact';
 
+// Swappable translator so individual tests can verify translated rendering
+// against a real locale dictionary (e.g. zh-CN). Default behaviour matches
+// the previous mock — fallback string, then last segment of the key.
+type TranslatorFn = (key: string, fallback?: string) => string;
+const DEFAULT_TRANSLATOR: TranslatorFn = (key, fallback) => fallback ?? key.split('.').pop() ?? key;
+let currentTranslator: TranslatorFn = DEFAULT_TRANSLATOR;
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string, fallback?: string) => fallback ?? key.split('.').pop() ?? key,
+    t: (key: string, fallback?: string) => currentTranslator(key, fallback),
   }),
 }));
 
@@ -29,9 +35,34 @@ vi.mock('../../src/api.js', () => ({
   onUserPrefChanged: (...args: unknown[]) => onUserPrefChangedMock(...args as Parameters<typeof onUserPrefChangedMock>),
 }));
 
-import { P2pConfigPanel } from '../../src/components/P2pConfigPanel.js';
+import { P2pConfigPanel, type P2pConfigPanelCapabilitySource } from '../../src/components/P2pConfigPanel.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { MAX_P2P_PARTICIPANTS } from '@shared/p2p-config-events.js';
+import {
+  P2P_WORKFLOW_CAPABILITY_V1,
+  P2P_WORKFLOW_KNOWN_SCHEMA_MAX,
+  P2P_WORKFLOW_SCHEMA_VERSION,
+} from '@shared/p2p-workflow-constants.js';
+import type { P2pWorkflowDraft, P2pWorkflowLaunchEnvelope } from '@shared/p2p-workflow-types.js';
+import { readFileSync } from 'node:fs';
+import { join as joinPath } from 'node:path';
+
+/** Build a capability source returning a fresh-now snapshot. Used to satisfy
+ *  the advanced launch capability gate when the test's intent is unrelated to
+ *  the gate itself (e.g. legacy save/migration regressions). */
+function freshCapabilitySource(capabilities: string[] = [P2P_WORKFLOW_CAPABILITY_V1]): P2pConfigPanelCapabilitySource {
+  const snapshot = {
+    daemonId: 'daemon-test',
+    capabilities,
+    helloEpoch: 1,
+    sentAt: Date.now(),
+    observedAt: Date.now(),
+  };
+  return {
+    getSnapshot: () => snapshot,
+    subscribe: () => () => {},
+  };
+}
 
 const sessions = [
   { name: 'deck_proj_brain', agentType: 'claude-code-sdk', state: 'running' },
@@ -49,11 +80,18 @@ function renderPanel(overrides: {
   subSessions?: typeof subSessions;
   activeSession?: string;
   serverId?: string | null;
-  initialTab?: 'participants' | 'combos';
+  initialTab?: 'participants' | 'combos' | 'advanced';
   onClose?: () => void;
   onSave?: (cfg: P2pSavedConfig) => void;
   onPersistDaemonConfig?: (scopeSession: string, cfg: P2pSavedConfig) => Promise<{ ok: boolean; error?: string }> | { ok: boolean; error?: string };
+  daemonCapabilitySource?: P2pConfigPanelCapabilitySource | null;
 } = {}) {
+  // Default to a fresh capability source so the advanced launch gate doesn't
+  // accidentally block tests that don't care about it. Pass `null` explicitly
+  // to opt out (e.g. tests that exercise the stale-capability path).
+  const daemonCapabilitySource = overrides.daemonCapabilitySource === undefined
+    ? freshCapabilitySource()
+    : overrides.daemonCapabilitySource;
   const props = {
     sessions: overrides.sessions ?? sessions,
     subSessions: overrides.subSessions ?? subSessions,
@@ -63,6 +101,7 @@ function renderPanel(overrides: {
     onClose: overrides.onClose ?? vi.fn(),
     onSave: overrides.onSave ?? vi.fn(),
     onPersistDaemonConfig: overrides.onPersistDaemonConfig,
+    daemonCapabilitySource,
   };
   return render(<P2pConfigPanel {...props} />);
 }
@@ -95,6 +134,7 @@ describe('P2pConfigPanel', () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+    currentTranslator = DEFAULT_TRANSLATOR;
   });
 
   it('renders session list excluding shell and script types', async () => {
@@ -281,6 +321,264 @@ describe('P2pConfigPanel', () => {
     expect(screen.queryByText('brain')).toBeNull();
   });
 
+  // ── R3 v2 PR-θ — dedicated advanced workflow tab ─────────────────────────
+  describe('advanced workflow tab', () => {
+    it('exposes the advanced workflow tab button on every panel mount', async () => {
+      renderPanel();
+      await flush();
+
+      const tabButton = screen.getByTestId('p2p-tab-advanced');
+      expect(tabButton).toBeDefined();
+      expect(tabButton.tagName).toBe('BUTTON');
+    });
+
+    it('clicking the advanced tab on a fresh panel auto-bootstraps a starter draft and renders the canvas', async () => {
+      // Cold panel — no saved config, no draft, no preset.
+      getUserPrefMock.mockResolvedValue(null);
+      renderPanel();
+      await flush();
+
+      // Initially, the canvas is NOT in the DOM (we are on participants tab
+      // and there is no draft yet).
+      expect(screen.queryByTestId('p2p-editor-canvas')).toBeNull();
+
+      // Click into the advanced tab.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-tab-advanced'));
+      });
+      await flush();
+
+      // After tab switch the bootstrap effect runs and a starter draft is
+      // injected. The canvas root + a single seed node MUST be rendered.
+      expect(screen.getByTestId('p2p-editor-canvas')).toBeDefined();
+      expect(screen.getByTestId('p2p-editor-node-shape-node_1')).toBeDefined();
+
+      // The participants tab content (agent grid header, rounds, hop-timeout)
+      // must NOT be in the DOM — we have switched away.
+      expect(screen.queryByText('settings_rounds')).toBeNull();
+      expect(screen.queryByText('settings_hop_timeout')).toBeNull();
+    });
+
+    it('opening the panel directly with initialTab=advanced renders the canvas immediately', async () => {
+      getUserPrefMock.mockResolvedValue(null);
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+
+      // Bootstrap fires synchronously on mount when activeTab is 'advanced'.
+      expect(screen.getByTestId('p2p-editor-canvas')).toBeDefined();
+      expect(screen.getByTestId('p2p-editor-node-shape-node_1')).toBeDefined();
+    });
+
+    it('participants tab no longer hosts the canvas, allowed-executables section, or workflow banners', async () => {
+      // A draft is loaded — under the old layout this would surface the
+      // canvas + banners on the participants tab. Under the new layout it
+      // must NOT, because all advanced UI lives under the advanced tab.
+      const draft: P2pWorkflowDraft = {
+        schemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+        id: 'draft-x',
+        title: 'X',
+        nodes: [{ id: 'a', title: 'A', nodeKind: 'llm', preset: 'discuss', permissionScope: 'analysis_only' }],
+        edges: [],
+      };
+      getUserPrefMock.mockResolvedValue(JSON.stringify({ sessions: {}, rounds: 1, workflowDraft: draft }));
+
+      renderPanel({ initialTab: 'participants' });
+      await flush();
+
+      expect(screen.queryByTestId('p2p-editor-canvas')).toBeNull();
+      expect(screen.queryByTestId('p2p-allowed-executables-section')).toBeNull();
+      expect(screen.queryByTestId('p2p-future-schema-banner')).toBeNull();
+      expect(screen.queryByTestId('p2p-capability-stale-banner')).toBeNull();
+      expect(screen.queryByTestId('p2p-missing-capability-banner')).toBeNull();
+    });
+  });
+
+  // ── R3 v2 PR-ι — workflow library (multi-workflow CRUD) ─────────────────
+  describe('workflow library', () => {
+    it('renders the library section + active badge after the canvas auto-bootstraps', async () => {
+      getUserPrefMock.mockResolvedValue(null);
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+
+      // Bootstrap effect synthesises one starter workflow → library has one entry.
+      const section = screen.getByTestId('p2p-workflow-library-section');
+      expect(section).toBeDefined();
+      const list = screen.getByTestId('p2p-workflow-library-list');
+      expect(list.querySelectorAll('li').length).toBe(1);
+      // The single entry is active.
+      const entries = list.querySelectorAll('li');
+      expect(entries[0].getAttribute('data-active')).toBe('true');
+      // Delete is disabled for a single-entry library (cannot delete the last).
+      const deleteBtn = screen.getByTestId('p2p-workflow-library-delete') as HTMLButtonElement;
+      expect(deleteBtn.disabled).toBe(true);
+    });
+
+    it('clicking + New adds a second workflow, activates it, and persists both through Save', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(null);
+      renderPanel({ initialTab: 'advanced', onSave });
+      await flush();
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-workflow-library-new'));
+      });
+      await flush();
+
+      const list = screen.getByTestId('p2p-workflow-library-list');
+      const entries = Array.from(list.querySelectorAll('li'));
+      expect(entries).toHaveLength(2);
+      // The second one auto-activates.
+      expect(entries[1].getAttribute('data-active')).toBe('true');
+      expect(entries[0].getAttribute('data-active')).toBe('false');
+
+      // Save and inspect the persisted shape.
+      await act(async () => {
+        fireEvent.click(screen.getByText('settings_save'));
+      });
+      await flush();
+      const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+      expect(cfg.workflowLibrary?.length).toBe(2);
+      expect(cfg.activeWorkflowId).toBeDefined();
+      // The persisted active id should match the second library entry.
+      expect(cfg.activeWorkflowId).toBe(cfg.workflowLibrary?.[1]?.id);
+      // Legacy mirror is set so older clients can still launch.
+      expect(cfg.workflowDraft?.id).toBe(cfg.activeWorkflowId);
+    });
+
+    it('clicking a non-active library entry switches the canvas + active id', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(null);
+      renderPanel({ initialTab: 'advanced', onSave });
+      await flush();
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-workflow-library-new'));
+      });
+      await flush();
+
+      // Now click the FIRST entry to switch back.
+      const list = screen.getByTestId('p2p-workflow-library-list');
+      const entries = Array.from(list.querySelectorAll('li'));
+      await act(async () => {
+        fireEvent.click(entries[0]);
+      });
+      await flush();
+      const updated = Array.from(screen.getByTestId('p2p-workflow-library-list').querySelectorAll('li'));
+      expect(updated[0].getAttribute('data-active')).toBe('true');
+      expect(updated[1].getAttribute('data-active')).toBe('false');
+    });
+
+    it('Duplicate clones the active workflow with a copy suffix', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(null);
+      renderPanel({ initialTab: 'advanced', onSave });
+      await flush();
+      // Rename so we can assert the suffix attaches to the right title.
+      const nameInput = screen.getByTestId('p2p-workflow-name-input') as HTMLInputElement;
+      await act(async () => {
+        fireEvent.input(nameInput, { target: { value: 'Audit pipeline' } });
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-workflow-library-duplicate'));
+      });
+      await flush();
+      const list = screen.getByTestId('p2p-workflow-library-list');
+      const titles = Array.from(list.querySelectorAll('li > span')).map((s) => s.textContent);
+      expect(titles).toContain('Audit pipeline');
+      // Find the copy: the test translator returns the LAST segment of the
+      // i18n key as the rendered text, so the suffix here resolves to the
+      // raw English fallback because the translator just echoes the key.
+      expect(titles.some((t) => t?.includes('Audit pipeline'))).toBe(true);
+      // After Duplicate, the second list entry is active.
+      const entries = Array.from(list.querySelectorAll('li'));
+      expect(entries[1].getAttribute('data-active')).toBe('true');
+    });
+
+    it('Delete removes the active workflow and promotes the first remaining entry', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(null);
+      // Stub confirm so the test does not get a JSDOM "not implemented" warning.
+      const originalConfirm = window.confirm;
+      window.confirm = () => true;
+      try {
+        renderPanel({ initialTab: 'advanced', onSave });
+        await flush();
+        await act(async () => {
+          fireEvent.click(screen.getByTestId('p2p-workflow-library-new'));
+        });
+        await flush();
+        // Now library has 2; delete should not be disabled.
+        const deleteBtn = screen.getByTestId('p2p-workflow-library-delete') as HTMLButtonElement;
+        expect(deleteBtn.disabled).toBe(false);
+        await act(async () => {
+          fireEvent.click(deleteBtn);
+        });
+        await flush();
+        const list = screen.getByTestId('p2p-workflow-library-list');
+        expect(list.querySelectorAll('li')).toHaveLength(1);
+      } finally {
+        window.confirm = originalConfirm;
+      }
+    });
+
+    it('renaming an active workflow updates the title input AND the library list label', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(null);
+      renderPanel({ initialTab: 'advanced', onSave });
+      await flush();
+      const nameInput = screen.getByTestId('p2p-workflow-name-input') as HTMLInputElement;
+      await act(async () => {
+        fireEvent.input(nameInput, { target: { value: 'My audit flow' } });
+      });
+      await flush();
+      // List entry text should now reflect the rename.
+      const list = screen.getByTestId('p2p-workflow-library-list');
+      const titles = Array.from(list.querySelectorAll('li > span')).map((s) => s.textContent);
+      expect(titles).toContain('My audit flow');
+      // The input value should also be the rename (not the bootstrap default).
+      expect((screen.getByTestId('p2p-workflow-name-input') as HTMLInputElement).value).toBe('My audit flow');
+      // Save and confirm the persisted active workflow carries the new title.
+      await act(async () => {
+        fireEvent.click(screen.getByText('settings_save'));
+      });
+      await flush();
+      const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+      const active = cfg.workflowLibrary?.find((e) => e.id === cfg.activeWorkflowId);
+      expect(active?.title).toBe('My audit flow');
+    });
+
+    it('hydrates a previously-saved library + activeWorkflowId from saved config', async () => {
+      const a: P2pWorkflowDraft = {
+        schemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+        id: 'wf_a',
+        title: 'Alpha',
+        nodes: [{ id: 'n1', title: 'N', nodeKind: 'llm', preset: 'discuss', permissionScope: 'analysis_only' }],
+        edges: [],
+        rootNodeId: 'n1',
+      };
+      const b: P2pWorkflowDraft = { ...a, id: 'wf_b', title: 'Beta' };
+      const savedConfig: P2pSavedConfig = {
+        sessions: {},
+        rounds: 1,
+        workflowLibrary: [a, b],
+        activeWorkflowId: 'wf_b',
+      };
+      getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+      const list = screen.getByTestId('p2p-workflow-library-list');
+      const entries = Array.from(list.querySelectorAll('li'));
+      expect(entries.map((e) => e.getAttribute('data-testid'))).toEqual([
+        'p2p-workflow-library-entry-wf_a',
+        'p2p-workflow-library-entry-wf_b',
+      ]);
+      // wf_b is active per saved activeWorkflowId.
+      expect(entries[1].getAttribute('data-active')).toBe('true');
+      // Title input mirrors the active workflow title.
+      const nameInput = screen.getByTestId('p2p-workflow-name-input') as HTMLInputElement;
+      expect(nameInput.value).toBe('Beta');
+    });
+  });
+
   it('new sessions not in saved config default to disabled with audit mode', async () => {
     const savedConfig: P2pSavedConfig = {
       sessions: {}, // no prior config for any session
@@ -417,7 +715,7 @@ describe('P2pConfigPanel', () => {
     expect(typeof jsonArg).toBe('string');
     const parsed = JSON.parse(jsonArg);
     expect(parsed).toHaveProperty('sessions');
-    expect(parsed).toHaveProperty('rounds');
+    expect(parsed.rounds).toBe(1);
   });
 
   it('persists the saved config to the daemon authority path', async () => {
@@ -530,6 +828,7 @@ describe('P2pConfigPanel', () => {
           title: 'Discussion',
           preset: 'discussion',
           executionMode: 'single_main',
+          permissionScope: 'analysis_only',
           timeoutMinutes: 5,
         },
       ],
@@ -546,25 +845,52 @@ describe('P2pConfigPanel', () => {
     await flush();
 
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
-    expect(cfg.advancedPresetKey).toBe('openspec');
-    expect(cfg.advancedRunTimeoutMinutes).toBe(42);
-    expect(cfg.contextReducer).toEqual(savedConfig.contextReducer);
-    expect(cfg.advancedRounds).toEqual(savedConfig.advancedRounds);
+    expect(cfg.workflowDraft).toEqual(expect.objectContaining({ schemaVersion: 1, id: 'old_openspec' }));
+    expect(cfg.workflowLaunchEnvelope).toEqual(expect.objectContaining({
+      workflowSchemaVersion: 1,
+      workflowKind: 'advanced',
+      advancedDraft: expect.objectContaining({ id: 'old_openspec' }),
+    }));
+    expect(cfg.advancedPresetKey).toBeUndefined();
+    expect(cfg.advancedRunTimeoutMinutes).toBeUndefined();
+    expect(cfg.contextReducer).toBeUndefined();
+    expect(cfg.advancedRounds).toBeUndefined();
   });
 
-  it('calls onClose after save completes', async () => {
+  it('Save & Close button calls onClose after save completes', async () => {
     const onClose = vi.fn();
 
     renderPanel({ onClose });
     await flush();
 
-    const saveBtn = screen.getByText('settings_save');
+    // R3 v2 PR-λ — The footer now exposes TWO save buttons. The
+    // "Save & Close" variant preserves the original close-on-save
+    // behaviour; the plain "Save" variant keeps the panel open so
+    // the user can keep editing the workflow library.
+    const saveAndCloseBtn = screen.getByTestId('p2p-save-and-close');
     await act(async () => {
-      fireEvent.click(saveBtn);
+      fireEvent.click(saveAndCloseBtn);
     });
     await flush();
 
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('R3 v2 PR-λ — Save (keep open) button persists changes WITHOUT closing the panel', async () => {
+    const onClose = vi.fn();
+    const onSave = vi.fn();
+
+    renderPanel({ onClose, onSave });
+    await flush();
+
+    const saveKeepOpen = screen.getByTestId('p2p-save-keep-open');
+    await act(async () => {
+      fireEvent.click(saveKeepOpen);
+    });
+    await flush();
+
+    expect(onSave).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('uses per-session config key for different sessions', async () => {
@@ -787,5 +1113,716 @@ describe('P2pConfigPanel', () => {
     await flush();
 
     expect(onSave.mock.calls[0][0].rounds).toBe(5);
+  });
+
+  // ── smart-p2p-upgrade tasks 9.5–9.7: capability gate + future schema ─────
+  describe('advanced launch capability gate', () => {
+    it('shows the capability_stale banner and surfaces the launch-disabled flag when no daemon.hello has been received', async () => {
+      const savedConfig: P2pSavedConfig = {
+        sessions: {},
+        rounds: 2,
+        // Old advanced preset is enough to set hasAdvancedConfig=true.
+        advancedPresetKey: 'openspec',
+        advancedRunTimeoutMinutes: 30,
+      };
+      getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
+
+      // Pass a source that always returns null → simulates daemon.hello never
+      // observed (e.g. daemon disconnected, or on first connect).
+      const stubSource: P2pConfigPanelCapabilitySource = {
+        getSnapshot: () => null,
+        subscribe: () => () => {},
+      };
+      // R3 v2 PR-θ — capability/migration/future-schema banners now live
+      // under the dedicated `advanced` tab (canvas + advanced controls).
+      // Open the panel directly on that tab so the banner is in the DOM.
+      renderPanel({ daemonCapabilitySource: stubSource, initialTab: 'advanced' });
+      await flush();
+
+      // Banner must use the translated diagnostic key (the test mock returns
+      // the last segment of the i18n key as the rendered string).
+      expect(screen.getByTestId('p2p-capability-stale-banner')).toBeDefined();
+
+      // Save button should signal the launch-disabled state to consumers via
+      // the data attribute, even if the button itself remains clickable
+      // (Save is the migration acceptance action, not the actual launch).
+      const saveBtn = screen.getByText('settings_save').closest('button')!;
+      expect(saveBtn.getAttribute('data-advanced-launch-disabled')).toBe('true');
+    });
+
+    it('shows the missing_required_capability banner when daemon.hello is fresh but lacks p2p.workflow.v1', async () => {
+      const savedConfig: P2pSavedConfig = {
+        sessions: {},
+        rounds: 1,
+        advancedPresetKey: 'openspec',
+      };
+      getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
+
+      // Fresh snapshot but no p2p.workflow.v1 capability — required cap missing.
+      const source = freshCapabilitySource(['some.other.cap']);
+      renderPanel({ daemonCapabilitySource: source, initialTab: 'advanced' });
+      await flush();
+
+      expect(screen.getByTestId('p2p-missing-capability-banner')).toBeDefined();
+      const saveBtn = screen.getByText('settings_save').closest('button')!;
+      expect(saveBtn.getAttribute('data-advanced-launch-disabled')).toBe('true');
+    });
+
+    it('does not show capability banners when no advanced workflow is configured', async () => {
+      const savedConfig: P2pSavedConfig = {
+        sessions: {},
+        rounds: 3,
+        // Note: no advanced fields → hasAdvancedConfig=false
+      };
+      getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
+
+      // Even with a stale source (null snapshot), the gate is dormant when
+      // the user has no advanced workflow configured.
+      const stubSource: P2pConfigPanelCapabilitySource = {
+        getSnapshot: () => null,
+        subscribe: () => () => {},
+      };
+      renderPanel({ daemonCapabilitySource: stubSource });
+      await flush();
+
+      expect(screen.queryByTestId('p2p-capability-stale-banner')).toBeNull();
+      expect(screen.queryByTestId('p2p-missing-capability-banner')).toBeNull();
+      const saveBtn = screen.getByText('settings_save').closest('button')!;
+      expect(saveBtn.getAttribute('data-advanced-launch-disabled')).toBe('false');
+    });
+  });
+
+  describe('future workflow schema read-only mode', () => {
+    it('blocks save and shows the unsupported_schema_version banner when the saved envelope declares a future schema version', async () => {
+      const futureVersion = (P2P_WORKFLOW_KNOWN_SCHEMA_MAX as number) + 1;
+      const savedConfig: P2pSavedConfig = {
+        sessions: {},
+        rounds: 2,
+        // Forge a launch envelope from a hypothetical future client.
+        workflowLaunchEnvelope: {
+          workflowSchemaVersion: futureVersion,
+          workflowKind: 'advanced',
+        } as unknown as NonNullable<P2pSavedConfig['workflowLaunchEnvelope']>,
+      };
+      getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
+
+      const onSave = vi.fn();
+      // Future-schema banner lives on the advanced tab.
+      renderPanel({ onSave, initialTab: 'advanced' });
+      await flush();
+
+      expect(screen.getByTestId('p2p-future-schema-banner')).toBeDefined();
+
+      const saveBtn = screen.getByText('settings_save').closest('button')!;
+      expect(saveBtn.disabled).toBe(true);
+      expect(saveBtn.getAttribute('data-save-blocked')).toBe('true');
+
+      const panel = saveBtn.closest('[data-readonly-mode]');
+      expect(panel?.getAttribute('data-readonly-mode')).toBe('true');
+
+      // Defense-in-depth: even forcing a click should not invoke onSave.
+      await act(async () => {
+        fireEvent.click(saveBtn);
+      });
+      await flush();
+      expect(onSave).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── smart-p2p-upgrade tasks 9.2 / 9.10 / §12.6 — list-based draft editor ─
+  describe('advanced workflow draft editor', () => {
+    function makeDraft(): P2pWorkflowDraft {
+      return {
+        schemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+        id: 'draft-test',
+        title: 'Draft test',
+        nodes: [
+          { id: 'discuss', title: 'Discuss', nodeKind: 'llm', preset: 'discuss', permissionScope: 'analysis_only' },
+          { id: 'audit', title: 'Audit', nodeKind: 'llm', preset: 'audit', permissionScope: 'analysis_only' },
+        ],
+        edges: [
+          { id: 'e1', fromNodeId: 'discuss', toNodeId: 'audit', edgeKind: 'default' },
+        ],
+      };
+    }
+
+    function makeSavedConfigWithDraft(extras: Partial<P2pSavedConfig> = {}): P2pSavedConfig {
+      const draft = makeDraft();
+      const envelope: P2pWorkflowLaunchEnvelope = {
+        workflowSchemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+        workflowKind: 'advanced',
+        advancedDraft: draft,
+        requiredDaemonCapabilities: [P2P_WORKFLOW_CAPABILITY_V1],
+      };
+      return {
+        sessions: {},
+        rounds: 2,
+        workflowDraft: draft,
+        workflowLaunchEnvelope: envelope,
+        ...extras,
+      };
+    }
+
+    it('renders the editor when a draft is present and not in future-schema mode', async () => {
+      getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
+      // R3 v2 PR-θ — canvas + advanced controls live under the `advanced` tab.
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+
+      const editor = screen.getByTestId('p2p-advanced-workflow-editor');
+      expect(editor).toBeDefined();
+      expect(editor.getAttribute('data-readonly')).toBe('false');
+      // Canvas variant must be active — there is only one editor surface
+      // (no list/canvas toggle, no list fallback).
+      expect(editor.getAttribute('data-editor-variant')).toBe('canvas');
+      // Canvas root is present.
+      expect(screen.getByTestId('p2p-editor-canvas')).toBeDefined();
+      // Both seeded nodes render as SVG shapes.
+      expect(screen.getByTestId('p2p-editor-node-shape-discuss')).toBeDefined();
+      expect(screen.getByTestId('p2p-editor-node-shape-audit')).toBeDefined();
+      // Seeded edge renders as SVG path group.
+      expect(screen.getByTestId('p2p-editor-edge-shape-e1')).toBeDefined();
+      // No diagnostic block for a valid seed draft.
+      expect(screen.queryByTestId('p2p-editor-diagnostics')).toBeNull();
+      // Read-only notice should not render.
+      expect(screen.queryByTestId('p2p-editor-readonly-notice')).toBeNull();
+      // Inspector starts empty (no selection on mount).
+      expect(screen.getByTestId('p2p-editor-inspector-empty')).toBeDefined();
+    });
+
+    it('add node and remove node update draft state and surface validator diagnostics inline', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
+      renderPanel({ onSave, initialTab: 'advanced' });
+      await flush();
+
+      // Initial: 2 nodes (rendered as SVG shapes on the canvas).
+      expect(screen.getByTestId('p2p-editor-node-shape-discuss')).toBeDefined();
+      expect(screen.getByTestId('p2p-editor-node-shape-audit')).toBeDefined();
+
+      // Add a node — should default to llm/discuss/analysis_only with id
+      // node_1 AND auto-select so the inspector surfaces immediately.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-editor-add-node'));
+      });
+      await flush();
+      // SVG shape for the new node exists on the canvas.
+      expect(screen.getByTestId('p2p-editor-node-shape-node_1')).toBeDefined();
+      // Inspector picked up the new node (testid lives on the inspector card,
+      // which is keyed by the selected node id).
+      expect(screen.getByTestId('p2p-editor-node-node_1')).toBeDefined();
+      // Default preset should be 'discuss' (a valid llm/analysis_only combo →
+      // no diagnostic from validateNodeCombination).
+      const presetSelect = screen.getByLabelText('node-node_1-preset') as HTMLSelectElement;
+      expect(presetSelect.value).toBe('discuss');
+
+      // R3 v2 PR-λ — Switching the preset to `implementation` USED to leave
+      // `permissionScope='analysis_only'` and surface a cryptic
+      // `invalid_workflow_graph (nodes[N])` diagnostic. The canvas editor
+      // now auto-aligns `permissionScope` (and `dispatchStyle`) to the
+      // picked preset so users never land on an invalid combination by
+      // accident. Verify: NO diagnostic appears, AND the scope dropdown
+      // jumps to 'implementation'.
+      await act(async () => {
+        presetSelect.value = 'implementation';
+        // Preact attaches handlers via the input event for native form
+        // controls, so fireEvent.input is the reliable trigger here.
+        fireEvent.input(presetSelect, { target: { value: 'implementation' } });
+      });
+      await flush();
+      expect(screen.queryByTestId('p2p-editor-diagnostics')).toBeNull();
+      const scopeSelect = screen.getByLabelText('node-node_1-scope') as HTMLSelectElement;
+      expect(scopeSelect.value).toBe('implementation');
+      // Dispatch style auto-flips to single_main for implementation preset.
+      const dispatchSelect = screen.getByLabelText('node-node_1-dispatch-style') as HTMLSelectElement;
+      expect(dispatchSelect.value).toBe('single_main');
+
+      // Remove the new node from the inspector and confirm the SVG shape is gone.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-editor-remove-node-node_1'));
+      });
+      await flush();
+      expect(screen.queryByTestId('p2p-editor-node-shape-node_1')).toBeNull();
+      expect(screen.queryByTestId('p2p-editor-node-node_1')).toBeNull();
+    });
+
+    it('select existing edge and switch to conditional routing_key_equals updates draft', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
+      renderPanel({ onSave, initialTab: 'advanced' });
+      await flush();
+
+      // The seed already has edge `e1` rendered as an SVG shape. Select it
+      // by clicking the shape; the inspector card with testid
+      // `p2p-editor-edge-e1` should appear.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-editor-edge-shape-e1'));
+      });
+      await flush();
+      expect(screen.getByTestId('p2p-editor-edge-e1')).toBeDefined();
+
+      // Switch edgeKind to conditional → condition controls should appear.
+      const kindSelect = screen.getByLabelText('edge-e1-kind') as HTMLSelectElement;
+      await act(async () => {
+        kindSelect.value = 'conditional';
+        fireEvent.input(kindSelect, { target: { value: 'conditional' } });
+      });
+      await flush();
+      const conditionKind = screen.getByLabelText('edge-e1-condition-kind') as HTMLSelectElement;
+      expect(conditionKind.value).toBe('routing_key_equals');
+      const conditionEquals = screen.getByLabelText('edge-e1-condition-equals') as HTMLInputElement;
+      // Empty equals → validator emits invalid_edge_condition diagnostic.
+      expect(screen.getByTestId('p2p-editor-diagnostics').textContent).toMatch(/invalid_edge_condition|e1\.condition/);
+
+      // Type a value into equals — diagnostic should clear.
+      await act(async () => {
+        fireEvent.input(conditionEquals, { target: { value: 'go-audit' } });
+      });
+      await flush();
+      // Save and inspect outgoing config — the workflowDraft must contain
+      // the conditional edge with the routing_key_equals condition.
+      await act(async () => {
+        fireEvent.click(screen.getByText('settings_save'));
+      });
+      await flush();
+      const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+      const draft = cfg.workflowDraft;
+      expect(draft).toBeDefined();
+      const conditionalEdge = draft!.edges.find((edge) => edge.id === 'e1');
+      expect(conditionalEdge).toMatchObject({
+        edgeKind: 'conditional',
+        condition: { kind: 'routing_key_equals', equals: 'go-audit' },
+      });
+    });
+
+    it('editor inputs are disabled when readOnly is true (future schema)', async () => {
+      const futureVersion = (P2P_WORKFLOW_KNOWN_SCHEMA_MAX as number) + 1;
+      // Force read-only via a future-version draft saved on the panel.
+      const future: P2pWorkflowDraft = {
+        ...makeDraft(),
+        schemaVersion: futureVersion as unknown as 1,
+      };
+      const savedConfig: P2pSavedConfig = {
+        sessions: {},
+        rounds: 2,
+        workflowDraft: future,
+        workflowLaunchEnvelope: {
+          workflowSchemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+          workflowKind: 'advanced',
+          advancedDraft: future,
+        },
+      };
+      getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
+
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+
+      const editor = screen.getByTestId('p2p-advanced-workflow-editor');
+      expect(editor.getAttribute('data-readonly')).toBe('true');
+      expect(editor.getAttribute('data-editor-variant')).toBe('canvas');
+      expect(screen.getByTestId('p2p-editor-readonly-notice')).toBeDefined();
+
+      // Add-node button must NOT render in readonly mode.
+      expect(screen.queryByTestId('p2p-editor-add-node')).toBeNull();
+      // Drag anchor must NOT render in readonly mode (no edge creation).
+      expect(screen.queryByTestId('p2p-editor-node-anchor-discuss')).toBeNull();
+
+      // Click the node shape to surface the inspector, then assert all
+      // inputs are disabled. The canvas itself doesn't disable selection
+      // so the user can still inspect the workflow read-only.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-editor-node-shape-discuss'));
+      });
+      await flush();
+      const titleInput = screen.getByLabelText('node-discuss-title') as HTMLInputElement;
+      expect(titleInput.disabled).toBe(true);
+      const presetSelect = screen.getByLabelText('node-discuss-preset') as HTMLSelectElement;
+      expect(presetSelect.disabled).toBe(true);
+
+      // Now select the edge via shape click and confirm its inputs are also
+      // disabled.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-editor-edge-shape-e1'));
+      });
+      await flush();
+      const fromSelect = screen.getByLabelText('edge-e1-from') as HTMLSelectElement;
+      expect(fromSelect.disabled).toBe(true);
+    });
+
+    it('editor edits never include forbidden envelope fields in onChange output', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
+      renderPanel({ onSave, initialTab: 'advanced' });
+      await flush();
+
+      // Make a few edits — select discuss node, change preset, add a node,
+      // save. The canvas auto-selects the new node so the inspector is
+      // already populated for the post-add assertion path.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-editor-node-shape-discuss'));
+      });
+      await flush();
+      const presetSelect = screen.getByLabelText('node-discuss-preset') as HTMLSelectElement;
+      await act(async () => {
+        presetSelect.value = 'brainstorm';
+        fireEvent.input(presetSelect, { target: { value: 'brainstorm' } });
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-editor-add-node'));
+      });
+      await flush();
+      await act(async () => {
+        fireEvent.click(screen.getByText('settings_save'));
+      });
+      await flush();
+
+      // Inspect the entire saved P2pSavedConfig recursively for forbidden
+      // private fields. The buildP2pWorkflowLaunchEnvelopeFromConfig path
+      // must not bake any compiled/private/raw/baseline fields into the
+      // saved envelope or draft as a side-effect of editing.
+      const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+      const FORBIDDEN = [
+        'compiledWorkflow',
+        'boundWorkflow',
+        'privateRuntimeState',
+        'runtimePrivateState',
+        'rawPrompt',
+        'rawPromptText',
+        'scriptRawOutputs',
+        'rawScriptOutput',
+        'artifactBaselines',
+        'privateArtifactBaselines',
+        'editorCache',
+        'hiddenEditorCache',
+        'env',
+        'environment',
+      ];
+      const stack: unknown[] = [cfg];
+      while (stack.length > 0) {
+        const value = stack.pop();
+        if (value && typeof value === 'object') {
+          for (const [key, child] of Object.entries(value)) {
+            const lower = key.toLowerCase();
+            expect(
+              FORBIDDEN.includes(key) || lower.endsWith('token') || lower.endsWith('secret') || lower.endsWith('apikey'),
+              `forbidden field "${key}" appeared in onChange/onSave output`,
+            ).toBe(false);
+            if (child && typeof child === 'object') stack.push(child);
+          }
+        }
+      }
+    });
+
+    it('renders editor strings via t() for a non-en locale (zh-CN)', async () => {
+      // Load the zh-CN locale dictionary directly so we can verify that the
+      // editor strings ARE wired through t() (vs hardcoded English).
+      const webRoot = process.cwd().endsWith('/web') ? process.cwd() : joinPath(process.cwd(), 'web');
+      const zh = JSON.parse(readFileSync(joinPath(webRoot, 'src/i18n/locales/zh-CN.json'), 'utf8')) as Record<string, unknown>;
+      function lookup(key: string): string | undefined {
+        const segments = key.split('.');
+        let current: unknown = zh;
+        for (const segment of segments) {
+          if (!current || typeof current !== 'object' || Array.isArray(current)) return undefined;
+          current = (current as Record<string, unknown>)[segment];
+        }
+        return typeof current === 'string' ? current : undefined;
+      }
+
+      // Override the swappable translator BEFORE rendering so the panel
+      // reads zh-CN strings as it mounts.
+      currentTranslator = (key: string, fallback?: string) => lookup(key) ?? fallback ?? key;
+      try {
+        getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
+        renderPanel({ initialTab: 'advanced' });
+        await flush();
+
+        const expectedTitle = lookup('p2p.workflow.editor.title');
+        const expectedAddNode = lookup('p2p.workflow.editor.add_node');
+        expect(expectedTitle).toBeDefined();
+        expect(expectedAddNode).toBeDefined();
+        expect(screen.getByText(expectedTitle!)).toBeDefined();
+        expect(screen.getByText(expectedAddNode!)).toBeDefined();
+        // Sanity: the zh-CN strings are not the English literal fallbacks.
+        expect(expectedTitle).not.toBe('Advanced workflow draft');
+      } finally {
+        currentTranslator = DEFAULT_TRANSLATOR;
+      }
+    });
+
+    it('every editor i18n key exists in every supported locale', () => {
+      // Updated for the canvas editor: dropped `add_edge` (edges are created
+      // by drag from the right anchor — no button); added `canvas_hint`,
+      // `inspector_empty`, and section labels for both node + edge cards.
+      const editorKeys = [
+        'p2p.workflow.editor.title',
+        'p2p.workflow.editor.add_node',
+        'p2p.workflow.editor.remove_node',
+        'p2p.workflow.editor.remove_edge',
+        'p2p.workflow.editor.diagnostics_header',
+        'p2p.workflow.editor.read_only_notice',
+        'p2p.workflow.editor.canvas_hint',
+        'p2p.workflow.editor.inspector_empty',
+        'p2p.workflow.editor.node.section_label',
+        'p2p.workflow.editor.node.preset_label',
+        'p2p.workflow.editor.node.permission_scope_label',
+        'p2p.workflow.editor.edge.section_label',
+        'p2p.workflow.editor.edge.from_label',
+        'p2p.workflow.editor.edge.to_label',
+        'p2p.workflow.editor.edge.condition_label',
+        // R3 PR-α follow-up — UI-managed allowedExecutables i18n keys.
+        'p2p.workflow.allowed_executables.title',
+        'p2p.workflow.allowed_executables.hint',
+        'p2p.workflow.allowed_executables.placeholder',
+        'p2p.workflow.allowed_executables.input_label',
+        'p2p.workflow.allowed_executables.add',
+        'p2p.workflow.allowed_executables.remove',
+        'p2p.workflow.allowed_executables.empty',
+      ];
+      const supported = ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'];
+      const webRoot = process.cwd().endsWith('/web') ? process.cwd() : joinPath(process.cwd(), 'web');
+      for (const locale of supported) {
+        const messages = JSON.parse(
+          readFileSync(joinPath(webRoot, 'src/i18n/locales', `${locale}.json`), 'utf8'),
+        ) as Record<string, unknown>;
+        for (const key of editorKeys) {
+          let current: unknown = messages;
+          for (const segment of key.split('.')) {
+            if (!current || typeof current !== 'object' || Array.isArray(current)) {
+              current = undefined;
+              break;
+            }
+            current = (current as Record<string, unknown>)[segment];
+          }
+          expect(typeof current, `${locale}:${key}`).toBe('string');
+          expect((current as string).trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+        }
+      }
+    });
+
+    // ─────────────────────────────────────────────────────────────────
+    // R3 PR-α follow-up — UI-managed allowedExecutables editor.
+    // The previous `~/.imcodes/p2p-policy.json` host-file workflow has
+    // been removed; the allowlist now lives in `P2pConfigPanel` and
+    // round-trips through `P2pSavedConfig.allowedExecutables` →
+    // `P2pWorkflowLaunchEnvelope.allowedExecutables` → daemon
+    // `P2pStaticPolicy.allowedExecutables`.
+    // ─────────────────────────────────────────────────────────────────
+
+    /*
+     * R3 v2 PR-ξ — Helper that builds a saved config whose workflow has a
+     * script node, making the allowed-executables section relevant. Without
+     * this the new gate hides the section entirely.
+     */
+    function makeSavedConfigWithScriptNode(extras: Partial<P2pSavedConfig> = {}): P2pSavedConfig {
+      const draft: P2pWorkflowDraft = {
+        schemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+        id: 'draft-script',
+        title: 'Draft with script',
+        nodes: [
+          { id: 'discuss', title: 'Discuss', nodeKind: 'llm', preset: 'discuss', permissionScope: 'analysis_only' },
+          { id: 'fmt', title: 'Format', nodeKind: 'script', preset: 'custom', permissionScope: 'analysis_only', script: { commandKind: 'argv', argv: ['/usr/bin/jq', '.'], requireMachineOutput: false, declaresArtifacts: false, declaresVariables: false } as never },
+        ],
+        edges: [{ id: 'e1', fromNodeId: 'discuss', toNodeId: 'fmt', edgeKind: 'default' }],
+      };
+      const envelope: P2pWorkflowLaunchEnvelope = {
+        workflowSchemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+        workflowKind: 'advanced',
+        advancedDraft: draft,
+        requiredDaemonCapabilities: [P2P_WORKFLOW_CAPABILITY_V1],
+      };
+      return { sessions: {}, rounds: 2, workflowDraft: draft, workflowLaunchEnvelope: envelope, ...extras };
+    }
+
+    /*
+     * R3 v2 PR-ξ — User feedback: the allowlist UI was always visible
+     * for any advanced workflow (after the bootstrap auto-creates an
+     * LLM-only draft). For LLM-only workflows the allowlist is
+     * irrelevant noise. The section is now hidden entirely when no
+     * workflow in the library has a script node AND no entries exist.
+     * Tests below assert the new gate.
+     */
+    it('R3 v2 PR-ξ — allowlist section is HIDDEN for LLM-only workflows with no entries', async () => {
+      getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithDraft()));
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+      // Workflow has only LLM nodes, no allowedExecutables → section MUST NOT appear.
+      expect(screen.queryByTestId('p2p-allowed-executables-section')).toBeNull();
+    });
+
+    it('R3 v2 PR-ξ — allowlist section is VISIBLE when the workflow has a script node, but COLLAPSED by default', async () => {
+      getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithScriptNode()));
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+      const section = screen.getByTestId('p2p-allowed-executables-section');
+      expect(section).toBeDefined();
+      expect(section.getAttribute('data-relevant')).toBe('true');
+      // Disclosure toggle is rendered.
+      const toggle = screen.getByTestId('p2p-allowed-executables-toggle');
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      // Body is collapsed: input + empty state are NOT in the DOM yet.
+      expect(screen.queryByTestId('p2p-allowed-executables-input')).toBeNull();
+      expect(screen.queryByTestId('p2p-allowed-executables-empty')).toBeNull();
+    });
+
+    it('shows "Required for script nodes" warning when workflow has a script node but allowedExecutables is empty (7f112b6e... screenshot)', async () => {
+      /*
+       * Regression for the user's 7f112b6e... screenshot, which
+       * showed "脚本节点必须配置" (Required for script nodes)
+       * next to the disclosure toggle. The warning is gated by
+       * (workflowHasScriptNode && allowedExecutables.length === 0)
+       * — both conditions must be true. This test pins the badge
+       * is rendered in that exact state and removed once an entry
+       * is added, so the user gets a clear "needs config" hint at
+       * a glance without expanding the section.
+       */
+      getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithScriptNode()));
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+      // Locate the section first, then assert the warning text is
+      // present somewhere in its rendered toggle row.
+      const section = screen.getByTestId('p2p-allowed-executables-section');
+      expect(section).toBeDefined();
+      expect(section.textContent ?? '').toContain('Required for script nodes');
+      // Adding an entry should clear the warning (the gate flips to
+      // `allowedExecutables.length === 0 → false`).
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-allowed-executables-toggle'));
+      });
+      await flush();
+      const input = screen.getByTestId('p2p-allowed-executables-input') as HTMLInputElement;
+      await act(async () => {
+        fireEvent.input(input, { target: { value: '/usr/bin/jq' } });
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-allowed-executables-add'));
+      });
+      await flush();
+      // Re-read section content — the warning span must be gone now.
+      expect(section.textContent ?? '').not.toContain('Required for script nodes');
+    });
+
+    it('does NOT show "Required for script nodes" warning for LLM-only workflows', async () => {
+      /*
+       * Symmetric guarantee: an LLM-only workflow that happens to
+       * have an allowedExecutables entry (so the section IS visible)
+       * MUST NOT show the "Required for script nodes" warning,
+       * because no script node depends on the allowlist.
+       */
+      getUserPrefMock.mockResolvedValue(JSON.stringify({
+        ...makeSavedConfigWithDraft(),
+        allowedExecutables: ['/usr/bin/jq'],
+      }));
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+      // The section is visible (because the entry exists), but the
+      // warning must NOT appear — no script node needs it.
+      const section = screen.queryByTestId('p2p-allowed-executables-section');
+      // Section may or may not exist depending on the gate's exact
+      // condition; the warning must NOT exist either way.
+      if (section) {
+        expect(section.textContent ?? '').not.toContain('Required for script nodes');
+      }
+    });
+
+    it('R3 v2 PR-ξ — clicking the disclosure toggle expands the body and shows the input + empty state', async () => {
+      getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithScriptNode()));
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-allowed-executables-toggle'));
+      });
+      await flush();
+      // After expand: body markers are in the DOM.
+      expect(screen.getByTestId('p2p-allowed-executables-input')).toBeDefined();
+      expect(screen.getByTestId('p2p-allowed-executables-empty')).toBeDefined();
+      expect(screen.getByTestId('p2p-allowed-executables-add')).toBeDefined();
+    });
+
+    it('adds an executable to the allowlist and persists it through Save', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(JSON.stringify(makeSavedConfigWithScriptNode()));
+      renderPanel({ onSave, initialTab: 'advanced' });
+      await flush();
+      // Expand the disclosure first (default collapsed under PR-ξ).
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-allowed-executables-toggle'));
+      });
+      await flush();
+      const input = screen.getByTestId('p2p-allowed-executables-input') as HTMLInputElement;
+      await act(async () => {
+        fireEvent.input(input, { target: { value: '/usr/bin/jq' } });
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-allowed-executables-add'));
+      });
+      await flush();
+      // List entry appears.
+      expect(screen.getByTestId('p2p-allowed-executables-entry-/usr/bin/jq')).toBeDefined();
+      // Saving propagates the entry both into `cfg.allowedExecutables` and
+      // into the materialized envelope.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-save-and-close'));
+      });
+      await flush();
+      const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+      expect(cfg.allowedExecutables).toEqual(['/usr/bin/jq']);
+      expect(cfg.workflowLaunchEnvelope?.allowedExecutables).toEqual(['/usr/bin/jq']);
+    });
+
+    it('removes an entry from the allowlist', async () => {
+      const onSave = vi.fn();
+      getUserPrefMock.mockResolvedValue(JSON.stringify({
+        ...makeSavedConfigWithDraft(),
+        allowedExecutables: ['/usr/bin/jq', '/bin/echo'],
+      }));
+      renderPanel({ onSave, initialTab: 'advanced' });
+      await flush();
+      // Existing entries make the section visible (gate condition met).
+      // Disclosure starts collapsed → click to expand before asserting entries.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-allowed-executables-toggle'));
+      });
+      await flush();
+      expect(screen.getByTestId('p2p-allowed-executables-entry-/usr/bin/jq')).toBeDefined();
+      expect(screen.getByTestId('p2p-allowed-executables-entry-/bin/echo')).toBeDefined();
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-allowed-executables-remove-/bin/echo'));
+      });
+      await flush();
+      expect(screen.queryByTestId('p2p-allowed-executables-entry-/bin/echo')).toBeNull();
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('p2p-save-and-close'));
+      });
+      await flush();
+      const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+      expect(cfg.allowedExecutables).toEqual(['/usr/bin/jq']);
+    });
+
+    it('Allowed executables section is read-only when the workflow is in future-schema mode', async () => {
+      const futureVersion = (P2P_WORKFLOW_KNOWN_SCHEMA_MAX as number) + 1;
+      const future: P2pWorkflowDraft = {
+        ...makeSavedConfigWithDraft().workflowDraft!,
+        schemaVersion: futureVersion as unknown as 1,
+      };
+      const savedConfig: P2pSavedConfig = {
+        sessions: {},
+        rounds: 2,
+        workflowDraft: future,
+        workflowLaunchEnvelope: {
+          workflowSchemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+          workflowKind: 'advanced',
+          advancedDraft: future,
+        },
+        allowedExecutables: ['/usr/bin/jq'],
+      };
+      getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
+      renderPanel({ initialTab: 'advanced' });
+      await flush();
+      const section = screen.getByTestId('p2p-allowed-executables-section');
+      expect(section.getAttribute('data-readonly')).toBe('true');
+      // Add row should be hidden, remove buttons hidden too.
+      expect(screen.queryByTestId('p2p-allowed-executables-input')).toBeNull();
+      expect(screen.queryByTestId('p2p-allowed-executables-remove-/usr/bin/jq')).toBeNull();
+    });
   });
 });

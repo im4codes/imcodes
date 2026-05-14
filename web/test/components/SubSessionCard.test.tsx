@@ -149,6 +149,24 @@ describe('SubSessionCard', () => {
     expect(container.querySelector('.idle-flash-layer--frame')).toBeNull();
   });
 
+  it('exposes the accent color as a CSS variable on the root card', () => {
+    const { container } = render(
+      <SubSessionCard
+        sub={makeSubSession({ id: 'sub-accent', sessionName: 'deck_sub_sub-accent', state: 'idle' })}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        accentColor="#fb7185"
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const card = container.querySelector('.subcard') as HTMLElement;
+    expect(card.style.getPropertyValue('--subsession-accent-color')).toBe('#fb7185');
+  });
+
   it('renders an idle-flash layer only when the token increments after mount', () => {
     const view = render(
       <SubSessionCard

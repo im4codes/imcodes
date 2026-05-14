@@ -471,7 +471,24 @@ export async function readSubSessionResponse(sessionName: string): Promise<{ sta
     ? (record.state === 'idle' ? 'idle' : 'thinking')
     : detectStatus(lines, agentType);
   if (status !== 'idle') return { status: 'working' };
-  const events = await timelineStore.readPreferred(sessionName);
+  // `readPreferred` may throw `TimelinePreferredReadError` when the SQLite
+  // projection is unavailable (commit 42dfabec contract change). Fall back
+  // to the JSONL `read()` path so a transiently-broken projection doesn't
+  // turn this RPC into a rejected promise — the caller would surface that
+  // as a hard failure even though the captured-pane text fallback below is
+  // perfectly serviceable.
+  let events: Awaited<ReturnType<typeof timelineStore.readPreferred>> = [];
+  try {
+    events = await timelineStore.readPreferred(sessionName);
+  } catch (err) {
+    const { default: lifecycleLogger } = await import('../util/logger.js');
+    lifecycleLogger.warn({ err, sessionName }, 'readSubSessionResponse: readPreferred failed, falling back to JSONL');
+    try {
+      events = timelineStore.read(sessionName);
+    } catch (fallbackErr) {
+      lifecycleLogger.warn({ err: fallbackErr, sessionName }, 'readSubSessionResponse: JSONL fallback also failed');
+    }
+  }
   const lastUserMsgIdx = events.map((e) => e.type).lastIndexOf('user.message');
   const responseEvents = lastUserMsgIdx >= 0 ? events.slice(lastUserMsgIdx + 1) : events;
   const textParts = responseEvents.filter((e) => e.type === 'assistant.text').map((e) => String(e.payload.text ?? ''));

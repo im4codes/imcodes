@@ -52,7 +52,7 @@ describe('timeline-store truncate', () => {
     }));
     writeFileSync(filePath, lines.join('\n') + '\n', 'utf8');
 
-    timelineStore.truncate('oversized_session', 5000);
+    await timelineStore.truncate('oversized_session', 5000);
 
     const kept = readFileSync(filePath, 'utf8').trimEnd().split('\n');
     expect(kept).toHaveLength(5000);

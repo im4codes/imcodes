@@ -143,8 +143,16 @@ jobs:
           cache: 'npm'
       - run: bash ./scripts/ci-npm-ci.sh .
       - run: npm run build
+      - name: Run Windows hook server send tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmd=(npx vitest run test/daemon/hook-send.test.ts --pool=threads --poolOptions.threads.singleThread=true --minWorkers=1 --maxWorkers=1)
+          "${cmd[@]}" || "${cmd[@]}"
+        env:
+          IMCODES_MUX: wezterm
       - name: Run Windows-specific unit tests
-        run: npx vitest run test/agent/wezterm.test.ts test/daemon/hook-send.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-upgrade-runner.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts test/util/postinstall-sharp-repair.test.ts test/util/sharp-repair-script.test.ts test/util/restart-daemon-cmd.test.ts
+        run: npx vitest run test/agent/wezterm.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-upgrade-runner.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts test/util/postinstall-sharp-repair.test.ts test/util/sharp-repair-script.test.ts test/util/restart-daemon-cmd.test.ts
         env:
           IMCODES_MUX: wezterm
       - name: Run Windows process-cleanup regression tests
@@ -327,6 +335,15 @@ jobs:
         run: ./scripts/ci-npm-ci.sh server
       - run: npm run build
       - run: npm run test:coverage
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage/
+            !coverage/tmp/
+          if-no-files-found: error
       - name: Upload to Codecov
         if: ${{ env.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v4

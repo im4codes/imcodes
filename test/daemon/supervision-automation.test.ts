@@ -7,6 +7,11 @@ import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../sha
 const mockStartP2pRun = vi.fn();
 const mockCancelP2pRun = vi.fn();
 const mockGetP2pRun = vi.fn();
+// Audit:R3 hardening / task 10.4 — supervision now consults
+// `listP2pRuns()` + `loadDaemonP2pStaticPolicy(serverLink)` to honour the
+// daemon admission cap. Mock returns "no active runs" so the bounded retry
+// helper never trips on `daemon_busy`.
+const mockListP2pRuns = vi.fn(() => [] as unknown[]);
 const mockSupervisionDecide = vi.fn(async () => ({ decision: 'complete', reason: 'done', confidence: 0.9 }));
 const mockTransportRuntime = {
   send: vi.fn(),
@@ -19,6 +24,7 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
   startP2pRun: mockStartP2pRun,
   cancelP2pRun: mockCancelP2pRun,
   getP2pRun: mockGetP2pRun,
+  listP2pRuns: mockListP2pRuns,
 }));
 
 vi.mock('../../src/agent/session-manager.js', () => ({
@@ -150,16 +156,22 @@ describe('SupervisionAutomation', () => {
     // advancedRounds pipeline from auditMode, and resolveP2pRoundPlan ignores
     // modeOverride when advancedRounds is non-empty. Asserting its absence pins
     // the "single source of routing truth" invariant.
+    // Audit:V-2 — supervision now passes rounds through the typed
+    // `advanced: { kind: 'supervision_internal', advancedRounds }` discriminated
+    // union (escape hatch). Assertions read the rounds from `advanced.advancedRounds`.
     expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
       initiatorSession: 'deck_supervision_brain',
-      advancedRounds: [expect.objectContaining({
-        preset: 'implementation_audit',
-        verdictPolicy: 'smart_gate',
-      })],
+      advanced: expect.objectContaining({
+        kind: 'supervision_internal',
+        advancedRounds: [expect.objectContaining({
+          preset: 'implementation_audit',
+          verdictPolicy: 'smart_gate',
+        })],
+      }),
     }));
-    const startArgs = mockStartP2pRun.mock.calls[0]?.[0] as { modeOverride?: unknown; advancedRounds: unknown[] };
+    const startArgs = mockStartP2pRun.mock.calls[0]?.[0] as { modeOverride?: unknown; advanced: { advancedRounds: unknown[] } };
     expect(startArgs.modeOverride).toBeUndefined();
-    expect(startArgs.advancedRounds).toHaveLength(1);
+    expect(startArgs.advanced.advancedRounds).toHaveLength(1);
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
@@ -422,10 +434,13 @@ describe('SupervisionAutomation', () => {
     await sleep(1_100);
 
     expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
-      advancedRounds: [
-        expect.objectContaining({ preset: 'implementation_audit', verdictPolicy: 'smart_gate' }),
-        expect.objectContaining({ preset: 'custom', verdictPolicy: 'none' }),
-      ],
+      advanced: expect.objectContaining({
+        kind: 'supervision_internal',
+        advancedRounds: [
+          expect.objectContaining({ preset: 'implementation_audit', verdictPolicy: 'smart_gate' }),
+          expect.objectContaining({ preset: 'custom', verdictPolicy: 'none' }),
+        ],
+      }),
     }));
   });
 
@@ -699,9 +714,12 @@ describe('SupervisionAutomation', () => {
         expect.objectContaining({ path: 'changed-files.txt', content: expect.stringContaining('src/demo.ts') }),
         expect.objectContaining({ path: 'validation-output.txt', content: expect.stringContaining('PASS src/demo.test.ts') }),
       ]),
-      advancedRounds: [expect.objectContaining({
-        promptAppend: expect.stringContaining('Do not rerun discussion or proposal phases.'),
-      })],
+      advanced: expect.objectContaining({
+        kind: 'supervision_internal',
+        advancedRounds: [expect.objectContaining({
+          promptAppend: expect.stringContaining('Do not rerun discussion or proposal phases.'),
+        })],
+      }),
     }));
   });
 
@@ -729,9 +747,12 @@ describe('SupervisionAutomation', () => {
 
     expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
       userText: expect.stringContaining('Contextual implementation audit'),
-      advancedRounds: [expect.objectContaining({
-        promptAppend: expect.stringContaining('Audit the implementation result against the original request'),
-      })],
+      advanced: expect.objectContaining({
+        kind: 'supervision_internal',
+        advancedRounds: [expect.objectContaining({
+          promptAppend: expect.stringContaining('Audit the implementation result against the original request'),
+        })],
+      }),
     }));
   });
 
@@ -804,15 +825,16 @@ describe('SupervisionAutomation', () => {
     await sleep(1_100);
 
     const args = mockStartP2pRun.mock.calls[0]?.[0] as {
-      advancedRounds: Array<{ preset: string; verdictPolicy: string; permissionScope: string }>;
+      advanced: { kind: string; advancedRounds: Array<{ preset: string; verdictPolicy: string; permissionScope: string }> };
       modeOverride?: unknown;
       rounds: number;
     };
     expect(args.modeOverride).toBeUndefined();
     expect(args.rounds).toBe(3);
-    expect(args.advancedRounds.map((r) => r.preset)).toEqual(['implementation_audit', 'implementation_audit', 'custom']);
-    expect(args.advancedRounds.map((r) => r.verdictPolicy)).toEqual(['none', 'smart_gate', 'none']);
-    expect(args.advancedRounds.every((r) => r.permissionScope === 'analysis_only')).toBe(true);
+    expect(args.advanced.kind).toBe('supervision_internal');
+    expect(args.advanced.advancedRounds.map((r) => r.preset)).toEqual(['implementation_audit', 'implementation_audit', 'custom']);
+    expect(args.advanced.advancedRounds.map((r) => r.verdictPolicy)).toEqual(['none', 'smart_gate', 'none']);
+    expect(args.advanced.advancedRounds.every((r) => r.permissionScope === 'analysis_only')).toBe(true);
   });
 
   it('expands audit>plan into a two-round pipeline where audit owns the verdict', async () => {
@@ -850,11 +872,12 @@ describe('SupervisionAutomation', () => {
     await sleep(1_100);
 
     const args = mockStartP2pRun.mock.calls[0]?.[0] as {
-      advancedRounds: Array<{ preset: string; verdictPolicy: string }>;
+      advanced: { kind: string; advancedRounds: Array<{ preset: string; verdictPolicy: string }> };
       rounds: number;
     };
     expect(args.rounds).toBe(2);
-    expect(args.advancedRounds).toEqual([
+    expect(args.advanced.kind).toBe('supervision_internal');
+    expect(args.advanced.advancedRounds).toEqual([
       expect.objectContaining({ preset: 'implementation_audit', verdictPolicy: 'smart_gate' }),
       expect.objectContaining({ preset: 'custom', verdictPolicy: 'none' }),
     ]);

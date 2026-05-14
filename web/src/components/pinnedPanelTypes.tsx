@@ -78,6 +78,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           ws={ctx.ws}
           workdir={liveSub.cwd ?? null}
           serverId={ctx.serverId}
+          onPreviewFile={ctx.onPreviewFile}
           onQuote={ctx.onQuote}
           agentType={liveSub.type}
         />
@@ -186,6 +187,7 @@ registerPanelType('repopage', {
       <RepoPage
         key={`${ctx.serverId}:${projectDir}`}
         ws={ctx.ws}
+        sessionId={ctx.activeSession ?? panel.props?.sessionName as string | undefined}
         projectDir={projectDir}
         onBack={() => {}}
         onCiEvent={ctx.onCiEvent ?? (() => {})}

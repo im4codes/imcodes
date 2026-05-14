@@ -57,6 +57,68 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
+  it('keeps the robot status row visible without hosting the repo branch summary', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 1000,
+          cacheTokens: 2000,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="running"
+      />,
+    );
+
+    const footer = container.querySelector('.session-usage-footer') as HTMLDivElement;
+    const ctxBar = container.querySelector('.session-ctx-bar');
+    const statsRow = container.querySelector('.session-usage-stats');
+    const liveStatus = container.querySelector('.session-live-status-inline.running');
+    const children = Array.from(footer.children);
+
+    expect(liveStatus?.textContent).toContain('🤖');
+    expect(liveStatus?.textContent).toContain('⚙️');
+    expect(liveStatus?.textContent).toContain('Agent working...');
+    expect(container.querySelector('.session-repo-branch-summary')).toBeNull();
+    expect(children.indexOf(ctxBar as Element)).toBeLessThan(children.indexOf(statsRow as Element));
+  });
+
+  it('keeps the robot status visible for idle or unknown agent states', () => {
+    const { container, rerender } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 0,
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    let status = container.querySelector('.session-live-status-inline.idle') as HTMLSpanElement | null;
+    expect(status?.textContent).toContain('🤖');
+    expect(status?.textContent).toContain('💤');
+    expect(status?.getAttribute('aria-label')).toContain('Agent idle');
+
+    rerender(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 0,
+        }}
+        sessionName="deck_test_brain"
+        sessionState="stopped"
+      />,
+    );
+
+    status = container.querySelector('.session-live-status-inline.idle') as HTMLSpanElement | null;
+    expect(status?.textContent).toContain('🤖');
+    expect(status?.textContent).toContain('💤');
+    expect(status?.getAttribute('aria-label')).toContain('Agent idle');
+  });
+
   it('defaults the tools/thinking toggle on while undecided and first click turns it off', () => {
     toolPref.value = null;
 

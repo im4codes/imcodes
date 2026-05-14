@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import type { Env } from '../src/env.js';
 import { IMCODES_POD_HEADER } from '../../shared/http-header-names.js';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
+import { TIMELINE_DETAIL_FIELD_PATHS } from '../../shared/timeline-protocol.js';
 
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
 const mockGetServersByUserId = vi.fn();
@@ -17,6 +19,7 @@ const mockGetActiveMainSessions = vi.fn();
 const mockHasReceivedActiveMainSessionSnapshot = vi.fn();
 const mockSendToDaemon = vi.fn();
 const mockGetPodIdentity = vi.fn(() => 'pod-a');
+const mockDbQueryOne = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -60,7 +63,9 @@ vi.mock('../src/util/pod-identity.js', () => ({
 
 function makeEnv(): Env {
   return {
-    DB: {} as never,
+    DB: {
+      queryOne: (...args: unknown[]) => mockDbQueryOne(...args),
+    } as never,
     JWT_SIGNING_KEY: 'test-signing-key-32chars-padding!!',
     BOT_ENCRYPTION_KEY: 'abcdef0123456789'.repeat(2),
     SERVER_URL: 'https://app.im.codes',
@@ -106,6 +111,15 @@ describe('Watch routes', () => {
     mockGetActiveMainSessions.mockReturnValue([]);
     mockHasReceivedActiveMainSessionSnapshot.mockReturnValue(false);
     mockRequestTimelineHistory.mockResolvedValue({ epoch: 7, events: [] });
+    mockDbQueryOne.mockImplementation(async (sql: string, params: unknown[]) => {
+      if (sql.includes('FROM sessions')) {
+        return params[1] === 'deck_proj_brain' ? { ok: 1 } : null;
+      }
+      if (sql.includes('FROM sub_sessions')) {
+        return params[1] === 'abc123' ? { ok: 1 } : null;
+      }
+      return null;
+    });
   });
 
   it('GET /api/watch/servers returns visible servers with baseUrl', async () => {
@@ -254,7 +268,13 @@ describe('Watch routes', () => {
       { eventId: 'e-old', sessionId: 'deck_proj_brain', ts: 100, type: 'user.message', payload: { text: 'older' } },
       { eventId: 'e-new', sessionId: 'deck_proj_brain', ts: 200, type: 'assistant.text', payload: { text: 'newer' } },
     ];
-    mockRequestTimelineHistory.mockResolvedValue({ epoch: 9, events });
+    const cursor = { epoch: 9, beforeTs: 100, direction: 'older' };
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 9,
+      events,
+      nextCursor: cursor,
+      actualPayloadBytes: expect.any(Number),
+    });
 
     const app = await buildTestApp();
     const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain&limit=2');
@@ -265,10 +285,19 @@ describe('Watch routes', () => {
       sessionName: 'deck_proj_brain',
       epoch: 9,
       events,
+      actualPayloadBytes: expect.any(Number),
+      timelineCursor: cursor,
       hasMore: true,
-      nextCursor: 100,
+      nextCursor: cursor,
+      earliestTs: 100,
+      legacyBeforeTs: 100,
     });
-    expect(mockRequestTimelineHistory).toHaveBeenCalledWith({ sessionName: 'deck_proj_brain', limit: 2 });
+    expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_proj_brain',
+      limit: 2,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
+      abortSignal: expect.any(AbortSignal),
+    }));
   });
 
   it('GET /api/server/:id/timeline/history strips non-watch-safe payload fields instead of failing decode', async () => {
@@ -307,9 +336,42 @@ describe('Watch routes', () => {
         { eventId: 'e-1', sessionId: 'deck_proj_brain', ts: 100, type: 'assistant.text', payload: { text: 'hello' } },
         { eventId: 'e-2', sessionId: 'deck_proj_brain', ts: 110, type: 'tool.call', payload: {} },
       ],
+      actualPayloadBytes: expect.any(Number),
       hasMore: false,
       nextCursor: null,
+      earliestTs: 100,
+      legacyBeforeTs: null,
     });
+  });
+
+  it('GET /api/server/:id/timeline/history enforces the final HTTP envelope budget', async () => {
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 9,
+      events: Array.from({ length: 8 }, (_, index) => ({
+        eventId: `e-${index}`,
+        sessionId: 'deck_proj_brain',
+        ts: 100 + index,
+        type: 'assistant.text',
+        payload: { text: `synthetic-${index}-${'x'.repeat(64 * 1024)}` },
+      })),
+      detailRefs: Array.from({ length: 8 }, (_, index) => ({
+        eventId: `e-${index}`,
+        fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_TEXT,
+        detailId: `detail-${index}`,
+      })),
+      hasMore: false,
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain&limit=8');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { actualPayloadBytes: number; payloadTruncated?: boolean; events: Array<{ eventId: string }>; detailRefs?: Array<{ eventId: string }> };
+    expect(body.actualPayloadBytes).toBeLessThanOrEqual(TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE);
+    expect(body.payloadTruncated).toBe(true);
+    expect(body.events.length).toBeLessThan(8);
+    const eventIds = new Set(body.events.map((event) => event.eventId));
+    expect((body.detailRefs ?? []).every((ref) => eventIds.has(ref.eventId))).toBe(true);
   });
 
   it('GET /api/server/:id/timeline/history forwards beforeTs and reports no more history when the page is short', async () => {
@@ -327,14 +389,19 @@ describe('Watch routes', () => {
       sessionName: 'deck_proj_brain',
       epoch: 10,
       events,
+      actualPayloadBytes: expect.any(Number),
       hasMore: false,
       nextCursor: null,
+      earliestTs: 90,
+      legacyBeforeTs: null,
     });
-    expect(mockRequestTimelineHistory).toHaveBeenCalledWith({
+    expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
       sessionName: 'deck_proj_brain',
       limit: 50,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
       beforeTs: 200,
-    });
+      abortSignal: expect.any(AbortSignal),
+    }));
   });
 
   it('GET /api/server/:id/timeline/history returns 503 when daemon is offline', async () => {
@@ -343,6 +410,83 @@ describe('Watch routes', () => {
     const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain');
     expect(res.status).toBe(503);
     await expect(res.json()).resolves.toEqual({ error: 'daemon_offline' });
+  });
+
+  it('GET /api/server/:id/timeline/history/full preserves structured cursor and payload metadata', async () => {
+    const cursor = { epoch: 11, beforeTs: 500, direction: 'older' };
+    const events = [
+      { eventId: 'e-full', sessionId: 'deck_proj_brain', ts: 500, type: 'tool.result', payload: { output: 'full shape' } },
+    ];
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 11,
+      events,
+      hasMore: true,
+      nextCursor: cursor,
+      actualPayloadBytes: expect.any(Number),
+      payloadBytes: 400,
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=1');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      epoch: 11,
+      events,
+      payloadBytes: 400,
+      actualPayloadBytes: expect.any(Number),
+      timelineCursor: cursor,
+      hasMore: true,
+      nextCursor: cursor,
+      earliestTs: 500,
+      legacyBeforeTs: 500,
+    });
+    expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_proj_brain',
+      limit: 1,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL,
+      includeDetails: true,
+      abortSignal: expect.any(AbortSignal),
+    }));
+  });
+
+  it('GET /api/server/:id/timeline/history/full enforces the final HTTP explicit-page budget', async () => {
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 11,
+      events: Array.from({ length: 5 }, (_, index) => ({
+        eventId: `full-${index}`,
+        sessionId: 'deck_proj_brain',
+        ts: 500 + index,
+        type: 'tool.result',
+        payload: { output: `synthetic-full-${index}-${'y'.repeat(320 * 1024)}` },
+      })),
+      hasMore: false,
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=5');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { actualPayloadBytes: number; payloadTruncated?: boolean; events: unknown[] };
+    expect(body.actualPayloadBytes).toBeLessThanOrEqual(TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL);
+    expect(body.payloadTruncated).toBe(true);
+    expect(body.events.length).toBeLessThan(5);
+  });
+
+  it('timeline HTTP routes reject sessions not owned by the current server before daemon/cache work', async () => {
+    mockDbQueryOne.mockResolvedValue(null);
+    const app = await buildTestApp();
+
+    const historyRes = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_other_brain');
+    const fullRes = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_other_brain');
+    const tailRes = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_other_brain');
+
+    expect(historyRes.status).toBe(403);
+    expect(fullRes.status).toBe(403);
+    expect(tailRes.status).toBe(403);
+    expect(mockRequestTimelineHistory).not.toHaveBeenCalled();
+    expect(mockGetSessionTextTailCache).not.toHaveBeenCalled();
   });
 
   it('GET /api/server/:id/timeline/text-tail returns cached entries', async () => {
@@ -362,6 +506,8 @@ describe('Watch routes', () => {
         { eventId: 'e1', ts: 100, type: 'user.message', text: 'hi' },
         { eventId: 'e2', ts: 200, type: 'assistant.text', text: 'hello', source: 'daemon', confidence: 'high' },
       ],
+      actualPayloadBytes: expect.any(Number),
+      textTailTruncated: false,
     });
   });
 
@@ -388,6 +534,8 @@ describe('Watch routes', () => {
         { eventId: 'e-old', ts: 100, type: 'user.message', text: 'old cached' },
         { eventId: 'e-new', ts: 200, type: 'assistant.text', text: 'new live text' },
       ],
+      actualPayloadBytes: expect.any(Number),
+      textTailTruncated: false,
     });
     expect(mockReplaceSessionTextTailCache).toHaveBeenCalledWith(
       expect.anything(),
@@ -460,11 +608,13 @@ describe('Watch routes', () => {
       sessionName: 'deck_proj_brain',
       limit: 500,
       timeoutMs: 1500,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
     });
     expect(mockRequestTimelineHistory).toHaveBeenNthCalledWith(2, {
       sessionName: 'deck_proj_brain',
       limit: 500,
       timeoutMs: 1500,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
       beforeTs: 1001,
     });
     expect(mockReplaceSessionTextTailCache).toHaveBeenCalledWith(
@@ -488,6 +638,8 @@ describe('Watch routes', () => {
     await expect(res.json()).resolves.toEqual({
       sessionName: 'deck_proj_brain',
       events: [],
+      actualPayloadBytes: expect.any(Number),
+      textTailTruncated: false,
     });
   });
 
@@ -514,6 +666,8 @@ describe('Watch routes', () => {
     await expect(res.json()).resolves.toEqual({
       sessionName: 'deck_proj_brain',
       events: [{ eventId: 'e1', ts: 100, type: 'user.message', text: 'cached only' }],
+      actualPayloadBytes: expect.any(Number),
+      textTailTruncated: false,
     });
     expect(mockReplaceSessionTextTailCache).not.toHaveBeenCalled();
   });

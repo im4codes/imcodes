@@ -9,10 +9,15 @@ import { getSession } from '../store/session-store.js';
 import { sessionName, getTransportRuntime } from '../agent/session-manager.js';
 import { detectStatusAsync, type AgentType } from '../agent/detect.js';
 import { startP2pRun, type P2pTarget } from './p2p-orchestrator.js';
+import { prepareAdvancedWorkflowLaunch } from './command-handler.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import type { TimelineEvent } from './timeline-event.js';
 import type { ServerLink } from './server-link.js';
 import logger from '../util/logger.js';
+
+/** Default retry budget when daemon admission returns `daemon_busy`. */
+const CRON_DAEMON_BUSY_DEFAULT_ATTEMPTS = 3;
+const CRON_DAEMON_BUSY_DEFAULT_DELAY_MS = 5_000;
 
 const BUSY_STATES = new Set(['streaming', 'thinking', 'tool_running', 'permission']);
 
@@ -166,18 +171,113 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
     }
 
     logger.info({ jobId, jobName, initiator: name, targets: targets.length, mode }, 'Cron: starting P2P discussion');
-    const run = await startP2pRun({
-      initiatorSession: name,
-      targets,
-      userText: topic,
-      fileContents: [],
-      serverLink,
-      rounds: rounds ?? 1,
-    });
-    // Link cron execution to P2P discussion so frontend can navigate
-    try {
-      serverLink.send({ type: 'cron.p2p_linked', jobId, discussionId: run.discussionId, runId: run.id });
-    } catch { /* not critical */ }
+
+    // Audit:R3 hardening / task 10.2 — when the cron action carries
+    // `workflowLaunchEnvelope`, route the launch through the SAME envelope
+    // path as manual launches so cron inherits capability gating, policy
+    // authority enforcement, and `static_policy_mismatch_recompiled` emission.
+    // Legacy cron rows without an envelope continue to use the direct path.
+    const initiatorRecord = getSession(name);
+    const projectDir = initiatorRecord?.projectDir ?? process.cwd();
+    const cronActionRecord = action as unknown as {
+      workflowLaunchEnvelope?: Record<string, unknown>;
+      daemonBusyRetry?: { attempts: number; delayMs: number };
+    };
+    const envelopeForLaunch = cronActionRecord.workflowLaunchEnvelope;
+
+    // Audit:R3 hardening / task 10.3 — bounded daemon_busy retry. cron
+    // dispatcher MUST NOT loop indefinitely: after `attempts` failures,
+    // mark the job failed with a stable diagnostic. Default 3 attempts /
+    // 5 s delay; overridable per cron job via `daemonBusyRetry`.
+    const retry = cronActionRecord.daemonBusyRetry ?? {
+      attempts: CRON_DAEMON_BUSY_DEFAULT_ATTEMPTS,
+      delayMs: CRON_DAEMON_BUSY_DEFAULT_DELAY_MS,
+    };
+
+    let lastDaemonBusyAttempt = 0;
+    while (lastDaemonBusyAttempt < retry.attempts) {
+      lastDaemonBusyAttempt += 1;
+      try {
+        let run;
+        if (envelopeForLaunch) {
+          // Synthesize a minimal cmd Record that prepareAdvancedWorkflowLaunch
+          // can parse (it only reads `p2pWorkflowLaunchEnvelope` /
+          // `workflowLaunchEnvelope` and old-advanced fields).
+          const fakeCmd: Record<string, unknown> = { workflowLaunchEnvelope: envelopeForLaunch };
+          const prepared = await prepareAdvancedWorkflowLaunch({
+            cmd: fakeCmd,
+            sessionName: name,
+            targets,
+            userText: topic,
+            projectDir,
+            commandId: `cron-${jobId}-${executionId ?? 'now'}-${lastDaemonBusyAttempt}`,
+            serverLink,
+          });
+          if (!prepared.ok) {
+            // Determine whether failure is daemon_busy (retryable) or terminal.
+            const busy = prepared.diagnostics.some((d) => d.code === 'daemon_busy');
+            if (busy && lastDaemonBusyAttempt < retry.attempts) {
+              logger.warn({ jobId, attempt: lastDaemonBusyAttempt, of: retry.attempts }, 'Cron: daemon_busy, retrying');
+              await new Promise((r) => setTimeout(r, retry.delayMs));
+              continue;
+            }
+            // Terminal failure (or budget exhausted)
+            const codes = prepared.diagnostics.map((d) => d.code).join(', ');
+            sendCommandResult(serverLink, {
+              type: CRON_MSG.COMMAND_RESULT,
+              jobId,
+              executionId,
+              status: 'error',
+              detail: busy
+                ? `Cron P2P launch exhausted ${retry.attempts} daemon_busy retries`
+                : `Cron P2P launch rejected: ${codes}`,
+            });
+            return;
+          }
+          run = await startP2pRun({
+            initiatorSession: name,
+            targets,
+            userText: topic,
+            fileContents: [],
+            serverLink,
+            rounds: rounds ?? 1,
+            advanced: {
+              kind: 'envelope_compiled',
+              bound: prepared.bound!,
+              advancedRounds: prepared.advancedRounds,
+              ...(prepared.advancedRunTimeoutMs !== undefined ? { advancedRunTimeoutMs: prepared.advancedRunTimeoutMs } : {}),
+              ...(prepared.contextReducer ? { contextReducer: prepared.contextReducer } : {}),
+            },
+          });
+        } else {
+          // Legacy cron path (no envelope) — direct startP2pRun.
+          run = await startP2pRun({
+            initiatorSession: name,
+            targets,
+            userText: topic,
+            fileContents: [],
+            serverLink,
+            rounds: rounds ?? 1,
+          });
+        }
+        // Link cron execution to P2P discussion so frontend can navigate
+        try {
+          serverLink.send({ type: 'cron.p2p_linked', jobId, discussionId: run.discussionId, runId: run.id });
+        } catch { /* not critical */ }
+        return;
+      } catch (err) {
+        // startP2pRun may throw for non-busy reasons; treat as terminal.
+        logger.error({ jobId, err }, 'Cron: P2P launch threw');
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'error',
+          detail: `Cron P2P launch failed: ${formatErr(err)}`,
+        });
+        return;
+      }
+    }
     return;
   }
 

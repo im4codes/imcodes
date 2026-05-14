@@ -114,6 +114,20 @@ export const TRANSPORT_MSG = {
 export type TransportMsgType =
   (typeof TRANSPORT_MSG)[keyof typeof TRANSPORT_MSG];
 
+export interface ChatSubscribeMessage {
+  type: typeof TRANSPORT_MSG.CHAT_SUBSCRIBE;
+  sessionId: string;
+  /**
+   * Ask the daemon to replay cached chat history for this subscription.
+   *
+   * Browser foreground probes resend same-socket subscriptions with false to
+   * repair the bridge live subscription without duplicate multi-KB/MB history
+   * bursts. Fresh sockets and first-time subscriptions set true because the
+   * bridge/daemon state is not yet established. Omitted means legacy client.
+   */
+  forceHistory?: boolean;
+}
+
 /** All relay message types that should be forwarded from bridge to browser. */
 export const TRANSPORT_RELAY_TYPES = new Set([
   TRANSPORT_EVENT.CHAT_DELTA,

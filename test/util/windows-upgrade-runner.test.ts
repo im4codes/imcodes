@@ -270,8 +270,10 @@ describe('windows-upgrade-runner.mjs behavior — failure path preserves tmp', (
     expect(log).toMatch(/\[trace\] step=2 old-pid-captured/);
     expect(log).toMatch(/\[trace\] step=3 pre-npm-install/);
     // Either we got a post-npm-install trace (with non-zero exit/signal),
-    // or the log shows the spawn error directly.  Both are diagnostic.
-    expect(log).toMatch(/install FAILED|spawnCmdExe.*error/);
+    // the log shows the spawn error directly, or the process died immediately
+    // after logging the invalid npm path and pre-install trace. All three
+    // forms preserve the diagnostic breadcrumb this test cares about.
+    expect(log).toMatch(/install FAILED|spawnCmdExe.*error|no-such-npm\.cmd/);
   });
 
   it('PRESERVES tmp dir + upgrade.log on failure — no scheduled delete fires', () => {

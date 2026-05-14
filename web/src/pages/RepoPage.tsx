@@ -5,6 +5,8 @@ import type { WsClient, ServerMessage } from '../ws-client.js';
 import { ChatMarkdown } from '../components/ChatMarkdown.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { forceRefreshSharedChangesForCheckout } from '../git-status-store.js';
+import { ingestSessionRepoContext, getSessionRepoContext } from '../session-repo-context-store.js';
 
 // ── Pull-to-refresh component ────────────────────────────────────────────
 
@@ -70,23 +72,31 @@ function PullToRefresh({ children, loading, onRefresh }: { children: ComponentCh
 
 interface Props {
   ws: WsClient;
+  sessionId?: string | null;
   projectDir: string;
   onBack?: () => void;
   focusLatestAction?: { token: number; failedJobName?: string; failedStepName?: string } | null;
   /** Called when a CI/CD run completes (success/failure). */
   onCiEvent?: (run: { name: string; status: string; conclusion?: string; url: string; failedJobName?: string; failedStepName?: string }) => void;
+  initialTab?: RepoPageTabKey;
+  initialTabToken?: number;
 }
 
-type TabKey = 'issues' | 'prs' | 'branches' | 'commits' | 'actions';
+export type RepoPageTabKey = 'issues' | 'prs' | 'branches' | 'commits' | 'actions';
+type TabKey = RepoPageTabKey;
 
 interface RepoContext {
   provider?: string; // 'github' | 'gitlab' | ...
   owner?: string;
   repo?: string;
   defaultBranch?: string;
+  currentBranch?: string;
   branches?: string[];
   cliInstalled?: boolean;
   lastRefresh?: number;
+  status?: string;
+  repoGeneration?: number;
+  detectedAt?: number;
 }
 
 interface TabState<T = any> {
@@ -100,11 +110,39 @@ interface TabState<T = any> {
   fetched: boolean; // true once first fetch completed (for lazy load)
 }
 
+interface TabRequestMeta {
+  key: TabKey;
+  page: number;
+  force: boolean;
+  branch?: string;
+  repoGeneration?: number;
+}
+
+interface DetailRequestMeta {
+  key: string;
+  tab: 'actions' | 'commits' | 'prs' | 'issues';
+  branch?: string;
+  repoGeneration?: number;
+}
+
+type CheckoutFeedback =
+  | { kind: 'success'; branch: string }
+  | { kind: 'error'; error: string; branch?: string }
+  | null;
+
 /** Map daemon RepoContext shape ({ info: { platform, owner, repo }, status }) to page context. */
 function mapDetectToContext(raw: any): RepoContext {
   if (!raw) return {};
   // Already in page shape (e.g. from old-style message or test mock)
-  if (raw.provider !== undefined) return raw;
+  if (raw.provider !== undefined) {
+    return {
+      ...raw,
+      currentBranch: raw.currentBranch ?? raw.info?.currentBranch,
+      defaultBranch: raw.defaultBranch ?? raw.info?.defaultBranch,
+      repoGeneration: raw.repoGeneration,
+      detectedAt: raw.detectedAt,
+    };
+  }
   // Daemon shape: { status, info: { platform, owner, repo, defaultBranch }, cliVersion, cliAuth }
   const info = raw.info;
   return {
@@ -112,7 +150,11 @@ function mapDetectToContext(raw: any): RepoContext {
     owner: info?.owner,
     repo: info?.repo,
     defaultBranch: info?.defaultBranch ?? raw.defaultBranch,
+    currentBranch: info?.currentBranch ?? raw.currentBranch,
     cliInstalled: raw.status !== 'cli_missing',
+    status: raw.status,
+    repoGeneration: raw.repoGeneration,
+    detectedAt: raw.detectedAt,
   };
 }
 
@@ -142,13 +184,14 @@ function isTransientWsSendError(err: unknown): boolean {
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props) {
+export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEvent, initialTab, initialTabToken }: Props) {
   const { t } = useTranslation();
 
   const [context, setContext] = useState<RepoContext | null>(null);
   const [detectLoading, setDetectLoading] = useState(true);
   const [detectError, setDetectError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabKey>(() => {
+    if (initialTab) return initialTab;
     const saved = localStorage.getItem('repo-active-tab');
     return saved && ['issues', 'prs', 'branches', 'commits', 'actions'].includes(saved) ? saved as TabKey : 'issues';
   });
@@ -165,14 +208,20 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
   const [detailData, setDetailData] = useState<Map<string, any>>(new Map());
   const [detailState, setDetailState] = useState<Map<string, 'loading' | 'loaded' | 'error'>>(new Map());
+  const [checkoutPendingBranch, setCheckoutPendingBranch] = useState<string | null>(null);
+  const [checkoutFeedback, setCheckoutFeedback] = useState<CheckoutFeedback>(null);
 
   // Track pending requestIds to discard stale responses
   const pendingRef = useRef<Set<string>>(new Set());
-  const detailReqRef = useRef<Map<string, string>>(new Map());
-  const tabReqRef = useRef<Map<string, { key: TabKey; page: number; force: boolean }>>(new Map());
+  const detailReqRef = useRef<Map<string, DetailRequestMeta>>(new Map());
+  const tabReqRef = useRef<Map<string, TabRequestMeta>>(new Map());
   const detailDataRef = useRef<Map<string, any>>(new Map());
+  const detailStateRef = useRef<Map<string, 'loading' | 'loaded' | 'error'>>(new Map());
   // Track detect requestId separately
   const detectReqRef = useRef<string | null>(null);
+  const checkoutReqRef = useRef<string | null>(null);
+  const checkoutPendingBranchRef = useRef<string | null>(null);
+  const processedCheckoutGenerationsRef = useRef<Set<number>>(new Set());
   const detectRetryCountRef = useRef(0);
   const detectRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tabRetryCountRef = useRef<Map<string, number>>(new Map());
@@ -191,17 +240,68 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
   const tabsRef = useRef(tabs);
 
   useEffect(() => {
+    if (!initialTab) return;
+    setActiveTab(initialTab);
+    localStorage.setItem('repo-active-tab', initialTab);
+  }, [initialTab, initialTabToken]);
+
+  useEffect(() => {
     contextRef.current = context;
   }, [context]);
   useEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
+  useEffect(() => {
+    detailStateRef.current = detailState;
+  }, [detailState]);
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
   const updateTab = useCallback((key: TabKey, patch: Partial<TabState>) => {
     setTabs(prev => ({ ...prev, [key]: { ...prev[key], ...patch } }));
   }, []);
+
+  const getActiveBranch = useCallback(() => {
+    const branch = contextRef.current?.currentBranch?.trim();
+    return branch || undefined;
+  }, []);
+
+  const getActiveRepoGeneration = useCallback(() => {
+    const generation = contextRef.current?.repoGeneration;
+    return typeof generation === 'number' && Number.isFinite(generation) ? generation : undefined;
+  }, []);
+
+  const applyDetectContext = useCallback((rawContext: unknown): boolean => {
+    const accepted = ingestSessionRepoContext({ sessionId, projectDir, context: rawContext });
+    if (!accepted) return false;
+    const shared = getSessionRepoContext(sessionId, projectDir);
+    const nextContext = mapDetectToContext(rawContext);
+    if (shared?.currentBranch && !nextContext.currentBranch) nextContext.currentBranch = shared.currentBranch;
+    if (typeof shared?.repoGeneration === 'number') nextContext.repoGeneration = shared.repoGeneration;
+    if (typeof shared?.detectedAt === 'number') nextContext.detectedAt = shared.detectedAt;
+    contextRef.current = nextContext;
+    setContext(nextContext);
+    return true;
+  }, [projectDir, sessionId]);
+
+  const isBranchScopedRequestStale = useCallback((meta: Pick<TabRequestMeta, 'key' | 'branch' | 'repoGeneration'>) => {
+    if (meta.key !== 'branches' && meta.key !== 'commits') return false;
+    const currentGeneration = getActiveRepoGeneration();
+    if (typeof currentGeneration === 'number' && meta.repoGeneration !== currentGeneration) return true;
+    if (meta.key === 'commits') {
+      const activeBranch = getActiveBranch();
+      if ((meta.branch ?? '') !== (activeBranch ?? '')) return true;
+    }
+    return false;
+  }, [getActiveBranch, getActiveRepoGeneration]);
+
+  const isCommitDetailRequestStale = useCallback((meta: DetailRequestMeta) => {
+    if (meta.tab !== 'commits') return false;
+    const currentGeneration = getActiveRepoGeneration();
+    if (typeof currentGeneration === 'number' && meta.repoGeneration !== currentGeneration) return true;
+    const activeBranch = getActiveBranch();
+    return (meta.branch ?? '') !== (activeBranch ?? '');
+  }, [getActiveBranch, getActiveRepoGeneration]);
 
   // ── Detail fetching (expand on click) ───────────────────────────────────
 
@@ -214,11 +314,13 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     }
     setExpandedKey(key);
     // Already loaded — just expand
-    if (detailData.has(key)) return;
+    if (detailData.has(key) || detailStateRef.current.get(key) === 'loading') return;
     // Fetch
     setDetailState(prev => new Map(prev).set(key, 'loading'));
     try {
       let rid: string;
+      const branch = tab === 'commits' ? getActiveBranch() : undefined;
+      const repoGeneration = tab === 'commits' ? getActiveRepoGeneration() : undefined;
       if (tab === 'commits') {
         rid = ws.repoCommitDetail(projectDir, id as string);
       } else if (tab === 'prs') {
@@ -227,11 +329,11 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         rid = ws.repoIssueDetail(projectDir, id as number);
       }
       pendingRef.current.add(rid);
-      detailReqRef.current.set(rid, key);
+      detailReqRef.current.set(rid, { key, tab, branch, repoGeneration });
     } catch {
       setDetailState(prev => new Map(prev).set(key, 'error'));
     }
-  }, [ws, projectDir, expandedKey, detailData]);
+  }, [ws, projectDir, expandedKey, detailData, getActiveBranch, getActiveRepoGeneration]);
 
   const fetchActionDetail = useCallback((runId: number, opts?: { force?: boolean }) => {
     const key = `actions:${runId}`;
@@ -240,7 +342,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     try {
       const rid = ws.repoActionDetail(projectDir, runId, opts);
       pendingRef.current.add(rid);
-      detailReqRef.current.set(rid, key);
+      detailReqRef.current.set(rid, { key, tab: 'actions' });
     } catch {
       setDetailState(prev => new Map(prev).set(key, 'error'));
     }
@@ -250,7 +352,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
 
   const detectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const doDetect = useCallback((opts?: { preserveUi?: boolean }) => {
+  const doDetect = useCallback((opts?: { preserveUi?: boolean; force?: boolean }) => {
     const preserveUi = opts?.preserveUi === true;
     const currentContext = contextRef.current;
     if (!preserveUi || !currentContext) {
@@ -263,7 +365,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
 
     let rid: string;
     try {
-      rid = ws.repoDetect(projectDir);
+      rid = ws.repoDetect(projectDir, { ...(opts?.force ? { force: true } : {}) });
     } catch (err) {
       const nextRetry = detectRetryCountRef.current + 1;
       if (isTransientWsSendError(err) && nextRetry <= MAX_SILENT_RETRIES) {
@@ -321,10 +423,16 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     setExpandedKey(null);
     setDetailData(new Map());
     setDetailState(new Map());
+    setCheckoutPendingBranch(null);
+    checkoutPendingBranchRef.current = null;
+    setCheckoutFeedback(null);
     setFocusedActionTargetKey(null);
     detailDataRef.current = new Map();
+    detailStateRef.current = new Map();
     detailReqRef.current.clear();
     tabReqRef.current.clear();
+    checkoutReqRef.current = null;
+    processedCheckoutGenerationsRef.current.clear();
     latestActionDetailRef.current = null;
     detectRetryCountRef.current = 0;
     if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
@@ -365,6 +473,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     }
     let rid: string;
     try {
+      const branch = key === 'commits' ? getActiveBranch() : undefined;
       switch (key) {
         case 'issues':
           rid = ws.repoListIssues(projectDir, { page, ...(force ? { force: true } : {}) });
@@ -373,10 +482,10 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
           rid = ws.repoListPRs(projectDir, { page, ...(force ? { force: true } : {}) });
           break;
         case 'branches':
-          rid = ws.repoListBranches(projectDir);
+          rid = ws.repoListBranches(projectDir, { ...(force ? { force: true } : {}) });
           break;
         case 'commits':
-          rid = ws.repoListCommits(projectDir, { page });
+          rid = ws.repoListCommits(projectDir, { page, ...(branch ? { branch } : {}), ...(force ? { force: true } : {}) });
           break;
         case 'actions':
           rid = ws.repoListActions(projectDir, { page, ...(force ? { force: true } : {}) });
@@ -412,8 +521,14 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
       return;
     }
     pendingRef.current.add(rid);
-    tabReqRef.current.set(rid, { key, page, force });
-  }, [ws, projectDir, updateTab]);
+    tabReqRef.current.set(rid, {
+      key,
+      page,
+      force,
+      ...(key === 'commits' && getActiveBranch() ? { branch: getActiveBranch() } : {}),
+      ...(getActiveRepoGeneration() !== undefined ? { repoGeneration: getActiveRepoGeneration() } : {}),
+    });
+  }, [ws, projectDir, updateTab, getActiveBranch, getActiveRepoGeneration]);
 
   // Lazy-load: fetch tab data on first activation
   useEffect(() => {
@@ -447,6 +562,9 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         detailReqRef.current.clear();
         tabReqRef.current.clear();
         detectReqRef.current = null;
+        checkoutReqRef.current = null;
+        setCheckoutPendingBranch(null);
+        checkoutPendingBranchRef.current = null;
         if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
         if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
         detectRetryTimerRef.current = null;
@@ -472,7 +590,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
         detectRetryTimerRef.current = null;
         detectRetryCountRef.current = 0;
-        setContext(mapDetectToContext((msg as any).context ?? msg));
+        applyDetectContext((msg as any).context ?? msg);
         setDetectLoading(false);
         setDetectError(null);
         return;
@@ -481,7 +599,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
       // Passive detect push — only accept if projectDir matches
       if (msg.type === REPO_MSG.DETECTED) {
         if (msg.projectDir !== projectDir) return;
-        setContext(prev => ({ ...prev, ...mapDetectToContext(msg.context) }));
+        applyDetectContext(msg.context);
         return;
       }
 
@@ -489,9 +607,18 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
       if (msg.type === REPO_MSG.ERROR) {
         if (!pendingRef.current.has(msg.requestId)) return;
         pendingRef.current.delete(msg.requestId);
-        const detailKey = detailReqRef.current.get(msg.requestId);
-        if (detailKey) {
+        if (msg.requestId === checkoutReqRef.current) {
+          checkoutReqRef.current = null;
+          const pendingBranch = checkoutPendingBranchRef.current;
+          checkoutPendingBranchRef.current = null;
+          setCheckoutPendingBranch(null);
+          setCheckoutFeedback({ kind: 'error', error: msg.error, branch: pendingBranch ?? undefined });
+          return;
+        }
+        const detailMeta = detailReqRef.current.get(msg.requestId);
+        if (detailMeta) {
           detailReqRef.current.delete(msg.requestId);
+          const detailKey = detailMeta.key;
           const retryKey = detailKey;
           const existingDetail = detailDataRef.current.get(detailKey);
           const nextRetry = (detailRetryCountRef.current.get(retryKey) ?? 0) + 1;
@@ -573,11 +700,73 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         return;
       }
 
+      if (msg.type === REPO_MSG.CHECKOUT_BRANCH_RESPONSE) {
+        const m = msg as any;
+        if (m.projectDir !== projectDir) return;
+        if (!m.requestId || m.requestId !== checkoutReqRef.current) return;
+        pendingRef.current.delete(m.requestId);
+        checkoutReqRef.current = null;
+        checkoutPendingBranchRef.current = null;
+        setCheckoutPendingBranch(null);
+
+        const previousContext = contextRef.current;
+        applyDetectContext({
+          status: previousContext?.status ?? 'ok',
+          info: {
+            platform: previousContext?.provider,
+            owner: previousContext?.owner,
+            repo: previousContext?.repo,
+            defaultBranch: previousContext?.defaultBranch,
+            currentBranch: m.currentBranch,
+          },
+          currentBranch: m.currentBranch,
+          defaultBranch: previousContext?.defaultBranch,
+          repoGeneration: m.repoGeneration,
+          detectedAt: m.detectedAt,
+        });
+        setCheckoutFeedback({ kind: 'success', branch: m.currentBranch });
+
+        const generation = typeof m.repoGeneration === 'number' && Number.isFinite(m.repoGeneration)
+          ? m.repoGeneration
+          : null;
+        if (generation == null || !processedCheckoutGenerationsRef.current.has(generation)) {
+          if (generation != null) processedCheckoutGenerationsRef.current.add(generation);
+          for (const [requestId, meta] of tabReqRef.current) {
+            if (meta.key === 'branches' || meta.key === 'commits') {
+              pendingRef.current.delete(requestId);
+              tabReqRef.current.delete(requestId);
+            }
+          }
+          for (const [requestId, meta] of detailReqRef.current) {
+            if (meta.tab === 'commits') {
+              pendingRef.current.delete(requestId);
+              detailReqRef.current.delete(requestId);
+            }
+          }
+          setExpandedKey((key) => key?.startsWith('commits:') ? null : key);
+          detailDataRef.current = new Map([...detailDataRef.current].filter(([key]) => !key.startsWith('commits:')));
+          setDetailData(prev => new Map([...prev].filter(([key]) => !key.startsWith('commits:'))));
+          setDetailState(prev => new Map([...prev].filter(([key]) => !key.startsWith('commits:'))));
+          setTabs(prev => ({
+            ...prev,
+            branches: emptyTab(),
+            commits: emptyTab(),
+          }));
+          doDetect({ preserveUi: true, force: true });
+          fetchTab('branches', 1, true, { preserveUi: true });
+          fetchTab('commits', 1, true, { preserveUi: true });
+          forceRefreshSharedChangesForCheckout(ws, projectDir, generation ?? undefined);
+        }
+        return;
+      }
+
       // Detail responses
       if (msg.type === REPO_MSG.ACTION_DETAIL_RESPONSE) {
         const m = msg as any;
         if (m.projectDir !== projectDir) return;
         if (m.requestId) {
+          const meta = detailReqRef.current.get(m.requestId);
+          if (!meta || meta.tab !== 'actions') return;
           pendingRef.current.delete(m.requestId);
           detailReqRef.current.delete(m.requestId);
         }
@@ -598,19 +787,27 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
       if (msg.type === REPO_MSG.COMMIT_DETAIL_RESPONSE) {
         const m = msg as any;
         if (m.projectDir !== projectDir) return;
-        if (m.requestId) {
+        if (!m.requestId) return;
+        const meta = detailReqRef.current.get(m.requestId);
+        if (!meta || meta.tab !== 'commits' || isCommitDetailRequestStale(meta)) {
           pendingRef.current.delete(m.requestId);
           detailReqRef.current.delete(m.requestId);
+          return;
         }
-        detailDataRef.current = new Map(detailDataRef.current).set(`commits:${m.detail.sha}`, m.detail);
-        setDetailData(prev => new Map(prev).set(`commits:${m.detail.sha}`, m.detail));
-        setDetailState(prev => new Map(prev).set(`commits:${m.detail.sha}`, 'loaded'));
+        pendingRef.current.delete(m.requestId);
+        detailReqRef.current.delete(m.requestId);
+        const key = meta.key;
+        detailDataRef.current = new Map(detailDataRef.current).set(key, m.detail);
+        setDetailData(prev => new Map(prev).set(key, m.detail));
+        setDetailState(prev => new Map(prev).set(key, 'loaded'));
         return;
       }
       if (msg.type === REPO_MSG.PR_DETAIL_RESPONSE) {
         const m = msg as any;
         if (m.projectDir !== projectDir) return;
         if (m.requestId) {
+          const meta = detailReqRef.current.get(m.requestId);
+          if (!meta || meta.tab !== 'prs') return;
           pendingRef.current.delete(m.requestId);
           detailReqRef.current.delete(m.requestId);
         }
@@ -623,6 +820,8 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         const m = msg as any;
         if (m.projectDir !== projectDir) return;
         if (m.requestId) {
+          const meta = detailReqRef.current.get(m.requestId);
+          if (!meta || meta.tab !== 'issues') return;
           pendingRef.current.delete(m.requestId);
           detailReqRef.current.delete(m.requestId);
         }
@@ -644,6 +843,12 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
       if (tabKey && 'requestId' in msg && 'projectDir' in msg) {
         const m = msg as any;
         if (!pendingRef.current.has(m.requestId)) return;
+        const meta = tabReqRef.current.get(m.requestId);
+        if (!meta || meta.key !== tabKey) {
+          pendingRef.current.delete(m.requestId);
+          tabReqRef.current.delete(m.requestId);
+          return;
+        }
         pendingRef.current.delete(m.requestId);
         tabReqRef.current.delete(m.requestId);
         tabRetryCountRef.current.delete(tabKey);
@@ -652,6 +857,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         tabRetryTimersRef.current.delete(tabKey);
         // Stale response check — projectDir must match
         if (m.projectDir !== projectDir) return;
+        if (isBranchScopedRequestStale(meta)) return;
         setTabs(prev => {
           const existing = prev[tabKey];
           const isLoadMore = m.page > 1;
@@ -750,6 +956,39 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     updateTab(key, { refreshing: true });
     fetchTab(key, 1, true);
   }, [fetchTab, updateTab]);
+
+  const checkoutErrorMessage = useCallback((error: string) => {
+    const keyByError: Record<string, string> = {
+      dirty_worktree: 'repo.checkout_dirty_worktree',
+      git_operation_in_progress: 'repo.checkout_git_operation_in_progress',
+      invalid_checkout_target: 'repo.checkout_invalid_target',
+      checkout_in_progress: 'repo.checkout_in_progress',
+      repo_busy: 'repo.checkout_busy',
+      branch_in_use: 'repo.checkout_branch_in_use',
+      detached_head: 'repo.checkout_detached_head',
+      not_a_git_repo: 'repo.checkout_not_a_git_repo',
+      checkout_failed: 'repo.checkout_failed',
+      cli_error: 'repo.checkout_failed',
+    };
+    return t(keyByError[error] ?? 'repo.checkout_failed');
+  }, [t]);
+
+  const handleCheckoutBranch = useCallback((branch: string) => {
+    if (checkoutReqRef.current || checkoutPendingBranch) return;
+    setCheckoutFeedback(null);
+    setCheckoutPendingBranch(branch);
+    checkoutPendingBranchRef.current = branch;
+    try {
+      const rid = ws.repoCheckoutBranch(projectDir, branch, { sessionId });
+      checkoutReqRef.current = rid;
+      pendingRef.current.add(rid);
+    } catch {
+      checkoutReqRef.current = null;
+      checkoutPendingBranchRef.current = null;
+      setCheckoutPendingBranch(null);
+      setCheckoutFeedback({ kind: 'error', error: 'checkout_failed', branch });
+    }
+  }, [checkoutPendingBranch, projectDir, sessionId, ws]);
 
   // ── CI/CD auto-refresh: 10s when running, 30s otherwise (always active) ─
   useEffect(() => {
@@ -907,23 +1146,76 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     </div>
   );
 
-  const renderBranchItem = (item: any) => (
-    <div key={item.name ?? item} style={listItemStyle}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <code style={{ color: '#e2e8f0', fontSize: 13 }}>{typeof item === 'string' ? item : item.name}</code>
-        {(typeof item !== 'string' && item.current) && (
-          <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 9999, background: '#166534', color: '#4ade80' }}>
-            {t('repo.current_branch')}
-          </span>
+  const renderBranchItem = (item: any) => {
+    const name = typeof item === 'string' ? item : item.name;
+    const isCurrent = typeof item !== 'string' && item.isCurrent;
+    const isDefault = typeof item !== 'string' && item.isDefault;
+    const localPresent = typeof item !== 'string' ? item.localPresent !== false && (item.localPresent || !item.remotePresent) : true;
+    const remotePresent = typeof item !== 'string' && item.remotePresent;
+    const checkoutable = typeof item !== 'string' && item.checkoutable === true;
+    const disabledReason = typeof item !== 'string'
+      ? item.checkoutBlockedReason || (!localPresent ? 'invalid_checkout_target' : null)
+      : null;
+    const isPending = checkoutPendingBranch === name;
+    const canSwitch = checkoutable && !isCurrent && !checkoutPendingBranch;
+    const disabledTitle = !canSwitch && !isCurrent
+      ? disabledReason === 'invalid_checkout_target' && !localPresent
+        ? t('repo.checkout_remote_only_disabled')
+        : disabledReason
+          ? checkoutErrorMessage(disabledReason)
+          : undefined
+      : undefined;
+
+    return (
+      <div key={name} style={listItemStyle}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+          <code style={{ color: '#e2e8f0', fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</code>
+          {isCurrent && (
+            <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 9999, background: '#166534', color: '#4ade80', flexShrink: 0 }}>
+              {t('repo.current_branch')}
+            </span>
+          )}
+          {isDefault && (
+            <span style={{ fontSize: 10, padding: '1px 6px', borderRadius: 9999, background: '#1e293b', color: '#94a3b8', flexShrink: 0 }}>
+              {t('repo.default_branch')}
+            </span>
+          )}
+          {localPresent && (
+            <span title={t('repo.branch_local_label')} style={{ fontSize: 10, color: '#93c5fd', flexShrink: 0 }}>{t('repo.branch_local_short')}</span>
+          )}
+          {remotePresent && (
+            <span title={t('repo.branch_remote_label')} style={{ fontSize: 10, color: '#c4b5fd', flexShrink: 0 }}>{t('repo.branch_remote_short')}</span>
+          )}
+          <span style={{ flex: 1 }} />
+          {isCurrent ? null : (
+            <button
+              class="btn btn-sm"
+              disabled={!canSwitch}
+              title={isPending ? t('repo.checkout_pending', { branch: name }) : disabledTitle ?? t('repo.checkout_switch_to', { branch: name })}
+              aria-label={isPending ? t('repo.checkout_pending', { branch: name }) : t('repo.checkout_switch_to', { branch: name })}
+              onClick={(e: MouseEvent) => {
+                e.stopPropagation();
+                handleCheckoutBranch(name);
+              }}
+              style={{ flexShrink: 0, opacity: canSwitch || isPending ? 1 : 0.48 }}
+            >
+              {isPending ? t('repo.checkout_switching') : t('repo.checkout_switch')}
+            </button>
+          )}
+        </div>
+        {disabledTitle && (
+          <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 4 }}>
+            {disabledTitle}
+          </div>
+        )}
+        {typeof item !== 'string' && (item.lastCommitDate || item.lastCommit) && (
+          <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+            {item.lastCommitDate ? formatTime(item.lastCommitDate) : item.lastCommit}
+          </div>
         )}
       </div>
-      {typeof item !== 'string' && item.lastCommit && (
-        <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
-          {item.lastCommit}
-        </div>
-      )}
-    </div>
-  );
+    );
+  };
 
   const renderCommitItem = (item: any) => {
     const sha = item.sha ?? item.oid ?? item.hash ?? '';
@@ -935,22 +1227,35 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     const filesDetail = detailData.get(commitKey);
     const filesState = detailState.get(commitKey);
 
-    const handleClick = () => {
-      // Toggle expand/collapse
-      setExpandedKey(isExpanded ? null : commitKey);
-    };
-
-    const handleShowFiles = (e: MouseEvent) => {
-      e.stopPropagation();
-      if (filesDetail) return; // already loaded
-      // Fetch detail for stats + files
+    const requestCommitDetail = () => {
+      if (filesDetail || detailStateRef.current.get(commitKey) === 'loading') return;
       setDetailState(prev => new Map(prev).set(commitKey, 'loading'));
       try {
         const rid = ws.repoCommitDetail(projectDir, sha);
         pendingRef.current.add(rid);
+        detailReqRef.current.set(rid, {
+          key: commitKey,
+          tab: 'commits',
+          branch: getActiveBranch(),
+          repoGeneration: getActiveRepoGeneration(),
+        });
       } catch {
         setDetailState(prev => new Map(prev).set(commitKey, 'error'));
       }
+    };
+
+    const handleClick = () => {
+      if (isExpanded && filesDetail) {
+        setExpandedKey(null);
+        return;
+      }
+      setExpandedKey(commitKey);
+      if (!filesDetail && filesState !== 'loading') requestCommitDetail();
+    };
+
+    const handleShowFiles = (e: MouseEvent) => {
+      e.stopPropagation();
+      requestCommitDetail();
     };
 
     return (
@@ -1595,6 +1900,23 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
           </span>
         )}
       </div>
+
+      {checkoutFeedback && (
+        <div
+          role={checkoutFeedback.kind === 'error' ? 'alert' : 'status'}
+          style={{
+            padding: '8px 16px',
+            borderBottom: '1px solid #1e293b',
+            color: checkoutFeedback.kind === 'error' ? '#fecaca' : '#bbf7d0',
+            background: checkoutFeedback.kind === 'error' ? 'rgba(127,29,29,0.24)' : 'rgba(20,83,45,0.22)',
+            fontSize: 12,
+          }}
+        >
+          {checkoutFeedback.kind === 'error'
+            ? checkoutErrorMessage(checkoutFeedback.error)
+            : t('repo.checkout_success', { branch: checkoutFeedback.branch })}
+        </div>
+      )}
 
       {/* Tab bar */}
       <div style={{

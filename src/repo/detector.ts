@@ -3,6 +3,8 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { RepoContext, RepoPlatform, RepoStatus } from './types.js';
+import { getCurrentBranch as getLocalCurrentBranch } from './local-git.js';
+import { getRepoGenerationSnapshot } from './generation.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -183,16 +185,6 @@ async function checkAuth(platform: RepoPlatform, host: string): Promise<boolean>
   }
 }
 
-/** Get current git branch. */
-async function getCurrentBranch(cwd: string): Promise<string | undefined> {
-  try {
-    const { stdout } = await execFileAsync('git', ['branch', '--show-current'], { cwd, timeout: 3000 });
-    return stdout.trim() || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 /** Get default branch from git. */
 async function getDefaultBranch(cwd: string): Promise<string | undefined> {
   try {
@@ -207,18 +199,24 @@ async function getDefaultBranch(cwd: string): Promise<string | undefined> {
 
 /** Main detection entry point. */
 export async function detectRepo(projectDir: string): Promise<RepoContext> {
+  const freshness = getRepoGenerationSnapshot(projectDir);
+  const finish = (ctx: RepoContext): RepoContext => ({
+    ...ctx,
+    ...freshness,
+  });
+
   // 1. Parse remotes
   let remoteOutput: string;
   try {
     const { stdout } = await execFileAsync('git', ['remote', '-v'], { cwd: projectDir, timeout: 5000 });
     remoteOutput = stdout;
   } catch {
-    return { info: null, status: 'no_repo' };
+    return finish({ info: null, status: 'no_repo' });
   }
 
   const remotes = parseRemotes(remoteOutput);
   if (remotes.length === 0) {
-    return { info: null, status: 'no_repo' };
+    return finish({ info: null, status: 'no_repo' });
   }
 
   // 2. Select remote — prefer 'origin', else multiple_remotes
@@ -230,22 +228,27 @@ export async function detectRepo(projectDir: string): Promise<RepoContext> {
     if (origin) {
       selected = origin;
     } else {
-      return {
+      return finish({
         info: null,
         status: 'multiple_remotes',
         remotes: remotes.map((r) => ({ name: r.name, url: r.url, platform: KNOWN_HOSTS[r.host] ?? 'unknown' })),
-      };
+      });
     }
   }
+
+  const [currentBranch, defaultBranch] = await Promise.all([
+    getLocalCurrentBranch(projectDir),
+    getDefaultBranch(projectDir),
+  ]);
 
   // 3. Detect platform (resolve SSH aliases like github-work → github.com)
   const resolvedHost = await resolveSSHHost(selected.host);
   const platform = await detectPlatform(selected.host);
   if (platform === 'unknown') {
-    return {
-      info: { platform, owner: selected.owner, repo: selected.repo, remoteUrl: selected.url },
+    return finish({
+      info: { platform, owner: selected.owner, repo: selected.repo, remoteUrl: selected.url, defaultBranch, currentBranch },
       status: 'unknown_platform',
-    };
+    });
   }
 
   // Use resolved host for CLI auth checks (alias won't work with gh auth --hostname)
@@ -254,32 +257,26 @@ export async function detectRepo(projectDir: string): Promise<RepoContext> {
   // 4. Check CLI
   const cliCheck = await checkCli(platform, projectDir);
   if (cliCheck.status !== 'ok') {
-    return {
-      info: { platform, owner: selected.owner, repo: selected.repo, remoteUrl: selected.url },
+    return finish({
+      info: { platform, owner: selected.owner, repo: selected.repo, remoteUrl: selected.url, defaultBranch, currentBranch },
       status: cliCheck.status,
       cliVersion: cliCheck.cliVersion,
       cliMinVersion: cliCheck.cliMinVersion,
-    };
+    });
   }
 
   // 5. Check auth
   const cliAuth = await checkAuth(platform, authHost);
   if (!cliAuth) {
-    return {
-      info: { platform, owner: selected.owner, repo: selected.repo, remoteUrl: selected.url },
+    return finish({
+      info: { platform, owner: selected.owner, repo: selected.repo, remoteUrl: selected.url, defaultBranch, currentBranch },
       status: 'unauthorized',
       cliVersion: cliCheck.cliVersion,
       cliAuth: false,
-    };
+    });
   }
 
-  // 6. Get branch info
-  const [currentBranch, defaultBranch] = await Promise.all([
-    getCurrentBranch(projectDir),
-    getDefaultBranch(projectDir),
-  ]);
-
-  return {
+  return finish({
     info: {
       platform,
       owner: selected.owner,
@@ -294,7 +291,7 @@ export async function detectRepo(projectDir: string): Promise<RepoContext> {
     status: 'ok',
     cliVersion: cliCheck.cliVersion,
     cliAuth: true,
-  };
+  });
 }
 
 // Re-export helpers for testing

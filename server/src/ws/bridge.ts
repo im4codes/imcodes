@@ -13,13 +13,15 @@
  */
 
 import WebSocket from 'ws';
+import { performance } from 'node:perf_hooks';
 import type { Database } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { sha256Hex } from '../security/crypto.js';
+import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
-import { REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
+import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import {
   MEMORY_WS,
@@ -84,7 +86,7 @@ import {
   type PreviewWsOpenedMessage,
 } from '../../../shared/preview-types.js';
 import { LocalWebPreviewRegistry } from '../preview/registry.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer } from '../db/queries.js';
 import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
@@ -93,7 +95,54 @@ import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '..
 import {
   DAEMON_UPGRADE_DELIVERY_STATUS,
 } from '../../../shared/daemon-upgrade.js';
+import {
+  P2P_WORKFLOW_MSG,
+  isP2pWorkflowRequestId,
+  parseP2pWorkflowMessageType,
+  type P2pWorkflowMessageDescriptor,
+  type P2pWorkflowMessageType,
+} from '../../../shared/p2p-workflow-messages.js';
+import {
+  P2P_BRIDGE_ERROR_CODES,
+  P2P_BRIDGE_PENDING_REQUEST_TIMEOUT_MS,
+  P2P_BRIDGE_PENDING_REQUESTS_GLOBAL,
+  P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET,
+  P2P_CAPABILITY_FRESHNESS_TTL_MS,
+} from '../../../shared/p2p-workflow-constants.js';
 import { DaemonUpgradeCoordinator, type DaemonUpgradeSource, type RequestDaemonUpgradeResult } from './daemon-upgrade-coordinator.js';
+import {
+  sanitizeP2pRunForPersistAndBroadcast,
+  sanitizeP2pRunUpdateForBroadcast,
+} from '../p2p-workflow-sanitize.js';
+import { sanitizeProjectName } from '../../../shared/sanitize-project-name.js';
+import {
+  SESSION_GROUP_CLONE_CAPABILITY_V1,
+  SESSION_GROUP_CLONE_MSG,
+  SESSION_GROUP_CLONE_STATES,
+  cloneP2pConfigWithSessionRemap,
+  mainSessionNameForProjectSlug,
+  type SessionGroupCloneCleanupResource,
+  type SessionGroupCloneEvent,
+  type SessionGroupCloneResult,
+  type SessionGroupCloneSkippedMember,
+  type SessionGroupCloneWarning,
+} from '../../../shared/session-group-clone.js';
+import { P2P_CONFIG_MSG } from '../../../shared/p2p-config-events.js';
+import { p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../../../shared/p2p-config-scope.js';
+import { isP2pSavedConfig, type P2pSavedConfig } from '../../../shared/p2p-modes.js';
+import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
+import {
+  TIMELINE_MESSAGES,
+  TIMELINE_PROTOCOL_CAPABILITY,
+  TIMELINE_RESPONSE_SOURCES,
+  TIMELINE_RESPONSE_STATUS,
+} from '../../../shared/timeline-protocol.js';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
+import type { DaemonBuildInfo } from '../../../shared/build-manifest-types.js';
+import {
+  TIMELINE_REQUEST_ERROR_REASONS,
+  isRecoverableTimelineRequestErrorReason,
+} from '../../../shared/timeline-history-errors.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
@@ -108,6 +157,8 @@ const MAX_PENDING_MEMORY_MANAGEMENT_REQUESTS_PER_SOCKET = 32;
 // real abuse patterns send orders-of-magnitude more.
 const BROWSER_RATE_LIMIT = 300;
 const BROWSER_RATE_WINDOW = 10_000; // 10s
+const FS_PENDING_UNICAST_TIMEOUT_MS = 20_000;
+const SESSION_GROUP_CLONE_CONTEXT_TTL_MS = 10 * 60 * 1000;
 /**
  * Master switch for the per-browser rate limiter.
  *
@@ -231,6 +282,17 @@ type WatchActiveSubSessionRow = {
   label?: string;
 };
 
+interface DaemonP2pWorkflowCapabilities {
+  daemonId: string;
+  capabilities: string[];
+  timelineProtocolCapability?: typeof TIMELINE_PROTOCOL_CAPABILITY;
+  timelineProtocolRevision?: number;
+  buildInfo?: DaemonBuildInfo;
+  helloEpoch: number;
+  sentAt: number;
+  receivedAt: number;
+}
+
 type PendingPreviewRequest = {
   readable: ReadableStream<Uint8Array>;
   controller: ReadableStreamDefaultController<Uint8Array> | null;
@@ -242,6 +304,25 @@ type PendingPreviewRequest = {
   resolveStart: (payload: PreviewStartPayload) => void;
   rejectStart: (err: Error) => void;
 };
+
+type PendingP2pWorkflowRequest = {
+  socket: WebSocket;
+  timer: ReturnType<typeof setTimeout>;
+  requestType: P2pWorkflowMessageType;
+  expectedResponseType: P2pWorkflowMessageType;
+  createdAt: number;
+};
+
+interface SessionGroupCloneOperationContext {
+  userId: string;
+  sourceMainSessionName: string;
+  createdAt: number;
+}
+
+interface SessionGroupCloneCachedEvent {
+  event: SessionGroupCloneEvent;
+  createdAt: number;
+}
 
 // ── WS tunnel state ───────────────────────────────────────────────────────────
 
@@ -262,11 +343,127 @@ type PendingHttpTimelineRequest = {
   resolve: (msg: Record<string, unknown>) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  abortSignal?: AbortSignal;
+  abortHandler?: () => void;
+  settled?: boolean;
+};
+
+type PendingTimelineRequest = {
+  socket: WebSocket;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+type TimelineDataPlaneRoute = 'browser_request' | 'http_request' | 'subscriber_fallback';
+
+type TimelineDataPlaneSendMeta = {
+  type: string;
+  route: TimelineDataPlaneRoute;
+  recipientCount: number;
+  requestIdFanoutCount: number;
+  httpCallerCount: number;
+  broadcastRecipientCount: number;
+  chunkCount: number;
+};
+
+type TimelineDataPlaneQueueMetrics = {
+  backlogAgeMs: number;
+  queueDepthAtEnqueue: number;
+  queueDepthBeforeDrain: number;
+  queuedBehindCount: number;
+  attachmentIndex?: number;
+  attachmentCount?: number;
+  fanoutYieldCount?: number;
+};
+
+type TimelineDataPlaneAttachment =
+  | {
+    origin: 'browser_request';
+    requestId?: string;
+    socket: WebSocket;
+    payload: Record<string, unknown>;
+  }
+  | {
+    origin: 'http_request';
+    requestId: string;
+    pending: PendingHttpTimelineRequest;
+    payload: Record<string, unknown>;
+  }
+  | {
+    origin: 'subscriber_fallback';
+    sessionName: string;
+    sockets: WebSocket[];
+    payload: Record<string, unknown>;
+  };
+
+type TimelineDataPlaneJob = {
+  meta: TimelineDataPlaneSendMeta;
+  attachments: TimelineDataPlaneAttachment[];
+  enqueuedAt: number;
+  deadlineAt: number;
+  queueDepthAtEnqueue: number;
+  queuedBehindCount: number;
 };
 
 const WATCH_RECENT_TEXT_CAP = 5;
 const WATCH_RECENT_TEXT_MAX_CHARS = 160;
 const HTTP_TIMELINE_TIMEOUT_MS = 15_000;
+const TIMELINE_PENDING_UNICAST_TIMEOUT_MS = 30_000;
+// Bumped from 128 → 4096 and 15s → 60s as part of the commit-42dfabec
+// regression fix. The original values were tight enough that any short
+// burst of timeline.history / page / detail traffic could exceed them on
+// weak links, and the bridge error response wasn't marked recoverable so
+// `useTimeline` treated it as terminal. With `recoverable: true` (above)
+// and a more generous ceiling, we recover automatically instead of
+// forcing a manual page refresh.
+const DEFAULT_TIMELINE_DATA_PLANE_QUEUE_CAP = 4096;
+const DEFAULT_TIMELINE_DATA_PLANE_JOB_DEADLINE_MS = 60_000;
+let timelineDataPlaneQueueCap = DEFAULT_TIMELINE_DATA_PLANE_QUEUE_CAP;
+let timelineDataPlaneJobDeadlineMs = DEFAULT_TIMELINE_DATA_PLANE_JOB_DEADLINE_MS;
+const BRIDGE_TIMELINE_LARGE_PAYLOAD_LOG_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
+const BRIDGE_TIMELINE_SLOW_SEND_LOG_MS = 50;
+const TIMELINE_REQUEST_TYPES = new Set<string>([
+  TIMELINE_MESSAGES.HISTORY_REQUEST,
+  TIMELINE_MESSAGES.REPLAY_REQUEST,
+  TIMELINE_MESSAGES.PAGE_REQUEST,
+  TIMELINE_MESSAGES.DETAIL_REQUEST,
+]);
+const TIMELINE_RESPONSE_TYPES = new Set<string>([
+  TIMELINE_MESSAGES.HISTORY,
+  TIMELINE_MESSAGES.REPLAY,
+  TIMELINE_MESSAGES.PAGE,
+  TIMELINE_MESSAGES.DETAIL,
+]);
+
+const TIMELINE_RESPONSE_TYPE_BY_REQUEST = new Map<string, string>([
+  [TIMELINE_MESSAGES.HISTORY_REQUEST, TIMELINE_MESSAGES.HISTORY],
+  [TIMELINE_MESSAGES.REPLAY_REQUEST, TIMELINE_MESSAGES.REPLAY],
+  [TIMELINE_MESSAGES.PAGE_REQUEST, TIMELINE_MESSAGES.PAGE],
+  [TIMELINE_MESSAGES.DETAIL_REQUEST, TIMELINE_MESSAGES.DETAIL],
+]);
+
+function deferTimelineDataPlaneTurn(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+export function __setTimelineDataPlaneQueueConfigForTests(config: {
+  queueCap?: number;
+  deadlineMs?: number;
+}): () => void {
+  const previous = {
+    queueCap: timelineDataPlaneQueueCap,
+    deadlineMs: timelineDataPlaneJobDeadlineMs,
+  };
+  if (typeof config.queueCap === 'number' && Number.isFinite(config.queueCap) && config.queueCap >= 0) {
+    timelineDataPlaneQueueCap = Math.trunc(config.queueCap);
+  }
+  if (typeof config.deadlineMs === 'number' && Number.isFinite(config.deadlineMs) && config.deadlineMs >= 0) {
+    timelineDataPlaneJobDeadlineMs = Math.trunc(config.deadlineMs);
+  }
+  return () => {
+    timelineDataPlaneQueueCap = previous.queueCap;
+    timelineDataPlaneJobDeadlineMs = previous.deadlineMs;
+  };
+}
 
 function normalizeRecentText(text: unknown): string | null {
   if (typeof text !== 'string') return null;
@@ -302,6 +499,335 @@ function mergeRecentTextRows(rows: WatchRecentTextRow[]): WatchRecentTextRow[] {
   return merged;
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function timelineResponseRequestIds(msg: Record<string, unknown>): string[] {
+  const ids: string[] = [];
+  const primary = optionalString(msg.requestId);
+  if (primary) ids.push(primary);
+  const fanout = Array.isArray(msg.requestIds) ? msg.requestIds : [];
+  for (const item of fanout) {
+    if (typeof item !== 'string' || item.length === 0 || ids.includes(item)) continue;
+    ids.push(item);
+  }
+  return ids;
+}
+
+function timelineResponseForRequestId(msg: Record<string, unknown>, requestId: string): Record<string, unknown> {
+  const response: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(msg)) {
+    if (key === 'requestIds') continue;
+    response[key] = value;
+  }
+  response.requestId = requestId;
+  return response;
+}
+
+function withBridgeActualPayloadBytes(msg: Record<string, unknown>): Record<string, unknown> {
+  let actualPayloadBytes = 0;
+  let next = { ...msg, actualPayloadBytes };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const encodedBytes = Buffer.byteLength(JSON.stringify(next), 'utf8');
+    if (encodedBytes === actualPayloadBytes) break;
+    actualPayloadBytes = encodedBytes;
+    next = { ...msg, actualPayloadBytes };
+  }
+  return next;
+}
+
+function timelineDataPlaneErrorResponse(
+  msg: Record<string, unknown>,
+  type: string,
+  errorReason: string,
+): Record<string, unknown> {
+  // Tag transient errors as `recoverable: true` so the web `useTimeline`
+  // hook actually auto-retries them. Before this flag, any `errorReason`
+  // hit `hasExplicitTimelineOutcome` and was treated as terminal; users
+  // had to refresh the page to get past a queue-full or deadline blip
+  // (regression observed after commit 42dfabec). The allow-list lives in
+  // `shared/timeline-history-errors.ts` so server + client never disagree.
+  const recoverable = isRecoverableTimelineRequestErrorReason(errorReason);
+  return {
+    type,
+    ...(optionalString(msg.requestId) ? { requestId: optionalString(msg.requestId) } : {}),
+    ...(optionalString(msg.sessionName) ? { sessionName: optionalString(msg.sessionName) } : {}),
+    status: TIMELINE_RESPONSE_STATUS.ERROR,
+    source: TIMELINE_RESPONSE_SOURCES.ERROR,
+    errorReason,
+    events: type === TIMELINE_MESSAGES.DETAIL ? undefined : [],
+    payloadTruncated: false,
+    hasMore: false,
+    ...(recoverable ? { recoverable: true } : {}),
+  };
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+type CloneOptionalStringResult =
+  | { ok: true; value: string | null | undefined }
+  | { ok: false };
+
+const SESSION_GROUP_CLONE_TERMINAL_STATES = new Set<SessionGroupCloneEvent['state']>(
+  SESSION_GROUP_CLONE_STATES.filter((state): state is SessionGroupCloneEvent['state'] => (
+    state === 'succeeded'
+    || state === 'failed'
+    || state === 'cancelled'
+    || state === 'cleanup_required'
+  )),
+);
+
+function readCloneOptionalString(body: Record<string, unknown>, key: string): CloneOptionalStringResult {
+  if (!Object.prototype.hasOwnProperty.call(body, key)) return { ok: true, value: undefined };
+  const value = body[key];
+  if (value === null) return { ok: true, value: null };
+  if (typeof value === 'string') return { ok: true, value };
+  return { ok: false };
+}
+
+function sanitizeCloneWarnings(value: unknown): SessionGroupCloneWarning[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const warnings: SessionGroupCloneWarning[] = [];
+  for (const item of value) {
+    if (!isPlainRecord(item) || typeof item.code !== 'string') continue;
+    warnings.push({
+      code: item.code as SessionGroupCloneWarning['code'],
+      ...(typeof item.fieldPath === 'string' ? { fieldPath: item.fieldPath } : {}),
+      ...(typeof item.sourceSessionName === 'string' ? { sourceSessionName: item.sourceSessionName } : {}),
+      ...(typeof item.message === 'string' ? { message: item.message } : {}),
+    });
+  }
+  return warnings.length ? warnings : undefined;
+}
+
+function sanitizeCloneSkippedMembers(value: unknown): SessionGroupCloneSkippedMember[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const skippedMembers: SessionGroupCloneSkippedMember[] = [];
+  for (const item of value) {
+    if (!isPlainRecord(item) || typeof item.sessionName !== 'string' || typeof item.reason !== 'string') continue;
+    skippedMembers.push({
+      sessionName: item.sessionName,
+      reason: item.reason as SessionGroupCloneSkippedMember['reason'],
+    });
+  }
+  return skippedMembers.length ? skippedMembers : undefined;
+}
+
+function sanitizeCloneCleanupResources(value: unknown): SessionGroupCloneCleanupResource[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const resources: SessionGroupCloneCleanupResource[] = [];
+  for (const item of value) {
+    if (!isPlainRecord(item) || typeof item.kind !== 'string' || typeof item.id !== 'string') continue;
+    resources.push({
+      kind: item.kind as SessionGroupCloneCleanupResource['kind'],
+      id: item.id,
+      ...(typeof item.sessionName === 'string' ? { sessionName: item.sessionName } : {}),
+      ...(typeof item.serverId === 'string' ? { serverId: item.serverId } : {}),
+      ...(typeof item.providerId === 'string' ? { providerId: item.providerId } : {}),
+      ...(typeof item.retriable === 'boolean' ? { retriable: item.retriable } : {}),
+    });
+  }
+  return resources.length ? resources : undefined;
+}
+
+function sanitizeStringRecord(value: unknown): Record<string, string> {
+  if (!isPlainRecord(value)) return {};
+  const result: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === 'string') result[key] = entry;
+  }
+  return result;
+}
+
+function sanitizeCopiedSubSessionIds(value: unknown): Array<{ sourceId: string; clonedId: string }> {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!isPlainRecord(item) || typeof item.sourceId !== 'string' || typeof item.clonedId !== 'string') return [];
+    return [{ sourceId: item.sourceId, clonedId: item.clonedId }];
+  });
+}
+
+function sanitizeCloneResult(value: unknown): SessionGroupCloneResult | undefined {
+  if (!isPlainRecord(value)) return undefined;
+  const operationId = optionalString(value.operationId);
+  const idempotencyKey = optionalString(value.idempotencyKey);
+  const sourceMainSession = optionalString(value.sourceMainSession);
+  const clonedMainSession = optionalString(value.clonedMainSession);
+  const targetProjectName = optionalString(value.targetProjectName);
+  const targetProjectSlug = optionalString(value.targetProjectSlug);
+  if (!operationId || !idempotencyKey || !sourceMainSession || !clonedMainSession || !targetProjectName || !targetProjectSlug) {
+    return undefined;
+  }
+  return {
+    operationId,
+    idempotencyKey,
+    sourceMainSession,
+    clonedMainSession,
+    targetProjectName,
+    targetProjectSlug,
+    sessionNameMap: sanitizeStringRecord(value.sessionNameMap),
+    copiedSubSessionIds: sanitizeCopiedSubSessionIds(value.copiedSubSessionIds),
+    skippedMembers: sanitizeCloneSkippedMembers(value.skippedMembers) ?? [],
+    skippedCronJobs: optionalNumber(value.skippedCronJobs) ?? 0,
+    skippedOrchestrationRuns: optionalNumber(value.skippedOrchestrationRuns) ?? 0,
+    warnings: sanitizeCloneWarnings(value.warnings) ?? [],
+  };
+}
+
+function sanitizeSessionGroupCloneEvent(msg: Record<string, unknown>): SessionGroupCloneEvent | null {
+  const operationId = optionalString(msg.operationId);
+  const idempotencyKey = optionalString(msg.idempotencyKey);
+  const state = optionalString(msg.state);
+  if (!operationId || !idempotencyKey || !state || !SESSION_GROUP_CLONE_STATES.includes(state as never)) {
+    return null;
+  }
+  const event: SessionGroupCloneEvent = {
+    type: SESSION_GROUP_CLONE_MSG.EVENT,
+    operationId,
+    idempotencyKey,
+    state: state as SessionGroupCloneEvent['state'],
+  };
+  const sourceMainSessionName = optionalString(msg.sourceMainSessionName);
+  if (sourceMainSessionName) event.sourceMainSessionName = sourceMainSessionName;
+  const clonedMainSessionName = optionalString(msg.clonedMainSessionName);
+  if (clonedMainSessionName) event.clonedMainSessionName = clonedMainSessionName;
+  const totalSubSessions = optionalNumber(msg.totalSubSessions);
+  if (totalSubSessions !== undefined) event.totalSubSessions = totalSubSessions;
+  const subSessionsCreated = optionalNumber(msg.subSessionsCreated);
+  if (subSessionsCreated !== undefined) event.subSessionsCreated = subSessionsCreated;
+  const skippedMembers = sanitizeCloneSkippedMembers(msg.skippedMembers);
+  if (skippedMembers) event.skippedMembers = skippedMembers;
+  const skippedCronJobs = optionalNumber(msg.skippedCronJobs);
+  if (skippedCronJobs !== undefined) event.skippedCronJobs = skippedCronJobs;
+  const skippedOrchestrationRuns = optionalNumber(msg.skippedOrchestrationRuns);
+  if (skippedOrchestrationRuns !== undefined) event.skippedOrchestrationRuns = skippedOrchestrationRuns;
+  const warnings = sanitizeCloneWarnings(msg.warnings);
+  if (warnings) event.warnings = warnings;
+  const errorCode = optionalString(msg.errorCode);
+  if (errorCode) event.errorCode = errorCode as SessionGroupCloneEvent['errorCode'];
+  const cleanupRequired = optionalBoolean(msg.cleanupRequired);
+  if (cleanupRequired !== undefined) event.cleanupRequired = cleanupRequired;
+  const cleanupResources = sanitizeCloneCleanupResources(msg.cleanupResources);
+  if (cleanupResources) event.cleanupResources = cleanupResources;
+  const result = sanitizeCloneResult(msg.result);
+  if (result) event.result = result;
+  return event;
+}
+
+function parseStoredP2pConfig(raw: string | null): P2pSavedConfig | null {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return isP2pSavedConfig(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getUserP2pConfigForRoot(
+  db: Database,
+  userId: string,
+  serverId: string,
+  rootSessionName: string,
+): Promise<{ key: string; config: P2pSavedConfig } | null> {
+  const keys = [
+    p2pSessionConfigPrefKey(rootSessionName, serverId),
+    ...p2pSessionConfigLegacyPrefKeys(rootSessionName),
+  ];
+  for (const key of keys) {
+    const config = parseStoredP2pConfig(await getUserPref(db, userId, key));
+    if (config) return { key, config };
+  }
+  return null;
+}
+
+function sourceProjectSlugFromMainSessionName(sessionName: string | undefined): string | null {
+  if (!sessionName) return null;
+  const match = sessionName.match(/^deck_(.+)_brain$/);
+  return match?.[1] ?? null;
+}
+
+function numericCount(row: Record<string, unknown> | null): number {
+  const value = row?.count;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+function mergeSkippedScheduledWorkCounts(
+  event: SessionGroupCloneEvent,
+  counts: { skippedCronJobs: number; skippedOrchestrationRuns: number },
+): SessionGroupCloneEvent {
+  const skippedCronJobs = Math.max(event.skippedCronJobs ?? event.result?.skippedCronJobs ?? 0, counts.skippedCronJobs);
+  const skippedOrchestrationRuns = Math.max(
+    event.skippedOrchestrationRuns ?? event.result?.skippedOrchestrationRuns ?? 0,
+    counts.skippedOrchestrationRuns,
+  );
+  return {
+    ...event,
+    skippedCronJobs,
+    skippedOrchestrationRuns,
+    ...(event.result ? {
+      result: {
+        ...event.result,
+        skippedCronJobs,
+        skippedOrchestrationRuns,
+      },
+    } : {}),
+  };
+}
+
+class SessionGroupCloneServerP2pError extends Error {
+  readonly cleanupResources: SessionGroupCloneCleanupResource[];
+
+  constructor(message: string, cleanupResources: SessionGroupCloneCleanupResource[]) {
+    super(message);
+    this.name = 'SessionGroupCloneServerP2pError';
+    this.cleanupResources = cleanupResources;
+  }
+}
+
+async function writeSessionGroupCloneAudit(
+  db: Database,
+  entry: {
+    userId?: string;
+    serverId: string;
+    action: string;
+    details: Record<string, unknown>;
+  },
+): Promise<void> {
+  try {
+    await db.execute(
+      'INSERT INTO audit_log (id, user_id, server_id, action, details, ip, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [
+        sha256Hex(`${entry.serverId}:${entry.userId ?? 'unknown'}:${entry.action}:${Date.now()}:${Math.random()}`).slice(0, 32),
+        entry.userId ?? null,
+        entry.serverId,
+        entry.action,
+        JSON.stringify(entry.details),
+        null,
+        Date.now(),
+      ],
+    );
+  } catch (err) {
+    logger.error({ action: entry.action, err }, 'Audit log write failed');
+  }
+}
+
 // ── Inflight command bookkeeping (ack reliability) ───────────────────────
 
 type InflightState = 'buffered' | 'dispatched' | 'acked';
@@ -316,6 +842,24 @@ interface InflightCommand {
   dispatchAttempts: number;    // daemon sends attempted by the bridge
   timeoutTimer: ReturnType<typeof setTimeout> | null;
 }
+
+type FsPendingRouteKind =
+  | 'fs.ls'
+  | 'fs.read'
+  | 'fs.git_status'
+  | 'fs.git_diff'
+  | 'file.search'
+  | 'fs.write';
+
+interface PendingFsRoute {
+  socket: WebSocket;
+  timer: ReturnType<typeof setTimeout>;
+  kind: FsPendingRouteKind;
+  requestId: string;
+  path: string;
+}
+
+type PendingFsRouteMap = Map<string, PendingFsRoute>;
 
 // Periodic cleanup interval handle (module-level, shared across all bridge instances)
 let cleanupSweepHandle: ReturnType<typeof setInterval> | null = null;
@@ -333,6 +877,27 @@ export class WsBridge {
   private mobileSockets = new Set<WebSocket>();
   private queue: string[] = [];
   private authTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Audit fix (78-server reconnect-storm investigation, 2026-05-11) —
+   * holds the in-flight auth promise so concurrent message handlers
+   * don't race against the DB lookup.
+   *
+   * The daemon sends `auth` immediately followed by `daemon.hello` on
+   * every WS connect (`server-link.ts:201-202`). With the previous
+   * `async` message handler, both messages started executing in
+   * parallel; the `auth` handler awaited `db.queryOne(...)` for the
+   * token check, and while that await was pending the `daemon.hello`
+   * handler observed `this.authenticated === false` and
+   * `msg.type !== 'auth'` → `ws.close(4001, 'auth_required')`. The
+   * server logged "Daemon authenticated" (success path) AFTER the
+   * close, but the daemon saw the 4001 first and reconnected — every
+   * ~500 ms — producing the auth-storm we found in production logs.
+   *
+   * Fix: every message handler awaits this promise before evaluating
+   * `this.authenticated`, so the `daemon.hello` cannot run until the
+   * auth check has settled.
+   */
+  private authPromise: Promise<void> | null = null;
   private browserRateLimiter = new MemoryRateLimiter();
 
   /** browser socket → session name → raw-enabled flag */
@@ -340,6 +905,7 @@ export class WsBridge {
 
   /** browser socket → set of subscribed transport session IDs */
   private transportSubscriptions = new Map<WebSocket, Set<string>>();
+  private transportSubscriptionRevisions = new Map<WebSocket, Map<string, number>>();
 
   /** browser socket → userId (for session ownership checks) */
   private browserUserIds = new Map<WebSocket, string>();
@@ -349,33 +915,32 @@ export class WsBridge {
 
   /** Cached provider connection status — pushed to browsers on connect, persisted to DB. */
   private providerStatus = new Map<string, boolean>();
+  /** Cached advanced P2P capabilities for the current authenticated daemon socket. */
+  private daemonP2pWorkflowCapabilities: DaemonP2pWorkflowCapabilities | null = null;
+  /** idempotencyKey → initiating user/source, used to copy user-scoped P2P preferences after daemon success. */
+  private sessionGroupCloneContexts = new Map<string, SessionGroupCloneOperationContext>();
+  /**
+   * idempotencyKey → latest daemon operation event.
+   * This server-side idempotency cache starts after the daemon has emitted an
+   * operation event, because the daemon owns operationId creation.
+   */
+  private sessionGroupCloneEvents = new Map<string, SessionGroupCloneCachedEvent>();
   /** Cached remote sessions from providers — pushed to browsers on connect, persisted to DB. */
   private providerRemoteSessions = new Map<string, unknown[]>();
 
-  /**
-   * Per-request fs.ls pending map: requestId → { socket, timer }.
-   * Used to single-cast fs.ls_response back to the requesting browser.
-   */
-  private pendingFsRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
+  /** Per-request FS/search pending maps used to single-cast daemon responses. */
+  private pendingFsRequests: PendingFsRouteMap = new Map();
+  private pendingFsReadRequests: PendingFsRouteMap = new Map();
+  private pendingFsGitStatusRequests: PendingFsRouteMap = new Map();
+  private pendingFsGitDiffRequests: PendingFsRouteMap = new Map();
+  private pendingFileSearchRequests: PendingFsRouteMap = new Map();
+  private pendingFsWriteRequests: PendingFsRouteMap = new Map();
 
-  /**
-   * Per-request fs.read pending map: requestId → { socket, timer }.
-   * Used to single-cast fs.read_response back to the requesting browser.
-   */
-  private pendingFsReadRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
+  /** Per-request timeline pending map — routes responses via requestId unicast. */
+  private pendingTimelineRequests = new Map<string, PendingTimelineRequest>();
 
-  /** Per-request fs.git_status pending map. */
-  private pendingFsGitStatusRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
-
-  /** Per-request fs.git_diff pending map. */
-  private pendingFsGitDiffRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
-  private pendingFileSearchRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
-
-  /** Per-request fs.write pending map. */
-  private pendingFsWriteRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
-
-  /** Per-request timeline.history / timeline.replay pending map — routes responses via requestId unicast. */
-  private pendingTimelineRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
+  /** Per-request P2P workflow pending map — routes request-scoped responses via requestId unicast. */
+  private pendingP2pWorkflowRequests = new Map<string, PendingP2pWorkflowRequest>();
 
   /** Per-request memory management pending map — routes sensitive admin responses via requestId unicast. */
   private pendingMemoryManagementRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
@@ -383,6 +948,10 @@ export class WsBridge {
   /** Per-request HTTP timeline/history relay pending map. */
   private pendingHttpTimelineRequests = new Map<string, PendingHttpTimelineRequest>();
   private pendingRecentTextBackfills = new Map<string, Promise<WatchRecentTextRow[]>>();
+
+  private timelineDataPlaneQueue: TimelineDataPlaneJob[] = [];
+  private timelineDataPlaneScheduled = false;
+  private timelineDataPlaneActive = false;
 
   /** Lightweight per-session hot cache for Watch first-paint text. */
   private recentTextBySession = new Map<string, WatchRecentTextRow[]>();
@@ -463,6 +1032,656 @@ export class WsBridge {
 
   static getAll(): Map<string, WsBridge> {
     return WsBridge.instances;
+  }
+
+  private pendingFsRouteMap(kind: FsPendingRouteKind): PendingFsRouteMap {
+    switch (kind) {
+      case 'fs.ls':
+        return this.pendingFsRequests;
+      case 'fs.read':
+        return this.pendingFsReadRequests;
+      case 'fs.git_status':
+        return this.pendingFsGitStatusRequests;
+      case 'fs.git_diff':
+        return this.pendingFsGitDiffRequests;
+      case 'file.search':
+        return this.pendingFileSearchRequests;
+      case 'fs.write':
+        return this.pendingFsWriteRequests;
+    }
+  }
+
+  private registerPendingFsRoute(kind: FsPendingRouteKind, ws: WebSocket, msg: Record<string, unknown>): void {
+    const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
+    if (!requestId) return;
+    const map = this.pendingFsRouteMap(kind);
+    const previous = map.get(requestId);
+    if (previous) {
+      clearTimeout(previous.timer);
+      logger.warn({ kind, requestId, serverId: this.serverId }, 'WsBridge: duplicate FS request id replaced');
+    }
+    const path = typeof msg.path === 'string' ? msg.path : '';
+    const timer = setTimeout(() => this.timeoutPendingFsRoute(kind, requestId), FS_PENDING_UNICAST_TIMEOUT_MS);
+    timer.unref?.();
+    map.set(requestId, { socket: ws, timer, kind, requestId, path });
+  }
+
+  private timeoutPendingFsRoute(kind: FsPendingRouteKind, requestId: string): void {
+    const map = this.pendingFsRouteMap(kind);
+    const pending = map.get(requestId);
+    if (!pending) return;
+    map.delete(requestId);
+    incrementCounter('ws_bridge_fs_pending_timeout', { kind });
+    safeSend(pending.socket, JSON.stringify(this.buildPendingFsTimeoutResponse(pending)));
+  }
+
+  private buildPendingFsTimeoutResponse(pending: PendingFsRoute): Record<string, unknown> {
+    const error = FS_READ_ERROR_CODES.PREVIEW_BRIDGE_TIMEOUT;
+    switch (pending.kind) {
+      case 'fs.ls':
+        return { type: 'fs.ls_response', requestId: pending.requestId, path: pending.path, status: 'error', error };
+      case 'fs.read':
+        return { type: 'fs.read_response', requestId: pending.requestId, path: pending.path, status: 'error', error };
+      case 'fs.git_status':
+        return { type: 'fs.git_status_response', requestId: pending.requestId, path: pending.path, status: 'error', files: [], error };
+      case 'fs.git_diff':
+        return { type: 'fs.git_diff_response', requestId: pending.requestId, path: pending.path, status: 'error', error };
+      case 'file.search':
+        return { type: 'file.search_response', requestId: pending.requestId, results: [], error };
+      case 'fs.write':
+        return { type: 'fs.write_response', requestId: pending.requestId, path: pending.path, status: 'error', error };
+    }
+  }
+
+  private forwardPendingFsRoute(kind: FsPendingRouteKind, requestId: string | undefined, msg: Record<string, unknown>): boolean {
+    if (!requestId) return false;
+    const map = this.pendingFsRouteMap(kind);
+    const pending = map.get(requestId);
+    if (!pending) {
+      incrementCounter('ws_bridge_fs_unrouted_response', { kind });
+      return false;
+    }
+    clearTimeout(pending.timer);
+    map.delete(requestId);
+    safeSend(pending.socket, JSON.stringify(msg));
+    return true;
+  }
+
+  private clearPendingFsRoutesForSocket(ws: WebSocket): void {
+    const maps = [
+      this.pendingFsRequests,
+      this.pendingFsReadRequests,
+      this.pendingFsGitStatusRequests,
+      this.pendingFsGitDiffRequests,
+      this.pendingFileSearchRequests,
+      this.pendingFsWriteRequests,
+    ];
+    for (const map of maps) {
+      for (const [requestId, pending] of map) {
+        if (pending.socket !== ws) continue;
+        clearTimeout(pending.timer);
+        map.delete(requestId);
+      }
+    }
+  }
+
+  private registerPendingTimelineRequest(ws: WebSocket, msg: Record<string, unknown>): void {
+    const requestId = optionalString(msg.requestId);
+    if (!requestId) return;
+    const previous = this.pendingTimelineRequests.get(requestId);
+    if (previous) {
+      clearTimeout(previous.timer);
+      logger.warn({ requestId, serverId: this.serverId, type: msg.type }, 'WsBridge: duplicate timeline request id replaced');
+    }
+    const timer = setTimeout(() => this.pendingTimelineRequests.delete(requestId), TIMELINE_PENDING_UNICAST_TIMEOUT_MS);
+    timer.unref?.();
+    this.pendingTimelineRequests.set(requestId, { socket: ws, timer });
+  }
+
+  private sendTimelineRequestError(
+    ws: WebSocket,
+    msg: Record<string, unknown>,
+    errorReason: string,
+  ): void {
+    const responseType = typeof msg.type === 'string'
+      ? TIMELINE_RESPONSE_TYPE_BY_REQUEST.get(msg.type)
+      : undefined;
+    if (!responseType) return;
+    safeSend(ws, JSON.stringify(withBridgeActualPayloadBytes(
+      timelineDataPlaneErrorResponse(msg, responseType, errorReason),
+    )));
+  }
+
+  private async verifyTimelineBrowserRequest(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {
+    const sessionName = optionalString(msg.sessionName);
+    if (!sessionName) {
+      this.sendTimelineRequestError(ws, msg, TIMELINE_REQUEST_ERROR_REASONS.MALFORMED_REQUEST);
+      return false;
+    }
+    const allowed = await this.verifySessionOwnership(sessionName);
+    if (!allowed) {
+      logger.warn({ serverId: this.serverId, sessionName, type: msg.type }, 'timeline request: session not owned by this server — rejected');
+      this.sendTimelineRequestError(ws, msg, TIMELINE_REQUEST_ERROR_REASONS.REQUEST_UNAUTHORIZED);
+      return false;
+    }
+    return true;
+  }
+
+  private settlePendingHttpTimelineRequest(
+    requestId: string | null,
+    pending: PendingHttpTimelineRequest,
+    fn: () => void,
+  ): void {
+    if (pending.settled) return;
+    pending.settled = true;
+    clearTimeout(pending.timer);
+    if (pending.abortSignal && pending.abortHandler) {
+      pending.abortSignal.removeEventListener('abort', pending.abortHandler);
+      pending.abortHandler = undefined;
+    }
+    if (requestId) this.pendingHttpTimelineRequests.delete(requestId);
+    fn();
+  }
+
+  private scheduleTimelineDataPlaneDrain(): void {
+    if (this.timelineDataPlaneScheduled || this.timelineDataPlaneActive) return;
+    this.timelineDataPlaneScheduled = true;
+    setImmediate(() => this.drainTimelineDataPlaneQueue());
+  }
+
+  private finishTimelineDataPlaneJob(): void {
+    this.timelineDataPlaneActive = false;
+    if (this.timelineDataPlaneQueue.length > 0) this.scheduleTimelineDataPlaneDrain();
+  }
+
+  private enqueueTimelineDataPlaneJob(
+    meta: TimelineDataPlaneSendMeta,
+    attachments: TimelineDataPlaneAttachment[],
+    options: {
+      deadlineMs?: number;
+    } = {},
+  ): boolean {
+    if (attachments.length === 0) return true;
+    const queuedBehindCount = this.timelineDataPlaneQueue.length;
+    if (queuedBehindCount >= timelineDataPlaneQueueCap) {
+      incrementCounter('ws_bridge_timeline_data_plane_queue_full', {
+        type: meta.type,
+        route: meta.route,
+      });
+      logger.warn({
+        serverId: this.serverId,
+        type: meta.type,
+        route: meta.route,
+        queueDepth: queuedBehindCount,
+        queueCap: timelineDataPlaneQueueCap,
+      }, 'WsBridge timeline data-plane queue full');
+      return false;
+    }
+    const queueDepthAtEnqueue = queuedBehindCount + 1;
+    const enqueuedAt = performance.now();
+    this.timelineDataPlaneQueue.push({
+      meta,
+      attachments,
+      enqueuedAt,
+      deadlineAt: enqueuedAt + (options.deadlineMs ?? timelineDataPlaneJobDeadlineMs),
+      queueDepthAtEnqueue,
+      queuedBehindCount,
+    });
+    incrementCounter('ws_bridge_timeline_data_plane_enqueue', {
+      type: meta.type,
+      route: meta.route,
+      backlog: queuedBehindCount > 0 ? 'queued' : 'empty',
+    });
+    this.scheduleTimelineDataPlaneDrain();
+    return true;
+  }
+
+  private isTimelineDataPlaneJobCanceled(job: TimelineDataPlaneJob): boolean {
+    return job.attachments.every((attachment) => this.isTimelineDataPlaneAttachmentCanceled(attachment));
+  }
+
+  private isTimelineDataPlaneAttachmentCanceled(attachment: TimelineDataPlaneAttachment): boolean {
+    if (attachment.origin === 'browser_request') {
+      return attachment.socket.readyState !== WebSocket.OPEN;
+    }
+    if (attachment.origin === 'http_request') {
+      return attachment.pending.settled === true;
+    }
+    return attachment.sockets.every((socket) => socket.readyState !== WebSocket.OPEN);
+  }
+
+  private handleTimelineDataPlaneJobDeadline(job: TimelineDataPlaneJob): void {
+    const { meta } = job;
+    for (const attachment of job.attachments) {
+      if (this.isTimelineDataPlaneAttachmentCanceled(attachment)) continue;
+      if (attachment.origin === 'browser_request') {
+        if (attachment.socket.readyState === WebSocket.OPEN) {
+          safeSend(attachment.socket, JSON.stringify(withBridgeActualPayloadBytes(
+            timelineDataPlaneErrorResponse(attachment.payload, meta.type, TIMELINE_REQUEST_ERROR_REASONS.DEADLINE_EXCEEDED),
+          )));
+        }
+        continue;
+      }
+      if (attachment.origin === 'http_request') {
+        this.settlePendingHttpTimelineRequest(null, attachment.pending, () => {
+          attachment.pending.reject(new Error(TIMELINE_REQUEST_ERROR_REASONS.DEADLINE_EXCEEDED));
+        });
+      }
+    }
+  }
+
+  private async runTimelineDataPlaneJob(job: TimelineDataPlaneJob, queue: TimelineDataPlaneQueueMetrics): Promise<void> {
+    const { meta } = job;
+    const canceledCount = job.attachments.filter((attachment) => this.isTimelineDataPlaneAttachmentCanceled(attachment)).length;
+    if (canceledCount > 0) {
+      incrementCounter('ws_bridge_timeline_data_plane_canceled', {
+        type: job.meta.type,
+        route: job.meta.route,
+      });
+    }
+    const attachments = job.attachments.filter((attachment) => !this.isTimelineDataPlaneAttachmentCanceled(attachment));
+    if (attachments.length === 0) return;
+    let fanoutYieldCount = 0;
+    for (let index = 0; index < attachments.length; index += 1) {
+      if (index > 0) {
+        fanoutYieldCount += 1;
+        await deferTimelineDataPlaneTurn();
+      }
+      const attachment = attachments[index]!;
+      if (this.isTimelineDataPlaneAttachmentCanceled(attachment)) {
+        incrementCounter('ws_bridge_timeline_data_plane_canceled', {
+          type: job.meta.type,
+          route: job.meta.route,
+        });
+        continue;
+      }
+      await this.runTimelineDataPlaneAttachment(attachment, meta, {
+        ...queue,
+        attachmentIndex: index + 1,
+        attachmentCount: attachments.length,
+        fanoutYieldCount,
+      });
+    }
+  }
+
+  private runTimelineDataPlaneAttachment(
+    attachment: TimelineDataPlaneAttachment,
+    meta: TimelineDataPlaneSendMeta,
+    queue: TimelineDataPlaneQueueMetrics,
+  ): void | Promise<void> {
+    if (attachment.origin === 'http_request') {
+      if (attachment.pending.settled) return;
+      const measured = withBridgeActualPayloadBytes(attachment.payload);
+      this.settlePendingHttpTimelineRequest(null, attachment.pending, () => attachment.pending.resolve(measured));
+      this.logTimelineDataPlaneSend(meta, {
+        jsonBytes: optionalNumber(measured.actualPayloadBytes),
+        stringifyMs: 0,
+        sendWaitMs: 0,
+        queue,
+      });
+      return;
+    }
+
+    if (attachment.origin === 'browser_request') {
+      const serialized = this.stringifyTimelineDataPlaneResponse(attachment.payload, meta);
+      if (!serialized) {
+        if (attachment.socket.readyState === WebSocket.OPEN) {
+          safeSend(attachment.socket, JSON.stringify(withBridgeActualPayloadBytes(
+            timelineDataPlaneErrorResponse(attachment.payload, meta.type, TIMELINE_REQUEST_ERROR_REASONS.INTERNAL_ERROR),
+          )));
+        }
+        return;
+      }
+      const sendStart = performance.now();
+      return new Promise<void>((resolve) => {
+        safeSend(attachment.socket, serialized.json, (err) => {
+          this.logTimelineDataPlaneSend(meta, {
+            jsonBytes: serialized.jsonBytes,
+            stringifyMs: serialized.stringifyMs,
+            sendWaitMs: performance.now() - sendStart,
+            failed: !!err,
+            queue,
+          });
+          resolve();
+        });
+      });
+    }
+
+    const serialized = this.stringifyTimelineDataPlaneResponse(attachment.payload, meta);
+    if (!serialized) return;
+    const sockets = attachment.sockets.filter((socket) => socket.readyState === WebSocket.OPEN);
+    if (sockets.length === 0) return;
+    const sendStart = performance.now();
+    let pendingCallbacks = sockets.length;
+    let failed = false;
+    return new Promise<void>((resolve) => {
+      for (const socket of sockets) {
+        safeSend(socket, serialized.json, (err) => {
+          pendingCallbacks -= 1;
+          failed = failed || !!err;
+          if (pendingCallbacks !== 0) return;
+          this.logTimelineDataPlaneSend(meta, {
+            jsonBytes: serialized.jsonBytes,
+            stringifyMs: serialized.stringifyMs,
+            sendWaitMs: performance.now() - sendStart,
+            failed,
+            queue,
+          });
+          resolve();
+        });
+      }
+    });
+  }
+
+  private drainTimelineDataPlaneQueue(): void {
+    this.timelineDataPlaneScheduled = false;
+    if (this.timelineDataPlaneActive) return;
+    const queueDepthBeforeDrain = this.timelineDataPlaneQueue.length;
+    const job = this.timelineDataPlaneQueue.shift();
+    if (!job) return;
+    this.timelineDataPlaneActive = true;
+    const queueMetrics: TimelineDataPlaneQueueMetrics = {
+      backlogAgeMs: performance.now() - job.enqueuedAt,
+      queueDepthAtEnqueue: job.queueDepthAtEnqueue,
+      queueDepthBeforeDrain,
+      queuedBehindCount: job.queuedBehindCount,
+    };
+    if (this.isTimelineDataPlaneJobCanceled(job)) {
+      incrementCounter('ws_bridge_timeline_data_plane_canceled', {
+        type: job.meta.type,
+        route: job.meta.route,
+      });
+      this.finishTimelineDataPlaneJob();
+      return;
+    }
+    if (performance.now() > job.deadlineAt) {
+      incrementCounter('ws_bridge_timeline_data_plane_deadline_exceeded', {
+        type: job.meta.type,
+        route: job.meta.route,
+      });
+      logger.warn({
+        serverId: this.serverId,
+        type: job.meta.type,
+        route: job.meta.route,
+        backlogAgeMs: queueMetrics.backlogAgeMs,
+        deadlineMs: Math.max(0, job.deadlineAt - job.enqueuedAt),
+      }, 'WsBridge timeline data-plane deadline exceeded');
+      this.handleTimelineDataPlaneJobDeadline(job);
+      this.finishTimelineDataPlaneJob();
+      return;
+    }
+    void Promise.resolve()
+      .then(() => this.runTimelineDataPlaneJob(job, queueMetrics))
+      .catch((err) => {
+        logger.warn({ serverId: this.serverId, err, type: job.meta.type, route: job.meta.route }, 'WsBridge timeline data-plane delivery failed');
+      })
+      .finally(() => this.finishTimelineDataPlaneJob());
+  }
+
+  private stringifyTimelineDataPlaneResponse(
+    msg: Record<string, unknown>,
+    meta: TimelineDataPlaneSendMeta,
+  ): { json: string; jsonBytes: number; stringifyMs: number } | null {
+    const stringifyStart = performance.now();
+    try {
+      const measured = withBridgeActualPayloadBytes(msg);
+      const json = JSON.stringify(measured);
+      const stringifyMs = performance.now() - stringifyStart;
+      const jsonBytes = Buffer.byteLength(json, 'utf8');
+      return { json, jsonBytes, stringifyMs };
+    } catch (err) {
+      incrementCounter('ws_bridge_timeline_data_plane_serialize_error', { type: meta.type, route: meta.route });
+      logger.warn({ serverId: this.serverId, err, type: meta.type, route: meta.route }, 'WsBridge failed to serialize timeline data-plane response');
+      return null;
+    }
+  }
+
+  private logTimelineDataPlaneSend(
+    meta: TimelineDataPlaneSendMeta,
+    timing: {
+      jsonBytes?: number;
+      stringifyMs?: number;
+      sendWaitMs?: number;
+      failed?: boolean;
+      queue?: TimelineDataPlaneQueueMetrics;
+    },
+  ): void {
+    incrementCounter('ws_bridge_timeline_data_plane_send', {
+      type: meta.type,
+      route: meta.route,
+      result: timing.failed ? 'failed' : 'ok',
+    });
+
+    const jsonBytes = timing.jsonBytes ?? 0;
+    const stringifyMs = timing.stringifyMs ?? 0;
+    const sendWaitMs = timing.sendWaitMs ?? 0;
+    const shouldLog = timing.failed
+      || jsonBytes >= BRIDGE_TIMELINE_LARGE_PAYLOAD_LOG_BYTES
+      || stringifyMs >= BRIDGE_TIMELINE_SLOW_SEND_LOG_MS
+      || sendWaitMs >= BRIDGE_TIMELINE_SLOW_SEND_LOG_MS;
+    if (!shouldLog) return;
+
+    const payload = {
+      serverId: this.serverId,
+      type: meta.type,
+      route: meta.route,
+      dataPlaneClass: 'timeline',
+      jsonBytes: timing.jsonBytes,
+      stringifyMs: timing.stringifyMs,
+      sendWaitMs: timing.sendWaitMs,
+      recipientCount: meta.recipientCount,
+      requestIdFanoutCount: meta.requestIdFanoutCount,
+      httpCallerCount: meta.httpCallerCount,
+      broadcastRecipientCount: meta.broadcastRecipientCount,
+      chunkCount: meta.chunkCount,
+      backlogAgeMs: timing.queue?.backlogAgeMs,
+      queueDepthAtEnqueue: timing.queue?.queueDepthAtEnqueue,
+      queueDepthBeforeDrain: timing.queue?.queueDepthBeforeDrain,
+      queuedBehindCount: timing.queue?.queuedBehindCount,
+      attachmentIndex: timing.queue?.attachmentIndex,
+      attachmentCount: timing.queue?.attachmentCount,
+      fanoutYieldCount: timing.queue?.fanoutYieldCount,
+    };
+    if (timing.failed) logger.warn(payload, 'WsBridge timeline data-plane send failed');
+    else logger.info(payload, 'WsBridge timeline data-plane send');
+  }
+
+  private rejectTimelineDataPlaneAttachmentsQueueFull(
+    attachments: TimelineDataPlaneAttachment[],
+    meta: TimelineDataPlaneSendMeta,
+  ): void {
+    for (const attachment of attachments) {
+      if (attachment.origin === 'browser_request') {
+        if (attachment.socket.readyState === WebSocket.OPEN) {
+          safeSend(attachment.socket, JSON.stringify(withBridgeActualPayloadBytes(
+            timelineDataPlaneErrorResponse(attachment.payload, meta.type, TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL),
+          )));
+        }
+        continue;
+      }
+      if (attachment.origin === 'http_request') {
+        this.settlePendingHttpTimelineRequest(attachment.requestId, attachment.pending, () => {
+          attachment.pending.reject(new Error(TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL));
+        });
+      }
+    }
+  }
+
+  private enqueueTimelineDataPlaneFanout(
+    attachments: TimelineDataPlaneAttachment[],
+    meta: TimelineDataPlaneSendMeta,
+  ): void {
+    const queued = this.enqueueTimelineDataPlaneJob(meta, attachments);
+    if (!queued) this.rejectTimelineDataPlaneAttachmentsQueueFull(attachments, meta);
+  }
+
+  private collectTimelineSubscriberSockets(sessionName: string): WebSocket[] {
+    const sockets: WebSocket[] = [];
+    const seen = new Set<WebSocket>();
+    for (const [ws, sessions] of this.browserSubscriptions) {
+      if (!sessions.has(sessionName) || seen.has(ws)) continue;
+      seen.add(ws);
+      sockets.push(ws);
+    }
+    for (const [ws, sessions] of this.transportSubscriptions) {
+      if (!sessions.has(sessionName) || seen.has(ws)) continue;
+      seen.add(ws);
+      sockets.push(ws);
+    }
+    return sockets;
+  }
+
+  private enqueueTimelineDataPlaneSubscriberSend(sessionName: string, msg: Record<string, unknown>, type: string): void {
+    const sockets = this.collectTimelineSubscriberSockets(sessionName);
+    if (sockets.length === 0) return;
+    const meta: TimelineDataPlaneSendMeta = {
+      type,
+      route: 'subscriber_fallback',
+      recipientCount: sockets.length,
+      requestIdFanoutCount: 0,
+      httpCallerCount: 0,
+      broadcastRecipientCount: sockets.length,
+      chunkCount: 1,
+    };
+    this.enqueueTimelineDataPlaneJob(meta, [{
+      origin: 'subscriber_fallback',
+      sessionName,
+      sockets,
+      payload: msg,
+    }]);
+  }
+
+  private handleTimelineDataPlaneResponse(msg: Record<string, unknown>, type: string): void {
+    const requestIds = timelineResponseRequestIds(msg);
+    if (requestIds.length > 0) {
+      const socketDeliveries: Array<{ requestId: string; pending: PendingTimelineRequest }> = [];
+      const httpDeliveries: Array<{ requestId: string; pending: PendingHttpTimelineRequest }> = [];
+      for (const requestId of requestIds) {
+        const pendingHttp = this.pendingHttpTimelineRequests.get(requestId);
+        if (pendingHttp) {
+          clearTimeout(pendingHttp.timer);
+          this.pendingHttpTimelineRequests.delete(requestId);
+          httpDeliveries.push({ requestId, pending: pendingHttp });
+        }
+
+        const pending = this.pendingTimelineRequests.get(requestId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingTimelineRequests.delete(requestId);
+          socketDeliveries.push({ requestId, pending });
+        }
+      }
+
+      const recipientCount = socketDeliveries.length + httpDeliveries.length;
+      if (recipientCount === 0) {
+        incrementCounter('ws_bridge_timeline_unrouted_response', { type });
+        logger.warn({ serverId: this.serverId, type, requestIdCount: requestIds.length }, 'timeline response missing pending request - dropped');
+        return;
+      }
+
+      const attachments: TimelineDataPlaneAttachment[] = [
+        ...httpDeliveries.map(({ requestId, pending }): TimelineDataPlaneAttachment => ({
+          origin: 'http_request',
+          requestId,
+          pending,
+          payload: timelineResponseForRequestId(msg, requestId),
+        })),
+        ...socketDeliveries.map(({ requestId, pending }): TimelineDataPlaneAttachment => ({
+          origin: 'browser_request',
+          requestId,
+          socket: pending.socket,
+          payload: timelineResponseForRequestId(msg, requestId),
+        })),
+      ];
+      this.enqueueTimelineDataPlaneFanout(attachments, {
+        type,
+        route: httpDeliveries.length > 0 && socketDeliveries.length === 0 ? 'http_request' : 'browser_request',
+        recipientCount,
+        requestIdFanoutCount: requestIds.length,
+        httpCallerCount: httpDeliveries.length,
+        broadcastRecipientCount: 0,
+        chunkCount: 1,
+      });
+      return;
+    }
+
+    const sessionName = optionalString(msg.sessionName);
+    if (!sessionName) {
+      logger.warn({ serverId: this.serverId, type }, 'timeline message missing sessionName - discarded');
+      return;
+    }
+
+    this.enqueueTimelineDataPlaneSubscriberSend(sessionName, msg, type);
+  }
+
+  private pruneSessionGroupCloneContexts(now = Date.now()): void {
+    for (const [key, context] of this.sessionGroupCloneContexts.entries()) {
+      if (now - context.createdAt > SESSION_GROUP_CLONE_CONTEXT_TTL_MS) {
+        this.sessionGroupCloneContexts.delete(key);
+      }
+    }
+    for (const [key, cached] of this.sessionGroupCloneEvents.entries()) {
+      if (now - cached.createdAt > SESSION_GROUP_CLONE_CONTEXT_TTL_MS) {
+        this.sessionGroupCloneEvents.delete(key);
+      }
+    }
+  }
+
+  registerSessionGroupCloneOperationContext(context: {
+    idempotencyKey: string;
+    userId: string;
+    sourceMainSessionName: string;
+  }): void {
+    const idempotencyKey = context.idempotencyKey.trim();
+    const userId = context.userId.trim();
+    const sourceMainSessionName = context.sourceMainSessionName.trim();
+    if (!idempotencyKey || !userId || !sourceMainSessionName) return;
+    this.pruneSessionGroupCloneContexts();
+    this.sessionGroupCloneContexts.set(idempotencyKey, {
+      userId,
+      sourceMainSessionName,
+      createdAt: Date.now(),
+    });
+  }
+
+  getSessionGroupCloneOperationEvent(idempotencyKey: string): SessionGroupCloneEvent | null {
+    const key = idempotencyKey.trim();
+    if (!key) return null;
+    this.pruneSessionGroupCloneContexts();
+    return this.sessionGroupCloneEvents.get(key)?.event ?? null;
+  }
+
+  async findExplicitSessionGroupCloneTargetConflict(targetProjectName: string | null | undefined): Promise<string | null> {
+    if (typeof targetProjectName !== 'string' || !targetProjectName.trim()) return null;
+    const targetMainSessionName = mainSessionNameForProjectSlug(sanitizeProjectName(targetProjectName.trim()));
+    if (this.activeMainSessions.has(targetMainSessionName)) return targetMainSessionName;
+    if (!this.db) return null;
+    const row = await this.db.queryOne<Record<string, unknown>>(
+      'SELECT 1 FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+      [this.serverId, targetMainSessionName],
+    );
+    return row ? targetMainSessionName : null;
+  }
+
+  private async getServerVisibleSessionNames(): Promise<string[]> {
+    if (!this.db) return [];
+    try {
+      const sessions = await getDbSessionsByServer(this.db, this.serverId);
+      return sessions
+        .map((session) => session.name)
+        .filter((name): name is string => typeof name === 'string' && name.length > 0);
+    } catch (err) {
+      logger.warn({ err, serverId: this.serverId }, 'session-group clone server-visible session lookup failed');
+      return [];
+    }
+  }
+
+  private rememberSessionGroupCloneOperationEvent(event: SessionGroupCloneEvent): void {
+    this.pruneSessionGroupCloneContexts();
+    this.sessionGroupCloneEvents.set(event.idempotencyKey, {
+      event,
+      createdAt: Date.now(),
+    });
   }
 
   private registerMemoryManagementRequest(ws: WebSocket, msg: Record<string, unknown>): string | null {
@@ -829,6 +2048,10 @@ export class WsBridge {
     }
     this.daemonWs = ws;
     this.authenticated = false;
+    // New connection: drop any auth promise from a prior connection so
+    // late-arriving messages don't await a stale (and possibly resolved
+    // for a different `ws`) auth.
+    this.authPromise = null;
 
     // Auth timeout
     this.authTimer = setTimeout(() => {
@@ -852,6 +2075,19 @@ export class WsBridge {
         return;
       }
 
+      // Audit fix (78-server reconnect-storm) — wait for any in-flight
+      // auth handshake before evaluating `this.authenticated`. Without
+      // this, `daemon.hello` (sent back-to-back with `auth` by every
+      // daemon) raced the auth DB lookup and was rejected with
+      // `ws.close(4001, 'auth_required')` even though auth was about to
+      // succeed milliseconds later. See `authPromise` field doc above.
+      if (this.authPromise) {
+        try { await this.authPromise; } catch { /* ignore — closed below */ }
+        // The connection may have been closed while we awaited (auth
+        // failed / timed out / replaced). Bail out before processing.
+        if (this.daemonWs !== ws) return;
+      }
+
       if (!this.authenticated) {
         if (msg.type !== 'auth' || typeof msg.token !== 'string' || typeof msg.serverId !== 'string') {
           ws.close(4001, 'auth_required');
@@ -859,15 +2095,35 @@ export class WsBridge {
         }
         if (this.authTimer) clearTimeout(this.authTimer);
 
+        // Capture the auth flow in `authPromise` so concurrent message
+        // handlers (the `daemon.hello` that arrives ~1 ms after `auth`)
+        // can `await` it instead of racing the DB lookup. The promise
+        // ALWAYS resolves (never rejects) — failure modes are signaled
+        // via `ws.close()` + `this.daemonWs = null`, which the awaiting
+        // handlers detect with their `daemonWs !== ws` bail-out check.
+        // Resolving (vs rejecting) avoids unhandled-rejection warnings
+        // when no concurrent handler is currently awaiting.
+        let resolveAuth!: () => void;
+        this.authPromise = new Promise<void>((res) => { resolveAuth = res; });
+
         const tokenHash = sha256Hex(msg.token);
-        const server = await db.queryOne<{ token_hash: string; user_id?: string }>(
-          'SELECT token_hash, user_id FROM servers WHERE id = $1',
-          [this.serverId],
-        );
+        let server: { token_hash: string; user_id?: string } | null = null;
+        try {
+          server = await db.queryOne<{ token_hash: string; user_id?: string }>(
+            'SELECT token_hash, user_id FROM servers WHERE id = $1',
+            [this.serverId],
+          );
+        } catch (err) {
+          resolveAuth();
+          this.authPromise = null;
+          throw err;
+        }
 
         if (!server || server.token_hash !== tokenHash) {
           logger.warn({ serverId: this.serverId }, 'Daemon auth failed');
           ws.close(4001, 'auth_failed');
+          resolveAuth();
+          this.authPromise = null;
           return;
         }
 
@@ -989,6 +2245,18 @@ export class WsBridge {
         this.broadcastToBrowsers(JSON.stringify({ type: MSG_DAEMON_ONLINE }));
         this.startAckHousekeepingIfNeeded();
 
+        // Audit fix (78-server reconnect-storm) — release waiters now
+        // that auth + replay are complete. Concurrent message handlers
+        // (e.g. the `daemon.hello` that landed before auth finished)
+        // will resume past their `await this.authPromise` and observe
+        // `this.authenticated === true`.
+        resolveAuth();
+        this.authPromise = null;
+        return;
+      }
+
+      if (msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO) {
+        this.handleDaemonP2pWorkflowHello(msg);
         return;
       }
 
@@ -1015,7 +2283,7 @@ export class WsBridge {
           );
         }
         // Timeline events: session.state(idle) and ask.question
-        if (pushType === 'timeline.event') {
+        if (pushType === TIMELINE_MESSAGES.EVENT) {
           const event = (msg as Record<string, unknown>).event as Record<string, unknown> | undefined;
           if (event?.type === 'ask.question') {
             this.dispatchEventPush(db, env, {
@@ -1044,6 +2312,12 @@ export class WsBridge {
       if (this.daemonWs === ws) {
         this.daemonWs = null;
         this.authenticated = false;
+        // Audit fix (78-server reconnect-storm) — drop the auth promise
+        // so the next reconnect's message handlers don't await a stale
+        // pending promise. If auth was still in flight when the socket
+        // closed, the awaiting handlers will fall through and observe
+        // `this.daemonWs !== ws` and bail out.
+        this.authPromise = null;
         this.recentTextBySession.clear();
         this.activeMainSessions.clear();
         this.activeSubSessions.clear();
@@ -1058,6 +2332,7 @@ export class WsBridge {
           this.broadcastToBrowsers(JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected: false }));
         }
         this.providerStatus.clear();
+        this.daemonP2pWorkflowCapabilities = null;
         this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }));
         void clearProviderStatus(db, this.serverId).catch(() => {});
         updateServerStatus(db, this.serverId, 'offline').catch((err) =>
@@ -1101,6 +2376,35 @@ export class WsBridge {
     // Push cached remote sessions for each connected provider
     for (const [providerId, sessions] of this.providerRemoteSessions) {
       safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions }));
+    }
+    /*
+     * R3 v2 PR-σ — Replay the cached `daemon.hello` to newly-connected
+     * browsers. Previously the daemon only sent hello on (a) WS
+     * connect/reconnect and (b) capability change, and the bridge
+     * forwarded it as it arrived but never replayed cached state. Any
+     * browser that opened AFTER the daemon's most recent hello would
+     * never receive one and its `capability_stale` 30 s TTL would
+     * fire as a false-positive "lost contact with the daemon" banner
+     * even though the daemon was healthy. Replaying the cached snapshot
+     * here gives every newly-connected browser the same starting
+     * capability picture as one that was open during the original
+     * hello broadcast.
+     */
+    if (this.daemonP2pWorkflowCapabilities) {
+      safeSend(ws, JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: this.daemonP2pWorkflowCapabilities.daemonId,
+        capabilities: this.daemonP2pWorkflowCapabilities.capabilities,
+        ...(this.daemonP2pWorkflowCapabilities.timelineProtocolRevision !== undefined
+          ? {
+            timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
+            timelineProtocolRevision: this.daemonP2pWorkflowCapabilities.timelineProtocolRevision,
+          }
+          : {}),
+        helloEpoch: this.daemonP2pWorkflowCapabilities.helloEpoch,
+        ...(this.daemonP2pWorkflowCapabilities.buildInfo ? { buildInfo: this.daemonP2pWorkflowCapabilities.buildInfo } : {}),
+        sentAt: this.daemonP2pWorkflowCapabilities.sentAt,
+      }));
     }
 
     ws.on('message', async (data) => {
@@ -1160,6 +2464,39 @@ export class WsBridge {
         return;
       }
 
+      if (msg.type === SESSION_GROUP_CLONE_MSG.START || msg.type === SESSION_GROUP_CLONE_MSG.CANCEL) {
+        await this.handleBrowserSessionGroupCloneCommand(ws, msg);
+        return;
+      }
+
+      const p2pBrowserMessage = parseP2pWorkflowMessageType(msg.type);
+      if (p2pBrowserMessage.kind === 'drop' && p2pBrowserMessage.reason === 'unknown_p2p_message') {
+        incrementCounter('p2p.bridge.unknown_message_drop', { direction: 'browser_to_daemon' });
+        logger.warn({ serverId: this.serverId, type: msg.type }, 'unknown browser p2p message — dropped');
+        return;
+      }
+      if (p2pBrowserMessage.kind === 'known') {
+        const descriptor = p2pBrowserMessage.descriptor;
+        if (
+          !descriptor.allowedIngress.includes('browser')
+          || descriptor.response
+          || descriptor.serverHandling !== 'forward_to_daemon'
+        ) {
+          incrementCounter('p2p.bridge.wrong_peer_drop', { direction: 'browser_to_daemon', type: msg.type });
+          logger.warn({ serverId: this.serverId, type: msg.type }, 'browser attempted disallowed p2p route — dropped');
+          safeSend(ws, JSON.stringify({
+            type: 'error',
+            code: P2P_BRIDGE_ERROR_CODES.WRONG_PEER,
+            originalType: msg.type,
+            requestId: msg.requestId,
+          }));
+          return;
+        }
+        if (descriptor.requestScoped && !this.registerP2pWorkflowRequest(ws, msg, descriptor)) {
+          return;
+        }
+      }
+
       if (this.isBrowserForbiddenDaemonCommandType(msg.type)) {
         logger.warn({ serverId: this.serverId, type: msg.type }, 'Browser attempted server-only daemon command — rejected');
         safeSend(ws, JSON.stringify({
@@ -1191,55 +2528,49 @@ export class WsBridge {
         return;
       }
 
+      if (msg.type === REPO_MSG.CHECKOUT_BRANCH) {
+        const authorized = await this.verifyRepoCheckoutAuthorization(ws, msg);
+        if (!authorized) return;
+      }
+
       // Track fs.ls requests for single-cast response routing
       if (msg.type === 'fs.ls' && typeof msg.requestId === 'string') {
-        const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsRequests.delete(reqId), 20_000);
-        this.pendingFsRequests.set(reqId, { socket: ws, timer });
+        this.registerPendingFsRoute('fs.ls', ws, msg);
       }
 
       // Track fs.read requests for single-cast response routing
       if (msg.type === 'fs.read' && typeof msg.requestId === 'string') {
-        const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsReadRequests.delete(reqId), 20_000);
-        this.pendingFsReadRequests.set(reqId, { socket: ws, timer });
+        this.registerPendingFsRoute('fs.read', ws, msg);
       }
 
       // Track fs.git_status requests for single-cast response routing
       if (msg.type === 'fs.git_status' && typeof msg.requestId === 'string') {
-        const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsGitStatusRequests.delete(reqId), 20_000);
-        this.pendingFsGitStatusRequests.set(reqId, { socket: ws, timer });
+        this.registerPendingFsRoute('fs.git_status', ws, msg);
       }
 
       // Track fs.git_diff requests for single-cast response routing
       if (msg.type === 'fs.git_diff' && typeof msg.requestId === 'string') {
-        const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsGitDiffRequests.delete(reqId), 20_000);
-        this.pendingFsGitDiffRequests.set(reqId, { socket: ws, timer });
+        this.registerPendingFsRoute('fs.git_diff', ws, msg);
       }
 
       // Track file.search requests for single-cast response routing
       if (msg.type === 'file.search' && typeof msg.requestId === 'string') {
-        const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFileSearchRequests.delete(reqId), 20_000);
-        this.pendingFileSearchRequests.set(reqId, { socket: ws, timer });
+        this.registerPendingFsRoute('file.search', ws, msg);
       }
 
       // Track fs.write requests for single-cast response routing
       if (msg.type === 'fs.write' && typeof msg.requestId === 'string') {
-        const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsWriteRequests.delete(reqId), 20_000);
-        this.pendingFsWriteRequests.set(reqId, { socket: ws, timer });
+        this.registerPendingFsRoute('fs.write', ws, msg);
       }
 
-      // Track timeline.history_request / timeline.replay_request for single-cast response routing
+      // Validate and track timeline request ids for single-cast response routing.
       // This eliminates the race where terminal.subscribe's async ownership check hasn't completed
-      // before the daemon responds with timeline.history — without this, the response is silently dropped.
-      if ((msg.type === 'timeline.history_request' || msg.type === 'timeline.replay_request') && typeof msg.requestId === 'string') {
-        const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingTimelineRequests.delete(reqId), 30_000);
-        this.pendingTimelineRequests.set(reqId, { socket: ws, timer });
+      // before the daemon responds with timeline data - without this, the response is silently dropped.
+      if (TIMELINE_REQUEST_TYPES.has(msg.type)) {
+        if (!await this.verifyTimelineBrowserRequest(ws, msg)) return;
+        if (typeof msg.requestId === 'string') {
+          this.registerPendingTimelineRequest(ws, msg);
+        }
       }
 
       // Track terminal subscriptions for binary routing + ref-counted daemon forwarding
@@ -1263,12 +2594,31 @@ export class WsBridge {
 
       // Track transport (chat) subscriptions for session-scoped transport event delivery
       if (msg.type === TRANSPORT_MSG.CHAT_SUBSCRIBE && typeof msg.sessionId === 'string') {
-        this.transportSubscriptions.get(ws)?.add(msg.sessionId);
-        // Forward to daemon so it can replay cached history
-        this.sendToDaemon(raw);
+        const sessionId = msg.sessionId;
+        const hasForceHistoryFlag = Object.prototype.hasOwnProperty.call(msg, 'forceHistory');
+        const forceHistory = (msg as { forceHistory?: unknown }).forceHistory === true;
+        const alreadySubscribed = this.transportSubscriptions.get(ws)?.has(sessionId) ?? false;
+        const revision = this.bumpTransportSubscriptionRevision(ws, sessionId);
+        void this.verifySessionOwnership(sessionId).then((allowed) => {
+          if (!allowed) {
+            logger.warn({ serverId: this.serverId, sessionId }, 'chat.subscribe: session not owned by this server — rejected');
+            return;
+          }
+          if (!this.isCurrentTransportSubscriptionRevision(ws, sessionId, revision)) return;
+          if (ws.readyState !== WebSocket.OPEN) return;
+          this.transportSubscriptions.get(ws)?.add(sessionId);
+          // Client v2 can explicitly send forceHistory:false to repair the
+          // transport live subscription after a foreground probe without
+          // triggering daemon chat.history replay. Legacy clients omit the flag,
+          // so their first subscribe keeps the old replay behavior.
+          if (forceHistory || (!hasForceHistoryFlag && !alreadySubscribed)) {
+            this.sendToDaemon(raw);
+          }
+        });
         return;
       }
       if (msg.type === TRANSPORT_MSG.CHAT_UNSUBSCRIBE && typeof msg.sessionId === 'string') {
+        this.bumpTransportSubscriptionRevision(ws, msg.sessionId);
         this.transportSubscriptions.get(ws)?.delete(msg.sessionId);
         return;
       }
@@ -1308,6 +2658,397 @@ export class WsBridge {
     });
   }
 
+  private async handleBrowserSessionGroupCloneCommand(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
+    const type = msg.type;
+    const requestId = msg.requestId;
+    const sendError = (code: string, extra: Record<string, unknown> = {}) => {
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code,
+        error: code,
+        originalType: type,
+        ...(typeof requestId === 'string' ? { requestId } : {}),
+        ...extra,
+      }));
+    };
+
+    if (msg.serverId !== this.serverId) {
+      sendError('invalid_request', { reason: 'serverId_required' });
+      return;
+    }
+
+    const db = this.db;
+    const userId = this.browserUserIds.get(ws)?.trim();
+    if (!db || !userId) {
+      sendError('forbidden');
+      return;
+    }
+
+    const role = await resolveServerRole(db, this.serverId, userId);
+    if (role !== 'owner' && role !== 'admin') {
+      await writeSessionGroupCloneAudit(db, {
+        userId,
+        serverId: this.serverId,
+        action: 'session_group_clone.forbidden',
+        details: {
+          role,
+          sourceMainSessionName: typeof msg.sourceMainSessionName === 'string' ? msg.sourceMainSessionName : undefined,
+          idempotencyKey: typeof msg.idempotencyKey === 'string' && msg.idempotencyKey.trim() ? msg.idempotencyKey.trim() : undefined,
+          errorCode: 'forbidden',
+        },
+      });
+      sendError('forbidden');
+      return;
+    }
+
+    if (type === SESSION_GROUP_CLONE_MSG.START) {
+      const duplicateEvent = this.getSessionGroupCloneOperationEvent(
+        typeof msg.idempotencyKey === 'string' ? msg.idempotencyKey : '',
+      );
+      if (duplicateEvent) {
+        this.broadcastToBrowsers(JSON.stringify(duplicateEvent));
+        return;
+      }
+    }
+
+    if (!this.hasDaemonCapability(SESSION_GROUP_CLONE_CAPABILITY_V1)) {
+      sendError('unsupported_command', { missingCapability: SESSION_GROUP_CLONE_CAPABILITY_V1 });
+      return;
+    }
+
+    if (type === SESSION_GROUP_CLONE_MSG.CANCEL) {
+      const operationId = typeof msg.operationId === 'string' ? msg.operationId.trim() : '';
+      const idempotencyKey = typeof msg.idempotencyKey === 'string' ? msg.idempotencyKey.trim() : '';
+      if (!operationId && !idempotencyKey) {
+        sendError('invalid_request', { reason: 'operationId_or_idempotencyKey_required' });
+        return;
+      }
+      this.sendToDaemon(JSON.stringify({
+        type: SESSION_GROUP_CLONE_MSG.CANCEL,
+        serverId: this.serverId,
+        ...(operationId ? { operationId } : {}),
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+      }));
+      return;
+    }
+
+    const sourceMainSessionName = typeof msg.sourceMainSessionName === 'string' ? msg.sourceMainSessionName.trim() : '';
+    const idempotencyKey = typeof msg.idempotencyKey === 'string' ? msg.idempotencyKey.trim() : '';
+    const targetProjectName = readCloneOptionalString(msg, 'targetProjectName');
+    const cwdOverride = readCloneOptionalString(msg, 'cwdOverride');
+    if (!sourceMainSessionName || !idempotencyKey || !targetProjectName.ok || !cwdOverride.ok) {
+      sendError('invalid_request');
+      return;
+    }
+    if (typeof targetProjectName.value === 'string' && targetProjectName.value.trim() === '') {
+      sendError('blank_target_project');
+      return;
+    }
+    const targetMainSessionName = await this.findExplicitSessionGroupCloneTargetConflict(targetProjectName.value);
+    if (targetMainSessionName) {
+      await writeSessionGroupCloneAudit(db, {
+        userId,
+        serverId: this.serverId,
+        action: 'session_group_clone.failed',
+        details: {
+          role,
+          sourceMainSessionName,
+          idempotencyKey,
+          targetProjectSlug: typeof targetProjectName.value === 'string' && targetProjectName.value.trim()
+            ? sanitizeProjectName(targetProjectName.value.trim())
+            : undefined,
+          errorCode: 'name_taken',
+        },
+      });
+      sendError('name_taken', { targetMainSessionName });
+      return;
+    }
+
+    const payload: Record<string, unknown> = {
+      type: SESSION_GROUP_CLONE_MSG.START,
+      serverId: this.serverId,
+      sourceMainSessionName,
+      idempotencyKey,
+    };
+    if (targetProjectName.value !== undefined) payload.targetProjectName = targetProjectName.value;
+    if (cwdOverride.value !== undefined) payload.cwdOverride = cwdOverride.value;
+    const unavailableSessionNames = await this.getServerVisibleSessionNames();
+    if (unavailableSessionNames.length > 0) payload.unavailableSessionNames = unavailableSessionNames;
+    this.registerSessionGroupCloneOperationContext({ idempotencyKey, userId, sourceMainSessionName });
+    this.sendToDaemon(JSON.stringify(payload));
+    await writeSessionGroupCloneAudit(db, {
+      userId,
+      serverId: this.serverId,
+      action: 'session_group_clone.accepted',
+      details: {
+        role,
+        sourceMainSessionName,
+        idempotencyKey,
+        targetProjectSlug: typeof targetProjectName.value === 'string' && targetProjectName.value.trim()
+          ? sanitizeProjectName(targetProjectName.value.trim())
+          : undefined,
+      },
+    });
+  }
+
+  private auditSessionGroupCloneTerminalEvent(event: SessionGroupCloneEvent): void {
+    if (!this.db || !SESSION_GROUP_CLONE_TERMINAL_STATES.has(event.state)) return;
+    const result = event.result;
+    void writeSessionGroupCloneAudit(this.db, {
+      serverId: this.serverId,
+      action: `session_group_clone.${event.state}`,
+      details: {
+        operationId: event.operationId,
+        idempotencyKey: event.idempotencyKey,
+        sourceMainSessionName: event.sourceMainSessionName ?? result?.sourceMainSession,
+        clonedMainSessionName: event.clonedMainSessionName ?? result?.clonedMainSession,
+        targetProjectSlug: result?.targetProjectSlug,
+        clonedSubSessionCount: result?.copiedSubSessionIds.length,
+        skippedCronJobs: event.skippedCronJobs ?? result?.skippedCronJobs,
+        skippedOrchestrationRuns: event.skippedOrchestrationRuns ?? result?.skippedOrchestrationRuns,
+        errorCode: event.errorCode,
+        cleanupRequired: event.cleanupRequired === true ? true : undefined,
+        cleanupResources: event.cleanupResources?.map((resource) => ({
+          kind: resource.kind,
+          id: resource.id,
+          sessionName: resource.sessionName,
+          serverId: resource.serverId,
+          providerId: resource.providerId,
+          retriable: resource.retriable,
+        })),
+      },
+    });
+  }
+
+  private async prepareSucceededSessionGroupCloneEvent(event: SessionGroupCloneEvent): Promise<SessionGroupCloneEvent> {
+    let finalEvent = event;
+    try {
+      const counts = await this.countSkippedScheduledWorkForClone(event);
+      if (counts) finalEvent = mergeSkippedScheduledWorkCounts(event, counts);
+    } catch (err) {
+      logger.warn({ err, serverId: this.serverId, operationId: event.operationId }, 'session-group clone skipped scheduled-work count failed');
+    }
+
+    try {
+      await this.copyServerSyncedP2pConfigForClone(finalEvent);
+    } catch (err) {
+      const cleanupResources = err instanceof SessionGroupCloneServerP2pError ? err.cleanupResources : [];
+      logger.warn({ err, serverId: this.serverId, operationId: event.operationId }, 'session-group clone server-synced P2P preference copy failed');
+      finalEvent = {
+        ...finalEvent,
+        state: 'cleanup_required',
+        errorCode: 'server_p2p_commit_failed',
+        cleanupRequired: true,
+        ...(cleanupResources.length ? { cleanupResources } : {}),
+      };
+    }
+    return finalEvent;
+  }
+
+  private async countSkippedScheduledWorkForClone(event: SessionGroupCloneEvent): Promise<{
+    skippedCronJobs: number;
+    skippedOrchestrationRuns: number;
+  } | null> {
+    const db = this.db;
+    const result = event.result;
+    if (!db || !result) return null;
+
+    const sourceSessionNames = Array.from(new Set([
+      ...Object.keys(result.sessionNameMap),
+      result.sourceMainSession,
+      event.sourceMainSessionName,
+    ].filter((name): name is string => typeof name === 'string' && name.length > 0)));
+    if (!sourceSessionNames.length) return null;
+
+    const sourceProjectSlug = sourceProjectSlugFromMainSessionName(result.sourceMainSession || event.sourceMainSessionName);
+    const cronRow = await db.queryOne<Record<string, unknown>>(
+      `SELECT COUNT(*)::int AS count
+       FROM cron_jobs
+       WHERE server_id = $1
+         AND (
+           target_session_name = ANY($2)
+           OR ($3::text IS NOT NULL AND target_role = $4 AND project_name = $3)
+         )`,
+      [this.serverId, sourceSessionNames, sourceProjectSlug, 'brain'],
+    );
+    const orchestrationRow = await db.queryOne<Record<string, unknown>>(
+      `SELECT COUNT(*)::int AS count
+       FROM discussion_orchestration_runs
+       WHERE server_id = $1
+         AND (
+           main_session = ANY($2)
+           OR initiator_session = ANY($2)
+           OR current_target_session = ANY($2)
+           OR final_return_session = ANY($2)
+         )`,
+      [this.serverId, sourceSessionNames],
+    );
+
+    return {
+      skippedCronJobs: numericCount(cronRow),
+      skippedOrchestrationRuns: numericCount(orchestrationRow),
+    };
+  }
+
+  private async copyServerSyncedP2pConfigForClone(event: SessionGroupCloneEvent): Promise<void> {
+    const db = this.db;
+    const result = event.result;
+    if (!db || event.state !== 'succeeded' || !result) return;
+
+    this.pruneSessionGroupCloneContexts();
+    const context = this.sessionGroupCloneContexts.get(event.idempotencyKey);
+    if (!context) return;
+
+    const sourceMainSessionName = result.sourceMainSession || event.sourceMainSessionName || context.sourceMainSessionName;
+    const source = await getUserP2pConfigForRoot(db, context.userId, this.serverId, sourceMainSessionName);
+    if (!source) return;
+
+    const targetKey = p2pSessionConfigPrefKey(result.clonedMainSession, this.serverId);
+    const previousTargetValue = await getUserPref(db, context.userId, targetKey);
+    const remapped = cloneP2pConfigWithSessionRemap(source.config, result.sessionNameMap, Date.now(), {
+      sourceGroupSessionNames: [
+        ...Object.keys(result.sessionNameMap),
+        ...result.skippedMembers.map((member) => member.sessionName),
+      ],
+    });
+
+    try {
+      await setUserPref(db, context.userId, targetKey, JSON.stringify(remapped.config));
+      this.sendToDaemon(JSON.stringify({
+        type: P2P_CONFIG_MSG.SAVE,
+        requestId: `session-group-clone:${event.operationId}`,
+        scopeSession: result.clonedMainSession,
+        config: remapped.config,
+      }));
+      await writeSessionGroupCloneAudit(db, {
+        userId: context.userId,
+        serverId: this.serverId,
+        action: 'session_group_clone.p2p_config_copied',
+        details: {
+          operationId: event.operationId,
+          idempotencyKey: event.idempotencyKey,
+          sourceMainSessionName,
+          clonedMainSessionName: result.clonedMainSession,
+          sourcePreferenceKey: source.key,
+          targetPreferenceKey: targetKey,
+          warningCount: remapped.warnings.length,
+        },
+      });
+    } catch (err) {
+      try {
+        if (previousTargetValue === null) {
+          await deleteUserPref(db, context.userId, targetKey);
+        } else {
+          await setUserPref(db, context.userId, targetKey, previousTargetValue);
+        }
+      } catch (restoreErr) {
+        logger.warn({ err: restoreErr, serverId: this.serverId, targetKey }, 'session-group clone P2P preference rollback failed');
+      }
+      logger.warn({ err, serverId: this.serverId, operationId: event.operationId }, 'session-group clone server-synced P2P preference copy failed');
+      await writeSessionGroupCloneAudit(db, {
+        userId: context.userId,
+        serverId: this.serverId,
+        action: 'session_group_clone.p2p_config_failed',
+        details: {
+          operationId: event.operationId,
+          idempotencyKey: event.idempotencyKey,
+          sourceMainSessionName,
+          clonedMainSessionName: result.clonedMainSession,
+        },
+      });
+      throw new SessionGroupCloneServerP2pError('server-synced P2P preference copy failed', [{
+        kind: 'server_p2p_pref',
+        id: targetKey,
+        sessionName: result.clonedMainSession,
+        serverId: this.serverId,
+        retriable: true,
+      }]);
+    }
+  }
+
+  private registerP2pWorkflowRequest(
+    ws: WebSocket,
+    msg: Record<string, unknown>,
+    descriptor: P2pWorkflowMessageDescriptor,
+  ): boolean {
+    if (!isP2pWorkflowRequestId(msg.requestId)) {
+      incrementCounter('p2p.bridge.invalid_request_id_drop', { type: descriptor.type });
+      logger.warn({ serverId: this.serverId, type: descriptor.type }, 'p2p request missing valid requestId — dropped');
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: P2P_BRIDGE_ERROR_CODES.INVALID_REQUEST_ID,
+        originalType: descriptor.type,
+        requestId: msg.requestId,
+      }));
+      return false;
+    }
+    const expectedResponseType = descriptor.expectedResponseType;
+    if (!expectedResponseType) {
+      incrementCounter('p2p.bridge.route_policy_drop', { direction: 'browser_to_daemon', type: descriptor.type });
+      logger.warn({ serverId: this.serverId, type: descriptor.type }, 'p2p request missing expected response policy — dropped');
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: P2P_BRIDGE_ERROR_CODES.ROUTE_POLICY_ERROR,
+        originalType: descriptor.type,
+        requestId: msg.requestId,
+      }));
+      return false;
+    }
+
+    const requestId = msg.requestId;
+    const existing = this.pendingP2pWorkflowRequests.get(requestId);
+    if (existing) {
+      incrementCounter('p2p.bridge.duplicate_request_id_drop', { type: descriptor.type });
+      logger.warn({ serverId: this.serverId, type: descriptor.type, requestId }, 'p2p duplicate active requestId — dropped');
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: P2P_BRIDGE_ERROR_CODES.DUPLICATE_REQUEST_ID,
+        originalType: descriptor.type,
+        requestId,
+      }));
+      return false;
+    }
+
+    let socketPendingCount = 0;
+    for (const pending of this.pendingP2pWorkflowRequests.values()) {
+      if (pending.socket === ws) socketPendingCount += 1;
+    }
+    if (socketPendingCount >= P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET) {
+      incrementCounter('p2p.bridge.pending_request_cap_drop', { scope: 'socket', type: descriptor.type });
+      logger.warn({ serverId: this.serverId, type: descriptor.type, requestId }, 'p2p per-socket pending cap exceeded — dropped');
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: P2P_BRIDGE_ERROR_CODES.PENDING_LIMIT_EXCEEDED,
+        scope: 'socket',
+        originalType: descriptor.type,
+        requestId,
+      }));
+      return false;
+    }
+    if (this.pendingP2pWorkflowRequests.size >= P2P_BRIDGE_PENDING_REQUESTS_GLOBAL) {
+      incrementCounter('p2p.bridge.pending_request_cap_drop', { scope: 'global', type: descriptor.type });
+      logger.warn({ serverId: this.serverId, type: descriptor.type, requestId }, 'p2p global pending cap exceeded — dropped');
+      safeSend(ws, JSON.stringify({
+        type: 'error',
+        code: P2P_BRIDGE_ERROR_CODES.PENDING_LIMIT_EXCEEDED,
+        scope: 'global',
+        originalType: descriptor.type,
+        requestId,
+      }));
+      return false;
+    }
+
+    const timer = setTimeout(() => this.pendingP2pWorkflowRequests.delete(requestId), P2P_BRIDGE_PENDING_REQUEST_TIMEOUT_MS);
+    this.pendingP2pWorkflowRequests.set(requestId, {
+      socket: ws,
+      timer,
+      requestType: descriptor.type,
+      expectedResponseType,
+      createdAt: Date.now(),
+    });
+    return true;
+  }
+
   // ── Relay helpers ──────────────────────────────────────────────────────────
 
   /**
@@ -1318,6 +3059,70 @@ export class WsBridge {
    */
   private relayToBrowsers(msg: Record<string, unknown>): void {
     const type = msg.type as string;
+
+    if (type === SESSION_GROUP_CLONE_MSG.EVENT) {
+      const event = sanitizeSessionGroupCloneEvent(msg);
+      if (!event) {
+        logger.warn({ serverId: this.serverId }, 'session group clone event malformed — discarded');
+        return;
+      }
+      if (event.state === 'succeeded') {
+        void this.prepareSucceededSessionGroupCloneEvent(event)
+          .then((finalEvent) => {
+            this.auditSessionGroupCloneTerminalEvent(finalEvent);
+            this.rememberSessionGroupCloneOperationEvent(finalEvent);
+            this.broadcastToBrowsers(JSON.stringify(finalEvent));
+          });
+        return;
+      }
+      this.auditSessionGroupCloneTerminalEvent(event);
+      this.rememberSessionGroupCloneOperationEvent(event);
+      this.broadcastToBrowsers(JSON.stringify(event));
+      return;
+    }
+
+    const p2pDaemonMessage = parseP2pWorkflowMessageType(type);
+    if (p2pDaemonMessage.kind === 'known' && !p2pDaemonMessage.descriptor.allowedIngress.includes('daemon')) {
+      incrementCounter('p2p.bridge.wrong_peer_drop', { direction: 'daemon_to_browser', type });
+      logger.warn({ serverId: this.serverId, type }, 'daemon attempted disallowed p2p route — dropped');
+      return;
+    }
+    if (p2pDaemonMessage.kind === 'known' && p2pDaemonMessage.descriptor.response && p2pDaemonMessage.descriptor.requestScoped) {
+      const requestId = msg.requestId;
+      if (!isP2pWorkflowRequestId(requestId)) {
+        incrementCounter('p2p.bridge.unrouted_response_drop', { type });
+        logger.warn({ serverId: this.serverId, type, requestId }, 'p2p response missing valid requestId — dropped');
+        return;
+      }
+      const pending = this.pendingP2pWorkflowRequests.get(requestId);
+      if (!pending) {
+        incrementCounter('p2p.bridge.unrouted_response_drop', { type });
+        logger.warn({ serverId: this.serverId, type, requestId }, 'p2p response missing pending request — dropped');
+        return;
+      }
+      if (pending.expectedResponseType !== type) {
+        incrementCounter('p2p.bridge.response_type_mismatch_drop', {
+          expected: pending.expectedResponseType,
+          received: type,
+          requestType: pending.requestType,
+        });
+        logger.warn({
+          serverId: this.serverId,
+          requestId,
+          requestType: pending.requestType,
+          expectedResponseType: pending.expectedResponseType,
+          receivedResponseType: type,
+          createdAt: pending.createdAt,
+        }, 'p2p response type mismatch — dropped without clearing pending request');
+        return;
+      }
+      clearTimeout(pending.timer);
+      this.pendingP2pWorkflowRequests.delete(requestId);
+      if (pending.socket.readyState === WebSocket.OPEN) {
+        pending.socket.send(JSON.stringify(msg));
+      }
+      return;
+    }
 
     // ── Preview WS tunnel control messages ──────────────────────────────────
     if (type === PREVIEW_MSG.WS_OPENED) {
@@ -1365,97 +3170,37 @@ export class WsBridge {
 
     // ── fs.ls_response: single-cast back to requesting browser ────────────────
     if (type === 'fs.ls_response') {
-      const requestId = msg.requestId as string | undefined;
-      if (requestId) {
-        const pending = this.pendingFsRequests.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingFsRequests.delete(requestId);
-          if (pending.socket.readyState === WebSocket.OPEN) {
-            pending.socket.send(JSON.stringify(msg));
-          }
-        }
-      }
+      this.forwardPendingFsRoute('fs.ls', msg.requestId as string | undefined, msg);
       return;
     }
 
     // ── fs.read_response: single-cast back to requesting browser ─────────────
     if (type === 'fs.read_response') {
-      const requestId = msg.requestId as string | undefined;
-      if (requestId) {
-        const pending = this.pendingFsReadRequests.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingFsReadRequests.delete(requestId);
-          if (pending.socket.readyState === WebSocket.OPEN) {
-            pending.socket.send(JSON.stringify(msg));
-          }
-        }
-      }
+      this.forwardPendingFsRoute('fs.read', msg.requestId as string | undefined, msg);
       return;
     }
 
     // ── fs.git_status_response: single-cast back to requesting browser ────────
     if (type === 'fs.git_status_response') {
-      const requestId = msg.requestId as string | undefined;
-      if (requestId) {
-        const pending = this.pendingFsGitStatusRequests.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingFsGitStatusRequests.delete(requestId);
-          if (pending.socket.readyState === WebSocket.OPEN) {
-            pending.socket.send(JSON.stringify(msg));
-          }
-        }
-      }
+      this.forwardPendingFsRoute('fs.git_status', msg.requestId as string | undefined, msg);
       return;
     }
 
     // ── fs.git_diff_response: single-cast back to requesting browser ──────────
     if (type === 'fs.git_diff_response') {
-      const requestId = msg.requestId as string | undefined;
-      if (requestId) {
-        const pending = this.pendingFsGitDiffRequests.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingFsGitDiffRequests.delete(requestId);
-          if (pending.socket.readyState === WebSocket.OPEN) {
-            pending.socket.send(JSON.stringify(msg));
-          }
-        }
-      }
+      this.forwardPendingFsRoute('fs.git_diff', msg.requestId as string | undefined, msg);
       return;
     }
 
     // ── fs.write_response: single-cast back to requesting browser ────────────
     if (type === 'fs.write_response') {
-      const requestId = msg.requestId as string | undefined;
-      if (requestId) {
-        const pending = this.pendingFsWriteRequests.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingFsWriteRequests.delete(requestId);
-          if (pending.socket.readyState === WebSocket.OPEN) {
-            pending.socket.send(JSON.stringify(msg));
-          }
-        }
-      }
+      this.forwardPendingFsRoute('fs.write', msg.requestId as string | undefined, msg);
       return;
     }
 
     // ── file.search_response: single-cast back to requesting browser ─────────
     if (type === 'file.search_response') {
-      const requestId = msg.requestId as string | undefined;
-      if (requestId) {
-        const pending = this.pendingFileSearchRequests.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingFileSearchRequests.delete(requestId);
-          if (pending.socket.readyState === WebSocket.OPEN) {
-            pending.socket.send(JSON.stringify(msg));
-          }
-        }
-      }
+      this.forwardPendingFsRoute('file.search', msg.requestId as string | undefined, msg);
       return;
     }
 
@@ -1499,11 +3244,11 @@ export class WsBridge {
     }
 
     // ── Timeline events: session-scoped ───────────────────────────────────────
-    if (type === 'timeline.event') {
+    if (type === TIMELINE_MESSAGES.EVENT) {
       const rawEvent = msg.event as Record<string, unknown> | undefined;
       const sessionId = rawEvent?.sessionId as string | undefined;
       if (!rawEvent || !sessionId) {
-        logger.warn({ serverId: this.serverId }, 'timeline.event missing sessionId — discarded');
+        logger.warn({ serverId: this.serverId }, 'timeline event missing sessionId - discarded');
         return;
       }
       if (rawEvent.type === 'user.message') {
@@ -1527,36 +3272,11 @@ export class WsBridge {
       return;
     }
 
-    // Timeline history/replay: route via requestId unicast (eliminates subscription race),
-    // falling back to session subscribers for legacy/live replay without requestId.
-    if (type === 'timeline.history' || type === 'timeline.replay') {
-      const requestId = msg.requestId as string | undefined;
-      if (requestId) {
-        const pendingHttp = this.pendingHttpTimelineRequests.get(requestId);
-        if (pendingHttp) {
-          clearTimeout(pendingHttp.timer);
-          this.pendingHttpTimelineRequests.delete(requestId);
-          pendingHttp.resolve(msg);
-          return;
-        }
-        const pending = this.pendingTimelineRequests.get(requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pendingTimelineRequests.delete(requestId);
-          if (pending.socket.readyState === WebSocket.OPEN) {
-            pending.socket.send(JSON.stringify(msg));
-          }
-          return;
-        }
-      }
-      // Fallback: no requestId or no pending request — use session subscribers
-      const sessionName = msg.sessionName as string | undefined;
-      if (!sessionName) {
-        logger.warn({ serverId: this.serverId, type }, 'timeline message missing sessionName — discarded');
-        return;
-      }
-      // Control-plane: bypass the PTY queue (see sendJsonToSessionSubscribers).
-      this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
+    // Timeline history/replay/page/detail responses are data-plane. Defer
+    // stringify/send so later control-plane messages can jump ahead, while
+    // requestId responses remain unicast to browser or HTTP callers.
+    if (TIMELINE_RESPONSE_TYPES.has(type)) {
+      this.handleTimelineDataPlaneResponse(msg, type);
       return;
     }
 
@@ -1775,7 +3495,7 @@ export class WsBridge {
     }
 
     // ── P2P conflict → broadcast to browsers ────────────────────────────────
-    if (type === 'p2p.conflict') {
+    if (type === P2P_WORKFLOW_MSG.CONFLICT) {
       this.broadcastToBrowsers(JSON.stringify(msg));
       return;
     }
@@ -1826,27 +3546,70 @@ export class WsBridge {
     }
 
     // ── P2P orchestration run persistence + broadcast ────────────────────────
-    if (type === 'p2p.run_save' && this.db) {
-      const run = { ...(msg.run as Record<string, unknown>), progress_snapshot: JSON.stringify(msg.run) };
-      void upsertOrchestrationRun(this.db, run as any).catch(() => {});
-      this.broadcastToBrowsers(JSON.stringify({ type: 'p2p.run_update', run: msg.run }));
+    // For RUN_SAVE/RUN_COMPLETE/RUN_ERROR we sanitize ONCE and reuse the same
+    // workflow_projection (and the same JSON progress_snapshot bytes) for both
+    // the DB upsert and the browser broadcast. This guarantees the diagnostic
+    // code set the browser sees matches what gets persisted.
+    if (type === P2P_WORKFLOW_MSG.RUN_SAVE) {
+      const { persisted, broadcast } = sanitizeP2pRunForPersistAndBroadcast(msg.run, { serverId: this.serverId });
+      if (this.db) void upsertOrchestrationRun(this.db, persisted).catch(() => {});
+      this.broadcastToBrowsers(JSON.stringify({
+        type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+        run: broadcast,
+      }));
       return;
     }
-    if (type === 'p2p.run_complete' && this.db) {
-      const run = msg.run as any;
-      run.status = 'completed';
-      run.completed_at = new Date().toISOString();
-      run.progress_snapshot = JSON.stringify(run);
-      void upsertOrchestrationRun(this.db, run).catch(() => {});
-      this.broadcastToBrowsers(JSON.stringify({ type: 'p2p.run_update', run }));
+    if (type === P2P_WORKFLOW_MSG.RUN_COMPLETE) {
+      const completedAt = new Date().toISOString();
+      const overrides = {
+        serverId: this.serverId,
+        status: 'completed',
+        completedAt,
+        updatedAt: completedAt,
+      };
+      const { persisted, broadcast } = sanitizeP2pRunForPersistAndBroadcast(msg.run, overrides);
+      if (this.db) void upsertOrchestrationRun(this.db, persisted).catch(() => {});
+      this.broadcastToBrowsers(JSON.stringify({
+        type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+        run: broadcast,
+      }));
       return;
     }
-    if (type === 'p2p.run_error' && this.db) {
-      const run = msg.run as any;
-      run.updated_at = new Date().toISOString();
-      run.progress_snapshot = JSON.stringify(run);
-      void upsertOrchestrationRun(this.db, run).catch(() => {});
-      this.broadcastToBrowsers(JSON.stringify({ type: 'p2p.run_update', run }));
+    if (type === P2P_WORKFLOW_MSG.RUN_ERROR) {
+      const updatedAt = new Date().toISOString();
+      const overrides = {
+        serverId: this.serverId,
+        updatedAt,
+      };
+      const { persisted, broadcast } = sanitizeP2pRunForPersistAndBroadcast(msg.run, overrides);
+      if (this.db) void upsertOrchestrationRun(this.db, persisted).catch(() => {});
+      this.broadcastToBrowsers(JSON.stringify({
+        type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+        run: broadcast,
+      }));
+      return;
+    }
+    if (type === P2P_WORKFLOW_MSG.RUN_UPDATE) {
+      const run = sanitizeP2pRunUpdateForBroadcast(msg.run, { serverId: this.serverId });
+      this.broadcastToBrowsers(JSON.stringify({ type: P2P_WORKFLOW_MSG.RUN_UPDATE, run }));
+      return;
+    }
+    if (
+      p2pDaemonMessage.kind === 'known'
+      && p2pDaemonMessage.descriptor.serverHandling === 'broadcast_to_browsers'
+      && p2pDaemonMessage.descriptor.browserDelivery === 'broadcast'
+    ) {
+      this.broadcastToBrowsers(JSON.stringify(msg));
+      return;
+    }
+    if (p2pDaemonMessage.kind === 'drop' && p2pDaemonMessage.reason === 'unknown_p2p_message') {
+      incrementCounter('p2p.bridge.unknown_message_drop', { direction: 'daemon_to_browser' });
+      logger.warn({ serverId: this.serverId, type }, 'unknown daemon p2p message — dropped');
+      return;
+    }
+    if (p2pDaemonMessage.kind === 'known') {
+      incrementCounter('p2p.bridge.route_policy_drop', { direction: 'daemon_to_browser', type });
+      logger.warn({ serverId: this.serverId, type }, 'known daemon p2p message had no bridge route — dropped');
       return;
     }
 
@@ -1914,6 +3677,70 @@ export class WsBridge {
 
     // ── Default-allow: forward unrecognised types to all browsers ─────────────
     this.broadcastToBrowsers(JSON.stringify(msg));
+  }
+
+  private handleDaemonP2pWorkflowHello(msg: Record<string, unknown>): void {
+    const daemonId = typeof msg.daemonId === 'string' ? msg.daemonId : null;
+    const helloEpoch = typeof msg.helloEpoch === 'number' && Number.isFinite(msg.helloEpoch)
+      ? msg.helloEpoch
+      : null;
+    const sentAt = typeof msg.sentAt === 'number' && Number.isFinite(msg.sentAt)
+      ? msg.sentAt
+      : null;
+    const capabilities = Array.isArray(msg.capabilities)
+      ? msg.capabilities.filter((capability): capability is string => typeof capability === 'string')
+      : null;
+    if (!daemonId || helloEpoch === null || sentAt === null || !capabilities) {
+      incrementCounter('p2p.bridge.invalid_daemon_hello_drop');
+      logger.warn({ serverId: this.serverId }, 'invalid daemon.hello — dropped');
+      return;
+    }
+    const existing = this.daemonP2pWorkflowCapabilities;
+    if (existing && helloEpoch < existing.helloEpoch) {
+      incrementCounter('p2p.bridge.stale_daemon_hello_drop');
+      logger.warn({ serverId: this.serverId, helloEpoch, currentEpoch: existing.helloEpoch }, 'stale daemon.hello — dropped');
+      return;
+    }
+    const sortedCapabilities = [...new Set(capabilities)].sort();
+    const timelineProtocolRevision = sortedCapabilities.includes(TIMELINE_PROTOCOL_CAPABILITY)
+      && typeof msg.timelineProtocolRevision === 'number'
+      && Number.isFinite(msg.timelineProtocolRevision)
+      ? msg.timelineProtocolRevision
+      : undefined;
+    const buildInfo = msg.buildInfo && typeof msg.buildInfo === 'object'
+      ? msg.buildInfo as DaemonBuildInfo
+      : undefined;
+    this.daemonP2pWorkflowCapabilities = {
+      daemonId,
+      capabilities: sortedCapabilities,
+      ...(timelineProtocolRevision !== undefined
+        ? {
+          timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
+          timelineProtocolRevision,
+        }
+        : {}),
+      ...(buildInfo ? { buildInfo } : {}),
+      helloEpoch,
+      sentAt,
+      receivedAt: Date.now(),
+    };
+    // Forward a sanitized snapshot to all browsers connected to this serverId
+    // so the web capability gate can react to missing/stale/downgraded caps.
+    // Per the message registry this is `browserDelivery: 'broadcast'`.
+    this.broadcastToBrowsers(JSON.stringify({
+      type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+      daemonId,
+      capabilities: sortedCapabilities,
+      ...(timelineProtocolRevision !== undefined
+        ? {
+          timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
+          timelineProtocolRevision,
+        }
+        : {}),
+      ...(buildInfo ? { buildInfo } : {}),
+      helloEpoch,
+      sentAt,
+    }));
   }
 
   private routeBinaryFrame(data: Buffer): void {
@@ -2211,6 +4038,21 @@ export class WsBridge {
     return this.terminalSubscriptionRevisions.get(ws)?.get(sessionName) === revision;
   }
 
+  private bumpTransportSubscriptionRevision(ws: WebSocket, sessionId: string): number {
+    let sessions = this.transportSubscriptionRevisions.get(ws);
+    if (!sessions) {
+      sessions = new Map();
+      this.transportSubscriptionRevisions.set(ws, sessions);
+    }
+    const next = (sessions.get(sessionId) ?? 0) + 1;
+    sessions.set(sessionId, next);
+    return next;
+  }
+
+  private isCurrentTransportSubscriptionRevision(ws: WebSocket, sessionId: string, revision: number): boolean {
+    return this.transportSubscriptionRevisions.get(ws)?.get(sessionId) === revision;
+  }
+
   private cleanupBrowserSocket(ws: WebSocket): void {
     this.browserSockets.delete(ws);
     this.mobileSockets.delete(ws);
@@ -2224,7 +4066,9 @@ export class WsBridge {
     }
     this.browserSubscriptions.delete(ws);
     this.terminalSubscriptionRevisions.delete(ws);
+    this.transportSubscriptionRevisions.delete(ws);
     this.transportSubscriptions.delete(ws);
+    this.clearPendingFsRoutesForSocket(ws);
     // Clean up pending timeline requests for this socket
     for (const [reqId, pending] of this.pendingTimelineRequests) {
       if (pending.socket === ws) {
@@ -2236,6 +4080,12 @@ export class WsBridge {
       if (pending.socket === ws) {
         clearTimeout(pending.timer);
         this.pendingMemoryManagementRequests.delete(reqId);
+      }
+    }
+    for (const [reqId, pending] of this.pendingP2pWorkflowRequests) {
+      if (pending.socket === ws) {
+        clearTimeout(pending.timer);
+        this.pendingP2pWorkflowRequests.delete(reqId);
       }
     }
   }
@@ -2255,7 +4105,7 @@ export class WsBridge {
       if (row) return true;
 
       // Check sub-sessions: name is deck_sub_{id}
-      const subMatch = sessionName.match(/^deck_sub_([a-z0-9]+)$/);
+      const subMatch = sessionName.match(/^deck_sub_(.+)$/);
       if (subMatch) {
         const subId = subMatch[1];
         const subRow = await this.db.queryOne<Record<string, unknown>>(
@@ -2269,6 +4119,72 @@ export class WsBridge {
     } catch (err) {
       logger.warn({ serverId: this.serverId, sessionName, err }, 'verifySessionOwnership: db error — denying');
       return false; // fail-closed: deny on transient DB errors to prevent unauthorized access
+    }
+  }
+
+  private async verifyRepoCheckoutAuthorization(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {
+    const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
+    const sessionId = typeof msg.sessionId === 'string' ? msg.sessionId.trim() : '';
+    const projectDir = typeof msg.projectDir === 'string' ? msg.projectDir : '';
+    const sendRepoError = (error: 'invalid_params' | 'unauthorized') => {
+      safeSend(ws, JSON.stringify({
+        type: REPO_MSG.ERROR,
+        ...(requestId ? { requestId } : {}),
+        ...(projectDir ? { projectDir } : {}),
+        error,
+      }));
+    };
+
+    if (!requestId || !sessionId || !projectDir || typeof msg.branch !== 'string') {
+      sendRepoError('invalid_params');
+      return false;
+    }
+
+    if (!this.db) return true;
+
+    const userId = this.browserUserIds.get(ws)?.trim();
+    if (!userId) {
+      sendRepoError('unauthorized');
+      return false;
+    }
+
+    try {
+      const sessionRow = await this.db.queryOne<Record<string, unknown>>(
+        `SELECT 1
+           FROM sessions s
+           JOIN servers srv ON srv.id = s.server_id
+          WHERE s.server_id = $1
+            AND s.name = $2
+            AND s.project_dir = $3
+            AND srv.user_id = $4
+          LIMIT 1`,
+        [this.serverId, sessionId, projectDir, userId],
+      );
+      if (sessionRow) return true;
+
+      const subMatch = sessionId.match(/^deck_sub_([a-z0-9]+)$/);
+      if (subMatch) {
+        const subRow = await this.db.queryOne<Record<string, unknown>>(
+          `SELECT 1
+             FROM sub_sessions ss
+             JOIN servers srv ON srv.id = ss.server_id
+            WHERE ss.server_id = $1
+              AND ss.id = $2
+              AND ss.cwd = $3
+              AND ss.closed_at IS NULL
+              AND srv.user_id = $4
+            LIMIT 1`,
+          [this.serverId, subMatch[1], projectDir, userId],
+        );
+        if (subRow) return true;
+      }
+
+      sendRepoError('unauthorized');
+      return false;
+    } catch (err) {
+      logger.warn({ serverId: this.serverId, sessionId, projectDir, err }, 'repo.checkout_branch: authorization check failed');
+      sendRepoError('unauthorized');
+      return false;
     }
   }
 
@@ -2577,6 +4493,8 @@ export class WsBridge {
       try { this.daemonWs.close(4001, 'token_rotated'); } catch { /* ignore */ }
       this.daemonWs = null;
       this.authenticated = false;
+      this.authPromise = null;
+      this.daemonP2pWorkflowCapabilities = null;
     }
   }
 
@@ -2622,36 +4540,58 @@ export class WsBridge {
     limit?: number;
     beforeTs?: number;
     afterTs?: number;
+    budgetBytes?: number;
+    includeDetails?: boolean;
     timeoutMs?: number;
+    abortSignal?: AbortSignal;
   }): Promise<Record<string, unknown>> {
     if (!this.isDaemonConnected()) {
       return Promise.reject(new Error('daemon_offline'));
+    }
+    if (params.abortSignal?.aborted) {
+      return Promise.reject(new Error(TIMELINE_REQUEST_ERROR_REASONS.REQUEST_CANCELED));
     }
 
     const requestId = `watch-hist-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const timeoutMs = params.timeoutMs ?? HTTP_TIMELINE_TIMEOUT_MS;
 
     return new Promise<Record<string, unknown>>((resolve, reject) => {
+      let pending: PendingHttpTimelineRequest;
       const timer = setTimeout(() => {
-        this.pendingHttpTimelineRequests.delete(requestId);
-        reject(new Error('timeout'));
+        const current = this.pendingHttpTimelineRequests.get(requestId) ?? pending;
+        this.settlePendingHttpTimelineRequest(requestId, current, () => reject(new Error('timeout')));
       }, timeoutMs);
+      timer.unref?.();
 
-      this.pendingHttpTimelineRequests.set(requestId, { resolve, reject, timer });
+      pending = { resolve, reject, timer, abortSignal: params.abortSignal };
+      if (params.abortSignal) {
+        pending.abortHandler = () => {
+          incrementCounter('ws_bridge_timeline_data_plane_http_abort', {
+            type: TIMELINE_MESSAGES.HISTORY,
+            route: 'http_request',
+          });
+          this.settlePendingHttpTimelineRequest(requestId, pending, () => reject(new Error(TIMELINE_REQUEST_ERROR_REASONS.REQUEST_CANCELED)));
+        };
+        params.abortSignal.addEventListener('abort', pending.abortHandler, { once: true });
+      }
+      this.pendingHttpTimelineRequests.set(requestId, pending);
 
       try {
         this.daemonWs!.send(JSON.stringify({
-          type: 'timeline.history_request',
+          type: TIMELINE_MESSAGES.HISTORY_REQUEST,
           sessionName: params.sessionName,
           requestId,
           ...(typeof params.limit === 'number' ? { limit: params.limit } : {}),
           ...(typeof params.beforeTs === 'number' ? { beforeTs: params.beforeTs } : {}),
           ...(typeof params.afterTs === 'number' ? { afterTs: params.afterTs } : {}),
+          ...(typeof params.budgetBytes === 'number' ? { budgetBytes: params.budgetBytes } : {}),
+          ...(typeof params.includeDetails === 'boolean' ? { includeDetails: params.includeDetails } : {}),
         }));
       } catch (err) {
-        this.pendingHttpTimelineRequests.delete(requestId);
-        clearTimeout(timer);
-        reject(err instanceof Error ? err : new Error(String(err)));
+        const current = this.pendingHttpTimelineRequests.get(requestId) ?? pending;
+        this.settlePendingHttpTimelineRequest(requestId, current, () => {
+          reject(err instanceof Error ? err : new Error(String(err)));
+        });
       }
     });
   }
@@ -2801,11 +4741,9 @@ export class WsBridge {
   }
 
   private rejectAllPendingHttpTimelineRequests(reason: string): void {
-    for (const [, pending] of this.pendingHttpTimelineRequests) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error(reason));
+    for (const [requestId, pending] of [...this.pendingHttpTimelineRequests]) {
+      this.settlePendingHttpTimelineRequest(requestId, pending, () => pending.reject(new Error(reason)));
     }
-    this.pendingHttpTimelineRequests.clear();
   }
 
   /**
@@ -3397,5 +5335,25 @@ export class WsBridge {
 
   get isAuthenticated(): boolean {
     return this.authenticated;
+  }
+
+  getDaemonP2pWorkflowCapabilities(now = Date.now()): DaemonP2pWorkflowCapabilities | null {
+    if (!this.daemonP2pWorkflowCapabilities) return null;
+    if (now - this.daemonP2pWorkflowCapabilities.receivedAt > P2P_CAPABILITY_FRESHNESS_TTL_MS) {
+      return null;
+    }
+    return {
+      ...this.daemonP2pWorkflowCapabilities,
+      capabilities: [...this.daemonP2pWorkflowCapabilities.capabilities],
+    };
+  }
+
+  hasDaemonCapability(capability: string, _now = Date.now()): boolean {
+    // Static feature gates (for example session-group clone) should remain
+    // true while the daemon socket that sent the hello is still connected.
+    // P2P workflow launch freshness continues to use
+    // getDaemonP2pWorkflowCapabilities(now).
+    if (!this.daemonWs || this.daemonWs.readyState !== WebSocket.OPEN) return false;
+    return this.daemonP2pWorkflowCapabilities?.capabilities.includes(capability) ?? false;
   }
 }

@@ -1,12 +1,35 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { WsBridge } from '../src/ws/bridge.js';
+import { performance } from 'node:perf_hooks';
+import { WsBridge, __setTimelineDataPlaneQueueConfigForTests } from '../src/ws/bridge.js';
+import { getCounter, resetMetricsForTests } from '../src/util/metrics.js';
 import {
   markDaemonUpgradeTargetVersionPublishedForTest,
   resetDaemonUpgradePublicationGateForTest,
 } from '../src/ws/daemon-upgrade-publication-gate.js';
 import * as dbQueries from '../src/db/queries.js';
 import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
+import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
+import { P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
+import {
+  P2P_BRIDGE_ERROR_CODES,
+  P2P_BRIDGE_PENDING_REQUESTS_GLOBAL,
+  P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET,
+  P2P_CAPABILITY_FRESHNESS_TTL_MS,
+  P2P_SANITIZE_MAX_STRING_BYTES,
+  P2P_WORKFLOW_CAPABILITY_V1,
+  P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
+} from '../../shared/p2p-workflow-constants.js';
+import { REPO_MSG } from '../../shared/repo-types.js';
+import {
+  TIMELINE_MESSAGES,
+  TIMELINE_PROTOCOL_CAPABILITY,
+  TIMELINE_PROTOCOL_REVISION,
+  TIMELINE_RESPONSE_SOURCES,
+  TIMELINE_RESPONSE_STATUS,
+} from '../../shared/timeline-protocol.js';
+import { TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -41,6 +64,30 @@ class MockWs extends EventEmitter {
   }
 }
 
+class SlowMockWs extends MockWs {
+  private pendingSendCallbacks: Array<(err?: Error) => void> = [];
+
+  override send(data: string | Buffer, _opts?: unknown, callback?: (err?: Error) => void) {
+    if (this.closed) {
+      const err = new Error('socket closed');
+      if (callback) { callback(err); return; }
+      throw err;
+    }
+    this.sent.push(data);
+    if (callback) this.pendingSendCallbacks.push(callback);
+  }
+
+  releaseNextSend(err?: Error): void {
+    this.pendingSendCallbacks.shift()?.(err);
+  }
+
+  releaseAllSends(err?: Error): void {
+    while (this.pendingSendCallbacks.length > 0) {
+      this.releaseNextSend(err);
+    }
+  }
+}
+
 // ── Build v1 binary frame ─────────────────────────────────────────────────────
 
 function packFrame(sessionName: string, payload: Buffer): Buffer {
@@ -66,6 +113,86 @@ function makeDb(tokenHash: string) {
   return db as unknown as import('../src/db/client.js').Database;
 }
 
+function makeRepoCheckoutDb(options: {
+  allowMain?: boolean;
+  allowSub?: boolean;
+  throwOnAuthorization?: boolean;
+} = {}) {
+  const db = {
+    queryOne: async (sql: string, params: unknown[]) => {
+      if (sql.includes('SELECT token_hash')) {
+        return { token_hash: 'valid-hash', user_id: 'test-user' };
+      }
+      if (options.throwOnAuthorization && (sql.includes('FROM sessions s') || sql.includes('FROM sub_sessions ss'))) {
+        throw new Error('authz unavailable');
+      }
+      if (sql.includes('FROM sessions s')) {
+        const [, sessionName, projectDir, userId] = params;
+        return options.allowMain
+          && sessionName === 'deck_proj_brain'
+          && projectDir === '/work/proj'
+          && userId === 'test-user'
+          ? { ok: 1 }
+          : null;
+      }
+      if (sql.includes('FROM sub_sessions ss')) {
+        const [, subId, projectDir, userId] = params;
+        return options.allowSub
+          && subId === 'abc123'
+          && projectDir === '/work/sub'
+          && userId === 'test-user'
+          ? { ok: 1 }
+          : null;
+      }
+      return null;
+    },
+    query: async () => [],
+    execute: async () => ({ changes: 1 }),
+    exec: async () => {},
+    transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => fn(db as unknown as import('../src/db/client.js').Database),
+    close: () => {},
+  };
+  return db as unknown as import('../src/db/client.js').Database;
+}
+
+function makeTimelineOwnershipDb(options: {
+  allowMain?: boolean;
+  allowSub?: boolean;
+  throwOnOwnership?: boolean;
+} = {}) {
+  const db = {
+    queryOne: async (sql: string, params: unknown[]) => {
+      if (sql.includes('SELECT token_hash')) {
+        return { token_hash: 'valid-hash', user_id: 'test-user' };
+      }
+      if (options.throwOnOwnership && (sql.includes('FROM sessions WHERE') || sql.includes('FROM sub_sessions WHERE'))) {
+        throw new Error('ownership db down');
+      }
+      if (sql.includes('FROM sessions WHERE')) {
+        return options.allowMain
+          && params[0] === 'srv-owned'
+          && params[1] === 'deck_proj_brain'
+          ? { ok: 1 }
+          : null;
+      }
+      if (sql.includes('FROM sub_sessions WHERE')) {
+        return options.allowSub
+          && params[0] === 'srv-owned'
+          && params[1] === 'abc-123'
+          ? { ok: 1 }
+          : null;
+      }
+      return null;
+    },
+    query: async () => [],
+    execute: async () => ({ changes: 1 }),
+    exec: async () => {},
+    transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => fn(db as unknown as import('../src/db/client.js').Database),
+    close: () => {},
+  };
+  return db as unknown as import('../src/db/client.js').Database;
+}
+
 // ── Mock crypto + push ─────────────────────────────────────────────────────────
 
 vi.mock('../src/security/crypto.js', () => ({
@@ -82,6 +209,20 @@ async function flushAsync() {
   for (let i = 0; i < 5; i++) await new Promise((r) => process.nextTick(r));
 }
 
+async function flushBridgeDataPlane() {
+  await flushAsync();
+  for (let i = 0; i < 5; i++) {
+    await new Promise((r) => setImmediate(r));
+    await flushAsync();
+  }
+}
+
+async function flushOneBridgeDataPlaneTurn() {
+  await flushAsync();
+  await new Promise((r) => setImmediate(r));
+  await flushAsync();
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('WsBridge', () => {
@@ -92,11 +233,13 @@ describe('WsBridge', () => {
     resetDaemonUpgradePublicationGateForTest();
     markDaemonUpgradeTargetVersionPublishedForTest('2026.4.905-dev.877');
     markDaemonUpgradeTargetVersionPublishedForTest('2026.4.905');
+    resetMetricsForTests();
   });
 
   afterEach(() => {
     WsBridge.getAll().clear();
     resetDaemonUpgradePublicationGateForTest();
+    resetMetricsForTests();
     vi.clearAllMocks();
   });
 
@@ -140,6 +283,63 @@ describe('WsBridge', () => {
       ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'bad-token' }));
       await flushAsync();
       expect(ws.closed).toBe(true);
+    });
+
+    // Audit fix (78-server reconnect-storm investigation, 2026-05-11) —
+    // pinned regression for the auth-handshake race that produced
+    // "Daemon authenticated" log entries every ~500 ms in production
+    // (and `code:4001 reason:auth_required` on the daemon side). Daemon
+    // sends `auth` immediately followed by `daemon.hello` on every WS
+    // connect, and the previous async message handler let the second
+    // message race the DB lookup of the first.
+    it('does NOT 4001-close when auth and daemon.hello arrive back-to-back during DB lookup', async () => {
+      // Build a DB whose token-hash lookup is deferred so we can emit
+      // both messages BEFORE the query resolves — this is the production
+      // race window. Without the fix, daemon.hello hits
+      // `if (msg.type !== 'auth') ws.close(4001, 'auth_required')`
+      // because `this.authenticated` is still false at that moment.
+      let resolveQuery: (value: { token_hash: string } | null) => void = () => {};
+      const queryPromise = new Promise<{ token_hash: string } | null>((res) => { resolveQuery = res; });
+      const db = {
+        queryOne: () => queryPromise,
+        query: async () => [],
+        execute: async () => ({ changes: 1 }),
+        exec: async () => {},
+        transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => fn(db as unknown as import('../src/db/client.js').Database),
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, db, {} as never);
+
+      // Emit BOTH messages before the query resolves. The race only
+      // shows up under `await db.queryOne(...)` being pending when the
+      // second message handler runs.
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+      ws.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1],
+        helloEpoch: 1,
+        sentAt: Date.now(),
+      }));
+      // Let microtasks settle so the auth handler is parked at its
+      // `await db.queryOne(...)` and the daemon.hello handler has had a
+      // chance to run if the bug were present.
+      await flushAsync();
+
+      // Pre-fix expectation: ws.closed === true with code 4001. Post-fix
+      // expectation: socket stays open and waits for auth to complete.
+      expect(ws.closed).toBe(false);
+      expect(ws.closeCode).toBeUndefined();
+
+      // Now resolve the DB query and let auth complete.
+      resolveQuery({ token_hash: 'valid-hash' });
+      await flushAsync();
+
+      expect(bridge.isAuthenticated).toBe(true);
+      expect(ws.closed).toBe(false);
     });
 
     it('sends daemon.upgrade when daemon is older than server version', async () => {
@@ -378,6 +578,123 @@ describe('WsBridge', () => {
       const { daemonWs, browserWs } = await setupBridge();
       browserWs.emit('message', JSON.stringify({ type: 'admin.shutdown' }));
       expect(daemonWs.sentStrings.some((s) => s.includes('admin.shutdown'))).toBe(true);
+    });
+
+    it('authorizes repo.checkout_branch against the browser user session/project binding before forwarding', async () => {
+      const bridge = WsBridge.get(serverId);
+      const db = makeRepoCheckoutDb({ allowMain: true });
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', db);
+      browserWs.emit('message', JSON.stringify({
+        type: REPO_MSG.CHECKOUT_BRANCH,
+        requestId: 'checkout-main',
+        projectDir: '/work/proj',
+        branch: 'feature/a',
+        sessionId: 'deck_proj_brain',
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings
+        .map((s) => { try { return JSON.parse(s) as Record<string, unknown>; } catch { return null; } })
+        .find((msg) => msg?.type === REPO_MSG.CHECKOUT_BRANCH);
+      expect(forwarded).toMatchObject({
+        requestId: 'checkout-main',
+        projectDir: '/work/proj',
+        branch: 'feature/a',
+        sessionId: 'deck_proj_brain',
+      });
+    });
+
+    it('authorizes repo.checkout_branch for a bound sub-session cwd', async () => {
+      const bridge = WsBridge.get(serverId);
+      const db = makeRepoCheckoutDb({ allowSub: true });
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', db);
+      browserWs.emit('message', JSON.stringify({
+        type: REPO_MSG.CHECKOUT_BRANCH,
+        requestId: 'checkout-sub',
+        projectDir: '/work/sub',
+        branch: 'feature/sub',
+        sessionId: 'deck_sub_abc123',
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((s) => {
+        try {
+          const msg = JSON.parse(s) as Record<string, unknown>;
+          return msg.type === REPO_MSG.CHECKOUT_BRANCH && msg.requestId === 'checkout-sub';
+        } catch {
+          return false;
+        }
+      })).toBe(true);
+    });
+
+    it('rejects repo.checkout_branch for unbound projectDir before daemon forwarding', async () => {
+      const bridge = WsBridge.get(serverId);
+      const db = makeRepoCheckoutDb();
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', db);
+      browserWs.emit('message', JSON.stringify({
+        type: REPO_MSG.CHECKOUT_BRANCH,
+        requestId: 'checkout-denied',
+        projectDir: '/work/other',
+        branch: 'feature/a',
+        sessionId: 'deck_proj_brain',
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((s) => {
+        try { return (JSON.parse(s) as Record<string, unknown>).type === REPO_MSG.CHECKOUT_BRANCH; } catch { return false; }
+      })).toBe(false);
+      expect(browserWs.sentStrings.some((s) => {
+        try {
+          const msg = JSON.parse(s) as Record<string, unknown>;
+          return msg.type === REPO_MSG.ERROR
+            && msg.requestId === 'checkout-denied'
+            && msg.projectDir === '/work/other'
+            && msg.error === 'unauthorized';
+        } catch {
+          return false;
+        }
+      })).toBe(true);
+    });
+
+    it('rejects malformed repo.checkout_branch requests before daemon forwarding', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+      browserWs.emit('message', JSON.stringify({
+        type: REPO_MSG.CHECKOUT_BRANCH,
+        projectDir: '/work/proj',
+        branch: 'feature/a',
+        sessionId: 'deck_proj_brain',
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((s) => {
+        try { return (JSON.parse(s) as Record<string, unknown>).type === REPO_MSG.CHECKOUT_BRANCH; } catch { return false; }
+      })).toBe(false);
+      expect(browserWs.sentStrings.some((s) => {
+        try {
+          const msg = JSON.parse(s) as Record<string, unknown>;
+          return msg.type === REPO_MSG.ERROR && msg.error === 'invalid_params';
+        } catch {
+          return false;
+        }
+      })).toBe(true);
     });
 
     it('rejects browser raw daemon.upgrade commands', async () => {
@@ -1109,6 +1426,122 @@ describe('WsBridge', () => {
       expect(disconnectCount).toBe(5);
     });
 
+    it('preserves final subscription state while mixed storm traffic is in flight across reconnect', async () => {
+      const bridge = WsBridge.get(serverId);
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      const daemonWs1 = new MockWs();
+      bridge.handleDaemonConnection(daemonWs1 as never, makeDb('valid-hash'), {} as never);
+      daemonWs1.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessStorm', raw: false }));
+      await flushAsync();
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.unsubscribe', session: 'sessStorm' }));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessStorm', raw: true }));
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'sessStorm' }));
+      browserWs.emit('message', JSON.stringify({ type: 'fs.ls', requestId: 'fs-storm', path: '/tmp' }));
+      browserWs.emit('message', JSON.stringify({ type: 'fs.git_status', requestId: 'git-storm', path: '/tmp' }));
+      browserWs.emit('message', JSON.stringify({ type: 'transport.list_models', requestId: 'models-storm', agentType: 'codex-sdk' }));
+      browserWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'sessStorm',
+        requestId: 'hist-storm',
+        limit: 10,
+      }));
+      browserWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+        sessionName: 'sessStorm',
+        requestId: 'replay-storm',
+        afterSeq: 0,
+        epoch: 1,
+      }));
+      browserWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.PAGE_REQUEST,
+        sessionName: 'sessStorm',
+        requestId: 'page-storm',
+        limit: 10,
+        cursor: { epoch: 1, beforeTs: 2, direction: 'older' },
+      }));
+      browserWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.DETAIL_REQUEST,
+        sessionName: 'sessStorm',
+        requestId: 'detail-storm',
+        detailId: 'td_synthetic',
+        eventId: 'event-storm',
+        fieldPath: 'payload.output',
+        epoch: 1,
+      }));
+      browserWs.emit('message', JSON.stringify({
+        type: 'session.send',
+        session: 'sessStorm',
+        text: 'interleaved storm send',
+        commandId: 'cmd-storm',
+      }));
+      await flushAsync();
+
+      const forwardedTypes = daemonWs1.sentStrings.flatMap((raw) => {
+        try { return [(JSON.parse(raw) as { type?: string }).type]; } catch { return []; }
+      });
+      expect(forwardedTypes).toEqual(expect.arrayContaining([
+        'terminal.subscribe',
+        'terminal.unsubscribe',
+        'chat.subscribe',
+        'fs.ls',
+        'fs.git_status',
+        'transport.list_models',
+        TIMELINE_MESSAGES.HISTORY_REQUEST,
+        TIMELINE_MESSAGES.REPLAY_REQUEST,
+        TIMELINE_MESSAGES.PAGE_REQUEST,
+        TIMELINE_MESSAGES.DETAIL_REQUEST,
+        'session.send',
+      ]));
+
+      daemonWs1.emit('message', JSON.stringify({ type: 'fs.ls_response', requestId: 'fs-storm', path: '/tmp', status: 'ok', entries: [] }));
+      daemonWs1.emit('message', JSON.stringify({ type: 'fs.git_status_response', requestId: 'git-storm', path: '/tmp', status: 'ok', files: [] }));
+      daemonWs1.emit('message', JSON.stringify({ type: 'command.ack', session: 'sessStorm', commandId: 'cmd-storm', status: 'accepted' }));
+      daemonWs1.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName: 'sessStorm',
+        requestId: 'hist-storm',
+        events: [{ eventId: 'event-storm', sessionId: 'sessStorm', ts: 1, type: 'tool.result', payload: { output: 'preview' } }],
+        epoch: 1,
+      }));
+      await flushBridgeDataPlane();
+
+      const browserTypes = browserWs.sentStrings.flatMap((raw) => {
+        try { return [(JSON.parse(raw) as { type?: string }).type]; } catch { return []; }
+      });
+      expect(browserTypes).toEqual(expect.arrayContaining([
+        'fs.ls_response',
+        'fs.git_status_response',
+        'command.ack',
+        TIMELINE_MESSAGES.HISTORY,
+      ]));
+
+      daemonWs1.emit('close');
+      await flushAsync();
+      const daemonWs2 = new MockWs();
+      bridge.handleDaemonConnection(daemonWs2 as never, makeDb('valid-hash'), {} as never);
+      daemonWs2.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const terminalReplay = daemonWs2.sentStrings.flatMap((raw) => {
+        try {
+          const parsed = JSON.parse(raw) as { type?: string; session?: string; raw?: boolean };
+          return parsed.type === 'terminal.subscribe' || parsed.type === 'terminal.unsubscribe' ? [parsed] : [];
+        } catch {
+          return [];
+        }
+      });
+      expect(terminalReplay).toEqual([expect.objectContaining({
+        type: 'terminal.subscribe',
+        session: 'sessStorm',
+        raw: true,
+      })]);
+    });
+
     it('rapid replace without auth does not crash or leak', async () => {
       const bridge = WsBridge.get(serverId);
       const browserWs = new MockWs();
@@ -1192,9 +1625,9 @@ describe('WsBridge', () => {
     }
 
     const sessionScopedCases: Array<[string, Record<string, unknown>, string]> = [
-      ['timeline.history', { type: 'timeline.history', sessionName: 'session-a', events: [{ eventId: 'e1' }], epoch: 1 }, 'session-a'],
-      ['timeline.replay', { type: 'timeline.replay', sessionName: 'session-a', events: [], truncated: false, epoch: 1 }, 'session-a'],
-      ['timeline.event', { type: 'timeline.event', event: { sessionId: 'session-a', eventId: 'e2', type: 'test' } }, 'session-a'],
+      [TIMELINE_MESSAGES.HISTORY, { type: TIMELINE_MESSAGES.HISTORY, sessionName: 'session-a', events: [{ eventId: 'e1' }], epoch: 1 }, 'session-a'],
+      [TIMELINE_MESSAGES.REPLAY, { type: TIMELINE_MESSAGES.REPLAY, sessionName: 'session-a', events: [], truncated: false, epoch: 1 }, 'session-a'],
+      [TIMELINE_MESSAGES.EVENT, { type: TIMELINE_MESSAGES.EVENT, event: { sessionId: 'session-a', eventId: 'e2', type: 'test' } }, 'session-a'],
       ['command.ack', { type: 'command.ack', session: 'session-a', commandId: 'c1', status: 'ok' }, 'session-a'],
       ['subsession.response', { type: 'subsession.response', sessionName: 'session-a', status: 'idle' }, 'session-a'],
       ['session.idle', { type: 'session.idle', session: 'session-a', project: 'p', agentType: 'claude-code' }, 'session-a'],
@@ -1207,7 +1640,11 @@ describe('WsBridge', () => {
         const { daemonWs, browserA, browserB } = await setupTwoBrowsers();
 
         daemonWs.emit('message', JSON.stringify(daemonMsg));
-        await flushAsync();
+        if (label === TIMELINE_MESSAGES.HISTORY || label === TIMELINE_MESSAGES.REPLAY) {
+          await flushBridgeDataPlane();
+        } else {
+          await flushAsync();
+        }
 
         // browserA (subscribed to session-a) must receive it
         expect(browserA.sentStrings.length).toBeGreaterThan(0);
@@ -1220,9 +1657,9 @@ describe('WsBridge', () => {
       const { daemonWs, browserA, browserB } = await setupTwoBrowsers();
 
       daemonWs.emit('message', JSON.stringify({
-        type: 'timeline.history', sessionName: 'session-b', events: [{ secret: 'data' }], epoch: 1,
+        type: TIMELINE_MESSAGES.HISTORY, sessionName: 'session-b', events: [{ secret: 'data' }], epoch: 1,
       }));
-      await flushAsync();
+      await flushBridgeDataPlane();
 
       expect(browserA.sentStrings.length).toBe(0); // session-a browser must be silent
       expect(browserB.sentStrings.length).toBeGreaterThan(0);
@@ -1550,6 +1987,28 @@ describe('WsBridge', () => {
       expect(msg.items[0].sha).toBe('abc123');
     });
 
+    it('repo.checkout_branch_response reaches browser', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: REPO_MSG.CHECKOUT_BRANCH_RESPONSE,
+        requestId: 'req-checkout',
+        projectDir: '/home/user/myproject',
+        ok: true,
+        previousBranch: 'main',
+        currentBranch: 'dev',
+        repoGeneration: 2,
+        detectedAt: 123456,
+      }));
+      await flushAsync();
+
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe(REPO_MSG.CHECKOUT_BRANCH_RESPONSE);
+      expect(msg.previousBranch).toBe('main');
+      expect(msg.currentBranch).toBe('dev');
+      expect(msg.repoGeneration).toBe(2);
+    });
+
     it('repo messages are broadcast to all connected browsers', async () => {
       const bridge = WsBridge.get(serverId);
       const daemonWs = new MockWs();
@@ -1792,6 +2251,496 @@ describe('WsBridge', () => {
 
       expect(browserWs.sentStrings.length).toBeGreaterThan(0);
       expect(JSON.parse(browserWs.sentStrings[0]).type).toBe('p2p.conflict');
+    });
+
+    it('drops unknown p2p messages from daemon instead of broadcasting', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'p2p.future_secret',
+        rawPrompt: 'do not leak',
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings).toHaveLength(0);
+    });
+
+    it('requires valid requestId before forwarding request-scoped p2p browser messages', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS,
+        requestId: 'é',
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((raw) => JSON.parse(raw).type === P2P_WORKFLOW_MSG.STATUS)).toBe(false);
+      expect(browserWs.sentStrings.some((raw) => JSON.parse(raw).code === P2P_BRIDGE_ERROR_CODES.INVALID_REQUEST_ID)).toBe(true);
+    });
+
+    it('rejects browser p2p messages that are daemon-only or responses', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+        run: { rawPrompt: 'do not forward' },
+      }));
+      browserWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS_RESPONSE,
+        requestId: 'p2p-response-from-browser',
+        runs: [],
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((raw) => JSON.parse(raw).type === P2P_WORKFLOW_MSG.RUN_UPDATE)).toBe(false);
+      expect(daemonWs.sentStrings.some((raw) => JSON.parse(raw).type === P2P_WORKFLOW_MSG.STATUS_RESPONSE)).toBe(false);
+      expect(browserWs.sentStrings.filter((raw) => JSON.parse(raw).code === P2P_BRIDGE_ERROR_CODES.WRONG_PEER)).toHaveLength(2);
+    });
+
+    it('single-casts request-scoped p2p responses to the pending requester only', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browser1 = new MockWs();
+      const browser2 = new MockWs();
+      bridge.handleBrowserConnection(browser1 as never, 'user-1', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browser2 as never, 'user-2', makeDb('valid-hash'));
+
+      browser1.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.READ_DISCUSSION,
+        requestId: 'p2p-read-1',
+        id: 'discussion-1',
+      }));
+      await flushAsync();
+      browser1.sent.length = 0;
+      browser2.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
+        requestId: 'p2p-read-1',
+        id: 'discussion-1',
+        content: 'private discussion',
+      }));
+      await flushAsync();
+
+      expect(browser1.sentStrings).toHaveLength(1);
+      expect(browser2.sentStrings).toHaveLength(0);
+      expect(JSON.parse(browser1.sentStrings[0])).toMatchObject({
+        type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
+        requestId: 'p2p-read-1',
+      });
+    });
+
+    it('drops mismatched p2p response types without clearing the pending request', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+
+      browserWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS,
+        requestId: 'p2p-status-1',
+      }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
+        requestId: 'p2p-status-1',
+        discussions: [],
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings).toHaveLength(0);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS_RESPONSE,
+        requestId: 'p2p-status-1',
+        runs: [],
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings).toHaveLength(1);
+      expect(JSON.parse(browserWs.sentStrings[0]).type).toBe(P2P_WORKFLOW_MSG.STATUS_RESPONSE);
+    });
+
+    it('rejects duplicate active p2p requestIds without replacing the original requester', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browser1 = new MockWs();
+      const browser2 = new MockWs();
+      bridge.handleBrowserConnection(browser1 as never, 'user-1', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browser2 as never, 'user-2', makeDb('valid-hash'));
+
+      browser1.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS,
+        requestId: 'p2p-duplicate-1',
+      }));
+      browser2.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS,
+        requestId: 'p2p-duplicate-1',
+      }));
+      await flushAsync();
+
+      expect(browser2.sentStrings.some((raw) => JSON.parse(raw).code === P2P_BRIDGE_ERROR_CODES.DUPLICATE_REQUEST_ID)).toBe(true);
+      browser1.sent.length = 0;
+      browser2.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS_RESPONSE,
+        requestId: 'p2p-duplicate-1',
+        runs: [],
+      }));
+      await flushAsync();
+
+      expect(browser1.sentStrings).toHaveLength(1);
+      expect(browser2.sentStrings).toHaveLength(0);
+    });
+
+    it('drops request-scoped p2p responses without a pending requester', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
+        requestId: 'p2p-missing',
+        discussions: [],
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings).toHaveLength(0);
+    });
+
+    it('enforces per-socket pending caps before forwarding p2p requests', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      daemonWs.sent.length = 0;
+
+      for (let i = 0; i < P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET + 1; i += 1) {
+        browserWs.emit('message', JSON.stringify({
+          type: P2P_WORKFLOW_MSG.STATUS,
+          requestId: `p2p-cap-${i}`,
+        }));
+      }
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === P2P_WORKFLOW_MSG.STATUS);
+      expect(forwarded).toHaveLength(P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET);
+      expect(browserWs.sentStrings.some((raw) => JSON.parse(raw).code === P2P_BRIDGE_ERROR_CODES.PENDING_LIMIT_EXCEEDED)).toBe(true);
+    });
+
+    it('enforces the global pending cap before forwarding p2p requests', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      daemonWs.sent.length = 0;
+
+      const socketCount = Math.ceil(P2P_BRIDGE_PENDING_REQUESTS_GLOBAL / P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET);
+      for (let socketIndex = 0; socketIndex < socketCount; socketIndex += 1) {
+        const browserWs = new MockWs();
+        bridge.handleBrowserConnection(browserWs as never, `user-${socketIndex}`, makeDb('valid-hash'));
+        browserWs.sent.length = 0;
+        for (let requestIndex = 0; requestIndex < P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET; requestIndex += 1) {
+          browserWs.emit('message', JSON.stringify({
+            type: P2P_WORKFLOW_MSG.STATUS,
+            requestId: `p2p-global-${socketIndex}-${requestIndex}`,
+          }));
+        }
+      }
+      await flushAsync();
+
+      const extraBrowser = new MockWs();
+      bridge.handleBrowserConnection(extraBrowser as never, 'user-extra', makeDb('valid-hash'));
+      extraBrowser.sent.length = 0;
+      extraBrowser.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.STATUS,
+        requestId: 'p2p-global-overflow',
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === P2P_WORKFLOW_MSG.STATUS);
+      expect(forwarded).toHaveLength(P2P_BRIDGE_PENDING_REQUESTS_GLOBAL);
+      expect(extraBrowser.sentStrings.some((raw) => {
+        const msg = JSON.parse(raw);
+        return msg.code === P2P_BRIDGE_ERROR_CODES.PENDING_LIMIT_EXCEEDED && msg.scope === 'global';
+      })).toBe(true);
+    });
+
+    it('handles p2p.run_complete and p2p.run_error as registered daemon messages', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.RUN_COMPLETE,
+        run: { id: 'run-complete', status: 'running', mode_key: 'audit' },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.RUN_ERROR,
+        run: { id: 'run-error', status: 'failed', mode_key: 'audit', error: 'failed' },
+      }));
+      await flushAsync();
+
+      const updates = browserWs.sentStrings.map((raw) => JSON.parse(raw));
+      expect(updates.filter((msg) => msg.type === P2P_WORKFLOW_MSG.RUN_UPDATE)).toHaveLength(2);
+      expect(updates.find((msg) => msg.run.id === 'run-complete')?.run.status).toBe('completed');
+      expect(updates.find((msg) => msg.run.id === 'run-error')?.run.error).toBe('failed');
+    });
+
+    it('writes the same diagnostic code set to DB upsert and to the browser broadcast', async () => {
+      // Regression for PR-D: the canonical sanitize result must be shared
+      // between the DB-bound `upsertOrchestrationRun` payload and the
+      // broadcast payload so the diagnostic code set the browser sees is
+      // byte-identical to what the DB row records.
+      const upsertSpy = vi.spyOn(dbQueries, 'upsertOrchestrationRun').mockResolvedValue();
+      try {
+        const { daemonWs, browserWs } = await setupAuthBridge();
+
+        // Force the bridge into the truncation branch via oversized routing_history.
+        const oversized = 'x'.repeat(P2P_SANITIZE_MAX_STRING_BYTES + 100);
+        daemonWs.emit('message', JSON.stringify({
+          type: P2P_WORKFLOW_MSG.RUN_SAVE,
+          run: {
+            id: 'run-parity',
+            discussion_id: 'disc-1',
+            mode_key: 'audit',
+            status: 'running',
+            diagnostics: [
+              { code: 'daemon_busy', phase: 'bind', severity: 'error', summary: 'busy' },
+              { code: 'missing_required_capability', phase: 'execute', summary: 'missing cap' },
+            ],
+            routing_history: Array.from({ length: 80 }, (_, idx) => ({
+              step: idx,
+              nested: { value: oversized },
+            })),
+          },
+        }));
+        await flushAsync();
+
+        expect(upsertSpy).toHaveBeenCalledTimes(1);
+        const persistedArg = upsertSpy.mock.calls[0]?.[1] as {
+          progress_snapshot: string;
+          workflow_projection: { diagnostics: Array<{ code: string }> };
+        };
+        const persistedSnap = JSON.parse(persistedArg.progress_snapshot) as {
+          diagnostics: Array<{ code: string }>;
+        };
+
+        const broadcasts = browserWs.sentStrings
+          .map((raw) => JSON.parse(raw))
+          .filter((msg) => msg.type === P2P_WORKFLOW_MSG.RUN_UPDATE);
+        expect(broadcasts).toHaveLength(1);
+        const broadcastDiagnostics = broadcasts[0].run.workflow_projection.diagnostics as Array<{ code: string }>;
+
+        const persistedCodes = [...persistedArg.workflow_projection.diagnostics.map((d) => d.code)].sort();
+        const persistedSnapCodes = [...persistedSnap.diagnostics.map((d) => d.code)].sort();
+        const broadcastCodes = [...broadcastDiagnostics.map((d) => d.code)].sort();
+
+        expect(broadcastCodes).toEqual(persistedCodes);
+        expect(broadcastCodes).toEqual(persistedSnapCodes);
+        expect(broadcastCodes).toContain('daemon_busy');
+        expect(broadcastCodes).toContain('missing_required_capability');
+        expect(broadcastCodes).toContain('private_projection_field_dropped');
+      } finally {
+        upsertSpy.mockRestore();
+      }
+    });
+
+    it('caches daemon.hello capabilities and clears stale/disconnected snapshots', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1, P2P_WORKFLOW_CAPABILITY_V1, TIMELINE_PROTOCOL_CAPABILITY],
+        timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
+        timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,
+        helloEpoch: 2,
+        sentAt: 123,
+      }));
+      await flushAsync();
+
+      expect(bridge.getDaemonP2pWorkflowCapabilities()?.capabilities).toEqual([
+        P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
+        P2P_WORKFLOW_CAPABILITY_V1,
+        TIMELINE_PROTOCOL_CAPABILITY,
+      ].sort());
+      expect(bridge.getDaemonP2pWorkflowCapabilities()?.timelineProtocolRevision).toBe(TIMELINE_PROTOCOL_REVISION);
+      expect(bridge.getDaemonP2pWorkflowCapabilities(Date.now() + P2P_CAPABILITY_FRESHNESS_TTL_MS + 1)).toBeNull();
+
+      daemonWs.close();
+      await flushAsync();
+
+      expect(bridge.getDaemonP2pWorkflowCapabilities()).toBeNull();
+    });
+
+    /*
+     * R3 v2 PR-σ — User feedback: "daemon 是正常的 一直报失联". The
+     * daemon only sends `daemon.hello` on (a) WS connect/reconnect and
+     * (b) capability change. The bridge forwarded each as it arrived
+     * but never replayed cached state, so any browser that opened
+     * AFTER the daemon's most recent hello never received one and its
+     * 30 s `capability_stale` TTL fired as a false-positive
+     * "lost contact with the daemon" banner — even though the daemon
+     * was healthy. The bridge now replays the cached hello to every
+     * newly-connected browser so the capability picture is consistent
+     * across late-joiners.
+     */
+    it('R3 v2 PR-σ — replays cached daemon.hello to a browser that connects AFTER the daemon hello arrived', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      // Daemon publishes capabilities BEFORE any browser connects.
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1, TIMELINE_PROTOCOL_CAPABILITY],
+        timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
+        timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,
+        helloEpoch: 1,
+        sentAt: 555,
+      }));
+      await flushAsync();
+
+      // Now a browser connects — it must receive the cached hello as
+      // an opening message.
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'late-user', makeDb('valid-hash'));
+      await flushAsync();
+
+      const helloMessages = browserWs.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO);
+      expect(helloMessages).toHaveLength(1);
+      expect(helloMessages[0]).toMatchObject({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1, TIMELINE_PROTOCOL_CAPABILITY].sort(),
+        timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
+        timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,
+        helloEpoch: 1,
+        sentAt: 555,
+      });
+    });
+
+    it('R3 v2 PR-σ — does NOT replay daemon.hello when no daemon is connected yet', async () => {
+      const bridge = WsBridge.get(serverId);
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'first-user', makeDb('valid-hash'));
+      await flushAsync();
+
+      const helloMessages = browserWs.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO);
+      expect(helloMessages).toHaveLength(0);
+    });
+
+    it('forwards p2p.config.save from browser to daemon and registers a pending response', async () => {
+      // PR-E: p2p.config.save must be registered alongside workflow messages
+      // so the bridge default-deny no longer drops it. The browser ingress
+      // forwards via the generic forward_to_daemon path, and a pending entry
+      // is created so the SAVE_RESPONSE can be singlecast back.
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: P2P_CONFIG_MSG.SAVE,
+        requestId: 'p2p-config-save-1',
+        scopeSession: 'deck_demo_brain',
+        config: { participants: [] },
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === P2P_CONFIG_MSG.SAVE);
+      expect(forwarded).toHaveLength(1);
+      expect(forwarded[0]).toMatchObject({
+        type: P2P_CONFIG_MSG.SAVE,
+        requestId: 'p2p-config-save-1',
+        scopeSession: 'deck_demo_brain',
+      });
+      // Browser must not receive any error code (route policy / wrong peer / unknown).
+      expect(browserWs.sentStrings.some((raw) => 'code' in JSON.parse(raw))).toBe(false);
+    });
+
+    it('singlecasts p2p.config.save_response to the requesting browser only', async () => {
+      // PR-E: SAVE_RESPONSE flows through the generic singlecast_response
+      // handler — only the browser that registered the requestId receives it.
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browser1 = new MockWs();
+      const browser2 = new MockWs();
+      bridge.handleBrowserConnection(browser1 as never, 'user-1', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browser2 as never, 'user-2', makeDb('valid-hash'));
+
+      browser1.emit('message', JSON.stringify({
+        type: P2P_CONFIG_MSG.SAVE,
+        requestId: 'p2p-config-save-singlecast',
+        scopeSession: 'deck_demo_brain',
+        config: { participants: [] },
+      }));
+      await flushAsync();
+      browser1.sent.length = 0;
+      browser2.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_CONFIG_MSG.SAVE_RESPONSE,
+        requestId: 'p2p-config-save-singlecast',
+        scopeSession: 'deck_demo_brain',
+        ok: true,
+      }));
+      await flushAsync();
+
+      expect(browser1.sentStrings).toHaveLength(1);
+      expect(browser2.sentStrings).toHaveLength(0);
+      expect(JSON.parse(browser1.sentStrings[0])).toMatchObject({
+        type: P2P_CONFIG_MSG.SAVE_RESPONSE,
+        requestId: 'p2p-config-save-singlecast',
+        ok: true,
+      });
+    });
+
+    it('keeps unknown p2p.* messages dropped after registering p2p.config.*', async () => {
+      // Default-deny safeguard: registering p2p.config.* must NOT widen the
+      // bridge to forward arbitrary p2p.* messages. Any unregistered p2p.*
+      // type from the daemon still drops, no broadcast.
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'p2p.future_secret',
+        rawPrompt: 'do not leak',
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'p2p.config.future_secret',
+        scopeSession: 'deck_demo_brain',
+        ok: true,
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings).toHaveLength(0);
     });
   });
 
@@ -2255,6 +3204,80 @@ describe('WsBridge', () => {
       expect(browserWs.sentStrings.filter(s => JSON.parse(s).type === 'chat.delta')).toHaveLength(0);
     });
 
+    it('does not forward duplicate chat.subscribe history replays unless forced', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-repeat' }));
+      await flushAsync();
+      expect(daemonWs.sentStrings.filter((s) => JSON.parse(s).type === 'chat.subscribe')).toHaveLength(1);
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-repeat' }));
+      await flushAsync();
+      expect(daemonWs.sentStrings.filter((s) => JSON.parse(s).type === 'chat.subscribe')).toHaveLength(0);
+
+      browserWs.emit('message', JSON.stringify({
+        type: 'chat.subscribe',
+        sessionId: 'ts-repeat',
+        forceHistory: true,
+      }));
+      await flushAsync();
+      const forced = daemonWs.sentStrings
+        .map((s) => JSON.parse(s))
+        .filter((msg) => msg.type === 'chat.subscribe');
+      expect(forced).toEqual([{ type: 'chat.subscribe', sessionId: 'ts-repeat', forceHistory: true }]);
+    });
+
+    it('accepts forceHistory:false as a live transport subscription without daemon history replay', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: 'chat.subscribe',
+        sessionId: 'ts-live-only',
+        forceHistory: false,
+      }));
+      await flushAsync();
+      expect(daemonWs.sentStrings.filter((s) => JSON.parse(s).type === 'chat.subscribe')).toHaveLength(0);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'evt-live-only',
+          sessionId: 'ts-live-only',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          type: 'assistant.text',
+          payload: { text: 'live repair works', streaming: true },
+        },
+      }));
+      await flushAsync();
+
+      const timelineEvents = browserWs.sentStrings
+        .map((s) => JSON.parse(s))
+        .filter((msg) => msg.type === 'timeline.event');
+      expect(timelineEvents).toHaveLength(1);
+      expect(timelineEvents[0].event.payload.text).toBe('live repair works');
+    });
+
+    it('forwards chat.subscribe again after unsubscribe', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-resub' }));
+      await flushAsync();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({ type: 'chat.unsubscribe', sessionId: 'ts-resub' }));
+      await flushAsync();
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-resub' }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.filter((s) => JSON.parse(s).type === 'chat.subscribe')).toHaveLength(1);
+    });
+
     it('relays chat.complete events to subscribed browsers', async () => {
       const { daemonWs, browserWs } = await setupAuthenticatedBridge();
       browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-complete' }));
@@ -2632,7 +3655,7 @@ describe('WsBridge', () => {
 
       // Browser sends timeline.history_request with requestId — NO terminal.subscribe first
       browserWs.emit('message', JSON.stringify({
-        type: 'timeline.history_request',
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
         sessionName: 'deck_sub_qwen',
         requestId: 'req-123',
         limit: 500,
@@ -2641,20 +3664,103 @@ describe('WsBridge', () => {
 
       // Daemon responds with timeline.history
       daemonWs.emit('message', JSON.stringify({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName: 'deck_sub_qwen',
         requestId: 'req-123',
         events: [{ type: 'user.message', text: 'hello', ts: 1000 }],
         epoch: 1,
       }));
-      await flushAsync();
+      await flushBridgeDataPlane();
 
       // Browser should receive the response (routed by requestId, not subscription)
       const received = browserWs.sentStrings.filter((s) => {
-        try { return (JSON.parse(s) as { type: string }).type === 'timeline.history'; } catch { return false; }
+        try { return (JSON.parse(s) as { type: string }).type === TIMELINE_MESSAGES.HISTORY; } catch { return false; }
       });
       expect(received).toHaveLength(1);
       expect(JSON.parse(received[0]).requestId).toBe('req-123');
+    });
+
+    it('rejects unauthorized browser timeline requests with a request-scoped error and does not forward daemon', async () => {
+      serverId = 'srv-owned';
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeTimelineOwnershipDb({ allowMain: true }), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeTimelineOwnershipDb({ allowMain: true }));
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_other_brain',
+        requestId: 'unauthorized-history',
+        limit: 50,
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings).toHaveLength(0);
+      const responses = browserWs.sentStrings.map((s) => JSON.parse(s) as Record<string, unknown>);
+      expect(responses).toHaveLength(1);
+      expect(responses[0]).toMatchObject({
+        type: TIMELINE_MESSAGES.HISTORY,
+        requestId: 'unauthorized-history',
+        sessionName: 'deck_other_brain',
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        source: TIMELINE_RESPONSE_SOURCES.ERROR,
+        errorReason: TIMELINE_REQUEST_ERROR_REASONS.REQUEST_UNAUTHORIZED,
+        events: [],
+        payloadTruncated: false,
+        hasMore: false,
+      });
+      expect(typeof responses[0].actualPayloadBytes).toBe('number');
+    });
+
+    it('checks deck_sub ownership before forwarding browser timeline page/detail requests', async () => {
+      serverId = 'srv-owned';
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      const db = makeTimelineOwnershipDb({ allowSub: true });
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', db);
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.PAGE_REQUEST,
+        sessionName: 'deck_sub_abc-123',
+        requestId: 'page-ok',
+      }));
+      browserWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.DETAIL_REQUEST,
+        sessionName: 'deck_sub_other',
+        requestId: 'detail-denied',
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings.map((s) => JSON.parse(s) as Record<string, unknown>);
+      expect(forwarded).toEqual([{
+        type: TIMELINE_MESSAGES.PAGE_REQUEST,
+        sessionName: 'deck_sub_abc-123',
+        requestId: 'page-ok',
+      }]);
+      const responses = browserWs.sentStrings.map((s) => JSON.parse(s) as Record<string, unknown>);
+      expect(responses).toHaveLength(1);
+      expect(responses[0]).toMatchObject({
+        type: TIMELINE_MESSAGES.DETAIL,
+        requestId: 'detail-denied',
+        sessionName: 'deck_sub_other',
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        source: TIMELINE_RESPONSE_SOURCES.ERROR,
+        errorReason: TIMELINE_REQUEST_ERROR_REASONS.REQUEST_UNAUTHORIZED,
+        payloadTruncated: false,
+        hasMore: false,
+      });
+      expect(typeof responses[0].actualPayloadBytes).toBe('number');
     });
 
     it('routes timeline.replay response via requestId', async () => {
@@ -2663,25 +3769,61 @@ describe('WsBridge', () => {
       bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
 
       browserWs.emit('message', JSON.stringify({
-        type: 'timeline.replay_request',
+        type: TIMELINE_MESSAGES.REPLAY_REQUEST,
         sessionName: 'deck_sub_qwen',
         requestId: 'replay-456',
       }));
       await flushAsync();
 
       daemonWs.emit('message', JSON.stringify({
-        type: 'timeline.replay',
+        type: TIMELINE_MESSAGES.REPLAY,
         sessionName: 'deck_sub_qwen',
         requestId: 'replay-456',
         events: [],
         epoch: 1,
       }));
-      await flushAsync();
+      await flushBridgeDataPlane();
 
       const received = browserWs.sentStrings.filter((s) => {
-        try { return (JSON.parse(s) as { type: string }).type === 'timeline.replay'; } catch { return false; }
+        try { return (JSON.parse(s) as { type: string }).type === TIMELINE_MESSAGES.REPLAY; } catch { return false; }
       });
       expect(received).toHaveLength(1);
+    });
+
+    it('routes timeline.page and timeline.detail responses via requestId', async () => {
+      const { daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      const bridge = WsBridge.get(serverId);
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      const cases = [
+        [TIMELINE_MESSAGES.PAGE_REQUEST, TIMELINE_MESSAGES.PAGE, 'page-1'],
+        [TIMELINE_MESSAGES.DETAIL_REQUEST, TIMELINE_MESSAGES.DETAIL, 'detail-1'],
+      ] as const;
+
+      for (const [requestType, responseType, requestId] of cases) {
+        browserWs.emit('message', JSON.stringify({
+          type: requestType,
+          sessionName: 'deck_sub_qwen',
+          requestId,
+        }));
+        await flushAsync();
+
+        daemonWs.emit('message', JSON.stringify({
+          type: responseType,
+          sessionName: 'deck_sub_qwen',
+          requestId,
+          events: responseType === TIMELINE_MESSAGES.PAGE ? [] : undefined,
+          detail: responseType === TIMELINE_MESSAGES.DETAIL ? { text: 'ok' } : undefined,
+          epoch: 1,
+        }));
+        await flushBridgeDataPlane();
+
+        const received = browserWs.sentStrings
+          .map((s) => JSON.parse(s) as { type: string; requestId?: string })
+          .filter((msg) => msg.type === responseType && msg.requestId === requestId);
+        expect(received).toHaveLength(1);
+      }
     });
 
     it('cleans up pending request after 30s timeout', async () => {
@@ -2691,7 +3833,7 @@ describe('WsBridge', () => {
       bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
 
       browserWs.emit('message', JSON.stringify({
-        type: 'timeline.history_request',
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
         sessionName: 'deck_sub_qwen',
         requestId: 'req-timeout',
         limit: 500,
@@ -2703,7 +3845,7 @@ describe('WsBridge', () => {
 
       // Late response after timeout — should NOT reach browser
       daemonWs.emit('message', JSON.stringify({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName: 'deck_sub_qwen',
         requestId: 'req-timeout',
         events: [{ type: 'user.message', text: 'late', ts: 2000 }],
@@ -2712,7 +3854,7 @@ describe('WsBridge', () => {
       await flushAsync();
 
       const received = browserWs.sentStrings.filter((s) => {
-        try { return (JSON.parse(s) as { type: string }).type === 'timeline.history'; } catch { return false; }
+        try { return (JSON.parse(s) as { type: string }).type === TIMELINE_MESSAGES.HISTORY; } catch { return false; }
       });
       expect(received).toHaveLength(0);
       vi.useRealTimers();
@@ -2724,7 +3866,7 @@ describe('WsBridge', () => {
       bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
 
       browserWs.emit('message', JSON.stringify({
-        type: 'timeline.history_request',
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
         sessionName: 'deck_sub_qwen',
         requestId: 'req-close',
         limit: 500,
@@ -2737,7 +3879,7 @@ describe('WsBridge', () => {
 
       // Response arrives after close — should NOT throw
       daemonWs.emit('message', JSON.stringify({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName: 'deck_sub_qwen',
         requestId: 'req-close',
         events: [],
@@ -2747,7 +3889,7 @@ describe('WsBridge', () => {
 
       // No crash, no sent messages
       expect(browserWs.sentStrings.filter((s) => {
-        try { return (JSON.parse(s) as { type: string }).type === 'timeline.history'; } catch { return false; }
+        try { return (JSON.parse(s) as { type: string }).type === TIMELINE_MESSAGES.HISTORY; } catch { return false; }
       })).toHaveLength(0);
     });
 
@@ -2764,17 +3906,484 @@ describe('WsBridge', () => {
 
       // Daemon sends timeline.history WITHOUT requestId (legacy)
       daemonWs.emit('message', JSON.stringify({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName: 'deck_sub_qwen',
         events: [{ type: 'assistant.text', text: 'hi', ts: 1000 }],
         epoch: 1,
       }));
-      await flushAsync();
+      await flushBridgeDataPlane();
 
       const received = browserWs.sentStrings.filter((s) => {
-        try { return (JSON.parse(s) as { type: string }).type === 'timeline.history'; } catch { return false; }
+        try { return (JSON.parse(s) as { type: string }).type === TIMELINE_MESSAGES.HISTORY; } catch { return false; }
       });
       expect(received).toHaveLength(1);
+    });
+
+    it('fans out a coalesced timeline response to browser and HTTP requestIds without subscriber leakage', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserA = new MockWs();
+      const browserB = new MockWs();
+      const unrelatedSubscriber = new MockWs();
+      bridge.handleBrowserConnection(browserA as never, 'test-user', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browserB as never, 'test-user', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(unrelatedSubscriber as never, 'test-user', makeDb('valid-hash'));
+
+      unrelatedSubscriber.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'deck_sub_qwen' }));
+      await flushAsync();
+      unrelatedSubscriber.sent.length = 0;
+
+      browserA.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'browser-a',
+        limit: 50,
+      }));
+      browserB.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'browser-b',
+        limit: 50,
+      }));
+      const httpPending = bridge.requestTimelineHistory({
+        sessionName: 'deck_sub_qwen',
+        limit: 50,
+        budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
+      });
+      await flushAsync();
+
+      const httpOutbound = daemonWs.sentStrings
+        .map((s) => JSON.parse(s) as { type?: string; requestId?: string })
+        .find((msg) => msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST && msg.requestId?.startsWith('watch-hist-'));
+      expect(httpOutbound?.requestId).toBeTruthy();
+      const httpRequestId = httpOutbound!.requestId!;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName: 'deck_sub_qwen',
+        requestIds: ['browser-a', 'browser-b', httpRequestId],
+        events: [{ eventId: 'e1', sessionId: 'deck_sub_qwen', ts: 100, type: 'assistant.text', payload: { text: 'hi' } }],
+        epoch: 2,
+      }));
+      await flushBridgeDataPlane();
+
+      for (const [socket, requestId] of [[browserA, 'browser-a'], [browserB, 'browser-b']] as const) {
+        const responses = socket.sentStrings
+          .map((s) => JSON.parse(s) as { type: string; requestId?: string })
+          .filter((msg) => msg.type === TIMELINE_MESSAGES.HISTORY);
+        expect(responses).toHaveLength(1);
+        expect(responses[0].requestId).toBe(requestId);
+      }
+      await expect(httpPending).resolves.toMatchObject({
+        type: TIMELINE_MESSAGES.HISTORY,
+        requestId: httpRequestId,
+        epoch: 2,
+      });
+      expect(unrelatedSubscriber.sentStrings.some((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === TIMELINE_MESSAGES.HISTORY; } catch { return false; }
+      })).toBe(false);
+    });
+
+    it('serializes coalesced timeline fan-out one browser payload at a time and records backlog metrics', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const slowBrowser = new SlowMockWs();
+      const fastBrowser = new MockWs();
+      bridge.handleBrowserConnection(slowBrowser as never, 'test-user', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(fastBrowser as never, 'test-user', makeDb('valid-hash'));
+
+      slowBrowser.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'deck_sub_qwen' }));
+      fastBrowser.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'deck_sub_qwen' }));
+      await flushAsync();
+
+      slowBrowser.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'slow-browser-history',
+      }));
+      fastBrowser.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'fast-browser-history',
+      }));
+      const httpPending = bridge.requestTimelineHistory({
+        sessionName: 'deck_sub_qwen',
+        budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
+      });
+      await flushAsync();
+
+      const httpOutbound = daemonWs.sentStrings
+        .map((s) => JSON.parse(s) as { type?: string; requestId?: string })
+        .find((msg) => msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST && msg.requestId?.startsWith('watch-hist-'));
+      expect(httpOutbound?.requestId).toBeTruthy();
+
+      slowBrowser.sent.length = 0;
+      fastBrowser.sent.length = 0;
+
+      const largeText = 'x'.repeat(TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE + 2048);
+      const rawCoalescedResponse = JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName: 'deck_sub_qwen',
+        requestIds: ['slow-browser-history', 'fast-browser-history', httpOutbound!.requestId],
+        payloadBytes: Buffer.byteLength(largeText, 'utf8'),
+        events: [{
+          eventId: 'large-fanout-e1',
+          sessionId: 'deck_sub_qwen',
+          ts: 100,
+          type: 'assistant.text',
+          payload: { text: largeText },
+        }],
+        epoch: 4,
+      });
+      const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const stringifySpy = vi.spyOn(JSON, 'stringify');
+      const historyStringifyCalls = () => stringifySpy.mock.calls.filter(([value]) => {
+        const msg = value as { type?: unknown; events?: unknown } | null;
+        return msg?.type === TIMELINE_MESSAGES.HISTORY && Array.isArray(msg.events);
+      });
+
+      try {
+        daemonWs.emit('message', rawCoalescedResponse);
+        await flushAsync();
+
+        const enqueueStringifyCount = historyStringifyCalls().length;
+        expect(getCounter('ws_bridge_timeline_data_plane_enqueue', {
+          type: TIMELINE_MESSAGES.HISTORY,
+          route: 'browser_request',
+          backlog: 'empty',
+        })).toBe(1);
+
+        await flushOneBridgeDataPlaneTurn();
+        await expect(httpPending).resolves.toMatchObject({
+          type: TIMELINE_MESSAGES.HISTORY,
+          requestId: httpOutbound!.requestId,
+        });
+        const afterHttpStringifyCount = historyStringifyCalls().length;
+        expect(afterHttpStringifyCount).toBeGreaterThanOrEqual(enqueueStringifyCount);
+
+        await flushOneBridgeDataPlaneTurn();
+        const afterSlowBrowserStringifyCount = historyStringifyCalls().length;
+        expect(afterSlowBrowserStringifyCount).toBeGreaterThanOrEqual(afterHttpStringifyCount);
+        expect(slowBrowser.sentStrings.some((s) => JSON.parse(s).type === TIMELINE_MESSAGES.HISTORY)).toBe(true);
+        expect(fastBrowser.sentStrings.some((s) => JSON.parse(s).type === TIMELINE_MESSAGES.HISTORY)).toBe(false);
+
+        daemonWs.emit('message', JSON.stringify({
+          type: 'command.ack',
+          session: 'deck_sub_qwen',
+          commandId: 'cmd-during-slow-fanout',
+          status: 'ok',
+        }));
+        await flushAsync();
+
+        expect(fastBrowser.sentStrings.map((s) => JSON.parse(s).type)).toContain('command.ack');
+
+        slowBrowser.releaseNextSend();
+        await flushOneBridgeDataPlaneTurn();
+        expect(historyStringifyCalls().length).toBeGreaterThanOrEqual(afterSlowBrowserStringifyCount);
+        expect(fastBrowser.sentStrings.map((s) => JSON.parse(s).type)).toContain(TIMELINE_MESSAGES.HISTORY);
+
+        expect(getCounter('ws_bridge_timeline_data_plane_send', {
+          type: TIMELINE_MESSAGES.HISTORY,
+          route: 'browser_request',
+          result: 'ok',
+        })).toBeGreaterThanOrEqual(2);
+
+        const sendLogs = consoleLogSpy.mock.calls.flatMap(([line]) => {
+          if (typeof line !== 'string') return [];
+          try {
+            const entry = JSON.parse(line) as Record<string, unknown>;
+            return entry.msg === 'WsBridge timeline data-plane send' && entry.type === TIMELINE_MESSAGES.HISTORY ? [entry] : [];
+          } catch {
+            return [];
+          }
+        });
+        const browserBacklogLog = sendLogs.find((entry) => entry.route === 'browser_request');
+        expect(browserBacklogLog).toMatchObject({
+          dataPlaneClass: 'timeline',
+          recipientCount: 3,
+          requestIdFanoutCount: 3,
+          httpCallerCount: 1,
+          queueDepthAtEnqueue: 1,
+          queueDepthBeforeDrain: 1,
+          attachmentCount: 3,
+        });
+        expect(typeof browserBacklogLog?.backlogAgeMs).toBe('number');
+      } finally {
+        slowBrowser.releaseAllSends();
+        stringifySpy.mockRestore();
+        consoleLogSpy.mockRestore();
+      }
+    });
+
+    it('skips queued browser timeline delivery when the requester closes before data-plane drain', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const slowBrowser = new SlowMockWs();
+      const closingBrowser = new MockWs();
+      bridge.handleBrowserConnection(slowBrowser as never, 'test-user', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(closingBrowser as never, 'test-user', makeDb('valid-hash'));
+
+      slowBrowser.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'slow-drain-history',
+      }));
+      closingBrowser.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'closing-drain-history',
+      }));
+      await flushAsync();
+      slowBrowser.sent.length = 0;
+      closingBrowser.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName: 'deck_sub_qwen',
+        requestIds: ['slow-drain-history', 'closing-drain-history'],
+        events: [{ eventId: 'e1', sessionId: 'deck_sub_qwen', ts: 100, type: 'assistant.text', payload: { text: 'hi' } }],
+        epoch: 2,
+      }));
+      closingBrowser.close();
+      await flushOneBridgeDataPlaneTurn();
+      slowBrowser.releaseNextSend();
+      await flushBridgeDataPlane();
+
+      expect(closingBrowser.sentStrings).toHaveLength(0);
+      expect(getCounter('ws_bridge_timeline_data_plane_canceled', {
+        type: TIMELINE_MESSAGES.HISTORY,
+        route: 'browser_request',
+      })).toBe(1);
+    });
+
+    it('rejects queued HTTP timeline delivery when bridge data-plane deadline expires', async () => {
+      const nowSpy = vi.spyOn(performance, 'now');
+      let now = 0;
+      nowSpy.mockImplementation(() => now);
+      // Pin a short deadline for the test — the production default was bumped
+      // to 60s as part of the commit-42dfabec regression fix, so this scenario
+      // would otherwise require simulating a minute of wall-clock passage.
+      const resetQueueConfig = __setTimelineDataPlaneQueueConfigForTests({ deadlineMs: 15_000 });
+      try {
+        const { bridge, daemonWs } = await setupAuth();
+        const slowBrowser = new SlowMockWs();
+        bridge.handleBrowserConnection(slowBrowser as never, 'test-user', makeDb('valid-hash'));
+
+        slowBrowser.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+          sessionName: 'deck_sub_qwen',
+          requestId: 'slow-before-http',
+        }));
+        await flushAsync();
+        slowBrowser.sent.length = 0;
+
+        daemonWs.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY,
+          sessionName: 'deck_sub_qwen',
+          requestId: 'slow-before-http',
+          events: [{ eventId: 'slow-e1', sessionId: 'deck_sub_qwen', ts: 100, type: 'assistant.text', payload: { text: 'hi' } }],
+          epoch: 2,
+        }));
+        await flushOneBridgeDataPlaneTurn();
+
+        const pending = bridge.requestTimelineHistory({
+          sessionName: 'deck_sub_qwen',
+          limit: 10,
+        });
+        const outbound = daemonWs.sentStrings
+          .map((s) => JSON.parse(s) as { type?: string; requestId?: string })
+          .find((msg) => msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST && msg.requestId?.startsWith('watch-hist-'));
+        expect(outbound?.requestId).toBeTruthy();
+
+        daemonWs.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY,
+          sessionName: 'deck_sub_qwen',
+          requestId: outbound!.requestId,
+          events: [{ eventId: 'http-e1', sessionId: 'deck_sub_qwen', ts: 101, type: 'assistant.text', payload: { text: 'after' } }],
+          epoch: 2,
+        }));
+        await flushAsync();
+
+        const assertion = expect(pending).rejects.toThrow(TIMELINE_REQUEST_ERROR_REASONS.DEADLINE_EXCEEDED);
+        now = 16_000;
+        slowBrowser.releaseNextSend();
+        await flushBridgeDataPlane();
+
+        await assertion;
+        expect(getCounter('ws_bridge_timeline_data_plane_deadline_exceeded', {
+          type: TIMELINE_MESSAGES.HISTORY,
+          route: 'http_request',
+        })).toBe(1);
+      } finally {
+        resetQueueConfig();
+        nowSpy.mockRestore();
+      }
+    });
+
+    it('returns a request-scoped queue_full error when bridge data-plane queue capacity is exhausted', async () => {
+      const resetQueueConfig = __setTimelineDataPlaneQueueConfigForTests({ queueCap: 1 });
+      try {
+        const { bridge, daemonWs } = await setupAuth();
+        const browserOk = new MockWs();
+        const browserQueueFull = new MockWs();
+        bridge.handleBrowserConnection(browserOk as never, 'test-user', makeDb('valid-hash'));
+        bridge.handleBrowserConnection(browserQueueFull as never, 'test-user', makeDb('valid-hash'));
+
+        browserOk.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+          sessionName: 'deck_sub_qwen',
+          requestId: 'queue-ok',
+        }));
+        browserQueueFull.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+          sessionName: 'deck_sub_qwen',
+          requestId: 'queue-full',
+        }));
+        await flushAsync();
+
+        daemonWs.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY,
+          sessionName: 'deck_sub_qwen',
+          requestId: 'queue-ok',
+          events: [{ eventId: 'queue-e1', sessionId: 'deck_sub_qwen', ts: 100, type: 'assistant.text', payload: { text: 'ok' } }],
+          epoch: 2,
+        }));
+        daemonWs.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY,
+          sessionName: 'deck_sub_qwen',
+          requestId: 'queue-full',
+          events: [{ eventId: 'queue-e2', sessionId: 'deck_sub_qwen', ts: 101, type: 'assistant.text', payload: { text: 'queued' } }],
+          epoch: 2,
+        }));
+        await flushAsync();
+
+        expect(browserOk.sentStrings.some((s) => JSON.parse(s).type === TIMELINE_MESSAGES.HISTORY)).toBe(false);
+        const queueFullResponses = browserQueueFull.sentStrings
+          .map((s) => JSON.parse(s) as Record<string, unknown>)
+          .filter((msg) => msg.type === TIMELINE_MESSAGES.HISTORY);
+        expect(queueFullResponses).toHaveLength(1);
+        expect(queueFullResponses[0]).toMatchObject({
+          type: TIMELINE_MESSAGES.HISTORY,
+          requestId: 'queue-full',
+          status: TIMELINE_RESPONSE_STATUS.ERROR,
+          errorReason: TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
+          events: [],
+        });
+
+        await flushBridgeDataPlane();
+        const okResponses = browserOk.sentStrings
+          .map((s) => JSON.parse(s) as Record<string, unknown>)
+          .filter((msg) => msg.type === TIMELINE_MESSAGES.HISTORY);
+        expect(okResponses).toHaveLength(1);
+        expect(okResponses[0]).toMatchObject({ requestId: 'queue-ok' });
+        expect(getCounter('ws_bridge_timeline_data_plane_queue_full', {
+          type: TIMELINE_MESSAGES.HISTORY,
+          route: 'browser_request',
+        })).toBe(1);
+      } finally {
+        resetQueueConfig();
+      }
+    });
+
+    it('cancels queued HTTP timeline delivery on abort and never resolves a late success', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const slowBrowser = new SlowMockWs();
+      bridge.handleBrowserConnection(slowBrowser as never, 'test-user', makeDb('valid-hash'));
+
+      slowBrowser.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'slow-before-http-abort',
+      }));
+      await flushAsync();
+      slowBrowser.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'slow-before-http-abort',
+        events: [{ eventId: 'slow-abort-e1', sessionId: 'deck_sub_qwen', ts: 100, type: 'assistant.text', payload: { text: 'hold' } }],
+        epoch: 2,
+      }));
+      await flushOneBridgeDataPlaneTurn();
+      expect(slowBrowser.sentStrings.some((s) => JSON.parse(s).type === TIMELINE_MESSAGES.HISTORY)).toBe(true);
+
+      const abortController = new AbortController();
+      const pending = bridge.requestTimelineHistory({
+        sessionName: 'deck_sub_qwen',
+        limit: 10,
+        abortSignal: abortController.signal,
+      });
+      await flushAsync();
+      const outbound = daemonWs.sentStrings
+        .map((s) => JSON.parse(s) as { type?: string; requestId?: string })
+        .find((msg) => msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST && msg.requestId?.startsWith('watch-hist-'));
+      expect(outbound?.requestId).toBeTruthy();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName: 'deck_sub_qwen',
+        requestId: outbound!.requestId,
+        events: [{ eventId: 'http-abort-e1', sessionId: 'deck_sub_qwen', ts: 101, type: 'assistant.text', payload: { text: 'late' } }],
+        epoch: 2,
+      }));
+      await flushAsync();
+
+      const assertion = expect(pending).rejects.toThrow(TIMELINE_REQUEST_ERROR_REASONS.REQUEST_CANCELED);
+      abortController.abort();
+      await assertion;
+      expect(getCounter('ws_bridge_timeline_data_plane_http_abort', {
+        type: TIMELINE_MESSAGES.HISTORY,
+        route: 'http_request',
+      })).toBe(1);
+
+      slowBrowser.releaseNextSend();
+      await flushBridgeDataPlane();
+      expect(getCounter('ws_bridge_timeline_data_plane_canceled', {
+        type: TIMELINE_MESSAGES.HISTORY,
+        route: 'http_request',
+      })).toBe(1);
+    });
+
+    it('defers large timeline data-plane sends so command.ack can pass first', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'deck_sub_qwen' }));
+      browserWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'large-history',
+        limit: 50,
+      }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'large-history',
+        events: [{
+          eventId: 'large-e1',
+          sessionId: 'deck_sub_qwen',
+          ts: 100,
+          type: 'assistant.text',
+          payload: { text: 'x'.repeat(TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE + 1024) },
+        }],
+        epoch: 3,
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'command.ack',
+        session: 'deck_sub_qwen',
+        commandId: 'cmd-after-large',
+        status: 'ok',
+      }));
+      await flushAsync();
+
+      let sentTypes = browserWs.sentStrings.map((s) => JSON.parse(s) as { type: string });
+      expect(sentTypes.map((msg) => msg.type)).toEqual(['command.ack']);
+
+      await flushBridgeDataPlane();
+      sentTypes = browserWs.sentStrings.map((s) => JSON.parse(s) as { type: string });
+      expect(sentTypes.map((msg) => msg.type)).toEqual(['command.ack', TIMELINE_MESSAGES.HISTORY]);
     });
   });
 

@@ -8,9 +8,15 @@
  */
 
 import { promises as fs } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import type { CcPreset, CcPresetModelInfo } from '../../shared/cc-presets.js';
+import {
+  getCcPresetAvailableModelIds,
+  getCcPresetEffectiveModel,
+  normalizeCcPresetName,
+  type CcPreset,
+  type CcPresetModelInfo,
+} from '../../shared/cc-presets.js';
 import logger from '../util/logger.js';
 
 const PRESETS_PATH = join(homedir(), '.imcodes', 'cc-presets.json');
@@ -78,9 +84,16 @@ function normalizePreset(raw: unknown): CcPreset | null {
 
 function normalizePresets(raw: unknown): CcPreset[] {
   if (!Array.isArray(raw)) return [];
-  return raw
+  const deduped = new Map<string, CcPreset>();
+  for (const preset of raw
     .map((item) => normalizePreset(item))
-    .filter((item): item is CcPreset => item !== null);
+    .filter((item): item is CcPreset => item !== null)) {
+    // Treat preset names as references. If stale files contain `minimax` and
+    // `MiniMax`, keep the last saved entry so later UI saves replace older
+    // values instead of getPreset() resolving the first stale copy after restart.
+    deduped.set(normalizeCcPresetName(preset.name), preset);
+  }
+  return [...deduped.values()];
 }
 
 export async function loadPresets(): Promise<CcPreset[]> {
@@ -89,39 +102,36 @@ export async function loadPresets(): Promise<CcPreset[]> {
     const raw = await fs.readFile(PRESETS_PATH, 'utf8');
     cachedPresets = normalizePresets(JSON.parse(raw));
     return cachedPresets;
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      logger.warn({ err, path: PRESETS_PATH }, 'Failed to load CC presets');
+    }
     cachedPresets = [];
     return cachedPresets;
   }
 }
 
 export async function savePresets(presets: CcPreset[]): Promise<void> {
-  cachedPresets = normalizePresets(presets);
-  await fs.writeFile(PRESETS_PATH, JSON.stringify(cachedPresets, null, 2), 'utf8');
-}
-
-function normalizePresetName(name: string): string {
-  return name.trim().toLowerCase();
+  const normalized = normalizePresets(presets);
+  await fs.mkdir(dirname(PRESETS_PATH), { recursive: true });
+  const tempPath = `${PRESETS_PATH}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(tempPath, JSON.stringify(normalized, null, 2), 'utf8');
+  await fs.rename(tempPath, PRESETS_PATH);
+  cachedPresets = normalized;
 }
 
 export async function getPreset(name: string): Promise<CcPreset | undefined> {
   const presets = await loadPresets();
-  const normalized = normalizePresetName(name);
-  return presets.find((p) => normalizePresetName(p.name) === normalized);
+  const normalized = normalizeCcPresetName(name);
+  return presets.find((p) => normalizeCcPresetName(p.name) === normalized);
 }
 
 export function getPresetEffectiveModel(preset: Pick<CcPreset, 'defaultModel' | 'env'>): string | undefined {
-  const model = preset.defaultModel?.trim() || preset.env['ANTHROPIC_MODEL']?.trim() || '';
-  return model || undefined;
+  return getCcPresetEffectiveModel(preset);
 }
 
 export function getPresetAvailableModelIds(preset: Pick<CcPreset, 'availableModels' | 'defaultModel' | 'env'>): string[] {
-  const discovered = preset.availableModels
-    ?.map((item) => item.id.trim())
-    .filter(Boolean) ?? [];
-  if (discovered.length > 0) return [...new Set(discovered)];
-  const fallback = getPresetEffectiveModel(preset);
-  return fallback ? [fallback] : [];
+  return getCcPresetAvailableModelIds(preset);
 }
 
 /**
@@ -339,9 +349,7 @@ export async function discoverPresetModels(preset: CcPreset): Promise<{
         throw new Error('No models returned by compatible API');
       }
       const existingModel = getPresetEffectiveModel(preset);
-      const defaultModel = availableModels.some((item) => item.id === existingModel)
-        ? existingModel
-        : (availableModels[0]?.id ?? undefined);
+      const defaultModel = existingModel ?? availableModels[0]?.id;
       return { availableModels, defaultModel, endpoint };
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
@@ -370,5 +378,5 @@ export function getSessionContextWindow(ccSessionId: string): number | undefined
 export function getCachedPresetContextWindow(presetName: string | null | undefined): number | undefined {
   const normalized = presetName?.trim().toLowerCase();
   if (!normalized || !cachedPresets) return undefined;
-  return cachedPresets.find((preset) => normalizePresetName(preset.name) === normalized)?.contextWindow;
+  return cachedPresets.find((preset) => normalizeCcPresetName(preset.name) === normalized)?.contextWindow;
 }

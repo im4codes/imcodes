@@ -70,4 +70,40 @@ describe('PreviewReadCacheFacade', () => {
     expect(cache.getInflight(key)).toBeNull();
     expect(cache.getGeneration('/tmp/a.txt')).toBe(1);
   });
+
+  it('sweeps expired entries for unrelated paths', () => {
+    const clock = new FakeClock();
+    const cache = new PreviewReadCacheFacade({ clock, ttlMs: 10 });
+    cache.writeSnapshot(snapshot('/tmp/a.txt', '10:5'));
+    cache.writeSnapshot(snapshot('/tmp/b.txt', '10:5'));
+
+    clock.current = 11;
+    expect(cache.getCached('/tmp/c.txt', '10:5')).toBeNull();
+
+    expect(cache.cacheSize()).toBe(0);
+    expect(cache.cacheBytes()).toBe(0);
+  });
+
+  it('evicts oldest entries by count and byte caps', () => {
+    const byCount = new PreviewReadCacheFacade({ maxEntries: 1 });
+    const a = snapshot('/tmp/a.txt', '10:5');
+    const b = snapshot('/tmp/b.txt', '10:5');
+    byCount.writeSnapshot(a);
+    byCount.writeSnapshot(b);
+    expect(byCount.getCached('/tmp/a.txt', '10:5')).toBeNull();
+    expect(byCount.getCached('/tmp/b.txt', '10:5')).toBe(b);
+
+    const byBytes = new PreviewReadCacheFacade({ maxBytes: 400 });
+    byBytes.writeSnapshot(snapshot('/tmp/large-a.txt', '10:5'));
+    byBytes.writeSnapshot(snapshot('/tmp/large-b.txt', '10:5'));
+    expect(byBytes.cacheBytes()).toBeLessThanOrEqual(400);
+  });
+
+  it('does not cache snapshots over the per-entry byte cap', () => {
+    const cache = new PreviewReadCacheFacade({ maxEntryBytes: 8 });
+    const value = snapshot('/tmp/a.txt', '10:5');
+
+    expect(cache.writeSnapshot(value)).toBe(false);
+    expect(cache.getCached('/tmp/a.txt', '10:5')).toBeNull();
+  });
 });

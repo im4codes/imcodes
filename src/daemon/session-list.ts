@@ -42,6 +42,7 @@ export interface SessionListItem extends SessionContextBootstrapState {
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
   description?: string;
   label?: string;
+  userCreated?: boolean;
   transportConfig?: Record<string, unknown>;
   transportPendingMessages?: string[];
   transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }>;
@@ -98,6 +99,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     contextSharedPolicyOverride: s.contextSharedPolicyOverride,
     description: s.description,
     label: s.label,
+    userCreated: s.userCreated,
     transportConfig: s.transportConfig,
     transportPendingMessages: runtime?.pendingMessages ?? [],
     transportPendingMessageEntries: runtime?.pendingEntries ?? [],

@@ -145,7 +145,7 @@ vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn()
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
 import { getTransportRuntime, launchTransportSession, relaunchSessionWithSettings, restoreTransportSessions, setSessionEventCallback, setSessionPersistCallback } from '../../src/agent/session-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
-import { getResendCount } from '../../src/daemon/transport-resend-queue.js';
+import { clearAllResend, enqueueResend, getResendCount } from '../../src/daemon/transport-resend-queue.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 
 const flush = async () => {
@@ -160,6 +160,7 @@ describe('sdk transport session restore', () => {
     mocks.claudeRuns.length = 0;
     mocks.codexRuns.length = 0;
     mocks.claudeFailures.clear();
+    clearAllResend();
     timelineEmitterEmitMock.mockClear();
     setSessionEventCallback(() => {});
     setSessionPersistCallback(async () => {});
@@ -221,6 +222,140 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_cc_brain')?.effort).toBe('high');
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-cc-restore' });
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
+  });
+
+  it('restoreTransportSessions awaits drainResend — pre-populated resend queue is fully transferred to runtime before resolve (audit cae1de69-826)', async () => {
+    /*
+     * End-to-end regression for the `await drainResend(...)` change in
+     * `src/agent/session-manager.ts:1517-1547` (commit 60d3d04b).
+     *
+     * Scenario:
+     *   1. A persisted transport session exists in the store.
+     *   2. The user sent messages while the daemon was offline; those
+     *      messages are sitting in the module-level resend queue.
+     *   3. `restoreTransportSessions(providerId)` is called.
+     *
+     * Contract enforced by the new `await drainResend(...)`:
+     *   - When `restoreTransportSessions` resolves, the resend queue
+     *     is empty.
+     *   - The first queued message has been dispatched to the
+     *     provider (visible in `mocks.claudeRuns`).
+     *   - Subsequent queued messages have been transferred into
+     *     `runtime._pendingMessages` (will fire as the next merged
+     *     turn when the first turn completes).
+     *
+     * This guards bug 1+3: any future refactor that reintroduces the
+     * fire-and-forget `void drainResend(...)` pattern AND inserts an
+     * `await` between `transportRuntimes.set` and `drainResend` would
+     * break this contract (msg-2 could arrive after the await and
+     * before drain dispatches msg-1).
+     */
+    mocks.store.set('deck_sdk_drain_brain', {
+      name: 'deck_sdk_drain_brain',
+      projectName: 'sdkdrain',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/sdk-drain',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'route-drain-restore',
+      ccSessionId: 'cc-session-drain',
+      requestedModel: 'sonnet',
+      activeModel: 'sonnet',
+      transportConfig: { provider: { mode: 'safe' }, sharedContextNamespace: { scope: 'personal', projectId: 'sdk-drain-restore' } },
+    });
+
+    // Pre-populate the resend queue with messages that arrived while
+    // the runtime was offline.
+    const queuedAt = Date.now();
+    enqueueResend('deck_sdk_drain_brain', { text: 'offline-msg-1', commandId: 'cmd-q1', queuedAt });
+    enqueueResend('deck_sdk_drain_brain', { text: 'offline-msg-2', commandId: 'cmd-q2', queuedAt });
+    enqueueResend('deck_sdk_drain_brain', { text: 'offline-msg-3', commandId: 'cmd-q3', queuedAt });
+
+    expect(getResendCount('deck_sdk_drain_brain')).toBe(3);
+
+    await connectProvider('claude-code-sdk', {});
+    await restoreTransportSessions('claude-code-sdk');
+
+    // CONTRACT 1 — module-level resend queue is empty BEFORE the
+    // function returned (because drain was awaited inside it).
+    expect(getResendCount('deck_sdk_drain_brain')).toBe(0);
+
+    // CONTRACT 2 — runtime exists after restore.
+    const runtime = getTransportRuntime('deck_sdk_drain_brain');
+    expect(runtime).toBeDefined();
+
+    // Let the dispatched turn(s) complete in the mock provider.
+    // Mock auto-completes each turn, so _drainPending will fire the
+    // second turn (merged msg-2 + msg-3) automatically.
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      if (mocks.claudeRuns.length >= 2) break;
+      await flush();
+    }
+
+    // CONTRACT 3 — every queued message reached the provider, in the
+    // expected pattern:
+    //   - claudeRuns[0]: msg-1 (dispatched via drainResend's first
+    //     dispatcher call, while _sending was false)
+    //   - claudeRuns[1]: merged msg-2 + msg-3 (after first turn
+    //     completed, _drainPending fired a new merged turn)
+    expect(mocks.claudeRuns).toHaveLength(2);
+    expect(mocks.claudeRuns[0].prompt).toBe('offline-msg-1');
+    expect(mocks.claudeRuns[1].prompt).toBe('offline-msg-2\n\nofflinemsg-3'.replace('offlinemsg', 'offline-msg'));
+  });
+
+  it('launchTransportSession awaits drainResend — fresh launch with pre-populated queue dispatches in order', async () => {
+    /*
+     * Mirrors the contract for the second `await drainResend(...)` site
+     * in `src/agent/session-manager.ts:1830-1853` (commit 60d3d04b).
+     *
+     * Scenario: A relaunch was triggered (e.g. provider auto-recover
+     * after error) while a user was typing — the messages went to the
+     * resend queue. When `launchTransportSession` completes, those
+     * messages must be in the runtime, not stranded in the resend
+     * queue waiting for a separate drain.
+     */
+    // Pre-populate queue BEFORE launching.
+    const queuedAt = Date.now();
+    enqueueResend('deck_sdk_launch_brain', { text: 'relaunch-msg-1', commandId: 'cmd-l1', queuedAt });
+    enqueueResend('deck_sdk_launch_brain', { text: 'relaunch-msg-2', commandId: 'cmd-l2', queuedAt });
+
+    await connectProvider('claude-code-sdk', {});
+    await launchTransportSession({
+      name: 'deck_sdk_launch_brain',
+      projectName: 'sdklaunch',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/sdk-launch',
+      requestedModel: 'sonnet',
+      ccSessionId: 'cc-session-launch',
+    });
+
+    // Queue is empty by the time launchTransportSession resolves.
+    expect(getResendCount('deck_sdk_launch_brain')).toBe(0);
+
+    const runtime = getTransportRuntime('deck_sdk_launch_brain');
+    expect(runtime).toBeDefined();
+
+    // Wait for mock provider to auto-complete both turns.
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      if (mocks.claudeRuns.length >= 2) break;
+      await flush();
+    }
+
+    // First queued message dispatched as its own turn (drainResend
+    // first iteration); second message merged into the follow-up
+    // turn fired by _drainPending after the first turn completed.
+    expect(mocks.claudeRuns).toHaveLength(2);
+    expect(mocks.claudeRuns[0].prompt).toBe('relaunch-msg-1');
+    expect(mocks.claudeRuns[1].prompt).toBe('relaunch-msg-2');
   });
 
   it('restores codex-sdk sessions with persisted thread id and sends via resumeThread()', async () => {

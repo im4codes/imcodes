@@ -10,6 +10,7 @@ import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestra
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { startLatencyTracer } from './latency-tracer.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import { timelineStore } from './timeline-store.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
@@ -18,6 +19,7 @@ import { initTempFileStore } from '../store/temp-file-store.js';
 import { setupCCHooks } from '../agent/signal.js';
 import type http from 'http';
 import net from 'node:net';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { loadConfig, type Config } from '../config.js';
 import { loadCredentials } from '../bind/bind-flow.js';
 import { sendKeys } from '../agent/tmux.js';
@@ -42,7 +44,7 @@ import { isTransportAgent } from '../agent/detect.js';
 import { DAEMON_VERSION } from '../util/version.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
-async function getLastAssistantText(sessionName: string): Promise<string | undefined> {
+export async function getLastAssistantText(sessionName: string): Promise<string | undefined> {
   try {
     const events = await timelineStore.readByTypesPreferred(sessionName, ['assistant.text'], { limit: 100 });
     for (let i = events.length - 1; i >= 0; i--) {
@@ -55,7 +57,7 @@ async function getLastAssistantText(sessionName: string): Promise<string | undef
   return undefined;
 }
 
-function resolvePushDisplayContext(sessionName: string, sessions: SessionRecord[]): {
+export function resolvePushDisplayContext(sessionName: string, sessions: SessionRecord[]): {
   project: string;
   label?: string;
   parentLabel?: string;
@@ -128,9 +130,10 @@ async function persistSessionToWorker(
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'X-Server-Id': serverId },
       body: JSON.stringify(payload),
     });
-    if (!res.ok) logger.warn({ status: res.status, name }, 'persistSessionToWorker: non-ok response');
+    if (!res.ok) throw new Error(`persistSessionToWorker non-ok response: ${res.status}`);
   } catch (e) {
     logger.warn({ err: e, name }, 'persistSessionToWorker: fetch failed');
+    throw e;
   }
 }
 
@@ -140,9 +143,10 @@ async function deleteSessionFromWorker(workerUrl: string, serverId: string, toke
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}`, 'X-Server-Id': serverId },
     });
-    if (!res.ok) logger.warn({ status: res.status, name }, 'deleteSessionFromWorker: non-ok response');
+    if (!res.ok) throw new Error(`deleteSessionFromWorker non-ok response: ${res.status}`);
   } catch (e) {
     logger.warn({ err: e, name }, 'deleteSessionFromWorker: fetch failed');
+    throw e;
   }
 }
 
@@ -152,9 +156,10 @@ async function deleteSubSessionFromWorker(workerUrl: string, serverId: string, t
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}`, 'X-Server-Id': serverId },
     });
-    if (!res.ok) logger.warn({ status: res.status, id }, 'deleteSubSessionFromWorker: non-ok response');
+    if (!res.ok) throw new Error(`deleteSubSessionFromWorker non-ok response: ${res.status}`);
   } catch (e) {
     logger.warn({ err: e, id }, 'deleteSubSessionFromWorker: fetch failed');
+    throw e;
   }
 }
 
@@ -350,9 +355,25 @@ export async function startup(): Promise<DaemonContext> {
   startCleanupTimer();
   logger.info('File transfer initialized');
 
-  // Clean up old timeline files (>7 days) and truncate oversized ones
-  timelineStore.cleanup();
-  timelineStore.truncateAll();
+  // Clean up old timeline files (>7 days) and truncate oversized ones.
+  //
+  // Both calls walk every JSONL file in ~/.imcodes/timeline. With a backlog
+  // of 50–100 oversized sessions (~5 MB each) the synchronous pre-R3 path
+  // blocked the daemon main thread for 5–20 s before `ready`. We now run
+  // them in the background, yielding the event loop between sessions, so
+  // the daemon comes up immediately and chip away at retention while WS /
+  // session restore proceeds in parallel. Both methods swallow internal
+  // errors; the surrounding handler logs anything that escapes.
+  void (async () => {
+    try {
+      const start = Date.now();
+      await timelineStore.cleanup();
+      await timelineStore.truncateAll();
+      logger.info({ elapsedMs: Date.now() - start }, 'TimelineStore: startup cleanup + truncateAll completed (background)');
+    } catch (err) {
+      logger.warn({ err }, 'TimelineStore: startup cleanup/truncateAll background failed');
+    }
+  })();
 
   // Archive stale local memory projections (recent_summary with no hits after 30 days)
   pruneLocalMemory();
@@ -576,7 +597,24 @@ export async function startup(): Promise<DaemonContext> {
   });
 
   for (const session of listSessions()) {
-    const history = await timelineStore.readPreferred(session.name, { limit: 100 });
+    // Per-session try/catch — commit 42dfabec changed `readPreferred` to
+    // throw `TimelinePreferredReadError` when the SQLite projection is
+    // unavailable instead of returning `[]`. An unhandled throw here would
+    // abort the whole startup backfill loop after the first bad session.
+    // Fall back to the JSONL `read()` path (same semantics, slower) so a
+    // single mid-init projection still lets every session bootstrap.
+    let history: Awaited<ReturnType<typeof timelineStore.readPreferred>> = [];
+    try {
+      history = await timelineStore.readPreferred(session.name, { limit: 100 });
+    } catch (err) {
+      logger.warn({ err, session: session.name }, 'Startup backfill: readPreferred failed, falling back to JSONL');
+      try {
+        history = timelineStore.read(session.name, { limit: 100 });
+      } catch (fallbackErr) {
+        logger.warn({ err: fallbackErr, session: session.name }, 'Startup backfill: JSONL fallback also failed; skipping session');
+        continue;
+      }
+    }
     if (history.length === 0) continue;
     void liveContextIngestion.backfillSessionFromEvents(session.name, history).catch((err) => {
       logger.warn({ err, session: session.name }, 'Shared-context timeline backfill failed');
@@ -596,7 +634,23 @@ export async function startup(): Promise<DaemonContext> {
     // Push all active sessions from local store to DB on startup.
     // Covers the case where DB was cleared while the daemon was running
     // (or route was misconfigured and persists silently failed).
+    //
+    // F1 fix (audit cae1de69-826) — per-entry try/catch + warn-continue.
+    // Previously the loop ran `await persistSessionToWorker(...)` with no
+    // try/catch; after the session-group-clone PR (cf7d8196) made
+    // `persistSessionToWorker` throw on non-2xx / fetch failure, ANY
+    // single push failure (server 5xx, network blip, DB conflict) would
+    // abort the entire bootstrap function BEFORE `autoReconnectProviders`
+    // (~200 lines later) had a chance to run. The end result was a
+    // "half-started zombie" daemon with the WS up but no transport
+    // runtimes restored, which directly produced the "bot stays asleep,
+    // no SDK output" symptom reported by the user.
+    //
+    // Worker DB sync is a remote-visibility concern, not a local-runtime
+    // dependency. It must NEVER block transport runtime recovery.
     const localSessions = listSessions();
+    const nonStoppedCount = localSessions.filter((s) => s.state !== 'stopped').length;
+    let pushFailures = 0;
     for (const s of localSessions) {
       if (s.state !== 'stopped' && !isKnownTestSessionLike({
         name: s.name,
@@ -604,11 +658,22 @@ export async function startup(): Promise<DaemonContext> {
         projectDir: s.projectDir,
         parentSession: s.parentSession,
       })) {
-        await persistSessionToWorker(workerUrl!, serverId, token, s.name, s);
+        try {
+          await persistSessionToWorker(workerUrl!, serverId, token, s.name, s);
+        } catch (err) {
+          pushFailures += 1;
+          logger.warn(
+            { err, session: s.name },
+            'startup: persistSessionToWorker failed (continuing daemon bootstrap)',
+          );
+        }
       }
     }
-    if (localSessions.filter((s) => s.state !== 'stopped').length > 0) {
-      logger.info({ count: localSessions.filter((s) => s.state !== 'stopped').length }, 'Pushed local sessions to server DB on startup');
+    if (nonStoppedCount > 0) {
+      logger.info(
+        { count: nonStoppedCount, failures: pushFailures },
+        'Pushed local sessions to server DB on startup',
+      );
     }
     void replicatePendingProcessedContext({ workerUrl: workerUrl!, serverId, token }).catch((err) => {
       logger.warn({ err }, 'Initial processed-context replication failed');
@@ -798,6 +863,9 @@ export async function startup(): Promise<DaemonContext> {
   startCodexQuotaPoller(serverLink);
   startContextReplicationPoller(workerUrl, serverId, token);
   startContextMaterializationPoller(liveContextIngestion);
+  startGcPoller();
+  startEventLoopDelayMonitor();
+  startLatencyTracer();
 
   logger.info('Daemon started');
 
@@ -903,6 +971,25 @@ export async function shutdown(exitCode = 0): Promise<void> {
     logger.warn({ err }, 'Daemon shutdown memory drain failed');
   }
 
+  // Flush the async timeline pipeline before terminating the projection
+  // worker. `flushAll` waits for per-session JSONL append chains; `drain`
+  // then waits for SQLite mirror writes to settle. Both are bounded so a
+  // hung disk cannot block shutdown indefinitely (matches the
+  // `drainMasterCompactions(5_000)` style above).
+  try {
+    const { timelineProjection } = await import('./timeline-projection.js');
+    const timelineFlushStart = Date.now();
+    await timelineStore.flushAll(5_000);
+    await timelineProjection.drain(2_000);
+    logger.info({
+      elapsedMs: Date.now() - timelineFlushStart,
+      pendingSessions: timelineStore.getPendingSessionCount(),
+      pendingProjection: timelineProjection.getPendingCount(),
+    }, 'Daemon shutdown: timeline pipeline drained');
+  } catch (err) {
+    logger.warn({ err }, 'Daemon shutdown timeline drain failed');
+  }
+
   try {
     const { disconnectAll } = await import('../agent/provider-registry.js');
     await disconnectAll();
@@ -916,10 +1003,33 @@ export async function shutdown(exitCode = 0): Promise<void> {
   }
 
   try {
+    const { shutdownDefaultTimelineHistoryWorkerPoolForDaemon } = await import('./timeline-history-pool.js');
+    await shutdownDefaultTimelineHistoryWorkerPoolForDaemon();
+  } catch (err) {
+    logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown timeline history worker drain failed');
+  }
+
+  try {
+    const { shutdownDefaultFsListWorkerPoolForDaemon } = await import('./fs-list-pool.js');
+    await shutdownDefaultFsListWorkerPoolForDaemon();
+  } catch (err) {
+    logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown fs list worker drain failed');
+  }
+
+  try {
+    const { shutdownDefaultFsGitStatusWorkerPoolForDaemon } = await import('./fs-git-status-pool.js');
+    await shutdownDefaultFsGitStatusWorkerPoolForDaemon();
+  } catch (err) {
+    logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown fs git status worker drain failed');
+  }
+
+  try {
     if (healthTimer) clearInterval(healthTimer);
     if (codexQuotaTimer) clearInterval(codexQuotaTimer);
     if (contextReplicationTimer) clearInterval(contextReplicationTimer);
     if (contextMaterializationTimer) clearInterval(contextMaterializationTimer);
+    if (gcTimer) clearInterval(gcTimer);
+    if (eventLoopDelayTimer) clearInterval(eventLoopDelayTimer);
     hookServer?.close();
     ctx?.serverLink?.disconnect();
     configureSharedContextRuntime(null);
@@ -944,10 +1054,16 @@ const HEALTH_POLL_MS = 30_000;
 const CODEX_QUOTA_REFRESH_MS = 60_000;
 const CONTEXT_REPLICATION_POLL_MS = 30_000;
 const CONTEXT_MATERIALIZATION_POLL_MS = 15_000;
+/** Periodic V8 major-GC trigger (5 min by default; tuneable via env).
+ *  See `startGcPoller()` for the rationale.
+ */
+const GC_POLL_MS = parseInt(process.env.IMCODES_GC_POLL_MS ?? '300000', 10);
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 let codexQuotaTimer: ReturnType<typeof setInterval> | null = null;
 let contextReplicationTimer: ReturnType<typeof setInterval> | null = null;
 let contextMaterializationTimer: ReturnType<typeof setInterval> | null = null;
+let gcTimer: ReturnType<typeof setInterval> | null = null;
+let eventLoopDelayTimer: ReturnType<typeof setInterval> | null = null;
 let hookServer: http.Server | null = null;
 
 /** Periodically check all running sessions; restart any that have disappeared or died. */
@@ -1015,6 +1131,102 @@ function startContextMaterializationPoller(liveContextIngestion: LiveContextInge
       logger.warn({ err }, 'Context materialization poll failed');
     });
   }, CONTEXT_MATERIALIZATION_POLL_MS);
+}
+
+/**
+ * Periodically force a V8 major GC.
+ *
+ * Why: production daemon on a self-hosted server (211) was OOM-crashing
+ * every 1–9 hours despite holding only ~218 MB of *live* objects. Manual
+ * SIGUSR2 (which forces a heap-snapshot pre-GC) shrunk RSS from 2755 MB
+ * → 1976 MB in one shot — i.e. ~780 MB of *unreachable* garbage was
+ * sitting in V8's old generation waiting for major GC. With V8's default
+ * heap limit of 4 GB, major GC only triggers when heap pressure forces
+ * it, by which point the daemon is already at the edge of OOM. If a
+ * legitimate spike in live data (e.g. a large transformers tokenizer
+ * batch) lands during that window, V8 aborts the process with
+ * "Reached heap limit Allocation failed".
+ *
+ * The bigger heap limit (`--max-old-space-size=12288` env override on
+ * 211) keeps the daemon alive but doesn't fix the underlying behavior
+ * — major GC still runs lazily, RSS climbs to many GB before
+ * collection, and each major GC pause is multi-second on a fat heap
+ * (looks like "the daemon went offline" to the operator). Forcing a
+ * GC every few minutes keeps RSS bounded near actual live size and
+ * keeps GC pauses short.
+ *
+ * Requires `--expose-gc`. Without it, `globalThis.gc` is undefined and
+ * the poller is a silent no-op (so this is safe to ship without
+ * mandating the flag — the worst case is we don't get the speedup).
+ */
+function startGcPoller(): void {
+  const gc = (globalThis as { gc?: () => void }).gc;
+  if (typeof gc !== 'function') {
+    logger.info('GC poller: --expose-gc not enabled, skipping (set NODE_OPTIONS to "--expose-gc --max-old-space-size=N" to enable)');
+    return;
+  }
+  if (!Number.isFinite(GC_POLL_MS) || GC_POLL_MS < 30_000) {
+    logger.info({ requested: process.env.IMCODES_GC_POLL_MS }, 'GC poller: interval clamped or invalid, defaulting to 5 min');
+  }
+  const intervalMs = Number.isFinite(GC_POLL_MS) && GC_POLL_MS >= 30_000 ? GC_POLL_MS : 300_000;
+  gcTimer = setInterval(() => {
+    const t0 = Date.now();
+    const before = process.memoryUsage().rss;
+    try {
+      gc();
+    } catch (err) {
+      logger.warn({ err }, 'GC poller: gc() threw');
+      return;
+    }
+    const after = process.memoryUsage().rss;
+    const elapsed = Date.now() - t0;
+    // Only log meaningful GCs (freed > 50 MB or took > 200 ms) to avoid
+    // chatty logs on quiet daemons.
+    if (before - after > 50 * 1024 * 1024 || elapsed > 200) {
+      logger.info(
+        { rssBeforeMB: (before / 1024 / 1024) | 0, rssAfterMB: (after / 1024 / 1024) | 0, elapsedMs: elapsed },
+        'GC poller: forced major GC',
+      );
+    }
+  }, intervalMs);
+  logger.info({ intervalMs }, 'GC poller: started');
+}
+
+/**
+ * Event-loop delay sampler. Emits a warn log every minute if the p99
+ * loop lag exceeds 50 ms in the last sampling window — a direct
+ * proxy for "is anything blocking the daemon main thread?". The
+ * histogram is `unref`'d so it never holds the process alive.
+ *
+ * After the async timeline refactor (PR-A), this metric should sit
+ * near zero except during cron / GC bursts. A persistently high p99
+ * signals that another sync I/O path slipped in.
+ */
+function startEventLoopDelayMonitor(): void {
+  let monitor: ReturnType<typeof monitorEventLoopDelay>;
+  try {
+    monitor = monitorEventLoopDelay({ resolution: 20 });
+    monitor.enable();
+  } catch (err) {
+    logger.debug({ err }, 'event-loop-delay: monitor unavailable (perf_hooks missing)');
+    return;
+  }
+  eventLoopDelayTimer = setInterval(() => {
+    const p99ms = monitor.percentile(99) / 1e6;
+    const meanMs = monitor.mean / 1e6;
+    if (p99ms > 50) {
+      logger.warn({
+        p99ms: Number(p99ms.toFixed(1)),
+        meanMs: Number(meanMs.toFixed(1)),
+        pendingSessions: timelineStore.getPendingSessionCount(),
+      }, 'event-loop-delay: high p99 (>50ms) — main thread blocked recently');
+    }
+    monitor.reset();
+  }, 60_000);
+  if (typeof eventLoopDelayTimer.unref === 'function') {
+    eventLoopDelayTimer.unref();
+  }
+  logger.info({ intervalMs: 60_000, warnThresholdMs: 50 }, 'event-loop-delay: monitor started');
 }
 
 function setupSignalHandlers(): void {

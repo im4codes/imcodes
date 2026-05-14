@@ -57,6 +57,90 @@ describe('P2pProgressCard', () => {
     expect(screen.queryByText('H4/2')).toBeNull();
   });
 
+  it('shows legacy combo cycle progress in the P2P bar instead of raw execution steps', () => {
+    const { container } = render(
+      <P2pProgressCard
+        discussion={{
+          id: 'p2p_run_combo_cycle',
+          topic: 'P2P brainstorm · brain',
+          state: 'running',
+          modeKey: 'brainstorm',
+          currentRound: 3,
+          maxRounds: 4,
+          flowCycleCurrent: 2,
+          flowCycleTotal: 2,
+          flowStepCurrent: 1,
+          flowStepTotal: 2,
+          completedHops: 2,
+          totalHops: 1,
+          activeHop: 3,
+          activeRoundHop: 1,
+          activePhase: 'hop',
+          nodes: [],
+        }}
+      />,
+    );
+
+    expect(screen.getAllByText('R2/2').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('S1/2').length).toBeGreaterThan(0);
+    expect(screen.queryByText('R3/4')).toBeNull();
+    expect(container.querySelectorAll('.discussions-progress-segments-round .discussions-progress-segment')).toHaveLength(2);
+  });
+
+  it('keeps combo cycle progress visible in the mobile P2P bar', () => {
+    render(
+      <P2pProgressCard
+        mobile
+        discussion={{
+          id: 'p2p_run_combo_cycle_mobile',
+          topic: 'P2P discuss · brain',
+          state: 'running',
+          modeKey: 'discuss',
+          currentRound: 4,
+          maxRounds: 4,
+          flowCycleCurrent: 2,
+          flowCycleTotal: 2,
+          flowStepCurrent: 2,
+          flowStepTotal: 2,
+          completedHops: 3,
+          totalHops: 1,
+          activeHop: 4,
+          activeRoundHop: 1,
+          activePhase: 'summary',
+          nodes: [],
+        }}
+      />,
+    );
+
+    expect(screen.getByText('R2/2')).toBeTruthy();
+    expect(screen.getByText('S2/2')).toBeTruthy();
+  });
+
+  it('shows execution phase while waiting for original-request marker proof', () => {
+    render(
+      <P2pProgressCard
+        discussion={{
+          id: 'p2p_run_execution_marker',
+          topic: 'P2P plan · brain',
+          state: 'running',
+          modeKey: 'plan',
+          currentRound: 1,
+          maxRounds: 1,
+          flowCycleCurrent: 1,
+          flowCycleTotal: 1,
+          completedHops: 1,
+          totalHops: 1,
+          activePhase: 'execution',
+          nodes: [
+            { label: 'brain', agentType: 'codex', status: 'active', phase: 'execution' },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getAllByText('phase_execution').length).toBeGreaterThan(0);
+  });
+
   it('shows a close action for failed discussions', () => {
     const onStopDiscussion = vi.fn();
 
@@ -83,6 +167,34 @@ describe('P2pProgressCard', () => {
     expect(screen.queryByText(/cancel/i)).toBeNull();
     fireEvent.click(closeButton);
     expect(onStopDiscussion).toHaveBeenCalledWith('p2p_run_failed');
+  });
+
+  it('requires a second confirmation click before cancelling active discussions', () => {
+    const onStopDiscussion = vi.fn();
+
+    render(
+      <P2pProgressCard
+        discussion={{
+          id: 'p2p_run_active',
+          topic: 'P2P audit · brain',
+          state: 'running',
+          modeKey: 'audit',
+          currentRound: 1,
+          maxRounds: 1,
+          completedHops: 0,
+          totalHops: 1,
+          activePhase: 'hop',
+          nodes: [],
+        }}
+        onStopDiscussion={onStopDiscussion}
+      />,
+    );
+
+    fireEvent.click(screen.getByText(/cancel/i));
+    expect(onStopDiscussion).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByText(/confirm_cancel/i));
+    expect(onStopDiscussion).toHaveBeenCalledWith('p2p_run_active');
   });
 
   it('keeps active progress highlighted but static once the discussion is no longer running', () => {

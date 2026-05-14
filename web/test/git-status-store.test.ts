@@ -8,6 +8,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   requestSharedChanges,
+  forceRefreshSharedChangesForCheckout,
   settleSharedChangesRequest,
   subscribeSharedChanges,
   getSharedChangesKey,
@@ -123,5 +124,31 @@ describe('git-status-store — refresh resilience', () => {
     // 5s TTL and fire again (user explicitly asking for fresh data).
     requestSharedChanges(ws, repo, true);
     expect(ws.fsGitStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it('checkout force refresh bypasses TTL once per generation and drops stale in-flight responses', () => {
+    const { ws, requestIds, emit } = makeFakeWs();
+    const repo = '/repo/e';
+    const listener = vi.fn();
+    subscribeSharedChanges(getSharedChangesKey(ws, repo), listener);
+
+    requestSharedChanges(ws, repo, false);
+    emit(filesResponse('req-1', [{ path: '/repo/e/old.ts', code: 'M' }]));
+    expect(listener).toHaveBeenCalledWith([{ path: '/repo/e/old.ts', code: 'M' }]);
+
+    requestSharedChanges(ws, repo, false);
+    expect(requestIds).toEqual(['req-1']);
+
+    forceRefreshSharedChangesForCheckout(ws, repo, 2);
+    expect(requestIds).toEqual(['req-1', 'req-2']);
+    forceRefreshSharedChangesForCheckout(ws, repo, 2);
+    expect(requestIds).toEqual(['req-1', 'req-2']);
+
+    forceRefreshSharedChangesForCheckout(ws, repo, 3);
+    expect(requestIds).toEqual(['req-1', 'req-2', 'req-3']);
+    emit(filesResponse('req-2', [{ path: '/repo/e/stale.ts', code: 'A' }]));
+    expect(listener).not.toHaveBeenLastCalledWith([{ path: '/repo/e/stale.ts', code: 'A' }]);
+    emit(filesResponse('req-3', []));
+    expect(listener).toHaveBeenLastCalledWith([]);
   });
 });

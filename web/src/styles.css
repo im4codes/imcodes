@@ -51,7 +51,7 @@ body {
 .tab:hover { color: #c9d1d9; background: #161b22; }
 .tab.active { color: #e6edf3; background: #161b22; border-top-color: #3b82f6; border-bottom-color: transparent; }
 .tab.brain { color: #9e7ff0; }
-.tab.brain.active { color: #c4b5fd; border-top-color: #8b5cf6; }
+.tab.brain.active { color: #c4b5fd; border-top-color: transparent; border-top-width: 2px; border-bottom-color: #8b5cf6; border-bottom-width: 4px; }
 .tab.idle::after { content: '●'; margin-left: 5px; color: #3fb950; font-size: 7px; vertical-align: middle; }
 .tab.busy::after { content: '◌'; margin-left: 5px; color: #e3b341; font-size: 7px; vertical-align: middle; animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -420,7 +420,13 @@ body {
 .openspec-change-action-btn { padding: 4px 8px; font-size: 11px; white-space: nowrap; }
 .openspec-submenu { z-index: 2147483647; }
 .openspec-submenu-inline { position: static; width: 100%; min-width: 0; max-width: none; max-height: none; margin-top: 6px; overflow: visible; }
-.menu-dropdown-p2p { z-index: 10001; width: max-content; min-width: 240px; max-width: min(560px, calc(100vw - 24px)); }
+.menu-dropdown-p2p { z-index: 10001; width: max-content; min-width: 240px; max-width: min(560px, calc(100vw - 24px)); max-height: none; overflow-y: visible; }
+.menu-dropdown-p2p .p2p-dropdown-rounds { display: grid; gap: 6px; padding: 8px 10px 6px; margin: 4px 6px 6px; background: linear-gradient(180deg, rgba(29, 78, 216, 0.46), rgba(30, 64, 175, 0.34)); border: 1px solid #22c55e; border-radius: 8px; box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.18), 0 0 0 1px rgba(34, 197, 94, 0.12); }
+.menu-dropdown-p2p .p2p-dropdown-rounds .p2p-menu-section-label { color: #86efac; }
+.p2p-dropdown-rounds-hint { color: #bfdbfe; }
+.p2p-dropdown-round { padding: 5px 0; text-align: center; border: 1px solid rgba(34, 197, 94, 0.48); border-radius: 4px; background: rgba(30, 64, 175, 0.48); color: #dbeafe; font-size: 12px; font-weight: 600; }
+.p2p-dropdown-round:hover { background: #1d4ed8; border-color: #4ade80; color: #ffffff; }
+.p2p-dropdown-round.menu-item-active { background: #1d4ed8 !important; border-color: #22c55e; color: #eff6ff; font-weight: 700; box-shadow: inset 0 0 12px rgba(59, 130, 246, 0.35), 0 0 0 1px rgba(34, 197, 94, 0.28); }
 .menu-item { display: block; width: 100%; padding: 9px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; transition: background 0.1s; }
 .menu-dropdown-p2p .menu-item,
 .menu-dropdown-p2p .menu-divider,
@@ -525,7 +531,33 @@ body {
   .openspec-submenu { max-height: min(45vh, calc(100vh - 120px)); }
   .openspec-submenu-inline { margin-top: 4px; }
   .openspec-submenu-inline .menu-item { white-space: normal; }
-  .menu-dropdown-p2p { right: 0; width: calc(100vw - 16px); min-width: calc(100vw - 16px); max-width: calc(100vw - 16px); }
+  .menu-dropdown-p2p {
+    position: fixed;
+    left: 8px;
+    right: 8px;
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 64px);
+    width: auto;
+    min-width: 0;
+    max-width: none;
+    max-height: min(72vh, calc(100vh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 96px));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  @supports (height: 100dvh) {
+    .menu-dropdown-p2p {
+      max-height: min(72dvh, calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 96px));
+    }
+  }
+  .menu-dropdown-p2p .p2p-dropdown-rounds {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    margin: 0 0 6px;
+    border-radius: 0 0 10px 10px;
+    background: linear-gradient(180deg, rgba(29, 78, 216, 0.54), rgba(30, 64, 175, 0.42));
+    border-color: #22c55e;
+  }
   .menu-dropdown-p2p .menu-item,
   .menu-dropdown-p2p .menu-divider,
   .p2p-menu-section-label { white-space: normal; }
@@ -981,8 +1013,21 @@ body {
 .chat-bubble-content { white-space: pre-wrap; word-break: break-word; }
 .chat-bubble-time { font-size: 10px; color: #64748b; margin-top: 2px; }
 .chat-sel-menu { position: absolute; z-index: 20; pointer-events: auto; display: flex; flex-wrap: wrap; gap: 4px; max-width: calc(100% - 16px); box-sizing: border-box; }
-/* Mobile: disable native text selection/callout in chat — custom long-press timer handles Copy/Quote. */
-@media (pointer: coarse) { .chat-view { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; } }
+/* Touch-pointer layout: disable native text selection/callout in chat so our
+   custom long-press timer handles Copy/Quote. This intentionally does NOT use
+   viewport width: desktop users can run narrow windows and still need native
+   selection plus the Copy/Quote popup. Keep in sync with ChatView.tsx's
+   TOUCH_GESTURE_MEDIA_QUERY. */
+@media (pointer: coarse) {
+  .chat-view { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  /* `touch-action: manipulation` hands the second short tap to JS without
+     iOS Safari's ~300ms double-tap-zoom probe. Viewport user-scalable=no
+     already suppresses the zoom itself; this just removes the latency. */
+  .chat-event.chat-assistant,
+  .chat-event.chat-user {
+    touch-action: manipulation;
+  }
+}
 .chat-sel-btn { background: #1e293b; border: 1px solid #475569; color: #e2e8f0; font-size: 13px; padding: 5px 14px; border-radius: 6px; cursor: pointer; font-family: inherit; white-space: nowrap; box-shadow: 0 4px 12px rgba(0,0,0,0.4); transition: background 0.15s; }
 .chat-sel-btn:hover { background: #334155; }
 .chat-sel-btn.copied { background: #166534; border-color: #16a34a; color: #86efac; }
@@ -1022,6 +1067,7 @@ body {
 .subcard-size-input:focus { border-color: #3b82f6; }
 .subcard-toolbar-label { font-size: 11px; color: #475569; }
 .daemon-stats-inline { font-size: 11px; margin-left: 8px; white-space: nowrap; }
+.daemon-local-clock { color: #94a3b8; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .subcard-toolbar-add { background: none; border: 1px dashed #475569; border-radius: 4px; color: #64748b; cursor: pointer; font-size: 16px; padding: 0 8px; margin-left: auto; transition: all 0.12s; }
 .subcard-toolbar-add:hover { border-color: #3b82f6; color: #93c5fd; }
 .subcard-empty-state { padding: 8px 12px; font-size: 12px; color: #475569; }
@@ -1037,7 +1083,7 @@ body {
 .subcard-drag-wrap:active { cursor: grabbing; }
 
 /* Individual card */
-.subcard { width: 350px; height: 250px; min-width: 350px; background: #0f1117; border: 1px solid #334155; border-radius: 8px; cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s; display: flex; flex-direction: column; isolation: isolate; }
+.subcard { width: 350px; height: 250px; min-width: 350px; background: #0f1117; border: 1px solid #334155; border-top: 3px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s; display: flex; flex-direction: column; isolation: isolate; }
 .subcard-header { border-radius: 8px 8px 0 0; overflow: hidden; }
 .subcard:hover { border-color: #475569; box-shadow: 0 2px 12px rgba(0,0,0,0.4); }
 .subcard-open { border-color: #334d6b; }
@@ -1048,6 +1094,11 @@ body {
 @keyframes subcard-focus-glow { 0%, 100% { box-shadow: 0 0 8px #60a5faaa, 0 0 20px #3b82f644; } 50% { box-shadow: 0 0 16px #60a5facc, 0 0 32px #3b82f666; } }
 .subcard-focused:not(.subcard-running-pulse) { border-color: #60a5fa; border-width: 2px; box-shadow: 0 0 8px #60a5faaa, 0 0 20px #3b82f644; }
 .subcard-focused.subcard-running-pulse { border-width: 2px; box-shadow: 0 0 12px #60a5faaa, 0 0 24px #3b82f644; }
+.subcard,
+.subcard:hover,
+.subcard-open,
+.subcard-focused,
+.subcard-running-pulse { border-top-color: var(--subsession-accent-color, #38bdf8) !important; border-top-width: 3px; }
 .subcard:not(.subcard-running-pulse):not(.subcard-focused) { transition: border-color 0.3s ease-out, box-shadow 0.3s ease-out; }
 
 @keyframes idle-flash-opacity { 0%, 100% { opacity: 0; } 50% { opacity: 1; } }
@@ -1119,9 +1170,13 @@ body {
 /* Quick input trigger in shortcuts row: hidden by default, shown when shell input is hidden */
 .shell-quick-trigger { display: none !important; }
 .kb-open .shell-terminal-pane .shell-quick-trigger { display: inline-flex !important; color: #fbbf24 !important; }
-.subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 52px; min-height: 52px; padding: 6px 10px; background: #1a2233; border: 1px solid #334155; border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: all 0.15s; flex-shrink: 0; position: relative; isolation: isolate; overflow: hidden; }
+.subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 52px; min-height: 52px; padding: 6px 10px; background: #1a2233; border: 1px solid #334155; border-top: 3px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: all 0.15s; flex-shrink: 0; position: relative; isolation: isolate; overflow: hidden; }
 .subsession-card:hover, .subsession-card.open { border-color: #3b82f6; background: #1e3a5f; color: #93c5fd; }
 .subsession-card.open { transform: scale(1.12); z-index: 1; box-shadow: 0 0 8px rgba(59,130,246,0.4); }
+.subsession-card,
+.subsession-card:hover,
+.subsession-card.open,
+.subsession-card.subcard-running-pulse { border-top-color: var(--subsession-accent-color, #38bdf8) !important; border-top-width: 3px; }
 .subsession-card-icon { font-size: 13px; font-weight: 700; letter-spacing: -0.5px; line-height: 1; }
 .subsession-card-label { font-size: 10px; color: #64748b; }
 .subsession-card.open .subsession-card-label { color: #93c5fd; }
@@ -1132,8 +1187,8 @@ body {
 .subsession-card-ctx-fill { display: block; height: 100%; background: #3b82f6; border-radius: 1px; transition: width 0.3s; }
 
 /* ── Sub-session window ───────────────────────────────────────────────────── */
-.subsession-window { display: flex; flex-direction: column; background: #0f1117; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); overflow: hidden; min-width: 300px; min-height: 200px; isolation: isolate; }
-.subsession-window-maximized { border: 2px solid #3b82f6; box-shadow: 0 0 0 1px rgba(96,165,250,0.45), 0 8px 32px rgba(0,0,0,0.6); box-sizing: border-box; }
+.subsession-window { display: flex; flex-direction: column; background: #0f1117; border: 1px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); overflow: hidden; min-width: 300px; min-height: 200px; isolation: isolate; }
+.subsession-window-maximized { border: 2px solid var(--subsession-accent-color, #38bdf8); box-shadow: 0 0 0 1px rgba(15,23,42,0.75), 0 8px 32px rgba(0,0,0,0.6); box-sizing: border-box; }
 .subsession-header { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #1a2233; border-bottom: 1px solid #1e293b; cursor: move; user-select: none; flex-shrink: 0; }
 .subsession-drag-icon { color: #475569; font-size: 16px; cursor: grab; }
 .subsession-title { font-size: 12px; color: #94a3b8; font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1150,12 +1205,13 @@ body {
 /* Usage footer — between chat/terminal and input controls */
 .session-usage-footer { flex-shrink: 0; padding: 4px 10px 3px; background: #0f1117; border-top: 1px solid #1e293b; }
 .session-ctx-bar { position: relative; width: 100%; height: 5px; background: #1e293b; border-radius: 3px; overflow: hidden; margin-bottom: 3px; }
+.session-repo-branch-summary-chat-titlebar { min-width: 0; max-width: 180px; flex-shrink: 1; }
 .session-usage-codex-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; align-items: center; }
 .session-usage-codex-quota { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; margin-bottom: 2px; }
 .session-usage-codex-line { color: #64748b; font-size: 9px; line-height: 1.2; text-align: right; }
 .session-ctx-input { position: absolute; left: 0; top: 0; height: 100%; background: #34d399; border-radius: 3px; }
 .session-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: #818cf8; border-radius: 3px; }
-.session-usage-stats { display: flex; justify-content: space-between; font-size: 10px; color: #475569; }
+.session-usage-stats { display: flex; align-items: center; gap: 6px; justify-content: space-between; min-width: 0; font-size: 10px; color: #475569; }
 .session-live-status-inline { display: inline-flex; align-items: center; justify-content: center; gap: 1px; min-width: 20px; color: #818cf8; min-width: 0; max-width: min(42vw, 240px); }
 .session-live-status-emoji { display: inline-block; font-size: 12px; line-height: 1; filter: saturate(1.1); }
 .session-live-status-emoji.robot { transform: translateY(0.2px); }
@@ -2028,7 +2084,7 @@ body {
 .fb-panel { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
 /* Panel layout: remove max-width cap so tree can be resized freely */
 .fb-panel .fb-files-and-changes.fb-tree-split { max-width: none; }
-.fb-panel .fb-body-split .fb-tree { max-width: none; }
+.fb-panel .fb-body-split > .fb-tree { max-width: none; }
 /* Draggable resize handle between tree and preview */
 .fb-resize-handle { width: 4px; cursor: col-resize; background: transparent; flex-shrink: 0; transition: background .15s; position: relative; z-index: 1; }
 .fb-resize-handle:hover, .fb-resize-handle:active { background: #3b82f6; }
@@ -2117,7 +2173,7 @@ body {
 .fb-node-empty { font-size: 11px; color: #475569; padding: 2px 8px; }
 /* Preview pane */
 .fb-body { display: flex; flex: 1; min-height: 0; overflow: hidden; }
-.fb-body-split .fb-tree { flex: 0 0 38%; min-width: 180px; max-width: 260px; border-right: 1px solid #334155; overflow-y: auto; }
+.fb-body-split > .fb-tree { flex: 0 0 38%; min-width: 180px; max-width: 260px; border-right: 1px solid #334155; overflow-y: auto; }
 .fb-body-split .fb-preview { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
 .fb-tree-split { flex: 0 0 38%; min-width: 180px; max-width: 260px; }
 .fb-preview { display: flex; flex-direction: column; flex: 1; min-width: 0; overflow: hidden; }
@@ -2159,7 +2215,7 @@ body {
 .fb-preview-back { display: none; background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 16px; padding: 2px 6px 2px 0; line-height: 1; }
 .fb-preview-back:hover { color: #e2e8f0; }
 @media (max-width: 640px) {
-  .fb-body-split .fb-tree { display: none; }
+  .fb-body-split > .fb-tree { display: none; }
   .fb-body-split .fb-preview { position: fixed; inset: 0; z-index: 2000; background: #0f172a; display: flex; flex-direction: column; width: 100%; height: 100%; }
   .fb-preview-back { display: block; }
   .fb-modal-wide { width: min(96vw, 900px) !important; }
@@ -2355,6 +2411,88 @@ body {
   .external-link-dialog { width: calc(100vw - 24px); padding: 16px; }
   .external-link-actions { flex-direction: column-reverse; }
   .external-link-btn { width: 100%; }
+}
+/* ── Zoomed text dialog ──────────────────────────────────────────────────── */
+/* Mobile users double-tap a chat bubble to open this modal. The chat view
+   disables `user-select` on touch devices so long-press triggers our custom
+   Copy/Quote menu rather than the native callout; inside this dialog the
+   selection is re-enabled (via the `!important` overrides below) so users
+   can drag the native iOS/Android handles and copy a specific portion. */
+.zoom-text-overlay {
+  background: rgba(2,6,23,0.78);
+  backdrop-filter: blur(6px);
+}
+.zoom-text-dialog {
+  position: relative;
+  width: min(640px, calc(100vw - 24px));
+  max-height: calc(100vh - var(--sat, 0px) - env(safe-area-inset-bottom, 0px) - 32px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px 16px;
+  background: #0f172a;
+  border: 1px solid rgba(100,116,139,0.55);
+  border-radius: 10px;
+  box-shadow: 0 24px 80px rgba(0,0,0,0.52), inset 0 1px 0 rgba(255,255,255,0.04);
+  overflow: hidden;
+}
+.zoom-text-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
+.zoom-text-title { font-size: 13px; font-weight: 600; color: #cbd5e1; letter-spacing: 0.02em; text-transform: uppercase; }
+.zoom-text-close { background: none; border: none; color: #64748b; font-size: 22px; line-height: 1; cursor: pointer; padding: 0 4px; }
+.zoom-text-close:hover { color: #e2e8f0; }
+.zoom-text-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  border: 1px solid rgba(51,65,85,0.9);
+  border-radius: 8px;
+  background: #020617;
+}
+.zoom-text-content {
+  margin: 0;
+  padding: 12px 14px;
+  font-size: 14px;
+  line-height: 1.55;
+  color: #e2e8f0;
+  font-family: inherit;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+/* Force-enable native selection inside the zoom dialog. The chat view's
+   `@media (pointer: coarse)` rule turns off user-select for everything inside
+   `.chat-view`, and the dialog is rendered as a sibling — but assistive
+   tools and some WebViews can still inherit conservative defaults, so we
+   make the override explicit and !important. */
+.zoom-text-dialog,
+.zoom-text-dialog * {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+  -webkit-touch-callout: default !important;
+}
+.zoom-text-selection-menu { z-index: 2; }
+.zoom-text-hint { font-size: 11px; color: #64748b; line-height: 1.4; flex-shrink: 0; }
+.zoom-text-actions { display: flex; justify-content: flex-end; gap: 8px; flex-shrink: 0; }
+.zoom-text-btn {
+  border: 1px solid rgba(96,165,250,0.5);
+  border-radius: 7px;
+  background: #2563eb;
+  color: #eff6ff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 7px 14px;
+  transition: background 0.15s, border-color 0.15s;
+}
+.zoom-text-btn:hover { background: #1d4ed8; border-color: rgba(147,197,253,0.72); }
+.zoom-text-btn.is-copied { background: #166534; border-color: #16a34a; color: #86efac; }
+@media (max-width: 520px) {
+  .zoom-text-dialog { width: calc(100vw - 16px); padding: 12px; }
+  .zoom-text-btn { width: 100%; padding: 10px; font-size: 13px; }
+  .zoom-text-actions { width: 100%; }
 }
 /* GFM tables in chat */
 .chat-table { border-collapse: collapse; margin: 8px 0; font-size: 13px; width: auto; max-width: 100%; overflow-x: auto; display: block; }

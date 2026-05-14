@@ -2,7 +2,9 @@ import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
 import { getServerById, getDbSessionsByServer, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession } from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import type { ServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
+import { logAudit } from '../security/audit.js';
 import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
@@ -11,6 +13,12 @@ import { isSessionAgentType } from '../../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 import { sanitizeProjectName } from '../../../shared/sanitize-project-name.js';
+import {
+  SESSION_GROUP_CLONE_CAPABILITY_V1,
+  SESSION_GROUP_CLONE_MSG,
+  mainSessionNameForProjectSlug,
+  type SessionGroupCloneErrorCode,
+} from '../../../shared/session-group-clone.js';
 
 export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -303,6 +311,152 @@ sessionMgmtRoutes.post('/:id/session/start', async (c) => {
   return relayToDaemon(c, 'session.start', body);
 });
 
+sessionMgmtRoutes.post('/:id/sessions/:rootSession/group-clone', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const sourceMainSessionName = c.req.param('rootSession')!;
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+
+  let body: Record<string, unknown>;
+  try {
+    const parsed = await c.req.json();
+    body = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    await auditSessionGroupClone(c, {
+      outcome: 'failed',
+      errorCode: 'invalid_request',
+      role,
+      sourceMainSessionName,
+    });
+    return c.json({ error: 'invalid_json' }, 400);
+  }
+
+  const idempotencyKey = typeof body.idempotencyKey === 'string' ? body.idempotencyKey.trim() : '';
+  const targetProjectNameResult = readOptionalStringField(body, 'targetProjectName');
+  const cwdOverrideResult = readOptionalStringField(body, 'cwdOverride');
+  const auditBase = {
+    role,
+    sourceMainSessionName,
+    idempotencyKey: idempotencyKey || undefined,
+    targetProjectName: targetProjectNameResult.ok ? targetProjectNameResult.value : undefined,
+  };
+
+  if (role !== 'owner' && role !== 'admin') {
+    await auditSessionGroupClone(c, {
+      ...auditBase,
+      outcome: 'forbidden',
+      errorCode: 'forbidden',
+    });
+    return c.json({ error: 'forbidden' }, 403);
+  }
+
+  if (!idempotencyKey) {
+    await auditSessionGroupClone(c, {
+      ...auditBase,
+      outcome: 'failed',
+      errorCode: 'invalid_request',
+    });
+    return c.json({ error: 'invalid_request', reason: 'idempotencyKey_required' }, 400);
+  }
+
+  if (!targetProjectNameResult.ok || !cwdOverrideResult.ok) {
+    await auditSessionGroupClone(c, {
+      ...auditBase,
+      outcome: 'failed',
+      errorCode: 'invalid_request',
+    });
+    return c.json({ error: 'invalid_request' }, 400);
+  }
+
+  if (typeof targetProjectNameResult.value === 'string' && targetProjectNameResult.value.trim() === '') {
+    await auditSessionGroupClone(c, {
+      ...auditBase,
+      outcome: 'failed',
+      errorCode: 'blank_target_project',
+    });
+    return c.json({ error: 'blank_target_project' }, 400);
+  }
+
+  const bridge = WsBridge.get(serverId);
+  const existingEvent = bridge.getSessionGroupCloneOperationEvent(idempotencyKey);
+  if (existingEvent) {
+    c.header(IMCODES_POD_HEADER, getPodIdentity());
+    return c.json({ ok: true, duplicate: true, event: existingEvent });
+  }
+
+  const dbSessions = await getDbSessionsByServer(c.env.DB, serverId);
+  if (typeof targetProjectNameResult.value === 'string') {
+    const targetProjectSlug = sanitizeProjectName(targetProjectNameResult.value.trim());
+    const targetMainSessionName = mainSessionNameForProjectSlug(targetProjectSlug);
+    if (dbSessions.some((session) => session.name === targetMainSessionName)) {
+      await auditSessionGroupClone(c, {
+        ...auditBase,
+        outcome: 'failed',
+        errorCode: 'name_taken',
+      });
+      return c.json({ error: 'name_taken', targetMainSessionName }, 409);
+    }
+  }
+
+  if (!bridge.hasDaemonCapability(SESSION_GROUP_CLONE_CAPABILITY_V1)) {
+    await auditSessionGroupClone(c, {
+      ...auditBase,
+      outcome: 'failed',
+      errorCode: 'unsupported_command',
+      missingCapability: SESSION_GROUP_CLONE_CAPABILITY_V1,
+    });
+    return c.json({
+      error: 'unsupported_command',
+      missingCapability: SESSION_GROUP_CLONE_CAPABILITY_V1,
+    }, 409);
+  }
+
+  const payload: Record<string, unknown> = {
+    type: SESSION_GROUP_CLONE_MSG.START,
+    serverId,
+    sourceMainSessionName,
+    idempotencyKey,
+  };
+  if (targetProjectNameResult.value !== undefined) {
+    payload.targetProjectName = targetProjectNameResult.value;
+  }
+  if (cwdOverrideResult.value !== undefined) {
+    payload.cwdOverride = cwdOverrideResult.value;
+  }
+  const unavailableSessionNames = dbSessions
+    .map((session) => session.name)
+    .filter((name): name is string => typeof name === 'string' && name.length > 0);
+  if (unavailableSessionNames.length > 0) {
+    payload.unavailableSessionNames = unavailableSessionNames;
+  }
+
+  try {
+    bridge.registerSessionGroupCloneOperationContext({
+      idempotencyKey,
+      userId,
+      sourceMainSessionName,
+    });
+    bridge.sendToDaemon(JSON.stringify(payload));
+  } catch (err) {
+    logger.error({ serverId, sourceMainSessionName, err }, 'WsBridge session group clone relay failed');
+    await auditSessionGroupClone(c, {
+      ...auditBase,
+      outcome: 'failed',
+      errorCode: 'internal_error',
+    });
+    return c.json({ error: 'relay_failed' }, 502);
+  }
+
+  await auditSessionGroupClone(c, {
+    ...auditBase,
+    outcome: 'accepted',
+  });
+  c.header(IMCODES_POD_HEADER, getPodIdentity());
+  return c.json({ ok: true });
+});
+
 sessionMgmtRoutes.post('/:id/session/stop', async (c) => {
   const userId = c.get('userId' as never) as string;
   const role = await resolveServerRole(c.env.DB, c.req.param('id')!, userId);
@@ -344,6 +498,49 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+type OptionalStringResult =
+  | { ok: true; value: string | null | undefined }
+  | { ok: false };
+
+function readOptionalStringField(body: Record<string, unknown>, key: string): OptionalStringResult {
+  if (!Object.prototype.hasOwnProperty.call(body, key)) return { ok: true, value: undefined };
+  const value = body[key];
+  if (value === null) return { ok: true, value: null };
+  if (typeof value === 'string') return { ok: true, value };
+  return { ok: false };
+}
+
+async function auditSessionGroupClone(
+  c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>,
+  entry: {
+    outcome: 'accepted' | 'failed' | 'forbidden';
+    role: ServerRole;
+    sourceMainSessionName: string;
+    idempotencyKey?: string;
+    targetProjectName?: string | null;
+    errorCode?: SessionGroupCloneErrorCode;
+    missingCapability?: string;
+  },
+): Promise<void> {
+  const targetProjectSlug = typeof entry.targetProjectName === 'string' && entry.targetProjectName.trim()
+    ? sanitizeProjectName(entry.targetProjectName.trim())
+    : undefined;
+  await logAudit({
+    userId: c.get('userId' as never) as string | undefined,
+    serverId: c.req.param('id')!,
+    action: `session_group_clone.${entry.outcome}`,
+    details: {
+      role: entry.role,
+      sourceMainSessionName: entry.sourceMainSessionName,
+      ...(entry.idempotencyKey ? { idempotencyKey: entry.idempotencyKey } : {}),
+      ...(targetProjectSlug ? { targetProjectSlug } : {}),
+      ...(entry.errorCode ? { errorCode: entry.errorCode } : {}),
+      ...(entry.missingCapability ? { missingCapability: entry.missingCapability } : {}),
+    },
+    ip: c.req.header('cf-connecting-ip') ?? c.req.header('x-forwarded-for') ?? undefined,
+  }, c.env.DB);
+}
 
 async function relayToDaemon(
   c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>,

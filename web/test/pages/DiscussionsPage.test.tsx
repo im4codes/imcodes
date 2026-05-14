@@ -13,8 +13,20 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
+// Forward onClick + the discussion shape so the click-to-select test
+// below can fire the click handler DiscussionsPage hands the live
+// cards. Production P2pProgressCard renders a complex SVG layout we
+// don't need here; only the click contract matters for this test
+// surface.
 vi.mock('../../src/components/P2pProgressCard.js', () => ({
-  P2pProgressCard: () => null,
+  P2pProgressCard: (props: { discussion: { id: string; fileId?: string }; onClick?: () => void }) => (
+    <button
+      type="button"
+      data-testid={`p2p-progress-card-${props.discussion.id}`}
+      data-file-id={props.discussion.fileId ?? ''}
+      onClick={props.onClick}
+    >progress card {props.discussion.id}</button>
+  ),
 }));
 
 vi.mock('../../src/components/FilePreviewPane.js', () => ({
@@ -25,9 +37,13 @@ describe('DiscussionsPage', () => {
   let handler: ((msg: ServerMessage) => void) | null = null;
   let ws: WsClient;
   let clipboardWriteText: ReturnType<typeof vi.fn>;
+  let nextP2pRequestIndex = 0;
 
   beforeEach(() => {
     clipboardWriteText = vi.fn().mockResolvedValue(undefined);
+    nextP2pRequestIndex = 0;
+    const nextP2pRequestId = () => `p2p-test-${++nextP2pRequestIndex}`;
+    const send = vi.fn();
     let rafTime = 0;
     vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
       rafTime += 120;
@@ -40,7 +56,17 @@ describe('DiscussionsPage', () => {
     });
 
     ws = {
-      send: vi.fn(),
+      send,
+      p2pListDiscussions: vi.fn((scope?: { sessionName?: string; projectDir?: string; cwd?: string }) => {
+        const requestId = nextP2pRequestId();
+        send({ type: 'p2p.list_discussions', requestId, ...scope });
+        return requestId;
+      }),
+      p2pReadDiscussion: vi.fn((id: string, scope?: { sessionName?: string; projectDir?: string; cwd?: string }) => {
+        const requestId = nextP2pRequestId();
+        send({ type: 'p2p.read_discussion', id, requestId, ...scope });
+        return requestId;
+      }),
       onMessage: (next: (msg: ServerMessage) => void) => {
         handler = next;
         return () => { handler = null; };
@@ -57,7 +83,11 @@ describe('DiscussionsPage', () => {
   it('defaults to auto-follow latest and scrolls to bottom when discussion content updates', async () => {
     const { container } = render(<DiscussionsPage ws={ws} />);
 
-    expect(ws.send).toHaveBeenCalledWith({ type: 'p2p.list_discussions' });
+    expect(ws.p2pListDiscussions).toHaveBeenCalledOnce();
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'p2p.list_discussions',
+      requestId: 'p2p-test-1',
+    }));
 
     await act(async () => {
       handler?.({
@@ -93,6 +123,33 @@ describe('DiscussionsPage', () => {
     await waitFor(() => expect(scrollEl.scrollTop).toBe(640));
     expect(screen.getByTitle('p2p.discussions.scroll_top')).toBeTruthy();
     expect(screen.getByTitle('p2p.discussions.scroll_bottom')).toBeTruthy();
+  });
+
+  it('passes discussion request scope into typed list and read helpers', async () => {
+    render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_proj_brain', projectDir: '/repo/project' }} />);
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'p2p.list_discussions',
+      requestId: 'p2p-test-1',
+      sessionName: 'deck_proj_brain',
+      projectDir: '/repo/project',
+    }));
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.list_discussions_response',
+        requestId: 'p2p-test-1',
+        discussions: [{ id: 'disc-1', fileName: 'disc-1.md', preview: 'Topic 1', mtime: 100 }],
+      } as ServerMessage);
+    });
+
+    fireEvent.click(screen.getByText('Topic 1'));
+    expect(ws.send).toHaveBeenLastCalledWith(expect.objectContaining({
+      type: 'p2p.read_discussion',
+      id: 'disc-1',
+      sessionName: 'deck_proj_brain',
+      projectDir: '/repo/project',
+    }));
   });
 
   it('disables follow when unchecked, and re-enables it from the bottom arrow', async () => {
@@ -213,6 +270,24 @@ describe('DiscussionsPage', () => {
     expect(screen.getByTestId('discussion-preview').textContent).toBe('Current preview content');
   });
 
+  it('refreshes via the typed p2pListDiscussions helper, never the legacy discussionList', async () => {
+    // PR-H regression: app.tsx and the DiscussionsPage must always go through
+    // the project-scoped `p2pListDiscussions` helper. The legacy
+    // `discussionList()` predates the daemon's scope guard and would yield
+    // empty/forbidden results under the new server-side enforcement.
+    const legacyDiscussionList = vi.fn();
+    const wsWithLegacy = {
+      ...(ws as unknown as Record<string, unknown>),
+      discussionList: legacyDiscussionList,
+    } as unknown as WsClient;
+
+    render(<DiscussionsPage ws={wsWithLegacy} requestScope={{ sessionName: 'deck_proj_brain' }} />);
+
+    expect(wsWithLegacy.p2pListDiscussions).toHaveBeenCalledTimes(1);
+    expect(wsWithLegacy.p2pListDiscussions).toHaveBeenCalledWith({ sessionName: 'deck_proj_brain' });
+    expect(legacyDiscussionList).not.toHaveBeenCalled();
+  });
+
   it('renders copy and scroll controls in the top nav controls instead of inside the list', async () => {
     const { container } = render(<DiscussionsPage ws={ws} />);
 
@@ -238,5 +313,159 @@ describe('DiscussionsPage', () => {
 
     expect(container.querySelector('.discussions-nav-controls .discussions-copy-btn')).toBeTruthy();
     expect(container.querySelectorAll('.discussions-nav-controls .discussions-scroll-btn-floating')).toHaveLength(3);
+  });
+
+  // Audit fix (live-bar ↔ list connection) — clicking a live P2P
+  // progress card on the discussions page used to do nothing (the
+  // bar at the top and the file list below were unrelated). Users
+  // had to manually find the matching entry in the list by id.
+  // The fix wires `onClick` on the cards to `selectDiscussion(fileId)`,
+  // which sends a `p2p.read_discussion` and highlights the matching
+  // list entry as active.
+  it('clicking a live P2P progress card opens the matching discussion file', async () => {
+    const FILE_ID = 'live-disc-7';
+    const liveDiscussion = {
+      id: `p2p_${FILE_ID}`,
+      fileId: FILE_ID,
+      topic: 'Live P2P run',
+      state: 'running',
+      currentRound: 1,
+      maxRounds: 3,
+    } as Parameters<typeof DiscussionsPage>[0]['liveDiscussions'][number];
+
+    const { container } = render(
+      <DiscussionsPage ws={ws} liveDiscussions={[liveDiscussion]} />,
+    );
+
+    // Seed the file list with the matching entry so the active-class
+    // assertion has something to match against.
+    await act(async () => {
+      handler?.({
+        type: 'p2p.list_discussions_response',
+        discussions: [{ id: FILE_ID, fileName: `${FILE_ID}.md`, preview: 'Topic live', mtime: 100 }],
+      } as ServerMessage);
+    });
+
+    // Clicking the live card should send a p2p.read_discussion for
+    // FILE_ID — same code path as clicking the list entry.
+    const card = screen.getByTestId(`p2p-progress-card-p2p_${FILE_ID}`);
+    expect(card.getAttribute('data-file-id')).toBe(FILE_ID);
+
+    const sendCallsBefore = vi.mocked(ws.send).mock.calls.length;
+    fireEvent.click(card);
+    const sendCallsAfter = vi.mocked(ws.send).mock.calls.length;
+    expect(sendCallsAfter).toBeGreaterThan(sendCallsBefore);
+
+    const lastSend = vi.mocked(ws.send).mock.calls.at(-1)?.[0] as { type?: string; id?: string };
+    expect(lastSend.type).toBe('p2p.read_discussion');
+    expect(lastSend.id).toBe(FILE_ID);
+
+    // Matching list entry must get the `active` class so the user
+    // sees the connection between bar and list.
+    const matchingItem = container.querySelector(`.discussions-list-item.active`);
+    expect(matchingItem).not.toBeNull();
+    expect(matchingItem?.textContent).toContain('Topic live');
+  });
+
+  // Audit fix (DiscussionsPage spam-fetch loop) — regression for the
+  // "加载中…" + "p2p per-socket pending cap exceeded" bug. Parent
+  // re-renders that pass a fresh inline `requestScope` object literal
+  // used to make `loadList`'s `useCallback` re-identify, which fired
+  // the mount effect again and dispatched another
+  // `p2p.list_discussions` request — saturating the bridge's
+  // per-socket cap until no response could come back.
+  //
+  // Contract pinned here: even when the parent supplies different
+  // request-scope object identities across renders, the page must
+  // dispatch only ONE list request per content-equal scope.
+  it('does not spam p2p.list_discussions on parent rerender with content-equal scope', async () => {
+    const view = render(
+      <DiscussionsPage
+        ws={ws}
+        // Inline literal — each render produces a new identity but
+        // identical content. The fix in app.tsx wraps the prop in
+        // useMemo; this test verifies DiscussionsPage tolerates the
+        // mistake even if a future refactor reverts the memoization.
+        requestScope={{ sessionName: 'deck_proj_brain' }}
+      />,
+    );
+
+    await act(async () => {
+      handler?.({ type: 'p2p.list_discussions_response', discussions: [] } as ServerMessage);
+    });
+
+    // Force several parent rerenders with NEW object identities but
+    // identical content.
+    for (let i = 0; i < 5; i += 1) {
+      view.rerender(
+        <DiscussionsPage
+          ws={ws}
+          requestScope={{ sessionName: 'deck_proj_brain' }}
+        />,
+      );
+      await act(async () => { /* yield microtask */ });
+    }
+
+    const listCalls = vi.mocked(ws.send).mock.calls.filter(
+      (call) => (call[0] as { type?: string }).type === 'p2p.list_discussions',
+    );
+    // Expected: exactly 1 dispatch on initial mount. Pre-fix would
+    // produce 6+ (mount + 5 rerenders).
+    expect(
+      listCalls.length,
+      `expected 1 list_discussions dispatch across 5 rerenders, got ${listCalls.length}`,
+    ).toBeLessThanOrEqual(2); // ≤2 to allow a single in-flight retry
+  });
+
+  it('debounces list_discussions across a burst of RUN_UPDATE messages', async () => {
+    render(<DiscussionsPage ws={ws} />);
+    await act(async () => {
+      handler?.({ type: 'p2p.list_discussions_response', discussions: [] } as ServerMessage);
+    });
+    const baselineCalls = vi.mocked(ws.send).mock.calls.filter(
+      (c) => (c[0] as { type?: string }).type === 'p2p.list_discussions',
+    ).length;
+
+    // Burst 10 RUN_UPDATE messages in rapid succession.
+    for (let i = 0; i < 10; i += 1) {
+      await act(async () => {
+        handler?.({
+          type: 'p2p.run_update',
+          run: { id: `run-${i}`, status: 'running', discussion_id: `disc-${i}` },
+        } as unknown as ServerMessage);
+      });
+    }
+    // Wait past the debounce window (250ms) for the coalesced fetch.
+    await new Promise((r) => setTimeout(r, 350));
+
+    const finalCalls = vi.mocked(ws.send).mock.calls.filter(
+      (c) => (c[0] as { type?: string }).type === 'p2p.list_discussions',
+    ).length;
+    // Pre-fix would produce 10 new dispatches (one per RUN_UPDATE).
+    // Post-fix: at most 1 coalesced dispatch.
+    expect(
+      finalCalls - baselineCalls,
+      `expected ≤1 list_discussions dispatch from 10 RUN_UPDATEs, got ${finalCalls - baselineCalls}`,
+    ).toBeLessThanOrEqual(1);
+  });
+
+  it('clicking a live progress card with NO fileId is a no-op (orphan run mid-bind)', async () => {
+    const liveDiscussion = {
+      id: 'p2p_orphan',
+      // fileId intentionally omitted — runs that never produced a file
+      // (failed bind, supervision-internal, etc.) shouldn't crash the
+      // page on click.
+      topic: 'Orphan',
+      state: 'queued',
+      currentRound: 0,
+      maxRounds: 1,
+    } as Parameters<typeof DiscussionsPage>[0]['liveDiscussions'][number];
+
+    render(<DiscussionsPage ws={ws} liveDiscussions={[liveDiscussion]} />);
+    const card = screen.getByTestId('p2p-progress-card-p2p_orphan');
+    const sendCallsBefore = vi.mocked(ws.send).mock.calls.length;
+    fireEvent.click(card);
+    // No onClick wired (fileId missing) — no new send calls.
+    expect(vi.mocked(ws.send).mock.calls.length).toBe(sendCallsBefore);
   });
 });

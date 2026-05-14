@@ -5,6 +5,7 @@ import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '@shared/context-model-defaults.js
 import type { ContextMemoryProjectView, ContextMemoryView, SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
 import { MEMORY_WS } from '@shared/memory-ws.js';
+import { CC_PRESET_MSG, getCcPresetEffectiveModel, type CcPresetModelInfo } from '@shared/cc-presets.js';
 import {
   type MemoryFeatureAdminRecord,
   type MemoryManagementErrorCode,
@@ -1000,6 +1001,9 @@ interface ProcessingPresetEntry {
   env: Record<string, string>;
   contextWindow?: number;
   initMessage?: string;
+  availableModels?: CcPresetModelInfo[];
+  defaultModel?: string;
+  modelDiscoveryError?: string;
 }
 
 /**
@@ -1064,7 +1068,7 @@ function ModelPresetChipSelector({
   const activePreset = supportsPresets
     ? presets.find((p) => p.name === trimmedPreset)
     : undefined;
-  const presetPinnedModel = activePreset?.env?.ANTHROPIC_MODEL?.trim() || '';
+  const presetPinnedModel = activePreset ? (getCcPresetEffectiveModel(activePreset) ?? '') : '';
   // When a preset is active, model selection collapses to what the preset
   // endpoint exposes — show ONLY the pinned model as a single read-ish chip.
   // User can still switch away by clicking a built-in chip, which clears
@@ -1087,7 +1091,7 @@ function ModelPresetChipSelector({
           </button>
           {presets.map((p) => {
             const active = trimmedPreset === p.name;
-            const pinned = p.env?.ANTHROPIC_MODEL?.trim();
+            const pinned = getCcPresetEffectiveModel(p);
             return (
               <button
                 key={`${idPrefix}:preset:${p.name}`}
@@ -1538,11 +1542,11 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   useEffect(() => {
     if (!ws) return;
     const unsub = ws.onMessage((msg) => {
-      if (msg.type === 'cc.presets.list_response') {
-        setProcessingPresets((msg as { presets?: Array<{ name: string; env: Record<string, string>; contextWindow?: number; initMessage?: string }> }).presets ?? []);
+      if (msg.type === CC_PRESET_MSG.LIST_RESPONSE) {
+        setProcessingPresets((msg as { presets?: ProcessingPresetEntry[] }).presets ?? []);
       }
     });
-    try { ws.send({ type: 'cc.presets.list' }); } catch {}
+    try { ws.send({ type: CC_PRESET_MSG.LIST }); } catch {}
     return unsub;
   }, [ws]);
 

@@ -234,4 +234,30 @@ describe('getActiveSessionsBlockingDaemonUpgrade — process + transport coverag
 
     expect(blocked).toEqual([]);
   });
+
+  /*
+   * R3 v2 PR-κ — User-reported regression: dispatching a turn that lands
+   * in `'queued'` state and then issuing `daemon.upgrade` would silently
+   * kill the queued turn because the gate only counted `'running'` as
+   * busy. The web client's `isRunningSessionState` already counts
+   * `'queued'` as busy; the gate now matches.
+   */
+  it('blocks process-agent sessions whose state is "queued" (R3 v2 PR-κ)', () => {
+    vi.spyOn(sessionManager, 'getTransportRuntime').mockReturnValue(undefined);
+
+    const blocked = getActiveSessionsBlockingDaemonUpgrade([
+      { name: 'deck_repo_brain', runtimeType: 'process', state: 'queued', agentType: 'claude-code' },
+      { name: 'deck_repo_running', runtimeType: 'process', state: 'running', agentType: 'codex' },
+      { name: 'deck_repo_idle', runtimeType: 'process', state: 'idle', agentType: 'gemini' },
+    ] as any);
+
+    // BOTH 'running' and 'queued' must show up — only 'idle' is allowed through.
+    expect(blocked.map((r) => r.name).sort()).toEqual(['deck_repo_brain', 'deck_repo_running']);
+    const queuedReason = blocked.find((r) => r.name === 'deck_repo_brain');
+    expect(queuedReason).toMatchObject({
+      runtimeType: 'process',
+      sessionState: 'queued',
+      transport: null,
+    });
+  });
 });

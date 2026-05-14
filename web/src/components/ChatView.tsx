@@ -11,15 +11,17 @@ import type { TimelineEvent, WsClient, MemoryContextTimelinePayload, MemoryConte
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL } from '@shared/session-control-commands.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
-import { FileBrowser } from './file-browser-lazy.js';
-import { FloatingPanel } from './FloatingPanel.js';
+import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
+import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
 import { splitTextByHttpUrls } from '../link-detection.js';
+import { domNodeToPlainText, selectionToPlainText } from '../util/dom-to-text.js';
+import { ZoomedTextDialog } from './ZoomedTextDialog.js';
 
 interface Props {
   events: TimelineEvent[];
@@ -40,12 +42,16 @@ interface Props {
   onScrollBottomFn?: (fn: () => void) => void;
   /** When true, render as a non-interactive preview (no scroll button, no status bar) */
   preview?: boolean;
-  /** When provided, clicking file paths in chat messages opens FileBrowser */
+  /** When provided, clicking file paths opens the shared floating preview host. */
+  onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
+  /** When provided, the right-side file panel is available. */
   ws?: WsClient | null;
   /** Called when user inserts a path via the FileBrowser opened from a chat message */
   onInsertPath?: (path: string) => void;
   /** Session working directory — used to resolve relative paths clicked in chat */
   workdir?: string | null;
+  /** Opens the repository view for this session/project. */
+  onViewRepo?: () => void;
   /** Called when user quotes selected text. */
   onQuote?: (text: string) => void;
   agentType?: string | null;
@@ -75,20 +81,41 @@ interface AssistantBlockProps {
   text: string;
   automation?: boolean;
   ts: number;
+  /** Stable identifier for this merged block. Wired through to a
+   *  `data-event-id` attribute so the mobile double-tap detector can pair
+   *  taps by event id instead of HTMLElement reference — DOM nodes are
+   *  recycled by Preact when the merged block grows, which would otherwise
+   *  break a `===` comparison between consecutive taps. */
+  eventId?: string;
   onPathClick?: (p: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: (path: string) => void;
 }
 
+/** Extract a chat event's visible text while preserving block/list/code
+ *  formatting. Uses `domNodeToPlainText` rather than `textContent` so that
+ *  copying a multi-paragraph assistant message keeps its paragraph and list
+ *  structure — `textContent` would flatten "foo\n\nbar" into "foobar". The
+ *  ignore-list inside `dom-to-text.ts` already drops timestamps, copy
+ *  buttons, and other UI chrome so we don't need to scrub them here. */
 function extractChatEventText(target: HTMLElement): string {
-  const clone = target.cloneNode(true) as HTMLElement;
-  for (const el of clone.querySelectorAll('.chat-bubble-time')) el.remove();
-  return (clone.textContent ?? '').trim();
+  return domNodeToPlainText(target);
 }
 
 function hasFileExtension(path: string): boolean {
   const basename = path.split(/[/\\]/).pop() ?? '';
   return /\.\w{1,10}$/.test(basename);
+}
+
+function isAbsolutePreviewPath(path: string): boolean {
+  return path.startsWith('/') || path.startsWith('~') || /^[A-Za-z]:[/\\]/.test(path);
+}
+
+function resolvePreviewPath(path: string, workdir: string | null | undefined): string {
+  const cleaned = path.replace(/^`+|`+$/g, '');
+  if (isAbsolutePreviewPath(cleaned)) return cleaned;
+  const root = (workdir && workdir.trim()) || '~';
+  return `${root.replace(/[/\\]+$/, '')}/${cleaned.replace(/^[/\\]+/, '')}`;
 }
 
 function isLikelyDomainPath(value: string): boolean {
@@ -166,11 +193,6 @@ const TOOL_INPUT_SUMMARY_KEYS = [
   'description',
   'name',
 ] as const;
-
-type FileBrowserTarget = {
-  path: string;
-  preferDiff: boolean;
-};
 
 type GroupedFileChange = {
   filePath: string;
@@ -555,6 +577,51 @@ interface SelectionMenu {
 const FILE_PANEL_MIN = 220;
 const FILE_PANEL_MAX_RATIO = 0.6; // 60% of viewport width
 const FILE_PANEL_DEFAULT = 340;
+/** Two short taps within this many ms on the same chat bubble open the zoom
+ *  modal. 500ms is wider than the strict iOS double-click window because
+ *  fingers on a phone are slower than mouse buttons, and we want this to
+ *  feel forgiving — single taps still don't pair because the chat view
+ *  has no other tap action that would accidentally satisfy the predicate. */
+const DOUBLE_TAP_THRESHOLD_MS = 500;
+/** A touch this much movement (px) from the start point still counts as a
+ *  tap (rather than a scroll). 15px gives finger-tremor headroom; smaller
+ *  values miss double-taps where the second tap drifted slightly. */
+const TAP_MOVE_TOLERANCE_PX = 15;
+const TOUCH_GESTURE_MEDIA_QUERY = '(pointer: coarse)';
+
+/** Track whether the current primary pointer is coarse so chat gestures
+ *  (long-press menu, double-tap zoom) flip on/off when the input mode changes.
+ *  Do not include viewport width here: desktop users can run narrow windows,
+ *  and they still expect native selection plus the Copy/Quote popup.
+ *  Falls back to plain `'ontouchstart' in window` when matchMedia isn't
+ *  available (older browsers / non-DOM test environments). */
+function useTouchChatGestures(): boolean {
+  const compute = (): boolean => {
+    if (typeof window === 'undefined') return false;
+    if (typeof window.matchMedia === 'function') {
+      return window.matchMedia(TOUCH_GESTURE_MEDIA_QUERY).matches;
+    }
+    return 'ontouchstart' in window;
+  };
+  const [isMobile, setIsMobile] = useState(compute);
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia(TOUCH_GESTURE_MEDIA_QUERY);
+    const onChange = () => setIsMobile(mq.matches);
+    // Safari < 14 only supports the legacy `addListener` API.
+    if (typeof mq.addEventListener === 'function') {
+      mq.addEventListener('change', onChange);
+      return () => mq.removeEventListener('change', onChange);
+    }
+    mq.addListener(onChange);
+    return () => mq.removeListener(onChange);
+  }, []);
+  return isMobile;
+}
+/** Long-press timer for the mobile Copy/Quote context menu. Matches the
+ *  iOS callout heuristic so users with muscle memory from native chat
+ *  apps see the menu at the expected moment. */
+const LONG_PRESS_MS = 400;
 const panelWidthKey = (id: string | null | undefined) => `chatFilePanelWidth:${id ?? '_'}`;
 const panelOpenKey  = (id: string | null | undefined) => `chatFilePanelOpen:${id ?? '_'}`;
 
@@ -603,11 +670,10 @@ function findScrollParent(start: HTMLElement): HTMLElement {
   return start;
 }
 
-export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
+export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const [fileBrowserTarget, setFileBrowserTarget] = useState<FileBrowserTarget | null>(null);
   const [selMenu, setSelMenu] = useState<SelectionMenu | null>(null);
   const selMenuRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
@@ -619,6 +685,12 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const ctxMenuRef = useRef<HTMLDivElement>(null);
   // Timestamp when ctx menu was opened — clicks within 400ms are synthetic (from long-press release)
   const menuOpenedAtRef = useRef(0);
+  // Zoomed text modal — opened by double-tap on a chat bubble on touch devices.
+  // The chat view sets `user-select: none` on mobile so that long-press fires
+  // our custom Copy/Quote menu rather than the native callout; this modal
+  // gives users a place to re-enable native selection and pick out exactly
+  // the portion they want to copy.
+  const [zoomText, setZoomText] = useState<string | null>(null);
 
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
@@ -733,17 +805,25 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     document.addEventListener('mouseup', onUp);
   }, [sessionId]);
 
-  const openFileBrowserTarget = useCallback((path: string, preferDiff = false) => {
-    setFileBrowserTarget({ path: path.replace(/^`+|`+$/g, ''), preferDiff });
-  }, []);
+  const openFilePreview = useCallback((path: string, preferDiff = false) => {
+    if (!onPreviewFile) return;
+    const resolvedPath = resolvePreviewPath(path, workdir);
+    onPreviewFile({
+      path: resolvedPath,
+      preferDiff,
+      preview: { status: 'loading', path: resolvedPath },
+      rootPath: workdir ?? undefined,
+      sourcePreviewLive: false,
+    });
+  }, [onPreviewFile, workdir]);
 
   const handlePathClick = useCallback((path: string) => {
-    openFileBrowserTarget(path, false);
-  }, [openFileBrowserTarget]);
+    openFilePreview(path, false);
+  }, [openFilePreview]);
 
   const handleFileChangeOpen = useCallback((path: string, preferDiff = false) => {
-    openFileBrowserTarget(path, preferDiff);
-  }, [openFileBrowserTarget]);
+    openFilePreview(path, preferDiff);
+  }, [openFilePreview]);
 
   const handleUrlClick = useCallback((url: string) => {
     setPendingUrl(url);
@@ -765,6 +845,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [serverId, ws]);
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
+  const fileChangeOpenHandler = ws && !preview && onPreviewFile ? handleFileChangeOpen : undefined;
   const urlClickHandler = !preview ? handleUrlClick : undefined;
   const downloadHandler = serverId && ws ? handleDownload : undefined;
 
@@ -1139,7 +1220,9 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     return () => ro.disconnect();
   }, [preview]);
 
-  const isTouchDevice = 'ontouchstart' in window;
+  // Touch gesture mode is based on pointer coarseness only. Narrow desktop
+  // windows still need native selection and the Copy/Quote popup.
+  const isTouchDevice = useTouchChatGestures();
   const getActionMenuContainerRect = useCallback(() => {
     const container = scrollRef.current;
     if (!container) return null;
@@ -1192,13 +1275,24 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
         setSelMenu(null);
         return;
       }
-      const text = sel.toString().trim();
+      // Use our DOM-walker rather than `sel.toString()` so that the captured
+      // text preserves paragraph/list/code-block boundaries. Browsers disagree
+      // on what `Selection.toString()` does at block boundaries (Safari often
+      // flattens), which is the bug that was dropping newlines from copied
+      // multi-paragraph assistant messages.
+      const text = selectionToPlainText(sel) || sel.toString().trim();
       if (!text) { setSelMenu(null); return; }
-      const selRect = range.getBoundingClientRect();
+      const selRect = typeof range.getBoundingClientRect === 'function'
+        ? range.getBoundingClientRect()
+        : null;
       const mainEl = container.closest('.chat-main') as HTMLElement | null;
       const mainRect = (mainEl ?? container).getBoundingClientRect();
-      const anchorClientX = selRect.left + selRect.width / 2;
-      const anchorClientY = selRect.top;
+      const anchorClientX = selRect && selRect.width > 0
+        ? selRect.left + selRect.width / 2
+        : mainRect.left + mainRect.width / 2;
+      const anchorClientY = selRect && selRect.height > 0
+        ? selRect.top
+        : mainRect.top + 12;
       const position = positionChatActionMenu(anchorClientX, anchorClientY, mainRect);
       setSelMenu({
         ...position,
@@ -1241,55 +1335,99 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     openCtxMenu(target, me.clientX ?? 0, me.clientY ?? 0);
   }, [preview, openCtxMenu]);
 
-  // Mobile: touch timer long-press (450ms) → custom menu.
+  // Mobile: touch timer long-press → custom menu.
   // Native contextmenu doesn't fire on iOS when user-select:none + touch-callout:none are set.
+  //
+  // Double-tap on a `.chat-assistant` / `.chat-user` bubble opens the
+  // ZoomedTextDialog so the user can re-enable native selection and copy a
+  // specific portion. We detect the second tap on the synthetic `click`
+  // event rather than `touchend` because:
+  //   * iOS Safari reliably fires `click` on a short tap (viewport
+  //     `user-scalable=no` removes the 300 ms double-tap probe delay);
+  //   * if long-press fires, the one-shot `cancelEvent` on touchend
+  //     `preventDefault`s, which suppresses the synthetic click;
+  //   * pairing by `data-event-id` (a string) survives Preact re-renders
+  //     of streaming assistant blocks — a DOM-ref `===` check would lose
+  //     the pairing whenever the merged bubble grew between taps.
   useEffect(() => {
     if (!isTouchDevice || preview) return;
     const container = scrollRef.current;
     if (!container) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let startX = 0, startY = 0;
+    let startTarget: HTMLElement | null = null;
+    let lastTapEventId = '';
+    let lastTapTs = 0;
 
     // Telegram pattern: eat the touchend + subsequent click after menu opens
     const cancelEvent = (e: Event) => { e.preventDefault(); e.stopPropagation(); };
 
     const onTouchStart = (e: TouchEvent) => {
-      if (e.touches.length > 1) return; // multi-touch → cancel
+      if (e.touches.length > 1) {
+        // multi-touch → cancel any in-flight tap tracking; this is a pinch/scroll
+        if (timer) { clearTimeout(timer); timer = null; }
+        return;
+      }
       const t = e.touches[0];
       startX = t.clientX; startY = t.clientY;
-      const targetEl = e.target as HTMLElement;
+      startTarget = e.target as HTMLElement;
       timer = setTimeout(() => {
         timer = null;
-        const chatEvent = targetEl.closest?.('.chat-event') as HTMLElement | null;
+        const chatEvent = startTarget?.closest?.('.chat-event') as HTMLElement | null;
         if (!chatEvent) return;
         openCtxMenu(chatEvent, startX, startY);
         // One-shot: eat the touchend that follows to prevent synthetic click from closing menu
         container.addEventListener('touchend', cancelEvent, { once: true, capture: true });
-      }, 400);
+      }, LONG_PRESS_MS);
     };
 
     const onTouchMove = (e: TouchEvent) => {
       if (!timer) return;
       const t = e.touches[0];
-      if (Math.abs(t.clientX - startX) > 10 || Math.abs(t.clientY - startY) > 10) {
+      if (Math.abs(t.clientX - startX) > TAP_MOVE_TOLERANCE_PX || Math.abs(t.clientY - startY) > TAP_MOVE_TOLERANCE_PX) {
         clearTimeout(timer); timer = null;
       }
     };
 
     const onTouchEnd = () => {
+      // Long-press fired or finger moved? clear timer; double-tap pairing
+      // is handled in onClick (which won't fire if cancelEvent ran).
       if (timer) { clearTimeout(timer); timer = null; }
+    };
+
+    const onClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      const bubble = target?.closest?.('.chat-assistant, .chat-user') as HTMLElement | null;
+      if (!bubble) {
+        lastTapEventId = ''; lastTapTs = 0;
+        return;
+      }
+      // Fall back to a positional fingerprint when data-event-id is absent
+      // (defensive — both bubble flavours now carry it, but a stale build
+      // or an unwired sub-component shouldn't break the zoom path).
+      const id = bubble.dataset.eventId || `pos:${Math.round(bubble.getBoundingClientRect().top)}`;
+      const now = Date.now();
+      if (lastTapEventId === id && now - lastTapTs < DOUBLE_TAP_THRESHOLD_MS) {
+        const text = extractChatEventText(bubble);
+        if (text) setZoomText(text);
+        lastTapEventId = ''; lastTapTs = 0;
+      } else {
+        lastTapEventId = id; lastTapTs = now;
+      }
     };
 
     container.addEventListener('touchstart', onTouchStart, { passive: true });
     container.addEventListener('touchmove', onTouchMove, { passive: true });
     container.addEventListener('touchend', onTouchEnd, { passive: true });
     container.addEventListener('touchcancel', onTouchEnd, { passive: true });
+    container.addEventListener('click', onClick);
     return () => {
       if (timer) clearTimeout(timer);
       container.removeEventListener('touchstart', onTouchStart);
       container.removeEventListener('touchmove', onTouchMove);
       container.removeEventListener('touchend', onTouchEnd);
       container.removeEventListener('touchcancel', onTouchEnd);
+      container.removeEventListener('click', onClick);
       container.removeEventListener('touchend', cancelEvent, { capture: true } as EventListenerOptions);
     };
   }, [isTouchDevice, preview, openCtxMenu]);
@@ -1360,6 +1498,12 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               prefs={chatFontPrefs}
               onChange={setChatFontPrefs}
               variant="compact"
+            />
+            <SessionRepoBranchSummary
+              sessionId={sessionId}
+              projectDir={workdir}
+              onOpenRepo={onViewRepo}
+              className="session-repo-branch-summary-chat-titlebar"
             />
           </div>
         )}
@@ -1501,6 +1645,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               return (
                 <AssistantBlock
                   key={item.key}
+                  eventId={item.key}
                   text={item.text!}
                   automation={item.assistantAutomation === true}
                   ts={item.lastTs ?? item.ts ?? 0}
@@ -1515,18 +1660,18 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={handleFileChangeOpen} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
                     event={linkedEvent}
                     onPathClick={pathClickHandler}
                     onUrlClick={urlClickHandler}
-                    onFileChangeOpen={handleFileChangeOpen}
+                    onFileChangeOpen={fileChangeOpenHandler}
                     onDownload={downloadHandler}
                     serverId={serverId}
                     onResendFailed={onResendFailed}
@@ -1656,9 +1801,20 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                 if (paths[0]) onInsertPath?.(paths[0]);
               }}
               onInsertPath={onInsertPath}
+              onPreviewFile={onPreviewFile ? (request) => onPreviewFile({
+                ...request,
+                rootPath: request.rootPath ?? workdir ?? undefined,
+                sourcePreviewLive: false,
+              }) : undefined}
             />
           </div>
         </>
+      )}
+      {/* Zoomed text dialog — opened by double-tap on a chat bubble on touch
+          devices, so the user can re-enable native text selection and copy a
+          specific portion. */}
+      {zoomText && (
+        <ZoomedTextDialog text={zoomText} onClose={() => setZoomText(null)} onQuote={onQuote} />
       )}
       {/* External link confirm dialog */}
       {pendingUrl && (
@@ -1685,46 +1841,6 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             </div>
           </div>
         </div>
-      )}
-      {fileBrowserTarget && ws && (
-        <FloatingPanel
-          id="chat-file-preview"
-          title={`📄 ${fileBrowserTarget.path.split(/[/\\]/).pop() ?? fileBrowserTarget.path}`}
-          onClose={() => setFileBrowserTarget(null)}
-          defaultW={600}
-          defaultH={500}
-        >
-          <FileBrowser
-            ws={ws}
-            serverId={serverId}
-            mode="file-single"
-            layout="panel"
-            initialPath={(() => {
-              const path = fileBrowserTarget.path;
-              const isAbsolute = path.startsWith('/') || path.startsWith('~') || /^[A-Za-z]:[/\\]/.test(path);
-              const resolved = isAbsolute ? path : `${workdir ?? '~'}/${path}`;
-              return resolved.includes('.') && !resolved.endsWith('/')
-                ? resolved.split(/[/\\]/).slice(0, -1).join('/') || '~'
-                : resolved;
-            })()}
-            highlightPath={fileBrowserTarget.path.startsWith('/') || fileBrowserTarget.path.startsWith('~') || /^[A-Za-z]:[/\\]/.test(fileBrowserTarget.path)
-              ? fileBrowserTarget.path
-              : `${workdir ?? '~'}/${fileBrowserTarget.path}`}
-            autoPreviewPath={fileBrowserTarget.path.startsWith('/') || fileBrowserTarget.path.startsWith('~') || /^[A-Za-z]:[/\\]/.test(fileBrowserTarget.path)
-              ? fileBrowserTarget.path
-              : `${workdir ?? '~'}/${fileBrowserTarget.path}`}
-            autoPreviewPreferDiff={fileBrowserTarget.preferDiff}
-            onConfirm={(paths) => {
-              if (paths[0]) onInsertPath?.(paths[0]);
-              setFileBrowserTarget(null);
-            }}
-            onInsertPath={onInsertPath ? (path) => {
-              onInsertPath(path);
-              setFileBrowserTarget(null);
-            } : undefined}
-            onClose={() => setFileBrowserTarget(null)}
-          />
-        </FloatingPanel>
       )}
     </div>
   );
@@ -1811,12 +1927,16 @@ const AssistantBlock = memo(function AssistantBlock({
   text,
   automation,
   ts,
+  eventId,
   onPathClick,
   onUrlClick,
   onDownload,
 }: AssistantBlockProps) {
   return (
-    <div class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}`}>
+    <div
+      class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}`}
+      data-event-id={eventId}
+    >
       <ChatMarkdown text={text} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} />
       <ChatTime ts={ts} />
     </div>

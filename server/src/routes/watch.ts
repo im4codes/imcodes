@@ -14,6 +14,8 @@ import {
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
+import { TIMELINE_RESPONSE_STATUS } from '../../../shared/timeline-protocol.js';
 import { getPodIdentity } from '../util/pod-identity.js';
 import logger from '../util/logger.js';
 
@@ -21,6 +23,8 @@ export const watchRoutes = new Hono<{ Bindings: Env; Variables: { userId: string
 const TEXT_TAIL_HISTORY_PAGE_LIMIT = 500;
 const TEXT_TAIL_HISTORY_MAX_PAGES = 6;
 const TEXT_TAIL_HISTORY_TIMEOUT_MS = 1500;
+const TEXT_TAIL_MAX_ENCODED_BYTES = 64 * 1024;
+const textTailBackfills = new Map<string, Promise<Awaited<ReturnType<typeof getSessionTextTailCache>>>>();
 
 type WatchSessionState = 'working' | 'idle' | 'error' | 'stopped';
 
@@ -81,6 +85,7 @@ async function backfillSessionTextTailFromDaemon(
       sessionName,
       limit: TEXT_TAIL_HISTORY_PAGE_LIMIT,
       timeoutMs: TEXT_TAIL_HISTORY_TIMEOUT_MS,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
       ...(beforeTs !== undefined ? { beforeTs } : {}),
     });
     const rawEvents = Array.isArray(response.events)
@@ -100,10 +105,11 @@ async function backfillSessionTextTailFromDaemon(
 
     const live = collectSessionTextTailCacheItems(sessionName, rawEvents);
     if (live.length > 0) {
-      events = mergeSessionTextTailCacheItems(events, live);
+      events = trimTextTailToBudget(mergeSessionTextTailCacheItems(events, live));
     }
 
     if (rawEvents.length < TEXT_TAIL_HISTORY_PAGE_LIMIT) break;
+    if (encodedJsonBytes(events) >= TEXT_TAIL_MAX_ENCODED_BYTES) break;
 
     let oldestTs: number | undefined;
     for (const event of rawEvents) {
@@ -118,6 +124,125 @@ async function backfillSessionTextTailFromDaemon(
   }
 
   return events;
+}
+
+function getBackfillSessionTextTailFromDaemon(
+  serverId: string,
+  sessionName: string,
+  cached: Awaited<ReturnType<typeof getSessionTextTailCache>>,
+): Promise<Awaited<ReturnType<typeof getSessionTextTailCache>>> {
+  const key = `${serverId}\0${sessionName}`;
+  const existing = textTailBackfills.get(key);
+  if (existing) return existing;
+  const promise = backfillSessionTextTailFromDaemon(serverId, sessionName, cached)
+    .finally(() => {
+      if (textTailBackfills.get(key) === promise) textTailBackfills.delete(key);
+    });
+  textTailBackfills.set(key, promise);
+  return promise;
+}
+
+function encodedJsonBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8');
+}
+
+function withHttpActualPayloadBytes<T extends Record<string, unknown>>(body: T): T & { actualPayloadBytes: number } {
+  let actualPayloadBytes = 0;
+  let next = { ...body, actualPayloadBytes };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const encodedBytes = encodedJsonBytes(next);
+    if (encodedBytes === actualPayloadBytes) break;
+    actualPayloadBytes = encodedBytes;
+    next = { ...body, actualPayloadBytes };
+  }
+  return next as T & { actualPayloadBytes: number };
+}
+
+function selectedEventIds(events: readonly unknown[]): Set<string> {
+  const ids = new Set<string>();
+  for (const event of events) {
+    if (!event || typeof event !== 'object') continue;
+    const eventId = (event as Record<string, unknown>).eventId;
+    if (typeof eventId === 'string') ids.add(eventId);
+  }
+  return ids;
+}
+
+function withBoundedHttpTimelinePayload<T extends Record<string, unknown>>(
+  body: T,
+  budgetBytes: number,
+): T & { actualPayloadBytes: number } {
+  let measured = withHttpActualPayloadBytes(body);
+  if (measured.actualPayloadBytes <= budgetBytes || !Array.isArray(body.events)) return measured;
+
+  const originalEvents = [...body.events];
+  const buildCandidate = (startIndex: number): T & { actualPayloadBytes: number } => {
+    const events = originalEvents.slice(startIndex);
+    const ids = selectedEventIds(events);
+    const detailRefs = Array.isArray(body.detailRefs)
+      ? body.detailRefs.filter((ref) => {
+        if (!ref || typeof ref !== 'object') return false;
+        const eventId = (ref as Record<string, unknown>).eventId;
+        return typeof eventId === 'string' && ids.has(eventId);
+      })
+      : undefined;
+    const earliestTs = events.length > 0 && typeof (events[0] as Record<string, unknown> | undefined)?.ts === 'number'
+      ? (events[0] as Record<string, unknown>).ts as number
+      : null;
+    return withHttpActualPayloadBytes({
+      ...body,
+      events,
+      ...(detailRefs && detailRefs.length > 0 ? { detailRefs } : { detailRefs: undefined }),
+      status: TIMELINE_RESPONSE_STATUS.PARTIAL,
+      payloadTruncated: true,
+      hasMore: true,
+      earliestTs,
+      legacyBeforeTs: earliestTs,
+    });
+  };
+
+  let low = 0;
+  let high = originalEvents.length;
+  let best: (T & { actualPayloadBytes: number }) | undefined;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = buildCandidate(mid);
+    if (candidate.actualPayloadBytes <= budgetBytes) {
+      best = candidate;
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+  return best ?? buildCandidate(originalEvents.length);
+}
+
+function trimTextTailToBudget<T extends Array<{ eventId: string; ts: number; text: string }>>(events: T): T {
+  let next = [...events];
+  while (next.length > 0 && encodedJsonBytes(next) > TEXT_TAIL_MAX_ENCODED_BYTES) {
+    next = next.slice(1);
+  }
+  return next as T;
+}
+
+function textTailSignature(events: Array<{ eventId: string; ts: number; type?: string; text?: string; source?: string; confidence?: string }>): string {
+  const first = events[0];
+  const last = events.at(-1);
+  let rolling = 0;
+  for (const event of events) {
+    const part = `${event.eventId}\0${event.ts}\0${event.type ?? ''}\0${event.text?.length ?? 0}\0${event.text ?? ''}\0${event.source ?? ''}\0${event.confidence ?? ''}`;
+    for (let index = 0; index < part.length; index += 1) {
+      rolling = ((rolling << 5) - rolling + part.charCodeAt(index)) | 0;
+    }
+  }
+  return [
+    events.length,
+    first?.eventId ?? '',
+    first?.ts ?? '',
+    last?.eventId ?? '',
+    last?.ts ?? '',
+    rolling >>> 0,
+  ].join(':');
 }
 
 function sanitizeWatchTimelineEvent(raw: unknown): {
@@ -145,6 +270,49 @@ function sanitizeWatchTimelineEvent(raw: unknown): {
     type,
     payload: text !== undefined ? { text } : {},
   };
+}
+
+function timelineResponseMetadata(response: Record<string, unknown>): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {};
+  for (const key of ['status', 'errorReason', 'source'] as const) {
+    if (typeof response[key] === 'string') metadata[key] = response[key];
+  }
+  for (const key of ['payloadBytes', 'actualPayloadBytes', 'droppedEvents', 'truncatedEvents'] as const) {
+    if (typeof response[key] === 'number' && Number.isFinite(response[key])) metadata[key] = response[key];
+  }
+  for (const key of ['payloadTruncated', 'cursorReset'] as const) {
+    if (typeof response[key] === 'boolean') metadata[key] = response[key];
+  }
+  if (Array.isArray(response.detailRefs)) metadata.detailRefs = response.detailRefs;
+  if (response.nextCursor && typeof response.nextCursor === 'object') metadata.timelineCursor = response.nextCursor;
+  return metadata;
+}
+
+async function verifyWatchSessionOwnership(db: Env['DB'], serverId: string, sessionName: string): Promise<boolean> {
+  try {
+    const mainRow = await db.queryOne<Record<string, unknown>>(
+      'SELECT 1 FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+      [serverId, sessionName],
+    );
+    if (mainRow) return true;
+
+    const subMatch = sessionName.match(/^deck_sub_(.+)$/);
+    if (!subMatch) return false;
+    const subRow = await db.queryOne<Record<string, unknown>>(
+      'SELECT 1 FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
+      [serverId, subMatch[1]],
+    );
+    return !!subRow;
+  } catch (err) {
+    logger.warn({ serverId, sessionName, err }, 'watch timeline session ownership check failed');
+    return false;
+  }
+}
+
+function structuredTimelineCursor(response: Record<string, unknown>): Record<string, unknown> | null {
+  return response.nextCursor && typeof response.nextCursor === 'object' && !Array.isArray(response.nextCursor)
+    ? response.nextCursor as Record<string, unknown>
+    : null;
 }
 
 
@@ -292,6 +460,9 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
 
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
+  if (!await verifyWatchSessionOwnership(c.env.DB, serverId, sessionName)) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
 
   const rawLimit = Number(c.req.query('limit') ?? '50');
   const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.trunc(rawLimit), 200) : 50;
@@ -304,6 +475,8 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
     const response = await WsBridge.get(serverId).requestTimelineHistory({
       sessionName,
       limit,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
+      abortSignal: c.req.raw.signal,
       ...(beforeTs !== undefined && Number.isFinite(beforeTs) ? { beforeTs } : {}),
       ...(afterTs !== undefined && Number.isFinite(afterTs) ? { afterTs } : {}),
     });
@@ -316,14 +489,20 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
       ? events[0].ts
       : null;
     const hasMore = earliestTs !== null && events.length >= limit;
+    const responseHasMore = typeof response.hasMore === 'boolean' ? response.hasMore : hasMore;
+    const nextCursor = structuredTimelineCursor(response);
 
-    return c.json({
+    const body = {
       sessionName,
       epoch: typeof response.epoch === 'number' ? response.epoch : null,
       events,
-      hasMore,
-      nextCursor: hasMore ? earliestTs : null,
-    });
+      ...timelineResponseMetadata(response),
+      hasMore: responseHasMore,
+      nextCursor,
+      earliestTs,
+      legacyBeforeTs: responseHasMore ? earliestTs : null,
+    };
+    return c.json(withBoundedHttpTimelinePayload(body, TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (message === 'daemon_offline') return c.json({ error: 'daemon_offline' }, 503);
@@ -333,14 +512,14 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
 });
 
 /**
- * Web-facing full-fidelity variant of the Watch timeline/history endpoint.
+ * Web-facing full-shape variant of the Watch timeline/history endpoint.
  *
  * The Watch endpoint above deliberately strips TimelineEvent down to
  * {eventId, sessionId, ts, type, payload.text} for bandwidth/complexity
- * on tiny Watch UIs. The web client needs the full event shape (tool.call
- * payloads, session.state fields, user.message pending flags, etc.) so it
- * can dedup via `mergeTimelineEvents` and render the same way as live
- * WS timeline.event messages.
+ * on tiny Watch UIs. The web client needs the shaped event records
+ * (tool previews, session.state fields, user.message pending flags, etc.)
+ * so it can dedup via `mergeTimelineEvents` and render the same way as live
+ * websocket timeline events.
  *
  * Why a separate HTTP path when WS `timeline.history_request` already exists:
  * the WS request rides on the same socket whose subscription may still be
@@ -351,8 +530,9 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
  * directly and recovers those events — dedup by eventId makes it safe to
  * merge alongside the WS path.
  *
- * Response schema mirrors the Watch variant except `events[]` contains the
- * raw, unsanitized TimelineEvent records the daemon persisted.
+ * Response schema mirrors the Watch variant except `events[]` preserves the
+ * daemon-shaped TimelineEvent fields. It is still a bounded data-plane page,
+ * not a raw unbounded history dump.
  */
 watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
@@ -362,6 +542,9 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
 
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
+  if (!await verifyWatchSessionOwnership(c.env.DB, serverId, sessionName)) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
 
   const rawLimit = Number(c.req.query('limit') ?? '50');
   const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.trunc(rawLimit), 500) : 50;
@@ -379,6 +562,9 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
     const response = await WsBridge.get(serverId).requestTimelineHistory({
       sessionName,
       limit,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL,
+      includeDetails: true,
+      abortSignal: c.req.raw.signal,
       ...(beforeTs !== undefined && Number.isFinite(beforeTs) ? { beforeTs } : {}),
       ...(afterTs !== undefined && Number.isFinite(afterTs) ? { afterTs } : {}),
     });
@@ -400,21 +586,29 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
       ? events[0].ts as number
       : null;
     const hasMore = earliestTs !== null && events.length >= limit;
+    const responseHasMore = typeof response.hasMore === 'boolean' ? response.hasMore : hasMore;
+    const nextCursor = structuredTimelineCursor(response);
 
     const totalMs = Date.now() - tStart;
     logger.info({
       serverId, sessionName, limit, afterTs, beforeTs,
       eventsReturned: events.length,
+      payloadBytes: typeof response.payloadBytes === 'number' ? response.payloadBytes : undefined,
+      payloadTruncated: typeof response.payloadTruncated === 'boolean' ? response.payloadTruncated : undefined,
       bridgeMs, totalMs,
     }, 'timeline.history/full served');
 
-    return c.json({
+    const body = {
       sessionName,
       epoch: typeof response.epoch === 'number' ? response.epoch : null,
       events,
-      hasMore,
-      nextCursor: hasMore ? earliestTs : null,
-    });
+      ...timelineResponseMetadata(response),
+      hasMore: responseHasMore,
+      nextCursor,
+      earliestTs,
+      legacyBeforeTs: responseHasMore ? earliestTs : null,
+    };
+    return c.json(withBoundedHttpTimelinePayload(body, TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL));
   } catch (err) {
     const bridgeMs = Date.now() - tStart;
     const message = err instanceof Error ? err.message : String(err);
@@ -433,13 +627,17 @@ watchRoutes.get('/server/:id/timeline/text-tail', requireAuth(), async (c) => {
 
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
+  if (!await verifyWatchSessionOwnership(c.env.DB, serverId, sessionName)) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
 
   try {
     const cached = await getSessionTextTailCache(c.env.DB, serverId, sessionName);
-    let events = cached;
+    let events = trimTextTailToBudget(cached);
     try {
-      events = await backfillSessionTextTailFromDaemon(serverId, sessionName, cached);
-      if (JSON.stringify(events) !== JSON.stringify(cached)) {
+      events = await getBackfillSessionTextTailFromDaemon(serverId, sessionName, cached);
+      events = trimTextTailToBudget(events);
+      if (textTailSignature(events) !== textTailSignature(cached)) {
         await replaceSessionTextTailCache(c.env.DB, serverId, sessionName, events);
       }
     } catch (err) {
@@ -450,7 +648,7 @@ watchRoutes.get('/server/:id/timeline/text-tail', requireAuth(), async (c) => {
       }, 'timeline.text-tail backfill skipped');
     }
     c.header(IMCODES_POD_HEADER, getPodIdentity());
-    return c.json({ sessionName, events });
+    return c.json(withHttpActualPayloadBytes({ sessionName, events, textTailTruncated: events.length < cached.length }));
   } catch (err) {
     logger.warn({
       serverId,

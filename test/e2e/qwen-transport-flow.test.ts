@@ -175,6 +175,7 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
     model: 'MiniMax-M2.7',
     availableModels: ['MiniMax-M2.7'],
     contextWindow: 200000,
+    systemPrompt: 'Runtime facts: provider is MiniMax, model is MiniMax-M2.7.',
     settings: {
       security: { auth: { selectedType: 'anthropic' } },
       model: { name: 'MiniMax-M2.7' },
@@ -492,9 +493,10 @@ describe('qwen transport flow e2e', () => {
       providerId: 'qwen',
       providerSessionId: 'route-qwen-preset',
       ccPreset: 'MiniMax',
-      requestedModel: 'MiniMax-M2.7',
-      activeModel: 'MiniMax-M2.7',
-      modelDisplay: 'MiniMax-M2.7',
+      requestedModel: 'qwen3-coder-plus',
+      activeModel: 'qwen3-coder-plus',
+      modelDisplay: 'qwen3-coder-plus',
+      qwenModel: 'qwen3-coder-plus',
     });
 
     await connectProvider('qwen', {});
@@ -517,12 +519,17 @@ describe('qwen transport flow e2e', () => {
         security: { auth: { selectedType: 'anthropic' } },
         model: { name: 'MiniMax-M2.7' },
       }),
+      systemPrompt: expect.stringContaining('provider is MiniMax'),
     }));
 
     const record = mocks.store.get(restoreSession);
     expect(record?.requestedModel).toBe('MiniMax-M2.7');
     expect(record?.activeModel).toBe('MiniMax-M2.7');
     expect(record?.modelDisplay).toBe('MiniMax-M2.7');
+    expect(record?.qwenModel).toBe('MiniMax-M2.7');
+    expect(record?.qwenAuthType).toBe('api-key');
+    expect(record?.qwenAvailableModels).toEqual(['MiniMax-M2.7']);
+    expect(record?.presetContextWindow).toBe(200000);
   });
 
   it('allows /model switch to preset model when runtime catalog does not list it', async () => {

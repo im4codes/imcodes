@@ -25,7 +25,7 @@ export type TimelineProjectionStatus = 'missing' | 'building' | 'ready' | 'stale
 const DEFAULT_QUERY_TIMEOUT_MS = 500;
 const DEFAULT_WRITE_TIMEOUT_MS = 2_000;
 
-function getProjectionDbPath(): string {
+export function getProjectionDbPath(): string {
   return process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH?.trim()
     || join(homedir(), '.imcodes', 'timeline.sqlite');
 }
@@ -190,6 +190,34 @@ class TimelineProjectionClient {
     } catch (err) {
       logger.debug({ err }, 'TimelineProjection: checkpointIfNeeded failed');
     }
+  }
+
+  /**
+   * Wait for in-flight write/query requests to settle without rejecting
+   * them. Polls `pending.size` every 10ms up to `timeoutMs`. Use during
+   * SIGTERM **before** `shutdown()` so legitimate appends mirror into
+   * SQLite instead of being failed with a synthetic shutdown error.
+   *
+   * Unlike `shutdown()`, this method does NOT terminate the worker.
+   */
+  async drain(timeoutMs: number): Promise<void> {
+    if (this.pending.size === 0) return;
+    const start = Date.now();
+    while (this.pending.size > 0 && Date.now() - start < timeoutMs) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    if (this.pending.size > 0) {
+      logger.warn({
+        pendingCount: this.pending.size,
+        elapsedMs: Date.now() - start,
+        timeoutMs,
+      }, 'TimelineProjection: drain timed out');
+    }
+  }
+
+  /** Current number of in-flight worker requests. */
+  getPendingCount(): number {
+    return this.pending.size;
   }
 
   async shutdown(): Promise<void> {

@@ -10,8 +10,23 @@ import { routeMessage, type InboundMessage, type RouterContext } from '../router
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { timelineStore } from './timeline-store.js';
-import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload } from '../shared/timeline/types.js';
+import { TimelinePreferredReadError, timelineStore } from './timeline-store.js';
+import {
+  recordFsWorkerMetric,
+  recordTimelineBudgetShape,
+  recordTransportListModelsStaleCompletion,
+  traceCommandAsync,
+  traceSync,
+  traceWebCommandReceived,
+} from './latency-tracer.js';
+import { getDefaultTimelineHistoryWorkerPool, shouldUseTimelineHistoryWorkerPool, TimelineHistoryPoolError } from './timeline-history-pool.js';
+import { FsListPoolError, getDefaultFsListWorkerPool, shouldUseFsListWorkerPool } from './fs-list-pool.js';
+import { scanFsListSnapshot } from './fs-list-worker.js';
+import { FsGitStatusPoolError, getDefaultFsGitStatusWorkerPool, shouldUseFsGitStatusWorkerPool, __resetFsGitStatusWorkerPoolForTests } from './fs-git-status-pool.js';
+import { scanFsGitStatusSnapshot } from './fs-git-status-worker.js';
+import { shapeTimelineDetailValueForTransport, shapeTimelineEventsForTransport } from './timeline-response-shaper.js';
+import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
+import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
 import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
 import {
@@ -23,11 +38,23 @@ import {
   subSessionName,
   type SubSessionRecord,
 } from './subsession-manager.js';
+import { sendSubSessionSync } from './subsession-sync.js';
 import logger from '../util/logger.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
+import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
+import {
+  TIMELINE_CURSOR_DIRECTIONS,
+  TIMELINE_MESSAGES,
+  TIMELINE_RESPONSE_SOURCES,
+  TIMELINE_RESPONSE_STATUS,
+  type TimelinePayloadMetadata,
+  type TimelineResponseSource,
+  type TimelineResponseStatus,
+} from '../../shared/timeline-protocol.js';
 import { homedir } from 'os';
-import { lstat as fsLstat, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
+import { lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
 import { exec as execCb, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -36,8 +63,8 @@ const execFileAsync = promisify(execFileCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
 import { buildSessionList } from './session-list.js';
 import { supervisionAutomation } from './supervision-automation.js';
-import { getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
-import type { P2pAdvancedRound, P2pContextReducerConfig } from '../../shared/p2p-advanced.js';
+import { parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
+import type { P2pAdvancedRound, P2pContextReducerConfig, P2pRoundPreset } from '../../shared/p2p-advanced.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { executeCronJob } from './cron-executor.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
@@ -68,11 +95,35 @@ import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
-import { CC_PRESET_MSG, type CcPreset } from '../../shared/cc-presets.js';
+import { CC_PRESET_MSG, normalizeCcPresetName, type CcPreset } from '../../shared/cc-presets.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
-import { p2pScopedSessionKey } from '../../shared/p2p-config-scope.js';
+import { P2P_PRESET_DEFAULT_SUMMARY_PROMPT, P2P_WORKFLOW_SCHEMA_VERSION } from '../../shared/p2p-workflow-constants.js';
+import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from '../../shared/p2p-workflow-diagnostics.js';
+import { compileP2pWorkflowDraft } from '../../shared/p2p-workflow-compiler.js';
+import { materializeOldAdvancedConfigToWorkflowDraft } from '../../shared/p2p-workflow-materialize.js';
+import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
+import { SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
+import { getP2pConfigStoreScope, handleSessionGroupCloneCancel, handleSessionGroupCloneCommand } from './session-group-clone.js';
+import { buildDefaultP2pStaticPolicy } from '../../shared/p2p-workflow-policy.js';
+import {
+  validateP2pWorkflowDraft,
+  validateP2pWorkflowLaunchEnvelope,
+} from '../../shared/p2p-workflow-validators.js';
+import type {
+  P2pBindRuntimeContext,
+  P2pBoundWorkflow,
+  P2pCompiledEdge,
+  P2pCompiledNode,
+  P2pCompiledWorkflow,
+  P2pStaticPolicy,
+  P2pWorkflowDraft,
+  P2pWorkflowLaunchEnvelope,
+  P2pWorkflowNodeDraft,
+} from '../../shared/p2p-workflow-types.js';
+import { bindP2pCompiledWorkflow } from './p2p-workflow-bind.js';
+import { readP2pDiscussionWithOffset } from './p2p-workflow-discussion-offsets.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
@@ -390,7 +441,7 @@ function schedulePreferencePersistence(input: {
  * timeline-visible (process path) or not (some P2P internal paths).
  */
 function emitCommandAckReliable(
-  serverLink: Pick<ServerLink, 'send'> | undefined,
+  serverLink: (Pick<ServerLink, 'send'> & Partial<Pick<ServerLink, 'trySend'>>) | undefined,
   params: {
     commandId: string;
     sessionName: string;
@@ -410,115 +461,53 @@ function emitCommandAckReliable(
     .catch((err) =>
       logger.error({ commandId: params.commandId, err }, 'ackOutbox.enqueue failed'),
     );
-  try {
-    serverLink?.send({
-      type: MSG_COMMAND_ACK,
-      commandId: params.commandId,
-      status: params.status,
-      session: params.sessionName,
-      ...(params.error ? { error: params.error } : {}),
-    });
+  const sent = trySendCommandAck(serverLink, {
+    commandId: params.commandId,
+    sessionName: params.sessionName,
+    status: params.status,
+    error: params.error,
+  });
+  if (sent) {
     outbox
       .markAcked(params.commandId)
       .catch((err) =>
         logger.warn({ commandId: params.commandId, err }, 'ackOutbox.markAcked failed'),
       );
-  } catch (err) {
+  } else {
     logger.warn(
-      { commandId: params.commandId, err },
-      'command.ack send failed, queued for retry via outbox',
+      { commandId: params.commandId },
+      'command.ack not sent, queued for retry via outbox',
     );
   }
 }
 
-/**
- * Build a unified subsession.sync payload from the session store record.
- * Ensures all fields (including Qwen metadata) are always sent — no more
- * scattered inline objects with different field subsets.
- *
- * For Qwen sub-sessions, display metadata (planLabel, quotaLabel, quotaUsageLabel)
- * is computed FRESH (same as buildSessionList for main sessions) rather than
- * reading stale values from the session store.
- */
-async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Promise<Record<string, unknown> | null> {
-  const sessionName = subSessionName(id);
-  const record = getSession(sessionName);
-  const r = { ...record, ...overrides };
-  if (!r?.agentType) {
-    logger.warn({ id, sessionName }, 'Skipping subsession.sync without agentType');
-    return null;
-  }
-
-  // Compute transport display metadata fresh — matches session-list.ts hydration logic.
-  // The session store may have stale or missing metadata during early launch/update windows.
-  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'codexAvailableModels' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'>> = r?.agentType === 'qwen'
-    ? getQwenDisplayMetadata({
-        model: r?.qwenModel,
-        authType: r?.qwenAuthType,
-        authLimit: r?.qwenAuthLimit,
-        quotaUsageLabel: r?.qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
-      })
-    : r?.agentType === 'claude-code-sdk'
-      ? await getClaudeSdkRuntimeConfig().catch(() => ({}))
-      : (r?.agentType === 'codex' || r?.agentType === 'codex-sdk')
-        ? mergeCodexDisplayMetadata(await getCodexRuntimeConfig().catch(() => ({})), r)
-    : {};
-
-  return {
-    type: 'subsession.sync',
-    id,
-    // Current state (idle/running/queued/stopped/error) — the web side (see
-    // `useSubSessions.ts subsession.sync/created handlers`) already reads
-    // this field, but the daemon previously sent metadata only, which left
-    // freshly-loaded sub-sessions stuck with `state: 'unknown'` → gray dot
-    // in the sidebar until the next live `session.state` event arrived.
-    // For an idle session with no recent state change, that next event
-    // might never come, so the dot could stay gray indefinitely.
-    state: r?.state ?? null,
-    sessionType: r.agentType,
-    cwd: r?.projectDir ?? null,
-    shellBin: null,
-    ccSessionId: r?.ccSessionId ?? null,
-    geminiSessionId: r?.geminiSessionId ?? null,
-    parentSession: r?.parentSession ?? null,
-    ccPresetId: r?.ccPreset ?? null,
-    description: r?.description ?? null,
-    label: r?.label ?? null,
-    runtimeType: r?.runtimeType ?? null,
-    providerId: r?.providerId ?? null,
-    providerSessionId: r?.providerSessionId ?? null,
-    requestedModel: r?.requestedModel ?? null,
-    activeModel: r?.activeModel ?? r?.modelDisplay ?? null,
-    contextNamespace: r?.contextNamespace ?? null,
-    contextNamespaceDiagnostics: r?.contextNamespaceDiagnostics ?? null,
-    contextRemoteProcessedFreshness: r?.contextRemoteProcessedFreshness ?? null,
-    contextLocalProcessedFreshness: r?.contextLocalProcessedFreshness ?? null,
-    contextRetryExhausted: r?.contextRetryExhausted ?? null,
-    contextSharedPolicyOverride: r?.contextSharedPolicyOverride ?? null,
-    transportConfig: r?.transportConfig ?? null,
-    // Qwen metadata — freshly computed display fields + stored config fields
-    qwenModel: r?.qwenModel ?? null,
-    qwenAuthType: r?.qwenAuthType ?? null,
-    qwenAuthLimit: r?.qwenAuthLimit ?? null,
-    qwenAvailableModels: r?.qwenAvailableModels ?? null,
-    codexAvailableModels: freshDisplay.codexAvailableModels ?? r?.codexAvailableModels ?? null,
-    modelDisplay: freshDisplay.modelDisplay ?? r?.modelDisplay ?? null,
-    planLabel: freshDisplay.planLabel ?? r?.planLabel ?? null,
-    quotaLabel: freshDisplay.quotaLabel ?? r?.quotaLabel ?? null,
-    quotaUsageLabel: freshDisplay.quotaUsageLabel ?? r?.quotaUsageLabel ?? null,
-    quotaMeta: freshDisplay.quotaMeta ?? r?.quotaMeta ?? null,
-    effort: r?.effort ?? null,
+function trySendCommandAck(
+  serverLink: (Pick<ServerLink, 'send'> & Partial<Pick<ServerLink, 'trySend'>>) | undefined,
+  params: {
+    commandId: string;
+    sessionName: string;
+    status: string;
+    error?: string;
+  },
+): boolean {
+  if (!serverLink) return false;
+  const wireMsg: Record<string, unknown> = {
+    type: MSG_COMMAND_ACK,
+    commandId: params.commandId,
+    status: params.status,
+    session: params.sessionName,
   };
-}
-
-async function sendSubSessionSync(
-  serverLink: ServerLink,
-  id: string,
-  overrides?: Partial<SessionRecord>,
-): Promise<void> {
-  const payload = await buildSubSessionSync(id, overrides);
-  if (!payload) return;
-  serverLink.send(payload);
+  if (params.error) wireMsg.error = params.error;
+  if (typeof serverLink.trySend === 'function') {
+    return serverLink.trySend(wireMsg);
+  }
+  try {
+    serverLink.send(wireMsg);
+    return true;
+  } catch (err) {
+    logger.warn({ commandId: params.commandId, err }, 'command.ack send failed');
+    return false;
+  }
 }
 
 function normalizeTransportConfigUpdate(value: unknown): Record<string, unknown> | undefined {
@@ -558,6 +547,7 @@ async function handleSessionTransportConfigUpdate(cmd: Record<string, unknown>, 
   // loop in lifecycle will retry from the local store.
   persistSessionRecord(nextRecord, sessionName);
   supervisionAutomation.applySnapshotUpdate(sessionName, extractSessionSupervisionSnapshot(nextTransportConfig ?? null));
+  invalidateTransportListModelsCache('session_transport_config_update');
   await handleGetSessions(serverLink);
 }
 
@@ -585,6 +575,7 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
   upsertSession(nextRecord);
   persistSessionRecord(nextRecord, sessionName);
   supervisionAutomation.applySnapshotUpdate(sessionName, extractSessionSupervisionSnapshot(nextTransportConfig ?? null));
+  invalidateTransportListModelsCache('subsession_transport_config_update');
   const id = sessionName.replace(/^deck_sub_/, '');
   try {
     await sendSubSessionSync(serverLink, id, { transportConfig: nextTransportConfig });
@@ -709,8 +700,9 @@ async function syncSubSessionIfNeeded(sessionName: string, serverLink: ServerLin
 /**
  * For sandboxed agents (Gemini, Codex): copy files from ~/.imcodes/ to
  * the session's project .imc/refs/ so the agent can access them.
- * Rewrites @paths in the message text. Auto-deletes copies after 30 min and
- * persists cleanup metadata in ~/.imcodes/temp-files.json.
+ * Rewrites @paths and `#N:(path)` attachment references in the message text.
+ * Auto-deletes copies after 30 min and persists cleanup metadata in
+ * ~/.imcodes/temp-files.json.
  */
 async function rewritePathsForSandbox(sessionName: string, text: string): Promise<string> {
   const record = getSession(sessionName);
@@ -718,17 +710,23 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
   if (!projectDir) return text;
 
   const imcodesDir = nodePath.join(homedir(), '.imcodes');
-  // Match @paths that point into ~/.imcodes/
-  const pathRegex = new RegExp(`@(${imcodesDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[/\\\\][^\\s]+)`, 'g');
+  const escapedImcodesDir = imcodesDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const legacyAtPathRegex = new RegExp(`@(${escapedImcodesDir}[/\\\\][^\\s)]+)`, 'g');
+  const taggedPathRegex = new RegExp(`#\\d+:\\((${escapedImcodesDir}[/\\\\][^)]+)\\)`, 'g');
 
   let result = text;
-  const matches = [...text.matchAll(pathRegex)];
-  if (matches.length === 0) return text;
+  const paths = new Set<string>();
+  for (const match of text.matchAll(legacyAtPathRegex)) {
+    if (match[1]) paths.add(match[1]);
+  }
+  for (const match of text.matchAll(taggedPathRegex)) {
+    if (match[1]) paths.add(match[1]);
+  }
+  if (paths.size === 0) return text;
 
   const refsDir = await ensureImcDir(projectDir, 'refs');
 
-  for (const match of matches) {
-    const srcPath = match[1];
+  for (const srcPath of paths) {
     const filename = nodePath.basename(srcPath);
     // Unique prefix prevents collision when multiple sessions copy the same file concurrently
     const uniqueName = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}_${filename}`;
@@ -742,12 +740,14 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
         expiresAt: now + (30 * 60_000),
         reason: 'sandbox-ref-copy',
       });
-      result = result.replace(`@${srcPath}`, `@${destPath}`);
+      result = result.replaceAll(`@${srcPath}`, `@${destPath}`);
+      result = result.replaceAll(`(${srcPath})`, `(${destPath})`);
       // Auto-delete after 30 minutes
-      setTimeout(async () => {
+      const cleanupTimer = setTimeout(async () => {
         try { const { unlink } = await import('node:fs/promises'); await unlink(destPath); } catch { /* already deleted */ }
         try { await removeTrackedTempFile(destPath); } catch { /* ignore */ }
       }, 30 * 60_000);
+      cleanupTimer.unref?.();
     } catch (err) {
       logger.warn({ src: srcPath, dest: destPath, err }, 'Failed to copy file for sandboxed agent');
     }
@@ -857,22 +857,6 @@ export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promis
   }
 }
 
-// ── Common MIME map for file metadata ────────────────────────────────────────
-
-const MIME_MAP: Record<string, string> = {
-  ts: 'text/typescript', tsx: 'text/typescript', js: 'text/javascript', jsx: 'text/javascript',
-  mjs: 'text/javascript', cjs: 'text/javascript', json: 'application/json', md: 'text/markdown',
-  txt: 'text/plain', html: 'text/html', css: 'text/css', xml: 'text/xml', yaml: 'text/yaml',
-  yml: 'text/yaml', toml: 'text/toml', sh: 'text/x-shellscript', py: 'text/x-python',
-  rb: 'text/x-ruby', go: 'text/x-go', rs: 'text/x-rust', java: 'text/x-java',
-  kt: 'text/x-kotlin', swift: 'text/x-swift', c: 'text/x-c', cpp: 'text/x-c++',
-  h: 'text/x-c', hpp: 'text/x-c++', sql: 'text/x-sql', lua: 'text/x-lua',
-  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
-  webp: 'image/webp', svg: 'image/svg+xml', ico: 'image/x-icon', bmp: 'image/bmp',
-  pdf: 'application/pdf', zip: 'application/zip', gz: 'application/gzip',
-  tar: 'application/x-tar', wasm: 'application/wasm',
-};
-
 // ── @@ token parsing ─────────────────────────────────────────────────────────
 
 /**
@@ -943,13 +927,6 @@ function resolveP2pConfigScopeSession(sessionName: string): string {
   return record?.parentSession ?? sessionName;
 }
 
-function getP2pConfigStoreScope(serverLink: ServerLink, scopeSession: string): string {
-  const serverId = typeof (serverLink as unknown as { getServerId?: () => string }).getServerId === 'function'
-    ? (serverLink as unknown as { getServerId: () => string }).getServerId()
-    : undefined;
-  return p2pScopedSessionKey(scopeSession, serverId);
-}
-
 async function resolveStructuredP2pSessionConfig(
   sessionName: string,
   serverLink: ServerLink,
@@ -974,7 +951,7 @@ function sendP2pTargetError(
   timelineMessage: string,
 ): void {
   timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: timelineMessage });
-  try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error }); } catch {}
+  emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error });
 }
 
 // Session names: alphanumeric + underscore only (matches deck_{project}_{role} and deck_sub_{id} patterns)
@@ -1110,6 +1087,54 @@ function getMutex(sessionName: string): AsyncMutex {
   return mutex;
 }
 
+const PROCESS_MEMORY_RECALL_DEADLINE_MS = 2_500;
+
+async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+interface ProcessDeliveryTurn {
+  waitForTurn(): Promise<void>;
+  releaseTurn(): void;
+}
+
+const processDeliveryChains = new Map<string, Promise<void>>();
+
+function reserveProcessDeliveryTurn(sessionName: string): ProcessDeliveryTurn {
+  const previous = processDeliveryChains.get(sessionName) ?? Promise.resolve();
+  let releaseCurrent!: () => void;
+  const current = new Promise<void>((resolve) => {
+    releaseCurrent = resolve;
+  });
+  const chain = previous.catch(() => { /* keep the delivery chain alive */ }).then(() => current);
+  processDeliveryChains.set(sessionName, chain);
+  let released = false;
+  return {
+    waitForTurn: () => previous.catch(() => { /* earlier delivery failure is surfaced elsewhere */ }),
+    releaseTurn: () => {
+      if (released) return;
+      released = true;
+      releaseCurrent();
+      void chain.finally(() => {
+        if (processDeliveryChains.get(sessionName) === chain) {
+          processDeliveryChains.delete(sessionName);
+        }
+      });
+    },
+  };
+}
+
 // ── CommandId dedup cache (100 entries / 5 min TTL per session) ──────────────
 
 class CommandDedup {
@@ -1181,6 +1206,7 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     return;
   }
   const cmd = msg as Record<string, unknown>;
+  traceWebCommandReceived(cmd);
 
   // Top-level isolation: any synchronous throw inside a handler — e.g.
   // a TypeError from `cmd.foo.bar` when `foo` is undefined, or a
@@ -1200,7 +1226,11 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
   // browsers, but the daemon does not crash.  Individual handlers
   // already do their own try/catch where input validation matters.
   try {
-    dispatchWebCommand(cmd, serverLink);
+    traceSync('web_command.dispatch_sync', {
+      type: typeof cmd.type === 'string' ? cmd.type : '<non-string>',
+      commandId: typeof cmd.commandId === 'string' ? cmd.commandId : undefined,
+      sessionName: typeof cmd.sessionName === 'string' ? cmd.sessionName : undefined,
+    }, () => dispatchWebCommand(cmd, serverLink));
   } catch (err) {
     logger.warn(
       { err, type: typeof cmd.type === 'string' ? cmd.type : '<non-string>' },
@@ -1226,6 +1256,12 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case DAEMON_COMMAND_TYPES.SESSION_CANCEL:
       void handleSessionCancel(cmd, serverLink);
       break;
+    case SESSION_GROUP_CLONE_MSG.START:
+      void handleSessionGroupCloneCommand(cmd, serverLink);
+      break;
+    case SESSION_GROUP_CLONE_MSG.CANCEL:
+      handleSessionGroupCloneCancel(cmd, serverLink);
+      break;
     case DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG:
       void handleSessionTransportConfigUpdate(cmd, serverLink);
       break;
@@ -1248,22 +1284,35 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       handleGetSessions(serverLink);
       break;
     case 'terminal.subscribe':
-      handleSubscribe(cmd, serverLink);
+      traceSync('web_command.terminal_subscribe', {
+        sessionName: typeof cmd.sessionName === 'string' ? cmd.sessionName : undefined,
+      }, () => handleSubscribe(cmd, serverLink));
       break;
     case 'terminal.unsubscribe':
-      handleUnsubscribe(cmd);
+      traceSync('web_command.terminal_unsubscribe', {
+        sessionName: typeof cmd.sessionName === 'string' ? cmd.sessionName : undefined,
+      }, () => handleUnsubscribe(cmd));
       break;
     case 'terminal.snapshot_request':
       handleSnapshotRequest(cmd);
       break;
-    case 'timeline.replay_request':
-      handleTimelineReplay(cmd, serverLink);
+    case TIMELINE_MESSAGES.REPLAY_REQUEST:
+      void traceCommandAsync(cmd, 'web_command.timeline_replay', () => handleTimelineReplay(cmd, serverLink));
       break;
-    case 'timeline.history_request':
-      void handleTimelineHistory(cmd, serverLink);
+    case TIMELINE_MESSAGES.HISTORY_REQUEST:
+      void traceCommandAsync(cmd, 'web_command.timeline_history', () => handleTimelineHistory(cmd, serverLink));
+      break;
+    case TIMELINE_MESSAGES.PAGE_REQUEST:
+      void traceCommandAsync(cmd, 'web_command.timeline_page', () => handleTimelineHistory(cmd, serverLink));
+      break;
+    case TIMELINE_MESSAGES.DETAIL_REQUEST:
+      traceSync('web_command.timeline_detail', {
+        sessionName: typeof cmd.sessionName === 'string' ? cmd.sessionName : undefined,
+        requestId: typeof cmd.requestId === 'string' ? cmd.requestId : undefined,
+      }, () => handleTimelineDetailRequest(cmd, serverLink));
       break;
     case 'chat.subscribe':
-      void handleChatSubscribeReplay(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.chat_subscribe', () => handleChatSubscribeReplay(cmd, serverLink));
       break;
     case TRANSPORT_MSG.APPROVAL_RESPONSE:
       void handleTransportApprovalResponse(cmd, serverLink);
@@ -1281,7 +1330,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleSubSessionTransportConfigUpdate(cmd, serverLink);
       break;
     case 'subsession.rebuild_all':
-      void handleSubSessionRebuildAll(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.subsession_rebuild_all', () => handleSubSessionRebuildAll(cmd, serverLink));
       break;
     case 'subsession.detect_shells':
       void handleSubSessionDetectShells(serverLink);
@@ -1360,11 +1409,11 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case 'discussion.status':
       handleDiscussionStatus(cmd, serverLink);
       break;
-    case 'p2p.list_discussions':
-      void handleP2pListDiscussions(cmd, serverLink);
+    case P2P_WORKFLOW_MSG.LIST_DISCUSSIONS:
+      void traceCommandAsync(cmd, 'web_command.p2p_list_discussions', () => handleP2pListDiscussions(cmd, serverLink));
       break;
-    case 'p2p.read_discussion':
-      void handleP2pReadDiscussion(cmd, serverLink);
+    case P2P_WORKFLOW_MSG.READ_DISCUSSION:
+      void traceCommandAsync(cmd, 'web_command.p2p_read_discussion', () => handleP2pReadDiscussion(cmd, serverLink));
       break;
     case 'discussion.stop':
       void handleDiscussionStop(cmd);
@@ -1390,10 +1439,10 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       }
       break;
     case 'file.search':
-      void handleFileSearch(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.file_search', () => handleFileSearch(cmd, serverLink));
       break;
     case MEMORY_WS.SEARCH:
-      void handleMemorySearch(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.memory_search', () => handleMemorySearch(cmd, serverLink));
       break;
     case MEMORY_WS.ARCHIVE:
       void handleMemoryArchive(cmd, serverLink);
@@ -1414,16 +1463,16 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleMemoryDelete(cmd, serverLink);
       break;
     case 'fs.ls':
-      void handleFsList(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.fs_ls', () => handleFsList(cmd, serverLink));
       break;
     case 'fs.read':
       void handleFsRead(cmd, serverLink);
       break;
     case 'fs.git_status':
-      void handleFsGitStatus(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.fs_git_status', () => handleFsGitStatus(cmd, serverLink));
       break;
     case 'fs.git_diff':
-      void handleFsGitDiff(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.fs_git_diff', () => handleFsGitDiff(cmd, serverLink));
       break;
     case 'fs.mkdir':
       void handleFsMkdir(cmd, serverLink);
@@ -1431,17 +1480,19 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case 'fs.write':
       void handleFsWrite(cmd, serverLink);
       break;
-    case 'p2p.cancel':
+    case P2P_WORKFLOW_MSG.CANCEL:
       void handleP2pCancel(cmd, serverLink);
       break;
-    case 'p2p.status':
-      void handleP2pStatus(cmd, serverLink);
+    case P2P_WORKFLOW_MSG.STATUS:
+      void traceCommandAsync(cmd, 'web_command.p2p_status', () => handleP2pStatus(cmd, serverLink));
       break;
     case CC_PRESET_MSG.LIST:
       void handleCcPresetsList(serverLink);
       break;
     case CC_PRESET_MSG.SAVE:
-      void handleCcPresetsSave(cmd, serverLink);
+      void handleCcPresetsSave(cmd, serverLink).catch((err) => {
+        logger.error({ err }, 'Unhandled CC preset save failure');
+      });
       break;
     case CC_PRESET_MSG.DISCOVER_MODELS:
       void handleCcPresetsDiscoverModels(cmd, serverLink);
@@ -1465,7 +1516,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       handleMemoryFeaturesSet(cmd, serverLink);
       break;
     case MEMORY_WS.PREF_QUERY:
-      void handleMemoryPreferencesQuery(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.memory_pref_query', () => handleMemoryPreferencesQuery(cmd, serverLink));
       break;
     case MEMORY_WS.PREF_CREATE:
       void handleMemoryPreferenceCreate(cmd, serverLink);
@@ -1477,7 +1528,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleMemoryPreferenceDelete(cmd, serverLink);
       break;
     case MEMORY_WS.SKILL_QUERY:
-      void handleMemorySkillsQuery(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.memory_skill_query', () => handleMemorySkillsQuery(cmd, serverLink));
       break;
     case MEMORY_WS.SKILL_REBUILD:
       void handleMemorySkillsRebuild(cmd, serverLink);
@@ -1492,7 +1543,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleMemoryMarkdownIngestRun(cmd, serverLink);
       break;
     case MEMORY_WS.OBSERVATION_QUERY:
-      void handleMemoryObservationsQuery(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.memory_observation_query', () => handleMemoryObservationsQuery(cmd, serverLink));
       break;
     case MEMORY_WS.OBSERVATION_UPDATE:
       void handleMemoryObservationUpdate(cmd, serverLink);
@@ -1542,14 +1593,17 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       })();
       break;
     case 'transport.list_models':
-      void handleTransportListModels(cmd, serverLink);
+      void traceCommandAsync(cmd, 'web_command.transport_list_models', () => handleTransportListModels(cmd, serverLink));
       break;
     case REPO_MSG.DETECT:
+      void traceCommandAsync(cmd, 'web_command.repo_detect', async () => { handleRepoCommand(cmd, serverLink); });
+      break;
     case REPO_MSG.LIST_ISSUES:
     case REPO_MSG.LIST_PRS:
     case REPO_MSG.LIST_BRANCHES:
     case REPO_MSG.LIST_COMMITS:
     case REPO_MSG.LIST_ACTIONS:
+    case REPO_MSG.CHECKOUT_BRANCH:
     case REPO_MSG.ACTION_DETAIL:
     case REPO_MSG.COMMIT_DETAIL:
     case REPO_MSG.PR_DETAIL:
@@ -2008,6 +2062,401 @@ function resolveSingleTargetMode(
   return configuredMode && configuredMode !== 'skip' ? configuredMode : 'discuss';
 }
 
+type PreparedAdvancedWorkflowLaunch =
+  | {
+      ok: true;
+      advancedRounds: P2pAdvancedRound[];
+      advancedRunTimeoutMs?: number;
+      contextReducer?: P2pContextReducerConfig;
+      diagnostics: P2pWorkflowDiagnostic[];
+      /**
+       * Audit:V-1 / N-H1 — when present, the bound workflow flowed through
+       * compile + bind. Caller MUST pass `advanced: { kind: 'envelope_compiled', bound, ... }`
+       * to `startP2pRun` so the orchestrator surfaces capabilitySnapshot/policy
+       * on the run state. Absent on legacy passthrough (no envelope).
+       */
+      bound?: P2pBoundWorkflow;
+    }
+  | { ok: false; diagnostics: P2pWorkflowDiagnostic[] };
+
+function hasOldAdvancedLaunchFields(cmd: Record<string, unknown>): boolean {
+  return cmd.p2pAdvancedPresetKey != null
+    || cmd.p2pAdvancedRounds != null
+    || cmd.p2pAdvancedRunTimeoutMinutes != null
+    || cmd.p2pContextReducer != null;
+}
+
+function roundPresetFromWorkflowPreset(node: Pick<P2pWorkflowNodeDraft, 'preset'>): P2pRoundPreset {
+  if (
+    node.preset === 'openspec_propose'
+    || node.preset === 'proposal_audit'
+    || node.preset === 'implementation'
+    || node.preset === 'implementation_audit'
+    || node.preset === 'custom'
+  ) {
+    return node.preset;
+  }
+  return 'discussion';
+}
+
+/**
+ * R3 PR-α (A2 / Cu1-N3) — order compiled nodes for legacy executor traversal.
+ *
+ * The previous implementation sorted by `node.id.localeCompare`, which made
+ * round execution order depend on lexical id spelling rather than the
+ * compiled `rootNodeId` + edges topology. That violated spec
+ * "Workflow rootNodeId SHALL define execution start" and produced
+ * non-deterministic order across renames. We now traverse from
+ * `workflow.rootNodeId` along DEFAULT edges, then append any unreachable
+ * nodes in declaration order so the legacy projection still surfaces them.
+ */
+export function orderCompiledNodesForExecution(workflow: P2pCompiledWorkflow): P2pCompiledNode[] {
+  const nodesById = new Map(workflow.nodes.map((node) => [node.id, node]));
+  const visited = new Set<string>();
+  const ordered: P2pCompiledNode[] = [];
+  const visit = (nodeId: string): void => {
+    if (visited.has(nodeId)) return;
+    const node = nodesById.get(nodeId);
+    if (!node) return;
+    visited.add(nodeId);
+    ordered.push(node);
+    const outgoing = workflow.edges
+      .filter((edge) => edge.fromNodeId === nodeId && edge.edgeKind === 'default')
+      .map((edge) => edge.toNodeId);
+    for (const next of outgoing) visit(next);
+  };
+  if (workflow.rootNodeId) visit(workflow.rootNodeId);
+  // Defensive: append any unreachable nodes in declaration order so the
+  // legacy projection still surfaces them. Compiler MUST reject unreachable
+  // graphs; this is just a safety net for adapter consumers.
+  for (const node of workflow.nodes) {
+    if (!visited.has(node.id)) ordered.push(node);
+  }
+  return ordered;
+}
+
+/**
+ * R3 PR-α (Cu1-N3) — Map a single compiled outgoing conditional edge to the
+ * legacy `jumpRule` shape. Returns undefined when the node has no conditional
+ * outgoing edge or when no loop budget is registered. Marker preserves the
+ * raw `condition.equals` string instead of compressing every non-`PASS`
+ * marker to `'REWORK'`; non-`PASS|REWORK` markers fall back to `'REWORK'`
+ * because the legacy `P2pVerdictMarker` union accepts only those two values.
+ * The new envelope_compiled executor (PR-β) bypasses this adapter entirely
+ * and reads `condition` directly, so the legacy compression is bounded to
+ * oldAdvanced surfaces.
+ */
+export function mapConditionalEdgeToJumpRule(
+  conditionalEdge: P2pCompiledEdge | undefined,
+  loopBudgets: Record<string, number>,
+): { jumpRule: P2pAdvancedRound['jumpRule']; verdictPolicy: P2pAdvancedRound['verdictPolicy'] } {
+  if (!conditionalEdge) return { jumpRule: undefined, verdictPolicy: 'none' };
+  const loopBudget = loopBudgets[conditionalEdge.id];
+  const rawMarker = conditionalEdge.condition?.equals;
+  const marker: 'PASS' | 'REWORK' = rawMarker === 'PASS' ? 'PASS' : 'REWORK';
+  if (loopBudget === undefined) {
+    // No registered loop budget → emit `forced_rework` policy without a
+    // jumpRule so the legacy projection records routing intent without
+    // letting orchestrator loop indefinitely.
+    return { jumpRule: undefined, verdictPolicy: 'forced_rework' };
+  }
+  return {
+    jumpRule: {
+      targetRoundId: conditionalEdge.toNodeId,
+      marker,
+      minTriggers: 0,
+      maxTriggers: loopBudget,
+    },
+    verdictPolicy: 'forced_rework',
+  };
+}
+
+/**
+ * R3 PR-α (A1 / W3 / Cu1-N3) — Map a compiled node to a legacy
+ * `P2pAdvancedRound`, preserving `nodeKind`, `script`, `routingAuthority`,
+ * and `artifactConvention` so the orchestrator can dispatch / recheck without
+ * a sidecar `bound.compiled.nodes.find(...)` lookup.
+ */
+export function mapCompiledNodeToLegacyRound(
+  node: P2pCompiledNode,
+  workflow: P2pCompiledWorkflow,
+): P2pAdvancedRound {
+  const conditionalEdge = workflow.edges.find((edge) => edge.fromNodeId === node.id && edge.edgeKind === 'conditional');
+  const { jumpRule, verdictPolicy } = mapConditionalEdgeToJumpRule(conditionalEdge, workflow.loopBudgets);
+  // R3 PR-α (W3) — preserve the FIRST artifact contract's convention so the
+  // orchestrator can decide between `openspec_convention` (per-file sha256
+  // baseline + frozen identity) and `explicit_paths` (legacy sha256 listing).
+  // Multi-contract nodes are not allowed in v1a; compiler enforces.
+  const artifactConvention: 'none' | 'explicit' | 'openspec_convention' | undefined =
+    node.artifacts.length > 0
+      ? (node.artifacts[0].convention as 'explicit' | 'openspec_convention')
+      : undefined;
+  /*
+   * R3 v2 PR-μ — Resolve the per-round summary prompt:
+   *   1. Use the user's `summaryPromptOverride` (canvas inspector) when set.
+   *   2. Fall back to `P2P_PRESET_DEFAULT_SUMMARY_PROMPT[node.preset]`.
+   * The legacy round carries the resolved string in
+   * `effectiveSummaryPrompt` so `normalizeAdvancedRound` can force the
+   * summary phase on EVERY workflow round, including single_main nodes
+   * that previously had `synthesisStyle='none'`.
+   */
+  const effectiveSummaryPrompt = (node.summaryPromptOverride ?? '').trim().length > 0
+    ? (node.summaryPromptOverride ?? '').trim()
+    : P2P_PRESET_DEFAULT_SUMMARY_PROMPT[node.preset];
+  return {
+    id: node.id,
+    title: node.title ?? node.id,
+    preset: roundPresetFromWorkflowPreset(node),
+    executionMode: node.dispatchStyle === 'multi_dispatch' ? 'multi_dispatch' : 'single_main',
+    permissionScope: node.permissionScope,
+    ...(node.promptAppend ? { promptAppend: node.promptAppend } : {}),
+    ...(node.artifacts.length > 0 ? { artifactOutputs: node.artifacts.flatMap((artifact) => artifact.paths).sort() } : {}),
+    verdictPolicy,
+    ...(jumpRule ? { jumpRule } : {}),
+    // R3 PR-α (A1 / W3) — compiled-node carriers preserved on the legacy
+    // round model so downstream consumers can read authoritative semantics.
+    nodeKind: node.nodeKind,
+    ...(node.script ? { script: node.script } : {}),
+    ...(node.routingAuthority ? { routingAuthority: node.routingAuthority } : {}),
+    ...(artifactConvention ? { artifactConvention } : {}),
+    ...(effectiveSummaryPrompt ? { effectiveSummaryPrompt } : {}),
+  } satisfies P2pAdvancedRound;
+}
+
+function compiledWorkflowToLegacyAdvancedRounds(workflow: P2pCompiledWorkflow): P2pAdvancedRound[] {
+  // R3 PR-α — replaced lexical sort with topological traversal so the
+  // execution order honours `rootNodeId` + DEFAULT edges (A2). Field
+  // preservation lives in `mapCompiledNodeToLegacyRound` (A1 / W3); jump rule
+  // mapping lives in `mapConditionalEdgeToJumpRule` (Cu1-N3 split). Each
+  // helper is independently unit-tested.
+  return orderCompiledNodesForExecution(workflow).map((node) => mapCompiledNodeToLegacyRound(node, workflow));
+}
+
+function buildAdvancedLaunchEnvelopeFromCommand(
+  cmd: Record<string, unknown>,
+  launchContext: P2pWorkflowLaunchEnvelope['launchContext'],
+): P2pWorkflowLaunchEnvelope | null {
+  const explicitEnvelope = cmd.p2pWorkflowLaunchEnvelope ?? cmd.workflowLaunchEnvelope;
+  if (isPlainRecord(explicitEnvelope)) {
+    return explicitEnvelope as unknown as P2pWorkflowLaunchEnvelope;
+  }
+  if (!hasOldAdvancedLaunchFields(cmd)) return null;
+  return {
+    workflowSchemaVersion: P2P_WORKFLOW_SCHEMA_VERSION,
+    workflowKind: 'advanced',
+    oldAdvanced: {
+      ...(typeof cmd.p2pAdvancedPresetKey === 'string' ? { advancedPresetKey: cmd.p2pAdvancedPresetKey } : {}),
+      ...(Array.isArray(cmd.p2pAdvancedRounds) ? { advancedRounds: cmd.p2pAdvancedRounds as Array<Record<string, unknown>> } : {}),
+      ...(typeof cmd.p2pAdvancedRunTimeoutMinutes === 'number' ? { advancedRunTimeoutMinutes: cmd.p2pAdvancedRunTimeoutMinutes } : {}),
+      ...(isPlainRecord(cmd.p2pContextReducer) ? { contextReducer: cmd.p2pContextReducer } : {}),
+    },
+    migrationPolicy: { kind: 'materialize_old_advanced' },
+    launchContext,
+  };
+}
+
+// `getCurrentDaemonWorkflowCapabilities` is the single entry point for
+// "what capabilities does this daemon currently advertise?". v1a fix
+// (audit:N-H2): the fallback when `serverLink.getP2pWorkflowCapabilities` is
+// missing now returns `[]` (fail-closed) — previously it returned all three
+// dangerous caps as a hardcoded permissive default, which was a fail-OPEN
+// authorisation bug. The function itself lives in the daemon static-policy
+// module so compile/bind/recheck all share one source.
+import {
+  loadDaemonP2pStaticPolicy,
+  readCachedHelloSnapshot,
+} from './p2p-workflow-static-policy.js';
+
+function makeBindRuntimeContext(
+  options: {
+    runId: string;
+    requestId?: string;
+    repoRoot: string;
+    serverLink: ServerLink;
+    policySnapshot: P2pStaticPolicy;
+    initiatorSession: string;
+    targets: P2pTarget[];
+    accepted: boolean;
+  },
+): P2pBindRuntimeContext {
+  const helloSnapshot = readCachedHelloSnapshot(options.serverLink);
+  return {
+    runId: options.runId,
+    requestId: options.requestId,
+    repoRoot: options.repoRoot,
+    participants: [
+      { sessionName: options.initiatorSession },
+      ...options.targets.map((target) => ({ sessionName: target.session, roleLabel: target.mode })),
+    ],
+    launchScope: {
+      serverId: typeof options.serverLink.getServerId === 'function' ? options.serverLink.getServerId() : undefined,
+      sessionName: options.initiatorSession,
+    },
+    // Real hello snapshot, not synthesised placeholder (audit:N2). When the
+    // daemon hasn't sent a hello yet (`helloEpoch === 0` AND `sentAt === 0`),
+    // we still record the actual values so projection consumers can detect
+    // "pre-hello bind" instead of being fed a fake `Date.now()` timestamp.
+    capabilitySnapshot: helloSnapshot,
+    // Audit:R3 PR-α — full P2pStaticPolicy snapshot replaces the previous
+    // ad-hoc { allowScript / allowImplementation / ... } subset. The clone
+    // ensures runtime mutations to the loaded policy never bleed into a run
+    // that was already bound under a different policy version.
+    policySnapshot: structuredClone(options.policySnapshot),
+    concurrencyAdmission: options.accepted ? { accepted: true } : { accepted: false, reason: 'daemon_busy' },
+  };
+}
+
+// Audit:R3 hardening / task 10.2 — exported so the cron dispatcher (and any
+// future automation entry point) can drive the same envelope→compile→bind
+// pipeline as `handleSend`. Keeping a single launch authority is the only way
+// to ensure cron and manual launches share `daemon_busy` admission, capability
+// gating, and `static_policy_mismatch_recompiled` emission.
+export async function prepareAdvancedWorkflowLaunch(options: {
+  cmd: Record<string, unknown>;
+  sessionName: string;
+  targets: P2pTarget[];
+  userText: string;
+  locale?: string;
+  projectDir: string;
+  commandId: string;
+  serverLink: ServerLink;
+}): Promise<PreparedAdvancedWorkflowLaunch> {
+  const envelope = buildAdvancedLaunchEnvelopeFromCommand(options.cmd, {
+    requestId: options.commandId,
+    sessionName: options.sessionName,
+    projectRoot: options.projectDir,
+    userText: options.userText,
+    locale: options.locale,
+  });
+  if (!envelope) return { ok: true, advancedRounds: [], diagnostics: [] };
+  if ((options.cmd.p2pWorkflowLaunchEnvelope || options.cmd.workflowLaunchEnvelope) && hasOldAdvancedLaunchFields(options.cmd)) {
+    return { ok: false, diagnostics: [makeP2pWorkflowDiagnostic('mixed_advanced_schema_fields', 'parse')] };
+  }
+  const envelopeValidation = validateP2pWorkflowLaunchEnvelope(envelope);
+  if (!envelopeValidation.ok) return { ok: false, diagnostics: envelopeValidation.diagnostics };
+
+  let draft: P2pWorkflowDraft | undefined = envelope.advancedDraft;
+  let contextReducer: P2pContextReducerConfig | undefined;
+  if (!draft && envelope.oldAdvanced) {
+    if (envelope.migrationPolicy?.kind !== 'materialize_old_advanced') {
+      return { ok: false, diagnostics: [makeP2pWorkflowDiagnostic('invalid_launch_envelope', 'parse', { fieldPath: 'migrationPolicy' })] };
+    }
+    try {
+      draft = materializeOldAdvancedConfigToWorkflowDraft({
+        advancedPresetKey: envelope.oldAdvanced.advancedPresetKey,
+        advancedRounds: envelope.oldAdvanced.advancedRounds as P2pAdvancedRound[] | undefined,
+        advancedRunTimeoutMinutes: envelope.oldAdvanced.advancedRunTimeoutMinutes,
+      });
+      contextReducer = envelope.oldAdvanced.contextReducer as P2pContextReducerConfig | undefined;
+    } catch (err) {
+      return {
+        ok: false,
+        diagnostics: [makeP2pWorkflowDiagnostic('invalid_launch_envelope', 'parse', {
+          summary: err instanceof Error ? err.message : String(err),
+        })],
+      };
+    }
+  }
+  if (!draft) {
+    return { ok: false, diagnostics: [makeP2pWorkflowDiagnostic('invalid_launch_envelope', 'parse', { fieldPath: 'advancedDraft' })] };
+  }
+  const draftValidation = validateP2pWorkflowDraft(draft);
+  if (!draftValidation.ok) return { ok: false, diagnostics: draftValidation.diagnostics };
+
+  // Audit:N4 — staticPolicy must derive from the daemon's actual capability
+  // advertisement, not from hardcoded permissive overrides. `loadDaemonP2pStaticPolicy`
+  // is the single source of truth: allow-flags reflect daemon hello capabilities,
+  // and `concurrency.maxAdvancedRuns` / `concurrency.maxScripts` come from the
+  // policy default (P2P_WORKFLOW_MAX_ACTIVE_RUNS / P2P_WORKFLOW_MAX_ACTIVE_SCRIPTS).
+  const baseStaticPolicy = loadDaemonP2pStaticPolicy(options.serverLink);
+  // R3 PR-α follow-up — UI-driven allowlist. When the envelope carries an
+  // `allowedExecutables` list (configured in `P2pConfigPanel`), rebuild
+  // the policy with that list and recompute the hash so bind validation
+  // sees the user-supplied executables. Daemon-side default is `[]`; the
+  // envelope is the SOLE source for non-empty allowlists in this product.
+  // Removes the previous `~/.imcodes/p2p-policy.json` JSON-file workflow
+  // (off-product for a UI-driven IM client).
+  const envelopeAllowedExecutables = Array.isArray(envelope.allowedExecutables)
+    ? [...new Set(envelope.allowedExecutables.filter((entry) => typeof entry === 'string'))].sort()
+    : [];
+  const staticPolicy = envelopeAllowedExecutables.length > 0
+    ? buildDefaultP2pStaticPolicy({ ...baseStaticPolicy, allowedExecutables: envelopeAllowedExecutables })
+    : baseStaticPolicy;
+  // Audit:R3 PR-γ / N-M5 / V-4 — when the envelope carries a saved
+  // `expectedStaticPolicyHash` (compiled against an earlier policy version)
+  // and the daemon's CURRENT policy hash differs, emit
+  // `static_policy_mismatch_recompiled` (warning severity) so callers know
+  // the preview's compilation result is no longer authoritative. The daemon
+  // proceeds with the current policy regardless; this diagnostic only
+  // documents that a recompile occurred.
+  const policyMismatchDiagnostics: P2pWorkflowDiagnostic[] = [];
+  if (
+    typeof envelope.expectedStaticPolicyHash === 'string'
+    && envelope.expectedStaticPolicyHash.length > 0
+    && envelope.expectedStaticPolicyHash !== staticPolicy.policyHash
+  ) {
+    policyMismatchDiagnostics.push(makeP2pWorkflowDiagnostic('static_policy_mismatch_recompiled', 'bind', {
+      fieldPath: 'expectedStaticPolicyHash',
+      summary: `Launch envelope referenced static policy ${envelope.expectedStaticPolicyHash} but daemon recompiled with current policy ${staticPolicy.policyHash ?? '<unhashed>'}.`,
+    }));
+  }
+  const compileResult = compileP2pWorkflowDraft(draft, staticPolicy);
+  if (!compileResult.ok) {
+    return { ok: false, diagnostics: [...policyMismatchDiagnostics, ...compileResult.diagnostics] };
+  }
+
+  // Audit:N-H3 — admission cap reads `staticPolicy.concurrency.maxAdvancedRuns`
+  // rather than the bare `P2P_WORKFLOW_MAX_ACTIVE_RUNS` constant, so future
+  // policy customisation (cron multi-run, supervision, env override) only has
+  // to update one place.
+  const activeAdvancedRuns = listP2pRuns().filter((run) => run.advancedP2pEnabled && !P2P_TERMINAL_RUN_STATUSES.has(run.status));
+  const bindContext = makeBindRuntimeContext({
+    runId: randomUUID(),
+    requestId: options.commandId,
+    repoRoot: options.projectDir,
+    serverLink: options.serverLink,
+    policySnapshot: staticPolicy,
+    initiatorSession: options.sessionName,
+    targets: options.targets,
+    accepted: activeAdvancedRuns.length < staticPolicy.concurrency.maxAdvancedRuns,
+  });
+  // Audit:N5 / Q5 (binder API single shape). `bindP2pCompiledWorkflow` always
+  // returns the `P2pBindResult` discriminated union — there is no legacy "no
+  // ok field" branch. Use the discriminant directly; the dead `else` branch
+  // that previously inspected `diagnostics.some(severity==='error')` has been
+  // removed. The reverse-regression suite blocks its reintroduction.
+  const bindResult = bindP2pCompiledWorkflow(compileResult.workflow, bindContext);
+  const bindDiagnostics = bindResult.diagnostics;
+  if (!bindResult.ok) {
+    // R3 PR-δ (A5 / Cu1-M1) — bind-fail must include any
+    // `policyMismatchDiagnostics` so callers learn that the daemon
+    // recompiled with the current policy before bind rejected it. Earlier
+    // versions returned only `bindDiagnostics`, hiding the
+    // `static_policy_mismatch_recompiled` warning from observers.
+    return { ok: false, diagnostics: [...policyMismatchDiagnostics, ...bindDiagnostics] };
+  }
+
+  return {
+    ok: true,
+    advancedRounds: compiledWorkflowToLegacyAdvancedRounds(compileResult.workflow),
+    advancedRunTimeoutMs: envelope.oldAdvanced?.advancedRunTimeoutMinutes != null
+      ? envelope.oldAdvanced.advancedRunTimeoutMinutes * 60_000
+      : undefined,
+    contextReducer,
+    bound: bindResult.bound,
+    diagnostics: [
+      ...envelopeValidation.diagnostics,
+      ...policyMismatchDiagnostics,
+      ...compileResult.diagnostics,
+      ...bindDiagnostics,
+    ],
+  };
+}
+
+function summarizeP2pWorkflowDiagnostics(diagnostics: P2pWorkflowDiagnostic[]): string {
+  return diagnostics.map((diagnostic) => diagnostic.code).join(', ') || 'invalid_launch_envelope';
+}
+
 async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = (cmd.sessionName ?? cmd.session) as string | undefined;
   const text = cmd.text as string | undefined;
@@ -2239,18 +2688,15 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     if (roundsMatch) p2pRounds = Math.min(parseInt(roundsMatch[1], 10), 6);
   }
 
-  // For combo pipelines, auto-set rounds to match pipeline length if not explicitly overridden
+  // For combo pipelines, `p2pRounds` is the user-selected number of complete
+  // flow cycles. The orchestrator expands each cycle into the full pipeline.
   const resolvedMode = p2pModeField ?? tokens.agents[0]?.mode ?? '';
-  const comboRounds = getComboRoundCount(resolvedMode);
-  if (comboRounds && !p2pRounds) {
-    p2pRounds = comboRounds;
-  }
 
   // All @@discuss tokens were rejected — sessions not found in store
   if (tokens.hadDiscussTokens) {
     logger.warn({ sessionName }, 'P2P: all @@discuss tokens had invalid session names — none matched session store');
     timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'No valid P2P targets — session names not found' });
-    try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: 'no_valid_targets' }); } catch {}
+    emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: 'no_valid_targets' });
     return;
   }
 
@@ -2313,7 +2759,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             commandId: effectiveId,
           });
           // Send command.ack so pending message state clears
-          serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'conflict', session: sessionName });
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'conflict' });
         } catch { /* not connected */ }
         return;
       }
@@ -2324,34 +2770,78 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         cancelP2pRun(existingRun.id, serverLink);
       }
 
-      const fileContents: Array<{ path: string; content: string }> = [];
       const record = getSession(sessionName);
       const projectDir = record?.projectDir ?? '';
-      for (const fp of tokens.files.slice(0, MAX_P2P_FILE_PULL_COUNT)) {
-        try {
-          const absPath = nodePath.isAbsolute(fp) ? fp : nodePath.join(projectDir, fp);
-          // Check for binary content (null bytes anywhere in the capped content)
-          const content = await fsReadFileRaw(absPath, 'utf8');
-          const capped = content.slice(0, 50_000);
-          if (capped.includes('\0')) {
-            // Binary file (image, etc.) — include path reference so agents can read it
-            fileContents.push({ path: absPath, content: '' });
-            continue;
-          }
-          fileContents.push({ path: fp, content: capped }); // cap at 50KB
-        } catch { /* ignore unreadable files */ }
+      // R3 v2 PR-ν — Removed the legacy verbose language-instruction
+      // injection that mutated `p2pExtraPrompt` with a 79-char bilingual
+      // English line. The language hint is now a first-class structured
+      // field: `run.locale` flows through to `buildHopPrompt` /
+      // `buildAdvancedPromptCommon`, which call
+      // `buildP2pLanguageInstruction(locale)` to emit the concise
+      // locale-native one-liner from the i18n dictionary
+      // (`p2p.discussion_language_instruction`). The new line sits right
+      // after `P2P_BASELINE_PROMPT` — a more prominent slot than the
+      // tail-of-prompt extraPrompt position the old line ended up in —
+      // and the autonym (中文 / 日本語 / etc.) ensures the agent reads
+      // the instruction in the same language it's being asked to reply in.
+      // The extraPrompt field is left untouched for user-supplied custom
+      // hints; nothing the daemon writes leaks into it now.
+      const advancedLaunchRequested = hasOldAdvancedLaunchFields(cmd)
+        || isPlainRecord((cmd as Record<string, unknown>).p2pWorkflowLaunchEnvelope)
+        || isPlainRecord((cmd as Record<string, unknown>).workflowLaunchEnvelope);
+      if (advancedLaunchRequested && tokens.files.length > 0) {
+        const diagnostic = makeP2pWorkflowDiagnostic('invalid_launch_envelope', 'parse', {
+          fieldPath: 'tokens.files',
+          summary: 'Advanced workflow launch requires explicit startContext file references.',
+        });
+        const errMsg = summarizeP2pWorkflowDiagnostics([diagnostic]);
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+        return;
       }
-      // Auto-append language instruction based on the user's selected i18n locale
-      if (p2pLocale && !p2pExtraPrompt?.match(/语言|language|lang|中文|日本語|한국어|español|русский/i)) {
-        const LOCALE_NAMES: Record<string, string> = {
-          'en': 'English',
-          'zh-CN': 'Chinese (Simplified)', 'zh-TW': 'Chinese (Traditional)',
-          'ja': 'Japanese', 'ko': 'Korean', 'es': 'Spanish', 'ru': 'Russian',
-        };
-        const langName = LOCALE_NAMES[p2pLocale] ?? p2pLocale;
-        const langInstr = `Use the user's selected i18n language (${langName}) for the discussion.`;
-        p2pExtraPrompt = p2pExtraPrompt ? `${p2pExtraPrompt}\n${langInstr}` : langInstr;
+      const preparedAdvanced = await prepareAdvancedWorkflowLaunch({
+        cmd,
+        sessionName,
+        targets: tokens.agents,
+        userText: tokens.cleanText,
+        locale: p2pLocale,
+        projectDir,
+        commandId: effectiveId,
+        serverLink,
+      });
+      if (!preparedAdvanced.ok) {
+        const errMsg = summarizeP2pWorkflowDiagnostics(preparedAdvanced.diagnostics);
+        logger.warn({ sessionName, diagnostics: preparedAdvanced.diagnostics }, 'P2P advanced workflow launch rejected');
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+        return;
       }
+      const fileContents: Array<{ path: string; content: string }> = [];
+      if (!advancedLaunchRequested) {
+        for (const fp of tokens.files.slice(0, MAX_P2P_FILE_PULL_COUNT)) {
+          try {
+            const absPath = nodePath.isAbsolute(fp) ? fp : nodePath.join(projectDir, fp);
+            // Check for binary content (null bytes anywhere in the capped content)
+            const content = await fsReadFileRaw(absPath, 'utf8');
+            const capped = content.slice(0, 50_000);
+            if (capped.includes('\0')) {
+              // Binary file (image, etc.) — include path reference so agents can read it
+              fileContents.push({ path: absPath, content: '' });
+              continue;
+            }
+            fileContents.push({ path: fp, content: capped }); // cap at 50KB
+          } catch { /* ignore unreadable files */ }
+        }
+      }
+      // Audit:V-1 / N-H1 — when the prepared advanced launch carries a `bound`
+      // workflow (envelope path), funnel it through the typed
+      // `advanced: { kind: 'envelope_compiled', bound, advancedRounds }`
+      // discriminated union so the orchestrator stores capabilitySnapshot &
+      // currentDaemonPolicy on the run state. Pure-legacy launches (no
+      // envelope, no compiled rounds) fall back to the deprecated top-level
+      // `advancedPresetKey`/`advancedRounds` passthrough until v1b.
+      const compiledFromEnvelope = preparedAdvanced.bound !== undefined
+        && preparedAdvanced.advancedRounds.length > 0;
       const run = await startP2pRun({
         initiatorSession: sessionName,
         targets: tokens.agents,
@@ -2363,10 +2853,27 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         extraPrompt: p2pExtraPrompt,
         modeOverride: resolvedMode || undefined,
         hopTimeoutMs: p2pHopTimeoutMs,
-        advancedPresetKey: p2pAdvancedPresetKey,
-        advancedRounds: p2pAdvancedRounds,
-        advancedRunTimeoutMs: p2pAdvancedRunTimeoutMinutes != null ? p2pAdvancedRunTimeoutMinutes * 60_000 : undefined,
-        contextReducer: p2pContextReducer,
+        ...(compiledFromEnvelope
+          ? {
+              advanced: {
+                kind: 'envelope_compiled' as const,
+                bound: preparedAdvanced.bound!,
+                advancedRounds: preparedAdvanced.advancedRounds,
+                ...(preparedAdvanced.advancedRunTimeoutMs !== undefined
+                  ? { advancedRunTimeoutMs: preparedAdvanced.advancedRunTimeoutMs }
+                  : {}),
+                ...(preparedAdvanced.contextReducer
+                  ? { contextReducer: preparedAdvanced.contextReducer }
+                  : {}),
+              },
+              advancedPresetKey: 'openspec',
+            }
+          : {
+              advancedPresetKey: p2pAdvancedPresetKey,
+              advancedRounds: p2pAdvancedRounds,
+              advancedRunTimeoutMs: p2pAdvancedRunTimeoutMinutes != null ? p2pAdvancedRunTimeoutMinutes * 60_000 : undefined,
+              contextReducer: p2pContextReducer,
+            }),
       });
       // NOTE: do NOT emit a `user.message` on the initiator timeline here.
       // A P2P send is a COMMAND to start a discussion, not a chat message to
@@ -2403,6 +2910,52 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
   const record = (await import('../store/session-store.js')).getSession(sessionName);
+
+  // F4 fix (audit f395d49c-78c) — fail closed when the session record is missing.
+  //
+  // Without this guard, the code below evaluates `isTransportSession` via
+  // `record?.runtimeType === 'transport' || (typeof record?.agentType ===
+  // 'string' && isTransportAgent(record.agentType))`. When `record` is
+  // undefined the expression resolves to false, so the message silently
+  // falls through to the process-agent / tmux path further down
+  // (around `sendProcessSessionMessage` ~line 3380+). That path uses
+  // `agentType='unknown'` and tries to `sendKeys` to a tmux session
+  // that does not exist; the failure is only logged, never surfaced to
+  // the client. The user sees an "accepted" command.ack while the
+  // message goes nowhere — bug 1 ("message bypasses queue, never
+  // reaches SDK").
+  //
+  // Additionally, the providerSessionId-null branch (~line 3022 area)
+  // would still emit `accepted` ack + queued state, but its
+  // `if (record)` guard skips the relaunch dispatch entirely — so the
+  // user receives an accepted ack with no actual recovery in flight.
+  //
+  // The safe behaviour for any record-missing send is the same
+  // regardless of the runtime state: emit an explicit error ack so the
+  // client surface can mark the message as failed and offer retry. We
+  // do not attempt to enqueue or relaunch because the launch metadata
+  // (agentType / projectDir / resume ids / transportConfig) only lives
+  // on the record itself.
+  if (!record) {
+    logger.warn(
+      { sessionName, commandId: effectiveId },
+      'handleSend: session record missing — emitting error ack instead of silent fallthrough',
+    );
+    timelineEmitter.emit(
+      sessionName,
+      'session.state',
+      { state: 'error', error: 'session_missing' },
+      { source: 'daemon', confidence: 'high' },
+    );
+    emitCommandAckReliable(serverLink, {
+      commandId: effectiveId,
+      sessionName,
+      status: 'error',
+      error: 'session_missing',
+    });
+    return;
+  }
+
   const preferenceUserId = preferenceUserIdForSend(cmd, record);
   const preferenceFeatureEnabled = isPreferenceFeatureEnabled();
   const preferenceIngest = processPreferenceLines({
@@ -2456,12 +3009,31 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       { sessionName, providerId: record.providerId, commandId: effectiveId },
       'session.send: transport session has no runtime — queuing for resend after reconnect',
     );
-    enqueueResend(sessionName, {
+    const enqueueResult = enqueueResend(sessionName, {
       text: displayText,
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
       commandId: effectiveId,
       queuedAt: Date.now(),
     });
+    // N-R3 fix (audit 0419d1ac-1f4) — surface a user-visible warning when
+    // the resend queue overflow drops the oldest entry. Previously the
+    // drop only logged at warn-level on the daemon, and the dropped
+    // entry's clientMessageId was already inside `settledCommandIdsRef`
+    // on the web (via `reconcileQueuedOptimisticMessages`), so a per-entry
+    // `command.ack error` would have been swallowed. An `assistant.text`
+    // summary is the only path the user actually sees.
+    if (enqueueResult.droppedOldest) {
+      timelineEmitter.emit(
+        sessionName,
+        'assistant.text',
+        {
+          text: '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。',
+          streaming: false,
+          memoryExcluded: true,
+        },
+        { source: 'daemon', confidence: 'high' },
+      );
+    }
     if (shouldTrackSupervisionTaskRun) {
       supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
@@ -2520,12 +3092,26 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       { sessionName, providerId: record?.providerId, commandId: effectiveId },
       'session.send: transport runtime missing provider session id — queuing and auto-resuming',
     );
-    enqueueResend(sessionName, {
+    const enqueueResultMissingSid = enqueueResend(sessionName, {
       text: displayText,
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
       commandId: effectiveId,
       queuedAt: Date.now(),
     });
+    // N-R3 fix (audit 0419d1ac-1f4) — surface droppedOldest the same way as
+    // the no-runtime branch above.
+    if (enqueueResultMissingSid.droppedOldest) {
+      timelineEmitter.emit(
+        sessionName,
+        'assistant.text',
+        {
+          text: '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。',
+          streaming: false,
+          memoryExcluded: true,
+        },
+        { source: 'daemon', confidence: 'high' },
+      );
+    }
     if (shouldTrackSupervisionTaskRun) {
       supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
@@ -2592,15 +3178,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         }, { source: 'daemon', confidence: 'high' });
         const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
-        try {
-          serverLink.send({ type: 'command.ack', commandId: effectiveId, status: clearStatus, session: sessionName });
-        } catch { /* */ }
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
       } catch (err) {
         const errMsg = describeTransportSendError(err);
         logger.error({ sessionName, err }, 'session.clear (transport) failed');
         timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Clear failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
       }
       return;
     }
@@ -2637,7 +3221,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
               memoryExcluded: true,
             }, { source: 'daemon', confidence: 'high' });
             timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Qwen model: ${nextModel}${authHint}` });
-            try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Qwen model: ${nextModel}${authHint}` }); } catch { /* */ }
+            emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Qwen model: ${nextModel}${authHint}` });
             return;
           }
           transportRuntime.setAgentId(nextModel);
@@ -2678,7 +3262,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             memoryExcluded: true,
           }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch { /* */ }
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
           return;
       }
       if (record?.agentType === 'claude-code-sdk' && modelMatch) {
@@ -2688,7 +3272,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Claude model: ${requestedModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
-          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Claude model: ${requestedModel}` }); } catch {}
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
           return;
         }
         transportRuntime.setAgentId(normalizeClaudeSdkModelForProvider(selectedModel));
@@ -2714,7 +3298,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
       if (record?.agentType === 'codex-sdk' && modelMatch) {
@@ -2730,7 +3314,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Codex model: ${nextModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Codex model: ${nextModel}` });
-          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Codex model: ${nextModel}` }); } catch {}
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Codex model: ${nextModel}` });
           return;
         }
         transportRuntime.setAgentId(nextModel);
@@ -2756,7 +3340,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
       if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'gemini-sdk') && modelMatch) {
@@ -2782,7 +3366,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
       if (supportsEffort(record?.agentType) && effortMatch) {
@@ -2797,7 +3381,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             memoryExcluded: true,
           }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unsupported thinking level: ${nextEffort}` });
-          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unsupported thinking level: ${nextEffort}` }); } catch {}
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unsupported thinking level: ${nextEffort}` });
           return;
         }
         transportRuntime.setEffort(nextEffort);
@@ -2818,7 +3402,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
@@ -2912,13 +3496,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }, { source: 'daemon', confidence: 'high' });
       const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
-      try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: clearStatus, session: sessionName }); } catch {}
+      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error({ sessionName, err }, 'session.clear failed');
       timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Clear failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-      try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch {}
+      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
     }
     return;
   }
@@ -2961,7 +3545,7 @@ function emitCommandAck(
   commandId: string,
   status: 'accepted' | 'accepted_legacy' | 'error',
   error: string | undefined,
-  serverLink: Pick<ServerLink, 'send'> | undefined,
+  serverLink: (Pick<ServerLink, 'send'> & Partial<Pick<ServerLink, 'trySend'>>) | undefined,
 ): void {
   const ackPayload: Record<string, unknown> = { commandId, status };
   if (error) ackPayload.error = error;
@@ -2976,15 +3560,13 @@ function emitCommandAck(
   }).catch((err) => {
     logger.error({ commandId, err }, 'ackOutbox.enqueue failed');
   });
-  try {
-    const wireMsg: Record<string, unknown> = { type: MSG_COMMAND_ACK, commandId, status, session: sessionName };
-    if (error) wireMsg.error = error;
-    serverLink?.send(wireMsg);
+  const sent = trySendCommandAck(serverLink, { commandId, sessionName, status, error });
+  if (sent) {
     outbox.markAcked(commandId).catch((err) => {
       logger.warn({ commandId, err }, 'ackOutbox.markAcked failed');
     });
-  } catch (err) {
-    logger.warn({ commandId, err }, 'command.ack send failed, queued for retry');
+  } else {
+    logger.warn({ commandId }, 'command.ack not sent, queued for retry');
   }
 }
 
@@ -3014,70 +3596,68 @@ async function sendProcessSessionMessage(
     emitCommandAck(sessionName, options.commandId, status, undefined, options.serverLink);
   }
 
-  // ── Step 2: Acquire per-session mutex to serialize tmux delivery ────────────
-  // The mutex preserves message ordering when multiple sends queue up. The ack
-  // above is already out — the user no longer waits on this lock.
-  const release = await getMutex(sessionName).acquire();
-  try {
-    const agentType = getSession(sessionName)?.agentType ?? 'unknown';
+  const deliveryTurn = reserveProcessDeliveryTurn(sessionName);
+  const agentType = getSession(sessionName)?.agentType ?? 'unknown';
 
-    let sendText = finalText;
+  // ── Step 2: Prepare advisory context outside the per-session delivery lock ──
+  // Path sandboxing and memory recall can touch disk/SQLite/embedding state.
+  // They must not block earlier queued tmux writes any longer than necessary.
+  let sendText = finalText;
+  try {
     if (agentType === 'gemini' || agentType === 'codex') {
       sendText = await rewritePathsForSandbox(sessionName, finalText);
     }
+  } catch (rewriteErr) {
+    logger.warn({ sessionName, err: rewriteErr }, 'sandbox path rewrite failed — sending original message');
+    sendText = finalText;
+  }
 
-    // ── Step 3: Memory recall — best-effort, NO deadline ─────────────────────
-    // Recall is purely advisory; it augments the prompt with related past work
-    // when available. A slow or failing recall MUST NOT delay the message —
-    // the user only cares that the agent gets the prompt. If recall succeeds
-    // we prepend; otherwise we send the raw text.
-    let memoryContext: Awaited<ReturnType<typeof prependLocalMemory>> = { text: sendText };
+  let memoryContext: Awaited<ReturnType<typeof prependLocalMemory>> = { text: sendText };
+  try {
+    const deadlineAt = Date.now() + PROCESS_MEMORY_RECALL_DEADLINE_MS;
+    memoryContext = await withDeadline(
+      prependLocalMemory(sendText, sessionName, { deadlineAt }),
+      PROCESS_MEMORY_RECALL_DEADLINE_MS,
+      'memory_recall_timeout',
+    );
+    sendText = memoryContext.text;
+  } catch (recallErr) {
+    logger.warn({ sessionName, timeoutMs: PROCESS_MEMORY_RECALL_DEADLINE_MS, err: recallErr }, 'memory recall skipped — sending without memory injection');
+  }
+
+  // ── Step 3: Serialize only the actual stdin write ──────────────────────────
+  // The delivery turn is reserved before async preparation, so parallel recall
+  // cannot reorder two user messages for the same process session.
+  await deliveryTurn.waitForTurn();
+  const release = await getMutex(sessionName).acquire();
+  try {
+    await sendShellAwareCommand(sessionName, sendText, agentType);
+  } catch (sendErr) {
+    const errMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+    logger.error({ sessionName, err: sendErr }, 'sendShellAwareCommand failed after ack');
     try {
-      memoryContext = await prependLocalMemory(sendText, sessionName);
-      sendText = memoryContext.text;
-    } catch (recallErr) {
-      logger.warn({ sessionName, err: recallErr }, 'memory recall failed — sending without memory injection');
-      // Fall through with the original sendText. Agent still gets the message;
-      // user just doesn't get the related-past-work block.
-    }
-
-    // ── Step 4: Deliver to tmux. Failures here surface as inline errors ──────
-    try {
-      await sendShellAwareCommand(sessionName, sendText, agentType);
-    } catch (sendErr) {
-      const errMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
-      logger.error({ sessionName, err: sendErr }, 'sendShellAwareCommand failed after ack');
-      try {
-        emitSessionInlineError(sessionName, `Failed to deliver message to agent: ${errMsg}`);
-      } catch { /* best-effort */ }
-      throw sendErr;
-    }
-
-    // ── Step 5: Post-delivery — emit memory.context + record hits ────────────
-    // Order matters — memory.context comes AFTER user.message and AFTER
-    // successful agent delivery so a failed send doesn't pollute recall
-    // analytics.
-    if (memoryContext.timelinePayload && userEvent) {
-      timelineEmitter.emit(sessionName, 'memory.context', {
-        ...memoryContext.timelinePayload,
-        relatedToEventId: userEvent.eventId,
-      });
-      if (memoryContext.hitIds && memoryContext.hitIds.length > 0) {
-        try { recordMemoryHits(memoryContext.hitIds); } catch { /* non-fatal */ }
-      }
-    }
-
-    if (agentType === 'opencode') {
-      const { scheduleCatchup } = await import('./opencode-watcher.js');
-      scheduleCatchup(sessionName);
-    }
-  } catch (err) {
-    // The ack is already out (status: accepted). Surface failures as inline
-    // session errors via the path above; we do NOT downgrade the ack to error
-    // because the user has already been told their message was received.
-    throw err;
+      emitSessionInlineError(sessionName, `Failed to deliver message to agent: ${errMsg}`);
+    } catch { /* best-effort */ }
+    throw sendErr;
   } finally {
     release();
+    deliveryTurn.releaseTurn();
+  }
+
+  // ── Step 4: Post-delivery — emit memory.context + record hits ──────────────
+  if (memoryContext.timelinePayload && userEvent) {
+    timelineEmitter.emit(sessionName, 'memory.context', {
+      ...memoryContext.timelinePayload,
+      relatedToEventId: userEvent.eventId,
+    });
+    if (memoryContext.hitIds && memoryContext.hitIds.length > 0) {
+      try { recordMemoryHits(memoryContext.hitIds); } catch { /* non-fatal */ }
+    }
+  }
+
+  if (agentType === 'opencode') {
+    const { scheduleCatchup } = await import('./opencode-watcher.js');
+    scheduleCatchup(sessionName);
   }
 }
 
@@ -3136,7 +3716,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
   const record = getSession(sessionName);
   if (!runtime || record?.runtimeType !== 'transport') {
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Transport session unavailable' });
-    try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error: 'Transport session unavailable' }); } catch {}
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Transport session unavailable' });
     return;
   }
   const release = await getMutex(sessionName).acquire();
@@ -3144,7 +3724,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
     const edited = runtime.editPendingMessage(clientMessageId, text);
     if (!edited) {
       timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queued message not found' });
-      try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error: 'Queued message not found' }); } catch {}
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queued message not found' });
       return;
     }
     supervisionAutomation.updateQueuedTaskIntent(sessionName, clientMessageId, text);
@@ -3155,7 +3735,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
       pendingMessageEntries: runtime.pendingEntries,
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
-    try { serverLink.send({ type: 'command.ack', commandId, status: 'accepted', session: sessionName }); } catch {}
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
   } finally {
     release();
   }
@@ -3172,7 +3752,7 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
   const record = getSession(sessionName);
   if (!runtime || record?.runtimeType !== 'transport') {
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Transport session unavailable' });
-    try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error: 'Transport session unavailable' }); } catch {}
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Transport session unavailable' });
     return;
   }
   const release = await getMutex(sessionName).acquire();
@@ -3180,7 +3760,7 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
     const removed = runtime.removePendingMessage(clientMessageId);
     if (!removed) {
       timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queued message not found' });
-      try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error: 'Queued message not found' }); } catch {}
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queued message not found' });
       return;
     }
     supervisionAutomation.removeQueuedTaskIntent(sessionName, clientMessageId);
@@ -3191,7 +3771,7 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
       pendingMessageEntries: runtime.pendingEntries,
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
-    try { serverLink.send({ type: 'command.ack', commandId, status: 'accepted', session: sessionName }); } catch {}
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
   } finally {
     release();
   }
@@ -3357,45 +3937,422 @@ function handleSnapshotRequest(cmd: Record<string, unknown>): void {
   logger.debug({ sessionName }, 'Snapshot requested via web');
 }
 
-function handleTimelineReplay(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+function timelineStatusFromPayload(droppedEvents: number, truncatedEvents: number): TimelineResponseStatus {
+  return droppedEvents > 0 || truncatedEvents > 0
+    ? TIMELINE_RESPONSE_STATUS.PARTIAL
+    : TIMELINE_RESPONSE_STATUS.OK;
+}
+
+function optionalFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function timelineHistoryResponseTypeForRequest(cmd: Record<string, unknown>): typeof TIMELINE_MESSAGES.HISTORY | typeof TIMELINE_MESSAGES.PAGE {
+  return cmd.type === TIMELINE_MESSAGES.PAGE_REQUEST ? TIMELINE_MESSAGES.PAGE : TIMELINE_MESSAGES.HISTORY;
+}
+
+function resolveTimelineHistoryBudgetBytes(cmd: Record<string, unknown>): number {
+  const requested = optionalFiniteNumber(cmd.budgetBytes);
+  const explicit = cmd.type === TIMELINE_MESSAGES.PAGE_REQUEST
+    || (requested !== undefined && requested > TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE);
+  const cap = explicit
+    ? TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL
+    : TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
+  if (requested === undefined || requested <= 0) return cap;
+  return Math.max(64 * 1024, Math.min(Math.trunc(requested), cap));
+}
+
+function buildTimelineNextCursor(
+  events: readonly TimelineEvent[],
+  epoch: number,
+  direction: 'newer' | 'older' = TIMELINE_CURSOR_DIRECTIONS.OLDER,
+): TimelinePayloadMetadata['nextCursor'] | undefined {
+  if (events.length === 0) return undefined;
+  if (direction === TIMELINE_CURSOR_DIRECTIONS.NEWER) {
+    const last = events[events.length - 1]!;
+    return { epoch, afterSeq: last.seq, afterTs: last.ts, direction };
+  }
+  const first = events[0]!;
+  return { epoch, beforeTs: first.ts, direction };
+}
+
+function measureTimelineActualPayloadBytes<T extends Record<string, unknown>>(message: T): T & { actualPayloadBytes: number } {
+  let actualPayloadBytes = 0;
+  let next = { ...message, actualPayloadBytes };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const encodedBytes = Buffer.byteLength(JSON.stringify(next), 'utf8');
+    if (encodedBytes === actualPayloadBytes) break;
+    actualPayloadBytes = encodedBytes;
+    next = { ...message, actualPayloadBytes };
+  }
+  return next as T & { actualPayloadBytes: number };
+}
+
+function timelineWireBudgetForMessage(message: Record<string, unknown>): number | undefined {
+  switch (message.type) {
+    case TIMELINE_MESSAGES.PAGE:
+    case TIMELINE_MESSAGES.DETAIL:
+      return TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL;
+    case TIMELINE_MESSAGES.HISTORY:
+    case TIMELINE_MESSAGES.REPLAY:
+      return TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
+    default:
+      return undefined;
+  }
+}
+
+function compactTimelineMessageToBudget<T extends Record<string, unknown>>(
+  message: T,
+  budgetBytes: number,
+  initialActualPayloadBytes?: number,
+): T {
+  if (!Array.isArray(message.events)) return message;
+  const startedAt = Date.now();
+  const originalEvents = [...message.events];
+  const originalDropped = typeof message.droppedEvents === 'number' ? message.droppedEvents : 0;
+  const originalTruncated = typeof message.truncatedEvents === 'number' ? message.truncatedEvents : 0;
+  const buildCandidate = (startIndex: number): Record<string, unknown> => {
+    const events = originalEvents.slice(startIndex);
+    const selectedEventIds = new Set(events
+      .map((event) => (event && typeof event === 'object' ? (event as { eventId?: unknown }).eventId : undefined))
+      .filter((eventId): eventId is string => typeof eventId === 'string'));
+    const detailRefs = Array.isArray(message.detailRefs)
+      ? message.detailRefs.filter((ref) => {
+        if (!ref || typeof ref !== 'object') return false;
+        const eventId = (ref as { eventId?: unknown }).eventId;
+        return typeof eventId === 'string' && selectedEventIds.has(eventId);
+      })
+      : undefined;
+    const droppedByEnvelope = startIndex;
+    return {
+      ...message,
+      events,
+      ...(detailRefs && detailRefs.length > 0 ? { detailRefs } : { detailRefs: undefined }),
+      ...(droppedByEnvelope > 0
+        ? {
+          status: TIMELINE_RESPONSE_STATUS.PARTIAL,
+          payloadTruncated: true,
+          hasMore: true,
+          droppedEvents: originalDropped + droppedByEnvelope,
+          truncatedEvents: originalTruncated + droppedByEnvelope,
+        }
+        : {}),
+    };
+  };
+
+  let low = 0;
+  let high = originalEvents.length;
+  let best: Record<string, unknown> | undefined;
+  let compactIterations = 0;
+  let bestActualPayloadBytes = 0;
+  while (low <= high) {
+    compactIterations += 1;
+    const mid = Math.floor((low + high) / 2);
+    const candidate = buildCandidate(mid);
+    const bytes = measureTimelineActualPayloadBytes(candidate).actualPayloadBytes;
+    if (bytes <= budgetBytes) {
+      best = candidate;
+      bestActualPayloadBytes = bytes;
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+  if (best) {
+    recordTimelineBudgetShape({
+      type: typeof message.type === 'string' ? message.type : undefined,
+      budgetBytes,
+      initialActualPayloadBytes,
+      finalActualPayloadBytes: bestActualPayloadBytes,
+      initialEventCount: originalEvents.length,
+      finalEventCount: Array.isArray(best.events) ? best.events.length : 0,
+      compactIterations,
+      durationMs: Date.now() - startedAt,
+      result: 'partial',
+    });
+    return best as T;
+  }
+  const errorMessage = {
+    ...message,
+    events: [],
+    detailRefs: undefined,
+    status: TIMELINE_RESPONSE_STATUS.ERROR,
+    source: TIMELINE_RESPONSE_SOURCES.ERROR,
+    errorReason: TIMELINE_REQUEST_ERROR_REASONS.PAYLOAD_TOO_LARGE,
+    payloadBytes: 2,
+    payloadTruncated: true,
+    hasMore: true,
+    droppedEvents: (typeof message.droppedEvents === 'number' ? message.droppedEvents : 0) + (Array.isArray(message.events) ? message.events.length : 0),
+    truncatedEvents: (typeof message.truncatedEvents === 'number' ? message.truncatedEvents : 0) + (Array.isArray(message.events) ? message.events.length : 0),
+  } as T;
+  const finalActualPayloadBytes = measureTimelineActualPayloadBytes(errorMessage).actualPayloadBytes;
+  recordTimelineBudgetShape({
+    type: typeof message.type === 'string' ? message.type : undefined,
+    budgetBytes,
+    initialActualPayloadBytes,
+    finalActualPayloadBytes,
+    initialEventCount: originalEvents.length,
+    finalEventCount: 0,
+    compactIterations,
+    durationMs: Date.now() - startedAt,
+    result: 'payload_too_large',
+  });
+  return errorMessage;
+}
+
+function withTimelineActualPayloadBytes<T extends Record<string, unknown>>(message: T): T & { actualPayloadBytes: number } {
+  const budgetBytes = timelineWireBudgetForMessage(message);
+  const measured = measureTimelineActualPayloadBytes(message);
+  if (budgetBytes === undefined || measured.actualPayloadBytes <= budgetBytes) return measured;
+  return measureTimelineActualPayloadBytes(compactTimelineMessageToBudget(message, budgetBytes, measured.actualPayloadBytes));
+}
+
+function sendTimelineMessage<T extends Record<string, unknown>>(serverLink: ServerLink, message: T): T & { actualPayloadBytes: number } {
+  const wireMessage = withTimelineActualPayloadBytes(message);
+  serverLink.send(wireMessage);
+  return wireMessage;
+}
+
+function sendTimelineReplayError(
+  serverLink: ServerLink,
+  sessionName: string | undefined,
+  requestId: string | undefined,
+  errorReason: TimelineRequestErrorReason,
+): void {
+  try {
+    sendTimelineMessage(serverLink, {
+      type: TIMELINE_MESSAGES.REPLAY,
+      sessionName,
+      requestId,
+      events: [],
+      truncated: false,
+      epoch: timelineEmitter.epoch,
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      errorReason,
+      source: TIMELINE_RESPONSE_SOURCES.ERROR,
+      payloadBytes: 2,
+      payloadTruncated: false,
+      hasMore: false,
+      droppedEvents: 0,
+      truncatedEvents: 0,
+    });
+  } catch { /* not connected */ }
+}
+
+interface TimelineReplayRequestParams {
+  sessionName: string;
+  afterSeq: number;
+  requestEpoch: number;
+}
+
+interface TimelineReplayBuildResult {
+  events: TimelineEvent[];
+  truncated: boolean;
+  epoch: number;
+  status: TimelineResponseStatus;
+  source: TimelineResponseSource | string;
+  payloadBytes: number;
+  payloadTruncated: boolean;
+  hasMore: boolean;
+  nextCursor?: TimelinePayloadMetadata['nextCursor'];
+  cursorReset?: boolean;
+  droppedEvents: number;
+  truncatedEvents: number;
+  detailRefs?: TimelinePayloadMetadata['detailRefs'];
+}
+
+const timelineReplayInflight = new Map<string, Promise<TimelineReplayBuildResult>>();
+
+function timelineReplayInflightKey(params: TimelineReplayRequestParams): string {
+  return JSON.stringify({
+    sessionName: params.sessionName,
+    afterSeq: params.afterSeq,
+    requestEpoch: params.requestEpoch,
+    epoch: timelineEmitter.epoch,
+  });
+}
+
+function buildTimelineReplay(params: TimelineReplayRequestParams): TimelineReplayBuildResult {
+  if (params.requestEpoch !== timelineEmitter.epoch) {
+    // Epoch mismatch — serve current epoch events from file store, fallback to all epochs.
+    const replayEpochResetLimit = 200;
+    let events = timelineStore.read(params.sessionName, { epoch: timelineEmitter.epoch, limit: replayEpochResetLimit });
+    if (events.length === 0) {
+      events = timelineStore.read(params.sessionName, { limit: replayEpochResetLimit });
+    }
+    const shaped = shapeTimelineEventsForTransport(events, {
+      detailSink: getDefaultTimelineDetailStore(),
+    });
+    const payloadTruncated = shaped.droppedEvents > 0 || shaped.truncatedEvents > 0;
+    return {
+      events: shaped.events,
+      truncated: false,
+      epoch: timelineEmitter.epoch,
+      status: timelineStatusFromPayload(shaped.droppedEvents, shaped.truncatedEvents),
+      source: TIMELINE_RESPONSE_SOURCES.JSONL_TAIL,
+      payloadBytes: shaped.payloadBytes,
+      payloadTruncated,
+      hasMore: shaped.droppedEvents > 0,
+      nextCursor: buildTimelineNextCursor(shaped.events, timelineEmitter.epoch),
+      cursorReset: true,
+      droppedEvents: shaped.droppedEvents,
+      truncatedEvents: shaped.truncatedEvents,
+      detailRefs: shaped.detailRefs.length > 0 ? shaped.detailRefs : undefined,
+    };
+  }
+
+  const { events, truncated, source = TIMELINE_RESPONSE_SOURCES.RING_BUFFER } = timelineEmitter.replay(params.sessionName, params.afterSeq);
+  const shaped = shapeTimelineEventsForTransport(events, {
+    detailSink: getDefaultTimelineDetailStore(),
+  });
+  const payloadTruncated = shaped.droppedEvents > 0 || shaped.truncatedEvents > 0;
+  return {
+    events: shaped.events,
+    truncated,
+    epoch: timelineEmitter.epoch,
+    status: timelineStatusFromPayload(shaped.droppedEvents, shaped.truncatedEvents),
+    source,
+    payloadBytes: shaped.payloadBytes,
+    payloadTruncated,
+    hasMore: shaped.droppedEvents > 0,
+    nextCursor: buildTimelineNextCursor(shaped.events, timelineEmitter.epoch, TIMELINE_CURSOR_DIRECTIONS.NEWER),
+    droppedEvents: shaped.droppedEvents,
+    truncatedEvents: shaped.truncatedEvents,
+    detailRefs: shaped.detailRefs.length > 0 ? shaped.detailRefs : undefined,
+  };
+}
+
+function getTimelineReplayResult(params: TimelineReplayRequestParams): Promise<TimelineReplayBuildResult> {
+  const key = timelineReplayInflightKey(params);
+  const existing = timelineReplayInflight.get(key);
+  if (existing) return existing;
+  const promise = new Promise<TimelineReplayBuildResult>((resolve, reject) => {
+    setImmediate(() => {
+      try {
+        resolve(buildTimelineReplay(params));
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }).finally(() => {
+    timelineReplayInflight.delete(key);
+  });
+  timelineReplayInflight.set(key, promise);
+  return promise;
+}
+
+async function handleTimelineReplay(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
   const afterSeq = cmd.afterSeq as number | undefined;
   const requestEpoch = cmd.epoch as number | undefined;
   const requestId = cmd.requestId as string | undefined;
 
   if (!sessionName || afterSeq === undefined || requestEpoch === undefined) {
-    logger.warn('timeline.replay_request: missing fields');
+    logger.warn({ sessionName, requestId }, 'timeline.replay_request: missing fields');
+    sendTimelineReplayError(serverLink, sessionName, requestId, TIMELINE_REQUEST_ERROR_REASONS.MALFORMED_REQUEST);
     return;
   }
 
-  if (requestEpoch !== timelineEmitter.epoch) {
-    // Epoch mismatch — serve current epoch events from file store, fallback to all epochs
-    let events = timelineStore.read(sessionName, { epoch: timelineEmitter.epoch });
-    if (events.length === 0) {
-      events = timelineStore.read(sessionName, {});
-    }
-    try {
-      serverLink.send({
-        type: 'timeline.replay',
-        sessionName,
-        requestId,
-        events,
-        truncated: false,
-        epoch: timelineEmitter.epoch,
-      });
-    } catch { /* not connected */ }
-    return;
-  }
-
-  const { events, truncated } = timelineEmitter.replay(sessionName, afterSeq);
   try {
-    serverLink.send({
-      type: 'timeline.replay',
+    const result = await getTimelineReplayResult({ sessionName, afterSeq, requestEpoch });
+    sendTimelineMessage(serverLink, {
+      type: TIMELINE_MESSAGES.REPLAY,
       sessionName,
       requestId,
-      events,
-      truncated,
-      epoch: timelineEmitter.epoch,
+      ...result,
+    });
+  } catch (err) {
+    logger.warn({ err, sessionName, requestId }, 'timeline.replay_request failed');
+    sendTimelineReplayError(serverLink, sessionName, requestId, TIMELINE_REQUEST_ERROR_REASONS.INTERNAL_ERROR);
+  }
+}
+
+function handleTimelineDetailRequest(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+  const sessionName = cmd.sessionName as string | undefined;
+  const requestId = cmd.requestId as string | undefined;
+  const detailId = cmd.detailId as string | undefined;
+  const eventId = cmd.eventId as string | undefined;
+  const fieldPath = cmd.fieldPath as string | undefined;
+  const epoch = optionalFiniteNumber(cmd.epoch);
+  const detailStoreGeneration = typeof cmd.detailStoreGeneration === 'string'
+    ? cmd.detailStoreGeneration
+    : undefined;
+  const sendError = (errorReason: string): void => {
+    try {
+      sendTimelineMessage(serverLink, {
+        type: TIMELINE_MESSAGES.DETAIL,
+        sessionName,
+        requestId,
+        detailId,
+        eventId,
+        fieldPath,
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        errorReason,
+        source: TIMELINE_RESPONSE_SOURCES.ERROR,
+        payloadBytes: 2,
+        payloadTruncated: false,
+        hasMore: false,
+      });
+    } catch { /* not connected */ }
+  };
+  if (!sessionName || !detailId || epoch === undefined) {
+    sendError(TIMELINE_DETAIL_ERROR_REASONS.MALFORMED);
+    return;
+  }
+  if (!getSession(sessionName)) {
+    sendError(TIMELINE_DETAIL_ERROR_REASONS.MISSING);
+    return;
+  }
+  let result;
+  try {
+    result = getDefaultTimelineDetailStore().get({
+      sessionName,
+      epoch,
+      detailId,
+      detailStoreGeneration,
+      eventId,
+      fieldPath,
+    });
+  } catch (err) {
+    logger.warn({ err, sessionName, requestId }, 'timeline.detail_request failed');
+    sendError(TIMELINE_DETAIL_ERROR_REASONS.INTERNAL_ERROR);
+    return;
+  }
+  if (!result.ok) {
+    sendError(result.reason);
+    return;
+  }
+  const detailValue = result.entry.value;
+  if (typeof detailValue !== 'string') {
+    sendError(TIMELINE_DETAIL_ERROR_REASONS.OVERSIZED);
+    return;
+  }
+  const responseEnvelope = {
+    type: TIMELINE_MESSAGES.DETAIL,
+    sessionName,
+    requestId,
+    detailId: result.entry.detailId,
+    eventId: result.entry.eventId,
+    fieldPath: result.entry.fieldPath,
+    status: TIMELINE_RESPONSE_STATUS.OK,
+    source: TIMELINE_RESPONSE_SOURCES.CACHE,
+    mediaType: result.entry.mediaType,
+    epoch: result.entry.epoch,
+    detailStoreGeneration: result.entry.generation,
+  };
+  const shaped = shapeTimelineDetailValueForTransport(detailValue, responseEnvelope);
+  if (!shaped.ok) {
+    sendError(shaped.errorReason);
+    return;
+  }
+  try {
+    sendTimelineMessage(serverLink, {
+      ...responseEnvelope,
+      payloadBytes: shaped.payloadBytes,
+      actualPayloadBytes: shaped.payloadBytes,
+      payloadTruncated: shaped.payloadTruncated,
+      hasMore: false,
+      value: shaped.value,
     });
   } catch { /* not connected */ }
 }
@@ -3459,25 +4416,88 @@ async function recoverOpenCodeSessionRecord(record: SessionRecord | undefined): 
   }
 }
 
-async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const sessionName = cmd.sessionName as string | undefined;
-  const requestId = cmd.requestId as string | undefined;
-  const rawLimit = cmd.limit;
-  const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 2000) : 500;
-  const rawAfterTs = cmd.afterTs;
-  const afterTs = typeof rawAfterTs === 'number' && Number.isFinite(rawAfterTs) ? rawAfterTs : undefined;
-  const rawBeforeTs = cmd.beforeTs;
-  const beforeTs = typeof rawBeforeTs === 'number' && Number.isFinite(rawBeforeTs) ? rawBeforeTs : undefined;
+interface TimelineHistoryRequestParams {
+  sessionName: string;
+  requestId?: string;
+  limit: number;
+  afterTs?: number;
+  beforeTs?: number;
+  maxResponseBytes: number;
+}
 
-  if (!sessionName) {
-    logger.warn('timeline.history_request: missing sessionName');
-    return;
+interface TimelineHistoryBuildResult {
+  events: TimelineEvent[];
+  eventsRead: number;
+  payloadBytes: number;
+  droppedEvents: number;
+  truncatedEvents: number;
+  readMs: number;
+  synthesizeMs: number;
+  sanitizeMs: number;
+  source: TimelineResponseSource | string;
+  status: TimelineResponseStatus;
+  errorReason?: TimelineRequestErrorReason | string;
+  cursorReset?: boolean;
+  detailRefs: TimelinePayloadMetadata['detailRefs'];
+}
+
+const timelineHistoryInflight = new Map<string, Promise<TimelineHistoryBuildResult>>();
+
+function timelineHistoryErrorResult(source: string, errorReason: TimelineRequestErrorReason | string): TimelineHistoryBuildResult {
+  return {
+    events: [],
+    eventsRead: 0,
+    payloadBytes: 2,
+    droppedEvents: 0,
+    truncatedEvents: 0,
+    readMs: 0,
+    synthesizeMs: 0,
+    sanitizeMs: 0,
+    source,
+    status: TIMELINE_RESPONSE_STATUS.ERROR,
+    errorReason,
+    detailRefs: [],
+  };
+}
+
+function timelineHistoryInflightKey(params: TimelineHistoryRequestParams): string {
+  return JSON.stringify({
+    sessionName: params.sessionName,
+    limit: params.limit,
+    afterTs: params.afterTs ?? null,
+    beforeTs: params.beforeTs ?? null,
+    maxResponseBytes: params.maxResponseBytes,
+  });
+}
+
+function buildTimelineHistory(params: TimelineHistoryRequestParams): Promise<TimelineHistoryBuildResult> {
+  const initialRecord = getSession(params.sessionName);
+  if (shouldUseTimelineHistoryWorkerPool() && initialRecord?.agentType !== 'opencode') {
+    return buildTimelineHistoryWithWorker(params).catch(async (err) => {
+      const reason = err instanceof TimelineHistoryPoolError ? err.reason : 'unknown';
+      if (reason === TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE) {
+        logger.debug({ sessionName: params.sessionName, requestId: params.requestId, reason }, 'timeline.history worker unavailable; falling back to projection client');
+        return await buildTimelineHistoryOnMain(params);
+      }
+      logger.warn({ sessionName: params.sessionName, requestId: params.requestId, reason }, 'timeline.history worker failed; returning terminal error response');
+      return timelineHistoryErrorResult(`worker_${reason}`, reason);
+    });
   }
+  return buildTimelineHistoryOnMain(params);
+}
 
-  // Instrumentation: measure disk-read + parse + synthesize + serialize so
-  // we can watch p95/p99 of user-visible history-pull latency over time.
-  // (Was previously unmeasured — see daemon.log grep for empty results.)
-  const tStart = Date.now();
+function getTimelineHistoryResult(params: TimelineHistoryRequestParams): Promise<TimelineHistoryBuildResult> {
+  const key = timelineHistoryInflightKey(params);
+  const existing = timelineHistoryInflight.get(key);
+  if (existing) return existing;
+  const promise = Promise.resolve().then(() => buildTimelineHistory(params)).finally(() => {
+    timelineHistoryInflight.delete(key);
+  });
+  timelineHistoryInflight.set(key, promise);
+  return promise;
+}
+
+async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams): Promise<TimelineHistoryBuildResult> {
   let readMs = 0;
   let synthesizeMs = 0;
 
@@ -3486,87 +4506,241 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   // O(requested rows) instead of decoding thousands of unrelated state events.
   // Do NOT filter by epoch — history should include events across daemon restarts.
   const tRead0 = Date.now();
-  const substantive = await timelineStore.readByTypesPreferred(
-    sessionName,
-    [...TIMELINE_HISTORY_CONTENT_TYPES],
-    { limit, afterTs, beforeTs },
-  );
-  let stateEvents: typeof substantive = [];
+  let substantive: TimelineEvent[];
+  let stateEvents: TimelineEvent[] = [];
+  try {
+    substantive = await timelineStore.readByTypesPreferred(
+      params.sessionName,
+      [...TIMELINE_HISTORY_CONTENT_TYPES],
+      { limit: params.limit, afterTs: params.afterTs, beforeTs: params.beforeTs },
+    );
+  } catch (err) {
+    if (err instanceof TimelinePreferredReadError) {
+      return timelineHistoryErrorResult(err.source, err.reason);
+    }
+    throw err;
+  }
   if (substantive.length > 0) {
     const cutoffTs = substantive[0]!.ts;
-    const stateAfterTs = afterTs === undefined ? cutoffTs - 1 : Math.max(afterTs, cutoffTs - 1);
-    stateEvents = await timelineStore.readByTypesPreferred(
-      sessionName,
-      [...TIMELINE_HISTORY_STATE_TYPES],
-      { limit: Math.max(limit * 2, 100), afterTs: stateAfterTs, beforeTs },
-    );
+    const stateAfterTs = params.afterTs === undefined ? cutoffTs - 1 : Math.max(params.afterTs, cutoffTs - 1);
+    try {
+      stateEvents = await timelineStore.readByTypesPreferred(
+        params.sessionName,
+        [...TIMELINE_HISTORY_STATE_TYPES],
+        { limit: Math.max(params.limit * 2, 100), afterTs: stateAfterTs, beforeTs: params.beforeTs },
+      );
+    } catch (err) {
+      if (err instanceof TimelinePreferredReadError) {
+        return timelineHistoryErrorResult(err.source, err.reason);
+      }
+      throw err;
+    }
   }
   const events = [...substantive, ...stateEvents].sort((a, b) => a.ts - b.ts);
   readMs = Date.now() - tRead0;
 
   // Content-aware limit: session.state events don't count toward the budget.
   // This prevents idle↔running oscillation storms from crowding out user.message events.
-  // Trim substantive to the requested limit
-  const trimmedSubstantive = substantive.length > limit ? substantive.slice(substantive.length - limit) : substantive;
-  // Interleave state events that fall within the trimmed time range
-  let trimmed: typeof events;
+  const trimmedSubstantive = substantive.length > params.limit ? substantive.slice(substantive.length - params.limit) : substantive;
+  let trimmed: TimelineEvent[];
   if (trimmedSubstantive.length > 0 && stateEvents.length > 0) {
-    const cutoffTs = trimmedSubstantive[0].ts;
-    const relevantState = stateEvents.filter((e) => e.ts >= cutoffTs);
+    const cutoffTs = trimmedSubstantive[0]!.ts;
+    const relevantState = stateEvents.filter((event) => event.ts >= cutoffTs);
     trimmed = [...trimmedSubstantive, ...relevantState].sort((a, b) => a.ts - b.ts);
   } else {
     trimmed = trimmedSubstantive;
   }
 
-  const record = await recoverOpenCodeSessionRecord(getSession(sessionName));
+  const record = await recoverOpenCodeSessionRecord(getSession(params.sessionName));
+  let opencodeInitialDeferred = false;
+  let opencodeSynthesized = false;
   if (record?.agentType === 'opencode' && record.projectDir && record.opencodeSessionId) {
-    const tSyn0 = Date.now();
-    try {
-      const { exportOpenCodeSession, buildTimelineEventsFromOpenCodeExport } = await import('./opencode-history.js');
-      const exportData = await exportOpenCodeSession(record.projectDir, record.opencodeSessionId);
-      const synthesizedAfterTs = getOpenCodeSynthesizedAfterTs(afterTs);
-      const synthesized = buildTimelineEventsFromOpenCodeExport(sessionName, exportData, timelineEmitter.epoch)
-        .filter((event) => synthesizedAfterTs === undefined || event.ts > synthesizedAfterTs)
-        .filter((event) => beforeTs === undefined || event.ts < beforeTs);
-      const synthesizedTrimmed = synthesized.length > limit ? synthesized.slice(synthesized.length - limit) : synthesized;
-      if (
-        !hasSubstantiveTimelineHistory(trimmed)
-        || countSubstantiveTimelineEvents(synthesizedTrimmed) > countSubstantiveTimelineEvents(trimmed)
-      ) {
-        trimmed = synthesizedTrimmed;
+    const initialHistoryRequest = params.afterTs === undefined && params.beforeTs === undefined;
+    if (initialHistoryRequest) {
+      opencodeInitialDeferred = !hasSubstantiveTimelineHistory(trimmed);
+    } else {
+      const tSyn0 = Date.now();
+      try {
+        const { exportOpenCodeSession, buildTimelineEventsFromOpenCodeExport } = await import('./opencode-history.js');
+        const exportData = await exportOpenCodeSession(record.projectDir, record.opencodeSessionId);
+        opencodeSynthesized = true;
+        const synthesizedAfterTs = getOpenCodeSynthesizedAfterTs(params.afterTs);
+        const synthesized = buildTimelineEventsFromOpenCodeExport(params.sessionName, exportData, timelineEmitter.epoch)
+          .filter((event) => synthesizedAfterTs === undefined || event.ts > synthesizedAfterTs)
+          .filter((event) => params.beforeTs === undefined || event.ts < params.beforeTs);
+        const synthesizedTrimmed = synthesized.length > params.limit ? synthesized.slice(synthesized.length - params.limit) : synthesized;
+        if (
+          !hasSubstantiveTimelineHistory(trimmed)
+          || countSubstantiveTimelineEvents(synthesizedTrimmed) > countSubstantiveTimelineEvents(trimmed)
+        ) {
+          trimmed = synthesizedTrimmed;
+        }
+      } catch (err) {
+        logger.debug({ err, sessionName: params.sessionName, opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
       }
-    } catch (err) {
-      logger.debug({ err, sessionName, opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
+      synthesizeMs = Date.now() - tSyn0;
     }
-    synthesizeMs = Date.now() - tSyn0;
   }
 
-  try {
-    serverLink.send({
-      type: 'timeline.history',
-      sessionName,
-      requestId,
-      events: trimmed,
-      epoch: timelineEmitter.epoch,
-    });
-  } catch { /* not connected */ }
-
-  // One line per pull. Fields: server-side disk/parse time, opencode
-  // synthesis time (0 for normal sessions), total handler time, counts.
-  // Hot-enough path that info-level is appropriate — expect ~1 pull per
-  // user session-open event, bounded by web-side cooldown.
-  const totalMs = Date.now() - tStart;
-  logger.info({
-    sessionName,
-    requestId,
-    limit,
-    afterTs,
-    eventsReturned: trimmed.length,
+  const tSanitize = Date.now();
+  const sanitized = shapeTimelineEventsForTransport(trimmed, {
+    maxResponseBytes: params.maxResponseBytes,
+    detailSink: getDefaultTimelineDetailStore(),
+  });
+  const status = opencodeInitialDeferred
+    ? TIMELINE_RESPONSE_STATUS.DEFERRED
+    : timelineStatusFromPayload(sanitized.droppedEvents, sanitized.truncatedEvents);
+  return {
+    events: sanitized.events,
     eventsRead: events.length,
+    payloadBytes: sanitized.payloadBytes,
+    droppedEvents: sanitized.droppedEvents,
+    truncatedEvents: sanitized.truncatedEvents,
     readMs,
     synthesizeMs,
-    totalMs,
-  }, 'timeline.history served');
+    sanitizeMs: Date.now() - tSanitize,
+    source: opencodeInitialDeferred
+      ? TIMELINE_RESPONSE_SOURCES.DEFERRED
+      : opencodeSynthesized
+      ? TIMELINE_RESPONSE_SOURCES.OPENCODE_EXPORT
+      : TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE,
+    status,
+    errorReason: opencodeInitialDeferred ? TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE : undefined,
+    detailRefs: sanitized.detailRefs,
+  };
+}
+
+async function buildTimelineHistoryWithWorker(params: TimelineHistoryRequestParams): Promise<TimelineHistoryBuildResult> {
+  const result = await getDefaultTimelineHistoryWorkerPool().dispatch({
+    sessionName: params.sessionName,
+    limit: params.limit,
+    afterTs: params.afterTs,
+    beforeTs: params.beforeTs,
+    maxResponseBytes: params.maxResponseBytes,
+    contentTypes: [...TIMELINE_HISTORY_CONTENT_TYPES],
+    stateTypes: [...TIMELINE_HISTORY_STATE_TYPES],
+  }, { deadlineAt: Date.now() + 4_500 });
+  const detailRefs = (result.detailCandidates ?? [])
+    .map((candidate) => getDefaultTimelineDetailStore().put(candidate))
+    .filter((ref): ref is NonNullable<typeof ref> => ref !== undefined);
+  return {
+    events: result.events,
+    eventsRead: result.eventsRead,
+    payloadBytes: result.payloadBytes,
+    droppedEvents: result.droppedEvents,
+    truncatedEvents: result.truncatedEvents,
+    readMs: result.readMs,
+    synthesizeMs: 0,
+    sanitizeMs: result.sanitizeMs,
+    source: result.source ?? TIMELINE_RESPONSE_SOURCES.WORKER_SQLITE,
+    status: timelineStatusFromPayload(result.droppedEvents, result.truncatedEvents),
+    detailRefs,
+  };
+}
+
+async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = cmd.sessionName as string | undefined;
+  const requestId = cmd.requestId as string | undefined;
+  const rawLimit = cmd.limit;
+  const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 2000) : 500;
+  const cursor = cmd.cursor && typeof cmd.cursor === 'object' && !Array.isArray(cmd.cursor)
+    ? cmd.cursor as Record<string, unknown>
+    : undefined;
+  const afterTs = optionalFiniteNumber(cmd.afterTs) ?? optionalFiniteNumber(cursor?.afterTs);
+  const beforeTs = optionalFiniteNumber(cmd.beforeTs) ?? optionalFiniteNumber(cursor?.beforeTs);
+  const maxResponseBytes = resolveTimelineHistoryBudgetBytes(cmd);
+
+  if (!sessionName) {
+    logger.warn({ requestId }, 'timeline.history_request: missing sessionName');
+    try {
+      sendTimelineMessage(serverLink, {
+        type: timelineHistoryResponseTypeForRequest(cmd),
+        sessionName,
+        requestId,
+        events: [],
+        epoch: timelineEmitter.epoch,
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        errorReason: TIMELINE_REQUEST_ERROR_REASONS.MALFORMED_REQUEST,
+        source: TIMELINE_RESPONSE_SOURCES.ERROR,
+        payloadBytes: 2,
+        payloadTruncated: false,
+        hasMore: false,
+        droppedEvents: 0,
+        truncatedEvents: 0,
+      });
+    } catch { /* not connected */ }
+    return;
+  }
+
+  const params: TimelineHistoryRequestParams = { sessionName, requestId, limit, afterTs, beforeTs, maxResponseBytes };
+  const tStart = Date.now();
+  try {
+    const result = await getTimelineHistoryResult(params);
+    const sent = sendTimelineMessage(serverLink, {
+      type: timelineHistoryResponseTypeForRequest(cmd),
+      sessionName,
+      requestId,
+      events: result.events,
+      epoch: timelineEmitter.epoch,
+      status: result.status,
+      errorReason: result.errorReason,
+      source: result.source,
+      payloadBytes: result.payloadBytes,
+      payloadTruncated: result.droppedEvents > 0 || result.truncatedEvents > 0,
+      hasMore: result.droppedEvents > 0,
+      nextCursor: buildTimelineNextCursor(result.events, timelineEmitter.epoch),
+      cursorReset: result.cursorReset,
+      droppedEvents: result.droppedEvents,
+      truncatedEvents: result.truncatedEvents,
+      detailRefs: result.detailRefs && result.detailRefs.length > 0 ? result.detailRefs : undefined,
+    });
+    const totalMs = Date.now() - tStart;
+    const requestedBudgetBytes = optionalFiniteNumber(cmd.budgetBytes);
+    logger.info({
+      sessionName,
+      requestId,
+      requestType: typeof cmd.type === 'string' ? cmd.type : undefined,
+      responseType: sent.type,
+      limit,
+      afterTs,
+      beforeTs,
+      includeDetails: cmd.includeDetails === true,
+      ...(requestedBudgetBytes !== undefined ? { requestedBudgetBytes } : {}),
+      maxResponseBytes,
+      actualPayloadBytes: sent.actualPayloadBytes,
+      source: result.source,
+      eventsReturned: result.events.length,
+      eventsRead: result.eventsRead,
+      eventsDropped: result.droppedEvents,
+      truncatedEvents: result.truncatedEvents,
+      payloadBytes: result.payloadBytes,
+      readMs: result.readMs,
+      synthesizeMs: result.synthesizeMs,
+      sanitizeMs: result.sanitizeMs,
+      totalMs,
+    }, 'timeline.history served');
+    return;
+  } catch (err) {
+    logger.error({ err, sessionName, requestId }, 'timeline.history_request unexpectedly failed');
+    try {
+      sendTimelineMessage(serverLink, {
+        type: timelineHistoryResponseTypeForRequest(cmd),
+        sessionName,
+        requestId,
+        events: [],
+        epoch: timelineEmitter.epoch,
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        errorReason: TIMELINE_REQUEST_ERROR_REASONS.INTERNAL_ERROR,
+        source: TIMELINE_RESPONSE_SOURCES.ERROR,
+        payloadBytes: 2,
+        payloadTruncated: false,
+        hasMore: false,
+        droppedEvents: 0,
+        truncatedEvents: 0,
+      });
+    } catch { /* not connected */ }
+    return;
+  }
 }
 
 // ── Sub-session handlers ──────────────────────────────────────────────────
@@ -3842,73 +5016,333 @@ async function handleAskAnswer(cmd: Record<string, unknown>): Promise<void> {
 
 // ── P2P discussion file listing ────────────────────────────────────────────
 
-async function handleP2pListDiscussions(_cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  // Collect unique project dirs from all sessions
-  const projectDirs = new Set<string>();
-  for (const s of listSessions()) {
-    if (s.projectDir) projectDirs.add(s.projectDir);
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+async function canonicalProjectDir(projectDir: string): Promise<string> {
+  try {
+    return await fsRealpath(projectDir);
+  } catch {
+    return nodePath.resolve(projectDir);
   }
-  const discussions: Array<{ id: string; fileName: string; path: string; preview: string; mtime: number }> = [];
-  for (const projectDir of projectDirs) {
-    const dir = imcSubDir(projectDir, 'discussions');
+}
+
+async function collectKnownProjectDirs(): Promise<Map<string, string>> {
+  const dirs = new Map<string, string>();
+  for (const session of listSessions()) {
+    if (!session.projectDir) continue;
+    const canonical = await canonicalProjectDir(session.projectDir);
+    dirs.set(canonical, session.projectDir);
+  }
+  return dirs;
+}
+
+async function resolveP2pDiscussionProjectScope(cmd: Record<string, unknown>): Promise<{ projectDir: string; canonicalProjectDir: string } | null> {
+  const scope = isPlainRecord(cmd.scope) ? cmd.scope : {};
+  const requestedSession = stringField(scope, 'sessionName') ?? stringField(cmd, 'sessionName');
+  if (requestedSession) {
+    const session = getSession(requestedSession);
+    if (!session?.projectDir) return null;
+    return {
+      projectDir: session.projectDir,
+      canonicalProjectDir: await canonicalProjectDir(session.projectDir),
+    };
+  }
+
+  const requestedProjectDir = stringField(scope, 'projectDir')
+    ?? stringField(scope, 'cwd')
+    ?? stringField(cmd, 'projectDir')
+    ?? stringField(cmd, 'cwd');
+  const knownProjectDirs = await collectKnownProjectDirs();
+  if (requestedProjectDir) {
+    const requestedCanonical = await canonicalProjectDir(requestedProjectDir);
+    const known = knownProjectDirs.get(requestedCanonical);
+    return known
+      ? { projectDir: known, canonicalProjectDir: requestedCanonical }
+      : null;
+  }
+
+  if (knownProjectDirs.size === 1) {
+    const [canonical, projectDir] = [...knownProjectDirs.entries()][0]!;
+    return { projectDir, canonicalProjectDir: canonical };
+  }
+
+  return null;
+}
+
+function isPathUnderDir(filePath: string, dir: string): boolean {
+  const relative = nodePath.relative(dir, nodePath.resolve(filePath));
+  return relative === '' || (!!relative && !relative.startsWith('..') && !nodePath.isAbsolute(relative));
+}
+
+const P2P_DISCUSSION_HISTORY_LIMIT = 50;
+const P2P_DISCUSSION_PREVIEW_BYTES = 64 * 1024;
+const P2P_DISCUSSION_FILE_STAT_CONCURRENCY = 24;
+const P2P_DISCUSSION_PREVIEW_CONCURRENCY = 8;
+
+interface P2pDiscussionHistoryCandidate {
+  id: string;
+  fileName: string;
+  fullPath: string;
+  mtime: number;
+  projectDir?: string;
+}
+
+interface P2pDiscussionHistoryEntry {
+  id: string;
+  fileName: string;
+  path: string;
+  preview: string;
+  mtime: number;
+  projectDir?: string;
+}
+
+function isCanonicalDiscussionFileName(entry: string): boolean {
+  if (!entry.endsWith('.md')) return false;
+  // Keep only canonical discussion documents in the history list.
+  // Intermediate hop artifacts and reducer snapshots are implementation
+  // details and should not crowd out the main discussion file.
+  if (/\.round\d+\.hop\d+\.md$/i.test(entry)) return false;
+  if (/\.reducer\.\d+\.md$/i.test(entry)) return false;
+  return true;
+}
+
+async function readP2pDiscussionPreview(filePath: string, fallback: string): Promise<string> {
+  let fh: Awaited<ReturnType<typeof fsOpen>> | null = null;
+  try {
+    fh = await fsOpen(filePath, 'r');
+    const buffer = Buffer.allocUnsafe(P2P_DISCUSSION_PREVIEW_BYTES);
+    const { bytesRead } = await fh.read(buffer, 0, buffer.length, 0);
+    const snippet = buffer.subarray(0, bytesRead).toString('utf8');
+    const reqMatch = snippet.match(/## User Request\s*\n+(.+)/);
+    return reqMatch?.[1]?.trim().slice(0, 120) || fallback;
+  } catch {
+    return fallback;
+  } finally {
+    if (fh) await fh.close().catch(() => {});
+  }
+}
+
+async function listP2pDiscussionCandidatesForProject(
+  projectDir: string,
+  includeProjectDir: boolean,
+): Promise<P2pDiscussionHistoryCandidate[]> {
+  const dir = imcSubDir(projectDir, 'discussions');
+  let entries: string[];
+  try {
+    entries = await fsReaddir(dir);
+  } catch {
+    return [];
+  }
+
+  const files = entries.filter(isCanonicalDiscussionFileName);
+  const candidates = await mapWithConcurrency(files, P2P_DISCUSSION_FILE_STAT_CONCURRENCY, async (f) => {
+    const fullPath = nodePath.join(dir, f);
     try {
-      const entries = await fsReaddir(dir);
-      const files = entries.filter((entry) => {
-        if (!entry.endsWith('.md')) return false;
-        // Keep only canonical discussion documents in the history list.
-        // Intermediate hop artifacts and reducer snapshots are implementation
-        // details and should not crowd out the main discussion file.
-        if (/\.round\d+\.hop\d+\.md$/i.test(entry)) return false;
-        if (/\.reducer\.\d+\.md$/i.test(entry)) return false;
-        return true;
-      });
-      for (const f of files) {
-        try {
-          const fullPath = nodePath.join(dir, f);
-          const s = await fsStat(fullPath);
-          const content = await fsReadFileRaw(fullPath, 'utf8');
-          const reqMatch = content.match(/## User Request\s*\n+(.+)/);
-          const preview = reqMatch?.[1]?.trim().slice(0, 120) || f;
-          discussions.push({ id: f.replace('.md', ''), fileName: f, path: fullPath, preview, mtime: s.mtimeMs });
-        } catch { /* skip unreadable */ }
-      }
-    } catch { /* dir may not exist */ }
+      const s = await fsStat(fullPath);
+      if (!s.isFile()) return null;
+      return {
+        id: f.replace(/\.md$/i, ''),
+        fileName: f,
+        fullPath,
+        mtime: s.mtimeMs,
+        ...(includeProjectDir ? { projectDir } : {}),
+      } satisfies P2pDiscussionHistoryCandidate;
+    } catch {
+      return null;
+    }
+  });
+  return candidates.filter((entry): entry is P2pDiscussionHistoryCandidate => entry !== null);
+}
+
+async function materializeP2pDiscussionHistoryEntry(
+  candidate: P2pDiscussionHistoryCandidate,
+): Promise<P2pDiscussionHistoryEntry> {
+  const preview = await readP2pDiscussionPreview(candidate.fullPath, candidate.fileName);
+  return {
+    id: candidate.id,
+    fileName: candidate.fileName,
+    path: candidate.fullPath,
+    preview,
+    mtime: candidate.mtime,
+    ...(candidate.projectDir ? { projectDir: candidate.projectDir } : {}),
+  };
+}
+
+async function handleP2pListDiscussions(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = cmd.requestId as string | undefined;
+  const scope = await resolveP2pDiscussionProjectScope(cmd);
+  // Audit fix (e940d73f-a8e / M7-B) — when the caller cannot supply scope
+  // (mobile global view, multi-project daemon's "view discussions" entry
+  // without an active session), aggregate discussions across **all** known
+  // projects instead of failing closed. The `error` field is still set so
+  // the UI can show a "scope optional" hint, but the list is no longer
+  // empty. Each entry carries `projectDir` so subsequent reads can route
+  // back. Single-project daemons still return the same one-project list.
+  const projectsToScan: Array<{ projectDir: string }> = [];
+  if (scope) {
+    projectsToScan.push({ projectDir: scope.projectDir });
+  } else {
+    const known = await collectKnownProjectDirs();
+    for (const projectDir of known.values()) projectsToScan.push({ projectDir });
   }
-  // Sort by mtime descending, cap at 50
-  discussions.sort((a, b) => b.mtime - a.mtime);
-  serverLink.send({ type: 'p2p.list_discussions_response', discussions: discussions.slice(0, 50) });
+  const candidateLists = await mapWithConcurrency(projectsToScan, 4, ({ projectDir }) =>
+    listP2pDiscussionCandidatesForProject(projectDir, !scope),
+  );
+  const recentCandidates = candidateLists
+    .flat()
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(0, P2P_DISCUSSION_HISTORY_LIMIT);
+  const discussions = await mapWithConcurrency(
+    recentCandidates,
+    P2P_DISCUSSION_PREVIEW_CONCURRENCY,
+    materializeP2pDiscussionHistoryEntry,
+  );
+  serverLink.send({
+    type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
+    requestId,
+    discussions,
+    // Surface to the caller that the list was aggregated across projects.
+    // Old clients ignore unknown fields.
+    ...(scope ? {} : { aggregated: true }),
+  });
 }
 
 async function handleP2pReadDiscussion(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const id = cmd.id as string | undefined;
   const requestId = cmd.requestId as string | undefined;
-  if (!id) { serverLink.send({ type: 'p2p.read_discussion_response', requestId, error: 'missing_id' }); return; }
+  if (!id) { serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, requestId, error: 'missing_id' }); return; }
+  if (id.includes('/') || id.includes('\\') || id.includes('\0') || id === '.' || id === '..') {
+    serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, error: 'invalid_id' });
+    return;
+  }
+  let scope = await resolveP2pDiscussionProjectScope(cmd);
+  if (!scope) {
+    // Audit fix (e940d73f-a8e / M7-B) — defense-in-depth scope fallback.
+    // Multi-project daemons require explicit scope from the UI, but several
+    // call sites (mobile push-into discussions, global "view discussions"
+    // entry without an active session) did not pass one. Returning
+    // `missing_or_invalid_scope` straight to the UI surfaced as
+    // "(加载失败)". Before erroring out, try to derive scope from:
+    //   1. an active P2P run whose `id`/`discussionId` matches — the run's
+    //      `contextFilePath` carries the authoritative project root.
+    //   2. otherwise, sweep `collectKnownProjectDirs()` for an
+    //      `<id>.md` hit under each project's `imcSubDir(.../discussions)`.
+    // The id is a 12-char UUID slice (low collision risk) so a cross-
+    // project search is acceptable. Lexical traversal is still guarded by
+    // `isPathUnderDir` below so this does NOT widen the safety boundary.
+    for (const run of listP2pRuns()) {
+      if (run.id !== id && run.discussionId !== id) continue;
+      const ctx = run.contextFilePath;
+      if (typeof ctx !== 'string' || ctx.length === 0) continue;
+      const runDiscussionsDir = nodePath.dirname(ctx);
+      // contextFilePath is `<projectDir>/.imc/discussions/<id>.md` so
+      // walking up two parents recovers the project root.
+      const inferredProjectDir = nodePath.resolve(runDiscussionsDir, '..', '..');
+      try {
+        const canonical = await canonicalProjectDir(inferredProjectDir);
+        scope = { projectDir: inferredProjectDir, canonicalProjectDir: canonical };
+        break;
+      } catch { /* ignore — fall through to cross-project sweep */ }
+    }
+    if (!scope) {
+      const known = await collectKnownProjectDirs();
+      for (const [canonical, projectDir] of known.entries()) {
+        const probeDir = nodePath.resolve(imcSubDir(projectDir, 'discussions'));
+        const probe = nodePath.join(probeDir, `${id}.md`);
+        if (!isPathUnderDir(probe, probeDir)) continue;
+        try {
+          // `fsStat` throws on ENOENT — successful resolve == file exists.
+          await fsStat(probe);
+          scope = { projectDir, canonicalProjectDir: canonical };
+          break;
+        } catch { /* file not in this project, keep sweeping */ }
+      }
+    }
+    if (!scope) {
+      serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, error: 'missing_or_invalid_scope' });
+      return;
+    }
+  }
+  const discussionsDir = nodePath.resolve(imcSubDir(scope.projectDir, 'discussions'));
+
+  // Tasks 5.4 / 12.4 — when the responder is reading on behalf of an active
+  // run (`runId` supplied), use the per-(run, source) offset tracker so
+  // repeated reads only return new bytes appended after the prior offset.
+  // Callers that don't supply a runId keep the historical full-file read
+  // semantics for backward compatibility (e.g. discussions list UI).
+  const runId = typeof cmd.runId === 'string' && cmd.runId ? cmd.runId : undefined;
+  const rawPolicy = typeof cmd.offsetMismatchPolicy === 'string' ? cmd.offsetMismatchPolicy : undefined;
+  const policy: 'fail' | 'reset' = rawPolicy === 'fail' ? 'fail' : 'reset';
+
+  async function respondWithOffset(filePath: string): Promise<boolean> {
+    if (!runId) return false;
+    try {
+      const result = await readP2pDiscussionWithOffset({ runId, sourceKey: id!, filePath, policy });
+      serverLink.send({
+        type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
+        id,
+        requestId,
+        content: result.content,
+        offset: { ...result.newOffset },
+        offsetReset: result.reset,
+        ...(result.diagnostics.length ? { diagnostics: result.diagnostics } : {}),
+      });
+      return true;
+    } catch (err) {
+      const wrapped = err as Error & {
+        code?: string;
+        diagnostic?: P2pWorkflowDiagnostic;
+        result?: { newOffset?: unknown; diagnostics?: P2pWorkflowDiagnostic[] };
+      };
+      if (wrapped?.code === 'discussion_read_offset_mismatch') {
+        serverLink.send({
+          type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
+          id,
+          requestId,
+          error: 'offset_mismatch',
+          offsetReset: 'mismatch_fail_closed',
+          ...(wrapped.result?.newOffset ? { offset: wrapped.result.newOffset } : {}),
+          ...(wrapped.result?.diagnostics?.length ? { diagnostics: wrapped.result.diagnostics } : {}),
+        });
+        return true;
+      }
+      // Any other read error (ENOENT etc.) → caller falls back to legacy paths.
+      return false;
+    }
+  }
 
   // 1. Check active P2P runs first (in-memory, always fresh)
   for (const run of listP2pRuns()) {
     if (run.id === id || run.discussionId === id) {
+      if (!isPathUnderDir(run.contextFilePath, discussionsDir)) continue;
+      if (await respondWithOffset(run.contextFilePath)) return;
       try {
         const content = await fsReadFileRaw(run.contextFilePath, 'utf8');
-        serverLink.send({ type: 'p2p.read_discussion_response', id, requestId, content });
+        serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, content });
         return;
       } catch { /* file may not exist yet */ }
     }
   }
 
-  // 2. Search across all known project .imc/discussions/ directories
-  const projectDirs = new Set<string>();
-  for (const s of listSessions()) {
-    if (s.projectDir) projectDirs.add(s.projectDir);
+  const filePath = nodePath.join(discussionsDir, `${id}.md`);
+  if (!isPathUnderDir(filePath, discussionsDir)) {
+    serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, error: 'invalid_id' });
+    return;
   }
-  for (const projectDir of projectDirs) {
-    const filePath = nodePath.join(imcSubDir(projectDir, 'discussions'), `${id}.md`);
-    try {
-      const content = await fsReadFileRaw(filePath, 'utf8');
-      serverLink.send({ type: 'p2p.read_discussion_response', id, requestId, content });
-      return;
-    } catch { /* try next project */ }
-  }
-  serverLink.send({ type: 'p2p.read_discussion_response', id, requestId, error: 'not_found' });
+  if (await respondWithOffset(filePath)) return;
+  try {
+    const content = await fsReadFileRaw(filePath, 'utf8');
+    serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, content });
+    return;
+  } catch { /* not found */ }
+  serverLink.send({ type: P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE, id, requestId, error: 'not_found' });
 }
 
 // ── Discussion handlers ────────────────────────────────────────────────────
@@ -4090,8 +5524,96 @@ function compareDaemonVersions(a: string, b: string): -1 | 0 | 1 {
  *     `npm install` catches the `targetVersion === 'latest'` case where npm
  *     may resolve to an older release than what's currently installed.
  */
+/** Auto-upgrade cooldown: rate-limit server-driven (no-targetVersion)
+ *  upgrade commands so a CI-publish flurry doesn't translate to a flurry
+ *  of daemon restarts. See handleDaemonUpgrade comment for context.
+ *
+ *  Pure function (testable). Returns:
+ *    onCooldown: true → caller should decline the upgrade
+ *    remainingMs: ms until the cooldown elapses (0 when not on cooldown)
+ *    lastAt: epoch ms of the last successful upgrade (null if sentinel
+ *            missing/unreadable — treated as "never upgraded")
+ */
+export interface AutoUpgradeCooldownInput {
+  /** Caller-specified targetVersion. Empty / 'latest' = auto upgrade. */
+  targetVersion: string | undefined;
+  /** Now (epoch ms). Defaults to Date.now(); param exists for tests. */
+  now?: number;
+  /** Cooldown window in ms. */
+  cooldownMs: number;
+  /** Reads the sentinel file; returns its trimmed text or null on miss. */
+  readSentinel: () => string | null;
+}
+export interface AutoUpgradeCooldownVerdict {
+  onCooldown: boolean;
+  remainingMs: number;
+  lastAt: number | null;
+}
+export function evaluateAutoUpgradeCooldown(
+  input: AutoUpgradeCooldownInput,
+): AutoUpgradeCooldownVerdict {
+  const { targetVersion, cooldownMs } = input;
+  const now = input.now ?? Date.now();
+  const isAutoUpgrade = !targetVersion || targetVersion === 'latest' || targetVersion === '';
+  if (!isAutoUpgrade) return { onCooldown: false, remainingMs: 0, lastAt: null };
+  if (!Number.isFinite(cooldownMs) || cooldownMs <= 0) return { onCooldown: false, remainingMs: 0, lastAt: null };
+  let raw: string | null = null;
+  try { raw = input.readSentinel(); } catch { /* sentinel unreadable */ }
+  if (!raw) return { onCooldown: false, remainingMs: 0, lastAt: null };
+  const lastAt = parseInt(raw.trim(), 10);
+  if (!Number.isFinite(lastAt)) return { onCooldown: false, remainingMs: 0, lastAt: null };
+  const ageMs = now - lastAt;
+  // Negative age (clock skew, sentinel from the future) → ignore the
+  // sentinel rather than blocking forever. Operator can also delete
+  // the file to force-bypass the cooldown.
+  if (ageMs < 0) return { onCooldown: false, remainingMs: 0, lastAt };
+  if (ageMs >= cooldownMs) return { onCooldown: false, remainingMs: 0, lastAt };
+  return { onCooldown: true, remainingMs: cooldownMs - ageMs, lastAt };
+}
+
 async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLink): Promise<void> {
   const UPGRADE_MEMORY_FREEZE_TTL_MS = 15 * 60 * 1000;
+
+  // ── Auto-upgrade cooldown ─────────────────────────────────────────────────
+  // Server pushes `daemon.upgrade` whenever it sees a new dev tag on the
+  // npm registry. With CI publishing every ~5 min during active dev work,
+  // four daemons each restarting on every tag = ~7 s offline × 4 boxes
+  // every few minutes, which a human operator perceives as "always
+  // offline". Bypassed when the operator names a specific targetVersion.
+  // Sentinel: ~/.imcodes/last-upgrade-at, updated by upgrade.sh.
+  try {
+    const { homedir: _homedir } = await import('os');
+    const { join: _join } = await import('path');
+    const { readFileSync: _readFile } = await import('fs');
+    const sentinelPath = _join(_homedir(), '.imcodes', 'last-upgrade-at');
+    const verdict = evaluateAutoUpgradeCooldown({
+      targetVersion,
+      cooldownMs: parseInt(
+        process.env.IMCODES_UPGRADE_COOLDOWN_MS ?? String(10 * 60 * 1000),
+        10,
+      ),
+      readSentinel: () => {
+        try { return _readFile(sentinelPath, 'utf8'); } catch { return null; }
+      },
+    });
+    if (verdict.onCooldown) {
+      logger.info({
+        targetVersion,
+        lastUpgradeAt: verdict.lastAt,
+        cooldownRemainingMs: verdict.remainingMs,
+      }, 'daemon.upgrade: auto-upgrade declined (cooldown active)');
+      try {
+        serverLink?.send({
+          type: DAEMON_MSG.UPGRADE_BLOCKED,
+          reason: 'cooldown_active',
+          cooldownRemainingMs: verdict.remainingMs,
+          lastUpgradeAt: verdict.lastAt,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
+  } catch { /* defensive — never block the upgrade on a sentinel read error */ }
+
   const activeRuns = getActiveP2pRunsBlockingDaemonUpgrade();
   if (activeRuns.length > 0) {
     logger.warn({
@@ -4953,6 +6475,15 @@ if [ -z "$HEALTH_PID" ]; then
   log "[step 5] WARN: no live new daemon after 14s — service unit may have a stale path or the new binary crashes on startup"
   log "[step 5] WARN: check 'systemctl --user status imcodes' (linux) or 'log show --predicate \"subsystem == \\\"imcodes\\\"\"' (macos)"
   log "[step 5] WARN: if path-stale, manually fix ExecStart in $HOME/.config/systemd/user/imcodes.service then 'systemctl --user daemon-reload && systemctl --user restart imcodes'"
+else
+  # Drop the auto-upgrade cooldown sentinel — handleDaemonUpgrade
+  # consults this on the new daemon's next auto-upgrade attempt to
+  # rate-limit dev-tag-poll-driven restarts. Survives restart by
+  # design (the very transition we are throttling against).
+  # date +%s%3N = epoch ms (matches Date.now in JS). Best-effort: a
+  # missing sentinel means no cooldown applies.
+  date +%s%3N > "$HOME/.imcodes/last-upgrade-at" 2>/dev/null || true
+  log "[step 5] cooldown sentinel updated: $HOME/.imcodes/last-upgrade-at"
 fi
 
 log "=== upgrade script done ==="
@@ -5003,17 +6534,55 @@ async function handleP2pCancel(cmd: Record<string, unknown>, serverLink: ServerL
   const runId = cmd.runId as string | undefined;
   if (!runId) return;
   const ok = await cancelP2pRun(runId, serverLink);
-  try { serverLink.send({ type: 'p2p.cancel_response', runId, ok }); } catch { /* ignore */ }
+  try { serverLink.send({ type: P2P_WORKFLOW_MSG.CANCEL_RESPONSE, runId, ok }); } catch { /* ignore */ }
 }
 
 async function handleP2pStatus(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const runId = cmd.runId as string | undefined;
+  const requestId = cmd.requestId as string | undefined;
+  // Resolve scope mirror of handleP2pListDiscussions/handleP2pReadDiscussion: every
+  // p2p.status request must be tied to a project context. Without scope we fail
+  // closed (empty list / null run) so a browser viewer of project A cannot
+  // observe runs belonging to project B that happens to share this daemon.
+  const scope = await resolveP2pDiscussionProjectScope(cmd);
+  if (!scope) {
+    if (runId) {
+      try { serverLink.send({ type: P2P_WORKFLOW_MSG.STATUS_RESPONSE, requestId, runId, run: null, error: 'missing_or_invalid_scope' }); } catch { /* ignore */ }
+    } else {
+      try { serverLink.send({ type: P2P_WORKFLOW_MSG.STATUS_RESPONSE, requestId, runs: [], error: 'missing_or_invalid_scope' }); } catch { /* ignore */ }
+    }
+    return;
+  }
+  const resolvedScope = scope;
+  const discussionsDir = nodePath.resolve(imcSubDir(resolvedScope.projectDir, 'discussions'));
+  // A run belongs to scope when its discussion file lives inside that project's
+  // .imc/discussions directory. We also require initiatorSession (when set) to
+  // resolve to the same canonical project — this catches edge cases where a run
+  // was started against an external file path but the session itself is in a
+  // different project.
+  async function runMatchesScope(run: ReturnType<typeof getP2pRun>): Promise<boolean> {
+    if (!run) return false;
+    if (run.contextFilePath && isPathUnderDir(run.contextFilePath, discussionsDir)) return true;
+    if (run.initiatorSession) {
+      const initRecord = getSession(run.initiatorSession);
+      if (initRecord?.projectDir) {
+        const canon = await canonicalProjectDir(initRecord.projectDir);
+        if (canon === resolvedScope.canonicalProjectDir) return true;
+      }
+    }
+    return false;
+  }
   if (runId) {
     const run = getP2pRun(runId);
-    try { serverLink.send({ type: 'p2p.status_response', runId, run: run ? serializeP2pRun(run) : null }); } catch { /* ignore */ }
+    const inScope = await runMatchesScope(run);
+    try { serverLink.send({ type: P2P_WORKFLOW_MSG.STATUS_RESPONSE, requestId, runId, run: inScope && run ? serializeP2pRun(run) : null }); } catch { /* ignore */ }
   } else {
     const runs = listP2pRuns();
-    try { serverLink.send({ type: 'p2p.status_response', runs: runs.map((run) => serializeP2pRun(run)) }); } catch { /* ignore */ }
+    const filtered: typeof runs = [];
+    for (const run of runs) {
+      if (await runMatchesScope(run)) filtered.push(run);
+    }
+    try { serverLink.send({ type: P2P_WORKFLOW_MSG.STATUS_RESPONSE, requestId, runs: filtered.map((run) => serializeP2pRun(run)) }); } catch { /* ignore */ }
   }
 }
 
@@ -5025,6 +6594,19 @@ const FILE_SEARCH_EXCLUDES = new Set([
 ]);
 
 const FILE_SEARCH_MAX = 20;
+const FILE_SEARCH_MAX_INDEXED_PATHS = 20_000;
+const FILE_SEARCH_CACHE_TTL_MS = 5_000;
+const FILE_SEARCH_CACHE_MAX_ENTRIES = 32;
+
+interface FileSearchSnapshot {
+  root: string;
+  dirSignature: string;
+  paths: string[];
+}
+
+const fileSearchCache = new Map<string, { expiresAt: number; value: FileSearchSnapshot }>();
+const fileSearchInflight = new Map<string, Promise<FileSearchSnapshot>>();
+const fileSearchGenerations = new Map<string, number>();
 
 export function getActiveP2pRunsBlockingDaemonUpgrade(runs = listP2pRuns()) {
   return runs.filter((run) => !P2P_TERMINAL_RUN_STATUSES.has(run.status));
@@ -5071,8 +6653,16 @@ export function getTransportSessionUpgradeBlockReason(sessionName: string): Tran
  *  `'running'` is set by tmux/ConPTY drivers when the underlying CLI agent
  *  (claude-code, codex, opencode, gemini) has emitted activity that the
  *  driver classifies as "agent generating" — a self-upgrade restart in that
- *  window kills the agent's child process mid-turn and discards its work. */
-const PROCESS_IN_PROGRESS_STATES: ReadonlySet<string> = new Set(['running']);
+ *  window kills the agent's child process mid-turn and discards its work.
+ *
+ *  `'queued'` represents a turn that the user has dispatched but the driver
+ *  has not yet flipped to `'running'` (e.g. waiting in tmux for the prompt
+ *  delivery to settle, or waiting for a session restart-on-relaunch handshake
+ *  to complete). The web client's `isRunningSessionState` already counts
+ *  `'queued'` as busy; the upgrade gate previously did not, so a turn
+ *  dispatched a few hundred ms before an `daemon.upgrade` broadcast would be
+ *  silently killed. Including `'queued'` here closes that race. */
+const PROCESS_IN_PROGRESS_STATES: ReadonlySet<string> = new Set(['running', 'queued']);
 
 /** Per-session reason a daemon upgrade is currently blocked. Covers both
  *  transport-runtime sessions (claude-code-sdk, codex-sdk, qwen, …) and
@@ -5139,36 +6729,22 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
   if (!requestId || !projectDir) return;
 
   try {
-    // 1. Crawl all files/dirs
-    const allPaths: string[] = [];
-    async function walk(dir: string, rel: string): Promise<void> {
-      if (allPaths.length >= 20000) return;
-      let entries: import('fs').Dirent[];
-      try { entries = await fsReaddir(dir, { withFileTypes: true }); } catch { return; }
-      for (const entry of entries) {
-        if (FILE_SEARCH_EXCLUDES.has(entry.name)) continue;
-        const relPath = rel ? `${rel}/${entry.name}` : entry.name;
-        if (entry.isDirectory()) {
-          if (entry.name.startsWith('.') && entry.name !== '.github') continue;
-          allPaths.push(relPath + '/');
-          await walk(nodePath.join(dir, entry.name), relPath);
-        } else if (entry.isFile()) {
-          allPaths.push(relPath);
-        }
-      }
+    const canonical = await resolveCanonical(projectDir, 'strict');
+    if (!canonical) {
+      try { serverLink.send({ type: 'file.search_response', requestId, results: [], error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+      return;
     }
-    await walk(projectDir, '');
+    const allPaths = (await getFileSearchSnapshot(canonical.realPath)).paths;
 
     let top: string[];
     if (!query) {
       // No query — return first files alphabetically
-      allPaths.sort();
-      top = allPaths.slice(0, FILE_SEARCH_MAX);
+      top = [...allPaths].sort().slice(0, FILE_SEARCH_MAX);
     } else {
       // 2. Fuzzy search via fzf
       const { Fzf } = await import('fzf');
       const fzf = new Fzf(allPaths, {
-        fuzzy: allPaths.length > 20000 ? 'v1' : 'v2',
+        fuzzy: allPaths.length >= FILE_SEARCH_MAX_INDEXED_PATHS ? 'v1' : 'v2',
         forward: false,
         casing: 'case-insensitive',
         tiebreakers: [fileSearchByBasenamePrefix, fileSearchByMatchPosFromEnd, fileSearchByLengthAsc],
@@ -5183,8 +6759,98 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
   }
 }
 
+async function loadFileSearchSnapshot(root: string): Promise<FileSearchSnapshot> {
+  const paths: string[] = [];
+  async function walk(dir: string, rel: string): Promise<void> {
+    if (paths.length >= FILE_SEARCH_MAX_INDEXED_PATHS) return;
+    let entries: import('fs').Dirent[];
+    try { entries = await fsReaddir(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (paths.length >= FILE_SEARCH_MAX_INDEXED_PATHS) return;
+      if (FILE_SEARCH_EXCLUDES.has(entry.name)) continue;
+      const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith('.') && entry.name !== '.github') continue;
+        paths.push(`${relPath}/`);
+        await walk(nodePath.join(dir, entry.name), relPath);
+      } else if (entry.isFile()) {
+        paths.push(relPath);
+      }
+    }
+  }
+  await walk(root, '');
+  return {
+    root,
+    dirSignature: await safeStatSignature(root),
+    paths,
+  };
+}
+
+async function getFileSearchSnapshot(root: string): Promise<FileSearchSnapshot> {
+  sweepExpiredCache(fileSearchCache);
+  const dirSignature = await safeStatSignature(root);
+  const cached = fileSearchCache.get(root);
+  if (cached && cached.expiresAt > Date.now() && cached.value.dirSignature === dirSignature) {
+    fileSearchCache.delete(root);
+    fileSearchCache.set(root, cached);
+    return cached.value;
+  }
+
+  const generation = getResourceGeneration(fileSearchGenerations, root);
+  const inflightKey = `${root}::${generation}`;
+  const inflight = fileSearchInflight.get(inflightKey);
+  if (inflight) return await inflight;
+
+  const promise = loadFileSearchSnapshot(root)
+    .then(async (value) => {
+      const currentSignature = await safeStatSignature(root);
+      if (getResourceGeneration(fileSearchGenerations, root) === generation && currentSignature === value.dirSignature) {
+        setBoundedCache(fileSearchCache, root, { value, expiresAt: Date.now() + FILE_SEARCH_CACHE_TTL_MS }, FILE_SEARCH_CACHE_MAX_ENTRIES);
+      }
+      return value;
+    })
+    .finally(() => {
+      fileSearchInflight.delete(inflightKey);
+    });
+  fileSearchInflight.set(inflightKey, promise);
+  return await promise;
+}
+
+function invalidateFileSearchCachesForPath(targetPath: string): void {
+  const normalized = normalizeFsPath(targetPath);
+  const roots = new Set<string>([
+    ...fileSearchCache.keys(),
+    ...fileSearchGenerations.keys(),
+    ...[...fileSearchInflight.keys()].map((key) => key.split('::')[0] ?? ''),
+  ]);
+  for (const root of roots) {
+    if (!root) continue;
+    if (!isPathInside(root, normalized) && !isPathInside(normalized, root)) continue;
+    bumpResourceGeneration(fileSearchGenerations, root);
+    fileSearchCache.delete(root);
+    for (const key of fileSearchInflight.keys()) {
+      if (key.startsWith(`${root}::`)) fileSearchInflight.delete(key);
+    }
+  }
+}
+
 const FS_LIST_DEADLINE_MS = 10_000;
 const FS_LIST_CACHE_TTL_MS = 5_000;
+const FS_LIST_STALE_CACHE_TTL_MS = 30_000;
+const FS_LIST_CACHE_MAX_ENTRIES = 128;
+const FS_LIST_INFLIGHT_FANOUT_CAP = 32;
+const FS_LIST_METADATA_CONCURRENCY = 32;
+
+interface FreshnessCacheEntry<T> {
+  expiresAt: number;
+  staleUntil?: number;
+  value: T;
+}
+
+interface InflightWork<T> {
+  promise: Promise<T>;
+  attached: number;
+}
 
 interface FsLsSnapshot {
   resolvedPath: string;
@@ -5192,9 +6858,55 @@ interface FsLsSnapshot {
   entries: Array<Record<string, unknown>>;
 }
 
-const fsListCache = new Map<string, { expiresAt: number; value: FsLsSnapshot }>();
-const fsListInflight = new Map<string, Promise<FsLsSnapshot>>();
+interface FsListRequestContext {
+  readonly terminal: boolean;
+  markTerminal(): void;
+  send(message: Record<string, unknown>): boolean;
+}
+
+const fsListCache = new Map<string, FreshnessCacheEntry<FsLsSnapshot>>();
+const fsListInflight = new Map<string, InflightWork<FsLsSnapshot>>();
 const fsListGenerations = new Map<string, number>();
+
+function sweepExpiredCache<T, E extends FreshnessCacheEntry<T>>(cache: Map<string, E>, now = Date.now()): void {
+  for (const [key, entry] of cache) {
+    if ((entry.staleUntil ?? entry.expiresAt) <= now) cache.delete(key);
+  }
+}
+
+function setBoundedCache<T, E extends FreshnessCacheEntry<T>>(
+  cache: Map<string, E>,
+  key: string,
+  entry: E,
+  maxEntries: number,
+): void {
+  cache.delete(key);
+  cache.set(key, entry);
+  while (cache.size > maxEntries) {
+    const oldestKey = cache.keys().next().value;
+    if (typeof oldestKey !== 'string') break;
+    cache.delete(oldestKey);
+  }
+}
+
+async function mapWithConcurrency<T, U>(
+  items: readonly T[],
+  limit: number,
+  mapper: (item: T, index: number) => Promise<U>,
+): Promise<U[]> {
+  if (items.length === 0) return [];
+  const results = new Array<U>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index], index);
+    }
+  }));
+  return results;
+}
 
 function getFsListCacheKey(realPath: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): string {
   const metadataMode = includeMetadata
@@ -5203,66 +6915,220 @@ function getFsListCacheKey(realPath: string, includeFiles: boolean, includeMetad
   return `${realPath}::${includeFiles ? 'files' : 'dirs'}::${metadataMode}`;
 }
 
-async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): Promise<FsLsSnapshot> {
-  const dirents = await fsReaddir(real, { withFileTypes: true });
-  const filtered = dirents.filter((d) => d.isDirectory() || (includeFiles && d.isFile()));
-
-  const entries = await Promise.all(filtered.map(async (d) => {
-    const entry: Record<string, unknown> = { name: d.name, path: nodePath.join(real, d.name), isDir: d.isDirectory(), hidden: d.name.startsWith('.') };
-    if (includeMetadata && !d.isDirectory()) {
+function createFsListRequestContext(serverLink: ServerLink): FsListRequestContext {
+  let terminal = false;
+  let sent = false;
+  return {
+    get terminal() {
+      return terminal;
+    },
+    markTerminal() {
+      terminal = true;
+    },
+    send(message: Record<string, unknown>): boolean {
+      if (terminal || sent) return false;
+      sent = true;
+      terminal = true;
       try {
-        const filePath = nodePath.join(real, d.name);
-        const fileStat = await fsStat(filePath);
-        entry.size = fileStat.size;
-        const ext = nodePath.extname(d.name).toLowerCase().slice(1);
-        entry.mime = MIME_MAP[ext] || undefined;
-        if (allowDownloadHandles) {
-          const handle = await tryCreateProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
-          if (handle) entry.downloadId = handle.id;
-        }
-      } catch { /* stat failed, skip metadata */ }
-    }
-    return entry;
-  }));
+        serverLink.send(message);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
 
-  entries.sort((a, b) => {
-    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-    if (a.hidden !== b.hidden) return (a.hidden ? 1 : 0) - (b.hidden ? 1 : 0);
-    return (a.name as string).localeCompare(b.name as string);
-  });
+function fsListErrorCode(error: unknown): string {
+  if (error instanceof FsListPoolError) {
+    if (error.reason === 'queue_full') return FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL;
+    if (error.reason === 'timeout') return FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT;
+    if (error.reason === 'unavailable' || error.reason === 'crashed' || error.reason === 'shutdown') {
+      return FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_UNAVAILABLE;
+    }
+    return FS_GENERIC_ERROR_CODES.INTERNAL_ERROR;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+function canUseFsListStaleCache(error: unknown): boolean {
+  return error instanceof FsListPoolError
+    && (
+      error.reason === 'queue_full'
+      || error.reason === 'timeout'
+      || error.reason === 'unavailable'
+      || error.reason === 'crashed'
+      || error.reason === 'shutdown'
+    );
+}
+
+function getCachedFsListSnapshot(cacheKey: string, dirSignature: string, allowStale: boolean): FsLsSnapshot | null {
+  const cached = fsListCache.get(cacheKey);
+  if (!cached || cached.value.dirSignature !== dirSignature) return null;
+  const now = Date.now();
+  const usableUntil = allowStale ? (cached.staleUntil ?? cached.expiresAt) : cached.expiresAt;
+  if (usableUntil <= now) return null;
+  fsListCache.delete(cacheKey);
+  fsListCache.set(cacheKey, cached);
+  return cached.value;
+}
+
+function fsListWorkerQueueDepth(): number {
+  if (!shouldUseFsListWorkerPool()) return 0;
+  const pool = getDefaultFsListWorkerPool() as { getQueueDepth?: () => number };
+  try {
+    return typeof pool.getQueueDepth === 'function' ? pool.getQueueDepth() : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function fsGitStatusWorkerQueueDepth(): number {
+  if (!shouldUseFsGitStatusWorkerPool()) return 0;
+  const pool = getDefaultFsGitStatusWorkerPool() as { getQueueDepth?: () => number };
+  try {
+    return typeof pool.getQueueDepth === 'function' ? pool.getQueueDepth() : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): Promise<FsLsSnapshot> {
+  const snapshot = shouldUseFsListWorkerPool()
+    ? await getDefaultFsListWorkerPool().dispatch({
+      realPath: real,
+      includeFiles,
+      includeMetadata,
+    })
+    : await scanFsListSnapshot({ realPath: real, includeFiles, includeMetadata });
+
+  const entries: Array<Record<string, unknown>> = snapshot.entries.map((entry) => ({ ...entry }));
+  if (includeMetadata && allowDownloadHandles) {
+    await mapWithConcurrency(entries, FS_LIST_METADATA_CONCURRENCY, async (entry) => {
+      if (entry.isDir === true || typeof entry.path !== 'string' || typeof entry.name !== 'string') return entry;
+      const size = typeof entry.size === 'number' ? entry.size : undefined;
+      const mime = typeof entry.mime === 'string' ? entry.mime : undefined;
+      const handle = await tryCreateProjectFileHandle(entry.path, entry.name, mime, size);
+      if (handle) entry.downloadId = handle.id;
+      return entry;
+    });
+  }
 
   return {
-    resolvedPath: real,
-    dirSignature: await safeStatSignature(real),
+    resolvedPath: snapshot.resolvedPath,
+    dirSignature: snapshot.dirSignature,
     entries,
   };
 }
 
 async function getFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): Promise<FsLsSnapshot> {
+  sweepExpiredCache(fsListCache);
   const dirSignature = await safeStatSignature(real);
   const cacheKey = getFsListCacheKey(real, includeFiles, includeMetadata, allowDownloadHandles);
-  const cached = fsListCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now() && cached.value.dirSignature === dirSignature) {
-    return cached.value;
+  const cached = getCachedFsListSnapshot(cacheKey, dirSignature, false);
+  if (cached) {
+    recordFsWorkerMetric({
+      commandType: 'fs.ls',
+      cacheStatus: 'hit',
+      terminalReason: 'ok',
+      queueDepth: fsListWorkerQueueDepth(),
+      queueWaitMs: 0,
+      workerExecutionMs: 0,
+      entryCount: cached.entries.length,
+      includeFiles,
+      includeMetadata,
+    });
+    return cached;
   }
+  const staleCached = getCachedFsListSnapshot(cacheKey, dirSignature, true);
 
   const generation = getResourceGeneration(fsListGenerations, real);
-  const inflightKey = `${cacheKey}::${generation}`;
+  const inflightKey = `${cacheKey}::${dirSignature}::${generation}`;
   const inflight = fsListInflight.get(inflightKey);
-  if (inflight) return await inflight;
+  if (inflight) {
+    if (inflight.attached >= FS_LIST_INFLIGHT_FANOUT_CAP) throw new FsListPoolError('queue_full');
+    inflight.attached += 1;
+    recordFsWorkerMetric({
+      commandType: 'fs.ls',
+      cacheStatus: 'inflight',
+      terminalReason: 'ok',
+      queueDepth: fsListWorkerQueueDepth(),
+      queueWaitMs: 0,
+      workerExecutionMs: 0,
+      attached: inflight.attached,
+      includeFiles,
+      includeMetadata,
+    });
+    return await inflight.promise;
+  }
 
+  const workerStartedAt = Date.now();
+  const queueDepthAtDispatch = fsListWorkerQueueDepth();
   const promise = loadFsListSnapshot(real, includeFiles, includeMetadata, allowDownloadHandles)
     .then(async (value) => {
       const currentSignature = await safeStatSignature(real);
-      if (getResourceGeneration(fsListGenerations, real) === generation && currentSignature === value.dirSignature) {
-        fsListCache.set(cacheKey, { value, expiresAt: Date.now() + FS_LIST_CACHE_TTL_MS });
+      if (
+        getResourceGeneration(fsListGenerations, real) === generation
+        && currentSignature === dirSignature
+        && value.dirSignature === dirSignature
+      ) {
+        setBoundedCache(
+          fsListCache,
+          cacheKey,
+          {
+            value,
+            expiresAt: Date.now() + FS_LIST_CACHE_TTL_MS,
+            staleUntil: Date.now() + FS_LIST_STALE_CACHE_TTL_MS,
+          },
+          FS_LIST_CACHE_MAX_ENTRIES,
+        );
       }
+      recordFsWorkerMetric({
+        commandType: 'fs.ls',
+        cacheStatus: 'miss',
+        terminalReason: 'ok',
+        queueDepth: queueDepthAtDispatch,
+        queueWaitMs: 0,
+        workerExecutionMs: Date.now() - workerStartedAt,
+        entryCount: value.entries.length,
+        includeFiles,
+        includeMetadata,
+      });
       return value;
+    })
+    .catch((error) => {
+      const terminalReason = fsListErrorCode(error);
+      if (staleCached && canUseFsListStaleCache(error)) {
+        recordFsWorkerMetric({
+          commandType: 'fs.ls',
+          cacheStatus: 'stale',
+          terminalReason,
+          queueDepth: queueDepthAtDispatch,
+          queueWaitMs: 0,
+          workerExecutionMs: Date.now() - workerStartedAt,
+          lateResultSkip: true,
+          entryCount: staleCached.entries.length,
+          includeFiles,
+          includeMetadata,
+        });
+        return staleCached;
+      }
+      recordFsWorkerMetric({
+        commandType: 'fs.ls',
+        cacheStatus: 'miss',
+        terminalReason,
+        queueDepth: queueDepthAtDispatch,
+        queueWaitMs: 0,
+        workerExecutionMs: Date.now() - workerStartedAt,
+        includeFiles,
+        includeMetadata,
+      });
+      throw error;
     })
     .finally(() => {
       fsListInflight.delete(inflightKey);
     });
-  fsListInflight.set(inflightKey, promise);
+  fsListInflight.set(inflightKey, { promise, attached: 1 });
   return await promise;
 }
 
@@ -5299,28 +7165,33 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
     ? rawPath
     : (rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath);
   const resolved = isDrivesSentinel ? rawPath : nodePath.resolve(expanded);
+  const requestContext = createFsListRequestContext(serverLink);
 
   let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
   const deadline = new Promise<never>((_, reject) => {
-    deadlineTimer = setTimeout(() => reject(new Error('fs_list_timeout')), FS_LIST_DEADLINE_MS);
+    deadlineTimer = setTimeout(() => reject(new Error(FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT)), FS_LIST_DEADLINE_MS);
     deadlineTimer.unref?.();
   });
 
   try {
-    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, serverLink), deadline]);
+    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, requestContext), deadline]);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg === 'fs_list_timeout') {
-      try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: 'fs_list_timeout' }); } catch { /* ignore */ }
+    const msg = fsListErrorCode(err);
+    if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT || msg === FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT) {
+      invalidateFsListCachesForPath(resolved);
+    }
+    if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT) {
+      requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT });
     } else {
-      try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: msg }); } catch { /* ignore */ }
+      requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: msg });
     }
   } finally {
     if (deadlineTimer) clearTimeout(deadlineTimer);
+    requestContext.markTerminal();
   }
 }
 
-async function handleFsListInner(resolved: string, rawPath: string, requestId: string, includeFiles: boolean, includeMetadata: boolean, serverLink: ServerLink): Promise<void> {
+async function handleFsListInner(resolved: string, rawPath: string, requestId: string, includeFiles: boolean, includeMetadata: boolean, requestContext: FsListRequestContext): Promise<void> {
   // Windows drive picker — only triggered by the explicit `:drives:` path,
   // NOT by `~` (which always means the user's home directory on every OS).
   if (process.platform === 'win32' && rawPath === WINDOWS_DRIVES_PATH) {
@@ -5336,28 +7207,26 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
           }
         }),
     );
-    try {
-      serverLink.send({
-        type: 'fs.ls_response',
-        requestId,
-        path: rawPath,
-        resolvedPath: WINDOWS_DRIVES_ROOT,
-        status: 'ok',
-        entries: entries.filter(Boolean),
-      });
-    } catch { /* ignore */ }
+    requestContext.send({
+      type: 'fs.ls_response',
+      requestId,
+      path: rawPath,
+      resolvedPath: WINDOWS_DRIVES_ROOT,
+      status: 'ok',
+      entries: entries.filter(Boolean),
+    });
     return;
   }
 
   const canonical = await resolveCanonical(resolved, includeMetadata ? 'lenient' : 'strict');
   if (!canonical) {
-    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+    requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH });
     return;
   }
 
   const snapshot = await getFsListSnapshot(canonical.realPath, includeFiles, includeMetadata, !canonical.usedFallback);
 
-  try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries: snapshot.entries }); } catch { /* ignore */ }
+  requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries: snapshot.entries });
 }
 
 const REPO_CONTEXT_CACHE_TTL_MS = 5_000;
@@ -5367,6 +7236,10 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
 }
 
 const GIT_STATUS_CACHE_TTL_MS = 5_000;
+const GIT_STATUS_STALE_CACHE_TTL_MS = 30_000;
+const GIT_STATUS_CACHE_MAX_ENTRIES = 128;
+const GIT_STATUS_DEADLINE_MS = 10_000;
+const GIT_STATUS_INFLIGHT_FANOUT_CAP = 32;
 const GIT_DIFF_CACHE_TTL_MS = 5_000;
 
 type GitStatusFile = { path: string; code: string; additions?: number; deletions?: number };
@@ -5402,6 +7275,14 @@ interface GitNumstatSnapshot {
   stats: Map<string, { additions?: number; deletions?: number }>;
 }
 
+interface GitStatusResponseSnapshot {
+  repoRoot: string;
+  repoSignature: string;
+  requestedPath: string;
+  includeStats: boolean;
+  files: GitStatusFile[];
+}
+
 interface GitDiffSnapshot {
   logicalPath: string;
   repoRoot: string;
@@ -5416,6 +7297,8 @@ const gitStatusCache = new Map<string, { expiresAt: number; value: GitStatusSnap
 const gitStatusInflight = new Map<string, Promise<GitStatusSnapshot>>();
 const gitNumstatCache = new Map<string, { expiresAt: number; value: GitNumstatSnapshot }>();
 const gitNumstatInflight = new Map<string, Promise<GitNumstatSnapshot>>();
+const gitStatusResponseCache = new Map<string, FreshnessCacheEntry<GitStatusResponseSnapshot>>();
+const gitStatusResponseInflight = new Map<string, InflightWork<GitStatusResponseSnapshot>>();
 const gitDiffCache = new Map<string, { expiresAt: number; value: GitDiffSnapshot }>();
 const gitDiffInflight = new Map<string, Promise<GitDiffSnapshot>>();
 const gitRepoGenerations = new Map<string, number>();
@@ -5677,6 +7560,202 @@ async function getRepoGitNumstatSnapshot(startPath: string): Promise<GitNumstatS
   return await promise;
 }
 
+function getGitStatusResponseCacheKey(repoRoot: string, requestedPath: string, includeStats: boolean): string {
+  return `${repoRoot}::${requestedPath}::${includeStats ? 'stats' : 'plain'}`;
+}
+
+function fsGitStatusErrorCode(error: unknown): string {
+  if (error instanceof FsGitStatusPoolError) {
+    if (error.reason === 'queue_full') return FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL;
+    if (error.reason === 'timeout') return FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT;
+    if (
+      error.reason === 'unavailable'
+      || error.reason === 'crashed'
+      || error.reason === 'shutdown'
+      || error.reason === 'git_unavailable'
+    ) {
+      return FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_UNAVAILABLE;
+    }
+    return FS_GENERIC_ERROR_CODES.INTERNAL_ERROR;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+function canUseGitStatusStaleCache(error: unknown): boolean {
+  return error instanceof FsGitStatusPoolError
+    && (
+      error.reason === 'queue_full'
+      || error.reason === 'timeout'
+      || error.reason === 'unavailable'
+      || error.reason === 'crashed'
+      || error.reason === 'shutdown'
+      || error.reason === 'git_unavailable'
+    );
+}
+
+function getCachedGitStatusResponseSnapshot(cacheKey: string, repoSignature: string, allowStale: boolean): GitStatusResponseSnapshot | null {
+  const cached = gitStatusResponseCache.get(cacheKey);
+  if (!cached || cached.value.repoSignature !== repoSignature) return null;
+  const now = Date.now();
+  const usableUntil = allowStale ? (cached.staleUntil ?? cached.expiresAt) : cached.expiresAt;
+  if (usableUntil <= now) return null;
+  gitStatusResponseCache.delete(cacheKey);
+  gitStatusResponseCache.set(cacheKey, cached);
+  return cached.value;
+}
+
+async function loadRepoGitStatusResponseSnapshot(
+  context: RepoContext,
+  requestedPath: string,
+  includeStats: boolean,
+): Promise<GitStatusResponseSnapshot> {
+  if (shouldUseFsGitStatusWorkerPool()) {
+    const snapshot = await getDefaultFsGitStatusWorkerPool().dispatch({
+      repoRoot: context.repoRoot,
+      repoSignature: context.repoSignature,
+      requestedPath,
+      includeStats,
+    });
+    return {
+      repoRoot: snapshot.repoRoot,
+      repoSignature: snapshot.repoSignature,
+      requestedPath: snapshot.requestedPath,
+      includeStats: snapshot.includeStats,
+      files: snapshot.files,
+    };
+  }
+
+  const [snapshot, numstat] = await Promise.all([
+    loadRepoGitStatusSnapshot(context.repoRoot, context.repoSignature),
+    includeStats ? loadRepoGitNumstatSnapshot(context.repoRoot, context.repoSignature) : Promise.resolve(null),
+  ]);
+  const files = filterRepoFilesForPath(snapshot.files, requestedPath).map((file) => {
+    const stats = numstat?.stats.get(file.path);
+    return stats ? { ...file, ...stats } : file;
+  });
+  return {
+    repoRoot: context.repoRoot,
+    repoSignature: context.repoSignature,
+    requestedPath,
+    includeStats,
+    files,
+  };
+}
+
+async function getRepoGitStatusResponseSnapshot(startPath: string, includeStats: boolean): Promise<GitStatusResponseSnapshot | null> {
+  const context = await resolveRepoContext(startPath);
+  if (!context) {
+    recordFsWorkerMetric({
+      commandType: 'fs.git_status',
+      cacheStatus: 'not_repo',
+      terminalReason: 'ok',
+      queueDepth: fsGitStatusWorkerQueueDepth(),
+      queueWaitMs: 0,
+      workerExecutionMs: 0,
+      includeStats,
+    });
+    return null;
+  }
+  const cacheKey = getGitStatusResponseCacheKey(context.repoRoot, startPath, includeStats);
+  const cached = getCachedGitStatusResponseSnapshot(cacheKey, context.repoSignature, false);
+  if (cached) {
+    recordFsWorkerMetric({
+      commandType: 'fs.git_status',
+      cacheStatus: 'hit',
+      terminalReason: 'ok',
+      queueDepth: fsGitStatusWorkerQueueDepth(),
+      queueWaitMs: 0,
+      workerExecutionMs: 0,
+      includeStats,
+      fileCount: cached.files.length,
+    });
+    return cached;
+  }
+  const staleCached = getCachedGitStatusResponseSnapshot(cacheKey, context.repoSignature, true);
+  const generation = getResourceGeneration(gitRepoGenerations, context.repoRoot);
+  const inflightKey = `${cacheKey}::${context.repoSignature}::${generation}`;
+  const inflight = gitStatusResponseInflight.get(inflightKey);
+  if (inflight) {
+    if (inflight.attached >= GIT_STATUS_INFLIGHT_FANOUT_CAP) throw new FsGitStatusPoolError('queue_full');
+    inflight.attached += 1;
+    recordFsWorkerMetric({
+      commandType: 'fs.git_status',
+      cacheStatus: 'inflight',
+      terminalReason: 'ok',
+      queueDepth: fsGitStatusWorkerQueueDepth(),
+      queueWaitMs: 0,
+      workerExecutionMs: 0,
+      attached: inflight.attached,
+      includeStats,
+    });
+    return await inflight.promise;
+  }
+  const workerStartedAt = Date.now();
+  const queueDepthAtDispatch = fsGitStatusWorkerQueueDepth();
+  const promise = loadRepoGitStatusResponseSnapshot(context, startPath, includeStats)
+    .then(async (value) => {
+      const currentSignature = await getRepoSignature(context.repoRoot, context.gitDir);
+      if (
+        getResourceGeneration(gitRepoGenerations, context.repoRoot) === generation
+        && currentSignature === value.repoSignature
+      ) {
+        setBoundedCache(
+          gitStatusResponseCache,
+          cacheKey,
+          {
+            value,
+            expiresAt: Date.now() + GIT_STATUS_CACHE_TTL_MS,
+            staleUntil: Date.now() + GIT_STATUS_STALE_CACHE_TTL_MS,
+          },
+          GIT_STATUS_CACHE_MAX_ENTRIES,
+        );
+      }
+      recordFsWorkerMetric({
+        commandType: 'fs.git_status',
+        cacheStatus: 'miss',
+        terminalReason: 'ok',
+        queueDepth: queueDepthAtDispatch,
+        queueWaitMs: 0,
+        workerExecutionMs: Date.now() - workerStartedAt,
+        includeStats,
+        fileCount: value.files.length,
+      });
+      return value;
+    })
+    .catch((error) => {
+      const terminalReason = fsGitStatusErrorCode(error);
+      if (staleCached && canUseGitStatusStaleCache(error)) {
+        recordFsWorkerMetric({
+          commandType: 'fs.git_status',
+          cacheStatus: 'stale',
+          terminalReason,
+          queueDepth: queueDepthAtDispatch,
+          queueWaitMs: 0,
+          workerExecutionMs: Date.now() - workerStartedAt,
+          lateResultSkip: true,
+          includeStats,
+          fileCount: staleCached.files.length,
+        });
+        return staleCached;
+      }
+      recordFsWorkerMetric({
+        commandType: 'fs.git_status',
+        cacheStatus: 'miss',
+        terminalReason,
+        queueDepth: queueDepthAtDispatch,
+        queueWaitMs: 0,
+        workerExecutionMs: Date.now() - workerStartedAt,
+        includeStats,
+      });
+      throw error;
+    })
+    .finally(() => {
+      gitStatusResponseInflight.delete(inflightKey);
+    });
+  gitStatusResponseInflight.set(inflightKey, { promise, attached: 1 });
+  return await promise;
+}
+
 async function loadFileGitDiffSnapshot(logicalPath: string, repoRoot: string, repoSignature: string, fileSignature: string): Promise<GitDiffSnapshot> {
   let diff = '';
   const repoRelativePath = nodePath.relative(repoRoot, logicalPath).split(nodePath.sep).join('/');
@@ -5747,6 +7826,13 @@ function collectAffectedRepoRoots(targetPath: string): Set<string> {
     const repoRoot = key.split('::')[0] ?? '';
     if (repoRoot && isPathInside(repoRoot, targetPath)) affected.add(repoRoot);
   }
+  for (const entry of gitStatusResponseCache.values()) {
+    if (isPathInside(entry.value.repoRoot, targetPath)) affected.add(entry.value.repoRoot);
+  }
+  for (const key of gitStatusResponseInflight.keys()) {
+    const repoRoot = key.split('::')[0] ?? '';
+    if (repoRoot && isPathInside(repoRoot, targetPath)) affected.add(repoRoot);
+  }
   for (const entry of repoContextCache.values()) {
     const repoRoot = entry.value?.repoRoot;
     if (repoRoot && isPathInside(repoRoot, targetPath)) affected.add(repoRoot);
@@ -5776,26 +7862,41 @@ function invalidateGitCachesForPath(targetPath: string): void {
     if (isPathInside(key, normalized)) gitNumstatCache.delete(key);
     if (isPathInside(key, normalized)) repoSignatureCache.delete(key);
   }
+  for (const [key, entry] of gitStatusResponseCache) {
+    if (isPathInside(entry.value.repoRoot, normalized)) gitStatusResponseCache.delete(key);
+  }
   for (const key of gitStatusInflight.keys()) {
     if (isPathInside(key.split('::')[0] ?? '', normalized)) gitStatusInflight.delete(key);
   }
   for (const key of gitNumstatInflight.keys()) {
     if (isPathInside(key.split('::')[0] ?? '', normalized)) gitNumstatInflight.delete(key);
   }
+  for (const key of gitStatusResponseInflight.keys()) {
+    if (isPathInside(key.split('::')[0] ?? '', normalized)) gitStatusResponseInflight.delete(key);
+  }
 }
 
 export function __resetFsGitCachesForTests(): void {
   void __resetPreviewReadCoordinatorForTests();
+  fsListCache.clear();
+  fsListInflight.clear();
+  fsListGenerations.clear();
+  fileSearchCache.clear();
+  fileSearchInflight.clear();
+  fileSearchGenerations.clear();
   repoContextCache.clear();
   repoSignatureCache.clear();
   gitStatusCache.clear();
   gitStatusInflight.clear();
   gitNumstatCache.clear();
   gitNumstatInflight.clear();
+  gitStatusResponseCache.clear();
+  gitStatusResponseInflight.clear();
   gitDiffCache.clear();
   gitDiffInflight.clear();
   gitRepoGenerations.clear();
   gitDiffGenerations.clear();
+  __resetFsGitStatusWorkerPoolForTests();
 }
 
 function filterRepoFilesForPath(files: GitStatusFile[], requestedPath: string): GitStatusFile[] {
@@ -5811,29 +7912,51 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
 
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
+  const requestContext = createFsListRequestContext(serverLink);
 
+  let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+  const deadline = new Promise<never>((_, reject) => {
+    deadlineTimer = setTimeout(() => reject(new FsGitStatusPoolError('timeout')), GIT_STATUS_DEADLINE_MS);
+    deadlineTimer.unref?.();
+  });
   try {
-    const real = await fsRealpath(resolved);
-    const allowed = isPathAllowed(real);
-    if (!allowed) {
-      try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
-      return;
-    }
-    const [snapshot, numstat] = await Promise.all([
-      getRepoGitStatusSnapshot(real),
-      includeStats ? getRepoGitNumstatSnapshot(real) : Promise.resolve(null),
-    ]);
-    const files = snapshot ? filterRepoFilesForPath(snapshot.files, real).map((file) => {
-      const stats = numstat?.stats.get(file.path);
-      return stats ? { ...file, ...stats } : file;
-    }) : [];
-    try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', files }); } catch { /* ignore */ }
+    await Promise.race([handleFsGitStatusInner(resolved, rawPath, requestId, includeStats, requestContext), deadline]);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = fsGitStatusErrorCode(err);
+    if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT) {
+      invalidateGitCachesForPath(resolved);
+    }
     // git not available or not a repo — return empty ok (not an error for the UI)
     const isNotRepo = msg.includes('not a git repository') || msg.includes('128');
-    try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: isNotRepo ? 'ok' : 'error', files: [], error: isNotRepo ? undefined : msg }); } catch { /* ignore */ }
+    requestContext.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: isNotRepo ? 'ok' : 'error', files: [], error: isNotRepo ? undefined : msg });
+  } finally {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    requestContext.markTerminal();
   }
+}
+
+async function handleFsGitStatusInner(
+  resolved: string,
+  rawPath: string,
+  requestId: string,
+  includeStats: boolean,
+  requestContext: FsListRequestContext,
+): Promise<void> {
+  const real = await fsRealpath(resolved);
+  const allowed = isPathAllowed(real);
+  if (!allowed) {
+    requestContext.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH });
+    return;
+  }
+  const snapshot = await getRepoGitStatusResponseSnapshot(real, includeStats);
+  requestContext.send({
+    type: 'fs.git_status_response',
+    requestId,
+    path: rawPath,
+    resolvedPath: real,
+    status: 'ok',
+    files: snapshot?.files ?? [],
+  });
 }
 
 /** fs.git_diff — return git diff for a specific file */
@@ -5890,7 +8013,7 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
       return;
     }
   } catch {
-    try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: 'parent_not_found' }); } catch { /* ignore */ }
+    try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND }); } catch { /* ignore */ }
     return;
   }
 
@@ -5899,6 +8022,7 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
     await mkdir(resolved, { recursive: true });
     const real = await fsRealpath(resolved);
     invalidateFsListCachesForPath(real);
+    invalidateFileSearchCachesForPath(real);
     try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, resolvedPath: real, status: 'ok' }); } catch { /* ignore */ }
   } catch (err) {
     try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
@@ -5910,7 +8034,7 @@ function getFsWriteErrorCode(err: unknown): string {
   const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
   const message = err instanceof Error ? err.message : String(err);
   if (code === 'EEXIST' || message.includes('EEXIST') || message.includes('file already exists')) return FS_WRITE_ERROR.FILE_EXISTS;
-  if (code === 'ENOENT' || code === 'ENOTDIR' || message.includes('ENOENT') || message.includes('no such file')) return 'parent_not_found';
+  if (code === 'ENOENT' || code === 'ENOTDIR' || message.includes('ENOENT') || message.includes('no such file')) return FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND;
   return FS_GENERIC_ERROR_CODES.INTERNAL_ERROR;
 }
 
@@ -5982,6 +8106,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       await fsWriteFile(real, content, 'utf-8');
       const newStats = await fsStat(real);
       invalidateFsListCachesForPath(real);
+      invalidateFileSearchCachesForPath(real);
       invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
@@ -6012,6 +8137,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       const newStats = await fsStat(resolved);
       const real = await fsRealpath(resolved);
       invalidateFsListCachesForPath(real);
+      invalidateFileSearchCachesForPath(real);
       invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
@@ -6083,8 +8209,8 @@ async function handleChatSubscribeReplay(cmd: Record<string, unknown>, serverLin
   const sessionId = cmd.sessionId as string | undefined;
   if (!sessionId) return;
   try {
-    const { replayTransportHistory } = await import('./transport-history.js');
-    const events = await replayTransportHistory(sessionId);
+    const { replayTransportHistory, trimTransportHistoryEventsToReplayBudget } = await import('./transport-history.js');
+    const events = trimTransportHistoryEventsToReplayBudget(sessionId, await replayTransportHistory(sessionId));
     if (events.length === 0) return;
     // Send history as a batch so the browser can render them before live events
     serverLink.send({ type: TRANSPORT_MSG.CHAT_HISTORY, sessionId, events });
@@ -6135,29 +8261,134 @@ async function handleTransportListModels(
     } catch { /* not connected */ }
   };
   try {
-    const { getProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
-    let provider = getProvider(agentType);
-
-    // Auto-connect local providers if missing, so we can probe for models
-    if (!provider && (agentType === 'gemini-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
-      try {
-        provider = await ensureProviderConnected(agentType, {});
-      } catch (err) {
-        logger.debug({ provider: agentType, err }, 'Auto-connect for model listing failed');
-      }
-    }
-
-    if (provider && typeof provider.listModels === 'function') {
-      const result = await provider.listModels(force);
-      reply(result);
-      return;
-    }
-    reply({ models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` });
+    const result = await getTransportListModels(cmd, agentType, force);
+    reply(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.warn({ err, agentType }, 'transport.list_models failed');
     reply({ models: [], error: message });
   }
+}
+
+const TRANSPORT_LIST_MODELS_DEFAULT_TTL_MS = 5_000;
+const TRANSPORT_LIST_MODELS_MAX_TTL_MS = 60_000;
+const TRANSPORT_LIST_MODELS_TTL_ENV = 'IMCODES_TRANSPORT_LIST_MODELS_CACHE_TTL_MS';
+
+type TransportListModelsResult = {
+  models: Array<{ id: string; name?: string; supportsReasoningEffort?: boolean }>;
+  defaultModel?: string;
+  isAuthenticated?: boolean;
+  error?: string;
+};
+
+const transportListModelsCache = new Map<string, { expiresAt: number; generation: number; value: TransportListModelsResult }>();
+const transportListModelsInflight = new Map<string, { generation: number; promise: Promise<TransportListModelsResult> }>();
+let transportListModelsCacheGeneration = 0;
+
+function resolveTransportListModelsCacheTtlMs(): number {
+  const raw = process.env[TRANSPORT_LIST_MODELS_TTL_ENV];
+  if (raw === undefined || raw.trim() === '') return TRANSPORT_LIST_MODELS_DEFAULT_TTL_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return TRANSPORT_LIST_MODELS_DEFAULT_TTL_MS;
+  return Math.min(Math.trunc(parsed), TRANSPORT_LIST_MODELS_MAX_TTL_MS);
+}
+
+function transportListModelsCacheKey(cmd: Record<string, unknown>, agentType: string): string {
+  const provider = typeof cmd.provider === 'string'
+    ? cmd.provider
+    : typeof cmd.providerId === 'string'
+      ? cmd.providerId
+      : '';
+  return `${agentType}\0${provider}`;
+}
+
+async function loadTransportListModels(agentType: string, force: boolean): Promise<TransportListModelsResult> {
+  const { getProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
+  let provider = getProvider(agentType);
+
+  // Auto-connect local providers if missing, so we can probe for models
+  if (!provider && (agentType === 'gemini-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
+    try {
+      provider = await ensureProviderConnected(agentType, {});
+    } catch (err) {
+      logger.debug({ provider: agentType, err }, 'Auto-connect for model listing failed');
+    }
+  }
+
+  if (provider && typeof provider.listModels === 'function') {
+    return await provider.listModels(force);
+  }
+  return { models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` };
+}
+
+async function getTransportListModels(
+  cmd: Record<string, unknown>,
+  agentType: string,
+  force: boolean,
+): Promise<TransportListModelsResult> {
+  const cacheKey = transportListModelsCacheKey(cmd, agentType);
+  const now = Date.now();
+  const ttlMs = resolveTransportListModelsCacheTtlMs();
+  const generation = transportListModelsCacheGeneration;
+  if (!force && ttlMs > 0) {
+    const cached = transportListModelsCache.get(cacheKey);
+    if (cached && cached.generation === generation && cached.expiresAt > now) return cached.value;
+  }
+
+  const inflightKey = `${cacheKey}\0${force ? 'force' : 'normal'}`;
+  const inflight = transportListModelsInflight.get(inflightKey);
+  if (inflight && inflight.generation === generation) return await inflight.promise;
+
+  const promise = loadTransportListModels(agentType, force)
+    .then((value) => {
+      if (transportListModelsCacheGeneration !== generation) {
+        recordTransportListModelsStaleCompletion({
+          agentType,
+          cacheKey,
+          force,
+          startedGeneration: generation,
+          currentGeneration: transportListModelsCacheGeneration,
+          result: value.error ? 'error' : 'ok',
+        });
+        return value;
+      }
+      if (ttlMs > 0 && !value.error) {
+        transportListModelsCache.set(cacheKey, { value, expiresAt: Date.now() + ttlMs, generation });
+      } else {
+        transportListModelsCache.delete(cacheKey);
+      }
+      return value;
+    })
+    .finally(() => {
+      const current = transportListModelsInflight.get(inflightKey);
+      if (current?.promise === promise) transportListModelsInflight.delete(inflightKey);
+    });
+  transportListModelsInflight.set(inflightKey, { generation, promise });
+  return await promise;
+}
+
+export function __resetTransportListModelsCacheForTests(): void {
+  transportListModelsCache.clear();
+  transportListModelsInflight.clear();
+  transportListModelsCacheGeneration = 0;
+}
+
+function invalidateTransportListModelsCache(reason: string): void {
+  transportListModelsCacheGeneration += 1;
+  transportListModelsCache.clear();
+  recordTransportListModelsStaleCompletion({
+    reason,
+    currentGeneration: transportListModelsCacheGeneration,
+    result: 'invalidated',
+  });
+}
+
+export function __invalidateTransportListModelsCacheForTests(reason = 'test'): void {
+  invalidateTransportListModelsCache(reason);
+}
+
+export function __resolveTransportListModelsCacheTtlMsForTests(): number {
+  return resolveTransportListModelsCacheTtlMs();
 }
 
 // ── File search tiebreakers for fzf (exported for unit testing) ──────────────
@@ -6206,12 +8437,30 @@ async function handleCcPresetsList(serverLink: ServerLink): Promise<void> {
 }
 
 async function handleCcPresetsSave(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const presets = cmd.presets as CcPreset[] | undefined;
-  if (!presets) return;
-  const { savePresets, invalidateCache } = await import('./cc-presets.js');
-  invalidateCache();
-  await savePresets(presets);
-  serverLink.send({ type: CC_PRESET_MSG.SAVE_RESPONSE, ok: true });
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const presets = Array.isArray(cmd.presets) ? cmd.presets as CcPreset[] : undefined;
+  if (!presets) {
+    serverLink.send({
+      type: CC_PRESET_MSG.SAVE_RESPONSE,
+      ...(requestId ? { requestId } : {}),
+      ok: false,
+      error: 'presets is required',
+    });
+    return;
+  }
+  const { savePresets } = await import('./cc-presets.js');
+  try {
+    await savePresets(presets);
+    serverLink.send({ type: CC_PRESET_MSG.SAVE_RESPONSE, ...(requestId ? { requestId } : {}), ok: true });
+  } catch (err) {
+    logger.error({ err }, 'Failed to save CC presets');
+    serverLink.send({
+      type: CC_PRESET_MSG.SAVE_RESPONSE,
+      ...(requestId ? { requestId } : {}),
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 async function handleCcPresetsDiscoverModels(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -6229,7 +8478,6 @@ async function handleCcPresetsDiscoverModels(cmd: Record<string, unknown>, serve
   }
 
   const { discoverPresetModels, loadPresets, savePresets, getPreset } = await import('./cc-presets.js');
-  const presets = await loadPresets();
   const preset = await getPreset(presetName);
   if (!preset) {
     serverLink.send({
@@ -6242,20 +8490,22 @@ async function handleCcPresetsDiscoverModels(cmd: Record<string, unknown>, serve
     return;
   }
 
-  const normalizedName = preset.name.trim().toLowerCase();
+  const normalizedName = normalizeCcPresetName(preset.name);
   try {
     const discovered = await discoverPresetModels(preset);
+    const latestPresets = await loadPresets();
+    const latestPreset = latestPresets.find((item) => normalizeCcPresetName(item.name) === normalizedName) ?? preset;
     const updatedPreset: CcPreset = {
-      ...preset,
-      transportMode: preset.transportMode ?? 'qwen-compatible-api',
-      authType: preset.authType ?? 'anthropic',
+      ...latestPreset,
+      transportMode: latestPreset.transportMode ?? 'qwen-compatible-api',
+      authType: latestPreset.authType ?? 'anthropic',
       availableModels: discovered.availableModels,
       ...(discovered.defaultModel ? { defaultModel: discovered.defaultModel } : {}),
       lastDiscoveredAt: Date.now(),
       modelDiscoveryError: undefined,
     };
-    await savePresets(presets.map((item) => (
-      item.name.trim().toLowerCase() === normalizedName ? updatedPreset : item
+    await savePresets(latestPresets.map((item) => (
+      normalizeCcPresetName(item.name) === normalizedName ? updatedPreset : item
     )));
     serverLink.send({
       type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,
@@ -6268,12 +8518,14 @@ async function handleCcPresetsDiscoverModels(cmd: Record<string, unknown>, serve
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const latestPresets = await loadPresets();
+    const latestPreset = latestPresets.find((item) => normalizeCcPresetName(item.name) === normalizedName) ?? preset;
     const updatedPreset: CcPreset = {
-      ...preset,
+      ...latestPreset,
       modelDiscoveryError: message,
     };
-    await savePresets(presets.map((item) => (
-      item.name.trim().toLowerCase() === normalizedName ? updatedPreset : item
+    await savePresets(latestPresets.map((item) => (
+      normalizeCcPresetName(item.name) === normalizedName ? updatedPreset : item
     )));
     serverLink.send({
       type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,
@@ -7941,6 +10193,7 @@ async function handleMemoryDelete(cmd: Record<string, unknown>, serverLink: Serv
 async function prependLocalMemory(
   prompt: string,
   sessionName: string,
+  options?: { deadlineAt?: number },
 ): Promise<{
   text: string;
   timelinePayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
@@ -7988,6 +10241,12 @@ async function prependLocalMemory(
       repo: recallContext.repo,
       limit: 10,
     });
+    if (typeof options?.deadlineAt === 'number' && Date.now() > options.deadlineAt) {
+      return {
+        text: prompt,
+        timelinePayload: buildMemoryContextStatusPayload(query, 'failed'),
+      };
+    }
     // 1) Template-origin legacy summaries never surface through recall.
     const notTemplate = searchResult.items.filter(
       (item) => !isTemplateOriginSummary(item.summary),

@@ -112,7 +112,21 @@ async function pollTick(sessionName: string, state: WatcherState): Promise<void>
     let sessionId = record?.opencodeSessionId;
     if (!record?.projectDir || !sessionId) return;
 
-    const recentTimeline = await timelineStore.readPreferred(sessionName, { limit: 200 });
+    // Tolerate `TimelinePreferredReadError` (projection unavailable mid-init)
+    // by falling back to the JSONL path; the outer try/catch would otherwise
+    // swallow it as debug and silently skip this tick's backfill diff, which
+    // is worse than running a slightly heavier read.
+    let recentTimeline: Awaited<ReturnType<typeof timelineStore.readPreferred>> = [];
+    try {
+      recentTimeline = await timelineStore.readPreferred(sessionName, { limit: 200 });
+    } catch (err) {
+      logger.warn({ err, sessionName }, 'opencode-watcher: readPreferred failed, falling back to JSONL');
+      try {
+        recentTimeline = timelineStore.read(sessionName, { limit: 200 });
+      } catch (fallbackErr) {
+        logger.warn({ err: fallbackErr, sessionName }, 'opencode-watcher: JSONL fallback also failed');
+      }
+    }
     const hasAssistantHistory = hasAssistantLikeTimeline(recentTimeline);
     if (!hasAssistantHistory) {
       const latestUserTs = getLatestUserMessageTs(recentTimeline);

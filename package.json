@@ -24,7 +24,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "postbuild": "node scripts/copy-worker-bootstraps.mjs && node scripts/mark-bin-executable.mjs",
+    "postbuild": "node scripts/copy-worker-bootstraps.mjs && node scripts/mark-bin-executable.mjs && node scripts/build-manifest.mjs",
     "prepack": "node scripts/strip-onnxruntime-gpu.mjs",
     "postpack": "node scripts/restore-package-json-after-pack.mjs",
     "dev": "tsx src/index.ts",
@@ -36,10 +36,13 @@
     "test:e2e": "vitest run --project e2e",
     "test:integration": "vitest run --workspace vitest.integration.config.ts",
     "test:preview-dist": "node scripts/run-preview-dist-smoke.mjs",
-    "test:coverage": "vitest run --coverage --project daemon --project web --project server && node scripts/write-coverage-summary.mjs",
+    "test:coverage": "vitest run --coverage --coverage.reporter=text --coverage.reporter=html --coverage.reporter=json --coverage.reporter=json-summary --testTimeout=120000 --hookTimeout=120000 --teardownTimeout=60000 --minWorkers=1 --maxWorkers=4 --project daemon --project web --project server && node scripts/write-coverage-summary.mjs && node scripts/check-coverage-thresholds.mjs",
+    "coverage:summary": "node scripts/write-coverage-summary.mjs",
+    "coverage:check": "node scripts/check-coverage-thresholds.mjs",
     "test:watch": "vitest",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
+    "trace:daemon": "node scripts/trace-daemon-latency.mjs",
     "prepublishOnly": "npm run build && npm run test:unit && npm run test:server && npm run test:web",
     "prepare": "husky",
     "bench:memory": "tsx bench/memory-pipeline.bench.ts"

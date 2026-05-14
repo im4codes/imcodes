@@ -19,6 +19,7 @@ import { P2pProgressCard } from './P2pProgressCard.js';
 import type { P2pProgressDiscussion } from './P2pProgressCard.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
 import { EmbeddingStatusIcon } from './EmbeddingStatusIcon.js';
 import type { EmbeddingStatus } from '@shared/embedding-status.js';
 import { formatDaemonVersionShort } from '../util/format-version.js';
@@ -29,6 +30,10 @@ import {
   createSubSessionEntryGestureController,
   type SubSessionEntryGestureController,
 } from '../subsession-entry-gesture.js';
+import {
+  DEFAULT_SUBSESSION_ACCENT_COLOR,
+  getSubSessionAccentColorMap,
+} from '../subsession-accent-colors.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -50,14 +55,19 @@ type DiscussionSummary = P2pProgressDiscussion & {
 
 interface CollapsedSubSessionButtonProps {
   sub: SubSession;
+  accentColor: string;
   isOpen: boolean;
   idleFlashToken: number;
   usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
   detectedModel?: string;
   inP2p: boolean;
+  draggable?: boolean;
   onEntryPointerDown: (id: string, event: JSX.TargetedPointerEvent<HTMLButtonElement>) => void;
   onEntryClick: (id: string, event: JSX.TargetedMouseEvent<HTMLButtonElement>) => void;
   onEntryDoubleClick: (id: string, event: JSX.TargetedMouseEvent<HTMLButtonElement>) => void;
+  onEntryDragStart: (id: string, event: JSX.TargetedDragEvent<HTMLButtonElement>) => void;
+  onEntryDragOver: (id: string, event: JSX.TargetedDragEvent<HTMLButtonElement>) => void;
+  onEntryDragEnd: (id: string, event: JSX.TargetedDragEvent<HTMLButtonElement>) => void;
   t: (key: string, vars?: Record<string, unknown>) => string;
 }
 
@@ -81,6 +91,15 @@ interface Props {
   onViewCron?: () => void;
 
   discussions?: DiscussionSummary[];
+  /**
+   * Total number of in-progress P2P discussions across the whole
+   * daemon (NOT scoped to the active session). The scoped
+   * `discussions` array shows only those relevant to the current
+   * session view; this number is rendered as a badge on the
+   * "View Discussions" (📋) button so the user can see at a glance
+   * that more runs exist elsewhere even when this session has none.
+   */
+  totalRunningDiscussions?: number;
   onStopDiscussion?: (id: string) => void;
   ws: WsClient | null;
   connected: boolean;
@@ -95,6 +114,7 @@ interface Props {
   focusedSubId?: string | null;
   collapsed?: boolean;
   onCollapsedChange?: (collapsed: boolean) => void;
+  onVisualOrderChange?: (ids: string[]) => void;
   /** Quick data for compact SessionControls in cards. */
   quickData?: import('./QuickInputPanel.js').UseQuickDataResult;
   /** All sessions — for @ picker. */
@@ -131,7 +151,13 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, onEntryPointerDown, onEntryClick, onEntryDoubleClick, t, detectedModel }: CollapsedSubSessionButtonProps) {
+function formatLocalDateTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, usage, inP2p, draggable, onEntryPointerDown, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -155,10 +181,15 @@ function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, 
       key={sub.id}
       data-sub-id={sub.id}
       class={`subsession-card${isOpen ? ' open' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
+      draggable={draggable}
       onPointerDown={(event) => onEntryPointerDown(sub.id, event)}
       onClick={(event) => onEntryClick(sub.id, event)}
       onDblClick={(event) => onEntryDoubleClick(sub.id, event)}
+      onDragStart={(event) => onEntryDragStart(sub.id, event)}
+      onDragOver={(event) => onEntryDragOver(sub.id, event)}
+      onDragEnd={(event) => onEntryDragEnd(sub.id, event)}
       title={label + (model ? ` · ${model}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
+      style={{ '--subsession-accent-color': accentColor } as JSX.CSSProperties}
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subbutton-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
       <span class="subsession-card-icon">{abbr}</span>
@@ -176,7 +207,7 @@ function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, 
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onClose, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onClose, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
@@ -188,6 +219,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const [draftW, setDraftW] = useState(String(cardSize.w));
   const [draftH, setDraftH] = useState(String(cardSize.h));
   const [stats, setStats] = useState<DaemonStats | null>(null);
+  const localClockNow = useNowTicker(desktopLayoutCapable && !!stats);
+  const localClockText = useMemo(() => formatLocalDateTime(localClockNow), [localClockNow]);
   // DB sort_order is the authority — subSessions arrive pre-sorted from server.
   // Local dragOrder only tracks in-session drag reorder (synced back to DB via reorderSubSessions).
   const [dragOrder, setDragOrder] = useState<string[] | null>(null);
@@ -302,10 +335,64 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     const sessionMap = new Map(subSessions.map((s) => [s.id, s]));
     return dragOrder.map((id) => sessionMap.get(id)).filter(Boolean) as SubSession[];
   }, [subSessions, dragOrder]);
+  const accentColorsById = useMemo(() => getSubSessionAccentColorMap(orderedSessions), [orderedSessions]);
+  const orderedSessionIds = useMemo(() => orderedSessions.map((sub) => sub.id), [orderedSessions]);
   const orderedSessionsRef = useRef(orderedSessions);
   orderedSessionsRef.current = orderedSessions;
   const dragOrderRef = useRef(dragOrder);
   dragOrderRef.current = dragOrder;
+
+  const moveSubSessionInDragOrder = useCallback((draggedId: string, overId: string) => {
+    if (draggedId === overId) return;
+    setDragOrder((prev) => {
+      const ids = prev ?? orderedSessionsRef.current.map((s) => s.id);
+      const from = ids.indexOf(draggedId);
+      const to = ids.indexOf(overId);
+      if (from === -1 || to === -1) return prev;
+      const next = [...ids];
+      next.splice(from, 1);
+      next.splice(to, 0, draggedId);
+      return next;
+    });
+  }, []);
+
+  const handleCollapsedEntryDragStart = useCallback((id: string, event: JSX.TargetedDragEvent<HTMLElement>) => {
+    if (!desktopLayoutCapableRef.current) {
+      event.preventDefault();
+      return;
+    }
+    dragIdRef.current = id;
+    suppressEntryClickRef.current = true;
+    getEntryGestureController(id).cancelPendingSingleClick();
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = 'move';
+      try { event.dataTransfer.setData('text/plain', id); } catch { /* ignore */ }
+    }
+    (event.currentTarget as HTMLElement).style.opacity = '0.5';
+    setDragOrder(orderedSessionsRef.current.map((s) => s.id));
+  }, [getEntryGestureController]);
+
+  const handleCollapsedEntryDragOver = useCallback((id: string, event: JSX.TargetedDragEvent<HTMLElement>) => {
+    if (!desktopLayoutCapableRef.current) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+    const draggedId = dragIdRef.current;
+    if (!draggedId) return;
+    moveSubSessionInDragOrder(draggedId, id);
+  }, [moveSubSessionInDragOrder]);
+
+  const handleCollapsedEntryDragEnd = useCallback((id: string, event: JSX.TargetedDragEvent<HTMLElement>) => {
+    getEntryGestureController(id).cancelPendingSingleClick();
+    dragIdRef.current = null;
+    setTimeout(() => { suppressEntryClickRef.current = false; }, 0);
+    (event.currentTarget as HTMLElement).style.opacity = '';
+    const ids = dragOrderRef.current;
+    if (ids) syncOrderToServer(ids);
+  }, [getEntryGestureController, syncOrderToServer]);
+
+  useEffect(() => {
+    onVisualOrderChange?.(orderedSessionIds);
+  }, [onVisualOrderChange, orderedSessionIds]);
 
   useEffect(() => {
     save(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, collapsed);
@@ -321,8 +408,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     save('rcc_subcard_p2p_hidden', p2pHidden);
   }, [p2pHidden]);
 
-  // Touch-based reorder for collapsed bar — must use addEventListener({ passive: false })
-  // so touchmove can preventDefault (passive listeners can't).
+  // Touch-based reorder for collapsed bar — desktop collapsed buttons use HTML5 drag events below.
+  // The touch path must use addEventListener({ passive: false }) so touchmove can preventDefault.
   useEffect(() => {
     const el = collapsedBarRef.current;
     if (!el) return;
@@ -356,17 +443,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       const targetEl = document.elementFromPoint(touch.clientX, touch.clientY);
       const overId = findBtnId(targetEl);
       if (overId && overId !== td.id) {
-        const draggedId = td.id;
-        setDragOrder((prev) => {
-          const ids = prev ?? orderedSessionsRef.current.map((s) => s.id);
-          const from = ids.indexOf(draggedId);
-          const to = ids.indexOf(overId);
-          if (from === -1 || to === -1) return prev;
-          const next = [...ids];
-          next.splice(from, 1);
-          next.splice(to, 0, draggedId);
-          return next;
-        });
+        moveSubSessionInDragOrder(td.id, overId);
       }
     };
 
@@ -398,7 +475,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       el.removeEventListener('touchcancel', onEnd);
       el.removeEventListener('contextmenu', onContext);
     };
-  }, [collapsed, syncOrderToServer]);
+  }, [collapsed, moveSubSessionInDragOrder, syncOrderToServer]);
 
   useEffect(() => {
     const installHorizontalEdgeGuard = (el: HTMLDivElement | null) => {
@@ -501,6 +578,17 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         <button class="subcard-toolbar-btn" onClick={() => setCollapsed(!collapsed)} title={collapsed ? t('subsessionBar.show') : t('subsessionBar.hide')}>
           {collapsed ? '▲' : '▼'}
         </button>
+        {isMobile && discussions.length > 0 && (
+          <button
+            class={`subcard-toolbar-btn${p2pHidden ? ' subcard-toolbar-btn-active' : ''}`}
+            data-testid="p2p-compact-toggle"
+            onClick={() => setP2pHidden((hidden) => !hidden)}
+            title={p2pHidden ? t('subsessionBar.p2p_compact_show') : t('subsessionBar.p2p_compact_hide')}
+            aria-label={p2pHidden ? t('subsessionBar.p2p_compact_show') : t('subsessionBar.p2p_compact_hide')}
+          >
+            P2P {p2pHidden ? '▾' : '▴'}
+          </button>
+        )}
         {!collapsed && (
           <>
             <button class="subcard-toolbar-btn" onClick={toggleLayout} title={layout === 'single' ? t('subsessionBar.layout_double') : t('subsessionBar.layout_single')}>
@@ -516,7 +604,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             <span class="subcard-toolbar-label">{t('subsessionBar.subs_count', { count: subSessions.length })}</span>
             {/* Desktop: full stats in expanded toolbar */}
             {stats && (
-              <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`}>
+              <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}>
                 {stats.daemonVersion && (
                   <>
                     {/* Display the short form (strips trailing -dev.NNN counter); the
@@ -542,11 +630,17 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 <span style={{ color: '#94a3b8' }}>
                   {formatUptime(stats.uptime)}
                 </span>
+                {desktopLayoutCapable && (
+                  <>
+                    <span style={{ color: '#94a3b8' }}> · </span>
+                    <span class="daemon-local-clock">{localClockText}</span>
+                  </>
+                )}
               </span>
             )}
           </>
         )}
-        {/* Mobile: compact stats in collapsed toolbar */}
+        {/* Collapsed toolbar: compact stats strip. */}
         {collapsed && stats && (() => {
           const totalGb = stats.memTotal / (1024 ** 3);
           const useG = totalGb >= 1;
@@ -556,7 +650,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           const memTotal = useG ? totalGb.toFixed(1) : (stats.memTotal / div).toFixed(0);
           const ei = { fontSize: '0.65em', verticalAlign: 'middle' } as const;
           return (
-            <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`} style={{ whiteSpace: 'nowrap', fontSize: 10 }}>
+            <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`} style={{ whiteSpace: 'nowrap', fontSize: 10 }}>
               {/* Mobile-narrow stat strip — show short version; full string in title above. */}
               {stats.daemonVersion && <span style={{ color: '#94a3b8' }}>v{formatDaemonVersionShort(stats.daemonVersion)} </span>}
               <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}><span style={ei}>⚙️</span>{stats.cpu}%</span>
@@ -566,13 +660,71 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               <span style={{ color: '#a78bfa' }}>≡{Number(stats.load1).toFixed(1)}</span>
               {' '}
               <EmbeddingStatusIcon status={stats.embedding} compact />
+              {desktopLayoutCapable && (
+                <>
+                  {' '}
+                  <span class="daemon-local-clock">{localClockText}</span>
+                </>
+              )}
             </span>
           );
         })()}
         <button class="subcard-toolbar-add" data-onboarding="new-sub-session" onClick={onNew} title={t('subsessionBar.new_sub_session')}>+</button>
         {onViewDiscussions && (
-          <button class="subcard-toolbar-btn" data-onboarding="discussion-history" onClick={onViewDiscussions} title={t('subsessionBar.p2p_discussions')} style={{ marginLeft: 4, fontSize: 11 }}>
+          <button
+            class="subcard-toolbar-btn"
+            data-onboarding="discussion-history"
+            data-running-discussions={totalRunningDiscussions}
+            onClick={onViewDiscussions}
+            // Tooltip: "View P2P discussions" with running count when > 0,
+            // so the user knows how many runs exist daemon-wide even
+            // when this session's bar shows none (the scoped
+            // discussions list filters to participants only).
+            title={
+              totalRunningDiscussions > 0
+                ? t(
+                    'subsessionBar.p2p_discussions_with_running',
+                    {
+                      count: totalRunningDiscussions,
+                      defaultValue: '{{count}} running discussions — view all',
+                    },
+                  )
+                : t('subsessionBar.p2p_discussions')
+            }
+            style={{ marginLeft: 4, fontSize: 11, position: 'relative' }}
+          >
             📋
+            {totalRunningDiscussions > 0 && (
+              <span
+                data-testid="p2p-discussions-running-badge"
+                aria-label={t(
+                  'subsessionBar.p2p_running_count_aria',
+                  {
+                    count: totalRunningDiscussions,
+                    defaultValue: '{{count}} P2P discussions running',
+                  },
+                )}
+                style={{
+                  position: 'absolute',
+                  top: -4,
+                  right: -4,
+                  minWidth: 14,
+                  height: 14,
+                  padding: '0 3px',
+                  borderRadius: 7,
+                  background: '#3b82f6',
+                  color: '#fff',
+                  fontSize: 9,
+                  fontWeight: 700,
+                  lineHeight: '14px',
+                  textAlign: 'center',
+                  pointerEvents: 'none',
+                  boxSizing: 'border-box',
+                }}
+              >
+                {totalRunningDiscussions > 99 ? '99+' : totalRunningDiscussions}
+              </span>
+            )}
           </button>
         )}
         {onViewRepo && (
@@ -652,21 +804,26 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         </div>
       )}
 
-      {/* Collapsed: compact buttons (all platforms) — long-press to reorder */}
+      {/* Collapsed: compact buttons (all platforms) — drag on desktop, long-press on touch */}
       {collapsed && subSessions.length > 0 && (
         <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}>
           {orderedSessions.map((sub) => (
             <CollapsedSubSessionButton
               key={sub.id}
               sub={sub}
+              accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
               isOpen={openIds.has(sub.id)}
               idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
               usage={subUsages?.get(`deck_sub_${sub.id}`)}
               detectedModel={detectedModels?.get(sub.sessionName)}
               inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
+              draggable={desktopLayoutCapable}
               onEntryPointerDown={handleEntryPointerDown}
               onEntryClick={handleEntryClick}
               onEntryDoubleClick={handleEntryDoubleClick}
+              onEntryDragStart={handleCollapsedEntryDragStart}
+              onEntryDragOver={handleCollapsedEntryDragOver}
+              onEntryDragEnd={handleCollapsedEntryDragEnd}
               t={t}
             />
           ))}
@@ -738,6 +895,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 serverId={serverId}
                 onTransportConfigSaved={onSubTransportConfigSaved}
                 inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
+                accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
               />
             </div>
           ))}

@@ -16,7 +16,12 @@ const SESSION_NAME_PATTERNS: RegExp[] = [
   /^deck_restorecheck[a-z0-9-]+_(brain|w\d+)$/i,
   /^deck_storecheck[a-z0-9-]+_(brain|w\d+)$/i,
   /^deck_shutdown[a-z0-9-]+_(brain|w\d+|probe)$/i,
+  /^deck_perflat_[a-z0-9-]+_(brain|w\d+|probe)$/i,
+  /^deck_storm_[a-z0-9-]+_(brain|w\d+|probe)$/i,
   /^deck_test_preview_[a-z0-9-]+_(brain|w\d+|probe)$/i,
+  /^deck_test_p2p_workflow_[a-z0-9-]+_(brain|w\d+|probe)$/i,
+  /^imc_perf_test_[a-z0-9-]+$/i,
+  /^imcodes-test-p2p-workflow[-_][a-z0-9-]+$/i,
   /^deck_sub_(?:cxsdk_e2e|cxsdk_effort|ccsdk_minimax_sub)$/i,
 ];
 
@@ -28,7 +33,12 @@ const PROJECT_NAME_PATTERNS: RegExp[] = [
   /^restorecheck[a-z0-9-]+$/i,
   /^storecheck[a-z0-9-]+$/i,
   /^shutdown[a-z0-9-]+$/i,
+  /^perflat_[a-z0-9-]+$/i,
+  /^storm_[a-z0-9-]+$/i,
+  /^imc_perf_test_[a-z0-9-]+$/i,
   /^imcodes-test-preview[-_]/i,
+  /^imcodes-test-p2p-workflow[-_]/i,
+  /^p2pworkflow[a-z0-9-]+$/i,
   /^e2e[-_]/i,
 ];
 
@@ -36,7 +46,12 @@ const PROJECT_DIR_PATTERNS: RegExp[] = [
   /[/\\]tmp[/\\].*e2e/i,
   /[/\\]tmp[/\\].*modeaware/i,
   /[/\\]tmp[/\\].*bootmain/i,
+  /[/\\]tmp[/\\].*(?:deck_)?perflat_[a-z0-9-]+/i,
+  /[/\\]tmp[/\\].*(?:deck_)?storm_[a-z0-9-]+/i,
+  /[/\\]tmp[/\\].*imc_perf_test_[a-z0-9-]+/i,
   /[/\\]tmp[/\\].*imcodes-test-preview/i,
+  /[/\\]tmp[/\\].*imcodes-test-p2p-workflow/i,
+  /[/\\]tmp[/\\].*imc_p2p_wf_test_/i,
 ];
 
 function normalize(value: string | null | undefined): string | undefined {

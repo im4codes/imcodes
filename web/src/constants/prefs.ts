@@ -9,6 +9,14 @@ export {
 export const PREF_KEY_P2P_COMBO_CONFIRM_SKIP = 'p2p_combo_direct_send_skip_confirm';
 export const PREF_KEY_P2P_CUSTOM_COMBOS = 'p2p_custom_combos';
 /**
+ * Last-selected tab in the P2P quick-pick dropdown shown above the chat
+ * input. Two tabs: `'combos'` (the original combo presets list) and
+ * `'workflows'` (the saved advanced workflow library for the active
+ * session). Persisted globally — not session-scoped — so the user's
+ * preferred tab follows them across sessions.
+ */
+export const PREF_KEY_P2P_DROPDOWN_TAB = 'p2p_dropdown_tab';
+/**
  * Whether the chat timeline shows tool calls / file changes / reasoning.
  *
  * Tri-state semantics for first-run UX:

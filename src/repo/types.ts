@@ -34,6 +34,8 @@ export interface RepoContext {
   cliMinVersion?: string;
   cliAuth?: boolean;
   remotes?: RepoRemote[];   // present when status='multiple_remotes'
+  repoGeneration?: number;
+  detectedAt?: number;
 }
 
 export interface RepoListResult<T> {
@@ -77,9 +79,14 @@ export interface RepoBranch {
   name: string;
   isDefault: boolean;
   isCurrent: boolean;
+  localPresent?: boolean;
+  remotePresent?: boolean;
+  checkoutable?: boolean;
+  checkoutBlockedReason?: RepoError;
   aheadBy?: number;
   behindBy?: number;
   lastCommitDate?: number;
+  url?: string;
 }
 
 export interface RepoCommit {
@@ -181,4 +188,39 @@ export type RepoError =
   | 'cli_outdated'
   | 'unknown_project'
   | 'invalid_params'
-  | 'not_detected';
+  | 'not_detected'
+  | 'invalid_checkout_target'
+  | 'dirty_worktree'
+  | 'git_operation_in_progress'
+  | 'detached_head'
+  | 'checkout_in_progress'
+  | 'repo_busy'
+  | 'branch_in_use'
+  | 'not_a_git_repo'
+  | 'checkout_failed';
+
+export const REPO_ERROR_CODES: readonly RepoError[] = [
+  'unauthorized',
+  'rate_limited',
+  'cli_error',
+  'cli_missing',
+  'cli_outdated',
+  'unknown_project',
+  'invalid_params',
+  'not_detected',
+  'invalid_checkout_target',
+  'dirty_worktree',
+  'git_operation_in_progress',
+  'detached_head',
+  'checkout_in_progress',
+  'repo_busy',
+  'branch_in_use',
+  'not_a_git_repo',
+  'checkout_failed',
+] as const;
+
+const REPO_ERROR_SET = new Set<string>(REPO_ERROR_CODES);
+
+export function isRepoErrorCode(value: unknown): value is RepoError {
+  return typeof value === 'string' && REPO_ERROR_SET.has(value);
+}

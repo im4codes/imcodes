@@ -8,15 +8,21 @@ import { QuickInputPanel } from './QuickInputPanel.js';
 import { getNavigableHistory } from './QuickInputPanel.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { FileBrowser } from './file-browser-lazy.js';
+import { CloneSessionGroupDialog } from './CloneSessionGroupDialog.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
-import { P2pConfigPanel } from './P2pConfigPanel.js';
+import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
+import { isFutureWorkflowSchema } from '@shared/p2p-workflow-validators.js';
+import {
+  P2P_CAPABILITY_FRESHNESS_TTL_MS,
+  P2P_WORKFLOW_CAPABILITY_V1,
+} from '@shared/p2p-workflow-constants.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
-import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
+import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { uploadFile, sendSessionViaHttp, cancelSessionViaHttp } from '../api.js';
 import { patchSession, patchSubSession } from '../api.js';
@@ -24,6 +30,7 @@ import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { isRunningSessionState } from '../thinking-utils.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
+import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import { isLegacyTransportPendingMessageId, normalizeTransportPendingEntries } from '../transport-queue.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
@@ -35,6 +42,8 @@ import {
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
+import { migrateLegacyWorkflowDraft, normalizeWorkflowLibrary } from '@shared/p2p-workflow-library.js';
+import type { P2pWorkflowDraft } from '@shared/p2p-workflow-types.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
@@ -128,6 +137,7 @@ interface Props {
 }
 
 const MAX_UPLOAD_SIZE_MB = Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024));
+export const OPENSPEC_LIST_REQUEST_TIMEOUT_MS = 12_000;
 const TRANSPORT_QUEUE_HIDDEN_KEY_PREFIX = 'imcodes:transport-queue-hidden:';
 type LocalQueuedTransportEntry = {
   clientMessageId: string;
@@ -164,7 +174,25 @@ type ModelChoice = 'opus[1M]' | 'sonnet' | 'haiku';
 
 const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
 
-type ComposerAttachment = { path: string; name: string };
+/*
+ * R3 v2 PR-ρ — Composer attachments now carry a per-composer sequence
+ * number `seq` (1, 2, 3, ...) so the user can reference them in chat
+ * text via short tags like `#1`, `#2`. The badge UI surfaces the tag
+ * (`#1 screenshot.png`) and the send-payload text-prepend uses
+ * `#1:(/full/daemon/path)` so the LLM sees the short reference and the
+ * exact path it can read. The counter resets naturally on send because
+ * `clearComposer` clears the attachments array.
+ */
+type ComposerAttachment = { path: string; name: string; seq: number };
+
+/**
+ * Renumber attachments so `seq` is `1..N` in array order. Used after
+ * removing a middle attachment so the remaining ones renumber to stay
+ * consecutive (otherwise `#1`, `#3`, `#5` gaps would confuse users).
+ */
+function renumberAttachments(list: ComposerAttachment[]): ComposerAttachment[] {
+  return list.map((entry, index) => ({ ...entry, seq: index + 1 }));
+}
 
 function buildComposerDraftScope(activeSession: SessionInfo | null, subSessionId?: string): string | null {
   if (subSessionId && subSessionId.trim()) return `sub:${subSessionId.trim()}`;
@@ -186,7 +214,14 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
   try {
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.flatMap((entry) => {
+    /*
+     * R3 v2 PR-ρ — Backward-compat: pre-PR-ρ stored entries have
+     * `{ path, name }` only (no `seq`). We renumber the surviving
+     * entries 1..N in array order so the badge labels stay
+     * consecutive across reloads even when the old entries lack
+     * `seq`.
+     */
+    const list: ComposerAttachment[] = parsed.flatMap((entry) => {
       if (!entry || typeof entry !== 'object') return [];
       const path = typeof (entry as { path?: unknown }).path === 'string'
         ? (entry as { path: string }).path.trim()
@@ -195,8 +230,9 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
         ? (entry as { name: string }).name.trim()
         : '';
       if (!path || !name) return [];
-      return [{ path, name }];
+      return [{ path, name, seq: 0 }];
     });
+    return renumberAttachments(list);
   } catch {
     return [];
   }
@@ -212,6 +248,7 @@ const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
 const P2P_BASE_MODES = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss', P2P_CONFIG_MODE] as const;
+const P2P_DROPDOWN_ROUND_OPTIONS = [1, 2, 3, 5] as const;
 const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
 const P2P_SINGLE_COLORS: Record<string, string> = { solo: '#dbe7f5', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
 
@@ -245,6 +282,27 @@ function getP2pModeLabel(mode: string, t: (key: string) => string): string {
 function getP2pMenuItemColor(mode: string, active: boolean): string {
   if (mode === 'solo') return active ? '#f8fafc' : '#dbe7f5';
   return getP2pModeColor(mode);
+}
+
+function CopySessionGroupIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+      style={{ flex: '0 0 auto' }}
+    >
+      <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+      <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+    </svg>
+  );
 }
 
 function getAnchoredOverlayStyle(
@@ -286,13 +344,6 @@ function getAnchoredOverlayStyle(
   return style;
 }
 
-type OptionalP2pAdvancedConfig = {
-  advancedPresetKey?: unknown;
-  advancedRounds?: unknown;
-  advancedRunTimeoutMinutes?: unknown;
-  contextReducer?: unknown;
-};
-
 interface PendingAtTarget {
   session: string;
   mode: string;
@@ -330,7 +381,7 @@ type ManualP2pResolveResult = {
   cleanText: string;
 };
 
-type P2pConfigTab = 'participants' | 'combos';
+type P2pConfigTab = 'participants' | 'combos' | 'advanced';
 
 type P2pConfigPersistResult = { ok: boolean; error?: string };
 
@@ -346,14 +397,56 @@ type PendingTransportApproval = {
   tool?: string;
 };
 
-function appendOptionalAdvancedP2pConfig(extra: Record<string, unknown>, config: P2pSavedConfig): void {
-  const advanced = config as P2pSavedConfig & OptionalP2pAdvancedConfig;
-  if (advanced.advancedPresetKey) extra.p2pAdvancedPresetKey = advanced.advancedPresetKey;
-  if (advanced.advancedRounds) extra.p2pAdvancedRounds = advanced.advancedRounds;
-  if (advanced.advancedRunTimeoutMinutes != null) {
-    extra.p2pAdvancedRunTimeoutMinutes = advanced.advancedRunTimeoutMinutes;
+/** Compute the launch-time capability gate from the live WS client + saved
+ *  config. Returns `stale=true` when no daemon.hello has been observed (or the
+ *  cached snapshot has aged past `P2P_CAPABILITY_FRESHNESS_TTL_MS`),
+ *  `missing` is the set of required capabilities not present, and
+ *  `futureSchema=true` if the saved draft/envelope encodes a workflow schema
+ *  this client cannot speak. The launch path uses these to decide whether to
+ *  attach the envelope. */
+function computeAdvancedLaunchCapabilityGate(
+  ws: WsClient | null,
+  config: P2pSavedConfig,
+): { stale: boolean; missing: string[]; futureSchema: boolean } {
+  const futureSchema = (config.workflowLaunchEnvelope && isFutureWorkflowSchema(config.workflowLaunchEnvelope))
+    || (config.workflowDraft && isFutureWorkflowSchema(config.workflowDraft))
+    || false;
+  const snapshot = ws?.getDaemonCapabilitySnapshot() ?? null;
+  const stale = !snapshot
+    || (Date.now() - snapshot.observedAt) > P2P_CAPABILITY_FRESHNESS_TTL_MS;
+  const required = new Set<string>([P2P_WORKFLOW_CAPABILITY_V1]);
+  const envelopeCaps = config.workflowLaunchEnvelope?.requiredDaemonCapabilities;
+  if (Array.isArray(envelopeCaps)) {
+    for (const cap of envelopeCaps) if (typeof cap === 'string' && cap) required.add(cap);
   }
-  if (advanced.contextReducer) extra.p2pContextReducer = advanced.contextReducer;
+  const have = stale ? new Set<string>() : new Set(snapshot?.capabilities ?? []);
+  const missing = stale ? [...required] : [...required].filter((cap) => !have.has(cap));
+  return { stale, missing, futureSchema };
+}
+
+function appendOptionalAdvancedP2pConfig(
+  extra: Record<string, unknown>,
+  config: P2pSavedConfig,
+  launchContext?: { sessionName?: string; projectDir?: string; cwd?: string; userText?: string; locale?: string },
+  capabilityGate?: { stale: boolean; missing: string[]; futureSchema: boolean },
+): void {
+  const hasNewWorkflowConfig = Boolean(config.workflowDraft || config.workflowLaunchEnvelope);
+  const hasLegacyAdvancedConfig = Boolean(
+    config.advancedPresetKey ||
+    config.advancedRounds?.length ||
+    config.advancedRunTimeoutMinutes != null ||
+    config.contextReducer,
+  );
+  if (!hasNewWorkflowConfig && !hasLegacyAdvancedConfig) return;
+  // smart-p2p-upgrade 9.5–9.7: refuse to attach the launch envelope when the
+  // daemon's capability state is stale, the required capability is missing,
+  // or the saved config encodes a future schema this client cannot speak.
+  // The panel surfaces the matching diagnostic banner; here we just no-op so
+  // the daemon never receives an unsupported launch.
+  if (capabilityGate?.stale || capabilityGate?.futureSchema) return;
+  if ((capabilityGate?.missing.length ?? 0) > 0) return;
+  const envelope = buildP2pWorkflowLaunchEnvelopeFromConfig(config, launchContext);
+  if (envelope) extra.p2pWorkflowLaunchEnvelope = envelope;
 }
 
 // Enter moved after ↓ arrow
@@ -457,6 +550,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [modelOpen, setModelOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
   const [thinkingOpen, setThinkingOpen] = useState(false);
+  const [cloneDialogOpen, setCloneDialogOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
   const [p2pMode, setP2pMode] = useState<P2pMode>('solo');
   const [p2pExcludeSameType, setP2pExcludeSameType] = useState(true);
@@ -510,6 +604,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const openSpecAuditButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const openSpecProposeButtonRef = useRef<HTMLButtonElement | null>(null);
   const openSpecRequestIdRef = useRef<string | null>(null);
+  const openSpecRequestTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
@@ -535,6 +630,22 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
     return [...byId.values()];
   }, [incomingQueuedTransportEntries, optimisticQueuedEntries]);
+
+  const clearOpenSpecRequestTimer = useCallback(() => {
+    if (openSpecRequestTimerRef.current) {
+      clearTimeout(openSpecRequestTimerRef.current);
+      openSpecRequestTimerRef.current = null;
+    }
+  }, []);
+
+  const formatOpenSpecLoadError = useCallback((error?: string | null) => {
+    const raw = error?.trim();
+    if (!raw) return t('openspec.load_error');
+    if (raw === FS_READ_ERROR_CODES.PREVIEW_BRIDGE_TIMEOUT || raw === FS_READ_ERROR_CODES.FS_LIST_TIMEOUT) {
+      return t('openspec.load_timeout');
+    }
+    return raw;
+  }, [t]);
   const queuedTransportMessages = queuedTransportEntries.map((entry) => entry.text);
   const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';
   const editingQueuedEntry = editingQueuedMessageId
@@ -726,6 +837,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [activeSession?.agentType, activeSession?.qwenModel, qwenModel]);
 
   const hasSession = !!activeSession;
+  const canShowCloneGroupAction = !!activeSession
+    && !subSessionId
+    && !compact
+    && activeSession.role === 'brain'
+    && !activeSession.name.startsWith('deck_sub_')
+    && activeSession.userCreated !== false;
   // Input only disabled when there's no session at all (can type while disconnected)
   const inputDisabled = !hasSession;
   // Send/action buttons disabled when disconnected or no session
@@ -865,6 +982,27 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     [allCombos],
   );
 
+  // R3 v2 PR-κ — Workflow library list available for the active session.
+  // Normalised + migrated from legacy single-draft on read so the dropdown
+  // never sees malformed entries even when an older client wrote the
+  // saved config.
+  const workflowLibraryItems = useMemo(() => {
+    if (!p2pSavedConfig) return [] as P2pWorkflowDraft[];
+    const migrated = migrateLegacyWorkflowDraft(p2pSavedConfig);
+    return normalizeWorkflowLibrary(migrated.workflowLibrary ?? []);
+  }, [p2pSavedConfig]);
+
+  // R3 v2 PR-κ — Persist the dropdown's active tab globally so the user's
+  // choice ("combos" vs. "workflows") follows them across sessions and
+  // survives a page reload. Default falls back to the safer "combos" tab
+  // because that's what the dropdown shipped with for years.
+  const dropdownTabPref = usePref<string>(PREF_KEY_P2P_DROPDOWN_TAB);
+  type P2pDropdownTab = 'combos' | 'workflows';
+  const dropdownActiveTab: P2pDropdownTab = dropdownTabPref.value === 'workflows' ? 'workflows' : 'combos';
+  const setDropdownActiveTab = useCallback((tab: P2pDropdownTab) => {
+    void dropdownTabPref.save(tab).catch(() => {});
+  }, [dropdownTabPref]);
+
   const comboSkipPref = usePref<boolean>(PREF_KEY_P2P_COMBO_CONFIRM_SKIP, { parse: parseBooleanish });
   useEffect(() => {
     if (comboSkipPref.value === true) setSkipComboSendConfirm(true);
@@ -884,6 +1022,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     || p2pOpen
     || p2pConfigOpen
     || openSpecOpen
+    || cloneDialogOpen
     || openSpecAuditMenu !== null
     || openSpecProposeMenuOpen
     || voiceOpen
@@ -1020,11 +1159,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
+  useEffect(() => { setCloneDialogOpen(false); }, [activeSession?.name]);
   useEffect(() => {
     setPendingComboSendConfirm(null);
     setRememberComboSendChoice(false);
   }, [activeSession?.name]);
+  useEffect(() => () => clearOpenSpecRequestTimer(), [clearOpenSpecRequestTimer]);
   useEffect(() => {
+    clearOpenSpecRequestTimer();
     setOpenSpecOpen(false);
     setOpenSpecChanges([]);
     setOpenSpecError(null);
@@ -1032,7 +1174,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecAuditMenu(null);
     setOpenSpecExpandedChange(null);
     openSpecRequestIdRef.current = null;
-  }, [activeSession?.projectDir]);
+  }, [activeSession?.projectDir, clearOpenSpecRequestTimer]);
 
   // Close menus when clicking outside
   useEffect(() => {
@@ -1261,11 +1403,35 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, []);
 
   const refreshOpenSpecChanges = useCallback(() => {
-    if (!ws || !openSpecChangesPath) return;
+    clearOpenSpecRequestTimer();
+    openSpecRequestIdRef.current = null;
+    if (!ws || !openSpecChangesPath) {
+      setOpenSpecLoading(false);
+      setOpenSpecChanges([]);
+      setOpenSpecError(null);
+      return;
+    }
     setOpenSpecLoading(true);
     setOpenSpecError(null);
-    openSpecRequestIdRef.current = ws.fsListDir(openSpecChangesPath, false, false);
-  }, [openSpecChangesPath, ws]);
+    let requestId: string;
+    try {
+      requestId = ws.fsListDir(openSpecChangesPath, false, false);
+    } catch {
+      setOpenSpecLoading(false);
+      setOpenSpecChanges([]);
+      setOpenSpecError(t('openspec.load_unavailable'));
+      return;
+    }
+    openSpecRequestIdRef.current = requestId;
+    openSpecRequestTimerRef.current = setTimeout(() => {
+      if (openSpecRequestIdRef.current !== requestId) return;
+      openSpecRequestIdRef.current = null;
+      openSpecRequestTimerRef.current = null;
+      setOpenSpecLoading(false);
+      setOpenSpecChanges([]);
+      setOpenSpecError(t('openspec.load_timeout'));
+    }, OPENSPEC_LIST_REQUEST_TIMEOUT_MS);
+  }, [clearOpenSpecRequestTimer, openSpecChangesPath, t, ws]);
 
   const insertOpenSpecPrompt = useCallback((kind: 'audit_implementation' | 'audit_spec' | 'implement' | 'propose_from_discussion' | 'propose_from_description', reference?: string) => {
     const prompt = kind === 'audit_implementation'
@@ -1351,7 +1517,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         >
           <div class="openspec-mobile-header">
             <span class="openspec-mobile-title">{t('openspec.title')}</span>
-            <button class="openspec-mobile-close" onClick={() => { setOpenSpecOpen(false); setOpenSpecAuditMenu(null); setOpenSpecProposeMenuOpen(false); }}>✕</button>
+            <button
+              class="openspec-mobile-close"
+              onClick={() => {
+                clearOpenSpecRequestTimer();
+                openSpecRequestIdRef.current = null;
+                setOpenSpecLoading(false);
+                setOpenSpecOpen(false);
+                setOpenSpecAuditMenu(null);
+                setOpenSpecProposeMenuOpen(false);
+              }}
+            >
+              ✕
+            </button>
           </div>
           {content}
         </div>
@@ -1368,7 +1546,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       </div>,
       document.body,
     );
-  }, [isOpenSpecMobile, openSpecDropdownStyle, t]);
+  }, [clearOpenSpecRequestTimer, isOpenSpecMobile, openSpecDropdownStyle, t]);
 
   useEffect(() => {
     if (!openSpecOpen || typeof window === 'undefined') return;
@@ -1442,6 +1620,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
     });
   }, [resolvePendingP2pConfigSave, ws]);
+
+  const handleP2pDropdownRoundsChange = useCallback((nextRounds: number) => {
+    const cfg: P2pSavedConfig = {
+      ...(p2pSavedConfig ?? { sessions: {}, rounds: 1 }),
+      rounds: nextRounds,
+      updatedAt: Date.now(),
+    };
+    setP2pSavedConfig(cfg);
+    void p2pSavedConfigPref.save(cfg).catch(() => {});
+    if (rootSession) {
+      void persistP2pConfigToDaemon(rootSession, cfg, { awaitAck: false });
+    }
+  }, [p2pSavedConfig, p2pSavedConfigPref, persistP2pConfigToDaemon, rootSession]);
+
   useEffect(() => {
     setP2pSavedConfig(p2pSavedConfigPref.value);
   }, [p2pSavedConfigPref.value]);
@@ -1472,6 +1664,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
       if (msg.type === DAEMON_MSG.DISCONNECTED) {
         rejectAllPendingP2pConfigSaves(P2P_CONFIG_ERROR.SAVE_TIMEOUT);
+        if (openSpecRequestIdRef.current) {
+          clearOpenSpecRequestTimer();
+          openSpecRequestIdRef.current = null;
+          setOpenSpecLoading(false);
+          setOpenSpecChanges([]);
+          setOpenSpecError(t('openspec.load_unavailable'));
+        }
         return;
       }
       if (msg.type === DAEMON_MSG.RECONNECTED) {
@@ -1483,21 +1682,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             }
           });
         }
+        if (openSpecOpen) refreshOpenSpecChanges();
         return;
       }
       const requestId = openSpecRequestIdRef.current;
       if (!requestId || msg.type !== 'fs.ls_response' || msg.requestId !== requestId) return;
       openSpecRequestIdRef.current = null;
+      clearOpenSpecRequestTimer();
       setOpenSpecLoading(false);
       if (msg.status === 'error') {
-        const errorText = msg.error ?? 'Unable to scan OpenSpec changes';
-        if (/enoent|not found|no such file/i.test(errorText)) {
+        const errorText = msg.error ?? null;
+        if (errorText === FS_READ_ERROR_CODES.FORBIDDEN_PATH || /enoent|not found|no such file/i.test(errorText ?? '')) {
           setOpenSpecChanges([]);
           setOpenSpecError(null);
           return;
         }
         setOpenSpecChanges([]);
-        setOpenSpecError(errorText);
+        setOpenSpecError(formatOpenSpecLoadError(errorText));
         return;
       }
       const changeNames = (msg.entries ?? [])
@@ -1507,7 +1708,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setOpenSpecChanges(changeNames);
       setOpenSpecError(null);
     });
-  }, [persistP2pConfigToDaemon, p2pSavedConfig, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, serverId, ws]);
+  }, [clearOpenSpecRequestTimer, formatOpenSpecLoadError, openSpecOpen, persistP2pConfigToDaemon, p2pSavedConfig, refreshOpenSpecChanges, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, serverId, t, ws]);
 
   useEffect(() => {
     if (!hasConfiguredP2pParticipants && isComboMode(p2pMode)) {
@@ -1562,15 +1763,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return { orderedTargets, cleanText };
   };
 
-  const applySavedP2pConfigSelection = useCallback((extra: Record<string, unknown>, mode: string) => {
+  const applySavedP2pConfigSelection = useCallback((extra: Record<string, unknown>, mode: string, userText?: string) => {
     if (!p2pSavedConfig || (mode !== P2P_CONFIG_MODE && !isComboMode(mode))) return;
     const selection = buildP2pConfigSelection(p2pSavedConfig, mode);
     extra.p2pSessionConfig = selection.config.sessions;
     extra.p2pRounds = selection.rounds;
     if (selection.config.extraPrompt) extra.p2pExtraPrompt = selection.config.extraPrompt;
     if (selection.config.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(selection.config.hopTimeoutMinutes * 60_000, 600_000);
-    if (mode === P2P_CONFIG_MODE) appendOptionalAdvancedP2pConfig(extra, selection.config);
-  }, [p2pSavedConfig]);
+    if (mode === P2P_CONFIG_MODE) appendOptionalAdvancedP2pConfig(extra, selection.config, {
+      sessionName: activeSession?.name,
+      projectDir: activeSession?.projectDir,
+      userText,
+      locale: i18n?.language ?? 'en',
+    }, computeAdvancedLaunchCapabilityGate(ws, selection.config));
+  }, [activeSession?.name, activeSession?.projectDir, i18n?.language, p2pSavedConfig, ws]);
 
   const buildSendPayload = useCallback((options?: string | BuildSendPayloadOptions): PendingSendPayload | null => {
     const normalizedOptions: BuildSendPayloadOptions =
@@ -1611,7 +1817,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pRounds = override?.rounds ?? cfg.rounds ?? 1;
           if (cfg.extraPrompt) extra.p2pExtraPrompt = cfg.extraPrompt;
           if (cfg.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(cfg.hopTimeoutMinutes * 60_000, 600_000);
-          if (!override?.modeOverride || override.modeOverride === P2P_CONFIG_MODE) appendOptionalAdvancedP2pConfig(extra, cfg);
+          if (!override?.modeOverride || override.modeOverride === P2P_CONFIG_MODE) appendOptionalAdvancedP2pConfig(extra, cfg, {
+            sessionName: activeSession?.name,
+            projectDir: activeSession?.projectDir,
+            userText: text,
+            locale: i18n?.language ?? 'en',
+          }, computeAdvancedLaunchCapabilityGate(ws, cfg));
         }
         // For non-config mode overrides (single or combo), send as p2pMode so the daemon uses it
         if (override?.modeOverride && override.modeOverride !== 'config') {
@@ -1631,7 +1842,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pMode = effectiveMode;
           if (p2pExcludeSameType) extra.p2pExcludeSameType = true;
         }
-        applySavedP2pConfigSelection(extra, effectiveMode);
+        applySavedP2pConfigSelection(extra, effectiveMode, text);
       }
     }
 
@@ -1645,9 +1856,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       const quoteBlock = quotes.map((q) => `> ${q.replace(/\n/g, '\n> ')}`).join('\n\n');
       text = text ? `${quoteBlock}\n\n${text}` : quoteBlock;
     }
-    // Prepend attachment references
+    // Prepend attachment references.
+    // R3 v2 PR-ρ/υ — Keep the compact user-facing tag (`#1`, `#2`, ...)
+    // but map it to the full daemon path, not just the display filename.
+    // The path is what the receiving LLM can actually open.
     if (attachments.length > 0) {
-      const refs = attachments.map((a) => `@${a.path}`).join(' ');
+      const refs = attachments.map((a) => `#${a.seq}:(${a.path})`).join(' ');
       text = text ? `${refs} ${text}` : refs;
     }
     return { text, extra };
@@ -1668,7 +1882,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     } else if (effectiveMode !== 'solo' && !text.includes('@@')) {
       extra.p2pMode = effectiveMode === P2P_CONFIG_MODE ? 'config' : effectiveMode;
       if (p2pExcludeSameType && effectiveMode !== P2P_CONFIG_MODE) extra.p2pExcludeSameType = true;
-      applySavedP2pConfigSelection(extra, effectiveMode);
+      applySavedP2pConfigSelection(extra, effectiveMode, cleanText);
     }
 
     if (extra.p2pAtTargets || extra.p2pMode) {
@@ -1958,6 +2172,36 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     requestSend(buildSendPayload(payloadOptions), { clearComposer: true });
   }, [buildSendPayload, p2pSavedConfig, requestSend]);
 
+  /*
+   * R3 v2 PR-κ — Click-to-launch a saved workflow from the P2P dropdown.
+   * Builds a config snapshot with the chosen workflow as active so the
+   * launch envelope (built downstream by `appendOptionalAdvancedP2pConfig`
+   * via `getActiveWorkflowFromConfig`) carries the user-picked entry. We
+   * pass the snapshot through `syntheticConfigOverride` so the picked
+   * workflow takes effect for THIS turn even if the saved config still
+   * names a different active id (the user did not commit the picked id
+   * via the panel — they just one-shot launched it).
+   */
+  const handleDirectWorkflowSelect = useCallback((workflowId: string) => {
+    setP2pOpen(false);
+    if (!p2pSavedConfig || workflowLibraryItems.length === 0) return;
+    const target = workflowLibraryItems.find((entry) => entry.id === workflowId);
+    if (!target) return;
+    const chosenConfig: P2pSavedConfig = { ...p2pSavedConfig, activeWorkflowId: workflowId };
+    const selection = buildP2pConfigSelection(chosenConfig, P2P_CONFIG_MODE);
+    const titleLabel = (target.title?.trim() || workflowId).slice(0, 40);
+    const payloadOptions: BuildSendPayloadOptions = {
+      modeOverride: P2P_CONFIG_MODE,
+      syntheticAtTargets: [{
+        session: '__all__',
+        mode: 'config',
+        label: `@@all(workflow:${titleLabel})`,
+      }],
+      syntheticConfigOverride: selection,
+    };
+    requestSend(buildSendPayload(payloadOptions), { clearComposer: true });
+  }, [buildSendPayload, p2pSavedConfig, requestSend, workflowLibraryItems]);
+
   const handleComboSendCancel = useCallback(() => {
     maybePersistComboSendSkip();
     setPendingComboSendConfirm(null);
@@ -2073,7 +2317,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         const result = await uploadFile(serverId, file, (pct) => setUploadProgress(pct));
         if (result.attachment?.daemonPath) {
           uploadedAny = true;
-          setAttachments((prev) => [...prev, { path: result.attachment!.daemonPath, name: file.name }]);
+          // R3 v2 PR-ρ — Assign the next sequential `seq` so the badge
+          // and the text-prepend reference (#N) match the upload order.
+          setAttachments((prev) => [
+            ...prev,
+            { path: result.attachment!.daemonPath, name: file.name, seq: prev.length + 1 },
+          ]);
         }
       } catch (err) {
         console.error('[upload] failed:', err);
@@ -2391,6 +2640,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 setOpenSpecOpen((open) => {
                   const next = !open;
                   if (!next) {
+                    clearOpenSpecRequestTimer();
+                    openSpecRequestIdRef.current = null;
+                    setOpenSpecLoading(false);
                     setOpenSpecAuditMenu(null);
                     setOpenSpecProposeMenuOpen(false);
                   }
@@ -2737,7 +2989,40 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             <span class="p2p-settings-label">{t('p2p.settings_button')}</span>
           </button>
           {p2pOpen && (
-            <div class="menu-dropdown menu-dropdown-p2p">
+            <div class="menu-dropdown menu-dropdown-p2p" data-testid="p2p-dropdown">
+              <div
+                class="p2p-dropdown-rounds"
+                data-testid="p2p-dropdown-rounds"
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                  <span class="p2p-menu-section-label" style={{ padding: 0 }}>{t('p2p.settings_rounds')}</span>
+                  <span
+                    class="p2p-dropdown-rounds-hint"
+                    title={t('p2p.settings_rounds_explanation')}
+                    style={{ fontSize: 10, whiteSpace: 'normal', textAlign: 'right' }}
+                  >
+                    {t('p2p.settings_rounds_hint')}
+                  </span>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: `repeat(${P2P_DROPDOWN_ROUND_OPTIONS.length}, minmax(0, 1fr))`, gap: 6 }}>
+                  {P2P_DROPDOWN_ROUND_OPTIONS.map((roundOption) => {
+                    const active = (p2pSavedConfig?.rounds ?? 1) === roundOption;
+                    return (
+                      <button
+                        key={roundOption}
+                        type="button"
+                        class={`menu-item p2p-dropdown-round ${active ? 'menu-item-active' : ''}`}
+                        data-testid={`p2p-dropdown-round-${roundOption}`}
+                        data-active={active ? 'true' : 'false'}
+                        onClick={() => handleP2pDropdownRoundsChange(roundOption)}
+                      >
+                        {roundOption}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              <div class="menu-divider" />
               <button
                 class={`menu-item ${p2pMode === 'solo' ? 'menu-item-active' : ''}`}
                 onClick={() => {
@@ -2750,37 +3035,138 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 {p2pMode === 'solo' ? '● ' : '○ '}{getP2pModeLabel('solo', t)}
               </button>
               <div class="menu-divider" />
-              <div class="p2p-menu-section-label">{t('p2p.combo_label')}</div>
-              {!hasConfiguredP2pParticipants && (
-                <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', color: '#fbbf24', marginTop: 4 }}>
-                  {t('p2p.combo_requires_participants_hint')}
+              {/*
+               * R3 v2 PR-κ — Tab switcher between the original combo
+               * presets list and the saved advanced workflow library.
+               * Tab choice persists globally via PREF_KEY_P2P_DROPDOWN_TAB
+               * so the user's preference follows them across sessions.
+               */}
+              <div
+                class="p2p-dropdown-tabs"
+                style={{ display: 'flex', gap: 4, padding: '4px 8px' }}
+                data-testid="p2p-dropdown-tabs"
+              >
+                <button
+                  type="button"
+                  class={`menu-item p2p-dropdown-tab ${dropdownActiveTab === 'combos' ? 'menu-item-active' : ''}`}
+                  data-testid="p2p-dropdown-tab-combos"
+                  data-active={dropdownActiveTab === 'combos' ? 'true' : 'false'}
+                  onClick={() => setDropdownActiveTab('combos')}
+                  style={{
+                    flex: 1, fontSize: 11, padding: '4px 8px', borderRadius: 4,
+                    background: dropdownActiveTab === 'combos' ? '#1d4ed840' : 'transparent',
+                    color: dropdownActiveTab === 'combos' ? '#bfdbfe' : '#94a3b8',
+                    fontWeight: dropdownActiveTab === 'combos' ? 600 : 500,
+                  }}
+                >
+                  {t('p2p.dropdown.tab_combos', t('p2p.combo_label', 'Combos'))}
+                </button>
+                <button
+                  type="button"
+                  class={`menu-item p2p-dropdown-tab ${dropdownActiveTab === 'workflows' ? 'menu-item-active' : ''}`}
+                  data-testid="p2p-dropdown-tab-workflows"
+                  data-active={dropdownActiveTab === 'workflows' ? 'true' : 'false'}
+                  onClick={() => setDropdownActiveTab('workflows')}
+                  style={{
+                    flex: 1, fontSize: 11, padding: '4px 8px', borderRadius: 4,
+                    background: dropdownActiveTab === 'workflows' ? '#1d4ed840' : 'transparent',
+                    color: dropdownActiveTab === 'workflows' ? '#bfdbfe' : '#94a3b8',
+                    fontWeight: dropdownActiveTab === 'workflows' ? 600 : 500,
+                  }}
+                >
+                  {t('p2p.dropdown.tab_workflows', 'Workflows')}
+                </button>
+              </div>
+              {dropdownActiveTab === 'combos' ? (
+                <>
+                  {!hasConfiguredP2pParticipants && (
+                    <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', color: '#fbbf24', marginTop: 4 }}>
+                      {t('p2p.combo_requires_participants_hint')}
+                    </div>
+                  )}
+                  {comboMenuItems.map((key) => (
+                    <button
+                      key={key}
+                      class="menu-item"
+                      onClick={() => {
+                        if (!hasConfiguredP2pParticipants) return;
+                        handleDirectComboSelect(key);
+                      }}
+                      disabled={!hasConfiguredP2pParticipants}
+                      title={!hasConfiguredP2pParticipants ? t('p2p.combo_requires_participants_hint') : undefined}
+                      style={{ color: getP2pModeColor(key), fontSize: 12, opacity: hasConfiguredP2pParticipants ? 1 : 0.45, cursor: hasConfiguredP2pParticipants ? 'pointer' : 'not-allowed' }}
+                    >
+                      ○ {getP2pModeLabel(key, t)}
+                    </button>
+                  ))}
+                  <div class="menu-divider" />
+                  <button
+                    class="menu-item"
+                    onClick={() => {
+                      setP2pOpen(false);
+                      openP2pConfigPanel('combos');
+                    }}
+                  >
+                    {t('p2p.settings_button')}
+                  </button>
+                </>
+              ) : (
+                <div data-testid="p2p-dropdown-workflows-body">
+                  {!hasConfiguredP2pParticipants && (
+                    <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', color: '#fbbf24', marginTop: 4 }}>
+                      {t('p2p.combo_requires_participants_hint')}
+                    </div>
+                  )}
+                  {workflowLibraryItems.length === 0 ? (
+                    <div
+                      class="p2p-menu-section-label"
+                      style={{ textTransform: 'none', letterSpacing: 'normal', color: '#94a3b8', padding: '8px 12px', whiteSpace: 'normal' }}
+                      data-testid="p2p-dropdown-workflows-empty"
+                    >
+                      {t('p2p.dropdown.workflows_empty', 'No saved workflows yet. Open Settings → Advanced Workflow to design one.')}
+                    </div>
+                  ) : (
+                    workflowLibraryItems.map((entry) => {
+                      const isActive = entry.id === p2pSavedConfig?.activeWorkflowId;
+                      const titleText = entry.title?.trim() ? entry.title : t('p2p.tab.advanced_workflow_starter_title', 'Untitled workflow');
+                      return (
+                        <button
+                          key={entry.id}
+                          class="menu-item"
+                          data-testid={`p2p-dropdown-workflow-${entry.id}`}
+                          data-active={isActive ? 'true' : 'false'}
+                          onClick={() => {
+                            if (!hasConfiguredP2pParticipants) return;
+                            handleDirectWorkflowSelect(entry.id);
+                          }}
+                          disabled={!hasConfiguredP2pParticipants}
+                          title={!hasConfiguredP2pParticipants ? t('p2p.combo_requires_participants_hint') : titleText}
+                          style={{
+                            fontSize: 12,
+                            opacity: hasConfiguredP2pParticipants ? 1 : 0.45,
+                            cursor: hasConfiguredP2pParticipants ? 'pointer' : 'not-allowed',
+                            color: isActive ? '#bfdbfe' : '#e2e8f0',
+                            fontWeight: isActive ? 600 : 500,
+                          }}
+                        >
+                          {isActive ? '● ' : '○ '}{titleText}
+                        </button>
+                      );
+                    })
+                  )}
+                  <div class="menu-divider" />
+                  <button
+                    class="menu-item"
+                    data-testid="p2p-dropdown-workflows-manage"
+                    onClick={() => {
+                      setP2pOpen(false);
+                      openP2pConfigPanel('advanced');
+                    }}
+                  >
+                    {t('p2p.dropdown.workflows_manage', 'Manage workflows')}
+                  </button>
                 </div>
               )}
-              {comboMenuItems.map((key) => (
-                <button
-                  key={key}
-                  class="menu-item"
-                  onClick={() => {
-                    if (!hasConfiguredP2pParticipants) return;
-                    handleDirectComboSelect(key);
-                  }}
-                  disabled={!hasConfiguredP2pParticipants}
-                  title={!hasConfiguredP2pParticipants ? t('p2p.combo_requires_participants_hint') : undefined}
-                  style={{ color: getP2pModeColor(key), fontSize: 12, opacity: hasConfiguredP2pParticipants ? 1 : 0.45, cursor: hasConfiguredP2pParticipants ? 'pointer' : 'not-allowed' }}
-                >
-                  ○ {getP2pModeLabel(key, t)}
-                </button>
-              ))}
-              <div class="menu-divider" />
-              <button
-                class="menu-item"
-                onClick={() => {
-                  setP2pOpen(false);
-                  openP2pConfigPanel('combos');
-                }}
-              >
-                {t('p2p.settings_button')}
-              </button>
               {p2pMode !== 'solo' && (
                 <>
                   <div class="menu-divider" />
@@ -2887,12 +3273,24 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       {attachments.length > 0 && (
         <div class="attachment-badges">
           {attachments.map((a, i) => (
-            <span key={a.path} class="attachment-badge" title={a.path}>
-              <span class="attachment-badge-icon">📎</span>
+            <span
+              key={a.path}
+              class="attachment-badge"
+              title={`#${a.seq} ${a.path}`}
+              data-attachment-seq={a.seq}
+            >
+              {/*
+                * R3 v2 PR-ρ — Surface the per-composer sequence number
+                * as a `#N` prefix so the user can reference the file in
+                * chat text via the same short tag (`#1`, `#2`, ...). The
+                * counter resets on send (the attachments array is wiped
+                * by `clearComposer`).
+                */}
+              <span class="attachment-badge-icon" data-testid={`attachment-tag-${a.seq}`}>#{a.seq}</span>
               <span class="attachment-badge-name">{a.name}</span>
               <button
                 class="attachment-badge-remove"
-                onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
+                onClick={() => setAttachments((prev) => renumberAttachments(prev.filter((_, j) => j !== i)))}
                 title={t('common.delete')}
               >×</button>
             </span>
@@ -3253,6 +3651,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   {t('session.settings')}
                 </button>
               )}
+              {canShowCloneGroupAction && (
+                <button
+                  class="menu-item"
+                  onClick={() => {
+                    setCloneDialogOpen(true);
+                    setMenuOpen(false);
+                    resetConfirm();
+                  }}
+                  style={{ display: 'flex', alignItems: 'center', gap: 8 }}
+                >
+                  <CopySessionGroupIcon />
+                  <span>{t('session.clone.menu')}</span>
+                </button>
+              )}
               <div class="menu-divider" />
               <button
                 class={`menu-item ${confirm === 'stop' ? 'menu-item-danger' : ''}`}
@@ -3266,6 +3678,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           )}
         </div>}
       </div>
+      {cloneDialogOpen && activeSession && (
+        <CloneSessionGroupDialog
+          ws={ws}
+          serverId={serverId}
+          sourceSession={activeSession}
+          sessions={sessions}
+          subSessions={subSessions}
+          onClose={() => setCloneDialogOpen(false)}
+        />
+      )}
       {queuedTransportMessages.length > 0 && (
         queuedHintExpanded ? (
           <div class="controls-queued-hint" role="status" aria-live="polite">
@@ -3380,6 +3802,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         onSave={(cfg) => {
           setP2pSavedConfig(cfg);
         }}
+        daemonCapabilitySource={ws ? {
+          getSnapshot: () => ws.getDaemonCapabilitySnapshot(),
+          subscribe: (listener) => ws.onDaemonCapabilitySnapshot(listener),
+          // Audit fix (7c2570e9 follow-up to e940d73f-a8e / N4) — expose
+          // the WS client's staleness judgment so the panel does not
+          // recompute it from `observedAt` (which only refreshes on
+          // `daemon.hello`). The WS client tracks a separate
+          // `daemonLastSeenAt` that is bumped on every daemon-originated
+          // message; this is the only definition that stays accurate
+          // during long-lived sessions.
+          isStale: (now) => ws.isDaemonCapabilityStale(now),
+        } : null}
       />
     )}
     </>

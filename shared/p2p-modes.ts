@@ -1,5 +1,6 @@
 /** P2P Quick Discussion mode configuration. */
 import type { P2pAdvancedPresetKey, P2pAdvancedRound, P2pContextReducerConfig } from './p2p-advanced.js';
+import type { P2pWorkflowDraft, P2pWorkflowLaunchEnvelope } from './p2p-workflow-types.js';
 
 /** The "config" meta-mode — each session uses its own saved default mode. */
 export const P2P_CONFIG_MODE = 'config' as const;
@@ -29,6 +30,47 @@ export interface P2pSavedConfig {
   advancedRunTimeoutMinutes?: number;
   /** Optional context compression/helper config for advanced workflows. */
   contextReducer?: P2pContextReducerConfig;
+  /**
+   * Versioned advanced workflow draft for smart P2P workflow v1+.
+   * **Legacy single-draft slot.** Retained for backwards compatibility with
+   * configs saved before the workflow-library refactor (R3 v2 PR-ι). New
+   * code should prefer `workflowLibrary` + `activeWorkflowId`. On load,
+   * `migrateLegacyWorkflowDraft` (in `shared/p2p-workflow-library.ts`) lifts
+   * a present `workflowDraft` into the library when no library exists yet.
+   */
+  workflowDraft?: P2pWorkflowDraft;
+  /** Optional saved launch envelope for scheduled/supervised advanced workflow launch. */
+  workflowLaunchEnvelope?: P2pWorkflowLaunchEnvelope;
+  /**
+   * R3 v2 PR-ι — Multi-workflow library. Each entry is an independently
+   * editable `P2pWorkflowDraft` with its own id + title. Users can name,
+   * duplicate, and delete entries through the `P2pConfigPanel` advanced
+   * tab. The currently active workflow (used by P2P launches) is selected
+   * via `activeWorkflowId`. Library size is capped by
+   * `P2P_WORKFLOW_LIBRARY_MAX_ENTRIES` to keep the saved-config payload
+   * bounded.
+   */
+  workflowLibrary?: P2pWorkflowDraft[];
+  /**
+   * R3 v2 PR-ι — Identifier (matching `P2pWorkflowDraft.id`) of the
+   * currently active workflow in `workflowLibrary`. When unset, the first
+   * library entry (or the legacy `workflowDraft`) is treated as active.
+   * Reading is centralised through `getActiveWorkflowFromConfig` so the
+   * resolution rules cannot drift between UI and launch envelope code.
+   */
+  activeWorkflowId?: string;
+  /**
+   * R3 PR-α follow-up — UI-managed allowlist of executable absolute paths
+   * (or `PATH`-relative basenames) that script nodes in this config's
+   * advanced workflow are permitted to spawn. Maintained in
+   * `P2pConfigPanel` → "Allowed executables" and round-tripped through
+   * the launch envelope (`P2pWorkflowLaunchEnvelope.allowedExecutables`).
+   *
+   * Empty list means script bind rejects every executable with
+   * `script_executable_denied`. Per-entry constraints (visible-ASCII,
+   * ≤256 bytes, ≤64 entries) live in `validateP2pWorkflowLaunchEnvelope`.
+   */
+  allowedExecutables?: string[];
 }
 
 
@@ -56,6 +98,8 @@ export function isP2pSavedConfig(value: unknown): value is P2pSavedConfig {
     advancedRounds?: unknown;
     advancedRunTimeoutMinutes?: unknown;
     contextReducer?: unknown;
+    workflowDraft?: unknown;
+    workflowLaunchEnvelope?: unknown;
   };
   if (!record.sessions || typeof record.sessions !== 'object' || Array.isArray(record.sessions)) return false;
   if (typeof record.rounds !== 'number' || !Number.isFinite(record.rounds)) return false;
@@ -66,6 +110,26 @@ export function isP2pSavedConfig(value: unknown): value is P2pSavedConfig {
   if (record.advancedRounds != null && !Array.isArray(record.advancedRounds)) return false;
   if (record.advancedRunTimeoutMinutes != null && (typeof record.advancedRunTimeoutMinutes !== 'number' || !Number.isFinite(record.advancedRunTimeoutMinutes))) return false;
   if (record.contextReducer != null && typeof record.contextReducer !== 'object') return false;
+  if (record.workflowDraft != null && (typeof record.workflowDraft !== 'object' || Array.isArray(record.workflowDraft))) return false;
+  if (record.workflowLaunchEnvelope != null && (typeof record.workflowLaunchEnvelope !== 'object' || Array.isArray(record.workflowLaunchEnvelope))) return false;
+  // R3 v2 PR-ι — workflow library shape check. Per-entry validation
+  // (schemaVersion, id, nodes/edges shape) is performed when each entry is
+  // surfaced through `validateP2pWorkflowDraft` / launch envelope build.
+  const libraryRaw = (record as { workflowLibrary?: unknown }).workflowLibrary;
+  if (libraryRaw != null) {
+    if (!Array.isArray(libraryRaw)) return false;
+    if (libraryRaw.some((entry) => !entry || typeof entry !== 'object' || Array.isArray(entry))) return false;
+  }
+  const activeIdRaw = (record as { activeWorkflowId?: unknown }).activeWorkflowId;
+  if (activeIdRaw != null && typeof activeIdRaw !== 'string') return false;
+  // R3 PR-α follow-up — UI-managed allowedExecutables. We perform only a
+  // shape check here; per-entry validation lives in
+  // `validateP2pWorkflowLaunchEnvelope` so the same rules apply on launch.
+  const allowedRaw = (record as { allowedExecutables?: unknown }).allowedExecutables;
+  if (allowedRaw != null) {
+    if (!Array.isArray(allowedRaw)) return false;
+    if (allowedRaw.some((entry) => typeof entry !== 'string')) return false;
+  }
   return Object.values(record.sessions as Record<string, unknown>).every(isP2pSessionEntry);
 }
 
@@ -90,7 +154,7 @@ export function buildP2pConfigSelection(
     : modeOverride;
   return {
     config: buildEffectiveP2pConfig(config, effectiveMode),
-    rounds: getComboRoundCount(modeOverride) ?? rounds,
+    rounds,
     modeOverride,
   };
 }
@@ -265,6 +329,26 @@ export function getModeForRound(mode: string, round: number): P2pMode | undefine
   const pipeline = parseModePipeline(mode);
   const idx = Math.min(round - 1, pipeline.length - 1);
   return getP2pMode(pipeline[idx]);
+}
+
+/** Get the mode key for a legacy execution step, wrapping combo pipelines for each user-selected cycle. */
+export function getLegacyModeKeyForExecutionRound(mode: string, round: number): string {
+  const pipeline = parseModePipeline(mode);
+  if (pipeline.length === 0) return mode;
+  const normalizedRound = Math.max(1, Math.floor(round || 1));
+  return pipeline[(normalizedRound - 1) % pipeline.length] ?? mode;
+}
+
+/** Get the mode config for a legacy execution step, wrapping combo pipelines for each user-selected cycle. */
+export function getLegacyModeForExecutionRound(mode: string, round: number): P2pMode | undefined {
+  return getP2pMode(getLegacyModeKeyForExecutionRound(mode, round));
+}
+
+/** Convert user-selected full-flow cycles into legacy executor step count. */
+export function getLegacyExecutionRoundCount(mode: string, cycles = 1): number {
+  const pipelineLength = Math.max(1, parseModePipeline(mode).length);
+  const normalizedCycles = Math.max(1, Math.floor(cycles || 1));
+  return pipelineLength * normalizedCycles;
 }
 
 /** Get the recommended round count for a mode (pipeline length for combos, undefined for single modes). */

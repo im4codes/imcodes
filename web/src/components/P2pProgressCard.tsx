@@ -2,6 +2,7 @@ import { useMemo, useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { memo } from 'preact/compat';
+import type { P2pWorkflowDiagnostic } from '@shared/p2p-workflow-diagnostics.js';
 
 export interface P2pProgressNode {
   label: string;
@@ -9,7 +10,7 @@ export interface P2pProgressNode {
   agentType: string;
   ccPreset?: string | null;
   mode?: string;
-  phase?: 'initial' | 'hop' | 'summary';
+  phase?: 'initial' | 'hop' | 'summary' | 'execution';
   status: 'done' | 'active' | 'pending' | 'skipped';
 }
 
@@ -23,17 +24,26 @@ export interface P2pHopState {
 
 export interface P2pProgressDiscussion {
   id: string;
+  /** Discussion file id (filename without `.md`). For P2P runs this is
+   *  the run's `discussion_id` — distinct from `id` which is the
+   *  prefixed run id (`p2p_<runId>`). Set when the run has produced
+   *  a file the user can navigate to. */
+  fileId?: string;
   topic: string;
   state: string;
   modeKey?: string;
   currentRound: number;
   maxRounds: number;
+  flowCycleCurrent?: number;
+  flowCycleTotal?: number;
+  flowStepCurrent?: number;
+  flowStepTotal?: number;
   completedHops?: number;
   completedRoundHops?: number;
   totalHops?: number;
   activeHop?: number | null;
   activeRoundHop?: number | null;
-  activePhase?: 'queued' | 'initial' | 'hop' | 'summary';
+  activePhase?: 'queued' | 'initial' | 'hop' | 'summary' | 'execution';
   conclusion?: string;
   error?: string;
   nodes?: P2pProgressNode[];
@@ -42,6 +52,8 @@ export interface P2pProgressDiscussion {
   startedAt?: number;
   /** Epoch ms when the current hop/phase started (server-provided for accurate elapsed) */
   hopStartedAt?: number;
+  /** Workflow diagnostics surfaced from sanitizer (parse/compile/bind/execute/sanitize phases) */
+  diagnostics?: P2pWorkflowDiagnostic[];
 }
 
 interface Props {
@@ -118,11 +130,16 @@ function DiscussionActionButton({ active, compact, onAction }: ActionButtonProps
     );
   }
 
-  if (compact && confirming) {
+  if (confirming) {
     return (
       <button
         class="discussions-progress-stop"
-        style={{ padding: '2px 7px', fontSize: '10px', background: 'rgba(239,68,68,0.3)', borderColor: '#ef4444', color: '#f87171' }}
+        style={{
+          ...(compact ? { padding: '2px 7px', fontSize: '10px' } : {}),
+          background: 'rgba(239,68,68,0.3)',
+          borderColor: '#ef4444',
+          color: '#f87171',
+        }}
         onClick={(e) => {
           e.stopPropagation();
           onAction();
@@ -140,8 +157,7 @@ function DiscussionActionButton({ active, compact, onAction }: ActionButtonProps
       style={compact ? { padding: '2px 7px', fontSize: '10px' } : undefined}
       onClick={(e) => {
         e.stopPropagation();
-        if (compact) setConfirming(true);
-        else onAction();
+        setConfirming(true);
       }}
     >
       {t('common.cancel')}
@@ -279,7 +295,18 @@ export const P2pProgressCard = memo(function P2pProgressCard({
     }
     return `H${visibleRoundHop ?? completedRoundHops}/${discussion.totalHops}`;
   }, [activeHopCount, activeHopRange, completedRoundHops, discussion.totalHops, visibleRoundHop]);
-  const roundText = `R${discussion.currentRound}/${discussion.maxRounds}`;
+  const logicalRound = typeof discussion.flowCycleCurrent === 'number' && discussion.flowCycleCurrent > 0
+    ? discussion.flowCycleCurrent
+    : discussion.currentRound;
+  const logicalMaxRounds = typeof discussion.flowCycleTotal === 'number' && discussion.flowCycleTotal > 0
+    ? discussion.flowCycleTotal
+    : discussion.maxRounds;
+  const roundText = `R${logicalRound}/${logicalMaxRounds}`;
+  const stepText = typeof discussion.flowStepCurrent === 'number'
+    && typeof discussion.flowStepTotal === 'number'
+    && discussion.flowStepTotal > 1
+    ? `S${discussion.flowStepCurrent}/${discussion.flowStepTotal}`
+    : null;
 
   const phaseLabel = useMemo(() => (
     discussion.activePhase ? t(`p2p.discussions.phase_${discussion.activePhase}`) : null
@@ -300,6 +327,7 @@ export const P2pProgressCard = memo(function P2pProgressCard({
         <div class="discussions-progress-mobile-row">
           <span class="discussions-progress-kicker">P2P</span>
           <span class="discussions-progress-badge">{roundText}</span>
+          {stepText && <span class="discussions-progress-badge">{stepText}</span>}
           {hopText && <span class="discussions-progress-badge">{hopText}</span>}
           <ElapsedTimer timerKey={runKey} startMs={discussion.startedAt} active={isRunning} className="p2p-timer p2p-timer-compact" />
           {phaseLabel && <span class="discussions-progress-badge discussions-progress-badge-phase">{phaseLabel}</span>}
@@ -339,18 +367,18 @@ export const P2pProgressCard = memo(function P2pProgressCard({
   // ── Desktop / standard rendering ───────────────────────────────────────
 
   const roundSegments = useMemo(() => (
-    Array.from({ length: Math.max(0, discussion.maxRounds) }, (_, idx) => {
+    Array.from({ length: Math.max(0, logicalMaxRounds) }, (_, idx) => {
       const roundNum = idx + 1;
       const status = discussion.state === 'done'
         ? 'done'
-        : roundNum < discussion.currentRound
+        : roundNum < logicalRound
           ? 'done'
-          : roundNum === discussion.currentRound
+          : roundNum === logicalRound
             ? 'active'
             : 'pending';
       return { roundNum, status };
     })
-  ), [discussion.currentRound, discussion.maxRounds, discussion.state]);
+  ), [discussion.state, logicalMaxRounds, logicalRound]);
 
   const nodesRef = useRef<HTMLDivElement>(null);
   const activeNodeIdx = useMemo(() => nodes.findIndex((n) => n.status === 'active'), [nodes]);
@@ -410,6 +438,7 @@ export const P2pProgressCard = memo(function P2pProgressCard({
           </span>
         )}
         <span class="discussions-progress-badge">{roundText}</span>
+        {stepText && <span class="discussions-progress-badge">{stepText}</span>}
         {hopText && <span class="discussions-progress-badge">{hopText}</span>}
         <HopElapsedTimer hopKey={hopKey} startMs={discussion.hopStartedAt} active={isRunning} className="p2p-timer p2p-timer-hop" />
         {phaseLabel && (
@@ -428,7 +457,7 @@ export const P2pProgressCard = memo(function P2pProgressCard({
               <div
                 key={seg.roundNum}
                 class={`discussions-progress-segment ${progressStatusClassName(seg.status as P2pProgressNode['status'], isRunning)}`}
-                title={`${t('p2p.discussions.round_label')} ${seg.roundNum}/${discussion.maxRounds}`}
+                title={`${t('p2p.discussions.round_label')} ${seg.roundNum}/${logicalMaxRounds}`}
               >
                 <span class="discussions-progress-segment-index">{seg.roundNum}</span>
               </div>
@@ -468,6 +497,27 @@ export const P2pProgressCard = memo(function P2pProgressCard({
               <span class="discussions-progress-node-label">{node.displayLabel ?? node.label}</span>
               {node.mode && <span class="discussions-progress-node-mode">{t(`p2p.mode.${node.mode}`, node.mode)}</span>}
               {node.phase && <span class="discussions-progress-node-phase">{t(`p2p.discussions.phase_${node.phase}`)}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {discussion.diagnostics && discussion.diagnostics.length > 0 && (
+        <div class="discussions-progress-diagnostics">
+          {discussion.diagnostics.map((d, idx) => (
+            <div
+              key={`${d.code}-${idx}`}
+              class={`discussions-progress-diagnostic discussions-progress-diagnostic-${d.severity}`}
+            >
+              <span class="discussions-progress-diagnostic-message">
+                {t(d.messageKey, { fieldPath: d.fieldPath ?? '', summary: d.summary ?? '' })}
+              </span>
+              {d.summary && (
+                <span class="discussions-progress-diagnostic-summary">{d.summary}</span>
+              )}
+              {d.fieldPath && (
+                <span class="discussions-progress-diagnostic-fieldpath">{d.fieldPath}</span>
+              )}
             </div>
           ))}
         </div>

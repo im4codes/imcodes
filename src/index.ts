@@ -62,12 +62,58 @@ import { execSync } from 'child_process';
 import { homedir } from 'os';
 import { existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
-import { formatDurationSeconds, readDaemonRestartCount, readPersistedDaemonUptimeSeconds, readProcessUptimeSeconds } from './util/daemon-status.js';
+import {
+  formatDurationSeconds,
+  getDaemonServerLinkFreshness,
+  readDaemonFilesystemSpace,
+  readDaemonRestartCount,
+  readDaemonRuntimeStatus,
+  readPersistedDaemonUptimeSeconds,
+  readProcessUptimeSeconds,
+  type DaemonFilesystemSpace,
+  type DaemonRuntimeStatus,
+  type DaemonServerLinkFreshness,
+} from './util/daemon-status.js';
 
 import { PROJECT_ROOT } from './util/project-root.js';
 
 const { version } = JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')) as { version: string };
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return 'unknown';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)}${units[unit]}`;
+}
+
+function formatDaemonLinkStatus(
+  runtimeStatus: DaemonRuntimeStatus | null,
+  freshness: DaemonServerLinkFreshness,
+): string {
+  const link = runtimeStatus?.serverLink;
+  if (!link || freshness.status === 'unknown') return '\x1b[33munknown\x1b[0m (no link health report yet)';
+  const proofSuffix = freshness.staleMs !== null
+    ? `, last proof ${formatDurationSeconds(Math.floor(freshness.staleMs / 1000))} ago`
+    : '';
+  const errorSuffix = link.lastError ? `, ${link.lastError}` : '';
+  if (freshness.status === 'connected') return `\x1b[32mconnected\x1b[0m${proofSuffix}`;
+  if (freshness.status === 'stale') return `\x1b[31mstale\x1b[0m (state ${link.state}${proofSuffix}${errorSuffix})`;
+  if (freshness.status === 'connecting') return `\x1b[33mconnecting\x1b[0m${proofSuffix}${errorSuffix}`;
+  return `\x1b[31mdisconnected\x1b[0m${proofSuffix}${errorSuffix}`;
+}
+
+function formatStorageStatus(storage: DaemonFilesystemSpace | null): string {
+  if (!storage) return '\x1b[33munknown\x1b[0m';
+  const color = storage.status === 'critical' ? '\x1b[31m' : storage.status === 'low' ? '\x1b[33m' : '\x1b[32m';
+  return `${color}${storage.status}\x1b[0m (${formatBytes(storage.freeBytes)} free, ${storage.usedPercent}% used)`;
+}
 
 /** Kill any lingering imcodes daemon processes after launchctl unload.
  *  Uses PID file (~/.imcodes/daemon.pid) for reliable targeting. */
@@ -126,6 +172,7 @@ function ensureServiceForeground(): void {
   }
 }
 
+export function createProgram(): Command {
 const program = new Command()
   .name('imcodes')
   .description('Remote AI coding agent controller')
@@ -295,6 +342,12 @@ program
       ? readProcessUptimeSeconds(daemonPidNumber) ?? readPersistedDaemonUptimeSeconds(daemonPidNumber)
       : null;
     const daemonRestartCount = readDaemonRestartCount();
+    const runtimeStatus = readDaemonRuntimeStatus();
+    const currentRuntimeStatus = daemonRunning && Number.isSafeInteger(daemonPidNumber) && runtimeStatus?.pid === daemonPidNumber
+      ? runtimeStatus
+      : null;
+    const linkFreshness = getDaemonServerLinkFreshness(currentRuntimeStatus);
+    const storageStatus = readDaemonFilesystemSpace();
 
     if (opts.json) {
       console.log(JSON.stringify({
@@ -304,6 +357,16 @@ program
           pid: daemonPid,
           uptimeSeconds: daemonUptimeSeconds,
           restartCount: daemonRestartCount,
+          link: currentRuntimeStatus?.serverLink
+            ? {
+              ...currentRuntimeStatus.serverLink,
+              health: linkFreshness.status,
+              fresh: linkFreshness.fresh,
+              staleMs: linkFreshness.staleMs,
+              lastProofAt: linkFreshness.lastProofAt,
+            }
+            : null,
+          storage: storageStatus,
           server: creds ? { url: creds.workerUrl, serverId: creds.serverId } : null,
         },
         sessions: sessions.map((s) => ({ ...s, tmuxAlive: liveSet.has(s.name) })),
@@ -320,6 +383,8 @@ program
     ];
     const detailSuffix = statusDetails.length > 0 ? ` (${statusDetails.join(', ')})` : '';
     console.log(`  Status:  ${daemonRunning ? `\x1b[32mrunning\x1b[0m${detailSuffix}` : `\x1b[31mstopped\x1b[0m${detailSuffix}`}`);
+    console.log(`  Link:    ${daemonRunning ? formatDaemonLinkStatus(currentRuntimeStatus, linkFreshness) : '\x1b[31mstopped\x1b[0m'}`);
+    console.log(`  Storage: ${formatStorageStatus(storageStatus)}`);
     if (creds) {
       console.log(`  Server:  ${creds.workerUrl}`);
       console.log(`  ID:      ${creds.serverId}`);
@@ -970,6 +1035,22 @@ memoryCmd
     }
   });
 
+return program;
+}
+
+export const program = createProgram();
+
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return resolve(entry) === fileURLToPath(import.meta.url);
+  }
+}
+
+if (isMainModule()) {
 program.parseAsync(process.argv).catch((err: unknown) => {
   const exitCode = typeof err === 'object' && err && 'exitCode' in err
     ? Number((err as { exitCode?: unknown }).exitCode)
@@ -986,3 +1067,4 @@ program.parseAsync(process.argv).catch((err: unknown) => {
   logger.error({ err }, 'Fatal error');
   process.exit(exitCode && exitCode > 0 ? exitCode : 1);
 });
+}

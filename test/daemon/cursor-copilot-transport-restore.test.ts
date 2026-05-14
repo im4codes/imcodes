@@ -307,6 +307,7 @@ describe("cursor/copilot transport restore", { timeout: 10_000 }, () => {
 
     await connectProvider("cursor-headless", {});
     await restoreTransportSessions("cursor-headless");
+    await flush();
 
     const runtime = getTransportRuntime("deck_cursor_restore_brain");
     expect(runtime?.providerSessionId).toBe("route-cursor-restore");

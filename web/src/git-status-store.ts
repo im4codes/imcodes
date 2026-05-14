@@ -45,6 +45,7 @@ export const SHARED_CHANGES_INFLIGHT_TIMEOUT_MS = 15_000;
 
 const sharedChangesByKey = new Map<string, SharedChangesEntry>();
 const sharedChangesRequestKey = new Map<string, string>();
+const checkoutRefreshGenerationByKey = new Map<string, number>();
 const wsIds = new WeakMap<WsClient, number>();
 const wsBridges = new WeakMap<WsClient, () => void>();
 let nextWsId = 1;
@@ -53,6 +54,7 @@ let nextWsId = 1;
 export function __resetSharedChangesForTests(): void {
   sharedChangesByKey.clear();
   sharedChangesRequestKey.clear();
+  checkoutRefreshGenerationByKey.clear();
   nextWsId = 1;
 }
 
@@ -150,6 +152,19 @@ export function requestSharedChanges(ws: WsClient, repoPath: string, force = fal
   entry.inFlightStartedAt = Date.now();
   entry.queued = false;
   sharedChangesRequestKey.set(requestId, key);
+}
+
+export function forceRefreshSharedChangesForCheckout(
+  ws: WsClient,
+  repoPath: string,
+  repoGeneration?: number,
+): void {
+  const key = getSharedChangesKey(ws, repoPath);
+  if (typeof repoGeneration === 'number' && Number.isFinite(repoGeneration)) {
+    if (checkoutRefreshGenerationByKey.get(key) === repoGeneration) return;
+    checkoutRefreshGenerationByKey.set(key, repoGeneration);
+  }
+  requestSharedChanges(ws, repoPath, true);
 }
 
 export function settleSharedChangesRequest(requestId: string, files: ChangeFile[] | null): boolean {

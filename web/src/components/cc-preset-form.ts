@@ -1,3 +1,4 @@
+import { getCcPresetEffectiveModel } from '@shared/cc-presets.js';
 import type { CcPreset, CcPresetModelInfo } from '@shared/cc-presets.js';
 
 export type CcPresetEntry = CcPreset;
@@ -26,8 +27,11 @@ const DEFAULT_CC_PRESET_CUSTOM_ENV_TEMPLATE = Object.freeze([
 
 const INLINE_ENV_KEYS = new Set([
   'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_MODEL',
+  'OPENAI_API_KEY',
+  'OPENAI_MODEL',
   'CLAUDE_CODE_ATTRIBUTION_HEADER',
 ]);
 
@@ -52,8 +56,8 @@ export function createCcPresetDraftFromPreset(preset: CcPresetEntry): CcPresetDr
   return {
     name: preset.name,
     baseUrl: preset.env.ANTHROPIC_BASE_URL ?? DEFAULT_CC_PRESET_BASE_URL,
-    token: preset.env.ANTHROPIC_AUTH_TOKEN ?? '',
-    model: preset.defaultModel ?? preset.env.ANTHROPIC_MODEL ?? DEFAULT_CC_PRESET_MODEL,
+    token: preset.env.ANTHROPIC_API_KEY ?? preset.env.ANTHROPIC_AUTH_TOKEN ?? '',
+    model: getCcPresetEffectiveModel(preset) ?? DEFAULT_CC_PRESET_MODEL,
     contextWindow: preset.contextWindow ? String(preset.contextWindow) : DEFAULT_CC_PRESET_CONTEXT_WINDOW,
     customEnv: Object.entries(preset.env)
       .filter(([key]) => !INLINE_ENV_KEYS.has(key))
@@ -69,7 +73,7 @@ export function buildCcPresetFromDraft(draft: CcPresetDraft): CcPresetEntry {
     ANTHROPIC_BASE_URL: draft.baseUrl.trim(),
     CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
   };
-  if (draft.token.trim()) env.ANTHROPIC_AUTH_TOKEN = draft.token.trim();
+  if (draft.token.trim()) env.ANTHROPIC_API_KEY = draft.token.trim();
   if (model) env.ANTHROPIC_MODEL = model;
   for (const { key, value } of draft.customEnv) {
     if (key.trim()) env[key.trim()] = value;

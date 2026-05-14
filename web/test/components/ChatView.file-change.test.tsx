@@ -3,7 +3,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
+import { cleanup, fireEvent, render } from '@testing-library/preact';
 import type { TimelineEvent } from '../../src/ws-client.js';
 import { isUserVisible } from '../../src/util/isUserVisible.js';
 
@@ -51,10 +51,6 @@ vi.mock('../../src/components/file-browser-lazy.js', () => ({
   },
 }));
 
-vi.mock('../../src/components/FloatingPanel.js', () => ({
-  FloatingPanel: ({ children }: any) => <div data-testid="floating-panel">{children}</div>,
-}));
-
 vi.mock('../../src/components/ChatMarkdown.js', () => ({
   ChatMarkdown: ({ text }: { text: string }) => <div>{text}</div>,
 }));
@@ -94,11 +90,44 @@ function makeEvent(type: TimelineEvent['type'], payload: Record<string, unknown>
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   fileBrowserProps.length = 0;
 });
 
 describe('ChatView file-change cards', () => {
-  it('renders exact file-change cards with stacked before/after blocks and opens diff preview in FileBrowser', async () => {
+  it('routes right-side file panel previews to the shared preview host', () => {
+    localStorage.setItem('chatFilePanelOpen:session-a', '1');
+    const onPreviewFile = vi.fn();
+
+    render(
+      <ChatView
+        events={[]}
+        loading={false}
+        ws={{} as any}
+        workdir="/repo"
+        sessionId="session-a"
+        onPreviewFile={onPreviewFile}
+      />,
+    );
+
+    expect(fileBrowserProps).toHaveLength(1);
+    fileBrowserProps[0]?.onPreviewFile?.({
+      path: '/repo/src/panel.ts',
+      preferDiff: false,
+      preview: { status: 'loading', path: '/repo/src/panel.ts' },
+    });
+
+    expect(onPreviewFile).toHaveBeenCalledWith({
+      path: '/repo/src/panel.ts',
+      preferDiff: false,
+      preview: { status: 'loading', path: '/repo/src/panel.ts' },
+      rootPath: '/repo',
+      sourcePreviewLive: false,
+    });
+  });
+
+  it('renders exact file-change cards with stacked before/after blocks and opens diff preview in the shared preview host', () => {
+    const onPreviewFile = vi.fn();
     const events = [
       makeEvent('file.change', {
         batch: {
@@ -116,7 +145,16 @@ describe('ChatView file-change cards', () => {
       }),
     ];
 
-    const { container } = render(<ChatView events={events} loading={false} ws={{} as any} workdir="/repo" sessionId="session-a" />);
+    const { container } = render(
+      <ChatView
+        events={events}
+        loading={false}
+        ws={{} as any}
+        workdir="/repo"
+        sessionId="session-a"
+        onPreviewFile={onPreviewFile}
+      />,
+    );
 
     expect(container.textContent).toContain('File changes (1)');
     expect(container.textContent).toContain('exact');
@@ -126,12 +164,13 @@ describe('ChatView file-change cards', () => {
 
     fireEvent.click(container.querySelector('.chat-file-change-path') as HTMLElement);
 
-    await waitFor(() => {
-      expect(fileBrowserProps).toHaveLength(1);
+    expect(onPreviewFile).toHaveBeenCalledWith({
+      path: '/repo/src/app.tsx',
+      preferDiff: true,
+      preview: { status: 'loading', path: '/repo/src/app.tsx' },
+      rootPath: '/repo',
+      sourcePreviewLive: false,
     });
-    expect(fileBrowserProps[0]?.autoPreviewPath).toBe('/repo/src/app.tsx');
-    expect(fileBrowserProps[0]?.autoPreviewPreferDiff).toBe(true);
-    expect(fileBrowserProps[0]?.initialPath).toBe('/repo/src');
   });
 
   it('does not render provider badges on file-change cards', () => {
@@ -201,7 +240,8 @@ describe('ChatView file-change cards', () => {
     expect(container.textContent).not.toContain('Edit ✓');
   });
 
-  it('renders exact unified diffs as stacked removed and added previews and keeps one preview host active', async () => {
+  it('renders exact unified diffs as stacked removed and added previews and keeps one preview request active', () => {
+    const onPreviewFile = vi.fn();
     const events = [
       makeEvent('file.change', {
         batch: {
@@ -224,7 +264,16 @@ describe('ChatView file-change cards', () => {
       }),
     ];
 
-    const { container, getAllByTestId } = render(<ChatView events={events} loading={false} ws={{} as any} workdir="/repo" sessionId="session-a" />);
+    const { container } = render(
+      <ChatView
+        events={events}
+        loading={false}
+        ws={{} as any}
+        workdir="/repo"
+        sessionId="session-a"
+        onPreviewFile={onPreviewFile}
+      />,
+    );
 
     expect(container.querySelector('.chat-file-change-diff-label-removed')?.textContent).toBe('-');
     expect(Array.from(container.querySelectorAll('.chat-file-change-diff-pre-removed .chat-file-change-diff-ln')).map((node) => node.textContent)).toContain('1');
@@ -237,8 +286,13 @@ describe('ChatView file-change cards', () => {
 
     fireEvent.click(container.querySelector('.chat-file-change-path') as HTMLElement);
 
-    await waitFor(() => {
-      expect(getAllByTestId('mock-file-browser')).toHaveLength(1);
+    expect(onPreviewFile).toHaveBeenCalledOnce();
+    expect(onPreviewFile).toHaveBeenCalledWith({
+      path: '/repo/src/diff.ts',
+      preferDiff: true,
+      preview: { status: 'loading', path: '/repo/src/diff.ts' },
+      rootPath: '/repo',
+      sourcePreviewLive: false,
     });
   });
 
@@ -266,7 +320,8 @@ describe('ChatView file-change cards', () => {
     expect(container.querySelector('.chat-file-change-diff-label-added')?.textContent).toBe('+');
   });
 
-  it('keeps renamed and deleted entries actionable through the file browser handoff', async () => {
+  it('keeps renamed and deleted entries actionable through the shared preview host', () => {
+    const onPreviewFile = vi.fn();
     const events = [
       makeEvent('file.change', {
         batch: {
@@ -288,7 +343,16 @@ describe('ChatView file-change cards', () => {
       }),
     ];
 
-    const { container } = render(<ChatView events={events} loading={false} ws={{} as any} workdir="/repo" sessionId="session-a" />);
+    const { container } = render(
+      <ChatView
+        events={events}
+        loading={false}
+        ws={{} as any}
+        workdir="/repo"
+        sessionId="session-a"
+        onPreviewFile={onPreviewFile}
+      />,
+    );
 
     expect(container.textContent).toContain('/repo/src/old-name.ts → /repo/src/new-name.ts');
     expect(container.textContent).toContain('/repo/src/deleted.ts');
@@ -297,14 +361,20 @@ describe('ChatView file-change cards', () => {
     fireEvent.click(paths[0] as HTMLElement);
     fireEvent.click(paths[1] as HTMLElement);
 
-    await waitFor(() => {
-      expect(fileBrowserProps.length).toBeGreaterThanOrEqual(2);
+    expect(onPreviewFile).toHaveBeenNthCalledWith(1, {
+      path: '/repo/src/new-name.ts',
+      preferDiff: false,
+      preview: { status: 'loading', path: '/repo/src/new-name.ts' },
+      rootPath: '/repo',
+      sourcePreviewLive: false,
     });
-
-    expect(fileBrowserProps[0]?.autoPreviewPath).toBe('/repo/src/new-name.ts');
-    expect(fileBrowserProps[0]?.autoPreviewPreferDiff).toBe(false);
-    expect(fileBrowserProps[1]?.autoPreviewPath).toBe('/repo/src/deleted.ts');
-    expect(fileBrowserProps[1]?.autoPreviewPreferDiff).toBe(false);
+    expect(onPreviewFile).toHaveBeenNthCalledWith(2, {
+      path: '/repo/src/deleted.ts',
+      preferDiff: false,
+      preview: { status: 'loading', path: '/repo/src/deleted.ts' },
+      rootPath: '/repo',
+      sourcePreviewLive: false,
+    });
   });
 });
 

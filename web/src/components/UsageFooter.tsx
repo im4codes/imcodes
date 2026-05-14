@@ -73,7 +73,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   // etc. Skip the live-work UI entirely for these session types.
   const isAgentless = agentType === 'shell' || agentType === 'script';
   const hasActiveLiveWork = !isAgentless && (!!activeToolCall || !!activeThinkingTs);
-  const showLiveStatus = !isAgentless && (sessionState === 'running' || sessionState === 'idle' || hasActiveLiveWork);
+  const showLiveStatus = !isAgentless;
   const [quotaNow, setQuotaNow] = useState(() => Date.now());
 
   const displayModel = modelOverride ?? usage.model;
@@ -145,21 +145,20 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     ? null
     : hasActiveLiveWork
       ? (activeToolCall ? 'tool' : 'thinking')
-      : sessionState === 'running'
+      : sessionState === 'running' || sessionState === 'queued'
         ? 'running'
-        : sessionState === 'idle'
-          ? (statusText ? (/^(?:supervised|auto):/i.test(statusText) ? 'result' : 'waiting') : 'idle')
-          : null;
+        : statusText
+          ? (/^(?:supervised|auto):/i.test(statusText) ? 'result' : 'waiting')
+          : 'idle';
   const liveStatusText = useMemo(() => {
     if (isAgentless) return null;
-    if (hasActiveLiveWork || sessionState === 'running') {
+    if (hasActiveLiveWork || sessionState === 'running' || sessionState === 'queued') {
       if (activeToolCall) return statusText || 'Tool running...';
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
       return 'Agent working...';
     }
-    if (sessionState === 'idle' && statusText) return statusText;
-    if (sessionState === 'idle') return 'Agent idle — waiting for input';
-    return null;
+    if (statusText) return statusText;
+    return 'Agent idle — waiting for input';
   }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, isAgentless, now, sessionState, statusText, t]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result';
   const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')

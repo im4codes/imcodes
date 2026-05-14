@@ -13,6 +13,7 @@ import {
   normalizeWindowGeometry,
   reserveWorkspaceBottom,
   shouldPersistGeometry,
+  viewportWorkspaceBelowSessionTabs,
   type WorkspaceBounds,
   type WindowGeometry,
 } from '../desktop-window-maximize.js';
@@ -40,12 +41,12 @@ const MIN_H = 280;
 const DRAG_MARGIN = 32;
 
 function currentViewportBounds(): WorkspaceBounds {
-  return reserveWorkspaceBottom({
-    x: 0,
-    y: 0,
-    w: Math.max(MIN_W, window.innerWidth),
-    h: Math.max(MIN_H, window.innerHeight),
-  });
+  return reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+    minW: MIN_W,
+    minH: MIN_H,
+  }));
 }
 
 function clampGeomToViewport(geom: WindowGeometry): WindowGeometry {
@@ -127,10 +128,13 @@ export function FloatingPanel({
   // ── Drag ─────────────────────────────────────────────────────────────────
   const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
 
-  const clampPos = useCallback((x: number, y: number, w: number) => ({
-    x: Math.min(Math.max(x, DRAG_MARGIN - w), window.innerWidth - DRAG_MARGIN),
-    y: Math.min(Math.max(y, 0), Math.max(0, window.innerHeight - DRAG_MARGIN)),
-  }), []);
+  const clampPos = useCallback((x: number, y: number, w: number) => {
+    const topBound = currentViewportBounds().y;
+    return {
+      x: Math.min(Math.max(x, DRAG_MARGIN - w), window.innerWidth - DRAG_MARGIN),
+      y: Math.min(Math.max(y, topBound), Math.max(topBound, window.innerHeight - DRAG_MARGIN)),
+    };
+  }, []);
 
   const startDrag = useCallback((e: MouseEvent) => {
     if (isDesktopMaximized) {
@@ -184,8 +188,9 @@ export function FloatingPanel({
           w = startRight - x;
         }
         if (dir.includes('n')) {
+          const bounds = currentViewportBounds();
           const desiredY = startG.y + dy;
-          y = Math.max(0, Math.min(desiredY, startBottom - MIN_H));
+          y = Math.max(bounds.y, Math.min(desiredY, startBottom - MIN_H));
           h = startBottom - y;
         }
         return clampGeomToViewport({ x, y, w, h });

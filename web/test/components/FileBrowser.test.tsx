@@ -189,6 +189,61 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-overlay')).toBeNull();
   });
 
+  it('keeps the panel file tree nested inside files-and-changes when preview is open', () => {
+    const { ws } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        initialPreview={{ status: 'ok', path: '/home/user/foo.ts', content: 'foo content' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    const bodySplit = document.querySelector('.fb-body.fb-body-split');
+    expect(bodySplit).not.toBeNull();
+
+    const directTrees = Array.from(bodySplit!.children).filter((child) => child.classList.contains('fb-tree'));
+    expect(directTrees).toHaveLength(0);
+
+    const filesAndChanges = Array.from(bodySplit!.children).find((child) => (
+      child.classList.contains('fb-files-and-changes') && child.classList.contains('fb-tree-split')
+    ));
+    expect(filesAndChanges).toBeTruthy();
+
+    const nestedTree = Array.from(filesAndChanges!.children).find((child) => child.classList.contains('fb-tree'));
+    expect(nestedTree).toBeTruthy();
+    expect(nestedTree!.classList.contains('fb-tree-split')).toBe(false);
+  });
+
+  it('keeps the changes tree as a direct split child when preview is open', () => {
+    const { ws } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        defaultTab="changes"
+        initialPreview={{ status: 'ok', path: '/home/user/foo.ts', content: 'foo content' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    const bodySplit = document.querySelector('.fb-body.fb-body-split');
+    expect(bodySplit).not.toBeNull();
+
+    const directChangesTree = Array.from(bodySplit!.children).find((child) => (
+      child.classList.contains('fb-tree')
+      && child.classList.contains('fb-tree-split')
+      && child.classList.contains('fb-changes-tree')
+    ));
+    expect(directChangesTree).toBeTruthy();
+  });
+
   it('shows "Select Directory" title in dir-only modal', () => {
     const { ws } = makeWsFactory();
     const { getByText } = render(
@@ -1590,7 +1645,37 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-preview-error')?.textContent).toBe('file_browser.preview_error');
   });
 
-  it('polls only for an active inline preview', async () => {
+  it('times out a missing preview read and allows same-file retry', async () => {
+    vi.useFakeTimers();
+    const { ws, respond } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onConfirm={vi.fn()}
+      />,
+    );
+    await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+
+    await act(async () => {
+      vi.advanceTimersByTime(22_000);
+    });
+
+    expect(document.querySelector('.fb-preview-error')?.textContent).toBe('file_browser.preview_error');
+
+    const fileNode = document.querySelector('.fb-node.previewing') as HTMLElement;
+    await act(async () => { fireEvent.click(fileNode); });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(2);
+    vi.useRealTimers();
+  });
+
+  it('polls only reads for an active inline preview unless diff view is active', async () => {
     vi.useFakeTimers();
     const { ws, respond, sendMsg } = makeWsFactory();
     render(
@@ -1614,11 +1699,11 @@ describe('FileBrowser', () => {
     expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
 
     await act(async () => {
-      vi.advanceTimersByTime(5_000);
+      vi.advanceTimersByTime(8_000);
     });
 
     expect((ws.fsReadFile as any).mock.calls).toHaveLength(2);
-    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(2);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
     vi.useRealTimers();
   });
 
@@ -1648,7 +1733,7 @@ describe('FileBrowser', () => {
     fireEvent.scroll(previewContent);
 
     await act(async () => {
-      vi.advanceTimersByTime(5_000);
+      vi.advanceTimersByTime(8_000);
     });
 
     previewContent.scrollTop = 0;

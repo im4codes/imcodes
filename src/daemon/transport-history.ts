@@ -11,6 +11,7 @@ import logger from '../util/logger.js';
 
 const TRANSPORT_DIR = join(homedir(), '.imcodes', 'transport');
 const MAX_REPLAY_LINES = 200;
+export const TRANSPORT_HISTORY_REPLAY_BUDGET_BYTES = 128 * 1024;
 /**
  * Reverse-read chunk size for the tail-N-lines scan. Small enough to
  * short-circuit on sessions with tiny messages, large enough to cover a
@@ -37,6 +38,9 @@ const TAIL_CHUNK_BYTES = 64 * 1024; // 64 KiB per read
  */
 const MAX_TAIL_BYTES = 16 * 1024 * 1024; // 16 MiB cap
 const NEWLINE_BYTE = 0x0a;
+export const TRANSPORT_HISTORY_TOOL_RESULT_PREVIEW_BYTES = 1024;
+const TRANSPORT_HISTORY_TRUNCATED_MARKER = '\n[transport result truncated]';
+const RENDERABLE_TRANSPORT_HISTORY_TYPES = new Set(['user.message', 'assistant.text', 'tool.result']);
 
 let dirEnsured = false;
 
@@ -52,11 +56,119 @@ function sessionFile(sessionId: string): string {
   return join(TRANSPORT_DIR, `${safe}.jsonl`);
 }
 
+function shouldKeepTransportHistoryEvent(event: Record<string, unknown>): boolean {
+  if (event.hidden === true) return false;
+  const type = typeof event.type === 'string' ? event.type : '';
+  return RENDERABLE_TRANSPORT_HISTORY_TYPES.has(type);
+}
+
+function truncateStringByUtf8Bytes(value: string, maxBytes: number): { value: string; truncated: boolean } {
+  const originalBytes = Buffer.byteLength(value, 'utf8');
+  if (originalBytes <= maxBytes) return { value, truncated: false };
+  const markerBytes = Buffer.byteLength(TRANSPORT_HISTORY_TRUNCATED_MARKER, 'utf8');
+  const targetBytes = Math.max(0, maxBytes - markerBytes);
+  let end = Math.min(value.length, targetBytes);
+  while (end > 0 && Buffer.byteLength(value.slice(0, end), 'utf8') > targetBytes) {
+    end = Math.floor(end * 0.9);
+  }
+  return {
+    value: `${value.slice(0, end)}${TRANSPORT_HISTORY_TRUNCATED_MARKER}`,
+    truncated: true,
+  };
+}
+
+function previewTransportResultValue(value: unknown): { value: unknown; truncated: boolean } {
+  if (typeof value === 'string') return truncateStringByUtf8Bytes(value, TRANSPORT_HISTORY_TOOL_RESULT_PREVIEW_BYTES);
+  if (value == null || typeof value === 'number' || typeof value === 'boolean') {
+    return { value, truncated: false };
+  }
+  return { value: '[non-string result omitted from transport history]', truncated: true };
+}
+
+function previewField(
+  out: Record<string, unknown>,
+  key: 'output' | 'error',
+  value: unknown,
+  truncatedFields: string[],
+): void {
+  if (value === undefined) return;
+  const preview = previewTransportResultValue(value);
+  if (preview.value !== undefined) out[key] = preview.value;
+  if (preview.truncated) truncatedFields.push(key);
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function pickToolResultOutput(event: Record<string, unknown>): unknown {
+  if (event.output !== undefined) return event.output;
+  const detail = record(event.detail);
+  return detail?.output ?? detail?.content;
+}
+
+function pickToolResultError(event: Record<string, unknown>): unknown {
+  if (event.error !== undefined) return event.error;
+  const detail = record(event.detail);
+  return detail?.error;
+}
+
+function preserveTruncationMetadata(source: Record<string, unknown>, out: Record<string, unknown>, fields: string[]): void {
+  const existingFields = Array.isArray(source.transportHistoryTruncatedFields)
+    ? source.transportHistoryTruncatedFields.filter((field): field is string => typeof field === 'string')
+    : [];
+  const truncatedFields = [...new Set([...existingFields, ...fields])];
+  if (truncatedFields.length === 0 && source.transportHistoryTruncated !== true) return;
+
+  out.transportHistoryTruncated = true;
+  out.transportHistoryLimitBytes = TRANSPORT_HISTORY_TOOL_RESULT_PREVIEW_BYTES;
+  if (truncatedFields.length > 0) {
+    out.transportHistoryTruncatedFields = truncatedFields;
+  }
+}
+
+export function sanitizeTransportHistoryEvent(event: Record<string, unknown>): Record<string, unknown> {
+  if (event.type !== 'tool.result') return event;
+
+  const truncatedFields: string[] = [];
+  const out: Record<string, unknown> = { type: 'tool.result' };
+
+  for (const key of ['sessionId', '_ts']) {
+    if (event[key] !== undefined) out[key] = event[key];
+  }
+  previewField(out, 'output', pickToolResultOutput(event), truncatedFields);
+  previewField(out, 'error', pickToolResultError(event), truncatedFields);
+  preserveTruncationMetadata(event, out, truncatedFields);
+
+  return out;
+}
+
+function chatHistoryEnvelopeBytes(sessionId: string, events: readonly Record<string, unknown>[]): number {
+  return Buffer.byteLength(JSON.stringify({ type: 'chat.history', sessionId, events }), 'utf8');
+}
+
+export function trimTransportHistoryEventsToReplayBudget(sessionId: string, events: Record<string, unknown>[]): Record<string, unknown>[] {
+  if (events.length === 0) return events;
+  if (chatHistoryEnvelopeBytes(sessionId, events) <= TRANSPORT_HISTORY_REPLAY_BUDGET_BYTES) return events;
+  const kept: Record<string, unknown>[] = [];
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    kept.unshift(events[index]!);
+    if (chatHistoryEnvelopeBytes(sessionId, kept) > TRANSPORT_HISTORY_REPLAY_BUDGET_BYTES) {
+      kept.shift();
+      break;
+    }
+  }
+  return kept;
+}
+
 /** Append a transport event to the session's JSONL file. */
 export async function appendTransportEvent(sessionId: string, event: Record<string, unknown>): Promise<void> {
   try {
+    if (!shouldKeepTransportHistoryEvent(event)) return;
     await ensureDir();
-    const line = JSON.stringify({ ...event, _ts: Date.now() }) + '\n';
+    const line = JSON.stringify(sanitizeTransportHistoryEvent({ ...event, _ts: Date.now() })) + '\n';
     await appendFile(sessionFile(sessionId), line, 'utf8');
   } catch (err) {
     logger.debug({ sessionId, err }, 'transport-history: append failed');
@@ -122,7 +234,9 @@ export async function replayTransportHistory(sessionId: string): Promise<Record<
     const events: Record<string, unknown>[] = [];
     for (const line of recent) {
       try {
-        events.push(JSON.parse(line) as Record<string, unknown>);
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        if (!shouldKeepTransportHistoryEvent(parsed)) continue;
+        events.push(sanitizeTransportHistoryEvent(parsed));
       } catch { /* skip malformed — e.g. lines that are themselves longer
                    than MAX_TAIL_BYTES end up truncated */ }
     }

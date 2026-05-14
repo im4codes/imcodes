@@ -20,9 +20,10 @@ import {
   type FileBrowserPreviewUpdate,
 } from './components/file-browser-lazy.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
 import type { UsageContextWindowSource } from '@shared/usage-context-window.js';
-import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from './p2p-run-mapping.js';
+import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate, mergeP2pStatusResponseDiscussions } from './p2p-run-mapping.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
@@ -42,7 +43,8 @@ import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
-import { RepoPage } from './pages/RepoPage.js';
+import { RepoPage, type RepoPageTabKey } from './pages/RepoPage.js';
+import { ingestSessionRepoContext } from './session-repo-context-store.js';
 import { FloatingPanel } from './components/FloatingPanel.js';
 import { SettingsPage } from './pages/SettingsPage.js';
 import { AdminPage } from './pages/AdminPage.js';
@@ -57,6 +59,10 @@ import { SessionTree } from './components/SessionTree.js';
 import { P2pRingProgress } from './components/P2pRingProgress.js';
 import { useUnreadCounts } from './hooks/useUnreadCounts.js';
 import { SidebarPinnedPanel } from './components/SidebarPinnedPanel.js';
+import {
+  DEFAULT_SUBSESSION_ACCENT_COLOR,
+  getSubSessionAccentColorMap,
+} from './subsession-accent-colors.js';
 import type { PanelRenderContext } from './components/PinnedPanelRegistry.js';
 import './components/pinnedPanelTypes.js'; // register all panel types
 import {
@@ -104,6 +110,7 @@ import {
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
+import { isP2pDiscussionVisibleInSubSessionBar } from './p2p-discussion-scope.js';
 import {
   extractTransportPendingMessages,
   mergeTransportPendingEntriesForIdleState,
@@ -145,7 +152,19 @@ const nativeCallback = typeof window !== 'undefined'
 
 type ViewMode = TerminalSubscribeViewMode;
 
-function isTextEntryElement(el: HTMLElement | null): boolean {
+type AppToast = {
+  id: number;
+  sessionName?: string;
+  project?: string;
+  kind: 'idle' | 'notification' | 'success';
+  title?: string;
+  message?: string;
+  openRepoLatest?: boolean;
+  failedJobName?: string;
+  failedStepName?: string;
+};
+
+export function isTextEntryElement(el: HTMLElement | null): boolean {
   if (!el) return false;
   const tag = el.tagName;
   return tag === 'INPUT'
@@ -164,7 +183,7 @@ type SharedContextDiagnosticsWindowState = {
   filePath?: string;
 };
 
-function buildSessionToastLabel(
+export function buildSessionToastLabel(
   sessionName: string,
   options: {
     label?: string | null;
@@ -198,7 +217,7 @@ export interface PinnedPanel {
   props: Record<string, unknown>;
 }
 
-function getFilePreviewInitialPath(request: FileBrowserPreviewRequest): string {
+export function getFilePreviewInitialPath(request: FileBrowserPreviewRequest): string {
   if (request.rootPath) return request.rootPath;
   const slash = request.path.lastIndexOf('/');
   const backslash = request.path.lastIndexOf('\\');
@@ -208,7 +227,7 @@ function getFilePreviewInitialPath(request: FileBrowserPreviewRequest): string {
   return '~';
 }
 
-function updateServerDaemonVersion<T extends { id: string; daemonVersion?: string | null }>(
+export function updateServerDaemonVersion<T extends { id: string; daemonVersion?: string | null }>(
   servers: T[],
   serverId: string | null | undefined,
   daemonVersion: string | null | undefined,
@@ -239,6 +258,13 @@ interface WatchSessionRow {
   previewUpdatedAt?: number;
   isSubSession?: boolean;
 }
+
+type RepoPanelTarget = {
+  sessionId: string | null;
+  projectDir: string;
+  initialTab?: RepoPageTabKey;
+  initialTabToken: number;
+};
 
 export function App() {
   const { t: trans } = useTranslation();
@@ -839,7 +865,12 @@ export function App() {
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
   const [idleFlashTokens, setIdleFlashTokens] = useState<Map<string, number>>(() => new Map());
-  const [toasts, setToasts] = useState<Array<{ id: number; sessionName: string; project: string; kind: 'idle' | 'notification'; title?: string; message?: string; openRepoLatest?: boolean; failedJobName?: string; failedStepName?: string }>>([]);
+  const [toasts, setToasts] = useState<AppToast[]>([]);
+  const showSuccessToast = useCallback((title: string) => {
+    const id = Date.now() + Math.random();
+    setToasts((prev) => [...prev, { id, kind: 'success', title }]);
+    setTimeout(() => setToasts((prev) => prev.filter((toast) => toast.id !== id)), 4000);
+  }, []);
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
   const detectedModelsRef = useRef<Map<string, string>>(new Map());
   const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string }>>(new Map());
@@ -876,19 +907,29 @@ export function App() {
     } catch { /* ignore */ }
     return new Set();
   });
+  const openSubIdsRef = useRef(openSubIds);
+  openSubIdsRef.current = openSubIds;
+  const persistOpenSubIds = useCallback((next: Set<string>) => {
+    const mainSession = localStorage.getItem('rcc_session');
+    if (!mainSession) return;
+    const ids = Array.from(next);
+    if (ids.length > 0) localStorage.setItem(`rcc_open_subs_${mainSession}`, JSON.stringify(ids));
+    else localStorage.removeItem(`rcc_open_subs_${mainSession}`);
+  }, []);
   const setOpenSubIds = useCallback((updater: Set<string> | ((prev: Set<string>) => Set<string>)) => {
+    if (typeof updater !== 'function') {
+      openSubIdsRef.current = updater;
+      persistOpenSubIds(updater);
+      setOpenSubIdsRaw(updater);
+      return;
+    }
     setOpenSubIdsRaw((prev) => {
-      const next = typeof updater === 'function' ? updater(prev) : updater;
-      // Persist open sub IDs for the current main session
-      const mainSession = localStorage.getItem('rcc_session');
-      if (mainSession) {
-        const ids = Array.from(next);
-        if (ids.length > 0) localStorage.setItem(`rcc_open_subs_${mainSession}`, JSON.stringify(ids));
-        else localStorage.removeItem(`rcc_open_subs_${mainSession}`);
-      }
+      const next = updater(prev);
+      openSubIdsRef.current = next;
+      persistOpenSubIds(next);
       return next;
     });
-  }, []);
+  }, [persistOpenSubIds]);
 
   // Panels pinned to the sidebar — synced to server, write-through cache
   const [pinnedPanels, setPinnedPanels] = useSyncedPreference<PinnedPanel[]>('sidebar_pinned_panels', [], 0);
@@ -964,8 +1005,6 @@ export function App() {
   // (stable string) — never the stack object or the Set instance — so this
   // memo only invalidates on real ordering / membership changes.
   const openSubIdsKeyMemo = useMemo(() => openSubIdsKey(openSubIds), [openSubIds]);
-  const openSubIdsRef = useRef(openSubIds);
-  openSubIdsRef.current = openSubIds;
   const maximizedSubIdsRef = useRef(maximizedSubIds);
   maximizedSubIdsRef.current = maximizedSubIds;
   const focusedSubId = useMemo(
@@ -1026,9 +1065,10 @@ export function App() {
 
   // ── Repo ────────────────────────────────────────────────────────────────────
   const [showRepoPage, setShowRepoPage] = useState(false);
+  const [repoPanelTarget, setRepoPanelTarget] = useState<RepoPanelTarget | null>(null);
+  const repoPanelOpenTokenRef = useRef(0);
   const [repoFocusLatestAction, setRepoFocusLatestAction] = useState<{ token: number; failedJobName?: string; failedStepName?: string } | null>(null);
-  const [pendingRepoToastSession, setPendingRepoToastSession] = useState<{ sessionName: string; focus: { token: number; failedJobName?: string; failedStepName?: string } } | null>(null);
-  /** Floating file preview request opened from pinned file browser. */
+  /** Floating file preview request opened from file panels and chat file links. */
   const [previewFileRequest, setPreviewFileRequest] = useState<FileBrowserPreviewRequest | null>(null);
   const [previewFileCache, setPreviewFileCache] = useState<Record<string, { preferDiff?: boolean; preview: FileBrowserPreviewState }>>({});
   const [repoContexts, setRepoContexts] = useState<Map<string, any>>(new Map());
@@ -1085,7 +1125,7 @@ export function App() {
     totalHops: number;
     activeHop?: number | null;
     activeRoundHop?: number | null;
-    activePhase?: 'queued' | 'initial' | 'hop' | 'summary';
+    activePhase?: 'queued' | 'initial' | 'hop' | 'summary' | 'execution';
     initiatorLabel?: string;
     currentSpeaker?: string;
     conclusion?: string;
@@ -1096,7 +1136,7 @@ export function App() {
       agentType: string;
       ccPreset?: string | null;
       mode?: string;
-      phase?: 'initial' | 'hop' | 'summary';
+      phase?: 'initial' | 'hop' | 'summary' | 'execution';
       status: 'done' | 'active' | 'pending' | 'skipped';
     }>;
     hopStates?: Array<{
@@ -1112,6 +1152,17 @@ export function App() {
     startedAt?: number;
     /** Epoch ms when the current hop/phase started (for hop-level elapsed timer) */
     hopStartedAt?: number;
+    /** Main session this discussion belongs to (parent of any sub-session
+     *  initiator). Used by SubSessionBar to scope the discussion banner
+     *  to the relevant session view only. */
+    mainSession?: string;
+    /** Session that originated the discussion. May equal mainSession or
+     *  may be a sub-session under it. */
+    initiatorSession?: string;
+    /** Every session participating in this run (initiator + targets +
+     *  hops). The bar matches against this set so any session involved
+     *  in the discussion shows the bar. */
+    participantSessions?: string[];
   }>>([]);
 
   /** Set of session names enabled in the P2P config for the active root session. */
@@ -1149,15 +1200,23 @@ export function App() {
    * sub-session does NOT bump the version — that is the load-bearing
    * render-stability guarantee.
    */
-  const bringSubToFront = useCallback((id: string) => {
-    if (isMobileRef.current) return;
+  const getSubSessionDesktopWindowMeta = useCallback((id: string): DesktopWindowMeta => {
     const sub = subSessionsRef.current.find((candidate) => candidate.id === id);
-    ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id), {
+    return {
       kind: DESKTOP_WINDOW_KINDS.subSession,
       subId: id,
       serverId: sub?.serverId ?? selectedServerIdRef.current ?? undefined,
-    }, { bringToFront: true });
-  }, [ensureDesktopWindow]);
+    };
+  }, []);
+
+  const bringSubToFront = useCallback((id: string) => {
+    if (isMobileRef.current) return;
+    for (const openId of openSubIdsRef.current) {
+      if (openId === id) continue;
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(openId), getSubSessionDesktopWindowMeta(openId));
+    }
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id), getSubSessionDesktopWindowMeta(id), { bringToFront: true });
+  }, [ensureDesktopWindow, getSubSessionDesktopWindowMeta]);
 
   const setSubSessionMaximized = useCallback((id: string, maximized: boolean) => {
     setMaximizedSubIds((prev) => {
@@ -1212,34 +1271,24 @@ export function App() {
 
   const toggleSubSession = useCallback((id: string) => {
     const mobile = isMobileRef.current;
-    let willOpen = false;
-    setOpenSubIds((prev) => {
-      if (mobile) {
-        // Exclusive on mobile: close if already open, otherwise open only this one
-        if (prev.has(id)) {
-          clearSubSessionMaximized(id);
-          return new Set();
-        }
-        willOpen = true;
-        clearSubSessionMaximized(id);
-        return new Set([id]);
-      }
-      const next = new Set(prev);
-      if (next.has(id)) {
-        next.delete(id);
-        willOpen = false;
-        clearSubSessionMaximized(id);
-      } else {
-        next.add(id);
-        willOpen = true;
-        clearSubSessionMaximized(id);
-      }
-      return next;
-    });
-    if (willOpen) {
-      bringSubToFront(id);
-    } else {
+    const wasOpen = openSubIdsRef.current.has(id);
+    clearSubSessionMaximized(id);
+
+    if (mobile) {
+      setOpenSubIds(wasOpen ? new Set() : new Set([id]));
+      return;
+    }
+
+    if (wasOpen) {
+      const next = new Set(openSubIdsRef.current);
+      next.delete(id);
+      setOpenSubIds(next);
       removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
+    } else {
+      const next = new Set(openSubIdsRef.current);
+      next.add(id);
+      setOpenSubIds(next);
+      bringSubToFront(id);
     }
   }, [bringSubToFront, clearSubSessionMaximized, removeDesktopWindow, setOpenSubIds]);
 
@@ -1247,6 +1296,19 @@ export function App() {
   activeSessionRef.current = activeSession;
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
+
+  const closeAllSubSessionWindows = useCallback(() => {
+    setMaximizedSubIds(new Set());
+    setOpenSubIds(new Set());
+    if (isMobileRef.current) return;
+    const stack = stackRef.current!;
+    let changed = false;
+    for (const entry of stack.getOrderForTests()) {
+      if (entry.meta.kind !== DESKTOP_WINDOW_KINDS.subSession) continue;
+      if (stack.removeWindow(entry.id)) changed = true;
+    }
+    if (changed) bumpStack();
+  }, [bumpStack, setOpenSubIds]);
 
   // ── Desktop window stack ↔ visibility-boolean sync ──────────────────────────
   // For each managed singleton floating window, mirror its show-boolean into
@@ -1346,26 +1408,6 @@ export function App() {
     }
   }, [previewFileRequest, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
 
-  // Sub-session stack cleanup: remove a sub-session's stack entry whenever it
-  // leaves `openSubIds` (close, minimize, pin, server switch, etc.). This is
-  // the single authoritative place that GCs sub-session stack memberships;
-  // user-action open paths (toggleSubSession, bringSubToFront) handle
-  // ensure+bring on the way in.
-  const openSubIdsKeyForEffect = openSubIdsKeyMemo;
-  useEffect(() => {
-    if (isMobileRef.current) return;
-    const currentlyOpen = new Set(openSubIdsRef.current);
-    const stack = stackRef.current!;
-    let changed = false;
-    for (const entry of stack.getOrderForTests()) {
-      if (entry.meta.kind !== DESKTOP_WINDOW_KINDS.subSession) continue;
-      if (entry.meta.subId && !currentlyOpen.has(entry.meta.subId)) {
-        if (stack.removeWindow(entry.id)) changed = true;
-      }
-    }
-    if (changed) bumpStack();
-  }, [openSubIdsKeyForEffect]);
-
   const setActiveSession = useCallback((name: string | null, opts?: { keepSubWindows?: boolean }) => {
     if (name) localStorage.setItem('rcc_session', name);
     else localStorage.removeItem('rcc_session');
@@ -1387,6 +1429,19 @@ export function App() {
     // scroll chat to bottom on session switch (rAF gives ChatView time to mount)
     if (name) requestAnimationFrame(() => chatScrollFnsRef.current.get(name)?.());
   }, [setOpenSubIds]);
+
+  const selectMainSessionTab = useCallback((name: string) => {
+    if (name === activeSessionRef.current) {
+      closeAllSubSessionWindows();
+    } else {
+      setActiveSession(name);
+    }
+    setIdleAlerts((prev) => {
+      const next = new Set(prev);
+      next.delete(name);
+      return next;
+    });
+  }, [closeAllSubSessionWindows, setActiveSession]);
 
   useEffect(() => {
     if (!auth || selectedServerId || !serversLoaded || servers.length === 0 || manualDashboard) return;
@@ -1494,6 +1549,10 @@ export function App() {
   // preference subscription key.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSession, subSessionParentSignature]);
+  const visibleSubSessionNames = useMemo(
+    () => visibleSubSessions.map((sub) => sub.sessionName),
+    [visibleSubSessions],
+  );
   const p2pConfigPref = usePref(
     activeRootSession ? p2pSessionConfigPrefKey(activeRootSession, selectedServerId) : null,
     {
@@ -1546,6 +1605,43 @@ export function App() {
   // subSessionsRef itself is declared earlier (forward-declared before
   // bringSubToFront so the callback can close over it). Just sync each render.
   subSessionsRef.current = subSessions;
+  const visibleSubSessionStackKey = useMemo(
+    () => visibleSubSessions
+      .map((sub) => `${sub.id}:${sub.serverId ?? selectedServerId ?? ''}`)
+      .sort()
+      .join('|'),
+    [selectedServerId, visibleSubSessions],
+  );
+
+  // Sub-session stack sync: every rendered open sub-session must have a
+  // desktop-stack entry, including windows restored from localStorage on
+  // page/session load. Without this, restored windows fall back to z-index
+  // 6000 while newly opened managed windows start at the stack band (5010,
+  // 5020, ...), so the latest opened window can appear behind stale peers.
+  useEffect(() => {
+    if (isMobileRef.current) return;
+    const renderedSubIds = new Set(visibleSubSessions.map((sub) => sub.id));
+    const currentlyOpen = new Set(
+      Array.from(openSubIdsRef.current).filter((id) => renderedSubIds.has(id)),
+    );
+    const stack = stackRef.current!;
+    let changed = false;
+
+    for (const subId of currentlyOpen) {
+      if (stack.ensureWindow(DESKTOP_WINDOW_IDS.subSession(subId), getSubSessionDesktopWindowMeta(subId))) {
+        changed = true;
+      }
+    }
+
+    for (const entry of stack.getOrderForTests()) {
+      if (entry.meta.kind !== DESKTOP_WINDOW_KINDS.subSession) continue;
+      if (!entry.meta.subId || !currentlyOpen.has(entry.meta.subId)) {
+        if (stack.removeWindow(entry.id)) changed = true;
+      }
+    }
+
+    if (changed) bumpStack();
+  }, [bumpStack, getSubSessionDesktopWindowMeta, openSubIdsKeyMemo, visibleSubSessionStackKey, visibleSubSessions]);
 
   useEffect(() => {
     const liveSessionNames = new Set<string>([
@@ -1629,6 +1725,16 @@ export function App() {
     if (panel.type === 'filebrowser' || panel.type === 'repo') {
       setShowDesktopFileBrowser(true);
     } else if (panel.type === 'repopage') {
+      const projectDir = typeof panel.props?.projectDir === 'string' ? panel.props.projectDir : undefined;
+      const sessionId = typeof panel.props?.sessionName === 'string' ? panel.props.sessionName : activeSession ?? null;
+      if (projectDir) {
+        repoPanelOpenTokenRef.current += 1;
+        setRepoPanelTarget({
+          sessionId,
+          projectDir,
+          initialTabToken: repoPanelOpenTokenRef.current,
+        });
+      }
       setShowRepoPage(true);
     } else if (panel.type === 'cronmanager') {
       setShowCronManager(true);
@@ -1656,7 +1762,7 @@ export function App() {
         bringSubToFront(sub.id);
       }
     }
-  }, [setPinnedPanels, subSessions, bringSubToFront]);
+  }, [activeSession, setPinnedPanels, subSessions, bringSubToFront]);
 
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   isMobileRef.current = isMobile;
@@ -1725,9 +1831,21 @@ export function App() {
         if (msg.event === 'connected') {
           setConnected(true);
           setConnecting(false);
+          if (msg.reason === 'probe_recovered') return;
           ws.requestSessionList();
-          ws.discussionList();
-          ws.p2pStatus();
+          // Migrate to scoped p2p list. The active session is captured via the
+          // ref to survive useEffect closure; the daemon will fail-closed and
+          // return [] if it cannot resolve a project scope from this session,
+          // matching the new server-side guard. The same scope is implicitly
+          // tracked inside the WS client via setP2pWorkflowRequestScope on
+          // terminal subscribe — passing it explicitly here just makes the
+          // scope source obvious at the call site.
+          {
+            const initialActive = activeSessionRef.current;
+            const initialScope = initialActive ? { sessionName: initialActive } : undefined;
+            ws.p2pListDiscussions(initialScope);
+            ws.p2pStatus(initialScope);
+          }
           requestActiveTimelineRefresh({ resetCooldowns: true });
           // Timeout: if session_list never arrives, stop blocking the UI
           if (sessionListRetryRef.current) clearTimeout(sessionListRetryRef.current);
@@ -2111,7 +2229,7 @@ export function App() {
         });
       }
       // ── P2P Quick Discussion progress → map to discussions state ──────────
-      if (msg.type === 'p2p.conflict') {
+      if (msg.type === P2P_WORKFLOW_MSG.CONFLICT) {
         // Active P2P run exists — notify user
         if (typeof window !== 'undefined') {
           window.alert(
@@ -2120,7 +2238,7 @@ export function App() {
           );
         }
       }
-      if (msg.type === 'p2p.run_update' && msg.run) {
+      if (msg.type === P2P_WORKFLOW_MSG.RUN_UPDATE && msg.run) {
         const entry = mapP2pRunToDiscussion(msg.run as Record<string, any>);
         setDiscussions((prev) => {
           const existing = prev.find((d) => d.id === entry.id);
@@ -2136,36 +2254,25 @@ export function App() {
           }, 120_000);
         }
       }
-      if (msg.type === 'p2p.cancel_response' && msg.ok && msg.runId) {
+      if (msg.type === P2P_WORKFLOW_MSG.CANCEL_RESPONSE && msg.ok && msg.runId) {
         setDiscussions((prev) => prev.filter((d) => d.id !== `p2p_${msg.runId}`));
       }
-      if (msg.type === 'p2p.status_response') {
+      if (msg.type === P2P_WORKFLOW_MSG.STATUS_RESPONSE) {
         const runs = Array.isArray(msg.runs)
           ? msg.runs
           : msg.run
             ? [msg.run]
             : [];
         const mapped = runs.map((run) => mapP2pRunToDiscussion(run as Record<string, any>));
-        const activeIds = new Set(mapped.map((d) => d.id));
-        setDiscussions((prev) => {
-          const retained = prev.filter((d) => {
-            if (!d.id.startsWith('p2p_')) return true;
-            return activeIds.has(d.id);
-          });
-          const merged = [...retained];
-          for (const entry of mapped) {
-            const idx = merged.findIndex((d) => d.id === entry.id);
-            if (idx >= 0) merged[idx] = mergeP2pDiscussionUpdate(merged[idx], entry);
-            else merged.push(entry);
-          }
-          return merged;
-        });
+        setDiscussions((prev) => mergeP2pStatusResponseDiscussions(prev, mapped, {
+          runId: typeof msg.runId === 'string' ? msg.runId : undefined,
+          runFound: !!msg.run,
+        }));
       }
       if (msg.type === REPO_MSG.DETECTED || msg.type === REPO_MSG.DETECT_RESPONSE) {
         const dir = msg.projectDir as string;
         if (dir) {
           // Normalize shape: repo.detected wraps in { context }, detect_response spreads at top level.
-          // Flatten so repoContext.status always works (SubSessionBar) AND repoContext.context.status works (effect).
           const context = (msg as any).context ?? msg;
           const normalized = { ...context, context, projectDir: dir };
           setRepoContexts((prev) => {
@@ -2173,6 +2280,20 @@ export function App() {
             next.set(dir, normalized);
             return next;
           });
+          const sessionIds = new Set<string>();
+          for (const session of sessionsRef.current) {
+            if (session.projectDir === dir) sessionIds.add(session.name);
+          }
+          for (const sub of subSessionsRef.current) {
+            if (sub.cwd === dir) sessionIds.add(sub.sessionName);
+          }
+          if (sessionIds.size === 0) {
+            ingestSessionRepoContext({ projectDir: dir, context });
+          } else {
+            for (const sessionId of sessionIds) {
+              ingestSessionRepoContext({ sessionId, projectDir: dir, context });
+            }
+          }
         }
       }
       if (msg.type === REPO_MSG.ERROR) {
@@ -2336,8 +2457,15 @@ export function App() {
           sessions: sessionsRef.current,
           subSessions: subSessionsRef.current,
         }));
-        // Refresh discussion list
-        ws.discussionList();
+        // Refresh discussion list — daemon now requires a project scope, so
+        // forward the active session as the scope source. Falls back to undefined
+        // (WS-client uses its tracked scope from terminal subscriptions) when the
+        // user has not picked an active session yet.
+        {
+          const reconnectActive = activeSessionRef.current;
+          const reconnectScope = reconnectActive ? { sessionName: reconnectActive } : undefined;
+          ws.p2pListDiscussions(reconnectScope);
+        }
       }
     });
 
@@ -2924,6 +3052,54 @@ export function App() {
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
 
+  const resolveRepoProjectDir = useCallback((sessionId?: string | null) => {
+    if (!sessionId) return activeSessionInfo?.projectDir ?? undefined;
+    const mainSession = sessions.find((s) => s.name === sessionId);
+    if (mainSession?.projectDir) return mainSession.projectDir;
+    const subSession = subSessions.find((s) => s.sessionName === sessionId);
+    return subSession?.cwd ?? activeSessionInfo?.projectDir ?? undefined;
+  }, [activeSessionInfo?.projectDir, sessions, subSessions]);
+
+  const openRepoPage = useCallback((target?: { sessionId?: string | null; projectDir?: string | null; initialTab?: RepoPageTabKey }) => {
+    const sessionId = target?.sessionId ?? activeSession ?? null;
+    const projectDir = target?.projectDir ?? resolveRepoProjectDir(sessionId);
+    if (!projectDir) return;
+    repoPanelOpenTokenRef.current += 1;
+    setRepoPanelTarget({
+      sessionId,
+      projectDir,
+      ...(target?.initialTab ? { initialTab: target.initialTab } : {}),
+      initialTabToken: repoPanelOpenTokenRef.current,
+    });
+    if (target?.initialTab !== 'actions') {
+      setRepoFocusLatestAction(null);
+    }
+    setShowRepoPage(true);
+  }, [activeSession, resolveRepoProjectDir]);
+
+  const repoPanelSessionId = repoPanelTarget?.sessionId ?? activeSession ?? null;
+  const repoPanelProjectDir = repoPanelTarget?.projectDir ?? activeSessionInfo?.projectDir;
+
+  // Audit fix (DiscussionsPage spam-fetch loop) — memoize the
+  // request-scope object so its identity stays stable across parent
+  // renders. Without this `useMemo`, every parent render of `App`
+  // produced a fresh object literal which made
+  // `DiscussionsPage`'s `useCallback(loadList, [requestScope])`
+  // re-identify, which fired its `useEffect([loadList])` and dispatched
+  // another `p2p.list_discussions` request — producing dozens of
+  // pending requests per second until the bridge's per-socket cap
+  // tripped (`p2p per-socket pending cap exceeded — dropped`) and the
+  // page hung on "加载中…" because no response ever returned.
+  const discussionsRequestScope = useMemo(() => {
+    const sessionName = activeSession ?? undefined;
+    const projectDir = activeSessionInfo?.projectDir ?? undefined;
+    if (!sessionName && !projectDir) return undefined;
+    const scope: { sessionName?: string; projectDir?: string } = {};
+    if (sessionName) scope.sessionName = sessionName;
+    if (projectDir) scope.projectDir = projectDir;
+    return scope;
+  }, [activeSession, activeSessionInfo?.projectDir]);
+
   useEffect(() => {
     if (typeof document === 'undefined') return;
     document.title = buildDocumentTitle(resolvedSelectedServerName, activeSessionInfo);
@@ -2996,6 +3172,8 @@ export function App() {
   function scheduleResubscribe(items: Array<{ name: string; mode?: ViewMode }>) {
     const ws = wsRef.current;
     if (!ws?.connected || items.length === 0) return;
+    for (const timer of resubscribeTimersRef.current) clearTimeout(timer);
+    resubscribeTimersRef.current.clear();
 
     const unique = new Map<string, { name: string; mode?: ViewMode }>();
     for (const item of items) {
@@ -3018,19 +3196,36 @@ export function App() {
     }
   }
 
-  useEffect(() => {
-    if (!pendingRepoToastSession) return;
-    if (activeSession !== pendingRepoToastSession.sessionName) return;
-    setShowRepoPage(true);
-    setRepoFocusLatestAction(pendingRepoToastSession.focus);
-    setPendingRepoToastSession(null);
-  }, [activeSession, pendingRepoToastSession]);
-
   // Memoized sub-session mappings — avoids creating new arrays on every render,
   // which would defeat memo() on child components (SessionPane, SessionTree, pinned panels).
   const subSessionsSlim = useMemo(() =>
     subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession })),
     [subSessions]
+  );
+  const [subSessionVisualOrderIds, setSubSessionVisualOrderIds] = useState<string[]>([]);
+  const handleSubSessionVisualOrderChange = useCallback((ids: string[]) => {
+    setSubSessionVisualOrderIds((prev) => {
+      if (prev.length === ids.length && prev.every((id, index) => id === ids[index])) return prev;
+      return ids;
+    });
+  }, []);
+  const visibleSubSessionAccentColors = useMemo(
+    () => {
+      const byId = new Map(visibleSubSessions.map((sub) => [sub.id, sub]));
+      const seen = new Set<string>();
+      const ordered = subSessionVisualOrderIds
+        .map((id) => byId.get(id))
+        .filter((sub): sub is typeof visibleSubSessions[number] => {
+          if (!sub || seen.has(sub.id)) return false;
+          seen.add(sub.id);
+          return true;
+        });
+      for (const sub of visibleSubSessions) {
+        if (!seen.has(sub.id)) ordered.push(sub);
+      }
+      return getSubSessionAccentColorMap(ordered);
+    },
+    [subSessionVisualOrderIds, visibleSubSessions],
   );
 
   const visiblePinnedPanels = useMemo(() =>
@@ -3464,7 +3659,7 @@ export function App() {
               idleAlerts={idleAlerts}
               p2pSessionLabels={p2pSessionLabels}
               onAlertDismiss={(name) => setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; })}
-              onSelect={(name) => { setActiveSession(name); setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; }); }}
+              onSelect={selectMainSessionTab}
               onNewSession={() => setShowNewSession(true)}
               onStopProject={handleStopProject}
               onRestartProject={handleRestartProject}
@@ -3547,11 +3742,16 @@ export function App() {
                 onStopProject={handleStopProject}
                 onRenameSession={() => setRenameRequest(s.name)}
                 onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null })}
+                onViewRepo={() => {
+                  setActiveSession(s.name);
+                  openRepoPage({ sessionId: s.name, projectDir: s.projectDir, initialTab: 'branches' });
+                }}
                 onTransportConfigSaved={(transportConfig) => {
                   setSessions((prev) => prev.map((session) => (
                     session.name === s.name ? { ...session, transportConfig } : session
                   )));
                 }}
+                onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
                 onAfterAction={focusTerminal}
                 mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
                 onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
@@ -3670,6 +3870,7 @@ export function App() {
                 desktopLayoutCapable={desktopLayoutCapable}
                 collapsed={subSessionBarCollapsed}
                 onCollapsedChange={setSubSessionBarCollapsed}
+                onVisualOrderChange={handleSubSessionVisualOrderChange}
                 idleFlashTokens={idleFlashTokens}
                 onOpen={toggleSubSession}
                 onClose={closeSubSessionAndClearMaximized}
@@ -3681,11 +3882,21 @@ export function App() {
                 onNew={() => setShowSubDialog(true)}
                 onViewDiscussions={() => { setDiscussionInitialId(null); setShowDiscussionsPage(true); }}
                 onViewDiscussion={(fileId) => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }}
-                discussions={discussions.filter((d) => d.state !== 'done')}
+                discussions={discussions.filter((d) => isP2pDiscussionVisibleInSubSessionBar(d, {
+                  activeSession,
+                  activeRootSession,
+                  visibleSubSessionNames,
+                }))}
+                // Daemon-wide running count (NOT scoped to this
+                // session) so the View Discussions (📋) button shows
+                // a badge even when the user is viewing a session
+                // unrelated to the running discussions. Lets the user
+                // notice and click through without losing track.
+                totalRunningDiscussions={discussions.filter((d) => d.state !== 'done').length}
                 onStopDiscussion={(id) => {
                   if (id.startsWith('p2p_')) {
                     // P2P runs use p2p.cancel with the actual run ID (strip p2p_ prefix)
-                    wsRef.current?.send({ type: 'p2p.cancel', runId: id.slice(4) });
+                    wsRef.current?.send({ type: P2P_WORKFLOW_MSG.CANCEL, runId: id.slice(4) });
                     // Remove from UI immediately
                     setDiscussions((prev) => prev.filter((d) => d.id !== id));
                   } else {
@@ -3697,7 +3908,7 @@ export function App() {
                 onDiff={registerDiffApplyer}
                 onHistory={registerHistoryApplyer}
                 serverId={selectedServerId}
-                onViewRepo={() => setShowRepoPage(true)}
+                onViewRepo={() => openRepoPage()}
                 onViewCron={() => setShowCronManager(true)}
                 subUsages={subUsages}
                 detectedModels={detectedModels}
@@ -3910,9 +4121,22 @@ export function App() {
               onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
               initialSelectedId={discussionInitialId}
               liveDiscussions={discussions}
+              // Audit fix (e940d73f-a8e / M7-A) — wire the active session
+              // into requestScope. Without this, multi-project daemons fail
+              // `resolveP2pDiscussionProjectScope` and every read returns
+              // `missing_or_invalid_scope` → the UI shows "(加载失败)".
+              // Single-project daemons fall through the size-1 fallback in
+              // the daemon, which is why the bug only surfaces in
+              // multi-project setups.
+              //
+              // The value MUST come from `useMemo` — see
+              // `discussionsRequestScope` above. Inline object literals
+              // here cause an infinite list-fetch loop inside
+              // `DiscussionsPage`.
+              requestScope={discussionsRequestScope}
               onStopDiscussion={(id) => {
                 if (id.startsWith('p2p_')) {
-                  wsRef.current?.send({ type: 'p2p.cancel', runId: id.slice(4) });
+                  wsRef.current?.send({ type: P2P_WORKFLOW_MSG.CANCEL, runId: id.slice(4) });
                   setDiscussions((prev) => prev.filter((d) => d.id !== id));
                 } else {
                   wsRef.current?.discussionStop(id);
@@ -3923,16 +4147,16 @@ export function App() {
         </FloatingPanel>
       )}
 
-      {showRepoPage && wsRef.current && activeSessionInfo?.projectDir && (
-        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} onPin={() => pinPanel('repopage', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowRepoPage(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={800} defaultH={600} zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.repo, 5050)} onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.repo)}>
-          <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
+      {showRepoPage && wsRef.current && repoPanelProjectDir && (
+        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} onPin={() => pinPanel('repopage', { sessionName: repoPanelSessionId, projectDir: repoPanelProjectDir, serverId: selectedServerId }, () => setShowRepoPage(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={800} defaultH={600} zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.repo, 5050)} onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.repo)}>
+          <RepoPage ws={wsRef.current} sessionId={repoPanelSessionId} projectDir={repoPanelProjectDir} initialTab={repoPanelTarget?.initialTab} initialTabToken={repoPanelTarget?.initialTabToken} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';
             const failurePath = [run.failedJobName, run.failedStepName].filter(Boolean).join(' → ');
             const message = failurePath || run.conclusion || run.status;
             setToasts((prev) => [...prev, {
               id,
-              sessionName: activeSession ?? '',
+              sessionName: repoPanelSessionId ?? '',
               project: `${icon} ${run.name}`,
               kind: 'notification',
               title: run.status === 'success' ? 'CI Passed' : 'CI Failed',
@@ -4157,6 +4381,7 @@ export function App() {
           onClose={() => setShowNewSession(false)}
           onSessionStarted={(name) => { setActiveSession(name); setShowNewSession(false); }}
           isProviderConnected={isProviderConnected}
+          onToast={showSuccessToast}
         />
       )}
 
@@ -4192,7 +4417,9 @@ export function App() {
                 if (label !== null) renameSubSession(sub.id, label);
               }}
               onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null })}
+              onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches' })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
+              onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
               zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000)}
               onFocus={() => bringSubToFront(sub.id)}
               desktopFileBrowserZIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id), getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000) + 1)}
@@ -4217,6 +4444,7 @@ export function App() {
               serverId={selectedServerId ?? undefined}
               detectedModelHint={detectedModels.get(sub.sessionName)}
               inP2p={p2pSessionLabels.has(sub.sessionName)}
+              accentColor={visibleSubSessionAccentColors.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
               pendingPrefillText={pendingPrefills[sub.sessionName] ?? null}
               onPendingPrefillApplied={() => setPendingPrefills((prev) => {
                 if (!(sub.sessionName in prev)) return prev;
@@ -4281,6 +4509,7 @@ export function App() {
           isProviderConnected={isProviderConnected}
           getRemoteSessions={getRemoteSessions}
           refreshSessions={refreshSessions}
+          onToast={showSuccessToast}
           onStart={async (type, shellBin, cwd, label, extra) => {
             setShowSubDialog(false);
             const sub = await createSubSession(type, shellBin, cwd, label, extra);
@@ -4351,13 +4580,8 @@ export function App() {
                     failedJobName: t.failedJobName,
                     failedStepName: t.failedStepName,
                   };
-                  localStorage.setItem('repo-active-tab', 'actions');
-                  if (t.sessionName && t.sessionName !== activeSession) {
-                    setPendingRepoToastSession({ sessionName: t.sessionName, focus });
-                  } else {
-                    setShowRepoPage(true);
-                    setRepoFocusLatestAction(focus);
-                  }
+                  openRepoPage({ sessionId: t.sessionName || activeSession, initialTab: 'actions' });
+                  setRepoFocusLatestAction(focus);
                 }
                 if (t.sessionName) {
                   // Reuse push notification navigation — handles sub-sessions, parent activation, etc.
@@ -4365,14 +4589,22 @@ export function App() {
                     detail: { session: t.sessionName, serverId: selectedServerId },
                   }));
                 }
-                setIdleAlerts((prev) => { const s = new Set(prev); s.delete(t.sessionName); return s; });
+                if (t.sessionName) {
+                  setIdleAlerts((prev) => {
+                    const s = new Set(prev);
+                    s.delete(t.sessionName!);
+                    return s;
+                  });
+                }
                 setToasts((prev) => prev.filter((x) => x.id !== t.id));
               }}
             >
-              <span class="toast-icon">{t.kind === 'idle' ? '✓' : '🔔'}</span>
+              <span class="toast-icon">{t.kind === 'notification' ? '🔔' : '✓'}</span>
               <span class="toast-body">
                 {t.kind === 'idle' ? (
                   <><strong>{t.project}</strong> {trans('toast.finished')}</>
+                ) : t.kind === 'success' ? (
+                  <strong>{t.title}</strong>
                 ) : (
                   <><strong>{t.title || t.project}</strong>{t.message ? <> — {t.message}</> : null}</>
                 )}

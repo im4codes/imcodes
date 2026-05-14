@@ -192,6 +192,128 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it('coalesces repeated daemon reconnect refreshes into one history request and one HTTP backfill', async () => {
+    const sessionName = `deck_http_backfill_reconnect_coalesce_${Date.now()}`;
+    const serverId = `srv-reconnect-coalesce-${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const sendTimelineHistoryRequest = vi.fn(() => `history-${sendTimelineHistoryRequest.mock.calls.length + 1}`);
+
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineReplayRequest: vi.fn(() => 'replay-reconnect-coalesce'),
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe' }, 'mounted');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('mounted');
+    });
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    fetchSpy.mockClear();
+    sendTimelineHistoryRequest.mockClear();
+
+    await act(async () => {
+      handler?.({ type: 'daemon.reconnected' } as unknown as ServerMessage);
+      handler?.({ type: 'daemon.reconnected' } as unknown as ServerMessage);
+      handler?.({ type: 'daemon.reconnected' } as unknown as ServerMessage);
+    });
+
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 999);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(650); });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      handler?.({ type: 'daemon.reconnected' } as unknown as ServerMessage);
+    });
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('times out a reconnect history request so the history overlay cannot stay running forever', async () => {
+    const sessionName = `deck_http_backfill_history_timeout_${Date.now()}`;
+    const serverId = `srv-history-timeout-${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineReplayRequest: vi.fn(() => 'replay-history-timeout'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history-timeout'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { refreshing, historyStatus } = useTimeline(sessionName, ws, serverId);
+      return h('div', {
+        'data-testid': 'probe',
+        'data-refreshing': String(refreshing),
+        'data-phase': historyStatus.phase,
+        'data-daemon': historyStatus.steps.daemon,
+      }, 'mounted');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('mounted');
+    });
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+
+    await act(async () => {
+      handler?.({ type: 'daemon.reconnected' } as unknown as ServerMessage);
+    });
+    expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('true');
+    expect(screen.getByTestId('probe').getAttribute('data-daemon')).toBe('running');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(8_100); });
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('false');
+    });
+    expect(screen.getByTestId('probe').getAttribute('data-phase')).toBe('idle');
+  });
+
   it('swallows HTTP backfill failures so they do not break the WS path', async () => {
     const sessionName = `deck_http_backfill_fail_${Date.now()}`;
     const serverId = `srv-fail-${Date.now()}`;

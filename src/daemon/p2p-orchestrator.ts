@@ -14,7 +14,17 @@ import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatusAsync } from '../agent/detect.js';
 import { getSession } from '../store/session-store.js';
 import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../agent/session-manager.js';
-import { P2P_BASELINE_PROMPT, getP2pMode, getModeForRound, isComboMode, parseModePipeline, roundPrompt, type P2pMode } from '../../shared/p2p-modes.js';
+import {
+  P2P_BASELINE_PROMPT,
+  getLegacyExecutionRoundCount,
+  getLegacyModeForExecutionRound,
+  getLegacyModeKeyForExecutionRound,
+  getP2pMode,
+  isComboMode,
+  parseModePipeline,
+  roundPrompt,
+  type P2pMode,
+} from '../../shared/p2p-modes.js';
 import {
   resolveP2pRoundPlan,
   type P2pAdvancedRound,
@@ -24,6 +34,44 @@ import {
   type P2pResolvedPlan,
   type P2pResolvedRound,
 } from '../../shared/p2p-advanced.js';
+import type {
+  P2pBindRuntimeContext,
+  P2pBoundWorkflow,
+  StartP2pRunAdvancedSource,
+} from '../../shared/p2p-workflow-types.js';
+import { recheckDangerousNodeCapabilities } from './p2p-workflow-policy-recheck.js';
+import { loadDaemonP2pStaticPolicy, getCurrentDaemonWorkflowCapabilities } from './p2p-workflow-static-policy.js';
+// Audit:R2-N1 / N5 — script-node production wiring. `runP2pScriptNode` was
+// shipped in PR-§12.1 but had ZERO production callers. The orchestrator now
+// invokes it for every compiled node with `nodeKind === 'script'`. Reverse-
+// regression #32 locks this so a future refactor can't reopen the gap.
+import { runP2pScriptNode } from './p2p-workflow-script-runner.js';
+import { acquireScriptSlot, releaseScriptSlot } from './p2p-workflow-script-concurrency.js';
+// Audit:R2-N2 — artifact runtime production wiring. `freezeP2pArtifactIdentity`
+// + `captureP2pArtifactBaseline` + `verifyP2pArtifactBaselineDelta` were
+// shipped in PR-§12.2 but had ZERO production callers. envelope_compiled runs
+// with `openspec_convention` artifacts now flow through the new helpers.
+import {
+  clearPersistedFrozenP2pArtifactIdentity,
+  freezeP2pArtifactIdentity,
+  captureP2pArtifactBaseline,
+  verifyP2pArtifactBaselineDelta,
+  loadPersistedFrozenP2pArtifactIdentities,
+  type P2pArtifactBaseline,
+  type P2pFrozenArtifactIdentity,
+} from './p2p-workflow-artifact-runtime.js';
+import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from '../../shared/p2p-workflow-diagnostics.js';
+import { evaluateP2pLogic } from '../../shared/p2p-workflow-logic-evaluator.js';
+import type { P2pWorkflowVariableValue } from '../../shared/p2p-workflow-types.js';
+import {
+  P2P_ROUTING_HISTORY_RETENTION_COUNT,
+  P2P_SCRIPT_RETRIABLE_DIAGNOSTIC_CODES,
+  P2P_SCRIPT_RETRY_DEFAULT_ATTEMPTS,
+  P2P_WORKFLOW_VARIABLE_ARRAY_MAX_ELEMENTS,
+  P2P_WORKFLOW_VARIABLE_ARRAY_MAX_ELEMENT_BYTES,
+  P2P_WORKFLOW_VARIABLE_NAME_PATTERN,
+} from '../../shared/p2p-workflow-constants.js';
+import { dropP2pDiscussionWriteQueue, enqueueP2pDiscussionWrite, flushP2pDiscussionWriteQueue } from './p2p-discussion-writer.js';
 import { formatP2pParticipantIdentity, shortP2pSessionName } from '../../shared/p2p-participant.js';
 import {
   P2P_TERMINAL_HOP_STATUSES,
@@ -37,6 +85,13 @@ import {
   type P2pRunUpdatePayload,
   type P2pSummaryPhase,
 } from '../../shared/p2p-status.js';
+import {
+  buildP2pExecutionMarker,
+  stringifyP2pExecutionMarker,
+  validateP2pExecutionMarkerContent,
+  type P2pExecutionMarker,
+  type P2pExecutionMarkerSpec,
+} from '../../shared/p2p-execution-marker.js';
 import enLocale from '../../web/src/i18n/locales/en.json' with { type: 'json' };
 import zhCNLocale from '../../web/src/i18n/locales/zh-CN.json' with { type: 'json' };
 import zhTWLocale from '../../web/src/i18n/locales/zh-TW.json' with { type: 'json' };
@@ -68,9 +123,25 @@ export interface StartP2pRunOptions {
   extraPrompt?: string;
   modeOverride?: string;
   hopTimeoutMs?: number;
+  /**
+   * Source of the advanced rounds (audit:V-1 / N-H1 / Q1). When supplied,
+   * `advanced.kind === 'envelope_compiled'` carries the bound workflow whose
+   * `bindContext.capabilitySnapshot` and `currentDaemonPolicy` are stored on
+   * the run state for downstream `recheckDangerousNodeCapabilities` calls.
+   * Pass `kind: 'supervision_internal'` to make the supervision escape hatch
+   * explicit in source review and reverse-regression checks.
+   *
+   * Older callers (cron / tests) may continue to pass the legacy
+   * `advancedPresetKey` / `advancedRounds` fields directly; v1b deletes them.
+   */
+  advanced?: StartP2pRunAdvancedSource;
+  /** @deprecated v1a passthrough — prefer `advanced` for new call sites. Removed in v1b. */
   advancedPresetKey?: string;
+  /** @deprecated v1a passthrough — prefer `advanced` for new call sites. Removed in v1b. */
   advancedRounds?: P2pAdvancedRound[];
+  /** @deprecated v1a passthrough — prefer `advanced` for new call sites. Removed in v1b. */
   advancedRunTimeoutMs?: number;
+  /** @deprecated v1a passthrough — prefer `advanced` for new call sites. Removed in v1b. */
   contextReducer?: P2pContextReducerConfig;
 }
 
@@ -123,6 +194,11 @@ export interface P2pRun {
   extraPrompt: string;
   /** Epoch ms when the current hop/phase started — used by the UI for hop-level elapsed timer. */
   hopStartedAt: number;
+  /** Post-summary original-request execution proof, reset for each cycle/final execution gate. */
+  executionAttempt?: number;
+  executionCycleCurrent?: number | null;
+  executionCycleTotal?: number | null;
+  executionMarkerPath?: string | null;
   /** Parallel hop runtime state across all rounds. */
   hopStates: P2pHopRuntime[];
   activeTargetSessions: string[];
@@ -131,12 +207,71 @@ export interface P2pRun {
   helperEligibleSnapshot: P2pParticipantSnapshotEntry[];
   contextReducer?: P2pContextReducerConfig;
   advancedRunTimeoutMs?: number;
+  /**
+   * Bind-time capability snapshot (audit:V-1 / N-H1). Present iff the run was
+   * started via `advanced: { kind: 'envelope_compiled', bound }` — i.e. the
+   * bound workflow flowed all the way through `prepareAdvancedWorkflowLaunch`.
+   * Stored on the run so dangerous-node executors can call
+   * `recheckDangerousNodeCapabilities` against the live daemon policy at
+   * execution time.
+   */
+  capabilitySnapshot?: P2pBindRuntimeContext['capabilitySnapshot'];
+  /**
+   * Bind-time daemon policy snapshot (audit:H3 / R3 PR-α). Full
+   * `P2pStaticPolicy` shape so `recheckDangerousNodeCapabilities` can compare
+   * `allowedExecutables` / `allowImplementationPermission` /
+   * `allowInterpreterScripts` field-for-field against the live daemon policy
+   * at executor time.
+   */
+  policySnapshot?: P2pBindRuntimeContext['policySnapshot'];
+  /**
+   * Full bound workflow (audit:R3 PR-α / N-M1). Holds
+   * `compiled.derivedRequiredCapabilities` plus the original bind context;
+   * required for v1b dangerous-node recheck because the helper must know what
+   * the run was bound for, not what the current draft would re-derive.
+   *
+   * MUST NOT be serialized to web/DB — `serializeP2pRun()` and
+   * `sanitizeP2pOrchestrationRunForBridge` allowlists exclude it. See
+   * reverse-regression #17 / #18.
+   */
+  boundWorkflow?: import('../../shared/p2p-workflow-types.js').P2pBoundWorkflow;
+  /**
+   * Discriminant of the advanced source used at start time. `'envelope_compiled'`
+   * marks runs that came from a validated workflow envelope; `'supervision_internal'`
+   * marks daemon-internal supervision audits (escape hatch); `undefined` is the
+   * legacy passthrough (cron / tests). Helps audit/projection code distinguish
+   * runs that obey the full v1 contract from legacy ones.
+   */
+  advancedSourceKind?: StartP2pRunAdvancedSource['kind'];
   deadlineAt?: number | null;
   currentRoundId?: string | null;
   currentExecutionStep: number;
   currentRoundAttempt: number;
   roundAttemptCounts: Record<string, number>;
   roundJumpCounts: Record<string, number>;
+  /**
+   * R3 PR-β (Cx1-H2 / W4) — per-compiled-edge usage counter for envelope_compiled
+   * runs. Independent from `roundJumpCounts` because compiled edges have
+   * per-edge `loopBudgets` (vs the round-aggregated jump budget on the
+   * legacy adapter projection). Test-only reset: see `__resetP2pRunArtifactRootCacheForTests`.
+   */
+  compiledEdgeUseCounts?: Record<string, number>;
+  /**
+   * R3 v2 PR-ζ (M2) — Per-script-round retry counter, independent of
+   * `roundAttemptCounts`. Decoupling ensures: (1) jump-rebound to the
+   * same round.id does not consume the script retry budget meant for
+   * transient errors only; (2) reset on jump can target this map without
+   * touching the canonical attempt history. `dispatchScriptRoundOrFail`
+   * reads + increments this on each retriable failure.
+   */
+  scriptRetryCounts?: Record<string, number>;
+  /**
+   * R3 v1b follow-up — mutable run variable state. Initialised from
+   * `bound.compiled.variables` (declared defaults) and patched by script
+   * nodes via `result.machineOutput.finalFrame.variables`. Logic nodes
+   * read from this map to evaluate their declarative rules.
+   */
+  runVariables?: Record<string, unknown>;
   routingHistory: Array<{
     fromRoundId?: string | null;
     toRoundId?: string | null;
@@ -154,6 +289,28 @@ export interface P2pRun {
 
 const activeRuns = new Map<string, P2pRun>();
 
+/**
+ * Audit fix (94b9b837-822 / N1) — module-level registry of "currently
+ * running script aborter" per active P2P run. Lets `cancelP2pRun` and the
+ * deadline watchdog terminate hung script-node child processes by calling
+ * the AbortController stored here, instead of relying on `run._cancelled`
+ * which a blocking `await runP2pScriptNode(...)` will never see.
+ *
+ * Without this, a script with `argv: ['/bin/sleep', '9999']` and no
+ * `script.timeoutMs` set would block `executeAdvancedChain` forever; the
+ * outer `ensureRunDeadline` check on the next loop iteration would not
+ * fire because the loop never advances. The result was that `failRun`
+ * never executed, `transition()` never ran, `scheduleP2pRunTerminalCleanup`
+ * never scheduled, and the `P2pRun` object stayed reachable in
+ * `activeRuns` until daemon restart (the underlying OOM trigger).
+ */
+const currentScriptAborters = new Map<string, () => void>();
+
+/** Test-only: clear the abort registry between tests. */
+export function __resetCurrentScriptAbortersForTests(): void {
+  currentScriptAborters.clear();
+}
+
 const P2P_POST_SUMMARY_EXECUTE_TEMPLATES: Record<string, string> = {
   en: enLocale.p2p.post_summary_execute_prompt,
   'zh-CN': zhCNLocale.p2p.post_summary_execute_prompt,
@@ -164,28 +321,137 @@ const P2P_POST_SUMMARY_EXECUTE_TEMPLATES: Record<string, string> = {
   ru: ruLocale.p2p.post_summary_execute_prompt,
 };
 
-export function buildPostSummaryExecutionPrompt(run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>): string {
+const P2P_PREVIOUS_CYCLE_AUDIT_SCOPE_TAIL_BYTES = 12 * 1024;
+const P2P_PREVIOUS_CYCLE_AUDIT_SCOPE_MAX_CHARS = 8_000;
+
+export interface PostSummaryExecutionPromptSpec extends P2pExecutionMarkerSpec {
+  markerPath: string;
+}
+
+export function buildPostSummaryExecutionPrompt(
+  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>,
+  markerSpec?: PostSummaryExecutionPromptSpec,
+  options: { attempt?: number; deadlineAt?: number } = {},
+): string {
   const template = P2P_POST_SUMMARY_EXECUTE_TEMPLATES[run.locale ?? ''] ?? P2P_POST_SUMMARY_EXECUTE_TEMPLATES.en;
-  return template
+  const basePrompt = template
     .replaceAll('{{discussionFile}}', run.contextFilePath)
     .replaceAll('{{request}}', run.userText);
+  if (!markerSpec) return basePrompt;
+
+  const successMarker = stringifyP2pExecutionMarker(buildP2pExecutionMarker(markerSpec, 'completed')).trimEnd();
+  const failureMarker = stringifyP2pExecutionMarker({
+    ...buildP2pExecutionMarker(markerSpec, 'failed'),
+    error: 'short reason',
+  }).trimEnd();
+  const deadlineLine = typeof options.deadlineAt === 'number'
+    ? `\nDeadline: ${new Date(options.deadlineAt).toISOString()}`
+    : '';
+  const attemptLine = options.attempt && options.attempt > 1
+    ? `\nThis is retry attempt ${options.attempt}; the required marker has not been observed yet.`
+    : '';
+
+  return `${basePrompt}
+
+Execution proof required before the P2P workflow can continue:
+- After you have directly executed the original request, write this exact JSON marker to: ${markerSpec.markerPath}
+- Keep runId, cycleIndex, cycleTotal, nonce, and status exactly as shown. Do not write the marker before doing the work.
+- If you cannot complete the request, write the failed marker instead and include a short error field.
+- The daemon will retry this prompt while the marker is missing; idling without the marker does not count as success.${deadlineLine}${attemptLine}
+
+Completed marker:
+\`\`\`json
+${successMarker}
+\`\`\`
+
+Failed marker:
+\`\`\`json
+${failureMarker}
+\`\`\``;
+}
+
+/*
+ * R3 v2 PR-ν — Concise i18n discussion-language instruction.
+ *
+ * Replaces the previous verbose English-only line:
+ *   "Use the user's selected i18n language (Chinese (Simplified)) for the discussion."
+ * with the locale's own native one-liner from the JSON dictionary, e.g.:
+ *   en    → "Reply in English."
+ *   zh-CN → "请用中文回复。"
+ *   ja    → "日本語で回答してください。"
+ *
+ * The native-name table uses each locale's autonym so the agent reads the
+ * instruction in the SAME language it is being asked to reply in — far less
+ * ambiguous than the bilingual mix the old line produced.
+ */
+const P2P_DISCUSSION_LANGUAGE_TEMPLATES: Record<string, string> = {
+  en: enLocale.p2p.discussion_language_instruction,
+  'zh-CN': zhCNLocale.p2p.discussion_language_instruction,
+  'zh-TW': zhTWLocale.p2p.discussion_language_instruction,
+  ja: jaLocale.p2p.discussion_language_instruction,
+  ko: koLocale.p2p.discussion_language_instruction,
+  es: esLocale.p2p.discussion_language_instruction,
+  ru: ruLocale.p2p.discussion_language_instruction,
+};
+
+const P2P_LANGUAGE_AUTONYMS: Record<string, string> = {
+  en: 'English',
+  'zh-CN': '中文',
+  'zh-TW': '繁體中文',
+  ja: '日本語',
+  ko: '한국어',
+  es: 'Español',
+  ru: 'Русский',
+};
+
+/**
+ * Build the per-run discussion-language reminder. Returns an empty string
+ * when no locale is set OR the locale is unknown — callers should treat
+ * an empty string as "skip this line" so unknown locales don't pollute
+ * prompts with a missing-language hint.
+ */
+export function buildP2pLanguageInstruction(locale: string | undefined): string {
+  if (!locale) return '';
+  const template = P2P_DISCUSSION_LANGUAGE_TEMPLATES[locale];
+  const autonym = P2P_LANGUAGE_AUTONYMS[locale];
+  if (!template || !autonym) return '';
+  return template.replaceAll('{{language}}', autonym);
 }
 
 export function getP2pRun(id: string): P2pRun | undefined { return activeRuns.get(id); }
 export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 
 export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
+  const projectedCurrentRound = Math.min(Math.max(1, run.currentRound), Math.max(1, run.rounds));
   const completedHopCount = run.hopStates.filter((hop) => hop.status === 'completed').length;
   const currentRoundCompletedHopCount = run.hopStates.filter(
-    (hop) => hop.round_index === run.currentRound && hop.status === 'completed',
+    (hop) => hop.round_index === projectedCurrentRound && hop.status === 'completed',
   ).length;
   const activeHopStates = run.hopStates.filter((hop) =>
-    hop.round_index === run.currentRound &&
+    hop.round_index === projectedCurrentRound &&
     (hop.status === 'running' || hop.status === 'dispatched'),
   );
   const currentHopState = activeHopStates[0] ?? null;
-  const currentHop = currentHopState?.session ?? run.activeTargetSessions[0] ?? run.currentTargetSession;
+  const currentHop = currentHopState?.session
+    ?? run.activeTargetSessions[0]
+    ?? run.currentTargetSession
+    ?? (run.activePhase === 'initial' || run.activePhase === 'summary' || run.activePhase === 'execution'
+      ? run.initiatorSession
+      : null);
   const hopCounts = countHopStates(run.hopStates);
+  const legacyPipelineLength = !run.advancedP2pEnabled && isComboMode(run.mode)
+    ? Math.max(1, parseModePipeline(run.mode).length)
+    : 1;
+  const legacyFlowCycleCurrent = !run.advancedP2pEnabled
+    ? Math.max(1, Math.ceil(projectedCurrentRound / legacyPipelineLength))
+    : null;
+  const legacyFlowCycleTotal = !run.advancedP2pEnabled
+    ? Math.max(1, Math.ceil(Math.max(1, run.rounds) / legacyPipelineLength))
+    : null;
+  const legacyFlowStepCurrent = !run.advancedP2pEnabled
+    ? (((projectedCurrentRound - 1) % legacyPipelineLength) + 1)
+    : null;
+  const legacyFlowStepTotal = !run.advancedP2pEnabled ? legacyPipelineLength : null;
   const routingHistory = Array.isArray(run.routingHistory) ? run.routingHistory : [];
   const latestStepByRoundId = routingHistory.reduce<Record<string, number>>((acc, entry) => {
     if (typeof entry.toRoundId === 'string' && typeof entry.atStep === 'number') {
@@ -204,7 +470,7 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     final_return_session: run.finalReturnSession,
     remaining_targets: JSON.stringify(run.remainingTargets),
     mode_key: run.mode,
-    current_round_mode: isComboMode(run.mode) ? (getModeForRound(run.mode, run.currentRound)?.key ?? run.mode) : run.mode,
+    current_round_mode: isComboMode(run.mode) ? getLegacyModeKeyForExecutionRound(run.mode, projectedCurrentRound) : run.mode,
     status: run.status,
     run_phase: run.runPhase,
     summary_phase: run.summaryPhase,
@@ -223,10 +489,17 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     remaining_count: run.remainingTargets.length,
     completed_hops_count: completedHopCount,
     completed_round_hops_count: currentRoundCompletedHopCount,
-    current_round: run.currentRound,
+    current_round: projectedCurrentRound,
     total_rounds: run.rounds,
+    flow_cycle_current: legacyFlowCycleCurrent ?? undefined,
+    flow_cycle_total: legacyFlowCycleTotal ?? undefined,
+    flow_step_current: legacyFlowStepCurrent ?? undefined,
+    flow_step_total: legacyFlowStepTotal ?? undefined,
     skipped_hops: run.skippedHops,
     active_phase: run.activePhase,
+    execution_attempt: run.executionAttempt ?? null,
+    execution_cycle_current: run.executionCycleCurrent ?? null,
+    execution_cycle_total: run.executionCycleTotal ?? null,
     hop_started_at: run.hopStartedAt || null,
     active_hop_number: currentHopState ? currentHopState.hop_index : null,
     active_round_hop_number: currentHopState && run.totalTargets > 0
@@ -300,11 +573,11 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
         agentType: string;
         ccPreset: string | null;
         mode: string;
-        phase: 'initial' | 'hop' | 'summary';
+        phase: 'initial' | 'hop' | 'summary' | 'execution';
         status: 'done' | 'active' | 'pending' | 'skipped';
       };
       const nodes: NodeInfo[] = [];
-      const getInfo = (s: string, mode: string, phase: 'initial' | 'hop' | 'summary') => {
+      const getInfo = (s: string, mode: string, phase: 'initial' | 'hop' | 'summary' | 'execution') => {
         const r = getSession(s);
         const label = r?.label || shortName(s);
         const agentType = r?.agentType ?? 'unknown';
@@ -329,14 +602,14 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
       const pipeline = combo ? parseModePipeline(run.mode) : null;
       const resolveMode = (round: number) => {
         if (!pipeline) return run.mode;
-        return pipeline[Math.min(round - 1, pipeline.length - 1)];
+        return pipeline[(Math.max(1, round) - 1) % Math.max(1, pipeline.length)] ?? run.mode;
       };
 
       const initMode = resolveMode(1);
       const init = getInfo(run.initiatorSession, initMode, 'initial');
       const phase1Done = run.currentRound > 1 || hopCounts.completed > 0 || run.status === 'completed';
       const phase1Active = run.activePhase === 'initial';
-      nodes.push({ session: run.initiatorSession, ...init, status: phase1Done ? 'done' : phase1Active ? 'active' : 'pending' });
+      nodes.push({ session: run.initiatorSession, ...init, status: phase1Active ? 'active' : phase1Done ? 'done' : 'pending' });
 
       for (const hop of run.hopStates.filter((item) => item.status === 'completed' || item.status === 'timed_out' || item.status === 'failed' || item.status === 'cancelled')) {
         const t = { session: hop.session, mode: hop.mode };
@@ -363,11 +636,17 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
         nodes.push({ session: t.session, ...info, status: 'pending' });
       }
 
-      const summaryDone = run.status === 'completed';
+      const summaryDone = run.status === 'completed' || run.summaryPhase === 'completed';
       const summaryActive = run.activePhase === 'summary' && !summaryDone;
       const lastMode = combo ? resolveMode(run.rounds) : run.mode;
       const summary = getInfo(run.initiatorSession, lastMode, 'summary');
       nodes.push({ session: run.initiatorSession, ...summary, status: summaryDone ? 'done' : summaryActive ? 'active' : 'pending' });
+      const executionActive = run.activePhase === 'execution' && !isTerminal(run.status);
+      if (executionActive || run.executionCycleCurrent != null || run.status === 'completed') {
+        const execution = getInfo(run.initiatorSession, lastMode, 'execution');
+        const executionDone = run.status === 'completed' || !isTerminal(run.status);
+        nodes.push({ session: run.initiatorSession, ...execution, status: executionActive ? 'active' : executionDone ? 'done' : 'skipped' });
+      }
       return nodes;
     })(),
   };
@@ -533,6 +812,25 @@ export async function startP2pRun(...args:
     number | undefined,
   ]
 ): Promise<P2pRun> {
+  const opts = normalizeStartP2pRunArgs(args);
+  // Audit:V-1 / N-H1 — when the caller supplies `advanced` (envelope-compiled
+  // or supervision-internal), unpack the rounds/preset/timeout from there.
+  // Otherwise fall back to the legacy `advancedPresetKey` / `advancedRounds`
+  // top-level fields. This keeps cron and existing test fixtures working
+  // while letting `prepareAdvancedWorkflowLaunch` and `supervision-automation`
+  // funnel through the typed discriminated union.
+  const advancedSource: StartP2pRunAdvancedSource | undefined = opts.advanced;
+  const advancedPresetKey = advancedSource?.kind === 'supervision_internal'
+    ? advancedSource.advancedPresetKey
+    : opts.advancedPresetKey;
+  const advancedRounds = advancedSource
+    ? advancedSource.advancedRounds
+    : opts.advancedRounds;
+  const advancedRunTimeoutMs = advancedSource?.advancedRunTimeoutMs
+    ?? opts.advancedRunTimeoutMs;
+  const contextReducer = advancedSource?.kind === 'envelope_compiled'
+    ? advancedSource.contextReducer
+    : opts.contextReducer;
   const {
     initiatorSession,
     targets,
@@ -544,11 +842,7 @@ export async function startP2pRun(...args:
     extraPrompt,
     modeOverride,
     hopTimeoutMs,
-    advancedPresetKey,
-    advancedRounds,
-    advancedRunTimeoutMs,
-    contextReducer,
-  } = normalizeStartP2pRunArgs(args);
+  } = opts;
   // Validate same domain
   const mainSession = extractMainSession(initiatorSession);
   for (const t of targets) {
@@ -599,7 +893,7 @@ export async function startP2pRun(...args:
   const P2P_MAX_ROUNDS = 6;
   const totalRounds = resolvedPlan.advanced
     ? resolvedPlan.rounds.length
-    : Math.min(P2P_MAX_ROUNDS, Math.max(1, rounds ?? 1));
+    : getLegacyExecutionRoundCount(mode, Math.min(P2P_MAX_ROUNDS, Math.max(1, rounds ?? 1)));
   const run: P2pRun = {
     id: runId,
     discussionId,
@@ -630,6 +924,10 @@ export async function startP2pRun(...args:
     allTargets: [...targets],
     extraPrompt: extraPrompt ?? '',
     hopStartedAt: Date.now(),
+    executionAttempt: 0,
+    executionCycleCurrent: null,
+    executionCycleTotal: null,
+    executionMarkerPath: null,
     hopStates: [],
     activeTargetSessions: [],
     advancedP2pEnabled: resolvedPlan.advanced,
@@ -647,9 +945,48 @@ export async function startP2pRun(...args:
     currentRoundAttempt: 1,
     roundAttemptCounts: {},
     roundJumpCounts: {},
+    // R3 v1b follow-up — initialise mutable variable state from the
+    // compiled workflow's declared variables so logic-node rules can read
+    // defaults even before any script node has patched the map. We store
+    // raw `value` because `P2pWorkflowVariableValue` widens to string |
+    // number | boolean | string[].
+    // R3 v2 PR-ζ (B1 / A5) — `runVariables` uses a null-prototype map so
+    // any later write of `__proto__` / `constructor` / `prototype` becomes
+    // a normal own property and does NOT touch the global Object.prototype
+    // chain. Defence-in-depth alongside the orchestrator's write-path name
+    // validation; even if the regex regresses, prototype pollution is
+    // structurally impossible.
+    runVariables: (() => {
+      const initial = Object.create(null) as Record<string, unknown>;
+      if (advancedSource?.kind === 'envelope_compiled') {
+        for (const variable of advancedSource.bound.compiled.variables ?? []) {
+          initial[variable.name] = variable.value;
+        }
+      }
+      return initial;
+    })(),
     routingHistory: [],
     helperDiagnostics: [],
     _cancelled: false,
+    // Audit:V-1 / N-H1 / N2 / R3 PR-α — store the bound workflow ON THE RUN
+    // so v1b dangerous-node executors can recheck against the live policy at
+    // execution time (`recheckDangerousNodeCapabilities`). The
+    // `capabilitySnapshot` and `policySnapshot` fields are convenience views;
+    // the full `boundWorkflow.bindContext` is the canonical source.
+    //
+    // For supervision-internal escapes (no bound) and legacy passthrough we
+    // leave these undefined; the recheck helper degrades to capability-string
+    // comparison only.
+    capabilitySnapshot: advancedSource?.kind === 'envelope_compiled'
+      ? advancedSource.bound.bindContext.capabilitySnapshot
+      : undefined,
+    policySnapshot: advancedSource?.kind === 'envelope_compiled'
+      ? advancedSource.bound.bindContext.policySnapshot
+      : undefined,
+    boundWorkflow: advancedSource?.kind === 'envelope_compiled'
+      ? advancedSource.bound
+      : undefined,
+    advancedSourceKind: advancedSource?.kind,
   };
 
   activeRuns.set(runId, run);
@@ -672,6 +1009,16 @@ export async function cancelP2pRun(runId: string, serverLink: ServerLink | null)
 
   run._cancelled = true;
   run.runPhase = 'cancelled';
+
+  // Audit fix (94b9b837-822 / N1) — abort any in-flight script-node child
+  // process. `_cancelled` is invisible to a blocking `await
+  // runP2pScriptNode(...)`; the AbortController sends SIGTERM (then
+  // SIGKILL after 5 s grace) to the child process group so the await
+  // settles instead of leaving the run stuck in `running` forever.
+  const aborter = currentScriptAborters.get(runId);
+  if (aborter) {
+    try { aborter(); } catch { /* ignore — best effort */ }
+  }
 
   if (run.status === 'queued') {
     run.activePhase = 'queued';
@@ -702,6 +1049,18 @@ export async function cancelP2pRun(runId: string, serverLink: ServerLink | null)
 // ── Resume after daemon restart ───────────────────────────────────────────
 
 export async function resumePendingOrchestrations(serverLink: ServerLink | null): Promise<void> {
+  // R3 v1b follow-up — Always rehydrate persisted artifact identities at
+  // daemon startup, even when serverLink is null (test harness / disconnected
+  // daemon). This restores the spec invariant "identity preserved across
+  // retry/re-entry": an in-flight run picked up after restart finds its
+  // existing frozen identity and re-uses the same slug-N suffix instead of
+  // producing a fresh one.
+  try {
+    const loaded = await loadPersistedFrozenP2pArtifactIdentities();
+    if (loaded > 0) logger.info({ loaded }, 'P2P: rehydrated persisted artifact identities');
+  } catch (err) {
+    logger.warn({ err }, 'P2P: failed to rehydrate persisted artifact identities');
+  }
   if (!serverLink) return;
   try {
     // Query server for active runs — the server handles this via WS request/response
@@ -848,8 +1207,121 @@ async function cleanupRoundHopArtifacts(roundHops: P2pHopRuntime[]): Promise<voi
   }));
 }
 
-async function dispatchPostSummaryExecutionPrompt(run: P2pRun): Promise<void> {
-  const prompt = buildPostSummaryExecutionPrompt(run);
+interface PostSummaryExecutionGateOptions {
+  cycleIndex: number;
+  cycleTotal: number;
+  timeoutMs?: number;
+}
+
+interface PostSummaryExecutionRuntimeSpec extends PostSummaryExecutionPromptSpec {
+  markerPath: string;
+}
+
+function createPostSummaryExecutionSpec(run: P2pRun, options: PostSummaryExecutionGateOptions): PostSummaryExecutionRuntimeSpec {
+  return {
+    runId: run.id,
+    cycleIndex: options.cycleIndex,
+    cycleTotal: options.cycleTotal,
+    nonce: randomUUID(),
+    markerPath: join(dirname(run.contextFilePath), `${run.id}.cycle${options.cycleIndex}.execution-marker.json`),
+  };
+}
+
+async function readPostSummaryExecutionMarker(spec: PostSummaryExecutionRuntimeSpec): Promise<ReturnType<typeof validateP2pExecutionMarkerContent> | null> {
+  try {
+    return validateP2pExecutionMarkerContent(await readFile(spec.markerPath, 'utf8'), spec);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    logger.warn({ markerPath: spec.markerPath, err }, 'P2P: failed to read post-summary execution marker');
+    return { ok: false, reason: 'marker_read_failed' };
+  }
+}
+
+async function appendPostSummaryExecutionAudit(
+  run: P2pRun,
+  spec: PostSummaryExecutionRuntimeSpec,
+  marker: P2pExecutionMarker,
+  attempts: number,
+): Promise<void> {
+  const lines = [
+    '',
+    `## P2P Original Request Execution Confirmed (cycle ${spec.cycleIndex}/${spec.cycleTotal})`,
+    '',
+    `Marker file: ${spec.markerPath}`,
+    `Status: ${marker.status}`,
+    `Attempts: ${attempts}`,
+    marker.summary ? `Summary: ${marker.summary}` : null,
+    marker.changedFiles?.length ? `Changed files: ${marker.changedFiles.join(', ')}` : null,
+    marker.tests?.length ? `Tests: ${marker.tests.join(', ')}` : null,
+    marker.completedAt ? `Completed at: ${marker.completedAt}` : null,
+    '',
+  ].filter((line): line is string => line !== null);
+  try {
+    await flushP2pDiscussionWriteQueue(run.contextFilePath);
+    await appendFile(run.contextFilePath, `\n${lines.join('\n')}`, 'utf8');
+  } catch (err) {
+    logger.warn({ runId: run.id, markerPath: spec.markerPath, err }, 'P2P: failed to append post-summary execution audit');
+  }
+}
+
+async function readDiscussionTail(filePath: string, maxBytes: number): Promise<string> {
+  let fh: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    fh = await open(filePath, 'r');
+    const { size } = await fh.stat();
+    if (size <= 0) return '';
+    const length = Math.min(maxBytes, size);
+    const buffer = Buffer.alloc(length);
+    await fh.read(buffer, 0, length, size - length);
+    return buffer.toString('utf8');
+  } finally {
+    await fh?.close().catch(() => {});
+  }
+}
+
+async function buildPreviousCycleAuditScopeInstruction(
+  run: P2pRun,
+  previousCycleIndex: number,
+  cycleTotal: number,
+): Promise<string> {
+  let previousOutputExcerpt = '';
+  try {
+    previousOutputExcerpt = (await readDiscussionTail(run.contextFilePath, P2P_PREVIOUS_CYCLE_AUDIT_SCOPE_TAIL_BYTES))
+      .slice(-P2P_PREVIOUS_CYCLE_AUDIT_SCOPE_MAX_CHARS)
+      .trim();
+  } catch (err) {
+    logger.warn({ runId: run.id, contextFilePath: run.contextFilePath, err }, 'P2P: failed to read previous cycle audit scope');
+  }
+
+  const scopeLines = [
+    `Previous cycle audit scope:`,
+    `- This is a new complete flow cycle. Treat cycle ${previousCycleIndex}/${cycleTotal} outputs as the primary audit scope for this initial analysis.`,
+    `- The previous cycle scope includes discussion evidence, the cycle summary, and the original-request execution result already appended to the discussion file.`,
+    `- First audit those previous outputs against the user's original request, then identify what the next participants should verify, deepen, or fix.`,
+  ];
+
+  if (previousOutputExcerpt) {
+    scopeLines.push(
+      '',
+      `Previous cycle output excerpt:`,
+      '```markdown',
+      previousOutputExcerpt,
+      '```',
+    );
+  } else {
+    scopeLines.push(`- If the excerpt is unavailable, read the full discussion file and audit the latest completed cycle before continuing.`);
+  }
+
+  return scopeLines.join('\n');
+}
+
+async function dispatchPostSummaryExecutionAttempt(
+  run: P2pRun,
+  spec: PostSummaryExecutionRuntimeSpec,
+  attempt: number,
+  deadlineAt: number,
+): Promise<boolean> {
+  const prompt = buildPostSummaryExecutionPrompt(run, spec, { attempt, deadlineAt });
   const session = run.initiatorSession;
   try {
     const transportRuntime = getTransportRuntime(session);
@@ -859,9 +1331,126 @@ async function dispatchPostSummaryExecutionPrompt(run: P2pRun): Promise<void> {
     } else {
       await sendKeysDelayedEnter(session, prompt);
     }
+    return true;
   } catch (err) {
-    logger.warn({ runId: run.id, session, err }, 'P2P: failed to dispatch post-summary execution prompt');
+    logger.warn({ runId: run.id, session, attempt, err }, 'P2P: failed to dispatch post-summary execution prompt');
+    return false;
   }
+}
+
+async function isPostSummaryExecutionRetryReady(
+  run: P2pRun,
+  session: string,
+  startedAt: number,
+  idleEventReceived: boolean,
+): Promise<boolean> {
+  const transportRuntime = getTransportRuntime(session);
+  if (transportRuntime) {
+    const status = transportRuntime.getStatus();
+    if (status === 'error' && !transportRuntime.sending && transportRuntime.pendingCount === 0) return true;
+    return !transportRuntime.sending && transportRuntime.pendingCount === 0 && status === 'idle';
+  }
+
+  const elapsed = Date.now() - startedAt;
+  if (!idleEventReceived && elapsed < MIN_PROCESSING_MS) return false;
+
+  const record = getSession(session);
+  const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
+  const useStoreState = agentType === 'gemini';
+  try {
+    return useStoreState
+      ? record?.state === 'idle'
+      : await detectStatusAsync(session, agentType) === 'idle';
+  } catch (err) {
+    logger.debug({ runId: run.id, session, err }, 'P2P: idle detection failed while waiting for post-summary execution marker');
+    return idleEventReceived;
+  }
+}
+
+async function runPostSummaryExecutionGate(
+  run: P2pRun,
+  serverLink: ServerLink | null,
+  options: PostSummaryExecutionGateOptions,
+): Promise<boolean> {
+  const session = run.initiatorSession;
+  const timeoutMs = Math.max(1, options.timeoutMs ?? (run.timeoutMs * 3));
+  const deadlineAt = Date.now() + timeoutMs;
+  const spec = createPostSummaryExecutionSpec(run, options);
+  let attempt = 0;
+  let lastDispatchAt = 0;
+  let idleEventReceived = false;
+  let idleWaiter: IdleWaiterHandle | undefined;
+
+  const armIdleWaiter = () => {
+    if (idleWaiter) idleWaiter.cancel();
+    idleEventReceived = false;
+    idleWaiter = waitForIdleEvent(session, Math.max(1, deadlineAt - Date.now()));
+    idleWaiter.promise.then((ok) => {
+      if (ok) idleEventReceived = true;
+    });
+  };
+
+  const sendAttempt = async () => {
+    attempt += 1;
+    lastDispatchAt = Date.now();
+    run.runPhase = 'executing_original_request';
+    run.activePhase = 'execution';
+    run.hopStartedAt = lastDispatchAt;
+    run.executionAttempt = attempt;
+    run.executionCycleCurrent = spec.cycleIndex;
+    run.executionCycleTotal = spec.cycleTotal;
+    run.executionMarkerPath = spec.markerPath;
+    pushState(run, serverLink);
+    armIdleWaiter();
+    return dispatchPostSummaryExecutionAttempt(run, spec, attempt, deadlineAt);
+  };
+
+  await sendAttempt();
+  const retryDelayMs = Math.max(IDLE_POLL_MS, Math.min(MIN_PROCESSING_MS, 5_000));
+  let lastInvalidMarkerReason: string | null = null;
+
+  try {
+    while (Date.now() < deadlineAt) {
+      if (run._cancelled || isTerminal(run.status)) return false;
+      if (!ensureRunDeadline(run, serverLink)) return false;
+
+      const markerState = await readPostSummaryExecutionMarker(spec);
+      if (markerState?.ok) {
+        await appendPostSummaryExecutionAudit(run, spec, markerState.marker, attempt);
+        logger.info({ runId: run.id, cycleIndex: spec.cycleIndex, cycleTotal: spec.cycleTotal, attempts: attempt }, 'P2P: post-summary execution marker confirmed');
+        return true;
+      }
+      if (markerState && !markerState.ok) {
+        lastInvalidMarkerReason = markerState.reason;
+        if (markerState.failedByAgent) {
+          failRun(run, 'post_summary_execution_failed', markerState.reason, serverLink);
+          return false;
+        }
+      }
+
+      await sleep(Math.min(IDLE_POLL_MS, Math.max(1, deadlineAt - Date.now())));
+      if (run._cancelled || isTerminal(run.status)) return false;
+      if (!ensureRunDeadline(run, serverLink)) return false;
+
+      if (Date.now() - lastDispatchAt < retryDelayMs) continue;
+      const retryReady = await isPostSummaryExecutionRetryReady(run, session, lastDispatchAt, idleEventReceived);
+      if (!retryReady || Date.now() >= deadlineAt) continue;
+      logger.warn({
+        runId: run.id,
+        session,
+        attempt,
+        markerPath: spec.markerPath,
+        lastInvalidMarkerReason,
+      }, 'P2P: initiator idle before execution marker; retrying post-summary execution prompt');
+      await sendAttempt();
+    }
+  } finally {
+    if (idleWaiter) idleWaiter.cancel();
+  }
+
+  logger.warn({ runId: run.id, session, timeoutMs, markerPath: spec.markerPath }, 'P2P: post-summary execution marker timed out');
+  failRun(run, 'timed_out', 'post_summary_execution_timeout', serverLink);
+  return false;
 }
 
 function scheduleRoundHopArtifactCleanup(roundHops: P2pHopRuntime[]): void {
@@ -895,14 +1484,15 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 
   // ── Multi-round loop ──
   const combo = isComboMode(run.mode);
+  const pipelineLength = combo ? Math.max(1, parseModePipeline(run.mode).length) : 1;
   for (; run.currentRound <= run.rounds; run.currentRound++) {
     if (run._cancelled || isTerminal(run.status)) return;
     run.runPhase = 'round_execution';
     run.summaryPhase = null;
 
     // For combo pipelines, resolve this round's mode; for single modes, use the fixed config
-    const roundModeConfig = combo ? getModeForRound(run.mode, run.currentRound) : modeConfig;
-    const roundModeKey = combo ? (parseModePipeline(run.mode)[Math.min(run.currentRound - 1, parseModePipeline(run.mode).length - 1)]) : run.mode;
+    const roundModeConfig = combo ? getLegacyModeForExecutionRound(run.mode, run.currentRound) : modeConfig;
+    const roundModeKey = combo ? getLegacyModeKeyForExecutionRound(run.mode, run.currentRound) : run.mode;
     const rp = roundPrompt(run.currentRound, run.rounds, combo ? roundModeKey : undefined);
     const roundLabel = run.rounds > 1 ? ` (round ${run.currentRound}/${run.rounds})` : '';
 
@@ -914,15 +1504,25 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 
     const targets = [...run.remainingTargets];
 
-    // ── Phase 1: Initiator initial analysis (first round only) ──
-    if (run.currentRound === 1) {
+    const isFlowCycleStart = ((run.currentRound - 1) % pipelineLength) === 0;
+
+    // ── Phase 1: Initiator initial analysis (first step of each complete flow cycle) ──
+    if (isFlowCycleStart) {
       if (run._cancelled) return;
       run.activePhase = 'initial';
+      const currentFlowCycle = Math.ceil(run.currentRound / pipelineLength);
+      const flowCycleTotal = Math.ceil(run.rounds / pipelineLength);
+      const previousCycleAuditScope = currentFlowCycle > 1
+        ? await buildPreviousCycleAuditScopeInstruction(run, currentFlowCycle - 1, flowCycleTotal)
+        : '';
       const initialHeader = `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Initial Analysis${roundLabel}`;
       const initialPrompt = buildHopPrompt(run, roundModeConfig, {
         session: run.initiatorSession,
         sectionHeader: initialHeader,
-        instruction: 'Read the discussion file and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
+        instruction: [
+          previousCycleAuditScope,
+          'Read the discussion file and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
+        ].filter(Boolean).join('\n\n'),
         isInitial: true,
       }, rp);
       const initialOk = await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, { sectionHeader: initialHeader, required: true });
@@ -976,8 +1576,9 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       run.summaryPhase = 'running';
       run.activePhase = 'summary';
       const isLastRound = run.currentRound === run.rounds;
+      const isFlowCycleEnd = (run.currentRound % pipelineLength) === 0;
       const summaryModeConfig = isLastRound && combo
-        ? getModeForRound(run.mode, run.rounds) // last pipeline mode for final summary
+        ? getLegacyModeForExecutionRound(run.mode, run.rounds) // last pipeline mode for final summary
         : roundModeConfig;
       const roundSummaryHeader = isLastRound
         ? `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Final Summary`
@@ -999,6 +1600,15 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       if (!summaryOk && (run._cancelled || isTerminal(run.status))) return;
       run.summaryPhase = summaryOk ? 'completed' : 'failed';
       if (run._cancelled || isTerminal(run.status)) return;
+      if (isFlowCycleEnd) {
+        const executionOk = await runPostSummaryExecutionGate(run, serverLink, {
+          cycleIndex: Math.ceil(run.currentRound / pipelineLength),
+          cycleTotal: Math.ceil(run.rounds / pipelineLength),
+          timeoutMs: run.timeoutMs * 3,
+        });
+        if (run._cancelled || isTerminal(run.status)) return;
+        if (!executionOk) return;
+      }
     } finally {
       scheduleRoundHopArtifactCleanup(roundHops);
     }
@@ -1044,18 +1654,73 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     p2pDiscussionId: run.discussionId,
     skippedHops: run.skippedHops,
   }, { source: 'daemon' });
-  await dispatchPostSummaryExecutionPrompt(run);
 
   // Keep in memory for a bit so status queries work, then clean up run entry only.
   // Discussion files are kept on disk (in .imc/discussions/) for history access.
-  setTimeout(() => {
-    activeRuns.delete(run.id);
-  }, 60_000);
+  // A3: `activeRuns.delete` is now scheduled by `scheduleP2pRunTerminalCleanup`
+  // (called from `transition('completed')` above), so no explicit timer here.
+}
+
+// Audit:R3 hardening / task 10.6 — diagnostic retention.
+//
+// Long-running advanced workflows can accumulate hundreds of helper
+// diagnostics (one per round attempt × node × loop). Without bounds the
+// `P2pRun` object grows monotonically, the projection blob grows past
+// `P2P_SANITIZE_MAX_TOTAL_BYTES` and starts truncating at the sanitizer,
+// and the `serializeP2pRun` payload exceeds frontend rendering budgets.
+//
+// Retention policy (stable ordering):
+//  - `P2P_HELPER_DIAGNOSTIC_RETENTION_COUNT` total entries kept per run.
+//  - When over count, drop the OLDEST entries first (FIFO). The most-recent
+//    entries are most useful for failure forensics; the oldest are usually
+//    transient warnings from earlier rounds.
+//  - `P2P_HELPER_DIAGNOSTIC_RETENTION_BYTES` total JSON-stringified byte
+//    budget. When exceeded, drop additional oldest entries until under
+//    budget. Single oversized entries still apply but are themselves
+//    truncated by the sanitizer downstream.
+//  - Stable ordering: insertion order preserved among retained entries.
+const P2P_HELPER_DIAGNOSTIC_RETENTION_COUNT = 100;
+const P2P_HELPER_DIAGNOSTIC_RETENTION_BYTES = 64 * 1024; // 64 KiB / run
+
+/**
+ * Audit fix (94b9b837-822 / A2) — bound `run.routingHistory` with a FIFO
+ * trim, mirroring the count-cap part of `addHelperDiagnostic`. Long-running
+ * advanced workflows that loop through compiled-edge jumps push to
+ * `routingHistory` on every jump and default-edge advance with no upper
+ * bound; combined with the projection-flush spread `[...routingHistory]`
+ * per debounce tick this is a real per-run growth source.
+ *
+ * Stable ordering: the most recent {@link P2P_ROUTING_HISTORY_RETENTION_COUNT}
+ * entries are retained — the oldest are dropped first.
+ */
+function pushRoutingHistory(run: P2pRun, entry: P2pRun['routingHistory'][number]): void {
+  run.routingHistory.push(entry);
+  while (run.routingHistory.length > P2P_ROUTING_HISTORY_RETENTION_COUNT) {
+    run.routingHistory.shift();
+  }
 }
 
 function addHelperDiagnostic(run: P2pRun, diagnostic: Omit<P2pHelperDiagnostic, 'timestamp'>): void {
   run.helperDiagnostics.push({ ...diagnostic, timestamp: Date.now() });
+  // Count cap (FIFO trim).
+  while (run.helperDiagnostics.length > P2P_HELPER_DIAGNOSTIC_RETENTION_COUNT) {
+    run.helperDiagnostics.shift();
+  }
+  // Byte cap (FIFO trim until under budget OR only newest entry remains).
+  let totalBytes = 0;
+  for (const d of run.helperDiagnostics) {
+    totalBytes += JSON.stringify(d).length;
+  }
+  while (totalBytes > P2P_HELPER_DIAGNOSTIC_RETENTION_BYTES && run.helperDiagnostics.length > 1) {
+    const dropped = run.helperDiagnostics.shift();
+    if (dropped) totalBytes -= JSON.stringify(dropped).length;
+  }
 }
+
+export const P2P_HELPER_DIAGNOSTIC_RETENTION_LIMITS = {
+  count: P2P_HELPER_DIAGNOSTIC_RETENTION_COUNT,
+  bytes: P2P_HELPER_DIAGNOSTIC_RETENTION_BYTES,
+} as const;
 
 function parseVerdictFromContent(content: string): 'PASS' | 'REWORK' | null {
   const matches = [...content.matchAll(/<!--\s*P2P_VERDICT:\s*(PASS|REWORK)\s*-->/g)];
@@ -1242,11 +1907,29 @@ async function reduceAdvancedContext(
   }
 }
 
+/**
+ * Legacy artifact baseline (oldAdvanced path only).
+ *
+ * R3 PR-γ (A3) — for envelope_compiled OpenSpec rounds, this function
+ * returns an empty baseline because the authoritative gate is now
+ * `verifyP2pArtifactBaselineDelta` against the frozen identity (see
+ * `executeAdvancedChain` post-round delta block). The legacy
+ * `readdir().join('\n')` heuristic violates spec
+ * "OpenSpec artifact verification SHALL use per-file sha256 baseline only";
+ * keeping it for envelope_compiled would be a fail-open second source.
+ *
+ * `explicit_paths` artifacts and oldAdvanced runs continue to use the
+ * legacy per-file readFile baseline.
+ */
 async function captureArtifactBaseline(run: P2pRun, round: P2pResolvedRound): Promise<Map<string, string | null>> {
   const baseline = new Map<string, string | null>();
   const record = getSession(run.initiatorSession);
   const projectDir = record?.projectDir ?? process.cwd();
   if (round.artifactConvention === 'openspec_convention') {
+    if (run.advancedSourceKind === 'envelope_compiled') {
+      // PR-γ — no legacy baseline; the new helper is the only authority.
+      return baseline;
+    }
     const target = join(projectDir, 'openspec', 'changes');
     try {
       const entries = await readdir(target);
@@ -1270,6 +1953,12 @@ async function captureArtifactBaseline(run: P2pRun, round: P2pResolvedRound): Pr
 async function validateArtifactOutputsForRound(run: P2pRun, round: P2pResolvedRound, baseline: Map<string, string | null>): Promise<void> {
   if (round.artifactConvention === 'none') return;
   if (round.artifactConvention === 'openspec_convention') {
+    if (run.advancedSourceKind === 'envelope_compiled') {
+      // PR-γ — envelope_compiled OpenSpec validation is owned by the new
+      // `verifyP2pArtifactBaselineDelta` gate (per-file sha256). The
+      // legacy `readdir().join()` heuristic is bypassed entirely.
+      return;
+    }
     const target = [...baseline.keys()][0];
     const before = baseline.get(target) ?? null;
     try {
@@ -1310,6 +1999,12 @@ function buildAdvancedPromptCommon(
   parts.push(buildAdvancedRoundPrefix(run, round));
   parts.push('');
   parts.push(P2P_BASELINE_PROMPT);
+  // R3 v2 PR-ν — concise locale-native language reminder, surfaced
+  // immediately after the baseline prompt so it's visible to the agent
+  // before any task-specific instructions. Empty string when locale is
+  // missing/unknown, so callers append nothing extra in that case.
+  const langLine = buildP2pLanguageInstruction(run.locale);
+  if (langLine) parts.push(langLine);
   if (round.presetPrompt) parts.push(round.presetPrompt);
   parts.push('');
   parts.push(`[P2P Advanced Task — run ${run.id}]`);
@@ -1377,6 +2072,417 @@ function buildAdvancedSynthesisPrompt(
   );
 }
 
+/**
+ * Audit:R3 / tasks 4.7b / 4.8b — a round is "dangerous" iff it asks the
+ * dispatcher to extend write authority beyond `analysis_only`. The recheck
+ * MUST run before every such round so a daemon policy/capability downgrade
+ * mid-run fails the round closed instead of silently bypassing the change.
+ */
+function isRoundDangerous(round: P2pResolvedRound): boolean {
+  if (round.permissionScope === 'implementation' || round.permissionScope === 'artifact_generation') return true;
+  // R3 PR-α (A4) — script-node rounds are dangerous regardless of
+  // permission scope, because script execution mutates the host environment
+  // (argv launch, env policy, file system writes, NDJSON parsing). spec
+  // "dangerous nodes SHALL recheck on policy downgrade" requires recheck on
+  // every script dispatch. The previous predicate only inspected
+  // permissionScope and silently let `analysis_only` script nodes bypass
+  // capability-downgrade detection.
+  if (round.nodeKind === 'script') return true;
+  // OpenSpec / explicit-paths artifact rounds are write-authoritative even
+  // under a permissive permissionScope; treat as dangerous when the resolved
+  // round carries an artifact convention beyond `none`.
+  if (round.artifactConvention && round.artifactConvention !== 'none') return true;
+  return false;
+}
+
+function recheckDangerousRoundOrFail(
+  run: P2pRun,
+  round: P2pResolvedRound,
+  serverLink: ServerLink | null,
+): 'ok' | 'fail_closed' {
+  const bound = run.boundWorkflow;
+  if (!bound) return 'ok';
+  // Source of truth: bound at compile/bind time, NOT recomputed from current draft.
+  const requiredCapabilities = bound.compiled.derivedRequiredCapabilities;
+  const bindCapabilitySnapshot = bound.bindContext.capabilitySnapshot.capabilities;
+  const boundPolicySnapshot = bound.bindContext.policySnapshot;
+
+  // Live state at execute time. When serverLink is null (test harness or
+  // disconnected daemon), degrade to bound snapshot — we can't observe a
+  // downgrade without a live source, so the recheck becomes a no-op rather
+  // than a false fail-closed.
+  const stubLink = { getP2pWorkflowCapabilities: () => bindCapabilitySnapshot } as unknown as ServerLink;
+  const link = serverLink ?? stubLink;
+  const currentDaemonCapabilities = getCurrentDaemonWorkflowCapabilities(link);
+  const currentDaemonPolicy = loadDaemonP2pStaticPolicy(link);
+
+  const result = recheckDangerousNodeCapabilities({
+    requiredCapabilities,
+    bindCapabilitySnapshot,
+    currentDaemonCapabilities,
+    boundPolicySnapshot,
+    currentDaemonPolicy,
+    runId: run.id,
+    nodeId: round.id,
+  });
+  if (result.ok) return 'ok';
+  // Fail the run closed; the helper diagnostic carries the precise downgrade
+  // metadata. Rely on the existing helper-diagnostic retention pipeline.
+  addHelperDiagnostic(run, {
+    code: 'P2P_DANGEROUS_NODE_RECHECK_FAILED',
+    message: result.diagnostic.summary ?? 'dangerous node recheck failed',
+    nodeId: round.id,
+    severity: 'error' as const,
+  } as unknown as Omit<P2pHelperDiagnostic, 'timestamp'>);
+  failRun(run, 'capability_downgraded_during_run', result.diagnostic.summary ?? 'recheck failed', serverLink);
+  return 'fail_closed';
+}
+
+/**
+ * Audit:R2-N1 / R3 §12.1 production wiring — when the round's compiled node
+ * is `nodeKind: 'script'` AND the run carries an envelope-compiled bound
+ * workflow, dispatch via `runP2pScriptNode` instead of the legacy
+ * `dispatchHop`. The script's stdout/stderr/machine-output are recorded into
+ * the discussion file as a "Script execution" segment so the rest of the
+ * round flow (verdict parsing, summary, etc.) sees authoritative content.
+ *
+ * Returns a synthetic "authoritative segment" string so the caller can keep
+ * its existing structure (round verdict / artifact validation / loop
+ * routing). On any failure the script-node round is marked failed via
+ * `failRun` and the helper returns null.
+ */
+async function dispatchScriptRoundOrFail(
+  run: P2pRun,
+  round: P2pResolvedRound,
+  serverLink: ServerLink | null,
+): Promise<
+  | { kind: 'ok'; authoritativeSegment: string; routingKey?: string; variables?: Record<string, unknown> }
+  | { kind: 'fail_closed' }
+  | { kind: 'retry' }
+  | { kind: 'not_a_script_round' }
+> {
+  const bound = run.boundWorkflow;
+  if (!bound) return { kind: 'not_a_script_round' };
+  // R3 PR-α (A1) — adapter now preserves `nodeKind` and `script` on the
+  // resolved round, so we read them from `round` first and fall back to the
+  // sidecar `bound.compiled.nodes.find(...)` only for old fixtures that
+  // pre-date the adapter widening. `script` may still live on `bound` even
+  // after A1 because compiled `P2pScriptNodeContract` is the authoritative
+  // shape.
+  const fallbackNode = bound.compiled.nodes.find((node) => node.id === round.id);
+  const isScript = round.nodeKind === 'script' || fallbackNode?.nodeKind === 'script';
+  const scriptContract = round.script ?? fallbackNode?.script;
+  if (!isScript || !scriptContract) {
+    return { kind: 'not_a_script_round' };
+  }
+  const policy = bound.bindContext.policySnapshot;
+  if (!policy) {
+    failRun(run, 'failed', 'Script-node round dispatch requires bound policySnapshot.', serverLink);
+    return { kind: 'fail_closed' };
+  }
+  // R3 PR-α (B3 / B5 / D-O4) — slot exhaustion now emits a structured
+  // workflow diagnostic via `helperDiagnostic.workflowDiagnostic` so web /
+  // monitoring can render the i18n key for `daemon_busy` instead of parsing
+  // free-form text.
+  const slot = acquireScriptSlot();
+  if (!slot.ok) {
+    const busyDiag = makeP2pWorkflowDiagnostic('daemon_busy', 'execute', {
+      nodeId: round.id,
+      summary: `Script slot pool exhausted (${slot.inUse}/${slot.capacity}).`,
+    });
+    addHelperDiagnostic(run, {
+      code: 'P2P_SCRIPT_SLOT_EXHAUSTED',
+      attempt: run.currentRoundAttempt,
+      sourceSession: run.initiatorSession,
+      message: busyDiag.summary ?? 'daemon_busy',
+      workflowDiagnostic: busyDiag,
+    });
+    failRun(run, 'failed', `Script slot pool exhausted (${slot.inUse}/${slot.capacity}); see daemon_busy.`, serverLink);
+    return { kind: 'fail_closed' };
+  }
+  // Audit fix (94b9b837-822 / N1) — wire an AbortController so the script
+  // child process can be terminated when (a) the user cancels the run,
+  // (b) the run's overall `deadlineAt` (default 30 min via the resolver,
+  // see `shared/p2p-advanced.ts`) expires while the script is blocked, or
+  // (c) the script's own `timeoutMs` is unset and would otherwise let
+  // `child.spawn(...)` run unbounded. Stored in the module-level
+  // `currentScriptAborters` so `cancelP2pRun` can reach in.
+  const ac = new AbortController();
+  currentScriptAborters.set(run.id, () => ac.abort());
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  if (typeof run.deadlineAt === 'number' && Number.isFinite(run.deadlineAt)) {
+    const remainingMs = Math.max(0, run.deadlineAt - Date.now());
+    if (remainingMs === 0) {
+      // Already past deadline — abort before we even launch.
+      ac.abort();
+    } else {
+      deadlineTimer = setTimeout(() => ac.abort(), remainingMs);
+      try { (deadlineTimer as { unref?: () => void }).unref?.(); } catch { /* ignore */ }
+    }
+  }
+  if (run._cancelled) ac.abort();
+  try {
+    const result = await runP2pScriptNode({
+      script: scriptContract,
+      policy,
+      repoRoot: bound.bindContext.repoRoot,
+      runId: run.id,
+      nodeId: round.id,
+      signal: ac.signal,
+    });
+    // Append a discussion-file segment so downstream verdict parsing /
+    // summary generation still sees the round's authoritative output.
+    const sectionHeader = `Script: ${round.title} (attempt ${run.currentRoundAttempt})`;
+    let segment = `\n\n## ${sectionHeader}\n\n`;
+    segment += `Exit code: ${result.exitCode}, signal: ${result.signal}, ok: ${result.ok}\n`;
+    if (result.machineOutput?.ok) {
+      segment += `\n### Machine output (final frame)\n\n\`\`\`json\n${JSON.stringify(result.machineOutput.finalFrame, null, 2)}\n\`\`\`\n`;
+    }
+    if (result.diagnostics.length) {
+      const codes = result.diagnostics.map((d) => d.code).join(', ');
+      segment += `\nDiagnostics: ${codes}\n`;
+    }
+    // R3 PR-α (B4 / D-O3) + v1b (W2) — discussion file write is now
+    // non-blocking via the per-run queue. Spec D-O3: in-memory
+    // `authoritativeSegment` is the verdict source-of-truth so the write
+    // does NOT gate dispatch latency. Failures still surface via helper
+    // diagnostic + logger.warn so audit gaps are visible.
+    //
+    // Audit fix (94b9b837-822 / A4) — closures below capture `runId` /
+    // `contextFilePath` / `attempt` as primitives instead of the full
+    // `run` object. The discussion writer's per-file `RunQueue` retains
+    // these closures via `onWriteFailure` / `onSegmentDropped`; capturing
+    // primitives means a terminal-cleanup activeRuns delete can actually
+    // free the P2pRun even if the queue hasn't drained yet. Stale-run
+    // failures swallow gracefully (no helper diagnostic destination).
+    {
+      const runId = run.id;
+      const contextFilePath = run.contextFilePath;
+      const attemptAtEnqueue = run.currentRoundAttempt;
+      const initiatorAtEnqueue = run.initiatorSession;
+      enqueueP2pDiscussionWrite(
+        contextFilePath,
+        segment,
+        (error: unknown) => {
+          const live = getP2pRun(runId);
+          if (!live) return;
+          const message = error instanceof Error ? error.message : String(error);
+          addHelperDiagnostic(live, {
+            code: 'P2P_DISCUSSION_WRITE_FAILED',
+            attempt: attemptAtEnqueue,
+            sourceSession: initiatorAtEnqueue,
+            message: `Failed to append script segment to ${contextFilePath}: ${message}`,
+          });
+        },
+        // R3 v2 PR-ζ (M1) — surface backpressure drops as helper diagnostic.
+        (droppedBytes, queuedBytes) => {
+          const live = getP2pRun(runId);
+          if (!live) return;
+          addHelperDiagnostic(live, {
+            code: 'P2P_DISCUSSION_WRITE_FAILED',
+            attempt: attemptAtEnqueue,
+            sourceSession: initiatorAtEnqueue,
+            message: `Discussion writer dropped ${droppedBytes}B due to backpressure (queued=${queuedBytes}B)`,
+          });
+        },
+      );
+    }
+    if (!result.ok) {
+      // R3 PR-α (B1 / B5) + v1b follow-up (script retry) — script
+      // execution failure either fails the round closed OR triggers a
+      // retry when ALL diagnostics are transient (e.g. `script_timeout`,
+      // `daemon_busy`) AND the round attempt count is below
+      // `P2P_SCRIPT_RETRY_DEFAULT_ATTEMPTS`. The structured workflow
+      // diagnostic is preserved via `helperDiagnostic.workflowDiagnostic`.
+      const primaryDiag: P2pWorkflowDiagnostic | undefined = result.diagnostics[0];
+      const primaryCode = primaryDiag?.code ?? 'script_machine_output_invalid';
+      const retriable = result.diagnostics.length > 0
+        && result.diagnostics.every((d) => (P2P_SCRIPT_RETRIABLE_DIAGNOSTIC_CODES as readonly string[]).includes(d.code));
+      // R3 v2 PR-ζ (M2 / ζ-10) — retry budget uses an independent counter
+      // so jump-rebound (via routing/jumpRule) doesn't consume the
+      // script transient-failure retry budget. The counter is reset
+      // when a jump targets this round (see jump block below).
+      if (!run.scriptRetryCounts) run.scriptRetryCounts = {};
+      const scriptAttemptsSoFar = run.scriptRetryCounts[round.id] ?? 0;
+      const attemptsRemain = scriptAttemptsSoFar < P2P_SCRIPT_RETRY_DEFAULT_ATTEMPTS - 1;
+      // pre-increment so the first failure shows as 1 attempt consumed
+      run.scriptRetryCounts[round.id] = scriptAttemptsSoFar + 1;
+      const attemptsSoFar = scriptAttemptsSoFar + 1;
+      for (const wd of result.diagnostics) {
+        addHelperDiagnostic(run, {
+          code: 'P2P_HELPER_PRIMARY_FAILED',
+          attempt: run.currentRoundAttempt,
+          sourceSession: run.initiatorSession,
+          message: `script:${wd.code} ${wd.summary ?? ''}`.trim(),
+          workflowDiagnostic: wd,
+        });
+      }
+      if (retriable && attemptsRemain) {
+        // Surface the retry decision but do NOT fail the run; the executor
+        // re-enters the same round (attempt count increments at the top).
+        logger.warn(
+          { runId: run.id, nodeId: round.id, attempt: attemptsSoFar, max: P2P_SCRIPT_RETRY_DEFAULT_ATTEMPTS, primaryCode },
+          'P2P: script transient failure, retrying',
+        );
+        return { kind: 'retry' };
+      }
+      failRun(
+        run,
+        'failed',
+        `Script node ${round.id} failed (exit=${result.exitCode}, signal=${result.signal ?? 'none'}); primary=${primaryCode}; attempts=${attemptsSoFar}/${P2P_SCRIPT_RETRY_DEFAULT_ATTEMPTS}`,
+        serverLink,
+      );
+      return { kind: 'fail_closed' };
+    }
+    // R3 PR-β (Cx1-H2) — surface the structured routing key from the
+    // machine output frame so the executor can route on the authoritative
+    // value instead of parsing free-form discussion text. The frame is
+    // the spec's "machine output is authoritative" source.
+    //
+    // R3 v1b follow-up — also surface the structured `variables` patch so
+    // downstream logic nodes can evaluate against the latest run state.
+    const finalFrame = result.machineOutput?.ok
+      ? (result.machineOutput.finalFrame as { routingKey?: unknown; variables?: Record<string, unknown> } | undefined)
+      : undefined;
+    const routingKey = typeof finalFrame?.routingKey === 'string' && finalFrame.routingKey.length > 0
+      ? finalFrame.routingKey
+      : undefined;
+    const variables = finalFrame?.variables && typeof finalFrame.variables === 'object' && !Array.isArray(finalFrame.variables)
+      ? finalFrame.variables
+      : undefined;
+    return {
+      kind: 'ok',
+      authoritativeSegment: segment,
+      ...(routingKey ? { routingKey } : {}),
+      ...(variables ? { variables } : {}),
+    };
+  } catch (error) {
+    failRun(run, 'failed', error instanceof Error ? error.message : String(error), serverLink);
+    return { kind: 'fail_closed' };
+  } finally {
+    releaseScriptSlot();
+    // Audit fix (94b9b837-822 / N1) — drop the aborter handle and any
+    // deadline watchdog timer. Calling `ac.abort()` here is intentional:
+    // it tears down the runner's listener even if it already settled,
+    // which is a no-op but reduces the chance of dangling event-emitter
+    // references.
+    currentScriptAborters.delete(run.id);
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+  }
+}
+
+/**
+ * Audit:R2-N2 / R3 §12.2 production wiring — for envelope_compiled runs that
+ * declare any `openspec_convention` artifact, lazily freeze the OpenSpec
+ * identity once per run (deterministic slug-N collision suffix; identity
+ * preserved across retry/re-entry in the in-memory map). Returns the frozen
+ * artifact root path the new helpers should baseline against.
+ *
+ * For runs WITHOUT openspec_convention (or for legacy non-envelope runs),
+ * returns null and the orchestrator falls back to the legacy
+ * `captureArtifactBaseline` map.
+ */
+/**
+ * R3 PR-α (W1) + PR-β (Cx1-H4) — Narrowed return type with explicit
+ * freeze-error signal. The caller no longer needs `!` to assert
+ * `run.boundWorkflow` because the helper returns the bound workflow
+ * alongside the resolved artifact root.
+ *
+ * PR-β change: when freeze attempt throws OR returns an identity with no
+ * `openspecChangePath`, we now surface `freezeError` (with the helper
+ * diagnostics from the freeze attempt when available). The orchestrator's
+ * envelope_compiled OpenSpec branch fails closed; oldAdvanced flows still
+ * fall back to the legacy baseline path so non-envelope runs are not
+ * regressed. The frozen identity is exposed so the post-round delta gate
+ * can use `identity.openspecArtifactPaths` (Cx1-H3) instead of the lossy
+ * adapter-projected `round.artifactOutputs`.
+ */
+interface RunArtifactRootResolution {
+  rootPath: string;
+  bound: P2pBoundWorkflow;
+  identity: P2pFrozenArtifactIdentity;
+  /**
+   * When set, freeze failed for this run's OpenSpec contract. envelope_compiled
+   * callers MUST `failRun` instead of silently falling back to legacy
+   * `readdir().join()` validation.
+   */
+  freezeError?: { reason: string; diagnostics: P2pWorkflowDiagnostic[] };
+}
+const runArtifactRootCache = new Map<string, RunArtifactRootResolution>();
+async function getOrFreezeRunArtifactRoot(run: P2pRun): Promise<RunArtifactRootResolution | null> {
+  const bound = run.boundWorkflow;
+  if (!bound) return null;
+  const cached = runArtifactRootCache.get(run.id);
+  if (cached) return cached;
+  // Pick the first OpenSpec convention artifact to drive identity freeze.
+  // The freeze operation is idempotent per `runId` so multiple OpenSpec
+  // nodes in the same run still freeze once.
+  let openSpecContract: { convention: 'openspec_convention'; paths: string[] } | null = null;
+  for (const node of bound.compiled.nodes) {
+    const found = node.artifacts?.find((artifact) => artifact.convention === 'openspec_convention');
+    if (found) { openSpecContract = found as { convention: 'openspec_convention'; paths: string[] }; break; }
+  }
+  if (!openSpecContract) return null;
+  // Suggest a slug derived from the run id so collision is rare in practice
+  // but `freezeP2pArtifactIdentity` still owns the slug-N collision suffix.
+  const inferredSlug = `p2p-run-${run.id.slice(0, 8)}`;
+  try {
+    const identity: P2pFrozenArtifactIdentity = await freezeP2pArtifactIdentity({
+      contract: openSpecContract,
+      runId: run.id,
+      repoRoot: bound.bindContext.repoRoot,
+      inferredSlug,
+    });
+    if (!identity.openspecChangePath) {
+      const resolution: RunArtifactRootResolution = {
+        rootPath: '',
+        bound,
+        identity,
+        freezeError: {
+          reason: 'artifact_identity_freeze_failed',
+          diagnostics: identity.diagnostics ?? [],
+        },
+      };
+      runArtifactRootCache.set(run.id, resolution);
+      return resolution;
+    }
+    const resolution: RunArtifactRootResolution = {
+      rootPath: identity.openspecChangePath,
+      bound,
+      identity,
+    };
+    runArtifactRootCache.set(run.id, resolution);
+    return resolution;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    // Surface the freeze error via the resolution shape so envelope_compiled
+    // callers can fail closed. We deliberately cache the error so retries
+    // don't re-attempt mkdir storms; the run terminates after the first
+    // visit anyway. oldAdvanced callers continue to ignore the resolution
+    // entirely (they go through the legacy `captureArtifactBaseline` path).
+    const resolution: RunArtifactRootResolution = {
+      rootPath: '',
+      bound,
+      identity: {
+        convention: 'openspec_convention',
+        openspecArtifactPaths: [],
+        frozenAt: new Date().toISOString(),
+        collisionResolved: false,
+        diagnostics: [],
+      },
+      freezeError: { reason, diagnostics: [] },
+    };
+    runArtifactRootCache.set(run.id, resolution);
+    return resolution;
+  }
+}
+
+
+/** Test-only: clear the per-run artifact-root cache between e2e tests. */
+export function __resetP2pRunArtifactRootCacheForTests(): void {
+  runArtifactRootCache.clear();
+}
+
 async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null): Promise<void> {
   const rounds = run.resolvedRounds ?? [];
   let roundIndex = 0;
@@ -1395,12 +2501,244 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
     run.activePhase = round.dispatchStyle === 'initiator_only' ? 'initial' : 'hop';
     pushState(run, serverLink);
 
+    // Audit:R3 / tasks 4.7b / 4.8b — in-tree dangerous-node recheck.
+    // Before executing any round whose semantics extend write authority
+    // (`permissionScope === 'implementation'`, OpenSpec artifact-write,
+    // script execution), re-check current daemon capabilities + policy
+    // against the bound snapshot. A capability/policy downgrade between
+    // bind and execute MUST fail the run closed — capability upgrade does
+    // NOT broaden the frozen requirement set (helper enforces).
+    if (
+      run.advancedSourceKind === 'envelope_compiled'
+      && run.boundWorkflow
+      && isRoundDangerous(round)
+    ) {
+      const recheck = recheckDangerousRoundOrFail(run, round, serverLink);
+      if (recheck === 'fail_closed') return;
+    }
+
     const artifactBaseline = await captureArtifactBaseline(run, round);
+
+    // Audit:R2-N2 / R3 PR-α / PR-β — for envelope_compiled runs that
+    // declare OpenSpec artifacts, capture the new-style baseline
+    // (size + sha256 + caps) under the frozen artifact root. The narrowed
+    // `RunArtifactRootResolution` return removes the `!` non-null assertion
+    // (W1) so future refactors can't accidentally drop the bind context.
+    //
+    // PR-β (Cx1-H4): freeze failure on an envelope_compiled run with
+    // declared OpenSpec artifacts MUST fail the run closed. The legacy
+    // `readdir().join()` validator is too weak a fallback for the OpenSpec
+    // convention (spec "freeze failure SHALL fail the run").
+    const artifactRootResolution = await getOrFreezeRunArtifactRoot(run);
+    if (
+      artifactRootResolution?.freezeError
+      && run.advancedSourceKind === 'envelope_compiled'
+      && round.artifactConvention === 'openspec_convention'
+    ) {
+      addHelperDiagnostic(run, {
+        code: 'P2P_HELPER_PRIMARY_FAILED',
+        attempt: run.currentRoundAttempt,
+        sourceSession: run.initiatorSession,
+        message: `Artifact identity freeze failed: ${artifactRootResolution.freezeError.reason}`,
+        workflowDiagnostic: artifactRootResolution.freezeError.diagnostics[0],
+      });
+      failRun(
+        run,
+        'failed',
+        `Artifact identity freeze failed for OpenSpec run: ${artifactRootResolution.freezeError.reason}`,
+        serverLink,
+      );
+      return;
+    }
+    let newArtifactBaseline: P2pArtifactBaseline | null = null;
+    if (artifactRootResolution && !artifactRootResolution.freezeError) {
+      try {
+        const captureResult = await captureP2pArtifactBaseline({
+          rootPath: artifactRootResolution.rootPath,
+          phase: 'baseline',
+          repoRoot: artifactRootResolution.bound.bindContext.repoRoot,
+        });
+        // R3 v2 PR-ζ (Cx1-A2 / ζ-9) — capture diagnostics with error
+        // severity OR `truncated === true` MUST fail the round closed.
+        // Pre v2 these were silently ignored, so artifact cap-exceeded /
+        // unsafe-root were demoted to "declared path missing" symptoms by
+        // the downstream delta verifier.
+        const errorDiag = captureResult.diagnostics.find((d) => d.severity === 'error');
+        if (errorDiag || captureResult.baseline.truncated) {
+          if (errorDiag) {
+            addHelperDiagnostic(run, {
+              code: 'P2P_HELPER_PRIMARY_FAILED',
+              attempt: run.currentRoundAttempt,
+              sourceSession: run.initiatorSession,
+              message: `Pre-round artifact baseline capture failed: ${errorDiag.code} ${errorDiag.summary ?? ''}`.trim(),
+              workflowDiagnostic: errorDiag,
+            });
+          }
+          if (captureResult.baseline.truncated) {
+            const truncDiag = makeP2pWorkflowDiagnostic('artifact_baseline_too_large', 'execute', {
+              nodeId: round.id,
+              summary: 'Artifact baseline truncated due to size cap.',
+            });
+            addHelperDiagnostic(run, {
+              code: 'P2P_HELPER_PRIMARY_FAILED',
+              attempt: run.currentRoundAttempt,
+              sourceSession: run.initiatorSession,
+              message: 'Pre-round artifact baseline truncated (cap exceeded).',
+              workflowDiagnostic: truncDiag,
+            });
+          }
+          failRun(
+            run,
+            'failed',
+            `Pre-round artifact baseline capture failed: ${errorDiag?.code ?? 'artifact_baseline_too_large'}`,
+            serverLink,
+          );
+          return;
+        }
+        newArtifactBaseline = captureResult.baseline;
+      } catch {
+        // Baseline capture can fail if the frozen root doesn't exist yet
+        // (no prior round wrote anything). Treat as empty baseline so the
+        // post-round delta sees fresh files.
+        newArtifactBaseline = null;
+      }
+    }
+
     const reducerSummary = await reduceAdvancedContext(run, round, serverLink);
     if (run._cancelled || isTerminal(run.status)) return;
 
+    // Audit:R2-N1 — script-node dispatch. When the round corresponds to a
+    // compiled `nodeKind: 'script'` node, route through the daemon script
+    // runner instead of legacy dispatchHop.
+    const scriptDispatch = await dispatchScriptRoundOrFail(run, round, serverLink);
+    if (scriptDispatch.kind === 'fail_closed') return;
+    if (scriptDispatch.kind === 'retry') {
+      // R3 v1b follow-up — transient script failure. Re-enter the same
+      // round; `roundAttemptCounts[round.id]` will increment on the next
+      // iteration's prologue. The retry budget is enforced inside
+      // `dispatchScriptRoundOrFail` so we never loop indefinitely.
+      continue;
+    }
+
     let authoritativeSegment = '';
-    if (round.dispatchStyle === 'initiator_only') {
+    // R3 PR-β (Cx1-H2) — capture the structured routing key emitted by the
+    // script's machine output frame so the compiled-edge jump logic can
+    // route on it instead of parsing free-form discussion text.
+    let scriptRoutingKey: string | undefined;
+    // R3 v1b follow-up — capture the structured logic marker emitted by
+    // a logic node so `logic_marker_equals` edges route on its value.
+    let logicMarker: string | undefined;
+    if (scriptDispatch.kind === 'ok') {
+      authoritativeSegment = scriptDispatch.authoritativeSegment;
+      scriptRoutingKey = scriptDispatch.routingKey;
+      // R3 v2 PR-ζ (B1 / A5 / B5) — Apply the structured variables patch
+      // to the run state. The orchestrator is the SINGLE write path, so
+      // it does its own defence-in-depth even though
+      // `parseP2pScriptMachineOutput` already enforced the same shape:
+      //   * key MUST match `P2P_WORKFLOW_VARIABLE_NAME_PATTERN`
+      //     (lowercase identifier — structurally rejects `__proto__` etc)
+      //   * value type ∈ string | number | boolean | string[]
+      //   * arrays SHALL be ≤ 64 elements AND every element ≤ 8 KiB
+      // Drops surface as `P2P_HELPER_PRIMARY_FAILED` helper diagnostics
+      // so users can see why their variable patch was ignored.
+      if (scriptDispatch.variables && run.runVariables) {
+        for (const [name, value] of Object.entries(scriptDispatch.variables)) {
+          if (!P2P_WORKFLOW_VARIABLE_NAME_PATTERN.test(name)) {
+            addHelperDiagnostic(run, {
+              code: 'P2P_HELPER_PRIMARY_FAILED',
+              attempt: run.currentRoundAttempt,
+              sourceSession: run.initiatorSession,
+              message: `Script variable name rejected (must match ${P2P_WORKFLOW_VARIABLE_NAME_PATTERN.source}): ${name.slice(0, 64)}`,
+            });
+            continue;
+          }
+          let acceptable = false;
+          if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+            acceptable = true;
+          } else if (Array.isArray(value)) {
+            if (value.length > P2P_WORKFLOW_VARIABLE_ARRAY_MAX_ELEMENTS) {
+              addHelperDiagnostic(run, {
+                code: 'P2P_HELPER_PRIMARY_FAILED',
+                attempt: run.currentRoundAttempt,
+                sourceSession: run.initiatorSession,
+                message: `Script variable ${name} array length ${value.length} exceeds cap ${P2P_WORKFLOW_VARIABLE_ARRAY_MAX_ELEMENTS}`,
+              });
+              continue;
+            }
+            const tooBigIndex = value.findIndex((v) => typeof v !== 'string' || Buffer.byteLength(v, 'utf8') > P2P_WORKFLOW_VARIABLE_ARRAY_MAX_ELEMENT_BYTES);
+            if (tooBigIndex >= 0) {
+              addHelperDiagnostic(run, {
+                code: 'P2P_HELPER_PRIMARY_FAILED',
+                attempt: run.currentRoundAttempt,
+                sourceSession: run.initiatorSession,
+                message: `Script variable ${name}[${tooBigIndex}] exceeds ${P2P_WORKFLOW_VARIABLE_ARRAY_MAX_ELEMENT_BYTES}B element cap or non-string`,
+              });
+              continue;
+            }
+            acceptable = true;
+          }
+          if (acceptable) run.runVariables[name] = value;
+        }
+      }
+    } else if (round.nodeKind === 'logic') {
+      // R3 v1b follow-up — logic node dispatch (envelope_compiled only).
+      // Evaluate the contract against current run.variables, append a
+      // small audit segment to the discussion file, set logicMarker for
+      // routing, and skip every other dispatch path (no agent send, no
+      // artifact verify — logic is pure).
+      const compiledNode = run.boundWorkflow?.compiled.nodes.find((node) => node.id === round.id);
+      const logic = compiledNode?.logic;
+      if (!logic) {
+        addHelperDiagnostic(run, {
+          code: 'P2P_HELPER_PRIMARY_FAILED',
+          attempt: run.currentRoundAttempt,
+          sourceSession: run.initiatorSession,
+          message: `Logic node ${round.id} has no compiled logic contract`,
+        });
+        failRun(run, 'failed', `Logic node ${round.id} missing logic contract`, serverLink);
+        return;
+      }
+      const evalResult = evaluateP2pLogic(logic, (run.runVariables ?? {}) as Record<string, P2pWorkflowVariableValue | undefined>);
+      logicMarker = evalResult.marker;
+      const sectionHeader = `Logic: ${round.title} (attempt ${run.currentRoundAttempt})`;
+      const segment = `\n\n## ${sectionHeader}\n\nemit: ${evalResult.marker}\nmatchedRuleIndex: ${evalResult.matchedRuleIndex}\n`;
+      authoritativeSegment = segment;
+      // R3 v1b (W2) + v2 PR-ζ (M1) — non-blocking + drop surfaces helper
+      // diagnostic. D-O3: in-memory authoritativeSegment is verdict
+      // source-of-truth.
+      //
+      // Audit fix (94b9b837-822 / A4) — see corresponding script-dispatch
+      // call site for rationale; closures capture primitives, not `run`.
+      const logicRunId = run.id;
+      const logicContextFilePath = run.contextFilePath;
+      const logicAttemptAtEnqueue = run.currentRoundAttempt;
+      const logicInitiatorAtEnqueue = run.initiatorSession;
+      enqueueP2pDiscussionWrite(
+        logicContextFilePath,
+        segment,
+        (error: unknown) => {
+          const live = getP2pRun(logicRunId);
+          if (!live) return;
+          const message = error instanceof Error ? error.message : String(error);
+          addHelperDiagnostic(live, {
+            code: 'P2P_DISCUSSION_WRITE_FAILED',
+            attempt: logicAttemptAtEnqueue,
+            sourceSession: logicInitiatorAtEnqueue,
+            message: `Failed to append logic segment to ${logicContextFilePath}: ${message}`,
+          });
+        },
+        (droppedBytes, queuedBytes) => {
+          const live = getP2pRun(logicRunId);
+          if (!live) return;
+          addHelperDiagnostic(live, {
+            code: 'P2P_DISCUSSION_WRITE_FAILED',
+            attempt: logicAttemptAtEnqueue,
+            sourceSession: logicInitiatorAtEnqueue,
+            message: `Discussion writer dropped ${droppedBytes}B due to backpressure (queued=${queuedBytes}B)`,
+          });
+        },
+      );
+    } else if (round.dispatchStyle === 'initiator_only') {
       const sectionHeader = `${discussionParticipantName(run.initiatorSession)} — ${round.title} (attempt ${run.currentRoundAttempt})`;
       const baselineBuffer = await readFile(run.contextFilePath).catch(() => Buffer.from(''));
       const prompt = buildAdvancedHopPrompt(
@@ -1462,8 +2800,124 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
     });
     if (run._cancelled || isTerminal(run.status)) return;
 
-    const verdict = round.requiresVerdict ? parseVerdictFromContent(authoritativeSegment) : null;
-    const effectiveVerdict = round.requiresVerdict
+    // Audit:R2-N2 / R3 PR-α (B2 / B5 / B7) / PR-β (Cx1-H3) — for
+    // envelope_compiled runs with OpenSpec artifacts, run the new-style
+    // baseline delta check as a SECOND authoritative gate (legacy
+    // `validateArtifactOutputsForRound` above remains as the first gate
+    // until PR-γ; either failing fails the round — "double gate").
+    // Post-round capture uses `phase: 'validate'` so diagnostics
+    // distinguish pre/post phases.
+    //
+    // PR-β (Cx1-H3) — `declaredFiles` now comes from
+    // `identity.openspecArtifactPaths` (the frozen identity's coordinate
+    // system) instead of `round.artifactOutputs` (the lossy adapter
+    // projection). Mismatched coordinate systems previously caused false
+    // missing-file diagnostics for valid OpenSpec writes.
+    if (artifactRootResolution && !artifactRootResolution.freezeError && round.artifactConvention === 'openspec_convention') {
+      const identityPaths = artifactRootResolution.identity.openspecArtifactPaths;
+      // When the frozen identity declared no artifact paths AND the round
+      // also declared none, there is nothing to verify; skip silently.
+      if (identityPaths.length === 0 && round.artifactOutputs.length === 0) {
+        // no-op
+      } else {
+        try {
+          const afterCapture = await captureP2pArtifactBaseline({
+            rootPath: artifactRootResolution.rootPath,
+            phase: 'validate',
+            repoRoot: artifactRootResolution.bound.bindContext.repoRoot,
+          });
+          // R3 v2 PR-ζ (Cx1-A2 / ζ-9) — post-round capture diagnostics
+          // also fail-closed; truncated baseline post-round means the
+          // round wrote more than the cap allows.
+          const errorDiag = afterCapture.diagnostics.find((d) => d.severity === 'error');
+          if (errorDiag || afterCapture.baseline.truncated) {
+            if (errorDiag) {
+              addHelperDiagnostic(run, {
+                code: 'P2P_HELPER_PRIMARY_FAILED',
+                attempt: run.currentRoundAttempt,
+                sourceSession: run.initiatorSession,
+                message: `Post-round artifact baseline capture failed: ${errorDiag.code} ${errorDiag.summary ?? ''}`.trim(),
+                workflowDiagnostic: errorDiag,
+              });
+            }
+            if (afterCapture.baseline.truncated) {
+              const truncDiag = makeP2pWorkflowDiagnostic('artifact_baseline_too_large', 'execute', {
+                nodeId: round.id,
+                summary: 'Post-round artifact baseline truncated due to size cap.',
+              });
+              addHelperDiagnostic(run, {
+                code: 'P2P_HELPER_PRIMARY_FAILED',
+                attempt: run.currentRoundAttempt,
+                sourceSession: run.initiatorSession,
+                message: 'Post-round artifact baseline truncated (cap exceeded).',
+                workflowDiagnostic: truncDiag,
+              });
+            }
+            failRun(
+              run,
+              'failed',
+              `Post-round artifact baseline capture failed: ${errorDiag?.code ?? 'artifact_baseline_too_large'}`,
+              serverLink,
+            );
+            return;
+          }
+          const before: P2pArtifactBaseline = newArtifactBaseline ?? {
+            rootPath: artifactRootResolution.rootPath,
+            files: [],
+            capturedAt: new Date().toISOString(),
+            truncated: false,
+          };
+          // Cx1-H3 — prefer frozen identity paths; fall back to the round's
+          // adapter-projected outputs only when the identity didn't surface
+          // declared paths (defensive).
+          const declaredSource = identityPaths.length > 0 ? identityPaths : round.artifactOutputs;
+          const declaredFiles = declaredSource.map((p) => ({ relativePath: p }));
+          const delta = verifyP2pArtifactBaselineDelta(before, afterCapture.baseline, declaredFiles);
+          if (!delta.ok) {
+            for (const diagnostic of delta.diagnostics) {
+              addHelperDiagnostic(run, {
+                code: 'P2P_HELPER_PRIMARY_FAILED',
+                attempt: run.currentRoundAttempt,
+                message: `Artifact contract not satisfied: ${diagnostic.code} ${diagnostic.fieldPath ?? ''} ${diagnostic.summary ?? ''}`.trim(),
+                sourceSession: run.initiatorSession,
+                workflowDiagnostic: diagnostic,
+              });
+            }
+            const primary = delta.diagnostics[0];
+            failRun(
+              run,
+              'failed',
+              `Artifact contract not satisfied: ${primary?.code ?? 'artifact_contract_not_satisfied'} ${primary?.fieldPath ?? ''}`.trim(),
+              serverLink,
+            );
+            return;
+          }
+        } catch (error) {
+          // Cap-exceeded / IO error during post-round capture: surface as a
+          // helper diagnostic so audit can see the gap. We do NOT fail the
+          // run here because the legacy `validateArtifactOutputsForRound`
+          // already ran and either passed or failed the round; failing
+          // again would double-fail. PR-γ collapses these two gates.
+          addHelperDiagnostic(run, {
+            code: 'P2P_HELPER_PRIMARY_FAILED',
+            attempt: run.currentRoundAttempt,
+            sourceSession: run.initiatorSession,
+            message: `Artifact post-round capture failed: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+      }
+    }
+
+    // R3 v1b follow-up — script and logic nodes do NOT require a verdict
+    // marker in the discussion text. Their authoritative routing input
+    // is the structured machine-output frame (script) or the evaluator
+    // result (logic). Suppressing the verdict requirement avoids spurious
+    // P2P_VERDICT_MISSING diagnostics for structured nodes.
+    const verdictRequiredForRound = round.requiresVerdict
+      && round.nodeKind !== 'script'
+      && round.nodeKind !== 'logic';
+    const verdict = verdictRequiredForRound ? parseVerdictFromContent(authoritativeSegment) : null;
+    const effectiveVerdict = verdictRequiredForRound
       ? (verdict ?? (() => {
         addHelperDiagnostic(run, {
           code: 'P2P_VERDICT_MISSING',
@@ -1475,31 +2929,171 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
       })())
       : null;
 
-    const jump = round.allowRouting && round.jumpRule
-      ? (() => {
-        const jumpCount = run.roundJumpCounts[round.id] ?? 0;
-        const belowMax = jumpCount < round.jumpRule!.maxTriggers;
-        if (!belowMax) return null;
-        if (round.verdictPolicy === 'forced_rework') {
-          if (jumpCount < round.jumpRule.minTriggers) return round.jumpRule.targetRoundId;
-          return effectiveVerdict === (round.jumpRule.marker ?? 'REWORK') ? round.jumpRule.targetRoundId : null;
+    // R3 PR-β (Cx1-H2 / A7 / A8) — for envelope_compiled runs, route on
+    // the COMPILED EDGE CONDITIONS rather than the legacy
+    // `verdictPolicy: forced_rework` projection. Conditional edges keep
+    // their full semantics:
+    //   - `routing_key_equals` is matched against `scriptRoutingKey`
+    //     (from the script's machine output frame — never read from text)
+    //   - `verdict_marker_equals` is matched against `effectiveVerdict`
+    //   - `logic_marker_equals` has no production evaluator yet; compile
+    //     should already have rejected such workflows, but if one slips
+    //     through we skip routing instead of misrouting silently.
+    // Per-edge loop budget is honoured via `bound.compiled.loopBudgets`,
+    // not the round-aggregated `roundJumpCounts`.
+    let jump: string | null = null;
+    let jumpTriggerLabel: string | null = effectiveVerdict;
+    let jumpEdgeId: string | null = null;
+    if (run.advancedSourceKind === 'envelope_compiled' && run.boundWorkflow) {
+      const compiled = run.boundWorkflow.compiled;
+      const outgoingConditional = compiled.edges.filter(
+        (edge) => edge.fromNodeId === round.id && edge.edgeKind === 'conditional',
+      );
+      for (const edge of outgoingConditional) {
+        if (!edge.condition) continue;
+        const useCount = run.compiledEdgeUseCounts?.[edge.id] ?? 0;
+        const budget = compiled.loopBudgets[edge.id] ?? Infinity;
+        if (useCount >= budget) continue;
+        let matched = false;
+        let triggerValue: string | null = null;
+        if (edge.condition.kind === 'routing_key_equals' && typeof scriptRoutingKey === 'string') {
+          matched = scriptRoutingKey === edge.condition.equals;
+          triggerValue = scriptRoutingKey;
+        } else if (edge.condition.kind === 'verdict_marker_equals' && effectiveVerdict !== null) {
+          matched = effectiveVerdict === edge.condition.equals;
+          triggerValue = effectiveVerdict;
+        } else if (edge.condition.kind === 'logic_marker_equals' && typeof logicMarker === 'string') {
+          // R3 v1b follow-up — match the logic node's emitted marker
+          // against the conditional edge condition. Authority for logic
+          // routing is the evaluator output, never discussion text.
+          matched = logicMarker === edge.condition.equals;
+          triggerValue = logicMarker;
+        } else if (edge.condition.kind === 'logic_marker_equals') {
+          // No logic marker available (the source node was not a logic
+          // node, or evaluation produced no marker). Skip — compiler is
+          // expected to reject mismatched routing authority.
+          continue;
         }
-        return effectiveVerdict === (round.jumpRule.marker ?? 'REWORK') ? round.jumpRule.targetRoundId : null;
-      })()
-      : null;
+        if (matched) {
+          jump = edge.toNodeId;
+          jumpEdgeId = edge.id;
+          jumpTriggerLabel = triggerValue;
+          break;
+        }
+      }
+    } else if (round.allowRouting && round.jumpRule) {
+      // oldAdvanced legacy routing — preserved unchanged.
+      const jumpCount = run.roundJumpCounts[round.id] ?? 0;
+      const belowMax = jumpCount < round.jumpRule.maxTriggers;
+      if (belowMax) {
+        if (round.verdictPolicy === 'forced_rework') {
+          if (jumpCount < round.jumpRule.minTriggers) {
+            jump = round.jumpRule.targetRoundId;
+          } else if (effectiveVerdict === (round.jumpRule.marker ?? 'REWORK')) {
+            jump = round.jumpRule.targetRoundId;
+          }
+        } else if (effectiveVerdict === (round.jumpRule.marker ?? 'REWORK')) {
+          jump = round.jumpRule.targetRoundId;
+        }
+      }
+    }
 
     if (jump) {
       run.roundJumpCounts[round.id] = (run.roundJumpCounts[round.id] ?? 0) + 1;
-      run.routingHistory.push({
+      if (jumpEdgeId) {
+        if (!run.compiledEdgeUseCounts) run.compiledEdgeUseCounts = {};
+        run.compiledEdgeUseCounts[jumpEdgeId] = (run.compiledEdgeUseCounts[jumpEdgeId] ?? 0) + 1;
+      }
+      // R3 v2 PR-ζ (M2 / ζ-10) — jump-rebound resets the script retry
+      // budget for the target round so a re-execution after rework
+      // starts fresh, not "halfway through" a previous transient-error
+      // budget that was consumed during the prior visit.
+      if (run.scriptRetryCounts) delete run.scriptRetryCounts[jump];
+      pushRoutingHistory(run, {
         fromRoundId: round.id,
         toRoundId: jump,
-        trigger: effectiveVerdict,
+        trigger: jumpTriggerLabel,
         atStep: run.currentExecutionStep,
         atAttempt: run.currentRoundAttempt,
         timestamp: Date.now(),
       });
       roundIndex = rounds.findIndex((entry) => entry.id === jump);
       continue;
+    }
+
+    // R3 v2 PR-η — for envelope_compiled runs, advance via the COMPILED
+    // GRAPH instead of the legacy `roundIndex++` array fallback. This
+    // closes the Cx1-A1 finding: if the current node has outgoing
+    // conditional edges but NONE matched the route AND no default edge
+    // exists, the previous code silently moved to the next round in
+    // declaration order — potentially executing an implementation /
+    // artifact_generation node WITHOUT route authorization. Now we
+    // either jump to the unique default edge or `failRun` with
+    // `unmatched_edge_route`. oldAdvanced runs keep the legacy
+    // `roundIndex++` behaviour.
+    if (run.advancedSourceKind === 'envelope_compiled' && run.boundWorkflow) {
+      const compiled = run.boundWorkflow.compiled;
+      const outgoing = compiled.edges.filter((edge) => edge.fromNodeId === round.id);
+      const hadConditional = outgoing.some((edge) => edge.edgeKind === 'conditional');
+      const defaults = outgoing.filter((edge) => edge.edgeKind === 'default');
+      if (defaults.length === 1) {
+        const next = defaults[0];
+        if (!run.compiledEdgeUseCounts) run.compiledEdgeUseCounts = {};
+        run.compiledEdgeUseCounts[next.id] = (run.compiledEdgeUseCounts[next.id] ?? 0) + 1;
+        if (run.scriptRetryCounts) delete run.scriptRetryCounts[next.toNodeId];
+        pushRoutingHistory(run, {
+          fromRoundId: round.id,
+          toRoundId: next.toNodeId,
+          trigger: 'default',
+          atStep: run.currentExecutionStep,
+          atAttempt: run.currentRoundAttempt,
+          timestamp: Date.now(),
+        });
+        roundIndex = rounds.findIndex((entry) => entry.id === next.toNodeId);
+        if (roundIndex < 0) {
+          // Compiled graph references a node not in legacy rounds —
+          // shouldn't happen, but fail closed instead of silent skip.
+          failRun(run, 'failed', `Compiled default edge target ${next.toNodeId} missing from resolved rounds`, serverLink);
+          return;
+        }
+        continue;
+      }
+      if (defaults.length > 1) {
+        const diag = makeP2pWorkflowDiagnostic('invalid_workflow_graph', 'execute', {
+          nodeId: round.id,
+          summary: `Compiled graph has ${defaults.length} default outgoing edges from node ${round.id}; expected at most 1.`,
+        });
+        addHelperDiagnostic(run, {
+          code: 'P2P_HELPER_PRIMARY_FAILED',
+          attempt: run.currentRoundAttempt,
+          sourceSession: run.initiatorSession,
+          message: diag.summary ?? 'Multiple default outgoing edges',
+          workflowDiagnostic: diag,
+        });
+        failRun(run, 'failed', `Compiled graph has multiple default edges from ${round.id}`, serverLink);
+        return;
+      }
+      // No default edge.
+      if (hadConditional) {
+        // Had conditional outgoing edges, none matched, no default —
+        // fail closed per spec "envelope_compiled SHALL fail closed
+        // when no conditional edge matches AND no default edge exists".
+        const diag = makeP2pWorkflowDiagnostic('unmatched_edge_route', 'execute', {
+          nodeId: round.id,
+          summary: `No outgoing conditional edge matched from ${round.id} and no default edge exists.`,
+        });
+        addHelperDiagnostic(run, {
+          code: 'P2P_HELPER_PRIMARY_FAILED',
+          attempt: run.currentRoundAttempt,
+          sourceSession: run.initiatorSession,
+          message: diag.summary ?? 'unmatched_edge_route',
+          workflowDiagnostic: diag,
+        });
+        failRun(run, 'failed', diag.summary ?? `unmatched_edge_route at ${round.id}`, serverLink);
+        return;
+      }
+      // No outgoing edges at all → terminal node, complete the run.
+      break;
     }
 
     roundIndex += 1;
@@ -1511,10 +3105,26 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   run.activePhase = 'summary';
   const finalRound = rounds[Math.max(rounds.length - 1, 0)];
   run.timeoutMs = finalRound?.timeoutMs ?? run.timeoutMs;
+  /*
+   * R3 v2 PR-μ — Resolution chain for the final-run summary prompt:
+   *   1. The final round's `summaryPrompt` (already resolved by
+   *      `normalizeAdvancedRound` from
+   *      `effectiveSummaryPrompt` → user override → per-preset default).
+   *      This is the workflow path; envelope_compiled runs always set it.
+   *   2. `BUILT_IN_MODES[finalMode].summaryPrompt` (legacy combo path —
+   *      audit/review/plan/discuss/brainstorm have rich per-mode
+   *      summary prompts here).
+   *   3. Generic one-line fallback (true legacy + custom modes).
+   */
+  const finalRoundSummaryPrompt = finalRound?.summaryPrompt;
+  const legacyModeSummaryPrompt = getP2pMode(finalRound?.modeKey ?? run.mode)?.summaryPrompt;
+  const resolvedFinalSummaryPrompt = finalRoundSummaryPrompt
+    ?? legacyModeSummaryPrompt
+    ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.';
   const finalPrompt = buildHopPrompt(run, getP2pMode(finalRound?.modeKey ?? run.mode), {
     session: run.initiatorSession,
     sectionHeader: `${discussionParticipantNameWithMode(run.initiatorSession, finalRound?.modeKey ?? run.mode)} — Final Summary`,
-    instruction: `${getP2pMode(finalRound?.modeKey ?? run.mode)?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.`,
+    instruction: `${resolvedFinalSummaryPrompt}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.`,
     isInitial: false,
   });
   const summaryOk = await dispatchHop(run, run.initiatorSession, finalPrompt, serverLink, {
@@ -1523,7 +3133,19 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   });
   if (!summaryOk && (run._cancelled || isTerminal(run.status))) return;
   run.summaryPhase = summaryOk ? 'completed' : 'failed';
+  if (run._cancelled || isTerminal(run.status)) return;
 
+  const executionOk = await runPostSummaryExecutionGate(run, serverLink, {
+    cycleIndex: 1,
+    cycleTotal: 1,
+    timeoutMs: run.timeoutMs * 3,
+  });
+  if (!executionOk || run._cancelled || isTerminal(run.status)) return;
+
+  // R3 v1b (W2) — flush the discussion write queue before reading so the
+  // result summary captures every queued segment instead of an
+  // intermediate snapshot.
+  await flushP2pDiscussionWriteQueue(run.contextFilePath);
   let fullContent = '';
   try {
     fullContent = await readFile(run.contextFilePath, 'utf8');
@@ -1531,8 +3153,9 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   } catch { /* ignore */ }
   run.completedAt = new Date().toISOString();
   transition(run, 'completed', serverLink);
-  await dispatchPostSummaryExecutionPrompt(run);
-  setTimeout(() => { activeRuns.delete(run.id); }, 60_000);
+  // A3: `activeRuns.delete` is now scheduled by
+  // `scheduleP2pRunTerminalCleanup` (called from `transition('completed')`
+  // above), so no explicit timer here.
 }
 
 // ── Single hop dispatch + wait ────────────────────────────────────────────
@@ -1878,6 +3501,13 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
   // Shared discussion-quality prompt
   parts.push(P2P_BASELINE_PROMPT);
 
+  // R3 v2 PR-ν — concise locale-native discussion-language reminder
+  // (e.g. "请用中文回复。"). Surfaced right after the baseline so the
+  // language requirement reaches the agent BEFORE any task-specific
+  // instructions. Empty string when locale is missing/unknown.
+  const langLine = buildP2pLanguageInstruction(run.locale);
+  if (langLine) parts.push(langLine);
+
   // Mode role prompt
   if (mode?.prompt) {
     parts.push(mode.prompt);
@@ -1940,6 +3570,55 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
+/**
+ * R3 v2 PR-ζ (A6 / O4) — Single source of truth for run-terminal cleanup.
+ * Schedules:
+ *   1. Discussion writer queue drop (frees `onWriteFailure` closure that
+ *      otherwise pins the run object).
+ *   2. Frozen artifact identity in-memory + on-disk clear.
+ *   3. `runArtifactRootCache` entry clear.
+ * Idempotent: safe to call from both `transition` and `failRun`. Wraps
+ * everything in a single 60 s `setTimeout` so a late web read can still
+ * see the discussion file / identity for a brief grace window — matching
+ * the existing `activeRuns.delete` cadence.
+ *
+ * Audit fix (94b9b837-822 / A3) — `activeRuns.delete(run.id)` is now
+ * funnelled through this single cleanup point. Previously the failed /
+ * timed_out paths hit `failRun()` which called this helper but did NOT
+ * remove the `P2pRun` from `activeRuns`, so failure/timeout runs leaked
+ * indefinitely. Only the success path (line 1278) and the older summary
+ * path (line 2710) had their own 60 s `setTimeout` to delete from
+ * `activeRuns`, so anything reaching `failed`/`timed_out` stayed forever.
+ * Cancel paths still call `activeRuns.delete(runId)` synchronously for
+ * immediate UX disappearance — the deferred delete here is then a
+ * harmless no-op miss.
+ */
+const terminalCleanupScheduled = new Set<string>();
+function scheduleP2pRunTerminalCleanup(run: P2pRun): void {
+  if (!P2P_TERMINAL_RUN_STATUSES.has(run.status)) return;
+  if (terminalCleanupScheduled.has(run.id)) return;
+  terminalCleanupScheduled.add(run.id);
+  setTimeout(() => {
+    try {
+      void dropP2pDiscussionWriteQueue(run.contextFilePath);
+    } catch { /* ignore */ }
+    try {
+      void clearPersistedFrozenP2pArtifactIdentity(run.id);
+    } catch { /* ignore */ }
+    try {
+      runArtifactRootCache.delete(run.id);
+    } catch { /* ignore */ }
+    // A3: unified activeRuns delete — covers completed/failed/timed_out/cancelled.
+    activeRuns.delete(run.id);
+    terminalCleanupScheduled.delete(run.id);
+  }, 60_000);
+}
+
+/** Test-only: clear the terminal-cleanup scheduling registry between runs. */
+export function __resetP2pRunTerminalCleanupForTests(): void {
+  terminalCleanupScheduled.clear();
+}
+
 function transition(run: P2pRun, status: P2pRunStatus, serverLink: ServerLink | null): void {
   run.status = status;
   if (status === 'completed') {
@@ -1957,6 +3636,7 @@ function transition(run: P2pRun, status: P2pRunStatus, serverLink: ServerLink | 
     } else {
       scheduleRoundHopArtifactCleanup(run.hopStates);
     }
+    scheduleP2pRunTerminalCleanup(run);
   }
   run.updatedAt = new Date().toISOString();
   logger.info({ runId: run.id, status }, 'P2P run state transition');
@@ -1980,11 +3660,22 @@ function failRun(run: P2pRun, errorType: string, message: string, serverLink: Se
   } else {
     scheduleRoundHopArtifactCleanup(run.hopStates);
   }
+  scheduleP2pRunTerminalCleanup(run);
   logger.warn({ runId: run.id, errorType, message }, 'P2P run failed');
   pushState(run, serverLink);
 }
 
-function pushState(run: P2pRun, serverLink: ServerLink | null): void {
+// Audit:R3 hardening / task 10.5 — projection 200 ms debounce. Non-terminal
+// updates within the window are coalesced (last-write-wins) so that a long
+// streaming round doesn't fire dozens of `p2p.run_save` events per second.
+// Terminal statuses (`completed` / `failed` / `timed_out` / `cancelled`) and
+// blocking diagnostics (errors) ALWAYS flush immediately — both because the
+// UI must reflect them without delay AND because a deferred terminal would
+// race with `delete activeRuns.get(runId)` cleanup.
+const PROJECTION_DEBOUNCE_MS = 200;
+const pendingProjectionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function flushProjection(run: P2pRun, serverLink: ServerLink | null): void {
   if (!serverLink) return;
   const s = run.status as string;
   const type = s === 'completed' ? 'p2p.run_complete'
@@ -1993,6 +3684,38 @@ function pushState(run: P2pRun, serverLink: ServerLink | null): void {
   try {
     serverLink.send({ type, run: serializeP2pRun(run) });
   } catch { /* not connected */ }
+}
+
+function pushState(run: P2pRun, serverLink: ServerLink | null): void {
+  if (!serverLink) return;
+  const existingTimer = pendingProjectionTimers.get(run.id);
+  if (existingTimer !== undefined) {
+    clearTimeout(existingTimer);
+    pendingProjectionTimers.delete(run.id);
+  }
+  // Terminal / blocking → flush immediately. Helper status check is
+  // intentionally over-broad (any non-running/queued/dispatched) so a future
+  // status added to `P2P_TERMINAL_RUN_STATUSES` automatically flushes.
+  const isTerminalStatus = isTerminal(run.status);
+  const isBlockingDiagnostic = (run.helperDiagnostics ?? []).some((d) => (d as { severity?: string }).severity === 'error');
+  if (isTerminalStatus || isBlockingDiagnostic) {
+    flushProjection(run, serverLink);
+    return;
+  }
+  // Non-terminal: schedule a coalesced flush.
+  const timer = setTimeout(() => {
+    pendingProjectionTimers.delete(run.id);
+    flushProjection(run, serverLink);
+  }, PROJECTION_DEBOUNCE_MS);
+  pendingProjectionTimers.set(run.id, timer);
+}
+
+/** Test-only: drain any pending throttled projections. */
+export function __flushPendingP2pProjectionsForTests(): void {
+  for (const [runId, timer] of pendingProjectionTimers) {
+    clearTimeout(timer);
+    pendingProjectionTimers.delete(runId);
+  }
 }
 
 function isTerminal(status: P2pRunStatus): boolean {

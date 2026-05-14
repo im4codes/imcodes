@@ -287,6 +287,10 @@ ${renderPlistProgramArguments(target)}
     <string>${process.env.PATH ?? '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'}</string>
     <key>HOME</key>
     <string>${homedir()}</string>
+    <!-- See bind-flow.ts.installSystemdService for rationale on these flags
+         (V8 lazy-GC + heap-limit OOM cascade observed on production daemons). -->
+    <key>NODE_OPTIONS</key>
+    <string>--expose-gc --max-old-space-size=8192</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -336,6 +340,17 @@ RestartSec=5
 KillMode=process
 Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
 Environment=HOME=${homedir()}
+# --expose-gc lets the daemon's startGcPoller proactively trigger major
+# GC, keeping RSS bounded near the live working set. Without this flag,
+# V8 lazy major GC lets old-gen garbage accumulate to many GB before
+# collection. Observed 779 MB of unreachable garbage freed in a single
+# GC cycle on a self-hosted production daemon (211, 2026-05-10),
+# correlating with the OOM cascade behind the always-offline symptom.
+# --max-old-space-size=8192 raises the V8 heap ceiling from the 4 GB
+# default so transient working-set spikes (transformers tokenizer,
+# large timeline batches) cannot OOM during the GC poll interval.
+# Both can be overridden via a drop-in.
+Environment="NODE_OPTIONS=--expose-gc --max-old-space-size=8192"
 StandardOutput=append:${logPath}
 StandardError=append:${logPath}
 

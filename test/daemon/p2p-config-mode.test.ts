@@ -7,6 +7,9 @@ import {
   parseModePipeline,
   isComboMode,
   getModeForRound,
+  getLegacyExecutionRoundCount,
+  getLegacyModeForExecutionRound,
+  getLegacyModeKeyForExecutionRound,
   getComboRoundCount,
   COMBO_PRESETS,
 } from '../../shared/p2p-modes.js';
@@ -297,6 +300,20 @@ describe('getComboRoundCount', () => {
 
   it('returns undefined for single mode', () => {
     expect(getComboRoundCount('brainstorm')).toBeUndefined();
+  });
+});
+
+describe('legacy execution cycle helpers', () => {
+  it('expands combo steps by user-selected full-flow cycles', () => {
+    expect(getLegacyExecutionRoundCount('brainstorm>discuss>plan', 2)).toBe(6);
+  });
+
+  it('wraps combo mode keys when execution continues into the next cycle', () => {
+    const combo = 'brainstorm>discuss>plan';
+    expect(getLegacyModeKeyForExecutionRound(combo, 1)).toBe('brainstorm');
+    expect(getLegacyModeKeyForExecutionRound(combo, 3)).toBe('plan');
+    expect(getLegacyModeKeyForExecutionRound(combo, 4)).toBe('brainstorm');
+    expect(getLegacyModeForExecutionRound(combo, 5)?.key).toBe('discuss');
   });
 });
 

@@ -1,6 +1,10 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
 
-import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from '../src/p2p-run-mapping.js';
+import {
+  mapP2pRunToDiscussion,
+  mergeP2pDiscussionUpdate,
+  mergeP2pStatusResponseDiscussions,
+} from '../src/p2p-run-mapping.js';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -33,6 +37,53 @@ describe('mapP2pRunToDiscussion', () => {
     expect(discussion.nodes?.map((node) => node.label)).toEqual(['brain', 'w1']);
     expect(discussion.totalHops).toBe(2);
     expect(discussion.currentSpeaker).toBe('w1');
+  });
+
+  it('preserves legacy flow cycle progress separately from execution steps', () => {
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_combo_cycle_progress',
+      status: 'running',
+      mode_key: 'brainstorm>discuss',
+      current_round_mode: 'brainstorm',
+      current_round: 3,
+      total_rounds: 4,
+      flow_cycle_current: 2,
+      flow_cycle_total: 2,
+      flow_step_current: 1,
+      flow_step_total: 2,
+      total_hops: 1,
+      active_phase: 'hop',
+    });
+
+    expect(discussion.currentRound).toBe(3);
+    expect(discussion.maxRounds).toBe(4);
+    expect(discussion.flowCycleCurrent).toBe(2);
+    expect(discussion.flowCycleTotal).toBe(2);
+    expect(discussion.flowStepCurrent).toBe(1);
+    expect(discussion.flowStepTotal).toBe(2);
+  });
+
+  it('preserves execution phase and marker-gate progress fields', () => {
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_execution_phase',
+      status: 'running',
+      mode_key: 'plan',
+      current_round: 2,
+      total_rounds: 2,
+      flow_cycle_current: 1,
+      flow_cycle_total: 1,
+      active_phase: 'execution',
+      execution_attempt: 2,
+      execution_cycle_current: 1,
+      execution_cycle_total: 1,
+      all_nodes: [
+        { label: 'brain', agentType: 'claude-code', status: 'done', phase: 'summary' },
+        { label: 'brain', agentType: 'claude-code', status: 'active', phase: 'execution' },
+      ],
+    });
+
+    expect(discussion.activePhase).toBe('execution');
+    expect(discussion.nodes?.find((node) => node.phase === 'execution')?.status).toBe('active');
   });
 
   it('maps advanced payloads to logical rounds instead of raw execution steps', () => {
@@ -321,5 +372,231 @@ describe('mapP2pRunToDiscussion', () => {
     expect(merged.hopStartedAt).toBe(existing.hopStartedAt);
     expect(merged.state).toBe('running');
     expect(merged.currentRound).toBe(1);
+  });
+
+  it('keeps existing P2P entries that are absent from a scoped status response', () => {
+    const existing = [
+      {
+        id: 'p2p_run_alpha',
+        topic: 'P2P audit · alpha',
+        state: 'running',
+        currentRound: 1,
+        maxRounds: 2,
+        completedHops: 0,
+        totalHops: 2,
+      },
+      {
+        id: 'p2p_run_beta',
+        topic: 'P2P review · beta',
+        state: 'running',
+        currentRound: 1,
+        maxRounds: 1,
+        completedHops: 0,
+        totalHops: 1,
+      },
+    ];
+
+    const merged = mergeP2pStatusResponseDiscussions(existing, []);
+
+    expect(merged.map((d) => d.id)).toEqual(['p2p_run_alpha', 'p2p_run_beta']);
+  });
+
+  it('removes only an explicitly missing status run', () => {
+    const existing = [
+      {
+        id: 'p2p_run_alpha',
+        topic: 'P2P audit · alpha',
+        state: 'running',
+        currentRound: 1,
+        maxRounds: 2,
+        completedHops: 0,
+        totalHops: 2,
+      },
+      {
+        id: 'p2p_run_beta',
+        topic: 'P2P review · beta',
+        state: 'running',
+        currentRound: 1,
+        maxRounds: 1,
+        completedHops: 0,
+        totalHops: 1,
+      },
+    ];
+
+    const merged = mergeP2pStatusResponseDiscussions(existing, [], {
+      runId: 'run_alpha',
+      runFound: false,
+    });
+
+    expect(merged.map((d) => d.id)).toEqual(['p2p_run_beta']);
+  });
+
+  it('exposes workflow_projection.diagnostics on the run model', () => {
+    // PR-D: the bridge now retains daemon-emitted workflow diagnostics inside
+    // workflow_projection. mapP2pRunToDiscussion MUST surface them so the
+    // progress card can render them with translated messageKey + summary.
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_with_diagnostics',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 1,
+      total_hops: 1,
+      active_phase: 'hop',
+      workflow_projection: {
+        projectionVersion: 1,
+        runId: 'run_with_diagnostics',
+        workflowId: 'audit',
+        status: 'running',
+        completedNodeIds: [],
+        diagnostics: [
+          {
+            code: 'daemon_busy',
+            phase: 'bind',
+            severity: 'error',
+            messageKey: 'p2p.workflow.diagnostics.daemon_busy',
+            summary: 'busy',
+            runId: 'run_with_diagnostics',
+          },
+          {
+            code: 'private_projection_field_dropped',
+            phase: 'sanitize',
+            severity: 'warning',
+            messageKey: 'p2p.workflow.diagnostics.private_projection_field_dropped',
+            summary: 'Sanitized oversized workflow payload',
+            runId: 'run_with_diagnostics',
+          },
+        ],
+        updatedAt: '2026-04-09T00:00:00.000Z',
+      },
+    });
+
+    expect(discussion.diagnostics).toBeDefined();
+    expect(discussion.diagnostics?.map((d) => d.code).sort()).toEqual([
+      'daemon_busy',
+      'private_projection_field_dropped',
+    ]);
+    const daemonBusy = discussion.diagnostics?.find((d) => d.code === 'daemon_busy');
+    expect(daemonBusy?.messageKey).toBe('p2p.workflow.diagnostics.daemon_busy');
+    expect(daemonBusy?.summary).toBe('busy');
+    expect(daemonBusy?.severity).toBe('error');
+  });
+
+  it('falls back to top-level diagnostics when workflow_projection is missing', () => {
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_legacy_diags',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 1,
+      total_hops: 1,
+      active_phase: 'hop',
+      diagnostics: [
+        {
+          code: 'missing_required_capability',
+          phase: 'bind',
+          severity: 'error',
+          messageKey: 'p2p.workflow.diagnostics.missing_required_capability',
+        },
+      ],
+    });
+
+    expect(discussion.diagnostics?.map((d) => d.code)).toEqual(['missing_required_capability']);
+  });
+
+  it('drops unknown diagnostic codes from the run mapping', () => {
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_bad_diags',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 1,
+      total_hops: 1,
+      active_phase: 'hop',
+      workflow_projection: {
+        projectionVersion: 1,
+        runId: 'run_bad_diags',
+        workflowId: 'audit',
+        status: 'running',
+        completedNodeIds: [],
+        diagnostics: [
+          { code: 'totally_made_up_code', phase: 'execute', severity: 'error' },
+          { code: 'daemon_busy', phase: 'bind', severity: 'error' },
+        ],
+        updatedAt: '2026-04-09T00:00:00.000Z',
+      },
+    });
+
+    expect(discussion.diagnostics?.map((d) => d.code)).toEqual(['daemon_busy']);
+  });
+
+  // Audit fix (P2P bar scoping) — pin the contract that the mapping
+  // preserves session-identity fields so `app.tsx` can filter the bar
+  // to the user's current session view. Without these, every active
+  // session view rendered the bar for every running P2P discussion
+  // across the daemon.
+  describe('session-identity fields for bar scoping', () => {
+    it('preserves mainSession + initiatorSession + participantSessions for advanced runs', () => {
+      const discussion = mapP2pRunToDiscussion({
+        id: 'run_with_sessions',
+        status: 'running',
+        mode_key: 'discuss',
+        current_round: 1,
+        total_rounds: 1,
+        active_phase: 'hop',
+        main_session: 'deck_proj_brain',
+        initiator_session: 'deck_proj_brain',
+        current_target_session: 'deck_sub_a',
+        hop_states: [
+          { hop_index: 1, round_index: 1, session: 'deck_sub_a', status: 'running' },
+          { hop_index: 2, round_index: 1, session: 'deck_sub_b', status: 'queued' },
+        ],
+      });
+
+      expect(discussion.mainSession).toBe('deck_proj_brain');
+      expect(discussion.initiatorSession).toBe('deck_proj_brain');
+      // De-duplicated set: initiator + main + current target + every hop session.
+      expect(discussion.participantSessions?.sort()).toEqual([
+        'deck_proj_brain', 'deck_sub_a', 'deck_sub_b',
+      ]);
+    });
+
+    it('omits session fields when run payload lacks them (legacy)', () => {
+      const discussion = mapP2pRunToDiscussion({
+        id: 'run_legacy_no_session',
+        status: 'running',
+        mode_key: 'audit',
+        current_round: 1,
+        total_rounds: 1,
+        total_hops: 0,
+        active_phase: 'queued',
+      });
+
+      expect(discussion.mainSession).toBeUndefined();
+      expect(discussion.initiatorSession).toBeUndefined();
+      // Legacy: undefined — caller treats this as "show unscoped".
+      expect(discussion.participantSessions).toBeUndefined();
+    });
+
+    it('aggregates participants from all_targets when hop_states is absent', () => {
+      const discussion = mapP2pRunToDiscussion({
+        id: 'run_pre_dispatch',
+        status: 'queued',
+        mode_key: 'audit',
+        current_round: 1,
+        total_rounds: 1,
+        active_phase: 'queued',
+        main_session: 'deck_proj_brain',
+        initiator_session: 'deck_proj_brain',
+        all_targets: [
+          { session: 'deck_sub_a', mode: 'audit' },
+          { session: 'deck_sub_b', mode: 'audit' },
+        ],
+      });
+
+      expect(discussion.participantSessions?.sort()).toEqual([
+        'deck_proj_brain', 'deck_sub_a', 'deck_sub_b',
+      ]);
+    });
   });
 });

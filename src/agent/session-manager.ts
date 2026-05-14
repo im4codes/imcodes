@@ -158,6 +158,10 @@ export function persistSessionRecord(record: SessionRecord | null, name: string)
   emitSessionPersist(record, name);
 }
 
+export async function persistSessionRecordAwaited(record: SessionRecord | null, name: string): Promise<void> {
+  await _onSessionPersist?.(record, name);
+}
+
 export interface ProjectConfig {
   name: string;
   dir: string;
@@ -1381,6 +1385,8 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       let systemPrompt: string | undefined;
       let transportSettings: string | Record<string, unknown> | undefined;
       let effectiveRequestedModel = requestedTransportModel;
+      let restoredPresetContextWindow = s.presetContextWindow;
+      let qwenPresetUsesApiKey = false;
       const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
         projectDir: s.projectDir,
         transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
@@ -1398,17 +1404,22 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
         const presetConfig = await getQwenPresetTransportConfig(s.ccPreset);
         extraEnv = { ...(extraEnv ?? {}), ...presetConfig.env };
-        if (presetConfig.availableModels?.length) availableQwenModels = presetConfig.availableModels;
-        if (!effectiveRequestedModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveRequestedModel))) {
-          effectiveRequestedModel = presetConfig.model ?? availableQwenModels[0] ?? effectiveRequestedModel;
+        const presetModels = presetConfig.availableModels ?? [];
+        if (presetModels.length) availableQwenModels = presetModels;
+        const presetPreferredModel = presetConfig.model ?? presetModels[0];
+        if (presetPreferredModel && (!effectiveRequestedModel || !presetModels.length || !presetModels.includes(effectiveRequestedModel))) {
+          effectiveRequestedModel = presetPreferredModel;
         }
         transportSettings = presetConfig.settings;
+        qwenPresetUsesApiKey = !!presetConfig.settings;
+        restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
         // Override the qwen CLI's built-in "I am Qwen Code" identity with the
         // preset's runtime-facts prompt — without this, the model introduces
         // itself as Qwen / 通义千问 even when the turn is served by MiniMax.
         if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
       }
       if (s.providerId === 'qwen'
+        && !s.ccPreset
         && (!effectiveRequestedModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveRequestedModel)))) {
         effectiveRequestedModel = availableQwenModels[0] ?? effectiveRequestedModel;
       }
@@ -1466,22 +1477,23 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         // against a user-provided API key (BYO tier). The user-level
         // `~/.qwen/settings.json` tier labels ("Free", "No longer available")
         // are misleading in that context, so override them for preset sessions.
-        qwenAuthType: (s.providerId === 'qwen' && s.ccPreset)
+        qwenAuthType: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
           ? QWEN_AUTH_TYPES.API_KEY
           : (qwenRuntime?.authType ?? s.qwenAuthType),
-        qwenAuthLimit: (s.providerId === 'qwen' && s.ccPreset)
+        qwenAuthLimit: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
           ? undefined
           : (qwenRuntime?.authLimit ?? s.qwenAuthLimit),
         ...(availableQwenModels.length > 0 ? { qwenAvailableModels: availableQwenModels } : {}),
+        ...(restoredPresetContextWindow ? { presetContextWindow: restoredPresetContextWindow } : {}),
         ...getQwenDisplayMetadata({
           model: effectiveRequestedModel,
-          authType: (s.providerId === 'qwen' && s.ccPreset)
+          authType: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
             ? QWEN_AUTH_TYPES.API_KEY
             : (qwenRuntime?.authType ?? s.qwenAuthType),
-          authLimit: (s.providerId === 'qwen' && s.ccPreset)
+          authLimit: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
             ? undefined
             : (qwenRuntime?.authLimit ?? s.qwenAuthLimit),
-          quotaUsageLabel: (s.providerId === 'qwen' && s.ccPreset)
+          quotaUsageLabel: (s.providerId === 'qwen' && s.ccPreset && qwenPresetUsesApiKey)
             ? undefined
             : ((qwenRuntime?.authType ?? s.qwenAuthType) === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined),
         }),
@@ -1505,37 +1517,74 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       // leave the optimistic pending bubble in place; it will be reconciled
       // once the turn actually fires.
       // Failures are logged and entries dropped to avoid retry loops.
+      //
+      // R-Drain fix (audit cae1de69-826) — `await drainResend(...)` instead
+      // of `void drainResend(...)`. The dispatcher is synchronous and
+      // `runtime.send()` synchronously sets `_sending=true` via
+      // `_dispatchTurn`, so the current race window is effectively zero
+      // (verified in transport-session-runtime.ts:376-462). The change is
+      // defensive: it ensures the resend queue has been fully transferred
+      // into either `_sending`/active state or `runtime._pendingMessages`
+      // before `restoreTransportSessions` returns. This protects against
+      // future refactors that might insert an `await` between
+      // `transportRuntimes.set` and `drainResend`, which WOULD reintroduce
+      // a real race window letting msg-2 arrive at `handleSend` while
+      // `_sending` is still false.
       const pendingCount = getResendCount(s.name);
       if (pendingCount > 0) {
         logger.info({ session: s.name, pendingCount }, 'Draining transport resend queue after reconnect');
-        void drainResend(s.name, (entry) => {
-          const attachments = entry.attachments ?? [];
-          const result = entry.messagePreamble
-            ? runtime.send(
-              entry.text,
-              entry.commandId,
-              attachments.length > 0 ? attachments : undefined,
-              entry.messagePreamble,
-            )
-            : (attachments.length > 0
-                ? runtime.send(entry.text, entry.commandId, attachments)
-                : runtime.send(entry.text, entry.commandId));
-          if (result === 'sent') {
+        try {
+          await drainResend(s.name, (entry) => {
+            const attachments = entry.attachments ?? [];
+            const result = entry.messagePreamble
+              ? runtime.send(
+                entry.text,
+                entry.commandId,
+                attachments.length > 0 ? attachments : undefined,
+                entry.messagePreamble,
+              )
+              : (attachments.length > 0
+                  ? runtime.send(entry.text, entry.commandId, attachments)
+                  : runtime.send(entry.text, entry.commandId));
+            if (result === 'sent') {
+              timelineEmitter.emit(
+                s.name,
+                'user.message',
+                {
+                  text: entry.text,
+                  allowDuplicate: true,
+                  commandId: entry.commandId,
+                  clientMessageId: entry.commandId,
+                  ...(attachments.length > 0 ? { attachments } : {}),
+                },
+                { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
+              );
+            }
+            return result;
+          },
+          // N-R6 fix (audit 0419d1ac-1f4) — surface a single user-visible
+          // summary when one or more queued messages were dropped because
+          // they exceeded RESEND_EXPIRY_MS. The web client's queued
+          // reconciliation has already added these commandIds to
+          // `settledCommandIdsRef`, so a per-entry `command.ack error`
+          // would be swallowed by `markOptimisticFailed`'s settle guard.
+          // The `assistant.text` summary is the only path the user sees.
+          ({ expiredCount }) => {
+            const minutes = Math.round((5 * 60 * 1000) / 60_000); // RESEND_EXPIRY_MS / minute
             timelineEmitter.emit(
               s.name,
-              'user.message',
+              'assistant.text',
               {
-                text: entry.text,
-                allowDuplicate: true,
-                commandId: entry.commandId,
-                clientMessageId: entry.commandId,
-                ...(attachments.length > 0 ? { attachments } : {}),
+                text: `⚠️ ${expiredCount} 条排队消息超过 ${minutes} 分钟未送达，已丢弃。请重新发送。`,
+                streaming: false,
+                memoryExcluded: true,
               },
-              { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
+              { source: 'daemon', confidence: 'high' },
             );
-          }
-          return result;
-        }).catch((err) => logger.warn({ err, session: s.name }, 'transport resend drain failed'));
+          });
+        } catch (err) {
+          logger.warn({ err, session: s.name }, 'transport resend drain failed');
+        }
       }
     } catch (err) {
       logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
@@ -1638,10 +1687,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         presetContextWindow = presetConfig.contextWindow;
         if (presetConfig.settings) transportSettings = presetConfig.settings;
         if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
-      qwenAuthType = QWEN_AUTH_TYPES.API_KEY;
-      qwenAuthLimit = undefined;
+        if (presetConfig.settings) {
+          qwenAuthType = QWEN_AUTH_TYPES.API_KEY;
+          qwenAuthLimit = undefined;
+        }
     }
-    if (!requestedTransportModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(requestedTransportModel))) {
+    if (!effectiveCcPreset && (!requestedTransportModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(requestedTransportModel)))) {
       requestedTransportModel = availableQwenModels[0] ?? requestedTransportModel;
     }
     const stored = !opts.fresh ? existing?.providerSessionId : undefined;
@@ -1818,30 +1869,56 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   // Emits user.message on 'sent' for the same reason the reconnect drain
   // does: the enqueue path skipped the emit so the timeline doesn't lie,
   // and now the turn is actually firing.
+  //
+  // R-Drain fix (audit cae1de69-826) — `await drainResend(...)` so the
+  // launch promise (and the per-session relaunch lock held by
+  // `runExclusiveSessionRelaunch`) does not resolve until the resend
+  // queue has been fully transferred into the runtime. See the matching
+  // change in `restoreTransportSessions` above for the full rationale.
   const pendingResendCount = getResendCount(name);
   if (pendingResendCount > 0) {
     logger.info({ session: name, pendingCount: pendingResendCount }, 'Draining transport resend queue after launch');
-    void drainResend(name, (entry) => {
-      const attachments = entry.attachments ?? [];
-      const result = attachments.length > 0
-        ? runtime.send(entry.text, entry.commandId, attachments)
-        : runtime.send(entry.text, entry.commandId);
-      if (result === 'sent') {
+    try {
+      await drainResend(name, (entry) => {
+        const attachments = entry.attachments ?? [];
+        const result = attachments.length > 0
+          ? runtime.send(entry.text, entry.commandId, attachments)
+          : runtime.send(entry.text, entry.commandId);
+        if (result === 'sent') {
+          timelineEmitter.emit(
+            name,
+            'user.message',
+            {
+              text: entry.text,
+              allowDuplicate: true,
+              commandId: entry.commandId,
+              clientMessageId: entry.commandId,
+              ...(attachments.length > 0 ? { attachments } : {}),
+            },
+            { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
+          );
+        }
+        return result;
+      },
+      // N-R6 fix (audit 0419d1ac-1f4) — same TTL-expired summary as the
+      // restoreTransportSessions caller above. See that callsite for the
+      // full rationale.
+      ({ expiredCount }) => {
+        const minutes = Math.round((5 * 60 * 1000) / 60_000);
         timelineEmitter.emit(
           name,
-          'user.message',
+          'assistant.text',
           {
-            text: entry.text,
-            allowDuplicate: true,
-            commandId: entry.commandId,
-            clientMessageId: entry.commandId,
-            ...(attachments.length > 0 ? { attachments } : {}),
+            text: `⚠️ ${expiredCount} 条排队消息超过 ${minutes} 分钟未送达，已丢弃。请重新发送。`,
+            streaming: false,
+            memoryExcluded: true,
           },
-          { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
+          { source: 'daemon', confidence: 'high' },
         );
-      }
-      return result;
-    }).catch((err) => logger.warn({ err, session: name }, 'transport resend drain (launch) failed'));
+      });
+    } catch (err) {
+      logger.warn({ err, session: name }, 'transport resend drain (launch) failed');
+    }
   }
 }
 

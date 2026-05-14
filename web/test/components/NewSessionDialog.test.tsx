@@ -388,6 +388,53 @@ describe('NewSessionDialog', () => {
     }));
   });
 
+  it('shows a toast when qwen preset JSON is copied to the clipboard', async () => {
+    const clipboardWriteText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: clipboardWriteText },
+    });
+    const onToast = vi.fn();
+    const ws = makeWs();
+    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
+      handler({
+        type: 'cc.presets.list_response',
+        presets: [
+          {
+            name: 'MiniMax',
+            env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+            defaultModel: 'MiniMax-M2.7',
+          },
+        ],
+      });
+      return () => {};
+    });
+
+    render(
+      <NewSessionDialog
+        ws={ws as any}
+        onClose={vi.fn()}
+        onSessionStarted={vi.fn()}
+        isProviderConnected={() => false}
+        onToast={onToast}
+      />,
+    );
+
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    agentTypeSelect.value = 'qwen';
+    fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
+    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
+
+    fireEvent.click(screen.getByText('api_provider_add_edit'));
+    fireEvent.click(screen.getByRole('button', { name: 'api_provider_export_json' }));
+
+    await waitFor(() => {
+      expect(clipboardWriteText).toHaveBeenCalledOnce();
+    });
+    expect(JSON.parse(clipboardWriteText.mock.calls[0][0])).toMatchObject({ name: 'MiniMax' });
+    expect(onToast).toHaveBeenCalledWith('api_provider_export_success');
+  });
+
   it('saves qwen presets with the new default env template', async () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
@@ -401,8 +448,9 @@ describe('NewSessionDialog', () => {
     fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'MiniMax' } });
     fireEvent.click(screen.getByRole('button', { name: /save preset/i }));
 
-    expect(ws.send).toHaveBeenCalledWith({
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'cc.presets.save',
+      requestId: expect.any(String),
       presets: [
         expect.objectContaining({
           name: 'MiniMax',
@@ -418,10 +466,10 @@ describe('NewSessionDialog', () => {
           }),
         }),
       ],
-    });
+    }));
   });
 
-  it('uses the updated preset default model for qwen', async () => {
+  it('keeps the preset env model authoritative for qwen after discovery', async () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
@@ -449,14 +497,13 @@ describe('NewSessionDialog', () => {
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
-    await waitFor(() => expect(screen.getByDisplayValue('MiniMax-Text-01')).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     await waitFor(() => {
       expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
         agentType: 'qwen',
         ccPreset: 'MiniMax',
-        requestedModel: 'MiniMax-Text-01',
+        requestedModel: 'MiniMax-M2.7',
       }));
     });
   });

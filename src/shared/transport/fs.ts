@@ -43,6 +43,7 @@ export interface FsReadResponse extends FsBaseResponse {
   content?: string;
   encoding?: 'base64';
   mimeType?: string;
+  previewMode?: 'stream';
   /** Preview metadata: why preview is unavailable. */
   previewReason?: FsReadPreviewReason;
   error?: FsReadErrorCode | string;
@@ -50,6 +51,8 @@ export interface FsReadResponse extends FsBaseResponse {
   downloadId?: string;
   /** File's last modified time in milliseconds (for conflict detection). */
   mtime?: number;
+  /** File size in bytes when the daemon returns stream/download metadata. */
+  size?: number;
 }
 
 export interface FsWriteRequest {

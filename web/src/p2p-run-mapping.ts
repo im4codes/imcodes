@@ -1,4 +1,59 @@
 import { mapP2pStatusToUiState, type P2pActivePhase, type P2pProgressNodeStatus } from '@shared/p2p-status.js';
+import {
+  P2P_WORKFLOW_DIAGNOSTIC_CODES,
+  P2P_WORKFLOW_DIAGNOSTIC_PHASES,
+  P2P_WORKFLOW_DIAGNOSTIC_SEVERITIES,
+  type P2pWorkflowDiagnostic,
+  type P2pWorkflowDiagnosticCode,
+  type P2pWorkflowDiagnosticPhase,
+  type P2pWorkflowDiagnosticSeverity,
+} from '@shared/p2p-workflow-diagnostics.js';
+
+const DIAGNOSTIC_CODES = new Set<string>(P2P_WORKFLOW_DIAGNOSTIC_CODES);
+const DIAGNOSTIC_PHASES = new Set<string>(P2P_WORKFLOW_DIAGNOSTIC_PHASES);
+const DIAGNOSTIC_SEVERITIES = new Set<string>(P2P_WORKFLOW_DIAGNOSTIC_SEVERITIES);
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function mapDiagnostic(raw: unknown): P2pWorkflowDiagnostic | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const code = typeof r.code === 'string' ? r.code : '';
+  if (!DIAGNOSTIC_CODES.has(code)) return null;
+  const phase = typeof r.phase === 'string' && DIAGNOSTIC_PHASES.has(r.phase)
+    ? r.phase as P2pWorkflowDiagnosticPhase
+    : 'sanitize';
+  const severity = typeof r.severity === 'string' && DIAGNOSTIC_SEVERITIES.has(r.severity)
+    ? r.severity as P2pWorkflowDiagnosticSeverity
+    : 'error';
+  const diagnostic: P2pWorkflowDiagnostic = {
+    code: code as P2pWorkflowDiagnosticCode,
+    phase,
+    severity,
+    messageKey: `p2p.workflow.diagnostics.${code as P2pWorkflowDiagnosticCode}`,
+  };
+  if (isString(r.summary)) diagnostic.summary = r.summary;
+  if (isString(r.nodeId)) diagnostic.nodeId = r.nodeId;
+  if (isString(r.runId)) diagnostic.runId = r.runId;
+  if (isString(r.fieldPath)) diagnostic.fieldPath = r.fieldPath;
+  return diagnostic;
+}
+
+function extractDiagnostics(source: Record<string, any>): P2pWorkflowDiagnostic[] {
+  const projection = source.workflow_projection as Record<string, unknown> | undefined;
+  const projectionDiags = projection && Array.isArray(projection.diagnostics)
+    ? projection.diagnostics
+    : null;
+  const fallbackDiags = Array.isArray(source.diagnostics) ? source.diagnostics : null;
+  const candidates = projectionDiags ?? fallbackDiags ?? [];
+  return candidates
+    .map(mapDiagnostic)
+    .filter((d): d is P2pWorkflowDiagnostic => d !== null);
+}
+
+export type { P2pWorkflowDiagnostic } from '@shared/p2p-workflow-diagnostics.js';
 
 function parseTimestamp(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
@@ -41,7 +96,7 @@ function mapLegacyNodes(source: Record<string, any>) {
     agentType: String(n.agentType ?? ''),
     ccPreset: n.ccPreset ?? n.cc_preset ?? null,
     mode: typeof n.mode === 'string' ? n.mode : undefined,
-    phase: typeof n.phase === 'string' ? n.phase as 'initial' | 'hop' | 'summary' : undefined,
+    phase: typeof n.phase === 'string' ? n.phase as 'initial' | 'hop' | 'summary' | 'execution' : undefined,
     status: String(n.status ?? 'pending') as P2pProgressNodeStatus,
   })) : undefined;
 }
@@ -62,6 +117,7 @@ function mapAdvancedNodes(source: Record<string, any>) {
 export function mapP2pRunToDiscussion(r: Record<string, any>) {
   const snapshot = parseSnapshot(r.progress_snapshot);
   const source = { ...r, ...snapshot } as Record<string, any>;
+  const diagnostics = extractDiagnostics(source);
   const receivedAt = Date.now();
   const advancedEnabled = source.advanced_p2p_enabled === true;
   const id = `p2p_${source.id}`;
@@ -98,6 +154,41 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
     status: String(hop.status ?? 'queued') as 'queued' | 'dispatched' | 'running' | 'completed' | 'timed_out' | 'failed' | 'cancelled',
   })) : undefined;
 
+  // Audit fix (P2P bar scoping) — preserve session-identity fields so
+  // the bar in `app.tsx` can filter discussions to the active session.
+  // Without these, every active main-session view rendered the bar for
+  // every running P2P discussion across the whole daemon, regardless
+  // of whether the user's currently-selected session participated.
+  const mainSession = typeof source.main_session === 'string' && source.main_session
+    ? source.main_session
+    : undefined;
+  const initiatorSession = typeof source.initiator_session === 'string' && source.initiator_session
+    ? source.initiator_session
+    : undefined;
+  // Aggregate every session that participates in this run so the bar's
+  // filter can match by ANY participant (initiator + every hop).
+  // Falls back to mainSession only when the run has no compiled hop
+  // states yet (legacy adapter projection).
+  const participantSessions = (() => {
+    const set = new Set<string>();
+    if (initiatorSession) set.add(initiatorSession);
+    if (mainSession) set.add(mainSession);
+    if (typeof source.current_target_session === 'string' && source.current_target_session) {
+      set.add(source.current_target_session);
+    }
+    if (Array.isArray(source.hop_states)) {
+      for (const hop of source.hop_states) {
+        if (hop && typeof hop.session === 'string' && hop.session) set.add(hop.session);
+      }
+    }
+    if (Array.isArray(source.all_targets)) {
+      for (const t of source.all_targets) {
+        if (t && typeof t.session === 'string' && t.session) set.add(t.session);
+      }
+    }
+    return set.size > 0 ? [...set] : undefined;
+  })();
+
   return {
     id,
     fileId: typeof source.discussion_id === 'string' && source.discussion_id
@@ -105,6 +196,9 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
       : undefined,
     topic: `P2P ${currentRoundMode} · ${initiatorLabel}`,
     state,
+    mainSession,
+    initiatorSession,
+    participantSessions,
     modeKey: currentRoundMode,
     currentRound: useAdvancedNodes
       ? ((advancedCurrentIndex >= 0 ? advancedCurrentIndex + 1 : 1))
@@ -112,6 +206,10 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
     maxRounds: useAdvancedNodes
       ? advancedNodes.length
       : (source.total_rounds ?? 1),
+    flowCycleCurrent: typeof source.flow_cycle_current === 'number' ? source.flow_cycle_current : undefined,
+    flowCycleTotal: typeof source.flow_cycle_total === 'number' ? source.flow_cycle_total : undefined,
+    flowStepCurrent: typeof source.flow_step_current === 'number' ? source.flow_step_current : undefined,
+    flowStepTotal: typeof source.flow_step_total === 'number' ? source.flow_step_total : undefined,
     completedHops: source.completed_hops_count ?? 0,
     completedRoundHops: typeof source.completed_round_hops_count === 'number' ? source.completed_round_hops_count : undefined,
     totalHops: useAdvancedNodes
@@ -136,6 +234,7 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
       source.updated_at ?? source.updatedAt,
       receivedAt,
     ),
+    diagnostics,
   };
 }
 
@@ -147,4 +246,24 @@ export function mergeP2pDiscussionUpdate<T extends { startedAt?: number; hopStar
     startedAt: incoming.startedAt ?? existing.startedAt,
     hopStartedAt: incoming.hopStartedAt ?? existing.hopStartedAt,
   };
+}
+
+export function mergeP2pStatusResponseDiscussions<T extends { id: string; startedAt?: number; hopStartedAt?: number }>(
+  existing: readonly T[],
+  incoming: readonly T[],
+  options: { runId?: string; runFound?: boolean } = {},
+): T[] {
+  const explicitMissingRunId = options.runId && options.runFound === false
+    ? `p2p_${options.runId}`
+    : null;
+  const merged = explicitMissingRunId
+    ? existing.filter((d) => d.id !== explicitMissingRunId)
+    : [...existing];
+
+  for (const entry of incoming) {
+    const idx = merged.findIndex((d) => d.id === entry.id);
+    if (idx >= 0) merged[idx] = mergeP2pDiscussionUpdate(merged[idx], entry);
+    else merged.push(entry);
+  }
+  return merged;
 }
