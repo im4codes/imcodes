@@ -65,8 +65,19 @@ function collectSystemStats(): SystemStats {
 const HEARTBEAT_MS = 5_000;
 const STATS_MS = 5_000; // daemon.stats update interval (separate from heartbeat)
 const DEFAULT_DATA_PLANE_SEND_QUEUE_SOFT_CAP = 256;
-const DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP = 512;
-const DEFAULT_DATA_PLANE_SEND_STALE_MS = 30_000;
+// Bumped from 512 → 100_000 (regression triage: commit 42dfabec used 512 +
+// shift-oldest, which silently dropped timeline.history responses on weak
+// links and forced users to refresh the page). 100_000 is an emergency
+// ceiling, not an expected steady-state — backpressure telemetry above
+// soft-cap is unchanged so ops can still see if a real backlog forms.
+const DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP = 100_000;
+// Bumped from 30s → 24h. 30s was the same regression: a brief WS hiccup
+// (Wi-Fi handoff, mobile background) silently expired the queued history /
+// fs / models responses before the link came back, so the reconnect flush
+// found an empty queue. With "drain peek-then-shift" (below) we no longer
+// rely on stale GC for correctness — this is purely a memory-protection
+// upper bound for catastrophic offline periods.
+const DEFAULT_DATA_PLANE_SEND_STALE_MS = 24 * 60 * 60 * 1000;
 let dataPlaneSendQueueSoftCap = DEFAULT_DATA_PLANE_SEND_QUEUE_SOFT_CAP;
 let dataPlaneSendQueueHardCap = DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP;
 let dataPlaneSendStaleMs = DEFAULT_DATA_PLANE_SEND_STALE_MS;
@@ -297,6 +308,12 @@ export class ServerLink {
         logger.warn({ err }, 'AckOutbox flush on reconnect failed');
       });
 
+      // Resume the data-plane drain after reconnect. Anything that piled up
+      // in `dataPlaneSendQueue` while the link was down is now safe to send
+      // because the new socket is OPEN. Without this kick the queue would
+      // sit there until the next enqueue happened to schedule another flush.
+      this.flushDataPlaneAfterReconnect();
+
       // Refresh the supervisor global-defaults cache on every (re)connect so
       // user edits to "Global custom instructions" land in the daemon within
       // one WS round-trip, not next restart. See `supervisor-defaults-cache.ts`.
@@ -523,6 +540,23 @@ export class ServerLink {
     }, 'ServerLink: dropped stale data-plane send');
   }
 
+  /** True if the underlying socket is in a state where `trySend` is expected
+   *  to succeed. Used by the drain loop so we never `shift()` a message off
+   *  the queue when the link is disconnected — that would silently drop the
+   *  message because `trySend` returns false without enqueuing for retry.
+   *  See regression triage for commit 42dfabec ("必须手动刷新页面才更新"). */
+  private isLinkSendable(): boolean {
+    return !!this.ws && this.ws.readyState === WebSocket.OPEN;
+  }
+
+  /** Public hook for the WS `open` handler to kick the data-plane drain
+   *  after reconnect. Without this, anything that piled up in the queue
+   *  during the disconnect window would never be flushed. */
+  flushDataPlaneAfterReconnect(): void {
+    if (this.dataPlaneSendQueue.length === 0) return;
+    this.scheduleDataPlaneFlush();
+  }
+
   private scheduleDataPlaneFlush(): void {
     if (this.dataPlaneSendScheduled) return;
     this.dataPlaneSendScheduled = true;
@@ -530,15 +564,45 @@ export class ServerLink {
       this.dataPlaneSendScheduled = false;
       const now = performance.now();
       this.dropExpiredDataPlaneSendItems(now, 'drain_stale');
-      const item = this.dataPlaneSendQueue.shift();
+      // Peek-then-shift: never remove an item from the queue while the link
+      // is down. With the old code (`shift()` followed by `trySend()` whose
+      // false return was ignored) every message that happened to be at the
+      // head of the queue when the WS went non-OPEN was silently lost. The
+      // user-visible result was "messages stopped updating" until a manual
+      // page refresh re-issued the request. Now: if the link isn't OPEN we
+      // leave the queue intact and let `flushDataPlaneAfterReconnect()` (or
+      // a subsequent enqueue) restart the drain.
+      const item = this.dataPlaneSendQueue[0];
       if (item === undefined) {
         this.dataPlaneQueueStartedAt = null;
         return;
       }
       if (item.deadlineAt <= now) {
+        this.dataPlaneSendQueue.shift();
         this.recordDataPlaneSendItemDropped(item, now, 'drain_stale');
+      } else if (!this.isLinkSendable()) {
+        // Stop the drain and wait for reconnect. Telemetry only — no drop.
+        recordServerLinkDataPlaneBackpressure({
+          msgType: item.msgType,
+          requestId: item.requestId,
+          queueDepth: this.dataPlaneSendQueue.length,
+          softCap: dataPlaneSendQueueSoftCap,
+          hardCap: dataPlaneSendQueueHardCap,
+          overflow: 0,
+        });
+        this.dataPlaneQueueStartedAt = this.dataPlaneSendQueue[0]?.enqueuedAt ?? null;
+        return;
       } else {
-        this.trySend(item.msg);
+        const ok = this.trySend(item.msg);
+        if (!ok) {
+          // trySend failed despite the readyState check (race with close, or
+          // a synchronous throw from `ws.send`). Keep the item and back off
+          // — the WS close handler will eventually clear the socket and
+          // `flushDataPlaneAfterReconnect()` will retry once it's back up.
+          this.dataPlaneQueueStartedAt = this.dataPlaneSendQueue[0]?.enqueuedAt ?? null;
+          return;
+        }
+        this.dataPlaneSendQueue.shift();
       }
       if (this.dataPlaneSendQueue.length === 0) {
         this.dataPlaneQueueStartedAt = null;

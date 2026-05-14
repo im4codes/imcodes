@@ -141,6 +141,7 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-
 import type { DaemonBuildInfo } from '../../../shared/build-manifest-types.js';
 import {
   TIMELINE_REQUEST_ERROR_REASONS,
+  isRecoverableTimelineRequestErrorReason,
 } from '../../../shared/timeline-history-errors.js';
 
 const AUTH_TIMEOUT_MS = 5000;
@@ -407,8 +408,15 @@ const WATCH_RECENT_TEXT_CAP = 5;
 const WATCH_RECENT_TEXT_MAX_CHARS = 160;
 const HTTP_TIMELINE_TIMEOUT_MS = 15_000;
 const TIMELINE_PENDING_UNICAST_TIMEOUT_MS = 30_000;
-const DEFAULT_TIMELINE_DATA_PLANE_QUEUE_CAP = 128;
-const DEFAULT_TIMELINE_DATA_PLANE_JOB_DEADLINE_MS = 15_000;
+// Bumped from 128 → 4096 and 15s → 60s as part of the commit-42dfabec
+// regression fix. The original values were tight enough that any short
+// burst of timeline.history / page / detail traffic could exceed them on
+// weak links, and the bridge error response wasn't marked recoverable so
+// `useTimeline` treated it as terminal. With `recoverable: true` (above)
+// and a more generous ceiling, we recover automatically instead of
+// forcing a manual page refresh.
+const DEFAULT_TIMELINE_DATA_PLANE_QUEUE_CAP = 4096;
+const DEFAULT_TIMELINE_DATA_PLANE_JOB_DEADLINE_MS = 60_000;
 let timelineDataPlaneQueueCap = DEFAULT_TIMELINE_DATA_PLANE_QUEUE_CAP;
 let timelineDataPlaneJobDeadlineMs = DEFAULT_TIMELINE_DATA_PLANE_JOB_DEADLINE_MS;
 const BRIDGE_TIMELINE_LARGE_PAYLOAD_LOG_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
@@ -542,6 +550,13 @@ function timelineDataPlaneErrorResponse(
   type: string,
   errorReason: string,
 ): Record<string, unknown> {
+  // Tag transient errors as `recoverable: true` so the web `useTimeline`
+  // hook actually auto-retries them. Before this flag, any `errorReason`
+  // hit `hasExplicitTimelineOutcome` and was treated as terminal; users
+  // had to refresh the page to get past a queue-full or deadline blip
+  // (regression observed after commit 42dfabec). The allow-list lives in
+  // `shared/timeline-history-errors.ts` so server + client never disagree.
+  const recoverable = isRecoverableTimelineRequestErrorReason(errorReason);
   return {
     type,
     ...(optionalString(msg.requestId) ? { requestId: optionalString(msg.requestId) } : {}),
@@ -552,6 +567,7 @@ function timelineDataPlaneErrorResponse(
     events: type === TIMELINE_MESSAGES.DETAIL ? undefined : [],
     payloadTruncated: false,
     hasMore: false,
+    ...(recoverable ? { recoverable: true } : {}),
   };
 }
 

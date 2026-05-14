@@ -597,7 +597,24 @@ export async function startup(): Promise<DaemonContext> {
   });
 
   for (const session of listSessions()) {
-    const history = await timelineStore.readPreferred(session.name, { limit: 100 });
+    // Per-session try/catch — commit 42dfabec changed `readPreferred` to
+    // throw `TimelinePreferredReadError` when the SQLite projection is
+    // unavailable instead of returning `[]`. An unhandled throw here would
+    // abort the whole startup backfill loop after the first bad session.
+    // Fall back to the JSONL `read()` path (same semantics, slower) so a
+    // single mid-init projection still lets every session bootstrap.
+    let history: Awaited<ReturnType<typeof timelineStore.readPreferred>> = [];
+    try {
+      history = await timelineStore.readPreferred(session.name, { limit: 100 });
+    } catch (err) {
+      logger.warn({ err, session: session.name }, 'Startup backfill: readPreferred failed, falling back to JSONL');
+      try {
+        history = timelineStore.read(session.name, { limit: 100 });
+      } catch (fallbackErr) {
+        logger.warn({ err: fallbackErr, session: session.name }, 'Startup backfill: JSONL fallback also failed; skipping session');
+        continue;
+      }
+    }
     if (history.length === 0) continue;
     void liveContextIngestion.backfillSessionFromEvents(session.name, history).catch((err) => {
       logger.warn({ err, session: session.name }, 'Shared-context timeline backfill failed');

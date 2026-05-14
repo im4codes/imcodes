@@ -14,6 +14,7 @@ import {
   TIMELINE_HISTORY_ERROR_REASONS,
   TIMELINE_PAGE_ERROR_REASONS,
   TIMELINE_REQUEST_ERROR_REASONS,
+  isRecoverableTimelineRequestErrorReason,
 } from '@shared/timeline-history-errors.js';
 import i18next from 'i18next';
 import {
@@ -752,6 +753,16 @@ function createTimelineHistoryResponseNotice(msg: TimelineProtocolServerMessage)
 function shouldRetryTimelineHistoryResponse(msg: TimelineEventsServerMessage, hasRenderedEvents: boolean): boolean {
   if (getTimelineEvents(msg).length > 0 || hasRenderedEvents) return false;
   if (msg.recoverable === true) return true;
+  // Defense-in-depth: when the server is silent about `recoverable` (older
+  // bridge/daemon that hasn't picked up the commit-42dfabec fix), fall back
+  // to a shared allow-list of `errorReason`s that we know are transient
+  // (queue_full, deadline_exceeded, timeout, unavailable). The allow-list
+  // lives in `shared/timeline-history-errors.ts` so server and client agree.
+  // We do NOT apply this when `recoverable === false` is explicit — that is
+  // a positive "don't retry" signal from a server that has thought about it.
+  if (msg.recoverable === undefined
+    && msg.errorReason
+    && isRecoverableTimelineRequestErrorReason(msg.errorReason)) return true;
   return !hasExplicitTimelineOutcome(msg);
 }
 

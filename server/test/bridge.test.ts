@@ -4157,6 +4157,10 @@ describe('WsBridge', () => {
       const nowSpy = vi.spyOn(performance, 'now');
       let now = 0;
       nowSpy.mockImplementation(() => now);
+      // Pin a short deadline for the test — the production default was bumped
+      // to 60s as part of the commit-42dfabec regression fix, so this scenario
+      // would otherwise require simulating a minute of wall-clock passage.
+      const resetQueueConfig = __setTimelineDataPlaneQueueConfigForTests({ deadlineMs: 15_000 });
       try {
         const { bridge, daemonWs } = await setupAuth();
         const slowBrowser = new SlowMockWs();
@@ -4208,6 +4212,7 @@ describe('WsBridge', () => {
           route: 'http_request',
         })).toBe(1);
       } finally {
+        resetQueueConfig();
         nowSpy.mockRestore();
       }
     });

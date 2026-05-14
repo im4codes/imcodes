@@ -59,3 +59,36 @@ export const TIMELINE_REQUEST_ERROR_REASONS = {
 
 export type TimelineRequestErrorReason =
   (typeof TIMELINE_REQUEST_ERROR_REASONS)[keyof typeof TIMELINE_REQUEST_ERROR_REASONS];
+
+/**
+ * Transient request errors that the daemon / bridge layer rejected for
+ * backpressure or scheduling reasons rather than because the request itself
+ * was bad. Web clients are expected to auto-retry these with backoff; the
+ * server signals "auto-retry OK" by setting `recoverable: true` on the
+ * error frame and the client also falls back to this set when an older
+ * server still emits an `errorReason` without the flag (defense-in-depth).
+ *
+ * Membership policy:
+ *   - QUEUE_FULL — daemon or bridge data-plane queue saturated; retry after
+ *     backoff should clear.
+ *   - DEADLINE_EXCEEDED — bridge job timed out before draining; same.
+ *   - TIMEOUT — generic timeout signal from worker pool / transport.
+ *   - UNAVAILABLE — downstream subsystem temporarily not ready (e.g.
+ *     projection mid-init).
+ *
+ * Explicitly NOT recoverable: PAYLOAD_TOO_LARGE (request shape problem),
+ * REQUEST_CANCELED (user intent), MALFORMED_*, REQUEST_UNAUTHORIZED,
+ * PROJECTION_UNAVAILABLE (semantic — fall back to JSONL on daemon, not
+ * retry from the client), CRASHED / SHUTDOWN (terminal), INTERNAL_ERROR.
+ */
+export const RECOVERABLE_TIMELINE_REQUEST_ERROR_REASONS: ReadonlySet<TimelineRequestErrorReason> = new Set<TimelineRequestErrorReason>([
+  TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
+  TIMELINE_REQUEST_ERROR_REASONS.DEADLINE_EXCEEDED,
+  TIMELINE_REQUEST_ERROR_REASONS.TIMEOUT,
+  TIMELINE_REQUEST_ERROR_REASONS.UNAVAILABLE,
+]);
+
+export function isRecoverableTimelineRequestErrorReason(reason: unknown): reason is TimelineRequestErrorReason {
+  return typeof reason === 'string'
+    && (RECOVERABLE_TIMELINE_REQUEST_ERROR_REASONS as ReadonlySet<string>).has(reason);
+}
