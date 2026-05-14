@@ -12,7 +12,6 @@ import {
 } from '@shared/supervision-config.js';
 import { useSubSessions, type SubSession } from '../src/hooks/useSubSessions.js';
 import { createSubSession, listSubSessions, patchSubSession } from '../src/api.js';
-import { DEFAULT_CODEX_MODEL_ID } from '../../src/shared/models/options.js';
 
 vi.mock('../src/api.js', () => ({
   listSubSessions: vi.fn().mockResolvedValue([]),
@@ -617,7 +616,6 @@ describe('sub-session runtime type inference', () => {
     vi.clearAllMocks();
     captured = [];
     createSubSessionHook = null;
-    sentMessages.length = 0;
   });
 
   it('marks copilot-sdk subsession.created payloads as transport when runtimeType is omitted', async () => {
@@ -760,41 +758,6 @@ describe('sub-session runtime type inference', () => {
     await createSubSessionHook?.('cursor-headless', undefined, '/tmp/project', 'CU');
     expect(sentMessages.some((m) => m.type === 'subsession.start' && m.sessionType === 'cursor-headless')).toBe(true);
     expect(ws.subSessionStart).not.toHaveBeenCalled();
-  });
-
-  it('sanitizes Claude-family model values before creating codex-sdk sub-sessions', async () => {
-    const { ws } = createMockWs();
-    vi.mocked(createSubSession).mockResolvedValueOnce({
-      id: 'cx-start-test', sessionName: 'deck_sub_cx-start-test', subSession: {
-        id: 'cx-start-test', serverId: 'srv1', type: 'codex-sdk', runtimeType: null,
-        providerId: null, providerSessionId: null, cwd: '/tmp/project', label: 'CX',
-        closedAt: null, createdAt: Date.now(), updatedAt: Date.now(),
-        ccSessionId: null, geminiSessionId: null, parentSession: null,
-        description: null, ccPresetId: null, requestedModel: null,
-        activeModel: null, modelDisplay: null, effort: null, transportConfig: null,
-      },
-    } as any);
-
-    render(<CreateHarness ws={ws} connected={true} />);
-    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
-
-    await createSubSessionHook?.('codex-sdk', undefined, '/tmp/project', 'CX', {
-      requestedModel: 'opus',
-      model: 'opus',
-      thinking: 'high',
-    });
-
-    expect(createSubSession).toHaveBeenCalledWith('srv1', expect.objectContaining({
-      type: 'codex-sdk',
-      requestedModel: DEFAULT_CODEX_MODEL_ID,
-      activeModel: DEFAULT_CODEX_MODEL_ID,
-    }));
-    expect(sentMessages).toContainEqual(expect.objectContaining({
-      type: 'subsession.start',
-      sessionType: 'codex-sdk',
-      requestedModel: DEFAULT_CODEX_MODEL_ID,
-    }));
-    expect(sentMessages.find((m) => m.type === 'subsession.start' && m.sessionType === 'codex-sdk')).not.toHaveProperty('model');
   });
 });
 

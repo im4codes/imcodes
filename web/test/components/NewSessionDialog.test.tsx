@@ -43,7 +43,6 @@ const makeWs = () => {
 
 describe('NewSessionDialog', () => {
   afterEach(() => {
-    localStorage.clear();
     cleanup();
   });
 
@@ -326,29 +325,6 @@ describe('NewSessionDialog', () => {
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'codex-sdk',
-      requestedModel: 'gpt-5.5',
-      thinking: 'high',
-    }));
-  });
-
-  it('does not reuse a stored Claude model when starting codex-sdk', async () => {
-    localStorage.setItem('imcodes-codex-model', 'opus');
-    const ws = makeWs();
-    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
-
-    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
-    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    fireEvent.input(agentTypeSelect, { target: { value: 'codex-sdk' } });
-    await waitFor(() => {
-      const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-      expect(selects.some((select) => select.value === 'gpt-5.5')).toBe(true);
-    });
-    fireEvent.click(screen.getByRole('button', { name: /start/i }));
-
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
-      agentType: 'codex-sdk',
-      requestedModel: 'gpt-5.5',
       thinking: 'high',
     }));
   });

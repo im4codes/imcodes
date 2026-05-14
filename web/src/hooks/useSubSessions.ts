@@ -22,7 +22,6 @@ import {
 } from '../transport-queue.js';
 import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
 import { getAutoSessionLabelPrefix } from '../agent-display.js';
-import { sanitizeCodexSdkRequestedModel } from '../../../src/shared/models/options.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
@@ -443,19 +442,7 @@ export function useSubSessions(
       const ccSessionId = type === 'claude-code' ? crypto.randomUUID() : undefined;
       const description = extra?.description as string | undefined;
       const ccPresetId = extra?.ccPreset as string | undefined;
-      const rawRequestedModel = (extra?.requestedModel as string | undefined) ?? (extra?.model as string | undefined);
-      const requestedModel = type === 'codex-sdk'
-        ? sanitizeCodexSdkRequestedModel(rawRequestedModel)
-        : rawRequestedModel;
-      const startExtra: Record<string, unknown> = { ...(extra ?? {}) };
-      if (type === 'codex-sdk') {
-        delete startExtra.model;
-        if (requestedModel) {
-          startExtra.requestedModel = requestedModel;
-        } else {
-          delete startExtra.requestedModel;
-        }
-      }
+      const requestedModel = (extra?.requestedModel as string | undefined) ?? (extra?.model as string | undefined);
       const transportConfig = extra?.transportConfig as Record<string, unknown> | undefined;
       const res = await apiCreate(serverId, {
         type,
@@ -500,7 +487,7 @@ export function useSubSessions(
           cwd,
           ccSessionId,
           parentSession: activeSession,
-          ...startExtra,
+          ...(extra ?? {}),
         });
       } else if (extra?.ccPreset || extra?.ccInitPrompt) {
         // Plain claude-code with preset — no transport provider but has CC extras

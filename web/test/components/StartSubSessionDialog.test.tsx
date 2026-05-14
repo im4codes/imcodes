@@ -118,10 +118,7 @@ describe('StartSubSessionDialog', () => {
     fireEvent.input(selects[0], { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
-    expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
-      requestedModel: 'gpt-5.5',
-      thinking: 'high',
-    });
+    expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, { thinking: 'high' });
   });
 
   it('passes requestedModel for codex-sdk sub-sessions', () => {
@@ -140,33 +137,6 @@ describe('StartSubSessionDialog', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
     fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gpt-5.5' } });
-    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
-
-    expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
-      requestedModel: 'gpt-5.5',
-      thinking: 'high',
-    });
-  });
-
-  it('does not reuse a stored Claude model when launching codex-sdk sub-sessions', async () => {
-    localStorage.setItem('imcodes-codex-model', 'opus');
-    const onStart = vi.fn();
-    render(
-      <StartSubSessionDialog
-        ws={makeWs() as any}
-        defaultCwd="/tmp"
-        isProviderConnected={() => false}
-        getRemoteSessions={() => []}
-        refreshSessions={vi.fn()}
-        onStart={onStart}
-        onClose={vi.fn()}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
-    await waitFor(() => {
-      expect((screen.getByPlaceholderText('selectModel') as HTMLInputElement).value).toBe('gpt-5.5');
-    });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {

@@ -26,26 +26,13 @@ import {
   normalizeCcPresetName,
   type CcPreset,
 } from '@shared/cc-presets.js';
-import {
-  CODEX_MODEL_IDS,
-  DEFAULT_CODEX_MODEL_ID,
-  GEMINI_MODEL_IDS,
-  mergeModelSuggestions,
-  normalizeCodexSdkModelSuggestion,
-  sanitizeCodexSdkRequestedModel,
-} from '../../../src/shared/models/options.js';
+import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import { loadCodexModelPreference } from '../codex-model-preference.js';
 
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const CODEX_SDK_MODEL_SUGGESTIONS = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
-
-function normalizeCodexModelSuggestions(...groups: ReadonlyArray<readonly string[]>): string[] {
-  return mergeModelSuggestions(...groups)
-    .map((model) => normalizeCodexSdkModelSuggestion(model))
-    .filter((model): model is string => !!model);
-}
 
 interface Props {
   ws: WsClient | null;
@@ -269,12 +256,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || type === 'qwen')) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if (type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'qwen') {
-      const nextRequestedModel = type === 'codex-sdk'
-        ? (sanitizeCodexSdkRequestedModel(requestedModel) ?? normalizeCodexSdkModelSuggestion(transportModels.defaultModel) ?? DEFAULT_CODEX_MODEL_ID)
-        : requestedModel.trim();
-      if (nextRequestedModel) extra.requestedModel = nextRequestedModel;
-    }
+    if ((type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -297,17 +279,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const modelSuggestions = useMemo(() => (
     type === 'qwen' && selectedCcPreset
       ? qwenPresetModels
-    : type === 'codex-sdk'
-      ? normalizeCodexModelSuggestions(
-        transportModels.defaultModel ? [transportModels.defaultModel] : [],
-        [DEFAULT_CODEX_MODEL_ID],
-        transportModels.models.map((model) => model.id),
-        CODEX_SDK_MODEL_SUGGESTIONS,
-      )
     : transportModels.models.length > 0
       ? (type === 'gemini-sdk'
         ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
         : transportModels.models.map((model) => model.id))
+      : type === 'codex-sdk'
+        ? [...CODEX_SDK_MODEL_SUGGESTIONS]
       : type === 'copilot-sdk'
         ? [...COPILOT_SDK_MODEL_SUGGESTIONS]
         : type === 'cursor-headless'
@@ -317,18 +294,19 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             : type === 'gemini-sdk'
               ? [...GEMINI_SDK_MODEL_SUGGESTIONS]
               : []
-  ), [transportModels.models, transportModels.defaultModel, type, qwenPresetModels, selectedCcPreset]);
+  ), [transportModels.models, type, qwenPresetModels, selectedCcPreset]);
 
   useEffect(() => {
     if (type !== 'codex-sdk') return;
     setRequestedModel((current) => {
-      const trimmed = normalizeCodexSdkModelSuggestion(current);
-      if (trimmed && modelSuggestions.includes(trimmed)) return trimmed;
-      const stored = normalizeCodexSdkModelSuggestion(loadCodexModelPreference());
-      if (stored && modelSuggestions.includes(stored)) return stored;
-      const runtimeDefault = normalizeCodexSdkModelSuggestion(transportModels.defaultModel);
-      if (runtimeDefault && modelSuggestions.includes(runtimeDefault)) return runtimeDefault;
-      return DEFAULT_CODEX_MODEL_ID;
+      const trimmed = current.trim();
+      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
+      const stored = loadCodexModelPreference();
+      if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) return stored;
+      if (transportModels.defaultModel && (modelSuggestions.length === 0 || modelSuggestions.includes(transportModels.defaultModel))) {
+        return transportModels.defaultModel;
+      }
+      return trimmed;
     });
   }, [type, modelSuggestions, transportModels.defaultModel]);
 

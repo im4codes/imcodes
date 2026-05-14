@@ -43,7 +43,6 @@ import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
-import { sanitizeCodexSdkRequestedModel } from '../shared/models/options.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -53,6 +52,30 @@ import { clearResend, drainResend, enqueueResend, getResendCount, getResendEntri
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
+
+const DEFAULT_CODEX_SDK_STARTUP_MODEL = 'gpt-5.5';
+
+function sanitizeCodexSdkStartupModel(value: string | null | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const lower = trimmed.toLowerCase();
+  const isClaudeModel = lower.startsWith('opus')
+    || lower.startsWith('sonnet')
+    || lower.startsWith('haiku')
+    || lower.startsWith('claude')
+    || lower.includes('/opus')
+    || lower.includes('-opus')
+    || lower.includes('_opus')
+    || lower.includes('/sonnet')
+    || lower.includes('-sonnet')
+    || lower.includes('_sonnet')
+    || lower.includes('/haiku')
+    || lower.includes('-haiku')
+    || lower.includes('_haiku')
+    || lower.includes('claude-')
+    || lower.includes('claude_');
+  return isClaudeModel ? DEFAULT_CODEX_SDK_STARTUP_MODEL : trimmed;
+}
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
@@ -1366,7 +1389,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         : [];
       let requestedTransportModel = s.requestedModel ?? s.qwenModel;
       if (s.providerId === 'codex-sdk') {
-        requestedTransportModel = sanitizeCodexSdkRequestedModel(requestedTransportModel);
+        requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
       }
       const runtime = new TransportSessionRuntime(provider, s.name);
       wireTransportCallbacks(runtime, s.name);
@@ -1638,7 +1661,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const storedProviderResumeId = !opts.fresh ? existing?.providerResumeId : undefined;
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
   if (agentType === 'codex-sdk') {
-    requestedTransportModel = sanitizeCodexSdkRequestedModel(requestedTransportModel);
+    requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
   }
   // Preserve existing transportConfig (including supervision) when opts doesn't override.
   // Only fall through to `undefined` if nothing is set — never force `{}`, which would

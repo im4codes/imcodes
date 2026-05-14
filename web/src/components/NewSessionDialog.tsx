@@ -38,14 +38,7 @@ import {
   normalizeCcPresetName,
   type CcPreset,
 } from "@shared/cc-presets.js";
-import {
-  CODEX_MODEL_IDS,
-  DEFAULT_CODEX_MODEL_ID,
-  GEMINI_MODEL_IDS,
-  mergeModelSuggestions,
-  normalizeCodexSdkModelSuggestion,
-  sanitizeCodexSdkRequestedModel,
-} from "../../../src/shared/models/options.js";
+import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
 import { loadCodexModelPreference } from "../codex-model-preference.js";
 
 // Fallback suggestions used only when the daemon probe returns an empty list
@@ -54,12 +47,6 @@ const CURSOR_HEADLESS_MODEL_FALLBACK = ["auto", "composer-2-fast", "gpt-5.2"] as
 const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5.4", "gpt-5.4-mini"] as const;
 const CODEX_SDK_MODEL_FALLBACK = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_FALLBACK = [...GEMINI_MODEL_IDS];
-
-function normalizeCodexModelSuggestions(...groups: ReadonlyArray<readonly string[]>): string[] {
-  return mergeModelSuggestions(...groups)
-    .map((model) => normalizeCodexSdkModelSuggestion(model))
-    .filter((model): model is string => !!model);
-}
 
 interface Props {
   ws: WsClient | null;
@@ -411,17 +398,15 @@ export function NewSessionDialog({
       if (ccInitPrompt.trim() && agentType === "claude-code")
         extra.ccInitPrompt = ccInitPrompt.trim();
       if (
-        agentType === "claude-code-sdk"
-        || agentType === "codex-sdk"
-        || agentType === "copilot-sdk"
-        || agentType === "cursor-headless"
-        || agentType === "gemini-sdk"
-        || agentType === "qwen"
+        (agentType === "claude-code-sdk"
+          || agentType === "codex-sdk"
+          || agentType === "copilot-sdk"
+          || agentType === "cursor-headless"
+          || agentType === "gemini-sdk"
+          || agentType === "qwen") &&
+        requestedModel.trim()
       ) {
-        const nextRequestedModel = agentType === "codex-sdk"
-          ? (sanitizeCodexSdkRequestedModel(requestedModel) ?? normalizeCodexSdkModelSuggestion(transportModels.defaultModel) ?? DEFAULT_CODEX_MODEL_ID)
-          : requestedModel.trim();
-        if (nextRequestedModel) extra.requestedModel = nextRequestedModel;
+        extra.requestedModel = requestedModel.trim();
       }
       ws.sendSessionCommand("start", {
         project: project.trim(),
@@ -470,15 +455,6 @@ export function NewSessionDialog({
   const transportModels = useTransportModels(ws, dynamicModelsAgentType);
   const modelSuggestions = useMemo(() => {
     if (agentType === "qwen" && selectedCcPreset) return qwenPresetModels;
-    if (agentType === "codex-sdk") {
-      const dynamicModelIds = transportModels.models.map((m) => m.id);
-      return normalizeCodexModelSuggestions(
-        transportModels.defaultModel ? [transportModels.defaultModel] : [],
-        [DEFAULT_CODEX_MODEL_ID],
-        dynamicModelIds,
-        CODEX_SDK_MODEL_FALLBACK,
-      );
-    }
     if (transportModels.models.length > 0) {
       const dynamicModelIds = transportModels.models.map((m) => m.id);
       return agentType === "gemini-sdk"
@@ -487,21 +463,23 @@ export function NewSessionDialog({
     }
     if (agentType === "qwen") return qwenPresetModels;
     if (agentType === "copilot-sdk") return [...COPILOT_SDK_MODEL_FALLBACK];
+    if (agentType === "codex-sdk") return [...CODEX_SDK_MODEL_FALLBACK];
     if (agentType === "cursor-headless") return [...CURSOR_HEADLESS_MODEL_FALLBACK];
     if (agentType === "gemini-sdk") return [...GEMINI_SDK_MODEL_FALLBACK];
     return [] as string[];
-  }, [transportModels.models, transportModels.defaultModel, agentType, qwenPresetModels, selectedCcPreset]);
+  }, [transportModels.models, agentType, qwenPresetModels, selectedCcPreset]);
 
   useEffect(() => {
     if (agentType !== "codex-sdk") return;
     setRequestedModel((current) => {
-      const trimmed = normalizeCodexSdkModelSuggestion(current);
-      if (trimmed && modelSuggestions.includes(trimmed)) return trimmed;
-      const stored = normalizeCodexSdkModelSuggestion(loadCodexModelPreference());
-      if (stored && modelSuggestions.includes(stored)) return stored;
-      const runtimeDefault = normalizeCodexSdkModelSuggestion(transportModels.defaultModel);
-      if (runtimeDefault && modelSuggestions.includes(runtimeDefault)) return runtimeDefault;
-      return DEFAULT_CODEX_MODEL_ID;
+      const trimmed = current.trim();
+      if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
+      const stored = loadCodexModelPreference();
+      if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) return stored;
+      if (transportModels.defaultModel && (modelSuggestions.length === 0 || modelSuggestions.includes(transportModels.defaultModel))) {
+        return transportModels.defaultModel;
+      }
+      return trimmed;
     });
   }, [agentType, modelSuggestions, transportModels.defaultModel]);
 
