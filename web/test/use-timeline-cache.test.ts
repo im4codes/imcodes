@@ -540,6 +540,106 @@ describe('useTimeline global cache bounds', () => {
     expect(screen.getByTestId('probe').getAttribute('data-key')).toBe('chat.timelineStatus.queueFull');
   });
 
+  it('retries timeline history when server marks the queue-full error recoverable: true', async () => {
+    // Section-10 (post-deploy audit fix for reduce-daemon-main-thread-latency
+    // commit f25f72e7): when the bridge stamps a transient backpressure
+    // error with `recoverable: true`, useTimeline MUST auto-retry instead
+    // of stopping at the error UI. This is the positive counterpart to
+    // the "recoverable: false" negative-retry test above.
+    const sessionName = `deck_recoverable_history_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const sendTimelineHistoryRequest = vi.fn(() => `history-recoverable-${Math.random()}`);
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { loading } = useTimeline(sessionName, ws);
+      return h('div', { 'data-testid': 'probe', 'data-loading': String(loading) }, 'probe');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+    });
+    const firstRequestId = sendTimelineHistoryRequest.mock.results[0]!.value as string;
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.history',
+        sessionName,
+        requestId: firstRequestId,
+        epoch: 1,
+        events: [],
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        errorReason: TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL,
+        recoverable: true,
+      } as ServerMessage);
+      await vi.advanceTimersByTimeAsync(2_500);
+    });
+
+    // recoverable: true → retry fired → at least one additional request
+    expect(sendTimelineHistoryRequest.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('retries timeline history on allow-listed errorReason when recoverable is omitted (rollout fallback)', async () => {
+    // Defense-in-depth: during rollout, an older bridge may emit an error
+    // frame with `errorReason: 'deadline_exceeded'` but no `recoverable`
+    // flag. useTimeline.shouldRetryTimelineHistoryResponse MUST still
+    // retry by consulting the shared allow-list. recoverable === false
+    // (explicit) is respected as terminal; recoverable === undefined
+    // (silent) falls back to allow-list — that distinction is exactly
+    // what this test pins down.
+    const sessionName = `deck_recoverable_fallback_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const sendTimelineHistoryRequest = vi.fn(() => `history-fallback-${Math.random()}`);
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { loading } = useTimeline(sessionName, ws);
+      return h('div', { 'data-testid': 'probe', 'data-loading': String(loading) }, 'probe');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+    });
+    const firstRequestId = sendTimelineHistoryRequest.mock.results[0]!.value as string;
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.history',
+        sessionName,
+        requestId: firstRequestId,
+        epoch: 1,
+        events: [],
+        status: TIMELINE_RESPONSE_STATUS.ERROR,
+        errorReason: TIMELINE_HISTORY_ERROR_REASONS.DEADLINE_EXCEEDED,
+        // recoverable intentionally omitted — simulates an old bridge
+        // that hasn't picked up the commit-f25f72e7 server-side fix.
+      } as ServerMessage);
+      await vi.advanceTimersByTimeAsync(2_500);
+    });
+
+    expect(sendTimelineHistoryRequest.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
   it('does not blindly retry non-recoverable worker timeout or unavailable history errors', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
 

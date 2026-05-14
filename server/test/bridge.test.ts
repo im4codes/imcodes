@@ -4266,6 +4266,11 @@ describe('WsBridge', () => {
           errorReason: TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
           events: [],
         });
+        // Section-10 (post-deploy audit fix, commit f25f72e7) — transient
+        // backpressure errors MUST carry `recoverable: true` so the web
+        // `useTimeline.shouldRetryTimelineHistoryResponse` allow-list
+        // triggers an auto-retry instead of stalling until manual refresh.
+        expect(queueFullResponses[0].recoverable).toBe(true);
 
         await flushBridgeDataPlane();
         const okResponses = browserOk.sentStrings
