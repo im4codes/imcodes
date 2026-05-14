@@ -2367,6 +2367,86 @@ body {
   .external-link-actions { flex-direction: column-reverse; }
   .external-link-btn { width: 100%; }
 }
+/* ── Zoomed text dialog ──────────────────────────────────────────────────── */
+/* Mobile users double-tap a chat bubble to open this modal. The chat view
+   disables `user-select` on touch devices so long-press triggers our custom
+   Copy/Quote menu rather than the native callout; inside this dialog the
+   selection is re-enabled (via the `!important` overrides below) so users
+   can drag the native iOS/Android handles and copy a specific portion. */
+.zoom-text-overlay {
+  background: rgba(2,6,23,0.78);
+  backdrop-filter: blur(6px);
+}
+.zoom-text-dialog {
+  width: min(640px, calc(100vw - 24px));
+  max-height: calc(100vh - var(--sat, 0px) - env(safe-area-inset-bottom, 0px) - 32px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px 16px;
+  background: #0f172a;
+  border: 1px solid rgba(100,116,139,0.55);
+  border-radius: 10px;
+  box-shadow: 0 24px 80px rgba(0,0,0,0.52), inset 0 1px 0 rgba(255,255,255,0.04);
+  overflow: hidden;
+}
+.zoom-text-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
+.zoom-text-title { font-size: 13px; font-weight: 600; color: #cbd5e1; letter-spacing: 0.02em; text-transform: uppercase; }
+.zoom-text-close { background: none; border: none; color: #64748b; font-size: 22px; line-height: 1; cursor: pointer; padding: 0 4px; }
+.zoom-text-close:hover { color: #e2e8f0; }
+.zoom-text-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  border: 1px solid rgba(51,65,85,0.9);
+  border-radius: 8px;
+  background: #020617;
+}
+.zoom-text-content {
+  margin: 0;
+  padding: 12px 14px;
+  font-size: 14px;
+  line-height: 1.55;
+  color: #e2e8f0;
+  font-family: inherit;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+/* Force-enable native selection inside the zoom dialog. The chat view's
+   `@media (pointer: coarse)` rule turns off user-select for everything inside
+   `.chat-view`, and the dialog is rendered as a sibling — but assistive
+   tools and some WebViews can still inherit conservative defaults, so we
+   make the override explicit and !important. */
+.zoom-text-dialog,
+.zoom-text-dialog * {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+  -webkit-touch-callout: default !important;
+}
+.zoom-text-hint { font-size: 11px; color: #64748b; line-height: 1.4; flex-shrink: 0; }
+.zoom-text-actions { display: flex; justify-content: flex-end; gap: 8px; flex-shrink: 0; }
+.zoom-text-btn {
+  border: 1px solid rgba(96,165,250,0.5);
+  border-radius: 7px;
+  background: #2563eb;
+  color: #eff6ff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 7px 14px;
+  transition: background 0.15s, border-color 0.15s;
+}
+.zoom-text-btn:hover { background: #1d4ed8; border-color: rgba(147,197,253,0.72); }
+.zoom-text-btn.is-copied { background: #166534; border-color: #16a34a; color: #86efac; }
+@media (max-width: 520px) {
+  .zoom-text-dialog { width: calc(100vw - 16px); padding: 12px; }
+  .zoom-text-btn { width: 100%; padding: 10px; font-size: 13px; }
+  .zoom-text-actions { width: 100%; }
+}
 /* GFM tables in chat */
 .chat-table { border-collapse: collapse; margin: 8px 0; font-size: 13px; width: auto; max-width: 100%; overflow-x: auto; display: block; }
 .chat-table th, .chat-table td { border: 1px solid #334155; padding: 4px 10px; text-align: left; white-space: nowrap; }

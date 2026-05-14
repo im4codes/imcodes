@@ -13,6 +13,7 @@ import { useMemo, useState } from 'preact/hooks';
 import { marked, type Token, type Tokens } from 'marked';
 import { useTranslation } from 'react-i18next';
 import { splitTextByHttpUrls, trimDetectedUrl } from '../link-detection.js';
+import { copyToClipboard } from '../util/clipboard.js';
 
 // ── Code block with copy button ────────────────────────────────────────────
 
@@ -34,31 +35,10 @@ function CodeBlock({
 
   const handleCopy = (e: Event) => {
     e.stopPropagation();
-    if (!text) return;
-    const done = () => {
+    copyToClipboard(text, () => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    };
-    if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(text).then(done).catch(() => {
-        // fallback noop
-      });
-    } else {
-      // fallback for non-secure contexts
-      try {
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        done();
-      } catch {
-        // ignore
-      }
-    }
+    });
   };
 
   return (

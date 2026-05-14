@@ -20,6 +20,8 @@ import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
 import { splitTextByHttpUrls } from '../link-detection.js';
+import { domNodeToPlainText, selectionToPlainText } from '../util/dom-to-text.js';
+import { ZoomedTextDialog } from './ZoomedTextDialog.js';
 
 interface Props {
   events: TimelineEvent[];
@@ -84,10 +86,14 @@ interface AssistantBlockProps {
   onDownload?: (path: string) => void;
 }
 
+/** Extract a chat event's visible text while preserving block/list/code
+ *  formatting. Uses `domNodeToPlainText` rather than `textContent` so that
+ *  copying a multi-paragraph assistant message keeps its paragraph and list
+ *  structure — `textContent` would flatten "foo\n\nbar" into "foobar". The
+ *  ignore-list inside `dom-to-text.ts` already drops timestamps, copy
+ *  buttons, and other UI chrome so we don't need to scrub them here. */
 function extractChatEventText(target: HTMLElement): string {
-  const clone = target.cloneNode(true) as HTMLElement;
-  for (const el of clone.querySelectorAll('.chat-bubble-time')) el.remove();
-  return (clone.textContent ?? '').trim();
+  return domNodeToPlainText(target);
 }
 
 function hasFileExtension(path: string): boolean {
@@ -565,6 +571,15 @@ interface SelectionMenu {
 const FILE_PANEL_MIN = 220;
 const FILE_PANEL_MAX_RATIO = 0.6; // 60% of viewport width
 const FILE_PANEL_DEFAULT = 340;
+/** Two short taps within this many ms on the same chat bubble open the zoom
+ *  modal. 320ms is comfortably below the 500ms iOS double-tap-to-zoom
+ *  reflex so single taps don't accidentally pair, but long enough that
+ *  users on a moving train don't have to hit a 200ms window. */
+const DOUBLE_TAP_THRESHOLD_MS = 320;
+/** Long-press timer for the mobile Copy/Quote context menu. Matches the
+ *  iOS callout heuristic so users with muscle memory from native chat
+ *  apps see the menu at the expected moment. */
+const LONG_PRESS_MS = 400;
 const panelWidthKey = (id: string | null | undefined) => `chatFilePanelWidth:${id ?? '_'}`;
 const panelOpenKey  = (id: string | null | undefined) => `chatFilePanelOpen:${id ?? '_'}`;
 
@@ -628,6 +643,12 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const ctxMenuRef = useRef<HTMLDivElement>(null);
   // Timestamp when ctx menu was opened — clicks within 400ms are synthetic (from long-press release)
   const menuOpenedAtRef = useRef(0);
+  // Zoomed text modal — opened by double-tap on a chat bubble on touch devices.
+  // The chat view sets `user-select: none` on mobile so that long-press fires
+  // our custom Copy/Quote menu rather than the native callout; this modal
+  // gives users a place to re-enable native selection and pick out exactly
+  // the portion they want to copy.
+  const [zoomText, setZoomText] = useState<string | null>(null);
 
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
@@ -1210,7 +1231,12 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
         setSelMenu(null);
         return;
       }
-      const text = sel.toString().trim();
+      // Use our DOM-walker rather than `sel.toString()` so that the captured
+      // text preserves paragraph/list/code-block boundaries. Browsers disagree
+      // on what `Selection.toString()` does at block boundaries (Safari often
+      // flattens), which is the bug that was dropping newlines from copied
+      // multi-paragraph assistant messages.
+      const text = selectionToPlainText(sel);
       if (!text) { setSelMenu(null); return; }
       const selRect = range.getBoundingClientRect();
       const mainEl = container.closest('.chat-main') as HTMLElement | null;
@@ -1259,31 +1285,46 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     openCtxMenu(target, me.clientX ?? 0, me.clientY ?? 0);
   }, [preview, openCtxMenu]);
 
-  // Mobile: touch timer long-press (450ms) → custom menu.
+  // Mobile: touch timer long-press → custom menu.
   // Native contextmenu doesn't fire on iOS when user-select:none + touch-callout:none are set.
+  //
+  // The same handler also detects double-taps on text bubbles
+  // (`.chat-assistant` / `.chat-user`) and opens the ZoomedTextDialog so the
+  // user can re-enable native selection and copy a specific portion. Tap
+  // bookkeeping: each touch that ends as a "short tap" (timer still active,
+  // finger didn't move >10px) records its target + timestamp; a second short
+  // tap on the same bubble within DOUBLE_TAP_THRESHOLD_MS triggers the zoom.
   useEffect(() => {
     if (!isTouchDevice || preview) return;
     const container = scrollRef.current;
     if (!container) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let startX = 0, startY = 0;
+    let startTarget: HTMLElement | null = null;
+    let lastTapTs = 0;
+    let lastTapTarget: HTMLElement | null = null;
 
     // Telegram pattern: eat the touchend + subsequent click after menu opens
     const cancelEvent = (e: Event) => { e.preventDefault(); e.stopPropagation(); };
 
     const onTouchStart = (e: TouchEvent) => {
-      if (e.touches.length > 1) return; // multi-touch → cancel
+      if (e.touches.length > 1) {
+        // multi-touch → cancel any in-flight tap tracking; this is a pinch/scroll
+        if (timer) { clearTimeout(timer); timer = null; }
+        lastTapTarget = null; lastTapTs = 0;
+        return;
+      }
       const t = e.touches[0];
       startX = t.clientX; startY = t.clientY;
-      const targetEl = e.target as HTMLElement;
+      startTarget = e.target as HTMLElement;
       timer = setTimeout(() => {
         timer = null;
-        const chatEvent = targetEl.closest?.('.chat-event') as HTMLElement | null;
+        const chatEvent = startTarget?.closest?.('.chat-event') as HTMLElement | null;
         if (!chatEvent) return;
         openCtxMenu(chatEvent, startX, startY);
         // One-shot: eat the touchend that follows to prevent synthetic click from closing menu
         container.addEventListener('touchend', cancelEvent, { once: true, capture: true });
-      }, 400);
+      }, LONG_PRESS_MS);
     };
 
     const onTouchMove = (e: TouchEvent) => {
@@ -1291,11 +1332,35 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       const t = e.touches[0];
       if (Math.abs(t.clientX - startX) > 10 || Math.abs(t.clientY - startY) > 10) {
         clearTimeout(timer); timer = null;
+        // Any drag cancels the pending double-tap pairing — scrolling shouldn't zoom.
+        lastTapTarget = null; lastTapTs = 0;
       }
     };
 
     const onTouchEnd = () => {
+      const wasShortTap = !!timer;
       if (timer) { clearTimeout(timer); timer = null; }
+      if (!wasShortTap) {
+        // Long-press fired or finger moved — neither counts as a tap, so
+        // reset pairing to avoid a stale tap accidentally pairing with the
+        // next clean tap.
+        lastTapTarget = null; lastTapTs = 0;
+        return;
+      }
+      const bubble = startTarget?.closest?.('.chat-assistant, .chat-user') as HTMLElement | null;
+      if (!bubble) {
+        lastTapTarget = null; lastTapTs = 0;
+        return;
+      }
+      const now = Date.now();
+      if (lastTapTarget === bubble && now - lastTapTs < DOUBLE_TAP_THRESHOLD_MS) {
+        // Double-tap → open zoom modal with format-preserving text.
+        const text = extractChatEventText(bubble);
+        if (text) setZoomText(text);
+        lastTapTarget = null; lastTapTs = 0;
+      } else {
+        lastTapTarget = bubble; lastTapTs = now;
+      }
     };
 
     container.addEventListener('touchstart', onTouchStart, { passive: true });
@@ -1688,6 +1753,12 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             />
           </div>
         </>
+      )}
+      {/* Zoomed text dialog — opened by double-tap on a chat bubble on touch
+          devices, so the user can re-enable native text selection and copy a
+          specific portion. */}
+      {zoomText && (
+        <ZoomedTextDialog text={zoomText} onClose={() => setZoomText(null)} />
       )}
       {/* External link confirm dialog */}
       {pendingUrl && (
