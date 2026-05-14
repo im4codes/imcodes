@@ -2997,7 +2997,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
                   <span class="p2p-menu-section-label" style={{ padding: 0 }}>{t('p2p.settings_rounds')}</span>
-                  <span style={{ fontSize: 10, color: '#64748b', whiteSpace: 'normal', textAlign: 'right' }}>{t('p2p.settings_rounds_hint')}</span>
+                  <span
+                    title={t('p2p.settings_rounds_explanation')}
+                    style={{ fontSize: 10, color: '#64748b', whiteSpace: 'normal', textAlign: 'right' }}
+                  >
+                    {t('p2p.settings_rounds_hint')}
+                  </span>
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: `repeat(${P2P_DROPDOWN_ROUND_OPTIONS.length}, minmax(0, 1fr))`, gap: 6 }}>
                   {P2P_DROPDOWN_ROUND_OPTIONS.map((roundOption) => {

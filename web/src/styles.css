@@ -420,7 +420,7 @@ body {
 .openspec-change-action-btn { padding: 4px 8px; font-size: 11px; white-space: nowrap; }
 .openspec-submenu { z-index: 2147483647; }
 .openspec-submenu-inline { position: static; width: 100%; min-width: 0; max-width: none; max-height: none; margin-top: 6px; overflow: visible; }
-.menu-dropdown-p2p { z-index: 10001; width: max-content; min-width: 240px; max-width: min(560px, calc(100vw - 24px)); }
+.menu-dropdown-p2p { z-index: 10001; width: max-content; min-width: 240px; max-width: min(560px, calc(100vw - 24px)); max-height: none; overflow-y: visible; }
 .menu-item { display: block; width: 100%; padding: 9px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; transition: background 0.1s; }
 .menu-dropdown-p2p .menu-item,
 .menu-dropdown-p2p .menu-divider,
@@ -525,7 +525,31 @@ body {
   .openspec-submenu { max-height: min(45vh, calc(100vh - 120px)); }
   .openspec-submenu-inline { margin-top: 4px; }
   .openspec-submenu-inline .menu-item { white-space: normal; }
-  .menu-dropdown-p2p { right: 0; width: calc(100vw - 16px); min-width: calc(100vw - 16px); max-width: calc(100vw - 16px); }
+  .menu-dropdown-p2p {
+    position: fixed;
+    left: 8px;
+    right: 8px;
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 64px);
+    width: auto;
+    min-width: 0;
+    max-width: none;
+    max-height: min(72vh, calc(100vh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 96px));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  @supports (height: 100dvh) {
+    .menu-dropdown-p2p {
+      max-height: min(72dvh, calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 96px));
+    }
+  }
+  .menu-dropdown-p2p .p2p-dropdown-rounds {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: #1e293b;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+  }
   .menu-dropdown-p2p .menu-item,
   .menu-dropdown-p2p .menu-divider,
   .p2p-menu-section-label { white-space: normal; }

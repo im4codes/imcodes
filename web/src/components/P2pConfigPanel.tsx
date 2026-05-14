@@ -1126,6 +1126,9 @@ export function P2pConfigPanel({
                     <div style={{ fontSize: 11, color: '#64748b', marginTop: 6 }}>
                       {t('p2p.settings_rounds_hint')}
                     </div>
+                    <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 6, lineHeight: 1.5 }}>
+                      {t('p2p.settings_rounds_explanation')}
+                    </div>
                   </div>
 
                   <div style={sectionCardStyle}>
