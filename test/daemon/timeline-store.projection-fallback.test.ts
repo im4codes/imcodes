@@ -116,8 +116,10 @@ describe('timeline-store SQLite-preferred reads', () => {
       },
     ], sessionId);
 
-    const events = await timelineStore.readPreferred(sessionId, { limit: 10 });
-    expect(events).toEqual([]);
+    await expect(timelineStore.readPreferred(sessionId, { limit: 10 })).rejects.toMatchObject({
+      reason: 'projection_unavailable',
+      source: 'main_sqlite',
+    });
     expect(projectionMocks.queryHistory).toHaveBeenCalledWith({
       sessionId,
       afterTs: undefined,
@@ -167,11 +169,15 @@ describe('timeline-store SQLite-preferred reads', () => {
       },
     ], sessionId);
 
-    const typed = await timelineStore.readByTypesPreferred(sessionId, ['assistant.text'], { limit: 10 });
-    expect(typed).toEqual([]);
+    await expect(timelineStore.readByTypesPreferred(sessionId, ['assistant.text'], { limit: 10 })).rejects.toMatchObject({
+      reason: 'projection_unavailable',
+      source: 'main_sqlite',
+    });
 
-    const completed = await timelineStore.readCompletedTextTail(sessionId, 10);
-    expect(completed).toEqual([]);
+    await expect(timelineStore.readCompletedTextTail(sessionId, 10)).rejects.toMatchObject({
+      reason: 'projection_unavailable',
+      source: 'main_sqlite',
+    });
   });
 
   it('returns null latest markers when the SQLite projection returns null', async () => {

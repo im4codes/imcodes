@@ -29,6 +29,28 @@ interface GcMarker {
   endedAt: number;
 }
 
+interface RecentCommand {
+  type: string;
+  receivedAt: number;
+  commandId?: string;
+  requestId?: string;
+  sessionName?: string;
+  commandBytes?: number;
+}
+
+interface RecentServerSend {
+  msgType: string;
+  endedAt: number;
+  jsonBytes: number;
+  totalMs: number;
+  stringifyMs: number;
+  wsSendMs: number;
+  plane: ServerSendPlane;
+  outboundQueueDepth?: number;
+  outboundQueueAgeMs?: number;
+  sendBacklogAgeMs?: number;
+}
+
 const TRUE_RE = /^(1|true|yes|on|debug)$/i;
 const DEFAULT_LOG_DIR = join(homedir(), '.imcodes', 'logs');
 const DEFAULT_FLAG_FILE = join(homedir(), '.imcodes', 'latency-trace.enabled');
@@ -53,8 +75,14 @@ const commandReceipts = new Map<string, CommandReceipt>();
 const activeSpanStack: RecentSpan[] = [];
 const recentSpans: RecentSpan[] = [];
 const recentGcMarkers: GcMarker[] = [];
+const recentCommands: RecentCommand[] = [];
+const recentServerSends: RecentServerSend[] = [];
 const RECENT_SPAN_MAX = 64;
 const RECENT_GC_MAX = 32;
+const RECENT_COMMAND_MAX = 256;
+const RECENT_COMMAND_WINDOW_MS = 5_000;
+const RECENT_SEND_MAX = 64;
+const RECENT_SEND_WINDOW_MS = 5_000;
 
 function envFlag(name: string): boolean {
   return TRUE_RE.test(String(process.env[name] ?? ''));
@@ -80,6 +108,10 @@ function asyncThresholdMs(): number {
 
 function sendThresholdMs(): number {
   return numberEnv('IMCODES_DAEMON_LATENCY_TRACE_SEND_MS', 20, 1);
+}
+
+function largeSendTraceBytes(): number {
+  return numberEnv('IMCODES_DAEMON_LATENCY_TRACE_LARGE_SEND_BYTES', 64 * 1024, 1);
 }
 
 function ackSlowMs(): number {
@@ -187,10 +219,50 @@ function rememberGcMarker(marker: GcMarker): void {
   if (recentGcMarkers.length > RECENT_GC_MAX) recentGcMarkers.splice(0, recentGcMarkers.length - RECENT_GC_MAX);
 }
 
+function rememberRecentCommand(command: RecentCommand): void {
+  recentCommands.push(command);
+  if (recentCommands.length > RECENT_COMMAND_MAX) recentCommands.splice(0, recentCommands.length - RECENT_COMMAND_MAX);
+}
+
+function rememberRecentServerSend(send: RecentServerSend): void {
+  recentServerSends.push(send);
+  if (recentServerSends.length > RECENT_SEND_MAX) recentServerSends.splice(0, recentServerSends.length - RECENT_SEND_MAX);
+}
+
 function findRecentSpan(now: number): RecentSpan | null {
   for (let index = recentSpans.length - 1; index >= 0; index -= 1) {
     const span = recentSpans[index]!;
     if (now - span.endedAt < 2_000) return span;
+  }
+  return null;
+}
+
+function findRecentCommand(now: number): RecentCommand | null {
+  for (let index = recentCommands.length - 1; index >= 0; index -= 1) {
+    const command = recentCommands[index]!;
+    if (now - command.receivedAt < RECENT_COMMAND_WINDOW_MS) return command;
+  }
+  return null;
+}
+
+function summarizeRecentCommandBurst(now: number): { count: number; type: string } | null {
+  const counts = new Map<string, number>();
+  for (let index = recentCommands.length - 1; index >= 0; index -= 1) {
+    const command = recentCommands[index]!;
+    if (now - command.receivedAt >= RECENT_COMMAND_WINDOW_MS) break;
+    counts.set(command.type, (counts.get(command.type) ?? 0) + 1);
+  }
+  let top: { count: number; type: string } | null = null;
+  for (const [type, count] of counts) {
+    if (!top || count > top.count) top = { type, count };
+  }
+  return top && top.count >= 3 ? top : null;
+}
+
+function findRecentServerSend(now: number): RecentServerSend | null {
+  for (let index = recentServerSends.length - 1; index >= 0; index -= 1) {
+    const send = recentServerSends[index]!;
+    if (now - send.endedAt < RECENT_SEND_WINDOW_MS) return send;
   }
   return null;
 }
@@ -303,6 +375,8 @@ export function startLatencyTracer(): void {
       load5: Number(load5.toFixed(2)),
       load15: Number(load15.toFixed(2)),
       pendingCommandReceipts: commandReceipts.size,
+      recentCommands: recentCommands.length,
+      recentServerSends: recentServerSends.length,
       ...(activeHandles !== undefined ? { activeHandles } : {}),
       ...(activeRequests !== undefined ? { activeRequests } : {}),
       ...(eventLoopMonitor ? {
@@ -329,8 +403,11 @@ export function startLatencyTracer(): void {
     if (drift < driftThresholdMs()) return;
     const active = activeSpanStack.at(-1) ?? null;
     const recent = findRecentSpan(now);
+    const recentSend = findRecentServerSend(now);
     const recentGc = findRecentGc(now);
-    const reason = active ? 'active_span' : recent ? 'recent_span' : recentGc ? 'gc' : 'unknown';
+    const recentCommand = findRecentCommand(now);
+    const commandBurst = summarizeRecentCommandBurst(now);
+    const reason = active ? 'active_span' : recent ? 'recent_span' : recentSend ? 'recent_server_send' : recentGc ? 'gc' : recentCommand ? 'recent_command' : 'unknown';
     writeTrace('event_loop_block', {
       driftMs: roundMs(drift),
       thresholdMs: driftThresholdMs(),
@@ -345,9 +422,33 @@ export function startLatencyTracer(): void {
         likelyRecentSpanDurationMs: recent.durationMs,
         likelyRecentSpanMeta: recent.meta,
       } : {}),
+      ...(recentSend ? {
+        likelyRecentServerSendType: recentSend.msgType,
+        likelyRecentServerSendBytes: recentSend.jsonBytes,
+        likelyRecentServerSendTotalMs: recentSend.totalMs,
+        likelyRecentServerSendStringifyMs: recentSend.stringifyMs,
+        likelyRecentServerSendWsSendMs: recentSend.wsSendMs,
+        likelyRecentServerSendPlane: recentSend.plane,
+        ...(recentSend.outboundQueueDepth !== undefined ? { likelyRecentServerSendQueueDepth: recentSend.outboundQueueDepth } : {}),
+        ...(recentSend.outboundQueueAgeMs !== undefined ? { likelyRecentServerSendQueueAgeMs: recentSend.outboundQueueAgeMs } : {}),
+        ...(recentSend.sendBacklogAgeMs !== undefined ? { likelyRecentServerSendBacklogAgeMs: recentSend.sendBacklogAgeMs } : {}),
+      } : {}),
       ...(recentGc ? {
         likelyGcKind: recentGc.kind,
         likelyGcDurationMs: recentGc.durationMs,
+      } : {}),
+      ...(recentCommand ? {
+        likelyRecentCommandType: recentCommand.type,
+        likelyRecentCommandAgeMs: roundMs(now - recentCommand.receivedAt),
+        ...(recentCommand.commandId ? { likelyRecentCommandId: recentCommand.commandId } : {}),
+        ...(recentCommand.requestId ? { likelyRecentRequestId: recentCommand.requestId } : {}),
+        ...(recentCommand.sessionName ? { likelyRecentCommandSessionName: recentCommand.sessionName } : {}),
+        ...(recentCommand.commandBytes !== undefined ? { likelyRecentCommandBytes: recentCommand.commandBytes } : {}),
+      } : {}),
+      ...(commandBurst ? {
+        commandBurst: commandBurst.count,
+        commandBurstType: commandBurst.type,
+        commandBurstWindowMs: RECENT_COMMAND_WINDOW_MS,
       } : {}),
     });
   }, driftMs);
@@ -388,6 +489,7 @@ export function traceWebCommandReceived(cmd: Record<string, unknown>): void {
   if (!enabled) return;
   const type = typeof cmd.type === 'string' ? cmd.type : '<non-string>';
   const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim() ? cmd.commandId.trim() : undefined;
+  const requestId = typeof cmd.requestId === 'string' && cmd.requestId.trim() ? cmd.requestId.trim() : undefined;
   const sessionName = typeof cmd.sessionName === 'string'
     ? cmd.sessionName
     : (typeof cmd.session === 'string' ? cmd.session : undefined);
@@ -405,9 +507,18 @@ export function traceWebCommandReceived(cmd: Record<string, unknown>): void {
   } catch {
     commandBytes = undefined;
   }
+  rememberRecentCommand({
+    type,
+    receivedAt: performance.now(),
+    ...(commandId ? { commandId } : {}),
+    ...(requestId ? { requestId } : {}),
+    ...(sessionName ? { sessionName } : {}),
+    ...(commandBytes !== undefined ? { commandBytes } : {}),
+  });
   writeTrace('web_command_received', {
     type,
     ...(commandId ? { commandId } : {}),
+    ...(requestId ? { requestId } : {}),
     ...(sessionName ? { sessionName } : {}),
     ...(commandBytes !== undefined ? { commandBytes } : {}),
   });
@@ -477,7 +588,27 @@ export function recordServerSend(input: {
   const slow = sendTotalMs >= sendThresholdMs()
     || input.stringifyMs >= sendThresholdMs()
     || (ackLatencyMs !== undefined && ackLatencyMs >= ackSlowMs());
-  if (!slow && !isAck) return;
+  const largePayload = input.jsonBytes >= largeSendTraceBytes();
+  const queuedOrBacklogged = plane === 'data' && (
+    (input.outboundQueueDepth ?? 0) > 0
+    || (input.outboundQueueAgeMs ?? 0) >= driftThresholdMs()
+    || (input.sendBacklogAgeMs ?? 0) >= driftThresholdMs()
+  );
+  if (slow || largePayload || queuedOrBacklogged) {
+    rememberRecentServerSend({
+      msgType: input.msgType ?? '<unknown>',
+      endedAt: performance.now(),
+      jsonBytes: input.jsonBytes,
+      totalMs: roundMs(sendTotalMs),
+      stringifyMs: roundMs(input.stringifyMs),
+      wsSendMs: roundMs(input.wsSendMs),
+      plane,
+      ...(input.outboundQueueDepth !== undefined ? { outboundQueueDepth: input.outboundQueueDepth } : {}),
+      ...(input.outboundQueueAgeMs !== undefined ? { outboundQueueAgeMs: roundMs(input.outboundQueueAgeMs) } : {}),
+      ...(input.sendBacklogAgeMs !== undefined ? { sendBacklogAgeMs: roundMs(input.sendBacklogAgeMs) } : {}),
+    });
+  }
+  if (!slow && !isAck && !largePayload && !queuedOrBacklogged) return;
 
   writeTrace(isAck ? 'command_ack_send' : 'server_send', {
     msgType: input.msgType ?? '<unknown>',
@@ -489,6 +620,8 @@ export function recordServerSend(input: {
     wsSendMs: roundMs(input.wsSendMs),
     totalMs: roundMs(sendTotalMs),
     plane,
+    traceReason: slow ? 'slow_send' : largePayload ? 'large_payload' : queuedOrBacklogged ? 'queued_or_backlogged' : 'ack',
+    largeSendThresholdBytes: largeSendTraceBytes(),
     ...(input.bufferedAmountBefore !== undefined ? { bufferedAmountBefore: input.bufferedAmountBefore } : {}),
     ...(input.bufferedAmountAfter !== undefined ? { bufferedAmountAfter: input.bufferedAmountAfter } : {}),
     ...(input.sendBacklogAgeMs !== undefined ? { sendBacklogAgeMs: roundMs(input.sendBacklogAgeMs) } : {}),
@@ -527,4 +660,33 @@ export function classifyServerSendPlane(msgType: string | undefined): ServerSend
 
 export function recordTimelineEmit(input: JsonRecord & { durationMs: number; type: string; sessionId: string }): void {
   maybeRecordSpan('timeline.emit', input.durationMs, input, spanThresholdMs(), false);
+}
+
+export function recordFsWorkerMetric(input: JsonRecord & {
+  commandType: 'fs.ls' | 'fs.git_status';
+  cacheStatus: string;
+  terminalReason: string;
+}): void {
+  if (!enabled) return;
+  writeTrace(input.commandType === 'fs.ls' ? 'fs_list_worker' : 'fs_git_status_worker', input);
+}
+
+export function recordServerLinkDataPlaneBackpressure(input: JsonRecord): void {
+  if (!enabled) return;
+  writeTrace('serverlink_data_plane_backpressure', input);
+}
+
+export function recordServerLinkDataPlaneStaleDropped(input: JsonRecord): void {
+  if (!enabled) return;
+  writeTrace('serverlink_data_plane_stale_dropped', input);
+}
+
+export function recordTimelineBudgetShape(input: JsonRecord): void {
+  if (!enabled) return;
+  writeTrace('timeline_budget_shape', input);
+}
+
+export function recordTransportListModelsStaleCompletion(input: JsonRecord): void {
+  if (!enabled) return;
+  writeTrace('transport_list_models_stale_completion', input);
 }

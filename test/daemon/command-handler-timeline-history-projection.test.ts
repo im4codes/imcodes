@@ -3,6 +3,8 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-bud
 import { TIMELINE_HISTORY_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 import { TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS, TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 
+import { TimelinePreferredReadError } from '../../src/daemon/timeline-store.js';
+
 const {
   getSessionMock,
   upsertSessionMock,
@@ -67,18 +69,23 @@ vi.mock('../../src/agent/tmux.js', () => ({
 vi.mock('../../src/router/message-router.js', () => ({ routeMessage: vi.fn() }));
 vi.mock('../../src/daemon/terminal-streamer.js', () => ({ terminalStreamer: { subscribe: vi.fn(), unsubscribe: vi.fn(), start: vi.fn(), stop: vi.fn() } }));
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({ timelineEmitter: { emit: vi.fn(), on: vi.fn(() => () => {}), off: vi.fn(), epoch: 99, replay: vi.fn(() => ({ events: [], truncated: false })) } }));
-vi.mock('../../src/daemon/timeline-store.js', () => ({
-  timelineStore: {
-    append: vi.fn(),
-    read: vi.fn(() => []),
-    readPreferred: readPreferredMock,
-    readCompletedTextTail: vi.fn(),
-    readByTypesPreferred: readByTypesPreferredMock,
-    getLatest: vi.fn(() => null),
-    getLatestPreferred: vi.fn(() => null),
-    clear: vi.fn(),
-  },
-}));
+
+vi.mock('../../src/daemon/timeline-store.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/daemon/timeline-store.js')>();
+  return {
+    ...actual,
+    timelineStore: {
+      append: vi.fn(),
+      read: vi.fn(() => []),
+      readPreferred: readPreferredMock,
+      readCompletedTextTail: vi.fn(),
+      readByTypesPreferred: readByTypesPreferredMock,
+      getLatest: vi.fn(() => null),
+      getLatestPreferred: vi.fn(() => null),
+      clear: vi.fn(),
+    },
+  };
+});
 vi.mock('../../src/daemon/timeline-history-pool.js', () => ({
   getDefaultTimelineHistoryWorkerPool: vi.fn(() => ({ dispatch: historyWorkerDispatchMock })),
   shouldUseTimelineHistoryWorkerPool: shouldUseHistoryWorkerMock,
@@ -188,6 +195,63 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
         fieldPath: 'payload.text',
       })],
     }));
+  });
+
+  it('keeps timeline.history under the default envelope when includeDetails is requested without an explicit larger budget', async () => {
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    getSessionMock.mockReturnValue({ name: 'deck_worker', agentType: 'codex' });
+    historyWorkerDispatchMock.mockResolvedValue({
+      events: [],
+      detailCandidates: [],
+      eventsRead: 0,
+      payloadBytes: 2,
+      droppedEvents: 0,
+      truncatedEvents: 0,
+      readMs: 1,
+      sanitizeMs: 0,
+    });
+
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_worker',
+      requestId: 'hist-include-details',
+      includeDetails: true,
+      limit: 300,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(historyWorkerDispatchMock).toHaveBeenCalledWith(expect.objectContaining({
+      maxResponseBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
+    }), expect.objectContaining({ deadlineAt: expect.any(Number) }));
+  });
+
+  it('allows explicit full-history callers to request the larger page/detail budget', async () => {
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    getSessionMock.mockReturnValue({ name: 'deck_worker', agentType: 'codex' });
+    historyWorkerDispatchMock.mockResolvedValue({
+      events: [],
+      detailCandidates: [],
+      eventsRead: 0,
+      payloadBytes: 2,
+      droppedEvents: 0,
+      truncatedEvents: 0,
+      readMs: 1,
+      sanitizeMs: 0,
+    });
+
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_worker',
+      requestId: 'hist-explicit-full',
+      includeDetails: true,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL,
+      limit: 300,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(historyWorkerDispatchMock).toHaveBeenCalledWith(expect.objectContaining({
+      maxResponseBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL,
+    }), expect.objectContaining({ deadlineAt: expect.any(Number) }));
   });
 
   it('falls back to the projection client when the history worker reports projection_unavailable', async () => {
@@ -477,6 +541,63 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
       status: TIMELINE_RESPONSE_STATUS.ERROR,
       errorReason: TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT,
       source: `worker_${TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT}`,
+      events: [],
+      hasMore: false,
+    }));
+  });
+
+  it('returns ERROR/projection_unavailable when the SQLite projection is unavailable — distinct from successful empty history', async () => {
+    // Both return events:[], but only projection failure gets ERROR + errorReason
+    getSessionMock.mockReturnValue({ name: 'deck_proj_unavail', agentType: 'codex' });
+    shouldUseHistoryWorkerMock.mockReturnValue(false);
+    readByTypesPreferredMock.mockRejectedValue(
+      new TimelinePreferredReadError(
+        TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE,
+        'main_sqlite',
+      ),
+    );
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_proj_unavail',
+      requestId: 'hist-proj-unavail',
+      limit: 50,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: 'deck_proj_unavail',
+      requestId: 'hist-proj-unavail',
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      errorReason: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE,
+      source: 'main_sqlite',
+      events: [],
+      hasMore: false,
+    }));
+  });
+
+  it('returns OK/empty when there genuinely is no history — distinct from projection failure', async () => {
+    getSessionMock.mockReturnValue({ name: 'deck_empty', agentType: 'codex' });
+    shouldUseHistoryWorkerMock.mockReturnValue(false);
+    // Both reads return empty arrays (no error thrown)
+    readByTypesPreferredMock.mockResolvedValue([]);
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_empty',
+      requestId: 'hist-empty',
+      limit: 50,
+    }, serverLink as any);
+    await flushAsync();
+
+    // Successful empty history has status=OK, NO errorReason
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: 'deck_empty',
+      requestId: 'hist-empty',
+      status: TIMELINE_RESPONSE_STATUS.OK,
+      errorReason: undefined,
       events: [],
       hasMore: false,
     }));

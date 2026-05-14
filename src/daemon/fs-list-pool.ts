@@ -1,5 +1,6 @@
 import { Worker } from 'node:worker_threads';
 import logger from '../util/logger.js';
+import { recordFsWorkerMetric } from './latency-tracer.js';
 import {
   DEFAULT_FS_LIST_POOL_QUEUE_CAP,
   DEFAULT_FS_LIST_WORKERS_TARGET,
@@ -42,6 +43,7 @@ export interface FsListWorkerPoolOptions {
   restartBackoffMs?: number;
   clock?: { now(): number };
   createWorker?: (slotId: FsListWorkerSlotId, generation: FsListWorkerGeneration) => FsListWorkerThreadLike;
+  onStaleResultDropped?: (event: Record<string, unknown>) => void;
 }
 
 export interface FsListDispatchOptions {
@@ -102,6 +104,7 @@ export class FsListWorkerPool {
   private readonly restartBackoffMs: number;
   private readonly clock: { now(): number };
   private readonly createWorker: (slotId: FsListWorkerSlotId, generation: FsListWorkerGeneration) => FsListWorkerThreadLike;
+  private readonly onStaleResultDropped?: (event: Record<string, unknown>) => void;
   private readonly slots: WorkerSlot[] = [];
   private readonly queue: QueuedJob[] = [];
   private nextWorkerRequestId: FsListWorkerRequestId = 1;
@@ -119,6 +122,7 @@ export class FsListWorkerPool {
     this.restartBackoffMs = Math.max(0, Math.trunc(options.restartBackoffMs ?? DEFAULT_FS_LIST_RESTART_BACKOFF_MS));
     this.clock = options.clock ?? { now: () => Date.now() };
     this.createWorker = options.createWorker ?? (() => createNodeWorker());
+    this.onStaleResultDropped = options.onStaleResultDropped;
   }
 
   getQueueDepth(): number {
@@ -189,15 +193,51 @@ export class FsListWorkerPool {
   }
 
   private handleWorkerMessage(slot: WorkerSlot, generation: FsListWorkerGeneration, message: FsListWorkerResult): void {
-    if (slot.generation !== generation || slot.state === 'dead') return;
+    if (slot.generation !== generation || slot.state === 'dead') {
+      this.recordStaleResultDropped(slot, generation, message, 'stale_worker_generation');
+      return;
+    }
     const active = slot.currentJob;
-    if (!active || !isFsListWorkerResultFor(message, active.identity)) return;
+    if (!active) {
+      this.recordStaleResultDropped(slot, generation, message, 'no_active_job');
+      return;
+    }
+    if (!isFsListWorkerResultFor(message, active.identity)) {
+      this.recordStaleResultDropped(slot, generation, message, 'identity_mismatch');
+      return;
+    }
     this.clearActiveTimer(active);
     slot.currentJob = null;
     slot.state = 'idle';
     if (message.kind === 'success') active.resolve(message);
     else active.reject(new FsListPoolError(message.reason));
     this.pump();
+  }
+
+  private recordStaleResultDropped(
+    slot: WorkerSlot,
+    listenerGeneration: FsListWorkerGeneration,
+    message: FsListWorkerResult,
+    reason: string,
+  ): void {
+    const event = {
+      reason,
+      slotId: slot.slotId,
+      currentGeneration: slot.generation,
+      listenerGeneration,
+      workerRequestId: typeof message.workerRequestId === 'number' ? message.workerRequestId : undefined,
+      workerSlotId: typeof message.workerSlotId === 'number' ? message.workerSlotId : undefined,
+      workerGeneration: typeof message.workerGeneration === 'number' ? message.workerGeneration : undefined,
+    };
+    if (this.onStaleResultDropped) this.onStaleResultDropped(event);
+    else {
+      recordFsWorkerMetric({
+        commandType: 'fs.ls',
+        cacheStatus: 'stale_result_dropped',
+        terminalReason: 'stale_result_dropped',
+        ...event,
+      });
+    }
   }
 
   private handleWorkerFailure(slot: WorkerSlot, generation: FsListWorkerGeneration, error: Error): void {
@@ -324,6 +364,7 @@ function describeError(error: unknown): string {
 
 export function shouldUseFsListWorkerPool(): boolean {
   if (process.env.IMCODES_FS_LIST_WORKER_POOL === '0') return false;
+  if (process.env.IMCODES_FS_LIST_WORKER_POOL === '1') return true;
   if (process.env.VITEST === 'true' || process.env.VITEST_WORKER_ID !== undefined) return false;
   return true;
 }

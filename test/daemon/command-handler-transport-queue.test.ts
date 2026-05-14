@@ -13,7 +13,7 @@ import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { MEMORY_MANAGEMENT_CONTEXT_FIELD } from '../../shared/memory-management-context.js';
 import { MEMORY_MANAGEMENT_ERROR_CODES } from '../../shared/memory-management.js';
 import { MEMORY_FEATURE_CONFIG_MSG, MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
-import { TIMELINE_DETAIL_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
+import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import {
   PREFERENCE_CONTEXT_START,
@@ -293,6 +293,7 @@ vi.mock('../../src/daemon/supervision-automation.js', () => ({
 
 import {
   handleWebCommand,
+  __invalidateTransportListModelsCacheForTests,
   __resetTransportListModelsCacheForTests,
   __resolveTransportListModelsCacheTtlMsForTests,
 } from '../../src/daemon/command-handler.js';
@@ -1508,6 +1509,7 @@ describe('handleWebCommand transport queue behavior', () => {
   it('shapes multi-MB timeline.replay payloads under the default envelope budget without legacy gap truncation', async () => {
     vi.mocked(timelineEmitter.replay).mockReturnValueOnce({
       truncated: false,
+      source: TIMELINE_RESPONSE_SOURCES.RING_BUFFER,
       events: Array.from({ length: 80 }, (_, index) => timelineEvent({
         eventId: `replay-tool-${index}`,
         ts: index,
@@ -1577,6 +1579,7 @@ describe('handleWebCommand transport queue behavior', () => {
   it('coalesces equivalent in-flight timeline.replay requests while preserving request ids', async () => {
     vi.mocked(timelineEmitter.replay).mockReturnValueOnce({
       truncated: false,
+      source: TIMELINE_RESPONSE_SOURCES.RING_BUFFER,
       events: [timelineEvent({
         eventId: 'replay-coalesced-event',
         payload: { text: 'shared replay' },
@@ -1610,6 +1613,28 @@ describe('handleWebCommand transport queue behavior', () => {
       requestId: 'replay-coalesce-2',
       events: [expect.objectContaining({ eventId: 'replay-coalesced-event' })],
     }));
+  });
+
+  it('returns a terminal malformed error for invalid timeline.replay requests', async () => {
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+      sessionName: 'deck_transport_brain',
+      requestId: 'replay-malformed',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.REPLAY,
+      sessionName: 'deck_transport_brain',
+      requestId: 'replay-malformed',
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      source: TIMELINE_RESPONSE_SOURCES.ERROR,
+      errorReason: TIMELINE_REQUEST_ERROR_REASONS.MALFORMED_REQUEST,
+      events: [],
+      payloadBytes: 2,
+      payloadTruncated: false,
+    }));
+    expect(timelineEmitter.replay).not.toHaveBeenCalled();
   });
 
   it('acks ordinary transport sends while a data-plane serverLink.send promise is unsettled', async () => {
@@ -1669,6 +1694,7 @@ describe('handleWebCommand transport queue behavior', () => {
     historyWorkerDispatchMock.mockReturnValue(new Promise(() => {}));
     vi.mocked(timelineEmitter.replay).mockReturnValueOnce({
       truncated: false,
+      source: TIMELINE_RESPONSE_SOURCES.RING_BUFFER,
       events: Array.from({ length: 60 }, (_, index) => timelineEvent({
         eventId: `synthetic-replay-${index}`,
         ts: index,
@@ -1769,6 +1795,7 @@ describe('handleWebCommand transport queue behavior', () => {
       sessionName: 'deck_transport_brain',
       requestId: 'detail-ok',
       detailId: ref!.detailId,
+      epoch: 0,
       eventId: 'evt-detail',
       fieldPath: 'payload.output',
     }, serverLink as any);
@@ -1791,6 +1818,7 @@ describe('handleWebCommand transport queue behavior', () => {
       sessionName: 'deck_transport_brain',
       requestId: 'detail-bad-field',
       detailId: ref!.detailId,
+      epoch: 0,
       eventId: 'evt-detail',
       fieldPath: 'payload.error',
     }, serverLink as any);
@@ -1817,6 +1845,7 @@ describe('handleWebCommand transport queue behavior', () => {
       sessionName: 'deck_transport_brain',
       requestId: 'detail-missing',
       detailId: 'td_missing',
+      epoch: 0,
     }, serverLink as any);
 
     const oversized = getDefaultTimelineDetailStore().put({
@@ -1831,6 +1860,7 @@ describe('handleWebCommand transport queue behavior', () => {
       sessionName: 'deck_transport_brain',
       requestId: 'detail-oversized',
       detailId: oversized!.detailId,
+      epoch: 0,
     }, serverLink as any);
 
     const scoped = getDefaultTimelineDetailStore().put({
@@ -1853,6 +1883,7 @@ describe('handleWebCommand transport queue behavior', () => {
       sessionName: 'deck_other_brain',
       requestId: 'detail-cross-session',
       detailId: scoped!.detailId,
+      epoch: 0,
     }, serverLink as any);
 
     const store = getDefaultTimelineDetailStore();
@@ -1864,6 +1895,7 @@ describe('handleWebCommand transport queue behavior', () => {
       sessionName: 'deck_transport_brain',
       requestId: 'detail-internal',
       detailId: scoped!.detailId,
+      epoch: 0,
     }, serverLink as any);
 
     const reasonByRequestId = new Map(
@@ -1930,6 +1962,70 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(__resolveTransportListModelsCacheTtlMsForTests()).toBe(5_000);
     vi.stubEnv('IMCODES_TRANSPORT_LIST_MODELS_CACHE_TTL_MS', '120000');
     expect(__resolveTransportListModelsCacheTtlMsForTests()).toBe(60_000);
+  });
+
+  it('invalidates transport.list_models TTL cache when session transport config changes', async () => {
+    const listModels = vi.fn()
+      .mockResolvedValueOnce({ models: [{ id: 'old-config-model' }] })
+      .mockResolvedValueOnce({ models: [{ id: 'new-config-model' }] });
+    getProviderMock.mockReturnValue({ listModels });
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'codex-sdk', providerId: 'local', requestId: 'config-cache-1' }, serverLink as any);
+    await flushAsync();
+    await flushAsync();
+
+    handleWebCommand({
+      type: 'session.update_transport_config',
+      sessionName: 'deck_transport_brain',
+      transportConfig: { providerId: 'local', apiKeyRef: 'synthetic-next' },
+    }, serverLink as any);
+    await flushAsync();
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'codex-sdk', providerId: 'local', requestId: 'config-cache-2' }, serverLink as any);
+    await flushAsync();
+    await flushAsync();
+
+    expect(listModels).toHaveBeenCalledTimes(2);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      requestId: 'config-cache-2',
+      models: [{ id: 'new-config-model' }],
+    }));
+  });
+
+  it('does not let stale transport.list_models inflight results repopulate cache after invalidation', async () => {
+    let resolveOld!: (value: { models: Array<{ id: string }> }) => void;
+    let resolveNew!: (value: { models: Array<{ id: string }> }) => void;
+    const listModels = vi.fn()
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveNew = resolve; }));
+    getProviderMock.mockReturnValue({ listModels });
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'gemini-sdk', providerId: 'local', requestId: 'stale-inflight-1' }, serverLink as any);
+    await flushAsync();
+    expect(listModels).toHaveBeenCalledTimes(1);
+
+    __invalidateTransportListModelsCacheForTests('synthetic_config_change');
+    resolveOld({ models: [{ id: 'stale-model' }] });
+    await flushAsync();
+    await flushAsync();
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'gemini-sdk', providerId: 'local', requestId: 'stale-inflight-2' }, serverLink as any);
+    await flushAsync();
+    expect(listModels).toHaveBeenCalledTimes(2);
+    resolveNew({ models: [{ id: 'fresh-model' }] });
+    await flushAsync();
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      requestId: 'stale-inflight-2',
+      models: [{ id: 'fresh-model' }],
+    }));
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      requestId: 'stale-inflight-2',
+      models: [{ id: 'stale-model' }],
+    }));
   });
 
   it('refreshes transport.list_models after TTL expiry', async () => {

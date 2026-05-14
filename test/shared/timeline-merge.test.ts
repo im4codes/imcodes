@@ -73,6 +73,13 @@ describe('preferTimelineEvent', () => {
     expect(preferTimelineEvent(hydrated, full)).toBe(hydrated);
     expect(preferTimelineEvent(hydrated, preview)).toBe(hydrated);
   });
+
+  it('honors explicit top-level completeness metadata', () => {
+    const full = makeEvent({ eventId: 'evt-1', seq: 1, ts: 100, payload: { text: 'full payload' }, completeness: 'full' });
+    const preview = makeEvent({ eventId: 'evt-1', seq: 2, ts: 200, payload: { text: 'preview payload' }, completeness: 'preview' });
+
+    expect(preferTimelineEvent(full, preview)).toBe(full);
+  });
 });
 
 describe('mergeTimelineEvents', () => {

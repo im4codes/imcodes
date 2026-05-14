@@ -4,7 +4,10 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { TimelineEvent } from './timeline-event.js';
 import { shapeTimelineEventsForTransport } from './timeline-response-shaper.js';
-import { collectTimelineHistoryDetailCandidates } from './timeline-history-sanitize.js';
+import {
+  TIMELINE_HISTORY_DETAIL_CANDIDATE_RESPONSE_MAX_BYTES,
+  collectTimelineHistoryDetailCandidates,
+} from './timeline-history-sanitize.js';
 import type {
   TimelineHistoryWorkerDetailCandidate,
   TimelineHistoryWorkerError,
@@ -13,6 +16,7 @@ import type {
   TimelineHistoryWorkerSuccess,
 } from './timeline-history-worker-types.js';
 import { TIMELINE_HISTORY_WORKER_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
+import { TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -116,13 +120,18 @@ export function collectSelectedDetailCandidates(
   const selectedIds = new Set(selectedEvents.map((event) => event.eventId));
   const candidates: TimelineHistoryWorkerDetailCandidate[] = [];
   const seen = new Set<string>();
+  let candidateBytes = 0;
 
   for (const event of originalEvents) {
     if (!selectedIds.has(event.eventId)) continue;
     for (const candidate of collectTimelineHistoryDetailCandidates(event)) {
       const key = `${candidate.eventId}:${candidate.fieldPath}`;
       if (seen.has(key)) continue;
+      if (candidateBytes + candidate.valueBytes > TIMELINE_HISTORY_DETAIL_CANDIDATE_RESPONSE_MAX_BYTES) {
+        continue;
+      }
       seen.add(key);
+      candidateBytes += candidate.valueBytes;
       candidates.push(candidate);
     }
   }
@@ -183,6 +192,7 @@ export async function handleTimelineHistoryWorkerRequest(
       workerSlotId: message.workerSlotId,
       workerGeneration: message.workerGeneration,
       kind: 'success',
+      source: TIMELINE_RESPONSE_SOURCES.WORKER_SQLITE,
       events: sanitized.events,
       detailCandidates,
       eventsRead: events.length,

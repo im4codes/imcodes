@@ -15,6 +15,7 @@ import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
+import { TIMELINE_RESPONSE_STATUS } from '../../../shared/timeline-protocol.js';
 import { getPodIdentity } from '../util/pod-identity.js';
 import logger from '../util/logger.js';
 
@@ -22,6 +23,8 @@ export const watchRoutes = new Hono<{ Bindings: Env; Variables: { userId: string
 const TEXT_TAIL_HISTORY_PAGE_LIMIT = 500;
 const TEXT_TAIL_HISTORY_MAX_PAGES = 6;
 const TEXT_TAIL_HISTORY_TIMEOUT_MS = 1500;
+const TEXT_TAIL_MAX_ENCODED_BYTES = 64 * 1024;
+const textTailBackfills = new Map<string, Promise<Awaited<ReturnType<typeof getSessionTextTailCache>>>>();
 
 type WatchSessionState = 'working' | 'idle' | 'error' | 'stopped';
 
@@ -102,10 +105,11 @@ async function backfillSessionTextTailFromDaemon(
 
     const live = collectSessionTextTailCacheItems(sessionName, rawEvents);
     if (live.length > 0) {
-      events = mergeSessionTextTailCacheItems(events, live);
+      events = trimTextTailToBudget(mergeSessionTextTailCacheItems(events, live));
     }
 
     if (rawEvents.length < TEXT_TAIL_HISTORY_PAGE_LIMIT) break;
+    if (encodedJsonBytes(events) >= TEXT_TAIL_MAX_ENCODED_BYTES) break;
 
     let oldestTs: number | undefined;
     for (const event of rawEvents) {
@@ -120,6 +124,125 @@ async function backfillSessionTextTailFromDaemon(
   }
 
   return events;
+}
+
+function getBackfillSessionTextTailFromDaemon(
+  serverId: string,
+  sessionName: string,
+  cached: Awaited<ReturnType<typeof getSessionTextTailCache>>,
+): Promise<Awaited<ReturnType<typeof getSessionTextTailCache>>> {
+  const key = `${serverId}\0${sessionName}`;
+  const existing = textTailBackfills.get(key);
+  if (existing) return existing;
+  const promise = backfillSessionTextTailFromDaemon(serverId, sessionName, cached)
+    .finally(() => {
+      if (textTailBackfills.get(key) === promise) textTailBackfills.delete(key);
+    });
+  textTailBackfills.set(key, promise);
+  return promise;
+}
+
+function encodedJsonBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8');
+}
+
+function withHttpActualPayloadBytes<T extends Record<string, unknown>>(body: T): T & { actualPayloadBytes: number } {
+  let actualPayloadBytes = 0;
+  let next = { ...body, actualPayloadBytes };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const encodedBytes = encodedJsonBytes(next);
+    if (encodedBytes === actualPayloadBytes) break;
+    actualPayloadBytes = encodedBytes;
+    next = { ...body, actualPayloadBytes };
+  }
+  return next as T & { actualPayloadBytes: number };
+}
+
+function selectedEventIds(events: readonly unknown[]): Set<string> {
+  const ids = new Set<string>();
+  for (const event of events) {
+    if (!event || typeof event !== 'object') continue;
+    const eventId = (event as Record<string, unknown>).eventId;
+    if (typeof eventId === 'string') ids.add(eventId);
+  }
+  return ids;
+}
+
+function withBoundedHttpTimelinePayload<T extends Record<string, unknown>>(
+  body: T,
+  budgetBytes: number,
+): T & { actualPayloadBytes: number } {
+  let measured = withHttpActualPayloadBytes(body);
+  if (measured.actualPayloadBytes <= budgetBytes || !Array.isArray(body.events)) return measured;
+
+  const originalEvents = [...body.events];
+  const buildCandidate = (startIndex: number): T & { actualPayloadBytes: number } => {
+    const events = originalEvents.slice(startIndex);
+    const ids = selectedEventIds(events);
+    const detailRefs = Array.isArray(body.detailRefs)
+      ? body.detailRefs.filter((ref) => {
+        if (!ref || typeof ref !== 'object') return false;
+        const eventId = (ref as Record<string, unknown>).eventId;
+        return typeof eventId === 'string' && ids.has(eventId);
+      })
+      : undefined;
+    const earliestTs = events.length > 0 && typeof (events[0] as Record<string, unknown> | undefined)?.ts === 'number'
+      ? (events[0] as Record<string, unknown>).ts as number
+      : null;
+    return withHttpActualPayloadBytes({
+      ...body,
+      events,
+      ...(detailRefs && detailRefs.length > 0 ? { detailRefs } : { detailRefs: undefined }),
+      status: TIMELINE_RESPONSE_STATUS.PARTIAL,
+      payloadTruncated: true,
+      hasMore: true,
+      earliestTs,
+      legacyBeforeTs: earliestTs,
+    });
+  };
+
+  let low = 0;
+  let high = originalEvents.length;
+  let best: (T & { actualPayloadBytes: number }) | undefined;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = buildCandidate(mid);
+    if (candidate.actualPayloadBytes <= budgetBytes) {
+      best = candidate;
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+  return best ?? buildCandidate(originalEvents.length);
+}
+
+function trimTextTailToBudget<T extends Array<{ eventId: string; ts: number; text: string }>>(events: T): T {
+  let next = [...events];
+  while (next.length > 0 && encodedJsonBytes(next) > TEXT_TAIL_MAX_ENCODED_BYTES) {
+    next = next.slice(1);
+  }
+  return next as T;
+}
+
+function textTailSignature(events: Array<{ eventId: string; ts: number; type?: string; text?: string; source?: string; confidence?: string }>): string {
+  const first = events[0];
+  const last = events.at(-1);
+  let rolling = 0;
+  for (const event of events) {
+    const part = `${event.eventId}\0${event.ts}\0${event.type ?? ''}\0${event.text?.length ?? 0}\0${event.text ?? ''}\0${event.source ?? ''}\0${event.confidence ?? ''}`;
+    for (let index = 0; index < part.length; index += 1) {
+      rolling = ((rolling << 5) - rolling + part.charCodeAt(index)) | 0;
+    }
+  }
+  return [
+    events.length,
+    first?.eventId ?? '',
+    first?.ts ?? '',
+    last?.eventId ?? '',
+    last?.ts ?? '',
+    rolling >>> 0,
+  ].join(':');
 }
 
 function sanitizeWatchTimelineEvent(raw: unknown): {
@@ -353,6 +476,7 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
       sessionName,
       limit,
       budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
+      abortSignal: c.req.raw.signal,
       ...(beforeTs !== undefined && Number.isFinite(beforeTs) ? { beforeTs } : {}),
       ...(afterTs !== undefined && Number.isFinite(afterTs) ? { afterTs } : {}),
     });
@@ -368,7 +492,7 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
     const responseHasMore = typeof response.hasMore === 'boolean' ? response.hasMore : hasMore;
     const nextCursor = structuredTimelineCursor(response);
 
-    return c.json({
+    const body = {
       sessionName,
       epoch: typeof response.epoch === 'number' ? response.epoch : null,
       events,
@@ -377,7 +501,8 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
       nextCursor,
       earliestTs,
       legacyBeforeTs: responseHasMore ? earliestTs : null,
-    });
+    };
+    return c.json(withBoundedHttpTimelinePayload(body, TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (message === 'daemon_offline') return c.json({ error: 'daemon_offline' }, 503);
@@ -439,6 +564,7 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
       limit,
       budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL,
       includeDetails: true,
+      abortSignal: c.req.raw.signal,
       ...(beforeTs !== undefined && Number.isFinite(beforeTs) ? { beforeTs } : {}),
       ...(afterTs !== undefined && Number.isFinite(afterTs) ? { afterTs } : {}),
     });
@@ -472,7 +598,7 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
       bridgeMs, totalMs,
     }, 'timeline.history/full served');
 
-    return c.json({
+    const body = {
       sessionName,
       epoch: typeof response.epoch === 'number' ? response.epoch : null,
       events,
@@ -481,7 +607,8 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
       nextCursor,
       earliestTs,
       legacyBeforeTs: responseHasMore ? earliestTs : null,
-    });
+    };
+    return c.json(withBoundedHttpTimelinePayload(body, TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL));
   } catch (err) {
     const bridgeMs = Date.now() - tStart;
     const message = err instanceof Error ? err.message : String(err);
@@ -506,10 +633,11 @@ watchRoutes.get('/server/:id/timeline/text-tail', requireAuth(), async (c) => {
 
   try {
     const cached = await getSessionTextTailCache(c.env.DB, serverId, sessionName);
-    let events = cached;
+    let events = trimTextTailToBudget(cached);
     try {
-      events = await backfillSessionTextTailFromDaemon(serverId, sessionName, cached);
-      if (JSON.stringify(events) !== JSON.stringify(cached)) {
+      events = await getBackfillSessionTextTailFromDaemon(serverId, sessionName, cached);
+      events = trimTextTailToBudget(events);
+      if (textTailSignature(events) !== textTailSignature(cached)) {
         await replaceSessionTextTailCache(c.env.DB, serverId, sessionName, events);
       }
     } catch (err) {
@@ -520,7 +648,7 @@ watchRoutes.get('/server/:id/timeline/text-tail', requireAuth(), async (c) => {
       }, 'timeline.text-tail backfill skipped');
     }
     c.header(IMCODES_POD_HEADER, getPodIdentity());
-    return c.json({ sessionName, events });
+    return c.json(withHttpActualPayloadBytes({ sessionName, events, textTailTruncated: events.length < cached.length }));
   } catch (err) {
     logger.warn({
       serverId,

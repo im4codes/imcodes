@@ -8,7 +8,7 @@ import {
 } from '../../shared/p2p-workflow-constants.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
-import { TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/timeline-protocol.js';
+import { TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
 import type {
   P2pBindRuntimeContext,
   P2pCompiledWorkflow,
@@ -274,6 +274,8 @@ describe('ServerLink P2P workflow hello', () => {
         SESSION_GROUP_CLONE_CAPABILITY_V1,
         TIMELINE_PROTOCOL_CAPABILITY,
       ],
+      timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
+      timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,
       helloEpoch: 1,
       sentAt: Date.parse('2026-05-09T12:00:00.000Z'),
       seq: 1,
@@ -343,6 +345,8 @@ describe('ServerLink P2P workflow hello', () => {
         SESSION_GROUP_CLONE_CAPABILITY_V1,
         TIMELINE_PROTOCOL_CAPABILITY,
       ].sort(),
+      timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
+      timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,
       helloEpoch: 2,
       sentAt: Date.parse('2026-05-09T12:05:00.000Z'),
       seq: 2,

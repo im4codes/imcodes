@@ -14,6 +14,11 @@ const TIGHT_STRING_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.FIELD_PREVIEW;
 const TOOL_OUTPUT_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.FIELD_PREVIEW;
 const TOOL_RAW_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.FIELD_PREVIEW;
 const TEXT_EVENT_BYTES = 4 * 1024;
+const DETAIL_RESPONSE_HEADROOM_BYTES = 16 * 1024;
+export const TIMELINE_HISTORY_DETAIL_CANDIDATE_VALUE_MAX_BYTES =
+  TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL - DETAIL_RESPONSE_HEADROOM_BYTES;
+export const TIMELINE_HISTORY_DETAIL_CANDIDATE_RESPONSE_MAX_BYTES =
+  Math.min(256 * 1024, Math.floor(DEFAULT_TIMELINE_HISTORY_MAX_RESPONSE_BYTES / 2));
 
 interface ValuePolicy {
   maxStringBytes: number;
@@ -51,6 +56,8 @@ export interface TimelineHistoryDetailCandidate {
   eventId: string;
   fieldPath: TimelineDetailFieldPath;
   value: string;
+  valueBytes: number;
+  valueMaxBytes: number;
   previewBytes: number;
   mediaType?: string;
 }
@@ -306,8 +313,10 @@ export function collectTimelineHistoryDetailCandidates(event: TimelineEvent): Ti
   for (const candidate of fieldCandidates) {
     const value = detailStringAtPath(event, candidate.fieldPath);
     if (value === undefined) continue;
-    if (Buffer.byteLength(value, 'utf8') <= candidate.previewBytes) continue;
-    const duplicateKey = `${Buffer.byteLength(value, 'utf8')}:${value.slice(0, 128)}:${value.slice(-128)}`;
+    const valueBytes = Buffer.byteLength(value, 'utf8');
+    if (valueBytes <= candidate.previewBytes) continue;
+    if (valueBytes > TIMELINE_HISTORY_DETAIL_CANDIDATE_VALUE_MAX_BYTES) continue;
+    const duplicateKey = `${valueBytes}:${value.slice(0, 128)}:${value.slice(-128)}`;
     if (seen.has(duplicateKey)) continue;
     seen.add(duplicateKey);
     candidates.push({
@@ -316,6 +325,8 @@ export function collectTimelineHistoryDetailCandidates(event: TimelineEvent): Ti
       eventId: event.eventId,
       fieldPath: candidate.fieldPath,
       value,
+      valueBytes,
+      valueMaxBytes: TIMELINE_HISTORY_DETAIL_CANDIDATE_VALUE_MAX_BYTES,
       previewBytes: candidate.previewBytes,
       mediaType: candidate.mediaType,
     });

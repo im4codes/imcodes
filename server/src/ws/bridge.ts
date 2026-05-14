@@ -133,12 +133,13 @@ import { isP2pSavedConfig, type P2pSavedConfig } from '../../../shared/p2p-modes
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import {
   TIMELINE_MESSAGES,
+  TIMELINE_PROTOCOL_CAPABILITY,
   TIMELINE_RESPONSE_SOURCES,
   TIMELINE_RESPONSE_STATUS,
 } from '../../../shared/timeline-protocol.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
+import type { DaemonBuildInfo } from '../../../shared/build-manifest-types.js';
 import {
-  TIMELINE_DETAIL_ERROR_REASONS,
   TIMELINE_REQUEST_ERROR_REASONS,
 } from '../../../shared/timeline-history-errors.js';
 
@@ -283,6 +284,9 @@ type WatchActiveSubSessionRow = {
 interface DaemonP2pWorkflowCapabilities {
   daemonId: string;
   capabilities: string[];
+  timelineProtocolCapability?: typeof TIMELINE_PROTOCOL_CAPABILITY;
+  timelineProtocolRevision?: number;
+  buildInfo?: DaemonBuildInfo;
   helloEpoch: number;
   sentAt: number;
   receivedAt: number;
@@ -338,6 +342,9 @@ type PendingHttpTimelineRequest = {
   resolve: (msg: Record<string, unknown>) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  abortSignal?: AbortSignal;
+  abortHandler?: () => void;
+  settled?: boolean;
 };
 
 type PendingTimelineRequest = {
@@ -362,20 +369,48 @@ type TimelineDataPlaneQueueMetrics = {
   queueDepthAtEnqueue: number;
   queueDepthBeforeDrain: number;
   queuedBehindCount: number;
+  attachmentIndex?: number;
+  attachmentCount?: number;
+  fanoutYieldCount?: number;
 };
+
+type TimelineDataPlaneAttachment =
+  | {
+    origin: 'browser_request';
+    requestId?: string;
+    socket: WebSocket;
+    payload: Record<string, unknown>;
+  }
+  | {
+    origin: 'http_request';
+    requestId: string;
+    pending: PendingHttpTimelineRequest;
+    payload: Record<string, unknown>;
+  }
+  | {
+    origin: 'subscriber_fallback';
+    sessionName: string;
+    sockets: WebSocket[];
+    payload: Record<string, unknown>;
+  };
 
 type TimelineDataPlaneJob = {
   meta: TimelineDataPlaneSendMeta;
+  attachments: TimelineDataPlaneAttachment[];
   enqueuedAt: number;
+  deadlineAt: number;
   queueDepthAtEnqueue: number;
   queuedBehindCount: number;
-  work: (queue: TimelineDataPlaneQueueMetrics) => void | Promise<void>;
 };
 
 const WATCH_RECENT_TEXT_CAP = 5;
 const WATCH_RECENT_TEXT_MAX_CHARS = 160;
 const HTTP_TIMELINE_TIMEOUT_MS = 15_000;
 const TIMELINE_PENDING_UNICAST_TIMEOUT_MS = 30_000;
+const DEFAULT_TIMELINE_DATA_PLANE_QUEUE_CAP = 128;
+const DEFAULT_TIMELINE_DATA_PLANE_JOB_DEADLINE_MS = 15_000;
+let timelineDataPlaneQueueCap = DEFAULT_TIMELINE_DATA_PLANE_QUEUE_CAP;
+let timelineDataPlaneJobDeadlineMs = DEFAULT_TIMELINE_DATA_PLANE_JOB_DEADLINE_MS;
 const BRIDGE_TIMELINE_LARGE_PAYLOAD_LOG_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
 const BRIDGE_TIMELINE_SLOW_SEND_LOG_MS = 50;
 const TIMELINE_REQUEST_TYPES = new Set<string>([
@@ -397,6 +432,30 @@ const TIMELINE_RESPONSE_TYPE_BY_REQUEST = new Map<string, string>([
   [TIMELINE_MESSAGES.PAGE_REQUEST, TIMELINE_MESSAGES.PAGE],
   [TIMELINE_MESSAGES.DETAIL_REQUEST, TIMELINE_MESSAGES.DETAIL],
 ]);
+
+function deferTimelineDataPlaneTurn(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+export function __setTimelineDataPlaneQueueConfigForTests(config: {
+  queueCap?: number;
+  deadlineMs?: number;
+}): () => void {
+  const previous = {
+    queueCap: timelineDataPlaneQueueCap,
+    deadlineMs: timelineDataPlaneJobDeadlineMs,
+  };
+  if (typeof config.queueCap === 'number' && Number.isFinite(config.queueCap) && config.queueCap >= 0) {
+    timelineDataPlaneQueueCap = Math.trunc(config.queueCap);
+  }
+  if (typeof config.deadlineMs === 'number' && Number.isFinite(config.deadlineMs) && config.deadlineMs >= 0) {
+    timelineDataPlaneJobDeadlineMs = Math.trunc(config.deadlineMs);
+  }
+  return () => {
+    timelineDataPlaneQueueCap = previous.queueCap;
+    timelineDataPlaneJobDeadlineMs = previous.deadlineMs;
+  };
+}
 
 function normalizeRecentText(text: unknown): string | null {
   if (typeof text !== 'string') return null;
@@ -464,6 +523,36 @@ function timelineResponseForRequestId(msg: Record<string, unknown>, requestId: s
   }
   response.requestId = requestId;
   return response;
+}
+
+function withBridgeActualPayloadBytes(msg: Record<string, unknown>): Record<string, unknown> {
+  let actualPayloadBytes = 0;
+  let next = { ...msg, actualPayloadBytes };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const encodedBytes = Buffer.byteLength(JSON.stringify(next), 'utf8');
+    if (encodedBytes === actualPayloadBytes) break;
+    actualPayloadBytes = encodedBytes;
+    next = { ...msg, actualPayloadBytes };
+  }
+  return next;
+}
+
+function timelineDataPlaneErrorResponse(
+  msg: Record<string, unknown>,
+  type: string,
+  errorReason: string,
+): Record<string, unknown> {
+  return {
+    type,
+    ...(optionalString(msg.requestId) ? { requestId: optionalString(msg.requestId) } : {}),
+    ...(optionalString(msg.sessionName) ? { sessionName: optionalString(msg.sessionName) } : {}),
+    status: TIMELINE_RESPONSE_STATUS.ERROR,
+    source: TIMELINE_RESPONSE_SOURCES.ERROR,
+    errorReason,
+    events: type === TIMELINE_MESSAGES.DETAIL ? undefined : [],
+    payloadTruncated: false,
+    hasMore: false,
+  };
 }
 
 function optionalBoolean(value: unknown): boolean | undefined {
@@ -800,6 +889,7 @@ export class WsBridge {
 
   /** browser socket → set of subscribed transport session IDs */
   private transportSubscriptions = new Map<WebSocket, Set<string>>();
+  private transportSubscriptionRevisions = new Map<WebSocket, Map<string, number>>();
 
   /** browser socket → userId (for session ownership checks) */
   private browserUserIds = new Map<WebSocket, string>();
@@ -845,6 +935,7 @@ export class WsBridge {
 
   private timelineDataPlaneQueue: TimelineDataPlaneJob[] = [];
   private timelineDataPlaneScheduled = false;
+  private timelineDataPlaneActive = false;
 
   /** Lightweight per-session hot cache for Watch first-paint text. */
   private recentTextBySession = new Map<string, WatchRecentTextRow[]>();
@@ -1040,17 +1131,9 @@ export class WsBridge {
       ? TIMELINE_RESPONSE_TYPE_BY_REQUEST.get(msg.type)
       : undefined;
     if (!responseType) return;
-    const requestId = optionalString(msg.requestId);
-    const sessionName = optionalString(msg.sessionName);
-    safeSend(ws, JSON.stringify({
-      type: responseType,
-      ...(requestId ? { requestId } : {}),
-      ...(sessionName ? { sessionName } : {}),
-      status: TIMELINE_RESPONSE_STATUS.ERROR,
-      source: TIMELINE_RESPONSE_SOURCES.ERROR,
-      errorReason,
-      events: responseType === TIMELINE_MESSAGES.DETAIL ? undefined : [],
-    }));
+    safeSend(ws, JSON.stringify(withBridgeActualPayloadBytes(
+      timelineDataPlaneErrorResponse(msg, responseType, errorReason),
+    )));
   }
 
   private async verifyTimelineBrowserRequest(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {
@@ -1062,22 +1145,69 @@ export class WsBridge {
     const allowed = await this.verifySessionOwnership(sessionName);
     if (!allowed) {
       logger.warn({ serverId: this.serverId, sessionName, type: msg.type }, 'timeline request: session not owned by this server — rejected');
-      this.sendTimelineRequestError(ws, msg, TIMELINE_DETAIL_ERROR_REASONS.UNAUTHORIZED);
+      this.sendTimelineRequestError(ws, msg, TIMELINE_REQUEST_ERROR_REASONS.REQUEST_UNAUTHORIZED);
       return false;
     }
     return true;
   }
 
-  private enqueueTimelineDataPlaneDelivery(
-    meta: TimelineDataPlaneSendMeta,
-    work: (queue: TimelineDataPlaneQueueMetrics) => void | Promise<void>,
+  private settlePendingHttpTimelineRequest(
+    requestId: string | null,
+    pending: PendingHttpTimelineRequest,
+    fn: () => void,
   ): void {
+    if (pending.settled) return;
+    pending.settled = true;
+    clearTimeout(pending.timer);
+    if (pending.abortSignal && pending.abortHandler) {
+      pending.abortSignal.removeEventListener('abort', pending.abortHandler);
+      pending.abortHandler = undefined;
+    }
+    if (requestId) this.pendingHttpTimelineRequests.delete(requestId);
+    fn();
+  }
+
+  private scheduleTimelineDataPlaneDrain(): void {
+    if (this.timelineDataPlaneScheduled || this.timelineDataPlaneActive) return;
+    this.timelineDataPlaneScheduled = true;
+    setImmediate(() => this.drainTimelineDataPlaneQueue());
+  }
+
+  private finishTimelineDataPlaneJob(): void {
+    this.timelineDataPlaneActive = false;
+    if (this.timelineDataPlaneQueue.length > 0) this.scheduleTimelineDataPlaneDrain();
+  }
+
+  private enqueueTimelineDataPlaneJob(
+    meta: TimelineDataPlaneSendMeta,
+    attachments: TimelineDataPlaneAttachment[],
+    options: {
+      deadlineMs?: number;
+    } = {},
+  ): boolean {
+    if (attachments.length === 0) return true;
     const queuedBehindCount = this.timelineDataPlaneQueue.length;
+    if (queuedBehindCount >= timelineDataPlaneQueueCap) {
+      incrementCounter('ws_bridge_timeline_data_plane_queue_full', {
+        type: meta.type,
+        route: meta.route,
+      });
+      logger.warn({
+        serverId: this.serverId,
+        type: meta.type,
+        route: meta.route,
+        queueDepth: queuedBehindCount,
+        queueCap: timelineDataPlaneQueueCap,
+      }, 'WsBridge timeline data-plane queue full');
+      return false;
+    }
     const queueDepthAtEnqueue = queuedBehindCount + 1;
+    const enqueuedAt = performance.now();
     this.timelineDataPlaneQueue.push({
       meta,
-      work,
-      enqueuedAt: performance.now(),
+      attachments,
+      enqueuedAt,
+      deadlineAt: enqueuedAt + (options.deadlineMs ?? timelineDataPlaneJobDeadlineMs),
       queueDepthAtEnqueue,
       queuedBehindCount,
     });
@@ -1086,33 +1216,190 @@ export class WsBridge {
       route: meta.route,
       backlog: queuedBehindCount > 0 ? 'queued' : 'empty',
     });
-    if (this.timelineDataPlaneScheduled) return;
-    this.timelineDataPlaneScheduled = true;
-    setImmediate(() => this.drainTimelineDataPlaneQueue());
+    this.scheduleTimelineDataPlaneDrain();
+    return true;
+  }
+
+  private isTimelineDataPlaneJobCanceled(job: TimelineDataPlaneJob): boolean {
+    return job.attachments.every((attachment) => this.isTimelineDataPlaneAttachmentCanceled(attachment));
+  }
+
+  private isTimelineDataPlaneAttachmentCanceled(attachment: TimelineDataPlaneAttachment): boolean {
+    if (attachment.origin === 'browser_request') {
+      return attachment.socket.readyState !== WebSocket.OPEN;
+    }
+    if (attachment.origin === 'http_request') {
+      return attachment.pending.settled === true;
+    }
+    return attachment.sockets.every((socket) => socket.readyState !== WebSocket.OPEN);
+  }
+
+  private handleTimelineDataPlaneJobDeadline(job: TimelineDataPlaneJob): void {
+    const { meta } = job;
+    for (const attachment of job.attachments) {
+      if (this.isTimelineDataPlaneAttachmentCanceled(attachment)) continue;
+      if (attachment.origin === 'browser_request') {
+        if (attachment.socket.readyState === WebSocket.OPEN) {
+          safeSend(attachment.socket, JSON.stringify(withBridgeActualPayloadBytes(
+            timelineDataPlaneErrorResponse(attachment.payload, meta.type, TIMELINE_REQUEST_ERROR_REASONS.DEADLINE_EXCEEDED),
+          )));
+        }
+        continue;
+      }
+      if (attachment.origin === 'http_request') {
+        this.settlePendingHttpTimelineRequest(null, attachment.pending, () => {
+          attachment.pending.reject(new Error(TIMELINE_REQUEST_ERROR_REASONS.DEADLINE_EXCEEDED));
+        });
+      }
+    }
+  }
+
+  private async runTimelineDataPlaneJob(job: TimelineDataPlaneJob, queue: TimelineDataPlaneQueueMetrics): Promise<void> {
+    const { meta } = job;
+    const canceledCount = job.attachments.filter((attachment) => this.isTimelineDataPlaneAttachmentCanceled(attachment)).length;
+    if (canceledCount > 0) {
+      incrementCounter('ws_bridge_timeline_data_plane_canceled', {
+        type: job.meta.type,
+        route: job.meta.route,
+      });
+    }
+    const attachments = job.attachments.filter((attachment) => !this.isTimelineDataPlaneAttachmentCanceled(attachment));
+    if (attachments.length === 0) return;
+    let fanoutYieldCount = 0;
+    for (let index = 0; index < attachments.length; index += 1) {
+      if (index > 0) {
+        fanoutYieldCount += 1;
+        await deferTimelineDataPlaneTurn();
+      }
+      const attachment = attachments[index]!;
+      if (this.isTimelineDataPlaneAttachmentCanceled(attachment)) {
+        incrementCounter('ws_bridge_timeline_data_plane_canceled', {
+          type: job.meta.type,
+          route: job.meta.route,
+        });
+        continue;
+      }
+      await this.runTimelineDataPlaneAttachment(attachment, meta, {
+        ...queue,
+        attachmentIndex: index + 1,
+        attachmentCount: attachments.length,
+        fanoutYieldCount,
+      });
+    }
+  }
+
+  private runTimelineDataPlaneAttachment(
+    attachment: TimelineDataPlaneAttachment,
+    meta: TimelineDataPlaneSendMeta,
+    queue: TimelineDataPlaneQueueMetrics,
+  ): void | Promise<void> {
+    if (attachment.origin === 'http_request') {
+      if (attachment.pending.settled) return;
+      const measured = withBridgeActualPayloadBytes(attachment.payload);
+      this.settlePendingHttpTimelineRequest(null, attachment.pending, () => attachment.pending.resolve(measured));
+      this.logTimelineDataPlaneSend(meta, {
+        jsonBytes: optionalNumber(measured.actualPayloadBytes),
+        stringifyMs: 0,
+        sendWaitMs: 0,
+        queue,
+      });
+      return;
+    }
+
+    if (attachment.origin === 'browser_request') {
+      const serialized = this.stringifyTimelineDataPlaneResponse(attachment.payload, meta);
+      if (!serialized) {
+        if (attachment.socket.readyState === WebSocket.OPEN) {
+          safeSend(attachment.socket, JSON.stringify(withBridgeActualPayloadBytes(
+            timelineDataPlaneErrorResponse(attachment.payload, meta.type, TIMELINE_REQUEST_ERROR_REASONS.INTERNAL_ERROR),
+          )));
+        }
+        return;
+      }
+      const sendStart = performance.now();
+      return new Promise<void>((resolve) => {
+        safeSend(attachment.socket, serialized.json, (err) => {
+          this.logTimelineDataPlaneSend(meta, {
+            jsonBytes: serialized.jsonBytes,
+            stringifyMs: serialized.stringifyMs,
+            sendWaitMs: performance.now() - sendStart,
+            failed: !!err,
+            queue,
+          });
+          resolve();
+        });
+      });
+    }
+
+    const serialized = this.stringifyTimelineDataPlaneResponse(attachment.payload, meta);
+    if (!serialized) return;
+    const sockets = attachment.sockets.filter((socket) => socket.readyState === WebSocket.OPEN);
+    if (sockets.length === 0) return;
+    const sendStart = performance.now();
+    let pendingCallbacks = sockets.length;
+    let failed = false;
+    return new Promise<void>((resolve) => {
+      for (const socket of sockets) {
+        safeSend(socket, serialized.json, (err) => {
+          pendingCallbacks -= 1;
+          failed = failed || !!err;
+          if (pendingCallbacks !== 0) return;
+          this.logTimelineDataPlaneSend(meta, {
+            jsonBytes: serialized.jsonBytes,
+            stringifyMs: serialized.stringifyMs,
+            sendWaitMs: performance.now() - sendStart,
+            failed,
+            queue,
+          });
+          resolve();
+        });
+      }
+    });
   }
 
   private drainTimelineDataPlaneQueue(): void {
     this.timelineDataPlaneScheduled = false;
+    if (this.timelineDataPlaneActive) return;
     const queueDepthBeforeDrain = this.timelineDataPlaneQueue.length;
     const job = this.timelineDataPlaneQueue.shift();
     if (!job) return;
+    this.timelineDataPlaneActive = true;
     const queueMetrics: TimelineDataPlaneQueueMetrics = {
       backlogAgeMs: performance.now() - job.enqueuedAt,
       queueDepthAtEnqueue: job.queueDepthAtEnqueue,
       queueDepthBeforeDrain,
       queuedBehindCount: job.queuedBehindCount,
     };
+    if (this.isTimelineDataPlaneJobCanceled(job)) {
+      incrementCounter('ws_bridge_timeline_data_plane_canceled', {
+        type: job.meta.type,
+        route: job.meta.route,
+      });
+      this.finishTimelineDataPlaneJob();
+      return;
+    }
+    if (performance.now() > job.deadlineAt) {
+      incrementCounter('ws_bridge_timeline_data_plane_deadline_exceeded', {
+        type: job.meta.type,
+        route: job.meta.route,
+      });
+      logger.warn({
+        serverId: this.serverId,
+        type: job.meta.type,
+        route: job.meta.route,
+        backlogAgeMs: queueMetrics.backlogAgeMs,
+        deadlineMs: Math.max(0, job.deadlineAt - job.enqueuedAt),
+      }, 'WsBridge timeline data-plane deadline exceeded');
+      this.handleTimelineDataPlaneJobDeadline(job);
+      this.finishTimelineDataPlaneJob();
+      return;
+    }
     void Promise.resolve()
-      .then(() => job.work(queueMetrics))
+      .then(() => this.runTimelineDataPlaneJob(job, queueMetrics))
       .catch((err) => {
         logger.warn({ serverId: this.serverId, err, type: job.meta.type, route: job.meta.route }, 'WsBridge timeline data-plane delivery failed');
       })
-      .finally(() => {
-        if (this.timelineDataPlaneQueue.length > 0 && !this.timelineDataPlaneScheduled) {
-          this.timelineDataPlaneScheduled = true;
-          setImmediate(() => this.drainTimelineDataPlaneQueue());
-        }
-      });
+      .finally(() => this.finishTimelineDataPlaneJob());
   }
 
   private stringifyTimelineDataPlaneResponse(
@@ -1121,7 +1408,8 @@ export class WsBridge {
   ): { json: string; jsonBytes: number; stringifyMs: number } | null {
     const stringifyStart = performance.now();
     try {
-      const json = JSON.stringify(msg);
+      const measured = withBridgeActualPayloadBytes(msg);
+      const json = JSON.stringify(measured);
       const stringifyMs = performance.now() - stringifyStart;
       const jsonBytes = Buffer.byteLength(json, 'utf8');
       return { json, jsonBytes, stringifyMs };
@@ -1174,49 +1462,41 @@ export class WsBridge {
       queueDepthAtEnqueue: timing.queue?.queueDepthAtEnqueue,
       queueDepthBeforeDrain: timing.queue?.queueDepthBeforeDrain,
       queuedBehindCount: timing.queue?.queuedBehindCount,
+      attachmentIndex: timing.queue?.attachmentIndex,
+      attachmentCount: timing.queue?.attachmentCount,
+      fanoutYieldCount: timing.queue?.fanoutYieldCount,
     };
     if (timing.failed) logger.warn(payload, 'WsBridge timeline data-plane send failed');
     else logger.info(payload, 'WsBridge timeline data-plane send');
   }
 
-  private enqueueTimelineDataPlaneSocketSend(
-    socket: WebSocket,
-    msg: Record<string, unknown>,
+  private rejectTimelineDataPlaneAttachmentsQueueFull(
+    attachments: TimelineDataPlaneAttachment[],
     meta: TimelineDataPlaneSendMeta,
   ): void {
-    this.enqueueTimelineDataPlaneDelivery(meta, (queue) => {
-      const serialized = this.stringifyTimelineDataPlaneResponse(msg, meta);
-      if (!serialized) return;
-      const sendStart = performance.now();
-      return new Promise<void>((resolve) => {
-        safeSend(socket, serialized.json, (err) => {
-          this.logTimelineDataPlaneSend(meta, {
-            jsonBytes: serialized.jsonBytes,
-            stringifyMs: serialized.stringifyMs,
-            sendWaitMs: performance.now() - sendStart,
-            failed: !!err,
-            queue,
-          });
-          resolve();
+    for (const attachment of attachments) {
+      if (attachment.origin === 'browser_request') {
+        if (attachment.socket.readyState === WebSocket.OPEN) {
+          safeSend(attachment.socket, JSON.stringify(withBridgeActualPayloadBytes(
+            timelineDataPlaneErrorResponse(attachment.payload, meta.type, TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL),
+          )));
+        }
+        continue;
+      }
+      if (attachment.origin === 'http_request') {
+        this.settlePendingHttpTimelineRequest(attachment.requestId, attachment.pending, () => {
+          attachment.pending.reject(new Error(TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL));
         });
-      });
-    });
+      }
+    }
   }
 
-  private enqueueTimelineDataPlaneHttpResolve(
-    pending: PendingHttpTimelineRequest,
-    msg: Record<string, unknown>,
+  private enqueueTimelineDataPlaneFanout(
+    attachments: TimelineDataPlaneAttachment[],
     meta: TimelineDataPlaneSendMeta,
   ): void {
-    this.enqueueTimelineDataPlaneDelivery(meta, (queue) => {
-      pending.resolve(msg);
-      this.logTimelineDataPlaneSend(meta, {
-        jsonBytes: optionalNumber(msg.payloadBytes),
-        stringifyMs: 0,
-        sendWaitMs: 0,
-        queue,
-      });
-    });
+    const queued = this.enqueueTimelineDataPlaneJob(meta, attachments);
+    if (!queued) this.rejectTimelineDataPlaneAttachmentsQueueFull(attachments, meta);
   }
 
   private collectTimelineSubscriberSockets(sessionName: string): WebSocket[] {
@@ -1247,30 +1527,12 @@ export class WsBridge {
       broadcastRecipientCount: sockets.length,
       chunkCount: 1,
     };
-    this.enqueueTimelineDataPlaneDelivery(meta, (queue) => {
-      const serialized = this.stringifyTimelineDataPlaneResponse(msg, meta);
-      if (!serialized) return;
-      const sendStart = performance.now();
-      let pendingCallbacks = sockets.length;
-      let failed = false;
-      return new Promise<void>((resolve) => {
-        for (const socket of sockets) {
-          safeSend(socket, serialized.json, (err) => {
-            pendingCallbacks -= 1;
-            failed = failed || !!err;
-            if (pendingCallbacks !== 0) return;
-            this.logTimelineDataPlaneSend(meta, {
-              jsonBytes: serialized.jsonBytes,
-              stringifyMs: serialized.stringifyMs,
-              sendWaitMs: performance.now() - sendStart,
-              failed,
-              queue,
-            });
-            resolve();
-          });
-        }
-      });
-    });
+    this.enqueueTimelineDataPlaneJob(meta, [{
+      origin: 'subscriber_fallback',
+      sessionName,
+      sockets,
+      payload: msg,
+    }]);
   }
 
   private handleTimelineDataPlaneResponse(msg: Record<string, unknown>, type: string): void {
@@ -1301,29 +1563,29 @@ export class WsBridge {
         return;
       }
 
-      for (const { requestId, pending } of httpDeliveries) {
-        this.enqueueTimelineDataPlaneHttpResolve(pending, timelineResponseForRequestId(msg, requestId), {
-          type,
-          route: 'http_request',
-          recipientCount,
-          requestIdFanoutCount: requestIds.length,
-          httpCallerCount: httpDeliveries.length,
-          broadcastRecipientCount: 0,
-          chunkCount: 1,
-        });
-      }
-
-      for (const { requestId, pending } of socketDeliveries) {
-        this.enqueueTimelineDataPlaneSocketSend(pending.socket, timelineResponseForRequestId(msg, requestId), {
-          type,
-          route: 'browser_request',
-          recipientCount,
-          requestIdFanoutCount: requestIds.length,
-          httpCallerCount: httpDeliveries.length,
-          broadcastRecipientCount: 0,
-          chunkCount: 1,
-        });
-      }
+      const attachments: TimelineDataPlaneAttachment[] = [
+        ...httpDeliveries.map(({ requestId, pending }): TimelineDataPlaneAttachment => ({
+          origin: 'http_request',
+          requestId,
+          pending,
+          payload: timelineResponseForRequestId(msg, requestId),
+        })),
+        ...socketDeliveries.map(({ requestId, pending }): TimelineDataPlaneAttachment => ({
+          origin: 'browser_request',
+          requestId,
+          socket: pending.socket,
+          payload: timelineResponseForRequestId(msg, requestId),
+        })),
+      ];
+      this.enqueueTimelineDataPlaneFanout(attachments, {
+        type,
+        route: httpDeliveries.length > 0 && socketDeliveries.length === 0 ? 'http_request' : 'browser_request',
+        recipientCount,
+        requestIdFanoutCount: requestIds.length,
+        httpCallerCount: httpDeliveries.length,
+        broadcastRecipientCount: 0,
+        chunkCount: 1,
+      });
       return;
     }
 
@@ -2117,7 +2379,14 @@ export class WsBridge {
         type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
         daemonId: this.daemonP2pWorkflowCapabilities.daemonId,
         capabilities: this.daemonP2pWorkflowCapabilities.capabilities,
+        ...(this.daemonP2pWorkflowCapabilities.timelineProtocolRevision !== undefined
+          ? {
+            timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
+            timelineProtocolRevision: this.daemonP2pWorkflowCapabilities.timelineProtocolRevision,
+          }
+          : {}),
         helloEpoch: this.daemonP2pWorkflowCapabilities.helloEpoch,
+        ...(this.daemonP2pWorkflowCapabilities.buildInfo ? { buildInfo: this.daemonP2pWorkflowCapabilities.buildInfo } : {}),
         sentAt: this.daemonP2pWorkflowCapabilities.sentAt,
       }));
     }
@@ -2309,12 +2578,23 @@ export class WsBridge {
 
       // Track transport (chat) subscriptions for session-scoped transport event delivery
       if (msg.type === TRANSPORT_MSG.CHAT_SUBSCRIBE && typeof msg.sessionId === 'string') {
-        this.transportSubscriptions.get(ws)?.add(msg.sessionId);
-        // Forward to daemon so it can replay cached history
-        this.sendToDaemon(raw);
+        const sessionId = msg.sessionId;
+        const revision = this.bumpTransportSubscriptionRevision(ws, sessionId);
+        void this.verifySessionOwnership(sessionId).then((allowed) => {
+          if (!allowed) {
+            logger.warn({ serverId: this.serverId, sessionId }, 'chat.subscribe: session not owned by this server — rejected');
+            return;
+          }
+          if (!this.isCurrentTransportSubscriptionRevision(ws, sessionId, revision)) return;
+          if (ws.readyState !== WebSocket.OPEN) return;
+          this.transportSubscriptions.get(ws)?.add(sessionId);
+          // Forward to daemon so it can replay cached history.
+          this.sendToDaemon(raw);
+        });
         return;
       }
       if (msg.type === TRANSPORT_MSG.CHAT_UNSUBSCRIBE && typeof msg.sessionId === 'string') {
+        this.bumpTransportSubscriptionRevision(ws, msg.sessionId);
         this.transportSubscriptions.get(ws)?.delete(msg.sessionId);
         return;
       }
@@ -3398,9 +3678,24 @@ export class WsBridge {
       return;
     }
     const sortedCapabilities = [...new Set(capabilities)].sort();
+    const timelineProtocolRevision = sortedCapabilities.includes(TIMELINE_PROTOCOL_CAPABILITY)
+      && typeof msg.timelineProtocolRevision === 'number'
+      && Number.isFinite(msg.timelineProtocolRevision)
+      ? msg.timelineProtocolRevision
+      : undefined;
+    const buildInfo = msg.buildInfo && typeof msg.buildInfo === 'object'
+      ? msg.buildInfo as DaemonBuildInfo
+      : undefined;
     this.daemonP2pWorkflowCapabilities = {
       daemonId,
       capabilities: sortedCapabilities,
+      ...(timelineProtocolRevision !== undefined
+        ? {
+          timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
+          timelineProtocolRevision,
+        }
+        : {}),
+      ...(buildInfo ? { buildInfo } : {}),
       helloEpoch,
       sentAt,
       receivedAt: Date.now(),
@@ -3412,6 +3707,13 @@ export class WsBridge {
       type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
       daemonId,
       capabilities: sortedCapabilities,
+      ...(timelineProtocolRevision !== undefined
+        ? {
+          timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
+          timelineProtocolRevision,
+        }
+        : {}),
+      ...(buildInfo ? { buildInfo } : {}),
       helloEpoch,
       sentAt,
     }));
@@ -3712,6 +4014,21 @@ export class WsBridge {
     return this.terminalSubscriptionRevisions.get(ws)?.get(sessionName) === revision;
   }
 
+  private bumpTransportSubscriptionRevision(ws: WebSocket, sessionId: string): number {
+    let sessions = this.transportSubscriptionRevisions.get(ws);
+    if (!sessions) {
+      sessions = new Map();
+      this.transportSubscriptionRevisions.set(ws, sessions);
+    }
+    const next = (sessions.get(sessionId) ?? 0) + 1;
+    sessions.set(sessionId, next);
+    return next;
+  }
+
+  private isCurrentTransportSubscriptionRevision(ws: WebSocket, sessionId: string, revision: number): boolean {
+    return this.transportSubscriptionRevisions.get(ws)?.get(sessionId) === revision;
+  }
+
   private cleanupBrowserSocket(ws: WebSocket): void {
     this.browserSockets.delete(ws);
     this.mobileSockets.delete(ws);
@@ -3725,6 +4042,7 @@ export class WsBridge {
     }
     this.browserSubscriptions.delete(ws);
     this.terminalSubscriptionRevisions.delete(ws);
+    this.transportSubscriptionRevisions.delete(ws);
     this.transportSubscriptions.delete(ws);
     this.clearPendingFsRoutesForSocket(ws);
     // Clean up pending timeline requests for this socket
@@ -4201,22 +4519,38 @@ export class WsBridge {
     budgetBytes?: number;
     includeDetails?: boolean;
     timeoutMs?: number;
+    abortSignal?: AbortSignal;
   }): Promise<Record<string, unknown>> {
     if (!this.isDaemonConnected()) {
       return Promise.reject(new Error('daemon_offline'));
+    }
+    if (params.abortSignal?.aborted) {
+      return Promise.reject(new Error(TIMELINE_REQUEST_ERROR_REASONS.REQUEST_CANCELED));
     }
 
     const requestId = `watch-hist-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const timeoutMs = params.timeoutMs ?? HTTP_TIMELINE_TIMEOUT_MS;
 
     return new Promise<Record<string, unknown>>((resolve, reject) => {
+      let pending: PendingHttpTimelineRequest;
       const timer = setTimeout(() => {
-        this.pendingHttpTimelineRequests.delete(requestId);
-        reject(new Error('timeout'));
+        const current = this.pendingHttpTimelineRequests.get(requestId) ?? pending;
+        this.settlePendingHttpTimelineRequest(requestId, current, () => reject(new Error('timeout')));
       }, timeoutMs);
       timer.unref?.();
 
-      this.pendingHttpTimelineRequests.set(requestId, { resolve, reject, timer });
+      pending = { resolve, reject, timer, abortSignal: params.abortSignal };
+      if (params.abortSignal) {
+        pending.abortHandler = () => {
+          incrementCounter('ws_bridge_timeline_data_plane_http_abort', {
+            type: TIMELINE_MESSAGES.HISTORY,
+            route: 'http_request',
+          });
+          this.settlePendingHttpTimelineRequest(requestId, pending, () => reject(new Error(TIMELINE_REQUEST_ERROR_REASONS.REQUEST_CANCELED)));
+        };
+        params.abortSignal.addEventListener('abort', pending.abortHandler, { once: true });
+      }
+      this.pendingHttpTimelineRequests.set(requestId, pending);
 
       try {
         this.daemonWs!.send(JSON.stringify({
@@ -4230,9 +4564,10 @@ export class WsBridge {
           ...(typeof params.includeDetails === 'boolean' ? { includeDetails: params.includeDetails } : {}),
         }));
       } catch (err) {
-        this.pendingHttpTimelineRequests.delete(requestId);
-        clearTimeout(timer);
-        reject(err instanceof Error ? err : new Error(String(err)));
+        const current = this.pendingHttpTimelineRequests.get(requestId) ?? pending;
+        this.settlePendingHttpTimelineRequest(requestId, current, () => {
+          reject(err instanceof Error ? err : new Error(String(err)));
+        });
       }
     });
   }
@@ -4382,11 +4717,9 @@ export class WsBridge {
   }
 
   private rejectAllPendingHttpTimelineRequests(reason: string): void {
-    for (const [, pending] of this.pendingHttpTimelineRequests) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error(reason));
+    for (const [requestId, pending] of [...this.pendingHttpTimelineRequests]) {
+      this.settlePendingHttpTimelineRequest(requestId, pending, () => pending.reject(new Error(reason)));
     }
-    this.pendingHttpTimelineRequests.clear();
   }
 
   /**

@@ -11,6 +11,7 @@ import type {
   ProcessedContextProjectionStatus,
 } from '../../../shared/context-types.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../../shared/file-change.js';
+import type { TimelineDetailRef, TimelineEventCompleteness } from '../../../shared/timeline-protocol.js';
 
 export type TimelineEventType =
   | 'user.message'
@@ -94,7 +95,14 @@ export interface TimelineEvent {
   source: TimelineSource;
   confidence: TimelineConfidence;
   type: TimelineEventType;
-  payload: Record<string, unknown>;
+  payload: Record<string, unknown> & {
+    completeness?: TimelineEventCompleteness;
+    timelineCompleteness?: TimelineEventCompleteness;
+    detailRefs?: TimelineDetailRef[];
+  };
+  completeness?: TimelineEventCompleteness;
+  timelineCompleteness?: TimelineEventCompleteness;
+  detailRefs?: TimelineDetailRef[];
   hidden?: boolean;
 }
 

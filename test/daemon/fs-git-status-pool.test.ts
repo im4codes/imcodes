@@ -78,6 +78,10 @@ class ControlledFsGitStatusWorker implements FsGitStatusWorkerThreadLike {
     } satisfies FsGitStatusWorkerResult);
   }
 
+  emitStale(index: number): void {
+    this.complete(index);
+  }
+
   private emit(event: string, value: unknown): void {
     for (const listener of this.listeners.get(event) ?? []) listener(value);
   }
@@ -210,6 +214,38 @@ describe('fs git status worker pool', () => {
 
     await vi.advanceTimersByTimeAsync(11);
     await rejection;
+    await pool.shutdown();
+  });
+
+  it('records stale git status results that arrive after an active timeout', async () => {
+    vi.useFakeTimers();
+    const staleEvents: Record<string, unknown>[] = [];
+    const worker = new ControlledFsGitStatusWorker();
+    const pool = new FsGitStatusWorkerPool({
+      workersTarget: 1,
+      activeJobTimeoutMs: 10,
+      createWorker: () => worker,
+      onStaleResultDropped: (event) => staleEvents.push(event),
+    });
+
+    const pending = pool.dispatch({
+      repoRoot: '/tmp/project',
+      repoSignature: 'sig-1',
+      requestedPath: '/tmp/project',
+      includeStats: false,
+    });
+    const rejection = expect(pending).rejects.toMatchObject({ reason: 'timeout' } satisfies Partial<FsGitStatusPoolError>);
+
+    await vi.advanceTimersByTimeAsync(11);
+    await rejection;
+    worker.emitStale(0);
+
+    expect(staleEvents).toContainEqual(expect.objectContaining({
+      reason: 'no_active_job',
+      workerRequestId: 1,
+      workerSlotId: 1,
+      workerGeneration: 1,
+    }));
     await pool.shutdown();
   });
 });

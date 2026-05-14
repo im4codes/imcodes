@@ -15,6 +15,7 @@ import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
 import { recordTurnUsage } from '../store/context-store.js';
 import logger from '../util/logger.js';
 import { recordTimelineEmit } from './latency-tracer.js';
+import { TIMELINE_RESPONSE_SOURCES, type TimelineResponseSource } from '../../shared/timeline-protocol.js';
 
 /** Pattern matching temp file instruction: "Read and execute all instructions in @<path>" */
 const TEMP_FILE_RE = /^Read and execute all instructions in @(.+\.imcodes-prompt-[0-9a-f]+\.md)$/;
@@ -327,13 +328,13 @@ export class TimelineEmitter {
    * made appends async; without this merge the slow path would lose
    * any event whose JSONL write hadn't landed yet).
    */
-  replay(sessionId: string, afterSeq: number): { events: TimelineEvent[]; truncated: boolean } {
+  replay(sessionId: string, afterSeq: number): { events: TimelineEvent[]; truncated: boolean; source: TimelineResponseSource } {
     const buf = this.buffer.get(sessionId) ?? [];
 
     // Fast path — buffer covers everything from afterSeq+1 forward.
     if (buf.length > 0 && (afterSeq + 1) >= buf[0].seq) {
       const events = buf.filter(e => e.seq > afterSeq);
-      return { events, truncated: false };
+      return { events, truncated: false, source: TIMELINE_RESPONSE_SOURCES.RING_BUFFER };
     }
 
     // Slow path — buffer alone can't satisfy the request. Read JSONL
@@ -342,7 +343,7 @@ export class TimelineEmitter {
     // writes + buffer in-place stable-eventId updates).
     const fileEvents = timelineStore.read(sessionId, { epoch: this.epoch, afterSeq });
     if (buf.length === 0) {
-      return { events: fileEvents, truncated: false };
+      return { events: fileEvents, truncated: false, source: TIMELINE_RESPONSE_SOURCES.JSONL_TAIL };
     }
     const seen = new Set<string>();
     for (const e of fileEvents) seen.add(`${e.epoch}:${e.seq}`);
@@ -355,7 +356,7 @@ export class TimelineEmitter {
       merged.push(e);
     }
     merged.sort((a, b) => a.seq - b.seq);
-    return { events: merged, truncated: false };
+    return { events: merged, truncated: false, source: TIMELINE_RESPONSE_SOURCES.RING_BUFFER_JSONL };
   }
 }
 

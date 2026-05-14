@@ -97,6 +97,7 @@ export interface QuickData {
 }
 
 export const SESSION_TEXT_TAIL_CACHE_LIMIT = 50;
+export const SESSION_TEXT_TAIL_TEXT_MAX_CHARS = 1024;
 
 export interface SessionTextTailCacheItem {
   eventId: string;
@@ -123,7 +124,10 @@ interface ClassifiedSessionTextTailEvent {
 function normalizeSessionTextTailText(text: unknown): string | null {
   if (typeof text !== 'string') return null;
   const trimmed = text.trim();
-  return trimmed || null;
+  if (!trimmed) return null;
+  return trimmed.length > SESSION_TEXT_TAIL_TEXT_MAX_CHARS
+    ? trimmed.slice(0, SESSION_TEXT_TAIL_TEXT_MAX_CHARS)
+    : trimmed;
 }
 
 function isSessionTextTailType(type: unknown): type is SessionTextTailCacheItem['type'] {

@@ -8,6 +8,7 @@
  */
 
 import type { TimelineEvent } from './ws-client.js';
+import { preferTimelineEvent } from '../../src/shared/timeline/merge.js';
 
 const DB_NAME = 'imcodes-timeline';
 const DB_VERSION = 1;
@@ -47,18 +48,7 @@ export class TimelineDB {
   }
 
   async putEvent(event: TimelineEvent): Promise<void> {
-    if (this._memoryOnly || !this.db) {
-      this.memPut(event);
-      return;
-    }
-
-    try {
-      await txWrite(this.db, STORE_NAME, (store) => {
-        store.put(event);
-      });
-    } catch {
-      this.memPut(event);
-    }
+    await this.putEvents([event]);
   }
 
   async putEvents(events: TimelineEvent[]): Promise<void> {
@@ -70,9 +60,7 @@ export class TimelineDB {
     }
 
     try {
-      await txWrite(this.db, STORE_NAME, (store) => {
-        for (const e of events) store.put(e);
-      });
+      await txPutEventsPreservingCompleteness(this.db, events);
     } catch {
       for (const e of events) this.memPut(e);
     }
@@ -256,7 +244,7 @@ export class TimelineDB {
     // Idempotent overwrite by eventId (matches IndexedDB put semantics)
     const idx = events.findIndex((e) => e.eventId === event.eventId);
     if (idx >= 0) {
-      events[idx] = event;
+      events[idx] = preferTimelineEvent(events[idx]!, event);
     } else {
       events.push(event);
     }
@@ -291,6 +279,27 @@ export class TimelineDB {
     const last = events.reduce((a, b) => (a.seq > b.seq ? a : b));
     return { seq: last.seq, epoch: last.epoch };
   }
+}
+
+function txPutEventsPreservingCompleteness(
+  db: IDBDatabase,
+  events: TimelineEvent[],
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    for (const event of events) {
+      const getReq = store.get(event.eventId);
+      getReq.onsuccess = () => {
+        const existing = getReq.result as TimelineEvent | undefined;
+        store.put(existing ? preferTimelineEvent(existing, event) : event);
+      };
+      getReq.onerror = () => reject(getReq.error);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
 }
 
 // ── IDB transaction helper ─────────────────────────────────────────────────

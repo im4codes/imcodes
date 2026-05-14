@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { sanitizeTimelineHistoryEventsForTransport } from '../../src/daemon/timeline-history-sanitize.js';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 
 function event(overrides: Partial<TimelineEvent>): TimelineEvent {
   return {
@@ -81,6 +82,69 @@ describe('timeline history transport sanitization', () => {
       eventId: 'tool-detail-ref',
       fieldPath: 'payload.output',
     })]);
+  });
+
+  it('deduplicates duplicated provider payload detail refs without storing the same full value twice', () => {
+    const refs: Array<{ eventId: string; fieldPath: string; value: string }> = [];
+    const duplicatedProviderText = `provider-result:${'p'.repeat(64 * 1024)}`;
+    const result = sanitizeTimelineHistoryEventsForTransport([
+      event({
+        eventId: 'tool-duplicated-provider-payload',
+        payload: {
+          output: duplicatedProviderText,
+          detail: {
+            output: duplicatedProviderText,
+          },
+        },
+      }),
+    ], {
+      detailSink: {
+        put: (input) => {
+          refs.push({ eventId: input.eventId, fieldPath: input.fieldPath, value: input.value });
+          return {
+            detailId: `td_${refs.length}`,
+            eventId: input.eventId,
+            fieldPath: input.fieldPath,
+            previewBytes: input.previewBytes,
+            expiresAt: 123,
+          };
+        },
+      },
+    });
+
+    expect(result.events).toHaveLength(1);
+    expect(result.detailRefs).toHaveLength(1);
+    expect(refs).toEqual([{
+      eventId: 'tool-duplicated-provider-payload',
+      fieldPath: 'payload.output',
+      value: duplicatedProviderText,
+    }]);
+  });
+
+  it('bounds extremely wide synthetic objects without allocating a full transport payload', () => {
+    const wideRaw: Record<string, unknown> = {};
+    for (let index = 0; index < 2_000; index += 1) {
+      wideRaw[`wide_${index}`] = `value-${index}`;
+    }
+
+    const result = sanitizeTimelineHistoryEventsForTransport([
+      event({
+        eventId: 'tool-wide-object',
+        payload: {
+          tool: 'synthetic-wide',
+          output: 'short visible output',
+          detail: {
+            raw: wideRaw,
+          },
+        },
+      }),
+    ]);
+
+    expect(result.events).toHaveLength(1);
+    expect(result.truncatedEvents).toBeGreaterThan(0);
+    expect(Buffer.byteLength(JSON.stringify(result.events[0]), 'utf8')).toBeLessThanOrEqual(TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_EVENT);
+    const raw = (result.events[0]?.payload.detail as { raw?: Record<string, unknown> } | undefined)?.raw;
+    expect(Object.keys(raw ?? {})).toHaveLength(32);
   });
 
   it('keeps the newest events when the history batch exceeds the response budget', () => {

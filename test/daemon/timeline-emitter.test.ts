@@ -13,6 +13,7 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
 
 import { TimelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
+import { TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 
 describe('TimelineEmitter — seq counter', () => {
   let emitter: TimelineEmitter;
@@ -166,10 +167,11 @@ describe('TimelineEmitter — replay', () => {
     emitter.emit(session, 'assistant.text', { text: 'two' });   // seq 2
     emitter.emit(session, 'assistant.text', { text: 'three' }); // seq 3
 
-    const { events } = emitter.replay(session, 1);
+    const { events, source } = emitter.replay(session, 1);
     expect(events).toHaveLength(2);
     expect(events[0].seq).toBe(2);
     expect(events[1].seq).toBe(3);
+    expect(source).toBe(TIMELINE_RESPONSE_SOURCES.RING_BUFFER);
   });
 
   it('replay with afterSeq=0 returns all events', () => {
@@ -202,10 +204,37 @@ describe('TimelineEmitter — replay', () => {
     expect(timelineStore.read).toHaveBeenCalledWith(session, { epoch: emitter.epoch, afterSeq: 5 });
   });
 
+  it('marks replay slow path as mixed when JSONL tail and ring buffer both contribute', () => {
+    const session = 'session-mixed';
+    for (let i = 0; i < 510; i++) {
+      emitter.emit(session, 'assistant.text', { text: `msg-${i}` });
+    }
+    vi.mocked(timelineStore.read).mockReturnValueOnce([
+      {
+        eventId: 'jsonl-6',
+        sessionId: session,
+        ts: 6,
+        seq: 6,
+        epoch: emitter.epoch,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'from jsonl' },
+      },
+    ]);
+
+    const result = emitter.replay(session, 5);
+
+    expect(result.source).toBe(TIMELINE_RESPONSE_SOURCES.RING_BUFFER_JSONL);
+    expect(result.events[0]?.eventId).toBe('jsonl-6');
+    expect(result.events.at(-1)?.seq).toBe(510);
+  });
+
   it('empty buffer → truncated: false', () => {
-    const { events, truncated } = emitter.replay('session-empty', 0);
+    const { events, truncated, source } = emitter.replay('session-empty', 0);
     expect(events).toHaveLength(0);
     expect(truncated).toBe(false);
+    expect(source).toBe(TIMELINE_RESPONSE_SOURCES.JSONL_TAIL);
   });
 
   it('empty buffer with positive afterSeq → falls to file store', () => {

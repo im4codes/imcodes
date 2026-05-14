@@ -23,7 +23,7 @@ const VISIBLE_TYPES = new Set([
   'file.change',
 ]);
 
-export function isUserVisible(event: { type: string; payload?: { streaming?: boolean } }): boolean {
+export function isUserVisible(event: { type: string; payload?: Record<string, unknown> & { streaming?: boolean } }): boolean {
   if (!VISIBLE_TYPES.has(event.type)) return false;
   // Streaming deltas are intermediate updates to the same message — only count the final one.
   if (event.type === 'assistant.text' && event.payload?.streaming === true) return false;

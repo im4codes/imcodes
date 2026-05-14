@@ -17,8 +17,15 @@ import {
 } from '../../shared/p2p-workflow-constants.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
-import { TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/timeline-protocol.js';
-import { classifyServerSendPlane, recordServerSend, stringifyForServerSend } from './latency-tracer.js';
+import { TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
+import {
+  classifyServerSendPlane,
+  recordServerLinkDataPlaneBackpressure,
+  recordServerLinkDataPlaneStaleDropped,
+  recordServerSend,
+  stringifyForServerSend,
+} from './latency-tracer.js';
+import { getDaemonBuildInfo } from './build-info.js';
 
 interface SystemStats {
   cpu: number;
@@ -57,7 +64,20 @@ function collectSystemStats(): SystemStats {
 
 const HEARTBEAT_MS = 5_000;
 const STATS_MS = 5_000; // daemon.stats update interval (separate from heartbeat)
-const DATA_PLANE_SEND_QUEUE_CAP = 256; // max queued data-plane messages; overflow is logged not dropped
+const DEFAULT_DATA_PLANE_SEND_QUEUE_SOFT_CAP = 256;
+const DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP = 512;
+const DEFAULT_DATA_PLANE_SEND_STALE_MS = 30_000;
+let dataPlaneSendQueueSoftCap = DEFAULT_DATA_PLANE_SEND_QUEUE_SOFT_CAP;
+let dataPlaneSendQueueHardCap = DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP;
+let dataPlaneSendStaleMs = DEFAULT_DATA_PLANE_SEND_STALE_MS;
+
+type DataPlaneSendQueueItem = {
+  msg: unknown;
+  msgType?: string;
+  requestId?: string;
+  enqueuedAt: number;
+  deadlineAt: number;
+};
 /**
  * Audit fix (94b9b837-822 / A6) — reconnect tuning.
  *
@@ -111,6 +131,37 @@ export interface ServerLinkOpts {
 export type MessageHandler = (msg: unknown) => void;
 export type BinaryMessageHandler = (data: Buffer) => void;
 
+function messageTypeOf(msg: unknown): string | undefined {
+  return typeof (msg as { type?: unknown })?.type === 'string'
+    ? (msg as { type: string }).type
+    : undefined;
+}
+
+function requestIdOf(msg: unknown): string | undefined {
+  return typeof (msg as { requestId?: unknown })?.requestId === 'string'
+    ? (msg as { requestId: string }).requestId
+    : undefined;
+}
+
+export function __setServerLinkDataPlaneQueueConfigForTests(options: {
+  softCap?: number;
+  hardCap?: number;
+  staleMs?: number;
+} | null): void {
+  if (!options) {
+    dataPlaneSendQueueSoftCap = DEFAULT_DATA_PLANE_SEND_QUEUE_SOFT_CAP;
+    dataPlaneSendQueueHardCap = DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP;
+    dataPlaneSendStaleMs = DEFAULT_DATA_PLANE_SEND_STALE_MS;
+    return;
+  }
+  dataPlaneSendQueueSoftCap = Math.max(0, Math.trunc(options.softCap ?? DEFAULT_DATA_PLANE_SEND_QUEUE_SOFT_CAP));
+  dataPlaneSendQueueHardCap = Math.max(
+    Math.max(1, dataPlaneSendQueueSoftCap),
+    Math.trunc(options.hardCap ?? DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP),
+  );
+  dataPlaneSendStaleMs = Math.max(0, Math.trunc(options.staleMs ?? DEFAULT_DATA_PLANE_SEND_STALE_MS));
+}
+
 export class ServerLink {
   private ws: WebSocket | null = null;
   private handlers: MessageHandler[] = [];
@@ -134,7 +185,7 @@ export class ServerLink {
   private helloEpoch = 0;
   private lastHelloSentAt = 0;
   private sendBacklogStartedAt: number | null = null;
-  private dataPlaneSendQueue: unknown[] = [];
+  private dataPlaneSendQueue: DataPlaneSendQueueItem[] = [];
   private dataPlaneSendScheduled = false;
   private dataPlaneQueueStartedAt: number | null = null;
   private p2pWorkflowCapabilities: readonly string[] = [
@@ -321,14 +372,7 @@ export class ServerLink {
 
   send(msg: unknown): void {
     if (this.shouldDeferDataPlaneSend(msg)) {
-      this.dataPlaneSendQueue.push(msg);
-      this.dataPlaneQueueStartedAt ??= performance.now();
-      if (this.dataPlaneSendQueue.length > DATA_PLANE_SEND_QUEUE_CAP) {
-        // Log overflow but do NOT drop — the message is already in the queue.
-        // This is observable telemetry, not silent data loss.
-        const overflow = this.dataPlaneSendQueue.length - DATA_PLANE_SEND_QUEUE_CAP;
-        logger.warn({ overflow, queueDepth: this.dataPlaneSendQueue.length }, 'ServerLink: data-plane queue overflow');
-      }
+      this.enqueueDataPlaneSend(msg);
       this.scheduleDataPlaneFlush();
       return;
     }
@@ -403,10 +447,80 @@ export class ServerLink {
   }
 
   private shouldDeferDataPlaneSend(msg: unknown): boolean {
-    const msgType = typeof (msg as { type?: unknown })?.type === 'string'
-      ? (msg as { type: string }).type
-      : undefined;
+    const msgType = messageTypeOf(msg);
     return classifyServerSendPlane(msgType) === 'data';
+  }
+
+  private enqueueDataPlaneSend(msg: unknown): void {
+    const now = performance.now();
+    const msgType = messageTypeOf(msg);
+    const requestId = requestIdOf(msg);
+    this.dropExpiredDataPlaneSendItems(now, 'enqueue_stale');
+    if (this.dataPlaneSendQueue.length >= dataPlaneSendQueueSoftCap) {
+      const overflow = Math.max(0, this.dataPlaneSendQueue.length - dataPlaneSendQueueSoftCap + 1);
+      recordServerLinkDataPlaneBackpressure({
+        msgType,
+        requestId,
+        queueDepth: this.dataPlaneSendQueue.length,
+        softCap: dataPlaneSendQueueSoftCap,
+        hardCap: dataPlaneSendQueueHardCap,
+        overflow,
+      });
+      logger.warn({
+        msgType,
+        requestId,
+        overflow,
+        queueDepth: this.dataPlaneSendQueue.length,
+        softCap: dataPlaneSendQueueSoftCap,
+        hardCap: dataPlaneSendQueueHardCap,
+      }, 'ServerLink: data-plane queue backpressure');
+    }
+    if (this.dataPlaneSendQueue.length >= dataPlaneSendQueueHardCap) {
+      const dropped = this.dataPlaneSendQueue.shift();
+      this.recordDataPlaneSendItemDropped(dropped, now, 'hard_cap_drop_oldest');
+      this.dataPlaneQueueStartedAt = this.dataPlaneSendQueue[0]?.enqueuedAt ?? null;
+    }
+    this.dataPlaneSendQueue.push({
+      msg,
+      msgType,
+      requestId,
+      enqueuedAt: now,
+      deadlineAt: now + dataPlaneSendStaleMs,
+    });
+    this.dataPlaneQueueStartedAt ??= now;
+  }
+
+  private dropExpiredDataPlaneSendItems(now: number, reason: string): void {
+    if (this.dataPlaneSendQueue.length === 0) return;
+    const live: DataPlaneSendQueueItem[] = [];
+    for (const item of this.dataPlaneSendQueue) {
+      if (item.deadlineAt <= now) this.recordDataPlaneSendItemDropped(item, now, reason);
+      else live.push(item);
+    }
+    if (live.length === this.dataPlaneSendQueue.length) return;
+    this.dataPlaneSendQueue = live;
+    this.dataPlaneQueueStartedAt = this.dataPlaneSendQueue[0]?.enqueuedAt ?? null;
+  }
+
+  private recordDataPlaneSendItemDropped(item: DataPlaneSendQueueItem | undefined, now: number, reason: string): void {
+    if (!item) return;
+    const ageMs = Math.max(0, now - item.enqueuedAt);
+    recordServerLinkDataPlaneStaleDropped({
+      msgType: item.msgType,
+      requestId: item.requestId,
+      reason,
+      ageMs,
+      staleMs: dataPlaneSendStaleMs,
+      queueDepth: this.dataPlaneSendQueue.length,
+    });
+    logger.warn({
+      msgType: item.msgType,
+      requestId: item.requestId,
+      reason,
+      ageMs,
+      staleMs: dataPlaneSendStaleMs,
+      queueDepth: this.dataPlaneSendQueue.length,
+    }, 'ServerLink: dropped stale data-plane send');
   }
 
   private scheduleDataPlaneFlush(): void {
@@ -414,16 +528,23 @@ export class ServerLink {
     this.dataPlaneSendScheduled = true;
     setImmediate(() => {
       this.dataPlaneSendScheduled = false;
-      const msg = this.dataPlaneSendQueue.shift();
-      if (msg === undefined) {
+      const now = performance.now();
+      this.dropExpiredDataPlaneSendItems(now, 'drain_stale');
+      const item = this.dataPlaneSendQueue.shift();
+      if (item === undefined) {
         this.dataPlaneQueueStartedAt = null;
         return;
       }
-      this.trySend(msg);
+      if (item.deadlineAt <= now) {
+        this.recordDataPlaneSendItemDropped(item, now, 'drain_stale');
+      } else {
+        this.trySend(item.msg);
+      }
       if (this.dataPlaneSendQueue.length === 0) {
         this.dataPlaneQueueStartedAt = null;
         return;
       }
+      this.dataPlaneQueueStartedAt = this.dataPlaneSendQueue[0]?.enqueuedAt ?? null;
       this.scheduleDataPlaneFlush();
     });
   }
@@ -476,6 +597,9 @@ export class ServerLink {
       type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
       daemonId: this.serverId,
       capabilities: this.getDaemonCapabilities(),
+      timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
+      timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,
+      buildInfo: getDaemonBuildInfo() ?? undefined,
       helloEpoch: this.helloEpoch,
       sentAt,
     });

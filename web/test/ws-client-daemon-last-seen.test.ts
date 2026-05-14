@@ -16,6 +16,7 @@ import { WsClient } from '../src/ws-client.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.js';
 import { REPO_MSG } from '@shared/repo-types.js';
+import { TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '@shared/timeline-protocol.js';
 
 class MockWebSocket {
   static CONNECTING = 0;
@@ -54,7 +55,9 @@ const seedHello = (ws: MockWebSocket) => {
     data: JSON.stringify({
       type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
       daemonId: 'daemon-1',
-      capabilities: ['p2p_workflow_v1'],
+      capabilities: ['p2p_workflow_v1', TIMELINE_PROTOCOL_CAPABILITY],
+      timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
+      timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,
       helloEpoch: 1,
       sentAt: Date.now(),
     }),
@@ -100,6 +103,24 @@ describe('WsClient daemonLastSeenAt freshness whitelist (N4)', () => {
     const { client, ws } = await connect();
     seedHello(ws);
     expect(client.isDaemonCapabilityStale()).toBe(false);
+    expect(client.getDaemonCapabilitySnapshot()?.timelineProtocolRevision).toBe(TIMELINE_PROTOCOL_REVISION);
+    expect(client.supportsTimelineProtocolRevision(TIMELINE_PROTOCOL_REVISION)).toBe(true);
+  });
+
+  it('does not infer timeline protocol support from a revision field without the capability', async () => {
+    const { client, ws } = await connect();
+    ws.emit('message', {
+      data: JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: 'daemon-no-timeline',
+        capabilities: ['p2p_workflow_v1'],
+        timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,
+        helloEpoch: 1,
+        sentAt: Date.now(),
+      }),
+    });
+    expect(client.getDaemonCapabilitySnapshot()?.timelineProtocolRevision).toBeUndefined();
+    expect(client.supportsTimelineProtocolRevision(TIMELINE_PROTOCOL_REVISION)).toBe(false);
   });
 
   it('daemon.stats keeps the connection fresh past the hello TTL window', async () => {

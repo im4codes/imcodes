@@ -51,7 +51,7 @@ describe('timeline detail store', () => {
       detailId: ref!.detailId,
       eventId: 'evt-1',
       fieldPath: 'payload.output',
-    })).toEqual({ ok: false, reason: TIMELINE_DETAIL_ERROR_REASONS.MISSING });
+    })).toEqual({ ok: false, reason: TIMELINE_DETAIL_ERROR_REASONS.GENERATION_MISMATCH });
     expect(store.get({
       sessionName: 'deck_hist',
       epoch: 3,
@@ -59,7 +59,7 @@ describe('timeline detail store', () => {
       detailId: ref!.detailId,
       eventId: 'evt-2',
       fieldPath: 'payload.output',
-    })).toEqual({ ok: false, reason: TIMELINE_DETAIL_ERROR_REASONS.MISSING });
+    })).toEqual({ ok: false, reason: TIMELINE_DETAIL_ERROR_REASONS.EPOCH_MISMATCH });
     expect(store.get({
       sessionName: 'deck_hist',
       epoch: 2,

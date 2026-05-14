@@ -1,6 +1,7 @@
 import type { TimelineEvent, TimelineEventType } from './timeline-event.js';
 import type { TimelineHistoryDetailCandidate } from './timeline-history-sanitize.js';
 import type { TimelineHistoryWorkerErrorReason } from '../../shared/timeline-history-errors.js';
+import type { TimelineResponseSource } from '../../shared/timeline-protocol.js';
 
 export type { TimelineHistoryWorkerErrorReason };
 export type TimelineHistoryWorkerDetailCandidate = TimelineHistoryDetailCandidate;
@@ -34,6 +35,7 @@ export interface TimelineHistoryWorkerRequest extends TimelineHistoryBuildJobInp
 
 export interface TimelineHistoryWorkerSuccess extends TimelineHistoryWorkerIdentity {
   kind: 'success';
+  source: TimelineResponseSource;
   events: TimelineEvent[];
   detailCandidates: TimelineHistoryWorkerDetailCandidate[];
   eventsRead: number;

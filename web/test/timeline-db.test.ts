@@ -180,6 +180,45 @@ describe('TimelineDB — memory fallback mode', () => {
     expect(found?.hidden).toBe(true);
   });
 
+  it('does not overwrite full or hydrated events with later previews', async () => {
+    const full = makeEvent({
+      seq: 1,
+      epoch: 100,
+      eventId: 'complete-1',
+      payload: { text: 'complete output', completeness: 'full' },
+    });
+    const preview = makeEvent({
+      seq: 2,
+      epoch: 100,
+      eventId: 'complete-1',
+      payload: {
+        text: 'preview output',
+        completeness: 'preview',
+        detailRefs: [{ detailId: 'td_1', eventId: 'complete-1', fieldPath: 'payload.text' }],
+      },
+    });
+    const hydrated = makeEvent({
+      seq: 3,
+      epoch: 100,
+      eventId: 'complete-2',
+      payload: { text: 'hydrated output', completeness: 'hydrated' },
+    });
+    const laterFull = makeEvent({
+      seq: 4,
+      epoch: 100,
+      eventId: 'complete-2',
+      payload: { text: 'later full output', completeness: 'full' },
+    });
+
+    await db.putEvent(full);
+    await db.putEvent(preview);
+    await db.putEvents([hydrated, laterFull]);
+
+    const results = await db.getEvents('session-a', 100);
+    expect(results.find((e) => e.eventId === 'complete-1')?.payload.text).toBe('complete output');
+    expect(results.find((e) => e.eventId === 'complete-2')?.payload.text).toBe('hydrated output');
+  });
+
   it('results are sorted by seq ascending', async () => {
     await db.putEvent(makeEvent({ seq: 3, epoch: 100, eventId: 'c' }));
     await db.putEvent(makeEvent({ seq: 1, epoch: 100, eventId: 'a' }));

@@ -667,7 +667,7 @@ describe('useTimeline global cache bounds', () => {
     expect(sendSnapshotRequest).toHaveBeenCalledWith(sessionName);
   });
 
-  it('keeps older pagination open on partial empty pages and follows nextCursor', async () => {
+  it('keeps older pagination driven by hasMore plus structured nextCursor', async () => {
     const sessionName = `deck_partial_older_${Date.now()}`;
     let handler: ((msg: ServerMessage) => void) | null = null;
     let requestSeq = 0;
@@ -703,6 +703,7 @@ describe('useTimeline global cache bounds', () => {
       },
       sendTimelineHistoryRequest,
       sendTimelinePageRequest,
+      supportsTimelineProtocolRevision: vi.fn(() => true),
     } as unknown as WsClient;
 
     function Probe() {
@@ -724,17 +725,36 @@ describe('useTimeline global cache bounds', () => {
       expect(screen.getByTestId('older').getAttribute('data-events')).toBe('1');
       expect(sendTimelineHistoryRequest).toHaveBeenCalled();
     });
+    const initialRequestId = lastRequestId;
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: initialRequestId,
+        epoch: 1,
+        events: [],
+        status: TIMELINE_RESPONSE_STATUS.PARTIAL,
+        payloadTruncated: true,
+        hasMore: true,
+        nextCursor: { epoch: 1, beforeTs: 1000, direction: TIMELINE_CURSOR_DIRECTIONS.OLDER },
+      } as ServerMessage);
+    });
     sendTimelineHistoryRequest.mockClear();
 
     await act(async () => {
       screen.getByTestId('older').click();
     });
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, undefined, 1000);
+    expect(sendTimelinePageRequest).toHaveBeenCalledWith(
+      sessionName,
+      { epoch: 1, beforeTs: 1000, direction: TIMELINE_CURSOR_DIRECTIONS.OLDER },
+      300,
+    );
+    expect(sendTimelineHistoryRequest).not.toHaveBeenCalled();
     const olderRequestId = lastRequestId;
 
     await act(async () => {
       handler?.({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.PAGE,
         sessionName,
         requestId: olderRequestId,
         epoch: 1,
@@ -792,8 +812,161 @@ describe('useTimeline global cache bounds', () => {
       expect(screen.getByTestId('older').getAttribute('data-events')).toBe('2');
       expect(screen.getByTestId('older').getAttribute('data-text')).toBe('older-page|seed');
       expect(screen.getByTestId('older').getAttribute('data-loading')).toBe('false');
-      expect(screen.getByTestId('older').getAttribute('data-older')).toBe('true');
+      expect(screen.getByTestId('older').getAttribute('data-older')).toBe('false');
     });
+  });
+
+  it('does not close older pagination on terminal or deferred page outcomes', async () => {
+    const sessionName = `deck_older_errors_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    let requestSeq = 0;
+    const sendTimelinePageRequest = vi.fn(() => `page-${++requestSeq}`);
+
+    __setTimelineCacheForTests(sessionName, [{
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }]);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: vi.fn(() => 'history-older-errors'),
+      sendTimelinePageRequest,
+      supportsTimelineProtocolRevision: vi.fn(() => true),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, ws);
+      return h('button', {
+        type: 'button',
+        'data-testid': 'older-errors',
+        'data-older': String(timeline.hasOlderHistory),
+        'data-loading': String(timeline.loadingOlder),
+        onClick: timeline.loadOlderEvents,
+      }, 'older');
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('older-errors').getAttribute('data-older')).toBe('true');
+    });
+
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: 'history-older-errors',
+        epoch: 1,
+        events: [],
+        status: TIMELINE_RESPONSE_STATUS.OK,
+        hasMore: true,
+        nextCursor: { epoch: 1, beforeTs: 1000, direction: TIMELINE_CURSOR_DIRECTIONS.OLDER },
+      } as ServerMessage);
+    });
+
+    const outcomes = [
+      { status: TIMELINE_RESPONSE_STATUS.ERROR, errorReason: TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL },
+      { status: TIMELINE_RESPONSE_STATUS.ERROR, errorReason: TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT },
+      { status: TIMELINE_RESPONSE_STATUS.CANCELED, errorReason: TIMELINE_HISTORY_ERROR_REASONS.REQUEST_CANCELED },
+      { status: TIMELINE_RESPONSE_STATUS.DEFERRED },
+    ] as const;
+
+    for (const outcome of outcomes) {
+      await act(async () => {
+        screen.getByTestId('older-errors').click();
+      });
+      const requestId = `page-${requestSeq}`;
+      await act(async () => {
+        handler?.({
+          type: TIMELINE_MESSAGES.PAGE,
+          sessionName,
+          requestId,
+          epoch: 1,
+          events: [],
+          hasMore: false,
+          ...outcome,
+        } as ServerMessage);
+      });
+
+      expect(screen.getByTestId('older-errors').getAttribute('data-loading')).toBe('false');
+      expect(screen.getByTestId('older-errors').getAttribute('data-older')).toBe('true');
+    }
+  });
+
+  it('does not issue legacy older requests when structured cursor capability is missing', async () => {
+    const sessionName = `deck_legacy_older_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-legacy-older');
+    const sendTimelinePageRequest = vi.fn(() => 'page-legacy-older');
+
+    __setTimelineCacheForTests(sessionName, [{
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }]);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+      sendTimelinePageRequest,
+      supportsTimelineProtocolRevision: vi.fn(() => false),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, ws);
+      return h('button', {
+        type: 'button',
+        'data-testid': 'legacy-older',
+        onClick: timeline.loadOlderEvents,
+      }, 'older');
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+    });
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: 'history-legacy-older',
+        epoch: 1,
+        events: [],
+        status: TIMELINE_RESPONSE_STATUS.OK,
+        hasMore: true,
+        nextCursor: { epoch: 1, beforeTs: 1000, direction: TIMELINE_CURSOR_DIRECTIONS.OLDER },
+      } as ServerMessage);
+    });
+    sendTimelineHistoryRequest.mockClear();
+
+    await act(async () => {
+      screen.getByTestId('legacy-older').click();
+    });
+
+    expect(sendTimelineHistoryRequest).not.toHaveBeenCalled();
+    expect(sendTimelinePageRequest).not.toHaveBeenCalled();
   });
 
   it('does not let bounded preview history overwrite a full cached event', async () => {

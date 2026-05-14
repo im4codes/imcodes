@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import type { TimelineEvent } from '../../src/daemon/timeline-event.js';
 import type { TimelineHistoryWorkerRequest } from '../../src/daemon/timeline-history-worker-types.js';
+import { TIMELINE_HISTORY_DETAIL_CANDIDATE_RESPONSE_MAX_BYTES } from '../../src/daemon/timeline-history-sanitize.js';
 import { TIMELINE_HISTORY_WORKER_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 
 const require = createRequire(import.meta.url);
@@ -175,6 +176,43 @@ describe('timeline history worker', () => {
     expect(toolEvent).toBeTruthy();
     expect(Buffer.byteLength(JSON.stringify(toolEvent), 'utf8')).toBeLessThan(40 * 1024);
     expect(JSON.stringify(toolEvent)).toContain('history truncated');
+    expect(result.detailCandidates.every((candidate) => Buffer.byteLength(candidate.value, 'utf8') <= candidate.valueMaxBytes)).toBe(true);
+  });
+
+  it('does not send multi-MB raw detail candidates back to the main thread', async () => {
+    const huge = 'x'.repeat(2 * 1024 * 1024);
+    const { handleTimelineHistoryWorkerRequest } = await loadWorker((db) => {
+      insertSession(db, 'deck_hist');
+      insertEvent(db, 1, makeEvent('deck_hist', 1, 'tool.result', {
+        output: huge,
+        detail: { output: huge },
+      }, 100));
+    });
+
+    const result = await handleTimelineHistoryWorkerRequest(request({}));
+
+    expect(result.kind).toBe('success');
+    if (result.kind !== 'success') throw new Error(result.reason);
+    expect(result.detailCandidates).toEqual([]);
+  });
+
+  it('caps aggregate detail candidate bytes returned from the worker', async () => {
+    const medium = 'x'.repeat(80 * 1024);
+    const { handleTimelineHistoryWorkerRequest } = await loadWorker((db) => {
+      insertSession(db, 'deck_hist');
+      for (let seq = 1; seq <= 8; seq += 1) {
+        insertEvent(db, seq, makeEvent('deck_hist', seq, 'tool.result', {
+          output: `${medium}-${seq}`,
+        }, 100 + seq));
+      }
+    });
+
+    const result = await handleTimelineHistoryWorkerRequest(request({ maxResponseBytes: 512 * 1024 }));
+
+    expect(result.kind).toBe('success');
+    if (result.kind !== 'success') throw new Error(result.reason);
+    const aggregateBytes = result.detailCandidates.reduce((total, candidate) => total + candidate.valueBytes, 0);
+    expect(aggregateBytes).toBeLessThanOrEqual(TIMELINE_HISTORY_DETAIL_CANDIDATE_RESPONSE_MAX_BYTES);
   });
 
   it('returns projection_unavailable instead of doing main-thread fallback work inside the worker', async () => {

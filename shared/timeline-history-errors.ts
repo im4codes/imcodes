@@ -48,9 +48,13 @@ export type TimelinePageErrorReason =
 
 export const TIMELINE_REQUEST_ERROR_REASONS = {
   MALFORMED_REQUEST: 'malformed_request',
+  REQUEST_UNAUTHORIZED: 'request_unauthorized',
+  PAYLOAD_TOO_LARGE: 'payload_too_large',
   ...TIMELINE_HISTORY_ERROR_REASONS,
   ...TIMELINE_DETAIL_ERROR_REASONS,
   ...TIMELINE_PAGE_ERROR_REASONS,
+  DETAIL_MALFORMED: TIMELINE_DETAIL_ERROR_REASONS.MALFORMED,
+  PAGE_MALFORMED: TIMELINE_PAGE_ERROR_REASONS.MALFORMED,
 } as const;
 
 export type TimelineRequestErrorReason =

@@ -36,10 +36,23 @@ import { homedir } from 'os';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
 import { timelineProjection, type TimelineProjectionQueryOpts } from './timeline-projection.js';
+import { TIMELINE_HISTORY_ERROR_REASONS, type TimelineHistoryErrorReason } from '../../shared/timeline-history-errors.js';
+import { TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 
 export const TIMELINE_DIR = join(homedir(), '.imcodes', 'timeline');
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_EVENTS_PER_FILE = 5000;
+
+export class TimelinePreferredReadError extends Error {
+  constructor(
+    readonly reason: TimelineHistoryErrorReason,
+    readonly source = TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE,
+    message = reason,
+  ) {
+    super(message);
+    this.name = 'TimelinePreferredReadError';
+  }
+}
 
 /**
  * Read the last N lines from a file by reading backward from the end in chunks.
@@ -241,12 +254,14 @@ class TimelineStore {
     sessionName: string,
     opts?: { afterTs?: number; beforeTs?: number; limit?: number },
   ): Promise<TimelineEvent[]> {
-    return await timelineProjection.queryHistory({
+    const events = await timelineProjection.queryHistory({
       sessionId: sessionName,
       afterTs: opts?.afterTs,
       beforeTs: opts?.beforeTs,
       limit: opts?.limit,
-    }) ?? [];
+    });
+    if (events === null) throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE);
+    return events;
   }
 
   async readByTypesPreferred(
@@ -254,17 +269,21 @@ class TimelineStore {
     types: TimelineEvent['type'][],
     opts?: TimelineProjectionQueryOpts,
   ): Promise<TimelineEvent[]> {
-    return await timelineProjection.queryByTypes({
+    const events = await timelineProjection.queryByTypes({
       sessionId: sessionName,
       types,
       afterTs: opts?.afterTs,
       beforeTs: opts?.beforeTs,
       limit: opts?.limit,
-    }) ?? [];
+    });
+    if (events === null) throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE);
+    return events;
   }
 
   async readCompletedTextTail(sessionName: string, limit = 50): Promise<TimelineEvent[]> {
-    return await timelineProjection.queryCompletedTextTail(sessionName, limit) ?? [];
+    const events = await timelineProjection.queryCompletedTextTail(sessionName, limit);
+    if (events === null) throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE);
+    return events;
   }
 
   /**

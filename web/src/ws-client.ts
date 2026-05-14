@@ -21,8 +21,14 @@ import {
 } from '@shared/session-group-clone.js';
 import {
   TIMELINE_MESSAGES,
+  TIMELINE_PROTOCOL_CAPABILITY,
+  TIMELINE_PROTOCOL_REVISION,
   type TimelineCursor,
-  type TimelinePayloadMetadata,
+  type TimelineDetailRefV1,
+  type TimelineDetailResponse,
+  type TimelineHistoryResponse,
+  type TimelinePageResponse,
+  type TimelineReplayResponse,
 } from '@shared/timeline-protocol.js';
 import { CC_PRESET_MSG, type CcPreset, type CcPresetModelInfo } from '@shared/cc-presets.js';
 import { MEMORY_WS } from '@shared/memory-ws.js';
@@ -50,6 +56,7 @@ import type {
   FsWriteOptions,
   FsMkdirResponse,
 } from '../../src/shared/transport/fs.js';
+import type { DaemonBuildInfo } from '@shared/build-manifest-types.js';
 
 export type MessageHandler = (msg: ServerMessage) => void;
 
@@ -67,6 +74,9 @@ export interface P2pWorkflowRequestScope {
 export interface DaemonCapabilitySnapshot {
   daemonId: string;
   capabilities: string[];
+  timelineProtocolRevision?: number;
+  timelineProtocolCapability?: typeof TIMELINE_PROTOCOL_CAPABILITY;
+  buildInfo?: DaemonBuildInfo;
   helloEpoch: number;
   sentAt: number;
   observedAt: number;
@@ -88,43 +98,10 @@ export type TimelineEventMessage = {
   event: TimelineEvent;
 };
 
-export type TimelineReplayResponseMessage = TimelinePayloadMetadata & {
-  type: typeof TIMELINE_MESSAGES.REPLAY;
-  sessionName: string;
-  requestId?: string;
-  events: TimelineEvent[];
-  truncated?: boolean;
-  epoch: number;
-};
-
-export type TimelineHistoryResponseMessage = TimelinePayloadMetadata & {
-  type: typeof TIMELINE_MESSAGES.HISTORY;
-  sessionName: string;
-  requestId?: string;
-  events: TimelineEvent[];
-  epoch: number;
-};
-
-export type TimelinePageResponseMessage = TimelinePayloadMetadata & {
-  type: typeof TIMELINE_MESSAGES.PAGE;
-  sessionName: string;
-  requestId?: string;
-  events: TimelineEvent[];
-  epoch: number;
-};
-
-export type TimelineDetailResponseMessage = TimelinePayloadMetadata & {
-  type: typeof TIMELINE_MESSAGES.DETAIL;
-  sessionName?: string;
-  requestId?: string;
-  detailId?: string;
-  eventId?: string;
-  fieldPath?: string;
-  value?: unknown;
-  detail?: unknown;
-  content?: unknown;
-  epoch?: number;
-};
+export type TimelineReplayResponseMessage = TimelineReplayResponse<TimelineEvent>;
+export type TimelineHistoryResponseMessage = TimelineHistoryResponse<TimelineEvent>;
+export type TimelinePageResponseMessage = TimelinePageResponse<TimelineEvent>;
+export type TimelineDetailResponseMessage = TimelineDetailResponse;
 
 export type ServerMessage =
   | { type: 'terminal.diff'; diff: TerminalDiff }
@@ -168,7 +145,7 @@ export type ServerMessage =
   | FsReadResponse
   | FsGitStatusResponse
   | { type: 'file.search_response'; requestId: string; results: string[]; error?: string }
-  | { type: typeof P2P_WORKFLOW_MSG.DAEMON_HELLO; daemonId: string; capabilities: string[]; helloEpoch: number; sentAt: number }
+  | { type: typeof P2P_WORKFLOW_MSG.DAEMON_HELLO; daemonId: string; capabilities: string[]; helloEpoch: number; sentAt: number; timelineProtocolRevision?: number; timelineProtocolCapability?: string; buildInfo?: DaemonBuildInfo }
   | { type: typeof P2P_WORKFLOW_MSG.RUN_UPDATE; run: any }
   | { type: typeof P2P_CONFIG_MSG.SAVE_RESPONSE; requestId: string; scopeSession: string; ok: boolean; error?: string }
   | { type: typeof P2P_WORKFLOW_MSG.CONFLICT; existingRunId: string; initiatorSession: string; commandId: string }
@@ -898,6 +875,15 @@ export class WsClient {
     return now - lastSeen > P2P_CAPABILITY_FRESHNESS_TTL_MS;
   }
 
+  supportsTimelineProtocolRevision(minRevision = TIMELINE_PROTOCOL_REVISION): boolean {
+    const snapshot = this.daemonCapabilitySnapshot;
+    if (!snapshot) return false;
+    return snapshot.capabilities.includes(TIMELINE_PROTOCOL_CAPABILITY)
+      && snapshot.timelineProtocolCapability === TIMELINE_PROTOCOL_CAPABILITY
+      && typeof snapshot.timelineProtocolRevision === 'number'
+      && snapshot.timelineProtocolRevision >= minRevision;
+  }
+
   /** Subscribe to capability snapshot changes (incl. disconnect-driven clears).
    *  Fires synchronously with the current snapshot once and again whenever the
    *  cached value changes. Returns an unsubscribe function. */
@@ -985,6 +971,12 @@ export class WsClient {
       ? msg.capabilities.filter((cap): cap is string => typeof cap === 'string')
       : null;
     if (!daemonId || helloEpoch === null || sentAt === null || !capabilities) return;
+    const hasTimelineProtocolCapability = capabilities.includes(TIMELINE_PROTOCOL_CAPABILITY);
+    const timelineProtocolRevision = hasTimelineProtocolCapability
+      ? typeof msg.timelineProtocolRevision === 'number' && Number.isFinite(msg.timelineProtocolRevision)
+        ? msg.timelineProtocolRevision
+        : TIMELINE_PROTOCOL_REVISION
+      : undefined;
     const existing = this.daemonCapabilitySnapshot;
     // Drop stale epoch from the same daemon (out-of-order delivery). A new
     // daemonId always wins — the previous daemon is gone.
@@ -992,6 +984,13 @@ export class WsClient {
     this.setDaemonCapabilitySnapshot({
       daemonId,
       capabilities: [...new Set(capabilities)].sort(),
+      ...(timelineProtocolRevision !== undefined
+        ? {
+          timelineProtocolRevision,
+          timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
+        }
+        : {}),
+      ...(msg.buildInfo ? { buildInfo: msg.buildInfo } : {}),
       helloEpoch,
       sentAt,
       observedAt: Date.now(),
@@ -1198,6 +1197,9 @@ export class WsClient {
 
   /** Request a bounded explicit timeline page. */
   sendTimelinePageRequest(sessionName: string, cursor: TimelineCursor, limit = 500): string {
+    if (!this.supportsTimelineProtocolRevision(TIMELINE_PROTOCOL_REVISION)) {
+      throw new Error('timeline_protocol_unavailable');
+    }
     const requestId = crypto.randomUUID();
     this.send({
       type: TIMELINE_MESSAGES.PAGE_REQUEST,
@@ -1213,16 +1215,21 @@ export class WsClient {
     return requestId;
   }
 
-  /** Request a bounded timeline detail payload by opaque detail id. */
-  sendTimelineDetailRequest(sessionName: string, detailId: string, opts?: { eventId?: string; fieldPath?: string }): string {
+  /** Request a bounded timeline detail payload using the full v1 descriptor. */
+  sendTimelineDetailRequest(sessionName: string, ref: TimelineDetailRefV1): string {
+    if (!this.supportsTimelineProtocolRevision(TIMELINE_PROTOCOL_REVISION)) {
+      throw new Error('timeline_protocol_unavailable');
+    }
     const requestId = crypto.randomUUID();
     this.send({
       type: TIMELINE_MESSAGES.DETAIL_REQUEST,
       sessionName,
       requestId,
-      detailId,
-      ...(opts?.eventId ? { eventId: opts.eventId } : {}),
-      ...(opts?.fieldPath ? { fieldPath: opts.fieldPath } : {}),
+      detailId: ref.detailId,
+      epoch: ref.epoch,
+      detailStoreGeneration: ref.detailStoreGeneration,
+      eventId: ref.eventId,
+      fieldPath: ref.fieldPath,
     });
     return requestId;
   }

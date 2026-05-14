@@ -2,7 +2,9 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import {
   TIMELINE_CURSOR_DIRECTIONS,
+  TIMELINE_DETAIL_FIELD_PATHS as SHARED_TIMELINE_DETAIL_FIELD_PATHS,
   TIMELINE_MESSAGES,
+  TIMELINE_PROTOCOL_REVISION,
   TIMELINE_RESPONSE_STATUS,
   type TimelineCursor,
   type TimelinePayloadMetadata,
@@ -568,7 +570,7 @@ export interface UseTimelineOptions {
 export type TimelineHistoryPhase = 'idle' | 'bootstrap' | 'refresh' | 'older';
 export type TimelineHistoryStepState = 'pending' | 'running' | 'done' | 'skipped';
 export type TimelineHistoryStepKey = 'cache' | 'textTail' | 'daemon' | 'http' | 'older';
-export type TimelineHistoryResponseState = 'ok' | 'empty' | 'partial' | 'deferred' | 'error' | 'detail';
+export type TimelineHistoryResponseState = 'ok' | 'empty' | 'partial' | 'deferred' | 'canceled' | 'error' | 'detail';
 
 export interface TimelineHistoryResponseNotice {
   state: TimelineHistoryResponseState;
@@ -643,9 +645,11 @@ const TIMELINE_NOTICE_FALLBACKS: Record<string, string> = {
   'chat.timelineStatus.empty': 'No earlier timeline events',
   'chat.timelineStatus.partial': 'Timeline loaded partially',
   'chat.timelineStatus.deferred': 'Timeline is still being prepared',
+  'chat.timelineStatus.canceled': 'Timeline request was canceled',
   'chat.timelineStatus.payloadTruncated': 'Timeline was shortened for faster loading',
   'chat.timelineStatus.cursorReset': 'Timeline position changed; refresh history',
   'chat.timelineStatus.queueFull': 'Timeline worker is busy',
+  'chat.timelineStatus.deadlineExceeded': 'Timeline request timed out',
   'chat.timelineStatus.timeout': 'Timeline worker timed out',
   'chat.timelineStatus.unavailable': 'Timeline history is unavailable',
   'chat.timelineStatus.projectionUnavailable': 'Timeline index is unavailable',
@@ -656,6 +660,8 @@ const TIMELINE_NOTICE_FALLBACKS: Record<string, string> = {
   'chat.timelineStatus.detailUnauthorized': 'Timeline detail is unavailable for this session',
   'chat.timelineStatus.detailOversized': 'Timeline detail is too large',
   'chat.timelineStatus.detailMalformed': 'Timeline detail request was invalid',
+  'chat.timelineStatus.detailEpochMismatch': 'Timeline detail expired after restart',
+  'chat.timelineStatus.detailGenerationMismatch': 'Timeline detail expired after refresh',
   'chat.timelineStatus.detailHydrated': 'Timeline detail loaded',
   'chat.timelineStatus.pageCursorReset': 'Timeline page expired; refresh history',
   'chat.timelineStatus.pageMalformed': 'Timeline page request was invalid',
@@ -682,6 +688,8 @@ function hasExplicitTimelineOutcome(msg: TimelinePayloadMetadata): boolean {
 function getTimelineNoticeKey(msg: TimelinePayloadMetadata, state: TimelineHistoryResponseState): string {
   const reason = msg.errorReason;
   if (reason === TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL) return 'chat.timelineStatus.queueFull';
+  if (reason === TIMELINE_HISTORY_ERROR_REASONS.DEADLINE_EXCEEDED) return 'chat.timelineStatus.deadlineExceeded';
+  if (reason === TIMELINE_HISTORY_ERROR_REASONS.REQUEST_CANCELED) return 'chat.timelineStatus.canceled';
   if (reason === TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT) return 'chat.timelineStatus.timeout';
   if (
     reason === TIMELINE_HISTORY_ERROR_REASONS.UNAVAILABLE
@@ -695,12 +703,15 @@ function getTimelineNoticeKey(msg: TimelinePayloadMetadata, state: TimelineHisto
   if (reason === TIMELINE_DETAIL_ERROR_REASONS.UNAUTHORIZED) return 'chat.timelineStatus.detailUnauthorized';
   if (reason === TIMELINE_DETAIL_ERROR_REASONS.OVERSIZED) return 'chat.timelineStatus.detailOversized';
   if (reason === TIMELINE_DETAIL_ERROR_REASONS.MALFORMED) return 'chat.timelineStatus.detailMalformed';
+  if (reason === TIMELINE_DETAIL_ERROR_REASONS.EPOCH_MISMATCH) return 'chat.timelineStatus.detailEpochMismatch';
+  if (reason === TIMELINE_DETAIL_ERROR_REASONS.GENERATION_MISMATCH) return 'chat.timelineStatus.detailGenerationMismatch';
   if (reason === TIMELINE_PAGE_ERROR_REASONS.CURSOR_RESET) return 'chat.timelineStatus.pageCursorReset';
   if (reason === TIMELINE_PAGE_ERROR_REASONS.MALFORMED) return 'chat.timelineStatus.pageMalformed';
   if (reason === TIMELINE_HISTORY_ERROR_REASONS.INTERNAL_ERROR || reason === TIMELINE_DETAIL_ERROR_REASONS.INTERNAL_ERROR || reason === TIMELINE_PAGE_ERROR_REASONS.INTERNAL_ERROR) {
     return 'chat.timelineStatus.internalError';
   }
   if (state === 'deferred') return 'chat.timelineStatus.deferred';
+  if (state === 'canceled') return 'chat.timelineStatus.canceled';
   if (msg.cursorReset) return 'chat.timelineStatus.cursorReset';
   if (msg.payloadTruncated) return 'chat.timelineStatus.payloadTruncated';
   if (state === 'detail') return 'chat.timelineStatus.detailHydrated';
@@ -715,6 +726,7 @@ function getTimelineResponseState(
 ): TimelineHistoryResponseState {
   if (msg.status === TIMELINE_RESPONSE_STATUS.ERROR || msg.errorReason) return 'error';
   if (msg.status === TIMELINE_RESPONSE_STATUS.DEFERRED) return 'deferred';
+  if (msg.status === TIMELINE_RESPONSE_STATUS.CANCELED) return 'canceled';
   if (msg.status === TIMELINE_RESPONSE_STATUS.PARTIAL || msg.payloadTruncated) return 'partial';
   if (msg.type === TIMELINE_MESSAGES.DETAIL) return 'detail';
   return getTimelineEvents(msg).length === 0 ? 'empty' : 'ok';
@@ -730,7 +742,7 @@ function createTimelineHistoryResponseNotice(msg: TimelineProtocolServerMessage)
     recoverable: msg.recoverable === true,
     errorReason: msg.errorReason,
     source: typeof msg.source === 'string' ? msg.source : undefined,
-    payloadBytes: msg.payloadBytes,
+    payloadBytes: msg.actualPayloadBytes ?? msg.payloadBytes,
     payloadTruncated: msg.payloadTruncated,
     hasMore: msg.hasMore,
     cursorReset: msg.cursorReset,
@@ -748,6 +760,15 @@ function getOlderTimelineCursor(msg: TimelineEventsServerMessage): TimelineCurso
   if (!cursor || typeof cursor !== 'object') return null;
   if (cursor.direction !== TIMELINE_CURSOR_DIRECTIONS.OLDER) return null;
   return typeof cursor.beforeTs === 'number' ? cursor : null;
+}
+
+function hasStructuredOlderPage(msg: TimelineEventsServerMessage): boolean {
+  return msg.hasMore === true && getOlderTimelineCursor(msg) !== null;
+}
+
+function supportsTimelineProtocol(ws: WsClient): boolean {
+  const method = (ws as { supportsTimelineProtocolRevision?: (minRevision?: number) => boolean }).supportsTimelineProtocolRevision;
+  return typeof method === 'function' && method.call(ws, TIMELINE_PROTOCOL_REVISION);
 }
 
 const TIMELINE_DETAIL_FIELD_PATH_SET = new Set<string>(TIMELINE_DETAIL_FIELD_PATHS);
@@ -825,10 +846,10 @@ function hydrateTimelineDetailEvent(
 
   const value = timelineDetailValue(msg);
   const payload: Record<string, unknown> = { ...existing.payload };
-  if (msg.fieldPath === 'payload.text') payload.text = value;
-  else if (msg.fieldPath === 'payload.output') payload.output = value;
-  else if (msg.fieldPath === 'payload.error') payload.error = value;
-  else if (msg.fieldPath === 'payload.detail.output') {
+  if (msg.fieldPath === SHARED_TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_TEXT) payload.text = value;
+  else if (msg.fieldPath === SHARED_TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_OUTPUT) payload.output = value;
+  else if (msg.fieldPath === SHARED_TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_ERROR) payload.error = value;
+  else if (msg.fieldPath === SHARED_TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_DETAIL_OUTPUT) {
     const detail = isTimelineRecord(payload.detail) ? { ...payload.detail } : {};
     detail.output = value;
     payload.detail = detail;
@@ -1677,10 +1698,12 @@ export function useTimeline(
   const loadOlderEvents = useCallback(() => {
     if (disableHistory) return;
     if (!ws?.connected || !sessionId || loadingOlderRef.current) return;
+    if (!supportsTimelineProtocol(ws)) return;
     const key = cacheKeyRef.current;
     const cached = key ? getCachedEvents(key) : undefined;
     if (!cached || cached.length === 0) return;
-    const oldestTs = olderCursorRef.current?.beforeTs ?? Math.min(...cached.map((e) => e.ts));
+    const cursor = olderCursorRef.current;
+    if (!cursor) return;
     loadingOlderRef.current = true;
     setHistoryStatus({
       phase: 'older',
@@ -1694,9 +1717,7 @@ export function useTimeline(
       response: null,
     });
     setLoadingOlder(true);
-    olderRequestIdRef.current = olderCursorRef.current
-      ? ws.sendTimelinePageRequest(sessionId, olderCursorRef.current, MAX_MEMORY_EVENTS)
-      : ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS, undefined, oldestTs);
+    olderRequestIdRef.current = ws.sendTimelinePageRequest(sessionId, cursor, MAX_MEMORY_EVENTS);
     // Timeout: if response never arrives (packet loss, disconnect), reset after 10s
     if (olderTimeoutRef.current) clearTimeout(olderTimeoutRef.current);
     olderTimeoutRef.current = setTimeout(resetOlderState, 10_000);
@@ -2151,7 +2172,9 @@ export function useTimeline(
       if (msg.type === TIMELINE_MESSAGES.HISTORY || msg.type === TIMELINE_MESSAGES.PAGE) {
         if (msg.sessionName !== sessionId) return;
         const responseState = getTimelineResponseState(msg);
-        const isTerminalError = responseState === 'error' || responseState === 'deferred';
+        const shouldPreserveOlderAvailability = responseState === 'error'
+          || responseState === 'deferred'
+          || responseState === 'canceled';
 
         // Handle backward pagination response
         if (msg.requestId && msg.requestId === olderRequestIdRef.current) {
@@ -2159,17 +2182,17 @@ export function useTimeline(
           resetOlderState();
           recordTimelineResponse(msg, 'older');
           const olderCursor = getOlderTimelineCursor(msg);
-          if (olderCursor) olderCursorRef.current = olderCursor;
+          if (hasStructuredOlderPage(msg) && olderCursor) olderCursorRef.current = olderCursor;
           if (msg.events.length > 0) {
             mergeEvents(msg.events, MAX_HISTORY_EVENTS);
             idbPutEvents(msg.events);
           }
-          if (isTerminalError) {
+          if (shouldPreserveOlderAvailability) {
             return;
           }
-          if (msg.hasMore === true || msg.payloadTruncated === true || responseState === 'partial' || olderCursor) {
+          if (hasStructuredOlderPage(msg)) {
             setHasOlderHistory(true);
-          } else if (msg.hasMore === false || msg.events.length === 0) {
+          } else if (msg.hasMore === false) {
             olderCursorRef.current = null;
             setHasOlderHistory(false);
           }
@@ -2194,6 +2217,14 @@ export function useTimeline(
         updateHistoryStep('daemon', 'done', loading ? 'bootstrap' : 'refresh');
         recordTimelineResponse(msg, loading ? 'bootstrap' : 'refresh');
         historyLoadedRef.current = cacheKeyRef.current;
+        const forwardOlderCursor = getOlderTimelineCursor(msg);
+        if (hasStructuredOlderPage(msg) && forwardOlderCursor) {
+          olderCursorRef.current = forwardOlderCursor;
+          setHasOlderHistory(true);
+        } else if (msg.hasMore === false) {
+          olderCursorRef.current = null;
+          setHasOlderHistory(false);
+        }
 
         epochRef.current = msg.epoch;
 

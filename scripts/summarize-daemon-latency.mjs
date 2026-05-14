@@ -144,6 +144,7 @@ function eventLoopBlockAttribution(record) {
     'reasonField',
     'likelyReason',
     'eventLoopReason',
+    'attributionReason',
     'cause',
     'attribution',
   ]);
@@ -153,6 +154,9 @@ function eventLoopBlockAttribution(record) {
     || record.likelySpanName
     || record.activeSpan
     || record.recentSpan
+    || record.likelyActiveSpan
+    || record.likelyGcKind
+    || record.likelyGcDurationMs
     || record.gcKind
     || record.gcDurationMs
     || record.nativeReason
@@ -161,6 +165,11 @@ function eventLoopBlockAttribution(record) {
     || record.sendBacklog
     || record.backlogAgeMs
     || record.sendBacklogAgeMs
+    || record.likelyRecentCommandType
+    || record.likelyRecentRequestId
+    || record.likelyRecentServerSendType
+    || record.likelyRecentServerSendBytes
+    || record.likelyRecentServerSendQueueDepth
     || record.attributed === true
   );
   const explicitUnknown = isUnknownReason(reason) || record.unknown === true || record.unattributed === true;
@@ -181,6 +190,43 @@ function isBridgeFanOutRecord(record) {
     || record.chunkCount !== undefined
     || record.pageCount !== undefined
   );
+}
+
+function isBridgeQueueRecord(record) {
+  const event = String(record.event ?? record.name ?? record.msg ?? '');
+  return /bridge/i.test(event) && Boolean(
+    record.queueDepth !== undefined
+    || record.queueWaitMs !== undefined
+    || record.backlogAgeMs !== undefined
+    || record.canceled !== undefined
+    || record.cancelCount !== undefined
+    || record.deadlineExceeded !== undefined
+    || record.deadlineExceededCount !== undefined
+    || record.skipped !== undefined
+    || record.skippedCount !== undefined
+  );
+}
+
+function isFsGitWorkerRecord(record) {
+  const event = String(record.event ?? record.name ?? record.msg ?? '');
+  const command = firstString(record, ['commandType', 'type', 'msgType', 'command']);
+  const hasWorkerMetric = Boolean(
+    record.queueDepth !== undefined
+    || record.workerQueueDepth !== undefined
+    || record.queueWaitMs !== undefined
+    || record.workerQueueWaitMs !== undefined
+    || record.workerExecutionMs !== undefined
+    || record.workerDurationMs !== undefined
+    || record.cacheStatus !== undefined
+    || record.terminalReason !== undefined
+    || record.lateResultSkip !== undefined
+    || record.lateResultSkipped !== undefined
+    || record.lateResultSkipCount !== undefined
+  );
+  if (!hasWorkerMetric) return false;
+  return /fs[_.-]?(ls|list|git)|git[_.-]?status/i.test(event)
+    || command === 'fs.ls'
+    || command === 'fs.git_status';
 }
 
 function summarize(inputs, limit) {
@@ -204,9 +250,29 @@ function summarize(inputs, limit) {
     maxPageCount: 0,
     largestJsonBytes: 0,
   };
+  const bridgeQueueMetrics = {
+    count: 0,
+    maxQueueDepth: 0,
+    maxQueueWaitMs: 0,
+    maxBacklogAgeMs: 0,
+    canceledCount: 0,
+    skippedCount: 0,
+    deadlineExceededCount: 0,
+    maxQueueLength: 0,
+  };
+  const fsGitWorkerMetrics = {
+    count: 0,
+    byCommand: {},
+    maxQueueDepth: 0,
+    maxQueueWaitMs: 0,
+    maxWorkerExecutionMs: 0,
+    terminalReasons: {},
+    cacheStatusCounts: {},
+    lateResultSkipCount: 0,
+  };
 
   function processRecord(record) {
-    const bytes = firstNumber(record, ['jsonBytes', 'payloadBytes', 'responseBytes', 'bytes', 'sizeBytes', 'contentLength', 'totalBytes']);
+    const bytes = firstNumber(record, ['actualPayloadBytes', 'jsonBytes', 'payloadBytes', 'responseBytes', 'bytes', 'sizeBytes', 'contentLength', 'totalBytes']);
     if (bytes !== undefined) {
       pushTop(largestPayloads, {
         bytes,
@@ -247,8 +313,10 @@ function summarize(inputs, limit) {
       if (driftMs !== undefined) {
         pushTop(largestEventLoopBlocks, {
           driftMs,
-          reason: firstString(record, ['reason', 'reasonField', 'likelyReason', 'eventLoopReason', 'cause', 'attribution']),
+          reason: firstString(record, ['reason', 'reasonField', 'likelyReason', 'eventLoopReason', 'attributionReason', 'cause', 'attribution']),
           likelyRecentSpan: firstString(record, ['likelyRecentSpan', 'likelySpan', 'likelySpanName', 'activeSpan', 'recentSpan']),
+          likelyRecentCommandType: firstString(record, ['likelyRecentCommandType']),
+          likelyRecentServerSendType: firstString(record, ['likelyRecentServerSendType']),
           source: record.__sourceKind,
           path: record.__sourcePath,
           line: record.__line,
@@ -272,6 +340,31 @@ function summarize(inputs, limit) {
       bridgeFanOutMetrics.maxChunkCount = Math.max(bridgeFanOutMetrics.maxChunkCount, firstNumber(record, ['chunkCount']) ?? 0);
       bridgeFanOutMetrics.maxPageCount = Math.max(bridgeFanOutMetrics.maxPageCount, firstNumber(record, ['pageCount']) ?? 0);
       bridgeFanOutMetrics.largestJsonBytes = Math.max(bridgeFanOutMetrics.largestJsonBytes, firstNumber(record, ['jsonBytes', 'payloadBytes', 'responseBytes', 'bytes']) ?? 0);
+    }
+
+    if (isBridgeQueueRecord(record)) {
+      bridgeQueueMetrics.count += 1;
+      bridgeQueueMetrics.maxQueueDepth = Math.max(bridgeQueueMetrics.maxQueueDepth, firstNumber(record, ['queueDepth', 'depth', 'dataPlaneQueueDepth']) ?? 0);
+      bridgeQueueMetrics.maxQueueWaitMs = Math.max(bridgeQueueMetrics.maxQueueWaitMs, firstNumber(record, ['queueWaitMs', 'waitMs']) ?? 0);
+      bridgeQueueMetrics.maxBacklogAgeMs = Math.max(bridgeQueueMetrics.maxBacklogAgeMs, firstNumber(record, ['backlogAgeMs', 'queueAgeMs']) ?? 0);
+      bridgeQueueMetrics.maxQueueLength = Math.max(bridgeQueueMetrics.maxQueueLength, firstNumber(record, ['queueLength', 'pendingJobs']) ?? 0);
+      bridgeQueueMetrics.canceledCount += firstNumber(record, ['cancelCount', 'canceledCount']) ?? (record.canceled === true ? 1 : 0);
+      bridgeQueueMetrics.skippedCount += firstNumber(record, ['skippedCount']) ?? (record.skipped === true ? 1 : 0);
+      bridgeQueueMetrics.deadlineExceededCount += firstNumber(record, ['deadlineExceededCount']) ?? (record.deadlineExceeded === true ? 1 : 0);
+    }
+
+    if (isFsGitWorkerRecord(record)) {
+      fsGitWorkerMetrics.count += 1;
+      const command = firstString(record, ['commandType', 'type', 'msgType', 'command']) ?? '<unknown>';
+      fsGitWorkerMetrics.byCommand[command] = (fsGitWorkerMetrics.byCommand[command] ?? 0) + 1;
+      fsGitWorkerMetrics.maxQueueDepth = Math.max(fsGitWorkerMetrics.maxQueueDepth, firstNumber(record, ['queueDepth', 'workerQueueDepth']) ?? 0);
+      fsGitWorkerMetrics.maxQueueWaitMs = Math.max(fsGitWorkerMetrics.maxQueueWaitMs, firstNumber(record, ['queueWaitMs', 'workerQueueWaitMs']) ?? 0);
+      fsGitWorkerMetrics.maxWorkerExecutionMs = Math.max(fsGitWorkerMetrics.maxWorkerExecutionMs, firstNumber(record, ['workerExecutionMs', 'workerDurationMs', 'durationMs']) ?? 0);
+      const terminalReason = firstString(record, ['terminalReason', 'reason', 'error', 'errorReason']);
+      if (terminalReason) fsGitWorkerMetrics.terminalReasons[terminalReason] = (fsGitWorkerMetrics.terminalReasons[terminalReason] ?? 0) + 1;
+      const cacheStatus = firstString(record, ['cacheStatus', 'cache']);
+      if (cacheStatus) fsGitWorkerMetrics.cacheStatusCounts[cacheStatus] = (fsGitWorkerMetrics.cacheStatusCounts[cacheStatus] ?? 0) + 1;
+      fsGitWorkerMetrics.lateResultSkipCount += firstNumber(record, ['lateResultSkipCount']) ?? (record.lateResultSkip === true || record.lateResultSkipped === true ? 1 : 0);
     }
 
     if (record.__sourceKind === 'daemon-log' && String(record.msg ?? '').includes('timeline.history served')) {
@@ -318,6 +411,8 @@ function summarize(inputs, limit) {
       latestRssMB: latestProcessSample.rssMB ?? null,
     },
     bridgeFanOutMetrics,
+    bridgeQueueMetrics,
+    fsGitWorkerMetrics,
     eventLoopBlocks: {
       count: blocks.length,
       reasonFieldCoverage: blocks.length === 0 ? 1 : Number((reasonCount / blocks.length).toFixed(4)),
@@ -347,6 +442,8 @@ function printText(summary) {
   console.log(`event-loop blocks: count=${summary.eventLoopBlocks.count}, reasonFieldCoverage=${formatPercent(summary.eventLoopBlocks.reasonFieldCoverage)}, attributedCoverage=${formatPercent(summary.eventLoopBlocks.attributedCoverage)}, unattributed=${summary.eventLoopBlocks.unattributedBlockCount}`);
   console.log(`process: samples=${summary.process.sampleCount}, maxCpuOneCore=${summary.process.maxCpuPctOneCore}%, maxRss=${summary.process.maxRssMB}MB`);
   console.log(`bridge fan-out: count=${summary.bridgeFanOutMetrics.count}, maxRecipients=${summary.bridgeFanOutMetrics.maxRecipientCount}, maxRequestIdFanOut=${summary.bridgeFanOutMetrics.maxRequestIdFanOutCount}`);
+  console.log(`bridge queue: count=${summary.bridgeQueueMetrics.count}, maxDepth=${summary.bridgeQueueMetrics.maxQueueDepth}, canceled=${summary.bridgeQueueMetrics.canceledCount}, deadlineExceeded=${summary.bridgeQueueMetrics.deadlineExceededCount}`);
+  console.log(`fs/git worker: count=${summary.fsGitWorkerMetrics.count}, maxQueueDepth=${summary.fsGitWorkerMetrics.maxQueueDepth}, maxQueueWait=${summary.fsGitWorkerMetrics.maxQueueWaitMs}ms, maxWorker=${summary.fsGitWorkerMetrics.maxWorkerExecutionMs}ms, lateSkips=${summary.fsGitWorkerMetrics.lateResultSkipCount}`);
   console.log('high-frequency command counts:');
   for (const [type, count] of Object.entries(summary.highFrequencyCommandCounts).slice(0, 20)) {
     console.log(`  ${type}: ${count}`);
@@ -361,7 +458,7 @@ function printText(summary) {
   }
   console.log('largest event-loop blocks:');
   for (const block of summary.largestEventLoopBlocks) {
-    console.log(`  ${block.driftMs}ms${block.reason ? ` reason=${block.reason}` : ''}${block.likelyRecentSpan ? ` span=${block.likelyRecentSpan}` : ''}`);
+    console.log(`  ${block.driftMs}ms${block.reason ? ` reason=${block.reason}` : ''}${block.likelyRecentSpan ? ` span=${block.likelyRecentSpan}` : ''}${block.likelyRecentCommandType ? ` command=${block.likelyRecentCommandType}` : ''}${block.likelyRecentServerSendType ? ` send=${block.likelyRecentServerSendType}` : ''}`);
   }
 }
 

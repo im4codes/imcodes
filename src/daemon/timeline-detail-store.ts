@@ -120,12 +120,14 @@ export class TimelineDetailStore {
       return { ok: false, reason: TIMELINE_DETAIL_ERROR_REASONS.EXPIRED };
     }
     const inputGeneration = input.detailStoreGeneration ?? input.generation;
-    if (
-      entry.sessionName !== input.sessionName
-      || entry.epoch !== input.epoch
-      || (inputGeneration !== undefined && entry.generation !== inputGeneration)
-    ) {
+    if (entry.sessionName !== input.sessionName) {
       return { ok: false, reason: TIMELINE_DETAIL_ERROR_REASONS.MISSING };
+    }
+    if (entry.epoch !== input.epoch) {
+      return { ok: false, reason: TIMELINE_DETAIL_ERROR_REASONS.EPOCH_MISMATCH };
+    }
+    if (inputGeneration !== undefined && entry.generation !== inputGeneration) {
+      return { ok: false, reason: TIMELINE_DETAIL_ERROR_REASONS.GENERATION_MISMATCH };
     }
     if (
       (input.eventId !== undefined && input.eventId !== entry.eventId)

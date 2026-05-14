@@ -11,7 +11,7 @@ const MockWebSocket = vi.fn(() => mockWsInstance);
 MockWebSocket.OPEN = 1;
 vi.stubGlobal('WebSocket', MockWebSocket);
 
-import { ServerLink } from '../../src/daemon/server-link.js';
+import { ServerLink, __setServerLinkDataPlaneQueueConfigForTests } from '../../src/daemon/server-link.js';
 import { TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/timeline-protocol.js';
 
 describe('ServerLink', () => {
@@ -28,6 +28,7 @@ describe('ServerLink', () => {
 
   afterEach(() => {
     link.disconnect();
+    __setServerLinkDataPlaneQueueConfigForTests(null);
   });
 
   it('constructs without connecting', () => {
@@ -90,6 +91,19 @@ describe('ServerLink', () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(mockWsInstance.send).toHaveBeenCalledTimes(2);
     expect(JSON.parse(mockWsInstance.send.mock.calls[1][0] as string).type).toBe('chat.history');
+  });
+
+  it('drops stale queued data-plane sends without blocking later control-plane sends', async () => {
+    __setServerLinkDataPlaneQueueConfigForTests({ softCap: 1, hardCap: 2, staleMs: 0 });
+    link.connect();
+    link.send({ type: 'chat.history', requestId: 'hist-stale', sessionId: 'deck_test_brain', events: [{ text: 'synthetic' }] });
+    link.send({ type: 'command.ack', commandId: 'cmd-after-stale' });
+
+    expect(mockWsInstance.send).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(mockWsInstance.send.mock.calls[0][0] as string).type).toBe('command.ack');
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(mockWsInstance.send).toHaveBeenCalledTimes(1);
   });
 
   it('disconnect() closes the WebSocket', () => {

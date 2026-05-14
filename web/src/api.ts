@@ -815,6 +815,7 @@ export async function fetchTimelineHistoryHttp(
       errorReason?: string;
       source?: TimelinePayloadMetadata['source'];
       payloadBytes?: number;
+      actualPayloadBytes?: number;
       payloadTruncated?: boolean;
       cursorReset?: boolean;
       droppedEvents?: number;
@@ -841,6 +842,7 @@ export async function fetchTimelineHistoryHttp(
       errorReason: result.errorReason,
       source: result.source,
       payloadBytes: result.payloadBytes,
+      actualPayloadBytes: result.actualPayloadBytes,
       payloadTruncated: result.payloadTruncated,
       cursorReset: result.cursorReset,
       droppedEvents: result.droppedEvents,
