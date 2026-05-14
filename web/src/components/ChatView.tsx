@@ -578,15 +578,50 @@ const FILE_PANEL_MIN = 220;
 const FILE_PANEL_MAX_RATIO = 0.6; // 60% of viewport width
 const FILE_PANEL_DEFAULT = 340;
 /** Two short taps within this many ms on the same chat bubble open the zoom
- *  modal. 450ms is wider than the strict iOS double-click window because
+ *  modal. 500ms is wider than the strict iOS double-click window because
  *  fingers on a phone are slower than mouse buttons, and we want this to
  *  feel forgiving — single taps still don't pair because the chat view
  *  has no other tap action that would accidentally satisfy the predicate. */
-const DOUBLE_TAP_THRESHOLD_MS = 450;
+const DOUBLE_TAP_THRESHOLD_MS = 500;
 /** A touch this much movement (px) from the start point still counts as a
  *  tap (rather than a scroll). 15px gives finger-tremor headroom; smaller
  *  values miss double-taps where the second tap drifted slightly. */
 const TAP_MOVE_TOLERANCE_PX = 15;
+/** Viewport width below which we treat the device as a phone-class layout
+ *  regardless of the pointer kind. Chosen to match common phone+small-tablet
+ *  cutoffs (e.g. iPad mini portrait ≈ 768px). The chat-gesture predicate is
+ *  pointer-coarse OR width-below — either signal flips us into mobile mode. */
+const MOBILE_LIKE_MAX_WIDTH_PX = 768;
+const MOBILE_LIKE_MEDIA_QUERY = `(pointer: coarse), (max-width: ${MOBILE_LIKE_MAX_WIDTH_PX}px)`;
+
+/** Track whether the viewport currently matches the mobile-like media query
+ *  so chat gestures (long-press menu, double-tap zoom) flip on/off when the
+ *  user resizes a window between large-desktop and narrow-tablet layouts.
+ *  Falls back to plain `'ontouchstart' in window` when matchMedia isn't
+ *  available (older browsers / non-DOM test environments). */
+function useMobileLikeChatLayout(): boolean {
+  const compute = (): boolean => {
+    if (typeof window === 'undefined') return false;
+    if (typeof window.matchMedia === 'function') {
+      return window.matchMedia(MOBILE_LIKE_MEDIA_QUERY).matches;
+    }
+    return 'ontouchstart' in window;
+  };
+  const [isMobile, setIsMobile] = useState(compute);
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia(MOBILE_LIKE_MEDIA_QUERY);
+    const onChange = () => setIsMobile(mq.matches);
+    // Safari < 14 only supports the legacy `addListener` API.
+    if (typeof mq.addEventListener === 'function') {
+      mq.addEventListener('change', onChange);
+      return () => mq.removeEventListener('change', onChange);
+    }
+    mq.addListener(onChange);
+    return () => mq.removeListener(onChange);
+  }, []);
+  return isMobile;
+}
 /** Long-press timer for the mobile Copy/Quote context menu. Matches the
  *  iOS callout heuristic so users with muscle memory from native chat
  *  apps see the menu at the expected moment. */
@@ -1189,7 +1224,14 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     return () => ro.disconnect();
   }, [preview]);
 
-  const isTouchDevice = 'ontouchstart' in window;
+  // What counts as "mobile" for chat gestures (long-press menu + double-tap
+  // zoom)? `'ontouchstart' in window` was too loose — it returns true on
+  // Windows touch laptops where the user is driving with a mouse and
+  // expects desktop selection behaviour. Pair pointer-coarse with a
+  // viewport-width cutoff so a Surface in mouse mode lands on the desktop
+  // path, while phones (iOS Safari + Android Chrome) and narrow tablets
+  // get the mobile path.
+  const isTouchDevice = useMobileLikeChatLayout();
   const getActionMenuContainerRect = useCallback(() => {
     const container = scrollRef.current;
     if (!container) return null;

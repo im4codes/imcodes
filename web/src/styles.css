@@ -981,15 +981,18 @@ body {
 .chat-bubble-content { white-space: pre-wrap; word-break: break-word; }
 .chat-bubble-time { font-size: 10px; color: #64748b; margin-top: 2px; }
 .chat-sel-menu { position: absolute; z-index: 20; pointer-events: auto; display: flex; flex-wrap: wrap; gap: 4px; max-width: calc(100% - 16px); box-sizing: border-box; }
-/* Mobile: disable native text selection/callout in chat — custom long-press timer handles Copy/Quote. */
-@media (pointer: coarse) { .chat-view { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; } }
-/* Mobile bubbles use `touch-action: manipulation` so that a second short
-   tap reaches our touchend handler quickly. Without this, iOS Safari waits
-   ~300ms after the first tap to see if the user is starting a double-tap
-   zoom gesture, which both adds perceived latency and can mask the second
-   touchend behind synthetic events. Viewport `user-scalable=no` already
-   suppresses the zoom itself; this just hands the event to JS sooner. */
-@media (pointer: coarse) {
+/* Mobile-like layout: disable native text selection/callout in chat — our
+   custom long-press timer handles Copy/Quote. The predicate must match the
+   `useMobileLikeChatLayout` hook in ChatView.tsx so CSS and JS agree on
+   whether the chat is in mobile mode (pointer-coarse OR narrow viewport).
+   The width branch catches narrow desktop windows where the user is on a
+   small laptop in mouse mode — they get the mobile gesture set too, which
+   matches what the layout looks like at that width. */
+@media (pointer: coarse), (max-width: 768px) {
+  .chat-view { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  /* `touch-action: manipulation` hands the second short tap to JS without
+     iOS Safari's ~300ms double-tap-zoom probe. Viewport user-scalable=no
+     already suppresses the zoom itself; this just removes the latency. */
   .chat-event.chat-assistant,
   .chat-event.chat-user {
     touch-action: manipulation;
