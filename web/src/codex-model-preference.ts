@@ -1,4 +1,5 @@
 import { resolveEffectiveSessionModel, type SessionModelMetadata } from '@shared/session-model.js';
+import { normalizeCodexSdkModelSuggestion, sanitizeCodexSdkRequestedModel } from '../../src/shared/models/options.js';
 
 export const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const CODEX_MODEL_SESSION_STORAGE_PREFIX = `${CODEX_MODEL_STORAGE_KEY}:`;
@@ -37,13 +38,14 @@ export function loadCodexModelPreference(sessionName?: string | null): string | 
   const sessionKey = getSessionPreferenceKey(sessionName);
   if (sessionKey) {
     const sessionValue = readStorageValue(sessionKey);
-    if (sessionValue) return sessionValue;
+    if (sessionValue) return sanitizeCodexSdkRequestedModel(sessionValue) ?? null;
   }
-  return readStorageValue(CODEX_MODEL_STORAGE_KEY);
+  const globalValue = readStorageValue(CODEX_MODEL_STORAGE_KEY);
+  return sanitizeCodexSdkRequestedModel(globalValue) ?? null;
 }
 
 export function saveCodexModelPreference(model: string, sessionName?: string | null): void {
-  const trimmed = model.trim();
+  const trimmed = normalizeCodexSdkModelSuggestion(model);
   if (!trimmed) return;
   writeStorageValue(CODEX_MODEL_STORAGE_KEY, trimmed);
   const sessionKey = getSessionPreferenceKey(sessionName);

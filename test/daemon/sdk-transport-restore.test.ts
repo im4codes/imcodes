@@ -147,6 +147,7 @@ import { getTransportRuntime, launchTransportSession, relaunchSessionWithSetting
 import { newSession } from '../../src/agent/tmux.js';
 import { clearAllResend, enqueueResend, getResendCount } from '../../src/daemon/transport-resend-queue.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
+import { DEFAULT_CODEX_MODEL_ID } from '../../src/shared/models/options.js';
 
 const flush = async () => {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
@@ -397,6 +398,70 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_cx_brain')?.effort).toBe('medium');
     expect(mocks.store.get('deck_sdk_cx_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-cx-restore' });
     expect(mocks.store.get('deck_sdk_cx_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
+  });
+
+  it('normalizes forbidden codex-sdk requested models during fresh launch', async () => {
+    await connectProvider('codex-sdk', {});
+    await launchTransportSession({
+      name: 'deck_sdk_cx_launch_opus_brain',
+      projectName: 'sdkcxlaunchopus',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-cx-launch-opus',
+      requestedModel: 'opus',
+      fresh: true,
+    });
+
+    expect(mocks.store.get('deck_sdk_cx_launch_opus_brain')?.requestedModel).toBe(DEFAULT_CODEX_MODEL_ID);
+    expect(mocks.store.get('deck_sdk_cx_launch_opus_brain')?.modelDisplay).toBe(DEFAULT_CODEX_MODEL_ID);
+
+    const runtime = getTransportRuntime('deck_sdk_cx_launch_opus_brain');
+    expect(runtime).toBeDefined();
+    runtime!.send('launch with sanitized model');
+    await flush();
+
+    expect(mocks.codexRuns[0]).toMatchObject({
+      mode: 'start',
+      options: expect.objectContaining({ model: DEFAULT_CODEX_MODEL_ID }),
+    });
+  });
+
+  it('normalizes forbidden codex-sdk persisted models during restore', async () => {
+    mocks.store.set('deck_sdk_cx_opus_brain', {
+      name: 'deck_sdk_cx_opus_brain',
+      projectName: 'sdkcxopus',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-cx-opus',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-opus-restore',
+      codexSessionId: 'codex-thread-opus-restore',
+      requestedModel: 'opus',
+      activeModel: 'opus',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    expect(mocks.store.get('deck_sdk_cx_opus_brain')?.requestedModel).toBe(DEFAULT_CODEX_MODEL_ID);
+    expect(mocks.store.get('deck_sdk_cx_opus_brain')?.modelDisplay).toBe(DEFAULT_CODEX_MODEL_ID);
+
+    const runtime = getTransportRuntime('deck_sdk_cx_opus_brain');
+    expect(runtime).toBeDefined();
+    runtime!.send('resume with sanitized model');
+    await flush();
+
+    expect(mocks.codexRuns[0]).toMatchObject({
+      mode: 'resume',
+      id: 'codex-thread-opus-restore',
+      options: expect.objectContaining({ model: DEFAULT_CODEX_MODEL_ID }),
+    });
   });
 
   it('publishes idle after restoring a transport session from stale persisted running state', async () => {

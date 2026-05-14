@@ -43,6 +43,7 @@ import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
+import { sanitizeCodexSdkRequestedModel } from '../shared/models/options.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -1363,7 +1364,10 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       let availableQwenModels = s.providerId === 'qwen'
         ? (s.qwenAvailableModels?.length ? s.qwenAvailableModels : (qwenRuntime?.availableModels ?? []))
         : [];
-      const requestedTransportModel = s.requestedModel ?? s.qwenModel;
+      let requestedTransportModel = s.requestedModel ?? s.qwenModel;
+      if (s.providerId === 'codex-sdk') {
+        requestedTransportModel = sanitizeCodexSdkRequestedModel(requestedTransportModel);
+      }
       const runtime = new TransportSessionRuntime(provider, s.name);
       wireTransportCallbacks(runtime, s.name);
       wireTransportSessionInfo(runtime, s.name, s.agentType);
@@ -1633,6 +1637,9 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
   const storedProviderResumeId = !opts.fresh ? existing?.providerResumeId : undefined;
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
+  if (agentType === 'codex-sdk') {
+    requestedTransportModel = sanitizeCodexSdkRequestedModel(requestedTransportModel);
+  }
   // Preserve existing transportConfig (including supervision) when opts doesn't override.
   // Only fall through to `undefined` if nothing is set — never force `{}`, which would
   // strip supervision on restart/relaunch.
