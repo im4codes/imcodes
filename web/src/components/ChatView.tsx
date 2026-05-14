@@ -1299,13 +1299,17 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // Mobile: touch timer long-press → custom menu.
   // Native contextmenu doesn't fire on iOS when user-select:none + touch-callout:none are set.
   //
-  // The same handler also detects double-taps on text bubbles
-  // (`.chat-assistant` / `.chat-user`) and opens the ZoomedTextDialog so the
-  // user can re-enable native selection and copy a specific portion. Tap
-  // pairing is keyed off `data-event-id` (a string), not the HTMLElement —
-  // streaming assistant messages re-render between taps and Preact may
-  // replace the DOM node even when the logical bubble is unchanged, which
-  // would defeat a `===` ref check.
+  // Double-tap on a `.chat-assistant` / `.chat-user` bubble opens the
+  // ZoomedTextDialog so the user can re-enable native selection and copy a
+  // specific portion. We detect the second tap on the synthetic `click`
+  // event rather than `touchend` because:
+  //   * iOS Safari reliably fires `click` on a short tap (viewport
+  //     `user-scalable=no` removes the 300 ms double-tap probe delay);
+  //   * if long-press fires, the one-shot `cancelEvent` on touchend
+  //     `preventDefault`s, which suppresses the synthetic click;
+  //   * pairing by `data-event-id` (a string) survives Preact re-renders
+  //     of streaming assistant blocks — a DOM-ref `===` check would lose
+  //     the pairing whenever the merged bubble grew between taps.
   useEffect(() => {
     if (!isTouchDevice || preview) return;
     const container = scrollRef.current;
@@ -1323,7 +1327,6 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       if (e.touches.length > 1) {
         // multi-touch → cancel any in-flight tap tracking; this is a pinch/scroll
         if (timer) { clearTimeout(timer); timer = null; }
-        lastTapEventId = ''; lastTapTs = 0;
         return;
       }
       const t = e.touches[0];
@@ -1344,30 +1347,28 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       const t = e.touches[0];
       if (Math.abs(t.clientX - startX) > TAP_MOVE_TOLERANCE_PX || Math.abs(t.clientY - startY) > TAP_MOVE_TOLERANCE_PX) {
         clearTimeout(timer); timer = null;
-        // Scroll/drag — cancel pending double-tap pairing too.
-        lastTapEventId = ''; lastTapTs = 0;
       }
     };
 
     const onTouchEnd = () => {
-      const wasShortTap = !!timer;
+      // Long-press fired or finger moved? clear timer; double-tap pairing
+      // is handled in onClick (which won't fire if cancelEvent ran).
       if (timer) { clearTimeout(timer); timer = null; }
-      if (!wasShortTap) {
-        // Long-press fired or finger moved — neither counts as a tap, so
-        // reset pairing to avoid a stale tap accidentally pairing with the
-        // next clean tap.
+    };
+
+    const onClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      const bubble = target?.closest?.('.chat-assistant, .chat-user') as HTMLElement | null;
+      if (!bubble) {
         lastTapEventId = ''; lastTapTs = 0;
         return;
       }
-      const bubble = startTarget?.closest?.('.chat-assistant, .chat-user') as HTMLElement | null;
-      const id = bubble?.dataset?.eventId ?? '';
-      if (!bubble || !id) {
-        lastTapEventId = ''; lastTapTs = 0;
-        return;
-      }
+      // Fall back to a positional fingerprint when data-event-id is absent
+      // (defensive — both bubble flavours now carry it, but a stale build
+      // or an unwired sub-component shouldn't break the zoom path).
+      const id = bubble.dataset.eventId || `pos:${Math.round(bubble.getBoundingClientRect().top)}`;
       const now = Date.now();
       if (lastTapEventId === id && now - lastTapTs < DOUBLE_TAP_THRESHOLD_MS) {
-        // Double-tap → open zoom modal with format-preserving text.
         const text = extractChatEventText(bubble);
         if (text) setZoomText(text);
         lastTapEventId = ''; lastTapTs = 0;
@@ -1380,12 +1381,14 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     container.addEventListener('touchmove', onTouchMove, { passive: true });
     container.addEventListener('touchend', onTouchEnd, { passive: true });
     container.addEventListener('touchcancel', onTouchEnd, { passive: true });
+    container.addEventListener('click', onClick);
     return () => {
       if (timer) clearTimeout(timer);
       container.removeEventListener('touchstart', onTouchStart);
       container.removeEventListener('touchmove', onTouchMove);
       container.removeEventListener('touchend', onTouchEnd);
       container.removeEventListener('touchcancel', onTouchEnd);
+      container.removeEventListener('click', onClick);
       container.removeEventListener('touchend', cancelEvent, { capture: true } as EventListenerOptions);
     };
   }, [isTouchDevice, preview, openCtxMenu]);
