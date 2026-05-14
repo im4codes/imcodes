@@ -143,8 +143,12 @@ jobs:
           cache: 'npm'
       - run: bash ./scripts/ci-npm-ci.sh .
       - run: npm run build
+      - name: Run Windows hook server send tests
+        run: npx vitest run test/daemon/hook-send.test.ts --minWorkers=1 --maxWorkers=1
+        env:
+          IMCODES_MUX: wezterm
       - name: Run Windows-specific unit tests
-        run: npx vitest run test/agent/wezterm.test.ts test/daemon/hook-send.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-upgrade-runner.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts test/util/postinstall-sharp-repair.test.ts test/util/sharp-repair-script.test.ts test/util/restart-daemon-cmd.test.ts
+        run: npx vitest run test/agent/wezterm.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts test/util/windows-upgrade-runner.test.ts test/util/windows-launch-artifacts.test.ts test/util/windows-launch-artifacts.cmd-parse.test.ts test/util/postinstall-sharp-repair.test.ts test/util/sharp-repair-script.test.ts test/util/restart-daemon-cmd.test.ts
         env:
           IMCODES_MUX: wezterm
       - name: Run Windows process-cleanup regression tests
