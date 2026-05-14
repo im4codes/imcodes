@@ -12,7 +12,8 @@ MockWebSocket.OPEN = 1;
 vi.stubGlobal('WebSocket', MockWebSocket);
 
 import { ServerLink, __setServerLinkDataPlaneQueueConfigForTests } from '../../src/daemon/server-link.js';
-import { TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/timeline-protocol.js';
+import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/timeline-protocol.js';
+import { TRANSPORT_EVENT } from '../../shared/transport-events.js';
 
 describe('ServerLink', () => {
   let link: ServerLink;
@@ -87,6 +88,56 @@ describe('ServerLink', () => {
 
     expect(mockWsInstance.send).toHaveBeenCalledTimes(1);
     expect(JSON.parse(mockWsInstance.send.mock.calls[0][0] as string).type).toBe('command.ack');
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(mockWsInstance.send).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(mockWsInstance.send.mock.calls[1][0] as string).type).toBe('chat.history');
+  });
+
+  it('does not queue live timeline events behind bulk history sends', async () => {
+    link.connect();
+    link.send({
+      type: 'chat.history',
+      sessionId: 'deck_test_brain',
+      events: [{ text: 'x'.repeat(4096) }],
+    });
+    link.sendTimelineEvent({
+      eventId: 'evt-live',
+      sessionId: 'deck_test_brain',
+      ts: 1,
+      seq: 1,
+      epoch: 1,
+      type: 'assistant.text',
+      payload: { text: 'streaming token', streaming: true },
+    });
+
+    expect(mockWsInstance.send).toHaveBeenCalledTimes(1);
+    const immediate = JSON.parse(mockWsInstance.send.mock.calls[0][0] as string);
+    expect(immediate.type).toBe(TIMELINE_MESSAGES.EVENT);
+    expect(immediate.event.payload.text).toBe('streaming token');
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(mockWsInstance.send).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(mockWsInstance.send.mock.calls[1][0] as string).type).toBe('chat.history');
+  });
+
+  it('does not queue live transport deltas behind bulk history sends', async () => {
+    link.connect();
+    link.send({
+      type: 'chat.history',
+      sessionId: 'deck_test_brain',
+      events: [{ text: 'x'.repeat(4096) }],
+    });
+    link.send({
+      type: TRANSPORT_EVENT.CHAT_DELTA,
+      sessionId: 'deck_test_brain',
+      content: 'streaming token',
+    });
+
+    expect(mockWsInstance.send).toHaveBeenCalledTimes(1);
+    const immediate = JSON.parse(mockWsInstance.send.mock.calls[0][0] as string);
+    expect(immediate.type).toBe(TRANSPORT_EVENT.CHAT_DELTA);
+    expect(immediate.content).toBe('streaming token');
 
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(mockWsInstance.send).toHaveBeenCalledTimes(2);

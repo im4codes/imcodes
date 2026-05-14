@@ -5,6 +5,7 @@ import { PerformanceObserver, monitorEventLoopDelay, performance } from 'node:pe
 import logger from '../util/logger.js';
 import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
+import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -643,6 +644,18 @@ export function classifyServerSendPlane(msgType: string | undefined): ServerSend
     || msgType === 'daemon.hello'
     || msgType === 'daemon.stats'
     || msgType === 'heartbeat'
+    // Live timeline events carry the chat stream/typewriter updates and
+    // session.state transitions. They must bypass bulk history/data replay.
+    || msgType === TIMELINE_MESSAGES.EVENT
+    || msgType === TRANSPORT_EVENT.CHAT_DELTA
+    || msgType === TRANSPORT_EVENT.CHAT_COMPLETE
+    || msgType === TRANSPORT_EVENT.CHAT_ERROR
+    || msgType === TRANSPORT_EVENT.CHAT_STATUS
+    || msgType === TRANSPORT_EVENT.CHAT_TOOL
+    || msgType === TRANSPORT_EVENT.CHAT_APPROVAL
+    || msgType === TRANSPORT_MSG.CHAT_APPROVAL
+    || msgType === TRANSPORT_MSG.APPROVAL_RESPONSE
+    || msgType === TRANSPORT_MSG.PROVIDER_STATUS
   ) {
     return 'control';
   }
