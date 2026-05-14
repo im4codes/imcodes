@@ -189,6 +189,61 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-overlay')).toBeNull();
   });
 
+  it('keeps the panel file tree nested inside files-and-changes when preview is open', () => {
+    const { ws } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        initialPreview={{ status: 'ok', path: '/home/user/foo.ts', content: 'foo content' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    const bodySplit = document.querySelector('.fb-body.fb-body-split');
+    expect(bodySplit).not.toBeNull();
+
+    const directTrees = Array.from(bodySplit!.children).filter((child) => child.classList.contains('fb-tree'));
+    expect(directTrees).toHaveLength(0);
+
+    const filesAndChanges = Array.from(bodySplit!.children).find((child) => (
+      child.classList.contains('fb-files-and-changes') && child.classList.contains('fb-tree-split')
+    ));
+    expect(filesAndChanges).toBeTruthy();
+
+    const nestedTree = Array.from(filesAndChanges!.children).find((child) => child.classList.contains('fb-tree'));
+    expect(nestedTree).toBeTruthy();
+    expect(nestedTree!.classList.contains('fb-tree-split')).toBe(false);
+  });
+
+  it('keeps the changes tree as a direct split child when preview is open', () => {
+    const { ws } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        defaultTab="changes"
+        initialPreview={{ status: 'ok', path: '/home/user/foo.ts', content: 'foo content' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    const bodySplit = document.querySelector('.fb-body.fb-body-split');
+    expect(bodySplit).not.toBeNull();
+
+    const directChangesTree = Array.from(bodySplit!.children).find((child) => (
+      child.classList.contains('fb-tree')
+      && child.classList.contains('fb-tree-split')
+      && child.classList.contains('fb-changes-tree')
+    ));
+    expect(directChangesTree).toBeTruthy();
+  });
+
   it('shows "Select Directory" title in dir-only modal', () => {
     const { ws } = makeWsFactory();
     const { getByText } = render(

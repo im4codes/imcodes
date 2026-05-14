@@ -12,6 +12,7 @@ import { resolve } from 'node:path';
 
 describe('styles.css regression contracts', () => {
   const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
+  const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
   it('.chat-view-preview must NOT be a scroll container', () => {
     // User reported: card chat history flickers / oscillates infinitely
@@ -101,5 +102,34 @@ describe('styles.css regression contracts', () => {
     const listRule = css.match(/\.fb-changes-list\s*\{[^}]*\}/);
     expect(listRule).not.toBeNull();
     expect(listRule![0]).toMatch(/overflow-y:\s*auto/);
+  });
+
+  it('file browser split tree sizing must only target direct children', () => {
+    // User reported: opening a file preview made the `.fb-files-and-changes`
+    // area use less than half of its height. Root cause: the old descendant
+    // selector `.fb-body-split .fb-tree { flex: 0 0 38%; }` hit the tree
+    // nested inside `.fb-files-and-changes` (a column flex container), turning
+    // a row-width rule into a column-height cap. Split sizing must only apply
+    // to `.fb-tree` nodes that are direct children of `.fb-body-split`.
+    const descendantSplitTreeRules = [...cssWithoutComments.matchAll(/\.fb-body-split\s+\.fb-tree[^{]*\{/g)];
+    expect(descendantSplitTreeRules.map((match) => match[0])).toEqual([]);
+
+    const directSplitTreeRules = [...cssWithoutComments.matchAll(/\.fb-body-split\s*>\s*\.fb-tree[^{]*\{/g)];
+    expect(directSplitTreeRules.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('file browser panel wrapper owns split width while its inner tree fills height', () => {
+    const wrapperRules = [...css.matchAll(/\.fb-files-and-changes\.fb-tree-split\s*\{[^}]*\}/g)].map((match) => match[0]);
+    const wrapperRule = wrapperRules.find((rule) => /flex\s*:/.test(rule));
+    expect(wrapperRule).toBeTruthy();
+    expect(wrapperRule!).toMatch(/flex\s*:\s*0\s+0\s+38%/);
+
+    const innerTreeRule = css.match(/\.fb-files-and-changes\s+\.fb-tree\s*\{[^}]*\}/);
+    expect(innerTreeRule).not.toBeNull();
+    const flexGrow = innerTreeRule![0].match(/flex\s*:\s*(\d+)/);
+    expect(flexGrow).not.toBeNull();
+    expect(Number(flexGrow![1])).toBeGreaterThanOrEqual(1);
+    expect(innerTreeRule![0]).toMatch(/overflow-y:\s*auto/);
+    expect(innerTreeRule![0]).toMatch(/min-height:\s*0/);
   });
 });
