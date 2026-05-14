@@ -686,6 +686,25 @@ export class WsClient {
     this.sentTerminalSubscriptions.set(sessionName, desiredRaw);
   }
 
+  private replayLiveSubscriptionsAfterConnect(): void {
+    this.sentTerminalSubscriptions.clear();
+    this.terminalSubscriptionNextFlushAt = 0;
+
+    let terminalReplayIndex = 0;
+    for (const session of this.terminalSubscriptions.keys()) {
+      this.queueTerminalSubscriptionSync(session, terminalReplayIndex * TERMINAL_RECONNECT_REPLAY_STAGGER_MS);
+      terminalReplayIndex++;
+    }
+
+    for (const sessionId of this.transportSubscriptions) {
+      try {
+        this.send({ type: TRANSPORT_MSG.CHAT_SUBSCRIBE, sessionId });
+      } catch {
+        break;
+      }
+    }
+  }
+
   /** Subscribe to transport chat events for a session (history replay + live approval/tool updates). */
   subscribeTransportSession(sessionId: string): void {
     if (!sessionId) return;
@@ -1307,8 +1326,6 @@ export class WsClient {
       this._connected = true;
       this.clearReconnectTimer();
       this.reconnectAttempt = 0;
-      this.sentTerminalSubscriptions.clear();
-      this.terminalSubscriptionNextFlushAt = 0;
       this.postConnectNonCriticalUntil = Date.now() + POST_CONNECT_NON_CRITICAL_WINDOW_MS;
       this.postConnectNonCriticalSlots = 0;
       this.startHeartbeat();
@@ -1319,18 +1336,7 @@ export class WsClient {
         if (state.pendingSnapshot) clearTimeout(state.pendingSnapshot);
       }
       this.resetState.clear();
-      let terminalReplayIndex = 0;
-      for (const session of this.terminalSubscriptions.keys()) {
-        this.queueTerminalSubscriptionSync(session, terminalReplayIndex * TERMINAL_RECONNECT_REPLAY_STAGGER_MS);
-        terminalReplayIndex++;
-      }
-      for (const sessionId of this.transportSubscriptions) {
-        try {
-          this.send({ type: TRANSPORT_MSG.CHAT_SUBSCRIBE, sessionId });
-        } catch {
-          break;
-        }
-      }
+      this.replayLiveSubscriptionsAfterConnect();
       this.dispatch({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
     });
 
@@ -1363,6 +1369,7 @@ export class WsClient {
             this._resumeProbeTimer = null;
             if (!this._connected) {
               this._connected = true;
+              this.replayLiveSubscriptionsAfterConnect();
               this.dispatch({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
             }
           }

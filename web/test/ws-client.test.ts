@@ -412,6 +412,97 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
+  it('replays remembered live subscriptions after foreground probe recovery', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+
+    client.subscribeTerminal('live-session', false);
+    await vi.advanceTimersByTimeAsync(60);
+    client.subscribeTransportSession('live-session');
+    socket.send.mockClear();
+
+    client.probeConnection();
+    expect(JSON.parse(socket.send.mock.calls[0][0] as string)).toEqual({ type: 'ping' });
+    socket.send.mockClear();
+
+    socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+    await vi.advanceTimersByTimeAsync(0);
+
+    const messages = socket.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(messages).toContainEqual({ type: 'chat.subscribe', sessionId: 'live-session' });
+    expect(messages).toContainEqual({ type: 'terminal.subscribe', session: 'live-session', raw: false });
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('sends live subscriptions created while foreground probe is pending', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    socket.send.mockClear();
+
+    client.probeConnection();
+    expect(JSON.parse(socket.send.mock.calls[0][0] as string)).toEqual({ type: 'ping' });
+    socket.send.mockClear();
+
+    client.subscribeTerminal('pending-session', true);
+    client.subscribeTransportSession('pending-session');
+    expect(socket.send).not.toHaveBeenCalled();
+
+    socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+    await vi.advanceTimersByTimeAsync(0);
+
+    const messages = socket.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(messages).toContainEqual({ type: 'chat.subscribe', sessionId: 'pending-session' });
+    expect(messages).toContainEqual({ type: 'terminal.subscribe', session: 'pending-session', raw: true });
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('restores chat subscription before connected handlers request history refresh', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+
+    client.subscribeTransportSession('history-session');
+    client.onMessage((msg) => {
+      if (msg.type === 'session.event' && msg.event === 'connected') {
+        client.sendTimelineHistoryRequest('history-session', 25);
+      }
+    });
+    socket.send.mockClear();
+
+    client.probeConnection();
+    socket.send.mockClear();
+    socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+
+    const messages = socket.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(messages.map((message) => message.type)).toEqual([
+      'chat.subscribe',
+      TIMELINE_MESSAGES.HISTORY_REQUEST,
+    ]);
+    expect(messages[1]).toMatchObject({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'history-session',
+      limit: 25,
+    });
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
   it('foreground probe force-reconnects after two missed pongs', async () => {
     vi.useFakeTimers();
     const client = new WsClient('http://localhost:8787', 'srv-1');
