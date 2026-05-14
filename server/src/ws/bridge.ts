@@ -2579,6 +2579,7 @@ export class WsBridge {
       // Track transport (chat) subscriptions for session-scoped transport event delivery
       if (msg.type === TRANSPORT_MSG.CHAT_SUBSCRIBE && typeof msg.sessionId === 'string') {
         const sessionId = msg.sessionId;
+        const hasForceHistoryFlag = Object.prototype.hasOwnProperty.call(msg, 'forceHistory');
         const forceHistory = (msg as { forceHistory?: unknown }).forceHistory === true;
         const alreadySubscribed = this.transportSubscriptions.get(ws)?.has(sessionId) ?? false;
         const revision = this.bumpTransportSubscriptionRevision(ws, sessionId);
@@ -2590,11 +2591,11 @@ export class WsBridge {
           if (!this.isCurrentTransportSubscriptionRevision(ws, sessionId, revision)) return;
           if (ws.readyState !== WebSocket.OPEN) return;
           this.transportSubscriptions.get(ws)?.add(sessionId);
-          // Only first subscribe, explicit reconnect replay, or caller-forced
-          // history should reach daemon. Browser foreground probes can resend
-          // subscription state on the same socket; forwarding every duplicate
-          // triggers chat.history storms and starves live delta/typewriter UI.
-          if (!alreadySubscribed || forceHistory) {
+          // Client v2 can explicitly send forceHistory:false to repair the
+          // transport live subscription after a foreground probe without
+          // triggering daemon chat.history replay. Legacy clients omit the flag,
+          // so their first subscribe keeps the old replay behavior.
+          if (forceHistory || (!hasForceHistoryFlag && !alreadySubscribed)) {
             this.sendToDaemon(raw);
           }
         });

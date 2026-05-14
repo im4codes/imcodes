@@ -120,10 +120,10 @@ export interface ChatSubscribeMessage {
   /**
    * Ask the daemon to replay cached chat history for this subscription.
    *
-   * Browser foreground probes resend only missing same-socket subscriptions
-   * and keep this unset for already-sent subscriptions to avoid duplicate
-   * multi-KB/MB history bursts. Fresh sockets and first-time subscriptions
-   * set it to true because the bridge/daemon state is not yet established.
+   * Browser foreground probes resend same-socket subscriptions with false to
+   * repair the bridge live subscription without duplicate multi-KB/MB history
+   * bursts. Fresh sockets and first-time subscriptions set true because the
+   * bridge/daemon state is not yet established. Omitted means legacy client.
    */
   forceHistory?: boolean;
 }

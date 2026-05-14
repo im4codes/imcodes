@@ -3229,6 +3229,39 @@ describe('WsBridge', () => {
       expect(forced).toEqual([{ type: 'chat.subscribe', sessionId: 'ts-repeat', forceHistory: true }]);
     });
 
+    it('accepts forceHistory:false as a live transport subscription without daemon history replay', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: 'chat.subscribe',
+        sessionId: 'ts-live-only',
+        forceHistory: false,
+      }));
+      await flushAsync();
+      expect(daemonWs.sentStrings.filter((s) => JSON.parse(s).type === 'chat.subscribe')).toHaveLength(0);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'evt-live-only',
+          sessionId: 'ts-live-only',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          type: 'assistant.text',
+          payload: { text: 'live repair works', streaming: true },
+        },
+      }));
+      await flushAsync();
+
+      const timelineEvents = browserWs.sentStrings
+        .map((s) => JSON.parse(s))
+        .filter((msg) => msg.type === 'timeline.event');
+      expect(timelineEvents).toHaveLength(1);
+      expect(timelineEvents[0].event.payload.text).toBe('live repair works');
+    });
+
     it('forwards chat.subscribe again after unsubscribe', async () => {
       const { daemonWs, browserWs } = await setupAuthenticatedBridge();
       daemonWs.sent.length = 0;

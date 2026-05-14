@@ -416,7 +416,7 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
-  it('does not replay already-sent live subscriptions after foreground probe recovery', async () => {
+  it('repairs already-sent transport subscriptions after foreground probe recovery without history replay', async () => {
     vi.useFakeTimers();
     const client = new WsClient('http://localhost:8787', 'srv-1');
     client.connect();
@@ -437,7 +437,8 @@ describe('WsClient', () => {
     await vi.advanceTimersByTimeAsync(0);
 
     const messages = socket.send.mock.calls.map((call) => JSON.parse(call[0] as string));
-    expect(messages).toEqual([]);
+    expect(messages).toContainEqual({ type: 'chat.subscribe', sessionId: 'live-session', forceHistory: false });
+    expect(messages).not.toContainEqual({ type: 'terminal.subscribe', session: 'live-session', raw: false });
 
     client.disconnect();
     vi.useRealTimers();
@@ -524,7 +525,7 @@ describe('WsClient', () => {
     socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
 
     const messages = socket.send.mock.calls.map((call) => JSON.parse(call[0] as string));
-    expect(messages).toEqual([]);
+    expect(messages).toEqual([{ type: 'chat.subscribe', sessionId: 'history-session', forceHistory: false }]);
 
     client.disconnect();
     vi.useRealTimers();
@@ -985,7 +986,7 @@ describe('WsClient', () => {
       const secondWs = lastWs!;
       secondWs.emit('open');
 
-      expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"chat.subscribe"'));
+      expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"forceHistory":true'));
       client.disconnect();
       vi.useRealTimers();
     });

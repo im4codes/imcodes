@@ -736,9 +736,8 @@ export class WsClient {
       }
     }
     for (const sessionId of this.transportSubscriptions) {
-      if (!this.sentTransportSubscriptions.has(sessionId)) {
-        if (!this.sendTransportSubscribe(sessionId, true)) break;
-      }
+      const wasSent = this.sentTransportSubscriptions.has(sessionId);
+      if (!this.sendTransportSubscribe(sessionId, !wasSent)) break;
     }
   }
 
@@ -748,7 +747,7 @@ export class WsClient {
       this.send({
         type: TRANSPORT_MSG.CHAT_SUBSCRIBE,
         sessionId,
-        ...(forceHistory ? { forceHistory: true } : {}),
+        forceHistory,
       });
       this.sentTransportSubscriptions.add(sessionId);
       return true;
@@ -775,9 +774,7 @@ export class WsClient {
     const wasDesired = this.transportSubscriptions.has(sessionId);
     this.transportSubscriptions.add(sessionId);
     if (!this._connected) return;
-    if (!wasDesired || !this.sentTransportSubscriptions.has(sessionId)) {
-      this.sendTransportSubscribe(sessionId, true);
-    }
+    this.sendTransportSubscribe(sessionId, !wasDesired || !this.sentTransportSubscriptions.has(sessionId));
   }
 
   /** Unsubscribe from transport chat events for a session. */

@@ -164,6 +164,10 @@ describe('live timeline push over daemon ServerLink and server WsBridge', () => 
         5_000,
         'chat subscription reached daemon',
       );
+      daemonInbox.length = 0;
+      browser.send(JSON.stringify({ type: TRANSPORT_MSG.CHAT_SUBSCRIBE, sessionId: SESSION_ID, forceHistory: false }));
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(daemonInbox.some((msg) => msg.type === TRANSPORT_MSG.CHAT_SUBSCRIBE && msg.sessionId === SESSION_ID)).toBe(false);
       browserMessages.length = 0;
 
       link.send({
@@ -202,6 +206,7 @@ describe('live timeline push over daemon ServerLink and server WsBridge', () => 
         5_000,
         'live timeline events and bulk history delivered',
       );
+      expect(daemonInbox.some((msg) => msg.type === TRANSPORT_MSG.CHAT_SUBSCRIBE && msg.sessionId === SESSION_ID)).toBe(false);
 
       const receivedTypes = browserMessages.map((msg) => msg.type);
       const firstTimelineIndex = receivedTypes.indexOf(TIMELINE_MESSAGES.EVENT);
