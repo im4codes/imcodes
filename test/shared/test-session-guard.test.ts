@@ -22,6 +22,7 @@ describe('test session guard', () => {
     expect(isKnownTestSessionName('deck_test_preview_abc123_brain')).toBe(true);
     expect(isKnownTestSessionName('deck_test_p2p_workflow_abc123_brain')).toBe(true);
     expect(isKnownTestSessionName('imcodes-test-p2p-workflow-abc123')).toBe(true);
+    expect(isKnownTestSessionName('deck_sub_e2e_mcp_abc123')).toBe(true);
     expect(isKnownTestSessionName('deck_realproj_brain')).toBe(false);
     expect(isKnownTestSessionName('deck_performance_real_brain')).toBe(false);
   });

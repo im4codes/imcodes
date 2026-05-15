@@ -64,6 +64,7 @@ import { existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
+import { printDirectSendResult, printSendResult } from './cli/send-output.js';
 import {
   formatDurationSeconds,
   getDaemonServerLinkFreshness,
@@ -581,7 +582,7 @@ program
       : resolvedTarget;
     const { sendKeys } = await import('./agent/tmux.js');
     await sendKeys(name, message);
-    console.log(`Sent to ${name}`);
+    printDirectSendResult(name);
   });
 
 /** Read hook server port from ~/.imcodes/hook-port. Returns null if unavailable. */
@@ -628,31 +629,6 @@ async function postToHookServer(port: number, path: string, body: Record<string,
     req.write(data);
     req.end();
   });
-}
-
-/** Print the result of a /send call to stdout. */
-function printSendResult(res: Record<string, unknown>): void {
-  if (res.ok) {
-    // Broadcast response: delivered/queued are arrays
-    if (Array.isArray(res.delivered)) {
-      if (res.delivered.length > 0) console.log(`Sent to ${res.delivered.length} sessions: ${(res.delivered as string[]).join(', ')}`);
-      if (Array.isArray(res.queued) && res.queued.length > 0) console.log(`Queued for ${res.queued.length}: ${(res.queued as string[]).join(', ')}`);
-      if (Array.isArray(res.errors) && res.errors.length > 0) console.warn(`Errors: ${(res.errors as string[]).join('; ')}`);
-    } else if (res.queued) {
-      console.log(`Message queued for ${res.target ?? 'target'} (agent busy).`);
-    } else {
-      console.log(`Sent to ${res.target ?? 'target'}.`);
-    }
-  } else {
-    console.error(`Error: ${res.error ?? 'unknown error'}`);
-    if (Array.isArray(res.available) && res.available.length > 0) {
-      console.error('Available targets:');
-      for (const t of res.available) {
-        console.error(`  ${t}`);
-      }
-    }
-    process.exit(1);
-  }
 }
 
 program
@@ -974,6 +950,14 @@ program
 const memoryCmd = program
   .command('memory')
   .description('Search and inspect local agent memory');
+
+memoryCmd
+  .command('mcp')
+  .description('Run the daemon memory MCP server over stdio')
+  .action(async () => {
+    const { runMemoryMcpServer } = await import('./daemon/memory-mcp-server.js');
+    await runMemoryMcpServer();
+  });
 
 memoryCmd
   .command('search [query]')

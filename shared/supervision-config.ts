@@ -12,6 +12,7 @@ import {
 } from './shared-context-runtime-config.js';
 import { COMBO_PRESETS } from './p2p-modes.js';
 import { PROCESS_SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES } from './agent-types.js';
+import { PROVIDER_STATUS_REASON } from './provider-status-reasons.js';
 
 export const SUPERVISION_CONTRACT_IDS = {
   DECISION: 'supervision_decision_v1',
@@ -64,7 +65,7 @@ export const SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION = SUPERVISION_CONTRACT_
 // decision (provider, snapshot, or queue failure). Kept distinct from model-issued
 // ask_human verdicts so UI/UX can present a "repair required" path.
 export const SUPERVISION_UNAVAILABLE_REASONS = {
-  PROVIDER_NOT_CONNECTED: 'provider_not_connected',
+  PROVIDER_NOT_CONNECTED: PROVIDER_STATUS_REASON.PROVIDER_NOT_CONNECTED,
   INVALID_SNAPSHOT: 'invalid_snapshot',
   QUEUE_TIMEOUT: 'queue_timeout',
   DECISION_TIMEOUT: 'decision_timeout',

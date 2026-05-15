@@ -153,6 +153,15 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
 import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
+import {
+  IMCODES_DAEMON_NAMESPACE_ENV,
+  IMCODES_DAEMON_PROJECT_NAME_ENV,
+  IMCODES_DAEMON_PROJECT_ROOT_ENV,
+  IMCODES_DAEMON_SERVER_ID_ENV,
+  IMCODES_DAEMON_SESSION_NAME_ENV,
+  IMCODES_DAEMON_USER_ID_ENV,
+} from '../../shared/memory-mcp-env.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -1127,6 +1136,81 @@ describe('CodexSdkProvider', () => {
     expect(turnStartReq?.params?.env).toMatchObject({
       IMCODES_SESSION: 'deck_repo_w1',
       IMCODES_SESSION_LABEL: 'Cx1',
+    });
+  });
+
+  it('injects Memory MCP identity through per-thread config instead of app-server argv', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-mcp',
+      sessionName: 'deck_repo_w1',
+      projectName: 'repo',
+      serverId: 'srv-bound',
+      cwd: '/tmp/project',
+      contextNamespace: {
+        scope: 'user_private',
+        userId: 'user-secret-ish',
+        projectId: 'github.com/acme/project',
+      },
+    });
+
+    await provider.send('route-mcp', 'hello');
+    const child = childProcessMock.children[0];
+    const spawnArgs = childProcessMock.spawn.mock.calls[0]?.[1] as string[];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    const config = threadStartReq?.params?.config as Record<string, any> | undefined;
+    const mcpServer = config?.mcp_servers?.[IMCODES_MEMORY_MCP_SERVER_NAME];
+
+    expect(JSON.stringify(spawnArgs)).toContain(IMCODES_MEMORY_MCP_SERVER_NAME);
+    expect(JSON.stringify(spawnArgs)).not.toContain('user-secret-ish');
+    expect(JSON.stringify(spawnArgs)).not.toContain('github.com/acme/project');
+    expect(mcpServer).toMatchObject({
+      command: 'imcodes',
+      args: ['memory', 'mcp'],
+      env: {
+        [IMCODES_DAEMON_USER_ID_ENV]: 'user-secret-ish',
+        [IMCODES_DAEMON_SESSION_NAME_ENV]: 'deck_repo_w1',
+        [IMCODES_DAEMON_PROJECT_NAME_ENV]: 'repo',
+        [IMCODES_DAEMON_PROJECT_ROOT_ENV]: '/tmp/project',
+        [IMCODES_DAEMON_SERVER_ID_ENV]: 'srv-bound',
+      },
+    });
+    expect(JSON.parse(mcpServer.env[IMCODES_DAEMON_NAMESPACE_ENV])).toEqual({
+      scope: 'user_private',
+      userId: 'user-secret-ish',
+      projectId: 'github.com/acme/project',
+    });
+  });
+
+  it('re-sends Memory MCP identity config when resuming an existing Codex thread', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-mcp-resume',
+      resumeId: 'thread-existing',
+      sessionName: 'deck_repo_w2',
+      projectName: 'repo',
+      serverId: 'srv-bound',
+      cwd: '/tmp/project',
+      contextNamespace: {
+        scope: 'user_private',
+        userId: 'user-secret-ish',
+        projectId: 'github.com/acme/project',
+      },
+    });
+
+    await provider.send('route-mcp-resume', 'hello');
+    const child = childProcessMock.children[0];
+    const threadResumeReq = child.requests.find((req) => req.method === 'thread/resume');
+    const config = threadResumeReq?.params?.config as Record<string, any> | undefined;
+    const mcpServer = config?.mcp_servers?.[IMCODES_MEMORY_MCP_SERVER_NAME];
+
+    expect(mcpServer?.env).toMatchObject({
+      [IMCODES_DAEMON_USER_ID_ENV]: 'user-secret-ish',
+      [IMCODES_DAEMON_SESSION_NAME_ENV]: 'deck_repo_w2',
+      [IMCODES_DAEMON_PROJECT_NAME_ENV]: 'repo',
+      [IMCODES_DAEMON_SERVER_ID_ENV]: 'srv-bound',
     });
   });
 

@@ -354,11 +354,16 @@ describe('startSubSession — geminiSessionId stored in session-store', () => {
 describe('startSubSession — transport SDK agents do not use tmux', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    getSessionMock.mockImplementation(() => null);
     sessionExistsMock.mockResolvedValue(false);
     getTransportRuntimeMock.mockReturnValue(null);
   });
 
   it('launches claude-code-sdk via launchTransportSession instead of getDriver/newSession', async () => {
+    getSessionMock.mockImplementation((name: string) => (
+      name === 'deck_proj_brain' ? { name, projectName: 'proj' } : null
+    ));
+
     await startSubSession({
       id: 'sdk-sub1',
       type: 'claude-code-sdk',
@@ -372,6 +377,7 @@ describe('startSubSession — transport SDK agents do not use tmux', () => {
       name: 'deck_sub_sdk-sub1',
       agentType: 'claude-code-sdk',
       projectDir: '/proj',
+      projectName: 'proj',
       parentSession: 'deck_proj_brain',
       description: 'SDK test',
       fresh: true,

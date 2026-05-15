@@ -4,7 +4,20 @@ import { useTranslation } from 'react-i18next';
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '@shared/context-model-defaults.js';
 import type { ContextMemoryProjectView, ContextMemoryView, SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
-import { MEMORY_WS } from '@shared/memory-ws.js';
+import {
+  MEMORY_MCP_DEGRADED_REASON,
+  MEMORY_MCP_PROVIDER_IDS,
+  MEMORY_MCP_STATUS_VALUES,
+  MEMORY_MCP_TOOL_FAMILIES,
+  MEMORY_WS,
+  type MemoryMcpProviderId,
+  type MemoryMcpProviderStatusView,
+  type MemoryMcpRecentCallView,
+  type MemoryMcpStatusValue,
+  type MemoryMcpToolFamily,
+  type MemoryMcpToolFamilyGateView,
+} from '@shared/memory-ws.js';
+import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { CC_PRESET_MSG, getCcPresetEffectiveModel, type CcPresetModelInfo } from '@shared/cc-presets.js';
 import {
   type MemoryFeatureAdminRecord,
@@ -674,7 +687,7 @@ const deleteButtonStyle = {
 } as const;
 
 type KindOption = SharedDocument['kind'];
-type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing' | 'memory';
+type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing' | 'memory' | 'mcp';
 type MemoryTopTab = 'personal' | 'enterprise-memory';
 type MemoryPersonalSubTab = 'unprocessed' | 'processed' | 'cloud';
 type MemoryEnterpriseSubTab = 'shared-memory' | 'authored-context';
@@ -683,6 +696,7 @@ type MemoryObservationClassFilter = '' | ObservationClass;
 type MemoryResponseStatus = 'idle' | 'loading' | 'ready' | 'unavailable' | 'timeout' | 'error';
 type TimeoutHandle = ReturnType<typeof setTimeout>;
 const MD_INGEST_UI_SCOPES = ['personal', 'project_shared'] as const satisfies readonly MemoryScope[];
+type McpStatusResponseStatus = MemoryResponseStatus;
 interface PendingObservationPromotion {
   observationId: string;
   fromScope: MemoryScope;
@@ -708,7 +722,15 @@ type MemoryAdminRequestSurface =
   | 'mdIngest'
   | 'observationUpdate'
   | 'observationDelete'
-  | 'observationPromote';
+  | 'observationPromote'
+  | 'mcpStatus';
+
+interface McpStatusSnapshot {
+  providers: MemoryMcpProviderStatusView[];
+  toolFamilies: MemoryMcpToolFamilyGateView[];
+  recentCalls: MemoryMcpRecentCallView[];
+  updatedAt?: number;
+}
 
 interface Props {
   enterpriseId?: string;
@@ -1220,6 +1242,64 @@ function getMemoryRecordClassLabel(
   return t('sharedContext.management.memoryDurableCandidate');
 }
 
+const MCP_PROVIDER_LABEL_KEY: Record<MemoryMcpProviderId, string> = {
+  'claude-code-sdk': 'sharedContext.management.mcpProviderClaudeSdk',
+  'gemini-sdk': 'sharedContext.management.mcpProviderGeminiAcp',
+  'copilot-sdk': 'sharedContext.management.mcpProviderCopilotSdk',
+  'codex-sdk': 'sharedContext.management.mcpProviderCodexSdk',
+  'cursor-headless': 'sharedContext.management.mcpProviderCursorHeadless',
+  qwen: 'sharedContext.management.mcpProviderQwen',
+};
+
+function isManagedMcpProviderId(providerId: string): providerId is MemoryMcpProviderId {
+  return (MEMORY_MCP_PROVIDER_IDS as readonly string[]).includes(providerId);
+}
+
+function mcpProviderLabel(providerId: string, t: (key: string, options?: Record<string, unknown>) => string): string {
+  if (isManagedMcpProviderId(providerId)) return t(MCP_PROVIDER_LABEL_KEY[providerId]);
+  return t('sharedContext.management.mcpProviderUnknown', { provider: providerId });
+}
+
+function isMemoryMcpStatusValue(status: unknown): status is MemoryMcpStatusValue {
+  return typeof status === 'string' && (MEMORY_MCP_STATUS_VALUES as readonly string[]).includes(status);
+}
+
+function normalizeMcpStatusValue(status: unknown): MemoryMcpStatusValue {
+  return isMemoryMcpStatusValue(status) ? status : 'unknown';
+}
+
+function mcpStatusLabel(status: MemoryMcpStatusValue, t: (key: string) => string): string {
+  return t(`sharedContext.management.mcpStatus.${status}`);
+}
+
+function mcpToolFamilyLabel(family: MemoryMcpToolFamily, t: (key: string) => string): string {
+  return t(`sharedContext.management.mcpToolFamily.${family}`);
+}
+
+function mcpCallStatusLabel(status: string, t: (key: string, options?: Record<string, unknown>) => string): string {
+  switch (status) {
+    case 'ok':
+    case 'error':
+    case 'disabled':
+      return t(`sharedContext.management.mcpCallStatusValue.${status}`);
+    default:
+      return t('sharedContext.management.mcpCallStatusValue.unknown', { status });
+  }
+}
+
+function mcpReasonLabel(reason: string, t: (key: string, options?: Record<string, unknown>) => string): string {
+  switch (reason) {
+    case MEMORY_MCP_DEGRADED_REASON.ENV_FORWARDING_UNVERIFIED:
+    case MEMORY_MCP_DEGRADED_REASON.FEATURE_DISABLED:
+    case MEMORY_MCP_DEGRADED_REASON.PROVIDER_NOT_CONNECTED:
+    case MEMORY_MCP_DEGRADED_REASON.MCP_REGISTRATION_FAILED:
+    case MEMORY_MCP_DEGRADED_REASON.STATUS_NOT_REPORTED:
+      return t(`sharedContext.management.mcpReason.${reason}`);
+    default:
+      return t('sharedContext.management.mcpReason.unknown', { reason });
+  }
+}
+
 function memoryProjectOptionId(input: Pick<MemoryProjectOption, 'canonicalRepoId' | 'projectDir' | 'displayName'>): string {
   return input.canonicalRepoId?.trim()
     || input.projectDir?.trim()
@@ -1295,6 +1375,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const memoryViewGenerationRef = useRef(0);
   const personalMemoryStatusTimerRef = useRef<TimeoutHandle | null>(null);
   const memoryFeaturesStatusTimerRef = useRef<TimeoutHandle | null>(null);
+  const mcpStatusTimerRef = useRef<TimeoutHandle | null>(null);
   const memoryAdminRequestIdsRef = useRef<Record<MemoryAdminRequestSurface, string | null>>({
     projectResolve: null,
     features: null,
@@ -1315,6 +1396,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     observationUpdate: null,
     observationDelete: null,
     observationPromote: null,
+    mcpStatus: null,
   });
 
   const [teams, setTeams] = useState<TeamSummary[]>([]);
@@ -1390,6 +1472,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [deletingMemoryIds, setDeletingMemoryIds] = useState<Set<string>>(new Set());
   const [memoryFeatureRecords, setMemoryFeatureRecords] = useState<MemoryFeatureAdminRecord[]>([]);
   const [pendingMemoryFeatureFlags, setPendingMemoryFeatureFlags] = useState<Set<MemoryFeatureFlag>>(new Set());
+  const [mcpStatusSnapshot, setMcpStatusSnapshot] = useState<McpStatusSnapshot | null>(null);
+  const [mcpStatus, setMcpStatus] = useState<McpStatusResponseStatus>('idle');
+  const [mcpProviderConnections, setMcpProviderConnections] = useState<Record<string, boolean>>({});
   const [preferenceRecords, setPreferenceRecords] = useState<MemoryPreferenceAdminRecord[]>([]);
   const [preferenceFeatureEnabled, setPreferenceFeatureEnabled] = useState<boolean | null>(null);
   const preferenceUserId = 'server-derived';
@@ -1796,6 +1881,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     { id: 'knowledge', label: t('sharedContext.management.tabs.knowledge') },
     { id: 'processing', label: t('sharedContext.management.tabs.processing') },
     { id: 'memory', label: t('sharedContext.management.tabs.memory') },
+    { id: 'mcp', label: t('sharedContext.management.tabs.mcp') },
   ], [t]);
 
   const memoryTopTabs = useMemo(() => [
@@ -2261,9 +2347,46 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     });
   }, [markMemoryAdminRequest, observationClass, observationScope, selectedCanonicalRepoId, selectedProjectDir, ws]);
 
+  const loadMcpStatus = useCallback(() => {
+    if (!ws) {
+      clearTimeoutRef(mcpStatusTimerRef);
+      setMcpStatus('unavailable');
+      return;
+    }
+    const requestId = markMemoryAdminRequest('mcpStatus');
+    clearTimeoutRef(mcpStatusTimerRef);
+    setMcpStatus('loading');
+    mcpStatusTimerRef.current = setTimeout(() => {
+      mcpStatusTimerRef.current = null;
+      if (memoryAdminRequestIdsRef.current.mcpStatus === requestId) {
+        setMcpStatus((current) => (current === 'loading' ? 'timeout' : current));
+      }
+    }, 8000);
+    ws.send({ type: MEMORY_WS.MCP_STATUS_QUERY, requestId });
+  }, [markMemoryAdminRequest, ws]);
+
   useEffect(() => {
     if (!ws) return;
     return ws.onMessage((msg) => {
+      if (msg.type === TRANSPORT_MSG.PROVIDER_STATUS) {
+        const providerId = typeof msg.providerId === 'string' ? msg.providerId : '';
+        if (providerId) {
+          setMcpProviderConnections((current) => ({ ...current, [providerId]: msg.connected === true }));
+        }
+        return;
+      }
+      if (msg.type === MEMORY_WS.MCP_STATUS_RESPONSE) {
+        if (msg.requestId && !isCurrentMemoryAdminResponse('mcpStatus', msg.requestId)) return;
+        clearTimeoutRef(mcpStatusTimerRef);
+        setMcpStatus(msg.error ? 'error' : 'ready');
+        setMcpStatusSnapshot({
+          providers: Array.isArray(msg.providers) ? msg.providers : [],
+          toolFamilies: Array.isArray(msg.toolFamilies) ? msg.toolFamilies : [],
+          recentCalls: Array.isArray(msg.recentCalls) ? msg.recentCalls : [],
+          updatedAt: typeof msg.updatedAt === 'number' ? msg.updatedAt : undefined,
+        });
+        return;
+      }
       if (msg.type === MEMORY_WS.PROJECT_RESOLVE_RESPONSE) {
         const resolveMsg = msg as unknown as {
           requestId?: string;
@@ -2499,6 +2622,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   useEffect(() => () => {
     clearTimeoutRef(personalMemoryStatusTimerRef);
     clearTimeoutRef(memoryFeaturesStatusTimerRef);
+    clearTimeoutRef(mcpStatusTimerRef);
   }, []);
 
   useEffect(() => {
@@ -2510,6 +2634,12 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     if (activeTab !== 'memory') return;
     loadMemoryAdminViews();
   }, [activeTab, loadMemoryAdminViews]);
+
+  useEffect(() => {
+    if (activeTab !== 'mcp') return;
+    loadMemoryAdminViews();
+    loadMcpStatus();
+  }, [activeTab, loadMemoryAdminViews, loadMcpStatus]);
 
   const handleMemoryArchive = useCallback((id: string, recordProjectId?: string) => {
     if (!ws) return;
@@ -2719,6 +2849,89 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     : !manualMemoryCanonicalRepoId
       ? t('sharedContext.management.memoryManualAddProjectRequired')
       : null;
+  const mcpStatusNotice = mcpStatus === 'loading'
+    ? t('sharedContext.management.mcpStatusLoading')
+    : mcpStatus === 'unavailable'
+      ? t('sharedContext.management.mcpNoDaemon')
+      : mcpStatus === 'timeout'
+        ? t('sharedContext.management.mcpStatusTimeout')
+        : mcpStatus === 'error'
+          ? t('sharedContext.management.mcpStatusError')
+          : null;
+  const mcpProviderStatusById = useMemo(() => new Map(
+    (mcpStatusSnapshot?.providers ?? []).map((provider) => [provider.providerId, provider]),
+  ), [mcpStatusSnapshot]);
+  const mcpProviderRows = useMemo(() => {
+    const rows: Array<{
+      providerId: string;
+      connected: boolean | null;
+      status: MemoryMcpStatusValue;
+      degradedReasons: string[];
+    }> = MEMORY_MCP_PROVIDER_IDS.map((providerId) => {
+      const reported = mcpProviderStatusById.get(providerId);
+      const connected = reported?.connected ?? mcpProviderConnections[providerId] ?? null;
+      const status = normalizeMcpStatusValue(reported?.status);
+      return {
+        providerId,
+        connected,
+        status,
+        degradedReasons: reported?.degradedReasons ?? [],
+      };
+    });
+    for (const provider of mcpStatusSnapshot?.providers ?? []) {
+      if (isManagedMcpProviderId(provider.providerId)) continue;
+      rows.push({
+        providerId: provider.providerId,
+        connected: provider.connected ?? mcpProviderConnections[provider.providerId] ?? null,
+        status: normalizeMcpStatusValue(provider.status),
+        degradedReasons: provider.degradedReasons ?? [],
+      });
+    }
+    return rows;
+  }, [mcpProviderConnections, mcpProviderStatusById, mcpStatusSnapshot]);
+  const mcpToolGateByFamily = useMemo(() => new Map(
+    (mcpStatusSnapshot?.toolFamilies ?? []).map((gate) => [gate.family, gate]),
+  ), [mcpStatusSnapshot]);
+  const mcpToolFamilyGates = useMemo(() => MEMORY_MCP_TOOL_FAMILIES.map((family) => {
+    const reported = mcpToolGateByFamily.get(family);
+    if (reported) {
+      return {
+        ...reported,
+        status: normalizeMcpStatusValue(reported.status ?? (reported.enabled === true ? 'ready' : reported.enabled === false ? 'disabled' : 'unknown')),
+      };
+    }
+    if (family === 'memory') {
+      const relevantFlags = [
+        MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch,
+        MEMORY_FEATURE_FLAGS_BY_NAME.preferences,
+        MEMORY_FEATURE_FLAGS_BY_NAME.observationStore,
+      ] as const;
+      const records = relevantFlags.map((flag) => memoryFeatureRecordByFlag.get(flag));
+      const disabledRecord = records.find((record) => record?.enabled === false);
+      if (disabledRecord) {
+        return {
+          family,
+          status: 'disabled' as const,
+          enabled: false,
+          disabledFlag: disabledRecord.flag,
+          degradedReasons: [MEMORY_MCP_DEGRADED_REASON.FEATURE_DISABLED],
+        };
+      }
+      if (records.every((record) => record?.enabled === true)) {
+        return { family, status: 'ready' as const, enabled: true };
+      }
+    }
+    return {
+      family,
+      status: 'unknown' as const,
+      enabled: null,
+      degradedReasons: [MEMORY_MCP_DEGRADED_REASON.STATUS_NOT_REPORTED],
+    };
+  }), [mcpToolGateByFamily, memoryFeatureRecordByFlag]);
+  const mcpRecentCalls = mcpStatusSnapshot?.recentCalls ?? [];
+  const mcpUpdatedAtLabel = mcpStatusSnapshot?.updatedAt
+    ? new Date(mcpStatusSnapshot.updatedAt).toLocaleString()
+    : t('sharedContext.management.mcpUpdatedNever');
 
   const renderMemoryProjectPicker = () => (
     <div style={{ ...resourceCardStyle, gap: DT.space.sm }}>
@@ -3617,6 +3830,136 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <div>{t('sharedContext.management.processingOperationalLine2')}</div>
             <div>{t('sharedContext.management.processingOperationalLine3')}</div>
           </InfoCard>
+        </>
+      )}
+
+      {activeTab === 'mcp' && (
+        <>
+          <InfoCard title={t('sharedContext.management.mcpTitle')}>
+            <div>{t('sharedContext.management.mcpSummaryLine1')}</div>
+            <div>{t('sharedContext.management.mcpSummaryLine2')}</div>
+            <div>{t('sharedContext.management.mcpSummaryLine3')}</div>
+          </InfoCard>
+
+          <div style={sectionStyle}>
+            <SectionHeading
+              title={t('sharedContext.management.mcpProviderStatusTitle')}
+              description={t('sharedContext.management.mcpProviderStatusDescription')}
+              action={<button type="button" style={subtleButtonStyle} onClick={() => loadMcpStatus()} disabled={!ws}>{t('sharedContext.refresh')}</button>}
+            />
+            {mcpStatusNotice ? <div style={memoryProcessedNoteStyle}>{mcpStatusNotice}</div> : null}
+            <div style={metaGridStyle}>
+              <MetaCard label={t('sharedContext.management.mcpUpdatedAt')} value={mcpUpdatedAtLabel} />
+              <MetaCard label={t('sharedContext.management.mcpProvidersReported')} value={mcpStatusSnapshot?.providers.length ?? 0} />
+              <MetaCard label={t('sharedContext.management.mcpCallsReported')} value={mcpRecentCalls.length} />
+            </div>
+            <div style={featureFlagGridStyle}>
+              {mcpProviderRows.map((provider) => {
+                const blocked = provider.status === 'degraded';
+                const enabled = provider.status === 'ready'
+                  ? true
+                  : provider.status === 'disabled'
+                    ? false
+                    : null;
+                const connectionLabel = provider.connected === true
+                  ? t('sharedContext.management.mcpProviderConnected')
+                  : provider.connected === false
+                    ? t('sharedContext.management.mcpProviderDisconnected')
+                    : t('sharedContext.management.mcpProviderNoSignal');
+                const reasonText = provider.degradedReasons.length > 0
+                  ? t('sharedContext.management.mcpDegradedReasons', {
+                    reasons: provider.degradedReasons.map((reason) => mcpReasonLabel(reason, t)).join(', '),
+                  })
+                  : t('sharedContext.management.mcpProviderNoDegradedReasons');
+                return (
+                  <FeatureFlagCard
+                    key={provider.providerId}
+                    flag={provider.providerId}
+                    label={mcpProviderLabel(provider.providerId, t)}
+                    enabled={enabled}
+                    blocked={blocked}
+                    statusText={mcpStatusLabel(provider.status, t)}
+                    detail={`${connectionLabel}. ${blocked ? reasonText : t('sharedContext.management.mcpProviderStatusHint')}`}
+                  />
+                );
+              })}
+            </div>
+          </div>
+
+          <div style={sectionStyle}>
+            <SectionHeading
+              title={t('sharedContext.management.mcpToolGatesTitle')}
+              description={t('sharedContext.management.mcpToolGatesDescription')}
+            />
+            <div style={featureFlagGridStyle}>
+              {mcpToolFamilyGates.map((gate) => {
+                const status = normalizeMcpStatusValue(gate.status);
+                const blocked = status === 'degraded';
+                const enabled = gate.enabled === true || status === 'ready'
+                  ? true
+                  : gate.enabled === false || status === 'disabled'
+                    ? false
+                    : null;
+                const disabledFlag = gate.disabledFlag
+                  ? t('sharedContext.management.mcpDisabledFlag', { flag: gate.disabledFlag })
+                  : t('sharedContext.management.mcpDisabledFlagNone');
+                const reasons = gate.degradedReasons?.length
+                  ? t('sharedContext.management.mcpDegradedReasons', {
+                    reasons: gate.degradedReasons.map((reason) => mcpReasonLabel(reason, t)).join(', '),
+                  })
+                  : t('sharedContext.management.mcpGateNoDetails');
+                return (
+                  <FeatureFlagCard
+                    key={gate.family}
+                    flag={gate.disabledFlag ?? gate.family}
+                    label={mcpToolFamilyLabel(gate.family, t)}
+                    enabled={enabled}
+                    blocked={blocked}
+                    statusText={mcpStatusLabel(status, t)}
+                    detail={`${disabledFlag}. ${reasons}`}
+                  />
+                );
+              })}
+            </div>
+          </div>
+
+          <div style={sectionStyle}>
+            <SectionHeading
+              title={t('sharedContext.management.mcpRecentCallsTitle')}
+              description={t('sharedContext.management.mcpRecentCallsDescription')}
+            />
+            {mcpRecentCalls.length > 0 ? (
+              <div style={resourceListStyle}>
+                {mcpRecentCalls.map((call) => (
+                  <div key={call.id} style={resourceCardStyle}>
+                    <div style={metaGridStyle}>
+                      <MetaCard label={t('sharedContext.management.mcpCallProvider')} value={call.providerId ? mcpProviderLabel(call.providerId, t) : t('sharedContext.management.mcpProviderNoSignal')} />
+                      <MetaCard label={t('sharedContext.management.mcpCallTool')} value={call.toolName} />
+                      <MetaCard label={t('sharedContext.management.mcpCallStatus')} value={mcpCallStatusLabel(call.status, t)} />
+                      <MetaCard label={t('sharedContext.management.mcpCallDuration')} value={call.durationMs != null ? t('sharedContext.management.mcpCallDurationValue', { ms: call.durationMs }) : t('sharedContext.management.noneValue')} />
+                      <MetaCard label={t('sharedContext.management.mcpCallTime')} value={call.occurredAt ? new Date(call.occurredAt).toLocaleString() : t('sharedContext.management.noneValue')} />
+                      <MetaCard label={t('sharedContext.management.mcpCallFamily')} value={call.family ? mcpToolFamilyLabel(call.family, t) : t('sharedContext.management.noneValue')} />
+                    </div>
+                    {call.errorReason ? <div style={memoryProcessedNoteStyle}>{mcpReasonLabel(call.errorReason, t)}</div> : null}
+                    {call.redactedInput ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: DT.space.xs }}>
+                        <strong style={{ fontSize: 12, color: DT.text.secondary }}>{t('sharedContext.management.mcpCallInput')}</strong>
+                        <pre style={{ ...memoryContentExpandedStyle, whiteSpace: 'pre-wrap', fontFamily: 'ui-monospace, Menlo, monospace' }}>{call.redactedInput}</pre>
+                      </div>
+                    ) : null}
+                    {call.redactedResult ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: DT.space.xs }}>
+                        <strong style={{ fontSize: 12, color: DT.text.secondary }}>{t('sharedContext.management.mcpCallResult')}</strong>
+                        <pre style={{ ...memoryContentExpandedStyle, whiteSpace: 'pre-wrap', fontFamily: 'ui-monospace, Menlo, monospace' }}>{call.redactedResult}</pre>
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={helperTextStyle}>{t('sharedContext.management.mcpRecentCallsEmpty')}</div>
+            )}
+          </div>
         </>
       )}
 

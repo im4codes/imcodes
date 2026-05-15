@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
 
 const SESSION_CC = `deck_ccsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
@@ -38,6 +40,22 @@ const PRESET_ENV = {
   ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M2.7',
   IMCODES_CONTEXT_WINDOW: '200000',
 };
+
+function expectMemoryMcpEnv(
+  serverConfig: unknown,
+  expected: { sessionName: string; projectName: string },
+): void {
+  const server = (serverConfig as Record<string, any> | undefined)?.[IMCODES_MEMORY_MCP_SERVER_NAME];
+  expect(server).toMatchObject({
+    command: 'imcodes',
+    args: ['memory', 'mcp'],
+  });
+  expect(server?.env).toMatchObject({
+    [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: expected.sessionName,
+    [MEMORY_MCP_ENV_KEYS.PROJECT_NAME]: expected.projectName,
+  });
+  expect(JSON.stringify(server?.env ?? {})).not.toContain('IMCODES_SERVER_TOKEN');
+}
 
 vi.mock('../../src/daemon/cc-presets.js', () => ({
   getPreset: vi.fn(async (name: string) => (
@@ -80,11 +98,13 @@ vi.mock('node:child_process', async (importOriginal) => {
             stdout.write(JSON.stringify({ id: msg.id, result: { userAgent: 'test' } }) + '\n');
           }
           if (msg.method === 'thread/start' && typeof msg.id === 'number') {
+            mocks.codexCalls.push({ mode: 'start', id: null, input: '', options: msg.params ?? {} });
             stdout.write(JSON.stringify({ id: msg.id, result: { thread: { id: 'thread-codex-e2e' } } }) + '\n');
             stdout.write(JSON.stringify({ method: 'thread/started', params: { thread: { id: 'thread-codex-e2e' } } }) + '\n');
           }
           if (msg.method === 'thread/resume' && typeof msg.id === 'number') {
             const threadId = String(msg.params?.threadId ?? 'thread-codex-e2e');
+            mocks.codexCalls.push({ mode: 'resume', id: threadId, input: '', options: msg.params ?? {} });
             stdout.write(JSON.stringify({ id: msg.id, result: { thread: { id: threadId } } }) + '\n');
           }
           if (msg.method === 'turn/start' && typeof msg.id === 'number') {
@@ -1185,6 +1205,10 @@ describe('sdk transport flow e2e', () => {
       detail: expect.objectContaining({ kind: 'tool_use_complete' }),
     }));
     expect(claudeCall?.options.env).toMatchObject({ ANTHROPIC_BASE_URL: 'https://example.invalid' });
+    expectMemoryMcpEnv(claudeCall?.options.mcpServers, {
+      sessionName: SESSION_CC,
+      projectName: 'ccsdk',
+    });
     expect(ack?.payload.status).toBe('accepted');
   });
 
@@ -1363,5 +1387,11 @@ describe('sdk transport flow e2e', () => {
     expect(toolCall?.payload.tool).toBe('Bash');
     expect(toolResult?.payload.output).toBe('hi\n');
     expect(ack?.payload.status).toBe('accepted');
+
+    const codexStart = mocks.codexCalls.find((call) => call.mode === 'start');
+    expectMemoryMcpEnv((codexStart?.options.config as Record<string, any> | undefined)?.mcp_servers, {
+      sessionName: SESSION_CX,
+      projectName: 'cxsdk',
+    });
   });
 });

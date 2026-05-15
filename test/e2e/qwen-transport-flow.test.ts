@@ -23,6 +23,15 @@ const flushAsync = async () => {
   for (let i = 0; i < 5; i++) await new Promise((resolve) => process.nextTick(resolve));
 };
 
+async function waitForCondition(check: () => boolean, timeoutMs = 3000, intervalMs = 20): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error('Timed out waiting for condition');
+}
+
 const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, unknown>>();
   const emitted: Array<{ session: string; type: string; payload: Record<string, unknown>; opts?: Record<string, unknown> }> = [];
@@ -459,11 +468,13 @@ describe('qwen transport flow e2e', () => {
       agentType: 'qwen',
     }, serverLink);
     await flushAsync();
+    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'session_list'));
 
     const restarted = mocks.store.get(SESSION);
     expect(restarted?.providerSessionId).toBe('11111111-1111-4111-8111-111111111111');
 
     mocks.emitted.length = 0;
+    serverLink.send.mockClear();
     handleWebCommand({
       type: 'session.send',
       session: SESSION,
@@ -471,6 +482,7 @@ describe('qwen transport flow e2e', () => {
       commandId: 'cmd-qwen-after-restart',
     }, serverLink);
     await flushAsync();
+    await waitForCondition(() => mocks.emitted.some((e) => e.session === SESSION && e.type === 'assistant.text' && e.payload.streaming === false));
 
     const final = mocks.emitted.find((e) => e.session === SESSION && e.type === 'assistant.text' && e.payload.streaming === false);
     expect(final?.payload.text).toBe('Qwen: hello after restart');

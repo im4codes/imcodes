@@ -29,7 +29,6 @@ import { resolveSubSessionRuntimeType } from '../runtime-type.js';
 import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
 import {
   clampGeometryToWorkspace,
-  geometryFromWorkspace,
   normalizeWindowGeometry,
   reserveWorkspaceBottom,
   shouldPersistGeometry,
@@ -111,8 +110,8 @@ const IDLE_HISTORY_STATUS = {
 const LOCAL_KEY = (id: string) => `rcc_subsession_${id}`;
 const DEFAULT_W = 620;
 const DEFAULT_H = 620;
-const MIN_W = 300;
-const MIN_H = 200;
+const MIN_W = 600;
+const MIN_H = 400;
 const DESKTOP_VISIBLE_MARGIN = 32;
 
 function currentDesktopBounds(): WorkspaceBounds {
@@ -135,6 +134,22 @@ function clampDesktopGeom(geom: WindowGeometry): WindowGeometry {
     ...clamped,
     y: Math.min(clamped.y, Math.max(bounds.y, bounds.y + bounds.h - clamped.h)),
   };
+}
+
+function clampMaximizedGeom(bounds: WorkspaceBounds): WindowGeometry {
+  const workspace = currentDesktopBounds();
+  const minW = Math.min(MIN_W, workspace.w);
+  const minH = Math.min(MIN_H, workspace.h);
+  return clampGeometryToWorkspace({
+    x: bounds.x,
+    y: bounds.y,
+    w: Math.max(bounds.w, minW),
+    h: Math.max(bounds.h, minH),
+  }, workspace, {
+    minW,
+    minH,
+    visibleMargin: 0,
+  });
 }
 
 function loadLocal(id: string): { geom: WindowGeometry; viewMode: ViewMode } {
@@ -546,7 +561,8 @@ export function SubSessionWindow({
   const displayGeom = useMemo(() => {
     if (!isDesktopMaximized || isMobile) return geom;
     const bounds = getMaximizeBounds?.();
-    return bounds ? geometryFromWorkspace(bounds) : clampDesktopGeom(geom);
+    if (!bounds) return clampDesktopGeom(geom);
+    return clampMaximizedGeom(bounds);
   }, [geom, getMaximizeBounds, isMobile, isDesktopMaximized, maximizeBoundsVersion]);
 
   const style: Record<string, string | number> = isMobile

@@ -93,6 +93,7 @@ import type { TransportAttachment } from '../../../shared/transport-attachments.
 import logger from '../../util/logger.js';
 import type { TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
+import { getDefaultAcpMcpServers } from './getDefaultMcpServers.js';
 
 const GEMINI_BIN = 'gemini';
 /** ACP mode id we request once per session. Matches the `yolo` mode advertised
@@ -101,7 +102,12 @@ const GEMINI_YOLO_MODE = 'yolo';
 
 interface GeminiSdkSessionState {
   routeId: string;
+  sessionName?: string;
+  projectName?: string;
+  serverId?: string;
   cwd: string;
+  env?: Record<string, string>;
+  contextNamespace?: SessionConfig['contextNamespace'];
   model?: string;
   /** ACP-level session identifier returned by `newSession` or supplied for
    *  resume. Undefined until the first send actually creates/loads a session. */
@@ -211,7 +217,12 @@ export class GeminiSdkProvider implements TransportProvider {
     const existing = config.fresh ? undefined : this.sessions.get(routeId);
     const state: GeminiSdkSessionState = {
       routeId,
+      sessionName: config.sessionName ?? existing?.sessionName,
+      projectName: config.projectName ?? existing?.projectName,
+      serverId: config.serverId ?? existing?.serverId,
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
+      env: config.env ?? existing?.env,
+      contextNamespace: config.contextNamespace ?? existing?.contextNamespace,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       acpSessionId: config.resumeId ?? existing?.acpSessionId,
       loaded: false,
@@ -538,7 +549,7 @@ export class GeminiSdkProvider implements TransportProvider {
             loadResult = await loader.call(this.connection, {
               sessionId: state.acpSessionId,
               cwd: state.cwd,
-              mcpServers: [],
+              mcpServers: this.mcpServersForState(state),
             });
           } finally {
             state.replaying = false;
@@ -593,7 +604,7 @@ export class GeminiSdkProvider implements TransportProvider {
   private async createFreshAcpSession(sessionId: string, state: GeminiSdkSessionState): Promise<void> {
     const result: NewSessionResponse = await this.connection!.newSession({
       cwd: state.cwd,
-      mcpServers: [],
+      mcpServers: this.mcpServersForState(state),
     });
     state.acpSessionId = result.sessionId;
     state.loaded = true;
@@ -616,6 +627,18 @@ export class GeminiSdkProvider implements TransportProvider {
     })).filter((m) => m.id);
     this.cachedDefaultModel = typeof models.currentModelId === 'string' ? models.currentModelId : null;
     logger.debug({ provider: this.id, count: this.cachedModels.length, default: this.cachedDefaultModel }, 'Gemini models cached');
+  }
+
+  private mcpServersForState(state: GeminiSdkSessionState): ReturnType<typeof getDefaultAcpMcpServers> {
+    return getDefaultAcpMcpServers({
+      sessionKey: state.routeId,
+      sessionName: state.sessionName,
+      projectName: state.projectName,
+      serverId: state.serverId,
+      cwd: state.cwd,
+      env: state.env,
+      contextNamespace: state.contextNamespace,
+    });
   }
 
   async listModels(force?: boolean): Promise<ProviderModelList> {

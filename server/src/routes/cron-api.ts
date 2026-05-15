@@ -7,6 +7,7 @@ import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { CRON_STATUS } from '../../../shared/cron-types.js';
+import { MEMORY_MCP_SOURCE_FIELDS, stripMemoryMcpSourceProvenance } from '../../../shared/memory-mcp-provenance.js';
 import { P2P_MODE_KEYS } from '../../../shared/p2p-modes.js';
 import { dispatchJobNow } from '../cron/job-dispatch.js';
 
@@ -16,6 +17,7 @@ const MIN_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 const rolePattern = /^(brain|w\d+)$/;
 const sessionNamePattern = /^deck_sub_[a-zA-Z0-9_-]+$/;
+const sourceSessionNamePattern = /^deck_(?:sub_[a-zA-Z0-9_-]+|[a-zA-Z0-9._-]+_(?:brain|w\d+))$/;
 
 const cronParticipantSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('role'), value: z.string().regex(rolePattern) }),
@@ -24,6 +26,17 @@ const cronParticipantSchema = z.discriminatedUnion('type', [
 
 const cronActionSchemaRaw = z.discriminatedUnion('type', [
   z.object({ type: z.literal('command'), command: z.string().min(1) }),
+  z.object({
+    type: z.literal('send'),
+    target: z.string().min(1),
+    message: z.string().min(1),
+    reply: z.boolean().optional(),
+    broadcast: z.boolean().optional(),
+    idempotencyKey: z.string().min(1).optional(),
+    [MEMORY_MCP_SOURCE_FIELDS.SOURCE_SESSION_NAME]: z.string().regex(sourceSessionNamePattern).optional(),
+    [MEMORY_MCP_SOURCE_FIELDS.SOURCE_PROJECT_NAME]: z.string().min(1).max(64).optional(),
+    [MEMORY_MCP_SOURCE_FIELDS.SOURCE_SERVER_ID]: z.string().min(1).max(128).optional(),
+  }),
   z.object({
     type: z.literal('p2p'),
     topic: z.string().min(1),
@@ -64,6 +77,40 @@ const cronJobUpdateSchema = z.object({
   expiresAt: z.number().nullable().optional(),
 });
 
+function getPodStickyServerId(c: { req: { param: (name: string) => string | undefined } }): string | null {
+  return c.req.param('serverId') || null;
+}
+
+function withPodStickyServerId(body: unknown, serverId: string | null): unknown {
+  if (!serverId || !body || typeof body !== 'object' || Array.isArray(body)) return body;
+  return { ...(body as Record<string, unknown>), serverId };
+}
+
+function isWrongPodStickyServer(jobServerId: string, routeServerId: string | null): boolean {
+  return routeServerId !== null && jobServerId !== routeServerId;
+}
+
+function isDaemonServerTokenCronRequest(
+  c: { req: { header: (name: string) => string | undefined } },
+  routeServerId: string | null,
+): boolean {
+  if (!routeServerId) return false;
+  const authHeader = c.req.header('Authorization');
+  const headerServerId = c.req.header('X-Server-Id');
+  const cookieHeader = c.req.header('Cookie');
+  return !!authHeader?.startsWith('Bearer ')
+    && headerServerId === routeServerId
+    && !cookieHeader;
+}
+
+function normalizeCronActionForPersistence<T extends z.infer<typeof cronActionSchema>>(
+  action: T,
+  daemonAttested: boolean,
+): T {
+  if (daemonAttested || action.type !== 'send') return action;
+  return stripMemoryMcpSourceProvenance(action) as T;
+}
+
 /** Validate cron expression and enforce minimum 5-minute interval. Returns next run time or error string. */
 function validateCronExpr(cronExpr: string, timezone?: string): { nextRunAt: number } | { error: string } {
   try {
@@ -84,7 +131,8 @@ function validateCronExpr(cronExpr: string, timezone?: string): { nextRunAt: num
 // GET /api/cron — list user's cron jobs, optionally filtered by server/project
 cronApiRoutes.get('/', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
-  const serverId = c.req.query('serverId') || null;
+  const routeServerId = getPodStickyServerId(c);
+  const serverId = routeServerId ?? c.req.query('serverId') ?? null;
   const projectName = c.req.query('projectName') || null;
 
   if (serverId) {
@@ -105,11 +153,13 @@ cronApiRoutes.get('/', requireAuth(), async (c) => {
 // POST /api/cron — create a cron job
 cronApiRoutes.post('/', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
+  const routeServerId = getPodStickyServerId(c);
   const body = await c.req.json().catch(() => null);
-  const parsed = cronJobCreateSchema.safeParse(body);
+  const parsed = cronJobCreateSchema.safeParse(withPodStickyServerId(body, routeServerId));
   if (!parsed.success) return c.json({ error: 'invalid_body', issues: parsed.error.issues }, 400);
 
   const { name, cronExpr, serverId, projectName, targetRole, targetSessionName, action, timezone, expiresAt } = parsed.data;
+  const persistedAction = normalizeCronActionForPersistence(action, isDaemonServerTokenCronRequest(c, routeServerId));
 
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
@@ -125,17 +175,18 @@ cronApiRoutes.post('/', requireAuth(), async (c) => {
   await c.env.DB.execute(
     `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, timezone, status, next_run_at, expires_at, created_at, updated_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)`,
-    [id, serverId, userId, name, cronExpr, projectName, targetRole, targetSessionName ?? null, JSON.stringify(action), timezone ?? null, CRON_STATUS.ACTIVE, validation.nextRunAt, expiresAt ?? null, now],
+    [id, serverId, userId, name, cronExpr, projectName, targetRole, targetSessionName ?? null, JSON.stringify(persistedAction), timezone ?? null, CRON_STATUS.ACTIVE, validation.nextRunAt, expiresAt ?? null, now],
   );
 
   await logAudit({ userId, action: 'cron.create', details: { id, name, cronExpr, projectName } }, c.env.DB);
 
-  return c.json({ id, name, cronExpr, projectName, targetRole, targetSessionName: targetSessionName ?? null, action, timezone: timezone ?? null, status: CRON_STATUS.ACTIVE, nextRunAt: validation.nextRunAt, expiresAt: expiresAt ?? null }, 201);
+  return c.json({ id, name, cronExpr, projectName, targetRole, targetSessionName: targetSessionName ?? null, action: persistedAction, timezone: timezone ?? null, status: CRON_STATUS.ACTIVE, nextRunAt: validation.nextRunAt, expiresAt: expiresAt ?? null }, 201);
 });
 
 // PUT /api/cron/:id — update a cron job
 cronApiRoutes.put('/:id', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
+  const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
   const body = await c.req.json().catch(() => null);
   const parsed = cronJobUpdateSchema.safeParse(body);
@@ -146,6 +197,7 @@ cronApiRoutes.put('/:id', requireAuth(), async (c) => {
     [jobId, userId],
   );
   if (!job) return c.json({ error: 'not_found' }, 404);
+  if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
 
   const role = await resolveServerRole(c.env.DB, job.server_id, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
@@ -175,7 +227,10 @@ cronApiRoutes.put('/:id', requireAuth(), async (c) => {
   if (updates.projectName !== undefined) { sets.push(`project_name = $${idx++}`); vals.push(updates.projectName); }
   if (updates.targetRole !== undefined) { sets.push(`target_role = $${idx++}`); vals.push(updates.targetRole); }
   if (updates.targetSessionName !== undefined) { sets.push(`target_session_name = $${idx++}`); vals.push(updates.targetSessionName); }
-  if (updates.action !== undefined) { sets.push(`action = $${idx++}`); vals.push(JSON.stringify(updates.action)); }
+  if (updates.action !== undefined) {
+    sets.push(`action = $${idx++}`);
+    vals.push(JSON.stringify(normalizeCronActionForPersistence(updates.action, isDaemonServerTokenCronRequest(c, routeServerId))));
+  }
   if (updates.timezone !== undefined) { sets.push(`timezone = $${idx++}`); vals.push(updates.timezone); }
   if (updates.expiresAt !== undefined) { sets.push(`expires_at = $${idx++}`); vals.push(updates.expiresAt); }
   if (nextRunAt !== undefined) { sets.push(`next_run_at = $${idx++}`); vals.push(nextRunAt); }
@@ -198,6 +253,7 @@ cronApiRoutes.put('/:id', requireAuth(), async (c) => {
 // PATCH /api/cron/:id/status — pause/resume (only active ↔ paused)
 cronApiRoutes.patch('/:id/status', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
+  const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
   const body = await c.req.json().catch(() => null);
   const newStatus = (body as Record<string, unknown> | null)?.status;
@@ -210,6 +266,7 @@ cronApiRoutes.patch('/:id/status', requireAuth(), async (c) => {
     [jobId, userId],
   );
   if (!job) return c.json({ error: 'not_found' }, 404);
+  if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
 
   const role = await resolveServerRole(c.env.DB, job.server_id, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
@@ -230,6 +287,7 @@ cronApiRoutes.patch('/:id/status', requireAuth(), async (c) => {
 // DELETE /api/cron/:id — delete a cron job
 cronApiRoutes.delete('/:id', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
+  const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
 
   const job = await c.env.DB.queryOne<{ server_id: string }>(
@@ -237,6 +295,7 @@ cronApiRoutes.delete('/:id', requireAuth(), async (c) => {
     [jobId, userId],
   );
   if (!job) return c.json({ error: 'not_found' }, 404);
+  if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
 
   const role = await resolveServerRole(c.env.DB, job.server_id, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
@@ -250,6 +309,7 @@ cronApiRoutes.delete('/:id', requireAuth(), async (c) => {
 // POST /api/cron/:id/trigger — immediately dispatch a cron job
 cronApiRoutes.post('/:id/trigger', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
+  const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
 
   const job = await c.env.DB.queryOne<DbCronJob>(
@@ -257,6 +317,7 @@ cronApiRoutes.post('/:id/trigger', requireAuth(), async (c) => {
     [jobId, userId],
   );
   if (!job) return c.json({ error: 'not_found' }, 404);
+  if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
 
   const role = await resolveServerRole(c.env.DB, job.server_id, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
@@ -277,7 +338,8 @@ cronApiRoutes.post('/:id/trigger', requireAuth(), async (c) => {
 cronApiRoutes.get('/executions', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const mode = c.req.query('mode') || 'all';
-  const serverId = c.req.query('serverId') || null;
+  const routeServerId = getPodStickyServerId(c);
+  const serverId = routeServerId ?? c.req.query('serverId') ?? null;
   const limitParam = parseInt(c.req.query('limit') || '50', 10);
   const limit = Math.min(Math.max(1, limitParam), 200);
 
@@ -315,6 +377,7 @@ cronApiRoutes.get('/executions', requireAuth(), async (c) => {
 // GET /api/cron/:id/executions — execution history for a cron job
 cronApiRoutes.get('/:id/executions', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
+  const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
   const limitParam = parseInt(c.req.query('limit') || '20', 10);
   const limit = Math.min(Math.max(1, limitParam), 100);
@@ -324,6 +387,7 @@ cronApiRoutes.get('/:id/executions', requireAuth(), async (c) => {
     [jobId, userId],
   );
   if (!job) return c.json({ error: 'not_found' }, 404);
+  if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
 
   const role = await resolveServerRole(c.env.DB, job.server_id, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);

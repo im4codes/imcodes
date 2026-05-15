@@ -9,10 +9,22 @@ import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_STATE_STOPPING,
 } from '../../shared/session-control-commands.js';
-import { MEMORY_WS } from '../../shared/memory-ws.js';
+import {
+  MEMORY_MCP_PROVIDER_ID,
+  MEMORY_MCP_PROVIDER_IDS,
+  MEMORY_MCP_PROVIDER_STATUS_REASON,
+  MEMORY_MCP_DEGRADED_REASON,
+  MEMORY_MCP_STATUS,
+  MEMORY_MCP_TOOL_FAMILY,
+  MEMORY_WS,
+} from '../../shared/memory-ws.js';
 import { MEMORY_MANAGEMENT_CONTEXT_FIELD } from '../../shared/memory-management-context.js';
 import { MEMORY_MANAGEMENT_ERROR_CODES } from '../../shared/memory-management.js';
 import { MEMORY_FEATURE_CONFIG_MSG, MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
+import {
+  MEMORY_MCP_DISABLED_FLAGS,
+  MEMORY_MCP_TOOL_NAMES,
+} from '../../shared/memory-mcp-contracts.js';
 import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import {
@@ -3167,6 +3179,127 @@ describe('handleWebCommand transport queue behavior', () => {
         expect.objectContaining({ flag: MEMORY_FEATURE_FLAGS_BY_NAME.skills, enabled: false }),
       ]),
     });
+  });
+
+  it('responds to MCP status queries with the six managed providers and tool family gates', async () => {
+    enablePreferenceFeature();
+    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch), '1');
+    getProviderMock.mockImplementation((providerId: string) => ({
+      id: providerId,
+      getMemoryMcpStatus: providerId === MEMORY_MCP_PROVIDER_ID.QWEN
+        ? () => ({
+            providerId,
+            status: MEMORY_MCP_STATUS.DEGRADED,
+            connected: true,
+            degradedReasons: [MEMORY_MCP_PROVIDER_STATUS_REASON.MCP_REGISTRATION_FAILED],
+          })
+        : undefined,
+    }));
+
+    handleWebCommand({ type: MEMORY_WS.MCP_STATUS_QUERY, requestId: 'mcp-status-1' }, serverLink as any);
+    await flushAsync();
+
+    const response = serverLink.send.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((message) => message.type === MEMORY_WS.MCP_STATUS_RESPONSE);
+    expect(response).toMatchObject({
+      type: MEMORY_WS.MCP_STATUS_RESPONSE,
+      requestId: 'mcp-status-1',
+      updatedAt: expect.any(Number),
+      recentCalls: [],
+    });
+    const providers = response?.providers as Array<Record<string, unknown>>;
+    expect(providers.map((provider) => provider.providerId)).toEqual([...MEMORY_MCP_PROVIDER_IDS]);
+    expect(providers).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        providerId: MEMORY_MCP_PROVIDER_ID.CURSOR_HEADLESS,
+        status: MEMORY_MCP_STATUS.DEGRADED,
+        connected: true,
+        degradedReasons: [MEMORY_MCP_DEGRADED_REASON.STATUS_NOT_REPORTED],
+      }),
+      expect.objectContaining({
+        providerId: MEMORY_MCP_PROVIDER_ID.CODEX_SDK,
+        status: MEMORY_MCP_STATUS.DEGRADED,
+        connected: true,
+        degradedReasons: [MEMORY_MCP_DEGRADED_REASON.STATUS_NOT_REPORTED],
+      }),
+      expect.objectContaining({
+        providerId: MEMORY_MCP_PROVIDER_ID.QWEN,
+        status: MEMORY_MCP_STATUS.DEGRADED,
+        connected: true,
+        degradedReasons: [MEMORY_MCP_PROVIDER_STATUS_REASON.MCP_REGISTRATION_FAILED],
+      }),
+    ]));
+
+    const toolFamilies = response?.toolFamilies as Array<Record<string, unknown>>;
+    expect(toolFamilies).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        family: MEMORY_MCP_TOOL_FAMILY.MEMORY,
+        status: MEMORY_MCP_STATUS.READY,
+        tools: [
+          MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
+          MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+          MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
+          MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
+        ],
+      }),
+      expect.objectContaining({
+        family: MEMORY_MCP_TOOL_FAMILY.SEND,
+        status: MEMORY_MCP_STATUS.READY,
+        tools: [
+          MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
+          MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        ],
+      }),
+      expect.objectContaining({
+        family: MEMORY_MCP_TOOL_FAMILY.CRON,
+        status: MEMORY_MCP_STATUS.READY,
+        tools: [
+          MEMORY_MCP_TOOL_NAMES.CRON_CREATE,
+          MEMORY_MCP_TOOL_NAMES.CRON_LIST,
+          MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
+          MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
+        ],
+      }),
+    ]));
+  });
+
+  it('reports disconnected managed providers as unknown instead of assuming MCP readiness', async () => {
+    handleWebCommand({ type: MEMORY_WS.MCP_STATUS_QUERY, requestId: 'mcp-status-disconnected' }, serverLink as any);
+    await flushAsync();
+
+    const response = serverLink.send.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((message) => message.type === MEMORY_WS.MCP_STATUS_RESPONSE);
+    const providers = response?.providers as Array<Record<string, unknown>>;
+    expect(providers).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        providerId: MEMORY_MCP_PROVIDER_ID.CURSOR_HEADLESS,
+        status: MEMORY_MCP_STATUS.UNKNOWN,
+        connected: false,
+        degradedReasons: [MEMORY_MCP_PROVIDER_STATUS_REASON.PROVIDER_NOT_CONNECTED],
+      }),
+    ]));
+  });
+
+  it('reports disabled MCP memory tool gates when a required memory feature is off', async () => {
+    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch), '0');
+
+    handleWebCommand({ type: MEMORY_WS.MCP_STATUS_QUERY, requestId: 'mcp-status-disabled' }, serverLink as any);
+    await flushAsync();
+
+    const response = serverLink.send.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((message) => message.type === MEMORY_WS.MCP_STATUS_RESPONSE);
+    const toolFamilies = response?.toolFamilies as Array<Record<string, unknown>>;
+    expect(toolFamilies).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        family: MEMORY_MCP_TOOL_FAMILY.MEMORY,
+        status: MEMORY_MCP_STATUS.DEGRADED,
+        disabledFlag: MEMORY_MCP_DISABLED_FLAGS.QUICK_SEARCH,
+        degradedReasons: expect.arrayContaining([MEMORY_MCP_DISABLED_FLAGS.QUICK_SEARCH]),
+      }),
+    ]));
   });
 
   it('applies server-managed global memory feature config ahead of local daemon config', async () => {

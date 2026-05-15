@@ -8,15 +8,19 @@
 # leaks outside the canonical declaration in
 # `src/context/memory-read-tools.ts` (and tests that exercise it).
 set -euo pipefail
-matches=$(git grep -n -E 'allowGlobalOwnerSearch|_internalChatSearchFtsGlobal' -- server/src src shared web test 2>/dev/null || true)
+matches=$(git grep -n -E 'allowGlobalOwnerSearch|_internalChatSearchFtsGlobal|_createInternalMemoryToolCaller|InternalMemoryToolCaller' -- server/src src shared web test 2>/dev/null || true)
 if [[ -z "$matches" ]]; then
   exit 0
 fi
-bad=$(printf '%s\n' "$matches" \
+candidate=$(printf '%s\n' "$matches" \
   | grep -v -E '^src/context/memory-read-tools\.ts:' \
   | grep -v -E '^test/context/memory-read-tools\.test\.ts:' \
-  | grep -v -E '^src/daemon/.+:' \
+  | grep -v -E '^test/context/memory-tool-caller-brand\.test\.ts:' \
   || true)
+bad=$(printf '%s\n' "$candidate" | awk '
+  /^src\/daemon\/(memory-mcp|send-tool|send-dispatcher|cron-mcp|cron-action-validator)[^:]*:/ { print; next }
+  !/^src\/daemon\// { print; next }
+' || true)
 if [[ -n "$bad" ]]; then
   echo "Disallowed reference(s) to internal owner-search escape hatch:" >&2
   printf '%s\n' "$bad" >&2

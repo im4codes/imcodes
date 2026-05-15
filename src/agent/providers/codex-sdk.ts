@@ -35,6 +35,9 @@ import logger from '../../util/logger.js';
 import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getCodexBaseInstructions } from '../codex-runtime-config.js';
+import { getDefaultCodexMcpArgs } from './getDefaultCodexMcpArgs.js';
+import { getDefaultMcpServers } from './getDefaultMcpServers.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 
 const CODEX_BIN = 'codex';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
@@ -200,6 +203,7 @@ interface CodexSdkSessionState {
   routeId: string;
   cwd: string;
   env?: Record<string, string>;
+  mcpConfig?: Record<string, unknown>;
   model?: string;
   effort?: TransportEffortLevel;
   threadId?: string;
@@ -237,6 +241,20 @@ interface CodexSdkSessionState {
     codex_last_output_tokens?: number;
   };
   lastStatusSignature: string | null;
+}
+
+function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
+  const server = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME];
+  if (!server) return undefined;
+  return {
+    mcp_servers: {
+      [IMCODES_MEMORY_MCP_SERVER_NAME]: {
+        command: server.command,
+        args: server.args,
+        env: server.env,
+      },
+    },
+  };
 }
 
 function finiteNumber(value: unknown): number | undefined {
@@ -564,6 +582,7 @@ export class CodexSdkProvider implements TransportProvider {
       routeId,
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: { ...(existing?.env ?? {}), ...((config.env as Record<string, string> | undefined) ?? {}) },
+      mcpConfig: buildCodexMcpThreadConfig(config) ?? existing?.mcpConfig,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       effort: config.effort ?? existing?.effort,
       threadId: config.resumeId ?? existing?.threadId,
@@ -728,7 +747,7 @@ export class CodexSdkProvider implements TransportProvider {
     // Resolve npm .cmd shims into (node.exe, [scriptPath]) so spawn works
     // without shell:true (which has its own quoting issues on Windows).
     const resolved = resolveExecutableForSpawn(binaryPath);
-    const args = [...resolved.prependArgs, 'app-server'];
+    const args = [...resolved.prependArgs, ...getDefaultCodexMcpArgs(), 'app-server'];
     const child = spawn(resolved.executable, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) },
@@ -889,6 +908,7 @@ export class CodexSdkProvider implements TransportProvider {
     const result = await this.request('thread/resume', {
       threadId: state.threadId,
       ...this.sessionEnvironmentParams(state),
+      ...this.sessionMcpConfigParams(state),
       ...(state.model ? { model: state.model } : {}),
       baseInstructions,
     });
@@ -903,6 +923,7 @@ export class CodexSdkProvider implements TransportProvider {
     const result = await this.request('thread/start', {
       cwd: state.cwd,
       ...this.sessionEnvironmentParams(state),
+      ...this.sessionMcpConfigParams(state),
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
       personality: 'none',
@@ -938,6 +959,10 @@ export class CodexSdkProvider implements TransportProvider {
 
   private sessionEnvironmentParams(state: CodexSdkSessionState): { env?: Record<string, string> } {
     return state.env && Object.keys(state.env).length > 0 ? { env: state.env } : {};
+  }
+
+  private sessionMcpConfigParams(state: CodexSdkSessionState): { config?: Record<string, unknown> } {
+    return state.mcpConfig ? { config: state.mcpConfig } : {};
   }
 
   private handleLine(line: string): void {

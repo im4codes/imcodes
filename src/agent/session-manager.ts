@@ -997,6 +997,18 @@ function buildTransportSessionEnv(
   };
 }
 
+async function loadBoundServerIdForManagedMcp(): Promise<string | undefined> {
+  try {
+    const { loadCredentials } = await import('../bind/bind-flow.js');
+    const credentials = await loadCredentials();
+    return typeof credentials?.serverId === 'string' && credentials.serverId.trim()
+      ? credentials.serverId.trim()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function buildTransportImcodesIdentityPrompt(
   sessionName: string,
   label: string | null | undefined,
@@ -1450,8 +1462,12 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         && (!effectiveRequestedModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveRequestedModel)))) {
         effectiveRequestedModel = availableQwenModels[0] ?? effectiveRequestedModel;
       }
+      const boundServerId = await loadBoundServerIdForManagedMcp();
       await runtime.initialize({
         sessionKey: effectiveSessionKey,
+        sessionName: s.name,
+        projectName: s.projectName,
+        serverId: boundServerId,
         bindExistingKey: freshAfterCancel ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
         skipCreate: !freshAfterCancel && !!s.providerSessionId,
         env: buildTransportSessionEnv(s.name, s.label, extraEnv),
@@ -1791,8 +1807,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   // authoritative "force fresh" signal from /clear or explicit user action.
 
   // Create session on provider
-      await runtime.initialize({
+  const boundServerId = await loadBoundServerIdForManagedMcp();
+  await runtime.initialize({
     sessionKey: effectiveSessionKey,
+    sessionName: name,
+    projectName,
+    serverId: boundServerId,
     fresh: !!opts.fresh,
     env: buildTransportSessionEnv(name, label, transportEnv),
     cwd: projectDir,

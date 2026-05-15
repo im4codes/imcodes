@@ -9,11 +9,13 @@ import http from 'http';
 
 const getSessionMock = vi.hoisted(() => vi.fn());
 const upsertSessionMock = vi.hoisted(() => vi.fn());
+const listSessionsMock = vi.hoisted(() => vi.fn(() => []));
 const timelineEmitMock = vi.hoisted(() => vi.fn(() => ({})));
 
 vi.mock('../../src/store/session-store.js', () => ({
   getSession: getSessionMock,
   upsertSession: upsertSessionMock,
+  listSessions: listSessionsMock,
 }));
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({

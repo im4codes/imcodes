@@ -66,8 +66,10 @@ const SCAN_ROOTS = [
 ];
 
 const ALLOWED_EXACT_PATHS = new Set([
+  'shared/memory-mcp-errors.ts',
   'shared/timeline-history-errors.ts',
   'shared/timeline-protocol.ts',
+  'test/shared/memory-mcp-errors.test.ts',
   'test/shared/timeline-protocol-magic-string.test.ts',
 ]);
 

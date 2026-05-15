@@ -159,6 +159,7 @@ export function buildApp(env: Env) {
   app.route('/api/team', teamRoutes);
   app.route('/api/shared-context', sharedContextRoutes);
   app.route('/api/cron', cronApiRoutes);
+  app.route('/api/server/:serverId/cron', cronApiRoutes);
   app.route('/api/push', pushRoutes);
   app.route('/api/quick-data', quickDataRoutes);
   app.route('/api', watchRoutes);

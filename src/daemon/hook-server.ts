@@ -22,6 +22,7 @@ import { getSession, upsertSession, listSessions } from '../store/session-store.
 import type { SessionRecord } from '../store/session-store.js';
 import { refreshSessionWatcher } from './watcher-controls.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
+import { dispatchHookSend } from './send-tool.js';
 
 export const DEFAULT_HOOK_PORT = 51913;
 const PORT_FILE = path.join(os.homedir(), '.imcodes', 'hook-port');
@@ -224,27 +225,6 @@ export function resolveTarget(from: string, to: string): ResolveResult {
 
 // ─── Message Dispatch ────────────────────────────────────────────────────────
 
-/**
- * Send a message to a target session.
- * Process sessions: sendKeys via tmux.
- * Transport sessions: runtime.send().
- */
-async function dispatchMessage(target: SessionRecord, message: string): Promise<void> {
-  if (target.runtimeType === 'transport') {
-    const { getTransportRuntime } = await import('../agent/session-manager.js');
-    const runtime = getTransportRuntime(target.name);
-    if (!runtime) throw new Error(`no transport runtime for session ${target.name}`);
-    await runtime.send(message);
-    return;
-  }
-
-  // Process session: route through the same session.send pipeline as the web UI
-  // so CLI/hook sends keep recall, path rewriting, timeline emission, and other
-  // daemon-side behaviors in sync.
-  const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
-  await sendProcessSessionMessageForAutomation(target.name, message);
-}
-
 // ─── Circuit Breakers ────────────────────────────────────────────────────────
 
 function checkRateLimit(from: string): boolean {
@@ -284,7 +264,7 @@ export async function drainQueue(sessionName: string): Promise<void> {
     const record = getSession(sessionName);
     if (!record) break;
     try {
-      await dispatchMessage(record, msg.message);
+      await dispatchHookSend({ from: msg.from, targetRecords: [record], message: msg.message });
       logger.info({ target: sessionName, from: msg.from }, 'Delivered queued message');
     } catch (err) {
       logger.warn({ err, target: sessionName, from: msg.from }, 'Failed to deliver queued message');
@@ -326,9 +306,8 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
     return { status: 400, body: { ok: false, error: 'missing required fields: from, to, message' } };
   }
 
-  // Reject unsupported fields until Phase 2 implementation
-  if ((body.files && body.files.length > 0) || body.context) {
-    return { status: 501, body: { ok: false, error: 'files and context are not yet supported — send plain message only' } };
+  if (body.context) {
+    return { status: 501, body: { ok: false, error: 'context is not yet supported — send plain message only' } };
   }
 
   // Circuit breaker: depth limit
@@ -350,39 +329,37 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
   // Record send after successful resolution (prevents invalid senders from polluting rate-limit map)
   recordSend(from);
 
-  // Deliver to each target — always send immediately (no queue-when-busy)
-  const delivered: string[] = [];
-  const queued: string[] = [];
-  const errors: string[] = [];
-
-  for (const target of result.targets) {
-    try {
-      await dispatchMessage(target, message);
-      delivered.push(target.name);
-    } catch (err) {
-      errors.push(`${target.name}: ${(err as Error).message}`);
-    }
+  const sender = resolveSenderRecord(from, listSessions());
+  const projectRoot = sender && sender !== 'ambiguous' ? sender.projectDir : null;
+  let dispatch;
+  try {
+    dispatch = await dispatchHookSend({ from, targetRecords: result.targets, message, files: body.files, projectRoot });
+  } catch (err) {
+    return { status: 400, body: { ok: false, error: (err as Error).message } };
   }
 
   if (result.targets.length === 1) {
     const target = result.targets[0].name;
-    if (delivered.length === 1) {
-      return { status: 200, body: { ok: true, delivered: true, target } };
+    const messageId = dispatch.messages[0]?.messageId;
+    if (dispatch.delivered.length === 1) {
+      return { status: 200, body: { ok: true, delivered: true, target, dispatchId: dispatch.dispatchId, messageId } };
     }
-    if (queued.length === 1) {
-      return { status: 200, body: { ok: true, queued: true, target } };
+    if (dispatch.queued.length === 1) {
+      return { status: 200, body: { ok: true, queued: true, target, dispatchId: dispatch.dispatchId, messageId } };
     }
-    return { status: 500, body: { ok: false, error: errors[0] ?? 'dispatch failed' } };
+    return { status: 500, body: { ok: false, error: dispatch.errors[0] ?? 'dispatch failed' } };
   }
 
   // Broadcast response
   return {
     status: 200,
     body: {
-      ok: errors.length === 0,
-      delivered,
-      queued,
-      ...(errors.length > 0 ? { errors } : {}),
+      ok: dispatch.errors.length === 0,
+      delivered: dispatch.delivered,
+      queued: dispatch.queued,
+      dispatchId: dispatch.dispatchId,
+      messages: dispatch.messages,
+      ...(dispatch.errors.length > 0 ? { errors: dispatch.errors } : {}),
     },
   };
 }

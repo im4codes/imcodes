@@ -15,6 +15,7 @@ import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
+import type { MemoryMcpProviderStatusView } from '../../shared/memory-ws.js';
 import type {
   ProviderContextPayload,
   ProviderSupportClass,
@@ -139,6 +140,12 @@ export interface ProviderConfig {
 export interface SessionConfig {
   /** Local session key used by the daemon to identify this session. */
   sessionKey: string;
+  /** Exact IM.codes session name whose identity is injected into managed MCP servers. */
+  sessionName?: string;
+  /** Runtime-bound project name for project-scoped managed MCP servers. */
+  projectName?: string;
+  /** Runtime-bound server id for daemon-dependent managed MCP tools. */
+  serverId?: string;
   /** Force a brand-new provider conversation; do not reuse provider-side continuity. */
   fresh?: boolean;
   /** Environment variables to pass through for SDK-backed local providers. */
@@ -438,6 +445,12 @@ export interface TransportProvider {
    * @param force  When true, bypass any internal cache and re-probe.
    */
   listModels?(force?: boolean): Promise<ProviderModelList>;
+
+  /**
+   * Report the provider's live managed-MCP registration state when available.
+   * The daemon status surface uses this instead of assuming provider readiness.
+   */
+  getMemoryMcpStatus?(): MemoryMcpProviderStatusView;
 }
 
 /** A single model entry returned by listModels(). */
