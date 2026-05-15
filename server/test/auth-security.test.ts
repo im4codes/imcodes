@@ -324,18 +324,46 @@ describe('OAuth origin allowlist', () => {
     const stateNonce = randomHex(32);
     const stateJwt = signJwt({ nonce: stateNonce, origin: 'https://evil.example.com' }, env.JWT_SIGNING_KEY, 600);
 
-    // The callback should NOT relay or redirect to the evil origin.
-    // It will fail state_mismatch (no cookie) but the important thing is it doesn't redirect to evil.example.com.
-    const res = await app.request(`/api/auth/github/callback?code=fake&state=${stateJwt}`, {
-      headers: {
-        host: 'app.im.codes',
-        cookie: `oauth_state=${stateNonce}`,
-      },
-    });
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
 
-    // It may fail at token exchange (502) or state_mismatch, but must NOT redirect to evil.example.com
-    const location = res.headers.get('location') ?? '';
-    expect(location).not.toContain('evil.example.com');
+      if (url === 'https://github.com/login/oauth/access_token') {
+        return new Response(JSON.stringify({ access_token: 'fake-access-token' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url === 'https://api.github.com/user') {
+        return new Response(JSON.stringify({ id: 123456, login: 'test-user' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      throw new Error(`Unexpected fetch in auth-security test: ${url}`);
+    }));
+
+    // The callback should NOT relay or redirect to the evil origin.
+    // With the GitHub network mocked, the callback should complete and redirect
+    // to the allowlisted fallback origin instead of the injected origin.
+    try {
+      const res = await app.request(`/api/auth/github/callback?code=fake&state=${stateJwt}`, {
+        headers: {
+          host: 'app.im.codes',
+          cookie: `oauth_state=${stateNonce}`,
+        },
+      });
+
+      expect(res.status).toBe(302);
+      const location = res.headers.get('location') ?? '';
+      expect(location).toBe('https://app.im.codes');
+      expect(location).not.toContain('evil.example.com');
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('resolvedHost middleware does not trust x-forwarded-host without trusted proxy', async () => {
