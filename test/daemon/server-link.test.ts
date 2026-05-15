@@ -171,7 +171,7 @@ describe('ServerLink', () => {
     // is restored.
     mockWsInstance.readyState = 2; // CLOSING
 
-    const payload = { type: 'timeline.history', requestId: 'hist-1', sessionId: 'deck_test_brain', events: [{ text: 'x'.repeat(256) }] };
+    const payload = { type: TIMELINE_MESSAGES.HISTORY, requestId: 'hist-1', sessionId: 'deck_test_brain', events: [{ text: 'x'.repeat(256) }] };
     link.send(payload);
     // Let the setImmediate drain tick run while the socket is not OPEN.
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -191,7 +191,7 @@ describe('ServerLink', () => {
     const sentTypes = mockWsInstance.send.mock.calls.map((c) => {
       try { return JSON.parse(c[0] as string).type as string; } catch { return ''; }
     });
-    expect(sentTypes).toContain('timeline.history');
+    expect(sentTypes).toContain(TIMELINE_MESSAGES.HISTORY);
   });
 
   it('disconnect() closes the WebSocket', () => {
