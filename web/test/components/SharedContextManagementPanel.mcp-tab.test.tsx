@@ -3,7 +3,7 @@
  */
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { act } from 'preact/test-utils';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { MEMORY_WS } from '@shared/memory-ws.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
@@ -276,7 +276,11 @@ describe('SharedContextManagementPanel MCP tab', () => {
   });
 
   it('keeps MCP locale keys resolvable in every supported locale', () => {
-    const localeDir = join(process.cwd(), 'web/src/i18n/locales');
+    const localeDir = [
+      join(process.cwd(), 'src/i18n/locales'),
+      join(process.cwd(), 'web/src/i18n/locales'),
+    ].find((candidate) => existsSync(candidate));
+    expect(localeDir).toBeTruthy();
     const locales = ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'];
     const requiredKeys = [
       'sharedContext.management.tabs.mcp',
@@ -289,7 +293,7 @@ describe('SharedContextManagementPanel MCP tab', () => {
     ];
 
     for (const locale of locales) {
-      const parsed = JSON.parse(readFileSync(join(localeDir, `${locale}.json`), 'utf8')) as unknown;
+      const parsed = JSON.parse(readFileSync(join(localeDir!, `${locale}.json`), 'utf8')) as unknown;
       for (const key of requiredKeys) {
         expect(readPath(parsed, key), `${locale}:${key}`).toBeTruthy();
       }

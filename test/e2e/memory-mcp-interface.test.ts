@@ -10,6 +10,7 @@ import {
   MEMORY_MCP_TOOL_NAME_LIST,
   MEMORY_MCP_TOOL_NAMES,
 } from '../../shared/memory-mcp-contracts.js';
+import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
@@ -89,6 +90,8 @@ describe('memory MCP interface e2e', () => {
       }),
       IMCODES_CONTEXT_DB_PATH: process.env.IMCODES_CONTEXT_DB_PATH!,
       IMCODES_SERVER_CONFIG_PATH: serverConfigPath,
+      [memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.observationStore)]: 'true',
+      [memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.preferences)]: 'true',
     };
   }
 

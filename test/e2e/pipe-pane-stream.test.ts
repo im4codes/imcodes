@@ -15,6 +15,7 @@ import {
   startPipePaneStream,
   stopPipePaneStream,
   checkPipePaneCapability,
+  sessionExists,
 } from '../../src/agent/tmux.js';
 import { RawStreamParser, resetParser } from '../../src/daemon/terminal-parser.js';
 
@@ -87,10 +88,19 @@ async function waitForStreamText(stream: NodeJS.ReadableStream, expected: string
   });
 }
 
+async function killAndWaitSession(sessionName: string, attempts = 10, delayMs = 100): Promise<void> {
+  await killSession(sessionName).catch(() => {});
+  for (let i = 0; i < attempts; i++) {
+    if (!await sessionExists(sessionName)) return;
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  await killSession(sessionName).catch(() => {});
+}
+
 describe.skipIf(SKIP)('pipe-pane stream e2e (task 8.5)', () => {
   beforeEach(async () => {
-    await killSession(SESSION_A).catch(() => {});
-    await killSession(SESSION_B).catch(() => {});
+    await killAndWaitSession(SESSION_A);
+    await killAndWaitSession(SESSION_B);
     await retry(() => newSession(SESSION_A, 'bash', { cwd: '/tmp' }));
     await new Promise((r) => setTimeout(r, 300));
   });
@@ -98,8 +108,8 @@ describe.skipIf(SKIP)('pipe-pane stream e2e (task 8.5)', () => {
   afterEach(async () => {
     await stopPipePaneStream(SESSION_A).catch(() => {});
     await stopPipePaneStream(SESSION_B).catch(() => {});
-    await killSession(SESSION_A).catch(() => {});
-    await killSession(SESSION_B).catch(() => {});
+    await killAndWaitSession(SESSION_A);
+    await killAndWaitSession(SESSION_B);
     resetParser(SESSION_A);
     resetParser(SESSION_B);
   });
