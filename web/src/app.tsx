@@ -4191,7 +4191,19 @@ export function App() {
         </FloatingPanel>
       )}
 
-      {/* Floating file preview — one file at a time, opened from pinned file browser */}
+      {/* Floating file preview — one file at a time, opened from pinned file
+       *  browser OR from inside a chat message (SessionPane / SubSessionWindow).
+       *
+       *  Mobile fallback intentionally jumps above the sub-session window's
+       *  `zIndex=6000` fallback. On mobile the desktop stack is a no-op (see
+       *  `ensureDesktopWindow` early return) so the stack-managed z never gets
+       *  assigned, and the FloatingPanel falls back to this value. With a
+       *  fallback in the 5000 band the SubSessionWindow rendered ON TOP of the
+       *  user-requested file preview — see user report
+       *  "手机版 打开聊天里的文件预览被当前窗口盖住了". 6500 leaves clear
+       *  breathing room for any future intermediate tier. Desktop keeps the
+       *  5060 fallback so it stays in the documented floating-panel band
+       *  (5020-5090) while the stack lifecycle takes over within one tick. */}
       {previewFileRequest && wsRef.current && (
         <FloatingPanel
           id="file-preview"
@@ -4199,7 +4211,7 @@ export function App() {
           onClose={() => setPreviewFileRequest(null)}
           defaultW={700}
           defaultH={500}
-          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.filePreview, 5060)}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.filePreview, isMobile ? 6500 : 5060)}
           onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.filePreview)}
         >
           <FileBrowser
