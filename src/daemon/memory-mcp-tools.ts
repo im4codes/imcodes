@@ -29,6 +29,7 @@ import {
 } from '../../shared/memory-mcp-feature-flags.js';
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
 import { memoryGetSources } from '../context/memory-read-tools.js';
+import { getMemorySourcesOrchestrated, type GetSourcesOrchestratorResult, type OrchestratorDeps } from './memory-get-sources-orchestrator.js';
 import { searchMcpMemoryRecall, type MemoryMcpSearchHit, type MemoryMcpSearchResult } from './memory-mcp-search.js';
 import type { MemorySearchQuery } from '../context/memory-search.js';
 import { saveObservation, savePreference } from '../context/memory-write-tools.js';
@@ -45,7 +46,24 @@ export interface MemoryMcpToolDeps {
   featureFlags?: MCPFeatureFlagValues;
   isMemoryFeatureEnabled?: (flag: MemoryFeatureFlag) => boolean;
   searchMemory?: MemoryMcpSearch;
+  /**
+   * @deprecated kept for tests that want to short-circuit local lookups.
+   * Production code uses the orchestrator which itself delegates to
+   * `memoryGetSources` for the same-server path.
+   */
   getMemorySources?: typeof memoryGetSources;
+  /**
+   * Orchestrator override. Tests inject a fake to exercise local-vs-remote
+   * branching without going through the cache or HTTP. When absent, the
+   * real `getMemorySourcesOrchestrated` is used.
+   */
+  getMemorySourcesOrchestrator?: (
+    projectionId: string,
+    caller: Parameters<typeof memoryGetSources>[1],
+    deps?: OrchestratorDeps,
+  ) => Promise<GetSourcesOrchestratorResult>;
+  /** Deps forwarded to the orchestrator (fetchImpl, loadCredentials, cache). */
+  orchestratorDeps?: OrchestratorDeps;
   saveObservation?: typeof saveObservation;
   savePreference?: typeof savePreference;
   sendDeps?: SendToolDeps;
@@ -202,7 +220,15 @@ function cronOptionsForCaller(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps)
 
 export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
   const searchMemory = deps.searchMemory ?? searchMcpMemoryRecall;
-  const getMemorySources = deps.getMemorySources ?? memoryGetSources;
+  // Orchestrated path is the production wiring; the legacy `getMemorySources`
+  // dep is retained for tests that only want to verify the local SQLite
+  // branch without involving cache/cloud resolution.
+  const orchestrator = deps.getMemorySourcesOrchestrator
+    ?? ((projectionId, mcpCaller, orchDeps) => getMemorySourcesOrchestrated(
+      projectionId,
+      mcpCaller,
+      { ...(deps.orchestratorDeps ?? {}), ...(orchDeps ?? {}) },
+    ));
   const saveObservationTool = deps.saveObservation ?? saveObservation;
   const savePreferenceTool = deps.savePreference ?? savePreference;
   const cronCreate = deps.cronCreate ?? cronMcpCreate;
@@ -236,14 +262,27 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return sanitizeCaughtError(err);
       }
     },
-    [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: (input) => {
+    [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: async (input) => {
       const gate = memorySurfaceGate(deps, { sources: [] });
       if (gate) return gate;
+      // `serverId` stays in MEMORY_MCP_FORBIDDEN_ARG_NAMES — see
+      // shared/memory-mcp-contracts.ts. Callers cannot influence routing
+      // by supplying any identity-binding field; the orchestrator resolves
+      // `originServerId` from cache or cloud, never from input.
       const args = pickAllowedMcpArgs(input, ['projectionId']);
       const projectionId = stringArg(args, 'projectionId');
       if (!projectionId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'projectionId is required');
       try {
-        return { status: 'ok', ...getMemorySources(projectionId, memoryCaller()) };
+        const result = await orchestrator(projectionId, memoryCaller());
+        if (result.status === 'error') {
+          // Orchestrator reason values are the same string literals declared
+          // in MCP_ERROR_REASONS, so they are valid MCPErrorReason values.
+          return error(result.reason as MCPErrorReason, result.message);
+        }
+        // status === 'ok' branch. Spread directly so output preserves
+        // `originServerId`, `partial`, `sources`, etc.
+        const { status: _status, ...payload } = result;
+        return { status: 'ok', ...payload };
       } catch (err) {
         return sanitizeCaughtError(err);
       }

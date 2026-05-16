@@ -1480,6 +1480,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case MEMORY_WS.DELETE:
       void handleMemoryDelete(cmd, serverLink);
       break;
+    case MEMORY_WS.GET_SOURCES_REQUEST:
+      void handleMemoryGetSourcesRequest(cmd, serverLink);
+      break;
     case 'fs.ls':
       void traceCommandAsync(cmd, 'web_command.fs_ls', () => handleFsList(cmd, serverLink));
       break;
@@ -10299,6 +10302,106 @@ async function handleMemoryPin(cmd: Record<string, unknown>, serverLink: ServerL
   } catch (error) {
     logger.warn({ error }, 'manual memory pin failed');
     serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+  }
+}
+
+
+/**
+ * Cross-server projection source resolution.
+ *
+ * Triggered by the server's pod-sticky `GET /api/memory/sources?serverId=...
+ * &projectionId=...` route. The server has already authenticated the caller
+ * and verified they own *this* daemon's serverId before forwarding the
+ * request — so by the time the handler runs, the WS payload is trustworthy
+ * for THIS daemon's own data. We resolve sources directly from the daemon's
+ * local SQLite (the same call `memoryGetSources` makes after its owner
+ * check) and reply with the standard `MemoryGetSourcesResult` shape plus
+ * `originServerId` equal to this daemon's own serverId.
+ *
+ * Cross-namespace access stays fail-closed because every event's
+ * `target.namespace` is matched against the projection's namespace before
+ * its content is returned — same isolation `memoryGetSources` provides.
+ */
+async function handleMemoryGetSourcesRequest(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const projectionId = typeof cmd.projectionId === 'string' ? cmd.projectionId.trim() : '';
+  // The daemon's own bound serverId. Tagged on every reply so the server
+  // route can fill `originServerId` even before the orchestrator knows which
+  // daemon answered — useful for cache repopulation on the caller side.
+  const originServerId = typeof cmd.expectedServerId === 'string' && cmd.expectedServerId.trim()
+    ? cmd.expectedServerId.trim()
+    : undefined;
+
+  if (!projectionId) {
+    serverLink.send({
+      type: MEMORY_WS.GET_SOURCES_RESPONSE,
+      requestId,
+      status: 'error',
+      reason: 'validation_failed',
+      message: 'projectionId is required',
+      originServerId,
+    });
+    return;
+  }
+
+  try {
+    const { getProcessedProjectionById, listProjectionSources } = await import('../store/context-store.js');
+    const projection = getProcessedProjectionById(projectionId);
+    if (!projection) {
+      // Isomorphic with cross-namespace: the server already gated this
+      // request on user ownership, so a missing row really is missing.
+      serverLink.send({
+        type: MEMORY_WS.GET_SOURCES_RESPONSE,
+        requestId,
+        status: 'ok',
+        projectionId,
+        sourceEventCount: 0,
+        sources: [],
+        originServerId,
+      });
+      return;
+    }
+
+    const projectionNamespaceKey = serializeContextNamespace(projection.namespace);
+    const sources = listProjectionSources(projectionId).map((source) => {
+      // Same defense memoryGetSources applies: only surface event content
+      // when the underlying event's namespace matches the projection's.
+      // The daemon's SQLite is single-user, but a corrupt row from a past
+      // bug could conceivably mis-link namespaces, and silence is safer.
+      const event = source.event;
+      const eventInScope = !!event && serializeContextNamespace(event.target.namespace) === projectionNamespaceKey;
+      return {
+        eventId: source.eventId,
+        status: source.status,
+        content: eventInScope ? (event!.content ?? null) : null,
+        eventType: eventInScope ? event!.eventType : undefined,
+        createdAt: eventInScope ? event!.createdAt : undefined,
+      };
+    });
+
+    const partial = sources.length !== projection.sourceEventIds.length
+      || sources.some((source) => source.content === null);
+
+    serverLink.send({
+      type: MEMORY_WS.GET_SOURCES_RESPONSE,
+      requestId,
+      status: 'ok',
+      projectionId,
+      sourceEventCount: projection.sourceEventIds.length,
+      sources,
+      partial,
+      originServerId,
+    });
+  } catch (error) {
+    logger.warn({ error, projectionId }, 'memory.get_sources_request failed');
+    serverLink.send({
+      type: MEMORY_WS.GET_SOURCES_RESPONSE,
+      requestId,
+      status: 'error',
+      reason: 'internal_error',
+      message: 'failed to resolve sources',
+      originServerId,
+    });
   }
 }
 

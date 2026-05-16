@@ -1,6 +1,7 @@
 import type { ProcessedContextClass } from '../../shared/context-types.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 import { searchLocalMemorySemantic, type MemorySearchQuery } from '../context/memory-search.js';
+import { projectionOwnerCache } from './memory-projection-owner-cache.js';
 
 export interface MemoryMcpSearchHit {
   projectionId: string;
@@ -188,7 +189,17 @@ export async function searchMcpMemoryRecall(query: MemorySearchQuery, options: M
       : Promise.resolve([] as MemoryMcpSearchHit[]),
     searchLocalRecall(query, localServerId).catch(() => []),
   ]);
-  return {
-    items: dedupeAndLimit([...cloud, ...local], limit),
-  };
+  const items = dedupeAndLimit([...cloud, ...local], limit);
+  // Populate the projection-owner LRU. This is what makes
+  // `get_memory_sources` skip the cloud projection-owner round trip for
+  // any projectionId the agent just received from search_memory. Local
+  // hits stamp the local serverId so cache lookups are uniformly
+  // populated — keeps the orchestrator's branch decision purely on the
+  // map without needing a "did this come from cloud or local" check.
+  for (const item of items) {
+    if (item.projectionId && item.originServerId) {
+      projectionOwnerCache.set(item.projectionId, item.originServerId);
+    }
+  }
+  return { items };
 }

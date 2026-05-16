@@ -32,6 +32,7 @@ import { cronApiRoutes } from './routes/cron-api.js';
 import { pushRoutes } from './routes/push.js';
 import { quickDataRoutes } from './routes/quick-data.js';
 import { watchRoutes } from './routes/watch.js';
+import { memoryRoutes } from './routes/memory.js';
 import { sessionMgmtRoutes } from './routes/session-mgmt.js';
 import { subSessionRoutes } from './routes/sub-sessions.js';
 import { discussionRoutes } from './routes/discussions.js';
@@ -163,6 +164,10 @@ export function buildApp(env: Env) {
   app.route('/api/push', pushRoutes);
   app.route('/api/quick-data', quickDataRoutes);
   app.route('/api', watchRoutes);
+  // Pod-sticky memory routes: serverId is read from the `?serverId=` query
+  // string by the ingress for pod routing; the projection-owner resolver
+  // ignores serverId entirely (cloud-only PG lookup).
+  app.route('/api', memoryRoutes);
   // fileTransferRoutes MUST be first — its token-auth middleware bypasses requireAuth
   // for iOS downloads (SFSafariViewController has no cookies/Bearer). If mounted after
   // sessionMgmtRoutes (which has blanket requireAuth on /*), the token path is shadowed.

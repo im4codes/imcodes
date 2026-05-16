@@ -308,9 +308,19 @@ describe('memory MCP tool schema firewall', () => {
   });
 
   it('keeps get_memory_sources available when quick search is disabled but the MCP memory surface is enabled', async () => {
-    const getMemorySources = vi.fn(() => ({ projectionId: 'p1', sources: [] }));
+    // Production path: get_memory_sources flows through the orchestrator,
+    // which resolves originServerId from cache/cloud and then dispatches to
+    // the local SQLite or the pod-sticky remote. We bypass that machinery
+    // here by injecting a stub orchestrator so the test stays focused on
+    // the disabled-flag semantics.
+    const orchestrator = vi.fn(async () => ({
+      status: 'ok' as const,
+      projectionId: 'p1',
+      sourceEventCount: 0,
+      sources: [],
+    }));
     const handlers = createMemoryMcpToolHandlers(caller(), {
-      getMemorySources,
+      getMemorySourcesOrchestrator: orchestrator,
       isMemoryFeatureEnabled: (flag) => flag !== MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch,
     });
 
@@ -319,7 +329,7 @@ describe('memory MCP tool schema firewall', () => {
       projectionId: 'p1',
       sources: [],
     });
-    expect(getMemorySources).toHaveBeenCalled();
+    expect(orchestrator).toHaveBeenCalled();
   });
 
   it('allows cron calls without runtime server identity but rejects outside the caller project before the cron client', async () => {
