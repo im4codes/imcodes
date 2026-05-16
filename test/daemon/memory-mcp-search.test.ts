@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { searchMcpMemoryRecall } from '../../src/daemon/memory-mcp-search.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+import { projectionOwnerCache } from '../../src/daemon/memory-projection-owner-cache.js';
 
 describe('memory MCP recall search', () => {
   it('queries cloud memory recall with daemon server credentials and merges local recall fallback', async () => {
@@ -359,6 +360,76 @@ describe('memory MCP recall search', () => {
       expect(result.items.map((item) => item.summary)).toContain('Scoped local memory for repo one and daemon local user');
       expect(result.items.map((item) => item.summary)).not.toContain('Cross project local memory must not appear');
       expect(result.items.map((item) => item.summary)).not.toContain('Cross user local memory must not appear');
+    } finally {
+      await cleanupIsolatedSharedContextDb(tempDir);
+    }
+  });
+
+  // ── cache-side-effect (memory-source-server-routing) ──────────────────
+  //
+  // searchMcpMemoryRecall populates the process-local projectionOwnerCache
+  // as a side effect of returning hits. This is what lets the
+  // `get_memory_sources` orchestrator skip the cloud projection-owner round
+  // trip for any projectionId the agent just received via search. If a
+  // future refactor stops populating the cache, the orchestrator silently
+  // falls back to its cloud lookup — no correctness bug, just a needless
+  // round trip. Pin the behavior so a regression is loud.
+
+  it('populates projectionOwnerCache for every hit that carries an originServerId', async () => {
+    const tempDir = await createIsolatedSharedContextDb('memory-mcp-search-cache-side-effect');
+    try {
+      writeProcessedProjection({
+        namespace: { scope: 'personal', projectId: 'repo-1', userId: 'daemon-local' },
+        class: 'recent_summary',
+        sourceEventIds: ['evt-local'],
+        summary: 'Local hit must seed cache with self serverId',
+        content: {},
+        updatedAt: 100,
+      });
+
+      const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+        results: [
+          {
+            id: 'cloud-from-srv-A',
+            projectId: 'repo-1',
+            class: 'recent_summary',
+            summary: 'Cloud hit must seed cache with srv-A',
+            updatedAt: 200,
+            score: 0.91,
+            source: 'personal',
+            originServerId: 'srv-A',
+          },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as unknown as typeof fetch;
+
+      // Seed the cache with stale data so we can detect overwrites.
+      projectionOwnerCache.delete('cloud-from-srv-A');
+      projectionOwnerCache.delete(/* placeholder for the projection id we'll learn */ 'x');
+
+      const result = await searchMcpMemoryRecall({
+        query: 'cache side effect',
+        namespace: { scope: 'personal', projectId: 'repo-1', userId: 'daemon-local' },
+        repo: 'repo-1',
+        includeLegacyPersonalOwner: true,
+        limit: 5,
+      }, {
+        fetchImpl,
+        credentials: {
+          workerUrl: 'https://app.example.test',
+          serverId: 'srv-self',
+          token: 'server-token',
+        },
+      });
+
+      const localHit = result.items.find((item) => item.source === 'local');
+      const cloudHit = result.items.find((item) => item.projectionId === 'cloud-from-srv-A');
+      expect(localHit).toBeDefined();
+      expect(cloudHit).toBeDefined();
+
+      // Cloud hit → cache entry under the server-supplied originServerId.
+      expect(projectionOwnerCache.get('cloud-from-srv-A')).toBe('srv-A');
+      // Local hit → cache entry under the local daemon's bound serverId.
+      expect(projectionOwnerCache.get(localHit!.projectionId)).toBe('srv-self');
     } finally {
       await cleanupIsolatedSharedContextDb(tempDir);
     }
