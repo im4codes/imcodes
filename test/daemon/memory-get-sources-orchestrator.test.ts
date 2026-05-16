@@ -292,6 +292,42 @@ describe('get_memory_sources orchestrator', () => {
     }
   });
 
+  it('propagates partial=true from a remote daemon reply', async () => {
+    // Regression for memory-source-server-routing: when the owning daemon
+    // can't resolve every source event (some events archive-pruned), it
+    // sets `partial: true`. The orchestrator must NOT mask that — callers
+    // want to know the reply is incomplete.
+    const cache = createProjectionOwnerCache();
+    cache.set('proj-partial', REMOTE_SERVER_ID);
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      status: 'ok',
+      projectionId: 'proj-partial',
+      sourceEventCount: 3,
+      sources: [
+        { eventId: 'e-here', status: 'archived', content: 'present', eventType: 'chat.assistant', createdAt: 1 },
+        { eventId: 'e-gone-1', status: 'missing', content: null },
+        { eventId: 'e-gone-2', status: 'missing', content: null },
+      ],
+      partial: true,
+      originServerId: REMOTE_SERVER_ID,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+
+    const result = await getMemorySourcesOrchestrated('proj-partial', caller, {
+      cache,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      loadCredentials: async () => fakeCredentials(),
+      localGetSources: vi.fn(),
+    });
+
+    expect(result.status).toBe('ok');
+    if (result.status === 'ok') {
+      expect(result.partial).toBe(true);
+      expect(result.sourceEventCount).toBe(3);
+      expect(result.sources).toHaveLength(3);
+      expect(result.originServerId).toBe(REMOTE_SERVER_ID);
+    }
+  });
+
   it('skipCloudLookup bypasses the projection-owner fetch entirely', async () => {
     const cache = createProjectionOwnerCache();
     const fetchImpl = vi.fn();

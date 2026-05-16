@@ -307,6 +307,43 @@ describe('memory MCP tool schema firewall', () => {
     expect(dispatchMessage).toHaveBeenCalledTimes(1);
   });
 
+  it('strips forged serverId from get_memory_sources input — orchestrator never sees it', async () => {
+    // Regression for memory-source-server-routing: serverId is in the
+    // forbidden args list precisely so callers cannot influence routing by
+    // forging an identity field. The orchestrator resolves originServerId
+    // itself (cache or cloud), never from input. This test injects a
+    // forged `serverId: 'attacker-srv'` and asserts the orchestrator was
+    // called WITHOUT it (and projectionId was preserved).
+    const orchestrator = vi.fn(async (projectionId: string) => ({
+      status: 'ok' as const,
+      projectionId,
+      sourceEventCount: 0,
+      sources: [],
+    }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      getMemorySourcesOrchestrator: orchestrator,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({
+      projectionId: 'proj-1',
+      serverId: 'attacker-srv',
+      // throw the kitchen sink at it
+      userId: 'mallory',
+      namespace: { scope: 'org_shared' },
+      sourceServerId: 'attacker-srv-2',
+    });
+
+    // The orchestrator wraps two positional args: (projectionId, caller).
+    // Both must be free of attacker-controlled routing fields.
+    expect(orchestrator).toHaveBeenCalledOnce();
+    const [passedProjectionId, passedCaller] = orchestrator.mock.calls[0];
+    expect(passedProjectionId).toBe('proj-1');
+    expect(passedCaller.userId).toBe('user-1');
+    // Caller is built from runtime, not args — verify no smuggled fields.
+    expect((passedCaller as unknown as Record<string, unknown>).serverId).not.toBe('attacker-srv');
+  });
+
   it('keeps get_memory_sources available when quick search is disabled but the MCP memory surface is enabled', async () => {
     // Production path: get_memory_sources flows through the orchestrator,
     // which resolves originServerId from cache/cloud and then dispatches to

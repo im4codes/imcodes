@@ -143,4 +143,33 @@ describe('memory MCP shared contracts', () => {
     expect(cronUpdate.required).toEqual(['id']);
     expect(cronUpdate.properties ?? {}).not.toHaveProperty('schedule');
   });
+
+  // ── memory-source-server-routing change ─────────────────────────────
+  //
+  // `serverId` must stay in MEMORY_MCP_FORBIDDEN_ARG_NAMES so callers
+  // cannot forge routing by claiming a different daemon. The daemon's
+  // get_memory_sources orchestrator resolves originServerId from cache
+  // or the cloud projection-owner endpoint, never from tool input.
+
+  it('keeps serverId in the forbidden args list (cross-server routing safety)', () => {
+    expect(MEMORY_MCP_FORBIDDEN_ARG_NAMES).toContain('serverId');
+  });
+
+  it('strips serverId from get_memory_sources input via pickAllowedMcpArgs', () => {
+    const stripped = pickAllowedMcpArgs(
+      { projectionId: 'p1', serverId: 'attacker-srv', userId: 'mallory' },
+      ['projectionId'],
+    );
+    expect(stripped).toEqual({ projectionId: 'p1' });
+    expect(stripped).not.toHaveProperty('serverId');
+  });
+
+  it('also strips serverId via the broader stripForbiddenMcpArgs helper', () => {
+    const stripped = stripForbiddenMcpArgs({
+      projectionId: 'p1',
+      serverId: 'attacker-srv',
+      sourceServerId: 'attacker-2',
+    });
+    expect(stripped).toEqual({ projectionId: 'p1' });
+  });
 });
