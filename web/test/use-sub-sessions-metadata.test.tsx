@@ -676,6 +676,61 @@ describe('sub-session runtime type inference', () => {
     }));
   });
 
+  it('REGRESSION: auto-generated sub-session labels increment after each create', async () => {
+    const { ws } = createMockWs();
+    const createdResponse = (id: string, body: {
+      type: string;
+      cwd?: string;
+      label?: string;
+      parentSession?: string | null;
+    }) => ({
+      id,
+      sessionName: `deck_sub_${id}`,
+      subSession: {
+        id,
+        serverId: 'srv1',
+        type: body.type,
+        runtimeType: 'transport',
+        providerId: body.type,
+        providerSessionId: null,
+        cwd: body.cwd ?? null,
+        label: body.label ?? null,
+        closedAt: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        ccSessionId: null,
+        geminiSessionId: null,
+        parentSession: body.parentSession ?? null,
+        description: null,
+        ccPresetId: null,
+        requestedModel: null,
+        activeModel: null,
+        modelDisplay: null,
+        effort: null,
+        transportConfig: null,
+      },
+    } as any);
+
+    vi.mocked(createSubSession)
+      .mockImplementationOnce(async (_serverId, body) => createdResponse('cc-1', body))
+      .mockImplementationOnce(async (_serverId, body) => createdResponse('cc-2', body))
+      .mockImplementationOnce(async (_serverId, body) => createdResponse('cx-1', body))
+      .mockImplementationOnce(async (_serverId, body) => createdResponse('cx-2', body));
+
+    render(<CreateHarness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    await act(async () => { await createSubSessionHook?.('claude-code-sdk', undefined, '/tmp/project'); });
+    await waitFor(() => expect(captured).toHaveLength(1));
+    await act(async () => { await createSubSessionHook?.('claude-code-sdk', undefined, '/tmp/project'); });
+    await waitFor(() => expect(captured).toHaveLength(2));
+    await act(async () => { await createSubSessionHook?.('codex-sdk', undefined, '/tmp/project'); });
+    await waitFor(() => expect(captured).toHaveLength(3));
+    await act(async () => { await createSubSessionHook?.('codex-sdk', undefined, '/tmp/project'); });
+
+    expect(vi.mocked(createSubSession).mock.calls.map(([, body]) => body.label)).toEqual(['CC1', 'CC2', 'Cx1', 'Cx2']);
+  });
+
   it('keeps newly created copilot-sdk sub-sessions in transport mode before daemon sync arrives', async () => {
     const { ws } = createMockWs();
     vi.mocked(createSubSession).mockResolvedValueOnce({
