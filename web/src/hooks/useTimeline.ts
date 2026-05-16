@@ -193,7 +193,16 @@ const USER_MSG_DEDUP_WINDOW_MS = 5_000;
 const PROVISIONAL_TRANSPORT_HISTORY_PREFIX = 'transport-history:';
 const OPTIMISTIC_EVENT_ID_PREFIX = 'optimistic:';
 const TIMELINE_SNAPSHOT_STORAGE_PREFIX = 'rcc_timeline_snapshot:';
-const MAX_PERSISTED_SNAPSHOT_EVENTS = 50;
+// Snapshot tail size matches MAX_MEMORY_EVENTS (300) so the synchronous
+// first-paint seed approaches the same coverage as the IDB-restored cache.
+// The previous 50-event cap meant 5/6 of a 300-event session disappeared
+// after refresh until the async IDB load completed — visible on mobile as
+// "本地缓存还是没有立即显示". 300 events of compact payload is on the order
+// of 0.5–1 MB per session in localStorage; the per-origin 5 MB quota holds
+// up to ~5 active sessions before the `try/catch` swallow at the bottom of
+// `persistTimelineSnapshot` starts dropping writes. Dynamic LRU eviction
+// is a follow-up (see Round 3 plan PR-5 §quota).
+const MAX_PERSISTED_SNAPSHOT_EVENTS = 300;
 // If no confirmation arrives within this window we auto-flip the pending bubble to
 // "failed" so the user can retry rather than stare at a perpetual spinner.
 //
@@ -319,16 +328,23 @@ function loadPersistedTimelineSnapshot(cacheKey: string): TimelineEvent[] {
 
 function persistTimelineSnapshot(cacheKey: string, events: TimelineEvent[]): void {
   try {
-    if (events.length === 0) {
+    // Mirror the IDB write-side filter: streaming/typewriter intermediates
+    // are NOT durable history. Persisting them means a refresh-time seed
+    // can flash half-typed assistant text before the daemon replays the
+    // final non-streaming event. See Round 2 audit findings L1 + R3.
+    const persistable = events.filter(shouldPersistTimelineEvent);
+    if (persistable.length === 0) {
       localStorage.removeItem(getTimelineSnapshotStorageKey(cacheKey));
       return;
     }
-    const tail = events.length > MAX_PERSISTED_SNAPSHOT_EVENTS
-      ? events.slice(events.length - MAX_PERSISTED_SNAPSHOT_EVENTS)
-      : events;
+    const tail = persistable.length > MAX_PERSISTED_SNAPSHOT_EVENTS
+      ? persistable.slice(persistable.length - MAX_PERSISTED_SNAPSHOT_EVENTS)
+      : persistable;
     localStorage.setItem(getTimelineSnapshotStorageKey(cacheKey), JSON.stringify(tail));
   } catch {
-    // best-effort
+    // best-effort — quota / private mode / JSON encode failure all land here.
+    // A follow-up should add quota-driven LRU eviction; for now we lose the
+    // tail write on failure but never corrupt the on-disk snapshot.
   }
 }
 
@@ -921,7 +937,11 @@ export function useTimeline(
     const memCached = getCachedEvents(cacheKey);
     if (memCached && memCached.length > 0) return memCached;
     const persisted = loadPersistedTimelineSnapshot(cacheKey);
-    return persisted.length > 0 ? persisted : [];
+    if (persisted.length === 0) return [];
+    // Older snapshots written before we filtered streaming events on the
+    // write side may still contain typewriter intermediates. Filter on the
+    // read side too so the very first paint never flashes half-typed text.
+    return persisted.filter(shouldPersistTimelineEvent);
   });
   const eventsRef = useRef(events);
   eventsRef.current = events;

@@ -255,4 +255,32 @@ describe('TimelineDB — memory fallback mode', () => {
     const r2 = await db.getLastSeqAndEpoch('srv2:sess');
     expect(r2).toEqual({ seq: 10, epoch: 200 });
   });
+
+  it('putEvents before open() resolves still appear via getRecentEvents (B1 open-race fix)', async () => {
+    // Regression test for the audit finding "B1": before the fix, calls to
+    // putEvents during the open() pending window short-circuited to the
+    // memory fallback, then never got flushed once IDB became ready. In the
+    // jsdom test environment IDB.open() rejects → permanent memory-only,
+    // so this test verifies the equivalent on-the-fly path: a writer that
+    // starts before any explicit open() must still land in the same store
+    // that subsequent readers see.
+    const freshDb = new TimelineDB();
+    const event = makeEvent({
+      sessionId: 'race-session',
+      seq: 42,
+      epoch: 7,
+      eventId: 'race-evt-1',
+    });
+
+    // Kick off the write WITHOUT awaiting open() first — the old code path
+    // resolved this against `this.db === null`, dropping the event into a
+    // fallback Map that getRecentEvents() never reads back in IDB mode.
+    const writePromise = freshDb.putEvents([event]);
+    // Resolve open() concurrently.
+    await Promise.all([freshDb.open(), writePromise]);
+
+    const results = await freshDb.getRecentEvents('race-session');
+    expect(results).toHaveLength(1);
+    expect(results[0].eventId).toBe('race-evt-1');
+  });
 });
