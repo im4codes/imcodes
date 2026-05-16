@@ -98,9 +98,11 @@ export interface TransportMemoryRecallItem {
   relevanceScore?: number;
   createdAt?: number;
   updatedAt?: number;
+  sourceKind?: MemoryRecallSourceKind;
 }
 
 export type MemoryRecallRuntimeFamily = 'process' | 'transport';
+export type MemoryRecallSourceKind = 'local_processed' | 'remote_processed' | 'mixed_processed';
 export type MemoryRecallInjectionSurface =
   | 'text-prepend'
   | 'normalized-payload'
@@ -116,7 +118,7 @@ export interface TransportMemoryRecallArtifact {
   runtimeFamily?: MemoryRecallRuntimeFamily;
   injectionSurface?: MemoryRecallInjectionSurface;
   authoritySource?: ContextAuthorityDecision['authoritySource'];
-  sourceKind?: 'local_processed' | 'remote_processed';
+  sourceKind?: MemoryRecallSourceKind;
 }
 
 export interface CompiledAgentContextArtifact {

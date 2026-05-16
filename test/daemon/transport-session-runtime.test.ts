@@ -545,7 +545,7 @@ describe('TransportSessionRuntime', () => {
       runtimeFamily: 'transport' as const,
       authoritySource: 'processed_local' as const,
       sourceKind: 'local_processed' as const,
-      injectionSurface: 'system-text' as const,
+      injectionSurface: 'message-preamble' as const,
       injectedText: '# Recent project memory\n\n- Should not be re-injected on restart',
       items: [startupItem],
     };
@@ -592,7 +592,7 @@ describe('TransportSessionRuntime', () => {
       runtimeFamily: 'transport' as const,
       authoritySource: 'processed_local' as const,
       sourceKind: 'local_processed' as const,
-      injectionSurface: 'system-text' as const,
+      injectionSurface: 'message-preamble' as const,
       injectedText: '# Recent project memory\n\n- Persist that we injected startup memory',
       items: [startupItem],
     };
@@ -634,7 +634,7 @@ describe('TransportSessionRuntime', () => {
       runtimeFamily: 'transport' as const,
       authoritySource: 'processed_local' as const,
       sourceKind: 'local_processed' as const,
-      injectionSurface: 'system-text' as const,
+      injectionSurface: 'message-preamble' as const,
       injectedText: '# Recent project memory\n\n- Remember to keep transport recall parity visible',
       items: [startupItem],
     };
@@ -669,7 +669,11 @@ describe('TransportSessionRuntime', () => {
         sourceKind: 'local_processed',
         injectionSurface: 'normalized-payload',
       }),
+      messagePreamble: expect.stringContaining('transport recall parity visible'),
+      assembledMessage: expect.stringContaining('transport recall parity visible'),
     }));
+    const sentPayload = localMock.provider.send.mock.calls[0]?.[1] as { systemText?: string } | undefined;
+    expect(sentPayload?.systemText ?? '').not.toContain('transport recall parity visible');
     // Exactly ONE startup card — fired when the provider payload actually
     // carried the preamble, same boundary as the persisted flag.
     const startupCardsAfterSend = timelineEmitterEmitMock.mock.calls.filter(
@@ -704,7 +708,7 @@ describe('TransportSessionRuntime', () => {
       runtimeFamily: 'transport' as const,
       authoritySource: 'processed_local' as const,
       sourceKind: 'local_processed' as const,
-      injectionSurface: 'system-text' as const,
+      injectionSurface: 'message-preamble' as const,
       injectedText: '# Recent project memory\n\n- Do not emit card until provider accepts preamble',
       items: [startupItem],
     };

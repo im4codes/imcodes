@@ -1264,7 +1264,7 @@ describe('sdk transport flow e2e', () => {
         runtimeFamily: 'transport',
         authoritySource: 'processed_local',
         sourceKind: 'local_processed',
-        injectionSurface: expect.stringMatching(/^(system-text|normalized-payload|degraded-message-side)$/),
+        injectionSurface: expect.stringMatching(/^(message-preamble|normalized-payload|degraded-message-side)$/),
         injectedText: expect.stringContaining('# Recent project memory'),
         items: expect.arrayContaining([
           expect.objectContaining({

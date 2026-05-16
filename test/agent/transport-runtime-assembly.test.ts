@@ -104,7 +104,7 @@ describe('buildProviderContextPayload', () => {
     expect(payload.assembledMessage).toBe('/compact');
   });
 
-  it('renders startup memory into systemText and message recall into messagePreamble without mutating userMessage', () => {
+  it('renders startup memory and message recall into messagePreamble without mutating userMessage', () => {
     const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
       userMessage: 'Run tests',
       namespace: { scope: 'personal', projectId: 'repo-1' },
@@ -117,8 +117,10 @@ describe('buildProviderContextPayload', () => {
     });
 
     expect(payload.userMessage).toBe('Run tests');
-    expect(payload.systemText).toContain('# Recent project memory');
+    expect(payload.systemText ?? '').not.toContain('# Recent project memory');
+    expect(payload.messagePreamble).toContain('# Recent project memory');
     expect(payload.messagePreamble).toContain('[Related past work]');
+    expect(payload.assembledMessage).toContain('# Recent project memory');
     expect(payload.assembledMessage).toContain('[Related past work]');
     expect(payload.startupMemory?.injectionSurface).toBe('normalized-payload');
     expect(payload.memoryRecall?.injectionSurface).toBe('normalized-payload');
@@ -240,6 +242,55 @@ describe('buildProviderContextPayload', () => {
     expect(payload.messagePreamble).toContain('[Related past work]');
     expect(payload.diagnostics).toContain('memory:start:suppressed-authority');
     expect(payload.diagnostics).toContain('memory:message:local-auxiliary');
+  });
+
+  it('injects remote startup memory when remote processed context is authoritative', () => {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'Run tests',
+      namespace: { scope: 'project_shared', projectId: 'repo-1', enterpriseId: 'ent-1' },
+      remoteProcessedFreshness: 'fresh',
+      retryExhausted: true,
+      startupMemory: makeRecall({
+        reason: 'startup',
+        authoritySource: 'processed_remote',
+        sourceKind: 'mixed_processed',
+        injectedText: '# Recent project memory (reference only)\n<recent-project-memory advisory=\"true\">\n- [important] Cloud startup memory\n- [recent] Local startup memory\n</recent-project-memory>',
+        items: [
+          {
+            id: 'cloud-startup',
+            projectId: 'repo-1',
+            summary: 'Cloud startup memory',
+            projectionClass: 'durable_memory_candidate',
+            sourceKind: 'remote_processed',
+          },
+          {
+            id: 'local-startup',
+            projectId: 'repo-1',
+            summary: 'Local startup memory',
+            projectionClass: 'recent_summary',
+            sourceKind: 'local_processed',
+          },
+        ],
+      }),
+    });
+
+    expect(payload.authority.authoritySource).toBe('processed_remote');
+    expect(payload.startupMemory).toEqual(expect.objectContaining({
+      sourceKind: 'remote_processed',
+      authoritySource: 'processed_remote',
+      injectionSurface: 'normalized-payload',
+      items: [
+        expect.objectContaining({
+          id: 'cloud-startup',
+          sourceKind: 'remote_processed',
+        }),
+      ],
+    }));
+    expect(payload.messagePreamble).toContain('Cloud startup memory');
+    expect(payload.assembledMessage).toContain('Cloud startup memory');
+    expect(payload.systemText ?? '').not.toContain('Cloud startup memory');
+    expect(payload.systemText ?? '').not.toContain('Local startup memory');
+    expect(payload.diagnostics).toContain('memory:start');
   });
 
   it('allows shared local processed fallback only when explicit policy permits it', () => {

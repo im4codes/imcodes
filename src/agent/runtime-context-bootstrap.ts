@@ -1,12 +1,14 @@
 import type {
   ContextFreshness,
   ContextNamespace,
+  MemoryRecallSourceKind,
   SharedScopePolicyOverride,
   TransportMemoryRecallArtifact,
   TransportMemoryRecallItem,
 } from '../../shared/context-types.js';
 import { GitOriginRepositoryIdentityService } from './repository-identity-service.js';
 import { detectRepo } from '../repo/detector.js';
+import { fetchBackendStartupMemoryItems } from '../context/backend-startup-memory.js';
 import { fetchBackendSharedContextNamespace } from '../context/backend-context-namespace.js';
 import { getSharedContextRuntimeCredentials } from '../context/shared-context-runtime.js';
 import type { MemorySearchResultItem } from '../context/memory-search.js';
@@ -51,7 +53,7 @@ export async function resolveTransportContextBootstrap(
   const projectDir = input.projectDir?.trim();
   const explicitNamespace = parseExplicitContextNamespace(input.transportConfig);
   if (explicitNamespace) {
-    return buildBootstrapResult(explicitNamespace, {
+    return await buildBootstrapResult(explicitNamespace, {
       diagnostics: ['namespace:explicit'],
     }, input.startupMemoryAlreadyInjected, projectDir);
   }
@@ -76,7 +78,7 @@ export async function resolveTransportContextBootstrap(
         const resolved = await fetchBackendSharedContextNamespace(credentials, canonical.key);
         if (resolved?.namespace) {
           const namespace = resolved.namespace;
-          return buildBootstrapResult(namespace, {
+          return await buildBootstrapResult(namespace, {
             diagnostics: ['namespace:server-control-plane', ...resolved.diagnostics],
             remoteProcessedFreshness: resolved.remoteProcessedFreshness,
             retryExhausted: resolved.retryExhausted,
@@ -87,7 +89,7 @@ export async function resolveTransportContextBootstrap(
           scope: 'personal',
           projectId: canonical.key,
         };
-        return buildBootstrapResult(personalNamespace, {
+        return await buildBootstrapResult(personalNamespace, {
           diagnostics: ['namespace:server-personal-fallback', ...(resolved?.diagnostics ?? [])],
           remoteProcessedFreshness: resolved?.remoteProcessedFreshness,
           retryExhausted: resolved?.retryExhausted,
@@ -97,7 +99,7 @@ export async function resolveTransportContextBootstrap(
           scope: 'personal',
           projectId: canonical.key,
         };
-        return buildBootstrapResult(personalNamespace, {
+        return await buildBootstrapResult(personalNamespace, {
           diagnostics: ['namespace:server-resolution-failed', 'namespace:git-origin'],
         }, input.startupMemoryAlreadyInjected, projectDir);
       }
@@ -108,37 +110,61 @@ export async function resolveTransportContextBootstrap(
     scope: 'personal',
     projectId: canonical.key,
   };
-  return buildBootstrapResult(fallbackNamespace, {
+  return await buildBootstrapResult(fallbackNamespace, {
     diagnostics: [`namespace:${canonical.kind}`],
   }, input.startupMemoryAlreadyInjected, projectDir);
 }
 
-function buildBootstrapResult(
+async function buildBootstrapResult(
   namespace: ContextNamespace,
   extras: Omit<TransportContextBootstrap, 'namespace' | 'localProcessedFreshness' | 'startupMemory'>,
   skipStartupMemory = false,
   projectDir?: string,
-): TransportContextBootstrap {
+): Promise<TransportContextBootstrap> {
+  const startupMemory = skipStartupMemory ? undefined : await buildTransportStartupMemoryForBootstrap(namespace, projectDir);
   return {
     namespace,
     ...extras,
     localProcessedFreshness: getLocalProcessedFreshness(namespace),
-    startupMemory: skipStartupMemory ? undefined : buildTransportStartupMemory(namespace, {
-      projectDir,
-    }),
+    startupMemory,
   };
+}
+
+async function buildTransportStartupMemoryForBootstrap(
+  namespace: ContextNamespace,
+  projectDir?: string,
+): Promise<TransportMemoryRecallArtifact | undefined> {
+  const credentials = getSharedContextRuntimeCredentials();
+  const remoteItems = credentials
+    ? await fetchBackendStartupMemoryItems(credentials, namespace, STARTUP_MEMORY_TOTAL_LIMIT).catch(() => [])
+    : [];
+  return buildTransportStartupMemory(namespace, {
+    projectDir,
+    remoteItems,
+  });
 }
 
 export function buildTransportStartupMemory(
   namespace: ContextNamespace,
-  limitOrOptions: number | { limit?: number; projectDir?: string; homeDir?: string; skillsFeatureEnabled?: boolean } = STARTUP_MEMORY_TOTAL_LIMIT,
+  limitOrOptions: number | {
+    limit?: number;
+    projectDir?: string;
+    homeDir?: string;
+    skillsFeatureEnabled?: boolean;
+    remoteItems?: readonly MemorySearchResultItem[];
+  } = STARTUP_MEMORY_TOTAL_LIMIT,
 ): TransportMemoryRecallArtifact | undefined {
   try {
     const options = typeof limitOrOptions === 'number'
       ? { limit: limitOrOptions }
       : limitOrOptions;
     const limit = options.limit ?? STARTUP_MEMORY_TOTAL_LIMIT;
-    const processedItems = selectStartupMemoryItems(namespace, { totalLimit: limit });
+    const remoteItems = options.remoteItems ?? [];
+    const remoteIds = new Set(remoteItems.map((item) => item.id));
+    const processedItems = selectStartupMemoryItems(namespace, {
+      totalLimit: limit,
+      extraItems: remoteItems,
+    });
     const processedById = new Map(processedItems.map((item) => [item.id, item]));
     const skillCandidates = collectSkillStartupCandidates({
       namespace,
@@ -150,25 +176,35 @@ export function buildTransportStartupMemory(
       ...processedItems.map(memorySearchItemToStartupCandidate),
       ...skillCandidates,
     ]);
-    const items = selected.selected.map((candidate) => {
+    const selectedCandidates = selected.selected.slice(0, limit);
+    const items = selectedCandidates.map((candidate) => {
       const processed = processedById.get(candidate.id);
       return processed
-        ? toTransportMemoryRecallItem(processed)
+        ? toTransportMemoryRecallItem(processed, remoteIds.has(processed.id) ? 'remote_processed' : 'local_processed')
         : startupCandidateToTransportMemoryRecallItem(candidate, namespace);
     });
-    if (items.length === 0 || selected.selected.length === 0) return undefined;
+    if (items.length === 0 || selectedCandidates.length === 0) return undefined;
+    const sourceKind = resolveStartupMemorySourceKind(items);
     return {
       reason: 'startup',
       runtimeFamily: 'transport',
-      authoritySource: 'processed_local',
-      sourceKind: 'local_processed',
-      injectionSurface: 'system-text',
+      authoritySource: sourceKind === 'remote_processed' ? 'processed_remote' : 'processed_local',
+      sourceKind,
+      injectionSurface: 'message-preamble',
       items,
-      injectedText: renderStartupMemoryText(selected.selected, processedById),
+      injectedText: renderStartupMemoryText(selectedCandidates, processedById),
     };
   } catch {
     return undefined;
   }
+}
+
+function resolveStartupMemorySourceKind(items: readonly TransportMemoryRecallItem[]): MemoryRecallSourceKind {
+  const hasRemote = items.some((item) => item.sourceKind === 'remote_processed');
+  const hasLocal = items.some((item) => item.sourceKind !== 'remote_processed');
+  if (hasRemote && hasLocal) return 'mixed_processed';
+  if (hasRemote) return 'remote_processed';
+  return 'local_processed';
 }
 
 function memorySearchItemToStartupCandidate(item: MemorySearchResultItem): StartupMemoryCandidate {
@@ -198,7 +234,7 @@ function startupCandidateToTransportMemoryRecallItem(
   };
 }
 
-function toTransportMemoryRecallItem(item: MemorySearchResultItem): TransportMemoryRecallItem {
+function toTransportMemoryRecallItem(item: MemorySearchResultItem, sourceKind: MemoryRecallSourceKind = 'local_processed'): TransportMemoryRecallItem {
   return {
     id: item.id,
     type: 'processed',
@@ -215,6 +251,7 @@ function toTransportMemoryRecallItem(item: MemorySearchResultItem): TransportMem
     ...(typeof item.relevanceScore === 'number' ? { relevanceScore: item.relevanceScore } : {}),
     ...(typeof item.createdAt === 'number' ? { createdAt: item.createdAt } : {}),
     ...(typeof item.updatedAt === 'number' ? { updatedAt: item.updatedAt } : {}),
+    sourceKind,
   };
 }
 
@@ -225,7 +262,7 @@ function renderStartupMemoryText(
   const memoryItems = selected
     .map((candidate) => processedById.get(candidate.id))
     .filter((item): item is MemorySearchResultItem => !!item)
-    .map(toTransportMemoryRecallItem);
+    .map((item) => toTransportMemoryRecallItem(item));
   const sections: string[] = [];
   if (memoryItems.length > 0) {
     sections.push(buildStartupProjectMemoryText(memoryItems));

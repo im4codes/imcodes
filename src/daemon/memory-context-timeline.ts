@@ -9,6 +9,7 @@ import type {
   ContextAuthorityDecision,
   MemoryRecallInjectionSurface,
   MemoryRecallRuntimeFamily,
+  MemoryRecallSourceKind,
   TransportMemoryRecallItem,
 } from '../../shared/context-types.js';
 
@@ -21,7 +22,7 @@ export function buildMemoryContextTimelinePayload(
     injectionSurface?: MemoryRecallInjectionSurface;
     injectedText?: string;
     authoritySource?: ContextAuthorityDecision['authoritySource'];
-    sourceKind?: 'local_processed' | 'remote_processed';
+    sourceKind?: MemoryRecallSourceKind;
   },
 ): Omit<MemoryContextTimelinePayload, 'relatedToEventId'> | null {
   if (items.length === 0) return null;
@@ -59,7 +60,7 @@ export function buildMemoryContextStatusPayload(
     runtimeFamily?: MemoryRecallRuntimeFamily;
     injectionSurface?: MemoryRecallInjectionSurface;
     authoritySource?: ContextAuthorityDecision['authoritySource'];
-    sourceKind?: 'local_processed' | 'remote_processed';
+    sourceKind?: MemoryRecallSourceKind;
     matchedCount?: number;
     dedupedCount?: number;
   },

@@ -8,14 +8,18 @@ import type { ProviderError } from './transport-provider.js';
 import { incrementCounter } from '../util/metrics.js';
 import type {
   CompiledAgentContextArtifact,
+  ContextAuthorityDecision,
   ContextNamespace,
   ContextSendSurface,
   MemoryRecallInjectionSurface,
+  MemoryRecallSourceKind,
   ProviderContextPayload,
   ProviderSupportClass,
   RuntimeAuthoredContextBinding,
   TransportMemoryRecallArtifact,
+  TransportMemoryRecallItem,
 } from '../../shared/context-types.js';
+import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
 
 export interface TransportRuntimeAssemblyInput {
   userMessage: string;
@@ -155,8 +159,9 @@ export function buildProviderContextPayload(
   input: TransportRuntimeAssemblyInput,
 ): ProviderContextPayload {
   const { supportClass, authority } = resolveTransportDispatchAuthority(provider, input);
+  const sanitizedStartupMemory = filterStartupMemoryForAuthority(input.startupMemory, authority);
   const sanitizedRecall = {
-    startupMemory: authority.authoritySource === 'processed_local' ? input.startupMemory : undefined,
+    startupMemory: sanitizedStartupMemory,
     memoryRecall: input.memoryRecall,
   };
   const compiledContextInput = composeTransportMemoryInputs({
@@ -176,7 +181,7 @@ export function buildProviderContextPayload(
   for (const entry of input.namespaceDiagnostics ?? []) {
     if (!diagnostics.includes(entry)) diagnostics.push(entry);
   }
-  if (input.startupMemory) diagnostics.push(authority.authoritySource === 'processed_local' ? 'memory:start' : 'memory:start:suppressed-authority');
+  if (input.startupMemory) diagnostics.push(sanitizedStartupMemory ? 'memory:start' : 'memory:start:suppressed-authority');
   if (input.memoryRecall) diagnostics.push(authority.authoritySource === 'processed_local' ? 'memory:message' : 'memory:message:local-auxiliary');
   const recallInjectionSurface: MemoryRecallInjectionSurface = supportClass === 'degraded-message-side-context-mapping'
     ? 'degraded-message-side'
@@ -200,6 +205,35 @@ export function buildProviderContextPayload(
     supportClass,
     diagnostics,
   };
+}
+
+function filterStartupMemoryForAuthority(
+  startupMemory: TransportMemoryRecallArtifact | undefined,
+  authority: ContextAuthorityDecision,
+): TransportMemoryRecallArtifact | undefined {
+  if (!startupMemory) return undefined;
+  if (authority.authoritySource === 'processed_local') return startupMemory;
+  if (authority.authoritySource !== 'processed_remote') return undefined;
+  const remoteItems = startupMemory.items.filter((item) => (
+    item.sourceKind === 'remote_processed'
+    || (!item.sourceKind && startupMemory.sourceKind === 'remote_processed')
+  ));
+  if (remoteItems.length === 0) return undefined;
+  return {
+    ...startupMemory,
+    authoritySource: 'processed_remote',
+    sourceKind: resolveRecallSourceKind(remoteItems),
+    items: remoteItems,
+    injectedText: buildStartupProjectMemoryText(remoteItems),
+  };
+}
+
+function resolveRecallSourceKind(items: readonly TransportMemoryRecallItem[]): MemoryRecallSourceKind {
+  const hasRemote = items.some((item) => item.sourceKind === 'remote_processed');
+  const hasLocal = items.some((item) => item.sourceKind !== 'remote_processed');
+  if (hasRemote && hasLocal) return 'mixed_processed';
+  if (hasRemote) return 'remote_processed';
+  return 'local_processed';
 }
 
 export function resolveTransportDispatchAuthority(
@@ -282,11 +316,11 @@ function composeTransportMemoryInputs(input: TransportRuntimeAssemblyInput): Tra
   const memoryRecallText = input.memoryRecall?.injectedText?.trim();
   const uniqueMessagePreambleParts = dedupeTransportMemorySections([
     input.messagePreamble?.trim(),
+    startupMemoryText,
     memoryRecallText,
   ]);
   const uniqueSystemPromptParts = dedupeTransportMemorySections([
     input.systemPrompt?.trim(),
-    startupMemoryText,
   ]);
   return {
     ...input,

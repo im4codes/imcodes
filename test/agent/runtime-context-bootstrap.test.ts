@@ -410,15 +410,116 @@ describe('resolveTransportContextBootstrap', () => {
     }));
   });
 
+  it('includes cloud startup memory for the resolved personal project when backend sync is available', async () => {
+    detectRepoMock.mockResolvedValue({
+      info: {
+        remoteUrl: 'git@github.com:acme/repo.git',
+      },
+    });
+    configureSharedContextRuntime({
+      workerUrl: 'https://worker.example',
+      serverId: 'srv-1',
+      token: 'token-1',
+    });
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href.endsWith('/api/server/srv-1/shared-context/resolve-namespace')) {
+        return new Response(JSON.stringify({
+          canonicalRepoId: 'github.com/acme/repo',
+          namespace: null,
+          visibilityState: 'unenrolled',
+          remoteProcessedFreshness: 'fresh',
+          retryExhausted: true,
+          diagnostics: ['remote-personal-fresh'],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (href.endsWith('/api/shared-context/memory/search')) {
+        expect(init?.headers).toEqual(expect.objectContaining({
+          Authorization: 'Bearer token-1',
+          'X-Server-Id': 'srv-1',
+        }));
+        expect(JSON.parse(String(init?.body))).toEqual({
+          query: '',
+          scope: 'personal',
+          projectId: 'github.com/acme/repo',
+          limit: 50,
+        });
+        return new Response(JSON.stringify({
+          results: [
+            {
+              id: 'cloud-durable',
+              scope: 'personal',
+              class: 'durable_memory_candidate',
+              preview: 'Cloud durable startup memory',
+              projectId: 'github.com/acme/repo',
+              updatedAt: 200,
+            },
+            {
+              id: 'cloud-recent',
+              scope: 'personal',
+              class: 'recent_summary',
+              preview: 'Cloud recent startup memory',
+              projectId: 'github.com/acme/repo',
+              updatedAt: 100,
+            },
+            {
+              id: 'cloud-other-project',
+              scope: 'personal',
+              class: 'durable_memory_candidate',
+              preview: 'Wrong project must not enter startup memory',
+              projectId: 'github.com/acme/other',
+              updatedAt: 300,
+            },
+            {
+              id: 'cloud-other-scope',
+              scope: 'project_shared',
+              class: 'recent_summary',
+              preview: 'Wrong scope must not enter startup memory',
+              projectId: 'github.com/acme/repo',
+              updatedAt: 250,
+            },
+          ],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response('{}', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
 
+    const result = await resolveTransportContextBootstrap({
+      projectDir: '/tmp/project',
+      transportConfig: {},
+    });
 
-  it('buildTransportStartupMemory keeps up to 7 durable plus 8 recent memories', () => {
+    expect(result.remoteProcessedFreshness).toBe('fresh');
+    expect(result.startupMemory).toEqual(expect.objectContaining({
+      authoritySource: 'processed_remote',
+      sourceKind: 'remote_processed',
+      items: expect.arrayContaining([
+        expect.objectContaining({
+          id: 'cloud-durable',
+          projectionClass: 'durable_memory_candidate',
+          sourceKind: 'remote_processed',
+          summary: 'Cloud durable startup memory',
+        }),
+        expect.objectContaining({
+          id: 'cloud-recent',
+          projectionClass: 'recent_summary',
+          sourceKind: 'remote_processed',
+          summary: 'Cloud recent startup memory',
+        }),
+      ]),
+    }));
+    expect(result.startupMemory?.items.map((item) => item.id)).not.toContain('cloud-other-project');
+    expect(result.startupMemory?.items.map((item) => item.id)).not.toContain('cloud-other-scope');
+  });
+
+  it('buildTransportStartupMemory keeps up to 20 durable plus 30 recent memories', () => {
     const now = Date.now();
     const namespace = {
       scope: 'personal' as const,
       projectId: 'github.com/acme/repo-limit',
     };
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 25; i++) {
       writeProcessedProjection({
         namespace,
         class: 'durable_memory_candidate',
@@ -429,7 +530,7 @@ describe('resolveTransportContextBootstrap', () => {
         updatedAt: now - (1000 + i),
       });
     }
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 35; i++) {
       writeProcessedProjection({
         namespace,
         class: 'recent_summary',
@@ -443,10 +544,10 @@ describe('resolveTransportContextBootstrap', () => {
 
     const startup = buildTransportStartupMemory(namespace);
 
-    expect(startup?.items).toHaveLength(15);
-    expect(startup?.items.filter((item) => item.projectionClass === 'durable_memory_candidate')).toHaveLength(7);
-    expect(startup?.items.filter((item) => item.projectionClass === 'recent_summary')).toHaveLength(8);
-    expect(startup?.items.slice(0, 7).every((item) => item.projectionClass === 'durable_memory_candidate')).toBe(true);
+    expect(startup?.items).toHaveLength(50);
+    expect(startup?.items.filter((item) => item.projectionClass === 'durable_memory_candidate')).toHaveLength(20);
+    expect(startup?.items.filter((item) => item.projectionClass === 'recent_summary')).toHaveLength(30);
+    expect(startup?.items.slice(0, 20).every((item) => item.projectionClass === 'durable_memory_candidate')).toBe(true);
   });
 
   it('buildTransportStartupMemory mixes important and recent startup memories with durable entries first', () => {

@@ -7,6 +7,7 @@ import type {
   ContextAuthorityDecision,
   MemoryRecallInjectionSurface,
   MemoryRecallRuntimeFamily,
+  MemoryRecallSourceKind,
   ProcessedContextClass,
   ProcessedContextProjectionStatus,
 } from '../../../shared/context-types.js';
@@ -138,7 +139,7 @@ export interface MemoryContextTimelinePayload {
   runtimeFamily?: MemoryRecallRuntimeFamily;
   injectionSurface?: MemoryRecallInjectionSurface;
   authoritySource?: ContextAuthorityDecision['authoritySource'];
-  sourceKind?: 'local_processed' | 'remote_processed';
+  sourceKind?: MemoryRecallSourceKind;
   status?: MemoryContextTimelineStatus;
   matchedCount?: number;
   dedupedCount?: number;

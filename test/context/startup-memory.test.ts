@@ -20,7 +20,7 @@ describe('startup memory selection', () => {
     await cleanupIsolatedSharedContextDb(tempDir);
   });
 
-  it('backfills with recent summaries up to the total limit when durable memory is sparse', () => {
+  it('caps recent summaries at the startup summary quota when durable memory is sparse', () => {
     const now = Date.now();
     const namespace = {
       scope: 'personal' as const,
@@ -38,7 +38,7 @@ describe('startup memory selection', () => {
         updatedAt: now - 9_000 - i,
       });
     }
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 40; i++) {
       writeProcessedProjection({
         namespace,
         class: 'recent_summary',
@@ -52,9 +52,9 @@ describe('startup memory selection', () => {
 
     const items = selectStartupMemoryItems(namespace);
 
-    expect(items).toHaveLength(15);
+    expect(items).toHaveLength(33);
     expect(items.filter((item) => item.projectionClass === 'durable_memory_candidate')).toHaveLength(3);
-    expect(items.filter((item) => item.projectionClass === 'recent_summary')).toHaveLength(12);
+    expect(items.filter((item) => item.projectionClass === 'recent_summary')).toHaveLength(30);
     expect(items.slice(0, 3).every((item) => item.projectionClass === 'durable_memory_candidate')).toBe(true);
   });
 

@@ -4,9 +4,9 @@ import { searchLocalMemory } from './memory-search.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 import { MEMORY_DEFAULTS } from '../../shared/memory-defaults.js';
 
-export const STARTUP_MEMORY_DURABLE_LIMIT = 7;
-export const STARTUP_MEMORY_RECENT_LIMIT = 8;
-export const STARTUP_MEMORY_TOTAL_LIMIT = 15;
+export const STARTUP_MEMORY_DURABLE_LIMIT = 20;
+export const STARTUP_MEMORY_RECENT_LIMIT = 30;
+export const STARTUP_MEMORY_TOTAL_LIMIT = 50;
 export const STARTUP_MEMORY_STAGES = ['collect', 'prioritize', 'apply_quotas', 'trim', 'dedup', 'render'] as const;
 export const STARTUP_BOOTSTRAP_SOURCES = [
   'startup_memory',
@@ -49,6 +49,7 @@ export interface StartupMemorySelectionOptions {
   durableLimit?: number;
   recentLimit?: number;
   totalLimit?: number;
+  extraItems?: readonly MemorySearchResultItem[];
 }
 
 function tokenEstimate(candidate: StartupMemoryCandidate): number {
@@ -193,17 +194,28 @@ export function selectStartupMemoryItems(
   // the resulting summary is part of the project's history. Template-prompt
   // filtering is applied only on the recall/search paths.
 
-  const durable = searchLocalMemory({
+  const localDurable = searchLocalMemory({
     namespace,
     projectionClass: 'durable_memory_candidate',
     limit: durableLimit,
   }).items.filter((item): item is MemorySearchResultItem => item.type === 'processed');
 
-  const recent = searchLocalMemory({
+  const localRecent = searchLocalMemory({
     namespace,
     projectionClass: 'recent_summary',
-    limit: Math.max(recentLimit, totalLimit),
+    limit: recentLimit,
   }).items.filter((item): item is MemorySearchResultItem => item.type === 'processed');
+  const extraItems = (options.extraItems ?? []).filter((item) => item.type === 'processed');
+  const sortByUpdatedDesc = (a: MemorySearchResultItem, b: MemorySearchResultItem): number =>
+    (b.updatedAt ?? b.createdAt ?? 0) - (a.updatedAt ?? a.createdAt ?? 0);
+  const durable = [
+    ...localDurable,
+    ...extraItems.filter((item) => item.projectionClass === 'durable_memory_candidate'),
+  ].sort(sortByUpdatedDesc);
+  const recent = [
+    ...localRecent,
+    ...extraItems.filter((item) => item.projectionClass === 'recent_summary'),
+  ].sort(sortByUpdatedDesc);
 
   // ID-based dedup was failing against duplicates produced by the old
   // writeProcessedProjection path that generated fresh UUIDs on every turn
@@ -228,7 +240,7 @@ export function selectStartupMemoryItems(
   }
 
   const selectedDurable = dedupedDurable.slice(0, Math.min(durableLimit, totalLimit));
-  const remaining = Math.max(0, totalLimit - selectedDurable.length);
+  const remaining = Math.min(recentLimit, Math.max(0, totalLimit - selectedDurable.length));
   const selectedRecent: MemorySearchResultItem[] = [];
   for (const item of recent) {
     if (seenIds.has(item.id)) continue;
