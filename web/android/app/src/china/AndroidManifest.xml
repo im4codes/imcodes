@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  China flavor manifest fragment — merged on top of main/AndroidManifest.xml.
+
+  Adds:
+    1. JPushReceiver (our subclass of JPushMessageReceiver), required since
+       JPush 3.0.7 to receive registration / notification callbacks.
+    2. Our custom JCommonService subclass — required since JPush 5.2.0 for a
+       stable persistent push channel on more handset OEMs.
+    3. The custom intent-filter category requires our package name (declared
+       via the JPUSH_PKGNAME manifestPlaceholder set in app/build.gradle).
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!-- JPush message receiver — must declare the RECEIVE_MESSAGE filter
+             with our package as the category. -->
+        <receiver
+            android:name=".JPushReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="cn.jpush.android.intent.RECEIVE_MESSAGE" />
+                <category android:name="${JPUSH_PKGNAME}" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Subclass of JCommonService kept in a separate :pushcore process so
+             the persistent push channel survives main-process death on more
+             OEM ROMs. We don't add any custom logic — the parent class does
+             all the work. -->
+        <service
+            android:name="cn.jpush.android.service.JCommonService"
+            android:enabled="true"
+            android:exported="false"
+            android:process=":pushcore">
+            <intent-filter>
+                <action android:name="cn.jiguang.user.service.action" />
+            </intent-filter>
+        </service>
+    </application>
+
+</manifest>
