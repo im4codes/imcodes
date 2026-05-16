@@ -155,6 +155,12 @@ function compactSearchHit(item: MemoryMcpSearchHit) {
     updatedAt: item.updatedAt,
     relevanceScore: item.relevanceScore,
     source: item.source,
+    // Surface the originating daemon so callers can locate the raw events
+    // for follow-up source resolution. Omitted (not null) when unknown, to
+    // keep the wire shape minimal for older clients that ignore the field.
+    ...(typeof item.originServerId === 'string' && item.originServerId
+      ? { originServerId: item.originServerId }
+      : {}),
   };
 }
 

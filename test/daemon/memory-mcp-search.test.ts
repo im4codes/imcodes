@@ -147,6 +147,177 @@ describe('memory MCP recall search', () => {
     }
   });
 
+  // ── originServerId threading (memory-source-server-routing change) ──
+  //
+  // Once cross-server source resolution lands, the daemon's MCP search must
+  // surface the originating daemon for every hit so callers can route
+  // `get_memory_sources` back to the machine whose SQLite holds the raw
+  // events. Cloud hits use the value the server attached; local hits use
+  // the local daemon's bound serverId.
+
+  it('propagates server-supplied originServerId on cloud hits', async () => {
+    const tempDir = await createIsolatedSharedContextDb('memory-mcp-search-origin-cloud');
+    try {
+      const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+        results: [
+          {
+            id: 'cloud-from-srv-A',
+            projectId: 'repo-1',
+            class: 'recent_summary',
+            summary: 'Hit produced by another daemon',
+            updatedAt: 200,
+            score: 0.91,
+            source: 'personal',
+            originServerId: 'srv-A',
+          },
+          {
+            id: 'cloud-from-srv-B',
+            projectId: 'repo-1',
+            class: 'recent_summary',
+            summary: 'Hit produced by yet another daemon',
+            updatedAt: 210,
+            score: 0.92,
+            source: 'personal',
+            originServerId: 'srv-B',
+          },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as unknown as typeof fetch;
+
+      const result = await searchMcpMemoryRecall({
+        query: 'origin server tagging',
+        namespace: { scope: 'personal', projectId: 'repo-1', userId: 'daemon-local' },
+        repo: 'repo-1',
+        includeLegacyPersonalOwner: true,
+        limit: 5,
+      }, {
+        fetchImpl,
+        credentials: {
+          workerUrl: 'https://app.example.test',
+          serverId: 'srv-self',
+          token: 'server-token',
+        },
+      });
+
+      const byId = Object.fromEntries(result.items.map((item) => [item.projectionId, item]));
+      expect(byId['cloud-from-srv-A']?.originServerId).toBe('srv-A');
+      expect(byId['cloud-from-srv-B']?.originServerId).toBe('srv-B');
+      expect(byId['cloud-from-srv-A']?.source).toBe('cloud');
+    } finally {
+      await cleanupIsolatedSharedContextDb(tempDir);
+    }
+  });
+
+  it('stamps local-source hits with the local daemon serverId', async () => {
+    const tempDir = await createIsolatedSharedContextDb('memory-mcp-search-origin-local');
+    try {
+      writeProcessedProjection({
+        namespace: { scope: 'personal', projectId: 'repo-1', userId: 'daemon-local' },
+        class: 'recent_summary',
+        sourceEventIds: ['evt-local-1'],
+        summary: 'Local memory must carry the local serverId',
+        content: {},
+        updatedAt: 300,
+      });
+
+      const result = await searchMcpMemoryRecall({
+        query: 'local memory must carry',
+        namespace: { scope: 'personal', projectId: 'repo-1', userId: 'daemon-local' },
+        repo: 'repo-1',
+        includeLegacyPersonalOwner: true,
+        limit: 5,
+      }, {
+        credentials: {
+          workerUrl: 'https://app.example.test',
+          serverId: 'srv-self',
+          token: 'server-token',
+        },
+        // No fetchImpl supplied — cloud path stays empty and we exercise
+        // only the local-stamping behavior.
+        fetchImpl: (vi.fn(async () => new Response('{}', { status: 200 })) as unknown as typeof fetch),
+      });
+
+      const localHit = result.items.find((item) => item.source === 'local');
+      expect(localHit?.originServerId).toBe('srv-self');
+    } finally {
+      await cleanupIsolatedSharedContextDb(tempDir);
+    }
+  });
+
+  it('omits originServerId on local hits when daemon credentials are unavailable', async () => {
+    const tempDir = await createIsolatedSharedContextDb('memory-mcp-search-origin-no-creds');
+    try {
+      writeProcessedProjection({
+        namespace: { scope: 'personal', projectId: 'repo-1', userId: 'daemon-local' },
+        class: 'recent_summary',
+        sourceEventIds: ['evt-local-1'],
+        summary: 'Unbound daemon should still serve local recall',
+        content: {},
+        updatedAt: 300,
+      });
+
+      const result = await searchMcpMemoryRecall({
+        query: 'unbound daemon should still',
+        namespace: { scope: 'personal', projectId: 'repo-1', userId: 'daemon-local' },
+        repo: 'repo-1',
+        includeLegacyPersonalOwner: true,
+        limit: 5,
+      }, {
+        credentials: null,
+      });
+
+      // The hit must still be present (unchanged from prior behavior); only
+      // originServerId is omitted because we have nothing to stamp.
+      const localHit = result.items.find((item) => item.source === 'local');
+      expect(localHit).toBeDefined();
+      expect(localHit?.originServerId).toBeUndefined();
+    } finally {
+      await cleanupIsolatedSharedContextDb(tempDir);
+    }
+  });
+
+  it('tolerates servers that have not yet rolled out originServerId', async () => {
+    const tempDir = await createIsolatedSharedContextDb('memory-mcp-search-origin-legacy-server');
+    try {
+      const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+        results: [
+          {
+            // No originServerId — older server build.
+            id: 'cloud-legacy',
+            projectId: 'repo-1',
+            class: 'recent_summary',
+            summary: 'Legacy server response without originServerId',
+            updatedAt: 200,
+            score: 0.91,
+            source: 'personal',
+          },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as unknown as typeof fetch;
+
+      const result = await searchMcpMemoryRecall({
+        query: 'legacy server response',
+        namespace: { scope: 'personal', projectId: 'repo-1', userId: 'daemon-local' },
+        repo: 'repo-1',
+        includeLegacyPersonalOwner: true,
+        limit: 5,
+      }, {
+        fetchImpl,
+        credentials: {
+          workerUrl: 'https://app.example.test',
+          serverId: 'srv-self',
+          token: 'server-token',
+        },
+      });
+
+      const cloudHit = result.items.find((item) => item.projectionId === 'cloud-legacy');
+      expect(cloudHit).toBeDefined();
+      // No fabricated value — origin stays undefined when the server didn't
+      // supply one. We must NOT fall back to the local serverId here.
+      expect(cloudHit?.originServerId).toBeUndefined();
+    } finally {
+      await cleanupIsolatedSharedContextDb(tempDir);
+    }
+  });
+
   it('keeps local fallback scoped to the caller project and user', async () => {
     const tempDir = await createIsolatedSharedContextDb('memory-mcp-search-local-scope');
     try {

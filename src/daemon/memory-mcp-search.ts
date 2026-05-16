@@ -12,6 +12,15 @@ export interface MemoryMcpSearchHit {
   updatedAt?: number;
   relevanceScore?: number;
   source?: 'cloud' | 'local';
+  /**
+   * The daemon that originally produced this projection. Cloud hits carry the
+   * value the server attached from `shared_context_projections.server_id`;
+   * local hits are tagged with the local daemon's bound serverId so MCP output
+   * is uniformly identifiable. Consumers (e.g. a future cross-server
+   * `get_memory_sources` orchestrator) use this to route source lookups back
+   * to the daemon whose local SQLite holds the raw events.
+   */
+  originServerId?: string;
 }
 
 export interface MemoryMcpSearchResult {
@@ -37,6 +46,12 @@ interface CloudRecallResponse {
     updatedAt?: number;
     score?: number;
     source?: 'personal' | 'enterprise';
+    /**
+     * Added by the server in support of cross-server source resolution. The
+     * field is optional in the wire schema so this client stays compatible
+     * with servers that have not yet rolled out the addition.
+     */
+    originServerId?: string;
   }>;
 }
 
@@ -62,10 +77,16 @@ function cloudRecallUrl(workerUrl: string, serverId: string): string {
   return `${cleanBaseUrl(workerUrl)}/api/shared-context/${encodeURIComponent(serverId)}/shared-context/memory/recall`;
 }
 
-async function searchCloudMemoryRecall(query: MemorySearchQuery, options: MemoryMcpSearchOptions): Promise<MemoryMcpSearchHit[]> {
-  const credentials = options.credentials !== undefined
-    ? options.credentials
-    : await (options.loadCredentials ?? defaultLoadCredentials)();
+async function resolveCredentialsOnce(options: MemoryMcpSearchOptions): Promise<MemoryMcpSearchOptions['credentials']> {
+  if (options.credentials !== undefined) return options.credentials;
+  return (options.loadCredentials ?? defaultLoadCredentials)();
+}
+
+async function searchCloudMemoryRecall(
+  query: MemorySearchQuery,
+  options: MemoryMcpSearchOptions,
+  credentials: NonNullable<MemoryMcpSearchOptions['credentials']>,
+): Promise<MemoryMcpSearchHit[]> {
   if (!credentials?.workerUrl || !credentials.serverId || !credentials.token || !query.query?.trim()) return [];
   const requestedProjectId = query.repo ?? query.namespace?.projectId;
 
@@ -103,10 +124,16 @@ async function searchCloudMemoryRecall(query: MemorySearchQuery, options: Memory
       relevanceScore: item.score,
       scope: item.source === 'enterprise' ? 'project_shared' : 'personal',
       source: 'cloud' as const,
+      ...(typeof item.originServerId === 'string' && item.originServerId.trim()
+        ? { originServerId: item.originServerId.trim() }
+        : {}),
     }));
 }
 
-async function searchLocalRecall(query: MemorySearchQuery): Promise<MemoryMcpSearchHit[]> {
+async function searchLocalRecall(
+  query: MemorySearchQuery,
+  localServerId: string | undefined,
+): Promise<MemoryMcpSearchHit[]> {
   const result = await searchLocalMemorySemantic(query);
   return result.items
     .filter((item) => item.type === 'processed')
@@ -120,6 +147,12 @@ async function searchLocalRecall(query: MemorySearchQuery): Promise<MemoryMcpSea
       updatedAt: item.updatedAt,
       relevanceScore: item.relevanceScore,
       source: 'local' as const,
+      // Local-source hits live in this daemon's own SQLite file, so they are
+      // implicitly owned by this server. Stamping the local daemon's bound
+      // serverId here keeps the hit shape uniform with cloud results — every
+      // hit a consumer sees can be routed (eventually) to the right daemon
+      // without per-source-type branching downstream.
+      ...(localServerId ? { originServerId: localServerId } : {}),
     }));
 }
 
@@ -140,9 +173,20 @@ function dedupeAndLimit(items: MemoryMcpSearchHit[], limit: number): MemoryMcpSe
 
 export async function searchMcpMemoryRecall(query: MemorySearchQuery, options: MemoryMcpSearchOptions = {}): Promise<MemoryMcpSearchResult> {
   const limit = clampLimit(query.limit);
+  // Resolve credentials once so cloud and local paths share the same
+  // serverId view of the world. The cloud path consumes workerUrl + token;
+  // the local path only needs `serverId` to stamp `originServerId` on hits.
+  // If credentials are unavailable (offline / unbound daemon), local hits
+  // simply omit `originServerId` — backward-compatible with older clients.
+  const credentials = await resolveCredentialsOnce(options).catch(() => null);
+  const localServerId = credentials?.serverId && credentials.serverId.trim()
+    ? credentials.serverId.trim()
+    : undefined;
   const [cloud, local] = await Promise.all([
-    searchCloudMemoryRecall(query, options).catch(() => []),
-    searchLocalRecall(query).catch(() => []),
+    credentials
+      ? searchCloudMemoryRecall(query, options, credentials).catch(() => [])
+      : Promise.resolve([] as MemoryMcpSearchHit[]),
+    searchLocalRecall(query, localServerId).catch(() => []),
   ]);
   return {
     items: dedupeAndLimit([...cloud, ...local], limit),

@@ -54,6 +54,11 @@ interface MockRow {
   last_used_at?: number;
   status?: 'active' | 'archived';
   enterprise_id?: string;
+  // Optional in the test fixture; the recall route SELECTs the column and
+  // surfaces it as `originServerId` in the response. Tests that don't care
+  // about routing leave it omitted (response field will be undefined and
+  // dropped from JSON).
+  origin_server_id?: string;
 }
 
 function makeEnv(db: Database): Env {
@@ -598,5 +603,57 @@ describe('memory recall endpoint — I.5', () => {
     expect(json.vectorSearch).toBe(true);
     expect(json.results[0].id).toBe('en-result');
     expect(json.results[0].summary).toContain('Resolved WebSocket reconnect race');
+  });
+
+  // ── originServerId — memory-source-server-routing change ───────────────
+  //
+  // The route reads `shared_context_projections.server_id` for each hit and
+  // surfaces it as `originServerId`. Daemons consume that field to follow
+  // `get_memory_sources` back to the machine whose local SQLite holds the
+  // raw events. Without it, cross-daemon source resolution is impossible.
+
+  it('threads server_id through each hit as originServerId', async () => {
+    const now = Date.now();
+    const { db } = makeMockDb({
+      personalRows: [
+        { id: 'p-srv-A', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Personal hit produced by daemon A', updated_at: now, score: 0.95, origin_server_id: 'srv-A' },
+        { id: 'p-srv-B', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Personal hit produced by daemon B', updated_at: now, score: 0.9, origin_server_id: 'srv-B' },
+      ],
+      enterpriseRows: [
+        { id: 'e-srv-C', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Enterprise hit produced by daemon C', updated_at: now, score: 0.88, enterprise_id: 'ent-1', origin_server_id: 'srv-C' },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: 'origin server tagging', projectId: 'proj-a' });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: Array<{ id: string; originServerId: string }> };
+    expect(json.results).toHaveLength(3);
+    const byId = Object.fromEntries(json.results.map((r) => [r.id, r]));
+    expect(byId['p-srv-A'].originServerId).toBe('srv-A');
+    expect(byId['p-srv-B'].originServerId).toBe('srv-B');
+    expect(byId['e-srv-C'].originServerId).toBe('srv-C');
+  });
+
+  it('preserves originServerId on personal-vs-enterprise dedup', async () => {
+    // When the same projection id surfaces via both personal and enterprise
+    // queries, personal wins (existing behavior). The retained hit must
+    // carry the personal row's originServerId, not the enterprise one.
+    const now = Date.now();
+    const { db } = makeMockDb({
+      personalRows: [
+        { id: 'shared-1', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Personal version', updated_at: now, score: 0.95, origin_server_id: 'srv-personal' },
+      ],
+      enterpriseRows: [
+        { id: 'shared-1', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Enterprise version', updated_at: now, score: 0.95, enterprise_id: 'ent-1', origin_server_id: 'srv-enterprise' },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: 'dedup test', projectId: 'proj-a' });
+    const json = await res.json() as { results: Array<{ id: string; source: string; originServerId: string }> };
+    expect(json.results).toHaveLength(1);
+    expect(json.results[0].source).toBe('personal');
+    expect(json.results[0].originServerId).toBe('srv-personal');
   });
 });

@@ -1569,6 +1569,12 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
     hit_count?: number | null;
     last_used_at?: number | null;
     enterprise_id?: string | null;
+    // The daemon that originally produced this projection. The daemon needs
+    // this to follow `get_memory_sources` back to the owning machine's local
+    // SQLite (the only place the raw events live). Without surfacing it,
+    // cross-daemon source resolution is impossible. See
+    // openspec/changes/memory-source-server-routing.
+    origin_server_id: string;
   };
 
   let currentEnterpriseId: string | undefined;
@@ -1594,7 +1600,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
     // pgvector cosine distance: <=> returns distance (0 = identical), convert to similarity
     personalRows = await c.env.DB.query<RecallRow>(
       `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
-              p.hit_count, p.last_used_at, p.enterprise_id,
+              p.hit_count, p.last_used_at, p.enterprise_id, p.server_id AS origin_server_id,
               1 - (e.embedding <=> $1::vector) AS score
        FROM shared_context_projections p
        JOIN shared_context_embeddings e ON e.source_id = p.id AND e.source_kind = 'projection'
@@ -1608,8 +1614,8 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
 
     enterpriseRows = await c.env.DB.query<RecallRow>(
       `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
-              p.hit_count, p.last_used_at,
-              1 - (e.embedding <=> $1::vector) AS score, p.enterprise_id
+              p.hit_count, p.last_used_at, p.enterprise_id, p.server_id AS origin_server_id,
+              1 - (e.embedding <=> $1::vector) AS score
        FROM shared_context_projections p
        JOIN shared_context_embeddings e ON e.source_id = p.id AND e.source_kind = 'projection'
        JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $2
@@ -1624,7 +1630,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
     // Fallback: pg_trgm text similarity (for when embedding model is unavailable)
     personalRows = await c.env.DB.query<RecallRow>(
       `SELECT id, project_id, projection_class, summary, updated_at,
-              hit_count, last_used_at, enterprise_id,
+              hit_count, last_used_at, enterprise_id, server_id AS origin_server_id,
               similarity(summary, $1) AS score
        FROM shared_context_projections
        WHERE scope = 'personal' AND user_id = $2
@@ -1638,8 +1644,8 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
 
     enterpriseRows = await c.env.DB.query<RecallRow>(
       `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
-              p.hit_count, p.last_used_at,
-              similarity(p.summary, $1) AS score, p.enterprise_id
+              p.hit_count, p.last_used_at, p.enterprise_id, p.server_id AS origin_server_id,
+              similarity(p.summary, $1) AS score
        FROM shared_context_projections p
        JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $2
        JOIN unnest($3::text[]) AS allowed_scope(scope) ON allowed_scope.scope = p.scope
@@ -1657,7 +1663,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   // a templated workflow origin must not leak back through recall.
   const seen = new Set<string>();
   const currentProjectId = projectId ?? '__unknown_current_project__';
-  const results: Array<{ id: string; projectId: string; class: string; summary: string; updatedAt: number; score: number; source: 'personal' | 'enterprise' }> = [];
+  const results: Array<{ id: string; projectId: string; class: string; summary: string; updatedAt: number; score: number; source: 'personal' | 'enterprise'; originServerId: string }> = [];
   for (const row of personalRows) {
     if (seen.has(row.id)) continue;
     seen.add(row.id);
@@ -1677,6 +1683,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
         currentProjectId,
       }, runtimeConfig.memoryScoringWeights),
       source: 'personal',
+      originServerId: row.origin_server_id,
     });
   }
   for (const row of enterpriseRows) {
@@ -1700,6 +1707,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
         currentEnterpriseId,
       }, runtimeConfig.memoryScoringWeights),
       source: 'enterprise',
+      originServerId: row.origin_server_id,
     });
   }
   // Content-level dedup: projections stored before the writer's store-time
