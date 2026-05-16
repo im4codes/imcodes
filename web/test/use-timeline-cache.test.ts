@@ -1554,6 +1554,79 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
+  it('renders streaming timeline events without persisting each typewriter tick', async () => {
+    const sessionName = `deck_transport_stream_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const putEventsSpy = vi.spyOn(TimelineDB.prototype, 'putEvents').mockResolvedValue();
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: () => 'history-stream',
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId);
+      return h(
+        'div',
+        { 'data-testid': 'probe-stream' },
+        events.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    render(h(Probe, {}));
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.event',
+        event: {
+          eventId: `${sessionName}-assistant`,
+          sessionId: sessionName,
+          ts: 1,
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'partial', streaming: true },
+        },
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-stream').textContent).toBe('partial');
+    });
+    expect(putEventsSpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.event',
+        event: {
+          eventId: `${sessionName}-assistant`,
+          sessionId: sessionName,
+          ts: 2,
+          epoch: 1,
+          seq: 2,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'final', streaming: false },
+        },
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-stream').textContent).toBe('final');
+    });
+    expect(putEventsSpy).toHaveBeenCalledTimes(1);
+    const persisted = putEventsSpy.mock.calls[0]?.[0] as TimelineEvent[];
+    expect(persisted[0]?.payload).toMatchObject({ text: 'final', streaming: false });
+  });
+
   it('does not dedup confirmed user messages marked allowDuplicate', async () => {
     const sessionName = `deck_transport_dup_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;

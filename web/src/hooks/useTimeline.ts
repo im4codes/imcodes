@@ -438,6 +438,14 @@ function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void 
   sharedDb.putEvents(scopeEventsForDb(cacheKey, events)).catch(() => {});
 }
 
+function shouldPersistTimelineEvent(event: TimelineEvent): boolean {
+  // Streaming/typewriter deltas can arrive many times per second for the same
+  // eventId. They are already represented in the in-memory UI cache and the
+  // final non-streaming event is persisted, so writing every intermediate
+  // token to IndexedDB just builds a transaction backlog on busy chats.
+  return event.payload?.streaming !== true;
+}
+
 function getSharedTimelineBase(
   cacheKey: string | null | undefined,
   localEvents: TimelineEvent[],
@@ -1791,9 +1799,11 @@ export function useTimeline(
   const idbPutEvents = useCallback((evts: TimelineEvent[]) => {
     const key = cacheKeyRef.current;
     if (!key) return;
+    const persistable = evts.filter(shouldPersistTimelineEvent);
+    if (persistable.length === 0) return;
     const cached = getCachedEvents(key) ?? eventsRef.current;
     const cachedById = new Map(cached.map((event) => [event.eventId, event]));
-    const preferred = evts.map((event) => {
+    const preferred = persistable.map((event) => {
       const existing = cachedById.get(event.eventId);
       return existing ? preferTimelineEvent(existing, event) : event;
     });
