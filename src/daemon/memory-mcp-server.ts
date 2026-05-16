@@ -3,7 +3,6 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import {
   MemoryMcpCallerEnvError,
-  assertMcpRuntimeBoundUser,
   parseMcpRuntimeCallerFromEnv,
   type McpRuntimeCaller,
 } from './memory-mcp-caller.js';
@@ -26,7 +25,6 @@ export function createMemoryMcpServer(caller: McpRuntimeCaller, toolDeps: Memory
 
 export function createMemoryMcpServerFromEnv(options: MemoryMcpServerOptions = {}): McpServer {
   const caller = parseMcpRuntimeCallerFromEnv(options.env ?? process.env, 'stdio');
-  if (!options.skipBoundUserCheck) assertMcpRuntimeBoundUser(caller);
   return createMemoryMcpServer(caller, options.toolDeps);
 }
 

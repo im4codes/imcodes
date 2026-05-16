@@ -51,7 +51,7 @@ describe('memory read tools', () => {
     expectForbidden(() => chatGetEvent('evt-1', caller('alice', aliceRepo)));
   });
 
-  it('fails closed when caller or bound user identity is missing', async () => {
+  it('fails closed for malformed callers while allowing daemon-local fallback without bound user', async () => {
     const target = { namespace: bobRepo, kind: 'session' as const, sessionName: 'deck_repo_brain' };
     const event = recordContextEvent({ id: 'evt-auth', target, eventType: 'user.message', content: 'secret raw content', createdAt: 1 });
     archiveEventsForMaterialization([event], 2);
@@ -64,9 +64,11 @@ describe('memory read tools', () => {
 
     await rm(configPath, { force: true });
     expectForbidden(() => chatGetEvent('evt-auth', caller('bob', bobRepo)));
+    expect(() => chatSearchFts('secret', 10, caller('daemon-local', { scope: 'personal', projectId: 'repo', userId: 'daemon-local' }))).not.toThrow();
 
     await writeFile(configPath, '{not-json', 'utf8');
     expectForbidden(() => chatGetEvent('evt-auth', caller('bob', bobRepo)));
+    expect(() => chatSearchFts('secret', 10, caller('daemon-local', { scope: 'personal', projectId: 'repo', userId: 'daemon-local' }))).not.toThrow();
   });
 
   it('filters raw event and FTS results to the caller namespace', () => {

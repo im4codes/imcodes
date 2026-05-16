@@ -14,6 +14,7 @@ import {
 
 const MEMORY_TOOL_CALLER_BRAND: unique symbol = Symbol('MemoryToolCaller');
 const INTERNAL_MEMORY_TOOL_CALLER_BRAND: unique symbol = Symbol('InternalMemoryToolCaller');
+const DAEMON_LOCAL_MEMORY_USER_ID = 'daemon-local';
 
 /**
  * Caller identity passed to public read-tool handlers.
@@ -84,9 +85,9 @@ export function getBoundMemoryToolUserId(): string | undefined {
   const path = process.env.IMCODES_SERVER_CONFIG_PATH ?? join(homedir(), '.imcodes', 'server.json');
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as { userId?: string };
-    return typeof parsed.userId === 'string' ? parsed.userId : undefined;
+    return typeof parsed.userId === 'string' && parsed.userId.trim() ? parsed.userId.trim() : DAEMON_LOCAL_MEMORY_USER_ID;
   } catch {
-    return undefined;
+    return DAEMON_LOCAL_MEMORY_USER_ID;
   }
 }
 

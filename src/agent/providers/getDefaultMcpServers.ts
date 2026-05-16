@@ -13,6 +13,7 @@ import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-serve
 
 export const IMCODES_MEMORY_MCP_COMMAND = 'imcodes';
 export const IMCODES_MEMORY_MCP_ARGS = ['memory', 'mcp'] as const;
+const DAEMON_LOCAL_MEMORY_USER_ID = 'daemon-local';
 
 export interface DefaultMcpServerConfig {
   type: 'stdio';
@@ -41,14 +42,24 @@ function projectNameFromSessionName(sessionName: string | undefined): string | u
   return rest.slice(0, idx) || undefined;
 }
 
-function buildIdentityEnv(config: SessionConfig): Record<string, string> {
+function namespaceForMcp(config: SessionConfig): SessionConfig['contextNamespace'] {
   const namespace = config.contextNamespace ?? undefined;
+  if (!namespace) return undefined;
+  if (namespace.userId?.trim()) return namespace;
+  if (namespace.scope === 'personal' || namespace.scope === 'user_private') {
+    return { ...namespace, userId: DAEMON_LOCAL_MEMORY_USER_ID };
+  }
+  return namespace;
+}
+
+function buildIdentityEnv(config: SessionConfig): Record<string, string> {
+  const namespace = namespaceForMcp(config);
   const sessionName = stringValue(config.sessionName)
     ?? stringValue(config.env?.[IMCODES_SESSION_ENV])
     ?? stringValue(config.bindExistingKey)
     ?? stringValue(config.sessionKey);
   return buildMemoryMcpServerEnv({
-    [IMCODES_DAEMON_USER_ID_ENV]: namespace?.userId,
+    [IMCODES_DAEMON_USER_ID_ENV]: namespace?.userId ?? DAEMON_LOCAL_MEMORY_USER_ID,
     [IMCODES_DAEMON_NAMESPACE_ENV]: namespace ? JSON.stringify(namespace) : undefined,
     [IMCODES_DAEMON_SESSION_NAME_ENV]: sessionName,
     [IMCODES_DAEMON_PROJECT_NAME_ENV]: stringValue(config.projectName) ?? projectNameFromSessionName(sessionName),

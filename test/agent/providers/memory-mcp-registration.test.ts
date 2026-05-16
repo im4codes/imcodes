@@ -87,6 +87,24 @@ describe('managed provider MCP registration helpers', () => {
     expect(Object.keys(server.env).every(isMemoryMcpAllowedEnvKey)).toBe(true);
   });
 
+  it('fills daemon-local identity for local personal namespaces without user ids', () => {
+    const servers = getDefaultMcpServers({
+      ...sessionConfig,
+      contextNamespace: {
+        scope: 'personal',
+        projectId: 'github.com/acme/project',
+      },
+    });
+    const server = servers[IMCODES_MEMORY_MCP_SERVER_NAME];
+
+    expect(server.env[IMCODES_DAEMON_USER_ID_ENV]).toBe('daemon-local');
+    expect(JSON.parse(server.env[IMCODES_DAEMON_NAMESPACE_ENV])).toEqual({
+      scope: 'personal',
+      userId: 'daemon-local',
+      projectId: 'github.com/acme/project',
+    });
+  });
+
   it('allow-lists MCP child env even when the source process env has secrets', () => {
     const env = buildMemoryMcpServerEnv({
       [IMCODES_DAEMON_USER_ID_ENV]: 'user-1',
