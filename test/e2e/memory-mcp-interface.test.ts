@@ -90,6 +90,7 @@ describe('memory MCP interface e2e', () => {
       }),
       IMCODES_CONTEXT_DB_PATH: process.env.IMCODES_CONTEXT_DB_PATH!,
       IMCODES_SERVER_CONFIG_PATH: serverConfigPath,
+      [memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.namespaceRegistry)]: 'true',
       [memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.observationStore)]: 'true',
       [memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.preferences)]: 'true',
     };
