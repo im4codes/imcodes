@@ -22,7 +22,9 @@ function caller(overrides: Partial<McpRuntimeCaller> = {}): McpRuntimeCaller {
 
 describe('memory MCP tool schema firewall', () => {
   it('strips forged memory authority fields before search and write helpers', async () => {
-    const searchMemory = vi.fn(() => []);
+    const searchMemory = vi.fn(async () => ({
+      items: [],
+    }));
     const saveObservation = vi.fn(() => ({ status: 'ok', observationId: 'obs-1', fingerprint: 'fp', state: 'candidate' }));
     const handlers = createMemoryMcpToolHandlers(caller(), {
       searchMemory,
@@ -49,7 +51,15 @@ describe('memory MCP tool schema firewall', () => {
       sourceServerId: 'srv-forged',
     });
 
-    expect(searchMemory).toHaveBeenCalledWith('hello', 3, expect.objectContaining({ userId: 'user-1' }));
+    expect(searchMemory).toHaveBeenCalledWith(expect.objectContaining({
+      query: 'hello',
+      limit: 3,
+      namespace: expect.objectContaining({ userId: 'user-1' }),
+      includeLegacyPersonalOwner: true,
+    }));
+    expect(searchMemory.mock.calls[0][0]).not.toHaveProperty('userId', 'mallory');
+    expect(searchMemory.mock.calls[0][0]).not.toHaveProperty('embedding');
+    expect(searchMemory.mock.calls[0][0]).not.toHaveProperty('vector');
     expect(saveObservation).toHaveBeenCalledWith({ content: 'remember this' }, expect.objectContaining({
       userId: 'user-1',
       sourceSessionName: 'deck_proj_brain',
@@ -59,7 +69,7 @@ describe('memory MCP tool schema firewall', () => {
   });
 
   it('short-circuits memory disabled gates before backend calls', async () => {
-    const searchMemory = vi.fn(() => []);
+    const searchMemory = vi.fn();
     const savePreference = vi.fn(() => ({ status: 'ok' }));
     const enabled = (flag: MemoryFeatureFlag) => flag !== MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch && flag !== MEMORY_FEATURE_FLAGS_BY_NAME.preferences;
     const handlers = createMemoryMcpToolHandlers(caller(), {
@@ -78,6 +88,51 @@ describe('memory MCP tool schema firewall', () => {
     });
     expect(searchMemory).not.toHaveBeenCalled();
     expect(savePreference).not.toHaveBeenCalled();
+  });
+
+  it('returns compact hits from the same recall search used by message memory recall', async () => {
+    const searchMemory = vi.fn(async () => ({
+      items: [
+        {
+          projectionId: 'proj-1',
+          projectId: 'repo-1',
+          scope: 'user_private',
+          projectionClass: 'recent_summary',
+          summary: 'MCP provider readiness fixed for Gemini, Copilot, and Qwen.',
+          createdAt: 100,
+          updatedAt: 200,
+          relevanceScore: 0.9,
+          source: 'cloud',
+        },
+      ],
+    }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      searchMemory,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]({ query: 'provider readiness', limit: 5 })).resolves.toMatchObject({
+      status: 'ok',
+      items: [
+        {
+          projectionId: 'proj-1',
+          summary: 'MCP provider readiness fixed for Gemini, Copilot, and Qwen.',
+          projectionClass: 'recent_summary',
+          projectId: 'repo-1',
+          scope: 'user_private',
+          createdAt: 100,
+          updatedAt: 200,
+          relevanceScore: 0.9,
+          source: 'cloud',
+        },
+      ],
+    });
+    expect(searchMemory).toHaveBeenCalledWith(expect.objectContaining({
+      query: 'provider readiness',
+      namespace: expect.objectContaining({ scope: 'user_private', userId: 'user-1', projectId: 'repo-1' }),
+      repo: 'repo-1',
+      limit: 5,
+    }));
   });
 
   it('does not treat local send and cron MCP feature flags as auth gates', async () => {

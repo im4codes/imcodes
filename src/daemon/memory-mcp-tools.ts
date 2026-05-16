@@ -28,7 +28,9 @@ import {
   type MCPFeatureFlagValues,
 } from '../../shared/memory-mcp-feature-flags.js';
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
-import { chatSearchFts, memoryGetSources } from '../context/memory-read-tools.js';
+import { memoryGetSources } from '../context/memory-read-tools.js';
+import { searchMcpMemoryRecall, type MemoryMcpSearchHit, type MemoryMcpSearchResult } from './memory-mcp-search.js';
+import type { MemorySearchQuery } from '../context/memory-search.js';
 import { saveObservation, savePreference } from '../context/memory-write-tools.js';
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
 import { listSessions as listStoredSessions } from '../store/session-store.js';
@@ -37,11 +39,12 @@ import { cronMcpCreate, cronMcpDelete, cronMcpList, cronMcpUpdate, type CronMcpC
 
 type ToolResult = Record<string, unknown>;
 export type MemoryMcpToolHandler = (input?: unknown) => Promise<ToolResult> | ToolResult;
+type MemoryMcpSearch = (query: MemorySearchQuery) => Promise<MemoryMcpSearchResult> | MemoryMcpSearchResult;
 
 export interface MemoryMcpToolDeps {
   featureFlags?: MCPFeatureFlagValues;
   isMemoryFeatureEnabled?: (flag: MemoryFeatureFlag) => boolean;
-  searchMemory?: typeof chatSearchFts;
+  searchMemory?: MemoryMcpSearch;
   getMemorySources?: typeof memoryGetSources;
   saveObservation?: typeof saveObservation;
   savePreference?: typeof savePreference;
@@ -141,13 +144,17 @@ function memorySurfaceGate(deps: MemoryMcpToolDeps, extra: Record<string, unknow
   return isMcpMemorySurfaceEnabled(deps) ? null : disabled(MEMORY_MCP_DISABLED_FLAGS.MEMORY_SURFACE, extra);
 }
 
-function compactSearchHit(item: ReturnType<typeof chatSearchFts>[number]) {
+function compactSearchHit(item: MemoryMcpSearchHit) {
   return {
-    id: item.id,
-    eventType: item.eventType,
-    content: item.content,
+    projectionId: item.projectionId,
+    summary: item.summary,
+    projectionClass: item.projectionClass,
+    projectId: item.projectId,
+    scope: item.scope,
     createdAt: item.createdAt,
-    namespace: item.target.namespace,
+    updatedAt: item.updatedAt,
+    relevanceScore: item.relevanceScore,
+    source: item.source,
   };
 }
 
@@ -188,7 +195,7 @@ function cronOptionsForCaller(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps)
 }
 
 export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
-  const searchMemory = deps.searchMemory ?? chatSearchFts;
+  const searchMemory = deps.searchMemory ?? searchMcpMemoryRecall;
   const getMemorySources = deps.getMemorySources ?? memoryGetSources;
   const saveObservationTool = deps.saveObservation ?? saveObservation;
   const savePreferenceTool = deps.savePreference ?? savePreference;
@@ -208,7 +215,16 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (!query) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'query is required');
       const limit = numberArg(args, 'limit');
       try {
-        const items = searchMemory(query, limit, memoryCaller()).map(compactSearchHit);
+        const scopedCaller = memoryCaller();
+        const result = await searchMemory({
+          query,
+          namespace: scopedCaller.namespace,
+          currentEnterpriseId: scopedCaller.namespace.enterpriseId,
+          repo: scopedCaller.namespace.projectId,
+          includeLegacyPersonalOwner: true,
+          limit,
+        });
+        const items = result.items.map(compactSearchHit);
         return { status: 'ok', items };
       } catch (err) {
         return sanitizeCaughtError(err);
