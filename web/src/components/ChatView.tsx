@@ -23,6 +23,8 @@ import { splitTextByHttpUrls } from '../link-detection.js';
 import {
   CHAT_INITIAL_RENDER_ITEM_LIMIT,
   CHAT_RENDER_ITEM_INCREMENT,
+  PREVIEW_EVENT_TAIL_LIMIT,
+  PREVIEW_RENDER_ITEM_LIMIT,
   shouldSkipRichTextEnhancement,
 } from '../chat-render-limits.js';
 import { domNodeToPlainText, selectionToPlainText } from '../util/dom-to-text.js';
@@ -881,11 +883,24 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     void showToolCallsPref.save(false);
   }, [showToolCallsPref]);
 
-  const viewItems = useMemo(() => buildViewItems(events, showToolCalls), [events, showToolCalls]);
-  const hiddenRenderedItemCount = preview ? 0 : Math.max(0, viewItems.length - renderItemLimit);
+  // Preview cards (SubSessionCard) are small thumbnails; slice events to a
+  // bounded tail BEFORE buildViewItems so it doesn't walk thousands of items
+  // every time a sub-session card mounts/updates. Normal chat (the active
+  // session pane / sub-session window) keeps the full list so "load older"
+  // and infinite scroll-back continue to work — only the rendered slice is
+  // capped further down (`renderedViewItems`).
+  const sourceEvents = useMemo(
+    () => (preview && events.length > PREVIEW_EVENT_TAIL_LIMIT
+      ? events.slice(-PREVIEW_EVENT_TAIL_LIMIT)
+      : events),
+    [preview, events],
+  );
+  const viewItems = useMemo(() => buildViewItems(sourceEvents, showToolCalls), [sourceEvents, showToolCalls]);
+  const effectiveRenderLimit = preview ? PREVIEW_RENDER_ITEM_LIMIT : renderItemLimit;
+  const hiddenRenderedItemCount = Math.max(0, viewItems.length - effectiveRenderLimit);
   const renderedViewItems = useMemo(
-    () => (hiddenRenderedItemCount > 0 ? viewItems.slice(-renderItemLimit) : viewItems),
-    [hiddenRenderedItemCount, renderItemLimit, viewItems],
+    () => (hiddenRenderedItemCount > 0 ? viewItems.slice(-effectiveRenderLimit) : viewItems),
+    [hiddenRenderedItemCount, effectiveRenderLimit, viewItems],
   );
 
   useEffect(() => {
@@ -1202,8 +1217,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     setShowScrollBtn(!autoScrollRef.current);
     if (!autoScrollRef.current) lastScrollActivityRef.current = Date.now();
     lastScrollTopRef.current = scrollTop;
-    // Auto-trigger load older when scrolled near top
-    if (scrollTop < 100 && (hiddenRenderedItemCount > 0 || (onLoadOlder && hasOlderHistory)) && !loadingOlder && !loading) {
+    // Auto-trigger load older when scrolled near top. Skip in preview mode —
+    // preview cards have a fixed render tail (PREVIEW_RENDER_ITEM_LIMIT) and
+    // should never expand their event budget from a tiny thumbnail scroll.
+    if (!preview && scrollTop < 100 && (hiddenRenderedItemCount > 0 || (onLoadOlder && hasOlderHistory)) && !loadingOlder && !loading) {
       const now = Date.now();
       if (now - lastLoadOlderAtRef.current >= LOAD_OLDER_COOLDOWN_MS) {
         lastLoadOlderAtRef.current = now;

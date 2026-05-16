@@ -13,7 +13,11 @@ import {
   __resetSessionRepoContextStoreForTests,
   ingestSessionRepoContext,
 } from '../../src/session-repo-context-store.js';
-import { CHAT_INITIAL_RENDER_ITEM_LIMIT } from '../../src/chat-render-limits.js';
+import {
+  CHAT_INITIAL_RENDER_ITEM_LIMIT,
+  PREVIEW_EVENT_TAIL_LIMIT,
+  PREVIEW_RENDER_ITEM_LIMIT,
+} from '../../src/chat-render-limits.js';
 
 const chatMarkdownRenderSpy = vi.hoisted(() => vi.fn());
 const showToolCallsPref = vi.hoisted(() => ({
@@ -162,6 +166,45 @@ describe('ChatView', () => {
     fireEvent.click(screen.getByText('chat.load_older'));
 
     expect(screen.getByText('message-0')).toBeTruthy();
+  });
+
+  it('preview mode caps rendered items to PREVIEW_RENDER_ITEM_LIMIT (sub-session thumbnails)', () => {
+    // Regression test for "本地消息都没有立即显示. 空白半天 + sub-session 按钮无反应"
+    // (slow refresh + unresponsive buttons on mobile). Without the cap, every
+    // SubSessionCard would rebuild viewItems over PREVIEW_EVENT_TAIL_LIMIT + N
+    // events on mount, freezing the main thread when many sub-sessions exist.
+    const totalEvents = PREVIEW_EVENT_TAIL_LIMIT + 100; // well above both caps
+    const events = Array.from({ length: totalEvents }, (_, index) => ({
+      eventId: `user-${index}`,
+      type: 'user.message',
+      ts: 1_700_000_000_000 + index,
+      payload: { text: `preview-msg-${index}` },
+    }));
+
+    render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_preview_brain"
+        preview
+      />,
+    );
+
+    // Last message must be visible — preview cards are tail-anchored.
+    expect(screen.getByText(`preview-msg-${totalEvents - 1}`)).toBeTruthy();
+    // Earliest tail entry within the preview render limit must be visible.
+    expect(
+      screen.getByText(`preview-msg-${totalEvents - PREVIEW_RENDER_ITEM_LIMIT}`),
+    ).toBeTruthy();
+    // Anything older than the render limit must NOT be rendered — that's the
+    // savings that keeps the main thread free.
+    expect(
+      screen.queryByText(`preview-msg-${totalEvents - PREVIEW_RENDER_ITEM_LIMIT - 1}`),
+    ).toBeNull();
+    expect(screen.queryByText('preview-msg-0')).toBeNull();
+    // Preview mode never shows the "Load older" affordance.
+    expect(screen.queryByText('chat.load_older')).toBeNull();
   });
 
   it('always hides thinking events from the timeline regardless of preference', () => {
