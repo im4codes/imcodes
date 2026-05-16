@@ -57,11 +57,12 @@ export interface EnvConfig {
   /** APNs bundle ID (e.g. app.imcodes) */
   APNS_BUNDLE_ID?: string;
 
-  // FCM push notifications (Android, 海外)
+  // FCM push notifications (Android, International edition)
   FCM_SERVER_KEY?: string;
 
-  // 极光推送 JPush (Android, 国内 — aggregates Huawei/Xiaomi/OPPO/vivo/Honor vendor channels)
-  /** JPush AppKey (from https://www.jiguang.cn console, also embedded in china flavor APK) */
+  // JPush 极光推送 (Android, Mainland China edition — aggregates Huawei /
+  // Xiaomi / OPPO / vivo / Honor vendor channels)
+  /** JPush AppKey (from https://www.jiguang.cn console, also embedded in the Mainland China flavor APK) */
   JPUSH_APP_KEY?: string;
   /** JPush Master Secret (server-only; used for Basic auth to JPush REST API). MUST NOT be exposed in any client build. */
   JPUSH_MASTER_SECRET?: string;

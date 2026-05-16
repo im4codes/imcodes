@@ -61,11 +61,11 @@ android {
     // device can only install one of them; users pick the APK from GitHub
     // Releases based on their region.
     //
-    // - global: Google Play / 海外 — push goes through Firebase FCM as today.
-    // - china:  国内 — push goes through 极光推送 JPush, which aggregates the
-    //           on-device vendor channels (Xiaomi / vivo / etc.). FCM-related
-    //           code is excluded from this flavor so the APK can install on
-    //           devices without Google Play Services.
+    // - global: International edition. Push via Firebase FCM, as before.
+    // - china:  Mainland China edition. Push via JPush (极光推送), which
+    //           aggregates the on-device vendor channels (Xiaomi / vivo /
+    //           etc.) so notifications still work on devices that ship
+    //           without Google Play Services.
     flavorDimensions += "region"
     productFlavors {
         global {
@@ -137,10 +137,11 @@ dependencies {
     implementation "androidx.browser:browser:1.8.0"
 
     // ── china flavor: JPush + vendor channel plugins (Maven Central only) ──
-    // Excluded from the global flavor APK entirely.
+    // Excluded from the global (International) flavor APK entirely.
     //
-    // 华为 / OPPO / 荣耀 / 魅族 are deferred (require either HMS service json or
-    // local aars from JPush SDK zip) — see docs/plan/jpush.md Phase 2.1.
+    // Huawei / OPPO / Honor / Meizu are deferred (require either HMS service
+    // json or local aars from the JPush SDK zip) — see docs/plan/jpush.md
+    // Phase 2.1.
     chinaImplementation 'cn.jiguang.sdk:jpush:5.6.0'
     chinaImplementation 'cn.jiguang.sdk.plugin:xiaomi:5.6.0'
     chinaImplementation 'cn.jiguang.sdk.plugin:vivo:5.6.0'

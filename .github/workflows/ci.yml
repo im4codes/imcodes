@@ -691,12 +691,12 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.name }}
           body: |
-            ## Android — 选择对应版本下载
+            ## Android — Pick the edition that matches your region
 
-            - **`imcodes-global-*.apk`** — 海外版（FCM 推送，Play Store / 自建商店）
-            - **`imcodes-china-*.apk`** — 国内版（极光推送 JPush，国内应用商店 / 厂商通道）
+            - **`imcodes-global-*.apk`** — **International edition**. Push notifications via Firebase FCM (Google Play Services required). Use this everywhere outside Mainland China.
+            - **`imcodes-china-*.apk`** — **Mainland China edition**. Push notifications via 极光推送 JPush, which fans out to the on-device vendor channels (Huawei / Xiaomi / OPPO / vivo / Honor) so they work without Google Play Services.
 
-            两个 APK 包名相同（`com.im.codes`），一台设备只能装一个。
+            Both APKs share the same applicationId (`com.im.codes`) and cannot coexist on a single device — install only one.
           files: |
             imcodes-*-${{ steps.version.outputs.tag }}.apk
             imcodes-*-${{ steps.version.outputs.tag }}.aab

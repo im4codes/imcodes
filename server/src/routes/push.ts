@@ -3,9 +3,10 @@
  * POST /api/push/register — register device token
  * Dispatch: send push on session events (idle, notification, ask, error)
  *
- * iOS:                APNs HTTP/2 with JWT auth
- * Android (海外):     FCM legacy HTTP API
- * Android (国内):     JPush v3 REST API (aggregates Huawei / Xiaomi / OPPO / vivo / Honor vendor channels)
+ * iOS:                              APNs HTTP/2 with JWT auth
+ * Android (International edition):  FCM legacy HTTP API
+ * Android (Mainland China edition): JPush v3 REST API (aggregates the Huawei /
+ *                                   Xiaomi / OPPO / vivo / Honor vendor channels)
  *
  * Push credentials live ONLY on the central server (app.im.codes). Self-hosted
  * servers detect "I have no push credentials configured" and relay everything

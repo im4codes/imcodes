@@ -6,7 +6,7 @@ import android.util.Log;
 import cn.jpush.android.api.JPushInterface;
 
 /**
- * China flavor — 国内 build. Bootstraps the 极光推送 JPush SDK so the
+ * Mainland China edition. Bootstraps the JPush (极光推送) SDK so the
  * registration_id is provisioned on the very first launch and the persistent
  * push channel is up before any Activity runs.
  *

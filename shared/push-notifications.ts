@@ -3,14 +3,16 @@ export const PUSH_TIMELINE_EVENT_MAX_AGE_MS = 2 * 60 * 1000;
 
 // ── Device platform values stored in push_tokens.platform ──────────────────
 // Each value identifies BOTH the device OS and the push transport channel,
-// because Android in China can't reliably reach FCM and must go through a
-// third-party aggregator (极光推送 JPush) that fans out to vendor channels
-// (Xiaomi / Huawei / OPPO / vivo / Honor / Meizu).
+// because Android in Mainland China can't reliably reach FCM and must go
+// through a third-party aggregator (JPush 极光推送) that fans out to the
+// on-device vendor channels (Xiaomi / Huawei / OPPO / vivo / Honor / Meizu).
 //
 // - 'ios'           — Apple devices, dispatched via APNs HTTP/2
-// - 'android'       — Android devices reachable via Firebase FCM (海外 Play Store builds)
-// - 'android-jpush' — Android devices registered through JPush SDK (国内 builds);
-//                     token is the JPush registration_id, dispatch via JPush v3 REST API
+// - 'android'       — Android devices reachable via Firebase FCM
+//                     (International edition APK)
+// - 'android-jpush' — Android devices registered through the JPush SDK
+//                     (Mainland China edition APK); token is the JPush
+//                     registration_id, dispatch via JPush v3 REST API
 
 export const PUSH_PLATFORM_IOS = 'ios';
 export const PUSH_PLATFORM_ANDROID_FCM = 'android';

@@ -2,14 +2,14 @@
  * Push notification registration for Capacitor apps.
  *
  * Three flows, picked at runtime by Capacitor platform × compile-time region:
- *   - iOS:                  APNs (via @capacitor/push-notifications)
- *   - Android global flavor: FCM (via @capacitor/push-notifications)
- *   - Android china flavor:  极光推送 JPush (via our custom JPush plugin)
+ *   - iOS:                                APNs (via @capacitor/push-notifications)
+ *   - Android, International edition:     FCM  (via @capacitor/push-notifications)
+ *   - Android, Mainland China edition:    JPush 极光推送 (via our custom JPush plugin)
  *
- * The china branch sends platform='android-jpush' to /api/push/register so the
- * server's dispatchPush() routes the message to the JPush v3 REST API instead
- * of FCM. See shared/push-notifications.ts for the platform constants and
- * server/src/routes/push.ts for the dispatch side.
+ * The Mainland China branch sends platform='android-jpush' to /api/push/register
+ * so the server's dispatchPush() routes the message to the JPush v3 REST API
+ * instead of FCM. See shared/push-notifications.ts for the platform constants
+ * and server/src/routes/push.ts for the dispatch side.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const isNative = (): boolean => typeof (globalThis as any).Capacitor?.isNativePlatform === 'function' && (globalThis as any).Capacitor.isNativePlatform();
@@ -66,7 +66,7 @@ export async function initPushNotifications(
   }
 }
 
-// ── APNs (iOS) / FCM (海外 Android) via @capacitor/push-notifications ─────────
+// ── APNs (iOS) / FCM (International Android) via @capacitor/push-notifications ──
 
 async function initApnsOrFcm(apiKey: string, cfWorkerUrl: string): Promise<void> {
   // Dynamic import to avoid bundling on web
@@ -99,7 +99,7 @@ async function initApnsOrFcm(apiKey: string, cfWorkerUrl: string): Promise<void>
   });
 }
 
-// ── JPush (国内 Android) ─────────────────────────────────────────────────────
+// ── JPush 极光推送 (Mainland China Android) ──────────────────────────────────
 
 interface JPushPluginShape {
   getRegistrationID(): Promise<{ registrationID: string }>;
@@ -115,9 +115,10 @@ interface JPushPluginShape {
 }
 
 async function initJpush(apiKey: string, cfWorkerUrl: string): Promise<void> {
-  // The JPush plugin only exists in the `china` flavor APK. registerPlugin
-  // returns a proxy that throws on first call if the native impl is missing,
-  // so wrap it in try/catch to fail soft on global APKs that somehow get here.
+  // The JPush plugin only exists in the Mainland China flavor APK.
+  // registerPlugin returns a proxy that throws on first call if the native
+  // impl is missing, so wrap it in try/catch to fail soft on the International
+  // flavor APK if it ever reaches this branch.
   let JPush: JPushPluginShape;
   try {
     // Dynamic import keeps @capacitor/core out of pre-mount code paths.
