@@ -1078,7 +1078,7 @@ describe('sdk transport flow e2e', () => {
       agentType: 'claude-code-sdk',
     }, serverLink);
     await flushAsync();
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await waitForCondition(() => !!mocks.store.get('deck_ccsdk_main_brain'));
 
     const record = mocks.store.get('deck_ccsdk_main_brain');
     expect(record?.runtimeType).toBe('transport');
