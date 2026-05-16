@@ -25,7 +25,7 @@ import type {
   TransportMemoryRecallArtifact,
   TransportMemoryRecallItem,
 } from '../../shared/context-types.js';
-import type { MemoryContextTimelinePayload } from '../shared/timeline/types.js';
+import type { MemoryContextTimelinePayload, MemoryContextTimelinePreferenceItem } from '../shared/timeline/types.js';
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from '../daemon/memory-context-timeline.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import { searchLocalMemorySemantic, type MemorySearchResultItem } from '../context/memory-search.js';
@@ -542,9 +542,10 @@ export class TransportSessionRuntime implements SessionRuntime {
           }
         : await this.buildTransportMessageRecallResultWithinBudget(message, authority.authoritySource);
       const memoryRecall = memoryRecallResult.artifact;
+      const messagePreamble = isSlashControl ? undefined : this.mergeMessagePreambles(dispatchedEntries, message);
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: message,
-        messagePreamble: isSlashControl ? undefined : this.mergeMessagePreambles(dispatchedEntries, message),
+        messagePreamble,
         description: isSlashControl ? undefined : this._description,
         systemPrompt: isSlashControl ? undefined : this._systemPrompt,
         suppressMcpMemorySearchGuidance: isSlashControl,
@@ -588,7 +589,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         // (instead of eagerly in `initialize`) guarantees restart-before-
         // first-message never leaks an unbacked card — the card appears
         // exactly once, for the turn that actually carried the preamble.
-        this.emitStartupMemoryContext(this._startupMemory);
+        this.emitStartupMemoryContext(
+          dispatchResult.payload.startupMemory,
+          extractPreferenceContextTimelineItems(dispatchResult.payload.messagePreamble),
+        );
         this._startupMemory = null;
         // Notify session-manager so the flag is persisted to SessionRecord.
         // Invoked synchronously — the callback just schedules an upsert and
@@ -993,7 +997,10 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
   }
 
-  private emitStartupMemoryContext(startupMemory: TransportMemoryRecallArtifact | null): void {
+  private emitStartupMemoryContext(
+    startupMemory: TransportMemoryRecallArtifact | null,
+    preferenceItems: MemoryContextTimelinePreferenceItem[] = [],
+  ): void {
     if (this._startupMemoryTimelineEmitted || !startupMemory || startupMemory.items.length === 0) return;
     const payload = buildMemoryContextTimelinePayload(undefined, startupMemory.items, 'startup', {
       runtimeFamily: 'transport',
@@ -1001,6 +1008,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       injectedText: startupMemory.injectedText,
       authoritySource: startupMemory.authoritySource,
       sourceKind: startupMemory.sourceKind,
+      preferenceItems,
     });
     if (!payload) return;
     timelineEmitter.emit(this.sessionKey, 'memory.context', payload, { source: 'daemon', confidence: 'high' });
@@ -1100,6 +1108,28 @@ function extractPreferenceContextBlocks(text: string): { blocks: string[]; witho
     blocks,
     withoutBlocks: retained.join('').replace(/\n{3,}/g, '\n\n').trim(),
   };
+}
+
+function extractPreferenceContextTimelineItems(text: string | undefined): MemoryContextTimelinePreferenceItem[] {
+  const blocks = extractPreferenceContextBlocks(text ?? '').blocks;
+  const items: MemoryContextTimelinePreferenceItem[] = [];
+  const seen = new Set<string>();
+  for (const block of blocks) {
+    const body = block
+      .replace(PREFERENCE_CONTEXT_START, '')
+      .replace(PREFERENCE_CONTEXT_END, '')
+      .trim();
+    for (const line of body.split(/\r?\n/)) {
+      const match = line.trim().match(/^-\s+(.+)$/);
+      if (!match) continue;
+      const text = match[1].trim();
+      const key = text.replace(/\s+/g, ' ').toLowerCase();
+      if (!text || seen.has(key)) continue;
+      seen.add(key);
+      items.push({ id: `preference-${items.length + 1}`, text });
+    }
+  }
+  return items;
 }
 
 function normalizePreferenceContextSignature(blocks: readonly string[]): string {

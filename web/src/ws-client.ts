@@ -226,6 +226,7 @@ export type {
   TimelineEvent,
   MemoryContextTimelinePayload,
   MemoryContextTimelineItem,
+  MemoryContextTimelinePreferenceItem,
 } from '../../src/shared/timeline/types.js';
 
 export type {

@@ -658,7 +658,11 @@ describe('TransportSessionRuntime', () => {
       reason: 'startup',
     }), expect.any(Object));
 
-    r.send('Need a transport recall test');
+    const preferencePreamble = `${PREFERENCE_CONTEXT_START}
+User-authored preferences for this and future turns.
+- Use pnpm for project commands
+${PREFERENCE_CONTEXT_END}`;
+    r.send('Need a transport recall test', 'startup-pref-turn', undefined, preferencePreamble);
     await flushDispatch();
 
     expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
@@ -672,6 +676,8 @@ describe('TransportSessionRuntime', () => {
       messagePreamble: expect.stringContaining('transport recall parity visible'),
       assembledMessage: expect.stringContaining('transport recall parity visible'),
     }));
+    const firstPayload = localMock.provider.send.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(String(firstPayload.messagePreamble)).toContain('Use pnpm for project commands');
     const sentPayload = localMock.provider.send.mock.calls[0]?.[1] as { systemText?: string } | undefined;
     expect(sentPayload?.systemText ?? '').not.toContain('transport recall parity visible');
     // Exactly ONE startup card — fired when the provider payload actually
@@ -683,6 +689,9 @@ describe('TransportSessionRuntime', () => {
     expect(startupCardsAfterSend[0][2]).toEqual(expect.objectContaining({
       reason: 'startup',
       injectedText: expect.stringContaining('transport recall parity visible'),
+      preferenceItems: [
+        { id: 'preference-1', text: 'Use pnpm for project commands' },
+      ],
     }));
 
     timelineEmitterEmitMock.mockClear();

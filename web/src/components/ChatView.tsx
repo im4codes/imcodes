@@ -7,7 +7,13 @@ import { h } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
-import type { TimelineEvent, WsClient, MemoryContextTimelinePayload, MemoryContextTimelineItem } from '../ws-client.js';
+import type {
+  TimelineEvent,
+  WsClient,
+  MemoryContextTimelinePayload,
+  MemoryContextTimelineItem,
+  MemoryContextTimelinePreferenceItem,
+} from '../ws-client.js';
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL } from '@shared/session-control-commands.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
@@ -138,6 +144,69 @@ function formatMemoryContextScore(score: number | undefined): string | null {
 function formatMemoryContextTimestamp(ts: number | undefined): string | null {
   if (typeof ts !== 'number' || !Number.isFinite(ts)) return null;
   return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+type MemoryContextSection =
+  | {
+    key: string;
+    titleKey: string;
+    preferenceItems: MemoryContextTimelinePreferenceItem[];
+    items?: never;
+  }
+  | {
+    key: string;
+    titleKey: string;
+    items: MemoryContextTimelineItem[];
+    preferenceItems?: never;
+  };
+
+function normalizeMemoryContextPreferenceItems(
+  payload: MemoryContextTimelinePayload,
+): MemoryContextTimelinePreferenceItem[] {
+  if (!Array.isArray(payload.preferenceItems)) return [];
+  return payload.preferenceItems
+    .map((item, index) => ({
+      id: typeof item.id === 'string' && item.id.trim() ? item.id : `preference-${index + 1}`,
+      text: typeof item.text === 'string' ? item.text.trim() : '',
+    }))
+    .filter((item) => item.text);
+}
+
+function getMemoryContextSections(
+  items: MemoryContextTimelineItem[],
+  preferenceItems: MemoryContextTimelinePreferenceItem[],
+): MemoryContextSection[] {
+  const sections: MemoryContextSection[] = [];
+  if (preferenceItems.length > 0) {
+    sections.push({
+      key: 'preferences',
+      titleKey: 'chat.memory_context_section_preferences',
+      preferenceItems,
+    });
+  }
+
+  const durable = items.filter((item) => item.projectionClass === 'durable_memory_candidate');
+  const recent = items.filter((item) => item.projectionClass === 'recent_summary');
+  const master = items.filter((item) => item.projectionClass === 'master_summary');
+  const other = items.filter((item) => {
+    const projectionClass = item.projectionClass;
+    return !projectionClass
+      || (
+        projectionClass !== 'durable_memory_candidate'
+        && projectionClass !== 'recent_summary'
+        && projectionClass !== 'master_summary'
+      );
+  });
+  const buckets: Array<[string, string, MemoryContextTimelineItem[]]> = [
+    ['durable', 'chat.memory_context_section_durable', durable],
+    ['recent', 'chat.memory_context_section_recent', recent],
+    ['master', 'chat.memory_context_section_master', master],
+    ['other', 'chat.memory_context_section_other', other],
+  ];
+  for (const [key, titleKey, bucketItems] of buckets) {
+    if (bucketItems.length > 0) sections.push({ key, titleKey, items: bucketItems });
+  }
+  return sections;
 }
 
 function getMemoryContextStatusSummary(
@@ -2515,11 +2584,14 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
   const [expanded, setExpanded] = useState(false);
   const payload = event.payload as unknown as MemoryContextTimelinePayload;
   const items = Array.isArray(payload.items) ? payload.items as MemoryContextTimelineItem[] : [];
+  const preferenceItems = normalizeMemoryContextPreferenceItems(payload);
+  const sections = getMemoryContextSections(items, preferenceItems);
   const query = typeof payload.query === 'string' ? payload.query : '';
   const reason = payload.reason ?? 'message';
-  const statusSummary = getMemoryContextStatusSummary(t, payload, items.length);
+  const contextItemCount = items.length + preferenceItems.length;
+  const statusSummary = getMemoryContextStatusSummary(t, payload, contextItemCount);
   const statusDetail = getMemoryContextStatusDetail(t, payload);
-  const isStatusOnly = items.length === 0 && !!payload.status;
+  const isStatusOnly = contextItemCount === 0 && !!payload.status;
   // The startup-memory dump and the per-message recall both render as
   // memory-context cards, but they're conceptually different things:
   //   - startup: a one-shot "pre-loaded project history" preamble
@@ -2579,27 +2651,40 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
             <div class="chat-memory-context-query">{t('chat.memory_context_query', { query })}</div>
           )}
           <div class="chat-memory-context-list">
-            {items.map((item) => {
-              const score = formatMemoryContextScore(item.relevanceScore);
-              const recalledAt = formatMemoryContextTimestamp(item.lastUsedAt);
-              return (
-                <div key={item.id} class="chat-memory-context-item">
-                  <div class="chat-memory-context-item-summary">{item.summary}</div>
-                  <div class="chat-memory-context-item-meta">
-                    <span class="chat-memory-context-chip">{item.projectId}</span>
-                    {score && <span class="chat-memory-context-chip">{t('chat.memory_context_score', { score })}</span>}
-                    {typeof item.hitCount === 'number' && item.hitCount > 0 ? (
-                      <span class="chat-memory-context-chip">{t('sharedContext.management.memoryRecalls', { count: item.hitCount })}</span>
-                    ) : null}
-                    <span class="chat-memory-context-chip chat-memory-context-chip-muted">
-                      {recalledAt
-                        ? t('sharedContext.management.memoryLastRecalled', { time: recalledAt })
-                        : t('sharedContext.management.memoryNeverRecalled')}
-                    </span>
-                  </div>
+            {sections.map((section) => (
+              <div key={section.key} class="chat-memory-context-section">
+                <div class="chat-memory-context-section-title">
+                  {t(section.titleKey, {
+                    count: section.preferenceItems ? section.preferenceItems.length : section.items.length,
+                  })}
                 </div>
-              );
-            })}
+                {section.preferenceItems ? section.preferenceItems.map((item) => (
+                  <div key={item.id} class="chat-memory-context-item chat-memory-context-preference-item">
+                    <div class="chat-memory-context-item-summary">{item.text}</div>
+                  </div>
+                )) : section.items.map((item) => {
+                  const score = formatMemoryContextScore(item.relevanceScore);
+                  const recalledAt = formatMemoryContextTimestamp(item.lastUsedAt);
+                  return (
+                    <div key={item.id} class="chat-memory-context-item">
+                      <div class="chat-memory-context-item-summary">{item.summary}</div>
+                      <div class="chat-memory-context-item-meta">
+                        <span class="chat-memory-context-chip">{item.projectId}</span>
+                        {score && <span class="chat-memory-context-chip">{t('chat.memory_context_score', { score })}</span>}
+                        {typeof item.hitCount === 'number' && item.hitCount > 0 ? (
+                          <span class="chat-memory-context-chip">{t('sharedContext.management.memoryRecalls', { count: item.hitCount })}</span>
+                        ) : null}
+                        <span class="chat-memory-context-chip chat-memory-context-chip-muted">
+                          {recalledAt
+                            ? t('sharedContext.management.memoryLastRecalled', { time: recalledAt })
+                            : t('sharedContext.management.memoryNeverRecalled')}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
           </div>
           <button class="chat-memory-context-collapse-bottom" onClick={() => setExpanded(false)}>
             {t('chat.memory_context_collapse_bottom')}

@@ -122,6 +122,11 @@ export interface MemoryContextTimelineItem {
   relevanceScore?: number;
 }
 
+export interface MemoryContextTimelinePreferenceItem {
+  id?: string;
+  text: string;
+}
+
 export type MemoryContextTimelineStatus =
   | 'no_matches'
   | 'deduped_recently'
@@ -135,6 +140,7 @@ export interface MemoryContextTimelinePayload {
   query?: string;
   injectedText?: string;
   items: MemoryContextTimelineItem[];
+  preferenceItems?: MemoryContextTimelinePreferenceItem[];
   reason?: 'message' | 'startup';
   runtimeFamily?: MemoryRecallRuntimeFamily;
   injectionSurface?: MemoryRecallInjectionSurface;

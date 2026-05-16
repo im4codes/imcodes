@@ -978,7 +978,10 @@ body {
 .chat-memory-context-body { display: flex; flex-direction: column; gap: 8px; padding: 0 10px 10px; }
 .chat-memory-context-query { font-size: 11px; color: #94a3b8; white-space: pre-wrap; word-break: break-word; }
 .chat-memory-context-list { display: flex; flex-direction: column; gap: 8px; }
+.chat-memory-context-section { display: flex; flex-direction: column; gap: 6px; }
+.chat-memory-context-section-title { color: #a5b4fc; font-size: 11px; font-weight: 600; letter-spacing: 0; }
 .chat-memory-context-item { background: #111827; border: 1px solid #1f2937; border-radius: 6px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.chat-memory-context-preference-item { border-color: #334155; background: #0b1220; }
 .chat-memory-context-item-summary { font-size: 12px; line-height: 1.5; color: #e2e8f0; white-space: pre-wrap; word-break: break-word; }
 .chat-memory-context-item-meta { display: flex; flex-wrap: wrap; gap: 6px; }
 .chat-memory-context-chip { display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px; background: rgba(30,41,59,0.9); border: 1px solid #334155; color: #94a3b8; font-size: 10px; }

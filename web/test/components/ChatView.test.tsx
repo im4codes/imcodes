@@ -794,11 +794,21 @@ describe('ChatView', () => {
             payload: {
               reason: 'startup',
               injectedText: '[Related past work]\n- [codedeck] Fix websocket reconnect loop',
+              preferenceItems: [
+                { id: 'pref-1', text: 'Use pnpm for project commands' },
+              ],
               items: [
                 {
                   id: 'mem-1',
                   projectId: 'codedeck',
                   summary: 'Fix websocket reconnect loop',
+                  projectionClass: 'durable_memory_candidate',
+                },
+                {
+                  id: 'mem-2',
+                  projectId: 'codedeck',
+                  summary: 'Recent MCP startup injection work',
+                  projectionClass: 'recent_summary',
                 },
               ],
             },
@@ -818,7 +828,12 @@ describe('ChatView', () => {
 
     await waitFor(() => {
       expect(container.textContent).toContain('chat.memory_context_startup_reason');
+      expect(container.textContent).toContain('chat.memory_context_section_preferences');
+      expect(container.textContent).toContain('Use pnpm for project commands');
+      expect(container.textContent).toContain('chat.memory_context_section_durable');
       expect(container.textContent).toContain('Fix websocket reconnect loop');
+      expect(container.textContent).toContain('chat.memory_context_section_recent');
+      expect(container.textContent).toContain('Recent MCP startup injection work');
     });
   });
 
