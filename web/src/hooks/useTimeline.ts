@@ -1222,6 +1222,15 @@ export function useTimeline(
 
     // 3. IndexedDB cache → daemon history (first load for this session in this page session)
     if (localSnapshot.length === 0) setLoading(true);
+    // Active session ("the open window") loads IDB immediately. Inactive
+    // useTimeline instances (SubSessionCard previews in the bar, hidden
+    // SubSessionWindow tabs, etc.) defer to `requestIdleCallback` so they
+    // don't compete with the active session for IDB readwrite transactions
+    // and main-thread time. Without this gate, N SubSessionCards × IDB
+    // open + getLastSeqAndEpoch + getRecentEvents run in parallel on cold
+    // start and steal the active session's first-paint budget — exactly
+    // the "prioritize the open window first" behavior the user asked for.
+    let idbLoadCancel: (() => void) | null = null;
     const load = async () => {
       const db = sharedDb;
       if (!db) return;
@@ -1274,8 +1283,32 @@ export function useTimeline(
         }
       }
     };
-    load().catch(() => {});
-    return () => { cancelled = true; };
+    if (isActiveSession) {
+      // Active session: race straight to IDB so the open window paints with
+      // full local history ASAP.
+      load().catch(() => {});
+    } else {
+      // Inactive: schedule via requestIdleCallback (with a setTimeout
+      // fallback for Safari < 16.4 and jsdom). 500ms timeout caps how long
+      // we'll wait — if the browser stays busy that long, run anyway so
+      // background cards eventually populate.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ric: ((cb: () => void, opts?: { timeout?: number }) => number) | undefined =
+        (globalThis as any).requestIdleCallback;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const cic: ((handle: number) => void) | undefined = (globalThis as any).cancelIdleCallback;
+      if (typeof ric === 'function') {
+        const handle = ric(() => { if (!cancelled) load().catch(() => {}); }, { timeout: 500 });
+        idbLoadCancel = () => { if (typeof cic === 'function') cic(handle); };
+      } else {
+        const handle = setTimeout(() => { if (!cancelled) load().catch(() => {}); }, 50);
+        idbLoadCancel = () => clearTimeout(handle);
+      }
+    }
+    return () => {
+      cancelled = true;
+      idbLoadCancel?.();
+    };
   }, [buildForwardHistoryArgs, cacheKey, clearForwardHistoryTimeout, clearHttpBackfillTimer, disableHistory, isActiveSession, sendForwardHistoryRequest, sessionId, ws, wsConnected]);
 
   // Map of commandId → optimistic eventId for O(1) lookup on command.ack / dedup.
