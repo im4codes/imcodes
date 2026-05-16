@@ -1,26 +1,20 @@
 import type { CronSendAction } from '../../shared/cron-types.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import { buildMemoryMcpSourceProvenance, type MemoryMcpSourceProvenance } from '../../shared/memory-mcp-provenance.js';
-import {
-  MCP_FEATURE_FLAGS_BY_NAME,
-  isMcpFeatureEnabled,
-  type MCPFeatureFlag,
-  type MCPFeatureFlagValues,
-} from '../../shared/memory-mcp-feature-flags.js';
+import type { MCPFeatureFlagValues } from '../../shared/memory-mcp-feature-flags.js';
 import { validateMcpCronAction } from './cron-action-validator.js';
 
 const CRON_EXPIRES_AT_MAX_MS = 90 * 24 * 60 * 60 * 1000;
 const CRON_LIST_LIMIT_MAX = 100;
 const DEFAULT_TIMEOUT_MS = 15_000;
 
-export interface CronServerCredentials {
+export interface CronServerEndpoint {
   serverId: string;
-  token: string;
   workerUrl: string;
 }
 
 export interface CronMcpClientOptions {
-  credentials?: CronServerCredentials | null;
+  endpoint?: CronServerEndpoint | null;
   fetchImpl?: typeof fetch;
   featureFlags?: MCPFeatureFlagValues;
   nowMs?: () => number;
@@ -69,28 +63,22 @@ export interface CronListInput {
 }
 
 export type CronMcpFailure =
-  | { status: 'disabled'; reason: typeof MCP_ERROR_REASONS.FEATURE_DISABLED; disabledFlag: MCPFeatureFlag }
-  | { status: 'error'; reason: MCPErrorReason; message: string };
+  { status: 'error'; reason: MCPErrorReason; message: string };
 
 export type CronMcpResult<T> = ({ status: 'ok' } & T) | CronMcpFailure;
 
-async function loadBoundCredentials(): Promise<CronServerCredentials | null> {
+async function loadBoundEndpoint(): Promise<CronServerEndpoint | null> {
   try {
     const { loadCredentials } = await import('../bind/bind-flow.js');
     const creds = await loadCredentials();
     if (!creds) return null;
     return {
       serverId: creds.serverId,
-      token: creds.token,
       workerUrl: creds.workerUrl,
     };
   } catch {
     return null;
   }
-}
-
-function disabled(disabledFlag: MCPFeatureFlag): CronMcpFailure {
-  return { status: 'disabled', reason: MCP_ERROR_REASONS.FEATURE_DISABLED, disabledFlag };
 }
 
 function error(reason: MCPErrorReason, message: string): CronMcpFailure {
@@ -114,25 +102,20 @@ function cleanRuntimeServerId(serverId: string | null | undefined): string | nul
   return typeof serverId === 'string' && serverId.trim() ? serverId.trim() : null;
 }
 
-function cronUrl(credentials: CronServerCredentials, runtimeServerId: string, suffix = ''): string {
-  return `${cleanBaseUrl(credentials.workerUrl)}/api/server/${encodeURIComponent(runtimeServerId)}/cron${suffix}`;
+function cronUrl(endpoint: CronServerEndpoint, runtimeServerId: string, suffix = ''): string {
+  return `${cleanBaseUrl(endpoint.workerUrl)}/api/server/${encodeURIComponent(runtimeServerId)}/cron${suffix}`;
 }
 
-async function getCredentials(
+async function getEndpoint(
   options: CronMcpClientOptions,
-): Promise<{ credentials: CronServerCredentials; runtimeServerId: string } | CronMcpFailure> {
-  const runtimeServerId = cleanRuntimeServerId(options.runtimeServerId);
-  if (!runtimeServerId) {
-    return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'Cron MCP requires runtime-bound server identity');
+): Promise<{ endpoint: CronServerEndpoint; runtimeServerId: string } | CronMcpFailure> {
+  const endpoint = options.endpoint !== undefined ? options.endpoint : await loadBoundEndpoint();
+  if (!endpoint?.serverId || !endpoint.workerUrl) {
+    return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'Cron MCP requires a local daemon cron endpoint');
   }
-  const credentials = options.credentials !== undefined ? options.credentials : await loadBoundCredentials();
-  if (!credentials?.serverId || !credentials.token || !credentials.workerUrl) {
-    return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'Cron MCP requires bound server credentials');
-  }
-  if (credentials.serverId !== runtimeServerId) {
-    return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'Cron MCP runtime server identity does not match bound credentials');
-  }
-  return { credentials, runtimeServerId };
+  const runtimeServerId = cleanRuntimeServerId(options.runtimeServerId) ?? cleanRuntimeServerId(endpoint.serverId);
+  if (!runtimeServerId) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'Cron MCP requires local server identity');
+  return { endpoint, runtimeServerId };
 }
 
 function validateExpiresAt(expiresAt: number | null | undefined, nowMs: number): CronMcpFailure | null {
@@ -167,7 +150,7 @@ function responseMessage(body: unknown, fallback: string): string {
 }
 
 async function requestCron(
-  credentials: CronServerCredentials,
+  endpoint: CronServerEndpoint,
   runtimeServerId: string,
   pathSuffix: string,
   init: RequestInit,
@@ -177,10 +160,9 @@ async function requestCron(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   try {
-    const res = await fetchImpl(cronUrl(credentials, runtimeServerId, pathSuffix), {
+    const res = await fetchImpl(cronUrl(endpoint, runtimeServerId, pathSuffix), {
       ...init,
       headers: {
-        Authorization: `Bearer ${credentials.token}`,
         'X-Server-Id': runtimeServerId,
         'Content-Type': 'application/json',
         ...init.headers,
@@ -230,9 +212,6 @@ export async function cronMcpCreate(
   input: CronCreateInput,
   options: CronMcpClientOptions = {},
 ): Promise<CronMcpResult<{ body: unknown }>> {
-  if (!isMcpFeatureEnabled(options.featureFlags, MCP_FEATURE_FLAGS_BY_NAME.cronWrite)) {
-    return disabled(MCP_FEATURE_FLAGS_BY_NAME.cronWrite);
-  }
   const actionResult = validateMcpCronAction(input.action, buildMemoryMcpSourceProvenance({
     sourceSessionName: input.sourceSessionName,
     sourceProjectName: input.sourceProjectName,
@@ -241,9 +220,9 @@ export async function cronMcpCreate(
   if (!actionResult.ok) return error(actionResult.reason, actionResult.message);
   const expiresError = validateExpiresAt(input.expiresAt, (options.nowMs ?? Date.now)());
   if (expiresError) return expiresError;
-  const identity = await getCredentials(options);
+  const identity = await getEndpoint(options);
   if ('status' in identity) return identity;
-  return requestCron(identity.credentials, identity.runtimeServerId, '', {
+  return requestCron(identity.endpoint, identity.runtimeServerId, '', {
     method: 'POST',
     body: JSON.stringify(buildCreateBody(input, identity.runtimeServerId, actionResult.action)),
   }, options);
@@ -253,9 +232,6 @@ export async function cronMcpUpdate(
   input: CronUpdateInput,
   options: CronMcpClientOptions = {},
 ): Promise<CronMcpResult<{ body: unknown }>> {
-  if (!isMcpFeatureEnabled(options.featureFlags, MCP_FEATURE_FLAGS_BY_NAME.cronWrite)) {
-    return disabled(MCP_FEATURE_FLAGS_BY_NAME.cronWrite);
-  }
   let action: CronSendAction | undefined;
   if (input.action !== undefined) {
     const actionResult = validateMcpCronAction(input.action, buildMemoryMcpSourceProvenance({
@@ -268,9 +244,9 @@ export async function cronMcpUpdate(
   }
   const expiresError = validateExpiresAt(input.expiresAt, (options.nowMs ?? Date.now)());
   if (expiresError) return expiresError;
-  const identity = await getCredentials(options);
+  const identity = await getEndpoint(options);
   if ('status' in identity) return identity;
-  return requestCron(identity.credentials, identity.runtimeServerId, `/${encodeURIComponent(input.id)}`, {
+  return requestCron(identity.endpoint, identity.runtimeServerId, `/${encodeURIComponent(input.id)}`, {
     method: 'PUT',
     body: JSON.stringify(buildUpdateBody(input, action)),
   }, options);
@@ -280,27 +256,21 @@ export async function cronMcpDelete(
   id: string,
   options: CronMcpClientOptions = {},
 ): Promise<CronMcpResult<{ body: unknown }>> {
-  if (!isMcpFeatureEnabled(options.featureFlags, MCP_FEATURE_FLAGS_BY_NAME.cronWrite)) {
-    return disabled(MCP_FEATURE_FLAGS_BY_NAME.cronWrite);
-  }
-  const identity = await getCredentials(options);
+  const identity = await getEndpoint(options);
   if ('status' in identity) return identity;
-  return requestCron(identity.credentials, identity.runtimeServerId, `/${encodeURIComponent(id)}`, { method: 'DELETE' }, options);
+  return requestCron(identity.endpoint, identity.runtimeServerId, `/${encodeURIComponent(id)}`, { method: 'DELETE' }, options);
 }
 
 export async function cronMcpList(
   input: CronListInput = {},
   options: CronMcpClientOptions = {},
 ): Promise<CronMcpResult<{ body: unknown; limit: number }>> {
-  if (!isMcpFeatureEnabled(options.featureFlags, MCP_FEATURE_FLAGS_BY_NAME.cronRead)) {
-    return disabled(MCP_FEATURE_FLAGS_BY_NAME.cronRead);
-  }
-  const identity = await getCredentials(options);
+  const identity = await getEndpoint(options);
   if ('status' in identity) return identity;
   const limit = clampListLimit(input.limit);
   const params = new URLSearchParams({ limit: String(limit) });
   if (input.projectName) params.set('projectName', input.projectName);
-  const result = await requestCron(identity.credentials, identity.runtimeServerId, `?${params.toString()}`, { method: 'GET' }, options);
+  const result = await requestCron(identity.endpoint, identity.runtimeServerId, `?${params.toString()}`, { method: 'GET' }, options);
   if (result.status !== 'ok') return result;
   return { status: 'ok', body: result.body, limit };
 }

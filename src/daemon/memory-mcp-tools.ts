@@ -141,10 +141,6 @@ function memorySurfaceGate(deps: MemoryMcpToolDeps, extra: Record<string, unknow
   return isMcpMemorySurfaceEnabled(deps) ? null : disabled(MEMORY_MCP_DISABLED_FLAGS.MEMORY_SURFACE, extra);
 }
 
-function cronGate(deps: MemoryMcpToolDeps, flag: typeof MCP_FEATURE_FLAGS_BY_NAME.cronRead | typeof MCP_FEATURE_FLAGS_BY_NAME.cronWrite): ToolResult | null {
-  return isMcpFeatureEnabled(deps.featureFlags, flag) ? null : disabled(flag);
-}
-
 function compactSearchHit(item: ReturnType<typeof chatSearchFts>[number]) {
   return {
     id: item.id,
@@ -185,10 +181,10 @@ function cronOptionsForCaller(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps)
   const runtimeServerId = typeof caller.serverId === 'string' && caller.serverId.trim()
     ? caller.serverId.trim()
     : undefined;
-  if (!runtimeServerId) {
-    return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'cron tools require a runtime-bound server identity');
-  }
-  return { ...deps.cronOptions, featureFlags: deps.featureFlags, runtimeServerId };
+  return {
+    ...deps.cronOptions,
+    ...(runtimeServerId ? { runtimeServerId } : {}),
+  };
 }
 
 export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
@@ -247,8 +243,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         limit: numberArg(args, 'limit'),
       }, {
         ...deps.sendDeps,
-        isDispatchEnabled: () => isMcpFeatureEnabled(deps.featureFlags, MCP_FEATURE_FLAGS_BY_NAME.sendDispatch)
-          && (deps.sendDeps?.isDispatchEnabled?.() ?? true),
+        isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
       }) as unknown as ToolResult;
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
@@ -262,14 +257,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         idempotencyKey: stringArg(args, 'idempotencyKey'),
       }, {
         ...deps.sendDeps,
-        isDispatchEnabled: () => isMcpFeatureEnabled(deps.featureFlags, MCP_FEATURE_FLAGS_BY_NAME.sendDispatch)
-          && (deps.sendDeps?.isDispatchEnabled?.() ?? true),
+        isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
         exactTargetOnly: true,
       }) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: async (input) => {
-      const gate = cronGate(deps, MCP_FEATURE_FLAGS_BY_NAME.cronWrite);
-      if (gate) return gate;
       const args = pickAllowedMcpArgs(input, ['name', 'cronExpr', 'projectName', 'targetRole', 'targetSessionName', 'action', 'timezone', 'expiresAt']);
       const expiresAt = parseExpiresAt(args.expiresAt);
       if (Number.isNaN(expiresAt)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'expiresAt must be a timestamp or ISO string');
@@ -293,8 +285,6 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }, cronOptions) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.CRON_LIST]: async (input) => {
-      const gate = cronGate(deps, MCP_FEATURE_FLAGS_BY_NAME.cronRead);
-      if (gate) return gate;
       const args = pickAllowedMcpArgs(input, ['projectName', 'limit']);
       const projectName = resolveCronProjectName(caller, deps, args, MEMORY_MCP_TOOL_NAMES.CRON_LIST);
       if (typeof projectName !== 'string') return projectName;
@@ -306,8 +296,6 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }, cronOptions) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE]: async (input) => {
-      const gate = cronGate(deps, MCP_FEATURE_FLAGS_BY_NAME.cronWrite);
-      if (gate) return gate;
       const args = pickAllowedMcpArgs(input, ['id', 'name', 'cronExpr', 'projectName', 'targetRole', 'targetSessionName', 'action', 'timezone', 'expiresAt']);
       const id = stringArg(args, 'id');
       if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
@@ -334,8 +322,6 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }, cronOptions) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.CRON_DELETE]: async (input) => {
-      const gate = cronGate(deps, MCP_FEATURE_FLAGS_BY_NAME.cronWrite);
-      if (gate) return gate;
       const args = pickAllowedMcpArgs(input, ['id']);
       const id = stringArg(args, 'id');
       if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');

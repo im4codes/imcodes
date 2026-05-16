@@ -3,7 +3,7 @@ import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
 import { deriveMemoryToolCaller, parseMcpRuntimeCallerFromEnv } from '../../src/daemon/memory-mcp-caller.js';
 
 describe('MCP runtime caller env parsing', () => {
-  it('parses required identity and represents absent optional fields as null', () => {
+  it('parses provided identity and represents absent optional fields as null', () => {
     const caller = parseMcpRuntimeCallerFromEnv({
       [MEMORY_MCP_ENV_KEYS.USER_ID]: 'user-1',
       [MEMORY_MCP_ENV_KEYS.NAMESPACE]: JSON.stringify({ scope: 'personal', userId: 'user-1', projectId: 'repo' }),
@@ -19,6 +19,19 @@ describe('MCP runtime caller env parsing', () => {
     });
     expect(Object.isFrozen(caller)).toBe(true);
     expect(deriveMemoryToolCaller(caller)).toMatchObject({ userId: 'user-1' });
+  });
+
+  it('defaults to local daemon identity when env identity is absent', () => {
+    const caller = parseMcpRuntimeCallerFromEnv({});
+    expect(caller).toMatchObject({
+      userId: 'daemon-local',
+      namespace: { scope: 'user_private', userId: 'daemon-local' },
+      sessionName: null,
+      projectName: null,
+      projectRoot: null,
+      serverId: null,
+      transport: 'stdio',
+    });
   });
 
   it('derives exact runtime session provenance for memory writes', () => {
@@ -38,16 +51,15 @@ describe('MCP runtime caller env parsing', () => {
     });
   });
 
-  it('fails fast for missing env, invalid namespace, or mismatched identity', () => {
-    expect(() => parseMcpRuntimeCallerFromEnv({})).toThrow('IMCODES_DAEMON_{USER_ID,NAMESPACE} required');
+  it('fails fast for invalid namespace or unsafe session name', () => {
     expect(() => parseMcpRuntimeCallerFromEnv({
       [MEMORY_MCP_ENV_KEYS.USER_ID]: 'user-1',
       [MEMORY_MCP_ENV_KEYS.NAMESPACE]: '{not-json',
     })).toThrow('must be valid JSON');
-    expect(() => parseMcpRuntimeCallerFromEnv({
+    expect(parseMcpRuntimeCallerFromEnv({
       [MEMORY_MCP_ENV_KEYS.USER_ID]: 'user-1',
       [MEMORY_MCP_ENV_KEYS.NAMESPACE]: JSON.stringify({ scope: 'personal', userId: 'user-2', projectId: 'repo' }),
-    })).toThrow('does not match namespace user');
+    })).toMatchObject({ userId: 'user-2' });
     expect(() => parseMcpRuntimeCallerFromEnv({
       [MEMORY_MCP_ENV_KEYS.USER_ID]: 'user-1',
       [MEMORY_MCP_ENV_KEYS.NAMESPACE]: JSON.stringify({ scope: 'personal', userId: 'user-1', projectId: 'repo' }),

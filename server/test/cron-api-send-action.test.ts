@@ -43,6 +43,9 @@ function makeMockDb() {
         const job = cronJobs.get(params[0] as string);
         return job && job.user_id === params[1] ? job as T : null;
       }
+      if (s.includes('from servers where id')) {
+        return { user_id: 'user-1' } as T;
+      }
       return null;
     },
     query: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T[]> => {
@@ -161,7 +164,36 @@ describe('cron API structured send actions', () => {
     });
   });
 
-  it('preserves source provenance for daemon server-token pod-sticky cron requests', async () => {
+  it('preserves source provenance for no-auth daemon pod-sticky cron requests', async () => {
+    const res = await app.request('/api/server/srv-1/cron', jsonReq('POST', {
+      name: 'Send reminder',
+      cronExpr: '0 9 * * *',
+      serverId: 'srv-forged',
+      projectName: 'proj',
+      targetRole: 'brain',
+      action: {
+        type: 'send',
+        target: 'w1',
+        message: 'please review this',
+        [MEMORY_MCP_SOURCE_FIELDS.SOURCE_SESSION_NAME]: 'deck_sub_scheduler',
+        [MEMORY_MCP_SOURCE_FIELDS.SOURCE_PROJECT_NAME]: 'proj',
+        [MEMORY_MCP_SOURCE_FIELDS.SOURCE_SERVER_ID]: 'srv-1',
+      },
+    }));
+
+    expect(res.status).toBe(201);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.action).toMatchObject({
+      type: 'send',
+      target: 'w1',
+      message: 'please review this',
+      sourceSessionName: 'deck_sub_scheduler',
+      sourceProjectName: 'proj',
+      sourceServerId: 'srv-1',
+    });
+  });
+
+  it('still preserves source provenance for legacy daemon server-token pod-sticky cron requests', async () => {
     const res = await app.request('/api/server/srv-1/cron', jsonReq('POST', {
       name: 'Send reminder',
       cronExpr: '0 9 * * *',
@@ -184,9 +216,6 @@ describe('cron API structured send actions', () => {
     expect(res.status).toBe(201);
     const body = await res.json() as Record<string, unknown>;
     expect(body.action).toMatchObject({
-      type: 'send',
-      target: 'w1',
-      message: 'please review this',
       sourceSessionName: 'deck_sub_scheduler',
       sourceProjectName: 'proj',
       sourceServerId: 'srv-1',

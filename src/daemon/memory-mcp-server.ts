@@ -10,7 +10,6 @@ import { registerMemoryMcpTools, type MemoryMcpToolDeps } from './memory-mcp-too
 
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
-  skipBoundUserCheck?: boolean;
   toolDeps?: MemoryMcpToolDeps;
 }
 

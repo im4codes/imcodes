@@ -2,7 +2,7 @@ import type { ContextNamespace } from '../../shared/context-types.js';
 import { MEMORY_MCP_ENV_KEYS, type MemoryMcpEnvSource } from '../../shared/memory-mcp-env.js';
 import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
 import { isValidImcodesSessionName } from '../../shared/session-scope.js';
-import { createMemoryToolCaller, getBoundMemoryToolUserId, type MemoryToolCaller } from '../context/memory-read-tools.js';
+import { createMemoryToolCaller, type MemoryToolCaller } from '../context/memory-read-tools.js';
 
 export type MemoryMcpTransport = 'stdio' | 'in_process';
 
@@ -23,7 +23,7 @@ export class MemoryMcpCallerEnvError extends Error {
   }
 }
 
-const REQUIRED_ENV_ERROR = '[memory-mcp] fail-fast: IMCODES_DAEMON_{USER_ID,NAMESPACE} required';
+const DAEMON_LOCAL_MEMORY_USER_ID = 'daemon-local';
 
 function optionalString(value: string | undefined): string | null {
   const trimmed = value?.trim();
@@ -67,19 +67,23 @@ function parseNamespace(raw: string): ContextNamespace {
   return namespace;
 }
 
+function localNamespace(userId = DAEMON_LOCAL_MEMORY_USER_ID): ContextNamespace {
+  return { scope: 'user_private', userId };
+}
+
+function runtimeUserId(rawUserId: string | null, namespace: ContextNamespace): string {
+  const namespaceUserId = optionalString(namespace.userId);
+  return namespaceUserId ?? rawUserId ?? DAEMON_LOCAL_MEMORY_USER_ID;
+}
+
 export function parseMcpRuntimeCallerFromEnv(
   env: MemoryMcpEnvSource = process.env,
   transport: MemoryMcpTransport = 'stdio',
 ): McpRuntimeCaller {
-  const userId = optionalString(env[MEMORY_MCP_ENV_KEYS.USER_ID]);
   const namespaceJson = optionalString(env[MEMORY_MCP_ENV_KEYS.NAMESPACE]);
-  if (!userId || !namespaceJson) {
-    throw new MemoryMcpCallerEnvError(REQUIRED_ENV_ERROR);
-  }
-  const namespace = parseNamespace(namespaceJson);
-  if (namespace.userId && namespace.userId !== userId) {
-    throw new MemoryMcpCallerEnvError('[memory-mcp] fail-fast: runtime user does not match namespace user');
-  }
+  const envUserId = optionalString(env[MEMORY_MCP_ENV_KEYS.USER_ID]);
+  const namespace = namespaceJson ? parseNamespace(namespaceJson) : localNamespace(envUserId ?? undefined);
+  const userId = runtimeUserId(envUserId, namespace);
   const sessionName = optionalString(env[MEMORY_MCP_ENV_KEYS.SESSION_NAME]);
   if (sessionName && !isValidImcodesSessionName(sessionName)) {
     throw new MemoryMcpCallerEnvError('[memory-mcp] fail-fast: IMCODES_DAEMON_SESSION_NAME is invalid');
@@ -93,16 +97,6 @@ export function parseMcpRuntimeCallerFromEnv(
     serverId: optionalString(env[MEMORY_MCP_ENV_KEYS.SERVER_ID]),
     transport,
   });
-}
-
-export function assertMcpRuntimeBoundUser(caller: McpRuntimeCaller): void {
-  const boundUserId = getBoundMemoryToolUserId();
-  if (!boundUserId) {
-    throw new MemoryMcpCallerEnvError('[memory-mcp] fail-fast: raw memory tools require a bound IM.codes user');
-  }
-  if (boundUserId !== caller.userId) {
-    throw new MemoryMcpCallerEnvError('[memory-mcp] fail-fast: runtime user does not match bound IM.codes user');
-  }
 }
 
 export function deriveMemoryToolCaller(caller: McpRuntimeCaller): MemoryToolCaller {

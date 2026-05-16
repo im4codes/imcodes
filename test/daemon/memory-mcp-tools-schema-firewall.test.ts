@@ -80,7 +80,7 @@ describe('memory MCP tool schema firewall', () => {
     expect(savePreference).not.toHaveBeenCalled();
   });
 
-  it('short-circuits optional MCP kill switches before send and cron backends', async () => {
+  it('does not treat local send and cron MCP feature flags as auth gates', async () => {
     const listSessions = vi.fn(() => []);
     const cronList = vi.fn(async () => ({ status: 'ok', body: {}, limit: 10 }));
     const handlers = createMemoryMcpToolHandlers(caller(), {
@@ -94,15 +94,15 @@ describe('memory MCP tool schema firewall', () => {
     });
 
     expect(await handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({})).toMatchObject({
-      status: 'disabled',
-      disabledFlag: MCP_FEATURE_FLAGS_BY_NAME.sendDispatch,
+      status: 'ok',
+      items: [],
     });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_LIST]({})).resolves.toMatchObject({
-      status: 'disabled',
-      disabledFlag: MCP_FEATURE_FLAGS_BY_NAME.cronRead,
+      status: 'ok',
+      limit: 10,
     });
-    expect(listSessions).not.toHaveBeenCalled();
-    expect(cronList).not.toHaveBeenCalled();
+    expect(listSessions).toHaveBeenCalled();
+    expect(cronList).toHaveBeenCalled();
   });
 
   it('does not forward forged cron identity fields to the cron client', async () => {
@@ -267,15 +267,15 @@ describe('memory MCP tool schema firewall', () => {
     expect(getMemorySources).toHaveBeenCalled();
   });
 
-  it('rejects cron calls without runtime server identity or outside the caller project before the cron client', async () => {
+  it('allows cron calls without runtime server identity but rejects outside the caller project before the cron client', async () => {
     const cronList = vi.fn(async () => ({ status: 'ok', body: {}, limit: 10 }));
     const noServerHandlers = createMemoryMcpToolHandlers(caller({ serverId: null }), {
       cronList,
       isMemoryFeatureEnabled: () => true,
     });
     await expect(noServerHandlers[MEMORY_MCP_TOOL_NAMES.CRON_LIST]({})).resolves.toMatchObject({
-      status: 'error',
-      reason: 'identity_rejected',
+      status: 'ok',
+      limit: 10,
     });
 
     const scopedHandlers = createMemoryMcpToolHandlers(caller(), {
@@ -286,7 +286,8 @@ describe('memory MCP tool schema firewall', () => {
       status: 'error',
       reason: 'scope_forbidden',
     });
-    expect(cronList).not.toHaveBeenCalled();
+    expect(cronList).toHaveBeenCalledTimes(1);
+    expect(cronList.mock.calls[0][1]).not.toHaveProperty('runtimeServerId');
   });
 
   it('does not accept legacy cron schedule wrappers or unused cursor arguments', async () => {

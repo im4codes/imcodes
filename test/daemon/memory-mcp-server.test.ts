@@ -12,8 +12,8 @@ import { createMemoryMcpServerFromEnv } from '../../src/daemon/memory-mcp-server
 const namespace = { scope: 'user_private', userId: 'user-1', projectId: 'repo-1' };
 
 describe('memory MCP stdio server', () => {
-  it('fails fast for missing env and invalid namespace', async () => {
-    expect(() => createMemoryMcpServerFromEnv({ env: {} })).toThrow('IMCODES_DAEMON_{USER_ID,NAMESPACE} required');
+  it('starts with local defaults when env identity is absent and rejects invalid namespace', async () => {
+    expect(createMemoryMcpServerFromEnv({ env: {} }).isConnected()).toBe(false);
     expect(() => createMemoryMcpServerFromEnv({
       env: {
         [MEMORY_MCP_ENV_KEYS.USER_ID]: 'user-1',
@@ -82,5 +82,27 @@ describe('memory MCP stdio server', () => {
     }
 
     expect(readFileSync(serverConfigPath, 'utf8')).not.toContain('userId');
+  });
+
+  it('lists tools over stdio without identity env', async () => {
+    const client = new Client({ name: 'memory-mcp-local-default-test', version: '0.1.0' });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', 'tsx', 'src/index.ts', 'memory', 'mcp'],
+      cwd: process.cwd(),
+      env: {
+        PATH: process.env.PATH ?? '',
+        HOME: process.env.HOME ?? '',
+      },
+      stderr: 'pipe',
+    });
+
+    try {
+      await client.connect(transport);
+      const listed = await client.listTools();
+      expect(listed.tools.map((tool) => tool.name)).toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
+    } finally {
+      await client.close();
+    }
   });
 });

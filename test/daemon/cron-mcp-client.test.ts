@@ -6,17 +6,15 @@ import {
   cronMcpUpdate,
 } from '../../src/daemon/cron-mcp-client.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
-import { MCP_FEATURE_FLAGS_BY_NAME } from '../../shared/memory-mcp-feature-flags.js';
 
-const credentials = {
+const endpoint = {
   serverId: 'srv-bound',
-  token: 'tok-bound',
   workerUrl: 'https://worker.test/',
 };
 
 const boundIdentity = {
-  credentials,
-  runtimeServerId: credentials.serverId,
+  endpoint,
+  runtimeServerId: endpoint.serverId,
 };
 
 function okJson(body: unknown): Response {
@@ -42,7 +40,7 @@ describe('cron MCP client', () => {
     vi.clearAllMocks();
   });
 
-  it('uses pod-sticky /api/server/:serverId/cron and strips forged identity fields', async () => {
+  it('uses pod-sticky /api/server/:serverId/cron without auth headers and strips forged identity fields', async () => {
     const fetchImpl = vi.fn(async () => okJson({ id: 'job-1' }));
 
     const result = await cronMcpCreate(makeCreateInput({
@@ -57,10 +55,8 @@ describe('cron MCP client', () => {
     const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('https://worker.test/api/server/srv-bound/cron');
     expect(url).not.toContain('/api/cron');
-    expect(init.headers).toMatchObject({
-      Authorization: 'Bearer tok-bound',
-      'X-Server-Id': 'srv-bound',
-    });
+    expect(init.headers).toMatchObject({ 'X-Server-Id': 'srv-bound' });
+    expect(init.headers).not.toHaveProperty('Authorization');
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
     expect(body.serverId).toBe('srv-bound');
     expect(body.userId).toBeUndefined();
@@ -147,34 +143,7 @@ describe('cron MCP client', () => {
     expect(url).not.toContain('/api/cron');
   });
 
-  it('short-circuits disabled read and write flags before HTTP', async () => {
-    const fetchImpl = vi.fn();
-
-    const read = await cronMcpList({}, {
-      ...boundIdentity,
-      fetchImpl,
-      featureFlags: { [MCP_FEATURE_FLAGS_BY_NAME.cronRead]: false },
-    });
-    const write = await cronMcpCreate(makeCreateInput(), {
-      ...boundIdentity,
-      fetchImpl,
-      featureFlags: { [MCP_FEATURE_FLAGS_BY_NAME.cronWrite]: false },
-    });
-
-    expect(read).toEqual({
-      status: 'disabled',
-      reason: MCP_ERROR_REASONS.FEATURE_DISABLED,
-      disabledFlag: MCP_FEATURE_FLAGS_BY_NAME.cronRead,
-    });
-    expect(write).toEqual({
-      status: 'disabled',
-      reason: MCP_ERROR_REASONS.FEATURE_DISABLED,
-      disabledFlag: MCP_FEATURE_FLAGS_BY_NAME.cronWrite,
-    });
-    expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
-  it('uses bound server credentials for update and delete routes', async () => {
+  it('uses the local daemon endpoint for update and delete routes', async () => {
     const fetchImpl = vi.fn(async () => okJson({ ok: true }));
 
     await cronMcpUpdate({
@@ -228,10 +197,10 @@ describe('cron MCP client', () => {
     expect(JSON.stringify(body.action)).not.toContain('srv-forged');
   });
 
-  it('requires bound server credentials', async () => {
+  it('requires a local daemon cron endpoint', async () => {
     const fetchImpl = vi.fn();
 
-    const result = await cronMcpList({}, { credentials: null, runtimeServerId: credentials.serverId, fetchImpl });
+    const result = await cronMcpList({}, { endpoint: null, runtimeServerId: endpoint.serverId, fetchImpl });
 
     expect(result).toMatchObject({
       status: 'error',
@@ -240,22 +209,39 @@ describe('cron MCP client', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('rejects missing or mismatched runtime server identity before HTTP', async () => {
-    const fetchImpl = vi.fn();
+  it('uses the local daemon endpoint without requiring a runtime-bound identity match', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ jobs: [] }));
 
-    await expect(cronMcpList({}, { credentials, fetchImpl })).resolves.toMatchObject({
-      status: 'error',
-      reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+    await expect(cronMcpList({}, { endpoint, fetchImpl })).resolves.toMatchObject({
+      status: 'ok',
+      limit: 100,
     });
     await expect(cronMcpList({}, {
-      credentials,
-      runtimeServerId: 'srv-other',
+      endpoint,
+      runtimeServerId: 'srv-runtime',
       fetchImpl,
     })).resolves.toMatchObject({
-      status: 'error',
-      reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+      status: 'ok',
+      limit: 100,
     });
-    expect(fetchImpl).not.toHaveBeenCalled();
+
+    expect((fetchImpl.mock.calls[0] as [string, RequestInit])[0]).toBe('https://worker.test/api/server/srv-bound/cron?limit=100');
+    expect((fetchImpl.mock.calls[1] as [string, RequestInit])[0]).toBe('https://worker.test/api/server/srv-runtime/cron?limit=100');
+    expect((fetchImpl.mock.calls[1] as [string, RequestInit])[1].headers).toMatchObject({ 'X-Server-Id': 'srv-runtime' });
+    expect((fetchImpl.mock.calls[1] as [string, RequestInit])[1].headers).not.toHaveProperty('Authorization');
+  });
+
+  it('does not require or forward a token from the local endpoint config', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ jobs: [] }));
+
+    await expect(cronMcpList({}, {
+      endpoint: { serverId: 'srv-local', workerUrl: 'http://127.0.0.1:19138' },
+      fetchImpl,
+    })).resolves.toMatchObject({ status: 'ok' });
+
+    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(init.headers).toMatchObject({ 'X-Server-Id': 'srv-local' });
+    expect(init.headers).not.toHaveProperty('Authorization');
   });
 
   it('sanitizes HTTP and thrown errors', async () => {

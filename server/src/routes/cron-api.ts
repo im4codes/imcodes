@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import type { Context, Next } from 'hono';
 import { Cron } from 'croner';
 import { z } from 'zod';
 import type { Env } from '../env.js';
@@ -11,7 +12,9 @@ import { MEMORY_MCP_SOURCE_FIELDS, stripMemoryMcpSourceProvenance } from '../../
 import { P2P_MODE_KEYS } from '../../../shared/p2p-modes.js';
 import { dispatchJobNow } from '../cron/job-dispatch.js';
 
-export const cronApiRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
+type CronRouteEnv = { Bindings: Env; Variables: { userId: string; role: string; cronDaemonLocal?: boolean } };
+
+export const cronApiRoutes = new Hono<CronRouteEnv>();
 
 const MIN_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -103,6 +106,37 @@ function isDaemonServerTokenCronRequest(
     && !cookieHeader;
 }
 
+function isLocalDaemonCronRequest(c: Context<CronRouteEnv>): boolean {
+  return c.get('cronDaemonLocal') === true;
+}
+
+function isDaemonCronRequest(
+  c: Context<CronRouteEnv>,
+  routeServerId: string | null,
+): boolean {
+  return isLocalDaemonCronRequest(c) || isDaemonServerTokenCronRequest(c, routeServerId);
+}
+
+function requireCronAuth() {
+  return async (c: Context<CronRouteEnv>, next: Next): Promise<Response | void> => {
+    const routeServerId = getPodStickyServerId(c);
+    const hasAuthLikeHeader = Boolean(c.req.header('Authorization') || c.req.header('Cookie'));
+    if (routeServerId && !hasAuthLikeHeader) {
+      const server = await c.env.DB.queryOne<{ user_id: string }>(
+        'SELECT user_id FROM servers WHERE id = $1',
+        [routeServerId],
+      );
+      if (!server) return c.json({ error: 'not_found' }, 404);
+      c.set('userId', server.user_id);
+      c.set('role', 'owner');
+      c.set('cronDaemonLocal', true);
+      await next();
+      return;
+    }
+    return requireAuth()(c as unknown as Context<{ Bindings: Env }>, next);
+  };
+}
+
 function normalizeCronActionForPersistence<T extends z.infer<typeof cronActionSchema>>(
   action: T,
   daemonAttested: boolean,
@@ -129,7 +163,7 @@ function validateCronExpr(cronExpr: string, timezone?: string): { nextRunAt: num
 }
 
 // GET /api/cron — list user's cron jobs, optionally filtered by server/project
-cronApiRoutes.get('/', requireAuth(), async (c) => {
+cronApiRoutes.get('/', requireCronAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const routeServerId = getPodStickyServerId(c);
   const serverId = routeServerId ?? c.req.query('serverId') ?? null;
@@ -151,7 +185,7 @@ cronApiRoutes.get('/', requireAuth(), async (c) => {
 });
 
 // POST /api/cron — create a cron job
-cronApiRoutes.post('/', requireAuth(), async (c) => {
+cronApiRoutes.post('/', requireCronAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const routeServerId = getPodStickyServerId(c);
   const body = await c.req.json().catch(() => null);
@@ -159,7 +193,7 @@ cronApiRoutes.post('/', requireAuth(), async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body', issues: parsed.error.issues }, 400);
 
   const { name, cronExpr, serverId, projectName, targetRole, targetSessionName, action, timezone, expiresAt } = parsed.data;
-  const persistedAction = normalizeCronActionForPersistence(action, isDaemonServerTokenCronRequest(c, routeServerId));
+  const persistedAction = normalizeCronActionForPersistence(action, isDaemonCronRequest(c, routeServerId));
 
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
@@ -184,7 +218,7 @@ cronApiRoutes.post('/', requireAuth(), async (c) => {
 });
 
 // PUT /api/cron/:id — update a cron job
-cronApiRoutes.put('/:id', requireAuth(), async (c) => {
+cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
@@ -229,7 +263,7 @@ cronApiRoutes.put('/:id', requireAuth(), async (c) => {
   if (updates.targetSessionName !== undefined) { sets.push(`target_session_name = $${idx++}`); vals.push(updates.targetSessionName); }
   if (updates.action !== undefined) {
     sets.push(`action = $${idx++}`);
-    vals.push(JSON.stringify(normalizeCronActionForPersistence(updates.action, isDaemonServerTokenCronRequest(c, routeServerId))));
+    vals.push(JSON.stringify(normalizeCronActionForPersistence(updates.action, isDaemonCronRequest(c, routeServerId))));
   }
   if (updates.timezone !== undefined) { sets.push(`timezone = $${idx++}`); vals.push(updates.timezone); }
   if (updates.expiresAt !== undefined) { sets.push(`expires_at = $${idx++}`); vals.push(updates.expiresAt); }
@@ -251,7 +285,7 @@ cronApiRoutes.put('/:id', requireAuth(), async (c) => {
 });
 
 // PATCH /api/cron/:id/status — pause/resume (only active ↔ paused)
-cronApiRoutes.patch('/:id/status', requireAuth(), async (c) => {
+cronApiRoutes.patch('/:id/status', requireCronAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
@@ -285,7 +319,7 @@ cronApiRoutes.patch('/:id/status', requireAuth(), async (c) => {
 });
 
 // DELETE /api/cron/:id — delete a cron job
-cronApiRoutes.delete('/:id', requireAuth(), async (c) => {
+cronApiRoutes.delete('/:id', requireCronAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
@@ -307,7 +341,7 @@ cronApiRoutes.delete('/:id', requireAuth(), async (c) => {
 });
 
 // POST /api/cron/:id/trigger — immediately dispatch a cron job
-cronApiRoutes.post('/:id/trigger', requireAuth(), async (c) => {
+cronApiRoutes.post('/:id/trigger', requireCronAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
@@ -335,7 +369,7 @@ cronApiRoutes.post('/:id/trigger', requireAuth(), async (c) => {
 
 // GET /api/cron/executions — cross-job execution list
 // mode=latest: most recent execution per job; mode=all: all executions sorted by time
-cronApiRoutes.get('/executions', requireAuth(), async (c) => {
+cronApiRoutes.get('/executions', requireCronAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const mode = c.req.query('mode') || 'all';
   const routeServerId = getPodStickyServerId(c);
@@ -375,7 +409,7 @@ cronApiRoutes.get('/executions', requireAuth(), async (c) => {
 });
 
 // GET /api/cron/:id/executions — execution history for a cron job
-cronApiRoutes.get('/:id/executions', requireAuth(), async (c) => {
+cronApiRoutes.get('/:id/executions', requireCronAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');

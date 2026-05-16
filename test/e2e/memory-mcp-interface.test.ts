@@ -206,9 +206,8 @@ describe('memory MCP interface e2e', () => {
         dispatchMessage,
       },
       cronOptions: {
-        credentials: {
+        endpoint: {
           serverId: SERVER_ID,
-          token: 'bound-server-token',
           workerUrl: 'https://worker.invalid/root/',
         },
         fetchImpl,
@@ -281,10 +280,8 @@ describe('memory MCP interface e2e', () => {
     });
     expect(cronCreated).toMatchObject({ status: 'ok' });
     expect(fetches.at(-1)?.url).toBe(`https://worker.invalid/root/api/server/${SERVER_ID}/cron`);
-    expect(fetches.at(-1)?.init.headers).toMatchObject({
-      Authorization: 'Bearer bound-server-token',
-      'X-Server-Id': SERVER_ID,
-    });
+    expect(fetches.at(-1)?.init.headers).toMatchObject({ 'X-Server-Id': SERVER_ID });
+    expect(fetches.at(-1)?.init.headers).not.toHaveProperty('Authorization');
     expect(fetches.at(-1)?.body).toMatchObject({
       serverId: SERVER_ID,
       projectName: PROJECT_NAME,
