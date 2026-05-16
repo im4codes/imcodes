@@ -67,8 +67,13 @@ describe('sendJpush', () => {
             title: 'Title',
             alert: 'Body text',
             extras: { k: 'v' },
-            priority: 2,
-            category: 'msg',
+            // High priority (1), NOT max (2) — IM.codes is a developer tool,
+            // not an IM client; max priority is reserved for chat by vendors.
+            priority: 1,
+            // CATEGORY_SERVICE — matches "agent finished task" semantics. NOT
+            // 'msg' (CATEGORY_MESSAGE), which would require IM-class
+            // qualification at every vendor channel.
+            category: 'service',
           },
         },
         options: { time_to_live: 86400 },

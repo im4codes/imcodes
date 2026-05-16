@@ -388,10 +388,17 @@ export async function sendJpush(
         alert: payload.body,
         title: payload.title,
         extras: payload.data ?? {},
-        // priority 2 = high; required for IM-class messages to bypass doze
-        priority: 2,
-        // category 'msg' aligns with vendor channel IM category (Huawei / Xiaomi)
-        category: 'msg',
+        // priority 1 (high) — developer-tool notifications should arrive
+        // promptly but are not life-critical. Value 2 (max) is reserved by
+        // most vendors for IM-class and triggers stricter quota checks.
+        priority: 1,
+        // Maps to Android Notification.CATEGORY_SERVICE — matches what this
+        // app actually emits ("AI agent finished a task", "session needs
+        // your attention"). NOT 'msg' / CATEGORY_MESSAGE: that's the IM
+        // chat category, which requires IM-class qualification at every
+        // vendor (Huawei / Xiaomi / OPPO / vivo) and would be rejected on
+        // review for a developer tool.
+        category: 'service',
         ...(payload.badge != null
           ? { badge_set_num: payload.badge, badge_class: 'com.im.codes.MainActivity' }
           : {}),
