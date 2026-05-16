@@ -104,6 +104,68 @@ describe('useTimeline global cache bounds', () => {
     expect(screen.getByTestId('window').textContent).toBe('3');
   });
 
+  it('seeds events synchronously from the memory cache on first paint (no blank flash)', () => {
+    // Regression test for "本地缓存还是没有立即显示" — useTimeline used to
+    // initialise `events` to `[]` and only fill it from cache in a useEffect
+    // that runs AFTER the first paint, so a fresh mount painted a blank pane
+    // before flashing the cached messages in. Seeding from memCache in the
+    // useState initialiser closes that gap.
+    __setTimelineCacheForTests('srv:deck_sub_seeded', makeEvents('deck_sub_seeded', 7));
+
+    function Probe() {
+      const { events, loading } = useTimeline('deck_sub_seeded', null, 'srv');
+      return h(
+        'div',
+        {
+          'data-testid': 'probe',
+          'data-loading': String(loading),
+        },
+        String(events.length),
+      );
+    }
+
+    render(h(Probe));
+
+    // FIRST PAINT must already show the cached events, NOT 0.
+    const probe = screen.getByTestId('probe');
+    expect(probe.textContent).toBe('7');
+    // Loading flag must start false when the seed had data (so consumers
+    // that gate on `loading` don't show a spinner over the just-painted
+    // content).
+    expect(probe.getAttribute('data-loading')).toBe('false');
+  });
+
+  it('seeds events synchronously from the localStorage tail snapshot on first paint', () => {
+    // Sibling of the memCache seed test, covering the cold-process case:
+    // after a full page refresh memCache is empty (module-scope) so the
+    // synchronous seed has to fall back to the localStorage tail. Without
+    // this path the user sees a blank pane between paint #1 and the
+    // bootstrap effect's first setEvents.
+    const events = makeEvents('deck_sub_persisted', 4);
+    localStorage.setItem(
+      'rcc_timeline_snapshot:srv:deck_sub_persisted',
+      JSON.stringify(events),
+    );
+
+    function Probe() {
+      const { events: seen, loading } = useTimeline('deck_sub_persisted', null, 'srv');
+      return h(
+        'div',
+        {
+          'data-testid': 'probe',
+          'data-loading': String(loading),
+        },
+        String(seen.length),
+      );
+    }
+
+    render(h(Probe));
+
+    const probe = screen.getByTestId('probe');
+    expect(probe.textContent).toBe('4');
+    expect(probe.getAttribute('data-loading')).toBe('false');
+  });
+
   it('stays idle for shell/script sessions with history disabled', async () => {
     const sessionName = `deck_shell_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;

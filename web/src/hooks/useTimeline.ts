@@ -614,11 +614,16 @@ export function createIdleHistoryStatus(): TimelineHistoryStatus {
   };
 }
 
-function createBootstrapHistoryStatus(opts: { canDaemon: boolean; canHttp: boolean }): TimelineHistoryStatus {
+function createBootstrapHistoryStatus(opts: {
+  canDaemon: boolean;
+  canHttp: boolean;
+  /** True when mount-time seed already populated `events`; flips `cache` to 'done'. */
+  cacheSeeded?: boolean;
+}): TimelineHistoryStatus {
   return {
     phase: 'bootstrap',
     steps: {
-      cache: 'running',
+      cache: opts.cacheSeeded ? 'done' : 'running',
       textTail: 'skipped',
       daemon: opts.canDaemon ? 'pending' : 'skipped',
       http: opts.canHttp ? 'pending' : 'skipped',
@@ -899,15 +904,48 @@ export function useTimeline(
   const wsConnected = !!ws?.connected;
   const cacheKeyRef = useRef(cacheKey);
   cacheKeyRef.current = cacheKey;
-  const [events, setEvents] = useState<TimelineEvent[]>([]);
+  // ── Synchronous cache seed at first render ─────────────────────────────
+  // The bootstrap effect that hits memCache / localStorage / IDB runs AFTER
+  // the first paint, so a fresh `useTimeline` mount paints with `events=[]`
+  // before the cache-hit `setEvents` lands. On mobile that "blank → flash
+  // of messages" gap was visible enough that the user reported the local
+  // cache as "not instant" even though it was hitting the snapshot.
+  //
+  // To collapse the gap we read the synchronous caches inside `useState`
+  // initializers — they run exactly once per mount, before the first
+  // render commits, so the first paint already shows whatever the memCache
+  // (module-level) or the localStorage tail holds. Async sources (IDB,
+  // daemon WS) are still surfaced by the bootstrap effect.
+  const [events, setEvents] = useState<TimelineEvent[]>(() => {
+    if (!cacheKey) return [];
+    const memCached = getCachedEvents(cacheKey);
+    if (memCached && memCached.length > 0) return memCached;
+    const persisted = loadPersistedTimelineSnapshot(cacheKey);
+    return persisted.length > 0 ? persisted : [];
+  });
   const eventsRef = useRef(events);
   eventsRef.current = events;
   const [hasOlderHistory, setHasOlderHistory] = useState(true);
-  const [loading, setLoading] = useState(true);
+  // Loading starts false when we already have a synchronous cache hit at
+  // mount — otherwise the first paint shows messages but ChatView still
+  // reads `loading=true` from the prop and would briefly render the spinner
+  // over the freshly-seeded content. Start true only when we have nothing.
+  const [loading, setLoading] = useState(() => events.length === 0);
   const [refreshing, setRefreshing] = useState(false);
   const [httpRefreshing, setHttpRefreshing] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
-  const [historyStatus, setHistoryStatus] = useState<TimelineHistoryStatus>(() => createIdleHistoryStatus());
+  // History status also reflects the synchronous seed: if cache had data,
+  // mark the `cache` step done up front so the bootstrap overlay doesn't
+  // briefly show "本地缓存…" alongside the just-painted messages.
+  const [historyStatus, setHistoryStatus] = useState<TimelineHistoryStatus>(() => (
+    events.length > 0
+      ? createBootstrapHistoryStatus({
+          canDaemon: !!ws?.connected,
+          canHttp: false,
+          cacheSeeded: true,
+        })
+      : createIdleHistoryStatus()
+  ));
   const loadingOlderRef = useRef(false); // Synchronous guard against duplicate pagination requests
   const httpBackfillInFlightRef = useRef(0);
   const httpBackfillTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1060,9 +1098,13 @@ export function useTimeline(
 
     setRefreshing(false);
     setHttpRefreshing(false);
+    // If the synchronous mount-time seed already populated `events`, mark
+    // the cache step done immediately so the bootstrap overlay never flashes
+    // "本地缓存…" alongside the just-painted messages.
     setHistoryStatus(createBootstrapHistoryStatus({
       canDaemon: wsConnected,
       canHttp: false,
+      cacheSeeded: eventsRef.current.length > 0,
     }));
     httpBackfillInFlightRef.current = 0;
     clearHttpBackfillTimer();
