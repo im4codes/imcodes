@@ -717,7 +717,7 @@ describe('WsBridge', () => {
 
     it('drops oversized payload', async () => {
       const { daemonWs, browserWs } = await setupBridge();
-      browserWs.emit('message', JSON.stringify({ type: 'session.send', text: 'x'.repeat(70000) }));
+      browserWs.emit('message', JSON.stringify({ type: 'session.send', text: 'x'.repeat(TIMELINE_PAYLOAD_BUDGET_BYTES.CHAT_HISTORY_TRACE_HARD_LIMIT + 1) }));
       expect(daemonWs.sent).toHaveLength(0);
     });
 

@@ -7,11 +7,12 @@
 import { appendFile, mkdir, open } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import logger from '../util/logger.js';
 
 const TRANSPORT_DIR = join(homedir(), '.imcodes', 'transport');
 const MAX_REPLAY_LINES = 200;
-export const TRANSPORT_HISTORY_REPLAY_BUDGET_BYTES = 128 * 1024;
+export const TRANSPORT_HISTORY_REPLAY_BUDGET_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.CHAT_HISTORY_TRACE_HARD_LIMIT;
 /**
  * Reverse-read chunk size for the tail-N-lines scan. Small enough to
  * short-circuit on sessions with tiny messages, large enough to cover a

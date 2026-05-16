@@ -3974,11 +3974,7 @@ function timelineHistoryResponseTypeForRequest(cmd: Record<string, unknown>): ty
 
 function resolveTimelineHistoryBudgetBytes(cmd: Record<string, unknown>): number {
   const requested = optionalFiniteNumber(cmd.budgetBytes);
-  const explicit = cmd.type === TIMELINE_MESSAGES.PAGE_REQUEST
-    || (requested !== undefined && requested > TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE);
-  const cap = explicit
-    ? TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL
-    : TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
+  const cap = TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL;
   if (requested === undefined || requested <= 0) return cap;
   return Math.max(64 * 1024, Math.min(Math.trunc(requested), cap));
 }
@@ -4013,10 +4009,9 @@ function timelineWireBudgetForMessage(message: Record<string, unknown>): number 
   switch (message.type) {
     case TIMELINE_MESSAGES.PAGE:
     case TIMELINE_MESSAGES.DETAIL:
-      return TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL;
     case TIMELINE_MESSAGES.HISTORY:
     case TIMELINE_MESSAGES.REPLAY:
-      return TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
+      return TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL;
     default:
       return undefined;
   }

@@ -174,7 +174,7 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
       limit: 25,
       afterTs: 100,
       beforeTs: 200,
-      maxResponseBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
+      maxResponseBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL,
       contentTypes: expect.arrayContaining(['user.message', 'assistant.text', 'tool.result']),
       stateTypes: ['session.state'],
     }), expect.objectContaining({ deadlineAt: expect.any(Number) }));
@@ -197,7 +197,7 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     }));
   });
 
-  it('keeps timeline.history under the default envelope when includeDetails is requested without an explicit larger budget', async () => {
+  it('uses the full page/detail budget for timeline.history even without an explicit larger budget', async () => {
     shouldUseHistoryWorkerMock.mockReturnValue(true);
     getSessionMock.mockReturnValue({ name: 'deck_worker', agentType: 'codex' });
     historyWorkerDispatchMock.mockResolvedValue({
@@ -221,7 +221,7 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     await flushAsync();
 
     expect(historyWorkerDispatchMock).toHaveBeenCalledWith(expect.objectContaining({
-      maxResponseBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
+      maxResponseBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL,
     }), expect.objectContaining({ deadlineAt: expect.any(Number) }));
   });
 

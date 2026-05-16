@@ -146,7 +146,7 @@ import {
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
-const MAX_BROWSER_PAYLOAD = 65536; // 64KB (subsession.rebuild_all can include many sessions)
+const MAX_BROWSER_PAYLOAD = TIMELINE_PAYLOAD_BUDGET_BYTES.CHAT_HISTORY_TRACE_HARD_LIMIT;
 const MAX_PENDING_MEMORY_MANAGEMENT_REQUESTS_PER_SOCKET = 32;
 // Desktop with pinned panels + many sessions can fire 60+ subscribe/repo/repo
 // detect / fs.git_status / chat.subscribe / ping messages on initial connect.

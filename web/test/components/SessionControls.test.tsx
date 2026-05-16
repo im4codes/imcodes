@@ -3305,8 +3305,7 @@ afterEach(() => {
     expect(uploadFileMock).not.toHaveBeenCalled();
   });
 
-  it('converts oversized plain-text paste into an attachment upload', async () => {
-    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/pasted-text.txt' } });
+  it('keeps large plain-text paste inline and sends it as text', async () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -3326,23 +3325,14 @@ afterEach(() => {
       },
     });
 
-    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
-    const uploadedFile = uploadFileMock.mock.calls[0]?.[1] as File;
-    expect(uploadedFile).toBeInstanceOf(File);
-    expect(uploadedFile.name).toMatch(/^pasted-text-.*\.txt$/);
-    expect(await readBlobText(uploadedFile)).toBe(longText);
-    expect(execCommandMock).not.toHaveBeenCalled();
-    expect(input.textContent).toBe('');
-    await waitFor(() => {
-      expect(document.querySelector('.attachment-badge-name')?.textContent).toMatch(/^pasted-text-.*\.txt$/);
-    });
+    expect(execCommandMock).toHaveBeenCalledWith('insertText', false, longText);
+    expect(input.textContent).toBe(longText);
+    expect(uploadFileMock).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
-    // R3 v2 PR-ρ/υ — attachment text-prefix keeps the short tag and
-    // maps it to the full daemon path so the LLM can open the file.
     expectSendPayload(ws, {
       sessionName: 'my-session',
-      text: '#1:(/tmp/pasted-text.txt)',
+      text: longText,
     });
   });
 
@@ -3489,14 +3479,16 @@ afterEach(() => {
     );
 
     const input = screen.getByRole('textbox') as HTMLDivElement;
+    const file = new File(['persisted'], 'persisted.txt', { type: 'text/plain' });
     fireEvent.paste(input, {
       clipboardData: {
-        getData: (type: string) => type === 'text/plain' ? 'x'.repeat(1300) : '',
+        files: [file],
+        getData: () => '',
       },
     });
 
     await waitFor(() => {
-      expect(document.querySelector('.attachment-badge-name')?.textContent).toMatch(/^pasted-text-.*\.txt$/);
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('persisted.txt');
     });
     const badgeName = document.querySelector('.attachment-badge-name')?.textContent ?? '';
 
@@ -3539,14 +3531,16 @@ afterEach(() => {
     );
 
     const input = screen.getByRole('textbox') as HTMLDivElement;
+    const file = new File(['persisted-sub'], 'persisted-sub.txt', { type: 'text/plain' });
     fireEvent.paste(input, {
       clipboardData: {
-        getData: (type: string) => type === 'text/plain' ? 'x'.repeat(1300) : '',
+        files: [file],
+        getData: () => '',
       },
     });
 
     await waitFor(() => {
-      expect(document.querySelector('.attachment-badge-name')?.textContent).toMatch(/^pasted-text-.*\.txt$/);
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('persisted-sub.txt');
     });
     const badgeName = document.querySelector('.attachment-badge-name')?.textContent ?? '';
 
@@ -3591,14 +3585,16 @@ afterEach(() => {
     );
 
     const input = within(first.container).getByRole('textbox') as HTMLDivElement;
+    const file = new File(['shared-sub'], 'shared-sub.txt', { type: 'text/plain' });
     fireEvent.paste(input, {
       clipboardData: {
-        getData: (type: string) => type === 'text/plain' ? 'x'.repeat(1300) : '',
+        files: [file],
+        getData: () => '',
       },
     });
 
     await waitFor(() => {
-      expect(first.container.querySelector('.attachment-badge-name')?.textContent).toMatch(/^pasted-text-.*\.txt$/);
+      expect(first.container.querySelector('.attachment-badge-name')?.textContent).toBe('shared-sub.txt');
     });
     const badgeName = first.container.querySelector('.attachment-badge-name')?.textContent ?? '';
 
@@ -3618,7 +3614,7 @@ afterEach(() => {
     expect(first.container.querySelector('.attachment-badge-name')?.textContent).toBe(badgeName);
   });
 
-  it('blocks oversized plain-text paste when upload context is unavailable', async () => {
+  it('keeps large plain-text paste inline when upload context is unavailable', async () => {
     render(
       <SessionControls
         ws={makeWs() as any}
@@ -3636,9 +3632,10 @@ afterEach(() => {
     });
 
     expect(uploadFileMock).not.toHaveBeenCalled();
-    expect(execCommandMock).not.toHaveBeenCalled();
-    expect(input.textContent).toBe('');
-    expect(await screen.findByText('Paste is too large for inline input here. Upload it as a file instead.')).toBeDefined();
+    const text = 'y'.repeat(13000);
+    expect(execCommandMock).toHaveBeenCalledWith('insertText', false, text);
+    expect(input.textContent).toBe(text);
+    expect(screen.queryByText('Paste is too large for inline input here. Upload it as a file instead.')).toBeNull();
   });
 
   it('uses the shared 2GB upload limit for user-facing size calculations', () => {
