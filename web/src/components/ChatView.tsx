@@ -21,6 +21,7 @@ import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/use
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
 import { splitTextByHttpUrls } from '../link-detection.js';
 import { domNodeToPlainText, selectionToPlainText } from '../util/dom-to-text.js';
+import { selectionSignature } from '../util/selection-signature.js';
 import { ZoomedTextDialog } from './ZoomedTextDialog.js';
 
 interface Props {
@@ -1263,18 +1264,24 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // Desktop: show selection popup menu when text is selected within the chat view
   useEffect(() => {
     if (isTouchDevice) return; // mobile uses long-press instead
+    let lastSelectionSignature = '';
     const onSelChange = () => {
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed || !sel.rangeCount) {
+        lastSelectionSignature = '';
         setSelMenu(null);
         return;
       }
+      const signature = selectionSignature(sel);
+      if (signature && signature === lastSelectionSignature) return;
       const range = sel.getRangeAt(0);
       const container = scrollRef.current;
       if (!container || !container.contains(range.commonAncestorContainer)) {
+        lastSelectionSignature = '';
         setSelMenu(null);
         return;
       }
+      lastSelectionSignature = signature;
       // Use our DOM-walker rather than `sel.toString()` so that the captured
       // text preserves paragraph/list/code-block boundaries. Browsers disagree
       // on what `Selection.toString()` does at block boundaries (Safari often
