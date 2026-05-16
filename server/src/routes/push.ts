@@ -3,8 +3,13 @@
  * POST /api/push/register — register device token
  * Dispatch: send push on session events (idle, notification, ask, error)
  *
- * iOS: APNs HTTP/2 with JWT auth
- * Android: FCM legacy HTTP API
+ * iOS:                APNs HTTP/2 with JWT auth
+ * Android (海外):     FCM legacy HTTP API
+ * Android (国内):     JPush v3 REST API (aggregates Huawei / Xiaomi / OPPO / vivo / Honor vendor channels)
+ *
+ * Push credentials live ONLY on the central server (app.im.codes). Self-hosted
+ * servers detect "I have no push credentials configured" and relay everything
+ * via POST /api/push/relay back to the central server.
  */
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
@@ -12,6 +17,13 @@ import type { Database } from '../db/client.js';
 import { requireAuth } from '../security/authorization.js';
 import { SignJWT, importPKCS8 } from 'jose';
 import logger from '../util/logger.js';
+import {
+  PUSH_PLATFORM_IOS,
+  PUSH_PLATFORM_ANDROID_FCM,
+  PUSH_PLATFORM_ANDROID_JPUSH,
+  isPushPlatform,
+  type PushPlatform,
+} from '../../../shared/push-notifications.js';
 
 export const pushRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -22,8 +34,11 @@ pushRoutes.use('/unregister', requireAuth());
 // POST /api/push/register — store device token for user
 pushRoutes.post('/register', async (c) => {
   const userId = c.get('userId' as never) as string;
-  const body = await c.req.json<{ token: string; platform: 'ios' | 'android' }>().catch(() => null);
+  const body = await c.req.json<{ token: string; platform: PushPlatform }>().catch(() => null);
   if (!body?.token || !body?.platform) return c.json({ error: 'token and platform required' }, 400);
+  if (!isPushPlatform(body.platform)) {
+    return c.json({ error: `unsupported platform: ${body.platform}` }, 400);
+  }
 
   try {
     await c.env.DB.execute(
@@ -75,20 +90,29 @@ pushRoutes.post('/relay', async (c) => {
     return c.json({ error: 'token, platform, title, body required' }, 400);
   }
 
-  // Only relay if this server has APNs configured
-  if (!c.env.APNS_KEY || !c.env.APNS_KEY_ID || !c.env.APNS_TEAM_ID) {
+  // This server can serve relay if it has any push credential configured.
+  // (Used to require APNs only; relaxed when JPush was added so a relay
+  // server that holds only China credentials could still serve android-jpush.)
+  const hasApns = !!(c.env.APNS_KEY && c.env.APNS_KEY_ID && c.env.APNS_TEAM_ID);
+  const hasFcm = !!c.env.FCM_SERVER_KEY;
+  const hasJpush = !!(c.env.JPUSH_APP_KEY && c.env.JPUSH_MASTER_SECRET);
+  if (!hasApns && !hasFcm && !hasJpush) {
     return c.json({ error: 'push relay not available on this server' }, 503);
   }
 
   try {
-    if (body.platform === 'ios') {
-      await sendApns(body.token, { userId: '', title: body.title, body: body.body, badge: body.badge, data: body.data }, c.env);
+    const relayPayload: PushPayload = { userId: '', title: body.title, body: body.body, badge: body.badge, data: body.data };
+    if (body.platform === PUSH_PLATFORM_IOS && hasApns) {
+      await sendApns(body.token, relayPayload, c.env);
       return c.json({ ok: true });
-    } else if (body.platform === 'android' && c.env.FCM_SERVER_KEY) {
-      await sendFcm(body.token, { userId: '', title: body.title, body: body.body, data: body.data }, c.env.FCM_SERVER_KEY);
+    } else if (body.platform === PUSH_PLATFORM_ANDROID_FCM && hasFcm) {
+      await sendFcm(body.token, relayPayload, c.env.FCM_SERVER_KEY!);
+      return c.json({ ok: true });
+    } else if (body.platform === PUSH_PLATFORM_ANDROID_JPUSH && hasJpush) {
+      await sendJpush(body.token, relayPayload, c.env.JPUSH_APP_KEY!, c.env.JPUSH_MASTER_SECRET!);
       return c.json({ ok: true });
     }
-    return c.json({ error: 'unsupported platform' }, 400);
+    return c.json({ error: `unsupported platform or credential missing: ${body.platform}` }, 400);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const unregistered = err instanceof PushError && err.unregistered;
@@ -155,17 +179,25 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
   payload.badge = badgeCount;
 
   const hasApns = !!(env.APNS_KEY && env.APNS_KEY_ID && env.APNS_TEAM_ID);
-  const relayUrl = hasApns ? null : (env.PUSH_RELAY_URL || 'https://app.im.codes');
+  const hasFcm = !!env.FCM_SERVER_KEY;
+  const hasJpush = !!(env.JPUSH_APP_KEY && env.JPUSH_MASTER_SECRET);
+  // Self-hosted server detection: no push credentials of any kind configured
+  // → this is a self-hosted instance, relay everything through the central
+  // server (app.im.codes by default) which holds all credentials.
+  const isSelfHosted = !hasApns && !hasFcm && !hasJpush;
+  const relayUrl = isSelfHosted ? (env.PUSH_RELAY_URL || 'https://app.im.codes') : null;
 
   for (const { token, platform } of tokens) {
     try {
       if (relayUrl) {
         // Self-hosted: relay through central server
         await relayPush(relayUrl, token, platform, payload);
-      } else if (platform === 'ios' && hasApns) {
+      } else if (platform === PUSH_PLATFORM_IOS && hasApns) {
         await sendApns(token, payload, env);
-      } else if (platform === 'android' && env.FCM_SERVER_KEY) {
-        await sendFcm(token, payload, env.FCM_SERVER_KEY);
+      } else if (platform === PUSH_PLATFORM_ANDROID_FCM && hasFcm) {
+        await sendFcm(token, payload, env.FCM_SERVER_KEY!);
+      } else if (platform === PUSH_PLATFORM_ANDROID_JPUSH && hasJpush) {
+        await sendJpush(token, payload, env.JPUSH_APP_KEY!, env.JPUSH_MASTER_SECRET!);
       }
     } catch (err) {
       logger.warn({ token: token.slice(0, 10) + '...', platform, err: err instanceof Error ? err.message : err }, 'Push dispatch failed');
@@ -320,5 +352,76 @@ async function sendFcm(deviceToken: string, payload: PushPayload, serverKey: str
     const errBody = await res.text().catch(() => '');
     const unregistered = errBody.includes('NotRegistered');
     throw new PushError(`FCM ${res.status}: ${errBody}`, unregistered);
+  }
+}
+
+// ── JPush (极光推送, China Android) ───────────────────────────────────────────
+//
+// API doc: https://docs.jiguang.cn/jpush/server/push/rest_api_v3_push
+//
+// `registrationId` is the JPush RegistrationID returned by the JPush SDK on
+// device init — opaque to us, just stored as push_tokens.token.
+//
+// Error codes that indicate the device is gone (we should delete the token):
+//   1003  invalid registration_id format
+//   1011  no valid users / registration_id targets
+//   1020  registration_id does not exist
+// See: https://docs.jiguang.cn/jpush/server/push/server_error_code
+
+export const JPUSH_API_URL = 'https://api.jpush.cn/v3/push';
+
+/** JPush error codes that mean the token is dead and should be unregistered. */
+const JPUSH_UNREGISTERED_CODES: ReadonlySet<number> = new Set([1003, 1011, 1020]);
+
+export async function sendJpush(
+  registrationId: string,
+  payload: PushPayload,
+  appKey: string,
+  masterSecret: string,
+): Promise<void> {
+  const auth = Buffer.from(`${appKey}:${masterSecret}`).toString('base64');
+  const requestBody = {
+    platform: ['android'],
+    audience: { registration_id: [registrationId] },
+    notification: {
+      android: {
+        alert: payload.body,
+        title: payload.title,
+        extras: payload.data ?? {},
+        // priority 2 = high; required for IM-class messages to bypass doze
+        priority: 2,
+        // category 'msg' aligns with vendor channel IM category (Huawei / Xiaomi)
+        category: 'msg',
+        ...(payload.badge != null
+          ? { badge_set_num: payload.badge, badge_class: 'com.im.codes.MainActivity' }
+          : {}),
+      },
+    },
+    options: {
+      // 24h retention if device offline; matches FCM / APNs defaults
+      time_to_live: 86400,
+    },
+  };
+
+  const res = await fetch(JPUSH_API_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${auth}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(requestBody),
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => '');
+    // JPush returns `{"error":{"code":1011,"message":"..."}}` on failure.
+    let code: number | null = null;
+    try {
+      const parsed = JSON.parse(errBody) as { error?: { code?: number } };
+      if (typeof parsed?.error?.code === 'number') code = parsed.error.code;
+    } catch { /* not JSON */ }
+    const unregistered = code !== null && JPUSH_UNREGISTERED_CODES.has(code);
+    throw new PushError(`JPush ${res.status} (code=${code ?? '?'}): ${errBody}`, unregistered);
   }
 }

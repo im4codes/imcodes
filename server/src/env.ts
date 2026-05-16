@@ -57,8 +57,14 @@ export interface EnvConfig {
   /** APNs bundle ID (e.g. app.imcodes) */
   APNS_BUNDLE_ID?: string;
 
-  // FCM push notifications (Android)
+  // FCM push notifications (Android, 海外)
   FCM_SERVER_KEY?: string;
+
+  // 极光推送 JPush (Android, 国内 — aggregates Huawei/Xiaomi/OPPO/vivo/Honor vendor channels)
+  /** JPush AppKey (from https://www.jiguang.cn console, also embedded in china flavor APK) */
+  JPUSH_APP_KEY?: string;
+  /** JPush Master Secret (server-only; used for Basic auth to JPush REST API). MUST NOT be exposed in any client build. */
+  JPUSH_MASTER_SECRET?: string;
 
   // Push relay for self-hosted servers without APNs keys (default: https://app.im.codes)
   PUSH_RELAY_URL?: string;
@@ -111,6 +117,8 @@ export function loadEnv(): EnvConfig {
     APNS_TEAM_ID: process.env.APNS_TEAM_ID,
     APNS_BUNDLE_ID: process.env.APNS_BUNDLE_ID ?? 'app.imcodes',
     FCM_SERVER_KEY: process.env.FCM_SERVER_KEY,
+    JPUSH_APP_KEY: process.env.JPUSH_APP_KEY,
+    JPUSH_MASTER_SECRET: process.env.JPUSH_MASTER_SECRET,
     PUSH_RELAY_URL: process.env.PUSH_RELAY_URL,
     DEFAULT_ADMIN_PASSWORD: process.env.DEFAULT_ADMIN_PASSWORD,
     LANDING_HOST: process.env.LANDING_HOST,
