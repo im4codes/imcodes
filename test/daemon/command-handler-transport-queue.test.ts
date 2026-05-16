@@ -13,7 +13,6 @@ import {
   MEMORY_MCP_PROVIDER_ID,
   MEMORY_MCP_PROVIDER_IDS,
   MEMORY_MCP_PROVIDER_STATUS_REASON,
-  MEMORY_MCP_DEGRADED_REASON,
   MEMORY_MCP_STATUS,
   MEMORY_MCP_TOOL_FAMILY,
   MEMORY_WS,
@@ -3187,16 +3186,13 @@ describe('handleWebCommand transport queue behavior', () => {
     getProviderMock.mockImplementation((providerId: string) => ({
       id: providerId,
       getMemoryMcpStatus: () => {
-        if (providerId === MEMORY_MCP_PROVIDER_ID.QWEN) return {
-            providerId,
-            status: MEMORY_MCP_STATUS.DEGRADED,
-            connected: true,
-            degradedReasons: [MEMORY_MCP_PROVIDER_STATUS_REASON.MCP_REGISTRATION_FAILED],
-          };
         if (
           providerId === MEMORY_MCP_PROVIDER_ID.CLAUDE_CODE_SDK
+          || providerId === MEMORY_MCP_PROVIDER_ID.GEMINI_SDK
+          || providerId === MEMORY_MCP_PROVIDER_ID.COPILOT_SDK
           || providerId === MEMORY_MCP_PROVIDER_ID.CODEX_SDK
           || providerId === MEMORY_MCP_PROVIDER_ID.CURSOR_HEADLESS
+          || providerId === MEMORY_MCP_PROVIDER_ID.QWEN
         ) return {
           providerId,
           status: MEMORY_MCP_STATUS.READY,
@@ -3236,15 +3232,21 @@ describe('handleWebCommand transport queue behavior', () => {
       }),
       expect.objectContaining({
         providerId: MEMORY_MCP_PROVIDER_ID.COPILOT_SDK,
-        status: MEMORY_MCP_STATUS.DEGRADED,
+        status: MEMORY_MCP_STATUS.READY,
         connected: true,
-        degradedReasons: [MEMORY_MCP_DEGRADED_REASON.STATUS_NOT_REPORTED],
+        degradedReasons: [],
+      }),
+      expect.objectContaining({
+        providerId: MEMORY_MCP_PROVIDER_ID.GEMINI_SDK,
+        status: MEMORY_MCP_STATUS.READY,
+        connected: true,
+        degradedReasons: [],
       }),
       expect.objectContaining({
         providerId: MEMORY_MCP_PROVIDER_ID.QWEN,
-        status: MEMORY_MCP_STATUS.DEGRADED,
+        status: MEMORY_MCP_STATUS.READY,
         connected: true,
-        degradedReasons: [MEMORY_MCP_PROVIDER_STATUS_REASON.MCP_REGISTRATION_FAILED],
+        degradedReasons: [],
       }),
     ]));
 

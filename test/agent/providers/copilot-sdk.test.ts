@@ -4,6 +4,7 @@ import {
   copilotSdkRuntimeHooks,
 } from '../../../src/agent/providers/copilot-sdk.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../../shared/session-control-commands.js';
+import { MEMORY_MCP_STATUS } from '../../../shared/memory-ws.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 
 vi.mock('../../../src/util/logger.js', () => ({
@@ -120,6 +121,29 @@ describe('CopilotSdkProvider', () => {
   afterEach(async () => {
     copilotSdkRuntimeHooks.loadSdk = originalLoadSdk;
     vi.useRealTimers();
+  });
+
+  it('reports managed MCP ready after the SDK client connects', async () => {
+    const harness = createCopilotHarness();
+    const provider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: harness.FakeClient,
+    }) as typeof import('@github/copilot-sdk');
+
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      providerId: 'copilot-sdk',
+      status: MEMORY_MCP_STATUS.UNKNOWN,
+      connected: false,
+    });
+
+    await provider.connect({ binaryPath: 'copilot' });
+
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      providerId: 'copilot-sdk',
+      status: MEMORY_MCP_STATUS.READY,
+      connected: true,
+      degradedReasons: [],
+    });
   });
 
   it('bridges SDK permission requests into approval callbacks and resolves responses', async () => {

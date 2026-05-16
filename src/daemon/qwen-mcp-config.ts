@@ -107,8 +107,17 @@ function parseQwenMcpList(output: string): Map<string, QwenMcpListedServer> | nu
 
 function cleanTableLine(line: string): string {
   return line
+    .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '')
     .replace(/[│┃║╎╏]/g, ' ')
+    .replace(/^(?:[✓✔●○■□◆◇∙•*]\s*)+/, '')
     .replace(/^[\s|+─━\-┌┐└┘├┤┬┴┼]+|[\s|+─━\-┌┐└┘├┤┬┴┼]+$/g, '')
+    .trim();
+}
+
+function cleanCommandText(commandText: string): string {
+  return commandText
+    .replace(/\s+\((?:stdio|sse|http|streamable-http)\)\s*(?:[-–—]\s*(?:connected|disconnected|failed|unknown|error).*)?$/i, '')
+    .replace(/\s+[-–—]\s*(?:connected|disconnected|failed|unknown|error)\b.*$/i, '')
     .trim();
 }
 
@@ -120,14 +129,17 @@ function parseQwenMcpListText(output: string): Map<string, QwenMcpListedServer> 
     if (/^(name|server\s*name)\b/i.test(line) && /\b(command|commandorurl|args)\b/i.test(line)) continue;
     if (/^(server|name)\s*[:=]\s*$/i.test(line)) continue;
 
-    const knownName = line.match(/\b(imcodes-memory(?:-daemon)?)\b\s+(.+)$/);
+    const colonEntry = line.match(/^([A-Za-z0-9_.-]+)\s*:\s+(.+)$/);
+    const knownName = line.match(/\b(imcodes-memory(?:-daemon)?)\b\s*:?\s+(.+)$/);
     const parts = knownName
       ? [knownName[1], knownName[2]]
+      : colonEntry
+        ? [colonEntry[1], colonEntry[2]]
       : line.split(/\s{2,}|\t+/).filter(Boolean);
     if (parts.length < 2) continue;
 
     const name = parts[0]?.trim();
-    const commandText = parts.slice(1).join(' ').trim();
+    const commandText = cleanCommandText(parts.slice(1).join(' ').trim());
     if (!name || !commandText || /^command\b/i.test(commandText)) continue;
     const tokens = commandText.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token) => token.replace(/^['"]|['"]$/g, '')) ?? [];
     const command = tokens[0];

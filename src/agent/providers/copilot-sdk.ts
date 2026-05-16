@@ -22,6 +22,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import {
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
   isSessionControlCommandText,
@@ -342,6 +343,15 @@ export class CopilotSdkProvider implements TransportProvider {
       if (this.isProviderError(error)) throw error;
       throw this.normalizeConnectError(error);
     }
+  }
+
+  getMemoryMcpStatus(): MemoryMcpProviderStatusView {
+    return {
+      providerId: this.id,
+      status: this.config && this.client ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
+      connected: Boolean(this.config && this.client),
+      degradedReasons: [],
+    };
   }
 
   async disconnect(): Promise<void> {

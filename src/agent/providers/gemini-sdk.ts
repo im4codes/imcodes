@@ -90,6 +90,7 @@ import {
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
+import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import logger from '../../util/logger.js';
 import type { TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
@@ -200,6 +201,15 @@ export class GeminiSdkProvider implements TransportProvider {
     await this.startAcpServer(config);
     this.config = config;
     logger.info({ provider: this.id }, 'Gemini SDK provider connected via --acp');
+  }
+
+  getMemoryMcpStatus(): MemoryMcpProviderStatusView {
+    return {
+      providerId: this.id,
+      status: this.config && this.connection ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
+      connected: Boolean(this.config && this.connection),
+      degradedReasons: [],
+    };
   }
 
   async disconnect(): Promise<void> {

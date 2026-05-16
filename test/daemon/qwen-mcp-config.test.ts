@@ -141,4 +141,29 @@ describe('ensureQwenMcpHasImcodesEntry', () => {
     });
     expect(execFileImpl).toHaveBeenCalledTimes(1);
   });
+
+  it('parses connected qwen mcp list output with ANSI status markers', async () => {
+    const execFileImpl = vi.fn(async (_file: string, args: string[]) => {
+      if (args.join(' ') === 'mcp list') {
+        return {
+          stdout: 'Configured MCP servers:\n\u001b[32m✓\u001b[0m imcodes-memory: imcodes memory mcp (stdio) - Connected\n',
+          stderr: '',
+        };
+      }
+      throw new Error(`unexpected qwen args: ${args.join(' ')}`);
+    });
+
+    const result = await ensureQwenMcpHasImcodesEntry({
+      noticeMarkerPath: join(dir, 'notice'),
+      execFileImpl,
+    });
+
+    expect(result).toMatchObject({
+      serverName: IMCODES_MEMORY_MCP_SERVER_NAME,
+      changed: false,
+      degraded: false,
+      safeToAllow: true,
+    });
+    expect(execFileImpl).toHaveBeenCalledTimes(1);
+  });
 });
