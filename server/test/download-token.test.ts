@@ -1,5 +1,5 @@
 /**
- * Download token tests — verifies one-time token auth for file downloads.
+ * Download token tests — verifies native token auth for file downloads.
  * Uses in-memory mocks (no DB/daemon needed).
  */
 
@@ -86,7 +86,7 @@ describe('download-token', () => {
     expect(body).toBe('hello world');
   });
 
-  it('token is single-use (second request fails)', async () => {
+  it('token allows repeated same-resource requests for native download handoff', async () => {
     const tokenRes = await app.request(
       '/api/server/srv1/uploads/abc123/download-token',
       { method: 'POST', headers: { Authorization: 'Bearer test' } },
@@ -97,9 +97,25 @@ describe('download-token', () => {
     const res1 = await app.request(`/api/server/srv1/uploads/abc123/download?token=${token}`);
     expect(res1.status).toBe(200);
 
-    // Second use — token consumed
+    // Android download managers can re-request the same URL during handoff.
     const res2 = await app.request(`/api/server/srv1/uploads/abc123/download?token=${token}`);
-    expect(res2.status).toBe(401);
+    expect(res2.status).toBe(200);
+  });
+
+  it('token expires after its small same-resource use budget', async () => {
+    const tokenRes = await app.request(
+      '/api/server/srv1/uploads/abc123/download-token',
+      { method: 'POST', headers: { Authorization: 'Bearer test' } },
+    );
+    const { token } = await tokenRes.json() as { token: string };
+
+    for (let i = 0; i < 5; i++) {
+      const res = await app.request(`/api/server/srv1/uploads/abc123/download?token=${token}`);
+      expect(res.status).toBe(200);
+    }
+
+    const exhausted = await app.request(`/api/server/srv1/uploads/abc123/download?token=${token}`);
+    expect(exhausted.status).toBe(401);
   });
 
   it('expired token is rejected', async () => {
