@@ -166,6 +166,131 @@ describe('useTimeline global cache bounds', () => {
     expect(probe.getAttribute('data-loading')).toBe('false');
   });
 
+  it('inactive sessions still load IDB history after a short stagger (not just visible ones)', async () => {
+    // Regression for "很多聊天窗口都没加载历史消息，只加载了可视窗口的".
+    // Commit 90cd30ec gated path-3 IDB load behind `isActiveSession` and
+    // deferred inactive instances to `requestIdleCallback` with a 500ms
+    // fallback — and cancelled the pending handle on every effect cleanup.
+    // Under real-world dep churn (ws (re)connect, callback identity flips)
+    // the cancel-then-reschedule loop never resolved, so non-active
+    // chat windows showed empty history forever.
+    //
+    // This test mounts a useTimeline instance with isActiveSession=false,
+    // advances fake timers past the 80ms stagger, and asserts the IDB
+    // history actually surfaces.
+    vi.useFakeTimers();
+    const sessionName = `deck_inactive_load_${Date.now()}`;
+    const serverId = `srv-inactive-${Date.now()}`;
+    const stored: TimelineEvent[] = [{
+      eventId: `${sessionName}-stored-1`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'inactive history is loaded too' },
+    }];
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue(stored);
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, null, serverId, {
+        // Crucial: inactive, like a SubSessionCard / hidden tab.
+        isActiveSession: false,
+      });
+      return h(
+        'div',
+        { 'data-testid': 'inactive-probe' },
+        events.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    render(h(Probe));
+    // Sanity: synchronous render is empty (no memCache or localStorage seed
+    // for this session) — proves the IDB path is what loads the history.
+    expect(screen.getByTestId('inactive-probe').textContent).toBe('');
+
+    // Advance past the 80ms stagger. After this the load() should run,
+    // open IDB, getLastSeqAndEpoch, getRecentEvents, and setEvents.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('inactive-probe').textContent).toBe('inactive history is loaded too');
+    });
+  });
+
+  it('inactive load survives effect-cleanup dep churn', async () => {
+    // Hardening regression. Even if React re-runs the bootstrap effect
+    // (which would have cancelled the pending requestIdleCallback in the
+    // old code), the new staggered setTimeout must NOT be cancelled and
+    // the IDB load must still surface for the now-current closure.
+    vi.useFakeTimers();
+    const sessionName = `deck_inactive_dep_churn_${Date.now()}`;
+    const serverId = `srv-churn-${Date.now()}`;
+    const stored: TimelineEvent[] = [{
+      eventId: `${sessionName}-stored-1`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'survived dep churn' },
+    }];
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue(stored);
+
+    // Stub WsClient whose `connected` we'll flip between renders. The
+    // bootstrap effect deps include `wsConnected`, so each flip re-runs
+    // the effect and the old code would cancel the pending idle handle.
+    let connectedState = false;
+    const ws: WsClient = {
+      get connected() { return connectedState; },
+      onMessage: () => () => { /* noop */ },
+      sendTimelineHistoryRequest: () => 'history-churn',
+    } as unknown as WsClient;
+
+    function Probe({ rev }: { rev: number }) {
+      const { events } = useTimeline(sessionName, ws, serverId, {
+        isActiveSession: false,
+      });
+      return h(
+        'div',
+        { 'data-testid': 'churn-probe', 'data-rev': String(rev) },
+        events.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    const { rerender } = render(h(Probe, { rev: 0 }));
+
+    // Churn the deps before the stagger expires — flip wsConnected so the
+    // effect re-runs and the old cleanup would have cancelled the pending
+    // load. The new code does NOT cancel, so the load still fires.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20);
+      connectedState = true;
+      rerender(h(Probe, { rev: 1 }));
+      await vi.advanceTimersByTimeAsync(20);
+      connectedState = false;
+      rerender(h(Probe, { rev: 2 }));
+      // Now wait out the full stagger window for the latest effect run.
+      await vi.advanceTimersByTimeAsync(120);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('churn-probe').textContent).toBe('survived dep churn');
+    });
+  });
+
   it('stays idle for shell/script sessions with history disabled', async () => {
     const sessionName = `deck_shell_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;

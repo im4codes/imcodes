@@ -1224,13 +1224,26 @@ export function useTimeline(
     if (localSnapshot.length === 0) setLoading(true);
     // Active session ("the open window") loads IDB immediately. Inactive
     // useTimeline instances (SubSessionCard previews in the bar, hidden
-    // SubSessionWindow tabs, etc.) defer to `requestIdleCallback` so they
-    // don't compete with the active session for IDB readwrite transactions
-    // and main-thread time. Without this gate, N SubSessionCards × IDB
-    // open + getLastSeqAndEpoch + getRecentEvents run in parallel on cold
-    // start and steal the active session's first-paint budget — exactly
-    // the "prioritize the open window first" behavior the user asked for.
-    let idbLoadCancel: (() => void) | null = null;
+    // SubSessionWindow tabs, etc.) stagger by ~80ms so the active session
+    // can grab IDB transactions first, but they still load reliably.
+    //
+    // History: `90cd30ec` deferred inactive loads to `requestIdleCallback`
+    // with a 500ms fallback timeout — and cancelled the pending handle in
+    // the effect cleanup. Two problems showed up in production
+    // ("很多聊天窗口都没加载历史消息，只加载了可视窗口的"):
+    //   1. `requestIdleCallback` can be starved indefinitely under render
+    //      churn / busy main thread on real devices; the 500ms `timeout`
+    //      fallback didn't always kick in either.
+    //   2. The effect's dep array (ws, wsConnected, callback identities)
+    //      churns; every churn ran the cleanup which cancelled the
+    //      pending idle handle and scheduled a fresh one — repeat → the
+    //      inactive timer never resolved.
+    //
+    // Fix: stagger with a plain `setTimeout(80)` and DON'T cancel it on
+    // cleanup. The `cancelled` guard inside `load()` already handles
+    // staleness, so a quick dep churn just queues a (harmless) extra
+    // `load()` whose old closure exits on `cancelled === true` before
+    // it can touch state.
     const load = async () => {
       const db = sharedDb;
       if (!db) return;
@@ -1288,27 +1301,13 @@ export function useTimeline(
       // full local history ASAP.
       load().catch(() => {});
     } else {
-      // Inactive: schedule via requestIdleCallback (with a setTimeout
-      // fallback for Safari < 16.4 and jsdom). 500ms timeout caps how long
-      // we'll wait — if the browser stays busy that long, run anyway so
-      // background cards eventually populate.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const ric: ((cb: () => void, opts?: { timeout?: number }) => number) | undefined =
-        (globalThis as any).requestIdleCallback;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const cic: ((handle: number) => void) | undefined = (globalThis as any).cancelIdleCallback;
-      if (typeof ric === 'function') {
-        const handle = ric(() => { if (!cancelled) load().catch(() => {}); }, { timeout: 500 });
-        idbLoadCancel = () => { if (typeof cic === 'function') cic(handle); };
-      } else {
-        const handle = setTimeout(() => { if (!cancelled) load().catch(() => {}); }, 50);
-        idbLoadCancel = () => clearTimeout(handle);
-      }
+      // Inactive: short stagger so the active session's IDB read can kick
+      // off first. We intentionally do NOT save a handle to cancel on
+      // cleanup — see the long comment above for why cancelling here
+      // would let dep churn starve background sessions forever.
+      setTimeout(() => { if (!cancelled) load().catch(() => {}); }, 80);
     }
-    return () => {
-      cancelled = true;
-      idbLoadCancel?.();
-    };
+    return () => { cancelled = true; };
   }, [buildForwardHistoryArgs, cacheKey, clearForwardHistoryTimeout, clearHttpBackfillTimer, disableHistory, isActiveSession, sendForwardHistoryRequest, sessionId, ws, wsConnected]);
 
   // Map of commandId → optimistic eventId for O(1) lookup on command.ack / dedup.
