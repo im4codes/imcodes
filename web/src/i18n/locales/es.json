@@ -158,6 +158,7 @@
     "confirm_new": "¿Confirmar nuevo?",
     "stop": "✕ Detener",
     "stop_plain": "Detener",
+    "unpin_to_stop": "Primero desancla la pestaña para detener",
     "state_stop_requested": "Detención solicitada",
     "state_stopping": "Deteniendo...",
     "confirm_stop": "¿Confirmar detención?",

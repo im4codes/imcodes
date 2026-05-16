@@ -37,6 +37,8 @@ const defaultProps = {
   onNewSession: vi.fn(),
   onStopProject: vi.fn(),
   onRestartProject: vi.fn(),
+  pinned: new Set<string>(),
+  setPinnedArr: vi.fn(),
 };
 
 describe('SessionTabs', () => {

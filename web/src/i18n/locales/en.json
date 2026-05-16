@@ -158,6 +158,7 @@
     "confirm_new": "Confirm new?",
     "stop": "✕ Stop",
     "stop_plain": "Stop",
+    "unpin_to_stop": "Unpin tab first to stop",
     "state_stop_requested": "Stop requested",
     "state_stopping": "Stopping...",
     "confirm_stop": "Confirm stop?",
