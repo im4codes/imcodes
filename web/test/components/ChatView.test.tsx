@@ -13,6 +13,7 @@ import {
   __resetSessionRepoContextStoreForTests,
   ingestSessionRepoContext,
 } from '../../src/session-repo-context-store.js';
+import { CHAT_INITIAL_RENDER_ITEM_LIMIT } from '../../src/chat-render-limits.js';
 
 const chatMarkdownRenderSpy = vi.hoisted(() => vi.fn());
 const showToolCallsPref = vi.hoisted(() => ({
@@ -135,6 +136,32 @@ describe('ChatView', () => {
 
   afterAll(() => {
     (window as Window & { visualViewport?: typeof visualViewportMock }).visualViewport = originalVisualViewport as any;
+  });
+
+  it('renders only the recent tail of very large cached timelines on first mount', () => {
+    const events = Array.from({ length: CHAT_INITIAL_RENDER_ITEM_LIMIT + 10 }, (_, index) => ({
+      eventId: `user-${index}`,
+      type: 'user.message',
+      ts: 1_700_000_000_000 + index,
+      payload: { text: `message-${index}` },
+    }));
+
+    render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_large_brain"
+      />,
+    );
+
+    expect(screen.queryByText('message-0')).toBeNull();
+    expect(screen.getByText('message-10')).toBeTruthy();
+    expect(screen.getByText(`message-${CHAT_INITIAL_RENDER_ITEM_LIMIT + 9}`)).toBeTruthy();
+
+    fireEvent.click(screen.getByText('chat.load_older'));
+
+    expect(screen.getByText('message-0')).toBeTruthy();
   });
 
   it('always hides thinking events from the timeline regardless of preference', () => {

@@ -20,6 +20,11 @@ import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
 import { splitTextByHttpUrls } from '../link-detection.js';
+import {
+  CHAT_INITIAL_RENDER_ITEM_LIMIT,
+  CHAT_RENDER_ITEM_INCREMENT,
+  shouldSkipRichTextEnhancement,
+} from '../chat-render-limits.js';
 import { domNodeToPlainText, selectionToPlainText } from '../util/dom-to-text.js';
 import { selectionSignature } from '../util/selection-signature.js';
 import { ZoomedTextDialog } from './ZoomedTextDialog.js';
@@ -692,6 +697,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // gives users a place to re-enable native selection and pick out exactly
   // the portion they want to copy.
   const [zoomText, setZoomText] = useState<string | null>(null);
+  const [renderItemLimit, setRenderItemLimit] = useState(CHAT_INITIAL_RENDER_ITEM_LIMIT);
 
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
@@ -876,6 +882,15 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [showToolCallsPref]);
 
   const viewItems = useMemo(() => buildViewItems(events, showToolCalls), [events, showToolCalls]);
+  const hiddenRenderedItemCount = preview ? 0 : Math.max(0, viewItems.length - renderItemLimit);
+  const renderedViewItems = useMemo(
+    () => (hiddenRenderedItemCount > 0 ? viewItems.slice(-renderItemLimit) : viewItems),
+    [hiddenRenderedItemCount, renderItemLimit, viewItems],
+  );
+
+  useEffect(() => {
+    setRenderItemLimit(CHAT_INITIAL_RENDER_ITEM_LIMIT);
+  }, [sessionId]);
 
   const markProgrammaticScroll = () => {
     // Bounded one-shot: skip exactly one upcoming synthetic scroll event.
@@ -1094,7 +1109,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       return;
     }
     scrollToBottom(false);
-  }, [preview, viewItems, loading, loadingOlder]);
+  }, [preview, renderedViewItems, loading, loadingOlder]);
 
   // Restore scroll position after Load Older prepends events
   useLayoutEffect(() => {
@@ -1105,7 +1120,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     const delta = el.scrollHeight - anchor.scrollHeight;
     if (delta > 0) el.scrollTop += delta;
     scrollAnchorRef.current = null;
-  }, [events]);
+  }, [events, renderItemLimit]);
 
   // Fallback for timestamp-based message additions. The layout effect above handles
   // streaming edits and other view changes that do not advance timestamps.
@@ -1188,12 +1203,16 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     if (!autoScrollRef.current) lastScrollActivityRef.current = Date.now();
     lastScrollTopRef.current = scrollTop;
     // Auto-trigger load older when scrolled near top
-    if (scrollTop < 100 && onLoadOlder && hasOlderHistory && !loadingOlder && !loading) {
+    if (scrollTop < 100 && (hiddenRenderedItemCount > 0 || (onLoadOlder && hasOlderHistory)) && !loadingOlder && !loading) {
       const now = Date.now();
       if (now - lastLoadOlderAtRef.current >= LOAD_OLDER_COOLDOWN_MS) {
         lastLoadOlderAtRef.current = now;
         scrollAnchorRef.current = { scrollHeight };
-        onLoadOlder();
+        if (hiddenRenderedItemCount > 0) {
+          setRenderItemLimit((limit) => limit + CHAT_RENDER_ITEM_INCREMENT);
+        } else {
+          onLoadOlder?.();
+        }
       }
     }
   };
@@ -1631,7 +1650,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               <div class="chat-tool-chooser-footnote">{t('chat.tool_chooser_footnote')}</div>
             </div>
           )}
-          {!loading && !preview && onLoadOlder && viewItems.length > 0 && hasOlderHistory && (
+          {!loading && !preview && viewItems.length > 0 && (hiddenRenderedItemCount > 0 || (onLoadOlder && hasOlderHistory)) && (
             <div style={{ textAlign: 'center', padding: '8px 0' }}>
               <button
                 class="btn btn-sm"
@@ -1639,15 +1658,19 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                 onClick={() => {
                   const el = scrollRef.current;
                   if (el) scrollAnchorRef.current = { scrollHeight: el.scrollHeight };
-                  onLoadOlder();
+                  if (hiddenRenderedItemCount > 0) {
+                    setRenderItemLimit((limit) => limit + CHAT_RENDER_ITEM_INCREMENT);
+                  } else {
+                    onLoadOlder?.();
+                  }
                 }}
-                disabled={loadingOlder}
+                disabled={hiddenRenderedItemCount === 0 && loadingOlder}
               >
-                {loadingOlder ? t('chat.loading_older') : t('chat.load_older')}
+                {hiddenRenderedItemCount === 0 && loadingOlder ? t('chat.loading_older') : t('chat.load_older')}
               </button>
             </div>
           )}
-          {!loading && viewItems.map((item) => {
+          {!loading && renderedViewItems.map((item) => {
             if (item.type === 'assistant-block') {
               return (
                 <AssistantBlock
@@ -2599,6 +2622,7 @@ function splitPathsAndUrls(
   onDownload?: (path: string) => void,
 ): h.JSX.Element[] {
   if (!onPathClick && !onUrlClick && !onDownload) return [<span>{text}</span>];
+  if (shouldSkipRichTextEnhancement(text)) return [<span>{text}</span>];
 
   // Step 1: Split by URLs first (URLs take priority over path detection)
   const parts: preact.JSX.Element[] = [];
