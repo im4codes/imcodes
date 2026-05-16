@@ -1627,9 +1627,23 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           {loading ? (
             <div class="chat-loading">{t('chat.loading')}</div>
           ) : viewItems.length === 0 ? (
-            <div class="chat-loading">
-              {sessionState ? t('chat.session_state', { state: sessionState }) : t('chat.no_events')}
-            </div>
+            // Suppress the "no events" placeholder while history bootstrap
+            // is in flight: SubSessionWindow forces `loading={false}` to
+            // avoid flicker on minimize/restore, so when a freshly-opened
+            // sub-session has no cached snapshot, this branch used to flash
+            // "暂无消息" on top of the still-spinning 历史 → 本地缓存 → daemon
+            // overlay. Defer the placeholder until the overlay has cleared.
+            (historyStatus
+              && historyStatus.phase === 'bootstrap'
+              && (historyStatus.steps.cache === 'running' || historyStatus.steps.cache === 'pending'
+                || historyStatus.steps.daemon === 'running' || historyStatus.steps.daemon === 'pending'
+                || historyStatus.steps.http === 'running' || historyStatus.steps.http === 'pending'))
+              ? null
+              : (
+                <div class="chat-loading">
+                  {sessionState ? t('chat.session_state', { state: sessionState }) : t('chat.no_events')}
+                </div>
+              )
           ) : null}
           {/* First-time tool-call view chooser. Renders only when the user
            *  has never picked AND the current timeline has tool events to

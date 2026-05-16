@@ -168,6 +168,59 @@ describe('ChatView', () => {
     expect(screen.getByText('message-0')).toBeTruthy();
   });
 
+  it('suppresses the "no events" placeholder while bootstrap history is still loading (SubSessionWindow flash fix)', () => {
+    // Regression test for "本地历史还是没有瞬间加载" / 暂无消息 flash:
+    // SubSessionWindow forces `loading={false}` so its ChatView doesn't
+    // flicker on minimize/restore. Combined with an empty cache, this
+    // used to surface the "no events" placeholder while the
+    // 历史 → 本地缓存 → daemon overlay was still spinning. The placeholder
+    // must defer to the overlay during the bootstrap phase.
+    const { container, rerender } = render(
+      <ChatView
+        events={[] as any}
+        loading={false}
+        sessionId="deck_sub_bootstrap"
+        historyStatus={{
+          phase: 'bootstrap',
+          steps: {
+            cache: 'running',
+            textTail: 'skipped',
+            daemon: 'pending',
+            http: 'pending',
+            older: 'skipped',
+          },
+        }}
+      />,
+    );
+
+    // Overlay must be visible, placeholder must be hidden.
+    expect(container.querySelector('.chat-history-overlay')).not.toBeNull();
+    expect(screen.queryByText('chat.no_events')).toBeNull();
+
+    // Once bootstrap finishes AND events are still empty, the placeholder
+    // returns (so users on a truly-empty session don't sit looking at a
+    // blank pane after the overlay disappears).
+    rerender(
+      <ChatView
+        events={[] as any}
+        loading={false}
+        sessionId="deck_sub_bootstrap"
+        historyStatus={{
+          phase: 'idle',
+          steps: {
+            cache: 'done',
+            textTail: 'skipped',
+            daemon: 'done',
+            http: 'done',
+            older: 'skipped',
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText('chat.no_events')).toBeTruthy();
+  });
+
   it('preview mode caps rendered items to PREVIEW_RENDER_ITEM_LIMIT (sub-session thumbnails)', () => {
     // Regression test for "本地消息都没有立即显示. 空白半天 + sub-session 按钮无反应"
     // (slow refresh + unresponsive buttons on mobile). Without the cap, every
