@@ -89,6 +89,20 @@ body {
 /* Hide xterm's built-in scrollbar — frees up width for FitAddon so tmux cols match visual width */
 .xterm-viewport { scrollbar-width: none; }
 .xterm-viewport::-webkit-scrollbar { display: none; }
+/* xterm's CharSizeService injects a hidden <span class="xterm-char-measure-element">
+   with textContent = "W".repeat(32) for each Terminal instance. Even though the
+   element is visibility:hidden + position:absolute left:-9999em, mobile WebViews
+   (iOS Safari/Android WebView) still include its text in Select-All. With many
+   terminal sessions open, that's hundreds of "W"s pasted at the end of any
+   document-wide copy (e.g. when the user opens the chat zoom dialog and uses the
+   native "Select All" callout). Belt-and-suspenders: also mark it inert/aria-hidden
+   semantics with user-select:none and -webkit-user-select:none. */
+.xterm-char-measure-element {
+  -webkit-user-select: none !important;
+  user-select: none !important;
+  -webkit-touch-callout: none !important;
+  pointer-events: none !important;
+}
 
 /* Terminal scroll overlay — progress bar + scroll-to-bottom */
 .term-scroll-track { position: absolute; right: 2px; top: 4px; bottom: 4px; width: 4px; border-radius: 2px; background: #ffffff10; opacity: 1; transition: opacity 0.3s; pointer-events: none; z-index: 5; }
