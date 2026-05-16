@@ -632,8 +632,13 @@ jobs:
         run: |
           VERSION=$(grep versionName web/android/app/build.gradle | head -1 | sed 's/.*"\(.*\)".*/\1/')
           COMMIT_SHORT=$(git rev-parse --short HEAD)
-          echo "tag=android-v${VERSION}-${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
-          echo "name=Android v${VERSION} (${COMMIT_SHORT})" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then
+            echo "tag=android-dev-v${VERSION}-${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
+            echo "name=Android Dev v${VERSION} (${COMMIT_SHORT})" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=android-v${VERSION}-${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
+            echo "name=Android v${VERSION} (${COMMIT_SHORT})" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Rename artifacts with version
         run: |
@@ -643,7 +648,7 @@ jobs:
           cp "$AAB" "imcodes-${{ steps.version.outputs.tag }}.aab"
 
       - name: Create GitHub Release
-        if: github.ref == 'refs/heads/master'
+        if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
@@ -652,6 +657,7 @@ jobs:
             imcodes-*.apk
             imcodes-*.aab
           generate_release_notes: true
-          make_latest: true
+          prerelease: ${{ github.ref == 'refs/heads/dev' }}
+          make_latest: ${{ github.ref == 'refs/heads/master' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
