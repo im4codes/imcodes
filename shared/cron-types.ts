@@ -1,6 +1,8 @@
+import type { MemoryMcpSourceProvenance } from './memory-mcp-provenance.js';
+
 // ── Cron Action types (discriminated union) ──────────────────────────────
 
-export type CronActionType = 'command' | 'p2p';
+export type CronActionType = 'command' | 'p2p' | 'send';
 
 export interface CronCommandAction {
   type: 'command';
@@ -42,7 +44,16 @@ export interface CronP2pAction {
   };
 }
 
-export type CronAction = CronCommandAction | CronP2pAction;
+export interface CronSendAction extends MemoryMcpSourceProvenance {
+  type: 'send';
+  target: string;
+  message: string;
+  reply?: boolean;
+  broadcast?: boolean;
+  idempotencyKey?: string;
+}
+
+export type CronAction = CronCommandAction | CronP2pAction | CronSendAction;
 
 // ── WS message types ─────────────────────────────────────────────────────
 
@@ -69,7 +80,7 @@ export interface CronCommandResultMessage {
   jobId: string;
   executionId?: string;
   detail: string;
-  status?: 'manual_trigger' | 'dispatched' | 'skipped_busy' | 'error';
+  status?: 'manual_trigger' | 'dispatched' | 'partial' | 'skipped_busy' | 'error';
 }
 
 // ── Job status ───────────────────────────────────────────────────────────

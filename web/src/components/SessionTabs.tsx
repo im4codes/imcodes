@@ -26,22 +26,22 @@ interface Props {
   onRenameSession?: (sessionName: string, nextLabel: string | null) => void;
   /** True once sessions have been loaded (from API or WS) */
   sessionsLoaded?: boolean;
+  /** Pinned session names (lifted to app.tsx so Stop guards can read it) */
+  pinned: Set<string>;
+  /** Setter for the pinned array (server-synced via useSyncedPreference) */
+  setPinnedArr: (value: string[] | ((prev: string[]) => string[])) => void;
 }
 
 interface CtxMenu { x: number; y: number; session: SessionInfo }
 
-/** Legacy localStorage keys — read once on first load for migration. */
+/** Legacy localStorage key — read once on first load for migration. */
 const LEGACY_LS_ORDER = 'rcc_tab_order';
-const LEGACY_LS_PINNED = 'rcc_tab_pinned';
 
 function readLegacyOrder(): string[] {
   try { return JSON.parse(localStorage.getItem(LEGACY_LS_ORDER) ?? '[]'); } catch { return []; }
 }
-function readLegacyPinned(): string[] {
-  try { return JSON.parse(localStorage.getItem(LEGACY_LS_PINNED) ?? '[]'); } catch { return []; }
-}
 
-export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded }: Props) {
+export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
   const { t } = useTranslation();
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
   const [stopConfirmProject, setStopConfirmProject] = useState<string | null>(null);
@@ -52,21 +52,14 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   const renameRef = useRef<HTMLInputElement>(null);
   const tabBarRef = useRef<HTMLDivElement>(null);
 
-  // Persisted order & pinned state via server-synced preferences.
-  // Default to legacy localStorage values so existing users don't lose their arrangement.
+  // Persisted order via server-synced preferences. (Pinned state is lifted to
+  // app.tsx so handleStopProject can guard against stopping pinned sessions.)
+  // Default to legacy localStorage value so existing users don't lose their arrangement.
   const [tabOrder, setTabOrder] = useSyncedPreference<string[]>(
     'tab_order',
     readLegacyOrder(),
     500,
   );
-  const [pinnedArr, setPinnedArr] = useSyncedPreference<string[]>(
-    'tab_pinned',
-    readLegacyPinned(),
-    0,
-  );
-
-  // Derive a Set from the synced array for O(1) lookups.
-  const pinned = useMemo(() => new Set(pinnedArr), [pinnedArr]);
 
   // Drag state
   const dragIdx = useRef<number | null>(null);
@@ -311,7 +304,12 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
 
       <button class="tab-add-btn" onClick={onNewSession} title="New session">＋</button>
 
-      {ctx && (
+      {ctx && (() => {
+        // Pinned tabs can't be stopped — user must unpin first. Check both the
+        // right-clicked session and any sibling sessions of the same project,
+        // since `Stop` terminates the whole project (all its tmux processes).
+        const projectHasPinned = sessions.some((s) => s.project === ctx.session.project && pinned.has(s.name));
+        return (
         <div ref={menuRef} class="tab-context-menu" style={{ left: menuX, top: menuY }}>
           <button class="menu-item" onClick={() => togglePin(ctx.session.name)}>
             {pinned.has(ctx.session.name) ? '📌 Unpin' : '📌 Pin'}
@@ -321,9 +319,22 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
           <button class="menu-item" onClick={() => { onRestartProject(ctx.session.project, true); setCtx(null); }}>＋ New</button>
           <button class="menu-item" onClick={() => startRename(ctx.session)}>✎ Rename</button>
           <div class="menu-divider" />
-          <button class="menu-item menu-item-danger" onClick={() => { setStopConfirmProject(ctx.session.project); setStopConfirmLevel(0); setCtx(null); }}>✕ Stop</button>
+          <button
+            class="menu-item menu-item-danger"
+            disabled={projectHasPinned}
+            title={projectHasPinned ? t('session.unpin_to_stop') : undefined}
+            onClick={() => {
+              if (projectHasPinned) return;
+              setStopConfirmProject(ctx.session.project);
+              setStopConfirmLevel(0);
+              setCtx(null);
+            }}
+          >
+            {projectHasPinned ? `📌 ${t('session.unpin_to_stop')}` : '✕ Stop'}
+          </button>
         </div>
-      )}
+        );
+      })()}
       {stopConfirmProject && (
         <div class="ask-dialog-overlay" onClick={() => { setStopConfirmProject(null); setStopConfirmLevel(0); }}>
           <div class="ask-dialog stop-session-dialog" onClick={(e) => e.stopPropagation()}>

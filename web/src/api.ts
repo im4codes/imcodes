@@ -1211,24 +1211,26 @@ export async function uploadFile(
 }
 
 export async function downloadAttachment(serverId: string, attachmentId: string): Promise<void> {
-  // Native (iOS): skip blob fetch — WKWebView can't trigger downloads from blob URLs.
+  // Native: skip blob fetch — WebViews can't reliably trigger downloads from blob URLs.
   // Get a one-time token and open in system browser which handles save natively.
   const isNative = !!(globalThis as Record<string, unknown>).Capacitor;
   if (isNative) {
-    const tokenRes = await apiFetch(`/api/server/${serverId}/uploads/${attachmentId}/download-token`, { method: 'POST' });
+    const encodedServerId = encodeURIComponent(serverId);
+    const encodedAttachmentId = encodeURIComponent(attachmentId);
+    const tokenRes = await apiFetch(`/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download-token`, { method: 'POST' });
     const downloadToken = (tokenRes as { token?: string }).token;
     if (!downloadToken || typeof downloadToken !== 'string' || downloadToken.length < 32) {
       throw new Error('Failed to acquire download token');
     }
     const baseUrl = _baseUrl || window.location.origin;
-    const downloadUrl = `${baseUrl}/api/server/${serverId}/uploads/${attachmentId}/download?token=${downloadToken}`;
+    const downloadUrl = `${baseUrl}/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download?token=${encodeURIComponent(downloadToken)}`;
     const { Browser } = await import('@capacitor/browser');
     await Browser.open({ url: downloadUrl });
     return;
   }
 
   // Desktop: fetch blob and trigger <a download>
-  const res = await rawFetch(`/api/server/${serverId}/uploads/${attachmentId}/download`);
+  const res = await rawFetch(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`);
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new ApiError(res.status, body);
@@ -1256,7 +1258,7 @@ export async function downloadAttachment(serverId: string, attachmentId: string)
 }
 
 export async function previewAttachment(serverId: string, attachmentId: string): Promise<void> {
-  const res = await rawFetch(`/api/server/${serverId}/uploads/${attachmentId}/download`);
+  const res = await rawFetch(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`);
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new ApiError(res.status, body);

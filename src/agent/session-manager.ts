@@ -53,6 +53,30 @@ import { materializeMasterSummary } from '../context/materialization-coordinator
 import { serializeContextNamespace } from '../context/context-keys.js';
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 
+const DEFAULT_CODEX_SDK_STARTUP_MODEL = 'gpt-5.5';
+
+function sanitizeCodexSdkStartupModel(value: string | null | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const lower = trimmed.toLowerCase();
+  const isClaudeModel = lower.startsWith('opus')
+    || lower.startsWith('sonnet')
+    || lower.startsWith('haiku')
+    || lower.startsWith('claude')
+    || lower.includes('/opus')
+    || lower.includes('-opus')
+    || lower.includes('_opus')
+    || lower.includes('/sonnet')
+    || lower.includes('-sonnet')
+    || lower.includes('_sonnet')
+    || lower.includes('/haiku')
+    || lower.includes('-haiku')
+    || lower.includes('_haiku')
+    || lower.includes('claude-')
+    || lower.includes('claude_');
+  return isClaudeModel ? DEFAULT_CODEX_SDK_STARTUP_MODEL : trimmed;
+}
+
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
   if (ccSessionId) {
@@ -973,6 +997,18 @@ function buildTransportSessionEnv(
   };
 }
 
+async function loadBoundServerIdForManagedMcp(): Promise<string | undefined> {
+  try {
+    const { loadCredentials } = await import('../bind/bind-flow.js');
+    const credentials = await loadCredentials();
+    return typeof credentials?.serverId === 'string' && credentials.serverId.trim()
+      ? credentials.serverId.trim()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function buildTransportImcodesIdentityPrompt(
   sessionName: string,
   label: string | null | undefined,
@@ -1363,7 +1399,10 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       let availableQwenModels = s.providerId === 'qwen'
         ? (s.qwenAvailableModels?.length ? s.qwenAvailableModels : (qwenRuntime?.availableModels ?? []))
         : [];
-      const requestedTransportModel = s.requestedModel ?? s.qwenModel;
+      let requestedTransportModel = s.requestedModel ?? s.qwenModel;
+      if (s.providerId === 'codex-sdk') {
+        requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
+      }
       const runtime = new TransportSessionRuntime(provider, s.name);
       wireTransportCallbacks(runtime, s.name);
       wireTransportSessionInfo(runtime, s.name, s.agentType);
@@ -1423,8 +1462,12 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         && (!effectiveRequestedModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveRequestedModel)))) {
         effectiveRequestedModel = availableQwenModels[0] ?? effectiveRequestedModel;
       }
+      const boundServerId = await loadBoundServerIdForManagedMcp();
       await runtime.initialize({
         sessionKey: effectiveSessionKey,
+        sessionName: s.name,
+        projectName: s.projectName,
+        serverId: boundServerId,
         bindExistingKey: freshAfterCancel ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
         skipCreate: !freshAfterCancel && !!s.providerSessionId,
         env: buildTransportSessionEnv(s.name, s.label, extraEnv),
@@ -1633,6 +1676,9 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
   const storedProviderResumeId = !opts.fresh ? existing?.providerResumeId : undefined;
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
+  if (agentType === 'codex-sdk') {
+    requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
+  }
   // Preserve existing transportConfig (including supervision) when opts doesn't override.
   // Only fall through to `undefined` if nothing is set — never force `{}`, which would
   // strip supervision on restart/relaunch.
@@ -1761,8 +1807,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   // authoritative "force fresh" signal from /clear or explicit user action.
 
   // Create session on provider
-      await runtime.initialize({
+  const boundServerId = await loadBoundServerIdForManagedMcp();
+  await runtime.initialize({
     sessionKey: effectiveSessionKey,
+    sessionName: name,
+    projectName,
+    serverId: boundServerId,
     fresh: !!opts.fresh,
     env: buildTransportSessionEnv(name, label, transportEnv),
     cwd: projectDir,

@@ -53,6 +53,7 @@
     "@anthropic-ai/tokenizer": "^0.0.4",
     "@github/copilot-sdk": "^0.2.2",
     "@huggingface/transformers": "^4.1.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@openai/codex-sdk": "^0.125.0",
     "commander": "^12.1.0",
     "croner": "^10.0.1",

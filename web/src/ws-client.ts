@@ -31,7 +31,7 @@ import {
   type TimelineReplayResponse,
 } from '@shared/timeline-protocol.js';
 import { CC_PRESET_MSG, type CcPreset, type CcPresetModelInfo } from '@shared/cc-presets.js';
-import { MEMORY_WS } from '@shared/memory-ws.js';
+import { MEMORY_WS, type MemoryMcpStatusResponseMessage } from '@shared/memory-ws.js';
 import type {
   MemoryFeatureAdminRecord,
   MemoryFeatureSetResponse,
@@ -219,7 +219,8 @@ export type ServerMessage =
   | { type: typeof MEMORY_WS.OBSERVATION_RESPONSE; requestId?: string; records: MemoryObservationAdminRecord[]; featureEnabled?: boolean }
   | { type: typeof MEMORY_WS.OBSERVATION_UPDATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.OBSERVATION_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
-  | { type: typeof MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE; requestId?: string; success: boolean; audit?: Record<string, unknown>; error?: string; errorCode?: MemoryManagementErrorCode };
+  | { type: typeof MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE; requestId?: string; success: boolean; audit?: Record<string, unknown>; error?: string; errorCode?: MemoryManagementErrorCode }
+  | MemoryMcpStatusResponseMessage;
 
 export type {
   TimelineEvent,

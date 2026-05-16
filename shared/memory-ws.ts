@@ -1,3 +1,6 @@
+import { PROVIDER_STATUS_REASON } from './provider-status-reasons.js';
+import { MCP_ERROR_REASONS } from './memory-mcp-errors.js';
+
 export const MEMORY_WS = {
   SEARCH: 'memory.search',
   SEARCH_RESPONSE: 'memory.search_response',
@@ -47,9 +50,118 @@ export const MEMORY_WS = {
   OBSERVATION_DELETE_RESPONSE: 'memory.observations.delete_response',
   OBSERVATION_PROMOTE: 'memory.observations.promote',
   OBSERVATION_PROMOTE_RESPONSE: 'memory.observations.promote_response',
+  MCP_STATUS_QUERY: 'memory.mcp_status.query',
+  MCP_STATUS_RESPONSE: 'memory.mcp_status.response',
 } as const;
 
 export type MemoryWsType = typeof MEMORY_WS[keyof typeof MEMORY_WS];
+
+export const MEMORY_MCP_PROVIDER_ID = {
+  CLAUDE_CODE_SDK: 'claude-code-sdk',
+  GEMINI_SDK: 'gemini-sdk',
+  COPILOT_SDK: 'copilot-sdk',
+  CODEX_SDK: 'codex-sdk',
+  CURSOR_HEADLESS: 'cursor-headless',
+  QWEN: 'qwen',
+} as const;
+
+export const MEMORY_MCP_PROVIDER_IDS = [
+  MEMORY_MCP_PROVIDER_ID.CLAUDE_CODE_SDK,
+  MEMORY_MCP_PROVIDER_ID.GEMINI_SDK,
+  MEMORY_MCP_PROVIDER_ID.COPILOT_SDK,
+  MEMORY_MCP_PROVIDER_ID.CODEX_SDK,
+  MEMORY_MCP_PROVIDER_ID.CURSOR_HEADLESS,
+  MEMORY_MCP_PROVIDER_ID.QWEN,
+] as const;
+
+export type MemoryMcpProviderId = (typeof MEMORY_MCP_PROVIDER_IDS)[number];
+
+export const MEMORY_MCP_TOOL_FAMILY = {
+  MEMORY: 'memory',
+  SEND: 'send',
+  CRON: 'cron',
+} as const;
+
+export const MEMORY_MCP_TOOL_FAMILIES = [
+  MEMORY_MCP_TOOL_FAMILY.MEMORY,
+  MEMORY_MCP_TOOL_FAMILY.SEND,
+  MEMORY_MCP_TOOL_FAMILY.CRON,
+] as const;
+
+export type MemoryMcpToolFamily = (typeof MEMORY_MCP_TOOL_FAMILIES)[number];
+
+export const MEMORY_MCP_STATUS = {
+  READY: 'ready',
+  DEGRADED: 'degraded',
+  DISABLED: 'disabled',
+  UNKNOWN: 'unknown',
+} as const;
+
+export const MEMORY_MCP_STATUS_VALUES = [
+  MEMORY_MCP_STATUS.READY,
+  MEMORY_MCP_STATUS.DEGRADED,
+  MEMORY_MCP_STATUS.DISABLED,
+  MEMORY_MCP_STATUS.UNKNOWN,
+] as const;
+
+export type MemoryMcpStatusValue = (typeof MEMORY_MCP_STATUS_VALUES)[number];
+
+export const MEMORY_MCP_PROVIDER_STATUS_REASON = {
+  PROVIDER_NOT_CONNECTED: PROVIDER_STATUS_REASON.PROVIDER_NOT_CONNECTED,
+  MCP_REGISTRATION_FAILED: 'mcp_registration_failed',
+} as const;
+
+export type MemoryMcpProviderStatusReason =
+  (typeof MEMORY_MCP_PROVIDER_STATUS_REASON)[keyof typeof MEMORY_MCP_PROVIDER_STATUS_REASON];
+
+export const MEMORY_MCP_DEGRADED_REASON = {
+  ...MEMORY_MCP_PROVIDER_STATUS_REASON,
+  ENV_FORWARDING_UNVERIFIED: 'env_forwarding_unverified',
+  FEATURE_DISABLED: MCP_ERROR_REASONS.FEATURE_DISABLED,
+  STATUS_NOT_REPORTED: 'status_not_reported',
+} as const;
+
+export type MemoryMcpDegradedReason =
+  (typeof MEMORY_MCP_DEGRADED_REASON)[keyof typeof MEMORY_MCP_DEGRADED_REASON];
+
+export interface MemoryMcpProviderStatusView {
+  providerId: MemoryMcpProviderId | string;
+  status: MemoryMcpStatusValue;
+  connected?: boolean | null;
+  degradedReasons?: string[];
+}
+
+export interface MemoryMcpToolFamilyGateView {
+  family: MemoryMcpToolFamily;
+  status?: MemoryMcpStatusValue;
+  enabled?: boolean | null;
+  disabledFlag?: string;
+  degradedReasons?: string[];
+  tools?: string[];
+}
+
+export interface MemoryMcpRecentCallView {
+  id: string;
+  providerId?: MemoryMcpProviderId | string;
+  toolName: string;
+  family?: MemoryMcpToolFamily;
+  status: string;
+  occurredAt?: number;
+  durationMs?: number;
+  redactedInput?: string;
+  redactedResult?: string;
+  errorReason?: string;
+}
+
+export interface MemoryMcpStatusResponseMessage {
+  type: typeof MEMORY_WS.MCP_STATUS_RESPONSE;
+  requestId?: string;
+  providers?: MemoryMcpProviderStatusView[];
+  toolFamilies?: MemoryMcpToolFamilyGateView[];
+  recentCalls?: MemoryMcpRecentCallView[];
+  updatedAt?: number;
+  error?: string;
+}
 
 export const MEMORY_MANAGEMENT_REQUEST_TYPES = [
   MEMORY_WS.SEARCH,
@@ -76,6 +188,7 @@ export const MEMORY_MANAGEMENT_REQUEST_TYPES = [
   MEMORY_WS.OBSERVATION_UPDATE,
   MEMORY_WS.OBSERVATION_DELETE,
   MEMORY_WS.OBSERVATION_PROMOTE,
+  MEMORY_WS.MCP_STATUS_QUERY,
 ] as const satisfies readonly MemoryWsType[];
 
 export const MEMORY_MANAGEMENT_RESPONSE_TYPES = [
@@ -103,6 +216,7 @@ export const MEMORY_MANAGEMENT_RESPONSE_TYPES = [
   MEMORY_WS.OBSERVATION_DELETE_RESPONSE,
   MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE,
   MEMORY_WS.SEARCH_RESPONSE,
+  MEMORY_WS.MCP_STATUS_RESPONSE,
 ] as const;
 
 const MEMORY_MANAGEMENT_REQUEST_TYPE_SET: ReadonlySet<string> = new Set(MEMORY_MANAGEMENT_REQUEST_TYPES);

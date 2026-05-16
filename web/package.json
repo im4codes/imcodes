@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "build:global": "tsc --noEmit && VITE_REGION=global vite build",
+    "build:china": "tsc --noEmit && VITE_REGION=china vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

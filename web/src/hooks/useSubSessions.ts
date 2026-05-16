@@ -510,7 +510,7 @@ export function useSubSessions(
       alert(`Failed to create session: ${msg}`);
       return null;
     }
-  }, [serverId, ws, activeSession]);
+  }, [serverId, ws, activeSession, subSessions]);
 
   const close = useCallback(async (id: string) => {
     if (!serverId) return;

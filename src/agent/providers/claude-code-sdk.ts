@@ -24,9 +24,11 @@ import {
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
+import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import logger from '../../util/logger.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveClaudeCodePathForSdk, resolveExecutableForSpawn } from '../transport-paths.js';
+import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 
 const CLAUDE_BIN = 'claude';
 const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
@@ -35,8 +37,12 @@ const FORCE_KILL_TIMEOUT_MS = 500;
 
 interface ClaudeSdkSessionState {
   routeId: string;
+  sessionName?: string;
+  projectName?: string;
+  serverId?: string;
   cwd: string;
   env?: Record<string, string>;
+  contextNamespace?: SessionConfig['contextNamespace'];
   model?: string;
   settings?: string | Record<string, unknown>;
   description?: string;
@@ -135,6 +141,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     logger.info({ provider: this.id, resolved: resolved.executable }, 'Claude Code SDK provider connected');
   }
 
+  getMemoryMcpStatus(): MemoryMcpProviderStatusView {
+    return {
+      providerId: this.id,
+      status: this.config ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
+      connected: Boolean(this.config),
+      degradedReasons: [],
+    };
+  }
+
   async listModels(_force?: boolean): Promise<ProviderModelList> {
     const { getClaudeSdkAvailableModels } = await import('../sdk-runtime-config.js');
     const { getClaudeSdkRuntimeConfig } = await import('../sdk-runtime-config.js');
@@ -165,8 +180,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     const resumeId = config.resumeId ?? existing?.resumeId ?? routeId;
     this.sessions.set(routeId, {
       routeId,
+      sessionName: config.sessionName ?? existing?.sessionName,
+      projectName: config.projectName ?? existing?.projectName,
+      serverId: config.serverId ?? existing?.serverId,
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: config.env ?? existing?.env,
+      contextNamespace: config.contextNamespace ?? existing?.contextNamespace,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       settings: config.settings ?? existing?.settings,
       description: config.description ?? existing?.description,
@@ -319,6 +338,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       ...(state.model ? { model: state.model } : {}),
       ...(state.settings ? { settings: state.settings } : {}),
       ...(state.effort ? { effort: state.effort } : {}),
+      mcpServers: getDefaultMcpServers({
+        sessionKey: state.routeId,
+        sessionName: state.sessionName,
+        projectName: state.projectName,
+        serverId: state.serverId,
+        cwd: state.cwd,
+        env: state.env,
+        contextNamespace: state.contextNamespace,
+      }),
       ...(baseSystemPrompt ? {
         appendSystemPrompt: baseSystemPrompt,
       } : {}),

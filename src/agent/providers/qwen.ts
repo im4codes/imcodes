@@ -33,6 +33,14 @@ import {
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
   isSessionCompactCommandText,
 } from '../../../shared/session-control-commands.js';
+import { ensureQwenMcpHasImcodesEntry, type QwenMcpEnsureResult } from '../../daemon/qwen-mcp-config.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { getDefaultMcpServers } from './getDefaultMcpServers.js';
+import {
+  MEMORY_MCP_PROVIDER_STATUS_REASON,
+  MEMORY_MCP_STATUS,
+  type MemoryMcpProviderStatusView,
+} from '../../../shared/memory-ws.js';
 
 const execFileAsync = promisify(execFile);
 const QWEN_BIN = 'qwen';
@@ -105,6 +113,7 @@ interface QwenSessionState {
   description?: string;
   model?: string;
   env?: Record<string, string>;
+  mcpEnv?: Record<string, string>;
   effort: TransportEffortLevel;
   settings?: string | Record<string, unknown>;
   settingsDir?: string;
@@ -239,6 +248,11 @@ function sanitizeUsageForDisplay(usage: QwenUsage | undefined, model?: string): 
   return usage;
 }
 
+function buildQwenMemoryMcpEnv(config: SessionConfig): Record<string, string> | undefined {
+  const env = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME]?.env;
+  return env && Object.keys(env).length > 0 ? env : undefined;
+}
+
 export class QwenProvider implements TransportProvider {
   readonly id = 'qwen';
   readonly connectionMode = CONNECTION_MODES.LOCAL_SDK;
@@ -264,6 +278,7 @@ export class QwenProvider implements TransportProvider {
   };
 
   private config: ProviderConfig | null = null;
+  private mcpRegistration: QwenMcpEnsureResult | null = null;
   private sessions = new Map<string, QwenSessionState>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
@@ -275,8 +290,31 @@ export class QwenProvider implements TransportProvider {
   async connect(config: ProviderConfig): Promise<void> {
     const resolved = resolveExecutableForSpawn(QWEN_BIN);
     await execFileAsync(resolved.executable, [...resolved.prependArgs, '--version'], { windowsHide: true });
+    this.mcpRegistration = await ensureQwenMcpHasImcodesEntry({
+      qwenBinary: resolved.executable,
+      execFileImpl: (file, args, options) => execFileAsync(file, [...resolved.prependArgs, ...args], options) as Promise<{ stdout: string; stderr: string }>,
+    });
     this.config = config;
     logger.info({ provider: this.id, resolved: resolved.executable }, 'Qwen provider connected');
+  }
+
+  getMemoryMcpStatus(): MemoryMcpProviderStatusView {
+    if (this.mcpRegistration?.degraded) {
+      return {
+        providerId: this.id,
+        status: MEMORY_MCP_STATUS.DEGRADED,
+        connected: true,
+        degradedReasons: [
+          this.mcpRegistration.reason ?? MEMORY_MCP_PROVIDER_STATUS_REASON.MCP_REGISTRATION_FAILED,
+        ],
+      };
+    }
+    return {
+      providerId: this.id,
+      status: MEMORY_MCP_STATUS.READY,
+      connected: true,
+      degradedReasons: [],
+    };
   }
 
   async disconnect(): Promise<void> {
@@ -307,6 +345,7 @@ export class QwenProvider implements TransportProvider {
       description: config.description ?? existing?.description,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       env: config.env ?? existing?.env,
+      mcpEnv: buildQwenMemoryMcpEnv(config) ?? existing?.mcpEnv,
       effort: config.effort ?? existing?.effort ?? DEFAULT_TRANSPORT_EFFORT,
       settings: config.settings ?? existing?.settings,
       settingsDir: existing?.settingsDir,
@@ -478,6 +517,9 @@ export class QwenProvider implements TransportProvider {
     if (cliAuthType) {
       args.push('--auth-type', cliAuthType);
     }
+    if (this.mcpRegistration?.safeToAllow) {
+      args.push('--allowed-mcp-server-names', this.mcpRegistration.serverName);
+    }
     if (state.started) {
       args.push('--resume', state.qwenConversationId);
     } else {
@@ -492,6 +534,7 @@ export class QwenProvider implements TransportProvider {
         ...process.env,
         ...((this.config.env as Record<string, string> | undefined) ?? {}),
         ...(state.env ?? {}),
+        ...(state.mcpEnv ?? {}),
         QWEN_CODE_SYSTEM_SETTINGS_PATH: await this.ensureSettingsPath(state),
       },
       stdio: ['ignore', 'pipe', 'pipe'],

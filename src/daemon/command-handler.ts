@@ -96,7 +96,16 @@ import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
 import { CC_PRESET_MSG, normalizeCcPresetName, type CcPreset } from '../../shared/cc-presets.js';
-import { MEMORY_WS } from '../../shared/memory-ws.js';
+import {
+  MEMORY_MCP_PROVIDER_IDS,
+  MEMORY_MCP_PROVIDER_STATUS_REASON,
+  MEMORY_MCP_DEGRADED_REASON,
+  MEMORY_MCP_STATUS,
+  MEMORY_MCP_TOOL_FAMILY,
+  MEMORY_WS,
+  type MemoryMcpProviderStatusView,
+  type MemoryMcpToolFamilyGateView,
+} from '../../shared/memory-ws.js';
 import { FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { P2P_PRESET_DEFAULT_SUMMARY_PROMPT, P2P_WORKFLOW_SCHEMA_VERSION } from '../../shared/p2p-workflow-constants.js';
@@ -235,6 +244,15 @@ import {
   setPersistedMemoryFeatureFlagValues,
   setRuntimeMemoryFeatureFlagValues,
 } from '../store/memory-feature-config-store.js';
+import {
+  MEMORY_MCP_DISABLED_FLAGS,
+  MEMORY_MCP_TOOL_NAMES,
+} from '../../shared/memory-mcp-contracts.js';
+import {
+  MCP_FEATURE_FLAGS_BY_NAME,
+  isMcpFeatureEnabled,
+} from '../../shared/memory-mcp-feature-flags.js';
+import { getProvider } from '../agent/provider-registry.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
 const processRecallRepositoryIdentityService = new GitOriginRepositoryIdentityService();
@@ -1514,6 +1532,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case MEMORY_WS.FEATURES_SET:
       handleMemoryFeaturesSet(cmd, serverLink);
+      break;
+    case MEMORY_WS.MCP_STATUS_QUERY:
+      handleMemoryMcpStatusQuery(cmd, serverLink);
       break;
     case MEMORY_WS.PREF_QUERY:
       void traceCommandAsync(cmd, 'web_command.memory_pref_query', () => handleMemoryPreferencesQuery(cmd, serverLink));
@@ -3953,11 +3974,7 @@ function timelineHistoryResponseTypeForRequest(cmd: Record<string, unknown>): ty
 
 function resolveTimelineHistoryBudgetBytes(cmd: Record<string, unknown>): number {
   const requested = optionalFiniteNumber(cmd.budgetBytes);
-  const explicit = cmd.type === TIMELINE_MESSAGES.PAGE_REQUEST
-    || (requested !== undefined && requested > TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE);
-  const cap = explicit
-    ? TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL
-    : TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
+  const cap = TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL;
   if (requested === undefined || requested <= 0) return cap;
   return Math.max(64 * 1024, Math.min(Math.trunc(requested), cap));
 }
@@ -3992,10 +4009,9 @@ function timelineWireBudgetForMessage(message: Record<string, unknown>): number 
   switch (message.type) {
     case TIMELINE_MESSAGES.PAGE:
     case TIMELINE_MESSAGES.DETAIL:
-      return TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL;
     case TIMELINE_MESSAGES.HISTORY:
     case TIMELINE_MESSAGES.REPLAY:
-      return TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
+      return TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL;
     default:
       return undefined;
   }
@@ -9046,6 +9062,132 @@ function handleMemoryFeaturesQuery(cmd: Record<string, unknown>, serverLink: Ser
     type: MEMORY_WS.FEATURES_RESPONSE,
     requestId,
     records: buildMemoryFeatureAdminRecords(),
+  });
+}
+
+function buildMemoryMcpProviderStatuses(): MemoryMcpProviderStatusView[] {
+  return MEMORY_MCP_PROVIDER_IDS.map((providerId) => {
+    const provider = getProvider(providerId);
+    if (!provider) {
+      return {
+        providerId,
+        status: MEMORY_MCP_STATUS.UNKNOWN,
+        connected: false,
+        degradedReasons: [MEMORY_MCP_PROVIDER_STATUS_REASON.PROVIDER_NOT_CONNECTED],
+      };
+    }
+    const reported = provider.getMemoryMcpStatus?.();
+    if (reported) {
+      return {
+        ...reported,
+        providerId,
+        connected: reported.connected ?? true,
+        degradedReasons: reported.degradedReasons ?? [],
+      };
+    }
+    return {
+      providerId,
+      status: MEMORY_MCP_STATUS.DEGRADED,
+      connected: true,
+      degradedReasons: [MEMORY_MCP_DEGRADED_REASON.STATUS_NOT_REPORTED],
+    };
+  });
+}
+
+function memoryMcpToolFamilyGate(): MemoryMcpToolFamilyGateView {
+  const tools = [
+    MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
+    MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+    MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
+    MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
+  ];
+  if (!isMcpFeatureEnabled(undefined, MCP_FEATURE_FLAGS_BY_NAME.memorySurface)) {
+    return {
+      family: MEMORY_MCP_TOOL_FAMILY.MEMORY,
+      status: MEMORY_MCP_STATUS.DISABLED,
+      enabled: false,
+      disabledFlag: MEMORY_MCP_DISABLED_FLAGS.MEMORY_SURFACE,
+      tools,
+    };
+  }
+  const disabledFlags = [
+    [MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch, MEMORY_MCP_DISABLED_FLAGS.QUICK_SEARCH],
+    [MEMORY_FEATURE_FLAGS_BY_NAME.observationStore, MEMORY_MCP_DISABLED_FLAGS.OBSERVATION_STORE],
+    [MEMORY_FEATURE_FLAGS_BY_NAME.preferences, MEMORY_MCP_DISABLED_FLAGS.PREFERENCES],
+  ] as const;
+  const disabledMemoryFlags = disabledFlags
+    .filter(([flag]) => !isMemoryFeatureEnabled(flag))
+    .map(([, disabledFlag]) => disabledFlag);
+  if (disabledMemoryFlags.length > 0) {
+    return {
+      family: MEMORY_MCP_TOOL_FAMILY.MEMORY,
+      status: MEMORY_MCP_STATUS.DEGRADED,
+      enabled: true,
+      disabledFlag: disabledMemoryFlags[0],
+      degradedReasons: disabledMemoryFlags,
+      tools,
+    };
+  }
+  return {
+    family: MEMORY_MCP_TOOL_FAMILY.MEMORY,
+    status: MEMORY_MCP_STATUS.READY,
+    enabled: true,
+    tools,
+  };
+}
+
+function sendMcpToolFamilyGate(): MemoryMcpToolFamilyGateView {
+  const enabled = isMcpFeatureEnabled(undefined, MCP_FEATURE_FLAGS_BY_NAME.sendDispatch);
+  return {
+    family: MEMORY_MCP_TOOL_FAMILY.SEND,
+    status: enabled ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.DISABLED,
+    enabled,
+    ...(enabled ? {} : { disabledFlag: MEMORY_MCP_DISABLED_FLAGS.SEND_DISPATCH }),
+    tools: [
+      MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
+      MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+    ],
+  };
+}
+
+function cronMcpToolFamilyGate(): MemoryMcpToolFamilyGateView {
+  const readEnabled = isMcpFeatureEnabled(undefined, MCP_FEATURE_FLAGS_BY_NAME.cronRead);
+  const writeEnabled = isMcpFeatureEnabled(undefined, MCP_FEATURE_FLAGS_BY_NAME.cronWrite);
+  const disabledFlags = [
+    ...(readEnabled ? [] : [MEMORY_MCP_DISABLED_FLAGS.CRON_READ]),
+    ...(writeEnabled ? [] : [MEMORY_MCP_DISABLED_FLAGS.CRON_WRITE]),
+  ];
+  return {
+    family: MEMORY_MCP_TOOL_FAMILY.CRON,
+    status: readEnabled && writeEnabled
+      ? MEMORY_MCP_STATUS.READY
+      : readEnabled || writeEnabled
+        ? MEMORY_MCP_STATUS.DEGRADED
+        : MEMORY_MCP_STATUS.DISABLED,
+    enabled: readEnabled || writeEnabled,
+    ...(disabledFlags[0] ? { disabledFlag: disabledFlags[0], degradedReasons: disabledFlags } : {}),
+    tools: [
+      MEMORY_MCP_TOOL_NAMES.CRON_CREATE,
+      MEMORY_MCP_TOOL_NAMES.CRON_LIST,
+      MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
+      MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
+    ],
+  };
+}
+
+function handleMemoryMcpStatusQuery(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+  const requestId = commandString(cmd, 'requestId') || undefined;
+  serverLink.send({
+    type: MEMORY_WS.MCP_STATUS_RESPONSE,
+    requestId,
+    providers: buildMemoryMcpProviderStatuses(),
+    toolFamilies: [
+      memoryMcpToolFamilyGate(),
+      sendMcpToolFamilyGate(),
+      cronMcpToolFamilyGate(),
+    ],
+    recentCalls: [],
+    updatedAt: Date.now(),
   });
 }
 

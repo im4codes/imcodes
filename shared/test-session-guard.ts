@@ -23,6 +23,7 @@ const SESSION_NAME_PATTERNS: RegExp[] = [
   /^imc_perf_test_[a-z0-9-]+$/i,
   /^imcodes-test-p2p-workflow[-_][a-z0-9-]+$/i,
   /^deck_sub_(?:cxsdk_e2e|cxsdk_effort|ccsdk_minimax_sub)$/i,
+  /^deck_sub_e2e_[a-z0-9_-]+$/i,
 ];
 
 const PROJECT_NAME_PATTERNS: RegExp[] = [

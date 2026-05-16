@@ -2,6 +2,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import type { ContextNamespace, LocalContextEvent } from '../../shared/context-types.js';
+import { buildMemoryMcpSourceProvenance, type MemoryMcpSourceProvenance, type MemoryMcpSourceProvenanceInput } from '../../shared/memory-mcp-provenance.js';
 import { serializeContextNamespace } from './context-keys.js';
 import {
   getArchivedEvent,
@@ -10,6 +11,10 @@ import {
   listProjectionSources,
   searchArchiveFts,
 } from '../store/context-store.js';
+
+const MEMORY_TOOL_CALLER_BRAND: unique symbol = Symbol('MemoryToolCaller');
+const INTERNAL_MEMORY_TOOL_CALLER_BRAND: unique symbol = Symbol('InternalMemoryToolCaller');
+const DAEMON_LOCAL_MEMORY_USER_ID = 'daemon-local';
 
 /**
  * Caller identity passed to public read-tool handlers.
@@ -21,9 +26,10 @@ import {
  *
  * (memory-system-1.1-foundations P4 / spec.md:298-311)
  */
-export interface MemoryToolCaller {
-  userId: string;
-  namespace: ContextNamespace;
+export interface MemoryToolCaller extends MemoryMcpSourceProvenance {
+  readonly userId: string;
+  readonly namespace: ContextNamespace;
+  readonly [MEMORY_TOOL_CALLER_BRAND]: true;
 }
 
 /**
@@ -38,24 +44,50 @@ export interface MemoryToolCaller {
  * from internal debug entry points where partial coverage is acceptable.
  */
 export interface InternalMemoryToolCaller {
-  userId: string;
+  readonly userId: string;
   /** Sentinel literal so the discriminator survives JSON round-trips in tests. */
-  allowGlobalOwnerSearch: true;
+  readonly allowGlobalOwnerSearch: true;
+  readonly [INTERNAL_MEMORY_TOOL_CALLER_BRAND]: true;
 }
 
 type AnyCaller = MemoryToolCaller | InternalMemoryToolCaller;
 
-function isInternalCaller(caller: AnyCaller): caller is InternalMemoryToolCaller {
-  return (caller as InternalMemoryToolCaller).allowGlobalOwnerSearch === true;
+export function createMemoryToolCaller(input: { userId: string; namespace: ContextNamespace } & MemoryMcpSourceProvenanceInput): MemoryToolCaller {
+  if (!input.userId.trim() || !input.namespace || typeof input.namespace !== 'object') {
+    throw new Error('invalid caller');
+  }
+  const provenance = buildMemoryMcpSourceProvenance(input);
+  return Object.freeze({
+    userId: input.userId,
+    namespace: input.namespace,
+    ...provenance,
+    [MEMORY_TOOL_CALLER_BRAND]: true as const,
+  }) as MemoryToolCaller;
 }
 
-function getBoundUserId(): string | undefined {
+export function _createInternalMemoryToolCaller(input: { userId: string }): InternalMemoryToolCaller {
+  if (!input.userId.trim()) {
+    throw new Error('invalid caller');
+  }
+  return Object.freeze({
+    userId: input.userId,
+    allowGlobalOwnerSearch: true,
+    [INTERNAL_MEMORY_TOOL_CALLER_BRAND]: true as const,
+  }) as InternalMemoryToolCaller;
+}
+
+function isInternalCaller(caller: AnyCaller): caller is InternalMemoryToolCaller {
+  return (caller as InternalMemoryToolCaller).allowGlobalOwnerSearch === true
+    && (caller as InternalMemoryToolCaller)[INTERNAL_MEMORY_TOOL_CALLER_BRAND] === true;
+}
+
+export function getBoundMemoryToolUserId(): string | undefined {
   const path = process.env.IMCODES_SERVER_CONFIG_PATH ?? join(homedir(), '.imcodes', 'server.json');
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as { userId?: string };
-    return typeof parsed.userId === 'string' ? parsed.userId : undefined;
+    return typeof parsed.userId === 'string' && parsed.userId.trim() ? parsed.userId.trim() : DAEMON_LOCAL_MEMORY_USER_ID;
   } catch {
-    return undefined;
+    return DAEMON_LOCAL_MEMORY_USER_ID;
   }
 }
 
@@ -66,7 +98,7 @@ function forbidden(message = 'raw memory events are private to the originating u
 }
 
 function assertOwner<T extends AnyCaller>(caller?: T): T {
-  const boundUserId = getBoundUserId();
+  const boundUserId = getBoundMemoryToolUserId();
   if (!boundUserId) throw forbidden('raw memory tools require a bound IM.codes user');
   if (!caller?.userId) throw forbidden('raw memory tools require an authenticated caller');
   if (caller.userId !== boundUserId) {
@@ -85,6 +117,9 @@ function assertOwner<T extends AnyCaller>(caller?: T): T {
 function assertPublicCallerHasNamespace(caller: MemoryToolCaller | undefined): MemoryToolCaller {
   if (!caller || !caller.namespace || typeof caller.namespace !== 'object') {
     throw forbidden('raw memory tools require caller namespace');
+  }
+  if ((caller as MemoryToolCaller)[MEMORY_TOOL_CALLER_BRAND] !== true) {
+    throw forbidden('raw memory tools require a factory-created caller');
   }
   // Reject any attempt to smuggle the internal flag through the public surface.
   if ((caller as unknown as { allowGlobalOwnerSearch?: unknown }).allowGlobalOwnerSearch) {

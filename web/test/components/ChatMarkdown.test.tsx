@@ -16,8 +16,17 @@ vi.mock('react-i18next', () => ({
 }));
 
 import { ChatMarkdown } from '../../src/components/ChatMarkdown';
+import { RICH_TEXT_ENHANCEMENT_CHAR_LIMIT } from '../../src/chat-render-limits';
 
 describe('ChatMarkdown', () => {
+  it('renders oversized text without markdown parsing', () => {
+    const text = `# ${'large message '.repeat(Math.ceil(RICH_TEXT_ENHANCEMENT_CHAR_LIMIT / 14))}`;
+    const { container } = render(<ChatMarkdown text={text} />);
+
+    expect(container.querySelector('h1')).toBeNull();
+    expect(container.textContent).toBe(text);
+  });
+
   it('detects relative paths with dots', () => {
     const { container } = render(
       <ChatMarkdown 

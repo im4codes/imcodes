@@ -16,6 +16,7 @@ import { useTranslation } from 'react-i18next';
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import { selectionToPlainText } from '../util/dom-to-text.js';
+import { selectionSignature } from '../util/selection-signature.js';
 
 interface Props {
   /** Plain-text content to display. Newlines and indentation are honoured. */
@@ -50,20 +51,26 @@ export function ZoomedTextDialog({ text, onClose, onQuote }: Props) {
   }, [onClose]);
 
   useEffect(() => {
+    let lastSelectionSignature = '';
     const onSelectionChange = () => {
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed || !sel.rangeCount) {
+        lastSelectionSignature = '';
         setSelectionMenu(null);
         return;
       }
+      const signature = selectionSignature(sel);
+      if (signature && signature === lastSelectionSignature) return;
 
       const range = sel.getRangeAt(0);
       const contentEl = contentRef.current;
       const dialogEl = dialogRef.current;
       if (!contentEl || !dialogEl || !contentEl.contains(range.commonAncestorContainer)) {
+        lastSelectionSignature = '';
         setSelectionMenu(null);
         return;
       }
+      lastSelectionSignature = signature;
 
       const selectedText = selectionToPlainText(sel) || sel.toString().trim();
       if (!selectedText) {

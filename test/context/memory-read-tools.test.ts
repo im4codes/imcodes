@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import { archiveEventsForMaterialization, recordContextEvent, resetContextStoreForTests, writeProcessedProjection } from '../../src/store/context-store.js';
-import { chatGetEvent, chatSearchFts, memoryGetSources } from '../../src/context/memory-read-tools.js';
+import { chatGetEvent, chatSearchFts, createMemoryToolCaller, memoryGetSources } from '../../src/context/memory-read-tools.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
 describe('memory read tools', () => {
@@ -22,6 +22,10 @@ describe('memory read tools', () => {
     } catch (error) {
       expect((error as Error & { code?: string }).code).toBe('IMCODES_MEMORY_FORBIDDEN');
     }
+  }
+
+  function caller(userId: string, namespace: ContextNamespace) {
+    return createMemoryToolCaller({ userId, namespace });
   }
 
   beforeEach(async () => {
@@ -43,11 +47,11 @@ describe('memory read tools', () => {
     const target = { namespace: bobRepo, kind: 'session' as const, sessionName: 'deck_repo_brain' };
     const event = recordContextEvent({ id: 'evt-1', target, eventType: 'user.message', content: 'secret raw content', createdAt: 1 });
     archiveEventsForMaterialization([event], 2);
-    expect(chatGetEvent('evt-1', { userId: 'bob', namespace: bobRepo })?.content).toBe('secret raw content');
-    expectForbidden(() => chatGetEvent('evt-1', { userId: 'alice', namespace: aliceRepo }));
+    expect(chatGetEvent('evt-1', caller('bob', bobRepo))?.content).toBe('secret raw content');
+    expectForbidden(() => chatGetEvent('evt-1', caller('alice', aliceRepo)));
   });
 
-  it('fails closed when caller or bound user identity is missing', async () => {
+  it('fails closed for malformed callers while allowing daemon-local fallback without bound user', async () => {
     const target = { namespace: bobRepo, kind: 'session' as const, sessionName: 'deck_repo_brain' };
     const event = recordContextEvent({ id: 'evt-auth', target, eventType: 'user.message', content: 'secret raw content', createdAt: 1 });
     archiveEventsForMaterialization([event], 2);
@@ -55,14 +59,16 @@ describe('memory read tools', () => {
     expectForbidden(() => (chatGetEvent as unknown as (id: string) => unknown)('evt-auth'));
     expectForbidden(() => (memoryGetSources as unknown as (id: string) => unknown)('projection-id'));
     expectForbidden(() => (chatSearchFts as unknown as (query: string) => unknown)('secret'));
-    expectForbidden(() => chatGetEvent('evt-auth', { userId: 'bob' }));
-    expectForbidden(() => chatSearchFts('secret', 10, { userId: 'bob' }));
+    expectForbidden(() => chatGetEvent('evt-auth', { userId: 'bob' } as never));
+    expectForbidden(() => chatSearchFts('secret', 10, { userId: 'bob' } as never));
 
     await rm(configPath, { force: true });
-    expectForbidden(() => chatGetEvent('evt-auth', { userId: 'bob', namespace: bobRepo }));
+    expectForbidden(() => chatGetEvent('evt-auth', caller('bob', bobRepo)));
+    expect(() => chatSearchFts('secret', 10, caller('daemon-local', { scope: 'personal', projectId: 'repo', userId: 'daemon-local' }))).not.toThrow();
 
     await writeFile(configPath, '{not-json', 'utf8');
-    expectForbidden(() => chatGetEvent('evt-auth', { userId: 'bob', namespace: bobRepo }));
+    expectForbidden(() => chatGetEvent('evt-auth', caller('bob', bobRepo)));
+    expect(() => chatSearchFts('secret', 10, caller('daemon-local', { scope: 'personal', projectId: 'repo', userId: 'daemon-local' }))).not.toThrow();
   });
 
   it('filters raw event and FTS results to the caller namespace', () => {
@@ -74,10 +80,10 @@ describe('memory read tools', () => {
     const aliceEvent = recordContextEvent({ id: 'evt-alice-repo', target: aliceTarget, eventType: 'user.message', content: 'needle hidden alice repo', createdAt: 3 });
     archiveEventsForMaterialization([bobEvent, otherEvent, aliceEvent], 4);
 
-    expectForbidden(() => chatGetEvent('evt-bob-other', { userId: 'bob', namespace: bobRepo }));
-    expectForbidden(() => chatGetEvent('evt-alice-repo', { userId: 'bob', namespace: bobRepo }));
+    expectForbidden(() => chatGetEvent('evt-bob-other', caller('bob', bobRepo)));
+    expectForbidden(() => chatGetEvent('evt-alice-repo', caller('bob', bobRepo)));
 
-    const matches = chatSearchFts('needle', 10, { userId: 'bob', namespace: bobRepo });
+    const matches = chatSearchFts('needle', 10, caller('bob', bobRepo));
     expect(matches.map((row) => row.id)).toEqual(['evt-bob-repo']);
     expect(matches.map((row) => row.content).join('\n')).not.toContain('hidden');
   });
@@ -87,7 +93,7 @@ describe('memory read tools', () => {
     const event = recordContextEvent({ id: 'evt-2', target, eventType: 'assistant.text', content: 'done', createdAt: 1 });
     archiveEventsForMaterialization([event], 2);
     const projection = writeProcessedProjection({ namespace: bobRepo, class: 'recent_summary', sourceEventIds: ['evt-2'], summary: 'done', content: {} });
-    const sources = memoryGetSources(projection.id, { userId: 'bob', namespace: bobRepo });
+    const sources = memoryGetSources(projection.id, caller('bob', bobRepo));
     expect(sources.sourceEventCount).toBe(1);
     expect(sources.sources?.[0]).toMatchObject({ eventId: 'evt-2', status: 'archived', content: 'done' });
     expect(sources.partial).toBe(false);
@@ -113,13 +119,13 @@ describe('memory read tools', () => {
       });
     }
 
-    const response = memoryGetSources(projection.id, { userId: 'bob', namespace: bobOtherRepo });
+    const response = memoryGetSources(projection.id, caller('bob', bobOtherRepo));
     expect(response).toEqual({
       projectionId: projection.id,
       sourceEventCount: 0,
       sources: [],
     });
-    const missing = memoryGetSources('missing-projection-id', { userId: 'bob', namespace: bobOtherRepo });
+    const missing = memoryGetSources('missing-projection-id', caller('bob', bobOtherRepo));
     expect({ sourceEventCount: response.sourceEventCount, sources: response.sources }).toEqual({
       sourceEventCount: missing.sourceEventCount,
       sources: missing.sources,
@@ -133,7 +139,7 @@ describe('memory read tools', () => {
     const otherEvent = recordContextEvent({ id: 'evt-malformed-other', target: otherTarget, eventType: 'user.message', content: 'literal malformed token foo" hidden', createdAt: 2 });
     archiveEventsForMaterialization([event, otherEvent], 3);
 
-    expect(() => chatSearchFts('foo"', 10, { userId: 'bob', namespace: bobRepo })).not.toThrow();
-    expect(chatSearchFts('foo"', 10, { userId: 'bob', namespace: bobRepo }).map((row) => row.id)).toEqual(['evt-malformed-ok']);
+    expect(() => chatSearchFts('foo"', 10, caller('bob', bobRepo))).not.toThrow();
+    expect(chatSearchFts('foo"', 10, caller('bob', bobRepo)).map((row) => row.id)).toEqual(['evt-malformed-ok']);
   });
 });

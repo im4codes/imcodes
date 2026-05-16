@@ -14,6 +14,7 @@ import { marked, type Token, type Tokens } from 'marked';
 import { useTranslation } from 'react-i18next';
 import { splitTextByHttpUrls, trimDetectedUrl } from '../link-detection.js';
 import { copyToClipboard } from '../util/clipboard.js';
+import { shouldSkipRichTextEnhancement } from '../chat-render-limits.js';
 
 // ── Code block with copy button ────────────────────────────────────────────
 
@@ -405,7 +406,19 @@ function splitPathsAndUrlsInternal(
 // ── Public component ────────────────────────────────────────────────────────
 
 export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload }: Props) {
-  const tokens = useMemo(() => marked.lexer(text), [text]);
+  const skipRichTextEnhancement = shouldSkipRichTextEnhancement(text);
+  const tokens = useMemo(() => (
+    skipRichTextEnhancement ? [] : marked.lexer(text)
+  ), [skipRichTextEnhancement, text]);
+
+  if (skipRichTextEnhancement) {
+    return (
+      <div class="chat-rich-text">
+        <span>{text}</span>
+      </div>
+    );
+  }
+
   return (
     <div class="chat-rich-text">
       {renderTokens(tokens, onPathClick, onUrlClick, false, onDownload)}

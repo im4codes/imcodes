@@ -14,7 +14,19 @@ const childProcessMock = vi.hoisted(() => {
     // Match either bare 'qwen' or a resolved node + cli.js path
     const isVersionCall = (file === 'qwen' || file.toLowerCase().endsWith('node.exe') || file.toLowerCase().endsWith('node'))
       && args.includes('--version');
-    cb?.(null, isVersionCall ? '0.13.2\n' : '', '');
+    if (isVersionCall) {
+      cb?.(null, '0.13.2\n', '');
+      return {} as never;
+    }
+    if (args.join(' ') === 'mcp list') {
+      cb?.(null, JSON.stringify({ servers: [] }), '');
+      return {} as never;
+    }
+    if (args[0] === 'mcp' && args[1] === 'add') {
+      cb?.(null, '', '');
+      return {} as never;
+    }
+    cb?.(null, '', '');
     return {} as never;
   });
 
@@ -72,6 +84,16 @@ import type { ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { AgentMessage } from '../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
+import {
+  IMCODES_DAEMON_NAMESPACE_ENV,
+  IMCODES_DAEMON_PROJECT_NAME_ENV,
+  IMCODES_DAEMON_PROJECT_ROOT_ENV,
+  IMCODES_DAEMON_SERVER_ID_ENV,
+  IMCODES_DAEMON_SESSION_NAME_ENV,
+  IMCODES_DAEMON_USER_ID_ENV,
+} from '../../shared/memory-mcp-env.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -117,6 +139,12 @@ describe('QwenProvider', () => {
       verified: true,
       completion: 'command-result',
       cancellation: 'provider-cancel',
+    });
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      providerId: 'qwen',
+      status: MEMORY_MCP_STATUS.READY,
+      connected: true,
+      degradedReasons: [],
     });
   });
 
@@ -216,6 +244,42 @@ describe('QwenProvider', () => {
     // choice stored in ~/.qwen/settings.json) — we must not force an auth tier
     // for them, or we'd override their working configuration.
     expect(spawned.args.includes('--auth-type')).toBe(false);
+  });
+
+  it('allows the daemon MCP server and passes per-session Memory MCP identity env to qwen', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-mcp',
+      sessionName: 'deck_repo_w1',
+      projectName: 'repo',
+      serverId: 'srv-bound',
+      cwd: '/tmp/project',
+      contextNamespace: {
+        scope: 'user_private',
+        userId: 'user-secret-ish',
+        projectId: 'github.com/acme/project',
+      },
+    });
+
+    await provider.send('sess-mcp', 'hello');
+    const spawned = lastSpawn();
+    const allowedIndex = spawned.args.indexOf('--allowed-mcp-server-names');
+
+    expect(allowedIndex).toBeGreaterThan(-1);
+    expect(spawned.args[allowedIndex + 1]).toBe(IMCODES_MEMORY_MCP_SERVER_NAME);
+    expect(spawned.env).toMatchObject({
+      [IMCODES_DAEMON_USER_ID_ENV]: 'user-secret-ish',
+      [IMCODES_DAEMON_SESSION_NAME_ENV]: 'deck_repo_w1',
+      [IMCODES_DAEMON_PROJECT_NAME_ENV]: 'repo',
+      [IMCODES_DAEMON_PROJECT_ROOT_ENV]: '/tmp/project',
+      [IMCODES_DAEMON_SERVER_ID_ENV]: 'srv-bound',
+    });
+    expect(JSON.parse(String(spawned.env?.[IMCODES_DAEMON_NAMESPACE_ENV]))).toEqual({
+      scope: 'user_private',
+      userId: 'user-secret-ish',
+      projectId: 'github.com/acme/project',
+    });
   });
 
   it('ignores settings.security.auth.selectedType that qwen CLI does not recognize', async () => {

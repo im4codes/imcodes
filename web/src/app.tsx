@@ -217,6 +217,10 @@ export interface PinnedPanel {
   props: Record<string, unknown>;
 }
 
+function readLegacyPinnedSessionTabs(): string[] {
+  try { return JSON.parse(localStorage.getItem('rcc_tab_pinned') ?? '[]') as string[]; } catch { return []; }
+}
+
 export function getFilePreviewInitialPath(request: FileBrowserPreviewRequest): string {
   if (request.rootPath) return request.rootPath;
   const slash = request.path.lastIndexOf('/');
@@ -933,6 +937,14 @@ export function App() {
 
   // Panels pinned to the sidebar — synced to server, write-through cache
   const [pinnedPanels, setPinnedPanels] = useSyncedPreference<PinnedPanel[]>('sidebar_pinned_panels', [], 0);
+  // Pinned session tabs — lifted to app.tsx so handleStopProject can guard
+  // against stopping pinned sessions. SessionTabs reads/writes via props.
+  const [pinnedTabsArr, setPinnedTabsArr] = useSyncedPreference<string[]>(
+    'tab_pinned',
+    readLegacyPinnedSessionTabs(),
+    0,
+  );
+  const pinnedTabs = useMemo(() => new Set(pinnedTabsArr), [pinnedTabsArr]);
   const [newUserGuidePref, setNewUserGuidePref] = useSyncedPreference<NewUserGuidePref>('new_user_guide', DEFAULT_NEW_USER_GUIDE_PREF, 0);
   const [showNewUserGuidePrompt, setShowNewUserGuidePrompt] = useState(false);
   const [showNewUserGuide, setShowNewUserGuide] = useState(false);
@@ -2501,18 +2513,18 @@ export function App() {
     ws.connect();
 
     // Probe the browser-server socket when the tab returns to the foreground.
-    // While the probe is waiting for pong, WsClient marks itself disconnected
-    // so the first user send cannot disappear into a stale-open socket.
+    // Focus can fire repeatedly while the page is already visible, so it must
+    // not also clear timeline backfill cooldowns and re-pull history.
     let lastResumeCheckAt = 0;
     let lastResumeCheckWasForce = false;
     let hiddenSinceAt = 0;
-    const handleResume = (forceIfStale = false) => {
+    const handleResume = (forceIfStale = false, refreshTimeline = false) => {
       const now = Date.now();
       if (now - lastResumeCheckAt < 500 && (!forceIfStale || lastResumeCheckWasForce)) return;
       lastResumeCheckAt = now;
       lastResumeCheckWasForce = forceIfStale;
       ws.resumeConnection(forceIfStale);
-      requestActiveTimelineRefresh({ resetCooldowns: true });
+      if (refreshTimeline) requestActiveTimelineRefresh({ resetCooldowns: true });
     };
     const onVisibility = () => {
       if (document.visibilityState === 'hidden') {
@@ -2521,13 +2533,13 @@ export function App() {
       }
       const wasLongHidden = hiddenSinceAt > 0 && Date.now() - hiddenSinceAt > 60_000;
       hiddenSinceAt = 0;
-      handleResume(wasLongHidden);
+      handleResume(wasLongHidden, true);
     };
     document.addEventListener('visibilitychange', onVisibility);
     const onFocus = () => handleResume(false);
     window.addEventListener('focus', onFocus);
     const onPageShow = (ev: PageTransitionEvent) => {
-      if (ev.persisted) handleResume();
+      if (ev.persisted) handleResume(false, true);
     };
     window.addEventListener('pageshow', onPageShow);
 
@@ -2997,11 +3009,18 @@ export function App() {
 
   const handleStopProject = useCallback((project: string) => {
     if (!wsRef.current) return;
+    // Pinned tabs are protected — refuse to stop a project that has any
+    // pinned session. User must unpin first. Defense-in-depth so all stop
+    // paths (tab context menu, session-controls menu) honor this.
+    if (sessions.some((s) => s.project === project && pinnedTabs.has(s.name))) {
+      try { window.alert(trans('session.unpin_to_stop')); } catch { /* ignore */ }
+      return;
+    }
     setSessions((prev) => prev.map((s) =>
       s.project === project ? { ...s, state: 'stopping' as SessionInfo['state'] } : s,
     ));
     wsRef.current.sendSessionCommand('stop', { project });
-  }, []);
+  }, [pinnedTabs, sessions, trans]);
 
   const handleRestartProject = useCallback((project: string, fresh?: boolean) => {
     wsRef.current?.sendSessionCommand('restart', { project, ...(fresh ? { fresh: true } : {}) });
@@ -3667,6 +3686,8 @@ export function App() {
               onRenameHandled={() => setRenameRequest(null)}
               onRenameSession={handleRenameSession}
               sessionsLoaded={sessionsLoaded}
+              pinned={pinnedTabs}
+              setPinnedArr={setPinnedTabsArr}
             />
 
             <div

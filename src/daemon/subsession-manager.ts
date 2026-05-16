@@ -51,6 +51,14 @@ export interface SubSessionRecord {
 
 export function subSessionName(id: string): string { return `deck_sub_${id}`; }
 
+function parentProjectName(sub: SubSessionRecord, fallbackSessionName: string): string {
+  const parentName = typeof sub.parentSession === 'string' && sub.parentSession.trim()
+    ? sub.parentSession.trim()
+    : undefined;
+  const parent = parentName ? getSession(parentName) : undefined;
+  return parent?.projectName ?? parentName ?? fallbackSessionName;
+}
+
 export function normalizeShellBinForHost(shellBin?: string | null): string | undefined {
   if (!shellBin) return undefined;
 
@@ -77,12 +85,13 @@ export function normalizeShellBinForHost(shellBin?: string | null): string | und
 export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   const sessionName = subSessionName(sub.id);
   const agentType = sub.type as AgentType;
+  const projectName = parentProjectName(sub, sessionName);
 
   if (isTransportAgent(agentType)) {
     if (await getTransportRuntime(sessionName)) return;
     await launchTransportSession({
       name: sessionName,
-      projectName: sessionName,
+      projectName,
       role: 'w1',
       agentType,
       projectDir: sub.cwd ?? process.cwd(),
@@ -215,7 +224,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   timelineEmitter.emit(sessionName, 'session.state', { state: 'started' });
 
   upsertSession({
-    name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion, role: 'w1', state: 'idle',
+    name: sessionName, projectName, agentType: sub.type, agentVersion, role: 'w1', state: 'idle',
     projectDir: sub.cwd ?? '', label: sub.label ?? undefined,
     ccSessionId: sub.ccSessionId ?? undefined,
     codexSessionId: sub.codexSessionId ?? undefined,
@@ -313,12 +322,13 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
 
   for (const sub of subSessions) {
     const sessionName = subSessionName(sub.id);
+    const projectName = parentProjectName(sub, sessionName);
     if (isTransportAgent(sub.type)) {
       const existingRuntime = getTransportRuntime(sessionName);
       if (!existingRuntime) {
       await launchTransportSession({
         name: sessionName,
-        projectName: sessionName,
+        projectName,
         role: 'w1',
         agentType: sub.type,
           projectDir: sub.cwd ?? process.cwd(),
@@ -375,7 +385,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       const effectiveGeminiSessionId = sub.geminiSessionId ?? stored?.geminiSessionId;
       const effectiveOpenCodeSessionId = sub.opencodeSessionId ?? stored?.opencodeSessionId;
       upsertSession({
-        name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: 'idle',
+        name: sessionName, projectName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: 'idle',
         projectDir: sub.cwd ?? '', label: sub.label ?? stored?.label ?? undefined,
         ccSessionId: effectiveCcSessionId ?? undefined,
         codexSessionId: effectiveCodexSessionId ?? undefined,

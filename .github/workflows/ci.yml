@@ -601,57 +601,107 @@ jobs:
           GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
 
-      - name: Build web assets
+      - name: Write JPush key into web/android/local.properties (china flavor only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${JPUSH_APP_KEY:-}" ]; then
+            : > web/android/local.properties
+            {
+              echo "JPUSH_APP_KEY=${JPUSH_APP_KEY}"
+              [ -n "${XIAOMI_APPID:-}" ]  && echo "XIAOMI_APPID=${XIAOMI_APPID}"
+              [ -n "${XIAOMI_APPKEY:-}" ] && echo "XIAOMI_APPKEY=${XIAOMI_APPKEY}"
+              [ -n "${VIVO_APPID:-}" ]    && echo "VIVO_APPID=${VIVO_APPID}"
+              [ -n "${VIVO_APPKEY:-}" ]   && echo "VIVO_APPKEY=${VIVO_APPKEY}"
+            } >> web/android/local.properties
+            echo "Wrote JPush + vendor keys to local.properties (china flavor will pick them up)."
+          else
+            echo "JPUSH_APP_KEY not set; china flavor will build but the JPush SDK will refuse to init at runtime."
+          fi
+        env:
+          JPUSH_APP_KEY:  ${{ secrets.JPUSH_APP_KEY }}
+          XIAOMI_APPID:   ${{ secrets.XIAOMI_APPID }}
+          XIAOMI_APPKEY:  ${{ secrets.XIAOMI_APPKEY }}
+          VIVO_APPID:     ${{ secrets.VIVO_APPID }}
+          VIVO_APPKEY:    ${{ secrets.VIVO_APPKEY }}
+
+      # The web bundle differs per flavor (compile-time VITE_REGION picks the
+      # push transport: FCM vs JPush). We therefore build web → cap sync →
+      # gradle assemble for each flavor in turn, rather than relying on
+      # gradle's default `assembleRelease` task that walks all flavors with a
+      # single set of web assets.
+
+      - name: Build web (global flavor) + sync + assemble globalRelease
         working-directory: web
-        run: npm run build
+        run: |
+          npm run build:global
+          npx cap sync android
+          (cd android && ./gradlew assembleGlobalRelease bundleGlobalRelease --stacktrace)
 
-      - name: Sync Capacitor Android project
+      - name: Build web (china flavor) + sync + assemble chinaRelease
         working-directory: web
-        run: npx cap sync android
-
-      - name: Build Android release APK + AAB
-        working-directory: web/android
-        run: ./gradlew assembleRelease bundleRelease --stacktrace
-
-      - name: Upload release APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: imcodes-android-release-apk
-          path: web/android/app/build/outputs/apk/release/*.apk
-          if-no-files-found: error
-
-      - name: Upload release AAB artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: imcodes-android-release-aab
-          path: web/android/app/build/outputs/bundle/release/*.aab
-          if-no-files-found: error
+        run: |
+          npm run build:china
+          npx cap sync android
+          (cd android && ./gradlew assembleChinaRelease bundleChinaRelease --stacktrace)
 
       - name: Get version info
         id: version
         run: |
           VERSION=$(grep versionName web/android/app/build.gradle | head -1 | sed 's/.*"\(.*\)".*/\1/')
           COMMIT_SHORT=$(git rev-parse --short HEAD)
-          echo "tag=android-v${VERSION}-${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
-          echo "name=Android v${VERSION} (${COMMIT_SHORT})" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then
+            echo "tag=android-dev-v${VERSION}-${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
+            echo "name=Android Dev v${VERSION} (${COMMIT_SHORT})" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=android-v${VERSION}-${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
+            echo "name=Android v${VERSION} (${COMMIT_SHORT})" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Rename artifacts with version
+      - name: Rename artifacts with version + flavor
         run: |
-          APK=$(ls web/android/app/build/outputs/apk/release/*.apk | head -1)
-          cp "$APK" "imcodes-${{ steps.version.outputs.tag }}.apk"
-          AAB=$(ls web/android/app/build/outputs/bundle/release/*.aab | head -1)
-          cp "$AAB" "imcodes-${{ steps.version.outputs.tag }}.aab"
+          set -euo pipefail
+          GLOBAL_APK=$(ls web/android/app/build/outputs/apk/global/release/*.apk | head -1)
+          CHINA_APK=$(ls  web/android/app/build/outputs/apk/china/release/*.apk  | head -1)
+          GLOBAL_AAB=$(ls web/android/app/build/outputs/bundle/globalRelease/*.aab | head -1)
+          CHINA_AAB=$(ls  web/android/app/build/outputs/bundle/chinaRelease/*.aab  | head -1)
+          cp "$GLOBAL_APK" "imcodes-global-${{ steps.version.outputs.tag }}.apk"
+          cp "$CHINA_APK"  "imcodes-china-${{ steps.version.outputs.tag }}.apk"
+          cp "$GLOBAL_AAB" "imcodes-global-${{ steps.version.outputs.tag }}.aab"
+          cp "$CHINA_AAB"  "imcodes-china-${{ steps.version.outputs.tag }}.aab"
+
+      - name: Upload release APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: imcodes-android-release-apk
+          path: imcodes-*-${{ steps.version.outputs.tag }}.apk
+          if-no-files-found: error
+
+      - name: Upload release AAB artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: imcodes-android-release-aab
+          path: imcodes-*-${{ steps.version.outputs.tag }}.aab
+          if-no-files-found: error
 
       - name: Create GitHub Release
-        if: github.ref == 'refs/heads/master'
+        if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.name }}
+          body: |
+            ## Android — Pick the edition that matches your region
+
+            - **`imcodes-global-*.apk`** — **International edition**. Push notifications via Firebase FCM (Google Play Services required). Use this everywhere outside Mainland China.
+            - **`imcodes-china-*.apk`** — **Mainland China edition**. Push notifications via 极光推送 JPush, which fans out to the on-device vendor channels (Huawei / Xiaomi / OPPO / vivo / Honor) so they work without Google Play Services.
+
+            Both APKs share the same applicationId (`com.im.codes`) and cannot coexist on a single device — install only one.
           files: |
-            imcodes-*.apk
-            imcodes-*.aab
+            imcodes-*-${{ steps.version.outputs.tag }}.apk
+            imcodes-*-${{ steps.version.outputs.tag }}.aab
           generate_release_notes: true
-          make_latest: true
+          prerelease: ${{ github.ref == 'refs/heads/dev' }}
+          make_latest: ${{ github.ref == 'refs/heads/master' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

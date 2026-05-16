@@ -314,7 +314,7 @@ describe('transport-history', () => {
     expect(firstIdx).toBe(4800);
   });
 
-  it('keeps default chat.history replay under 128KiB for subscribe bursts', async () => {
+  it('keeps default chat.history replay under the 1MiB trace cap without trimming chat text to 1KiB', async () => {
     // Synthetic subscribe burst. This intentionally avoids real transcripts.
     const session = `${TS}-bounded-chat-history`;
     const output = 'x'.repeat(5_000);
@@ -334,10 +334,11 @@ describe('transport-history', () => {
     const envelopeBytes = Buffer.byteLength(JSON.stringify({ type: 'chat.history', sessionId: session, events }), 'utf8');
 
     expect(envelopeBytes).toBeLessThanOrEqual(TRANSPORT_HISTORY_REPLAY_BUDGET_BYTES);
-    expect(events.length).toBeGreaterThan(0);
+    expect(events).toHaveLength(200);
     expect(events[events.length - 1]['idx']).toBe(219);
-    expect(events[0]['idx']).toBeGreaterThan(19);
+    expect(events[0]['idx']).toBe(20);
     expect(events.every((event) => event.type === 'assistant.text')).toBe(true);
+    expect(events.every((event) => event.text === output)).toBe(true);
     expect(events.every((event) => event.detail === undefined)).toBe(true);
   });
 });

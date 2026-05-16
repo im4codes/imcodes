@@ -13,10 +13,19 @@ import * as path from 'node:path';
 
 export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
-// ── One-time download tokens (in-memory, 15min expiry) ────────────────────────
-// Allows native apps (iOS WKWebView) to open download URLs in the system browser
-// without needing auth cookies. Token is single-use and short-lived.
-const downloadTokens = new Map<string, { serverId: string; attachmentId: string; userId: string; expiresAt: number }>();
+// ── Native download tokens (in-memory, 15min expiry) ─────────────────────────
+// Allows native apps to open download URLs in a system browser/download manager
+// without needing auth cookies. Android download handoff may request the same
+// URL more than once, so tokens are resource-bound and short-lived with a small
+// use budget instead of being consumed on the first GET.
+const DOWNLOAD_TOKEN_MAX_USES = 5;
+const downloadTokens = new Map<string, {
+  serverId: string;
+  attachmentId: string;
+  userId: string;
+  expiresAt: number;
+  remainingUses: number;
+}>();
 
 // Token-auth middleware for download endpoint only — scoped to upload/download paths
 // to avoid shadowing other sub-apps mounted at the same /api/server prefix.
@@ -25,7 +34,7 @@ const authMiddleware = requireAuth();
 fileTransferRoutes.use('/:id/upload', authMiddleware);
 fileTransferRoutes.use('/:id/uploads/:attachmentId/download-token', authMiddleware);
 fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) => {
-  // Token-based auth bypass for iOS downloads (SFSafariViewController has no cookies)
+  // Token-based auth bypass for native downloads (system browser has no app auth)
   const token = c.req.query('token');
   if (token && c.req.method === 'GET') {
     const entry = downloadTokens.get(token);
@@ -33,7 +42,13 @@ fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) =>
       downloadTokens.delete(token ?? '');
       return c.json({ error: 'invalid_or_expired_token' }, 401);
     }
-    downloadTokens.delete(token);
+    const serverId = c.req.param('id')!;
+    const attachmentId = c.req.param('attachmentId')!;
+    if (entry.serverId !== serverId || entry.attachmentId !== attachmentId) {
+      return c.json({ error: 'token_resource_mismatch' }, 403);
+    }
+    entry.remainingUses -= 1;
+    if (entry.remainingUses <= 0) downloadTokens.delete(token);
     c.set('userId' as never, entry.userId as never);
     c.set('tokenServerId' as never, entry.serverId as never);
     c.set('tokenAttachmentId' as never, entry.attachmentId as never);
@@ -139,7 +154,13 @@ fileTransferRoutes.post('/:id/uploads/:attachmentId/download-token', async (c) =
   }
 
   const token = randomHex(32);
-  downloadTokens.set(token, { serverId, attachmentId, userId, expiresAt: Date.now() + 900_000 });
+  downloadTokens.set(token, {
+    serverId,
+    attachmentId,
+    userId,
+    expiresAt: Date.now() + 900_000,
+    remainingUses: DOWNLOAD_TOKEN_MAX_USES,
+  });
 
   // Cleanup expired tokens periodically (max 1000 entries)
   if (downloadTokens.size > 1000) {
@@ -159,7 +180,8 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
   const serverId = c.req.param('id')!;
   const attachmentId = c.req.param('attachmentId')!;
 
-  // Token-auth binding: verify token was minted for this exact resource
+  // Token-auth binding: defense-in-depth. The middleware already checks this
+  // before decrementing remainingUses.
   const tokenServerId = c.get('tokenServerId' as never) as string | undefined;
   const tokenAttachmentId = c.get('tokenAttachmentId' as never) as string | undefined;
   if (tokenServerId && (tokenServerId !== serverId || tokenAttachmentId !== attachmentId)) {

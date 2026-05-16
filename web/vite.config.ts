@@ -2,9 +2,16 @@ import { defineConfig } from 'vite';
 import preact from '@preact/preset-vite';
 import path from 'path';
 
+// VITE_REGION selects the regional push channel at compile time:
+//   - 'global' (default) — FCM on Android via @capacitor/push-notifications
+//   - 'china'             — 极光推送 JPush on Android via our custom plugin
+// On iOS the value is ignored (APNs is used regardless).
+const pushRegion = process.env.VITE_REGION === 'china' ? 'china' : 'global';
+
 export default defineConfig({
   define: {
     __BUILD_TIME__: JSON.stringify(process.env.BUILD_TIME ?? new Date().toISOString()),
+    __PUSH_REGION__: JSON.stringify(pushRegion),
   },
   plugins: [preact()],
   resolve: {

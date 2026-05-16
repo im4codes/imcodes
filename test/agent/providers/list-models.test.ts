@@ -5,8 +5,9 @@
  * a ProviderModelList. These tests verify the contract is satisfied and that
  * handleTransportListModels dispatch delegates correctly.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import type { ProviderModelList } from '../../../src/agent/transport-provider.js';
+import { MEMORY_MCP_STATUS } from '../../../shared/memory-ws.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -115,6 +116,27 @@ describe('CursorHeadlessProvider.listModels', () => {
 // ── GeminiSdkProvider ────────────────────────────────────────────────────────
 
 describe('GeminiSdkProvider.listModels', () => {
+  it('reports managed MCP ready after the ACP connection is live', async () => {
+    const { GeminiSdkProvider } = await import('../../../src/agent/providers/gemini-sdk.js');
+    const provider = new GeminiSdkProvider();
+
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      providerId: 'gemini-sdk',
+      status: MEMORY_MCP_STATUS.UNKNOWN,
+      connected: false,
+    });
+
+    (provider as any).config = {};
+    (provider as any).connection = {};
+
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      providerId: 'gemini-sdk',
+      status: MEMORY_MCP_STATUS.READY,
+      connected: true,
+      degradedReasons: [],
+    });
+  });
+
   it('probes for models via newSession if not cached', async () => {
     const { GeminiSdkProvider } = await import('../../../src/agent/providers/gemini-sdk.js');
     const provider = new GeminiSdkProvider();

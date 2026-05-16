@@ -1,5 +1,13 @@
 declare const __BUILD_TIME__: string;
 
+/**
+ * Compile-time push channel selector, set by vite.config.ts based on the
+ * VITE_REGION env var. 'china' triggers the JPush registration path on
+ * Android; 'global' uses FCM via @capacitor/push-notifications. iOS ignores
+ * this entirely and always uses APNs.
+ */
+declare const __PUSH_REGION__: 'china' | 'global';
+
 // Vite ?url suffix — returns the asset URL as a string
 declare module '*?url' {
   const src: string;

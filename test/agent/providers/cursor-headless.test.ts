@@ -1,10 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   CursorHeadlessProvider,
   cursorHeadlessRuntimeHooks,
 } from '../../../src/agent/providers/cursor-headless.js';
 import { createCursorHeadlessHarness } from '../../cursor-headless-fixture.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import {
+  IMCODES_DAEMON_NAMESPACE_ENV,
+  IMCODES_DAEMON_PROJECT_NAME_ENV,
+  IMCODES_DAEMON_PROJECT_ROOT_ENV,
+  IMCODES_DAEMON_SERVER_ID_ENV,
+  IMCODES_DAEMON_SESSION_NAME_ENV,
+  IMCODES_DAEMON_USER_ID_ENV,
+} from '../../../shared/memory-mcp-env.js';
+import { MEMORY_MCP_STATUS } from '../../../shared/memory-ws.js';
 
 vi.mock('../../../src/util/logger.js', () => ({
   default: {
@@ -18,6 +30,7 @@ vi.mock('../../../src/util/logger.js', () => ({
 describe('CursorHeadlessProvider', () => {
   const originalLoadChildProcess = cursorHeadlessRuntimeHooks.loadChildProcess;
   let harness = createCursorHeadlessHarness();
+  let tempDirs: string[] = [];
 
   beforeEach(() => {
     harness = createCursorHeadlessHarness();
@@ -29,14 +42,24 @@ describe('CursorHeadlessProvider', () => {
 
   afterEach(() => {
     cursorHeadlessRuntimeHooks.loadChildProcess = originalLoadChildProcess;
+    for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+    tempDirs = [];
   });
 
   it('connects by probing version and authentication status', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-cursor-provider-mcp-'));
+    tempDirs.push(dir);
     const provider = new CursorHeadlessProvider();
-    await provider.connect({ binaryPath: 'cursor-agent' });
+    await provider.connect({ binaryPath: 'cursor-agent', cursorMcpConfigPath: join(dir, 'mcp.json') });
 
     expect(harness.execFile.mock.calls.some((call) => Array.isArray(call[1]) && (call[1] as string[]).includes('--version'))).toBe(true);
     expect(harness.execFile.mock.calls.some((call) => Array.isArray(call[1]) && (call[1] as string[]).includes('status'))).toBe(true);
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      providerId: 'cursor-headless',
+      status: MEMORY_MCP_STATUS.READY,
+      connected: true,
+      degradedReasons: [],
+    });
   });
 
   it('rejects when the status probe reports a logged-out account', async () => {
@@ -185,6 +208,41 @@ describe('CursorHeadlessProvider', () => {
       { name: 'shell', status: 'complete', output: 'hello' },
     ]);
     expect(infos).toContainEqual({ resumeId: 'cursor-chat-2', model: 'gpt-5.2' });
+  });
+
+  it('passes per-session Memory MCP identity env to the cursor-agent process', async () => {
+    harness.state.createChatOutput = 'cursor-chat-mcp\n';
+    const provider = new CursorHeadlessProvider();
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    const sessionId = await provider.createSession({
+      sessionKey: 'route-mcp',
+      sessionName: 'deck_repo_w1',
+      projectName: 'repo',
+      serverId: 'srv-bound',
+      cwd: '/tmp/project',
+      contextNamespace: {
+        scope: 'user_private',
+        userId: 'user-secret-ish',
+        projectId: 'github.com/acme/project',
+      },
+    });
+
+    await provider.send(sessionId, 'hello');
+    const spawned = harness.lastSpawn();
+
+    expect(spawned.args).toContain('--approve-mcps');
+    expect(spawned.env).toMatchObject({
+      [IMCODES_DAEMON_USER_ID_ENV]: 'user-secret-ish',
+      [IMCODES_DAEMON_SESSION_NAME_ENV]: 'deck_repo_w1',
+      [IMCODES_DAEMON_PROJECT_NAME_ENV]: 'repo',
+      [IMCODES_DAEMON_PROJECT_ROOT_ENV]: '/tmp/project',
+      [IMCODES_DAEMON_SERVER_ID_ENV]: 'srv-bound',
+    });
+    expect(JSON.parse(String(spawned.env?.[IMCODES_DAEMON_NAMESPACE_ENV]))).toEqual({
+      scope: 'user_private',
+      userId: 'user-secret-ish',
+      projectId: 'github.com/acme/project',
+    });
   });
 
   it('cancels the active child process and emits a recoverable cancelled error', async () => {

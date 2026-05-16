@@ -732,8 +732,41 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     await waitFor(() => {
       const panel = container.querySelector('.subsession-window') as HTMLElement | null;
       expect(panel).toBeTruthy();
+      expect(panel?.style.width).toBe('620px');
       expect(panel?.style.height).toBe('620px');
       expect(panel?.style.zIndex).toBe('6000');
+    });
+  });
+
+  it('clamps persisted desktop geometry to a minimum 600x400 window', async () => {
+    localStorage.setItem('rcc_subsession_sub-1', JSON.stringify({
+      geom: { x: 120, y: 80, w: 120, h: 60 },
+      viewMode: 'chat',
+    }));
+
+    const sub = makeSubSession();
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={6000}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const panel = container.querySelector('.subsession-window') as HTMLElement | null;
+      expect(panel).toBeTruthy();
+      expect(panel?.style.width).toBe('600px');
+      expect(panel?.style.height).toBe('400px');
     });
   });
 

@@ -33,6 +33,18 @@ import {
   parseCursorStreamLine,
   type CursorParsedEvent,
 } from './cursor-headless-stream.js';
+import {
+  ensureCursorMcpJsonHasImcodesEntry,
+  type CursorMcpEnsureOptions,
+  type CursorMcpEnsureResult,
+} from '../../daemon/cursor-mcp-config.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { getDefaultMcpServers } from './getDefaultMcpServers.js';
+import {
+  MEMORY_MCP_PROVIDER_STATUS_REASON,
+  MEMORY_MCP_STATUS,
+  type MemoryMcpProviderStatusView,
+} from '../../../shared/memory-ws.js';
 
 const CURSOR_BIN = 'cursor-agent';
 const CONNECT_PROBE_TIMEOUT_MS = 15_000;
@@ -52,6 +64,7 @@ interface CursorSessionState {
   resumeId: string;
   cwd: string;
   model?: string;
+  mcpEnv?: Record<string, string>;
   child: ChildProcess | null;
   currentMessageId: string | null;
   currentText: string;
@@ -90,6 +103,18 @@ function toProcessEnv(value: unknown): NodeJS.ProcessEnv {
   return value as NodeJS.ProcessEnv;
 }
 
+function buildCursorMemoryMcpEnv(config: SessionConfig): Record<string, string> | undefined {
+  const env = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME]?.env;
+  return env && Object.keys(env).length > 0 ? env : undefined;
+}
+
+function cursorMcpEnsureOptionsFromConfig(config: ProviderConfig): CursorMcpEnsureOptions {
+  const configPath = typeof config.cursorMcpConfigPath === 'string' && config.cursorMcpConfigPath.trim()
+    ? config.cursorMcpConfigPath.trim()
+    : undefined;
+  return configPath ? { configPath, skipTestDefaultPath: false } : {};
+}
+
 function extractResultText(event: CursorParsedEvent): string | undefined {
   if (event.kind !== 'result.success') return undefined;
   return event.text;
@@ -118,6 +143,7 @@ export class CursorHeadlessProvider implements TransportProvider {
   };
 
   private config: ProviderConfig | null = null;
+  private mcpRegistration: CursorMcpEnsureResult | null = null;
   private sessions = new Map<string, CursorSessionState>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
@@ -179,8 +205,37 @@ export class CursorHeadlessProvider implements TransportProvider {
       if (this.isAuthProbeFailure(err)) throw this.normalizeAuthError(err);
       throw this.normalizeConnectError(err, 'Cursor status probe failed');
     }
+    this.mcpRegistration = await ensureCursorMcpJsonHasImcodesEntry(cursorMcpEnsureOptionsFromConfig(config)).catch((err) => {
+      logger.warn({ provider: this.id, err }, 'Cursor MCP auto-configuration failed; continuing without managed MCP registration');
+      return {
+        serverName: IMCODES_MEMORY_MCP_SERVER_NAME,
+        configPath: '',
+        changed: false,
+        degraded: true as const,
+        reason: MEMORY_MCP_PROVIDER_STATUS_REASON.MCP_REGISTRATION_FAILED,
+      };
+    });
     this.config = config;
     logger.info({ provider: this.id, resolved: resolved.executable }, 'Cursor headless provider connected');
+  }
+
+  getMemoryMcpStatus(): MemoryMcpProviderStatusView {
+    if (this.mcpRegistration?.degraded) {
+      return {
+        providerId: this.id,
+        status: MEMORY_MCP_STATUS.DEGRADED,
+        connected: true,
+        degradedReasons: [
+          this.mcpRegistration.reason ?? MEMORY_MCP_PROVIDER_STATUS_REASON.MCP_REGISTRATION_FAILED,
+        ],
+      };
+    }
+    return {
+      providerId: this.id,
+      status: MEMORY_MCP_STATUS.READY,
+      connected: true,
+      degradedReasons: [],
+    };
   }
 
   async disconnect(): Promise<void> {
@@ -226,6 +281,7 @@ export class CursorHeadlessProvider implements TransportProvider {
       resumeId,
       cwd,
       model,
+      mcpEnv: buildCursorMemoryMcpEnv(config) ?? existingEntry?.[1].mcpEnv,
       child: null,
       currentMessageId: null,
       currentText: '',
@@ -340,6 +396,7 @@ export class CursorHeadlessProvider implements TransportProvider {
       '--output-format',
       'stream-json',
       '--stream-partial-output',
+      '--approve-mcps',
       '--resume',
       resumeId,
       ...(state.model ? ['--model', state.model] : []),
@@ -351,6 +408,7 @@ export class CursorHeadlessProvider implements TransportProvider {
       env: {
         ...process.env,
         ...toProcessEnv(this.config.env),
+        ...(state.mcpEnv ?? {}),
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
@@ -637,6 +695,7 @@ export class CursorHeadlessProvider implements TransportProvider {
       env: {
         ...process.env,
         ...toProcessEnv(this.config?.env),
+        ...(buildCursorMemoryMcpEnv(config) ?? {}),
       },
       cwd: normalizeTransportCwd(config.cwd) ?? normalizeTransportCwd(process.cwd())!,
     });
@@ -708,6 +767,7 @@ export class CursorHeadlessProvider implements TransportProvider {
       env: {
         ...process.env,
         ...toProcessEnv(this.config?.env),
+        ...(state.mcpEnv ?? {}),
       },
       cwd: state.cwd,
     });

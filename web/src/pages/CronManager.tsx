@@ -359,6 +359,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
               <span>→ {displayTarget(job)}</span>
               {action?.type === 'p2p' && <span style={{ opacity: 0.6 }}>P2P {action.mode}</span>}
               {action?.type === 'command' && <span style={{ opacity: 0.6, maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
+              {action?.type === 'send' && <span style={{ opacity: 0.6, maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('common.send')} → {action.target}</span>}
             </div>
 
             {isReadOnly && (
@@ -469,6 +470,7 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
               <span>→ {exec.target_role}</span>
               {action?.type === 'p2p' && <span>P2P {action.mode}</span>}
               {action?.type === 'command' && <span style={{ maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
+              {action?.type === 'send' && <span style={{ maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('common.send')} → {action.target}</span>}
               {hasP2p && onViewDiscussion && (
                 <button type="button" onClick={(e) => { e.stopPropagation(); onViewDiscussion(exec.detail!.slice(4)); }}
                   style={{ color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline' }}>
@@ -545,6 +547,9 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
         )}
         {action?.type === 'p2p' && (
           <div style={{ marginTop: '2px' }}><strong style={{ color: '#cbd5e1' }}>P2P:</strong> {action.mode} · {action.rounds ?? 1} {t('cron.p2p_rounds').toLowerCase()}</div>
+        )}
+        {action?.type === 'send' && (
+          <div style={{ marginTop: '2px' }}><strong style={{ color: '#cbd5e1' }}>{t('common.send')}:</strong> {action.target}</div>
         )}
         {job.next_run_at && <div style={{ marginTop: '4px', fontSize: '11px', color: '#64748b' }}>{t('cron.next_run')}: {fmtTime(job.next_run_at)}</div>}
       </div>
@@ -819,7 +824,9 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
   const [cronExpr, setCronExpr] = useState(job?.cron_expr ?? '');
   const [targetRole, setTargetRole] = useState(job?.target_role ?? 'brain');
   const [targetSessionName, setTargetSessionName] = useState<string | null>(job?.target_session_name ?? null);
-  const [actionType, setActionType] = useState<'command' | 'p2p'>(existingAction?.type ?? 'command');
+  const [actionType, setActionType] = useState<'command' | 'p2p' | 'send'>(
+    existingAction?.type === 'p2p' || existingAction?.type === 'send' ? existingAction.type : 'command',
+  );
   const [command, setCommand] = useState(existingAction?.type === 'command' ? existingAction.command : '');
   const [p2pTopic, setP2pTopic] = useState(existingAction?.type === 'p2p' ? existingAction.topic : '');
   const [p2pMode, setP2pMode] = useState(existingAction?.type === 'p2p' ? existingAction.mode : 'discuss');
@@ -870,7 +877,9 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
 
     const action: CronAction = actionType === 'command'
       ? { type: 'command', command }
-      : {
+      : actionType === 'send' && existingAction?.type === 'send'
+        ? existingAction
+        : {
           type: 'p2p', topic: p2pTopic, mode: p2pMode, rounds: p2pRounds,
           // When any session entries exist, use only participantEntries (avoids duplication).
           // Legacy participants field only for pure-role jobs (backward compat).
@@ -956,6 +965,12 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
             <input type="radio" name="actionType" checked={actionType === 'p2p'} onChange={() => setActionType('p2p')} style={{ marginRight: '6px' }} />
             {t('cron.action_p2p')}
           </label>
+          {actionType === 'send' && (
+            <label style={{ color: '#e2e8f0', fontSize: '14px' }}>
+              <input type="radio" name="actionType" checked readOnly style={{ marginRight: '6px' }} />
+              {t('common.send')}
+            </label>
+          )}
         </div>
 
         {actionType === 'command' && (

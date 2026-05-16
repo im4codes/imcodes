@@ -399,6 +399,70 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_cx_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
   });
 
+  it('uses gpt-5.5 instead of Claude-family models when launching codex-sdk', async () => {
+    await connectProvider('codex-sdk', {});
+    await launchTransportSession({
+      name: 'deck_sdk_cx_launch_opus_brain',
+      projectName: 'sdkcxlaunchopus',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-cx-launch-opus',
+      requestedModel: 'opus',
+      fresh: true,
+    });
+
+    expect(mocks.store.get('deck_sdk_cx_launch_opus_brain')?.requestedModel).toBe('gpt-5.5');
+    expect(mocks.store.get('deck_sdk_cx_launch_opus_brain')?.modelDisplay).toBe('gpt-5.5');
+
+    const runtime = getTransportRuntime('deck_sdk_cx_launch_opus_brain');
+    expect(runtime).toBeDefined();
+    runtime!.send('launch with sanitized model');
+    await flush();
+
+    expect(mocks.codexRuns[0]).toMatchObject({
+      mode: 'start',
+      options: expect.objectContaining({ model: 'gpt-5.5' }),
+    });
+  });
+
+  it('uses gpt-5.5 instead of stored Claude-family models when restoring codex-sdk', async () => {
+    mocks.store.set('deck_sdk_cx_opus_brain', {
+      name: 'deck_sdk_cx_opus_brain',
+      projectName: 'sdkcxopus',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-cx-opus',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-opus-restore',
+      codexSessionId: 'codex-thread-opus-restore',
+      requestedModel: 'opus',
+      activeModel: 'opus',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    expect(mocks.store.get('deck_sdk_cx_opus_brain')?.requestedModel).toBe('gpt-5.5');
+    expect(mocks.store.get('deck_sdk_cx_opus_brain')?.modelDisplay).toBe('gpt-5.5');
+
+    const runtime = getTransportRuntime('deck_sdk_cx_opus_brain');
+    expect(runtime).toBeDefined();
+    runtime!.send('resume with sanitized model');
+    await flush();
+
+    expect(mocks.codexRuns[0]).toMatchObject({
+      mode: 'resume',
+      id: 'codex-thread-opus-restore',
+      options: expect.objectContaining({ model: 'gpt-5.5' }),
+    });
+  });
+
   it('publishes idle after restoring a transport session from stale persisted running state', async () => {
     const persistedRecords: Array<Record<string, any> | null> = [];
     setSessionPersistCallback(async (record) => {

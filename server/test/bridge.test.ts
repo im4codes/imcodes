@@ -717,7 +717,7 @@ describe('WsBridge', () => {
 
     it('drops oversized payload', async () => {
       const { daemonWs, browserWs } = await setupBridge();
-      browserWs.emit('message', JSON.stringify({ type: 'session.send', text: 'x'.repeat(70000) }));
+      browserWs.emit('message', JSON.stringify({ type: 'session.send', text: 'x'.repeat(TIMELINE_PAYLOAD_BUDGET_BYTES.CHAT_HISTORY_TRACE_HARD_LIMIT + 1) }));
       expect(daemonWs.sent).toHaveLength(0);
     });
 
@@ -4266,6 +4266,11 @@ describe('WsBridge', () => {
           errorReason: TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
           events: [],
         });
+        // Section-10 (post-deploy audit fix, commit f25f72e7) — transient
+        // backpressure errors MUST carry `recoverable: true` so the web
+        // `useTimeline.shouldRetryTimelineHistoryResponse` allow-list
+        // triggers an auto-retry instead of stalling until manual refresh.
+        expect(queueFullResponses[0].recoverable).toBe(true);
 
         await flushBridgeDataPlane();
         const okResponses = browserOk.sentStrings

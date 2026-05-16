@@ -13,7 +13,6 @@ const NORMAL_STRING_BYTES = 4 * 1024;
 const TIGHT_STRING_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.FIELD_PREVIEW;
 const TOOL_OUTPUT_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.FIELD_PREVIEW;
 const TOOL_RAW_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.FIELD_PREVIEW;
-const TEXT_EVENT_BYTES = 4 * 1024;
 const DETAIL_RESPONSE_HEADROOM_BYTES = 16 * 1024;
 export const TIMELINE_HISTORY_DETAIL_CANDIDATE_VALUE_MAX_BYTES =
   TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL - DETAIL_RESPONSE_HEADROOM_BYTES;
@@ -241,6 +240,34 @@ function sanitizeToolDetail(detail: unknown, stats: MutableSanitizeStats): unkno
   return out;
 }
 
+function isTextTimelineEvent(event: TimelineEvent): boolean {
+  return event.type === 'user.message'
+    || event.type === 'assistant.text'
+    || event.type === 'assistant.thinking';
+}
+
+function sanitizeTextPayload(
+  payload: Record<string, unknown>,
+  stats: MutableSanitizeStats,
+  policy: ValuePolicy,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  let count = 0;
+  for (const key in payload) {
+    if (!Object.prototype.hasOwnProperty.call(payload, key)) continue;
+    if (count >= policy.maxObjectKeys) {
+      stats.truncatedValues += 1;
+      break;
+    }
+    const value = payload[key];
+    out[key] = key === 'text' && typeof value === 'string'
+      ? value
+      : sanitizeValue(value, policy, stats);
+    count += 1;
+  }
+  return out;
+}
+
 function sanitizePayload(event: TimelineEvent, stats: MutableSanitizeStats, policy = NORMAL_POLICY): Record<string, unknown> {
   const payload = event.payload ?? {};
   if (event.type === 'tool.call' || event.type === 'tool.result') {
@@ -267,11 +294,8 @@ function sanitizePayload(event: TimelineEvent, stats: MutableSanitizeStats, poli
     return out;
   }
 
-  if ((event.type === 'user.message' || event.type === 'assistant.text' || event.type === 'assistant.thinking') && typeof payload.text === 'string') {
-    return {
-      ...sanitizeValue(payload, policy, stats) as Record<string, unknown>,
-      text: truncateStringByUtf8Bytes(payload.text, TEXT_EVENT_BYTES),
-    };
+  if (isTextTimelineEvent(event) && typeof payload.text === 'string') {
+    return sanitizeTextPayload(payload, stats, policy);
   }
 
   return sanitizeValue(payload, policy, stats) as Record<string, unknown>;
@@ -283,7 +307,8 @@ function minimalPayload(event: TimelineEvent, originalPayloadBytes: number, stat
     historyPayloadTruncated: true,
     originalPayloadBytesBucket: bucketBytes(originalPayloadBytes),
   };
-  if (typeof payload.text === 'string') out.text = truncateStringByUtf8Bytes(payload.text, TEXT_EVENT_BYTES);
+  if (isTextTimelineEvent(event) && typeof payload.text === 'string') out.text = payload.text;
+  else if (typeof payload.text === 'string') out.text = truncateStringByUtf8Bytes(payload.text, TIGHT_STRING_BYTES);
   if (typeof payload.tool === 'string') out.tool = payload.tool;
   if (typeof payload.error === 'string') out.error = truncateStringByUtf8Bytes(payload.error, TIGHT_STRING_BYTES);
   if (typeof payload.output === 'string') out.output = truncateStringByUtf8Bytes(payload.output, TIGHT_STRING_BYTES);
@@ -303,7 +328,6 @@ function detailStringAtPath(event: TimelineEvent, fieldPath: string): string | u
 
 export function collectTimelineHistoryDetailCandidates(event: TimelineEvent): TimelineHistoryDetailCandidate[] {
   const fieldCandidates: Array<{ fieldPath: TimelineDetailFieldPath; previewBytes: number; mediaType?: string }> = [
-    { fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_TEXT, previewBytes: TEXT_EVENT_BYTES, mediaType: 'text/plain' },
     { fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_OUTPUT, previewBytes: TOOL_OUTPUT_BYTES, mediaType: 'text/plain' },
     { fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_ERROR, previewBytes: TIGHT_STRING_BYTES, mediaType: 'text/plain' },
     { fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_DETAIL_OUTPUT, previewBytes: TOOL_OUTPUT_BYTES, mediaType: 'text/plain' },
@@ -374,17 +398,18 @@ export function sanitizeTimelineHistoryEventForTransport(
   let next = eventWithPayload(event, sanitizePayload(event, stats));
   let bytes = jsonBytes(next);
 
-  if (bytes > maxEventBytes) {
+  if (bytes > maxEventBytes && !isTextTimelineEvent(event)) {
     next = eventWithPayload(event, sanitizePayload(next, stats, TIGHT_POLICY));
     bytes = jsonBytes(next);
   }
 
-  if (bytes > maxEventBytes) {
+  if (bytes > maxEventBytes && !isTextTimelineEvent(event)) {
     next = eventWithPayload(event, minimalPayload(event, originalPayloadBytes, stats));
     bytes = jsonBytes(next);
   }
 
-  const truncated = stats.truncatedValues > beforeTruncations || originalPayloadBytes > maxEventBytes;
+  const truncated = stats.truncatedValues > beforeTruncations
+    || (!isTextTimelineEvent(event) && originalPayloadBytes > maxEventBytes);
   return {
     event: next,
     bytes,

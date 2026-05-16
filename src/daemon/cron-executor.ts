@@ -21,6 +21,44 @@ const CRON_DAEMON_BUSY_DEFAULT_DELAY_MS = 5_000;
 
 const BUSY_STATES = new Set(['streaming', 'thinking', 'tool_running', 'permission']);
 
+export interface CronSendDispatchInput {
+  fromSessionName: string;
+  target: string;
+  message: string;
+  reply?: boolean;
+  broadcast?: boolean;
+  idempotencyKey?: string;
+}
+
+export interface CronSendDispatchResult {
+  dispatchId: string;
+  status?: 'dispatched' | 'partial';
+  deliveries: Array<{
+    target: string;
+    messageId?: string;
+    status?: 'delivered' | 'failed';
+    error?: string;
+  }>;
+}
+
+type CronSendDispatcher = (input: CronSendDispatchInput) => Promise<CronSendDispatchResult>;
+
+let cronSendDispatcherOverride: CronSendDispatcher | null = null;
+
+export function __setCronSendDispatcherForTests(dispatcher: CronSendDispatcher | null): void {
+  cronSendDispatcherOverride = dispatcher;
+}
+
+async function loadCronSendDispatcher(): Promise<CronSendDispatcher> {
+  if (cronSendDispatcherOverride) return cronSendDispatcherOverride;
+  const modulePath = './send-dispatcher.js';
+  const loaded = await import(modulePath) as { dispatchCronSend?: unknown };
+  if (typeof loaded.dispatchCronSend !== 'function') {
+    throw new Error('cron send dispatcher integration is unavailable');
+  }
+  return loaded.dispatchCronSend as CronSendDispatcher;
+}
+
 export async function executeCronJob(msg: CronDispatchMessage, serverLink: ServerLink): Promise<void> {
   const { jobId, executionId, jobName, projectName, targetRole, targetSessionName, action } = msg;
 
@@ -132,6 +170,47 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
 
     // Capture agent response: collect assistant.text events until session goes idle
     collectCommandResult(name, jobId, executionId, serverLink);
+    return;
+  }
+
+  if (action.type === 'send') {
+    logger.info({ jobId, jobName, sessionName: name, target: action.target }, 'Cron: dispatching structured send action');
+    try {
+      const dispatchCronSend = await loadCronSendDispatcher();
+      const result = await dispatchCronSend({
+        fromSessionName: name,
+        target: action.target,
+        message: action.message,
+        ...(action.reply !== undefined ? { reply: action.reply } : {}),
+        ...(action.broadcast !== undefined ? { broadcast: action.broadcast } : {}),
+        ...(action.idempotencyKey ? { idempotencyKey: action.idempotencyKey } : {}),
+      });
+      logger.info({
+        jobId,
+        executionId,
+        dispatchId: result.dispatchId,
+        messageIds: result.deliveries.map((delivery) => delivery.messageId),
+      }, 'Cron: structured send dispatched');
+      sendCommandResult(serverLink, {
+        type: CRON_MSG.COMMAND_RESULT,
+        jobId,
+        executionId,
+        status: result.status ?? 'dispatched',
+        detail: JSON.stringify({
+          dispatchId: result.dispatchId,
+          deliveries: result.deliveries,
+        }),
+      });
+    } catch (err) {
+      logger.error({ jobId, executionId, err }, 'Cron: structured send dispatch failed');
+      sendCommandResult(serverLink, {
+        type: CRON_MSG.COMMAND_RESULT,
+        jobId,
+        executionId,
+        status: 'error',
+        detail: `Cron structured send failed: ${formatErr(err)}`,
+      });
+    }
     return;
   }
 

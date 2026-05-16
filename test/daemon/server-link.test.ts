@@ -157,6 +157,43 @@ describe('ServerLink', () => {
     expect(mockWsInstance.send).toHaveBeenCalledTimes(1);
   });
 
+  it('drain leaves the queued data-plane item intact when the socket is not OPEN and resends it after reconnect', async () => {
+    // Section-10 (post-deploy audit fix for commit f25f72e7) anchor:
+    // before the fix, the drain loop ran `shift()` and then `trySend()`
+    // and ignored the trySend return value, so a brief WS-not-OPEN
+    // window silently dropped the queue head. The peek-then-shift fix
+    // requires that the item stay queued until trySend confirms send.
+    link.connect();
+    expect(mockWsInstance.readyState).toBe(1); // OPEN
+
+    // Simulate WS leaving OPEN state right before the drain runs:
+    // any data-plane message enqueued here must not be sent until OPEN
+    // is restored.
+    mockWsInstance.readyState = 2; // CLOSING
+
+    const payload = { type: TIMELINE_MESSAGES.HISTORY, requestId: 'hist-1', sessionId: 'deck_test_brain', events: [{ text: 'x'.repeat(256) }] };
+    link.send(payload);
+    // Let the setImmediate drain tick run while the socket is not OPEN.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // Peek-then-shift: the item must NOT have been sent and (critically)
+    // must NOT have been silently dropped — it stays in the queue.
+    expect(mockWsInstance.send).not.toHaveBeenCalledWith(
+      expect.stringContaining('"type":"timeline.history"'),
+    );
+
+    // Reconnect: socket becomes OPEN again, the WS open handler calls
+    // flushDataPlaneAfterReconnect() which restarts the drain.
+    mockWsInstance.readyState = 1;
+    link.flushDataPlaneAfterReconnect();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const sentTypes = mockWsInstance.send.mock.calls.map((c) => {
+      try { return JSON.parse(c[0] as string).type as string; } catch { return ''; }
+    });
+    expect(sentTypes).toContain(TIMELINE_MESSAGES.HISTORY);
+  });
+
   it('disconnect() closes the WebSocket', () => {
     link.connect();
     link.disconnect();

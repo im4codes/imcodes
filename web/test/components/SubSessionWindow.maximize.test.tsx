@@ -262,6 +262,20 @@ describe('SubSessionWindow maximize integration', () => {
     expect(panel.style.height).toBe('500px');
   });
 
+  it('clamps transient maximized bounds up to a sane visible workspace size', async () => {
+    const { container } = renderWindow({
+      maximized: true,
+      onToggleMaximized: vi.fn(),
+      getMaximizeBounds: () => ({ x: 10, y: 20, w: 700, h: 80 }),
+    });
+
+    const panel = container.querySelector('.subsession-window') as HTMLElement;
+    expect(panel.style.left).toBe('10px');
+    expect(panel.style.top).toBe('20px');
+    expect(panel.style.width).toBe('700px');
+    expect(panel.style.height).toBe('400px');
+  });
+
   it('normalizes malformed stored geometry instead of rendering NaN styles', async () => {
     localStorage.setItem('rcc_subsession_sub-1', JSON.stringify({
       geom: { x: null, y: 'bad', w: Number.NaN, h: Infinity },

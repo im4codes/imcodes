@@ -10,8 +10,27 @@ if (!releaseSigningAvailable) {
     logger.lifecycle("Release signing configuration not found. assembleRelease will build without a production signing key until KEYSTORE_FILE, KEYSTORE_PASSWORD, KEY_ALIAS, and KEY_PASSWORD are provided.")
 }
 
+// JPush + vendor keys for the china flavor. Sourced from local.properties (developer
+// machines) or environment variables (CI). Empty fallback is acceptable: gradle build
+// proceeds, but the SDK's vendor channels stay dormant until real keys are filled in.
+def localProps = new Properties()
+def lpFile = rootProject.file('local.properties')
+if (lpFile.exists()) {
+    lpFile.withInputStream { localProps.load(it) }
+}
+def envOrProp = { String key ->
+    return System.getenv(key) ?: localProps.getProperty(key) ?: ""
+}
+
+// Single source of truth — referenced from both defaultConfig and the china
+// flavor's manifestPlaceholders (JPUSH_PKGNAME). Don't read `applicationId`
+// inside the flavor block: AGP returns null for it there (flavors don't
+// inherit the resolved value at evaluation time) and the placeholder map
+// then trips ProcessNavigationXmlTask with a NullPointerException.
+def appPackageName = "com.im.codes"
+
 android {
-    namespace = "com.im.codes"
+    namespace = appPackageName
     compileSdk = rootProject.ext.compileSdkVersion
     signingConfigs {
         if (releaseSigningAvailable) {
@@ -24,7 +43,7 @@ android {
         }
     }
     defaultConfig {
-        applicationId "com.im.codes"
+        applicationId appPackageName
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 2
@@ -36,6 +55,57 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+
+    // ── Product flavors ────────────────────────────────────────────────────
+    // Two regional builds with the same applicationId (com.im.codes). A given
+    // device can only install one of them; users pick the APK from GitHub
+    // Releases based on their region.
+    //
+    // - global: International edition. Push via Firebase FCM, as before.
+    // - china:  Mainland China edition. Push via JPush (极光推送), which
+    //           aggregates the on-device vendor channels (Xiaomi / vivo /
+    //           etc.) so notifications still work on devices that ship
+    //           without Google Play Services.
+    flavorDimensions += "region"
+    productFlavors {
+        global {
+            dimension "region"
+            buildConfigField "String", "PUSH_REGION", "\"global\""
+            buildConfigField "boolean", "HAS_JPUSH", "false"
+        }
+        china {
+            dimension "region"
+            buildConfigField "String", "PUSH_REGION", "\"china\""
+            buildConfigField "boolean", "HAS_JPUSH", "true"
+            // manifestPlaceholders consumed by JPush SDK + vendor plugin manifests.
+            // Empty defaults mean the corresponding vendor channel stays dormant
+            // (no crash) — see Phase 2.1 follow-up for filling 华为/OPPO/荣耀 keys.
+            manifestPlaceholders = [
+                JPUSH_PKGNAME : appPackageName,
+                JPUSH_APPKEY  : envOrProp("JPUSH_APP_KEY"),
+                JPUSH_CHANNEL : "developer-default",
+                // 小米
+                XIAOMI_APPID  : envOrProp("XIAOMI_APPID"),
+                XIAOMI_APPKEY : envOrProp("XIAOMI_APPKEY"),
+                // vivo
+                VIVO_APPKEY   : envOrProp("VIVO_APPKEY"),
+                VIVO_APPID    : envOrProp("VIVO_APPID"),
+                // Placeholders for vendors not yet wired (see docs/plan/jpush.md Phase 2.1)
+                MEIZU_APPKEY  : "",
+                MEIZU_APPID   : "",
+                OPPO_APPKEY   : "",
+                OPPO_APPID    : "",
+                OPPO_APPSECRET: "",
+                HONOR_APPID   : "",
+                NIO_APPID     : "",
+            ]
+        }
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+
     buildTypes {
         release {
             minifyEnabled true
@@ -65,6 +135,16 @@ dependencies {
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')
     implementation "androidx.browser:browser:1.8.0"
+
+    // ── china flavor: JPush + vendor channel plugins (Maven Central only) ──
+    // Excluded from the global (International) flavor APK entirely.
+    //
+    // Huawei / OPPO / Honor / Meizu are deferred (require either HMS service
+    // json or local aars from the JPush SDK zip) — see docs/plan/jpush.md
+    // Phase 2.1.
+    chinaImplementation 'cn.jiguang.sdk:jpush:5.6.0'
+    chinaImplementation 'cn.jiguang.sdk.plugin:xiaomi:5.6.0'
+    chinaImplementation 'cn.jiguang.sdk.plugin:vivo:5.6.0'
 }
 
 apply from: 'capacitor.build.gradle'

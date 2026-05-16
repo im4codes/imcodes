@@ -22,6 +22,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import {
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
   isSessionControlCommandText,
@@ -30,6 +31,7 @@ import type { TransportAttachment } from '../../../shared/transport-attachments.
 import logger from '../../util/logger.js';
 import { resolveBinaryWithWindowsFallbacks } from '../transport-paths.js';
 import { type TransportEffortLevel } from '../../../shared/effort-levels.js';
+import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 
 const COPILOT_BIN = 'copilot';
 const MIN_PROTOCOL_VERSION = 3;
@@ -93,6 +95,9 @@ interface PendingApproval {
 
 interface CopilotSessionState {
   routeId: string;
+  sessionName?: string;
+  projectName?: string;
+  serverId?: string;
   sessionId: string;
   session: CopilotSessionLike;
   cwd: string;
@@ -340,6 +345,15 @@ export class CopilotSdkProvider implements TransportProvider {
     }
   }
 
+  getMemoryMcpStatus(): MemoryMcpProviderStatusView {
+    return {
+      providerId: this.id,
+      status: this.config && this.client ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
+      connected: Boolean(this.config && this.client),
+      degradedReasons: [],
+    };
+  }
+
   async disconnect(): Promise<void> {
     for (const state of this.sessions.values()) {
       state.unsubscribes.forEach((fn) => fn());
@@ -365,6 +379,9 @@ export class CopilotSdkProvider implements TransportProvider {
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const existing = this.sessions.get(routeId);
     if (existing && !config.fresh) {
+      existing.sessionName = config.sessionName ?? existing.sessionName;
+      existing.projectName = config.projectName ?? existing.projectName;
+      existing.serverId = config.serverId ?? existing.serverId;
       if (isNonEmptyString(config.agentId)) existing.model = config.agentId;
       if (isNonEmptyString(config.resumeId) && config.resumeId !== existing.sessionId) {
         await this.replaceSession(existing, config.resumeId);
@@ -387,6 +404,9 @@ export class CopilotSdkProvider implements TransportProvider {
       : await this.createSdkSession(config, model, effort);
     const state: CopilotSessionState = {
       routeId,
+      sessionName: config.sessionName,
+      projectName: config.projectName,
+      serverId: config.serverId,
       sessionId: session.sessionId,
       session,
       cwd: isNonEmptyString(config.cwd) ? config.cwd : process.cwd(),
@@ -743,6 +763,7 @@ export class CopilotSdkProvider implements TransportProvider {
       workingDirectory: config.cwd,
       ...(model ? { model } : {}),
       ...(mapEffortToCopilot(effort) ? { reasoningEffort: mapEffortToCopilot(effort) } : {}),
+      mcpServers: getDefaultMcpServers(config),
       onPermissionRequest: (request: Record<string, unknown>) => this.handlePermissionRequest(config.bindExistingKey ?? config.sessionKey, request),
     };
   }
@@ -995,6 +1016,9 @@ export class CopilotSdkProvider implements TransportProvider {
     try {
       const freshSession = await this.createSdkSession({
         sessionKey: state.routeId,
+        sessionName: state.sessionName,
+        projectName: state.projectName,
+        serverId: state.serverId,
         cwd: state.cwd,
         agentId: state.model,
         effort: state.effort,
@@ -1040,6 +1064,9 @@ export class CopilotSdkProvider implements TransportProvider {
     const oldSession = state.session;
     const resumed = await this.resumeSdkSession(resumeId, {
       sessionKey: state.routeId,
+      sessionName: state.sessionName,
+      projectName: state.projectName,
+      serverId: state.serverId,
       cwd: state.cwd,
       agentId: state.model,
       effort: state.effort,

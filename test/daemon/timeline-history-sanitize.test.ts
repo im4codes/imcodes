@@ -19,6 +19,34 @@ function event(overrides: Partial<TimelineEvent>): TimelineEvent {
 }
 
 describe('timeline history transport sanitization', () => {
+  it('preserves full chat text and streaming typewriter updates in history payloads', () => {
+    const userText = `user:${'u'.repeat(80 * 1024)}`;
+    const streamingText = `typing:${'t'.repeat(80 * 1024)}`;
+    const result = sanitizeTimelineHistoryEventsForTransport([
+      event({
+        eventId: 'user-long-text',
+        type: 'user.message',
+        payload: { text: userText },
+      }),
+      event({
+        eventId: 'assistant-streaming-long-text',
+        type: 'assistant.text',
+        ts: 2,
+        seq: 2,
+        payload: { text: streamingText, streaming: true },
+      }),
+    ], {
+      maxResponseBytes: 256 * 1024,
+    });
+
+    expect(result.events).toHaveLength(2);
+    expect(result.events[0]?.payload.text).toBe(userText);
+    expect(result.events[1]?.payload.text).toBe(streamingText);
+    expect(JSON.stringify(result.events)).not.toContain('history truncated');
+    expect(result.truncatedEvents).toBe(0);
+    expect(result.detailRefs).toEqual([]);
+  });
+
   it('caps large tool payloads before history responses leave the daemon', () => {
     const huge = 'x'.repeat(2 * 1024 * 1024);
     const result = sanitizeTimelineHistoryEventsForTransport([
