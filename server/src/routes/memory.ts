@@ -21,6 +21,7 @@ import { randomUUID } from 'node:crypto';
 import type { Env } from '../env.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
+import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import logger from '../util/logger.js';
 
 export const memoryRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -117,6 +118,6 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
       return c.json({ error: 'daemon_offline' }, 409);
     }
     logger.warn({ serverId, projectionId, err: message }, 'memory.get_sources failed');
-    return c.json({ error: 'internal_error', message }, 500);
+    return c.json({ error: FS_GENERIC_ERROR_CODES.INTERNAL_ERROR, message }, 500);
   }
 });

@@ -10398,7 +10398,7 @@ async function handleMemoryGetSourcesRequest(cmd: Record<string, unknown>, serve
       type: MEMORY_WS.GET_SOURCES_RESPONSE,
       requestId,
       status: 'error',
-      reason: 'internal_error',
+      reason: FS_GENERIC_ERROR_CODES.INTERNAL_ERROR,
       message: 'failed to resolve sources',
       originServerId,
     });

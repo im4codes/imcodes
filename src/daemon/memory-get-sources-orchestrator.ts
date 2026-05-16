@@ -18,14 +18,15 @@
  *        owner unknown   → local SQLite (legacy behaviour, unchanged)
  *
  * Error mapping for the remote path:
- *   HTTP 403            → reason='scope_forbidden'
- *   HTTP 409 daemon_offline → reason='projection_unavailable'
+ *   HTTP 403            → reason=scope_forbidden
+ *   HTTP 409 daemon_offline → reason=projection_unavailable (TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE)
  *   HTTP 404            → empty isomorphic result (same shape as missing)
- *   other / network err → reason='internal_error'
+ *   other / network err → reason=internal_error (TIMELINE_HISTORY_ERROR_REASONS.INTERNAL_ERROR)
  */
 import type { MemoryToolCaller } from '../context/memory-read-tools.js';
 import { memoryGetSources, type MemoryGetSourcesResult } from '../context/memory-read-tools.js';
 import { projectionOwnerCache } from './memory-projection-owner-cache.js';
+import { TIMELINE_HISTORY_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 import logger from '../util/logger.js';
 
 export interface OrchestratorCredentials {
@@ -51,7 +52,11 @@ export interface OrchestratorDeps {
 
 export interface GetSourcesError {
   status: 'error';
-  reason: 'scope_forbidden' | 'projection_unavailable' | 'internal_error' | 'validation_failed';
+  reason:
+    | 'scope_forbidden'
+    | typeof TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE
+    | typeof TIMELINE_HISTORY_ERROR_REASONS.INTERNAL_ERROR
+    | 'validation_failed';
   message?: string;
   projectionId: string;
 }
@@ -139,7 +144,7 @@ async function fetchRemoteSources(
   } catch (err) {
     return {
       status: 'error',
-      reason: 'internal_error',
+      reason: TIMELINE_HISTORY_ERROR_REASONS.INTERNAL_ERROR,
       message: err instanceof Error ? err.message : 'network_error',
       projectionId,
     };
@@ -152,7 +157,7 @@ async function fetchRemoteSources(
     // Daemon offline at the target serverId — pod-sticky route returned the
     // shared offline contract. Map to projection_unavailable so the MCP
     // caller surfaces a recoverable error and can retry later.
-    return { status: 'error', reason: 'projection_unavailable', projectionId };
+    return { status: 'error', reason: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE, projectionId };
   }
   if (response.status === 404) {
     // Isomorphic with "missing projection" so we don't leak existence.
@@ -165,12 +170,12 @@ async function fetchRemoteSources(
     };
   }
   if (!response.ok) {
-    return { status: 'error', reason: 'internal_error', projectionId, message: `http_${response.status}` };
+    return { status: 'error', reason: TIMELINE_HISTORY_ERROR_REASONS.INTERNAL_ERROR, projectionId, message: `http_${response.status}` };
   }
 
   const body = await response.json().catch(() => null) as RemoteSourcesEnvelope | null;
   if (!body || body.status !== 'ok') {
-    return { status: 'error', reason: 'internal_error', projectionId, message: body?.reason ?? 'invalid_body' };
+    return { status: 'error', reason: TIMELINE_HISTORY_ERROR_REASONS.INTERNAL_ERROR, projectionId, message: body?.reason ?? 'invalid_body' };
   }
   return {
     status: 'ok',
@@ -229,7 +234,7 @@ export async function getMemorySourcesOrchestrated(
       local = localGetSources(trimmed, caller);
     } catch (err) {
       logger.debug({ projectionId: trimmed, err: err instanceof Error ? err.message : String(err) }, 'local memoryGetSources failed');
-      return { status: 'error', reason: 'internal_error', projectionId: trimmed };
+      return { status: 'error', reason: TIMELINE_HISTORY_ERROR_REASONS.INTERNAL_ERROR, projectionId: trimmed };
     }
     return {
       status: 'ok',

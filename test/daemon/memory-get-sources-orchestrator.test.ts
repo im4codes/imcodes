@@ -14,6 +14,7 @@ import { getMemorySourcesOrchestrated } from '../../src/daemon/memory-get-source
 import { createProjectionOwnerCache } from '../../src/daemon/memory-projection-owner-cache.js';
 import { createMemoryToolCaller } from '../../src/context/memory-read-tools.js';
 import type { MemoryGetSourcesResult } from '../../src/context/memory-read-tools.js';
+import { TIMELINE_HISTORY_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 
 const SELF_SERVER_ID = 'srv-self';
 const REMOTE_SERVER_ID = 'srv-remote';
@@ -215,7 +216,7 @@ describe('get_memory_sources orchestrator', () => {
 
     expect(result.status).toBe('error');
     if (result.status === 'error') {
-      expect(result.reason).toBe('projection_unavailable');
+      expect(result.reason).toBe(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE);
     }
   });
 
