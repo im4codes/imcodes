@@ -172,6 +172,8 @@ function writeTransportQueueHidden(storageKey: string | null, hidden: boolean): 
 type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'opus[1M]' | 'sonnet' | 'haiku';
 
+const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
+
 /*
  * R3 v2 PR-ρ — Composer attachments now carry a per-composer sequence
  * number `seq` (1, 2, 3, ...) so the user can reference them in chat
@@ -196,6 +198,11 @@ function buildComposerDraftScope(activeSession: SessionInfo | null, subSessionId
   if (subSessionId && subSessionId.trim()) return `sub:${subSessionId.trim()}`;
   if (activeSession?.name?.trim()) return `session:${activeSession.name.trim()}`;
   return null;
+}
+
+function buildPastedTextFileName(now = new Date()): string {
+  const compact = now.toISOString().replace(/[:.]/g, '-');
+  return `pasted-text-${compact}.txt`;
 }
 
 function normalizeQueuedText(text: string): string {
@@ -2351,6 +2358,22 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     e.preventDefault();
     const text = ce.clipboardData?.getData('text/plain') ?? '';
     if (!text) return;
+    if (text.length > INLINE_PASTE_TEXT_CHAR_LIMIT) {
+      if (!serverId) {
+        showSendWarning(t('upload.long_text_requires_attachment'));
+        return;
+      }
+      const fileName = buildPastedTextFileName();
+      const textFile = new File([text], fileName, { type: 'text/plain' });
+      void (async () => {
+        const uploaded = await uploadAttachmentFiles([textFile]);
+        if (uploaded) {
+          showSendWarning(t('upload.long_text_attached', { name: fileName }));
+          divRef.current?.focus();
+        }
+      })();
+      return;
+    }
     document.execCommand('insertText', false, text);
     setHasText(!!(divRef.current?.textContent?.trim()));
   };
