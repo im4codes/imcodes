@@ -162,6 +162,7 @@ import {
   IMCODES_DAEMON_USER_ID_ENV,
 } from '../../shared/memory-mcp-env.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -175,6 +176,25 @@ describe('CodexSdkProvider', () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+  });
+
+  it('reports Memory MCP ready after app-server connect', async () => {
+    const provider = new CodexSdkProvider();
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      providerId: 'codex-sdk',
+      status: MEMORY_MCP_STATUS.UNKNOWN,
+      connected: false,
+      degradedReasons: [],
+    });
+
+    await provider.connect({ binaryPath: 'codex' });
+
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      providerId: 'codex-sdk',
+      status: MEMORY_MCP_STATUS.READY,
+      connected: true,
+      degradedReasons: [],
+    });
   });
 
   it('starts a thread, captures resume id, emits tool calls, streams message deltas, and completes', async () => {

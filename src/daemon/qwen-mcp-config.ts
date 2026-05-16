@@ -101,8 +101,41 @@ function parseQwenMcpList(output: string): Map<string, QwenMcpListedServer> | nu
     visit(parsed);
     return servers;
   } catch {
-    return null;
+    return parseQwenMcpListText(trimmed);
   }
+}
+
+function cleanTableLine(line: string): string {
+  return line
+    .replace(/[│┃║╎╏]/g, ' ')
+    .replace(/^[\s|+─━\-┌┐└┘├┤┬┴┼]+|[\s|+─━\-┌┐└┘├┤┬┴┼]+$/g, '')
+    .trim();
+}
+
+function parseQwenMcpListText(output: string): Map<string, QwenMcpListedServer> | null {
+  const servers = new Map<string, QwenMcpListedServer>();
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = cleanTableLine(rawLine);
+    if (!line) continue;
+    if (/^(name|server\s*name)\b/i.test(line) && /\b(command|commandorurl|args)\b/i.test(line)) continue;
+    if (/^(server|name)\s*[:=]\s*$/i.test(line)) continue;
+
+    const knownName = line.match(/\b(imcodes-memory(?:-daemon)?)\b\s+(.+)$/);
+    const parts = knownName
+      ? [knownName[1], knownName[2]]
+      : line.split(/\s{2,}|\t+/).filter(Boolean);
+    if (parts.length < 2) continue;
+
+    const name = parts[0]?.trim();
+    const commandText = parts.slice(1).join(' ').trim();
+    if (!name || !commandText || /^command\b/i.test(commandText)) continue;
+    const tokens = commandText.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token) => token.replace(/^['"]|['"]$/g, '')) ?? [];
+    const command = tokens[0];
+    const args = tokens.slice(1);
+    if (!command) continue;
+    servers.set(name, { name, command, args });
+  }
+  return servers.size > 0 ? servers : null;
 }
 
 async function writeNoticeOnce(markerPath: string, message: string): Promise<void> {

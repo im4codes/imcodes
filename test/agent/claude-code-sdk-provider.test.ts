@@ -73,6 +73,7 @@ vi.mock('../../src/util/logger.js', () => ({
 
 import { ClaudeCodeSdkProvider } from '../../src/agent/providers/claude-code-sdk.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
+import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -85,6 +86,25 @@ describe('ClaudeCodeSdkProvider', () => {
     sdkMock.setWaitForClose(false);
     sdkMock.setInterruptNeverResolves(false);
     childProcessMock.spawn.mockClear();
+  });
+
+  it('reports Memory MCP ready after provider connect', async () => {
+    const provider = new ClaudeCodeSdkProvider();
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      providerId: 'claude-code-sdk',
+      status: MEMORY_MCP_STATUS.UNKNOWN,
+      connected: false,
+      degradedReasons: [],
+    });
+
+    await provider.connect({ binaryPath: 'claude' });
+
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      providerId: 'claude-code-sdk',
+      status: MEMORY_MCP_STATUS.READY,
+      connected: true,
+      degradedReasons: [],
+    });
   });
 
   it('uses stable resume id, emits cumulative text deltas, and completes from result', async () => {

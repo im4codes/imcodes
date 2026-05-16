@@ -101,9 +101,30 @@ describe('ensureQwenMcpHasImcodesEntry', () => {
     });
   });
 
-  it('degrades without allowing MCP when qwen mcp list returns unparseable text', async () => {
+  it('parses text qwen mcp list output and preserves user-authored imcodes-memory entries', async () => {
     const execFileImpl = vi.fn(async (_file: string, args: string[]) => {
       if (args.join(' ') === 'mcp list') return { stdout: 'Name Command\nimcodes-memory custom', stderr: '' };
+      if (args[0] === 'mcp' && args[1] === 'add') return { stdout: '', stderr: '' };
+      throw new Error(`unexpected qwen args: ${args.join(' ')}`);
+    });
+
+    const result = await ensureQwenMcpHasImcodesEntry({
+      noticeMarkerPath: join(dir, 'notice'),
+      execFileImpl,
+    });
+
+    expect(result).toMatchObject({
+      serverName: `${IMCODES_MEMORY_MCP_SERVER_NAME}-daemon`,
+      changed: true,
+      degraded: false,
+      safeToAllow: true,
+    });
+    expect(execFileImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('parses text qwen mcp list output for the daemon entry', async () => {
+    const execFileImpl = vi.fn(async (_file: string, args: string[]) => {
+      if (args.join(' ') === 'mcp list') return { stdout: 'Name Command\nimcodes-memory imcodes memory mcp', stderr: '' };
       throw new Error(`unexpected qwen args: ${args.join(' ')}`);
     });
 
@@ -115,9 +136,8 @@ describe('ensureQwenMcpHasImcodesEntry', () => {
     expect(result).toMatchObject({
       serverName: IMCODES_MEMORY_MCP_SERVER_NAME,
       changed: false,
-      degraded: true,
-      safeToAllow: false,
-      reason: MEMORY_MCP_PROVIDER_STATUS_REASON.MCP_REGISTRATION_FAILED,
+      degraded: false,
+      safeToAllow: true,
     });
     expect(execFileImpl).toHaveBeenCalledTimes(1);
   });

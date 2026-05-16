@@ -3186,14 +3186,25 @@ describe('handleWebCommand transport queue behavior', () => {
     vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch), '1');
     getProviderMock.mockImplementation((providerId: string) => ({
       id: providerId,
-      getMemoryMcpStatus: providerId === MEMORY_MCP_PROVIDER_ID.QWEN
-        ? () => ({
+      getMemoryMcpStatus: () => {
+        if (providerId === MEMORY_MCP_PROVIDER_ID.QWEN) return {
             providerId,
             status: MEMORY_MCP_STATUS.DEGRADED,
             connected: true,
             degradedReasons: [MEMORY_MCP_PROVIDER_STATUS_REASON.MCP_REGISTRATION_FAILED],
-          })
-        : undefined,
+          };
+        if (
+          providerId === MEMORY_MCP_PROVIDER_ID.CLAUDE_CODE_SDK
+          || providerId === MEMORY_MCP_PROVIDER_ID.CODEX_SDK
+          || providerId === MEMORY_MCP_PROVIDER_ID.CURSOR_HEADLESS
+        ) return {
+          providerId,
+          status: MEMORY_MCP_STATUS.READY,
+          connected: true,
+          degradedReasons: [],
+        };
+        return undefined;
+      },
     }));
 
     handleWebCommand({ type: MEMORY_WS.MCP_STATUS_QUERY, requestId: 'mcp-status-1' }, serverLink as any);
@@ -3212,13 +3223,19 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(providers.map((provider) => provider.providerId)).toEqual([...MEMORY_MCP_PROVIDER_IDS]);
     expect(providers).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        providerId: MEMORY_MCP_PROVIDER_ID.CURSOR_HEADLESS,
-        status: MEMORY_MCP_STATUS.DEGRADED,
+        providerId: MEMORY_MCP_PROVIDER_ID.CLAUDE_CODE_SDK,
+        status: MEMORY_MCP_STATUS.READY,
         connected: true,
-        degradedReasons: [MEMORY_MCP_DEGRADED_REASON.STATUS_NOT_REPORTED],
+        degradedReasons: [],
       }),
       expect.objectContaining({
         providerId: MEMORY_MCP_PROVIDER_ID.CODEX_SDK,
+        status: MEMORY_MCP_STATUS.READY,
+        connected: true,
+        degradedReasons: [],
+      }),
+      expect.objectContaining({
+        providerId: MEMORY_MCP_PROVIDER_ID.COPILOT_SDK,
         status: MEMORY_MCP_STATUS.DEGRADED,
         connected: true,
         degradedReasons: [MEMORY_MCP_DEGRADED_REASON.STATUS_NOT_REPORTED],

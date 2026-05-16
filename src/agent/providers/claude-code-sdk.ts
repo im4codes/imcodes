@@ -24,6 +24,7 @@ import {
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
+import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import logger from '../../util/logger.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveClaudeCodePathForSdk, resolveExecutableForSpawn } from '../transport-paths.js';
@@ -138,6 +139,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     });
     this.config = config;
     logger.info({ provider: this.id, resolved: resolved.executable }, 'Claude Code SDK provider connected');
+  }
+
+  getMemoryMcpStatus(): MemoryMcpProviderStatusView {
+    return {
+      providerId: this.id,
+      status: this.config ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
+      connected: Boolean(this.config),
+      degradedReasons: [],
+    };
   }
 
   async listModels(_force?: boolean): Promise<ProviderModelList> {

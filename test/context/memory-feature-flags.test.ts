@@ -30,12 +30,16 @@ const EXPECTED_FLAGS = [
 ] as const satisfies readonly MemoryFeatureFlag[];
 
 describe('memory feature flags and counters', () => {
-  it('defines all memory feature flags as shared constants with default-off registry entries', () => {
+  it('defines all memory feature flags as shared constants with intentional registry defaults', () => {
     expect(MEMORY_FEATURE_FLAGS).toEqual(EXPECTED_FLAGS);
     for (const flag of MEMORY_FEATURE_FLAGS) {
       expect(isMemoryFeatureFlag(flag)).toBe(true);
-      expect(MEMORY_FEATURE_FLAG_REGISTRY[flag].defaultValue).toBe(false);
       expect(MEMORY_FEATURE_FLAG_REGISTRY[flag].disabledBehavior.length).toBeGreaterThan(0);
+    }
+    expect(MEMORY_FEATURE_FLAG_REGISTRY['mem.feature.namespace_registry'].defaultValue).toBe(true);
+    expect(MEMORY_FEATURE_FLAG_REGISTRY['mem.feature.quick_search'].defaultValue).toBe(true);
+    for (const flag of MEMORY_FEATURE_FLAGS.filter((item) => item !== 'mem.feature.namespace_registry' && item !== 'mem.feature.quick_search')) {
+      expect(MEMORY_FEATURE_FLAG_REGISTRY[flag].defaultValue).toBe(false);
     }
   });
 

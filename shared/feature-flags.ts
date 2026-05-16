@@ -105,7 +105,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   },
   [FLAG.namespaceRegistry]: {
     flag: FLAG.namespaceRegistry,
-    defaultValue: false,
+    defaultValue: true,
     runtimeSource: 'user_global_config',
     dependencies: [],
     requiredPrerequisites: [],
@@ -123,7 +123,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   },
   [FLAG.quickSearch]: {
     flag: FLAG.quickSearch,
-    defaultValue: false,
+    defaultValue: true,
     runtimeSource: 'user_global_config',
     dependencies: [FLAG.namespaceRegistry],
     requiredPrerequisites: [],

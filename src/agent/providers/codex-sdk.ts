@@ -38,6 +38,7 @@ import { getCodexBaseInstructions } from '../codex-runtime-config.js';
 import { getDefaultCodexMcpArgs } from './getDefaultCodexMcpArgs.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 
 const CODEX_BIN = 'codex';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
@@ -552,6 +553,15 @@ export class CodexSdkProvider implements TransportProvider {
     await this.startAppServer(binaryPath, config);
     this.config = config;
     logger.info({ provider: this.id, resolved: resolved.executable, prepend: resolved.prependArgs }, 'Codex SDK provider connected via app-server');
+  }
+
+  getMemoryMcpStatus(): MemoryMcpProviderStatusView {
+    return {
+      providerId: this.id,
+      status: this.config && this.child ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
+      connected: Boolean(this.config && this.child),
+      degradedReasons: [],
+    };
   }
 
   async disconnect(): Promise<void> {
