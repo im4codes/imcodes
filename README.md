@@ -2,9 +2,9 @@
 
 [English](README.md) | [简体中文](README.i18n/README.zh-CN.md) | [繁體中文](README.i18n/README.zh-TW.md) | [Español](README.i18n/README.es.md) | [Русский](README.i18n/README.ru.md) | [日本語](README.i18n/README.ja.md) | [한국어](README.i18n/README.ko.md)
 
-**The IM for agents. Shared memory, supervised execution, and cross-agent audit across AI providers.**
+**The IM for agents. Shared memory, managed MCP tools, supervised execution, and cross-agent audit across AI providers.**
 
-IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and native streaming output for transport-backed agents. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.
+IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and native streaming output for transport-backed agents. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.
 
 > **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
 
@@ -86,6 +86,15 @@ IM.codes continuously turns completed agent work into reusable memory and feeds 
 - **Automatic injection where it matters.** Relevant past work is injected both per-message and at session startup, with timeline cards that show what was recalled, why, the relevance score, recall count, and last-used time.
 - **User-visible inspection and control.** Shared Context UI separates raw events, processed summaries, cloud memory, and enterprise memory, with query, preview, archive/restore, and processing configuration controls.
 
+## Managed MCP Tools
+
+IM.codes also exposes a managed stdio MCP server to supported SDK-backed agents, so models can use the same memory and coordination layer without shelling out to ad hoc commands.
+
+- **Memory tools.** `search_memory` recalls prior work, project history, decisions, preferences, bugs, commits, deployments, and previously discussed context; `get_memory_sources` fetches provenance snippets for returned hits; `save_observation` and `save_preference` let agents persist useful facts and user preferences.
+- **Agent messaging tools.** `send_list_targets` and `send_message` let an agent discover sibling sessions and send scoped messages or file references through the same `imcodes send` pipeline.
+- **Cron tools.** `cron_create`, `cron_list`, `cron_update`, and `cron_delete` schedule future structured sends for reminders, recurring checks, or delegated follow-ups.
+- **Runtime-bound identity.** Tool calls are bound to the current IM.codes session, project, user, and server at runtime. Agents do not receive raw auth tokens, and memory/send/cron tools stay behind feature gates and MCP kill switches.
+
 ## Supervised Execution & Auto Audit
 
 IM.codes can drive supported agent sessions turn by turn — a supervisor with your own instructions evaluates each completed turn at the idle boundary and decides to auto-continue, hand back, or trigger an audit loop, instead of you typing "continue" every round.
@@ -133,6 +142,10 @@ Built-in modes include `audit` (structured audit → review → plan pipeline), 
 Native streaming output support for transport-backed agents like [Claude Code SDK](https://github.com/anthropics/claude-agent-sdk-typescript), [Codex SDK](https://github.com/openai/codex/tree/main/sdk/typescript), [OpenClaw](https://openclaw.com), and [Qwen](https://github.com/QwenLM/qwen-agent). These agents connect via network protocols or local SDKs instead of terminal scraping, delivering structured event streams with real-time delta updates, tool call tracking, and session restore.
 
 > **Note on OpenClaw:** `imcodes connect openclaw` has only been tested on macOS so far.
+
+### Managed MCP Tool Surface
+
+Supported SDK providers can receive IM.codes-managed MCP tools automatically. The tool surface includes memory recall and provenance, user preference capture, scoped agent-to-agent messaging, and cron scheduling. MCP status is reported per provider in the UI, with ready/degraded states so you can tell whether memory, Send, and Cron tools are actually available to that model.
 
 ### Agent-to-Agent Communication
 
@@ -223,12 +236,12 @@ You (browser / mobile)
 Server (self-hosted)
         ↓ WebSocket
 Daemon (your machine)
-        ↓ tmux / transport
+        ↓ tmux / transport / managed MCP
 AI Agents (Claude Code / Codex / Gemini CLI / OpenClaw)
         ↔ imcodes send (agent-to-agent)
 ```
 
-The daemon runs on your dev machine and manages process-backed agent sessions through tmux or transport-backed sessions through network protocols / local SDKs (for example Claude Code SDK, Codex SDK, OpenClaw gateway, and Qwen). Agents can communicate with each other via `imcodes send`. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.
+The daemon runs on your dev machine and manages process-backed agent sessions through tmux or transport-backed sessions through network protocols / local SDKs (for example Claude Code SDK, Codex SDK, OpenClaw gateway, and Qwen). It also owns the managed MCP server that exposes runtime-scoped memory, Send, and Cron tools to supported SDK providers. Agents can communicate with each other via `imcodes send`. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.
 
 ## Install
 

@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IM.codes — The IM for agents. Shared memory, supervised execution, and cross-agent audit across AI providers.</title>
-<meta name="description" content="The IM for agents. Shared memory, supervised execution, and cross-agent audit across AI providers — reuse solved work, supervise task completion, and run audit/rework loops across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, and OpenClaw.">
+<title>IM.codes — The IM for agents. Shared memory, managed MCP tools, supervised execution, and cross-agent audit across AI providers.</title>
+<meta name="description" content="The IM for agents. Shared memory, managed MCP tools, supervised execution, and cross-agent audit across AI providers — recall solved work, message sibling agents, schedule cron sends, supervise task completion, and run audit/rework loops across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, and OpenClaw.">
 <style>
 :root {
   --bg: #0a0a0a;
@@ -222,7 +222,7 @@ footer {
 <header>
   <div class="header-left">
     <h1>IM<span>.</span>codes</h1>
-    <div class="tagline" data-i18n="tagline">The IM for agents. Shared memory, supervised execution, and cross-agent audit across AI providers.</div>
+    <div class="tagline" data-i18n="tagline">The IM for agents. Shared memory, managed MCP tools, supervised execution, and cross-agent audit across AI providers.</div>
   </div>
   <div class="lang-switch">
     <button onclick="setLang('en')" data-lang="en" class="active">EN</button>
@@ -236,7 +236,7 @@ footer {
 </header>
 
 <section>
-  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.</p>
+  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.</p>
   <div class="prompt">imcodes bind https://app.im.codes/bind/&lt;key&gt;<span class="cursor"></span></div>
   <div class="output" data-i18n="hero_output">bound to app.im.codes &middot; daemon started &middot; registered as system service</div>
 </section>
@@ -298,6 +298,17 @@ footer {
 </section>
 
 <section>
+  <h2 data-i18n="h_mcp">managed MCP tools</h2>
+  <p style="color:var(--fg); margin-bottom:12px;" data-i18n="mcp_intro">Supported SDK-backed agents receive an IM.codes-managed stdio MCP server, so they can recall memory, inspect provenance, message sibling agents, and schedule follow-ups without handling raw tokens or ad hoc shell commands.</p>
+  <ul class="reqs">
+    <li data-i18n="mcp_1">Memory tools: <code>search_memory</code>, <code>get_memory_sources</code>, <code>save_observation</code>, and <code>save_preference</code>.</li>
+    <li data-i18n="mcp_2">Send tools: <code>send_list_targets</code> and <code>send_message</code> for scoped agent-to-agent coordination.</li>
+    <li data-i18n="mcp_3">Cron tools: create, list, update, and delete scheduled structured sends.</li>
+    <li data-i18n="mcp_4">Runtime-bound identity keeps calls scoped to the current session, project, user, and server, with provider-level ready/degraded status in the UI.</li>
+  </ul>
+</section>
+
+<section>
   <h2 data-i18n="h_auto">supervised execution</h2>
   <p style="color:var(--fg); margin-bottom:12px;" data-i18n="auto_intro">IM.codes can supervise supported transport sessions turn by turn instead of relying on blind auto-continue. Auto checks whether the latest turn is done, should continue, or should return control to you.</p>
   <ul class="reqs">
@@ -324,6 +335,7 @@ footer {
   <h2 data-i18n="h_features">features</h2>
   <div class="features">
     <div class="feat"><div class="feat-name" data-i18n="f_memory_name">shared agent context</div><div class="feat-desc" data-i18n="f_memory_desc">problem→solution memory, multilingual recall, automatic per-message and startup injection with visible timeline cards</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_mcp_name">managed MCP tools</div><div class="feat-desc" data-i18n="f_mcp_desc">memory recall, provenance, preferences, scoped Send, and Cron tools registered for supported SDK agents</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_auto_name">supervised execution</div><div class="feat-desc" data-i18n="f_auto_desc">turn-level completion checks, auto-continue, and optional audit→rework loops for transport-backed agents</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_remote_name">remote terminal</div><div class="feat-desc" data-i18n="f_remote_desc">browser & mobile, no SSH/VPN, real-time PTY streaming at 12fps</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser & git</div><div class="feat-desc" data-i18n="f_file_desc">tree view, upload/download, +/- stats, floating preview</div></div>
@@ -354,9 +366,9 @@ footer {
 <span class="label">Server</span> <span class="arrow">(self-hosted, relays connections)</span>
  <span class="arrow">│</span> <span class="proto">WebSocket</span>
 <span class="label">Daemon</span> <span class="arrow">(your machine, manages sessions)</span>
- <span class="arrow">│</span> <span class="proto">tmux / transport</span>
+ <span class="arrow">│</span> <span class="proto">tmux / transport / managed MCP</span>
 <span class="label">Agents</span> <span class="arrow">(multiple agents via CLI + SDK · native transport backends)</span></div>
-  <p style="color:var(--dim); font-size:13px; margin-top:12px;" data-i18n="arch_desc">The daemon runs on your dev machine and manages process-backed sessions through tmux plus transport-backed sessions through SDKs and network protocols. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.</p>
+  <p style="color:var(--dim); font-size:13px; margin-top:12px;" data-i18n="arch_desc">The daemon runs on your dev machine and manages process-backed sessions through tmux plus transport-backed sessions through SDKs and network protocols. It also owns the managed MCP server for runtime-scoped memory, Send, and Cron tools. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.</p>
 </section>
 
 <section>
@@ -483,8 +495,8 @@ docker compose up -d</div>
 const I18N = {
   en: {
     watch_intro: 'Watch support covers quick session monitoring, unread counts, OTA update visibility, push notifications, and quick replies from the wrist.',
-    tagline: 'The IM for agents. Shared memory, supervised execution, and cross-agent audit across AI providers.',
-    hero_intro: "IM.codes gives coding agents one shared memory layer across providers. It turns completed work into reusable context, then injects the right history back into future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.",
+    tagline: 'The IM for agents. Shared memory, managed MCP tools, supervised execution, and cross-agent audit across AI providers.',
+    hero_intro: "IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.",
     watch_badge: 'iPhone · iPad · Apple Watch',
     watch_download: 'Watch app includes session list, unread counts, and quick replies.',
     agents_intro: 'Multiple agents support both CLI and SDK integrations.',
@@ -494,6 +506,12 @@ const I18N = {
     memory_2: 'Enterprise shared context lets teams reuse fixes across workspaces and projects with queryable memory, stats, and inspection UI. It is still under active development and has not been fully production-tested yet.',
     memory_3: 'Multilingual recall uses local embeddings plus pgvector-backed server search, so related fixes can be found across different languages.',
     memory_4: 'Timeline cards show exactly what was injected, with relevance score, recall count, and last-used metadata.',
+    h_mcp: 'managed MCP tools',
+    mcp_intro: 'Supported SDK-backed agents receive an IM.codes-managed stdio MCP server, so they can recall memory, inspect provenance, message sibling agents, and schedule follow-ups without handling raw tokens or ad hoc shell commands.',
+    mcp_1: 'Memory tools: <code>search_memory</code>, <code>get_memory_sources</code>, <code>save_observation</code>, and <code>save_preference</code>.',
+    mcp_2: 'Send tools: <code>send_list_targets</code> and <code>send_message</code> for scoped agent-to-agent coordination.',
+    mcp_3: 'Cron tools: create, list, update, and delete scheduled structured sends.',
+    mcp_4: 'Runtime-bound identity keeps calls scoped to the current session, project, user, and server, with provider-level ready/degraded status in the UI.',
     h_auto: 'supervised execution',
     auto_intro: 'IM.codes can supervise supported transport sessions turn by turn instead of relying on blind auto-continue. Auto checks whether the latest turn is done, should continue, or should return control to you.',
     auto_1: 'Per-session Auto modes: Off, Supervised, and Supervised + audit.',
@@ -503,6 +521,8 @@ const I18N = {
     auto_5: 'Two-layer custom supervision instructions. Keep a global supervision persona plus a per-session addition — by default the two are concatenated into the prompt, or tick the session\'s "Override global" checkbox to ignore the global value for that session. Editing the global persona takes effect on already-enabled sessions on the next turn without re-enabling Auto.',
     f_memory_name: 'shared agent context',
     f_memory_desc: 'problem→solution memory, multilingual recall, automatic per-message and startup injection with visible timeline cards',
+    f_mcp_name: 'managed MCP tools',
+    f_mcp_desc: 'memory recall, provenance, preferences, scoped Send, and Cron tools registered for supported SDK agents',
     f_auto_name: 'supervised execution',
     f_auto_desc: 'turn-level completion checks, auto-continue, and optional audit→rework loops for transport-backed agents',
     h_openclaw: 'openclaw connect',
@@ -516,11 +536,11 @@ const I18N = {
     sh_manual_pgvector: 'Generated docker-compose.yml uses pgvector/pgvector:pg18 for PostgreSQL.',
   },
   'zh-CN': {
-    tagline: '给 AI agent 的 IM。共享记忆、受监督执行，以及跨模型审计。',
-    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层。它会把已完成的工作沉淀成可复用上下文，再把合适的历史注入后续 session，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。内置 Auto supervision 可在每轮完成后判断任务是否完成、是否继续自动执行，并可选进入审计/返工闭环后再把控制权交还给你。P2P 讨论功能让多个模型相互审阅对方的方案和实现——能有效减少单模型的遗漏、盲点和偏差。',
+    tagline: '给 AI agent 的 IM。共享记忆、托管 MCP 工具、受监督执行，以及跨模型审计。',
+    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层，以及一套托管 MCP 工具面。它会把已完成的工作沉淀成可复用上下文，再在后续 session 中注入或召回合适的历史，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。内置 Auto supervision 可在每轮完成后判断任务是否完成、是否继续自动执行，并可选进入审计/返工闭环后再把控制权交还给你。P2P 讨论功能让多个模型相互审阅对方的方案和实现——能有效减少单模型的遗漏、盲点和偏差。',
     hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
     self_host_warning: '<strong>强烈建议自行部署。</strong><code>app.im.codes</code> 是共享测试实例，无可用性保证，可能被限流、攻击或不可用。这是个人项目，不提供商用保障。正式使用请部署到自己的服务器。',
-    h_screenshots: '截图', h_why: '为什么', h_memory: '共享代理上下文', h_not: '它不是什么', h_features: '功能', h_arch: '架构', h_download: '下载', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
+    h_screenshots: '截图', h_why: '为什么', h_memory: '共享代理上下文', h_mcp: '托管 MCP 工具', h_not: '它不是什么', h_features: '功能', h_arch: '架构', h_download: '下载', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
     also_web: '也可作为 <a href="https://app.im.codes">网页版</a> 使用', watch_intro: 'Watch 支持可在手腕上快速查看会话、未读数、OTA 更新状态、推送通知和快捷回复。', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch App 提供会话列表、未读计数和快捷回复。',
     agents_intro: '支持多个 agent 通过 CLI 和 SDK 两种方式接入。',
     memory_intro: 'IM.codes 会把已完成的工作持续沉淀成可搜索的记忆——保存的是结构化的问题→解决方案摘要，而不是原始 prompt 日志。相关历史会在新消息和会话启动时自动召回，并且每次注入都会在时间线里可见。',
@@ -528,6 +548,11 @@ const I18N = {
     memory_2: '企业共享上下文让团队可以在 workspace / project 范围内复用修复经验，并通过可查询的记忆、统计和检查界面管理它。这部分仍在持续开发中，还没有经过完整的生产级测试。',
     memory_3: '多语言召回结合本地 embedding 和基于 pgvector 的服务端搜索，可以跨不同语言找到相关历史修复。',
     memory_4: '时间线卡片会明确显示注入了什么内容，以及相关性分数、召回次数和上次使用时间。',
+    mcp_intro: '支持的 SDK agent 会自动获得 IM.codes 托管的 stdio MCP server，因此模型可以召回记忆、查看来源、给兄弟会话发消息，并安排后续定时任务，而不需要接触原始 token 或临时 shell 命令。',
+    mcp_1: '记忆工具：<code>search_memory</code>、<code>get_memory_sources</code>、<code>save_observation</code> 和 <code>save_preference</code>。',
+    mcp_2: 'Send 工具：<code>send_list_targets</code> 和 <code>send_message</code>，用于有作用域的 agent-to-agent 协作。',
+    mcp_3: 'Cron 工具：创建、列出、更新和删除定时结构化发送任务。',
+    mcp_4: '运行时绑定身份会把调用限制在当前 session、project、user 和 server 内，并在 UI 中展示 provider 级 ready/degraded 状态。',
     h_auto: '受监督执行',
     auto_intro: 'IM.codes 可对支持的 transport session 做逐轮监督，而不是盲目自动继续。Auto 会判断最近一轮是已经完成、应该继续自动执行，还是该把控制权交还给你。',
     auto_1: '按 session 配置 Auto 模式：Off、Supervised、Supervised + audit。',
@@ -537,6 +562,8 @@ const I18N = {
     auto_5: '两层自定义监督提示词。保留一份全局监督人格，再加上每个 session 自己的补充——默认会拼接成 global + 空行 + session 发给监督者，或者在会话里勾上「覆盖全局」让该 session 忽略全局值。改全局人格对已启用的会话下一轮就生效，不用重新开启 Auto。',
     f_memory_name: '共享代理上下文',
     f_memory_desc: '问题→解决方案记忆、多语言召回、按消息/启动自动注入，并在时间线中可见',
+    f_mcp_name: '托管 MCP 工具',
+    f_mcp_desc: '为支持的 SDK agent 注册记忆召回、来源、偏好、Scoped Send 和 Cron 工具',
     f_auto_name: '受监督执行',
     f_auto_desc: '逐轮完成判定、自动继续，以及可选的审计→返工闭环，适用于 transport agent',
     why_text: '离开桌面后，大多数 coding agent 工作流就断了。代理还在终端里运行，但你通常只能靠 SSH、tmux attach、远程桌面，或者等回到电脑前。IM.codes 让这些会话在手机和网页上保持触手可及：打开终端、查看文件和 Git 变更、从另一台设备预览 localhost、在任务完成时收到通知，并在自己的基础设施上同时推进多个代理。',
@@ -569,7 +596,7 @@ const I18N = {
     f_sync_desc: '标签顺序、固定标签和面板同步到服务器',
     f_i18n_name: '7 种语言',
     f_i18n_desc: '中英日韩俄西 + 繁体中文',
-    arch_desc: '守护进程运行在你的开发机上，通过 tmux 管理代理会话。服务端在你的设备和守护进程之间中转连接。所有数据留在你的基础设施内。',
+    arch_desc: '守护进程运行在你的开发机上，通过 tmux 管理进程会话，并通过 SDK 和网络协议管理 transport 会话。它也负责托管 MCP server，为支持的 SDK provider 提供运行时作用域内的记忆、Send 和 Cron 工具。服务端在你的设备和守护进程之间中转连接。所有数据留在你的基础设施内。',
     copy_hint: '点击复制',
     qs_1: '使用 <a href="https://app.im.codes">app.im.codes</a> 或自行部署服务端',
     qs_2: '运行 <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
@@ -591,11 +618,11 @@ const I18N = {
     disclaimer: 'IM.codes 是一个独立的开源项目，与 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司无任何关联、认可或赞助关系。所有产品名称和商标均为其各自所有者的财产。',
   },
   'zh-TW': {
-    tagline: '給 AI agent 的 IM。共享記憶、受監督執行，以及跨模型審計。',
-    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層。它會把已完成的工作沉澱成可重用上下文，再把合適的歷史注入後續 session，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。P2P 討論功能讓多個模型互相審閱對方的方案和實作——能有效減少單模型的遺漏、盲點和偏差。',
+    tagline: '給 AI agent 的 IM。共享記憶、託管 MCP 工具、受監督執行，以及跨模型審計。',
+    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層，以及一套託管 MCP 工具面。它會把已完成的工作沉澱成可重用上下文，再在後續 session 中注入或召回合適的歷史，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。P2P 討論功能讓多個模型互相審閱對方的方案和實作——能有效減少單模型的遺漏、盲點和偏差。',
     hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
     self_host_warning: '<strong>強烈建議自行部署。</strong><code>app.im.codes</code> 是共享測試實例，無可用性保證，可能被限流、攻擊或不可用。這是個人專案，不提供商用保障。正式使用請部署到自己的伺服器。',
-    h_screenshots: '截圖', h_why: '為什麼', h_memory: '共享代理上下文', h_not: '它不是什麼', h_features: '功能', h_arch: '架構', h_download: '下載', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
+    h_screenshots: '截圖', h_why: '為什麼', h_memory: '共享代理上下文', h_mcp: '託管 MCP 工具', h_not: '它不是什麼', h_features: '功能', h_arch: '架構', h_download: '下載', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
     also_web: '也可作為 <a href="https://app.im.codes">網頁版</a> 使用', watch_intro: 'Watch 支援可在手腕上快速查看會話、未讀數、OTA 更新狀態、推送通知和快捷回覆。', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch App 提供會話列表、未讀計數和快捷回覆。',
     agents_intro: '支援多個 agent 透過 CLI 和 SDK 兩種方式接入。',
     memory_intro: 'IM.codes 會把已完成的工作持續沉澱成可搜尋的記憶——保存的是結構化的問題→解決方案摘要，而不是原始 prompt 日誌。相關歷史會在新訊息和工作階段啟動時自動召回，而且每次注入都會在時間線中可見。',
@@ -603,6 +630,11 @@ const I18N = {
     memory_2: '企業共享上下文讓團隊能在 workspace / project 範圍內重用修復經驗，並透過可查詢的記憶、統計和檢視介面管理它。這部分仍在持續開發中，還沒有經過完整的生產級測試。',
     memory_3: '多語言召回結合本地 embedding 與基於 pgvector 的伺服器搜尋，可以跨不同語言找到相關歷史修復。',
     memory_4: '時間線卡片會明確顯示注入了什麼內容，以及相關性分數、召回次數和上次使用時間。',
+    mcp_intro: '支援的 SDK agent 會自動獲得 IM.codes 託管的 stdio MCP server，因此模型可以召回記憶、查看來源、給兄弟會話發訊息，並安排後續定時任務，而不需要接觸原始 token 或臨時 shell 命令。',
+    mcp_1: '記憶工具：<code>search_memory</code>、<code>get_memory_sources</code>、<code>save_observation</code> 和 <code>save_preference</code>。',
+    mcp_2: 'Send 工具：<code>send_list_targets</code> 和 <code>send_message</code>，用於有作用域的 agent-to-agent 協作。',
+    mcp_3: 'Cron 工具：建立、列出、更新和刪除定時結構化發送任務。',
+    mcp_4: '執行時綁定身份會把呼叫限制在目前 session、project、user 和 server 內，並在 UI 中顯示 provider 級 ready/degraded 狀態。',
     h_auto: '受監督執行',
     auto_intro: 'IM.codes 可對支援的 transport session 做逐輪監督，而不是盲目自動繼續。Auto 會判斷最近一輪是已完成、應該繼續自動執行，還是該把控制權交還給你。',
     auto_1: '按 session 設定 Auto 模式：Off、Supervised、Supervised + audit。',
@@ -612,6 +644,8 @@ const I18N = {
     auto_5: '雙層自訂監督提示詞。可同時保留一份全域監督人格，以及每個 session 的個別補充——預設會拼接成 global + 空行 + session 後送給監督者；在會話中勾選「覆蓋全域」，該 session 就會忽略全域值。修改全域人格對已啟用的 session 下一輪就生效，不需要重新開啟 Auto。',
     f_memory_name: '共享代理上下文',
     f_memory_desc: '問題→解決方案記憶、多語言召回、按訊息/啟動自動注入，並在時間線中可見',
+    f_mcp_name: '託管 MCP 工具',
+    f_mcp_desc: '為支援的 SDK agent 註冊記憶召回、來源、偏好、Scoped Send 和 Cron 工具',
     f_auto_name: '受監督執行',
     f_auto_desc: '逐輪完成判定、自動繼續，以及可選的審計→返工閉環，適用於 transport agent',
     why_text: '離開桌面後，大多數 coding agent 工作流就斷了。代理還在終端機裡運行，但你通常只能靠 SSH、tmux attach、遠端桌面，或者等回到電腦前。IM.codes 讓這些會話在手機和網頁上保持觸手可及：打開終端機、查看檔案和 Git 變更、從另一台裝置預覽 localhost、在任務完成時收到通知，並在自己的基礎設施上同時推進多個代理。',
@@ -644,7 +678,7 @@ const I18N = {
     f_sync_desc: '標籤順序、固定標籤和面板同步到伺服器',
     f_i18n_name: '7 種語言',
     f_i18n_desc: '中英日韓俄西 + 繁體中文',
-    arch_desc: '守護程序運行在你的開發機上，透過 tmux 管理代理會話。伺服器在你的裝置和守護程序之間中轉連線。所有資料留在你的基礎設施內。',
+    arch_desc: '守護程序運行在你的開發機上，透過 tmux 管理進程會話，並透過 SDK 和網路協定管理 transport 會話。它也負責託管 MCP server，為支援的 SDK provider 提供執行時作用域內的記憶、Send 和 Cron 工具。伺服器在你的裝置和守護程序之間中轉連線。所有資料留在你的基礎設施內。',
     copy_hint: '點擊複製',
     qs_1: '使用 <a href="https://app.im.codes">app.im.codes</a> 或自行部署伺服器',
     qs_2: '執行 <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
@@ -666,11 +700,11 @@ const I18N = {
     disclaimer: 'IM.codes 是一個獨立的開源專案，與 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司無任何關聯、認可或贊助關係。所有產品名稱和商標均為其各自擁有者的財產。',
   },
   ja: {
-    tagline: 'エージェントのための IM。共有メモリ、監督付き実行、そして AI プロバイダー横断の監査。',
-    hero_intro: 'IM.codes は coding agent に、プロバイダーをまたぐ共有メモリレイヤーを提供します。完了した作業を再利用可能なコンテキストとして蓄積し、Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw などの後続 session に適切な履歴を再注入します。Built-in Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。P2P ディスカッションを内蔵 — 複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。',
+    tagline: 'エージェントのための IM。共有メモリ、managed MCP tools、監督付き実行、そして AI プロバイダー横断の監査。',
+    hero_intro: 'IM.codes は coding agent に、プロバイダーをまたぐ共有メモリレイヤーと managed MCP tool surface を提供します。完了した作業を再利用可能なコンテキストとして蓄積し、Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw などの後続 session に適切な履歴を注入またはリコールします。Built-in Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。P2P ディスカッションを内蔵 — 複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。',
     hero_output: 'app.im.codes にバインド完了 · デーモン起動 · システムサービスとして登録',
     self_host_warning: '<strong>セルフホスティングを強く推奨します。</strong><code>app.im.codes</code> は共有テストインスタンスであり、稼働保証はありません。レート制限、攻撃対象、利用不可の可能性があります。個人プロジェクトのため商用サポートはありません。評価以外の用途では自社インフラにデプロイしてください。',
-    h_screenshots: 'スクリーンショット', h_why: '背景', h_memory: '共有エージェントコンテキスト', h_not: 'これは何ではないか', h_features: '機能', h_arch: 'アーキテクチャ', h_download: 'ダウンロード', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
+    h_screenshots: 'スクリーンショット', h_why: '背景', h_memory: '共有エージェントコンテキスト', h_mcp: 'managed MCP tools', h_not: 'これは何ではないか', h_features: '機能', h_arch: 'アーキテクチャ', h_download: 'ダウンロード', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
     also_web: '<a href="https://app.im.codes">ウェブ版</a>もあります',
     agents_intro: '複数のエージェントが CLI と SDK の両方に対応しています。',
     memory_intro: 'IM.codes は完了済みの作業を検索可能な記憶として蓄積します。保存されるのは生のプロンプトログではなく、構造化された問題→解決の要約です。関連履歴は新しいメッセージ送信時やセッション起動時に自動で再利用され、その注入内容はタイムラインで確認できます。',
@@ -678,6 +712,11 @@ const I18N = {
     memory_2: 'Enterprise Shared Context により、チームは workspace / project 単位で修正知見を再利用し、検索・統計・閲覧 UI から管理できます。これはまだ継続開発中で、完全な本番テストは終わっていません。',
     memory_3: '多言語リコールはローカル embedding と pgvector ベースのサーバー検索を組み合わせ、異なる言語間でも関連修正を見つけます。',
     memory_4: 'タイムラインカードには注入内容、関連度スコア、再利用回数、最終使用時刻が表示されます。',
+    mcp_intro: '対応する SDK-backed agent には IM.codes-managed stdio MCP server が提供され、raw token や ad hoc shell command を扱わずに memory recall、provenance、sibling agent への送信、follow-up scheduling ができます。',
+    mcp_1: 'Memory tools: <code>search_memory</code>, <code>get_memory_sources</code>, <code>save_observation</code>, and <code>save_preference</code>.',
+    mcp_2: 'Send tools: <code>send_list_targets</code> and <code>send_message</code> for scoped agent-to-agent coordination.',
+    mcp_3: 'Cron tools: create, list, update, and delete scheduled structured sends.',
+    mcp_4: 'Runtime-bound identity keeps calls scoped to the current session, project, user, and server, with provider-level ready/degraded status in the UI.',
     h_auto: '監督付き実行',
     auto_intro: 'IM.codes は blind auto-continue に頼らず、対応する transport session をターンごとに監督できます。Auto は直近のターンが完了か、継続か、あなたに制御を返すべきかを判断します。',
     auto_1: 'セッション単位の Auto モード: Off / Supervised / Supervised + audit。',
@@ -687,6 +726,8 @@ const I18N = {
     auto_5: '2 層のカスタム監督指示。グローバルな監督ペルソナと session ごとの追加指示を併用できます。既定では両者を「global ＋ 空行 ＋ session」の順で連結して監督者に送ります。session 側の「Override global」をオンにすると、その session はグローバル値を無視して自分の指示のみを使います。グローバル値を編集しても、すでに Auto 有効な session には次のターンから反映され、再有効化は不要です。',
     f_memory_name: '共有エージェントコンテキスト',
     f_memory_desc: '問題→解決の記憶、多言語リコール、メッセージ時/起動時の自動注入をタイムラインで可視化',
+    f_mcp_name: 'managed MCP tools',
+    f_mcp_desc: 'memory recall, provenance, preferences, scoped Send, and Cron tools for supported SDK agents',
     f_auto_name: '監督付き実行',
     f_auto_desc: 'transport 系エージェント向けのターン単位完了判定、自動継続、任意の audit→rework ループ',
     why_text: 'デスクを離れると、多くの coding agent ワークフローは途切れます。エージェントはまだターミナルで動いていても、作業を続けるには SSH、tmux attach、リモートデスクトップ、あるいはラップトップに戻るまで待つしかありません。IM.codes はそのセッションをモバイルやWebから手の届く場所に保ちます。ターミナルを開く、ファイルや Git の変更を見る、別デバイスから localhost を確認する、作業完了時に通知を受ける、そして自分のインフラ上で複数のエージェントを並行して進めることができます。',
@@ -719,7 +760,7 @@ const I18N = {
     f_sync_desc: 'タブ順序、ピン留めタブ・パネルをサーバーに同期',
     f_i18n_name: '7言語',
     f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
-    arch_desc: 'デーモンは開発マシンで動作し、tmuxでエージェントセッションを管理します。サーバーはデバイスとデーモン間の接続を中継します。すべてのデータは自社インフラ内に留まります。',
+    arch_desc: 'デーモンは開発マシンで動作し、tmux で process-backed session を、SDK とネットワークプロトコルで transport-backed session を管理します。対応 SDK provider 向けの runtime-scoped memory、Send、Cron tools を提供する managed MCP server もデーモンが所有します。サーバーはデバイスとデーモン間の接続を中継します。すべてのデータは自社インフラ内に留まります。',
     copy_hint: 'クリックでコピー',
     qs_1: '<a href="https://app.im.codes">app.im.codes</a> を使用するか、サーバーをセルフホスト',
     qs_2: '<code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code> を実行',
@@ -741,11 +782,11 @@ const I18N = {
     disclaimer: 'IM.codes は独立したオープンソースプロジェクトであり、Anthropic、OpenAI、Google、Alibaba、OpenClaw、またはその他の言及された企業との提携、承認、スポンサーシップはありません。すべての製品名および商標は各所有者に帰属します。',
   },
   ko: {
-    tagline: '에이전트를 위한 IM. 공유 메모리, 감독된 실행, 그리고 AI 제공자 전반의 교차 감사.',
-    hero_intro: 'IM.codes는 coding agent를 위한 provider 간 공유 메모리 레이어를 제공합니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw 등 이후 session에 적절한 기록을 다시 주입합니다. 내장된 Auto supervision은 완료된 턴을 판정하고, 자동 계속과 감사/재작업 루프까지 수행한 뒤 제어를 돌려줄 수 있습니다. P2P 토론 기능 내장 — 여러 모델이 서로의 계획과 구현을 리뷰하고 감사하여, 단일 모델의 누락·맹점·편향을 효과적으로 줄입니다.',
+    tagline: '에이전트를 위한 IM. 공유 메모리, managed MCP tools, 감독된 실행, 그리고 AI 제공자 전반의 교차 감사.',
+    hero_intro: 'IM.codes는 coding agent를 위한 provider 간 공유 메모리 레이어와 managed MCP tool surface를 제공합니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw 등 이후 session에 적절한 기록을 주입하거나 다시 recall합니다. 내장된 Auto supervision은 완료된 턴을 판정하고, 자동 계속과 감사/재작업 루프까지 수행한 뒤 제어를 돌려줄 수 있습니다. P2P 토론 기능 내장 — 여러 모델이 서로의 계획과 구현을 리뷰하고 감사하여, 단일 모델의 누락·맹점·편향을 효과적으로 줄입니다.',
     hero_output: 'app.im.codes에 바인딩 완료 · 데몬 시작됨 · 시스템 서비스로 등록됨',
     self_host_warning: '<strong>셀프 호스팅을 강력히 권장합니다.</strong> <code>app.im.codes</code>는 공유 테스트 인스턴스로 가동 보장이 없으며, 속도 제한, 공격 대상이 되거나 사용 불가할 수 있습니다. 개인 프로젝트로 상업적 지원은 제공되지 않습니다. 평가 이외의 용도에는 자체 인프라에 배포하세요.',
-    h_screenshots: '스크린샷', h_why: '배경', h_memory: '공유 에이전트 컨텍스트', h_not: '무엇이 아닌가', h_features: '기능', h_arch: '아키텍처', h_download: '다운로드', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
+    h_screenshots: '스크린샷', h_why: '배경', h_memory: '공유 에이전트 컨텍스트', h_mcp: 'managed MCP tools', h_not: '무엇이 아닌가', h_features: '기능', h_arch: '아키텍처', h_download: '다운로드', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
     also_web: '<a href="https://app.im.codes">웹 앱</a>으로도 이용 가능', watch_intro: 'Watch 지원으로 손목에서 세션 목록, 읽지 않음 수, OTA 업데이트 상태, 푸시 알림, 빠른 답장을 확인할 수 있습니다.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch 앱은 세션 목록, 읽지 않음 수, 빠른 답장을 제공합니다.',
     agents_intro: '여러 에이전트가 CLI와 SDK 두 방식 모두를 지원합니다.',
     memory_intro: 'IM.codes는 완료된 작업을 검색 가능한 메모리로 계속 축적합니다. 저장되는 것은 원시 프롬프트 로그가 아니라 구조화된 문제→해결 요약입니다. 관련 기록은 새 메시지 전송과 세션 시작 시 자동으로 재사용되며, 어떤 내용이 주입됐는지도 타임라인에서 확인할 수 있습니다.',
@@ -753,6 +794,11 @@ const I18N = {
     memory_2: 'Enterprise Shared Context를 통해 팀은 workspace / project 범위에서 수정 경험을 재사용하고, 검색·통계·조회 UI로 관리할 수 있습니다. 이 부분은 아직 계속 개발 중이며 완전한 프로덕션 테스트는 끝나지 않았습니다.',
     memory_3: '다국어 리콜은 로컬 embedding과 pgvector 기반 서버 검색을 결합해 서로 다른 언어 사이에서도 관련 수정 이력을 찾습니다.',
     memory_4: '타임라인 카드는 무엇이 주입됐는지와 함께 관련성 점수, 재호출 횟수, 마지막 사용 시각을 보여줍니다.',
+    mcp_intro: '지원되는 SDK-backed agent는 IM.codes-managed stdio MCP server를 받아 raw token이나 ad hoc shell command 없이 memory recall, provenance 확인, sibling agent 메시지, follow-up scheduling을 사용할 수 있습니다.',
+    mcp_1: 'Memory tools: <code>search_memory</code>, <code>get_memory_sources</code>, <code>save_observation</code>, and <code>save_preference</code>.',
+    mcp_2: 'Send tools: <code>send_list_targets</code> and <code>send_message</code> for scoped agent-to-agent coordination.',
+    mcp_3: 'Cron tools: create, list, update, and delete scheduled structured sends.',
+    mcp_4: 'Runtime-bound identity keeps calls scoped to the current session, project, user, and server, with provider-level ready/degraded status in the UI.',
     h_auto: '감독된 실행',
     auto_intro: 'IM.codes는 blind auto-continue에 의존하지 않고 지원되는 transport session을 턴 단위로 감독할 수 있습니다. Auto는 최근 턴이 끝났는지, 더 진행해야 하는지, 아니면 제어를 사용자에게 돌려줘야 하는지 판단합니다.',
     auto_1: '세션별 Auto 모드: Off, Supervised, Supervised + audit.',
@@ -762,6 +808,8 @@ const I18N = {
     auto_5: '2단 사용자 지정 감독 지침. 전역 감독 페르소나와 세션별 추가 지침을 함께 쓸 수 있습니다. 기본값은 global + 빈 줄 + session 형태로 합쳐져 감독자에게 전송됩니다. 세션의 「Override global」을 체크하면 그 세션은 전역 값을 무시하고 자체 지침만 사용합니다. 전역 값을 수정해도 이미 Auto가 켜진 세션은 다음 턴부터 반영되며 재활성화가 필요하지 않습니다.',
     f_memory_name: '공유 에이전트 컨텍스트',
     f_memory_desc: '문제→해결 메모리, 다국어 리콜, 메시지/시작 시 자동 주입을 타임라인에서 가시화',
+    f_mcp_name: 'managed MCP tools',
+    f_mcp_desc: 'memory recall, provenance, preferences, scoped Send, and Cron tools for supported SDK agents',
     f_auto_name: '감독된 실행',
     f_auto_desc: 'transport 에이전트를 위한 턴 단위 완료 판정, 자동 계속, 선택적 audit→rework 루프',
     why_text: '책상을 떠나면 대부분의 coding agent 워크플로우는 끊깁니다. 에이전트는 여전히 터미널에서 돌아가지만, 작업을 이어가려면 보통 SSH, tmux attach, 원격 데스크톱을 쓰거나 노트북 앞으로 돌아갈 때까지 기다려야 합니다. IM.codes는 이런 세션을 모바일과 웹에서 계속 닿는 곳에 둡니다. 터미널을 열고, 파일과 Git 변경을 보고, 다른 기기에서 localhost를 미리 보고, 작업이 끝나면 알림을 받고, 자신의 인프라에서 여러 에이전트를 병렬로 계속 진행할 수 있습니다.',
@@ -794,7 +842,7 @@ const I18N = {
     f_sync_desc: '탭 순서, 고정 탭 및 패널 서버 동기화',
     f_i18n_name: '7개 언어',
     f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
-    arch_desc: '데몬은 개발 머신에서 실행되며 tmux를 통해 에이전트 세션을 관리합니다. 서버는 디바이스와 데몬 간의 연결을 중계합니다. 모든 데이터는 자체 인프라에 유지됩니다.',
+    arch_desc: '데몬은 개발 머신에서 실행되며 tmux로 process-backed session을, SDK와 네트워크 프로토콜로 transport-backed session을 관리합니다. 또한 지원되는 SDK provider를 위한 runtime-scoped memory, Send, Cron tools를 제공하는 managed MCP server를 소유합니다. 서버는 디바이스와 데몬 간의 연결을 중계합니다. 모든 데이터는 자체 인프라에 유지됩니다.',
     copy_hint: '클릭하여 복사',
     qs_1: '<a href="https://app.im.codes">app.im.codes</a> 사용 또는 서버 셀프 호스팅',
     qs_2: '<code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code> 실행',
@@ -816,11 +864,11 @@ const I18N = {
     disclaimer: 'IM.codes는 독립적인 오픈소스 프로젝트로, Anthropic, OpenAI, Google, Alibaba, OpenClaw 또는 언급된 다른 회사와 제휴, 보증 또는 후원 관계가 없습니다. 모든 제품 이름과 상표는 각 소유자의 자산입니다.',
   },
   es: {
-    tagline: 'El IM para agentes. Memoria compartida, ejecución supervisada y auditoría cruzada entre proveedores de IA.',
-    hero_intro: 'IM.codes da a los coding agents una capa de memoria compartida entre proveedores. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar el historial adecuado en sesiones futuras de Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw y más. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión P2P integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.',
+    tagline: 'El IM para agentes. Memoria compartida, herramientas MCP gestionadas, ejecución supervisada y auditoría cruzada entre proveedores de IA.',
+    hero_intro: 'IM.codes da a los coding agents una capa de memoria compartida y una superficie de herramientas MCP gestionadas entre proveedores. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras de Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw y más. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión P2P integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.',
     hero_output: 'vinculado a app.im.codes · daemon iniciado · registrado como servicio del sistema',
     self_host_warning: '<strong>Se recomienda encarecidamente el autoalojamiento.</strong> <code>app.im.codes</code> es una instancia de prueba compartida sin garantías de disponibilidad — puede tener límites, ser objetivo de ataques o no estar disponible. Este es un proyecto personal sin soporte comercial. Para uso más allá de la evaluación, despliega en tu propia infraestructura.',
-    h_screenshots: 'capturas', h_why: 'por qué', h_memory: 'contexto compartido para agentes', h_not: 'qué no es', h_features: 'características', h_arch: 'arquitectura', h_download: 'descargar', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
+    h_screenshots: 'capturas', h_why: 'por qué', h_memory: 'contexto compartido para agentes', h_mcp: 'herramientas MCP gestionadas', h_not: 'qué no es', h_features: 'características', h_arch: 'arquitectura', h_download: 'descargar', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
     also_web: 'También disponible como <a href="https://app.im.codes">app web</a>', watch_intro: 'La compatibilidad con Watch cubre monitoreo rápido de sesiones, contadores de no leídos, visibilidad de actualizaciones OTA, notificaciones push y respuestas rápidas desde la muñeca.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'La app de Watch incluye lista de sesiones, contadores de no leídos y respuestas rápidas.',
     agents_intro: 'Varios agentes admiten integración tanto por CLI como por SDK.',
     memory_intro: 'IM.codes convierte el trabajo ya resuelto en memoria reutilizable y buscable. Guarda resúmenes estructurados de problema→solución en lugar de logs crudos de prompts. El historial relevante se recupera automáticamente para nuevos mensajes y al iniciar sesiones, y cada inyección queda visible en la línea de tiempo.',
@@ -828,6 +876,11 @@ const I18N = {
     memory_2: 'El contexto compartido empresarial permite reutilizar soluciones entre workspaces y proyectos con memoria consultable, estadísticas y UI de inspección. Esta parte sigue en desarrollo activo y todavía no ha pasado pruebas completas de producción.',
     memory_3: 'La recuperación multilingüe combina embeddings locales con búsqueda del lado del servidor basada en pgvector para encontrar soluciones relacionadas entre distintos idiomas.',
     memory_4: 'Las tarjetas de la línea de tiempo muestran exactamente qué se inyectó, junto con puntuación de relevancia, número de recuperaciones y último uso.',
+    mcp_intro: 'Los agentes compatibles basados en SDK reciben un servidor MCP stdio gestionado por IM.codes, para recuperar memoria, revisar procedencia, enviar mensajes a sesiones hermanas y programar seguimientos sin manejar tokens crudos ni comandos shell improvisados.',
+    mcp_1: 'Herramientas de memoria: <code>search_memory</code>, <code>get_memory_sources</code>, <code>save_observation</code> y <code>save_preference</code>.',
+    mcp_2: 'Herramientas Send: <code>send_list_targets</code> y <code>send_message</code> para coordinación agent-to-agent con alcance.',
+    mcp_3: 'Herramientas Cron: crear, listar, actualizar y eliminar envíos estructurados programados.',
+    mcp_4: 'La identidad vinculada al runtime mantiene las llamadas dentro de la sesión, proyecto, usuario y servidor actuales, con estado ready/degraded por provider en la UI.',
     h_auto: 'ejecución supervisada',
     auto_intro: 'IM.codes puede supervisar sesión por sesión los transport sessions compatibles en lugar de depender de un auto-continue ciego. Auto comprueba si el último turno ya terminó, debe continuar o debe devolverte el control.',
     auto_1: 'Modos Auto por sesión: Off, Supervised y Supervised + audit.',
@@ -837,6 +890,8 @@ const I18N = {
     auto_5: 'Instrucciones de supervisión personalizadas en dos capas. Mantén una persona global de supervisión y añade lo específico por sesión — por defecto ambas se concatenan (global + línea en blanco + sesión) al enviarse al supervisor. Marca la casilla «Override global» de una sesión para que ignore el valor global. Al editar la persona global, el cambio se aplica a las sesiones ya activadas en el siguiente turno sin reactivar Auto.',
     f_memory_name: 'contexto compartido para agentes',
     f_memory_desc: 'memoria problema→solución, recuperación multilingüe e inyección automática por mensaje y al iniciar, visible en la línea de tiempo',
+    f_mcp_name: 'herramientas MCP gestionadas',
+    f_mcp_desc: 'recuperación de memoria, procedencia, preferencias, Send con alcance y Cron para agentes SDK compatibles',
     f_auto_name: 'ejecución supervisada',
     f_auto_desc: 'comprobaciones de finalización por turno, auto-continue y bucles opcionales audit→rework para agentes transport',
     why_text: 'Cuando te alejas del escritorio, la mayoría de los flujos con coding agents se rompen. El agente sigue ejecutándose en una terminal, pero continuar el trabajo suele significar usar SSH, tmux attach, escritorio remoto o esperar a volver al portátil. IM.codes mantiene esas sesiones al alcance desde móvil o web: abre la terminal, inspecciona archivos y cambios Git, previsualiza localhost desde otro dispositivo, recibe notificaciones cuando el trabajo termina y mantén varios agentes avanzando en paralelo sobre tu propia infraestructura.',
@@ -869,7 +924,7 @@ const I18N = {
     f_sync_desc: 'orden de pestañas, pestañas y paneles fijados sincronizados',
     f_i18n_name: '7 idiomas',
     f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
-    arch_desc: 'El daemon se ejecuta en tu máquina de desarrollo y gestiona sesiones de agentes a través de tmux. El servidor retransmite conexiones entre tus dispositivos y el daemon. Todo permanece en tu infraestructura.',
+    arch_desc: 'El daemon se ejecuta en tu máquina de desarrollo y gestiona sesiones process-backed con tmux, además de sesiones transport-backed mediante SDKs y protocolos de red. También aloja el servidor MCP gestionado que ofrece herramientas de memoria, Send y Cron con alcance runtime para providers SDK compatibles. El servidor retransmite conexiones entre tus dispositivos y el daemon. Todo permanece en tu infraestructura.',
     copy_hint: 'clic para copiar',
     qs_1: 'Usa <a href="https://app.im.codes">app.im.codes</a> o autoaloja el servidor',
     qs_2: 'Ejecuta <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
@@ -891,11 +946,11 @@ const I18N = {
     disclaimer: 'IM.codes es un proyecto de código abierto independiente y no está afiliado, respaldado ni patrocinado por Anthropic, OpenAI, Google, Alibaba, OpenClaw ni ninguna otra empresa mencionada. Todos los nombres de productos y marcas son propiedad de sus respectivos dueños.',
   },
   ru: {
-    tagline: 'IM для агентов. Общая память, контролируемое выполнение и кросс-модельный аудит поверх AI-провайдеров.',
-    hero_intro: 'IM.codes даёт coding agents единый слой памяти поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает нужную историю в будущие session для Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw и других. Встроенный Auto supervision умеет оценивать завершённые ходы, продолжать работу автономно и при необходимости запускать цикл audit/rework перед возвратом контроля. P2P-обсуждение — несколько моделей взаимно проверяют и аудируют планы и реализации друг друга, эффективно уменьшая пропуски, «слепые зоны» и смещения одной модели.',
+    tagline: 'IM для агентов. Общая память, управляемые MCP tools, контролируемое выполнение и кросс-модельный аудит поверх AI-провайдеров.',
+    hero_intro: 'IM.codes даёт coding agents единый слой памяти и управляемую поверхность MCP tools поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает или recall нужную историю в будущие session для Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw и других. Встроенный Auto supervision умеет оценивать завершённые ходы, продолжать работу автономно и при необходимости запускать цикл audit/rework перед возвратом контроля. P2P-обсуждение — несколько моделей взаимно проверяют и аудируют планы и реализации друг друга, эффективно уменьшая пропуски, «слепые зоны» и смещения одной модели.',
     hero_output: 'привязан к app.im.codes · демон запущен · зарегистрирован как системная служба',
     self_host_warning: '<strong>Настоятельно рекомендуется самостоятельный хостинг.</strong> <code>app.im.codes</code> — общий тестовый экземпляр без гарантий доступности. Может быть ограничен, атакован или недоступен. Это личный проект без коммерческой поддержки. Для использования помимо тестирования разверните на собственной инфраструктуре.',
-    h_screenshots: 'скриншоты', h_why: 'зачем', h_memory: 'общий контекст агентов', h_not: 'чем это не является', h_features: 'возможности', h_arch: 'архитектура', h_download: 'скачать', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
+    h_screenshots: 'скриншоты', h_why: 'зачем', h_memory: 'общий контекст агентов', h_mcp: 'управляемые MCP tools', h_not: 'чем это не является', h_features: 'возможности', h_arch: 'архитектура', h_download: 'скачать', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
     also_web: 'Также доступно как <a href="https://app.im.codes">веб-приложение</a>', watch_intro: 'Поддержка Watch даёт быстрый просмотр сессий, счётчики непрочитанного, статус OTA-обновлений, push-уведомления и быстрые ответы прямо с запястья.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Приложение для Watch показывает список сессий, счётчики непрочитанного и быстрые ответы.',
     agents_intro: 'Несколько агентов поддерживают интеграции как через CLI, так и через SDK.',
     memory_intro: 'IM.codes превращает уже решённую работу в переиспользуемую и доступную для поиска память. Сохраняются не сырые логи промптов, а структурированные сводки проблема→решение. Релевантная история автоматически подмешивается в новые сообщения и при старте сессии, а каждая инъекция видна в таймлайне.',
@@ -903,6 +958,11 @@ const I18N = {
     memory_2: 'Enterprise Shared Context позволяет командам переиспользовать решения между workspace / project с поиском по памяти, статистикой и интерфейсом просмотра. Эта часть всё ещё активно разрабатывается и ещё не прошла полноценное продакшен-тестирование.',
     memory_3: 'Многоязычный recall сочетает локальные embedding и серверный поиск на pgvector, поэтому связанные решения находятся даже между разными языками.',
     memory_4: 'Карточки таймлайна показывают, что именно было подмешано, а также score релевантности, число recall и время последнего использования.',
+    mcp_intro: 'Поддерживаемые SDK-backed агенты получают управляемый IM.codes stdio MCP server, чтобы выполнять memory recall, смотреть provenance, отправлять сообщения sibling agents и планировать follow-up без сырых токенов и ad hoc shell-команд.',
+    mcp_1: 'Memory tools: <code>search_memory</code>, <code>get_memory_sources</code>, <code>save_observation</code> и <code>save_preference</code>.',
+    mcp_2: 'Send tools: <code>send_list_targets</code> и <code>send_message</code> для scoped agent-to-agent координации.',
+    mcp_3: 'Cron tools: создание, просмотр, обновление и удаление scheduled structured sends.',
+    mcp_4: 'Runtime-bound identity удерживает вызовы в рамках текущих session, project, user и server, а UI показывает ready/degraded статус по provider.',
     h_auto: 'контролируемое выполнение',
     auto_intro: 'IM.codes может контролировать поддерживаемые transport session ход за ходом вместо слепого auto-continue. Auto определяет, завершён ли последний ход, нужно ли продолжать, или пора вернуть управление вам.',
     auto_1: 'Режимы Auto на уровне session: Off, Supervised и Supervised + audit.',
@@ -912,6 +972,8 @@ const I18N = {
     auto_5: 'Двухслойные пользовательские инструкции supervisor. Сохраняйте глобальную supervisor-персону вместе с дополнением на уровне session — по умолчанию они объединяются в «global + пустая строка + session» и отправляются supervisor. Установите флажок «Override global» в сессии, чтобы она игнорировала глобальное значение. Правка глобальной персоны применяется к уже активным session со следующего хода, повторная активация Auto не нужна.',
     f_memory_name: 'общий контекст агентов',
     f_memory_desc: 'память проблема→решение, многоязычный recall и автоматическая инъекция при сообщении и старте сессии с видимостью в таймлайне',
+    f_mcp_name: 'управляемые MCP tools',
+    f_mcp_desc: 'memory recall, provenance, preferences, scoped Send и Cron tools для поддерживаемых SDK agents',
     f_auto_name: 'контролируемое выполнение',
     f_auto_desc: 'проверка завершения по ходам, auto-continue и необязательные циклы audit→rework для transport-агентов',
     why_text: 'Когда вы отходите от рабочего стола, большинство workflows с coding agents ломается. Агент всё ещё работает в терминале, но продолжение работы обычно означает SSH, tmux attach, удалённый рабочий стол или ожидание, пока вы вернётесь к ноутбуку. IM.codes держит эти сессии под рукой на телефоне и в браузере: откройте терминал, посмотрите файлы и Git-изменения, превью localhost с другого устройства, получите уведомление по завершении работы и ведите несколько агентов параллельно на своей инфраструктуре.',
@@ -944,7 +1006,7 @@ const I18N = {
     f_sync_desc: 'порядок вкладок, закреплённые вкладки и панели синхронизированы',
     f_i18n_name: '7 языков',
     f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
-    arch_desc: 'Демон работает на вашей машине разработки и управляет сессиями агентов через tmux. Сервер передаёт соединения между вашими устройствами и демоном. Все данные остаются на вашей инфраструктуре.',
+    arch_desc: 'Демон работает на вашей машине разработки и управляет process-backed session через tmux, а transport-backed session — через SDK и сетевые протоколы. Он также владеет managed MCP server, который даёт runtime-scoped memory, Send и Cron tools поддерживаемым SDK providers. Сервер передаёт соединения между вашими устройствами и демоном. Все данные остаются на вашей инфраструктуре.',
     copy_hint: 'нажмите для копирования',
     qs_1: 'Используйте <a href="https://app.im.codes">app.im.codes</a> или разверните свой сервер',
     qs_2: 'Выполните <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
