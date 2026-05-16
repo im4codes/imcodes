@@ -142,7 +142,7 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
       userMessage: 'hi',
       assembledMessage: 'hi',
-      systemText: undefined,
+      systemText: expect.stringContaining('Use memory MCP search'),
     }));
   });
 
@@ -314,7 +314,10 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
       userMessage: 'help',
       assembledMessage: 'help',
-      systemText: 'expert\n\nruntime only',
+      systemText: expect.stringContaining('expert\n\nruntime only'),
+    }));
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      systemText: expect.stringContaining('Use memory MCP search'),
     }));
   });
 

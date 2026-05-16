@@ -1,12 +1,19 @@
 import { describe, expect, it, vi } from 'vitest';
-import { buildProviderContextPayload, dispatchSharedContextSend } from '../../src/agent/transport-runtime-assembly.js';
+import {
+  buildProviderContextPayload,
+  dispatchSharedContextSend,
+  MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE,
+} from '../../src/agent/transport-runtime-assembly.js';
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { TransportMemoryRecallArtifact } from '../../shared/context-types.js';
 
-function makeProvider(contextSupport: NonNullable<TransportProvider['capabilities']['contextSupport']>): TransportProvider {
+function makeProvider(
+  contextSupport: NonNullable<TransportProvider['capabilities']['contextSupport']>,
+  id = 'mock',
+): TransportProvider {
   const send = vi.fn(async () => {});
   return {
-    id: 'mock',
+    id,
     connectionMode: 'local-sdk',
     sessionOwnership: 'shared',
     capabilities: {
@@ -56,12 +63,45 @@ describe('buildProviderContextPayload', () => {
       namespace: { scope: 'personal', projectId: 'repo-1' },
     });
 
-    expect(payload).toMatchObject({
-      userMessage: 'Run tests',
-      assembledMessage: 'Run tests',
-      systemText: 'Be concise\n\nNever edit generated files',
-      supportClass: 'full-normalized-context-injection',
+    expect(payload.userMessage).toBe('Run tests');
+    expect(payload.assembledMessage).toBe('Run tests');
+    expect(payload.supportClass).toBe('full-normalized-context-injection');
+    expect(payload.systemText).toContain('Be concise');
+    expect(payload.systemText).toContain('Never edit generated files');
+    expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+  });
+
+  it('adds MCP memory search guidance for every managed SDK provider id', () => {
+    const providerIds = [
+      'claude-code-sdk',
+      'gemini-sdk',
+      'copilot-sdk',
+      'codex-sdk',
+      'cursor-headless',
+      'qwen',
+    ];
+
+    for (const providerId of providerIds) {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', providerId), {
+        userMessage: 'What did we decide about memory recall last week?',
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+
+      expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+      expect(payload.systemText).toContain('Do not call memory for bare control messages');
+      expect(payload.assembledMessage).toBe('What did we decide about memory recall last week?');
+    }
+  });
+
+  it('can suppress MCP memory search guidance for raw slash controls', () => {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: '/compact',
+      suppressMcpMemorySearchGuidance: true,
+      namespace: { scope: 'personal', projectId: 'repo-1' },
     });
+
+    expect(payload.systemText).toBeUndefined();
+    expect(payload.assembledMessage).toBe('/compact');
   });
 
   it('renders startup memory into systemText and message recall into messagePreamble without mutating userMessage', () => {

@@ -21,6 +21,7 @@ export interface TransportRuntimeAssemblyInput {
   userMessage: string;
   description?: string;
   systemPrompt?: string;
+  suppressMcpMemorySearchGuidance?: boolean;
   messagePreamble?: string;
   attachments?: TransportAttachment[];
   namespace?: ContextNamespace;
@@ -43,6 +44,12 @@ export interface TransportRuntimeAssemblyInput {
   startupMemory?: TransportMemoryRecallArtifact;
   memoryRecall?: TransportMemoryRecallArtifact;
 }
+
+export const MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE = [
+  'Use memory MCP search when the user asks about prior work, project history, past decisions, preferences, bugs, commits, deployments, or previously discussed context.',
+  'Before answering those requests, call search_memory with a concise query based on the user message and current project.',
+  'Do not call memory for bare control messages like "continue", "go on", "ok", "yes", "commit", "push", "run tests", or other short commands without searchable context.',
+].join('\n');
 
 export interface DispatchSharedContextSendOptions {
   flags?: SharedContextCutoverFlags;
@@ -259,8 +266,9 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     });
   }
   const renderedAuthoredSystemText = renderAuthoredSystemText(authoredContext.required, authoredContext.advisory);
+  const memorySearchGuidance = input.suppressMcpMemorySearchGuidance ? undefined : MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE;
   return {
-    systemText: [input.description?.trim(), input.systemPrompt?.trim(), renderedAuthoredSystemText].filter(Boolean).join('\n\n') || undefined,
+    systemText: [input.description?.trim(), input.systemPrompt?.trim(), memorySearchGuidance, renderedAuthoredSystemText].filter(Boolean).join('\n\n') || undefined,
     messagePreamble: input.messagePreamble?.trim() || undefined,
     requiredAuthoredContext: authoredContext.required,
     advisoryAuthoredContext: authoredContext.advisory,

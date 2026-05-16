@@ -547,6 +547,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         messagePreamble: isSlashControl ? undefined : this.mergeMessagePreambles(dispatchedEntries, message),
         description: isSlashControl ? undefined : this._description,
         systemPrompt: isSlashControl ? undefined : this._systemPrompt,
+        suppressMcpMemorySearchGuidance: isSlashControl,
         attachments,
         namespace: this._contextNamespace,
         namespaceDiagnostics: this._contextNamespaceDiagnostics,
