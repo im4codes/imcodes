@@ -702,6 +702,57 @@ ${PREFERENCE_CONTEXT_END}`;
     }), expect.any(Object));
   });
 
+  it('carries personal local startup memory when remote context is authoritative but has no startup hits', async () => {
+    const startupItem = makeSearchItem({
+      projectId: 'repo-1',
+      summary: 'Local personal startup memory should still be visible',
+    });
+    const startupMemory = {
+      reason: 'startup' as const,
+      runtimeFamily: 'transport' as const,
+      authoritySource: 'processed_local' as const,
+      sourceKind: 'local_processed' as const,
+      injectionSurface: 'message-preamble' as const,
+      injectedText: '# Recent project memory\n\n- Local personal startup memory should still be visible',
+      items: [startupItem],
+    };
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:server-personal-fallback', 'remote-processed:fresh'],
+      remoteProcessedFreshness: 'fresh',
+      retryExhausted: true,
+      startupMemory,
+    }));
+
+    await r.initialize(defaultConfig);
+    timelineEmitterEmitMock.mockClear();
+
+    r.send('first remote-authoritative personal turn');
+    await flushDispatch();
+
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      startupMemory: expect.objectContaining({
+        reason: 'startup',
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+        injectedText: expect.stringContaining('Local personal startup memory'),
+      }),
+      messagePreamble: expect.stringContaining('Local personal startup memory'),
+      diagnostics: expect.arrayContaining(['memory:start:local-auxiliary']),
+    }));
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'memory.context',
+      expect.objectContaining({
+        reason: 'startup',
+        injectedText: expect.stringContaining('Local personal startup memory'),
+      }),
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
+  });
+
   it('does not stack duplicate startup cards across restart-before-first-message cycles', async () => {
     // Regression for the timeline showing multiple "Historical context ·
     // injected" cards on a session that had been restarted repeatedly

@@ -181,7 +181,13 @@ export function buildProviderContextPayload(
   for (const entry of input.namespaceDiagnostics ?? []) {
     if (!diagnostics.includes(entry)) diagnostics.push(entry);
   }
-  if (input.startupMemory) diagnostics.push(sanitizedStartupMemory ? 'memory:start' : 'memory:start:suppressed-authority');
+  if (input.startupMemory) {
+    diagnostics.push(sanitizedStartupMemory
+      ? (authority.authoritySource === 'processed_remote' && sanitizedStartupMemory.sourceKind === 'local_processed'
+          ? 'memory:start:local-auxiliary'
+          : 'memory:start')
+      : 'memory:start:suppressed-authority');
+  }
   if (input.memoryRecall) diagnostics.push(authority.authoritySource === 'processed_local' ? 'memory:message' : 'memory:message:local-auxiliary');
   const recallInjectionSurface: MemoryRecallInjectionSurface = supportClass === 'degraded-message-side-context-mapping'
     ? 'degraded-message-side'
@@ -218,7 +224,9 @@ function filterStartupMemoryForAuthority(
     item.sourceKind === 'remote_processed'
     || (!item.sourceKind && startupMemory.sourceKind === 'remote_processed')
   ));
-  if (remoteItems.length === 0) return undefined;
+  if (remoteItems.length === 0) {
+    return authority.namespace.scope === 'personal' ? startupMemory : undefined;
+  }
   return {
     ...startupMemory,
     authoritySource: 'processed_remote',

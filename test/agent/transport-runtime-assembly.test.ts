@@ -244,6 +244,29 @@ describe('buildProviderContextPayload', () => {
     expect(payload.diagnostics).toContain('memory:message:local-auxiliary');
   });
 
+  it('keeps personal local startup memory as auxiliary when remote authority has no startup hits', () => {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'Run tests',
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      remoteProcessedFreshness: 'fresh',
+      retryExhausted: true,
+      startupMemory: makeRecall({
+        reason: 'startup',
+        injectedText: '# Recent project memory (reference only)\n<recent-project-memory advisory="true">\n- Local personal startup memory\n</recent-project-memory>',
+      }),
+    });
+
+    expect(payload.authority.authoritySource).toBe('processed_remote');
+    expect(payload.startupMemory).toEqual(expect.objectContaining({
+      sourceKind: 'local_processed',
+      authoritySource: 'processed_local',
+      injectionSurface: 'normalized-payload',
+    }));
+    expect(payload.messagePreamble).toContain('Local personal startup memory');
+    expect(payload.assembledMessage).toContain('Local personal startup memory');
+    expect(payload.diagnostics).toContain('memory:start:local-auxiliary');
+  });
+
   it('injects remote startup memory when remote processed context is authoritative', () => {
     const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
       userMessage: 'Run tests',
