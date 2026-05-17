@@ -143,6 +143,10 @@ export function createSubSessionEntryGestureController(
     }
 
     cancelPendingSingleClick();
+    if (lastPointerType === 'touch' || options.isDesktopDoubleClickEnabled?.() === false) {
+      run('single');
+      return;
+    }
     pendingSingleClick = setTimeout(() => {
       pendingSingleClick = null;
       if (isSuppressed()) return;

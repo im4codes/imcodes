@@ -189,6 +189,7 @@ describe('sub-session entry gesture helper', () => {
 
     controller.handlePointerDown({ pointerType: 'touch' });
     controller.handleClick(makeMouseEvent(root), root);
+    expect(log).toEqual(['openNormal']);
     controller.handleDoubleClick(makeMouseEvent(root), root);
     vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS);
 
@@ -206,6 +207,7 @@ describe('sub-session entry gesture helper', () => {
 
     controller.handlePointerDown({ pointerType: 'mouse' });
     controller.handleClick(makeMouseEvent(root), root);
+    expect(log).toEqual(['openNormal']);
     controller.handleDoubleClick(makeMouseEvent(root), root);
     vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS);
 
@@ -327,10 +329,24 @@ describe('SubSessionBar component entry gestures', () => {
     const entry = screen.getByRole('button', { name: /worker/ });
     fireEvent.pointerDown(entry, { pointerType: 'mouse' });
     fireEvent.click(entry);
+    expect(onOpen).toHaveBeenCalledWith('sub-1');
     fireEvent.dblClick(entry);
     vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS);
 
     expect(onOpenMaximized).not.toHaveBeenCalled();
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens touch entries immediately without waiting for the double-click delay', () => {
+    const onOpen = vi.fn();
+    renderBar({ onOpen });
+
+    const entry = screen.getByRole('button', { name: /worker/ });
+    fireEvent.pointerDown(entry, { pointerType: 'touch' });
+    fireEvent.click(entry);
+
     expect(onOpen).toHaveBeenCalledWith('sub-1');
+    vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS);
+    expect(onOpen).toHaveBeenCalledTimes(1);
   });
 });
