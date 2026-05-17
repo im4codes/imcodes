@@ -167,7 +167,8 @@ describe('useTimeline global cache bounds', () => {
   });
 
   it('inactive sessions still load IDB history after a short stagger (not just visible ones)', async () => {
-    // Regression for "很多聊天窗口都没加载历史消息，只加载了可视窗口的".
+    // Regression: SubSessionCard previews and hidden tabs went empty
+    // after commit 90cd30ec gated path-3 behind isActiveSession.
     // Commit 90cd30ec gated path-3 IDB load behind `isActiveSession` and
     // deferred inactive instances to `requestIdleCallback` with a 500ms
     // fallback — and cancelled the pending handle on every effect cleanup.
@@ -292,7 +293,8 @@ describe('useTimeline global cache bounds', () => {
   });
 
   it('cold-cache inactive sessions force-through a one-shot daemon history request', async () => {
-    // Regression for "还是有一些不加载的". Inactive (e.g. SubSessionCard
+    // Regression: even after the inactive-load fix, sub-session windows
+    // with no local cache still rendered empty. Inactive (e.g. SubSessionCard
     // preview / hidden tab) sessions without local cache used to show
     // permanently empty: `requestDaemonHistory` was gated on
     // `isActiveSessionRef.current` and `fireHttpBackfill` had the same
@@ -351,6 +353,95 @@ describe('useTimeline global cache bounds', () => {
     await waitFor(() => {
       expect(fetchHistorySpy).toHaveBeenCalled();
     });
+  });
+
+  it('falls back to raw sessionId IDB key when the scoped read is empty (cacheKey scope drift)', async () => {
+    // Regression for the scope-drift bug — PR-4 in
+    // .imc/discussions/e9dbc48c-dda.md. When the app mounts before
+    // `selectedServerId` resolves, WS events get persisted under the
+    // bare sessionId. Once serverId resolves, useTimeline reads with
+    // the scoped key (`${serverId}:${sessionId}`) and the bare-key
+    // events become orphans — invisible to every later read. The
+    // fallback re-reads under the raw sessionId and stamps the events
+    // back under the scoped key so the user sees their history.
+    const sessionName = `deck_scope_drift_${Date.now()}`;
+    const serverId = `srv-drift-${Date.now()}`;
+    const stored: TimelineEvent[] = [{
+      eventId: `${sessionName}-raw-1`,
+      sessionId: sessionName, // ← bare sessionId, NOT scoped
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'orphaned history from bare-key write' },
+    }];
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    // Scoped key: nothing. Raw key: has the orphaned events.
+    const getLastSeqAndEpochSpy = vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch')
+      .mockImplementation(async (key: string) => {
+        if (key === sessionName) return { seq: 1, epoch: 1 };
+        return null;
+      });
+    const getRecentEventsSpy = vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
+      .mockImplementation(async (key: string) => {
+        if (key === sessionName) return stored;
+        return [];
+      });
+    const migrateSpy = vi.spyOn(TimelineDB.prototype, 'migrateRawToScoped').mockResolvedValue();
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, null, serverId);
+      return h(
+        'div',
+        { 'data-testid': 'probe-drift' },
+        events.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-drift').textContent).toBe('orphaned history from bare-key write');
+    });
+
+    // Both reads (scoped first, then raw fallback) and migration must
+    // have been invoked exactly as designed.
+    expect(getLastSeqAndEpochSpy).toHaveBeenCalledWith(`${serverId}:${sessionName}`);
+    expect(getLastSeqAndEpochSpy).toHaveBeenCalledWith(sessionName);
+    expect(getRecentEventsSpy).toHaveBeenCalledWith(`${serverId}:${sessionName}`, { limit: 300 });
+    expect(getRecentEventsSpy).toHaveBeenCalledWith(sessionName, { limit: 300 });
+    expect(migrateSpy).toHaveBeenCalledWith(sessionName, `${serverId}:${sessionName}`, stored);
+  });
+
+  it('falls back to raw localStorage snapshot when scoped key is empty', () => {
+    // Sibling regression. Snapshot was written under bare sessionId
+    // because `selectedServerId` was null at the time. The synchronous
+    // useState seed must surface that data using the fallback variant.
+    const sessionName = `deck_ls_drift_${Date.now()}`;
+    const serverId = `srv-ls-drift-${Date.now()}`;
+    const events = makeEvents(sessionName, 3);
+    // Write under the BARE sessionId (the "before serverId resolved" shape).
+    localStorage.setItem(
+      `rcc_timeline_snapshot:${sessionName}`,
+      JSON.stringify(events),
+    );
+    // Scoped key has nothing.
+    localStorage.removeItem(`rcc_timeline_snapshot:${serverId}:${sessionName}`);
+
+    function Probe() {
+      const { events: seen } = useTimeline(sessionName, null, serverId);
+      return h('div', { 'data-testid': 'ls-drift-probe' }, String(seen.length));
+    }
+
+    render(h(Probe));
+
+    expect(screen.getByTestId('ls-drift-probe').textContent).toBe('3');
+    // The fallback also migrates the snapshot to the scoped key.
+    expect(localStorage.getItem(`rcc_timeline_snapshot:${serverId}:${sessionName}`)).toBeTruthy();
+    expect(localStorage.getItem(`rcc_timeline_snapshot:${sessionName}`)).toBeNull();
   });
 
   it('stays idle for shell/script sessions with history disabled', async () => {

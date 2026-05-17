@@ -326,6 +326,33 @@ function loadPersistedTimelineSnapshot(cacheKey: string): TimelineEvent[] {
   }
 }
 
+/**
+ * Reads the snapshot under `cacheKey`; if empty falls back to the bare
+ * `sessionId` snapshot (written when `selectedServerId` hadn't resolved
+ * yet). On a fallback hit, migrates the snapshot to the scoped key and
+ * removes the raw one so the next read takes the fast path.
+ */
+function loadPersistedTimelineSnapshotWithFallback(
+  cacheKey: string,
+  rawSessionId: string | undefined,
+): TimelineEvent[] {
+  const scoped = loadPersistedTimelineSnapshot(cacheKey);
+  if (scoped.length > 0) return scoped;
+  if (!rawSessionId || rawSessionId === cacheKey) return scoped;
+  const raw = loadPersistedTimelineSnapshot(rawSessionId);
+  if (raw.length === 0) return scoped;
+  // Best-effort migration: re-persist under the scoped key and clear the
+  // raw entry. localStorage.setItem can throw on quota; if it does we
+  // still return the raw events so the user sees them.
+  try {
+    localStorage.setItem(getTimelineSnapshotStorageKey(cacheKey), JSON.stringify(raw));
+    localStorage.removeItem(getTimelineSnapshotStorageKey(rawSessionId));
+  } catch {
+    /* ignore — fallback read still surfaced the events */
+  }
+  return raw;
+}
+
 function persistTimelineSnapshot(cacheKey: string, events: TimelineEvent[]): void {
   try {
     // Mirror the IDB write-side filter: streaming/typewriter intermediates
@@ -936,7 +963,12 @@ export function useTimeline(
     if (!cacheKey) return [];
     const memCached = getCachedEvents(cacheKey);
     if (memCached && memCached.length > 0) return memCached;
-    const persisted = loadPersistedTimelineSnapshot(cacheKey);
+    // Fall back to the bare sessionId snapshot for rows written before
+    // `selectedServerId` resolved on this page session — without this the
+    // first paint after a refresh shows blank even when the snapshot is
+    // present under the old key. PR-4 in .imc/discussions/e9dbc48c-dda.md.
+    const rawSessionIdForFallback = sessionId && sessionId !== cacheKey ? sessionId : undefined;
+    const persisted = loadPersistedTimelineSnapshotWithFallback(cacheKey, rawSessionIdForFallback);
     if (persisted.length === 0) return [];
     // Older snapshots written before we filtered streaming events on the
     // write side may still contain typewriter intermediates. Filter on the
@@ -1159,7 +1191,7 @@ export function useTimeline(
       // request — otherwise the user sees a permanently blank pane for any
       // sub-session they haven't opened on this browser before, with no
       // way to recover until they focus it. The cold branch passes
-      // `force=true` for this one-shot. User report: "还是有一些不加载的".
+      // `force=true` for this one-shot.
       //
       // When the user later activates the card, this effect re-runs (the
       // mount-effect dep array includes `isActiveSession`) and the gate
@@ -1200,7 +1232,10 @@ export function useTimeline(
     // 1.5 Synchronous localStorage snapshot — instant restore across full page
     // reloads before IndexedDB/network complete. This is intentionally only a
     // tail snapshot for first paint; IndexedDB remains the fuller local source.
-    const localSnapshot = loadPersistedTimelineSnapshot(cacheKey!);
+    // Use the fallback variant so cacheKey-scope shifts (early-mount
+    // serverId resolution) still surface the prior snapshot.
+    const rawSessionIdForFallback = sessionId && sessionId !== cacheKey ? sessionId : undefined;
+    const localSnapshot = loadPersistedTimelineSnapshotWithFallback(cacheKey!, rawSessionIdForFallback);
     if (localSnapshot.length > 0) {
       updateHistoryStep('cache', 'done', 'bootstrap');
       setCachedEvents(cacheKey!, localSnapshot);
@@ -1236,8 +1271,8 @@ export function useTimeline(
     //
     // History: `90cd30ec` deferred inactive loads to `requestIdleCallback`
     // with a 500ms fallback timeout — and cancelled the pending handle in
-    // the effect cleanup. Two problems showed up in production
-    // ("很多聊天窗口都没加载历史消息，只加载了可视窗口的"):
+    // the effect cleanup. Two problems showed up in production where
+    // many non-visible chat windows never loaded their history:
     //   1. `requestIdleCallback` can be starved indefinitely under render
     //      churn / busy main thread on real devices; the 500ms `timeout`
     //      fallback didn't always kick in either.
@@ -1256,12 +1291,32 @@ export function useTimeline(
       if (!db) return;
       await db.open();
       if (cancelled) return;
-      const last = await db.getLastSeqAndEpoch(cacheKey!);
+      // Read the scoped key first; fall back to the bare sessionId for
+      // rows that were persisted before `serverId` resolved on this page
+      // session. Migrate-on-hit so future reads take the fast path.
+      // See PR-4 in .imc/discussions/e9dbc48c-dda.md.
+      const rawSessionIdForFallback = sessionId && sessionId !== cacheKey ? sessionId : undefined;
+      let last = await db.getLastSeqAndEpoch(cacheKey!);
+      if (!last && rawSessionIdForFallback) {
+        last = await db.getLastSeqAndEpoch(rawSessionIdForFallback);
+      }
       if (cancelled) return;
       if (last) {
         epochRef.current = last.epoch;
         seqRef.current = last.seq;
-        const stored = await db.getRecentEvents(cacheKey!, { limit: MAX_MEMORY_EVENTS });
+        let stored = await db.getRecentEvents(cacheKey!, { limit: MAX_MEMORY_EVENTS });
+        if (stored.length === 0 && rawSessionIdForFallback) {
+          const rawStored = await db.getRecentEvents(rawSessionIdForFallback, { limit: MAX_MEMORY_EVENTS });
+          if (rawStored.length > 0) {
+            // Re-stamp sessionId on the in-memory copy so consumers treat
+            // these as scoped events. Migration to IDB runs async so the
+            // next mount finds them under the scoped key directly.
+            stored = rawStored.map((event) => (
+              event.sessionId === cacheKey ? event : { ...event, sessionId: cacheKey! }
+            ));
+            db.migrateRawToScoped(rawSessionIdForFallback, cacheKey!, rawStored).catch(() => { /* ignore */ });
+          }
+        }
         if (cancelled) return;
         const existing = getSharedTimelineBase(cacheKey!, eventsRef.current, MAX_MEMORY_EVENTS);
         const restored = mergeTimelineEvents(existing, stored, MAX_MEMORY_EVENTS);

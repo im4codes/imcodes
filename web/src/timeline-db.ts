@@ -232,6 +232,54 @@ export class TimelineDB {
     }
   }
 
+  /**
+   * Async migration helper used by `useTimeline`'s scope-fallback path.
+   * Re-writes `events` under `scopedKey` and deletes the raw-key rows.
+   * Best-effort; failures leave both copies alive so the fallback path
+   * keeps working on the next read.
+   *
+   * Why this exists: `useTimeline` scopes the IDB key by serverId
+   * (`${serverId}:${sessionId}`). When the app first paints with
+   * `selectedServerId === null` (state loading from localStorage), WS
+   * events arriving in that window get persisted under the bare
+   * `sessionId`. Once selectedServerId resolves, subsequent reads use
+   * the scoped key and the bare-key rows become "orphans" — invisible
+   * to every later read. The data IS there in IDB, just under the
+   * previous (raw) key shape — so the chat pane reads empty despite a
+   * real local cache.
+   *
+   * See `.imc/discussions/e9dbc48c-dda.md` PR-4 for the full audit.
+   */
+  async migrateRawToScoped(
+    rawSessionId: string,
+    scopedKey: string,
+    rawEvents: TimelineEvent[],
+  ): Promise<void> {
+    if (rawSessionId === scopedKey || rawEvents.length === 0) return;
+    // 1. Re-stamp + put under scoped key. putEvents internally awaits
+    //    ensureOpen so we don't need to re-check.
+    const restamped = rawEvents.map((event) => ({ ...event, sessionId: scopedKey }));
+    await this.putEvents(restamped);
+    // 2. Delete the raw rows by eventId. Each event's eventId is the
+    //    primary key, so a single readwrite transaction can drop them.
+    const db = await this.ensureOpen();
+    if (!db) return;
+    await new Promise<void>((resolve, reject) => {
+      try {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+        for (const event of rawEvents) {
+          try { store.delete(event.eventId); } catch { /* ignore */ }
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
   async getLastSeqAndEpoch(sessionId: string): Promise<{ seq: number; epoch: number } | null> {
     const db = await this.ensureOpen();
     if (!db) {
