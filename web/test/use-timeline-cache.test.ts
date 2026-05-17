@@ -291,6 +291,68 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
+  it('cold-cache inactive sessions force-through a one-shot daemon history request', async () => {
+    // Regression for "还是有一些不加载的". Inactive (e.g. SubSessionCard
+    // preview / hidden tab) sessions without local cache used to show
+    // permanently empty: `requestDaemonHistory` was gated on
+    // `isActiveSessionRef.current` and `fireHttpBackfill` had the same
+    // gate, so the cold-IDB branch silently dropped the request and just
+    // setLoading(false). The fix passes `force=true` from the cold branch
+    // so EXACTLY ONCE the inactive session is allowed to fetch its
+    // history. The N-card flood concern is preserved: subsequent effect
+    // runs hit path 2 (historyLoadedRef.current === cacheKey) before
+    // reaching the gate.
+    vi.useFakeTimers();
+    const sessionName = `deck_cold_inactive_${Date.now()}`;
+    const serverId = `srv-cold-${Date.now()}`;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-cold-inactive');
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => { /* noop */ },
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    // Cold IDB: open succeeds, getLastSeqAndEpoch returns null (no rows).
+    // This drives the bootstrap effect into the `else` branch of path 3.
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId, {
+        isActiveSession: false,
+      });
+      return h(
+        'div',
+        { 'data-testid': 'cold-probe' },
+        String(events.length),
+      );
+    }
+
+    render(h(Probe));
+
+    // Wait out the inactive 80ms stagger so the cold-IDB branch runs.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+
+    // The cold branch must have force-through'd the daemon WS history
+    // request — without the fix this would have been zero.
+    await waitFor(() => {
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+    });
+
+    // It must also have scheduled the HTTP backfill (force-through'd
+    // through the same gate). Advance past the 200ms bootstrap delay so
+    // the timer fires and we see fetchHistorySpy called.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    await waitFor(() => {
+      expect(fetchHistorySpy).toHaveBeenCalled();
+    });
+  });
+
   it('stays idle for shell/script sessions with history disabled', async () => {
     const sessionName = `deck_shell_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;

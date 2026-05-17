@@ -1142,7 +1142,7 @@ export function useTimeline(
       setRefreshing(false);
     };
 
-    const requestDaemonHistory = (visible: boolean, limit?: number, sourceEvents?: TimelineEvent[]): void => {
+    const requestDaemonHistory = (visible: boolean, limit?: number, sourceEvents?: TimelineEvent[], force = false): void => {
       if (!wsConnected || !ws) return;
       // Gate WS-side timeline.history_request behind isActiveSession the same
       // way fireHttpBackfill is gated. SubSessionCard mounts one useTimeline
@@ -1154,11 +1154,18 @@ export function useTimeline(
       // reconnect. Inactive cards still render previews from memory/IDB
       // cache and live WS event pushes; they don't need their own backfill.
       //
+      // EXCEPTION: when local cache is completely empty (cold IDB branch
+      // below), inactive sessions MUST be allowed exactly one history
+      // request — otherwise the user sees a permanently blank pane for any
+      // sub-session they haven't opened on this browser before, with no
+      // way to recover until they focus it. The cold branch passes
+      // `force=true` for this one-shot. User report: "还是有一些不加载的".
+      //
       // When the user later activates the card, this effect re-runs (the
       // mount-effect dep array includes `isActiveSession`) and the gate
       // passes — at which point the bootstrap path issues its history
       // request as normal.
-      if (!isActiveSessionRef.current) {
+      if (!isActiveSessionRef.current && !force) {
         updateHistoryStep('daemon', 'skipped', 'bootstrap');
         setLoading(false);
         setRefreshing(false);
@@ -1284,16 +1291,21 @@ export function useTimeline(
         // reconcile (matched by commandId).
         setEvents((prev) => prev.filter(isLocalOptimisticUserMessage));
         if (wsConnected) {
-          requestDaemonHistory(true);
+          // Cold cache: force the daemon history request through even when
+          // inactive. The N-card flood concern in the gate above does not
+          // apply here — this branch only runs once per cacheKey for the
+          // session's entire page lifetime (path 2's historyLoadedRef
+          // short-circuits subsequent effect runs).
+          requestDaemonHistory(true, undefined, undefined, /* force */ true);
         } else {
           setLoading(false);
         }
-        // Cold load — no IDB cache, no memory cache. Still fire the same
-        // delayed HTTP backfill so an empty timeline can recover missed
-        // daemon-side events without waiting for a later reconnect.
-        if (isActiveSession) {
-          fireHttpBackfillRef.current(200, { cooldownMs: 0, phase: 'bootstrap' });
-        }
+        // Cold load — no IDB cache, no memory cache. Always fire the
+        // delayed HTTP backfill (active or not) so an empty timeline can
+        // recover missed daemon-side events without waiting for a later
+        // reconnect. Same one-shot rationale as the daemon request
+        // above; SubSessionCard previews need this too.
+        fireHttpBackfillRef.current(200, { cooldownMs: 0, phase: 'bootstrap', force: true });
       }
     };
     if (isActiveSession) {
@@ -1945,7 +1957,7 @@ export function useTimeline(
   // fire a fresh backfill, and the WS path remains the primary.
   const HTTP_BACKFILL_RETRY_DELAYS_MS = [800, 2000] as const;
 
-  const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number; phase?: 'bootstrap' | 'refresh'; visible?: boolean; _retryAttempt?: number }) => {
+  const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number; phase?: 'bootstrap' | 'refresh'; visible?: boolean; force?: boolean; _retryAttempt?: number }) => {
     // Read `isActiveSession` via ref so this gate always reflects the latest
     // render's value, never a stale closure. The closure value only desynchs
     // briefly during same-tick `setState` → render → effect sequences (e.g.
@@ -1954,8 +1966,15 @@ export function useTimeline(
     // backfills on real iOS/Android resumes — even after f72193f6 removed
     // `isActiveSession` from the listener's deps. Reading the ref closes
     // the remaining hole.
-    if (disableHistory || !isActiveSessionRef.current || !serverId || !sessionId) {
-      backfillDebug('fireHttpBackfill: gated', { disableHistory, isActiveSession: isActiveSessionRef.current, hasServerId: !!serverId, hasSessionId: !!sessionId, sessionId });
+    //
+    // `force=true` callers bypass the active gate. Used by the cold-IDB
+    // branch of the bootstrap effect so SubSessionCard previews for
+    // sessions the user has never opened on this browser still recover
+    // their history through HTTP backfill. Without this, the WS-side
+    // request (also force-through'd) is the only data source, and if WS
+    // is mid-reconnect the user sees a permanently empty pane.
+    if (disableHistory || !serverId || !sessionId || (!isActiveSessionRef.current && !opts?.force)) {
+      backfillDebug('fireHttpBackfill: gated', { disableHistory, isActiveSession: isActiveSessionRef.current, hasServerId: !!serverId, hasSessionId: !!sessionId, sessionId, force: opts?.force });
       return;
     }
     const cooldownMs = opts?.cooldownMs ?? 0;
