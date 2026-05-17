@@ -63,6 +63,12 @@ function makeMouseEvent(target: Element): Event {
   return event;
 }
 
+function firePointerDown(target: Element, pointerType: string): void {
+  const event = new Event('pointerdown', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'pointerType', { configurable: true, value: pointerType });
+  fireEvent(target, event);
+}
+
 describe('sub-session entry gesture helper', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -279,7 +285,7 @@ describe('SubSessionBar component entry gestures', () => {
     renderBar({ onOpen });
 
     const entry = screen.getByRole('button', { name: /worker/ });
-    fireEvent.pointerDown(entry, { pointerType: 'mouse' });
+    firePointerDown(entry, 'mouse');
     fireEvent.click(entry);
 
     vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS - 1);
@@ -295,7 +301,7 @@ describe('SubSessionBar component entry gestures', () => {
     renderBar({ onOpen, onOpenMaximized });
 
     const entry = screen.getByRole('button', { name: /worker/ });
-    fireEvent.pointerDown(entry, { pointerType: 'mouse' });
+    firePointerDown(entry, 'mouse');
     fireEvent.click(entry);
     fireEvent.click(entry);
     fireEvent.dblClick(entry);
@@ -314,7 +320,7 @@ describe('SubSessionBar component entry gestures', () => {
     });
 
     const entry = screen.getByRole('button', { name: /worker/ });
-    fireEvent.pointerDown(entry, { pointerType: 'mouse' });
+    firePointerDown(entry, 'mouse');
     fireEvent.click(entry);
     vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS);
 
@@ -327,7 +333,7 @@ describe('SubSessionBar component entry gestures', () => {
     renderBar({ desktopLayoutCapable: false, onOpen, onOpenMaximized });
 
     const entry = screen.getByRole('button', { name: /worker/ });
-    fireEvent.pointerDown(entry, { pointerType: 'mouse' });
+    firePointerDown(entry, 'mouse');
     fireEvent.click(entry);
     expect(onOpen).toHaveBeenCalledWith('sub-1');
     fireEvent.dblClick(entry);
@@ -342,7 +348,7 @@ describe('SubSessionBar component entry gestures', () => {
     renderBar({ onOpen });
 
     const entry = screen.getByRole('button', { name: /worker/ });
-    fireEvent.pointerDown(entry, { pointerType: 'touch' });
+    fireEvent.touchStart(entry);
     fireEvent.click(entry);
 
     expect(onOpen).toHaveBeenCalledWith('sub-1');

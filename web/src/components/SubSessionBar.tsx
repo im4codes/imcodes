@@ -63,6 +63,7 @@ interface CollapsedSubSessionButtonProps {
   inP2p: boolean;
   draggable?: boolean;
   onEntryPointerDown: (id: string, event: JSX.TargetedPointerEvent<HTMLButtonElement>) => void;
+  onEntryTouchStart: (id: string) => void;
   onEntryClick: (id: string, event: JSX.TargetedMouseEvent<HTMLButtonElement>) => void;
   onEntryDoubleClick: (id: string, event: JSX.TargetedMouseEvent<HTMLButtonElement>) => void;
   onEntryDragStart: (id: string, event: JSX.TargetedDragEvent<HTMLButtonElement>) => void;
@@ -157,7 +158,7 @@ function formatLocalDateTime(timestamp: number): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, usage, inP2p, draggable, onEntryPointerDown, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel }: CollapsedSubSessionButtonProps) {
+function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, usage, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -183,6 +184,7 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, u
       class={`subsession-card${isOpen ? ' open' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
       draggable={draggable}
       onPointerDown={(event) => onEntryPointerDown(sub.id, event)}
+      onTouchStart={() => onEntryTouchStart(sub.id)}
       onClick={(event) => onEntryClick(sub.id, event)}
       onDblClick={(event) => onEntryDoubleClick(sub.id, event)}
       onDragStart={(event) => onEntryDragStart(sub.id, event)}
@@ -299,6 +301,10 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
 
   const handleEntryPointerDown = useCallback((id: string, event: JSX.TargetedPointerEvent<HTMLElement>) => {
     getEntryGestureController(id).handlePointerDown(event);
+  }, [getEntryGestureController]);
+
+  const handleEntryTouchStart = useCallback((id: string) => {
+    getEntryGestureController(id).handlePointerDown({ pointerType: 'touch' });
   }, [getEntryGestureController]);
 
   const handleEntryClick = useCallback((id: string, event: JSX.TargetedMouseEvent<HTMLElement>) => {
@@ -819,6 +825,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
               draggable={desktopLayoutCapable}
               onEntryPointerDown={handleEntryPointerDown}
+              onEntryTouchStart={handleEntryTouchStart}
               onEntryClick={handleEntryClick}
               onEntryDoubleClick={handleEntryDoubleClick}
               onEntryDragStart={handleCollapsedEntryDragStart}
@@ -843,6 +850,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               class="subcard-drag-wrap"
               draggable
               onPointerDown={(event) => handleEntryPointerDown(sub.id, event)}
+              onTouchStart={() => handleEntryTouchStart(sub.id)}
               onClick={(event) => handleEntryClick(sub.id, event)}
               onDblClick={(event) => handleEntryDoubleClick(sub.id, event)}
               onDragStart={(e) => {
