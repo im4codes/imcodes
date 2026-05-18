@@ -158,7 +158,7 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
 
     const buffer = Buffer.from(content, 'base64');
     if (buffer.length > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
-      throw new Error('file_too_large');
+      throw new Error(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
     }
     if (typeof msg.size === 'number' && buffer.length !== msg.size) {
       throw new Error('size_mismatch');

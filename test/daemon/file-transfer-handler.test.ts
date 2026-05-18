@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, realpath, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { FILE_TRANSFER_LIMITS } from '../../shared/transport/file-transfer.js';
 
 async function loadFileTransferHandler(fakeHome: string, options?: { maxFileSize?: number }) {
@@ -220,7 +221,7 @@ describe('file-transfer local handle hardening', () => {
     expect(failed.sent[0]).toMatchObject({
       type: 'file.upload_error',
       uploadId: 'upload-too-large',
-      message: 'file_too_large',
+      message: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE,
     });
   });
 
