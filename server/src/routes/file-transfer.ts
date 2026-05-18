@@ -19,6 +19,7 @@ export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId:
 // URL more than once, so tokens are resource-bound and short-lived with a small
 // use budget instead of being consumed on the first GET.
 const DOWNLOAD_TOKEN_MAX_USES = 5;
+const MULTIPART_UPLOAD_OVERHEAD_BYTES = 1024 * 1024;
 const downloadTokens = new Map<string, {
   serverId: string;
   attachmentId: string;
@@ -67,6 +68,18 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   // Permission check
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+
+  const contentLengthHeader = c.req.header('content-length');
+  const contentLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : Number.NaN;
+  if (
+    Number.isFinite(contentLength)
+    && contentLength > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE + MULTIPART_UPLOAD_OVERHEAD_BYTES
+  ) {
+    return c.json({
+      error: 'file_too_large',
+      maxBytes: FILE_TRANSFER_LIMITS.MAX_FILE_SIZE,
+    }, 413);
+  }
 
   // Parse multipart
   const formData = await c.req.formData().catch(() => null);

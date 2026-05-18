@@ -4,12 +4,24 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { FILE_TRANSFER_LIMITS } from '../../shared/transport/file-transfer.js';
 
-async function loadFileTransferHandler(fakeHome: string) {
+async function loadFileTransferHandler(fakeHome: string, options?: { maxFileSize?: number }) {
   vi.resetModules();
   vi.doMock('node:os', async (importOriginal) => {
     const actual = await importOriginal<typeof import('node:os')>();
     return { ...actual, homedir: () => fakeHome };
   });
+  if (options?.maxFileSize !== undefined) {
+    vi.doMock('../../shared/transport/file-transfer.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../shared/transport/file-transfer.js')>();
+      return {
+        ...actual,
+        FILE_TRANSFER_LIMITS: {
+          ...actual.FILE_TRANSFER_LIMITS,
+          MAX_FILE_SIZE: options.maxFileSize,
+        },
+      };
+    });
+  }
   vi.doMock('../../src/util/logger.js', () => ({
     default: {
       info: vi.fn(),
@@ -47,6 +59,7 @@ describe('file-transfer local handle hardening', () => {
   afterEach(async () => {
     vi.restoreAllMocks();
     vi.doUnmock('node:os');
+    vi.doUnmock('../../shared/transport/file-transfer.js');
     vi.doUnmock('../../src/util/logger.js');
     vi.resetModules();
     await rm(rootDir, { recursive: true, force: true });
@@ -186,6 +199,50 @@ describe('file-transfer local handle hardening', () => {
       type: 'file.download_error',
       downloadId: 'download-expired',
       message: 'expired',
+    });
+  });
+
+  it('rejects legacy uploads over the active single-frame cap', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome, { maxFileSize: 4 });
+    const failed = createServerLinkMock();
+
+    await transfer.handleFileUpload(
+      {
+        type: 'file.upload',
+        uploadId: 'upload-too-large',
+        filename: 'safe.txt',
+        size: 5,
+        content: Buffer.from('hello').toString('base64'),
+      },
+      failed.serverLink as never,
+    );
+
+    expect(failed.sent[0]).toMatchObject({
+      type: 'file.upload_error',
+      uploadId: 'upload-too-large',
+      message: 'file_too_large',
+    });
+  });
+
+  it('rejects legacy upload payloads whose decoded byte count does not match the declared size', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const failed = createServerLinkMock();
+
+    await transfer.handleFileUpload(
+      {
+        type: 'file.upload',
+        uploadId: 'upload-size-mismatch',
+        filename: 'safe.txt',
+        size: 99,
+        content: Buffer.from('hello').toString('base64'),
+      },
+      failed.serverLink as never,
+    );
+
+    expect(failed.sent[0]).toMatchObject({
+      type: 'file.upload_error',
+      uploadId: 'upload-size-mismatch',
+      message: 'size_mismatch',
     });
   });
 });
