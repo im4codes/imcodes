@@ -39,6 +39,10 @@ function makeEvents(sessionId: string, count: number): TimelineEvent[] {
   }));
 }
 
+async function flushMicrotasks(count = 6): Promise<void> {
+  for (let i = 0; i < count; i += 1) await Promise.resolve();
+}
+
 describe('useTimeline global cache bounds', () => {
   beforeEach(() => {
     __resetTimelineCacheForTests();
@@ -219,11 +223,10 @@ describe('useTimeline global cache bounds', () => {
     // open IDB, getLastSeqAndEpoch, getRecentEvents, and setEvents.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(100);
+      await flushMicrotasks();
     });
 
-    await waitFor(() => {
-      expect(screen.getByTestId('inactive-probe').textContent).toBe('inactive history is loaded too');
-    });
+    expect(screen.getByTestId('inactive-probe').textContent).toBe('inactive history is loaded too');
   });
 
   it('inactive load survives effect-cleanup dep churn', async () => {
@@ -285,11 +288,10 @@ describe('useTimeline global cache bounds', () => {
       rerender(h(Probe, { rev: 2 }));
       // Now wait out the full stagger window for the latest effect run.
       await vi.advanceTimersByTimeAsync(120);
+      await flushMicrotasks();
     });
 
-    await waitFor(() => {
-      expect(screen.getByTestId('churn-probe').textContent).toBe('survived dep churn');
-    });
+    expect(screen.getByTestId('churn-probe').textContent).toBe('survived dep churn');
   });
 
   it('cold-cache inactive sessions do not fan out daemon or HTTP history requests', async () => {
@@ -330,17 +332,18 @@ describe('useTimeline global cache bounds', () => {
     // Wait out the inactive 80ms stagger so the cold-IDB branch runs.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(150);
+      await flushMicrotasks();
     });
 
-    await waitFor(() => {
-      expect(screen.getByTestId('cold-probe').getAttribute('data-loading')).toBe('false');
-    });
+    expect(screen.getByTestId('cold-probe').getAttribute('data-loading')).toBe('false');
     expect(sendTimelineHistoryRequest).not.toHaveBeenCalled();
     expect(fetchHistorySpy).not.toHaveBeenCalled();
 
     rerender(h(Probe, { active: true }));
     await act(async () => {
+      await flushMicrotasks();
       await vi.advanceTimersByTimeAsync(300);
+      await flushMicrotasks();
     });
 
     expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
