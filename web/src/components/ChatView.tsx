@@ -643,6 +643,49 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   return items;
 }
 
+function textRevision(text: string | undefined): string {
+  const value = text ?? '';
+  return `${value.length}:${value.slice(-48)}`;
+}
+
+function eventRevision(event: TimelineEvent): string {
+  const text = typeof event.payload.text === 'string' ? textRevision(event.payload.text) : '';
+  const state = typeof event.payload.state === 'string' ? event.payload.state : '';
+  return [
+    event.eventId,
+    event.type,
+    event.ts,
+    event.seq,
+    event.payload.streaming === true ? 'streaming' : '',
+    event.payload.pending === true ? 'pending' : '',
+    event.payload.failed === true ? 'failed' : '',
+    state,
+    text,
+  ].join(':');
+}
+
+function viewItemRevision(item: ViewItem): string {
+  if (item.type === 'assistant-block') {
+    return [
+      item.key,
+      item.type,
+      item.ts ?? 0,
+      item.lastTs ?? 0,
+      item.assistantAutomation === true ? 'automation' : '',
+      textRevision(item.text),
+    ].join(':');
+  }
+  if (item.type === 'tool-group') {
+    return `${item.key}:tool-group:${(item.toolEvents ?? []).map(eventRevision).join('|')}`;
+  }
+  const linked = item.linkedEvents?.map(eventRevision).join('|') ?? '';
+  return `${item.key}:event:${item.event ? eventRevision(item.event) : ''}:${linked}`;
+}
+
+function getRenderedViewRevision(items: ViewItem[]): string {
+  return items.map(viewItemRevision).join('\n');
+}
+
 interface SelectionMenu {
   x: number;
   y: number;
@@ -971,6 +1014,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     () => (hiddenRenderedItemCount > 0 ? viewItems.slice(-effectiveRenderLimit) : viewItems),
     [hiddenRenderedItemCount, effectiveRenderLimit, viewItems],
   );
+  const renderedRevision = useMemo(
+    () => getRenderedViewRevision(renderedViewItems),
+    [renderedViewItems],
+  );
 
   useEffect(() => {
     setRenderItemLimit(CHAT_INITIAL_RENDER_ITEM_LIMIT);
@@ -1158,6 +1205,9 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [events]);
   const prevVisibleTsRef = useRef(lastVisibleTs);
   const hasInitialScrolledRef = useRef(false);
+  const layoutHandledVisibleTsRef = useRef(lastVisibleTs);
+  const prevRenderedRevisionRef = useRef(renderedRevision);
+  const prevLoadingRef = useRef(loading);
 
   // Synchronous scroll-to-bottom BEFORE paint on initial history load.
   // useLayoutEffect runs after DOM mutation but before the browser paints,
@@ -1183,6 +1233,11 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // contract because it is a tiny live monitor, not a reading surface.
   // Skip while prepending older history so anchor restoration can preserve position.
   useLayoutEffect(() => {
+    const revisionChanged = renderedRevision !== prevRenderedRevisionRef.current;
+    const contentBecameVisible = prevLoadingRef.current && !loading;
+    prevRenderedRevisionRef.current = renderedRevision;
+    prevLoadingRef.current = loading;
+    if (!revisionChanged && !contentBecameVisible) return;
     if (loadingOlder || scrollAnchorRef.current) return;
     const shouldFollow = preview || autoScrollRef.current;
     if (!shouldFollow) {
@@ -1190,10 +1245,12 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       // arrival via the unread counter on the "↓" affordance.
       newSinceUnfollowRef.current += 1;
       setNewSinceUnfollow(newSinceUnfollowRef.current);
+      layoutHandledVisibleTsRef.current = lastVisibleTs;
       return;
     }
     scrollToBottom(false);
-  }, [preview, renderedViewItems, loading, loadingOlder]);
+    layoutHandledVisibleTsRef.current = lastVisibleTs;
+  }, [preview, renderedRevision, loading, loadingOlder, lastVisibleTs]);
 
   // Restore scroll position after Load Older prepends events
   useLayoutEffect(() => {
@@ -1212,6 +1269,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     const changed = lastVisibleTs !== prevVisibleTsRef.current;
     prevVisibleTsRef.current = lastVisibleTs;
     if (!changed && !preview) return;
+    if (layoutHandledVisibleTsRef.current === lastVisibleTs) return;
     requestAnimationFrame(() => {
       // Re-check inside the rAF callback so a state flip during the frame
       // window (e.g. a user scroll-up that lands between schedule and fire)

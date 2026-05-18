@@ -274,6 +274,15 @@ function setCachedEvents(cacheKey: string, events: TimelineEvent[]): void {
   pruneTimelineCache();
 }
 
+function scheduleBrowserFrame(callback: () => void): () => void {
+  if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+    const id = window.requestAnimationFrame(() => callback());
+    return () => window.cancelAnimationFrame(id);
+  }
+  const id = setTimeout(callback, 16);
+  return () => clearTimeout(id);
+}
+
 function subscribeCache(cacheKey: string, listener: (events: TimelineEvent[]) => void): () => void {
   let listeners = cacheListeners.get(cacheKey);
   if (!listeners) {
@@ -433,6 +442,7 @@ function scheduleTimelineSnapshotPersist(cacheKey: string, events: TimelineEvent
 
 if (typeof document !== 'undefined' && typeof window !== 'undefined') {
   const flushSnapshotsBeforeFreeze = (): void => {
+    flushPendingTimelineCacheIngests();
     flushPendingTimelineSnapshotWrites();
   };
   document.addEventListener('visibilitychange', () => {
@@ -558,6 +568,60 @@ function shouldPersistTimelineEvent(event: TimelineEvent): boolean {
   return event.payload?.streaming !== true;
 }
 
+function shouldFrameCoalesceTimelineEvent(event: TimelineEvent): boolean {
+  return event.type === 'assistant.text' && event.payload?.streaming === true;
+}
+
+const pendingTimelineCacheIngests = new Map<string, Map<string, TimelineEvent>>();
+let pendingTimelineCacheIngestCancel: (() => void) | null = null;
+
+function flushPendingTimelineCacheIngests(): void {
+  if (pendingTimelineCacheIngestCancel) {
+    const cancel = pendingTimelineCacheIngestCancel;
+    pendingTimelineCacheIngestCancel = null;
+    cancel();
+  }
+  if (pendingTimelineCacheIngests.size === 0) return;
+  const batches = [...pendingTimelineCacheIngests.entries()];
+  pendingTimelineCacheIngests.clear();
+  for (const [cacheKey, byEventId] of batches) {
+    const incoming = [...byEventId.values()];
+    if (incoming.length === 0) continue;
+    const existing = getCachedEvents(cacheKey) ?? [];
+    const merged = mergeTimelineEvents(existing, incoming, MAX_MEMORY_EVENTS);
+    if (merged !== existing) setCachedEvents(cacheKey, merged);
+    persistTimelineEvents(cacheKey, incoming);
+  }
+}
+
+function queueTimelineCacheIngest(cacheKey: string, event: TimelineEvent): void {
+  let bucket = pendingTimelineCacheIngests.get(cacheKey);
+  if (!bucket) {
+    bucket = new Map();
+    pendingTimelineCacheIngests.set(cacheKey, bucket);
+  }
+  const existing = bucket.get(event.eventId);
+  bucket.set(event.eventId, existing ? preferTimelineEvent(existing, event) : event);
+  if (pendingTimelineCacheIngestCancel) return;
+  pendingTimelineCacheIngestCancel = scheduleBrowserFrame(() => {
+    pendingTimelineCacheIngestCancel = null;
+    flushPendingTimelineCacheIngests();
+  });
+}
+
+function dropPendingTimelineCacheIngest(cacheKey: string, eventId: string): void {
+  const bucket = pendingTimelineCacheIngests.get(cacheKey);
+  if (!bucket) return;
+  bucket.delete(eventId);
+  if (bucket.size === 0) pendingTimelineCacheIngests.delete(cacheKey);
+}
+
+function cancelPendingTimelineCacheIngests(): void {
+  pendingTimelineCacheIngestCancel?.();
+  pendingTimelineCacheIngestCancel = null;
+  pendingTimelineCacheIngests.clear();
+}
+
 function getSharedTimelineBase(
   cacheKey: string | null | undefined,
   localEvents: TimelineEvent[],
@@ -580,6 +644,7 @@ export function __getSharedTimelineBaseForTests(
 }
 
 export function __resetTimelineCacheForTests(): void {
+  cancelPendingTimelineCacheIngests();
   flushPendingTimelineSnapshotWrites();
   eventsCache.clear();
   eventsCacheAccess.clear();
@@ -622,12 +687,21 @@ export function __getTimelineCacheKeysForTests(): string[] {
   return [...eventsCache.keys()];
 }
 
+export function __getTimelineCacheForTests(cacheKey: string): TimelineEvent[] | undefined {
+  return eventsCache.get(cacheKey);
+}
+
 export function __setTimelineCacheForTests(cacheKey: string, events: TimelineEvent[]): void {
   setCachedEvents(cacheKey, events);
 }
 
 export function ingestTimelineEventForCache(event: TimelineEvent, serverId?: string | null): void {
   const cacheKey = scopeCacheKey(serverId, event.sessionId);
+  if (shouldFrameCoalesceTimelineEvent(event)) {
+    queueTimelineCacheIngest(cacheKey, event);
+    return;
+  }
+  dropPendingTimelineCacheIngest(cacheKey, event.eventId);
   const existing = getCachedEvents(cacheKey) ?? [];
   const merged = mergeTimelineEvents(existing, [event], MAX_MEMORY_EVENTS);
   if (merged !== existing) setCachedEvents(cacheKey, merged);
@@ -2034,6 +2108,37 @@ export function useTimeline(
     persistTimelineEvents(key, preferred);
   }, []);
 
+  const pendingRealtimeEventsRef = useRef(new Map<string, TimelineEvent>());
+  const pendingRealtimeFlushCancelRef = useRef<(() => void) | null>(null);
+
+  const flushPendingRealtimeEvents = useCallback(() => {
+    pendingRealtimeFlushCancelRef.current = null;
+    const incoming = [...pendingRealtimeEventsRef.current.values()];
+    pendingRealtimeEventsRef.current.clear();
+    if (incoming.length === 0) return;
+    mergeEvents(incoming);
+    idbPutEvents(incoming);
+  }, [idbPutEvents, mergeEvents]);
+
+  const appendRealtimeEvent = useCallback((event: TimelineEvent) => {
+    if (!shouldFrameCoalesceTimelineEvent(event)) {
+      pendingRealtimeEventsRef.current.delete(event.eventId);
+      appendEvent(event);
+      idbPutEvents([event]);
+      return;
+    }
+    const existing = pendingRealtimeEventsRef.current.get(event.eventId);
+    pendingRealtimeEventsRef.current.set(event.eventId, existing ? preferTimelineEvent(existing, event) : event);
+    if (pendingRealtimeFlushCancelRef.current) return;
+    pendingRealtimeFlushCancelRef.current = scheduleBrowserFrame(flushPendingRealtimeEvents);
+  }, [appendEvent, flushPendingRealtimeEvents, idbPutEvents]);
+
+  useEffect(() => () => {
+    pendingRealtimeFlushCancelRef.current?.();
+    pendingRealtimeFlushCancelRef.current = null;
+    pendingRealtimeEventsRef.current.clear();
+  }, []);
+
   /**
    * Defense-in-depth: fire an HTTP "/timeline/history/full" read for this
    * session after a short delay. Results are merged via `eventId`, so the
@@ -2401,9 +2506,11 @@ export function useTimeline(
         // history response will merge the authoritative set, and ts-sort handles cross-epoch order.
         epochRef.current = event.epoch;
         seqRef.current = Math.max(seqRef.current, event.seq);
-        if (!userMessageAlreadyMerged) appendEvent(event);
-
-        idbPutEvents([event]);
+        if (!userMessageAlreadyMerged) {
+          appendRealtimeEvent(event);
+        } else {
+          idbPutEvents([event]);
+        }
       }
 
       // ── History response (full load from daemon file store) ──
