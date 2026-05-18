@@ -133,6 +133,9 @@ interface CardSize { w: number; h: number }
 
 const DEFAULT_SIZE: CardSize = { w: 350, h: 250 };
 export const SUBSESSION_BAR_COLLAPSED_STORAGE_KEY = 'rcc_subcard_collapsed';
+const EXPANDED_PREVIEW_INITIAL_COUNT = 2;
+const EXPANDED_PREVIEW_BATCH_SIZE = 4;
+const EXPANDED_PREVIEW_BATCH_DELAY_MS = 32;
 
 function load<T>(key: string, fallback: T): T {
   try {
@@ -206,6 +209,30 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, u
         </span>
       )}
     </button>
+  );
+}
+
+function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, inP2p, t }: { sub: SubSession; accentColor: string; cardSize: CardSize; inP2p: boolean; t: (key: string, vars?: Record<string, unknown>) => string }) {
+  const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
+  const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
+  const abbr = getAgentBadgeLabel(sub.type);
+  return (
+    <div
+      class={`subcard subcard-preview-placeholder${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
+      style={{
+        width: cardSize.w,
+        height: cardSize.h,
+        minWidth: cardSize.w,
+        position: 'relative',
+        '--subsession-accent-color': accentColor,
+      } as JSX.CSSProperties}
+    >
+      <div class="subcard-header">
+        <span class="subcard-icon">{abbr}</span>
+        <span class="subcard-label">{label}</span>
+        {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
+      </div>
+    </div>
   );
 }
 
@@ -343,10 +370,20 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   }, [subSessions, dragOrder]);
   const accentColorsById = useMemo(() => getSubSessionAccentColorMap(orderedSessions), [orderedSessions]);
   const orderedSessionIds = useMemo(() => orderedSessions.map((sub) => sub.id), [orderedSessions]);
+  const orderedSessionIdsKey = orderedSessionIds.join(',');
   const orderedSessionsRef = useRef(orderedSessions);
   orderedSessionsRef.current = orderedSessions;
   const dragOrderRef = useRef(dragOrder);
   dragOrderRef.current = dragOrder;
+  const expandedPreviewKeyRef = useRef(orderedSessionIdsKey);
+  const [expandedPreviewBudget, setExpandedPreviewBudget] = useState(EXPANDED_PREVIEW_INITIAL_COUNT);
+  const currentExpandedPreviewBudget = expandedPreviewKeyRef.current === orderedSessionIdsKey
+    ? expandedPreviewBudget
+    : EXPANDED_PREVIEW_INITIAL_COUNT;
+  const hydratedExpandedPreviewIds = useMemo(
+    () => new Set(orderedSessions.slice(0, currentExpandedPreviewBudget).map((sub) => sub.id)),
+    [currentExpandedPreviewBudget, orderedSessions],
+  );
 
   const moveSubSessionInDragOrder = useCallback((draggedId: string, overId: string) => {
     if (draggedId === overId) return;
@@ -399,6 +436,35 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   useEffect(() => {
     onVisualOrderChange?.(orderedSessionIds);
   }, [onVisualOrderChange, orderedSessionIds]);
+
+  useEffect(() => {
+    expandedPreviewKeyRef.current = orderedSessionIdsKey;
+    if (collapsed) {
+      setExpandedPreviewBudget(0);
+      return;
+    }
+    const total = orderedSessions.length;
+    const initial = Math.min(total, EXPANDED_PREVIEW_INITIAL_COUNT);
+    setExpandedPreviewBudget(initial);
+    if (initial >= total) return;
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let nextBudget = initial;
+    const step = () => {
+      if (cancelled) return;
+      nextBudget = Math.min(total, nextBudget + EXPANDED_PREVIEW_BATCH_SIZE);
+      setExpandedPreviewBudget(nextBudget);
+      if (nextBudget < total) {
+        timer = setTimeout(step, EXPANDED_PREVIEW_BATCH_DELAY_MS);
+      }
+    };
+    timer = setTimeout(step, 0);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [collapsed, orderedSessionIdsKey, orderedSessions.length]);
 
   useEffect(() => {
     save(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, collapsed);
@@ -883,29 +949,39 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 if (dragOrder) syncOrderToServer(dragOrder);
               }}
             >
-              <SubSessionCard
-                sub={sub}
-                ws={ws}
-                connected={connected}
-                isOpen={openIds.has(sub.id)}
-                isFocused={focusedSubId === sub.id}
-                idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
-                onOpen={() => {}}
-                onClose={() => onClose(sub.id)}
-                onRestart={() => onRestart(sub.id)}
-                onDiff={onDiff}
-                onHistory={onHistory}
-                cardW={cardSize.w}
-                cardH={cardSize.h}
-                quickData={quickData}
-                sessions={sessions}
-                subSessions={allSubSessions}
-                serverId={serverId}
-                onTransportConfigSaved={onSubTransportConfigSaved}
-                inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
-                accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
-                previewHydrateDelayMs={Math.min(1200, 120 + index * 60)}
-              />
+              {hydratedExpandedPreviewIds.has(sub.id) || openIds.has(sub.id) || focusedSubId === sub.id ? (
+                <SubSessionCard
+                  sub={sub}
+                  ws={ws}
+                  connected={connected}
+                  isOpen={openIds.has(sub.id)}
+                  isFocused={focusedSubId === sub.id}
+                  idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
+                  onOpen={() => {}}
+                  onClose={() => onClose(sub.id)}
+                  onRestart={() => onRestart(sub.id)}
+                  onDiff={onDiff}
+                  onHistory={onHistory}
+                  cardW={cardSize.w}
+                  cardH={cardSize.h}
+                  quickData={quickData}
+                  sessions={sessions}
+                  subSessions={allSubSessions}
+                  serverId={serverId}
+                  onTransportConfigSaved={onSubTransportConfigSaved}
+                  inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
+                  accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
+                  previewHydrateDelayMs={Math.min(1200, 120 + index * 60)}
+                />
+              ) : (
+                <ExpandedSubSessionPlaceholder
+                  sub={sub}
+                  accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
+                  cardSize={cardSize}
+                  inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
+                  t={t}
+                />
+              )}
             </div>
           ))}
         </div>

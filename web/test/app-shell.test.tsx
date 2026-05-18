@@ -715,10 +715,55 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('tabs-select'));
 
     await waitFor(() => {
-      expect(first.getAttribute('data-active')).toBe('false');
-      expect(second.getAttribute('data-active')).toBe('false');
+      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
+      expect(screen.queryByTestId('sub-session-window-sub-2')).toBeNull();
       expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBeNull();
     });
+  }, 20_000);
+
+  it('does not mount closed sub-session windows after sub-sessions load', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+      {
+        id: 'sub-2',
+        sessionName: 'deck_sub_alpha_reviewer',
+        parentSession: 'deck_alpha_brain',
+        label: 'Reviewer',
+        description: 'Reviewer session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
+    expect(screen.queryByTestId('sub-session-window-sub-2')).toBeNull();
+
+    fireEvent.click(screen.getByText('subbar-open-sub-2'));
+    expect(await screen.findByTestId('sub-session-window-sub-2')).toBeTruthy();
+    expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
   }, 20_000);
 
   it('executes app-level shell callbacks and websocket message reducers', async () => {

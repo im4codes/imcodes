@@ -4421,13 +4421,14 @@ export function App() {
       {/* Sub-session windows (floating) — only show if not pinned */}
       {visibleSubSessions.filter((sub) => isMobile || !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName)).map((sub) => {
         const isOpen = openSubIds.has(sub.id);
+        if (!isOpen) return null;
         return (
-          <div key={sub.id} style={{ display: isOpen ? 'contents' : 'none' }}>
+          <div key={sub.id} style={{ display: 'contents' }}>
             <SubSessionWindow
               sub={sub}
               ws={wsRef.current}
               connected={connected}
-              active={isOpen}
+              active
               idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}
               onHistory={registerHistoryApplyer}

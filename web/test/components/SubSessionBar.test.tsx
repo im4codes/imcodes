@@ -308,6 +308,45 @@ describe('SubSessionBar', () => {
     expect((view.getByTestId('subsession-preview-sub-b') as HTMLElement).style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[1]);
   });
 
+  it('progressively mounts expanded preview cards instead of mounting every card in the first render', async () => {
+    vi.useFakeTimers();
+    const subSessions = Array.from({ length: 8 }, (_, index) => makeSubSession({
+      id: `sub-${index + 1}`,
+      sessionName: `deck_sub_sub-${index + 1}`,
+      label: `worker-${index + 1}`,
+    }));
+
+    const view = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={false}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(2);
+    expect(view.container.querySelectorAll('.subcard-preview-placeholder')).toHaveLength(6);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(6);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(32);
+    });
+    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(8);
+    expect(view.container.querySelectorAll('.subcard-preview-placeholder')).toHaveLength(0);
+  });
+
   it('toggles the mobile P2P compact bar from the toolbar', () => {
     const view = render(
       <SubSessionBar

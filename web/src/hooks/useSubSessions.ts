@@ -99,10 +99,10 @@ export function useSubSessions(
           if (gen !== loadGenRef.current) return;
           console.warn(`[sub-sessions] loaded ${list.length} for server ${serverId}`);
           loadedGenRef.current = gen;
-          setSubSessions((prev) => list.map((s) => mergeLoadedSubSession(
-            s,
-            prev.find((existing) => existing.id === s.id),
-          )));
+          setSubSessions((prev) => {
+            const previousById = new Map(prev.map((existing) => [existing.id, existing] as const));
+            return list.map((s) => mergeLoadedSubSession(s, previousById.get(s.id)));
+          });
           setLoadedServerId(serverId);
         })
         .catch((err) => {
