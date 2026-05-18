@@ -140,6 +140,7 @@ import { installNativeAppResumeRefresh } from './app-resume-refresh.js';
 import { isImeComposingKeyEvent } from './ime-keyboard.js';
 import { markServerDaemonActivity, markServerOffline, touchServerHeartbeat } from './server-online-state.js';
 import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
+import { markSessionRunningIfNeeded } from './session-state-updates.js';
 
 const DashboardPage = lazy(() => import('./pages/DashboardPage.js').then((m) => ({ default: m.DashboardPage })));
 const DiscussionsPage = lazy(() => import('./pages/DiscussionsPage.js').then((m) => ({ default: m.DiscussionsPage })));
@@ -1989,11 +1990,10 @@ export function App() {
         ingestTimelineEventForCache(event, selectedServerId);
         watchProjectionStore.handleTimelineEvent(event);
         if (isRunningTimelineEvent(event) && !event.sessionId.startsWith('deck_sub_')) {
-          setSessions((prev) => prev.map((s) =>
-            s.name === event.sessionId && s.state !== 'running'
-              ? { ...s, state: 'running' as SessionInfo['state'] }
-              : s,
-          ));
+          const current = sessionsRef.current.find((session) => session.name === event.sessionId);
+          if (current && current.state !== 'running') {
+            setSessions((prev) => markSessionRunningIfNeeded(prev, event.sessionId));
+          }
         }
         if (isIdleSessionStateTimelineEvent(event)) {
           flashIdleSession(event.sessionId);

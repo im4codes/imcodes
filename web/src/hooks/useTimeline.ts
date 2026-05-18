@@ -199,6 +199,7 @@ const USER_MSG_DEDUP_WINDOW_MS = 5_000;
 const PROVISIONAL_TRANSPORT_HISTORY_PREFIX = 'transport-history:';
 const OPTIMISTIC_EVENT_ID_PREFIX = 'optimistic:';
 const TIMELINE_SNAPSHOT_STORAGE_PREFIX = 'rcc_timeline_snapshot:';
+const TIMELINE_SNAPSHOT_WRITE_DELAY_MS = 750;
 // Snapshot tail size matches MAX_MEMORY_EVENTS (300) so the synchronous
 // first-paint seed approaches the same coverage as the IDB-restored cache.
 // The previous 50-event cap meant 5/6 of a 300-event session disappeared
@@ -206,7 +207,7 @@ const TIMELINE_SNAPSHOT_STORAGE_PREFIX = 'rcc_timeline_snapshot:';
 // "本地缓存还是没有立即显示". 300 events of compact payload is on the order
 // of 0.5–1 MB per session in localStorage; the per-origin 5 MB quota holds
 // up to ~5 active sessions before the `try/catch` swallow at the bottom of
-// `persistTimelineSnapshot` starts dropping writes. Dynamic LRU eviction
+// `persistTimelineSnapshotTail` starts dropping writes. Dynamic LRU eviction
 // is a follow-up (see Round 3 plan PR-5 §quota).
 const MAX_PERSISTED_SNAPSHOT_EVENTS = 300;
 // If no confirmation arrives within this window we auto-flip the pending bubble to
@@ -240,6 +241,9 @@ const ACK_TIMEOUT_BACKFILL_GRACE_MS = 1_500;
  */
 const CLIENT_RETRY_DELAYS_MS = [800, 2000, 3200] as const;
 const CLIENT_RETRY_MAX_ATTEMPTS = CLIENT_RETRY_DELAYS_MS.length; // 3 WS attempts before HTTP fallback
+const pendingTimelineSnapshotTails = new Map<string, TimelineEvent[]>();
+const pendingTimelineSnapshotTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const lastWrittenTimelineSnapshotTails = new Map<string, TimelineEvent[]>();
 
 /** Normalize text for echo comparison: strip prompt prefixes, collapse whitespace. */
 function normalizeForEcho(text: string): string {
@@ -262,7 +266,7 @@ function getCachedEvents(cacheKey: string): TimelineEvent[] | undefined {
 function setCachedEvents(cacheKey: string, events: TimelineEvent[]): void {
   eventsCache.set(cacheKey, events);
   markCacheAccess(cacheKey);
-  persistTimelineSnapshot(cacheKey, events);
+  scheduleTimelineSnapshotPersist(cacheKey, events);
   const listeners = cacheListeners.get(cacheKey);
   if (listeners) {
     for (const listener of listeners) listener(events);
@@ -359,26 +363,83 @@ function loadPersistedTimelineSnapshotWithFallback(
   return raw;
 }
 
-function persistTimelineSnapshot(cacheKey: string, events: TimelineEvent[]): void {
+function getPersistableTimelineTail(events: TimelineEvent[]): TimelineEvent[] {
+  const persistable = events.filter(shouldPersistTimelineEvent);
+  return persistable.length > MAX_PERSISTED_SNAPSHOT_EVENTS
+    ? persistable.slice(persistable.length - MAX_PERSISTED_SNAPSHOT_EVENTS)
+    : persistable;
+}
+
+function areTimelineSnapshotTailsSame(left: TimelineEvent[] | undefined, right: TimelineEvent[]): boolean {
+  if (!left) return false;
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i] !== right[i]) return false;
+  }
+  return true;
+}
+
+function persistTimelineSnapshotTail(cacheKey: string, tail: TimelineEvent[]): void {
   try {
-    // Mirror the IDB write-side filter: streaming/typewriter intermediates
-    // are NOT durable history. Persisting them means a refresh-time seed
-    // can flash half-typed assistant text before the daemon replays the
-    // final non-streaming event. See Round 2 audit findings L1 + R3.
-    const persistable = events.filter(shouldPersistTimelineEvent);
-    if (persistable.length === 0) {
+    if (tail.length === 0) {
       localStorage.removeItem(getTimelineSnapshotStorageKey(cacheKey));
+      lastWrittenTimelineSnapshotTails.set(cacheKey, tail);
       return;
     }
-    const tail = persistable.length > MAX_PERSISTED_SNAPSHOT_EVENTS
-      ? persistable.slice(persistable.length - MAX_PERSISTED_SNAPSHOT_EVENTS)
-      : persistable;
     localStorage.setItem(getTimelineSnapshotStorageKey(cacheKey), JSON.stringify(tail));
+    lastWrittenTimelineSnapshotTails.set(cacheKey, tail);
   } catch {
     // best-effort — quota / private mode / JSON encode failure all land here.
     // A follow-up should add quota-driven LRU eviction; for now we lose the
     // tail write on failure but never corrupt the on-disk snapshot.
   }
+}
+
+function flushTimelineSnapshotPersist(cacheKey: string): void {
+  const pendingTail = pendingTimelineSnapshotTails.get(cacheKey);
+  if (!pendingTail) return;
+  pendingTimelineSnapshotTails.delete(cacheKey);
+  const timer = pendingTimelineSnapshotTimers.get(cacheKey);
+  if (timer) clearTimeout(timer);
+  pendingTimelineSnapshotTimers.delete(cacheKey);
+  persistTimelineSnapshotTail(cacheKey, pendingTail);
+}
+
+function flushPendingTimelineSnapshotWrites(): void {
+  for (const cacheKey of [...pendingTimelineSnapshotTails.keys()]) {
+    flushTimelineSnapshotPersist(cacheKey);
+  }
+}
+
+function clearPendingTimelineSnapshotWrites(): void {
+  for (const timer of pendingTimelineSnapshotTimers.values()) clearTimeout(timer);
+  pendingTimelineSnapshotTimers.clear();
+  pendingTimelineSnapshotTails.clear();
+  lastWrittenTimelineSnapshotTails.clear();
+}
+
+function scheduleTimelineSnapshotPersist(cacheKey: string, events: TimelineEvent[]): void {
+  const tail = getPersistableTimelineTail(events);
+  const pendingTail = pendingTimelineSnapshotTails.get(cacheKey);
+  if (areTimelineSnapshotTailsSame(pendingTail, tail)) return;
+  if (!pendingTail && areTimelineSnapshotTailsSame(lastWrittenTimelineSnapshotTails.get(cacheKey), tail)) return;
+  pendingTimelineSnapshotTails.set(cacheKey, tail);
+  if (pendingTimelineSnapshotTimers.has(cacheKey)) return;
+  pendingTimelineSnapshotTimers.set(cacheKey, setTimeout(() => {
+    flushTimelineSnapshotPersist(cacheKey);
+  }, TIMELINE_SNAPSHOT_WRITE_DELAY_MS));
+}
+
+if (typeof document !== 'undefined' && typeof window !== 'undefined') {
+  const flushSnapshotsBeforeFreeze = (): void => {
+    flushPendingTimelineSnapshotWrites();
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushSnapshotsBeforeFreeze();
+  });
+  window.addEventListener('pagehide', flushSnapshotsBeforeFreeze);
+  window.addEventListener('beforeunload', flushSnapshotsBeforeFreeze);
 }
 
 function isProvisionalTransportHistoryEvent(event: TimelineEvent): boolean {
@@ -484,7 +545,9 @@ function scopeEventsForDb(cacheKey: string, events: TimelineEvent[]): TimelineEv
 
 function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void {
   if (events.length === 0) return;
-  sharedDb.putEvents(scopeEventsForDb(cacheKey, events)).catch(() => {});
+  const persistable = events.filter(shouldPersistTimelineEvent);
+  if (persistable.length === 0) return;
+  sharedDb.putEvents(scopeEventsForDb(cacheKey, persistable)).catch(() => {});
 }
 
 function shouldPersistTimelineEvent(event: TimelineEvent): boolean {
@@ -517,6 +580,7 @@ export function __getSharedTimelineBaseForTests(
 }
 
 export function __resetTimelineCacheForTests(): void {
+  flushPendingTimelineSnapshotWrites();
   eventsCache.clear();
   eventsCacheAccess.clear();
   cacheListeners.clear();
@@ -528,6 +592,7 @@ export function __resetBackfillCooldownsForTests(): void {
 }
 
 export function __clearPersistedTimelineSnapshotsForTests(): void {
+  clearPendingTimelineSnapshotWrites();
   try {
     const keys: string[] = [];
     for (let i = 0; i < localStorage.length; i++) {

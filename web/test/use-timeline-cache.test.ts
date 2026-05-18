@@ -729,6 +729,175 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
+  it('debounces localStorage snapshot writes during rapid cache updates', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_debounce_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const snapshotKey = `rcc_timeline_snapshot:${serverId}:${sessionName}`;
+
+    for (let i = 0; i < 6; i += 1) {
+      ingestTimelineEventForCache({
+        eventId: `${sessionName}-${i}`,
+        sessionId: sessionName,
+        ts: i,
+        epoch: 1,
+        seq: i,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: `chunk ${i}` },
+      }, serverId);
+    }
+
+    expect(localStorage.getItem(snapshotKey)).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(749);
+    });
+    expect(localStorage.getItem(snapshotKey)).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+
+    const snapshot = JSON.parse(localStorage.getItem(snapshotKey) ?? '[]') as TimelineEvent[];
+    expect(snapshot.map((event) => event.eventId)).toEqual([
+      `${sessionName}-0`,
+      `${sessionName}-1`,
+      `${sessionName}-2`,
+      `${sessionName}-3`,
+      `${sessionName}-4`,
+      `${sessionName}-5`,
+    ]);
+  });
+
+  it('does not rewrite the local snapshot for streaming-only replacements', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_streaming_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const snapshotKey = `rcc_timeline_snapshot:${serverId}:${sessionName}`;
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-stable`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'stable history' },
+    }, serverId);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(750);
+    });
+    const initialSnapshot = localStorage.getItem(snapshotKey);
+    expect(initialSnapshot).toBeTruthy();
+
+    for (let i = 0; i < 30; i += 1) {
+      ingestTimelineEventForCache({
+        eventId: `${sessionName}-streaming`,
+        sessionId: sessionName,
+        ts: 2,
+        epoch: 1,
+        seq: 2,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: `streaming ${i}`, streaming: true },
+      }, serverId);
+    }
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    expect(localStorage.getItem(snapshotKey)).toBe(initialSnapshot);
+    const snapshot = JSON.parse(localStorage.getItem(snapshotKey) ?? '[]') as TimelineEvent[];
+    expect(snapshot.map((event) => event.eventId)).toEqual([`${sessionName}-stable`]);
+  });
+
+  it('does not persist streaming-only global ingests to IndexedDB', async () => {
+    const sessionName = `deck_streaming_idb_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const putEventsSpy = vi.spyOn(TimelineDB.prototype, 'putEvents').mockResolvedValue();
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-streaming`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'partial', streaming: true },
+    }, serverId);
+
+    expect(putEventsSpy).not.toHaveBeenCalled();
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-final`,
+      sessionId: sessionName,
+      ts: 2,
+      epoch: 1,
+      seq: 2,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'final', streaming: false },
+    }, serverId);
+
+    expect(putEventsSpy).toHaveBeenCalledTimes(1);
+    expect(putEventsSpy.mock.calls[0]?.[0]).toEqual([
+      expect.objectContaining({
+        eventId: `${sessionName}-final`,
+        sessionId: `${serverId}:${sessionName}`,
+      }),
+    ]);
+  });
+
+  it('flushes pending localStorage snapshots before a hidden tab is frozen', () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_hidden_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const snapshotKey = `rcc_timeline_snapshot:${serverId}:${sessionName}`;
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-1`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'flush before freeze' },
+    }, serverId);
+
+    expect(localStorage.getItem(snapshotKey)).toBeNull();
+
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      value: 'hidden',
+    });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    const flushedSnapshot = localStorage.getItem(snapshotKey);
+    expect(flushedSnapshot).toContain('flush before freeze');
+
+    act(() => {
+      vi.advanceTimersByTime(750);
+    });
+    expect(localStorage.getItem(snapshotKey)).toBe(flushedSnapshot);
+
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      value: 'visible',
+    });
+  });
+
   it('does not use the PostgreSQL text-tail bootstrap path', async () => {
     const sessionName = `deck_no_text_tail_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;
