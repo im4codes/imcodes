@@ -72,6 +72,7 @@ const eventsCacheAccess = new Map<string, number>();
 const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
 const lastHttpBackfillOkAt = new Map<string, number>();
 const MOUNT_BACKFILL_COOLDOWN_MS = 60_000;
+const RESUME_RESET_COOLDOWN_AFTER_MS = 60_000;
 /**
  * Cooldown for "user signaled they want fresh data" refreshes (activation
  * event, false→true active flip). Without it, opening or switching to a
@@ -161,9 +162,14 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
       return;
     }
     // visible: notify the mounted timeline hook for the active session.
-    const wasHidden = hiddenAt !== null;
-    if (wasHidden) {
-      resetBackfillCooldowns();
+    // Only clear cooldowns after a real background interval. Browser tab
+    // peeks on desktop can fire hidden→visible repeatedly within seconds;
+    // resetting the cooldown every time turns harmless focus churn into an
+    // HTTP backfill on each tab switch.
+    const hiddenStartedAt = hiddenAt;
+    if (hiddenStartedAt !== null) {
+      const hiddenMs = Date.now() - hiddenStartedAt;
+      if (hiddenMs > RESUME_RESET_COOLDOWN_AFTER_MS) resetBackfillCooldowns();
       dispatchActiveTimelineRefresh();
     }
     hiddenAt = null;
@@ -1345,22 +1351,14 @@ export function useTimeline(
         // the daemon will arrive shortly after via WS / HTTP backfill and
         // reconcile (matched by commandId).
         setEvents((prev) => prev.filter(isLocalOptimisticUserMessage));
-        if (wsConnected) {
-          // Cold cache: force the daemon history request through even when
-          // inactive. The N-card flood concern in the gate above does not
-          // apply here — this branch only runs once per cacheKey for the
-          // session's entire page lifetime (path 2's historyLoadedRef
-          // short-circuits subsequent effect runs).
-          requestDaemonHistory(true, undefined, undefined, /* force */ true);
+        if (isActiveSession && wsConnected) {
+          requestDaemonHistory(true);
         } else {
           setLoading(false);
         }
-        // Cold load — no IDB cache, no memory cache. Always fire the
-        // delayed HTTP backfill (active or not) so an empty timeline can
-        // recover missed daemon-side events without waiting for a later
-        // reconnect. Same one-shot rationale as the daemon request
-        // above; SubSessionCard previews need this too.
-        fireHttpBackfillRef.current(200, { cooldownMs: 0, phase: 'bootstrap', force: true });
+        if (isActiveSession) {
+          fireHttpBackfillRef.current(200, { cooldownMs: 0, phase: 'bootstrap' });
+        }
       }
     };
     if (isActiveSession) {

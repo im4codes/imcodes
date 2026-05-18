@@ -2533,7 +2533,7 @@ export function App() {
       }
       const wasLongHidden = hiddenSinceAt > 0 && Date.now() - hiddenSinceAt > 60_000;
       hiddenSinceAt = 0;
-      handleResume(wasLongHidden, true);
+      handleResume(wasLongHidden, wasLongHidden);
     };
     document.addEventListener('visibilitychange', onVisibility);
     const onFocus = () => handleResume(false);

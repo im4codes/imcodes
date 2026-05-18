@@ -292,18 +292,13 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
-  it('cold-cache inactive sessions force-through a one-shot daemon history request', async () => {
-    // Regression: even after the inactive-load fix, sub-session windows
-    // with no local cache still rendered empty. Inactive (e.g. SubSessionCard
-    // preview / hidden tab) sessions without local cache used to show
-    // permanently empty: `requestDaemonHistory` was gated on
-    // `isActiveSessionRef.current` and `fireHttpBackfill` had the same
-    // gate, so the cold-IDB branch silently dropped the request and just
-    // setLoading(false). The fix passes `force=true` from the cold branch
-    // so EXACTLY ONCE the inactive session is allowed to fetch its
-    // history. The N-card flood concern is preserved: subsequent effect
-    // runs hit path 2 (historyLoadedRef.current === cacheKey) before
-    // reaching the gate.
+  it('cold-cache inactive sessions do not fan out daemon or HTTP history requests', async () => {
+    // SubSessionCard previews and hidden tabs can mount dozens of inactive
+    // timelines immediately after /sub-sessions returns. If cold-cache
+    // inactive hooks force daemon + HTTP history, first paint and browser
+    // tab resume both turn into an N-session network fan-out. Cold inactive
+    // hooks should read local caches only; the network path runs when that
+    // session actually becomes active.
     vi.useFakeTimers();
     const sessionName = `deck_cold_inactive_${Date.now()}`;
     const serverId = `srv-cold-${Date.now()}`;
@@ -319,40 +314,38 @@ describe('useTimeline global cache bounds', () => {
     vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
     vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
 
-    function Probe() {
-      const { events } = useTimeline(sessionName, ws, serverId, {
-        isActiveSession: false,
+    function Probe({ active }: { active: boolean }) {
+      const { events, loading } = useTimeline(sessionName, ws, serverId, {
+        isActiveSession: active,
       });
       return h(
         'div',
-        { 'data-testid': 'cold-probe' },
+        { 'data-testid': 'cold-probe', 'data-loading': String(loading) },
         String(events.length),
       );
     }
 
-    render(h(Probe));
+    const { rerender } = render(h(Probe, { active: false }));
 
     // Wait out the inactive 80ms stagger so the cold-IDB branch runs.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(150);
     });
 
-    // The cold branch must have force-through'd the daemon WS history
-    // request — without the fix this would have been zero.
     await waitFor(() => {
-      expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
-      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+      expect(screen.getByTestId('cold-probe').getAttribute('data-loading')).toBe('false');
     });
+    expect(sendTimelineHistoryRequest).not.toHaveBeenCalled();
+    expect(fetchHistorySpy).not.toHaveBeenCalled();
 
-    // It must also have scheduled the HTTP backfill (force-through'd
-    // through the same gate). Advance past the 200ms bootstrap delay so
-    // the timer fires and we see fetchHistorySpy called.
+    rerender(h(Probe, { active: true }));
     await act(async () => {
       await vi.advanceTimersByTimeAsync(300);
     });
-    await waitFor(() => {
-      expect(fetchHistorySpy).toHaveBeenCalled();
-    });
+
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+    expect(fetchHistorySpy).toHaveBeenCalled();
   });
 
   it('falls back to raw sessionId IDB key when the scoped read is empty (cacheKey scope drift)', async () => {

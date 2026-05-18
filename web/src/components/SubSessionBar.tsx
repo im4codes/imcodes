@@ -844,7 +844,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           class={`subcard-scroll ${layout === 'double' ? 'subcard-double' : 'subcard-single'}`}
           style={layout === 'double' ? { gridAutoColumns: 'max-content' } : undefined}
         >
-          {orderedSessions.map((sub) => (
+          {orderedSessions.map((sub, index) => (
             <div
               key={sub.id}
               class="subcard-drag-wrap"
@@ -904,6 +904,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 onTransportConfigSaved={onSubTransportConfigSaved}
                 inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
                 accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
+                previewHydrateDelayMs={Math.min(1200, 120 + index * 60)}
               />
             </div>
           ))}
