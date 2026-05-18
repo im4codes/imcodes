@@ -142,6 +142,16 @@ export interface ServerLinkOpts {
 export type MessageHandler = (msg: unknown) => void;
 export type BinaryMessageHandler = (data: Buffer) => void;
 
+async function toWebSocketBinaryBuffer(data: unknown): Promise<Buffer> {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  if (data && typeof (data as Blob).arrayBuffer === 'function') {
+    return Buffer.from(await (data as Blob).arrayBuffer());
+  }
+  return Buffer.from(data as ArrayBuffer);
+}
+
 function messageTypeOf(msg: unknown): string | undefined {
   return typeof (msg as { type?: unknown })?.type === 'string'
     ? (msg as { type: string }).type
@@ -348,8 +358,13 @@ export class ServerLink {
       if (this.ws !== ws) return; // stale socket
       this.lastPong = Date.now();
       if (typeof event.data !== 'string') {
-        const buffer = Buffer.isBuffer(event.data) ? event.data : Buffer.from(event.data as ArrayBuffer);
-        for (const h of this.binaryHandlers) h(buffer);
+        void (async () => {
+          const buffer = await toWebSocketBinaryBuffer(event.data);
+          if (this.ws !== ws) return; // stale socket after async Blob read
+          for (const h of this.binaryHandlers) h(buffer);
+        })().catch((err) => {
+          logger.warn({ err }, 'ServerLink: binary message decode failed');
+        });
         return;
       }
       try {

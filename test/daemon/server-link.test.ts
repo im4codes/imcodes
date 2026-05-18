@@ -144,6 +144,23 @@ describe('ServerLink', () => {
     expect(JSON.parse(mockWsInstance.send.mock.calls[1][0] as string).type).toBe('chat.history');
   });
 
+  it('accepts Blob binary messages from Node WebSocket without throwing', async () => {
+    link.connect();
+    const binaryHandler = vi.fn();
+    link.onBinaryMessage(binaryHandler);
+
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    expect(messageHandler).toBeDefined();
+
+    messageHandler?.({ data: new Blob([Uint8Array.from([1, 2, 3])]) } as MessageEvent);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(binaryHandler).toHaveBeenCalledOnce();
+    expect(binaryHandler.mock.calls[0][0]).toEqual(Buffer.from([1, 2, 3]));
+  });
+
   it('drops stale queued data-plane sends without blocking later control-plane sends', async () => {
     __setServerLinkDataPlaneQueueConfigForTests({ softCap: 1, hardCap: 2, staleMs: 0 });
     link.connect();
