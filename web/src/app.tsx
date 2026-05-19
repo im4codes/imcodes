@@ -73,7 +73,13 @@ import {
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { formatDaemonVersionShort } from './util/format-version.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
-import { mergeSessionListEntry, type IncomingSessionListEntry } from './session-list-merge.js';
+import {
+  isNavigableMainSession,
+  isSubSessionName,
+  mergeSessionListEntry,
+  parseMainSessionName,
+  type IncomingSessionListEntry,
+} from './session-list-merge.js';
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { parseString, usePref } from './hooks/usePref.js';
@@ -828,20 +834,25 @@ export function App() {
         const existing = prev.find((p) => p.name === s.name);
         return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
       }));
+      const navigableMapped = mapped.filter(isNavigableMainSession);
       // Only mark loaded if we got data — empty means daemon hasn't synced yet,
       // so wait for WS session_list to avoid flashing "No active sessions"
       if (mapped.length > 0) {
         setSessionsLoaded(true);
       }
       // Auto-select first session if none was previously saved
-      if (mapped.length > 0 && !localStorage.getItem('rcc_session')) {
-        setActiveSession(mapped[0].name);
+      if (navigableMapped.length > 0 && !localStorage.getItem('rcc_session')) {
+        setActiveSession(navigableMapped[0].name);
       }
     }).catch(() => { clearTimeout(timer); /* WS fallback */ });
     return () => { clearTimeout(timer); ctrl.abort(); };
   }, [auth, selectedServerId]);
 
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const navigableMainSessions = useMemo(
+    () => sessions.filter(isNavigableMainSession),
+    [sessions],
+  );
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [activeSession, setActiveSessionState] = useState<string | null>(
     () => resolveInitialSessionName(),
@@ -1457,6 +1468,16 @@ export function App() {
   }, [closeAllSubSessionWindows, setActiveSession]);
 
   useEffect(() => {
+    if (!activeSession) return;
+    if (navigableMainSessions.some((session) => session.name === activeSession)) return;
+    const hiddenActive = sessions.find((session) => session.name === activeSession);
+    if (!hiddenActive || isNavigableMainSession(hiddenActive)) return;
+    const replacement = navigableMainSessions.find((session) => session.project === hiddenActive.project)
+      ?? navigableMainSessions[0];
+    if (replacement) setActiveSession(replacement.name);
+  }, [activeSession, navigableMainSessions, sessions, setActiveSession]);
+
+  useEffect(() => {
     if (!auth || selectedServerId || !serversLoaded || servers.length === 0 || manualDashboard) return;
     const runId = ++autoEntryRunRef.current;
     let cancelled = false;
@@ -1883,7 +1904,7 @@ export function App() {
             daemonOfflineGraceTimerRef.current = null;
           }
         }
-        if (msg.session && !msg.session.startsWith('deck_sub_')) {
+        if (msg.session && !isSubSessionName(msg.session)) {
           setSessions((prev) => {
             // Stopped → remove the tab immediately
             if (msg.event === 'stopped') {
@@ -1892,9 +1913,14 @@ export function App() {
             const existing = prev.find((s) => s.name === msg.session);
             if (!existing && msg.session) {
               // Parse project name from session name pattern: deck_{project}_{role}
-              const parts = msg.session.split('_');
-              const project = parts.length >= 3 && parts[0] === 'deck' ? parts.slice(1, -1).join('_') : msg.session;
-              return [...prev, { name: msg.session, project, role: 'brain', agentType: 'unknown', state: msg.state as SessionInfo['state'] }];
+              const parsed = parseMainSessionName(msg.session);
+              return [...prev, {
+                name: msg.session,
+                project: parsed?.project ?? msg.session,
+                role: parsed?.role ?? 'brain',
+                agentType: 'unknown',
+                state: msg.state as SessionInfo['state'],
+              }];
             }
             return prev.map((s) => s.name === msg.session ? { ...s, state: msg.state as SessionInfo['state'] } : s);
           });
@@ -1955,15 +1981,22 @@ export function App() {
           selectedServerId,
           msg.daemonVersion,
         ));
-        const newSessions = msg.sessions.filter((s) => !s.name.startsWith('deck_sub_'));
+        const newSessions = msg.sessions.filter((s) => !isSubSessionName(s.name));
+        const navigableNewSessions = newSessions.filter(isNavigableMainSession);
         setSessions((prev) => newSessions.map((s) => {
           const existing = prev.find((p) => p.name === s.name);
           return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
         }));
         setSessionsLoaded(true);
-        // If active session disappeared from the list, navigate back
-        if (activeSessionRef.current && !newSessions.some((s) => s.name === activeSessionRef.current)) {
-          setActiveSession(null);
+        // If the active top-level session disappeared or is a hidden worker,
+        // navigate back to the owning brain session instead of surfacing W1/W2
+        // as independent windows.
+        if (activeSessionRef.current && !navigableNewSessions.some((s) => s.name === activeSessionRef.current)) {
+          const hiddenActive = newSessions.find((s) => s.name === activeSessionRef.current);
+          const replacement = hiddenActive
+            ? navigableNewSessions.find((s) => s.project === hiddenActive.project)
+            : null;
+          setActiveSession(replacement?.name ?? null);
         }
       }
       if (msg.type === 'terminal.diff') {
@@ -3334,7 +3367,7 @@ export function App() {
     connected,
     sessionsLoaded,
   );
-  const resolvedActiveSessionExists = hasResolvedActiveSession(activeSession, sessions);
+  const resolvedActiveSessionExists = hasResolvedActiveSession(activeSession, navigableMainSessions);
   const selectedServerInfo = selectedServerId
     ? servers.find((server) => server.id === selectedServerId) ?? null
     : null;
@@ -3419,7 +3452,7 @@ export function App() {
             {/* Session tree */}
             <SessionTree
               serverId={selectedServerId}
-              sessions={sessions}
+              sessions={navigableMainSessions}
               subSessions={subSessions}
               activeSession={activeSession}
               unreadCounts={unreadCounts}
@@ -3671,7 +3704,7 @@ export function App() {
             {showMobileServerMenu && <div class="mobile-server-backdrop" onClick={() => setShowMobileServerMenu(false)} />}
 
             <SessionTabs
-              sessions={sessions}
+              sessions={navigableMainSessions}
               activeSession={activeSession}
               connected={connected}
               latencyMs={latencyMs}
@@ -3738,8 +3771,8 @@ export function App() {
               </div>
             )}
 
-            {/* Session panes: all sessions kept alive (terminal views persist), show/hide per active */}
-            {sessions.map((s) => (
+            {/* Session panes: visible brain sessions stay mounted; worker sessions remain addressable but hidden from main windows. */}
+            {navigableMainSessions.map((s) => (
               <ErrorBoundary key={`eb-${s.name}`}>
               <SessionPane
                 key={s.name}
@@ -4018,7 +4051,7 @@ export function App() {
               {/* Session tree — collapsible via sidebar toggle */}
               {!mobileHideTabBar && <SessionTree
                 serverId={selectedServerId}
-                sessions={sessions}
+                sessions={navigableMainSessions}
                 subSessions={subSessions}
                 activeSession={activeSession}
                 unreadCounts={unreadCounts}

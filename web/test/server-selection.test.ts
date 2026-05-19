@@ -104,6 +104,13 @@ describe('pickMostRecentMainSession', () => {
       { serverId: 'srv-1', sessionName: 'deck_sub_child', previewUpdatedAt: 50, isSubSession: true },
     ])).toBeNull();
   });
+
+  it('does not auto-enter worker sessions as independent main windows', () => {
+    expect(pickMostRecentMainSession([
+      { serverId: 'srv-1', sessionName: 'deck_proj_w1', previewUpdatedAt: 50 },
+      { serverId: 'srv-1', sessionName: 'deck_proj_brain', previewUpdatedAt: 20 },
+    ])).toEqual({ serverId: 'srv-1', sessionName: 'deck_proj_brain' });
+  });
 });
 
 describe('pickAutoEntryServer', () => {

@@ -1,3 +1,5 @@
+import { isWorkerSessionName } from './session-list-merge.js';
+
 export interface SelectableServerInfo {
   id: string;
   name: string;
@@ -79,7 +81,9 @@ export function hasResolvedActiveSession(
 export function pickMostRecentMainSession(
   candidates: readonly RecentSessionCandidate[],
 ): AutoEntrySelection | null {
-  const main = candidates.filter((candidate) => !candidate.isSubSession);
+  const main = candidates.filter((candidate) =>
+    !candidate.isSubSession && !isWorkerSessionName(candidate.sessionName),
+  );
   if (main.length === 0) return null;
   const [best] = [...main].sort((a, b) => {
     const bTs = typeof b.previewUpdatedAt === 'number' ? b.previewUpdatedAt : -1;

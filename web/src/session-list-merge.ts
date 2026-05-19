@@ -63,6 +63,30 @@ export interface IncomingSessionListEntry {
   transportPendingMessageEntries?: unknown;
 }
 
+export function isSubSessionName(sessionName: string): boolean {
+  return sessionName.startsWith('deck_sub_');
+}
+
+export function parseMainSessionName(sessionName: string): { project: string; role: SessionInfo['role'] } | null {
+  const match = /^deck_(.+)_(brain|w\d+)$/.exec(sessionName);
+  if (!match) return null;
+  return {
+    project: match[1],
+    role: match[2] as SessionInfo['role'],
+  };
+}
+
+export function isWorkerSessionName(sessionName: string): boolean {
+  const parsed = parseMainSessionName(sessionName);
+  return Boolean(parsed && parsed.role !== 'brain');
+}
+
+export function isNavigableMainSession(session: { name: string; role?: string | null }): boolean {
+  return !isSubSessionName(session.name)
+    && !isWorkerSessionName(session.name)
+    && session.role === 'brain';
+}
+
 export function mergeSessionListEntry(
   incoming: IncomingSessionListEntry,
   existing: SessionInfo | undefined,
