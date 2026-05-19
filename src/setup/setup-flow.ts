@@ -20,6 +20,7 @@ import { join } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { dockerComposeTemplate, caddyfileTemplate, envTemplate } from './templates.js';
 import { resolveDaemonLaunchTarget, renderSystemdExecStart } from '../util/launch-target.js';
+import { enableSystemdUserLinger, formatSystemdLingerFailureMessage } from '../util/systemd-linger.js';
 
 const CREDS_DIR = join(homedir(), '.imcodes');
 const CREDS_PATH = join(CREDS_DIR, 'server.json');
@@ -415,10 +416,16 @@ WantedBy=default.target
     execSync('systemctl --user daemon-reload', { stdio: 'ignore' });
     execSync('systemctl --user enable imcodes', { stdio: 'ignore' });
     execSync('systemctl --user restart imcodes', { stdio: 'ignore' });
-    // Enable lingering so the service runs without active login session
-    execSync('loginctl enable-linger', { stdio: 'ignore' });
   } catch {
     console.log('  Could not start systemd service automatically. Run: systemctl --user start imcodes');
+  }
+
+  const linger = enableSystemdUserLinger();
+  if (linger.ok) {
+    log(`Systemd user-linger enabled for ${linger.user} (daemon survives logout).`);
+  } else {
+    log(formatSystemdLingerFailureMessage(linger.user));
+    log('The daemon may stop when you log out until this is fixed.');
   }
 }
 

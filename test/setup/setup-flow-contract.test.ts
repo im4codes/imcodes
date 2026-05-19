@@ -20,6 +20,7 @@ vi.mock('node:child_process', () => ({
 vi.mock('node:os', () => ({
   homedir: () => setupState.home,
   hostname: () => setupState.host,
+  userInfo: () => ({ username: 'setup-user' }),
 }));
 
 vi.mock('node:readline', () => ({
