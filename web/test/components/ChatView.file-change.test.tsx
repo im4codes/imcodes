@@ -173,6 +173,49 @@ describe('ChatView file-change cards', () => {
     });
   });
 
+  it('renders full file update text instead of clipping long previews', () => {
+    const beforeText = Array.from({ length: 18 }, (_, index) => `before line ${index + 1}`).join('\n');
+    const afterText = [
+      ...Array.from({ length: 18 }, (_, index) => `after line ${index + 1}`),
+      `after long tail ${'x'.repeat(1300)}`,
+    ].join('\n');
+    const derivedText = [
+      ...Array.from({ length: 20 }, (_, index) => `derived line ${index + 1}`),
+      `derived long tail ${'y'.repeat(1300)}`,
+    ].join('\n');
+    const events = [
+      makeEvent('file.change', {
+        batch: {
+          provider: 'codex-sdk',
+          patches: [
+            {
+              filePath: '/repo/src/full.ts',
+              operation: 'update',
+              confidence: 'exact',
+              beforeText,
+              afterText,
+            },
+            {
+              filePath: '/repo/src/derived-full.ts',
+              operation: 'update',
+              confidence: 'derived',
+              afterText: derivedText,
+            },
+          ],
+        },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} ws={{} as any} workdir="/repo" sessionId="session-a" />);
+
+    expect(container.textContent).toContain('before line 18');
+    expect(container.textContent).toContain('after line 18');
+    expect(container.textContent).toContain(`after long tail ${'x'.repeat(1300)}`);
+    expect(container.textContent).toContain('derived line 20');
+    expect(container.textContent).toContain(`derived long tail ${'y'.repeat(1300)}`);
+    expect(container.textContent).not.toContain('truncated');
+  });
+
   it('does not render provider badges on file-change cards', () => {
     const events = [
       makeEvent('file.change', {
