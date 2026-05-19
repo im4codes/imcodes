@@ -270,6 +270,9 @@ const TOOL_INPUT_SUMMARY_KEYS = [
   'description',
   'name',
 ] as const;
+const TOOL_SUMMARY_MAX_CHARS = 240;
+const TOOL_SUMMARY_SCAN_CHARS = 4_096;
+const TOOL_SUMMARY_ARRAY_ITEMS = 8;
 
 type GroupedFileChange = {
   filePath: string;
@@ -289,16 +292,50 @@ function getFileChangeBatch(event: TimelineEvent): FileChangeBatch | null {
   return payload;
 }
 
-function truncateToolText(text: string, max = 240): string {
+function truncateToolText(text: string, max = TOOL_SUMMARY_MAX_CHARS): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+function normalizeToolSummaryText(text: string, max = TOOL_SUMMARY_MAX_CHARS): string {
+  let out = '';
+  let pendingSpace = false;
+  let sawText = false;
+  const scanLength = Math.min(text.length, TOOL_SUMMARY_SCAN_CHARS);
+  for (let i = 0; i < scanLength; i += 1) {
+    const ch = text[i]!;
+    if (/\s/.test(ch)) {
+      if (sawText) pendingSpace = true;
+      continue;
+    }
+    if (pendingSpace && out.length > 0) {
+      out += ' ';
+      pendingSpace = false;
+    }
+    out += ch;
+    sawText = true;
+    if (out.length >= max) return truncateToolText(out, max);
+  }
+  return truncateToolText(out.trim(), max);
+}
+
+function formatToolObjectSummary(record: Record<string, unknown>): string {
+  const entries = Object.entries(record);
+  if (entries.length === 0) return '';
+  const parts = entries.slice(0, 4).map(([key, value]) => {
+    const formatted = formatToolPayloadValue(value);
+    return formatted ? `${key}: ${formatted}` : key;
+  });
+  if (entries.length > 4) parts.push('…');
+  return truncateToolText(`{${parts.join(', ')}}`);
 }
 
 function formatToolPayloadValue(value: unknown): string {
   if (value == null) return '';
-  if (typeof value === 'string') return truncateToolText(value.replace(/\s+/g, ' ').trim());
+  if (typeof value === 'string') return normalizeToolSummaryText(value);
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   if (Array.isArray(value)) {
-    const parts = value.map((item) => formatToolPayloadValue(item)).filter(Boolean);
+    const parts = value.slice(0, TOOL_SUMMARY_ARRAY_ITEMS).map((item) => formatToolPayloadValue(item)).filter(Boolean);
+    if (value.length > TOOL_SUMMARY_ARRAY_ITEMS) parts.push('…');
     if (parts.length === 0) return '';
     return truncateToolText(parts.join(', '));
   }
@@ -315,11 +352,7 @@ function formatToolPayloadValue(value: unknown): string {
     if (entries.length === 1) {
       return formatToolPayloadValue(entries[0][1]);
     }
-    try {
-      return truncateToolText(JSON.stringify(value));
-    } catch {
-      return '[object]';
-    }
+    return formatToolObjectSummary(record);
   }
   return truncateToolText(String(value));
 }
@@ -408,6 +441,64 @@ function ToolDetailSection({
       <div class="chat-tool-detail-label">{label}</div>
       <pre class="chat-tool-detail-pre">{text}</pre>
     </div>
+  );
+}
+
+function MergedToolDetailPanel({
+  toolName,
+  callDetail,
+  resultDetail,
+}: {
+  toolName: string;
+  callDetail: unknown;
+  resultDetail: unknown;
+}) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  if (!callDetail && !resultDetail) return null;
+  const detailInput = useMemo(() => (
+    open ? pickMergedToolDetailInput(toolName, callDetail, resultDetail) : undefined
+  ), [callDetail, open, resultDetail, toolName]);
+  const detailMeta = useMemo(() => (
+    open ? pickMergedToolDetailMeta(toolName, callDetail, resultDetail) : undefined
+  ), [callDetail, open, resultDetail, toolName]);
+  const rawDetail = open ? (callDetail as any)?.raw ?? (resultDetail as any)?.raw : undefined;
+  return (
+    <details
+      class="chat-tool-detail"
+      onToggle={(event: Event) => setOpen((event.currentTarget as HTMLDetailsElement).open)}
+    >
+      <summary class="chat-tool-detail-summary" onClick={() => setOpen(true)}>{t('chat.tool_detail_toggle')}</summary>
+      {open && (
+        <>
+          <ToolDetailSection label={t('chat.tool_detail_input')} value={detailInput} />
+          <ToolDetailSection label={t('chat.tool_detail_output')} value={(resultDetail as any)?.output} />
+          <ToolDetailSection label={t('chat.tool_detail_meta')} value={detailMeta} />
+          <ToolDetailSection label={t('chat.tool_detail_raw')} value={rawDetail} />
+        </>
+      )}
+    </details>
+  );
+}
+
+function ToolResultDetailPanel({ detail }: { detail: unknown }) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  if (!detail) return null;
+  return (
+    <details
+      class="chat-tool-detail"
+      onToggle={(event: Event) => setOpen((event.currentTarget as HTMLDetailsElement).open)}
+    >
+      <summary class="chat-tool-detail-summary" onClick={() => setOpen(true)}>{t('chat.tool_detail_toggle')}</summary>
+      {open && (
+        <>
+          <ToolDetailSection label={t('chat.tool_detail_output')} value={(detail as any).output} />
+          <ToolDetailSection label={t('chat.tool_detail_meta')} value={(detail as any).meta} />
+          <ToolDetailSection label={t('chat.tool_detail_raw')} value={(detail as any).raw} />
+        </>
+      )}
+    </details>
   );
 }
 
@@ -2264,8 +2355,6 @@ const ChatEvent = memo(function ChatEvent({
       const callInput = summarizeToolInput(event.payload.input, callDetail);
       const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
       const toolInput = pickMergedToolInput(toolName, callInput, resultInput);
-      const detailInput = pickMergedToolDetailInput(toolName, callDetail, resultDetail);
-      const detailMeta = pickMergedToolDetailMeta(toolName, callDetail, resultDetail);
       const toolOutput = event.payload._output ? String(event.payload._output) : undefined;
       return (
         <ToolBlockFold>
@@ -2280,15 +2369,7 @@ const ChatEvent = memo(function ChatEvent({
               <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, onUrlClick, onDownload)}</span>
             </div>
           )}
-          {(callDetail || resultDetail) && (
-            <details class="chat-tool-detail">
-              <summary class="chat-tool-detail-summary">{t('chat.tool_detail_toggle')}</summary>
-              <ToolDetailSection label={t('chat.tool_detail_input')} value={detailInput} />
-              <ToolDetailSection label={t('chat.tool_detail_output')} value={(resultDetail as any)?.output} />
-              <ToolDetailSection label={t('chat.tool_detail_meta')} value={detailMeta} />
-              <ToolDetailSection label={t('chat.tool_detail_raw')} value={(callDetail as any)?.raw ?? (resultDetail as any)?.raw} />
-            </details>
-          )}
+          <MergedToolDetailPanel toolName={toolName} callDetail={callDetail} resultDetail={resultDetail} />
         </ToolBlockFold>
       );
     }
@@ -2311,14 +2392,7 @@ const ChatEvent = memo(function ChatEvent({
             )}
             {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
           </div>
-          {detail && (
-            <details class="chat-tool-detail">
-              <summary class="chat-tool-detail-summary">{t('chat.tool_detail_toggle')}</summary>
-              <ToolDetailSection label={t('chat.tool_detail_output')} value={(detail as any).output} />
-              <ToolDetailSection label={t('chat.tool_detail_meta')} value={(detail as any).meta} />
-              <ToolDetailSection label={t('chat.tool_detail_raw')} value={(detail as any).raw} />
-            </details>
-          )}
+          <ToolResultDetailPanel detail={detail} />
         </ToolBlockFold>
       );
     }

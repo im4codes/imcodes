@@ -27,6 +27,23 @@ function makeEvent(text: string, overrides: Partial<TimelineEvent> = {}): Timeli
   } as TimelineEvent;
 }
 
+function makeToolEvent(eventId: string, type: 'tool.call' | 'tool.result', overrides: Partial<TimelineEvent> = {}): TimelineEvent {
+  return {
+    eventId,
+    type,
+    sessionId: 'deck_perf_brain',
+    ts: 1000,
+    epoch: 1,
+    seq: 1,
+    source: 'daemon',
+    confidence: 'high',
+    payload: type === 'tool.call'
+      ? { tool: 'Read', input: { path: '/tmp/a.ts' } }
+      : { output: 'ok' },
+    ...overrides,
+  } as TimelineEvent;
+}
+
 describe('useTimeline streaming coalescing', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -81,6 +98,20 @@ describe('useTimeline streaming coalescing', () => {
     expect(cached).toHaveLength(1);
     expect(cached[0]?.payload.text).toBe('final');
     expect(cached[0]?.payload.streaming).toBe(false);
+  });
+
+  it('coalesces tool cache ingests until the next animation frame', () => {
+    ingestTimelineEventForCache(makeToolEvent('tool-1', 'tool.call'), 'srv-1');
+    ingestTimelineEventForCache(makeToolEvent('tool-2', 'tool.result', { seq: 2 }), 'srv-1');
+
+    expect(__getTimelineCacheForTests('srv-1:deck_perf_brain')).toBeUndefined();
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+
+    const cached = __getTimelineCacheForTests('srv-1:deck_perf_brain') ?? [];
+    expect(cached.map((event) => event.type)).toEqual(['tool.call', 'tool.result']);
   });
 
   it('coalesces live hook streaming events into one rendered state update per frame', async () => {

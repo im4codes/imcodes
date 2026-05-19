@@ -569,7 +569,9 @@ function shouldPersistTimelineEvent(event: TimelineEvent): boolean {
 }
 
 function shouldFrameCoalesceTimelineEvent(event: TimelineEvent): boolean {
-  return event.type === 'assistant.text' && event.payload?.streaming === true;
+  return (event.type === 'assistant.text' && event.payload?.streaming === true)
+    || event.type === 'tool.call'
+    || event.type === 'tool.result';
 }
 
 const pendingTimelineCacheIngests = new Map<string, Map<string, TimelineEvent>>();

@@ -76,6 +76,10 @@ type WatchSessionLike = {
 };
 
 const DEFAULT_DEBOUNCE_MS = 1000;
+const SNAPSHOT_RETRY_MS = 5_000;
+const PREVIEW_MIN_LENGTH = 10;
+const PREVIEW_MAX_LENGTH = 120;
+const PREVIEW_SCAN_CHAR_LIMIT = 4_096;
 const NOISE_PREFIXES = [
   'let me',
   'let’s',
@@ -154,12 +158,34 @@ function isSubSessionName(name: string, parentSession?: string | null): boolean 
   return Boolean(parentSession) || name.startsWith('deck_sub_');
 }
 
+function normalizePreviewText(text: string): string {
+  let out = '';
+  let pendingSpace = false;
+  let sawText = false;
+  const scanLength = Math.min(text.length, PREVIEW_SCAN_CHAR_LIMIT);
+  for (let i = 0; i < scanLength; i += 1) {
+    const ch = text[i]!;
+    if (/\s/.test(ch)) {
+      if (sawText) pendingSpace = true;
+      continue;
+    }
+    if (pendingSpace && out.length > 0) {
+      out += ' ';
+      pendingSpace = false;
+    }
+    out += ch;
+    sawText = true;
+    if (out.length >= PREVIEW_MAX_LENGTH + 40) break;
+  }
+  return out.trim();
+}
+
 function extractPreviewText(text: string): string | null {
-  const trimmed = text.trim().replace(/\s+/g, ' ');
-  if (trimmed.length < 10) return null;
+  const trimmed = normalizePreviewText(text);
+  if (trimmed.length < PREVIEW_MIN_LENGTH) return null;
   const lower = trimmed.toLowerCase();
   if (NOISE_PREFIXES.some((prefix) => lower.startsWith(prefix))) return null;
-  return trimmed.length > 120 ? trimmed.slice(0, 120) : trimmed;
+  return trimmed.length > PREVIEW_MAX_LENGTH ? trimmed.slice(0, PREVIEW_MAX_LENGTH) : trimmed;
 }
 
 function cloneServerRows(servers: WatchServerRow[]): WatchServerRow[] {
@@ -194,8 +220,11 @@ export class WatchProjectionStore {
   private apiKeyOverride: string | null | undefined = undefined;
 
   private lastComparableSnapshot = '';
-  private pendingComparableSnapshot: string | null = null;
   private pushTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private dirty = false;
+  private dirtyVersion = 0;
+  private flushInFlight = false;
 
   constructor(deps: WatchProjectionStoreDeps = {}) {
     this.debounceMs = deps.debounceMs ?? DEFAULT_DEBOUNCE_MS;
@@ -331,23 +360,19 @@ export class WatchProjectionStore {
   }
 
   trackAssistantText(sessionName: string, text: string): boolean {
-    const trimmed = text.trim().replace(/\s+/g, ' ');
-    if (trimmed.length < 10) {
+    const preview = extractPreviewText(text);
+    if (!preview) {
       this.assistantTextBySession.delete(sessionName);
       return false;
     }
-    this.assistantTextBySession.set(sessionName, trimmed);
+    this.assistantTextBySession.set(sessionName, text);
 
-    // Update previewText in real-time (debounce will coalesce rapid updates)
     const row = this.sessionsByName.get(sessionName);
-    if (row) {
-      const preview = extractPreviewText(trimmed);
-      if (preview && preview !== row.previewText) {
-        const ts = this.now();
-        this.previewBySession.set(sessionName, { previewText: preview, previewUpdatedAt: ts });
-        this.sessionsByName.set(sessionName, { ...row, previewText: preview, previewUpdatedAt: ts });
-        this.maybePush();
-      }
+    if (row && preview !== row.previewText) {
+      const ts = this.now();
+      this.previewBySession.set(sessionName, { previewText: preview, previewUpdatedAt: ts });
+      this.sessionsByName.set(sessionName, { ...row, previewText: preview, previewUpdatedAt: ts });
+      this.maybePush();
     }
     return true;
   }
@@ -379,6 +404,10 @@ export class WatchProjectionStore {
     }
     if (event.type !== 'assistant.text') return changed;
     const text = typeof event.payload.text === 'string' ? event.payload.text : '';
+    if (event.payload.streaming === true) {
+      if (text) this.assistantTextBySession.set(event.sessionId, text);
+      return changed;
+    }
     return this.trackAssistantText(event.sessionId, text) || changed;
   }
 
@@ -387,33 +416,77 @@ export class WatchProjectionStore {
   }
 
   maybePush(immediate = false): void {
+    this.dirty = true;
+    this.dirtyVersion += 1;
+    if (immediate) {
+      this.clearPushTimer();
+      void this.flushDirtySnapshot();
+      return;
+    }
+    this.schedulePushTimer(true);
+  }
+
+  private clearPushTimer(): void {
+    if (!this.pushTimer) return;
+    clearTimeout(this.pushTimer);
+    this.pushTimer = null;
+  }
+
+  private clearRetryTimer(): void {
+    if (!this.retryTimer) return;
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+  }
+
+  private schedulePushTimer(reset = false): void {
+    if (this.flushInFlight) return;
+    if (this.pushTimer) {
+      if (!reset) return;
+      clearTimeout(this.pushTimer);
+      this.pushTimer = null;
+    }
+    this.pushTimer = setTimeout(() => {
+      this.pushTimer = null;
+      void this.flushDirtySnapshot();
+    }, this.debounceMs);
+  }
+
+  private scheduleRetryTimer(): void {
+    if (this.retryTimer) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      void this.flushDirtySnapshot();
+    }, SNAPSHOT_RETRY_MS);
+  }
+
+  private async flushDirtySnapshot(): Promise<void> {
+    if (!this.dirty) return;
+    if (this.flushInFlight) {
+      this.schedulePushTimer();
+      return;
+    }
+    this.flushInFlight = true;
+    const flushVersion = this.dirtyVersion;
     const snapshot = this.getSnapshot();
     const comparable = buildComparableSnapshot(snapshot);
 
     if (comparable === this.lastComparableSnapshot) {
-      if (this.pushTimer) {
-        clearTimeout(this.pushTimer);
-        this.pushTimer = null;
-        this.pendingComparableSnapshot = null;
-      }
+      if (this.dirtyVersion === flushVersion) this.dirty = false;
+      this.flushInFlight = false;
       return;
     }
 
-    this.pendingComparableSnapshot = comparable;
-    if (this.pushTimer) {
-      clearTimeout(this.pushTimer);
-      this.pushTimer = null;
+    try {
+      await this.flushSnapshot(comparable, snapshot);
+      if (this.dirtyVersion === flushVersion) this.dirty = false;
+      this.clearRetryTimer();
+    } catch {
+      this.dirty = true;
+      this.scheduleRetryTimer();
+    } finally {
+      this.flushInFlight = false;
+      if (this.dirty && this.dirtyVersion !== flushVersion) this.schedulePushTimer();
     }
-
-    if (immediate) {
-      void this.flushSnapshot(comparable, snapshot);
-      return;
-    }
-
-    this.pushTimer = setTimeout(() => {
-      this.pushTimer = null;
-      void this.flushSnapshot(this.pendingComparableSnapshot ?? comparable, this.getSnapshot());
-    }, this.debounceMs);
   }
 
   private async flushSnapshot(comparable: string, snapshot: WatchApplicationContext): Promise<void> {
@@ -423,18 +496,10 @@ export class WatchProjectionStore {
       ...snapshot,
       generatedAt: emittedAt,
       apiKey: this.resolveApiKey(),
-      servers: cloneServerRows(this.servers),
-      sessions: this.buildSessions(),
     };
-    try {
-      await this.syncSnapshotFn(payload);
-      this.generatedAt = emittedAt;
-      this.lastComparableSnapshot = comparable;
-      this.pendingComparableSnapshot = null;
-    } catch {
-      // Best-effort snapshot delivery. Leave lastComparableSnapshot unchanged so
-      // a later state change can retry.
-    }
+    await this.syncSnapshotFn(payload);
+    this.generatedAt = emittedAt;
+    this.lastComparableSnapshot = comparable;
   }
 
   private upsertServer(server: WatchServerRow): void {
