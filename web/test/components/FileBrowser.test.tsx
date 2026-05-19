@@ -277,7 +277,7 @@ describe('FileBrowser', () => {
     render(
       <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="~/projects" onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
-    expect(fsListDir).toHaveBeenCalledWith('~/projects', false, false);
+    expect(fsListDir).toHaveBeenCalledWith('~/projects', false, true);
   });
 
   it('does NOT include files for dir-only mode', () => {
@@ -290,6 +290,20 @@ describe('FileBrowser', () => {
     const { ws, getIncludeFiles } = makeWsFactory();
     render(<FileBrowser ws={ws} mode="file-multi" layout="panel" onConfirm={vi.fn()} />);
     expect(getIncludeFiles()).toBe(true);
+  });
+
+  it('shows hidden files by default and renders distinct create buttons', () => {
+    const { ws, fsListDir } = makeWsFactory();
+    const { getByTitle } = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />,
+    );
+
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, true);
+    expect(getByTitle('Hidden').querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(true);
+    expect(getByTitle('New file').querySelector('.fb-create-icon-file')).not.toBeNull();
+    expect(getByTitle('New folder').querySelector('.fb-create-icon-folder')).not.toBeNull();
+    expect(getByTitle('New file').querySelector('.fb-create-plus')?.textContent).toBe('+');
+    expect(getByTitle('New folder').querySelector('.fb-create-plus')?.textContent).toBe('+');
   });
 
   // ── Tree rendering ─────────────────────────────────────────────────────
@@ -313,7 +327,7 @@ describe('FileBrowser', () => {
 
   it('renders cached root entries immediately before refreshing live data', () => {
     localStorage.setItem(
-      'rcc_fb_snapshot_v1:local:dirs:visible:/home/user',
+      'rcc_fb_snapshot_v1:local:dirs:hidden:/home/user',
       JSON.stringify({
         savedAt: Date.now(),
         currentLabel: '/home/user',
@@ -330,7 +344,7 @@ describe('FileBrowser', () => {
 
     expect(getByText('projects')).toBeDefined();
     expect(getByText('documents')).toBeDefined();
-    expect(fsListDir).toHaveBeenCalledWith('/home/user', false, false);
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', false, true);
   });
 
   it('keeps the initial list request lightweight even when downloads are enabled', () => {
@@ -346,7 +360,7 @@ describe('FileBrowser', () => {
       />,
     );
 
-    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, false);
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, true);
   });
 
   it('uses entry.path from a Windows drive root listing', async () => {
@@ -500,7 +514,7 @@ describe('FileBrowser', () => {
       sendMsg({ type: 'fs.mkdir_response', requestId: 'mock-mkdir-id', path: '/home/user/newdir', resolvedPath: '/home/user/newdir', status: 'ok' } as any);
     });
 
-    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, false);
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, true);
   });
 
   it('creates a new file, refreshes the parent directory, and opens the new file preview', async () => {
@@ -530,7 +544,7 @@ describe('FileBrowser', () => {
       sendMsg({ type: 'fs.write_response', requestId: 'mock-write-id', path: '/home/user/new-file.ts', resolvedPath: '/home/user/new-file.ts', status: 'ok', mtime: 2000 } as any);
     });
 
-    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', true, false);
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', true, true);
     expect(fsReadFile).toHaveBeenCalledWith('/home/user/new-file.ts');
   });
 

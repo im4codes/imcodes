@@ -2164,11 +2164,15 @@ body {
 .fb-nav-hidden-toggle { display: flex; align-items: center; gap: 3px; color: #475569; font-size: 11px; cursor: pointer; flex-shrink: 0; user-select: none; }
 .fb-nav-hidden-toggle:hover { color: #94a3b8; }
 .fb-nav-hidden-toggle input { cursor: pointer; accent-color: #6366f1; }
-.fb-create-btn { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 20px; background: #111827; border: 1px solid #334155; color: #94a3b8; font-size: 13px; cursor: pointer; border-radius: 5px; flex-shrink: 0; line-height: 1; }
-.fb-create-btn::before { content: ""; position: absolute; left: 4px; top: 4px; width: 8px; height: 10px; border: 1px solid currentColor; border-radius: 1px; opacity: 0.55; }
-.fb-create-folder-btn::before { top: 6px; width: 10px; height: 7px; border-radius: 2px; }
-.fb-create-folder-btn::after { content: ""; position: absolute; left: 4px; top: 4px; width: 6px; height: 3px; border-radius: 2px 2px 0 0; background: currentColor; opacity: 0.45; }
-.fb-create-btn:hover { color: #e2e8f0; border-color: #475569; background: #172033; }
+.fb-create-btn { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 22px; background: #111827; border: 1px solid #334155; cursor: pointer; border-radius: 5px; flex-shrink: 0; line-height: 1; overflow: visible; }
+.fb-create-icon { position: relative; display: block; flex-shrink: 0; }
+.fb-create-icon-file { width: 11px; height: 14px; border: 1px solid #7dd3fc; border-radius: 2px; background: linear-gradient(135deg, #38bdf8 0%, #0ea5e9 100%); box-shadow: inset 0 -3px 0 rgba(3, 105, 161, 0.35); }
+.fb-create-icon-file::after { content: ""; position: absolute; right: -1px; top: -1px; width: 5px; height: 5px; background: #bae6fd; clip-path: polygon(0 0, 100% 100%, 100% 0); border-radius: 0 1px 0 0; }
+.fb-create-icon-folder { width: 15px; height: 11px; margin-top: 2px; border: 1px solid #fbbf24; border-radius: 3px; background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%); box-shadow: inset 0 -3px 0 rgba(146, 64, 14, 0.3); }
+.fb-create-icon-folder::before { content: ""; position: absolute; left: 1px; top: -5px; width: 8px; height: 5px; border: 1px solid #fbbf24; border-bottom: 0; border-radius: 3px 3px 0 0; background: #fde68a; }
+.fb-create-plus { position: absolute; right: -2px; top: -4px; display: inline-flex; align-items: center; justify-content: center; width: 11px; height: 11px; border-radius: 999px; background: #22c55e; color: #052e16; border: 1px solid #86efac; font-size: 10px; font-weight: 800; line-height: 1; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35); }
+.fb-create-btn:hover { border-color: #64748b; background: #172033; }
+.fb-create-btn:hover .fb-create-plus { background: #4ade80; }
 .fb-create-btn:active { transform: translateY(1px); }
 .fb-new-folder-bar { display: flex; gap: 6px; padding: 4px 12px; align-items: center; }
 .fb-new-folder-bar input { flex: 1; background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-family: inherit; }

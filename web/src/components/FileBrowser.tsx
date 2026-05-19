@@ -361,6 +361,8 @@ function previewScrollKey(path: string, mode: PreviewScrollMode): string {
  *  working after the shared-changes cache moved to `git-status-store.ts`. */
 export const __resetFileBrowserSharedChangesForTests = __resetSharedChangesForTests;
 
+const DEFAULT_SHOW_HIDDEN_FILES = true;
+
 type NewEntryKind = 'file' | 'folder';
 
 export function FileBrowser({
@@ -390,7 +392,7 @@ export function FileBrowser({
   const isMulti = mode === 'file-multi';
 
   const startPath = initialPath || '~';
-  const initialTreeSnapshot = loadFileBrowserSnapshot(startPath, includeFiles, false, serverId);
+  const initialTreeSnapshot = loadFileBrowserSnapshot(startPath, includeFiles, DEFAULT_SHOW_HIDDEN_FILES, serverId);
   const [data, setData] = useState<FsNode[]>([
     {
       id: startPath,
@@ -404,7 +406,7 @@ export function FileBrowser({
   );
   const [currentLabel, setCurrentLabel] = useState(initialTreeSnapshot?.currentLabel ?? startPath);
   const [error, setError] = useState<string | null>(null);
-  const [showHidden, setShowHidden] = useState(false);
+  const [showHidden, setShowHidden] = useState(DEFAULT_SHOW_HIDDEN_FILES);
   const [preview, setPreview] = useState<FileBrowserPreviewState>(() => initialPreview ?? { status: 'idle' });
   const previewRef = useRef<FileBrowserPreviewState>(preview);
   useEffect(() => { previewRef.current = preview; }, [preview]);
@@ -580,7 +582,7 @@ export function FileBrowser({
       // Keep the initial directory list lightweight. The tree currently only
       // renders names/dir flags, so per-file metadata (size/mime/downloadId)
       // just adds avoidable stat work on first open, especially on mobile.
-      requestId = ws.fsListDir(nodePath, includeFiles, false);
+      requestId = ws.fsListDir(nodePath, includeFiles, showHidden);
     } catch {
       setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
       return;
@@ -602,7 +604,7 @@ export function FileBrowser({
       }
     }, REQUEST_TIMEOUT_MS);
     timersRef.current.set(requestId, timer);
-  }, [includeFiles, serverId, t, ws]);
+  }, [includeFiles, showHidden, t, ws]);
 
   // Listen for fs.ls_response and fs.read_response
   // IMPORTANT: Every setState call is guarded by mountedRef to prevent crashes
@@ -1649,14 +1651,20 @@ export function FileBrowser({
           title={t('chat.new_file')}
           aria-label={t('chat.new_file')}
           onClick={() => { setNewEntry({ kind: 'file', parentPath: currentLabel }); setNewEntryName(''); }}
-        >＋</button>
+        >
+          <span class="fb-create-icon fb-create-icon-file" aria-hidden="true" />
+          <span class="fb-create-plus" aria-hidden="true">+</span>
+        </button>
       )}
       <button
         class="fb-create-btn fb-create-folder-btn"
         title={t('chat.new_folder')}
         aria-label={t('chat.new_folder')}
         onClick={() => { setNewEntry({ kind: 'folder', parentPath: currentLabel }); setNewEntryName(''); }}
-      >＋</button>
+      >
+        <span class="fb-create-icon fb-create-icon-folder" aria-hidden="true" />
+        <span class="fb-create-plus" aria-hidden="true">+</span>
+      </button>
     </div>
   );
 
