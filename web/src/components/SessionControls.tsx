@@ -237,6 +237,63 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
     return [];
   }
 }
+
+function appendStoredComposerAttachment(storageKey: string, attachment: ComposerAttachment): ComposerAttachment[] {
+  const current = parseStoredComposerAttachments(window.sessionStorage.getItem(storageKey));
+  const next = renumberAttachments([...current, attachment]);
+  window.sessionStorage.setItem(storageKey, JSON.stringify(next));
+  return next;
+}
+
+type ComposerUploadSnapshot = {
+  uploading: boolean;
+  progress: number;
+  error: string | null;
+};
+
+type ComposerUploadEntry = {
+  snapshot: ComposerUploadSnapshot;
+  listeners: Set<(snapshot: ComposerUploadSnapshot) => void>;
+};
+
+const DEFAULT_COMPOSER_UPLOAD_STATE: ComposerUploadSnapshot = {
+  uploading: false,
+  progress: 0,
+  error: null,
+};
+const composerUploadStore = new Map<string, ComposerUploadEntry>();
+
+function getComposerUploadEntry(key: string): ComposerUploadEntry {
+  let entry = composerUploadStore.get(key);
+  if (!entry) {
+    entry = { snapshot: { ...DEFAULT_COMPOSER_UPLOAD_STATE }, listeners: new Set() };
+    composerUploadStore.set(key, entry);
+  }
+  return entry;
+}
+
+function getComposerUploadSnapshot(key: string): ComposerUploadSnapshot {
+  return { ...getComposerUploadEntry(key).snapshot };
+}
+
+function updateComposerUploadSnapshot(key: string, patch: Partial<ComposerUploadSnapshot>): void {
+  const entry = getComposerUploadEntry(key);
+  entry.snapshot = { ...entry.snapshot, ...patch };
+  const next = { ...entry.snapshot };
+  for (const listener of entry.listeners) listener(next);
+}
+
+function subscribeComposerUploadSnapshot(key: string, listener: (snapshot: ComposerUploadSnapshot) => void): () => void {
+  const entry = getComposerUploadEntry(key);
+  entry.listeners.add(listener);
+  listener({ ...entry.snapshot });
+  return () => {
+    entry.listeners.delete(listener);
+    if (entry.listeners.size === 0 && !entry.snapshot.uploading && !entry.snapshot.error) {
+      composerUploadStore.delete(key);
+    }
+  };
+}
 type CodexModelChoice = string;
 type QwenModelChoice = string;
 type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainstorm>discuss>plan' | typeof P2P_CONFIG_MODE
@@ -666,11 +723,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const draftRef = useRef('');      // saved unsent text while navigating
   const imeComposingRef = useRef(false);
   const attachmentDraftRef = useRef<ComposerAttachment[]>([]);
+  const composerDraftScope = buildComposerDraftScope(activeSession, subSessionId);
+  const draftKey = composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
+  const attachmentDraftKey = composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
+  const attachmentDraftKeyRef = useRef<string | null>(attachmentDraftKey);
+  attachmentDraftKeyRef.current = attachmentDraftKey;
+  const mountedRef = useRef(true);
+  const composerUploadKey = composerDraftScope ? `composer:${composerDraftScope}` : 'composer:global';
   // File upload state
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [uploading, setUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
-  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadSnapshot, setUploadSnapshot] = useState(() => getComposerUploadSnapshot(composerUploadKey));
+  const uploading = uploadSnapshot.uploading;
+  const uploadProgress = uploadSnapshot.progress;
+  const uploadError = uploadSnapshot.error;
   const [sendWarning, setSendWarning] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -691,6 +756,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return () => {
       el.removeEventListener('compositionstart', handleCompositionStart);
       el.removeEventListener('compositionend', handleCompositionEnd);
+    };
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
     };
   }, []);
 
@@ -729,9 +801,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, []);
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
-  const composerDraftScope = buildComposerDraftScope(activeSession, subSessionId);
-  const draftKey = composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
-  const attachmentDraftKey = composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
   const [hydratedAttachmentDraftKey, setHydratedAttachmentDraftKey] = useState<string | null>(null);
   useEffect(() => {
     if (!draftKey || !divRef.current) return;
@@ -769,6 +838,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       /* ignore */
     }
   }, [attachmentDraftKey, attachments, hydratedAttachmentDraftKey]);
+
+  useEffect(() => subscribeComposerUploadSnapshot(composerUploadKey, setUploadSnapshot), [composerUploadKey]);
 
   useEffect(() => () => {
     if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);
@@ -2308,38 +2379,43 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const uploadAttachmentFiles = useCallback(async (files: readonly File[]): Promise<boolean> => {
     if (files.length === 0 || !serverId) return false;
-    setUploading(true);
-    setUploadProgress(0);
-    setUploadError(null);
+    const uploadKey = composerUploadKey;
+    const uploadAttachmentDraftKey = attachmentDraftKey;
+    updateComposerUploadSnapshot(uploadKey, { uploading: true, progress: 0, error: null });
     let uploadedAny = false;
     for (const file of files) {
       try {
-        const result = await uploadFile(serverId, file, (pct) => setUploadProgress(pct));
+        const result = await uploadFile(serverId, file, (pct) => updateComposerUploadSnapshot(uploadKey, { progress: pct }));
         if (result.attachment?.daemonPath) {
           uploadedAny = true;
-          // R3 v2 PR-ρ — Assign the next sequential `seq` so the badge
-          // and the text-prepend reference (#N) match the upload order.
-          setAttachments((prev) => [
-            ...prev,
-            { path: result.attachment!.daemonPath, name: file.name, seq: prev.length + 1 },
-          ]);
+          const attachment = { path: result.attachment.daemonPath, name: file.name, seq: 0 };
+          if (uploadAttachmentDraftKey) {
+            const next = appendStoredComposerAttachment(uploadAttachmentDraftKey, attachment);
+            if (mountedRef.current && attachmentDraftKeyRef.current === uploadAttachmentDraftKey) {
+              setAttachments(next);
+            }
+          } else {
+            setAttachments((prev) => renumberAttachments([...prev, attachment]));
+          }
         }
       } catch (err) {
         console.error('[upload] failed:', err);
         const body = err instanceof Error ? err.message : String(err);
+        let errorMessage: string;
         if (body.includes('daemon_offline')) {
-          setUploadError(t('upload.daemon_offline'));
+          errorMessage = t('upload.daemon_offline');
         } else if (body.includes('file_too_large')) {
-          setUploadError(t('upload.file_too_large', { max: MAX_UPLOAD_SIZE_MB }));
+          errorMessage = t('upload.file_too_large', { max: MAX_UPLOAD_SIZE_MB });
         } else {
-          setUploadError(t('upload.upload_failed'));
+          errorMessage = t('upload.upload_failed');
         }
-        setTimeout(() => setUploadError(null), 5000);
+        updateComposerUploadSnapshot(uploadKey, { error: errorMessage });
+        setTimeout(() => updateComposerUploadSnapshot(uploadKey, { error: null }), 5000);
       }
     }
-    setUploading(false);
+    updateComposerUploadSnapshot(uploadKey, { uploading: false, progress: uploadedAny ? 100 : 0 });
     return uploadedAny;
-  }, [serverId, t]);
+  }, [attachmentDraftKey, composerUploadKey, serverId, t]);
 
   const handleFileUpload = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;

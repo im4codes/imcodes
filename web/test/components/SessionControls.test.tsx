@@ -3577,6 +3577,61 @@ afterEach(() => {
     });
   });
 
+  it('keeps an in-flight upload bound to its original composer when switching windows', async () => {
+    let resolveUpload: ((value: { attachment: { daemonPath: string } }) => void) | null = null;
+    uploadFileMock.mockImplementation(() => new Promise((resolve) => {
+      resolveUpload = resolve;
+    }));
+    const ws = makeWs();
+    const { rerender } = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_upload-1' })}
+        subSessionId="upload-1"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [new File(['large'], 'large.bin')],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_upload-2' })}
+        subSessionId="upload-2"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+    expect(document.querySelector('.attachment-badge-name')).toBeNull();
+
+    await act(async () => {
+      resolveUpload?.({ attachment: { daemonPath: '/tmp/large.bin' } });
+    });
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_upload-1' })}
+        subSessionId="upload-1"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('large.bin');
+    });
+  });
+
   it('does not clear stored attachments when another control surface mounts for the same sub-session', async () => {
     uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/shared-sub-attachment.txt' } });
     const ws = makeWs();

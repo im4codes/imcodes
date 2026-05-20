@@ -85,11 +85,32 @@ describe('file-transfer upload route', () => {
     expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
   });
 
-  it('relays a valid legacy upload with base64 content', async () => {
+  it('stages an upload for daemon HTTP fetch without relaying file bytes over WS', async () => {
+    const app = makeApp();
+    sendFileTransferRequestMock.mockImplementationOnce(async (_requestId, message) => {
+      const uploadMessage = message as { downloadUrl: string };
+      const fetchUrl = new URL(uploadMessage.downloadUrl);
+
+      const first = await app.request(`${fetchUrl.pathname}${fetchUrl.search}`);
+      await expect(first.text()).resolves.toBe('hello');
+      const retry = await app.request(`${fetchUrl.pathname}${fetchUrl.search}`);
+      await expect(retry.text()).resolves.toBe('hello');
+
+      return {
+        type: 'file.upload_done',
+        attachment: {
+          id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt',
+          source: 'upload',
+          daemonPath: '/tmp/upload.txt',
+          downloadable: true,
+        },
+      };
+    });
+
     const form = new FormData();
     form.append('file', new File(['hello'], 'hello.txt', { type: 'text/plain' }));
 
-    const res = await makeApp().request('/api/server/srv-1/upload', {
+    const res = await app.request('/api/server/srv-1/upload', {
       method: 'POST',
       headers: { Authorization: 'Bearer test' },
       body: form,
@@ -106,13 +127,14 @@ describe('file-transfer upload route', () => {
     expect(sendFileTransferRequestMock).toHaveBeenCalledWith(
       expect.any(String),
       expect.objectContaining({
-        type: 'file.upload',
+        type: 'file.upload_fetch',
         originalName: 'hello.txt',
         mime: 'text/plain',
         size: 5,
-        content: Buffer.from('hello').toString('base64'),
+        downloadUrl: expect.stringContaining('/api/server/srv-1/upload-staged/'),
       }),
       FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS,
     );
+    expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).not.toHaveProperty('content');
   });
 });

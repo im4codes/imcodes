@@ -135,6 +135,7 @@ describe('handleWebCommand: malformed inputs do not crash', () => {
       'timeline.history_request',
       'chat.subscribe',
       'file.upload',
+      'file.upload_fetch',
       'file.download',
     ];
     for (const type of types) {

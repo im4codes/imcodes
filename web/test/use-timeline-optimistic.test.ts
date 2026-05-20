@@ -48,6 +48,17 @@ const AUTO_RETRY_EXHAUSTION_MS = 6_500;
 
 type HookRef = UseTimelineResult | null;
 
+async function cleanupRenderedTimeline() {
+  cleanup();
+  // Preact schedules passive hook cleanup through requestAnimationFrame plus
+  // a timeout. Drain that scheduler while fake timers and jsdom globals are
+  // still alive; otherwise root workspace runs can report a late
+  // cancelAnimationFrame ReferenceError after the environment has torn down.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(50);
+  });
+}
+
 function captureHookRef(ref: { current: HookRef }, handlerBox: { fn: ((msg: ServerMessage) => void) | null }) {
   const ws: WsClient = {
     connected: true,
@@ -85,7 +96,8 @@ describe('useTimeline optimistic send flow', () => {
     sendSessionViaHttpMock.mockRejectedValue(new Error('http unavailable in test'));
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await cleanupRenderedTimeline();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -1156,7 +1168,8 @@ describe('useTimeline dual-ack (audit 0419d1ac-1f4 / N-R2)', () => {
     sendSessionViaHttpMock.mockRejectedValue(new Error('http unavailable in test'));
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await cleanupRenderedTimeline();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });

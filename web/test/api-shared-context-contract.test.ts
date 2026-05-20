@@ -67,6 +67,7 @@ class MockXmlHttpRequest {
   send(body: unknown) {
     this.body = body;
     this.upload.onprogress?.({ lengthComputable: true, loaded: 6, total: 12 } as ProgressEvent);
+    this.upload.onprogress?.({ lengthComputable: true, loaded: 12, total: 12 } as ProgressEvent);
     this.onload?.();
   }
 }
@@ -211,7 +212,7 @@ describe('shared-context and file API contracts', () => {
     expect(browserUpload.url).toBe('https://api.example/api/server/srv-1/upload');
     expect(browserUpload.withCredentials).toBe(true);
     expect(browserUpload.headers.get('X-CSRF-Token')).toBe('csrf-token');
-    expect(progress).toEqual([50]);
+    expect(progress).toEqual([50, 95, 100]);
 
     configureApiKey('native-key');
     await uploadFile('srv-2', new File(['hello'], 'notes.txt'));

@@ -7,9 +7,14 @@ import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
 import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js';
-import type { AttachmentRef, FileUploadRequest, FileDownloadRequest } from '../../../shared/transport/file-transfer.js';
+import type { AttachmentRef, FileDownloadRequest, FileUploadFetchRequest } from '../../../shared/transport/file-transfer.js';
 import logger from '../util/logger.js';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import * as path from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
 export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -20,6 +25,7 @@ export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId:
 // use budget instead of being consumed on the first GET.
 const DOWNLOAD_TOKEN_MAX_USES = 5;
 const MULTIPART_UPLOAD_OVERHEAD_BYTES = 1024 * 1024;
+const STAGED_UPLOAD_PREFIX = 'imcodes-staged-upload-';
 const downloadTokens = new Map<string, {
   serverId: string;
   attachmentId: string;
@@ -27,6 +33,42 @@ const downloadTokens = new Map<string, {
   expiresAt: number;
   remainingUses: number;
 }>();
+const stagedUploads = new Map<string, {
+  serverId: string;
+  token: string;
+  dir: string;
+  filePath: string;
+  size: number;
+  mime?: string;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout>;
+}>();
+
+function deleteStagedUpload(uploadId: string): void {
+  const entry = stagedUploads.get(uploadId);
+  if (!entry) return;
+  stagedUploads.delete(uploadId);
+  clearTimeout(entry.timer);
+  void rm(entry.dir, { recursive: true, force: true }).catch((err) => {
+    logger.warn({ uploadId, err }, 'Failed to clean staged upload');
+  });
+}
+
+async function persistStagedUpload(file: File, filePath: string): Promise<number> {
+  await pipeline(
+    Readable.fromWeb(file.stream() as never),
+    createWriteStream(filePath),
+  );
+  const fileStat = await stat(filePath);
+  return fileStat.size;
+}
+
+function buildStagedUploadUrl(requestUrl: string, serverId: string, uploadId: string, token: string): string {
+  const url = new URL(requestUrl);
+  url.pathname = `/api/server/${encodeURIComponent(serverId)}/upload-staged/${encodeURIComponent(uploadId)}`;
+  url.search = `token=${encodeURIComponent(token)}`;
+  return url.toString();
+}
 
 // Token-auth middleware for download endpoint only — scoped to upload/download paths
 // to avoid shadowing other sub-apps mounted at the same /api/server prefix.
@@ -57,6 +99,32 @@ fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) =>
   }
   // No token — fall back to cookie/bearer auth
   return (authMiddleware as any)(c, next);
+});
+
+// ── GET /api/server/:id/upload-staged/:uploadId ─────────────────────────────
+// Token-authenticated, relay-local temporary object fetch for daemon uploads.
+// The token is reusable until expiry so daemon-side HTTP retries do not fail.
+
+fileTransferRoutes.get('/:id/upload-staged/:uploadId', async (c) => {
+  const serverId = c.req.param('id')!;
+  const uploadId = c.req.param('uploadId')!;
+  const token = c.req.query('token') ?? '';
+  const entry = stagedUploads.get(uploadId);
+  if (!entry || entry.serverId !== serverId) return c.json({ error: 'not_found' }, 404);
+  if (Date.now() > entry.expiresAt) {
+    deleteStagedUpload(uploadId);
+    return c.json({ error: 'expired' }, 410);
+  }
+  if (!token || token !== entry.token) return c.json({ error: 'forbidden' }, 403);
+
+  return new Response(Readable.toWeb(createReadStream(entry.filePath)) as ReadableStream, {
+    status: 200,
+    headers: {
+      'Content-Type': entry.mime || 'application/octet-stream',
+      'Content-Length': String(entry.size),
+      'Cache-Control': 'no-store',
+    },
+  });
 });
 
 // ── POST /api/server/:id/upload ─────────────────────────────────────────────
@@ -106,19 +174,39 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   const uploadId = randomHex(16);
   const ext = path.extname(file.name || '').replace(/[^a-zA-Z0-9.]/g, '').slice(0, 20);
   const filename = `${randomHex(16)}${ext}`;
+  const stagedDir = await mkdtemp(path.join(tmpdir(), STAGED_UPLOAD_PREFIX));
+  const stagedPath = path.join(stagedDir, filename);
+  const stagedSize = await persistStagedUpload(file, stagedPath).catch(async (err) => {
+    await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
+    throw err;
+  });
+  if (stagedSize !== file.size) {
+    await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
+    return c.json({ error: 'upload_failed', message: 'size_mismatch' }, 400);
+  }
+  const token = randomHex(32);
+  const expiresAt = Date.now() + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS;
+  const timer = setTimeout(() => deleteStagedUpload(uploadId), FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS);
+  timer.unref?.();
+  stagedUploads.set(uploadId, {
+    serverId,
+    token,
+    dir: stagedDir,
+    filePath: stagedPath,
+    size: stagedSize,
+    mime: file.type || undefined,
+    expiresAt,
+    timer,
+  });
 
-  // Read file as base64
-  const arrayBuffer = await file.arrayBuffer();
-  const content = Buffer.from(arrayBuffer).toString('base64');
-
-  const uploadMsg: FileUploadRequest = {
-    type: 'file.upload',
+  const uploadMsg: FileUploadFetchRequest = {
+    type: 'file.upload_fetch',
     uploadId,
     filename,
     originalName: file.name || undefined,
     mime: file.type || undefined,
     size: file.size,
-    content,
+    downloadUrl: buildStagedUploadUrl(c.req.url, serverId, uploadId, token),
   };
 
   try {
@@ -130,12 +218,14 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
 
     if (result.type === 'file.upload_error') {
       logger.warn({ serverId, uploadId, error: result.message }, 'Daemon upload error');
+      deleteStagedUpload(uploadId);
       return c.json({ error: 'upload_failed', message: result.message }, 500);
     }
 
     const attachment = result.attachment as AttachmentRef;
     // Server fills serverId (daemon doesn't know it)
     attachment.serverId = serverId;
+    deleteStagedUpload(uploadId);
     return c.json({ ok: true, attachment });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

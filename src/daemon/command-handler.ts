@@ -776,6 +776,7 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
 import { handleRepoCommand } from './repo-handler.js';
 import {
   handleFileUpload,
+  handleFileUploadFetch,
   handleFileDownload,
   tryCreateProjectFileHandle,
   lookupAttachment,
@@ -1580,6 +1581,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case 'file.upload':
       void handleFileUpload(cmd, serverLink);
+      break;
+    case 'file.upload_fetch':
+      void handleFileUploadFetch(cmd, serverLink);
       break;
     case 'file.download':
       void handleFileDownload(cmd, serverLink);

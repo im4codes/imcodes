@@ -59,6 +59,7 @@ describe('file-transfer local handle hardening', () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     vi.doUnmock('node:os');
     vi.doUnmock('../../shared/transport/file-transfer.js');
     vi.doUnmock('../../src/util/logger.js');
@@ -244,6 +245,66 @@ describe('file-transfer local handle hardening', () => {
       type: 'file.upload_error',
       uploadId: 'upload-size-mismatch',
       message: 'size_mismatch',
+    });
+  });
+
+  it('downloads relay-staged uploads over HTTP and registers the attachment', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const fetchMock = vi.fn().mockResolvedValue(new Response('hello', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const done = createServerLinkMock();
+
+    await transfer.handleFileUploadFetch(
+      {
+        type: 'file.upload_fetch',
+        uploadId: 'upload-fetch',
+        filename: 'safe.txt',
+        originalName: 'safe.txt',
+        mime: 'text/plain',
+        size: 5,
+        downloadUrl: 'https://relay.example/upload-staged/upload-fetch?token=reusable',
+      },
+      done.serverLink as never,
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith('https://relay.example/upload-staged/upload-fetch?token=reusable');
+    expect(done.sent[0]).toMatchObject({
+      type: 'file.upload_done',
+      uploadId: 'upload-fetch',
+      attachment: {
+        id: 'safe.txt',
+        originalName: 'safe.txt',
+        mime: 'text/plain',
+        size: 5,
+        downloadable: true,
+      },
+    });
+  });
+
+  it('retries relay-staged upload downloads with the same URL before failing', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('try again', { status: 503 }))
+      .mockResolvedValueOnce(new Response('hello', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const done = createServerLinkMock();
+
+    await transfer.handleFileUploadFetch(
+      {
+        type: 'file.upload_fetch',
+        uploadId: 'upload-fetch-retry',
+        filename: 'retry.txt',
+        size: 5,
+        downloadUrl: 'https://relay.example/upload-staged/upload-fetch-retry?token=reusable',
+      },
+      done.serverLink as never,
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(2, 'https://relay.example/upload-staged/upload-fetch-retry?token=reusable');
+    expect(done.sent[0]).toMatchObject({
+      type: 'file.upload_done',
+      uploadId: 'upload-fetch-retry',
     });
   });
 });

@@ -37,6 +37,8 @@ export const FILE_TRANSFER_LIMITS = {
   MAX_FILE_SIZE: 2 * 1024 * 1024 * 1024,
   /** Server waits this long for daemon upload ack (ms). */
   UPLOAD_TIMEOUT_MS: 300_000,
+  /** Relay-staged uploads expire after this duration (ms). */
+  STAGED_UPLOAD_TTL_MS: 10 * 60 * 1000,
   /** Server waits this long for daemon download response (ms). */
   DOWNLOAD_TIMEOUT_MS: 300_000,
   /** Temporary uploaded files are cleaned after this duration (ms). 24 hours. */
@@ -57,6 +59,16 @@ export interface FileUploadRequest {
   mime?: string;
   size: number;
   content: string; // base64
+}
+
+export interface FileUploadFetchRequest {
+  type: 'file.upload_fetch';
+  uploadId: string;
+  filename: string;
+  originalName?: string;
+  mime?: string;
+  size: number;
+  downloadUrl: string;
 }
 
 export interface FileDownloadRequest {
@@ -102,6 +114,7 @@ export type FileTransferDaemonMessage =
 
 export type FileTransferServerMessage =
   | FileUploadRequest
+  | FileUploadFetchRequest
   | FileDownloadRequest;
 
 // ── FileBrowser extensions ────────────────────────────────────────────────────

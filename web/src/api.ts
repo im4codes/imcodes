@@ -1175,6 +1175,7 @@ export async function uploadFile(
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const form = new FormData();
   form.append('file', file);
+  const pendingAckProgress = 95;
 
   // Use XHR for upload progress reporting
   return new Promise((resolve, reject) => {
@@ -1192,13 +1193,18 @@ export async function uploadFile(
 
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && onProgress) {
-        onProgress(Math.round((e.loaded / e.total) * 100));
+        const transportPct = Math.round((e.loaded / e.total) * 100);
+        onProgress(Math.min(transportPct, pendingAckProgress));
       }
     };
 
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
-        try { resolve(JSON.parse(xhr.responseText)); }
+        try {
+          const parsed = JSON.parse(xhr.responseText);
+          onProgress?.(100);
+          resolve(parsed);
+        }
         catch { reject(new ApiError(xhr.status, 'Invalid JSON response')); }
       } else {
         reject(new ApiError(xhr.status, xhr.responseText));

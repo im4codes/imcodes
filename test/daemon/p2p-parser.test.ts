@@ -94,6 +94,7 @@ vi.mock('../../src/daemon/repo-handler.js', () => ({
 
 vi.mock('../../src/daemon/file-transfer-handler.js', () => ({
   handleFileUpload: vi.fn(),
+  handleFileUploadFetch: vi.fn(),
   handleFileDownload: vi.fn(),
   initFileTransfer: vi.fn().mockResolvedValue(undefined),
   startCleanupTimer: vi.fn(),
