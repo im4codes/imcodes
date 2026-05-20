@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot } from '../../src/daemon/session-bootstrap.js';
+import {
+  buildWorkerSessionPersistBody,
+  mergeWorkerSessionSnapshot,
+  shouldPersistMainSessionToWorkerOnStartup,
+} from '../../src/daemon/session-bootstrap.js';
 
 describe('session bootstrap supervision persistence', () => {
   it('includes the resolved transportConfig supervision snapshot when persisting to the worker', () => {
@@ -38,6 +42,32 @@ describe('session bootstrap supervision persistence', () => {
         auditMode: 'audit',
       }),
     }));
+  });
+
+  it('does not push sub-sessions through the main session startup sync path', () => {
+    const main = {
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/proj',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 2,
+    } as const;
+
+    expect(shouldPersistMainSessionToWorkerOnStartup(main as any)).toBe(true);
+    expect(shouldPersistMainSessionToWorkerOnStartup({
+      ...main,
+      name: 'deck_sub_abc123',
+      parentSession: 'deck_proj_brain',
+    } as any)).toBe(false);
+    expect(shouldPersistMainSessionToWorkerOnStartup({
+      ...main,
+      state: 'stopped',
+    } as any)).toBe(false);
   });
 
   it('preserves an existing session supervision snapshot when later worker defaults change elsewhere', () => {

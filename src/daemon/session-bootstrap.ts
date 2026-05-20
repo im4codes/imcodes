@@ -1,4 +1,5 @@
 import type { SessionRecord } from '../store/session-store.js';
+import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 
 export interface WorkerSessionSnapshot {
   name: string;
@@ -50,6 +51,20 @@ export function buildWorkerSessionPersistBody(record: SessionRecord): WorkerSess
     effort: record.effort ?? null,
     transportConfig: record.transportConfig ?? null,
   };
+}
+
+export function shouldPersistMainSessionToWorkerOnStartup(record: SessionRecord): boolean {
+  if (record.state === 'stopped') return false;
+  // Sub-sessions are synced through `subsession.sync` / `/sub-sessions`.
+  // Pushing them to `/sessions/:name` returns 400 and used to serially slow
+  // daemon startup before the local runtime became fully ready.
+  if (record.name.startsWith('deck_sub_')) return false;
+  return !isKnownTestSessionLike({
+    name: record.name,
+    projectName: record.projectName,
+    projectDir: record.projectDir,
+    parentSession: record.parentSession,
+  });
 }
 
 export function mergeWorkerSessionSnapshot(

@@ -30,7 +30,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { pickReadableSessionDisplay } from '../../shared/session-display.js';
-import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot } from './session-bootstrap.js';
+import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot, shouldPersistMainSessionToWorkerOnStartup } from './session-bootstrap.js';
 import { replicatePendingProcessedContext } from '../context/processed-context-replication.js';
 import { configureSharedContextRuntime } from '../context/shared-context-runtime.js';
 import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runtime-config.js';
@@ -261,6 +261,15 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
   } catch (e) {
     logger.warn({ err: e }, 'syncSessionsFromWorker: fetch failed');
   }
+}
+
+function scheduleDaemonStartupBackgroundTask(label: string, task: () => Promise<void>, delayMs = 0): void {
+  const timer = setTimeout(() => {
+    void task().catch((err) => {
+      logger.warn({ err }, `${label} failed`);
+    });
+  }, delayMs);
+  timer.unref?.();
 }
 
 /** Write PID file so restart can reliably find the old process. */
@@ -596,30 +605,42 @@ export async function startup(): Promise<DaemonContext> {
     }
   });
 
-  for (const session of listSessions()) {
-    // Per-session try/catch — commit 42dfabec changed `readPreferred` to
-    // throw `TimelinePreferredReadError` when the SQLite projection is
-    // unavailable instead of returning `[]`. An unhandled throw here would
-    // abort the whole startup backfill loop after the first bad session.
-    // Fall back to the JSONL `read()` path (same semantics, slower) so a
-    // single mid-init projection still lets every session bootstrap.
-    let history: Awaited<ReturnType<typeof timelineStore.readPreferred>> = [];
-    try {
-      history = await timelineStore.readPreferred(session.name, { limit: 100 });
-    } catch (err) {
-      logger.warn({ err, session: session.name }, 'Startup backfill: readPreferred failed, falling back to JSONL');
+  const backfillLiveContextFromTimeline = async (): Promise<void> => {
+    const startedAt = Date.now();
+    let sessionsSeen = 0;
+    let sessionsBackfilled = 0;
+    for (const session of listSessions()) {
+      sessionsSeen += 1;
+      // Per-session try/catch — commit 42dfabec changed `readPreferred` to
+      // throw `TimelinePreferredReadError` when the SQLite projection is
+      // unavailable instead of returning `[]`. An unhandled throw here would
+      // abort the whole startup backfill loop after the first bad session.
+      // Fall back to the JSONL `read()` path (same semantics, slower) so a
+      // single mid-init projection still lets every session bootstrap.
+      let history: Awaited<ReturnType<typeof timelineStore.readPreferred>> = [];
       try {
-        history = timelineStore.read(session.name, { limit: 100 });
-      } catch (fallbackErr) {
-        logger.warn({ err: fallbackErr, session: session.name }, 'Startup backfill: JSONL fallback also failed; skipping session');
-        continue;
+        history = await timelineStore.readPreferred(session.name, { limit: 100 });
+      } catch (err) {
+        logger.warn({ err, session: session.name }, 'Startup backfill: readPreferred failed, falling back to JSONL');
+        try {
+          history = timelineStore.read(session.name, { limit: 100 });
+        } catch (fallbackErr) {
+          logger.warn({ err: fallbackErr, session: session.name }, 'Startup backfill: JSONL fallback also failed; skipping session');
+          continue;
+        }
       }
+      if (history.length === 0) continue;
+      sessionsBackfilled += 1;
+      void liveContextIngestion.backfillSessionFromEvents(session.name, history).catch((err) => {
+        logger.warn({ err, session: session.name }, 'Shared-context timeline backfill failed');
+      });
     }
-    if (history.length === 0) continue;
-    void liveContextIngestion.backfillSessionFromEvents(session.name, history).catch((err) => {
-      logger.warn({ err, session: session.name }, 'Shared-context timeline backfill failed');
-    });
-  }
+    logger.info(
+      { sessionsSeen, sessionsBackfilled, elapsedMs: Date.now() - startedAt },
+      'Shared-context startup timeline backfill completed (background)',
+    );
+  };
+  let pushLocalSessionsToWorkerOnStartup: (() => Promise<void>) | null = null;
 
   // Wire session persist → D1 via Worker API
   if (creds) {
@@ -648,16 +669,11 @@ export async function startup(): Promise<DaemonContext> {
     //
     // Worker DB sync is a remote-visibility concern, not a local-runtime
     // dependency. It must NEVER block transport runtime recovery.
-    const localSessions = listSessions();
-    const nonStoppedCount = localSessions.filter((s) => s.state !== 'stopped').length;
-    let pushFailures = 0;
-    for (const s of localSessions) {
-      if (s.state !== 'stopped' && !isKnownTestSessionLike({
-        name: s.name,
-        projectName: s.projectName,
-        projectDir: s.projectDir,
-        parentSession: s.parentSession,
-      })) {
+    pushLocalSessionsToWorkerOnStartup = async (): Promise<void> => {
+      const localSessions = listSessions();
+      const persistableSessions = localSessions.filter(shouldPersistMainSessionToWorkerOnStartup);
+      let pushFailures = 0;
+      for (const s of persistableSessions) {
         try {
           await persistSessionToWorker(workerUrl!, serverId, token, s.name, s);
         } catch (err) {
@@ -668,13 +684,13 @@ export async function startup(): Promise<DaemonContext> {
           );
         }
       }
-    }
-    if (nonStoppedCount > 0) {
-      logger.info(
-        { count: nonStoppedCount, failures: pushFailures },
-        'Pushed local sessions to server DB on startup',
-      );
-    }
+      if (persistableSessions.length > 0) {
+        logger.info(
+          { count: persistableSessions.length, skipped: localSessions.length - persistableSessions.length, failures: pushFailures },
+          'Pushed local main sessions to server DB on startup (background)',
+        );
+      }
+    };
     void replicatePendingProcessedContext({ workerUrl: workerUrl!, serverId, token }).catch((err) => {
       logger.warn({ err }, 'Initial processed-context replication failed');
     });
@@ -870,6 +886,10 @@ export async function startup(): Promise<DaemonContext> {
   logger.info('Daemon started');
 
   void autoReconnectProviders();
+  scheduleDaemonStartupBackgroundTask('shared-context startup timeline backfill', backfillLiveContextFromTimeline, 2_000);
+  if (pushLocalSessionsToWorkerOnStartup) {
+    scheduleDaemonStartupBackgroundTask('startup local main session DB push', pushLocalSessionsToWorkerOnStartup, 4_000);
+  }
 
   return ctx;
 }
