@@ -370,11 +370,15 @@ export class ServerLink {
       try {
         const msg = JSON.parse(event.data);
         if (msg?.type === 'heartbeat_ack') {
+          // Heartbeat acks are the CLI/status proof-of-life source. They must
+          // not be throttled behind a just-written heartbeat-sent record, or
+          // the runtime file can report a false stale link while acks are
+          // arriving normally.
           this.recordRuntimeLinkStatus({
             state: 'connected',
             lastHeartbeatAckAt: this.lastPong,
             clearError: true,
-          }, 10_000);
+          });
         }
         for (const h of this.handlers) h(msg);
       } catch {

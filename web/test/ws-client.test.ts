@@ -991,6 +991,60 @@ describe('WsClient', () => {
       vi.useRealTimers();
     });
 
+    it('supports live-only passive transport subscriptions without history replay', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      client.subscribeTransportSession('passive-session', { replayHistory: false });
+      expect(JSON.parse(firstWs.send.mock.calls.at(-1)[0] as string)).toEqual({
+        type: 'chat.subscribe',
+        sessionId: 'passive-session',
+        forceHistory: false,
+      });
+
+      firstWs.send.mockClear();
+      firstWs.emit('close');
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(0);
+      const secondWs = lastWs!;
+      secondWs.emit('open');
+
+      expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"forceHistory":false'));
+      expect(secondWs.send).not.toHaveBeenCalledWith(expect.stringContaining('"forceHistory":true'));
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('can upgrade a live-only transport subscription to request history once', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const socket = lastWs!;
+
+      client.subscribeTransportSession('passive-session', { replayHistory: false });
+      socket.send.mockClear();
+
+      client.subscribeTransportSession('passive-session');
+      expect(JSON.parse(socket.send.mock.calls.at(-1)[0] as string)).toEqual({
+        type: 'chat.subscribe',
+        sessionId: 'passive-session',
+        forceHistory: true,
+      });
+
+      socket.send.mockClear();
+      client.subscribeTransportSession('passive-session', { replayHistory: false });
+      expect(socket.send).toHaveBeenCalledWith(expect.stringContaining('"forceHistory":false'));
+      expect(socket.send).not.toHaveBeenCalledWith(expect.stringContaining('"forceHistory":true'));
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
     it('respondTransportApproval sends chat.approval_response', async () => {
       const client = await connectClient();
       lastWs!.send.mockClear();

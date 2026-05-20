@@ -2641,7 +2641,7 @@ export function App() {
     if (!ws?.connected || sessions.length === 0) return;
     const names = listGlobalTransportSubscriptionNames(sessions);
     for (const name of names) {
-      try { ws.subscribeTransportSession(name); } catch { /* ignore */ }
+      try { ws.subscribeTransportSession(name, { replayHistory: false }); } catch { /* ignore */ }
     }
     return () => {
       for (const name of names) {
@@ -2685,7 +2685,7 @@ export function App() {
     if (!ws?.connected || subSessions.length === 0) return;
     const names = listGlobalTransportSubSessionNames(subSessions);
     for (const name of names) {
-      try { ws.subscribeTransportSession(name); } catch { /* ignore */ }
+      try { ws.subscribeTransportSession(name, { replayHistory: false }); } catch { /* ignore */ }
     }
     return () => {
       for (const name of names) {

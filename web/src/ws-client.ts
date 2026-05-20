@@ -362,6 +362,8 @@ export class WsClient {
 
   /** Desired transport-chat subscriptions per session. Replayed on browser reconnect. */
   private transportSubscriptions = new Set<string>();
+  /** Whether replaying transport chat history is allowed for a desired subscription. */
+  private transportSubscriptionReplayHistory = new Map<string, boolean>();
   /** Transport-chat subscriptions confirmed sent on the current browser WS. */
   private sentTransportSubscriptions = new Set<string>();
 
@@ -716,7 +718,8 @@ export class WsClient {
     }
 
     for (const sessionId of this.transportSubscriptions) {
-      if (!this.sendTransportSubscribe(sessionId, true)) break;
+      const replayHistory = this.transportSubscriptionReplayHistory.get(sessionId) !== false;
+      if (!this.sendTransportSubscribe(sessionId, replayHistory)) break;
     }
   }
 
@@ -739,7 +742,8 @@ export class WsClient {
     }
     for (const sessionId of this.transportSubscriptions) {
       const wasSent = this.sentTransportSubscriptions.has(sessionId);
-      if (!this.sendTransportSubscribe(sessionId, !wasSent)) break;
+      const replayHistory = this.transportSubscriptionReplayHistory.get(sessionId) !== false;
+      if (!this.sendTransportSubscribe(sessionId, replayHistory && !wasSent)) break;
     }
   }
 
@@ -769,14 +773,32 @@ export class WsClient {
     }
   }
 
-  /** Subscribe to transport chat events for a session (history replay + live approval/tool updates). */
-  subscribeTransportSession(sessionId: string): void {
+  /** Subscribe to transport chat events for a session.
+   *
+   * `replayHistory:false` is for global/passive subscriptions that only need
+   * live deltas. Without it, opening a page with many SDK-backed sessions asks
+   * the daemon to replay every session's `chat.history` at once, which can
+   * stall heartbeat proof and make the UI look disconnected.
+   */
+  subscribeTransportSession(sessionId: string, options?: { replayHistory?: boolean }): void {
     if (!sessionId) return;
     this.setP2pWorkflowRequestScope({ sessionName: sessionId });
     const wasDesired = this.transportSubscriptions.has(sessionId);
+    const wasReplayHistoryAllowed = this.transportSubscriptionReplayHistory.get(sessionId) !== false;
+    const replayHistory = options?.replayHistory !== false;
     this.transportSubscriptions.add(sessionId);
+    // A later explicit history-capable subscription may upgrade a passive
+    // live-only hold, but a passive hold must not downgrade an already-active
+    // history-capable subscription.
+    if (replayHistory || !wasDesired) {
+      this.transportSubscriptionReplayHistory.set(sessionId, replayHistory);
+    }
     if (!this._connected) return;
-    this.sendTransportSubscribe(sessionId, !wasDesired || !this.sentTransportSubscriptions.has(sessionId));
+    const needsHistoryUpgrade = replayHistory && !wasReplayHistoryAllowed;
+    this.sendTransportSubscribe(
+      sessionId,
+      replayHistory && (!wasDesired || !this.sentTransportSubscriptions.has(sessionId) || needsHistoryUpgrade),
+    );
   }
 
   /** Unsubscribe from transport chat events for a session. */
@@ -784,6 +806,7 @@ export class WsClient {
     if (!sessionId) return;
     const wasDesired = this.transportSubscriptions.delete(sessionId);
     const wasSent = this.sentTransportSubscriptions.has(sessionId);
+    this.transportSubscriptionReplayHistory.delete(sessionId);
     if (!wasDesired && !wasSent) return;
     if (!this._connected) return;
     if (wasSent) this.sendTransportUnsubscribe(sessionId);

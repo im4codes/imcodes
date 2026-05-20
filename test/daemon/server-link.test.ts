@@ -11,9 +11,16 @@ const MockWebSocket = vi.fn(() => mockWsInstance);
 MockWebSocket.OPEN = 1;
 vi.stubGlobal('WebSocket', MockWebSocket);
 
+vi.mock('../../src/util/daemon-status.js', () => ({
+  recordDaemonServerLinkStatus: vi.fn(),
+}));
+
 import { ServerLink, __setServerLinkDataPlaneQueueConfigForTests } from '../../src/daemon/server-link.js';
+import { recordDaemonServerLinkStatus } from '../../src/util/daemon-status.js';
 import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_EVENT } from '../../shared/transport-events.js';
+
+const recordDaemonServerLinkStatusMock = vi.mocked(recordDaemonServerLinkStatus);
 
 describe('ServerLink', () => {
   let link: ServerLink;
@@ -142,6 +149,24 @@ describe('ServerLink', () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(mockWsInstance.send).toHaveBeenCalledTimes(2);
     expect(JSON.parse(mockWsInstance.send.mock.calls[1][0] as string).type).toBe('chat.history');
+  });
+
+  it('records heartbeat ack proof even when runtime status was just written', () => {
+    link.connect();
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    expect(messageHandler).toBeDefined();
+
+    const writesBeforeAck = recordDaemonServerLinkStatusMock.mock.calls.length;
+    messageHandler?.({ data: JSON.stringify({ type: 'heartbeat_ack' }) } as MessageEvent);
+
+    expect(recordDaemonServerLinkStatusMock).toHaveBeenCalledTimes(writesBeforeAck + 1);
+    expect(recordDaemonServerLinkStatusMock.mock.calls.at(-1)?.[0]).toMatchObject({
+      state: 'connected',
+      lastHeartbeatAckAt: expect.any(Number),
+      clearError: true,
+    });
   });
 
   it('accepts Blob binary messages from Node WebSocket without throwing', async () => {
