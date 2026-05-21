@@ -71,6 +71,7 @@ const QWEN_CLI_AUTH_TYPES = new Set([
   'gemini',
   'vertex-ai',
 ]);
+const QWEN_EMPTY_RESPONSE_MESSAGE = 'Qwen exited without producing a response';
 
 /** Extract `security.auth.selectedType` from a settings object if it names a
  *  qwen CLI auth type. Returns undefined when settings are absent, malformed,
@@ -161,6 +162,10 @@ function resolveQwenReasoningSetting(
 
 function isReasoningContentReplayError(message: string): boolean {
   return /reasoning_content[\s\S]*thinking mode[\s\S]*passed back/i.test(message);
+}
+
+function isEmptyResponseError(message: string): boolean {
+  return /empty response|without producing a response/i.test(message);
 }
 
 interface QwenStreamEvent {
@@ -643,7 +648,8 @@ export class QwenProvider implements TransportProvider {
       const errorCode = state.cancelled
         ? PROVIDER_ERROR_CODES.CANCELLED
         : (this.isAuthFailureMessage(messageText) ? PROVIDER_ERROR_CODES.AUTH_FAILED : PROVIDER_ERROR_CODES.PROVIDER_ERROR);
-      const recoverable = errorCode === PROVIDER_ERROR_CODES.CANCELLED;
+      const recoverable = errorCode === PROVIDER_ERROR_CODES.CANCELLED
+        || isEmptyResponseError(messageText);
       this.errorCallbacks.forEach((cb) => cb(sessionId, this.makeError(errorCode, messageText, recoverable, details)));
     };
 
@@ -907,13 +913,19 @@ export class QwenProvider implements TransportProvider {
         emitError('Cancelled');
         return;
       }
-      if (!completed && !sawError && (code === 0 || code === null)) {
+      if (!completed && !sawError && code === 0) {
         if (state.pendingFinalText) {
           emitComplete(state.pendingFinalText, state.currentMessageId ?? undefined, state.pendingFinalMetadata);
           return;
         }
+        logger.warn(
+          { provider: this.id, sessionId, code, signal, stderr: stderrBuf.trim() || undefined },
+          'Qwen process exited successfully without a terminal response',
+        );
+        recoverOrEmitProviderError(QWEN_EMPTY_RESPONSE_MESSAGE, { code, signal, stderr: stderrBuf });
+        return;
       }
-      if (!completed && !sawError && code !== 0) {
+      if (!completed && !sawError) {
         if (allowResumeFallback && state.started && /No saved session found with ID/i.test(stderrBuf)) {
           state.started = false;
           state.qwenConversationId = randomUUID();
@@ -968,7 +980,7 @@ export class QwenProvider implements TransportProvider {
   }
 
   private isRetryableTransientError(message: string): boolean {
-    return /premature close|fetch failed|connection error|socket hang up|econnreset|etimedout|network error/i.test(message);
+    return /premature close|empty response|without producing a response|fetch failed|connection error|socket hang up|econnreset|etimedout|network error/i.test(message);
   }
 
   private isAuthFailureMessage(message: string): boolean {

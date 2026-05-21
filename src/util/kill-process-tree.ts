@@ -90,6 +90,33 @@ export interface KillProcessTreeOptions {
   gracefulMs?: number;
 }
 
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForChildClose(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode != null || child.signalCode != null) return true;
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (closed: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off('close', onClose);
+      resolve(closed);
+    };
+    const onClose = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    timer.unref?.();
+    child.once('close', onClose);
+  });
+}
+
 /**
  * Tree-kill a process and all of its descendants.
  *
@@ -122,13 +149,11 @@ export async function killProcessTree(
     // No pid means we can't walk `ps` — but if we were given a ChildProcess
     // we can still ask it to terminate via its own `kill()` method. This
     // keeps mock-based tests (where child.pid is undefined) working.
-    if (child && !child.killed) {
+    if (child) {
+      const closedPromise = waitForChildClose(child, opts?.gracefulMs ?? 1_000);
       try { child.kill('SIGTERM'); } catch { /* already gone */ }
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, opts?.gracefulMs ?? 1_000);
-        timer.unref?.();
-      });
-      if (!child.killed) {
+      const closed = await closedPromise;
+      if (!closed) {
         try { child.kill('SIGKILL'); } catch { /* gone */ }
       }
     }
@@ -168,15 +193,17 @@ export async function killProcessTree(
 
   // SIGKILL sweep.
   for (const pid of orderedDescendants) {
-    try { process.kill(pid, 0); } catch { continue; } // already reaped
+    if (!pidAlive(pid)) continue;
     try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
   }
-  if (child) {
-    if (!child.killed) {
+  // `child.killed` only means "kill() was called successfully", not "the
+  // process exited". Probe the pid instead so TERM-ignoring SDK wrappers don't
+  // leave the runtime permanently busy.
+  if (pidAlive(rootPid)) {
+    if (child) {
       try { child.kill('SIGKILL'); } catch { /* gone */ }
+    } else {
+      try { process.kill(rootPid, 'SIGKILL'); } catch { /* gone */ }
     }
-  } else {
-    try { process.kill(rootPid, 0); } catch { return; }
-    try { process.kill(rootPid, 'SIGKILL'); } catch { /* gone */ }
   }
 }

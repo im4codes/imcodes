@@ -1228,6 +1228,27 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingCount).toBe(0);
   });
 
+  it('recoverable provider errors drain pending messages into the next turn', async () => {
+    runtime.send('first');
+    await flushDispatch();
+    runtime.send('queued after empty response', 'msg-q1');
+
+    mock.fireError('sess-1', {
+      code: 'PROVIDER_ERROR',
+      message: 'Qwen exited without producing a response',
+      recoverable: true,
+    });
+    await flushDispatch();
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after empty response',
+      assembledMessage: 'queued after empty response',
+    }));
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.sending).toBe(true);
+  });
+
   it('CANCELLED error → idle (not error)', () => {
     runtime.send('go');
     mock.fireError('sess-1', { code: 'CANCELLED', message: 'cancelled', recoverable: true });

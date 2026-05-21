@@ -108,7 +108,7 @@ async function flushIO(): Promise<void> {
 }
 
 async function waitForSpawnCount(count: number): Promise<void> {
-  for (let i = 0; i < 20; i += 1) {
+  for (let i = 0; i < 80; i += 1) {
     if (childProcessMock.spawn.mock.calls.length >= count) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -459,6 +459,34 @@ describe('QwenProvider', () => {
     expect(second.args).toContain('--resume');
     expect(second.args).toContain(firstSessionId);
     expect(second.args).not.toContain('--session-id');
+  });
+
+  it('turns an empty zero-exit qwen run into a recoverable terminal error when retry budget is exhausted', async () => {
+    const provider = new QwenProvider();
+    const errors: Array<{ sid: string; error: unknown }> = [];
+    provider.onError((sid, error) => errors.push({ sid, error }));
+
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-empty-zero',
+      cwd: '/tmp/project',
+    });
+
+    await provider.send('sess-empty-zero', 'hello', undefined, undefined, true, 0);
+    const first = lastSpawn();
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(1);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      sid: 'sess-empty-zero',
+      error: {
+        code: 'PROVIDER_ERROR',
+        message: 'Qwen exited without producing a response',
+        recoverable: true,
+      },
+    });
   });
 
   it('uses a provided UUID resumeId when restoring qwen sessions', async () => {
@@ -918,11 +946,15 @@ describe('QwenProvider', () => {
 
     const second = lastSpawn();
     second.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-retry-ok', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    await flushIO();
     second.child.emit('close', 0, null);
     await flushIO();
     await flushIO();
 
-    expect(childProcessMock.spawn).toHaveBeenCalledTimes(2);
+    const retryMeSpawns = childProcessMock.spawn.mock.calls.filter(
+      (call) => (call[1] as string[]).includes('retry me'),
+    );
+    expect(retryMeSpawns).toHaveLength(2);
     expect(completed).toEqual(['OK']);
     expect(errors).toEqual([]);
   });
