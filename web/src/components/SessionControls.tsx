@@ -44,7 +44,7 @@ import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { migrateLegacyWorkflowDraft, normalizeWorkflowLibrary } from '@shared/p2p-workflow-library.js';
 import type { P2pWorkflowDraft } from '@shared/p2p-workflow-types.js';
-import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
+import { getQwenAuthTier, QWEN_AUTH_TIERS, QWEN_AUTH_TYPES } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
@@ -997,19 +997,21 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const displayedCodexModel = activeSession?.agentType === 'codex-sdk'
     ? genericTransportModel
     : (genericTransportModel ?? codexModel);
+  const qwenCompatibleApiSession = activeSession?.agentType === 'qwen'
+    && (!!activeSession?.ccPreset || activeSession?.qwenAuthType === QWEN_AUTH_TYPES.API_KEY);
   const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
     activeSession?.agentType === 'claude-code-sdk'
       ? CLAUDE_SDK_EFFORT_LEVELS
       : activeSession?.agentType === 'codex-sdk'
         ? CODEX_SDK_EFFORT_LEVELS
         : activeSession?.agentType === 'qwen'
-          ? QWEN_EFFORT_LEVELS
+          ? (qwenCompatibleApiSession ? ['high'] : QWEN_EFFORT_LEVELS)
           : activeSession?.agentType === 'copilot-sdk'
             ? COPILOT_SDK_EFFORT_LEVELS
           : activeSession?.agentType === 'openclaw'
             ? OPENCLAW_THINKING_LEVELS
             : []
-  ), [activeSession?.agentType]);
+  ), [activeSession?.agentType, qwenCompatibleApiSession]);
   const supportsThinking = thinkingLevels.length > 0;
   // Default the pill to a sensible value whenever the agent supports thinking
   // but the session doesn't yet have an `effort` persisted. Prefer 'high' if
@@ -1020,8 +1022,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         ? 'high'
         : thinkingLevels[thinkingLevels.length - 1])
     : undefined;
-  const currentThinking = (activeSession?.effort as TransportEffortLevel | undefined)
-    ?? defaultThinkingForAgent;
+  const persistedThinking = activeSession?.effort as TransportEffortLevel | undefined;
+  const currentThinking = persistedThinking && thinkingLevels.includes(persistedThinking)
+    ? persistedThinking
+    : defaultThinkingForAgent;
   const qwenTier = getQwenAuthTier(activeSession?.qwenAuthType);
   const qwenTierLabel = qwenTier === QWEN_AUTH_TIERS.FREE
     ? t('session.qwen_tier_free')

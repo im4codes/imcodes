@@ -429,6 +429,7 @@ export function NewSessionDialog({
       : agentType === "claude-code-sdk" || agentType === "codex-sdk"
         ? "sdk"
         : null;
+  const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
   const thinkingLevels =
     agentType === "claude-code-sdk"
       ? CLAUDE_SDK_EFFORT_LEVELS
@@ -437,7 +438,7 @@ export function NewSessionDialog({
         : agentType === "copilot-sdk"
           ? COPILOT_SDK_EFFORT_LEVELS
           : agentType === "qwen"
-            ? QWEN_EFFORT_LEVELS
+            ? (qwenCompatibleApiPresetSelected ? ["high"] : QWEN_EFFORT_LEVELS)
             : agentType === "openclaw"
               ? OPENCLAW_THINKING_LEVELS
               : [];
@@ -485,7 +486,7 @@ export function NewSessionDialog({
 
   useEffect(() => {
     setThinking("high");
-  }, [agentType]);
+  }, [agentType, qwenCompatibleApiPresetSelected]);
 
   useEffect(() => {
     if (agentType !== "qwen") return;

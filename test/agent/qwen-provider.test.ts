@@ -179,7 +179,7 @@ describe('QwenProvider', () => {
     });
   });
 
-  it('merges provided qwen settings with reasoning settings', async () => {
+  it('preserves compatible API preset settings while forcing high qwen reasoning', async () => {
     const provider = new QwenProvider();
     await provider.connect({});
     await provider.createSession({
@@ -332,7 +332,7 @@ describe('QwenProvider', () => {
       security: { auth: { selectedType: 'anthropic' } },
       model: {
         name: 'MiniMax-M2.7',
-        generationConfig: { reasoning: { effort: 'medium' } },
+        generationConfig: { reasoning: { effort: 'high' } },
       },
       modelProviders: {
         anthropic: [
@@ -924,6 +924,62 @@ describe('QwenProvider', () => {
 
     expect(childProcessMock.spawn).toHaveBeenCalledTimes(2);
     expect(completed).toEqual(['OK']);
+    expect(errors).toEqual([]);
+  });
+
+  it('retries qwen reasoning_content replay errors in a fresh high-thinking conversation', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-reasoning-replay-error',
+      cwd: '/tmp/project',
+      effort: 'high',
+    });
+
+    const errors: string[] = [];
+    const completed: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.message));
+    provider.onComplete((_sid, msg) => completed.push(String(msg.content)));
+
+    await provider.send('sess-reasoning-replay-error', 'first turn');
+    await waitForSpawnCount(1);
+    const first = lastSpawn();
+    const settingsPath = first.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH;
+    expect(JSON.parse(await readFile(String(settingsPath), 'utf8'))).toEqual({
+      model: { generationConfig: { reasoning: { effort: 'high' } } },
+    });
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-first-ok', content: [{ type: 'text', text: 'First OK' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-reasoning-replay-error', 'retry with a fresh conversation');
+    await waitForSpawnCount(2);
+    const second = lastSpawn();
+    expect(second.args).toContain('--resume');
+
+    second.child.stdout.write(`${JSON.stringify({
+      type: 'result',
+      is_error: true,
+      error: {
+        message: 'API Error: 400 {"error":{"code":"400","message":"Param Incorrect","param":"The reasoning_content in the thinking mode must be passed back to the API.","type":""}}',
+      },
+    })}\n`);
+    await waitForSpawnCount(3);
+
+    const third = lastSpawn();
+    expect(third.args).toContain('--session-id');
+    expect(third.args).not.toContain('--resume');
+    expect(third.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH).toBe(String(settingsPath));
+    expect(JSON.parse(await readFile(String(settingsPath), 'utf8'))).toEqual({
+      model: { generationConfig: { reasoning: { effort: 'high' } } },
+    });
+    third.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-reasoning-fallback-ok', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    third.child.emit('close', 0, null);
+    await flushIO();
+    await flushIO();
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(3);
+    expect(completed).toEqual(['First OK', 'OK']);
     expect(errors).toEqual([]);
   });
 

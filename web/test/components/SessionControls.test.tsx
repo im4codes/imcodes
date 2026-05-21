@@ -2404,6 +2404,25 @@ afterEach(() => {
     });
   });
 
+  it('forces qwen compatible API sessions to high thinking mode', () => {
+    render(<SessionControls
+      ws={makeWs() as any}
+      activeSession={makeSession({
+        name: 'qwen-compatible-session',
+        agentType: 'qwen',
+        runtimeType: 'transport',
+        effort: 'high',
+        ccPreset: 'MiniMax',
+        qwenAuthType: 'api-key',
+      })}
+      quickData={makeQuickData() as any}
+    />);
+
+    expect(screen.getByRole('button', { name: /^high$/i })).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: /^high$/i }));
+    expect(screen.queryByRole('button', { name: /^○ off$/i })).toBeNull();
+  });
+
 
   it('shows queued transport messages at the bottom', () => {
     const runningSession = makeSession({

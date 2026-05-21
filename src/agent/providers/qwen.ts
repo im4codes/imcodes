@@ -48,6 +48,12 @@ const QWEN_COMPACT_SLASH_COMMAND = '/compress' as const;
 const TRANSIENT_RETRY_DELAY_MS = 250;
 const TRANSIENT_RETRY_MAX_ATTEMPTS = 1;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const QWEN_COMPATIBLE_API_CLI_AUTH_TYPES = new Set([
+  'openai',
+  'anthropic',
+  'gemini',
+  'vertex-ai',
+]);
 
 /**
  * Auth types accepted by the qwen CLI's `--auth-type` flag.
@@ -137,6 +143,24 @@ function toQwenReasoning(effort: TransportEffortLevel): false | { effort: 'low' 
   if (effort === 'high') return { effort: 'high' };
   if (effort === 'low') return { effort: 'low' };
   return { effort: 'medium' };
+}
+
+function resolveQwenReasoningSetting(
+  settings: string | Record<string, unknown> | undefined,
+  effort: TransportEffortLevel,
+): false | { effort: 'low' | 'medium' | 'high' } {
+  const cliAuthType = resolveCliAuthType(settings);
+  // Compatible API routes are explicitly used for stronger third-party
+  // reasoning models. Keep thinking on and pin it to high; if the Qwen CLI
+  // later fails to resume because it did not round-trip reasoning_content, the
+  // send path below resets the provider conversation instead of disabling
+  // thinking.
+  if (cliAuthType && QWEN_COMPATIBLE_API_CLI_AUTH_TYPES.has(cliAuthType)) return { effort: 'high' };
+  return toQwenReasoning(effort);
+}
+
+function isReasoningContentReplayError(message: string): boolean {
+  return /reasoning_content[\s\S]*thinking mode[\s\S]*passed back/i.test(message);
 }
 
 interface QwenStreamEvent {
@@ -441,6 +465,7 @@ export class QwenProvider implements TransportProvider {
     extraSystemPrompt?: string,
     allowResumeFallback = true,
     transientRetryBudget = TRANSIENT_RETRY_MAX_ATTEMPTS,
+    reasoningReplayFallbackBudget = 1,
   ): Promise<void> {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Qwen provider not connected', false);
@@ -554,6 +579,7 @@ export class QwenProvider implements TransportProvider {
     let sawError = false;
     let stderrBuf = '';
     let retryScheduled = false;
+    let reasoningFallbackScheduled = false;
 
     const sawVisibleTurnProgress = (): boolean => {
       return state.currentText.length > 0
@@ -572,6 +598,42 @@ export class QwenProvider implements TransportProvider {
       await new Promise((resolve) => setTimeout(resolve, TRANSIENT_RETRY_DELAY_MS));
       await this.send(sessionId, payload, _attachments, extraSystemPrompt, allowResumeFallback, transientRetryBudget - 1);
       return true;
+    };
+
+    const maybeRetryWithFreshConversation = async (messageText: string, details?: unknown): Promise<boolean> => {
+      if (reasoningFallbackScheduled || reasoningReplayFallbackBudget <= 0) return false;
+      if (sawVisibleTurnProgress()) return false;
+      if (!isReasoningContentReplayError(messageText)) return false;
+      reasoningFallbackScheduled = true;
+      completed = true;
+      state.child = null;
+      state.started = false;
+      state.qwenConversationId = randomUUID();
+      this.emitSessionInfo(sessionId, { resumeId: state.qwenConversationId });
+      await this.ensureSettingsPath(state);
+      logger.warn(
+        { provider: this.id, sessionId, conversationId: state.qwenConversationId, message: messageText, details },
+        'Qwen provider rejected missing reasoning_content; retrying turn in a fresh high-thinking conversation',
+      );
+      await this.send(
+        sessionId,
+        payload,
+        _attachments,
+        extraSystemPrompt,
+        false,
+        transientRetryBudget,
+        reasoningReplayFallbackBudget - 1,
+      );
+      return true;
+    };
+
+    const recoverOrEmitProviderError = (messageText: string, details?: unknown): void => {
+      void maybeRetryWithFreshConversation(messageText, details).then((reasoningRetried) => {
+        if (reasoningRetried) return;
+        void maybeRetryTransientError(messageText, details).then((transientRetried) => {
+          if (!transientRetried) emitError(messageText, details);
+        });
+      });
     };
 
     const emitError = (messageText: string, details?: unknown): void => {
@@ -768,9 +830,7 @@ export class QwenProvider implements TransportProvider {
         if (finalText) {
           const syntheticApiError = extractSyntheticApiError(finalText);
           if (syntheticApiError) {
-            void maybeRetryTransientError(syntheticApiError, payload).then((retried) => {
-              if (!retried) emitError(syntheticApiError, payload);
-            });
+            recoverOrEmitProviderError(syntheticApiError, payload);
             return;
           }
           state.pendingFinalText = finalText;
@@ -809,16 +869,12 @@ export class QwenProvider implements TransportProvider {
         this.clearStatus(sessionId, state);
         if (payload.is_error) {
           const errorText = payload.error?.message || stderrBuf || 'Qwen execution failed';
-          void maybeRetryTransientError(errorText, payload).then((retried) => {
-            if (!retried) emitError(errorText, payload);
-          });
+          recoverOrEmitProviderError(errorText, payload);
           return;
         }
         const syntheticApiError = extractSyntheticApiError(payload.result);
         if (syntheticApiError) {
-          void maybeRetryTransientError(syntheticApiError, payload).then((retried) => {
-            if (!retried) emitError(syntheticApiError, payload);
-          });
+          recoverOrEmitProviderError(syntheticApiError, payload);
           return;
         }
         const resultText = typeof payload.result === 'string' && payload.result.trim()
@@ -871,9 +927,7 @@ export class QwenProvider implements TransportProvider {
           return;
         }
         const errorText = stderrBuf.trim() || `Qwen exited with code ${code ?? 'null'}${signal ? ` (${signal})` : ''}`;
-        void maybeRetryTransientError(errorText, { code, signal, stderr: stderrBuf }).then((retried) => {
-          if (!retried) emitError(errorText);
-        });
+        recoverOrEmitProviderError(errorText, { code, signal, stderr: stderrBuf });
       }
     });
 
@@ -885,9 +939,7 @@ export class QwenProvider implements TransportProvider {
     // uncaughtException and crash the daemon.
     child.on('error', (err) => {
       logger.error({ provider: this.id, err }, 'Qwen child process error');
-      void maybeRetryTransientError(err.message, err).then((retried) => {
-        if (!retried) emitError(err.message, err);
-      });
+      recoverOrEmitProviderError(err.message, err);
     });
   }
 
@@ -960,7 +1012,7 @@ export class QwenProvider implements TransportProvider {
             ? (base.model as Record<string, unknown>).generationConfig as Record<string, unknown>
             : {}
         ),
-        reasoning: toQwenReasoning(state.effort),
+        reasoning: resolveQwenReasoningSetting(state.settings, state.effort),
       },
     };
     const next = {
