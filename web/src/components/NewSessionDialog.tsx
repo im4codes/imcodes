@@ -430,7 +430,7 @@ export function NewSessionDialog({
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
-  const thinkingLevels =
+  const thinkingLevels: readonly TransportEffortLevel[] =
     agentType === "claude-code-sdk"
       ? CLAUDE_SDK_EFFORT_LEVELS
       : agentType === "codex-sdk"
