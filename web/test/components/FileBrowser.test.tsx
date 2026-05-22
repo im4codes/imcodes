@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, act, cleanup } from '@testing-library/preact';
+import { render, screen, fireEvent, act, cleanup, waitFor } from '@testing-library/preact';
 
 // Mock FileEditor.js to prevent Vitest's SSR module graph from evaluating
 // 17 CodeMirror/Lezer imports (causes OOM in jsdom). vi.mock is hoisted but
@@ -55,6 +55,8 @@ vi.mock('react-i18next', () => {
     'file_browser.mkdir_failed': 'Failed to create folder',
     'file_browser.create_file_failed': 'Failed to create file',
     'file_browser.file_exists': 'File already exists',
+    'fileBrowser.copyPath': 'Copy path',
+    'fileBrowser.copied': 'Copied!',
     'common.cancel': 'Cancel',
     'chat.new_file': 'New file',
     'chat.new_file_name': 'File name',
@@ -631,6 +633,37 @@ describe('FileBrowser', () => {
     expect(onConfirm).toHaveBeenCalledWith(
       expect.arrayContaining(['/home/user/a.ts', '/home/user/b.ts']),
     );
+  });
+
+  it('copies the current directory path from the footer next to Select', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    const { ws, respond } = makeWsFactory();
+    const { getByText, container } = render(
+      <FileBrowser ws={ws} mode="file-multi" layout="panel" initialPath="/home/user/project" onConfirm={vi.fn()} />,
+    );
+
+    await act(async () => {
+      respond([{ name: 'proposal.md', isDir: false }], '/home/user/project');
+    });
+
+    const footer = container.querySelector('.fb-footer') as HTMLElement;
+    const copyButton = getByText('Copy path') as HTMLButtonElement;
+    const selectButton = getByText('Select') as HTMLButtonElement;
+
+    expect(copyButton.parentElement).toBe(footer);
+    expect(copyButton.nextElementSibling).toBe(selectButton);
+
+    await act(async () => {
+      fireEvent.click(copyButton);
+      await Promise.resolve();
+    });
+
+    expect(writeText).toHaveBeenCalledWith('/home/user/project');
+    await waitFor(() => expect(getByText('Copied!')).toBeDefined());
   });
 
   it('deselects a path when clicked again in multi-select', async () => {

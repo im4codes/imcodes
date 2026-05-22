@@ -1498,6 +1498,25 @@ export function FileBrowser({
         <button class="btn btn-secondary" onClick={onClose}>{t('common.cancel')}</button>
       )}
       <button
+        class="btn btn-secondary fb-footer-copy-path"
+        title={currentLabel}
+        onClick={() => {
+          const path = currentLabel;
+          void (async () => {
+            try {
+              await navigator.clipboard.writeText(path);
+              setCopiedPath(path);
+              setTimeout(() => setCopiedPath((cur) => (cur === path ? null : cur)), 1500);
+            } catch {
+              // Clipboard access can be blocked in insecure contexts; keep the
+              // file picker usable and leave the path visible in the title.
+            }
+          })();
+        }}
+      >
+        {copiedPath === currentLabel ? t('fileBrowser.copied') : t('fileBrowser.copyPath')}
+      </button>
+      <button
         class="btn btn-primary"
         disabled={mode !== 'dir-only' && selectedPaths.size === 0}
         onClick={handleConfirm}
