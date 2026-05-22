@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact';
+import { act, render, screen, fireEvent, cleanup } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -65,6 +65,7 @@ describe('SessionTabs', () => {
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
   });
 
   beforeEach(() => {
@@ -141,6 +142,32 @@ describe('SessionTabs', () => {
 
     expect(onSelect).toHaveBeenCalledOnce();
     expect(onSelect).toHaveBeenCalledWith('session_w2');
+  });
+
+  it('opens the tab context menu from a touch long-press without selecting the tab', () => {
+    vi.useFakeTimers();
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    fireEvent.pointerDown(tab, {
+      pointerId: 7,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    act(() => {
+      vi.advanceTimersByTime(520);
+    });
+
+    expect(screen.getByText('📌 Pin')).toBeDefined();
+
+    fireEvent.click(tab);
+    expect(onSelect).not.toHaveBeenCalled();
   });
 
   it('renders brain tab with brain class and project name', () => {
