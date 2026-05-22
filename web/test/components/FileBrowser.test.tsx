@@ -635,6 +635,38 @@ describe('FileBrowser', () => {
     );
   });
 
+  it('shortens long breadcrumb segments while keeping each level clickable', async () => {
+    const currentPath = '/home/user/some-extremely-long-folder-name-that-would-dominate-mobile/project';
+    const factory = makeWsFactory();
+    const rendered = render(
+      <FileBrowser ws={factory.ws} mode="file-multi" layout="panel" initialPath={currentPath} onConfirm={vi.fn()} />,
+    );
+
+    await act(async () => {
+      factory.respond([{ name: 'proposal.md', isDir: false }], currentPath);
+    });
+
+    const longSegmentPath = '/home/user/some-extremely-long-folder-name-that-would-dominate-mobile';
+    const longSegment = rendered.container.querySelector(`.fb-breadcrumb-seg[title="${longSegmentPath}"]`) as HTMLElement;
+    const nav = rendered.container.querySelector('.fb-nav') as HTMLElement;
+    const breadcrumbRow = rendered.container.querySelector('.fb-breadcrumb-row') as HTMLElement;
+    expect(breadcrumbRow.previousElementSibling).toBe(nav);
+    expect(breadcrumbRow.contains(longSegment)).toBe(true);
+    expect(nav.contains(longSegment)).toBe(false);
+    expect(breadcrumbRow.getAttribute('title')).toBe(currentPath);
+    expect(longSegment).toBeTruthy();
+    expect(longSegment.textContent).toContain('…');
+    expect(longSegment.textContent).not.toContain('some-extremely-long-folder-name-that-would-dominate-mobile');
+
+    const callsBefore = factory.fsListDir.mock.calls.length;
+    await act(async () => {
+      fireEvent.click(longSegment);
+    });
+
+    expect(factory.fsListDir.mock.calls.length).toBe(callsBefore + 1);
+    expect(factory.fsListDir).toHaveBeenLastCalledWith(longSegmentPath, true, true);
+  });
+
   it('copies the current directory path from the footer next to Select', async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     const currentPath = '/home/user/some-extremely-long-folder-name-that-would-dominate-mobile/project';
@@ -651,16 +683,11 @@ describe('FileBrowser', () => {
       respond([{ name: 'proposal.md', isDir: false }], currentPath);
     });
 
-    const pathStrip = container.querySelector('.fb-current-path-strip') as HTMLElement;
     const footer = container.querySelector('.fb-footer') as HTMLElement;
     const copyButton = getByText('Copy path') as HTMLButtonElement;
     const selectButton = getByText('Select') as HTMLButtonElement;
 
-    expect(pathStrip.nextElementSibling).toBe(footer);
-    expect(pathStrip.getAttribute('title')).toBe(currentPath);
-    expect(pathStrip.textContent).toContain('/…/');
-    expect(pathStrip.textContent).toContain('project');
-    expect(pathStrip.textContent).not.toContain('some-extremely-long-folder-name-that-would-dominate-mobile');
+    expect(container.querySelector('.fb-current-path-strip')).toBeNull();
     expect(copyButton.parentElement).toBe(footer);
     expect(copyButton.nextElementSibling).toBe(selectButton);
 

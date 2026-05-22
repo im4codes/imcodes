@@ -372,37 +372,6 @@ function shortenPathSegment(segment: string, maxLength: number): string {
   return `${segment.slice(0, head)}…${segment.slice(-tail)}`;
 }
 
-function formatCurrentPathLabel(path: string): string {
-  const raw = path.trim();
-  if (!raw) return raw;
-  if (raw === '/' || raw === '~' || /^[A-Za-z]:[\\/]?$/.test(raw)) return raw;
-  const separator = raw.includes('\\') && !raw.includes('/') ? '\\' : '/';
-  const driveMatch = raw.match(/^([A-Za-z]:)[/\\]?(.*)$/);
-  const isHome = raw === '~' || raw.startsWith('~/') || raw.startsWith('~\\');
-  const isAbsolute = raw.startsWith('/') || !!driveMatch;
-  const root = driveMatch ? `${driveMatch[1]}${separator}` : isHome ? '~' : raw.startsWith('/') ? '/' : '';
-  const body = driveMatch
-    ? driveMatch[2]
-    : isHome
-      ? raw.slice(raw.length > 1 ? 2 : 1)
-      : raw.startsWith('/')
-        ? raw.slice(1)
-        : raw;
-  const parts = body.split(/[/\\]/).filter(Boolean);
-  if (parts.length === 0) return root || raw;
-  const shortParts = parts.map((part, index) => shortenPathSegment(part, index === parts.length - 1 ? 26 : 18));
-  const rootPrefix = root === '/'
-    ? '/'
-    : root === '~'
-      ? `~${separator}`
-      : root;
-  if (shortParts.length <= 3) return `${rootPrefix}${shortParts.join(separator)}`;
-  const tail = shortParts.slice(-2).join(separator);
-  return isAbsolute || root
-    ? `${rootPrefix}…${separator}${tail}`
-    : `…${separator}${tail}`;
-}
-
 export function FileBrowser({
   ws,
   mode,
@@ -1253,7 +1222,6 @@ export function FileBrowser({
     : selectedPaths.size > 0
       ? t('file_browser.insert', { count: selectedPaths.size })
       : t('file_browser.select');
-  const currentPathLabel = useMemo(() => formatCurrentPathLabel(currentLabel), [currentLabel]);
 
   const alreadySet = new Set(alreadyInserted);
   const usesExternalPreview = !!onPreviewFile;
@@ -1528,46 +1496,41 @@ export function FileBrowser({
   ) : null;
 
   const footer = hideFooter ? null : (
-    <>
-      <div class="fb-current-path-strip" title={currentLabel}>
-        <span class="fb-current-path-label">{currentPathLabel}</span>
-      </div>
-      <div class="fb-footer">
-        {isMulti && selectedPaths.size > 0 && (
-          <span class="fb-count">{t('file_browser.selected_count', { count: selectedPaths.size })}</span>
-        )}
-        <div style={{ flex: 1 }} />
-        {layout === 'modal' && (
-          <button class="btn btn-secondary" onClick={onClose}>{t('common.cancel')}</button>
-        )}
-        <button
-          class="btn btn-secondary fb-footer-copy-path"
-          title={currentLabel}
-          onClick={() => {
-            const path = currentLabel;
-            void (async () => {
-              try {
-                await navigator.clipboard.writeText(path);
-                setCopiedPath(path);
-                setTimeout(() => setCopiedPath((cur) => (cur === path ? null : cur)), 1500);
-              } catch {
-                // Clipboard access can be blocked in insecure contexts; keep the
-                // file picker usable and leave the path visible in the title.
-              }
-            })();
-          }}
-        >
-          {copiedPath === currentLabel ? t('fileBrowser.copied') : t('fileBrowser.copyPath')}
-        </button>
-        <button
-          class="btn btn-primary"
-          disabled={mode !== 'dir-only' && selectedPaths.size === 0}
-          onClick={handleConfirm}
-        >
-          {confirmLabel}
-        </button>
-      </div>
-    </>
+    <div class="fb-footer">
+      {isMulti && selectedPaths.size > 0 && (
+        <span class="fb-count">{t('file_browser.selected_count', { count: selectedPaths.size })}</span>
+      )}
+      <div style={{ flex: 1 }} />
+      {layout === 'modal' && (
+        <button class="btn btn-secondary" onClick={onClose}>{t('common.cancel')}</button>
+      )}
+      <button
+        class="btn btn-secondary fb-footer-copy-path"
+        title={currentLabel}
+        onClick={() => {
+          const path = currentLabel;
+          void (async () => {
+            try {
+              await navigator.clipboard.writeText(path);
+              setCopiedPath(path);
+              setTimeout(() => setCopiedPath((cur) => (cur === path ? null : cur)), 1500);
+            } catch {
+              // Clipboard access can be blocked in insecure contexts; keep the
+              // file picker usable and leave the path visible in the title.
+            }
+          })();
+        }}
+      >
+        {copiedPath === currentLabel ? t('fileBrowser.copied') : t('fileBrowser.copyPath')}
+      </button>
+      <button
+        class="btn btn-primary"
+        disabled={mode !== 'dir-only' && selectedPaths.size === 0}
+        onClick={handleConfirm}
+      >
+        {confirmLabel}
+      </button>
+    </div>
   );
 
   // Git changes section (shown at bottom of Files view or as standalone Changes view)
@@ -1675,59 +1638,65 @@ export function FileBrowser({
   const isAtDrives = currentLabel === thisPcLabel;
 
   const breadcrumb = (
-    <div class="fb-nav">
-      <button class="fb-nav-btn" disabled={!canGoBack} onClick={goBack}>←</button>
-      <button class="fb-nav-btn" onClick={goUp} title="Go up">⬆</button>
-      {looksLikeWindows && (
+    <div class="fb-nav-stack">
+      <div class="fb-nav">
+        <button class="fb-nav-btn" disabled={!canGoBack} onClick={goBack}>←</button>
+        <button class="fb-nav-btn" onClick={goUp} title="Go up">⬆</button>
+        {looksLikeWindows && (
+          <button
+            class="fb-nav-btn"
+            onClick={() => navigateTo(isAtDrives ? '~' : WINDOWS_DRIVES_PATH)}
+            title={isAtDrives ? t('file_browser.home') : t('file_browser.this_pc')}
+          >{isAtDrives ? '🏠' : '💾'}</button>
+        )}
+        <div class="fb-nav-spacer" />
         <button
-          class="fb-nav-btn"
-          onClick={() => navigateTo(isAtDrives ? '~' : WINDOWS_DRIVES_PATH)}
-          title={isAtDrives ? t('file_browser.home') : t('file_browser.this_pc')}
-        >{isAtDrives ? '🏠' : '💾'}</button>
-      )}
-      <div class="fb-breadcrumb-segments">
-        {breadcrumbSegments.map((seg, i) => {
-          const isLast = i === breadcrumbSegments.length - 1;
-          return (
-            <>
-              {i > 0 && <span class="fb-breadcrumb-sep">›</span>}
-              <span
-                class={`fb-breadcrumb-seg${isLast ? ' active' : ''}`}
-                onClick={isLast ? undefined : () => navigateTo(seg.path)}
-              >{seg.label}</span>
-            </>
-          );
-        })}
-      </div>
-      <button
-        class={`fb-nav-btn${error ? ' fb-nav-btn-error' : ''}`}
-        title={error || 'Refresh'}
-        onClick={() => { loadedRef.current.clear(); setError(null); fetchDir(currentLabel); }}
-      >{error ? '⚠' : '↻'}</button>
-      <label class="fb-nav-hidden-toggle" title={t('file_browser.show_hidden')}>
-        <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden((e.target as HTMLInputElement).checked)} />
-        {' ·'}
-      </label>
-      {includeFiles && (
+          class={`fb-nav-btn${error ? ' fb-nav-btn-error' : ''}`}
+          title={error || 'Refresh'}
+          onClick={() => { loadedRef.current.clear(); setError(null); fetchDir(currentLabel); }}
+        >{error ? '⚠' : '↻'}</button>
+        <label class="fb-nav-hidden-toggle" title={t('file_browser.show_hidden')}>
+          <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden((e.target as HTMLInputElement).checked)} />
+          {' ·'}
+        </label>
+        {includeFiles && (
+          <button
+            class="fb-create-btn fb-create-file-btn"
+            title={t('chat.new_file')}
+            aria-label={t('chat.new_file')}
+            onClick={() => { setNewEntry({ kind: 'file', parentPath: currentLabel }); setNewEntryName(''); }}
+          >
+            <span class="fb-create-icon fb-create-icon-file" aria-hidden="true" />
+            <span class="fb-create-plus" aria-hidden="true">+</span>
+          </button>
+        )}
         <button
-          class="fb-create-btn fb-create-file-btn"
-          title={t('chat.new_file')}
-          aria-label={t('chat.new_file')}
-          onClick={() => { setNewEntry({ kind: 'file', parentPath: currentLabel }); setNewEntryName(''); }}
+          class="fb-create-btn fb-create-folder-btn"
+          title={t('chat.new_folder')}
+          aria-label={t('chat.new_folder')}
+          onClick={() => { setNewEntry({ kind: 'folder', parentPath: currentLabel }); setNewEntryName(''); }}
         >
-          <span class="fb-create-icon fb-create-icon-file" aria-hidden="true" />
+          <span class="fb-create-icon fb-create-icon-folder" aria-hidden="true" />
           <span class="fb-create-plus" aria-hidden="true">+</span>
         </button>
-      )}
-      <button
-        class="fb-create-btn fb-create-folder-btn"
-        title={t('chat.new_folder')}
-        aria-label={t('chat.new_folder')}
-        onClick={() => { setNewEntry({ kind: 'folder', parentPath: currentLabel }); setNewEntryName(''); }}
-      >
-        <span class="fb-create-icon fb-create-icon-folder" aria-hidden="true" />
-        <span class="fb-create-plus" aria-hidden="true">+</span>
-      </button>
+      </div>
+      <div class="fb-breadcrumb-row" title={currentLabel}>
+        <div class="fb-breadcrumb-segments">
+          {breadcrumbSegments.map((seg, i) => {
+            const isLast = i === breadcrumbSegments.length - 1;
+            return (
+              <>
+                {i > 0 && <span class="fb-breadcrumb-sep">›</span>}
+                <span
+                  class={`fb-breadcrumb-seg${isLast ? ' active' : ''}`}
+                  title={seg.path}
+                  onClick={isLast ? undefined : () => navigateTo(seg.path)}
+                >{shortenPathSegment(seg.label, isLast ? 26 : 16)}</span>
+              </>
+            );
+          })}
+        </div>
+      </div>
     </div>
   );
 
