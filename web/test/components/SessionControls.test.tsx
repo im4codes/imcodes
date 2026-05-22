@@ -1087,6 +1087,7 @@ afterEach(() => {
       status: 'ok',
       resolvedPath: '/repo/openspec/changes',
       entries: [
+        { name: 'archive', path: '/repo/openspec/changes/archive', isDir: true, hidden: false },
         { name: 'change-b', path: '/repo/openspec/changes/change-b', isDir: true, hidden: false },
         { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
         { name: 'README.md', path: '/repo/openspec/changes/README.md', isDir: false, hidden: false },
@@ -1096,6 +1097,7 @@ afterEach(() => {
 
     const changeButton = screen.getByRole('button', { name: 'change-a' });
     expect(changeButton.textContent).toContain('@');
+    expect(screen.queryByRole('button', { name: 'archive' })).toBeNull();
 
     fireEvent.click(changeButton);
 
@@ -1119,11 +1121,13 @@ afterEach(() => {
       status: 'ok',
       resolvedPath: '/repo/openspec/changes',
       entries: [
+        { name: 'archive', path: '/repo/openspec/changes/archive', isDir: true, hidden: false },
         { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
       ],
     });
     await flushAsync();
 
+    expect(screen.queryByRole('button', { name: 'archive' })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'pinned_repo' }));
 
     const browser = await screen.findByTestId('mock-file-browser');

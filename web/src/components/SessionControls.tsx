@@ -138,6 +138,7 @@ interface Props {
 
 const MAX_UPLOAD_SIZE_MB = Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024));
 export const OPENSPEC_LIST_REQUEST_TIMEOUT_MS = 12_000;
+const OPENSPEC_NON_CHANGE_DIR_NAMES = new Set(['archive']);
 const TRANSPORT_QUEUE_HIDDEN_KEY_PREFIX = 'imcodes:transport-queue-hidden:';
 type LocalQueuedTransportEntry = {
   clientMessageId: string;
@@ -1789,7 +1790,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         return;
       }
       const changeNames = (msg.entries ?? [])
-        .filter((entry) => entry.isDir)
+        .filter((entry) => entry.isDir && !OPENSPEC_NON_CHANGE_DIR_NAMES.has(entry.name))
         .map((entry) => entry.name)
         .sort((a, b) => a.localeCompare(b));
       setOpenSpecChanges(changeNames);
