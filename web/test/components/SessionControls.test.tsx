@@ -153,8 +153,20 @@ vi.mock('../../src/components/AtPicker.js', () => ({
 }));
 
 vi.mock('../../src/components/file-browser-lazy.js', () => ({
-  FileBrowser: ({ initialPath, mode, onConfirm }: { initialPath?: string; mode: string; onConfirm: (paths: string[]) => void }) => (
-    <div data-testid="mock-file-browser" data-initial-path={initialPath ?? ''} data-mode={mode}>
+  FileBrowser: ({ initialPath, mode, defaultTab, changesRootPath, onConfirm }: {
+    initialPath?: string;
+    mode: string;
+    defaultTab?: string;
+    changesRootPath?: string;
+    onConfirm: (paths: string[]) => void;
+  }) => (
+    <div
+      data-testid="mock-file-browser"
+      data-initial-path={initialPath ?? ''}
+      data-mode={mode}
+      data-default-tab={defaultTab ?? ''}
+      data-changes-root-path={changesRootPath ?? ''}
+    >
       <button onClick={() => onConfirm([`${initialPath ?? ''}/proposal.md`])}>mock-file-confirm</button>
     </div>
   ),
@@ -1117,6 +1129,8 @@ afterEach(() => {
     const browser = await screen.findByTestId('mock-file-browser');
     expect(browser.getAttribute('data-initial-path')).toBe('/repo/openspec/changes/change-a');
     expect(browser.getAttribute('data-mode')).toBe('file-multi');
+    expect(browser.getAttribute('data-default-tab')).toBe('files');
+    expect(browser.getAttribute('data-changes-root-path')).toBe('');
 
     fireEvent.click(screen.getByRole('button', { name: 'mock-file-confirm' }));
 

@@ -2641,7 +2641,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             mode="file-multi"
             layout="panel"
             initialPath={openSpecFolderPath}
-            changesRootPath={activeSession.projectDir ?? undefined}
+            defaultTab="files"
             hideFooter={false}
             onConfirm={(paths) => {
               appendToInput(paths.map((path) => toComposerReference(path)));
