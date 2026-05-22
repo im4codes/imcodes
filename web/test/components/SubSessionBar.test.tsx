@@ -460,6 +460,69 @@ describe('SubSessionBar', () => {
     });
   });
 
+  it('keeps mobile long-press drag reorder working without opening the sub-session', async () => {
+    vi.useFakeTimers();
+    const onOpen = vi.fn();
+    const onVisualOrderChange = vi.fn();
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+    ];
+
+    const view = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={false}
+        serverId="srv-1"
+        onVisualOrderChange={onVisualOrderChange}
+        onOpen={onOpen}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const first = view.container.querySelector('[data-sub-id="sub-a"]') as HTMLElement;
+    const second = view.container.querySelector('[data-sub-id="sub-b"]') as HTMLElement;
+    const originalElementFromPoint = document.elementFromPoint;
+    Object.defineProperty(document, 'elementFromPoint', {
+      configurable: true,
+      value: vi.fn(() => second),
+    });
+
+    try {
+      fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => {
+        vi.advanceTimersByTime(401);
+      });
+      fireEvent.touchMove(first, { touches: [{ clientX: 80, clientY: 10 }] });
+
+      await waitFor(() => {
+        expect(Array.from(view.container.querySelectorAll('.subsession-card')).map((node) => (node as HTMLElement).dataset.subId)).toEqual(['sub-b', 'sub-a']);
+        expect(onVisualOrderChange).toHaveBeenLastCalledWith(['sub-b', 'sub-a']);
+      });
+
+      fireEvent.touchEnd(first);
+      act(() => {
+        vi.advanceTimersByTime(151);
+      });
+
+      expect(onOpen).not.toHaveBeenCalled();
+      expect(vi.mocked(reorderSubSessions)).toHaveBeenCalledWith('srv-1', ['sub-b', 'sub-a']);
+    } finally {
+      Object.defineProperty(document, 'elementFromPoint', {
+        configurable: true,
+        value: originalElementFromPoint,
+      });
+    }
+  });
+
   it('shows idle flash on collapsed buttons only when the token increments after mount', () => {
     const view = render(
       <SubSessionBar

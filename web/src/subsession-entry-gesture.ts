@@ -52,6 +52,7 @@ export interface SubSessionEntryGestureControllerOptions {
 
 export interface SubSessionEntryGestureController {
   handlePointerDown: (event: Pick<PointerEvent, 'pointerType'>) => void;
+  handleTouchEndFallback: (event: Event, root?: Element | null) => void;
   handleClick: (event: Event, root?: Element | null) => void;
   handleDoubleClick: (event: Event, root?: Element | null) => void;
   cancelPendingSingleClick: () => void;
@@ -119,11 +120,29 @@ export function createSubSessionEntryGestureController(
   const delayMs = options.delayMs ?? SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS;
   let pendingSingleClick: ReturnType<typeof setTimeout> | null = null;
   let lastPointerType: string | null = null;
+  let suppressSyntheticClick = false;
+  let suppressSyntheticClickTimer: ReturnType<typeof setTimeout> | null = null;
 
   const cancelPendingSingleClick = () => {
     if (!pendingSingleClick) return;
     clearTimeout(pendingSingleClick);
     pendingSingleClick = null;
+  };
+
+  const clearSyntheticClickSuppression = () => {
+    suppressSyntheticClick = false;
+    if (!suppressSyntheticClickTimer) return;
+    clearTimeout(suppressSyntheticClickTimer);
+    suppressSyntheticClickTimer = null;
+  };
+
+  const suppressNextSyntheticClick = () => {
+    suppressSyntheticClick = true;
+    if (suppressSyntheticClickTimer) clearTimeout(suppressSyntheticClickTimer);
+    suppressSyntheticClickTimer = setTimeout(() => {
+      suppressSyntheticClick = false;
+      suppressSyntheticClickTimer = null;
+    }, 800);
   };
 
   const isSuppressed = () => options.isGestureSuppressed?.() === true;
@@ -137,6 +156,12 @@ export function createSubSessionEntryGestureController(
   };
 
   const handleClick = (event: Event, root?: Element | null) => {
+    if (suppressSyntheticClick) {
+      clearSyntheticClickSuppression();
+      cancelPendingSingleClick();
+      return;
+    }
+
     if (shouldIgnoreEvent(event, root)) {
       cancelPendingSingleClick();
       return;
@@ -168,14 +193,30 @@ export function createSubSessionEntryGestureController(
     run('double');
   };
 
+  const handleTouchEndFallback = (event: Event, root?: Element | null) => {
+    if (shouldIgnoreEvent(event, root)) {
+      cancelPendingSingleClick();
+      return;
+    }
+
+    cancelPendingSingleClick();
+    lastPointerType = 'touch';
+    suppressNextSyntheticClick();
+    run('single');
+  };
+
   return {
     handlePointerDown(event) {
       lastPointerType = event.pointerType || null;
       if (isSuppressed()) cancelPendingSingleClick();
     },
+    handleTouchEndFallback,
     handleClick,
     handleDoubleClick,
     cancelPendingSingleClick,
-    dispose: cancelPendingSingleClick,
+    dispose() {
+      cancelPendingSingleClick();
+      clearSyntheticClickSuppression();
+    },
   };
 }

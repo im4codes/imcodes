@@ -256,7 +256,14 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const dragIdRef = useRef<string | null>(null);
   const reorderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Touch-drag state for collapsed bar (persists across re-renders)
-  const touchDragRef = useRef<{ id: string | null; active: boolean; timer: ReturnType<typeof setTimeout> | null }>({ id: null, active: false, timer: null });
+  const touchDragRef = useRef<{
+    id: string | null;
+    active: boolean;
+    timer: ReturnType<typeof setTimeout> | null;
+    startX: number;
+    startY: number;
+    moved: boolean;
+  }>({ id: null, active: false, timer: null, startX: 0, startY: 0, moved: false });
   const entryGestureControllersRef = useRef<Map<string, SubSessionEntryGestureController>>(new Map());
   const suppressEntryClickRef = useRef(false);
   const openIdsRef = useRef(openIds);
@@ -496,7 +503,14 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     const onStart = (e: TouchEvent) => {
       const id = findBtnId(e.target);
       if (!id) return;
+      const touch = e.touches[0];
+      td.id = id;
+      td.active = false;
+      td.moved = false;
+      td.startX = touch?.clientX ?? 0;
+      td.startY = touch?.clientY ?? 0;
       td.timer = setTimeout(() => {
+        if (td.id !== id || td.moved) return;
         td.id = id;
         td.active = true;
         setDragOrder(orderedSessionsRef.current.map((s) => s.id));
@@ -508,10 +522,16 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     };
 
     const onMove = (e: TouchEvent) => {
-      if (td.timer && !td.active) { clearTimeout(td.timer); td.timer = null; return; }
+      const touch = e.touches[0];
+      if (touch) {
+        const dx = touch.clientX - td.startX;
+        const dy = touch.clientY - td.startY;
+        if (Math.hypot(dx, dy) > 8) td.moved = true;
+      }
+      if (td.timer && !td.active && td.moved) { clearTimeout(td.timer); td.timer = null; return; }
       if (!td.active || !td.id) return;
       e.preventDefault(); // works because { passive: false }
-      const touch = e.touches[0];
+      if (!touch) return;
       const targetEl = document.elementFromPoint(touch.clientX, touch.clientY);
       const overId = findBtnId(targetEl);
       if (overId && overId !== td.id) {
@@ -519,18 +539,27 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       }
     };
 
-    const onEnd = () => {
+    const onEnd = (e: TouchEvent) => {
+      const endedId = td.id ?? findBtnId(e.target);
+      const wasActive = td.active;
+      const moved = td.moved;
       if (td.timer) { clearTimeout(td.timer); td.timer = null; }
-      if (td.active && td.id) {
+      if (wasActive && td.id) {
         suppressEntryClickRef.current = true;
         setTimeout(() => { suppressEntryClickRef.current = false; }, 0);
         const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
         if (btn) { btn.style.transform = ''; btn.style.boxShadow = ''; btn.style.borderColor = ''; btn.style.zIndex = ''; }
         el.style.overflowX = '';
         if (dragOrderRef.current) syncOrderToServer(dragOrderRef.current);
+      } else if (endedId && !moved) {
+        const btn = el.querySelector(`[data-sub-id="${endedId}"]`) as HTMLElement | null;
+        getEntryGestureController(endedId).handleTouchEndFallback(e, btn);
       }
       td.id = null;
       td.active = false;
+      td.moved = false;
+      td.startX = 0;
+      td.startY = 0;
     };
 
     const onContext = (e: Event) => { if (td.active) e.preventDefault(); };
@@ -547,7 +576,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       el.removeEventListener('touchcancel', onEnd);
       el.removeEventListener('contextmenu', onContext);
     };
-  }, [collapsed, moveSubSessionInDragOrder, syncOrderToServer]);
+  }, [collapsed, getEntryGestureController, moveSubSessionInDragOrder, syncOrderToServer]);
 
   useEffect(() => {
     const installHorizontalEdgeGuard = (el: HTMLDivElement | null) => {

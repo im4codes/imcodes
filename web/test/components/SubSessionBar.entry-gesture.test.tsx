@@ -219,6 +219,27 @@ describe('sub-session entry gesture helper', () => {
 
     expect(log).toEqual(['openNormal']);
   });
+
+  it('uses touchend as a fallback when mobile browsers do not synthesize click', () => {
+    const log: string[] = [];
+    const root = document.createElement('div');
+    const controller = createSubSessionEntryGestureController({
+      getState: () => ({ isOpen: false, isMaximized: false }),
+      actions: makeActions(log),
+    });
+
+    controller.handlePointerDown({ pointerType: 'touch' });
+    controller.handleTouchEndFallback(makeMouseEvent(root), root);
+    expect(log).toEqual(['openNormal']);
+
+    controller.handleClick(makeMouseEvent(root), root);
+    expect(log).toEqual(['openNormal']);
+
+    vi.advanceTimersByTime(800);
+    controller.handlePointerDown({ pointerType: 'touch' });
+    controller.handleClick(makeMouseEvent(root), root);
+    expect(log).toEqual(['openNormal', 'openNormal']);
+  });
 });
 
 function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
@@ -354,5 +375,30 @@ describe('SubSessionBar component entry gestures', () => {
     expect(onOpen).toHaveBeenCalledWith('sub-1');
     vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS);
     expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens collapsed mobile entries on touchend even if no synthetic click follows', () => {
+    const onOpen = vi.fn();
+    renderBar({ desktopLayoutCapable: false, onOpen });
+
+    const entry = screen.getByRole('button', { name: /worker/ });
+    fireEvent.touchStart(entry, { touches: [{ clientX: 10, clientY: 10 }] });
+    fireEvent.touchEnd(entry);
+
+    expect(onOpen).toHaveBeenCalledWith('sub-1');
+    fireEvent.click(entry);
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not open collapsed mobile entries when the touch becomes a horizontal scroll gesture', () => {
+    const onOpen = vi.fn();
+    renderBar({ desktopLayoutCapable: false, onOpen });
+
+    const entry = screen.getByRole('button', { name: /worker/ });
+    fireEvent.touchStart(entry, { touches: [{ clientX: 10, clientY: 10 }] });
+    fireEvent.touchMove(entry, { touches: [{ clientX: 40, clientY: 12 }] });
+    fireEvent.touchEnd(entry);
+
+    expect(onOpen).not.toHaveBeenCalled();
   });
 });
