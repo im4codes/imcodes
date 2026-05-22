@@ -55,6 +55,7 @@ export interface SubSessionEntryGestureController {
   handleTouchEndFallback: (event: Event, root?: Element | null) => void;
   handleClick: (event: Event, root?: Element | null) => void;
   handleDoubleClick: (event: Event, root?: Element | null) => void;
+  cancelTouchSequence: () => void;
   cancelPendingSingleClick: () => void;
   dispose: () => void;
 }
@@ -194,6 +195,8 @@ export function createSubSessionEntryGestureController(
   };
 
   const handleTouchEndFallback = (event: Event, root?: Element | null) => {
+    if (suppressSyntheticClick) return;
+
     if (shouldIgnoreEvent(event, root)) {
       cancelPendingSingleClick();
       return;
@@ -213,6 +216,10 @@ export function createSubSessionEntryGestureController(
     handleTouchEndFallback,
     handleClick,
     handleDoubleClick,
+    cancelTouchSequence() {
+      cancelPendingSingleClick();
+      suppressNextSyntheticClick();
+    },
     cancelPendingSingleClick,
     dispose() {
       cancelPendingSingleClick();

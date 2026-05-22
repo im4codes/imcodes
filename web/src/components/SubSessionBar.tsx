@@ -264,6 +264,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     startY: number;
     moved: boolean;
   }>({ id: null, active: false, timer: null, startX: 0, startY: 0, moved: false });
+  const expandedTouchRef = useRef<{ id: string | null; startX: number; startY: number; moved: boolean }>({
+    id: null,
+    startX: 0,
+    startY: 0,
+    moved: false,
+  });
   const entryGestureControllersRef = useRef<Map<string, SubSessionEntryGestureController>>(new Map());
   const suppressEntryClickRef = useRef(false);
   const openIdsRef = useRef(openIds);
@@ -347,6 +353,42 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
 
   const handleEntryDoubleClick = useCallback((id: string, event: JSX.TargetedMouseEvent<HTMLElement>) => {
     getEntryGestureController(id).handleDoubleClick(event, event.currentTarget as Element);
+  }, [getEntryGestureController]);
+
+  const handleExpandedEntryTouchStart = useCallback((id: string, event: JSX.TargetedTouchEvent<HTMLElement>) => {
+    handleEntryTouchStart(id);
+    const touch = event.touches[0];
+    expandedTouchRef.current = {
+      id,
+      startX: touch?.clientX ?? 0,
+      startY: touch?.clientY ?? 0,
+      moved: false,
+    };
+  }, [handleEntryTouchStart]);
+
+  const handleExpandedEntryTouchMove = useCallback((id: string, event: JSX.TargetedTouchEvent<HTMLElement>) => {
+    const state = expandedTouchRef.current;
+    if (state.id !== id) return;
+    const touch = event.touches[0];
+    if (!touch) return;
+    const dx = touch.clientX - state.startX;
+    const dy = touch.clientY - state.startY;
+    if (Math.hypot(dx, dy) > 8) state.moved = true;
+  }, []);
+
+  const handleExpandedEntryTouchEnd = useCallback((id: string, event: JSX.TargetedTouchEvent<HTMLElement>) => {
+    const state = expandedTouchRef.current;
+    const shouldActivate = state.id === id && !state.moved;
+    expandedTouchRef.current = { id: null, startX: 0, startY: 0, moved: false };
+    if (!shouldActivate) return;
+    getEntryGestureController(id).handleTouchEndFallback(event, event.currentTarget as Element);
+  }, [getEntryGestureController]);
+
+  const handleExpandedEntryTouchCancel = useCallback((id: string) => {
+    const state = expandedTouchRef.current;
+    if (state.id !== id) return;
+    expandedTouchRef.current = { id: null, startX: 0, startY: 0, moved: false };
+    getEntryGestureController(id).cancelTouchSequence();
   }, [getEntryGestureController]);
 
   // Reset drag order only when session membership changes (add/remove),
@@ -539,6 +581,14 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       }
     };
 
+    const resetTouchDrag = () => {
+      td.id = null;
+      td.active = false;
+      td.moved = false;
+      td.startX = 0;
+      td.startY = 0;
+    };
+
     const onEnd = (e: TouchEvent) => {
       const endedId = td.id ?? findBtnId(e.target);
       const wasActive = td.active;
@@ -555,11 +605,18 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         const btn = el.querySelector(`[data-sub-id="${endedId}"]`) as HTMLElement | null;
         getEntryGestureController(endedId).handleTouchEndFallback(e, btn);
       }
-      td.id = null;
-      td.active = false;
-      td.moved = false;
-      td.startX = 0;
-      td.startY = 0;
+      resetTouchDrag();
+    };
+
+    const onCancel = () => {
+      if (td.timer) { clearTimeout(td.timer); td.timer = null; }
+      if (td.active && td.id) {
+        const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
+        if (btn) { btn.style.transform = ''; btn.style.boxShadow = ''; btn.style.borderColor = ''; btn.style.zIndex = ''; }
+        el.style.overflowX = '';
+      }
+      if (td.id) getEntryGestureController(td.id).cancelTouchSequence();
+      resetTouchDrag();
     };
 
     const onContext = (e: Event) => { if (td.active) e.preventDefault(); };
@@ -567,13 +624,13 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     el.addEventListener('touchstart', onStart, { passive: true });
     el.addEventListener('touchmove', onMove, { passive: false });
     el.addEventListener('touchend', onEnd);
-    el.addEventListener('touchcancel', onEnd);
+    el.addEventListener('touchcancel', onCancel);
     el.addEventListener('contextmenu', onContext);
     return () => {
       el.removeEventListener('touchstart', onStart);
       el.removeEventListener('touchmove', onMove);
       el.removeEventListener('touchend', onEnd);
-      el.removeEventListener('touchcancel', onEnd);
+      el.removeEventListener('touchcancel', onCancel);
       el.removeEventListener('contextmenu', onContext);
     };
   }, [collapsed, getEntryGestureController, moveSubSessionInDragOrder, syncOrderToServer]);
@@ -945,7 +1002,10 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               class="subcard-drag-wrap"
               draggable
               onPointerDown={(event) => handleEntryPointerDown(sub.id, event)}
-              onTouchStart={() => handleEntryTouchStart(sub.id)}
+              onTouchStart={(event) => handleExpandedEntryTouchStart(sub.id, event)}
+              onTouchMove={(event) => handleExpandedEntryTouchMove(sub.id, event)}
+              onTouchEnd={(event) => handleExpandedEntryTouchEnd(sub.id, event)}
+              onTouchCancel={() => handleExpandedEntryTouchCancel(sub.id)}
               onClick={(event) => handleEntryClick(sub.id, event)}
               onDblClick={(event) => handleEntryDoubleClick(sub.id, event)}
               onDragStart={(e) => {
