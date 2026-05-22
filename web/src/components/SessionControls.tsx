@@ -622,6 +622,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [openSpecAuditMenu, setOpenSpecAuditMenu] = useState<string | null>(null);
   const [openSpecProposeMenuOpen, setOpenSpecProposeMenuOpen] = useState(false);
   const [openSpecExpandedChange, setOpenSpecExpandedChange] = useState<string | null>(null);
+  const [openSpecFolderPath, setOpenSpecFolderPath] = useState<string | null>(null);
   const [openSpecLayoutTick, setOpenSpecLayoutTick] = useState(0);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModelPreference);
@@ -1100,6 +1101,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     || cloneDialogOpen
     || openSpecAuditMenu !== null
     || openSpecProposeMenuOpen
+    || !!openSpecFolderPath
     || voiceOpen
     || !!mobileFileBrowserOpen;
 
@@ -1247,7 +1249,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecError(null);
     setOpenSpecLoading(false);
     setOpenSpecAuditMenu(null);
+    setOpenSpecProposeMenuOpen(false);
     setOpenSpecExpandedChange(null);
+    setOpenSpecFolderPath(null);
     openSpecRequestIdRef.current = null;
   }, [activeSession?.projectDir, clearOpenSpecRequestTimer]);
 
@@ -1471,6 +1475,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!cwd) return null;
     return `${cwd.replace(/[\\/]+$/, '')}/openspec/changes`;
   }, [activeSession?.projectDir]);
+
+  const openOpenSpecChangeFolder = useCallback((changeName: string) => {
+    if (!openSpecChangesPath) return;
+    setOpenSpecFolderPath(`${openSpecChangesPath}/${changeName}`);
+    setOpenSpecAuditMenu(null);
+    setOpenSpecProposeMenuOpen(false);
+    setOpenSpecOpen(false);
+  }, [openSpecChangesPath]);
 
   const openP2pConfigPanel = useCallback((tab: P2pConfigTab = 'participants') => {
     setP2pConfigInitialTab(tab);
@@ -2615,6 +2627,31 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         />
       </div>
     )}
+    {openSpecFolderPath && ws && activeSession && (
+      <div class="fb-overlay openspec-folder-overlay" onClick={() => setOpenSpecFolderPath(null)}>
+        <div class="fb-modal openspec-folder-modal" onClick={(event) => event.stopPropagation()}>
+          <div class="fb-header openspec-folder-header">
+            <span class="fb-breadcrumb-path">{toComposerReference(openSpecFolderPath)}</span>
+            <button class="fb-close" onClick={() => setOpenSpecFolderPath(null)}>✕</button>
+          </div>
+          <FileBrowser
+            key={`${serverId ?? 'local'}:${openSpecFolderPath}`}
+            ws={ws}
+            serverId={serverId}
+            mode="file-multi"
+            layout="panel"
+            initialPath={openSpecFolderPath}
+            changesRootPath={activeSession.projectDir ?? undefined}
+            hideFooter={false}
+            onConfirm={(paths) => {
+              appendToInput(paths.map((path) => toComposerReference(path)));
+              setOpenSpecFolderPath(null);
+            }}
+            onClose={() => setOpenSpecFolderPath(null)}
+          />
+        </div>
+      </div>
+    )}
     <div class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}${mobileComposerExpanded ? ' controls-wrapper-mobile-expanded' : ''}`}>
       {/* Header control row — compact mode keeps meta controls but still hides terminal shortcuts */}
       {!hideShortcuts && (!compact || showCompactMetaControls) && <div class="shortcuts-row">
@@ -2767,7 +2804,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                           setOpenSpecOpen(false);
                         }}
                       >
-                        {changeName}
+                        <span class="openspec-change-ref-prefix" aria-hidden="true">@</span>
+                        <span class="openspec-change-name-text">{changeName}</span>
+                      </button>
+                      <button
+                        type="button"
+                        class="openspec-change-folder-btn"
+                        title={t('sidebar.pinned_repo')}
+                        aria-label={t('sidebar.pinned_repo')}
+                        onClick={() => openOpenSpecChangeFolder(changeName)}
+                      >
+                        <span class="fb-create-icon fb-create-icon-folder" aria-hidden="true" />
                       </button>
                       {isOpenSpecMobile && (
                         <button

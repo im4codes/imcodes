@@ -152,6 +152,14 @@ vi.mock('../../src/components/AtPicker.js', () => ({
   },
 }));
 
+vi.mock('../../src/components/file-browser-lazy.js', () => ({
+  FileBrowser: ({ initialPath, mode, onConfirm }: { initialPath?: string; mode: string; onConfirm: (paths: string[]) => void }) => (
+    <div data-testid="mock-file-browser" data-initial-path={initialPath ?? ''} data-mode={mode}>
+      <button onClick={() => onConfirm([`${initialPath ?? ''}/proposal.md`])}>mock-file-confirm</button>
+    </div>
+  ),
+}));
+
 const uploadFileMock = vi.fn();
 const execCommandMock = vi.fn(() => true);
 const getUserPrefMock = vi.fn().mockResolvedValue(null);
@@ -1074,9 +1082,46 @@ afterEach(() => {
     });
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: 'change-a' }));
+    const changeButton = screen.getByRole('button', { name: 'change-a' });
+    expect(changeButton.textContent).toContain('@');
+
+    fireEvent.click(changeButton);
 
     expect(screen.getByRole('textbox').textContent).toBe('@openspec/changes/change-a');
+  });
+
+  it('opens an openspec change folder in the file browser and can insert files from it', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'pinned_repo' }));
+
+    const browser = await screen.findByTestId('mock-file-browser');
+    expect(browser.getAttribute('data-initial-path')).toBe('/repo/openspec/changes/change-a');
+    expect(browser.getAttribute('data-mode')).toBe('file-multi');
+
+    fireEvent.click(screen.getByRole('button', { name: 'mock-file-confirm' }));
+
+    expect(screen.getByRole('textbox').textContent).toBe('@openspec/changes/change-a/proposal.md');
+    expect(screen.queryByTestId('mock-file-browser')).toBeNull();
   });
 
   it('does not leave openspec changes loading when the list request cannot be sent', async () => {
