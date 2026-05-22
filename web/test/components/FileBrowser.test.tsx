@@ -637,23 +637,30 @@ describe('FileBrowser', () => {
 
   it('copies the current directory path from the footer next to Select', async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
+    const currentPath = '/home/user/some-extremely-long-folder-name-that-would-dominate-mobile/project';
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
       value: { writeText },
     });
     const { ws, respond } = makeWsFactory();
     const { getByText, container } = render(
-      <FileBrowser ws={ws} mode="file-multi" layout="panel" initialPath="/home/user/project" onConfirm={vi.fn()} />,
+      <FileBrowser ws={ws} mode="file-multi" layout="panel" initialPath={currentPath} onConfirm={vi.fn()} />,
     );
 
     await act(async () => {
-      respond([{ name: 'proposal.md', isDir: false }], '/home/user/project');
+      respond([{ name: 'proposal.md', isDir: false }], currentPath);
     });
 
+    const pathStrip = container.querySelector('.fb-current-path-strip') as HTMLElement;
     const footer = container.querySelector('.fb-footer') as HTMLElement;
     const copyButton = getByText('Copy path') as HTMLButtonElement;
     const selectButton = getByText('Select') as HTMLButtonElement;
 
+    expect(pathStrip.nextElementSibling).toBe(footer);
+    expect(pathStrip.getAttribute('title')).toBe(currentPath);
+    expect(pathStrip.textContent).toContain('/…/');
+    expect(pathStrip.textContent).toContain('project');
+    expect(pathStrip.textContent).not.toContain('some-extremely-long-folder-name-that-would-dominate-mobile');
     expect(copyButton.parentElement).toBe(footer);
     expect(copyButton.nextElementSibling).toBe(selectButton);
 
@@ -662,7 +669,7 @@ describe('FileBrowser', () => {
       await Promise.resolve();
     });
 
-    expect(writeText).toHaveBeenCalledWith('/home/user/project');
+    expect(writeText).toHaveBeenCalledWith(currentPath);
     await waitFor(() => expect(getByText('Copied!')).toBeDefined());
   });
 

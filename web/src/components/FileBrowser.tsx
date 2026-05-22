@@ -365,6 +365,44 @@ const DEFAULT_SHOW_HIDDEN_FILES = true;
 
 type NewEntryKind = 'file' | 'folder';
 
+function shortenPathSegment(segment: string, maxLength: number): string {
+  if (segment.length <= maxLength) return segment;
+  const head = Math.max(6, Math.floor((maxLength - 1) * 0.55));
+  const tail = Math.max(4, maxLength - 1 - head);
+  return `${segment.slice(0, head)}…${segment.slice(-tail)}`;
+}
+
+function formatCurrentPathLabel(path: string): string {
+  const raw = path.trim();
+  if (!raw) return raw;
+  if (raw === '/' || raw === '~' || /^[A-Za-z]:[\\/]?$/.test(raw)) return raw;
+  const separator = raw.includes('\\') && !raw.includes('/') ? '\\' : '/';
+  const driveMatch = raw.match(/^([A-Za-z]:)[/\\]?(.*)$/);
+  const isHome = raw === '~' || raw.startsWith('~/') || raw.startsWith('~\\');
+  const isAbsolute = raw.startsWith('/') || !!driveMatch;
+  const root = driveMatch ? `${driveMatch[1]}${separator}` : isHome ? '~' : raw.startsWith('/') ? '/' : '';
+  const body = driveMatch
+    ? driveMatch[2]
+    : isHome
+      ? raw.slice(raw.length > 1 ? 2 : 1)
+      : raw.startsWith('/')
+        ? raw.slice(1)
+        : raw;
+  const parts = body.split(/[/\\]/).filter(Boolean);
+  if (parts.length === 0) return root || raw;
+  const shortParts = parts.map((part, index) => shortenPathSegment(part, index === parts.length - 1 ? 26 : 18));
+  const rootPrefix = root === '/'
+    ? '/'
+    : root === '~'
+      ? `~${separator}`
+      : root;
+  if (shortParts.length <= 3) return `${rootPrefix}${shortParts.join(separator)}`;
+  const tail = shortParts.slice(-2).join(separator);
+  return isAbsolute || root
+    ? `${rootPrefix}…${separator}${tail}`
+    : `…${separator}${tail}`;
+}
+
 export function FileBrowser({
   ws,
   mode,
@@ -1215,6 +1253,7 @@ export function FileBrowser({
     : selectedPaths.size > 0
       ? t('file_browser.insert', { count: selectedPaths.size })
       : t('file_browser.select');
+  const currentPathLabel = useMemo(() => formatCurrentPathLabel(currentLabel), [currentLabel]);
 
   const alreadySet = new Set(alreadyInserted);
   const usesExternalPreview = !!onPreviewFile;
@@ -1489,41 +1528,46 @@ export function FileBrowser({
   ) : null;
 
   const footer = hideFooter ? null : (
-    <div class="fb-footer">
-      {isMulti && selectedPaths.size > 0 && (
-        <span class="fb-count">{t('file_browser.selected_count', { count: selectedPaths.size })}</span>
-      )}
-      <div style={{ flex: 1 }} />
-      {layout === 'modal' && (
-        <button class="btn btn-secondary" onClick={onClose}>{t('common.cancel')}</button>
-      )}
-      <button
-        class="btn btn-secondary fb-footer-copy-path"
-        title={currentLabel}
-        onClick={() => {
-          const path = currentLabel;
-          void (async () => {
-            try {
-              await navigator.clipboard.writeText(path);
-              setCopiedPath(path);
-              setTimeout(() => setCopiedPath((cur) => (cur === path ? null : cur)), 1500);
-            } catch {
-              // Clipboard access can be blocked in insecure contexts; keep the
-              // file picker usable and leave the path visible in the title.
-            }
-          })();
-        }}
-      >
-        {copiedPath === currentLabel ? t('fileBrowser.copied') : t('fileBrowser.copyPath')}
-      </button>
-      <button
-        class="btn btn-primary"
-        disabled={mode !== 'dir-only' && selectedPaths.size === 0}
-        onClick={handleConfirm}
-      >
-        {confirmLabel}
-      </button>
-    </div>
+    <>
+      <div class="fb-current-path-strip" title={currentLabel}>
+        <span class="fb-current-path-label">{currentPathLabel}</span>
+      </div>
+      <div class="fb-footer">
+        {isMulti && selectedPaths.size > 0 && (
+          <span class="fb-count">{t('file_browser.selected_count', { count: selectedPaths.size })}</span>
+        )}
+        <div style={{ flex: 1 }} />
+        {layout === 'modal' && (
+          <button class="btn btn-secondary" onClick={onClose}>{t('common.cancel')}</button>
+        )}
+        <button
+          class="btn btn-secondary fb-footer-copy-path"
+          title={currentLabel}
+          onClick={() => {
+            const path = currentLabel;
+            void (async () => {
+              try {
+                await navigator.clipboard.writeText(path);
+                setCopiedPath(path);
+                setTimeout(() => setCopiedPath((cur) => (cur === path ? null : cur)), 1500);
+              } catch {
+                // Clipboard access can be blocked in insecure contexts; keep the
+                // file picker usable and leave the path visible in the title.
+              }
+            })();
+          }}
+        >
+          {copiedPath === currentLabel ? t('fileBrowser.copied') : t('fileBrowser.copyPath')}
+        </button>
+        <button
+          class="btn btn-primary"
+          disabled={mode !== 'dir-only' && selectedPaths.size === 0}
+          onClick={handleConfirm}
+        >
+          {confirmLabel}
+        </button>
+      </div>
+    </>
   );
 
   // Git changes section (shown at bottom of Files view or as standalone Changes view)
