@@ -1293,6 +1293,18 @@ export function App() {
     bringSubToFront(id);
   }, [bringSubToFront, clearSubSessionMaximized]);
 
+  const openSubSessionWindow = useCallback((id: string) => {
+    clearSubSessionMaximized(id);
+
+    if (isMobileRef.current) {
+      setOpenSubIds(new Set([id]));
+      return;
+    }
+
+    setOpenSubIds((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
+    bringSubToFront(id);
+  }, [bringSubToFront, clearSubSessionMaximized, setOpenSubIds]);
+
   const toggleSubSession = useCallback((id: string) => {
     const mobile = isMobileRef.current;
     const wasOpen = openSubIdsRef.current.has(id);
@@ -1466,6 +1478,13 @@ export function App() {
       return next;
     });
   }, [closeAllSubSessionWindows, setActiveSession]);
+
+  const selectSubSessionFromTree = useCallback((sub: SubSession) => {
+    if (sub.parentSession && sub.parentSession !== activeSessionRef.current) {
+      setActiveSession(sub.parentSession, { keepSubWindows: true });
+    }
+    openSubSessionWindow(sub.id);
+  }, [openSubSessionWindow, setActiveSession]);
 
   useEffect(() => {
     if (!activeSession) return;
@@ -3463,10 +3482,7 @@ export function App() {
                 setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; });
               }}
               onSelectSubSession={(sub) => {
-                if (sub.parentSession && sub.parentSession !== activeSession) {
-                  setActiveSession(sub.parentSession, { keepSubWindows: true });
-                }
-                toggleSubSession(sub.id);
+                selectSubSessionFromTree(sub);
               }}
               onNewSession={() => setShowNewSession(true)}
               onNewSubSession={() => setShowSubDialog(true)}
@@ -3926,7 +3942,7 @@ export function App() {
                 onCollapsedChange={setSubSessionBarCollapsed}
                 onVisualOrderChange={handleSubSessionVisualOrderChange}
                 idleFlashTokens={idleFlashTokens}
-                onOpen={toggleSubSession}
+                onOpen={desktopLayoutCapable ? toggleSubSession : openSubSessionWindow}
                 onClose={closeSubSessionAndClearMaximized}
                 onOpenMaximized={openSubSessionMaximized}
                 onMaximize={maximizeOpenSubSession}
@@ -4063,10 +4079,7 @@ export function App() {
                   closeSidebar();
                 }}
                 onSelectSubSession={(sub) => {
-                  if (sub.parentSession && sub.parentSession !== activeSession) {
-                    setActiveSession(sub.parentSession, { keepSubWindows: true });
-                  }
-                  toggleSubSession(sub.id);
+                  selectSubSessionFromTree(sub);
                   closeSidebar();
                 }}
                 onNewSession={() => { setShowNewSession(true); closeSidebar(); }}
