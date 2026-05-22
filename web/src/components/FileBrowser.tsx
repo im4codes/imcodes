@@ -119,6 +119,8 @@ export interface FileBrowserProps {
   serverId?: string;
   onConfirm: (paths: string[]) => void;
   onClose?: () => void;
+  /** Called after a new directory is successfully created. */
+  onDirectoryCreated?: (path: string) => void;
   /** Seed external preview state so a new host can reuse an existing load. */
   initialPreview?: FileBrowserPreviewState;
   /** Keep an external preview host in sync with this FileBrowser's preview state. */
@@ -387,6 +389,7 @@ export function FileBrowser({
   serverId,
   onConfirm,
   onClose,
+  onDirectoryCreated,
   initialPreview,
   onPreviewStateChange,
   skipAutoPreviewIfLoading = false,
@@ -877,12 +880,15 @@ export function FileBrowser({
         }
 
         loadedRef.current.delete(pending.parentPath);
+        const createdPath = msg.resolvedPath ?? pending.targetPath;
         setError(null);
+        setSelectedPaths(new Set([createdPath]));
         fetchDir(pending.parentPath);
+        onDirectoryCreated?.(createdPath);
         return;
       }
     });
-  }, [clearAllPendingPreviewRequests, clearPendingPreviewRequest, fetchDir, getActivePreviewCycle, startPath, showHidden, highlightPath, t, ws]);
+  }, [clearAllPendingPreviewRequests, clearPendingPreviewRequest, fetchDir, getActivePreviewCycle, onDirectoryCreated, startPath, showHidden, highlightPath, t, ws]);
 
   const fetchPreview = useCallback((filePath: string, preferDiff = false) => {
     if (editDirtyRef.current) {

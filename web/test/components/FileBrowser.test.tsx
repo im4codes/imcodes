@@ -492,8 +492,17 @@ describe('FileBrowser', () => {
 
   it('creates a new folder and refreshes the parent directory after fs.mkdir_response', async () => {
     const { ws, respond, sendMsg, fsMkdir, fsListDir } = makeWsFactory();
+    const onDirectoryCreated = vi.fn();
     const { getByTitle, getByPlaceholderText, getByText } = render(
-      <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="/home/user" onConfirm={vi.fn()} onClose={vi.fn()} />,
+      <FileBrowser
+        ws={ws}
+        mode="dir-only"
+        layout="modal"
+        initialPath="/home/user"
+        onConfirm={vi.fn()}
+        onClose={vi.fn()}
+        onDirectoryCreated={onDirectoryCreated}
+      />,
     );
 
     await act(async () => {
@@ -517,6 +526,7 @@ describe('FileBrowser', () => {
     });
 
     expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, true);
+    expect(onDirectoryCreated).toHaveBeenCalledWith('/home/user/newdir');
   });
 
   it('creates a new file, refreshes the parent directory, and opens the new file preview', async () => {

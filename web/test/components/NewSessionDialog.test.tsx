@@ -21,6 +21,18 @@ vi.mock('../../src/components/FileBrowser.js', () => ({
   FileBrowser: () => null,
 }));
 
+vi.mock('../../src/components/file-browser-lazy.js', () => ({
+  FileBrowser: (props: {
+    onConfirm?: (paths: string[]) => void;
+    onDirectoryCreated?: (path: string) => void;
+  }) => (
+    <div data-testid="mock-file-browser">
+      <button onClick={() => props.onConfirm?.(['/home/user/selected'])}>mock-select-dir</button>
+      <button onClick={() => props.onDirectoryCreated?.('/home/user/new-project')}>mock-create-folder</button>
+    </div>
+  ),
+}));
+
 import { NewSessionDialog } from '../../src/components/NewSessionDialog.js';
 
 const makeWs = () => {
@@ -58,6 +70,18 @@ describe('NewSessionDialog', () => {
   it('renders working directory input', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     expect(screen.getByPlaceholderText('~/projects/my-project')).toBeDefined();
+  });
+
+  it('uses a newly created folder from the directory picker as the working directory', async () => {
+    render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.click(screen.getByTitle('browse'));
+    fireEvent.click(screen.getByText('mock-create-folder'));
+
+    await waitFor(() => {
+      expect((screen.getByPlaceholderText('~/projects/my-project') as HTMLInputElement).value).toBe('/home/user/new-project');
+    });
+    expect(screen.queryByTestId('mock-file-browser')).toBeNull();
   });
 
   it('renders agent type selector', () => {

@@ -602,6 +602,11 @@ export function NewSessionDialog({
               setDir(paths[0] ?? "");
               setShowDirBrowser(false);
             }}
+            onDirectoryCreated={(path) => {
+              setDir(path);
+              setShowDirBrowser(false);
+              setError("");
+            }}
             onClose={() => setShowDirBrowser(false)}
           />
         )}
