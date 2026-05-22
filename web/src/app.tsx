@@ -3942,7 +3942,7 @@ export function App() {
                 onCollapsedChange={setSubSessionBarCollapsed}
                 onVisualOrderChange={handleSubSessionVisualOrderChange}
                 idleFlashTokens={idleFlashTokens}
-                onOpen={desktopLayoutCapable ? toggleSubSession : openSubSessionWindow}
+                onOpen={toggleSubSession}
                 onClose={closeSubSessionAndClearMaximized}
                 onOpenMaximized={openSubSessionMaximized}
                 onMaximize={maximizeOpenSubSession}

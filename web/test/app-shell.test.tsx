@@ -703,7 +703,7 @@ describe('App shell', () => {
     });
   }, 20_000);
 
-  it('keeps the mobile bottom sub-session button as an idempotent opener', async () => {
+  it('toggles a mobile bottom sub-session button open and closed', async () => {
     const originalUserAgent = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
 
@@ -711,7 +711,6 @@ describe('App shell', () => {
       localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
       localStorage.setItem('rcc_server', 'srv-1');
       localStorage.setItem('rcc_session', 'deck_alpha_brain');
-      localStorage.setItem('rcc_open_subs_deck_alpha_brain', JSON.stringify(['sub-1']));
       useSubSessionsState.subSessions = [
         {
           id: 'sub-1',
@@ -732,13 +731,20 @@ describe('App shell', () => {
       render(<App />);
 
       await waitFor(() => expect(wsInstances.length).toBe(1));
-      expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
 
       fireEvent.click(screen.getByText('subbar-open-sub-1'));
 
       await waitFor(() => {
         expect(screen.queryByTestId('sub-session-window-sub-1')).toBeTruthy();
         expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBe(JSON.stringify(['sub-1']));
+      });
+
+      fireEvent.click(screen.getByText('subbar-open-sub-1'));
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
+        expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBeNull();
       });
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
