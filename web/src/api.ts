@@ -1175,12 +1175,14 @@ export async function uploadFile(
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const form = new FormData();
   form.append('file', file);
-  const pendingAckProgress = 95;
+  const browserUploadWeight = 50;
+  const daemonDownloadWeight = 50;
 
   // Use XHR for upload progress reporting
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `${_baseUrl}/api/server/${serverId}/upload`);
+    xhr.setRequestHeader('Accept', 'application/x-ndjson, application/json');
 
     // Auth headers (same as rawFetch)
     if (_apiKey) {
@@ -1194,13 +1196,78 @@ export async function uploadFile(
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && onProgress) {
         const transportPct = Math.round((e.loaded / e.total) * 100);
-        onProgress(Math.min(transportPct, pendingAckProgress));
+        onProgress(Math.min(Math.round((transportPct / 100) * browserUploadWeight), browserUploadWeight));
       }
     };
+
+    let processedResponseLength = 0;
+    let finalPayload: { ok: boolean; attachment: AttachmentRefResponse } | null = null;
+    let streamError: ApiError | null = null;
+    let highestProgress = 0;
+
+    const emitProgress = (pct: number) => {
+      const next = Math.max(highestProgress, Math.min(100, Math.round(pct)));
+      highestProgress = next;
+      onProgress?.(next);
+    };
+
+    const consumeProgressLines = (flush = false) => {
+      const response = xhr.responseText ?? '';
+      let chunk = response.slice(processedResponseLength);
+      if (!chunk) return;
+      if (!flush) {
+        const lastNewline = chunk.lastIndexOf('\n');
+        if (lastNewline < 0) return;
+        chunk = chunk.slice(0, lastNewline + 1);
+      }
+      processedResponseLength += chunk.length;
+
+      for (const line of chunk.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let msg: Record<string, unknown>;
+        try {
+          msg = JSON.parse(trimmed) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        if (msg.type === 'file.upload_progress') {
+          const loaded = typeof msg.loaded === 'number' ? msg.loaded : 0;
+          const total = typeof msg.total === 'number' && msg.total > 0 ? msg.total : file.size;
+          const daemonPct = total > 0 ? Math.min(1, loaded / total) : 0;
+          emitProgress(browserUploadWeight + daemonPct * daemonDownloadWeight);
+          continue;
+        }
+        if (msg.type === 'file.upload_done' && msg.attachment) {
+          finalPayload = { ok: true, attachment: msg.attachment as AttachmentRefResponse };
+          emitProgress(100);
+          continue;
+        }
+        if (msg.type === 'file.upload_error') {
+          const message = typeof msg.error === 'string'
+            ? msg.error
+            : typeof msg.message === 'string'
+              ? msg.message
+              : 'upload_failed';
+          streamError = new ApiError(xhr.status >= 400 ? xhr.status : 500, message);
+        }
+      }
+    };
+
+    xhr.onprogress = () => consumeProgressLines(false);
 
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
+          consumeProgressLines(true);
+          if (streamError) {
+            reject(streamError);
+            return;
+          }
+          if (finalPayload) {
+            resolve(finalPayload);
+            return;
+          }
           const parsed = JSON.parse(xhr.responseText);
           onProgress?.(100);
           resolve(parsed);

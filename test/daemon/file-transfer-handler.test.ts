@@ -268,17 +268,23 @@ describe('file-transfer local handle hardening', () => {
     );
 
     expect(fetchMock).toHaveBeenCalledWith('https://relay.example/upload-staged/upload-fetch?token=reusable');
-    expect(done.sent[0]).toMatchObject({
+    expect(done.sent).toContainEqual(expect.objectContaining({
+      type: 'file.upload_progress',
+      uploadId: 'upload-fetch',
+      loaded: 0,
+      total: 5,
+    }));
+    expect(done.sent).toContainEqual(expect.objectContaining({
       type: 'file.upload_done',
       uploadId: 'upload-fetch',
-      attachment: {
+      attachment: expect.objectContaining({
         id: 'safe.txt',
         originalName: 'safe.txt',
         mime: 'text/plain',
         size: 5,
         downloadable: true,
-      },
-    });
+      }),
+    }));
   });
 
   it('retries relay-staged upload downloads with the same URL before failing', async () => {
@@ -302,9 +308,9 @@ describe('file-transfer local handle hardening', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock).toHaveBeenNthCalledWith(2, 'https://relay.example/upload-staged/upload-fetch-retry?token=reusable');
-    expect(done.sent[0]).toMatchObject({
+    expect(done.sent).toContainEqual(expect.objectContaining({
       type: 'file.upload_done',
       uploadId: 'upload-fetch-retry',
-    });
+    }));
   });
 });

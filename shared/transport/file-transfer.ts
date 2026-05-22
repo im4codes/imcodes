@@ -91,6 +91,13 @@ export interface FileUploadError {
   message: string;
 }
 
+export interface FileUploadProgress {
+  type: 'file.upload_progress';
+  uploadId: string;
+  loaded: number;
+  total: number;
+}
+
 export interface FileDownloadDone {
   type: 'file.download_done';
   downloadId: string;
@@ -109,6 +116,7 @@ export interface FileDownloadError {
 export type FileTransferDaemonMessage =
   | FileUploadDone
   | FileUploadError
+  | FileUploadProgress
   | FileDownloadDone
   | FileDownloadError;
 

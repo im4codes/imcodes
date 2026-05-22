@@ -7,7 +7,7 @@ import { mkdir, writeFile, readFile, readdir, stat, unlink, realpath as fsRealpa
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
-import { Readable } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import logger from '../util/logger.js';
 import {
@@ -17,6 +17,7 @@ import {
   type FileUploadFetchRequest,
   type FileUploadDone,
   type FileUploadError,
+  type FileUploadProgress,
   type FileDownloadRequest,
   type FileDownloadDone,
   type FileDownloadError,
@@ -154,7 +155,22 @@ function sendUploadError(serverLink: ServerLink, uploadId: string, filename: str
   serverLink.send(response);
 }
 
-async function fetchRelayUpload(downloadUrl: string, resolved: string, expectedSize: number): Promise<number> {
+function sendUploadProgress(serverLink: ServerLink, uploadId: string, loaded: number, total: number): void {
+  const response: FileUploadProgress = {
+    type: 'file.upload_progress',
+    uploadId,
+    loaded: Math.max(0, Math.min(loaded, total)),
+    total,
+  };
+  serverLink.send(response);
+}
+
+async function fetchRelayUpload(
+  downloadUrl: string,
+  resolved: string,
+  expectedSize: number,
+  onProgress?: (loaded: number, total: number) => void,
+): Promise<number> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
@@ -165,14 +181,38 @@ async function fetchRelayUpload(downloadUrl: string, resolved: string, expectedS
       if (!response.body) {
         throw new Error('relay_fetch_empty_body');
       }
+      let loaded = 0;
+      let lastPct = -1;
+      let lastSentAt = 0;
+      const reportProgress = (force = false) => {
+        const total = Math.max(1, expectedSize);
+        const pct = Math.floor((loaded / total) * 100);
+        const now = Date.now();
+        if (force || pct !== lastPct && (now - lastSentAt >= 250 || pct >= 100)) {
+          lastPct = pct;
+          lastSentAt = now;
+          onProgress?.(loaded, expectedSize);
+        }
+      };
+      reportProgress(true);
+      const progress = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          loaded += chunk.length;
+          reportProgress();
+          callback(null, chunk);
+        },
+      });
       await pipeline(
         Readable.fromWeb(response.body as never),
+        progress,
         createWriteStream(resolved),
       );
       const fileStat = await stat(resolved);
       if (fileStat.size !== expectedSize) {
         throw new Error('size_mismatch');
       }
+      loaded = fileStat.size;
+      reportProgress(true);
       return fileStat.size;
     } catch (err) {
       lastErr = err;
@@ -292,7 +332,9 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
       throw new Error('missing_download_url');
     }
 
-    const size = await fetchRelayUpload(downloadUrl, resolved, msg.size);
+    const size = await fetchRelayUpload(downloadUrl, resolved, msg.size, (loaded, total) => {
+      sendUploadProgress(serverLink, uploadId, loaded, total);
+    });
     await finalizeUploadedFile({
       uploadId,
       filename,

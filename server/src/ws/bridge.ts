@@ -970,6 +970,7 @@ export class WsBridge {
     resolve: (msg: Record<string, unknown>) => void;
     reject: (err: Error) => void;
     timer: ReturnType<typeof setTimeout>;
+    onProgress?: (msg: Record<string, unknown>) => void;
   }>();
 
   /**
@@ -3220,6 +3221,11 @@ export class WsBridge {
     }
 
     // ── File transfer responses: resolve HTTP handler Promises ─────────────────
+    if (type === 'file.upload_progress') {
+      const requestId = msg.uploadId as string | undefined;
+      if (requestId) this.notifyFileTransferProgress(requestId, msg);
+      return;
+    }
     if (type === 'file.upload_done' || type === 'file.upload_error') {
       const requestId = msg.uploadId as string | undefined;
       if (requestId) this.resolveFileTransfer(requestId, msg);
@@ -4732,7 +4738,12 @@ export class WsBridge {
    * Send a file transfer request to daemon and await the correlated response.
    * Rejects if daemon is offline or the request times out.
    */
-  sendFileTransferRequest(requestId: string, message: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+  sendFileTransferRequest(
+    requestId: string,
+    message: Record<string, unknown>,
+    timeoutMs: number,
+    onProgress?: (msg: Record<string, unknown>) => void,
+  ): Promise<Record<string, unknown>> {
     if (!this.isDaemonConnected()) {
       return Promise.reject(new Error('daemon_offline'));
     }
@@ -4742,7 +4753,7 @@ export class WsBridge {
         reject(new Error('timeout'));
       }, timeoutMs);
 
-      this.pendingFileTransfers.set(requestId, { resolve, reject, timer });
+      this.pendingFileTransfers.set(requestId, { resolve, reject, timer, onProgress });
 
       try {
         this.daemonWs!.send(JSON.stringify(message));
@@ -4781,6 +4792,13 @@ export class WsBridge {
     clearTimeout(pending.timer);
     this.pendingFileTransfers.delete(requestId);
     pending.resolve(msg);
+    return true;
+  }
+
+  notifyFileTransferProgress(requestId: string, msg: Record<string, unknown>): boolean {
+    const pending = this.pendingFileTransfers.get(requestId);
+    if (!pending) return false;
+    pending.onProgress?.(msg);
     return true;
   }
 

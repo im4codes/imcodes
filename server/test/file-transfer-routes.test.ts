@@ -124,17 +124,63 @@ describe('file-transfer upload route', () => {
         daemonPath: '/tmp/upload.txt',
       },
     });
-    expect(sendFileTransferRequestMock).toHaveBeenCalledWith(
-      expect.any(String),
-      expect.objectContaining({
-        type: 'file.upload_fetch',
-        originalName: 'hello.txt',
-        mime: 'text/plain',
-        size: 5,
-        downloadUrl: expect.stringContaining('/api/server/srv-1/upload-staged/'),
-      }),
-      FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS,
-    );
+    expect(sendFileTransferRequestMock.mock.calls[0]?.[0]).toEqual(expect.any(String));
+    expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
+      type: 'file.upload_fetch',
+      originalName: 'hello.txt',
+      mime: 'text/plain',
+      size: 5,
+      downloadUrl: expect.stringContaining('/api/server/srv-1/upload-staged/'),
+    }));
+    expect(sendFileTransferRequestMock.mock.calls[0]?.[2]).toBe(FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS);
     expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).not.toHaveProperty('content');
+  });
+
+  it('streams daemon fetch progress for browsers that opt in', async () => {
+    sendFileTransferRequestMock.mockImplementationOnce(async (_requestId, _message, _timeoutMs, onProgress) => {
+      onProgress?.({
+        type: 'file.upload_progress',
+        uploadId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        loaded: 3,
+        total: 6,
+      });
+      return {
+        type: 'file.upload_done',
+        attachment: {
+          id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt',
+          source: 'upload',
+          daemonPath: '/tmp/upload.txt',
+          downloadable: true,
+        },
+      };
+    });
+
+    const form = new FormData();
+    form.append('file', new File(['hello!'], 'hello.txt', { type: 'text/plain' }));
+
+    const res = await makeApp().request('/api/server/srv-1/upload', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer test',
+        Accept: 'application/x-ndjson',
+      },
+      body: form,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('application/x-ndjson');
+    const lines = (await res.text()).trim().split('\n').map((line) => JSON.parse(line));
+    expect(lines).toEqual([
+      expect.objectContaining({ type: 'file.upload_progress', loaded: 0, total: 6 }),
+      expect.objectContaining({ type: 'file.upload_progress', loaded: 3, total: 6 }),
+      expect.objectContaining({
+        type: 'file.upload_done',
+        ok: true,
+        attachment: expect.objectContaining({
+          serverId: 'srv-1',
+          daemonPath: '/tmp/upload.txt',
+        }),
+      }),
+    ]);
   });
 });
