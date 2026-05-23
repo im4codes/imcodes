@@ -275,7 +275,13 @@ type RepoPanelTarget = {
   projectDir: string;
   initialTab?: RepoPageTabKey;
   initialTabToken: number;
+  parentSubId?: string | null;
+  parentServerId?: string | null;
 };
+
+function getRepoDesktopWindowId(parentSubId?: string | null): string {
+  return parentSubId ? DESKTOP_WINDOW_IDS.subsessionRepo(parentSubId) : DESKTOP_WINDOW_IDS.repo;
+}
 
 export function App() {
   const { t: trans } = useTranslation();
@@ -1091,6 +1097,9 @@ export function App() {
   const [showRepoPage, setShowRepoPage] = useState(false);
   const [repoPanelTarget, setRepoPanelTarget] = useState<RepoPanelTarget | null>(null);
   const repoPanelOpenTokenRef = useRef(0);
+  const repoPanelParentSubId = repoPanelTarget?.parentSubId ?? null;
+  const repoPanelDesktopWindowId = getRepoDesktopWindowId(repoPanelParentSubId);
+  const repoPanelStackServerId = repoPanelTarget?.parentServerId ?? selectedServerId ?? undefined;
   const [repoFocusLatestAction, setRepoFocusLatestAction] = useState<{ token: number; failedJobName?: string; failedStepName?: string } | null>(null);
   /** Floating file preview request opened from file panels and chat file links. */
   const [previewFileRequest, setPreviewFileRequest] = useState<FileBrowserPreviewRequest | null>(null);
@@ -1355,14 +1364,24 @@ export function App() {
   // Mobile is a no-op (the helpers themselves bail out on isMobileRef).
   useEffect(() => {
     if (showRepoPage) {
-      ensureDesktopWindow(DESKTOP_WINDOW_IDS.repo, {
-        kind: DESKTOP_WINDOW_KINDS.repo,
-        serverId: selectedServerId ?? undefined,
+      if (repoPanelParentSubId) {
+        const parentId = DESKTOP_WINDOW_IDS.subSession(repoPanelParentSubId);
+        ensureDesktopWindow(parentId, {
+          kind: DESKTOP_WINDOW_KINDS.subSession,
+          subId: repoPanelParentSubId,
+          serverId: repoPanelStackServerId,
+        });
+      }
+      ensureDesktopWindow(repoPanelDesktopWindowId, {
+        kind: repoPanelParentSubId ? DESKTOP_WINDOW_KINDS.subsessionRepo : DESKTOP_WINDOW_KINDS.repo,
+        parentId: repoPanelParentSubId ? DESKTOP_WINDOW_IDS.subSession(repoPanelParentSubId) : undefined,
+        subId: repoPanelParentSubId ?? undefined,
+        serverId: repoPanelStackServerId,
       }, { bringToFront: true });
     } else {
-      removeDesktopWindow(DESKTOP_WINDOW_IDS.repo);
+      removeDesktopWindow(repoPanelDesktopWindowId);
     }
-  }, [showRepoPage, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
+  }, [showRepoPage, repoPanelDesktopWindowId, repoPanelParentSubId, repoPanelStackServerId, ensureDesktopWindow, removeDesktopWindow]);
 
   useEffect(() => {
     if (showCronManager) {
@@ -3132,13 +3151,31 @@ export function App() {
     return subSession?.cwd ?? activeSessionInfo?.projectDir ?? undefined;
   }, [activeSessionInfo?.projectDir, sessions, subSessions]);
 
-  const openRepoPage = useCallback((target?: { sessionId?: string | null; projectDir?: string | null; initialTab?: RepoPageTabKey }) => {
+  const openRepoPage = useCallback((target?: { sessionId?: string | null; projectDir?: string | null; initialTab?: RepoPageTabKey; parentSubId?: string | null }) => {
     const sessionId = target?.sessionId ?? activeSession ?? null;
     const projectDir = target?.projectDir ?? resolveRepoProjectDir(sessionId);
     if (!projectDir) return;
-    ensureDesktopWindow(DESKTOP_WINDOW_IDS.repo, {
-      kind: DESKTOP_WINDOW_KINDS.repo,
-      serverId: selectedServerId ?? undefined,
+    const subSessionTarget = sessionId ? subSessions.find((sub) => sub.sessionName === sessionId) : null;
+    const parentSubId = target?.parentSubId ?? subSessionTarget?.id ?? null;
+    const parentServerId = subSessionTarget?.serverId ?? selectedServerId ?? null;
+    const previousWindowId = getRepoDesktopWindowId(repoPanelTarget?.parentSubId);
+    const nextWindowId = getRepoDesktopWindowId(parentSubId);
+    if (previousWindowId !== nextWindowId) {
+      removeDesktopWindow(previousWindowId);
+    }
+    if (parentSubId) {
+      const parentId = DESKTOP_WINDOW_IDS.subSession(parentSubId);
+      ensureDesktopWindow(parentId, {
+        kind: DESKTOP_WINDOW_KINDS.subSession,
+        subId: parentSubId,
+        serverId: parentServerId ?? undefined,
+      });
+    }
+    ensureDesktopWindow(nextWindowId, {
+      kind: parentSubId ? DESKTOP_WINDOW_KINDS.subsessionRepo : DESKTOP_WINDOW_KINDS.repo,
+      parentId: parentSubId ? DESKTOP_WINDOW_IDS.subSession(parentSubId) : undefined,
+      subId: parentSubId ?? undefined,
+      serverId: parentServerId ?? undefined,
     }, { bringToFront: true });
     repoPanelOpenTokenRef.current += 1;
     setRepoPanelTarget({
@@ -3146,12 +3183,14 @@ export function App() {
       projectDir,
       ...(target?.initialTab ? { initialTab: target.initialTab } : {}),
       initialTabToken: repoPanelOpenTokenRef.current,
+      parentSubId,
+      parentServerId,
     });
     if (target?.initialTab !== 'actions') {
       setRepoFocusLatestAction(null);
     }
     setShowRepoPage(true);
-  }, [activeSession, ensureDesktopWindow, resolveRepoProjectDir, selectedServerId]);
+  }, [activeSession, ensureDesktopWindow, removeDesktopWindow, repoPanelTarget?.parentSubId, resolveRepoProjectDir, selectedServerId, subSessions]);
 
   const repoPanelSessionId = repoPanelTarget?.sessionId ?? activeSession ?? null;
   const repoPanelProjectDir = repoPanelTarget?.projectDir ?? activeSessionInfo?.projectDir;
@@ -4220,7 +4259,22 @@ export function App() {
       )}
 
       {showRepoPage && wsRef.current && repoPanelProjectDir && (
-        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} onPin={() => pinPanel('repopage', { sessionName: repoPanelSessionId, projectDir: repoPanelProjectDir, serverId: selectedServerId }, () => setShowRepoPage(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={800} defaultH={600} zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.repo, 5050)} onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.repo)}>
+        <FloatingPanel
+          id="repo"
+          title="Repository"
+          onClose={() => setShowRepoPage(false)}
+          onPin={() => pinPanel('repopage', { sessionName: repoPanelSessionId, projectDir: repoPanelProjectDir, serverId: selectedServerId }, () => setShowRepoPage(false))}
+          pinTooltip={trans('sidebar.pin_to_sidebar')}
+          defaultW={800}
+          defaultH={600}
+          zIndex={getDesktopWindowZIndex(
+            repoPanelDesktopWindowId,
+            repoPanelParentSubId
+              ? getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(repoPanelParentSubId), 6000) + 1
+              : 5050,
+          )}
+          onFocus={() => bringDesktopWindowToFront(repoPanelDesktopWindowId)}
+        >
           <RepoPage ws={wsRef.current} sessionId={repoPanelSessionId} projectDir={repoPanelProjectDir} initialTab={repoPanelTarget?.initialTab} initialTabToken={repoPanelTarget?.initialTabToken} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';
@@ -4502,7 +4556,7 @@ export function App() {
                 if (label !== null) renameSubSession(sub.id, label);
               }}
               onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null })}
-              onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches' })}
+              onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
               onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
               zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000)}

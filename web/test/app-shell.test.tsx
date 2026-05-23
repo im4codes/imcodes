@@ -708,7 +708,7 @@ describe('App shell', () => {
     await waitFor(() => expect(subZ()).toBeGreaterThan(repoZ()));
 
     fireEvent.click(screen.getByText('sub-window-repo-sub-1'));
-    await waitFor(() => expect(repoZ()).toBeGreaterThan(subZ()));
+    await waitFor(() => expect(repoZ()).toBe(subZ() + 1));
   }, 20_000);
 
   it('keeps an existing sub-session window open when selecting its session-tree button', async () => {

@@ -69,7 +69,44 @@ jobs:
       matrix:
         node: ['22', '24']
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        id: checkout_1
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Wait before checkout retry 2
+        if: steps.checkout_1.outcome == 'failure'
+        run: |
+          echo "::warning::actions/checkout failed on attempt 1; retrying in 15s"
+          sleep 15
+
+      - name: Checkout (retry 2)
+        id: checkout_2
+        if: steps.checkout_1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Wait before checkout retry 3
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure'
+        run: |
+          echo "::warning::actions/checkout failed on attempt 2; retrying in 30s"
+          sleep 30
+
+      - name: Checkout (retry 3)
+        id: checkout_3
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Wait before checkout retry 4
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure' && steps.checkout_3.outcome == 'failure'
+        run: |
+          echo "::warning::actions/checkout failed on attempt 3; retrying in 60s"
+          sleep 60
+
+      - name: Checkout (retry 4)
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure' && steps.checkout_3.outcome == 'failure'
+        uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
