@@ -3,7 +3,8 @@
  */
 import { cleanup, render } from '@testing-library/preact';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { HTML_RENDER_MAX_BYTES } from '../../../shared/html-preview.js';
 import { HtmlSafePreview } from '../../src/components/HtmlSafePreview.js';
@@ -22,6 +23,8 @@ vi.mock('react-i18next', () => ({
     },
   }),
 }));
+
+const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 
 afterEach(() => {
   cleanup();
@@ -172,8 +175,8 @@ describe('HtmlSafePreview', () => {
 
   it('keeps the safe render path free of forbidden preview primitives', () => {
     const files = [
-      join(process.cwd(), 'web/src/components/HtmlSafePreview.tsx'),
-      join(process.cwd(), 'web/src/util/html-safe-preview.ts'),
+      resolve(TEST_DIR, '../../src/components/HtmlSafePreview.tsx'),
+      resolve(TEST_DIR, '../../src/util/html-safe-preview.ts'),
     ];
     const forbidden = [
       'allow-scripts',
