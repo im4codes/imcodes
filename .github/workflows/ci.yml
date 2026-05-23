@@ -418,14 +418,39 @@ jobs:
         run: npm version ${{ needs.docker.outputs.npm_version }} --no-git-tag-version
       - name: Publish (skip if version already on npm)
         run: |
+          set -euo pipefail
           VERSION=${{ needs.docker.outputs.npm_version }}
+          PUBLISH_ARGS=(--access public)
+          if [ "${{ github.ref }}" = "refs/heads/dev" ]; then
+            PUBLISH_ARGS=(--tag dev "${PUBLISH_ARGS[@]}")
+          fi
+
           if npm view "imcodes@${VERSION}" version >/dev/null 2>&1; then
             echo "::warning::Version ${VERSION} already published — skipping"
-          elif [ "${{ github.ref }}" = "refs/heads/dev" ]; then
-            npm publish --tag dev --provenance --access public
-          else
-            npm publish --provenance --access public
+            exit 0
           fi
+
+          set +e
+          npm publish "${PUBLISH_ARGS[@]}" --provenance 2>&1 | tee npm-publish.log
+          publish_status=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${publish_status}" -eq 0 ]; then
+            exit 0
+          fi
+
+          if npm view "imcodes@${VERSION}" version >/dev/null 2>&1; then
+            echo "::warning::Version ${VERSION} was published despite npm publish exiting ${publish_status}; treating as success"
+            exit 0
+          fi
+
+          if grep -q 'TLOG_CREATE_ENTRY_ERROR' npm-publish.log; then
+            echo "::warning::npm provenance transparency-log entry already exists, but ${VERSION} is not published; retrying once without --provenance"
+            npm publish "${PUBLISH_ARGS[@]}"
+            exit 0
+          fi
+
+          exit "${publish_status}"
 
   # ── Build & push Docker image ─────────────────────────────────────────────
 
