@@ -1238,6 +1238,7 @@ describe('FileBrowser', () => {
     expect(onPreviewFile).toHaveBeenCalledWith({
       path: '/home/user/foo.ts',
       preferDiff: true,
+      previewViewMode: 'diff',
       preview: { status: 'loading', path: '/home/user/foo.ts' },
     });
   });
@@ -1281,6 +1282,7 @@ describe('FileBrowser', () => {
     expect(onPreviewFile).toHaveBeenLastCalledWith({
       path: '/home/user/foo.ts',
       preferDiff: true,
+      previewViewMode: 'diff',
       preview: { status: 'loading', path: '/home/user/foo.ts' },
     });
   });
@@ -1348,6 +1350,7 @@ describe('FileBrowser', () => {
     expect(onPreviewFile).toHaveBeenCalledWith({
       path: '/home/user/foo.ts',
       preferDiff: false,
+      previewViewMode: 'source',
       preview: { status: 'loading', path: '/home/user/foo.ts' },
     });
     expect(document.querySelector('.fb-preview')).toBeNull();
@@ -1430,7 +1433,7 @@ describe('FileBrowser', () => {
       />,
     );
 
-    const toggle = screen.getByTitle('Toggle diff view');
+    const toggle = screen.getByTitle('file_browser.view_diff');
     expect(document.querySelector('.fb-diff')).toBeNull();
     expect(toggle.className).not.toContain('active');
 
@@ -1460,7 +1463,7 @@ describe('FileBrowser', () => {
     );
 
     expect(document.querySelector('.fb-diff')?.textContent).toContain('diff after');
-    expect(screen.getByTitle('Toggle diff view').className).toContain('active');
+    expect(screen.getByTitle('file_browser.view_source').className).toContain('active');
   });
 
   it('fetches preview data when a floating preview is hydrated with a loading state', () => {
@@ -1788,6 +1791,8 @@ describe('FileBrowser', () => {
 
     expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
     expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+    expect(screen.getByTestId('mock-file-preview').textContent).toContain('const x = 1;');
+    expect(document.querySelector('.fb-diff')).toBeNull();
 
     await act(async () => {
       vi.advanceTimersByTime(8_000);
@@ -1892,6 +1897,105 @@ describe('FileBrowser', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
     expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
     expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+  });
+
+  it('opens eligible HTML files in rendered mode without requesting a git diff', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/page.html"
+        initialPreviewViewMode="html-render"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'page.html', isDir: false }], '/home/user'); });
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/page.html',
+        status: 'ok',
+        content: '<!doctype html><h1>Hello</h1>',
+      });
+    });
+
+    expect(document.querySelector('iframe.html-safe-preview-frame')).not.toBeNull();
+    const renderToggle = screen.getByTitle('file_browser.view_source');
+    expect(renderToggle.textContent).toBe('👁');
+    fireEvent.click(renderToggle);
+    expect(screen.getByTestId('mock-file-preview').textContent).toContain('<!doctype html><h1>Hello</h1>');
+  });
+
+  it('keeps HTML render refreshes read-only and does not issue git diff polling', async () => {
+    vi.useFakeTimers();
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/page.html"
+        initialPreviewViewMode="html-render"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'page.html', isDir: false }], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/page.html',
+        status: 'ok',
+        content: '<h1>before</h1>',
+      });
+    });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
+
+    await act(async () => {
+      vi.advanceTimersByTime(8_000);
+    });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(2);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
+    vi.useRealTimers();
+  });
+
+  it('emits html-render preview mode through preview state updates', async () => {
+    const { ws, respond } = makeWsFactory();
+    const onPreviewStateChange = vi.fn();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/page.html"
+        initialPreviewViewMode="html-render"
+        onPreviewStateChange={onPreviewStateChange}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'page.html', isDir: false }], '/home/user'); });
+
+    expect(onPreviewStateChange).toHaveBeenCalledWith(expect.objectContaining({
+      path: '/home/user/page.html',
+      preferDiff: false,
+      previewViewMode: 'html-render',
+      preview: { status: 'loading', path: '/home/user/page.html' },
+    }));
   });
 
   // ── Expand ────────────────────────────────────────────────────────────

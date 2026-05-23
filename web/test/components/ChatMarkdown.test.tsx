@@ -166,6 +166,56 @@ describe('ChatMarkdown', () => {
     expect(onDownload).toHaveBeenCalledWith('./dist/report.pdf');
   });
 
+  it.each([
+    ['plain text path', 'Open ./dist/index.html', './dist/index.html'],
+    ['markdown link', '[preview](./dist/INDEX.HTML)', './dist/INDEX.HTML'],
+    ['code span', 'Open `./dist/index.htm`', './dist/index.htm'],
+    ['fenced code block', '```bash\n./dist/index.html\n```', './dist/index.html'],
+  ])('renders download then HTML preview actions for %s', (_name, text, expectedPath) => {
+    const onDownload = vi.fn();
+    const onHtmlPreview = vi.fn();
+    const { container } = render(
+      <ChatMarkdown
+        text={text}
+        onPathClick={() => {}}
+        onDownload={onDownload}
+        onHtmlPreview={onHtmlPreview}
+      />,
+    );
+
+    const action = container.querySelector('.chat-path-actions') as HTMLElement | null;
+    expect(action).not.toBeNull();
+    const children = Array.from(action!.children);
+    expect(children[0].classList.contains('chat-path-link')).toBe(true);
+    expect(children[1].classList.contains('chat-dl-btn')).toBe(true);
+    expect(children[2].classList.contains('chat-html-preview-btn')).toBe(true);
+
+    fireEvent.click(children[1] as HTMLButtonElement);
+    expect(onDownload).toHaveBeenCalledWith(expectedPath);
+    fireEvent.click(children[2] as HTMLButtonElement);
+    expect(onHtmlPreview).toHaveBeenCalledWith(expectedPath);
+  });
+
+  it('does not render HTML preview for non-HTML paths or without a preview callback', () => {
+    const withNonHtml = render(
+      <ChatMarkdown
+        text="Open ./dist/readme.md"
+        onPathClick={() => {}}
+        onHtmlPreview={() => {}}
+      />,
+    );
+    expect(withNonHtml.container.querySelector('.chat-html-preview-btn')).toBeNull();
+
+    const withoutCallback = render(
+      <ChatMarkdown
+        text="Open ./dist/index.html"
+        onPathClick={() => {}}
+        onDownload={() => {}}
+      />,
+    );
+    expect(withoutCallback.container.querySelector('.chat-html-preview-btn')).toBeNull();
+  });
+
   it('does not detect paths inside URLs', () => {
     const { container } = render(
       <ChatMarkdown 

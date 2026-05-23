@@ -16,11 +16,13 @@ import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { lazy, Suspense } from 'preact/compat';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
+import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FS_WRITE_ERROR } from '../../../src/shared/transport/fs.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import { FileEditor, FileEditorContent } from './file-editor-lazy.js';
 const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
+import { HtmlSafePreview } from './HtmlSafePreview.js';
 import { downloadAttachment, getApiBaseUrl } from '../api.js';
 import {
   getSharedChangesKey,
@@ -107,6 +109,8 @@ export interface FileBrowserProps {
   autoPreviewPath?: string;
   /** When autoPreviewPath is set, start in diff mode instead of source mode. */
   autoPreviewPreferDiff?: boolean;
+  /** When autoPreviewPath is set, start in source/diff/rendered HTML mode. */
+  initialPreviewViewMode?: HtmlPreviewViewMode;
   /** Paths already inserted — shown with a badge to avoid duplicates */
   alreadyInserted?: string[];
   /** Hide the footer (select/confirm buttons) — for embedded panel views */
@@ -246,6 +250,7 @@ export type FileBrowserPreviewState =
 export interface FileBrowserPreviewRequest {
   path: string;
   preferDiff?: boolean;
+  previewViewMode?: HtmlPreviewViewMode;
   preview?: FileBrowserPreviewState;
   sourcePreviewLive?: boolean;
   /** Project/root directory used to keep the floating preview's Changes tab available. */
@@ -255,6 +260,7 @@ export interface FileBrowserPreviewRequest {
 export interface FileBrowserPreviewUpdate {
   path: string;
   preferDiff?: boolean;
+  previewViewMode?: HtmlPreviewViewMode;
   preview: FileBrowserPreviewState;
 }
 
@@ -334,7 +340,7 @@ function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): 
 type PendingPreviewReason = 'interactive' | 'refresh';
 type PendingPreviewRequest = { path: string; cycleId: number; reason?: PendingPreviewReason; startedAt?: number };
 type PendingPreviewDiff = PendingPreviewRequest & { diff: string; diffHtml: string };
-type PreviewScrollMode = Exclude<FileBrowserPreviewState['status'], 'idle' | 'ok'> | 'source' | 'diff' | 'edit';
+type PreviewScrollMode = Exclude<FileBrowserPreviewState['status'], 'idle' | 'ok'> | HtmlPreviewViewMode | 'edit';
 type PreviewScrollSnapshot = { key: string; scrollTop: number; scrollLeft: number };
 
 function previewCycleKey(path: string, cycleId: number): string {
@@ -344,13 +350,14 @@ function previewCycleKey(path: string, cycleId: number): string {
 function getPreviewScrollMode(
   preview: FileBrowserPreviewState,
   isEditing: boolean,
-  showDiff: boolean,
+  previewViewMode: HtmlPreviewViewMode,
   canRenderDiff: boolean,
 ): PreviewScrollMode | null {
   if (preview.status === 'idle') return null;
   if (preview.status === 'ok') {
     if (isEditing) return 'edit';
-    return showDiff && canRenderDiff ? 'diff' : 'source';
+    if (previewViewMode === 'html-render') return 'html-render';
+    return previewViewMode === 'diff' && canRenderDiff ? 'diff' : 'source';
   }
   return preview.status;
 }
@@ -382,6 +389,7 @@ export function FileBrowser({
   highlightPath,
   autoPreviewPath,
   autoPreviewPreferDiff = false,
+  initialPreviewViewMode,
   alreadyInserted = [],
   hideFooter = false,
   changesRootPath,
@@ -424,6 +432,9 @@ export function FileBrowser({
     if (initialPreview?.status === 'ok' && initialPreview.diffHtml && autoPreviewPreferDiff) return true;
     return false;
   });
+  const [previewViewMode, setPreviewViewMode] = useState<HtmlPreviewViewMode>(() => (
+    initialPreviewViewMode ?? (autoPreviewPreferDiff ? 'diff' : 'source')
+  ));
   const [lightbox, setLightbox] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   // Transient "Copied!" label flips back to the default after 1.5s. Keyed by
@@ -890,12 +901,23 @@ export function FileBrowser({
     });
   }, [clearAllPendingPreviewRequests, clearPendingPreviewRequest, fetchDir, getActivePreviewCycle, onDirectoryCreated, startPath, showHidden, highlightPath, t, ws]);
 
-  const fetchPreview = useCallback((filePath: string, preferDiff = false) => {
+  const fetchPreview = useCallback((
+    filePath: string,
+    preferDiff = false,
+    requestedViewMode?: HtmlPreviewViewMode,
+  ) => {
+    const nextViewMode = requestedViewMode ?? (preferDiff ? 'diff' : 'source');
+    const shouldFetchDiff = nextViewMode !== 'html-render';
     if (editDirtyRef.current) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
     }
     if (onPreviewFile) {
-      onPreviewFile({ path: filePath, preferDiff, preview: { status: 'loading', path: filePath } });
+      onPreviewFile({
+        path: filePath,
+        preferDiff,
+        previewViewMode: nextViewMode,
+        preview: { status: 'loading', path: filePath },
+      });
       return;
     }
     dismissedAutoPreviewPathRef.current = autoPreviewPath && filePath !== autoPreviewPath
@@ -914,13 +936,19 @@ export function FileBrowser({
     activePreviewCycleRef.current = { path: filePath, cycleId };
     const loadingPreview: FileBrowserPreviewState = { status: 'loading', path: filePath };
     setPreview(loadingPreview);
-    setShowDiff(preferDiff);
-    onPreviewStateChange?.({ path: filePath, preferDiff, preview: loadingPreview });
+    setPreviewViewMode(nextViewMode);
+    setShowDiff(nextViewMode === 'diff');
+    onPreviewStateChange?.({
+      path: filePath,
+      preferDiff,
+      previewViewMode: nextViewMode,
+      preview: loadingPreview,
+    });
     if (!hasPendingPreviewWork('read', filePath, cycleId)) {
       const requestId = ws.fsReadFile(filePath);
       trackPendingPreviewRequest('read', requestId, { path: filePath, cycleId, reason: 'interactive' });
     }
-    if (!hasPendingPreviewWork('diff', filePath, cycleId)) {
+    if (shouldFetchDiff && !hasPendingPreviewWork('diff', filePath, cycleId)) {
       const diffId = ws.fsGitDiff(filePath);
       trackPendingPreviewRequest('diff', diffId, { path: filePath, cycleId, reason: 'interactive' });
     }
@@ -1047,6 +1075,12 @@ export function FileBrowser({
   }, [initialPreview]);
 
   useEffect(() => {
+    const nextMode = initialPreviewViewMode ?? (autoPreviewPreferDiff ? 'diff' : 'source');
+    setPreviewViewMode(nextMode);
+    setShowDiff(nextMode === 'diff');
+  }, [autoPreviewPreferDiff, initialPreviewViewMode]);
+
+  useEffect(() => {
     if (!autoPreviewPath) {
       dismissedAutoPreviewPathRef.current = null;
       return;
@@ -1061,10 +1095,11 @@ export function FileBrowser({
     if (preview.status === 'idle') return;
     onPreviewStateChange({
       path: (preview as { path: string }).path,
-      preferDiff: showDiff,
+      preferDiff: previewViewMode === 'diff' && showDiff,
+      previewViewMode,
       preview,
     });
-  }, [onPreviewStateChange, preview, showDiff]);
+  }, [onPreviewStateChange, preview, previewViewMode, showDiff]);
 
   // Auto-preview file on open (e.g. when clicking a path link in chat)
   useEffect(() => {
@@ -1073,16 +1108,18 @@ export function FileBrowser({
     const currentPreviewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
     if (currentPreviewPath === autoPreviewPath && preview.status !== 'idle') {
       if (previewTabOverridePathRef.current !== autoPreviewPath) {
-        setShowDiff(autoPreviewPreferDiff);
+        const nextMode = initialPreviewViewMode ?? (autoPreviewPreferDiff ? 'diff' : 'source');
+        setPreviewViewMode(nextMode);
+        setShowDiff(nextMode === 'diff');
       }
       if (preview.status === 'loading' && initialPreview?.status === 'loading' && !skipAutoPreviewIfLoading) {
         const hasPendingRead = hasPendingPreviewWork('read', autoPreviewPath);
-        if (!hasPendingRead) fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
+        if (!hasPendingRead) fetchPreview(autoPreviewPath, autoPreviewPreferDiff, initialPreviewViewMode);
       }
       return;
     }
-    fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
-  }, [autoPreviewPath, autoPreviewPreferDiff, fetchPreview, hasPendingPreviewWork, initialPreview, preview, skipAutoPreviewIfLoading]);
+    fetchPreview(autoPreviewPath, autoPreviewPreferDiff, initialPreviewViewMode);
+  }, [autoPreviewPath, autoPreviewPreferDiff, fetchPreview, hasPendingPreviewWork, initialPreview, initialPreviewViewMode, preview, skipAutoPreviewIfLoading]);
 
   const dismissPreview = useCallback(() => {
     if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
@@ -1108,20 +1145,21 @@ export function FileBrowser({
     const timer = setInterval(() => {
       if (!mountedRef.current) return;
       if (Date.now() < previewRefreshBackoffUntilRef.current) return;
-      if (hasPendingPreviewWork('read', path) || hasPendingPreviewWork('diff', path)) return;
+      const shouldRefreshDiff = previewViewMode === 'diff' && showDiff;
+      if (hasPendingPreviewWork('read', path) || (shouldRefreshDiff && hasPendingPreviewWork('diff', path))) return;
       try {
         const cycleId = nextPreviewCycleIdRef.current++;
         activePreviewCycleRef.current = { path, cycleId };
         const reqId = ws.fsReadFile(path);
         trackPendingPreviewRequest('read', reqId, { path, cycleId, reason: 'refresh' });
-        if (showDiff) {
+        if (shouldRefreshDiff) {
           const diffId = ws.fsGitDiff(path);
           trackPendingPreviewRequest('diff', diffId, { path, cycleId, reason: 'refresh' });
         }
       } catch { /* ws disconnected */ }
     }, PREVIEW_REFRESH_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [preview.status, (preview as any).path, ws, onPreviewFile, isEditing, hasPendingPreviewWork, showDiff, trackPendingPreviewRequest]);
+  }, [preview.status, (preview as any).path, ws, onPreviewFile, isEditing, hasPendingPreviewWork, previewViewMode, showDiff, trackPendingPreviewRequest]);
 
   // Rate-limited git status refresh for the changes panel
   const CHANGES_RATE_LIMIT_MS = 5_000;
@@ -1259,7 +1297,10 @@ export function FileBrowser({
 
   const hasDiff = preview.status === 'ok' && (!!preview.diff || !!preview.diffHtml);
   const canRenderDiff = preview.status === 'ok' && !!preview.diffHtml;
-  const previewScrollMode = getPreviewScrollMode(preview, isEditing, showDiff, canRenderDiff);
+  const isHtmlRenderMode = previewViewMode === 'html-render';
+  const canRenderHtml = preview.status === 'ok' && isHtmlPreviewPath(preview.path);
+  const shouldRenderHtml = canRenderHtml && isHtmlRenderMode && !isEditing;
+  const previewScrollMode = getPreviewScrollMode(preview, isEditing, previewViewMode, canRenderDiff);
   const activePreviewScrollKey = previewScrollMode && preview.status !== 'idle'
     ? previewScrollKey((preview as { path: string }).path, previewScrollMode)
     : null;
@@ -1331,14 +1372,29 @@ export function FileBrowser({
             />
           </Suspense>
         )}
-        {!isEditing && hasDiff && (
+        {!isEditing && canRenderHtml && (
+          <button
+            class={`fb-diff-toggle${isHtmlRenderMode ? ' active' : ''}`}
+            onClick={() => {
+              previewTabOverridePathRef.current = preview.path;
+              setPreviewViewMode((mode) => (mode === 'html-render' ? 'source' : 'html-render'));
+              setShowDiff(false);
+            }}
+            title={isHtmlRenderMode ? t('file_browser.view_source') : t('file_browser.view_rendered')}
+            aria-label={isHtmlRenderMode ? t('file_browser.view_source') : t('file_browser.view_rendered')}
+          >
+            👁
+          </button>
+        )}
+        {!isEditing && hasDiff && !isHtmlRenderMode && (
           <button
             class={`fb-diff-toggle${showDiff ? ' active' : ''}`}
             onClick={() => {
               previewTabOverridePathRef.current = preview.path;
+              setPreviewViewMode((mode) => (mode === 'diff' ? 'source' : 'diff'));
               setShowDiff((v) => !v);
             }}
-            title="Toggle diff view"
+            title={showDiff ? t('file_browser.view_source') : t('file_browser.view_diff')}
           >
             {showDiff ? t('file_browser.view_source') : t('file_browser.view_diff')}
           </button>
@@ -1489,12 +1545,15 @@ export function FileBrowser({
             />
           </Suspense>
         )}
-        {preview.status === 'ok' && !isEditing && (!showDiff || !canRenderDiff) && (
+        {preview.status === 'ok' && shouldRenderHtml && (
+          <HtmlSafePreview path={preview.path} content={preview.content} />
+        )}
+        {preview.status === 'ok' && !isEditing && !shouldRenderHtml && (!showDiff || !canRenderDiff) && (
           <Suspense fallback={<div class="fb-preview-loading"><div class="fb-loading-spinner" /></div>}>
             <FilePreviewPane content={preview.content} path={preview.path} />
           </Suspense>
         )}
-        {preview.status === 'ok' && !isEditing && showDiff && canRenderDiff && (
+        {preview.status === 'ok' && !isEditing && !shouldRenderHtml && showDiff && canRenderDiff && (
           <div class="fb-diff" dangerouslySetInnerHTML={{ __html: preview.diffHtml ?? '' }} />
         )}
       </div>

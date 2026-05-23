@@ -16,7 +16,6 @@ import { lazy, Suspense } from 'preact/compat';
 import {
   FileBrowser,
   type FileBrowserPreviewRequest,
-  type FileBrowserPreviewState,
   type FileBrowserPreviewUpdate,
 } from './components/file-browser-lazy.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
@@ -37,7 +36,12 @@ import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './component
 import { SubSessionWindow } from './components/SubSessionWindow.js';
 import { DesktopWindowMaximizeButton } from './components/DesktopWindowMaximizeButton.js';
 import { useSharedGitChanges, requestSharedChanges } from './git-status-store.js';
-import { applyFilePreviewRequestUpdate, updateFilePreviewCache } from './file-preview-state.js';
+import {
+  applyFilePreviewRequestUpdate,
+  normalizePreviewViewMode,
+  updateFilePreviewCache,
+  type FilePreviewCache,
+} from './file-preview-state.js';
 import { StartSubSessionDialog } from './components/StartSubSessionDialog.js';
 import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
@@ -1103,7 +1107,7 @@ export function App() {
   const [repoFocusLatestAction, setRepoFocusLatestAction] = useState<{ token: number; failedJobName?: string; failedStepName?: string } | null>(null);
   /** Floating file preview request opened from file panels and chat file links. */
   const [previewFileRequest, setPreviewFileRequest] = useState<FileBrowserPreviewRequest | null>(null);
-  const [previewFileCache, setPreviewFileCache] = useState<Record<string, { preferDiff?: boolean; preview: FileBrowserPreviewState }>>({});
+  const [previewFileCache, setPreviewFileCache] = useState<FilePreviewCache>({});
   const [repoContexts, setRepoContexts] = useState<Map<string, any>>(new Map());
   const repoContextsRef = useRef(repoContexts);
   repoContextsRef.current = repoContexts;
@@ -1779,10 +1783,12 @@ export function App() {
 
   const handlePreviewFileRequest = useCallback((request: FileBrowserPreviewRequest) => {
     const cached = previewFileCache[request.path];
+    const previewViewMode = normalizePreviewViewMode(request.previewViewMode ?? cached?.previewViewMode);
     setPreviewFileRequest({
       ...request,
       preview: request.preview ?? cached?.preview,
-      preferDiff: request.preferDiff ?? cached?.preferDiff,
+      preferDiff: previewViewMode === 'diff' ? (request.preferDiff ?? cached?.preferDiff) : false,
+      previewViewMode,
     });
   }, [previewFileCache]);
 
@@ -4330,6 +4336,7 @@ export function App() {
             initialPreview={previewFileRequest.preview ?? previewFileCache[previewFileRequest.path]?.preview}
             autoPreviewPath={previewFileRequest.path}
             autoPreviewPreferDiff={!!previewFileRequest.preferDiff}
+            initialPreviewViewMode={normalizePreviewViewMode(previewFileRequest.previewViewMode ?? previewFileCache[previewFileRequest.path]?.previewViewMode)}
             skipAutoPreviewIfLoading={!!previewFileRequest.sourcePreviewLive}
             hideFooter
             onPreviewStateChange={handlePreviewStateChange}

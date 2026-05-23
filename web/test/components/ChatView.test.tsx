@@ -260,6 +260,52 @@ describe('ChatView', () => {
     expect(screen.queryByText('chat.load_older')).toBeNull();
   });
 
+  it('renders plain-text HTML path action only outside preview mode', () => {
+    const onPreviewFile = vi.fn();
+    const events = [{
+      eventId: 'user-html-path',
+      type: 'user.message',
+      ts: Date.now(),
+      payload: { text: 'Open ./dist/index.HTML' },
+    }];
+
+    const { container, rerender } = render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        sessionId="deck_main_brain"
+        ws={{} as any}
+        workdir="/repo"
+        onPreviewFile={onPreviewFile}
+      />,
+    );
+
+    const htmlButton = container.querySelector('.chat-html-preview-btn') as HTMLButtonElement | null;
+    expect(htmlButton).not.toBeNull();
+    fireEvent.click(htmlButton!);
+    expect(onPreviewFile).toHaveBeenCalledWith(expect.objectContaining({
+      path: '/repo/./dist/index.HTML',
+      preferDiff: false,
+      previewViewMode: 'html-render',
+      preview: { status: 'loading', path: '/repo/./dist/index.HTML' },
+      rootPath: '/repo',
+      sourcePreviewLive: false,
+    }));
+
+    rerender(
+      <ChatView
+        events={events as any}
+        loading={false}
+        sessionId="deck_preview_brain"
+        preview
+        ws={{} as any}
+        workdir="/repo"
+        onPreviewFile={onPreviewFile}
+      />,
+    );
+    expect(container.querySelector('.chat-html-preview-btn')).toBeNull();
+  });
+
   it('always hides thinking events from the timeline regardless of preference', () => {
     // Thinking events (both live and finished) are unconditionally hidden —
     // the agent's running state and memory-context card already give enough

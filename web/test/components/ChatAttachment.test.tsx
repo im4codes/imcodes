@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, cleanup } from '@testing-library/preact';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 
 if (!HTMLElement.prototype.scrollIntoView) {
   HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -23,8 +23,14 @@ vi.mock('../../src/components/FileBrowser.js', () => ({
   FileBrowser: () => null,
 }));
 
+vi.mock('../../src/api.js', () => ({
+  downloadAttachment: vi.fn().mockResolvedValue(undefined),
+  previewAttachment: vi.fn().mockResolvedValue(undefined),
+}));
+
 import { ChatView } from '../../src/components/ChatView.js';
 import type { TimelineEvent } from '../../src/ws-client.js';
+import { downloadAttachment, previewAttachment } from '../../src/api.js';
 
 function makeEvent(overrides: Partial<TimelineEvent> & { type: string; payload: Record<string, unknown> }): TimelineEvent {
   return {
@@ -40,7 +46,11 @@ function makeEvent(overrides: Partial<TimelineEvent> & { type: string; payload: 
 }
 
 describe('ChatView attachment download', () => {
-  afterEach(() => cleanup());
+  afterEach(() => {
+    cleanup();
+    vi.mocked(downloadAttachment).mockClear();
+    vi.mocked(previewAttachment).mockClear();
+  });
 
   it('renders download buttons when user.message has attachments and serverId is set', () => {
     const events = [makeEvent({
@@ -139,5 +149,91 @@ describe('ChatView attachment download', () => {
 
     expect(screen.getByTitle('readme.txt')).toBeDefined();
     expect(screen.getByTitle('logo.png')).toBeDefined();
+  });
+
+  it('shows daemonPath HTML render after download while primary click opens source preview', () => {
+    const onPreviewFile = vi.fn();
+    const events = [makeEvent({
+      type: 'user.message',
+      payload: {
+        text: 'render this',
+        attachments: [
+          { id: 'html-1', originalName: 'page.html', size: 1024, daemonPath: './page.HTML' },
+        ],
+      },
+    })];
+
+    const { container } = render(
+      <ChatView
+        events={events}
+        loading={false}
+        serverId="srv-1"
+        ws={{} as any}
+        workdir="/repo"
+        onPreviewFile={onPreviewFile}
+      />,
+    );
+
+    const row = container.querySelector('.chat-attachment-row') as HTMLElement;
+    const buttons = Array.from(row.querySelectorAll('button'));
+    expect(buttons).toHaveLength(3);
+    expect(buttons[1].getAttribute('title')).toBe('download_file');
+    expect(buttons[2].classList.contains('chat-html-preview-btn')).toBe(true);
+
+    fireEvent.click(buttons[0]);
+    expect(onPreviewFile).toHaveBeenCalledWith(expect.objectContaining({
+      path: '/repo/./page.HTML',
+      preferDiff: false,
+      preview: { status: 'loading', path: '/repo/./page.HTML' },
+      rootPath: '/repo',
+      sourcePreviewLive: false,
+    }));
+    expect(onPreviewFile.mock.calls[0][0].previewViewMode).not.toBe('html-render');
+
+    fireEvent.click(buttons[2]);
+    expect(onPreviewFile).toHaveBeenLastCalledWith(expect.objectContaining({
+      path: '/repo/./page.HTML',
+      preferDiff: false,
+      previewViewMode: 'html-render',
+      preview: { status: 'loading', path: '/repo/./page.HTML' },
+      rootPath: '/repo',
+      sourcePreviewLive: false,
+    }));
+  });
+
+  it('does not show a render action for HTML attachments without daemonPath', async () => {
+    const onPreviewFile = vi.fn();
+    const events = [makeEvent({
+      type: 'user.message',
+      payload: {
+        text: 'html upload',
+        attachments: [
+          { id: 'html-no-path', originalName: 'upload.html', size: 1024 },
+        ],
+      },
+    })];
+
+    const { container } = render(
+      <ChatView
+        events={events}
+        loading={false}
+        serverId="srv-1"
+        ws={{} as any}
+        workdir="/repo"
+        onPreviewFile={onPreviewFile}
+      />,
+    );
+
+    const row = container.querySelector('.chat-attachment-row') as HTMLElement;
+    const buttons = Array.from(row.querySelectorAll('button'));
+    expect(buttons).toHaveLength(2);
+    expect(row.querySelector('.chat-html-preview-btn')).toBeNull();
+
+    fireEvent.click(buttons[1]);
+    await waitFor(() => {
+      expect(downloadAttachment).toHaveBeenCalledWith('srv-1', 'html-no-path');
+    });
+    expect(previewAttachment).not.toHaveBeenCalled();
+    expect(onPreviewFile).not.toHaveBeenCalled();
   });
 });

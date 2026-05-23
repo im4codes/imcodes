@@ -2256,6 +2256,7 @@ body {
 .fb-preview-md th, .fb-preview-md td { border: 1px solid #334155; padding: 6px 10px; text-align: left; font-size: 12px; white-space: nowrap; }
 .fb-preview-md th { background: #1e293b; color: #e2e8f0; }
 .fb-preview-md img { max-width: 100%; height: auto; }
+.html-safe-preview-frame { display: block; width: 100%; height: 100%; min-height: 100%; border: 0; background: #fff; color-scheme: light; }
 .fb-modal-wide { width: min(92vw, 900px) !important; }
 .mobile-fb-overlay { position: fixed; inset: 0; z-index: 2000; background: #0f172a; display: flex; flex-direction: column; }
 .mobile-fb-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid #334155; flex-shrink: 0; }
@@ -2372,6 +2373,8 @@ body {
 .chat-path-link:hover { color: #a5b4fc; }
 .chat-dl-btn { background: none; border: none; color: #64748b; cursor: pointer; font-size: 11px; padding: 0 2px; margin-left: 2px; vertical-align: middle; line-height: 1; }
 .chat-dl-btn:hover { color: #818cf8; }
+.chat-html-preview-btn { color: #0891b2; }
+.chat-html-preview-btn:hover { color: #06b6d4; }
 .chat-external-link { color: #60a5fa; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
 .chat-external-link:hover { color: #93c5fd; }
 .external-link-overlay {

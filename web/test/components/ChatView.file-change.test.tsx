@@ -167,6 +167,7 @@ describe('ChatView file-change cards', () => {
     expect(onPreviewFile).toHaveBeenCalledWith({
       path: '/repo/src/app.tsx',
       preferDiff: true,
+      previewViewMode: 'diff',
       preview: { status: 'loading', path: '/repo/src/app.tsx' },
       rootPath: '/repo',
       sourcePreviewLive: false,
@@ -333,6 +334,7 @@ describe('ChatView file-change cards', () => {
     expect(onPreviewFile).toHaveBeenCalledWith({
       path: '/repo/src/diff.ts',
       preferDiff: true,
+      previewViewMode: 'diff',
       preview: { status: 'loading', path: '/repo/src/diff.ts' },
       rootPath: '/repo',
       sourcePreviewLive: false,
@@ -407,6 +409,7 @@ describe('ChatView file-change cards', () => {
     expect(onPreviewFile).toHaveBeenNthCalledWith(1, {
       path: '/repo/src/new-name.ts',
       preferDiff: false,
+      previewViewMode: 'source',
       preview: { status: 'loading', path: '/repo/src/new-name.ts' },
       rootPath: '/repo',
       sourcePreviewLive: false,
@@ -414,6 +417,7 @@ describe('ChatView file-change cards', () => {
     expect(onPreviewFile).toHaveBeenNthCalledWith(2, {
       path: '/repo/src/deleted.ts',
       preferDiff: false,
+      previewViewMode: 'source',
       preview: { status: 'loading', path: '/repo/src/deleted.ts' },
       rootPath: '/repo',
       sourcePreviewLive: false,
