@@ -367,7 +367,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
   ),
 }));
 vi.mock('../src/components/SubSessionWindow.js', () => ({
-  SubSessionWindow: ({ sub, active, zIndex, onFocus }: any) => (
+  SubSessionWindow: ({ sub, active, zIndex, onFocus, onViewRepo }: any) => (
     <div
       data-testid={`sub-session-window-${sub?.id}`}
       data-active={String(active)}
@@ -375,6 +375,7 @@ vi.mock('../src/components/SubSessionWindow.js', () => ({
       onMouseDown={onFocus}
     >
       sub-session-window
+      <button onClick={onViewRepo}>sub-window-repo-{sub?.id}</button>
     </div>
   ),
 }));
@@ -438,8 +439,8 @@ vi.mock('../src/components/ServerContextMenu.js', () => ({
   ),
 }));
 vi.mock('../src/components/FloatingPanel.js', () => ({
-  FloatingPanel: ({ children, onClose, onFocus, onPin, onToggleMaximized }: any) => (
-    <div>
+  FloatingPanel: ({ children, id, zIndex, onClose, onFocus, onPin, onToggleMaximized }: any) => (
+    <div data-testid={`floating-panel-${id}`} style={{ zIndex }}>
       floating-panel
       <button onClick={onFocus}>floating-focus</button>
       <button onClick={onPin}>floating-pin</button>
@@ -666,6 +667,48 @@ describe('App shell', () => {
       expect(restoredZ).toBeGreaterThan(0);
       expect(openedZ).toBeGreaterThan(restoredZ);
     });
+  }, 20_000);
+
+  it('brings an already-open repository panel above a sub-session when the sub-session branch action opens it', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem('rcc_open_subs_deck_alpha_brain', JSON.stringify(['sub-1']));
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    const subWindow = await screen.findByTestId('sub-session-window-sub-1');
+
+    fireEvent.click(screen.getByText('subbar-repo'));
+    expect(await screen.findByText('repo-page')).toBeTruthy();
+
+    const repoZ = () => Number((screen.getByTestId('floating-panel-repo') as HTMLElement).style.zIndex);
+    const subZ = () => Number((subWindow as HTMLElement).style.zIndex);
+
+    await waitFor(() => expect(repoZ()).toBeGreaterThan(subZ()));
+
+    fireEvent.mouseDown(subWindow);
+    await waitFor(() => expect(subZ()).toBeGreaterThan(repoZ()));
+
+    fireEvent.click(screen.getByText('sub-window-repo-sub-1'));
+    await waitFor(() => expect(repoZ()).toBeGreaterThan(subZ()));
   }, 20_000);
 
   it('keeps an existing sub-session window open when selecting its session-tree button', async () => {

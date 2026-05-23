@@ -3135,6 +3135,10 @@ export function App() {
     const sessionId = target?.sessionId ?? activeSession ?? null;
     const projectDir = target?.projectDir ?? resolveRepoProjectDir(sessionId);
     if (!projectDir) return;
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.repo, {
+      kind: DESKTOP_WINDOW_KINDS.repo,
+      serverId: selectedServerId ?? undefined,
+    }, { bringToFront: true });
     repoPanelOpenTokenRef.current += 1;
     setRepoPanelTarget({
       sessionId,
@@ -3146,7 +3150,7 @@ export function App() {
       setRepoFocusLatestAction(null);
     }
     setShowRepoPage(true);
-  }, [activeSession, resolveRepoProjectDir]);
+  }, [activeSession, ensureDesktopWindow, resolveRepoProjectDir, selectedServerId]);
 
   const repoPanelSessionId = repoPanelTarget?.sessionId ?? activeSession ?? null;
   const repoPanelProjectDir = repoPanelTarget?.projectDir ?? activeSessionInfo?.projectDir;
