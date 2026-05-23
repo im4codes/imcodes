@@ -27,7 +27,11 @@
  * `31f2a56e` (reverted) and the `7c4e43b3` revert.
  */
 
-export const DESKTOP_WINDOW_STACK_BASE_Z = 5000;
+// Keep managed desktop windows above legacy fallback layers such as
+// SubSessionWindow's 6000 default and mobile file preview's 6500 fallback.
+// Otherwise a temporarily unregistered/restored sub-session can cover a
+// stack-managed window that was just raised.
+export const DESKTOP_WINDOW_STACK_BASE_Z = 7000;
 export const DESKTOP_WINDOW_STACK_STRIDE = 10;
 
 /**

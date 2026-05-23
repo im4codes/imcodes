@@ -1668,9 +1668,10 @@ export function App() {
 
   // Sub-session stack sync: every rendered open sub-session must have a
   // desktop-stack entry, including windows restored from localStorage on
-  // page/session load. Without this, restored windows fall back to z-index
-  // 6000 while newly opened managed windows start at the stack band (5010,
-  // 5020, ...), so the latest opened window can appear behind stale peers.
+  // page/session load. Without this, restored windows can briefly fall back to
+  // their legacy z-index while newly opened managed windows rely on stack
+  // ordering. The stack base is intentionally above those legacy fallbacks, but
+  // keeping every visible sub-session registered still preserves exact ordering.
   useEffect(() => {
     if (isMobileRef.current) return;
     const renderedSubIds = new Set(visibleSubSessions.map((sub) => sub.id));
@@ -4248,12 +4249,12 @@ export function App() {
        *  `zIndex=6000` fallback. On mobile the desktop stack is a no-op (see
        *  `ensureDesktopWindow` early return) so the stack-managed z never gets
        *  assigned, and the FloatingPanel falls back to this value. With a
-       *  fallback in the 5000 band the SubSessionWindow rendered ON TOP of the
-       *  user-requested file preview — see user report
+       *  fallback below the sub-session fallback rendered the SubSessionWindow
+       *  ON TOP of the user-requested file preview — see user report
        *  "手机版 打开聊天里的文件预览被当前窗口盖住了". 6500 leaves clear
        *  breathing room for any future intermediate tier. Desktop keeps the
-       *  5060 fallback so it stays in the documented floating-panel band
-       *  (5020-5090) while the stack lifecycle takes over within one tick. */}
+       *  5060 fallback while the higher managed desktop stack lifecycle takes
+       *  over within one tick. */}
       {previewFileRequest && wsRef.current && (
         <FloatingPanel
           id="file-preview"

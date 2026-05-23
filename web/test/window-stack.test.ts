@@ -209,6 +209,12 @@ describe('MutableDesktopWindowStack', () => {
       expect(s.getZIndex('c')).toBe(DESKTOP_WINDOW_STACK_BASE_Z + 3 * DESKTOP_WINDOW_STACK_STRIDE);
     });
 
+    it('keeps first managed root above legacy floating fallback layers', () => {
+      const s = new MutableDesktopWindowStack();
+      s.ensureWindow(DESKTOP_WINDOW_IDS.repo, { kind: DESKTOP_WINDOW_KINDS.repo });
+      expect(s.getZIndex(DESKTOP_WINDOW_IDS.repo)!).toBeGreaterThan(6500);
+    });
+
     it('returns null for unknown id', () => {
       const s = new MutableDesktopWindowStack();
       expect(s.getZIndex('mystery')).toBeNull();
