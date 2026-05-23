@@ -612,6 +612,7 @@ export function QuickInputPanel({
                 ? paths.map((p) => '@' + (p.startsWith(cwd + '/') ? p.slice(cwd.length + 1) : p) + ' ')
                 : paths.map((p) => '@' + p + ' ');
               onAppendPaths?.(rel);
+              onClose();
             }}
           />
         )}
