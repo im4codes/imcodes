@@ -69,9 +69,11 @@ Supports iPhone, iPad, and Apple Watch. Also available as a [web app](https://ap
 
 When you leave your desk, most coding-agent workflows fall apart. The agent is still running in a terminal, but continuing the work usually means SSH, tmux attach, remote desktop hacks, or waiting until you're back at your laptop.
 
-[IM.codes](https://im.codes) keeps those sessions within reach from mobile or web: open the terminal, inspect files and git changes, preview localhost from another device, get notified when work finishes, and keep multiple agents moving on your own infrastructure.
+That reach problem is only one half of it. Complex coding-agent work also needs steadier judgment: a single model can fall into familiar patterns, miss issues, or produce unstable answers on hard tasks. Switching providers can help, but without shared context it can also lose the thread.
 
-It is not another AI IDE or a generic remote terminal. It is the messaging/control layer around terminal-based coding agents.
+[IM.codes](https://im.codes) is built around both needs. It keeps sessions within reach from mobile or web: open the terminal, inspect files and git changes, preview localhost from another device, get notified when work finishes, and keep multiple agents moving on your own infrastructure. It also pairs [Shared Agent Context & Memory](#shared-agent-context--memory) with [Multi-Agent Discussions & Cross-Provider Audit](#multi-agent-discussions--cross-provider-audit): durable recall comes from summarized completed work, while P2P discussion is structured cross-model review before code lands. It does not make output perfect, but it reduces single-model blind spots and helps complex work converge with more review.
+
+It is not another AI IDE or a generic remote terminal. It is the messaging, memory, and review layer around terminal-based coding agents.
 
 This is a personal project. I haven't written any code myself — it was built almost entirely by [Claude Code](https://github.com/anthropics/claude-code), with significant contributions from [Codex](https://github.com/openai/codex) and [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
@@ -135,7 +137,7 @@ Auto supervision splits configuration into two layers. Backend, model, and timeo
 
 ### Multi-Agent Discussions & Cross-Provider Audit
 
-Single-model output shouldn't be trusted blindly. P2P discussions let multiple agents — across different providers and thinking styles — collaborate on the same codebase before a single line is written. Each round follows a customizable multi-phase pipeline where every agent reads all prior contributions and builds on them. Different models catch different classes of issues: one spots a race condition, another flags a missing migration, a third questions the API design. This cross-provider scrutiny catches the majority of problems before implementation, dramatically reducing rework cycles.
+Single-model output shouldn't be trusted blindly. P2P discussions let multiple agents — across different providers and thinking styles — collaborate on the same codebase before a single line is written. Each round follows a customizable multi-phase pipeline where every agent reads all prior contributions and builds on them. Different models catch different classes of issues: one spots a race condition, another flags a missing migration, a third questions the API design. This cross-provider scrutiny catches problems a single model often misses before implementation, reducing rework cycles.
 
 Built-in modes include `audit` (structured audit → review → plan pipeline), `review`, `discuss`, and `brainstorm` — or define your own phase sequence. Ring progress indicator shows round/hop completion in the sidebar. Works across Claude Code, Codex, Gemini CLI, and Qwen, including sandboxed agents. Configure participants, round counts, modes, and per-session P2P settings via `@@all(config)` or the UI.
 

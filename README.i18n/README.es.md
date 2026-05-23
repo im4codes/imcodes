@@ -64,9 +64,11 @@ Compatible con iPhone, iPad y Apple Watch. También disponible como [web app](ht
 
 Cuando te alejas del escritorio, la mayoría de los flujos con coding agents se rompen. El agente sigue ejecutándose en un terminal, pero continuar normalmente implica SSH, `tmux attach`, escritorios remotos o esperar hasta volver al portátil.
 
-[IM.codes](https://im.codes) mantiene esas sesiones al alcance desde móvil o web: abrir el terminal, inspeccionar archivos y cambios Git, previsualizar localhost desde otro dispositivo, recibir notificaciones cuando el trabajo termina y mantener varios agentes en marcha sobre tu propia infraestructura.
+Ese problema de acceso es solo la mitad. El trabajo complejo con coding agents también necesita un criterio más estable: un solo modelo puede caer en patrones familiares, pasar por alto problemas o producir respuestas inestables en tareas difíciles. Cambiar de provider puede aportar otra perspectiva, pero sin contexto compartido también puede perder el hilo.
 
-No es otro IDE de IA ni un cliente genérico de terminal remota. Es la capa de mensajería y control alrededor de coding agents basados en terminal.
+[IM.codes](https://im.codes) está pensado para ambas necesidades. Mantiene esas sesiones al alcance desde móvil o web: abrir el terminal, inspeccionar archivos y cambios Git, previsualizar localhost desde otro dispositivo, recibir notificaciones cuando el trabajo termina y mantener varios agentes en marcha sobre tu propia infraestructura. También combina "Shared Agent Context y memoria" con "Auditoría cross-modelo y discusiones P2P": la recuperación duradera viene de resúmenes del trabajo completado, mientras que la discusión P2P es revisión cross-modelo estructurada antes de que el código aterrice. No vuelve perfecto el resultado, pero reduce puntos ciegos de un solo modelo y ayuda a que el trabajo complejo converja con más revisión.
+
+No es otro IDE de IA ni un cliente genérico de terminal remota. Es la capa de mensajería, memoria y revisión alrededor de coding agents basados en terminal.
 
 Este es un proyecto personal. Yo prácticamente no escribí código: fue construido casi por completo por [Claude Code](https://github.com/anthropics/claude-code), con contribuciones importantes de [Codex](https://github.com/openai/codex) y [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
@@ -118,7 +120,7 @@ Previsualiza tu servidor de desarrollo local desde cualquier dispositivo sin des
 Soporte completo para móvil, autenticación biométrica, notificaciones push, entrada interactiva para sesiones shell y respuestas rápidas desde Apple Watch.
 
 ### Auditoría cross-modelo y discusiones P2P
-La salida de un solo modelo no debería confiarse ciegamente. Las discusiones P2P permiten que múltiples agentes — de distintos proveedores y estilos de pensamiento — colaboren en el análisis del mismo código antes de escribir una sola línea. Cada ronda sigue un pipeline multifase personalizable, donde cada agente lee todas las contribuciones anteriores. Diferentes modelos detectan diferentes tipos de problemas. Esta revisión cruzada entre proveedores encuentra la mayoría de los problemas antes de la implementación, reduciendo drásticamente el retrabajo.
+La salida de un solo modelo no debería confiarse ciegamente. Las discusiones P2P permiten que múltiples agentes — de distintos proveedores y estilos de pensamiento — colaboren en el análisis del mismo código antes de escribir una sola línea. Cada ronda sigue un pipeline multifase personalizable, donde cada agente lee todas las contribuciones anteriores. Diferentes modelos detectan diferentes tipos de problemas. Esta revisión cruzada entre proveedores encuentra problemas que un solo modelo suele pasar por alto antes de la implementación, reduciendo el retrabajo.
 
 Modos integrados: `audit` (pipeline estructurado audit → review → plan), `review`, `discuss` y `brainstorm` — o define tu propia secuencia de fases. Funciona con Claude Code, Codex, Gemini CLI y Qwen.
 
