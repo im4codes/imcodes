@@ -140,7 +140,7 @@ const statusSchema = objectSchema({
 export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, MemoryMcpToolContract>> = {
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: {
     name: MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
-    description: 'Search the caller-bound memory namespace with a text query. Use it before answering when prior project or user context may matter; returns compact hits with projection ids and summaries for optional source lookup. The query is text only; embeddings and vectors are computed internally when available.',
+    description: 'Search the caller-bound memory namespace with a text query. Use it before answering when prior project or user context may matter; returns compact hits with projection ids and summaries for optional source lookup. If a relevant summary may affect the answer but is not enough, call get_memory_sources with its projection id. The query is text only; embeddings and vectors are computed internally when available.',
     inputSchema: objectSchema({
       query: stringSchema('Required text query to search for. Do not send embeddings, vectors, identity, or namespace fields.'),
       limit: numberSchema(`Optional maximum hit count; defaults to ${MEMORY_MCP_CAPS.SEARCH_MEMORY_DEFAULT_LIMIT} and is clamped to ${MEMORY_MCP_CAPS.SEARCH_MEMORY_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.SEARCH_MEMORY_MAX_LIMIT }),
@@ -152,7 +152,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: {
     name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
-    description: 'Fetch source event snippets for a projection id returned by memory search. Use it only when a hit needs provenance; missing or cross-namespace ids return an empty source list without revealing which case occurred.',
+    description: 'Fetch source event snippets for a projection id returned by memory search. Use it after search_memory for exact prior instructions, decisions, preferences, bug details, commit/deployment facts, or provenance-sensitive answers; missing or cross-namespace ids return an empty source list without revealing which case occurred.',
     inputSchema: objectSchema({
       projectionId: stringSchema('Required projection id from search_memory. Caller identity and namespace are runtime-bound.'),
     }, ['projectionId']),

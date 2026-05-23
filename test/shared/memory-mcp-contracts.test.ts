@@ -63,6 +63,18 @@ describe('memory MCP shared contracts', () => {
     }
   });
 
+  it('documents when search_memory results should be expanded through get_memory_sources', () => {
+    const search = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY];
+    const getSources = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES];
+    const projectionId = getSources.inputSchema.properties?.projectionId as { description?: string } | undefined;
+
+    expect(search.description).toContain('call get_memory_sources');
+    expect(search.description).toMatch(/projection id/i);
+    expect(getSources.description).toContain('Use it after search_memory');
+    expect(getSources.description).toContain('provenance-sensitive answers');
+    expect(projectionId?.description).toContain('search_memory');
+  });
+
   it('pins locked caps and disabled response shape', () => {
     expect(MEMORY_MCP_CAPS).toMatchObject({
       OBSERVATION_CONTENT_MAX_BYTES: 16 * 1024,

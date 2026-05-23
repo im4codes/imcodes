@@ -417,11 +417,11 @@ function toolResult(result: ToolResult): CallToolResult {
 
 const schemas = {
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: z.object({
-    query: z.string().describe('Required text query to search for.'),
+    query: z.string().describe('Required text query to search for. Results include projectionId values for get_memory_sources when more detail is needed.'),
     limit: z.number().int().min(1).max(100).optional().describe('Optional maximum hit count.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: z.object({
-    projectionId: z.string().describe('Projection id returned by search_memory.'),
+    projectionId: z.string().describe('Projection id returned by search_memory for a relevant hit whose summary is insufficient.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: z.object({
     content: z.string().describe('Observation text to persist as a candidate memory.'),

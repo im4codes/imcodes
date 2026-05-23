@@ -3839,6 +3839,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <div>{t('sharedContext.management.mcpSummaryLine1')}</div>
             <div>{t('sharedContext.management.mcpSummaryLine2')}</div>
             <div>{t('sharedContext.management.mcpSummaryLine3')}</div>
+            <div>{t('sharedContext.management.mcpSummaryLine4')}</div>
+            <div>{t('sharedContext.management.mcpSummaryLine5')}</div>
           </InfoCard>
 
           <div style={sectionStyle}>

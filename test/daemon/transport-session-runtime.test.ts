@@ -144,6 +144,12 @@ describe('TransportSessionRuntime', () => {
       assembledMessage: 'hi',
       systemText: expect.stringContaining('Use memory MCP search'),
     }));
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      systemText: expect.stringContaining('get_memory_sources'),
+    }));
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      systemText: expect.stringContaining('projectionId'),
+    }));
   });
 
   it('send() returns "queued" when busy', async () => {
@@ -318,6 +324,9 @@ describe('TransportSessionRuntime', () => {
     }));
     expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
       systemText: expect.stringContaining('Use memory MCP search'),
+    }));
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      systemText: expect.stringContaining('do not invent details from summaries alone'),
     }));
   });
 

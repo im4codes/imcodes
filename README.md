@@ -88,12 +88,14 @@ IM.codes continuously turns completed agent work into reusable memory and feeds 
 
 ## Managed MCP Tools
 
-IM.codes also exposes a managed stdio MCP server to supported SDK-backed agents, so models can use the same memory and coordination layer without shelling out to ad hoc commands.
+IM.codes exposes a daemon-managed stdio MCP server to supported SDK-backed providers. Agents get one runtime-scoped tool surface for memory, agent-to-agent messaging, and scheduled follow-ups, without raw auth tokens or ad hoc shell commands.
 
-- **Memory tools.** `search_memory` recalls prior work, project history, decisions, preferences, bugs, commits, deployments, and previously discussed context; `get_memory_sources` fetches provenance snippets for returned hits; `save_observation` and `save_preference` let agents persist useful facts and user preferences.
-- **Agent messaging tools.** `send_list_targets` and `send_message` let an agent discover sibling sessions and send scoped messages or file references through the same `imcodes send` pipeline.
-- **Cron tools.** `cron_create`, `cron_list`, `cron_update`, and `cron_delete` schedule future structured sends for reminders, recurring checks, or delegated follow-ups.
-- **Runtime-bound identity.** Tool calls are bound to the current IM.codes session, project, user, and server at runtime. Agents do not receive raw auth tokens, and memory/send/cron tools stay behind feature gates and MCP kill switches.
+- **Memory recall and provenance.** `search_memory` searches the caller-bound memory namespace for prior work, project history, decisions, preferences, bugs, commits, deployments, and previously discussed context. Results include compact summaries plus `projectionId` values; `get_memory_sources` expands a relevant hit into provenance snippets when the model needs exact prior instructions, bug details, commit/deployment context, or source evidence.
+- **Memory writes.** `save_observation` stores useful facts, decisions, or implementation notes as user-private memory candidates; `save_preference` stores stable user preferences through the explicit preference path.
+- **Agent messaging.** `send_list_targets` lists sibling sessions in the current project, and `send_message` sends scoped messages, optional file path references, reply requests, or broadcasts through the same guarded `imcodes send` pipeline.
+- **Cron scheduling.** `cron_create`, `cron_list`, `cron_update`, and `cron_delete` manage future structured sends for reminders, recurring checks, delegated reviews, or scheduled P2P follow-ups, with target/session/project fields and optional expiration/timezone data.
+- **Runtime-bound identity and safety.** Tool calls are bound to the current IM.codes session, project, user, and server at runtime. Agents cannot forge namespace, user, server, token, or routing fields; memory, Send, and Cron all remain behind their underlying feature gates plus MCP kill switches.
+- **Operational visibility.** The Shared Context UI reports MCP readiness per managed provider, tool-family gate state, degraded reasons, update time, and recent daemon-redacted tool calls so you can tell whether the model really has Memory, Send, and Cron available.
 
 ## Supervised Execution & Auto Audit
 
@@ -145,11 +147,13 @@ Native streaming output support for transport-backed agents like [Claude Code SD
 
 ### Managed MCP Tool Surface
 
-Supported SDK providers can receive IM.codes-managed MCP tools automatically. The tool surface includes memory recall and provenance, user preference capture, scoped agent-to-agent messaging, and cron scheduling. MCP status is reported per provider in the UI, with ready/degraded states so you can tell whether memory, Send, and Cron tools are actually available to that model.
+Supported SDK providers can receive the ten-tool IM.codes-managed MCP surface automatically: memory search/source lookup, observation and preference capture, scoped Send, and Cron scheduling. MCP status is reported per provider in the UI, with ready/degraded states so you can tell whether Memory, Send, and Cron tools are actually available to that model.
 
 ### Agent-to-Agent Communication
 
 Agents can message each other directly using `imcodes send`. An agent running in one session can ask a sibling to review code, run tests, or coordinate on a task — no user intervention needed. Target resolution by label, session name, or agent type. `--reply` flag instructs the target to send its response back automatically. Built-in circuit breakers prevent abuse (depth limit, rate limiting, broadcast cap).
+
+The same flow is available to SDK-backed agents through MCP: `send_list_targets` discovers valid sibling targets, and `send_message` sends scoped text, file references, reply requests, or broadcasts without exposing raw routing credentials.
 
 ```bash
 imcodes send "Plan" "review the changes in src/api.ts"
@@ -207,6 +211,8 @@ View issues, pull requests, branches, commits, and CI/CD runs directly in the ap
 ### Scheduled Tasks (Cron)
 
 Automate recurring agent workflows with cron-style scheduling. Create scheduled tasks that send commands to specific sessions or trigger multi-agent P2P discussions on a timetable. Visual cron picker for common intervals, timezone-aware scheduling, and manual "Run Now" for testing. Execution history with expandable result detail — click any record to navigate to the target session and quote the result for follow-up. Cross-job execution list with Latest/All modes and multi-server filtering.
+
+SDK-backed agents can manage the same scheduler through MCP with `cron_create`, `cron_list`, `cron_update`, and `cron_delete`, creating structured sends for reminders, recurring checks, delegated reviews, or follow-ups while staying bound to the current project/session identity.
 
 ### Cross-Device Sync
 
