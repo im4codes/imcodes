@@ -49,6 +49,10 @@ export const FILE_TRANSFER_LIMITS = {
   UPLOAD_DIR: '/tmp/imcodes-uploads',
 } as const;
 
+// ── Capability advertisement ────────────────────────────────────────────────
+
+export const FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY = 'file.transfer.upload_fetch.v1' as const;
+
 // ── Server → Daemon messages ──────────────────────────────────────────────────
 
 export interface FileUploadRequest {

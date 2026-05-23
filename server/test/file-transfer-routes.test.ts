@@ -1,10 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
-import { FILE_TRANSFER_LIMITS } from '../../shared/transport/file-transfer.js';
+import {
+  FILE_TRANSFER_LIMITS,
+  FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+} from '../../shared/transport/file-transfer.js';
 
-const { sendFileTransferRequestMock, isDaemonConnectedMock } = vi.hoisted(() => ({
+const { sendFileTransferRequestMock, isDaemonConnectedMock, hasDaemonCapabilityMock } = vi.hoisted(() => ({
   sendFileTransferRequestMock: vi.fn(),
   isDaemonConnectedMock: vi.fn(),
+  hasDaemonCapabilityMock: vi.fn(),
 }));
 
 vi.mock('../src/security/authorization.js', () => ({
@@ -26,6 +30,7 @@ vi.mock('../src/ws/bridge.js', () => ({
     get: () => ({
       isDaemonConnected: isDaemonConnectedMock,
       sendFileTransferRequest: sendFileTransferRequestMock,
+      hasDaemonCapability: hasDaemonCapabilityMock,
     }),
   },
 }));
@@ -54,7 +59,9 @@ describe('file-transfer upload route', () => {
   beforeEach(() => {
     sendFileTransferRequestMock.mockReset();
     isDaemonConnectedMock.mockReset();
+    hasDaemonCapabilityMock.mockReset();
     isDaemonConnectedMock.mockReturnValue(true);
+    hasDaemonCapabilityMock.mockReturnValue(true);
     sendFileTransferRequestMock.mockResolvedValue({
       type: 'file.upload_done',
       attachment: {
@@ -133,7 +140,81 @@ describe('file-transfer upload route', () => {
       downloadUrl: expect.stringContaining('/api/server/srv-1/upload-staged/'),
     }));
     expect(sendFileTransferRequestMock.mock.calls[0]?.[2]).toBe(FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS);
+    expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
     expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).not.toHaveProperty('content');
+  });
+
+  it('cleans relay-staged uploads after a successful daemon fetch grace window', async () => {
+    vi.useFakeTimers();
+    try {
+      const app = makeApp();
+      sendFileTransferRequestMock.mockImplementationOnce(async (_requestId, message) => {
+        const uploadMessage = message as { downloadUrl: string };
+        const fetchUrl = new URL(uploadMessage.downloadUrl);
+        const stagedPath = `${fetchUrl.pathname}${fetchUrl.search}`;
+
+        const first = await app.request(stagedPath);
+        expect(first.status).toBe(200);
+        await expect(first.text()).resolves.toBe('hello');
+
+        await vi.advanceTimersByTimeAsync(30_001);
+        const expired = await app.request(stagedPath);
+        expect(expired.status).toBe(404);
+
+        return {
+          type: 'file.upload_done',
+          attachment: {
+            id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt',
+            source: 'upload',
+            daemonPath: '/tmp/upload.txt',
+            downloadable: true,
+          },
+        };
+      });
+
+      const form = new FormData();
+      form.append('file', new File(['hello'], 'hello.txt', { type: 'text/plain' }));
+
+      const res = await app.request('/api/server/srv-1/upload', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer test' },
+        body: form,
+      });
+
+      expect(res.status).toBe(200);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('falls back to legacy base64 upload when daemon has no relay fetch capability', async () => {
+    hasDaemonCapabilityMock.mockReturnValue(false);
+
+    const form = new FormData();
+    form.append('file', new File(['hello'], 'hello.txt', { type: 'text/plain' }));
+
+    const res = await makeApp().request('/api/server/srv-1/upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test' },
+      body: form,
+    });
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      attachment: {
+        serverId: 'srv-1',
+        daemonPath: '/tmp/upload.txt',
+      },
+    });
+    expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
+      type: 'file.upload',
+      originalName: 'hello.txt',
+      mime: 'text/plain',
+      size: 5,
+      content: Buffer.from('hello').toString('base64'),
+    }));
+    expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).not.toHaveProperty('downloadUrl');
   });
 
   it('streams daemon fetch progress for browsers that opt in', async () => {

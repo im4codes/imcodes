@@ -19,6 +19,7 @@ import { ServerLink, __setServerLinkDataPlaneQueueConfigForTests } from '../../s
 import { recordDaemonServerLinkStatus } from '../../src/util/daemon-status.js';
 import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_EVENT } from '../../shared/transport-events.js';
+import { FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../shared/transport/file-transfer.js';
 
 const recordDaemonServerLinkStatusMock = vi.mocked(recordDaemonServerLinkStatus);
 
@@ -76,6 +77,10 @@ describe('ServerLink', () => {
 
   it('advertises the shared timeline protocol capability in daemon hello capabilities', () => {
     expect(link.getDaemonCapabilities()).toContain(TIMELINE_PROTOCOL_CAPABILITY);
+  });
+
+  it('advertises relay upload fetch capability for server-side compatibility gating', () => {
+    expect(link.getDaemonCapabilities()).toContain(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
   });
 
   it('send() adds monotonic seq counter', () => {

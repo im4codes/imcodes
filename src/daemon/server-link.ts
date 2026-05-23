@@ -18,6 +18,7 @@ import {
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
 import { TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
+import { FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../shared/transport/file-transfer.js';
 import {
   classifyServerSendPlane,
   recordServerLinkDataPlaneBackpressure,
@@ -131,6 +132,7 @@ const PONG_TIMEOUT_MS = 10_000;       // if no pong within 10s, connection is de
 const DAEMON_STATIC_CAPABILITIES = [
   SESSION_GROUP_CLONE_CAPABILITY_V1,
   TIMELINE_PROTOCOL_CAPABILITY,
+  FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 ] as const;
 
 export interface ServerLinkOpts {

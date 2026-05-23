@@ -6,11 +6,16 @@ import type { Env } from '../env.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
-import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js';
-import type { AttachmentRef, FileDownloadRequest, FileUploadFetchRequest } from '../../../shared/transport/file-transfer.js';
+import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../../shared/transport/file-transfer.js';
+import type {
+  AttachmentRef,
+  FileDownloadRequest,
+  FileUploadFetchRequest,
+  FileUploadRequest,
+} from '../../../shared/transport/file-transfer.js';
 import logger from '../util/logger.js';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { Readable } from 'node:stream';
@@ -26,6 +31,7 @@ export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId:
 const DOWNLOAD_TOKEN_MAX_USES = 5;
 const MULTIPART_UPLOAD_OVERHEAD_BYTES = 1024 * 1024;
 const STAGED_UPLOAD_PREFIX = 'imcodes-staged-upload-';
+const STAGED_UPLOAD_FETCH_CLEANUP_GRACE_MS = 30_000;
 const UPLOAD_PROGRESS_STREAM_MIME = 'application/x-ndjson';
 const downloadTokens = new Map<string, {
   serverId: string;
@@ -43,6 +49,7 @@ const stagedUploads = new Map<string, {
   mime?: string;
   expiresAt: number;
   timer: ReturnType<typeof setTimeout>;
+  deleteAfterFetchTimer?: ReturnType<typeof setTimeout>;
 }>();
 
 function deleteStagedUpload(uploadId: string): void {
@@ -50,9 +57,20 @@ function deleteStagedUpload(uploadId: string): void {
   if (!entry) return;
   stagedUploads.delete(uploadId);
   clearTimeout(entry.timer);
+  if (entry.deleteAfterFetchTimer) clearTimeout(entry.deleteAfterFetchTimer);
   void rm(entry.dir, { recursive: true, force: true }).catch((err) => {
     logger.warn({ uploadId, err }, 'Failed to clean staged upload');
   });
+}
+
+function scheduleStagedUploadFetchCleanup(uploadId: string): void {
+  const entry = stagedUploads.get(uploadId);
+  if (!entry || entry.deleteAfterFetchTimer) return;
+  entry.deleteAfterFetchTimer = setTimeout(
+    () => deleteStagedUpload(uploadId),
+    STAGED_UPLOAD_FETCH_CLEANUP_GRACE_MS,
+  );
+  entry.deleteAfterFetchTimer.unref?.();
 }
 
 async function persistStagedUpload(file: File, filePath: string): Promise<number> {
@@ -112,7 +130,8 @@ fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) =>
 
 // ── GET /api/server/:id/upload-staged/:uploadId ─────────────────────────────
 // Token-authenticated, relay-local temporary object fetch for daemon uploads.
-// The token is reusable until expiry so daemon-side HTTP retries do not fail.
+// The token stays reusable for a short grace window after a successful read so
+// daemon-side HTTP retries do not fail, then the staged object is removed.
 
 fileTransferRoutes.get('/:id/upload-staged/:uploadId', async (c) => {
   const serverId = c.req.param('id')!;
@@ -126,7 +145,13 @@ fileTransferRoutes.get('/:id/upload-staged/:uploadId', async (c) => {
   }
   if (!token || token !== entry.token) return c.json({ error: 'forbidden' }, 403);
 
-  return new Response(Readable.toWeb(createReadStream(entry.filePath)) as ReadableStream, {
+  const fileStream = createReadStream(entry.filePath);
+  fileStream.once('end', () => scheduleStagedUploadFetchCleanup(uploadId));
+  fileStream.once('error', (err) => {
+    logger.warn({ uploadId, err }, 'Staged upload stream failed');
+  });
+
+  return new Response(Readable.toWeb(fileStream) as ReadableStream, {
     status: 200,
     headers: {
       'Content-Type': entry.mime || 'application/octet-stream',
@@ -193,30 +218,59 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
     await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
     return c.json({ error: 'upload_failed', message: 'size_mismatch' }, 400);
   }
-  const token = randomHex(32);
-  const expiresAt = Date.now() + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS;
-  const timer = setTimeout(() => deleteStagedUpload(uploadId), FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS);
-  timer.unref?.();
-  stagedUploads.set(uploadId, {
-    serverId,
-    token,
-    dir: stagedDir,
-    filePath: stagedPath,
-    size: stagedSize,
-    mime: file.type || undefined,
-    expiresAt,
-    timer,
-  });
-
-  const uploadMsg: FileUploadFetchRequest = {
-    type: 'file.upload_fetch',
-    uploadId,
-    filename,
-    originalName: file.name || undefined,
-    mime: file.type || undefined,
-    size: file.size,
-    downloadUrl: buildStagedUploadUrl(c.req.url, serverId, uploadId, token),
+  const supportsRelayFetch = bridge.hasDaemonCapability(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
+  let relayStaged = false;
+  let legacyStageDeleted = false;
+  const cleanupUploadStage = () => {
+    if (relayStaged) {
+      deleteStagedUpload(uploadId);
+      return;
+    }
+    if (legacyStageDeleted) return;
+    legacyStageDeleted = true;
+    void rm(stagedDir, { recursive: true, force: true }).catch((err) => {
+      logger.warn({ uploadId, err }, 'Failed to clean legacy staged upload');
+    });
   };
+
+  let uploadMsg: FileUploadFetchRequest | FileUploadRequest;
+  if (supportsRelayFetch) {
+    const token = randomHex(32);
+    const expiresAt = Date.now() + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS;
+    const timer = setTimeout(() => deleteStagedUpload(uploadId), FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS);
+    timer.unref?.();
+    stagedUploads.set(uploadId, {
+      serverId,
+      token,
+      dir: stagedDir,
+      filePath: stagedPath,
+      size: stagedSize,
+      mime: file.type || undefined,
+      expiresAt,
+      timer,
+    });
+    relayStaged = true;
+
+    uploadMsg = {
+      type: 'file.upload_fetch',
+      uploadId,
+      filename,
+      originalName: file.name || undefined,
+      mime: file.type || undefined,
+      size: file.size,
+      downloadUrl: buildStagedUploadUrl(c.req.url, serverId, uploadId, token),
+    };
+  } else {
+    uploadMsg = {
+      type: 'file.upload',
+      uploadId,
+      filename,
+      originalName: file.name || undefined,
+      mime: file.type || undefined,
+      size: file.size,
+      content: (await readFile(stagedPath)).toString('base64'),
+    };
+  }
 
   const runDaemonFetch = async (onProgress?: (msg: Record<string, unknown>) => void): Promise<Response> => {
     try {
@@ -229,14 +283,12 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
 
       if (result.type === 'file.upload_error') {
         logger.warn({ serverId, uploadId, error: result.message }, 'Daemon upload error');
-        deleteStagedUpload(uploadId);
         return c.json({ error: 'upload_failed', message: result.message }, 500);
       }
 
       const attachment = result.attachment as AttachmentRef;
       // Server fills serverId (daemon doesn't know it)
       attachment.serverId = serverId;
-      deleteStagedUpload(uploadId);
       return c.json({ ok: true, attachment });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -249,6 +301,8 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       }
       logger.error({ serverId, uploadId, err }, 'Upload relay failed');
       return c.json({ error: 'upload_failed' }, 500);
+    } finally {
+      cleanupUploadStage();
     }
   };
 
@@ -280,14 +334,12 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
 
         if (result.type === 'file.upload_error') {
           logger.warn({ serverId, uploadId, error: result.message }, 'Daemon upload error');
-          deleteStagedUpload(uploadId);
           write({ type: 'file.upload_error', uploadId, error: 'upload_failed', message: result.message });
           return;
         }
 
         const attachment = result.attachment as AttachmentRef;
         attachment.serverId = serverId;
-        deleteStagedUpload(uploadId);
         write({ type: 'file.upload_done', uploadId, ok: true, attachment });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -301,13 +353,13 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
           write({ type: 'file.upload_error', uploadId, error: 'upload_failed' });
         }
       } finally {
-        deleteStagedUpload(uploadId);
+        cleanupUploadStage();
         closed = true;
         controller.close();
       }
     },
     cancel() {
-      deleteStagedUpload(uploadId);
+      cleanupUploadStage();
     }
   });
 
