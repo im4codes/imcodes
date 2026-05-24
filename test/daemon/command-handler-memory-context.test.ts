@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -206,6 +206,17 @@ vi.mock('../../src/repo/detector.js', () => ({
     }
     return null;
   }),
+  parseRemotes: vi.fn((output: string) => output
+    .split('\n')
+    .map((line) => /^(\S+)\s+(\S+)\s+\(fetch\)/.exec(line))
+    .filter((match): match is RegExpExecArray => Boolean(match))
+    .map((match) => {
+      if (match[2] === 'git@github.com:imcodes/codedeck.git') {
+        return { name: match[1], url: match[2], host: 'github.com', owner: 'imcodes', repo: 'codedeck' };
+      }
+      return null;
+    })
+    .filter((remote): remote is { name: string; url: string; host: string; owner: string; repo: string } => Boolean(remote))),
 }));
 
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
@@ -913,6 +924,110 @@ describe('handleWebCommand memory context timeline', () => {
     expect(updateProcessedProjectionSummaryMock).not.toHaveBeenCalled();
     expect(upsertPinnedNoteMock).not.toHaveBeenCalled();
     expect(deleteMemoryMock).not.toHaveBeenCalled();
+  });
+
+  it('validates manual memory project directories before trusting canonical repo ids', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'imcodes-manual-memory-'));
+    const projectDir = join(tempDir, 'codedeck');
+    await mkdir(projectDir);
+    await mkdir(join(projectDir, '.git', 'objects'), { recursive: true });
+    await mkdir(join(projectDir, '.git', 'refs', 'heads'), { recursive: true });
+    await writeFile(join(projectDir, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+    await writeFile(join(projectDir, '.git', 'config'), [
+      '[core]',
+      '\trepositoryformatversion = 0',
+      '\tfilemode = true',
+      '\tbare = false',
+      '\tlogallrefupdates = true',
+      '[remote "origin"]',
+      '\turl = git@github.com:imcodes/codedeck.git',
+      '\tfetch = +refs/heads/*:refs/remotes/origin/*',
+      '',
+    ].join('\n'));
+    listSessionsMock.mockReturnValue([{ name: 'deck_codedeck_brain', projectDir }]);
+
+    try {
+      handleWebCommand({
+        type: MEMORY_WS.CREATE,
+        requestId: 'create-local-project-memory',
+        canonicalRepoId: 'github.com/imcodes/codedeck',
+        projectDir,
+        text: 'Remember local project identity checks.',
+        [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+          actorId: 'user-bob',
+          userId: 'user-bob',
+          role: 'user',
+          source: 'server_bridge',
+          requestId: 'create-local-project-memory',
+          boundProjects: [{ projectDir, canonicalRepoId: 'github.com/imcodes/codedeck' }],
+        },
+      }, serverLink as any);
+
+      await vi.waitFor(() => {
+        expect(writeProcessedProjectionMock).toHaveBeenCalledWith(expect.objectContaining({
+          namespace: { scope: 'personal', projectId: 'github.com/imcodes/codedeck', userId: 'user-bob' },
+          summary: 'Remember local project identity checks.',
+        }));
+        expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: MEMORY_WS.CREATE_RESPONSE,
+          requestId: 'create-local-project-memory',
+          success: true,
+        }));
+      });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects manual memory create when project directory identity does not match the requested canonical id', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'imcodes-manual-memory-mismatch-'));
+    const projectDir = join(tempDir, 'codedeck');
+    await mkdir(projectDir);
+    await mkdir(join(projectDir, '.git', 'objects'), { recursive: true });
+    await mkdir(join(projectDir, '.git', 'refs', 'heads'), { recursive: true });
+    await writeFile(join(projectDir, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+    await writeFile(join(projectDir, '.git', 'config'), [
+      '[core]',
+      '\trepositoryformatversion = 0',
+      '\tfilemode = true',
+      '\tbare = false',
+      '\tlogallrefupdates = true',
+      '[remote "origin"]',
+      '\turl = git@github.com:imcodes/codedeck.git',
+      '\tfetch = +refs/heads/*:refs/remotes/origin/*',
+      '',
+    ].join('\n'));
+    listSessionsMock.mockReturnValue([{ name: 'deck_codedeck_brain', projectDir }]);
+
+    try {
+      handleWebCommand({
+        type: MEMORY_WS.CREATE,
+        requestId: 'create-local-project-memory-mismatch',
+        canonicalRepoId: 'github.com/acme/private',
+        projectDir,
+        text: 'This must not be written under a spoofed repo id.',
+        [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+          actorId: 'user-bob',
+          userId: 'user-bob',
+          role: 'user',
+          source: 'server_bridge',
+          requestId: 'create-local-project-memory-mismatch',
+          boundProjects: [{ projectDir, canonicalRepoId: 'github.com/acme/private' }],
+        },
+      }, serverLink as any);
+
+      await vi.waitFor(() => {
+        expect(writeProcessedProjectionMock).not.toHaveBeenCalled();
+        expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: MEMORY_WS.CREATE_RESPONSE,
+          requestId: 'create-local-project-memory-mismatch',
+          success: false,
+          errorCode: MEMORY_MANAGEMENT_ERROR_CODES.PROJECT_IDENTITY_MISMATCH,
+        }));
+      });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('requires an authorized canonical project binding before manual memory creation', async () => {

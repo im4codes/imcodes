@@ -10183,7 +10183,14 @@ async function handleMemoryCreate(cmd: Record<string, unknown>, serverLink: Serv
     serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_IDENTITY) });
     return;
   }
-  if (!ctx.boundProjects?.some((project) => project.canonicalRepoId === canonicalRepoId)) {
+  const projectDir = commandString(cmd, 'projectDir');
+  if (projectDir) {
+    const projectBinding = await validateProjectScopedManagementBinding(cmd, ctx);
+    if ('errorCode' in projectBinding) {
+      serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(projectBinding.errorCode) });
+      return;
+    }
+  } else if (!ctx.boundProjects?.some((project) => project.canonicalRepoId === canonicalRepoId)) {
     serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN) });
     return;
   }

@@ -20,6 +20,7 @@ import {
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { CC_PRESET_MSG, getCcPresetEffectiveModel, type CcPresetModelInfo } from '@shared/cc-presets.js';
 import {
+  MEMORY_MANAGEMENT_ERROR_CODES,
   type MemoryFeatureAdminRecord,
   type MemoryManagementErrorCode,
   type MemoryObservationAdminRecord,
@@ -2666,15 +2667,41 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
 
   const handleManualMemoryCreate = useCallback(() => {
     const text = manualMemoryText.trim();
-    if (!ws || !text || !manualMemoryCanonicalRepoId) return;
+    setError(null);
+    setNotice(null);
+    if (!text) {
+      setError(memoryAdminErrorMessage(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_MEMORY_TEXT));
+      return;
+    }
+    if (!ws) {
+      setError(t('sharedContext.management.memoryToolDisabledNoDaemon'));
+      return;
+    }
+    if (!manualMemoryCanonicalRepoId) {
+      if (selectedMemoryProject?.status === 'needs_resolution') resolveMemoryProject(selectedMemoryProject);
+      setError(t('sharedContext.management.memoryManualAddProjectRequired'));
+      return;
+    }
     ws.send({
       type: MEMORY_WS.CREATE,
       requestId: markMemoryAdminRequest('memoryCreate'),
       text,
       projectionClass: manualMemoryProjectionClass,
       canonicalRepoId: manualMemoryCanonicalRepoId,
+      projectDir: selectedProjectDir,
     });
-  }, [manualMemoryCanonicalRepoId, manualMemoryProjectionClass, manualMemoryText, markMemoryAdminRequest, ws]);
+  }, [
+    manualMemoryCanonicalRepoId,
+    manualMemoryProjectionClass,
+    manualMemoryText,
+    markMemoryAdminRequest,
+    memoryAdminErrorMessage,
+    resolveMemoryProject,
+    selectedMemoryProject,
+    selectedProjectDir,
+    t,
+    ws,
+  ]);
 
   const handleLocalMemoryUpdate = useCallback((id: string, recordProjectId?: string) => {
     const text = editingMemoryText.trim();
@@ -4967,7 +4994,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     <button
                       type="button"
                       style={buttonStyle}
-                      disabled={!!manualMemoryDisabledReason || !manualMemoryText.trim()}
+                      disabled={false}
                       title={manualMemoryDisabledReason ?? undefined}
                       onClick={handleManualMemoryCreate}
                     >

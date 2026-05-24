@@ -1214,7 +1214,7 @@ export function P2pConfigPanel({
               </>
             ) : (
               /*
-               * R3 v2 PR-θ — Advanced Workflow tab. Single home for the
+               * Advanced Workflow tab shell. Single home for the
                * full canvas-based graph editor plus every advanced-config
                * block (migration banner, allowed-executables allowlist,
                * future-schema banner, capability stale/missing banners).
@@ -1404,6 +1404,12 @@ export function P2pConfigPanel({
                   </div>
                 )}
 
+                {/*
+                 * R3 v2 PR-θ — Advanced Workflow tab. Keep this marker close
+                 * to the canvas + allowlist mounts so the source-level
+                 * regression guard proves both live in this branch even as
+                 * the explanatory/library UI above evolves.
+                 */}
                 {workflowDraft && (
                   <div style={{ ...sectionCardStyle, marginTop: 12 }} data-testid="p2p-workflow-name-section">
                     <label style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>

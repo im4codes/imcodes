@@ -1981,6 +1981,22 @@ export class WsBridge {
             }],
           };
         }
+        if (projectDir) {
+          const localSession = await this.db.queryOne<{ name?: string }>(
+            'SELECT name FROM sessions WHERE server_id = $1 AND project_dir = $2 LIMIT 1',
+            [this.serverId, projectDir],
+          );
+          const localSubSession = localSession ? null : await this.db.queryOne<{ id?: string }>(
+            'SELECT id FROM sub_sessions WHERE server_id = $1 AND cwd = $2 AND closed_at IS NULL LIMIT 1',
+            [this.serverId, projectDir],
+          );
+          if (localSession || localSubSession) {
+            return {
+              role: 'user',
+              boundProjects: [{ projectDir, canonicalRepoId }],
+            };
+          }
+        }
         return { role: 'user', boundProjects: [] };
       }
 
