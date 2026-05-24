@@ -54,6 +54,7 @@ interface MockRow {
   last_used_at?: number;
   status?: 'active' | 'archived';
   enterprise_id?: string;
+  match_kind?: 'exact' | 'semantic' | 'trigram';
   // Optional in the test fixture; the recall route SELECTs the column and
   // surfaces it as `originServerId` in the response. Tests that don't care
   // about routing leave it omitted (response field will be undefined and
@@ -141,7 +142,7 @@ async function buildTestApp(db: Database) {
 
 async function postRecall(
   app: Hono<{ Bindings: Env }>,
-  body: { query: string; projectId?: string; limit?: number },
+  body: { query: string; projectId?: string; limit?: number; mode?: 'recall' | 'search' },
 ) {
   return app.request('/api/shared-context/srv-1/shared-context/memory/recall', {
     method: 'POST',
@@ -639,6 +640,7 @@ describe('memory recall endpoint — I.5', () => {
           summary: 'im服务器(78服务器): ssh root@116.62.239.78',
           updated_at: now - 1_000,
           score: 1,
+          match_kind: 'exact',
         },
       ],
     });
@@ -654,8 +656,71 @@ describe('memory recall endpoint — I.5', () => {
     expect(json.results[0]).toMatchObject({
       id: 'infra-exact',
       class: 'durable_memory_candidate',
+      matchKind: 'exact',
       summary: expect.stringContaining('116.62.239.78'),
     });
+  });
+
+  it('lets explicit MCP search requests retrieve more than prompt-recall caps', async () => {
+    const now = Date.now();
+    const rows = Array.from({ length: 12 }, (_, index): MockRow => ({
+      id: `mcp-search-${index}`,
+      project_id: 'proj',
+      projection_class: 'recent_summary',
+      summary: `MCP search result ${index}`,
+      updated_at: now - index,
+      score: 0.95 - index * 0.01,
+      match_kind: 'semantic',
+    }));
+    const { db } = makeMockDb({ personalRows: rows });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: 'mcp search result', projectId: 'proj', limit: 12, mode: 'search' });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: Array<{ id: string }> };
+    expect(json.results).toHaveLength(12);
+  });
+
+  it('prioritizes exact matches before semantic rows for explicit MCP search', async () => {
+    generateEmbeddingMock.mockResolvedValueOnce(new Float32Array([0.4, 0.2, 0.1]));
+    embeddingToSqlMock.mockReturnValue('[0.4,0.2,0.1]');
+    const now = Date.now();
+    const { db } = makeMockDb({
+      personalRows: [
+        {
+          id: 'semantic-top',
+          project_id: 'github.com/im4codes/imcodes',
+          projection_class: 'recent_summary',
+          summary: 'Deployment workflow notes for IM.codes server upgrades',
+          updated_at: now,
+          score: 0.99,
+          match_kind: 'semantic',
+        },
+      ],
+      lexicalPersonalRows: [
+        {
+          id: 'exact-ip',
+          project_id: 'github.com/im4codes/imcodes',
+          projection_class: 'durable_memory_candidate',
+          summary: 'im服务器(78服务器): ssh root@116.62.239.78',
+          updated_at: now - 1_000,
+          score: 1,
+          match_kind: 'exact',
+        },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, {
+      query: '116.62.239.78',
+      projectId: 'github.com/im4codes/imcodes',
+      limit: 1,
+      mode: 'search',
+    });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: Array<{ id: string; matchKind: string }> };
+    expect(json.results).toHaveLength(1);
+    expect(json.results[0]).toMatchObject({ id: 'exact-ip', matchKind: 'exact' });
   });
 
   // ── originServerId — memory-source-server-routing change ───────────────

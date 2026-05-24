@@ -208,6 +208,21 @@ function escapeSqlLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, (char) => `\\${char}`);
 }
 
+function buildLexicalLikePatterns(query: string): string[] {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) return [];
+  const patterns = new Set<string>();
+  patterns.add(`%${escapeSqlLikePattern(normalized)}%`);
+  const tokens = normalized
+    .split(/[^\p{L}\p{N}._@-]+/u)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3 || /[\d\u4e00-\u9fff]/.test(token));
+  for (const token of tokens) patterns.add(`%${escapeSqlLikePattern(token)}%`);
+  const ips = normalized.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g) ?? [];
+  for (const ip of ips) patterns.add(`%${escapeSqlLikePattern(ip)}%`);
+  return [...patterns].slice(0, 32);
+}
+
 type MemoryStatsRow = {
   total_records?: number | null;
   recent_summary_count?: number | null;
@@ -1536,7 +1551,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
       : runtimeConfigRow?.shared_context_runtime_config,
   );
 
-  let body: { query: string; projectId?: string; limit?: number };
+  let body: { query: string; projectId?: string; limit?: number; mode?: 'recall' | 'search' };
   try {
     body = await c.req.json() as typeof body;
   } catch {
@@ -1558,8 +1573,11 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   if (isImperativeCommand(query)) {
     return c.json({ results: [], vectorSearch: false, skipped: 'imperative_command' });
   }
-  const limit = typeof rawLimit === 'number' && rawLimit > 0 ? Math.min(rawLimit, 20) : 5;
-  const candidateLimit = Math.max(limit * 4, 20);
+  const searchMode = body.mode === 'search';
+  const limitCap = searchMode ? 100 : 20;
+  const defaultLimit = searchMode ? 20 : 5;
+  const limit = typeof rawLimit === 'number' && rawLimit > 0 ? Math.min(rawLimit, limitCap) : defaultLimit;
+  const candidateLimit = Math.max(limit * 4, searchMode ? 40 : 20);
 
   // Try vector search first, fall back to pg_trgm
   const { generateEmbedding, embeddingToSql } = await import('../util/embedding.js');
@@ -1581,6 +1599,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
     // cross-daemon source resolution is impossible. See
     // openspec/changes/memory-source-server-routing.
     origin_server_id: string;
+    match_kind?: 'exact' | 'semantic' | 'trigram' | null;
   };
 
   let currentEnterpriseId: string | undefined;
@@ -1599,41 +1618,43 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
 
   let personalRows: RecallRow[];
   let enterpriseRows: RecallRow[];
-  const escapedLikeQuery = `%${escapeSqlLikePattern(query.trim().toLowerCase())}%`;
+  const lexicalLikePatterns = buildLexicalLikePatterns(query);
 
   const loadPersonalLexicalRows = () => c.env.DB.query<RecallRow>(
     `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
             p.hit_count, p.last_used_at, p.enterprise_id, p.server_id AS origin_server_id,
-            1.0 AS score
+            1.0 AS score, 'exact' AS match_kind
        FROM shared_context_projections p
       WHERE p.scope = 'personal' AND p.user_id = $1
         AND COALESCE(p.status, 'active') = 'active'
         ${projectId ? 'AND p.project_id = $2' : ''}
-        AND (
-          LOWER(p.summary) LIKE $${projectId ? 3 : 2} ESCAPE '\\'
-          OR LOWER(COALESCE(p.content_json::text, '')) LIKE $${projectId ? 3 : 2} ESCAPE '\\'
+        AND EXISTS (
+          SELECT 1 FROM unnest($${projectId ? 3 : 2}::text[]) AS pat(pattern)
+          WHERE LOWER(p.summary) LIKE pat.pattern ESCAPE '\\'
+             OR LOWER(COALESCE(p.content_json::text, '')) LIKE pat.pattern ESCAPE '\\'
         )
       ORDER BY p.updated_at DESC
       LIMIT $${projectId ? 4 : 3}`,
-    [userId, ...(projectId ? [projectId] : []), escapedLikeQuery, candidateLimit],
+    [userId, ...(projectId ? [projectId] : []), lexicalLikePatterns, candidateLimit],
   );
 
   const loadEnterpriseLexicalRows = () => c.env.DB.query<RecallRow>(
     `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
             p.hit_count, p.last_used_at, p.enterprise_id, p.server_id AS origin_server_id,
-            1.0 AS score
+            1.0 AS score, 'exact' AS match_kind
        FROM shared_context_projections p
        JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $1
        JOIN unnest($2::text[]) AS allowed_scope(scope) ON allowed_scope.scope = p.scope
       WHERE COALESCE(p.status, 'active') = 'active'
         ${projectId ? 'AND p.project_id = $3' : ''}
-        AND (
-          LOWER(p.summary) LIKE $${projectId ? 4 : 3} ESCAPE '\\'
-          OR LOWER(COALESCE(p.content_json::text, '')) LIKE $${projectId ? 4 : 3} ESCAPE '\\'
+        AND EXISTS (
+          SELECT 1 FROM unnest($${projectId ? 4 : 3}::text[]) AS pat(pattern)
+          WHERE LOWER(p.summary) LIKE pat.pattern ESCAPE '\\'
+             OR LOWER(COALESCE(p.content_json::text, '')) LIKE pat.pattern ESCAPE '\\'
         )
       ORDER BY p.updated_at DESC
       LIMIT $${projectId ? 5 : 4}`,
-    [userId, [...REPLICABLE_SHARED_PROJECTION_SCOPES], ...(projectId ? [projectId] : []), escapedLikeQuery, candidateLimit],
+    [userId, [...REPLICABLE_SHARED_PROJECTION_SCOPES], ...(projectId ? [projectId] : []), lexicalLikePatterns, candidateLimit],
   );
 
   if (queryEmbedding) {
@@ -1644,7 +1665,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
       c.env.DB.query<RecallRow>(
       `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
               p.hit_count, p.last_used_at, p.enterprise_id, p.server_id AS origin_server_id,
-              1 - (e.embedding <=> $1::vector) AS score
+              1 - (e.embedding <=> $1::vector) AS score, 'semantic' AS match_kind
        FROM shared_context_projections p
        JOIN shared_context_embeddings e ON e.source_id = p.id AND e.source_kind = 'projection'
        WHERE p.scope = 'personal' AND p.user_id = $2
@@ -1657,7 +1678,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
       c.env.DB.query<RecallRow>(
       `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
               p.hit_count, p.last_used_at, p.enterprise_id, p.server_id AS origin_server_id,
-              1 - (e.embedding <=> $1::vector) AS score
+              1 - (e.embedding <=> $1::vector) AS score, 'semantic' AS match_kind
        FROM shared_context_projections p
        JOIN shared_context_embeddings e ON e.source_id = p.id AND e.source_kind = 'projection'
        JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $2
@@ -1681,7 +1702,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
       c.env.DB.query<RecallRow>(
       `SELECT id, project_id, projection_class, summary, updated_at,
               hit_count, last_used_at, enterprise_id, server_id AS origin_server_id,
-              similarity(summary, $1) AS score
+              similarity(summary, $1) AS score, 'trigram' AS match_kind
        FROM shared_context_projections
        WHERE scope = 'personal' AND user_id = $2
          AND COALESCE(status, 'active') = 'active'
@@ -1694,7 +1715,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
       c.env.DB.query<RecallRow>(
       `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
               p.hit_count, p.last_used_at, p.enterprise_id, p.server_id AS origin_server_id,
-              similarity(p.summary, $1) AS score
+              similarity(p.summary, $1) AS score, 'trigram' AS match_kind
        FROM shared_context_projections p
        JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $2
        JOIN unnest($3::text[]) AS allowed_scope(scope) ON allowed_scope.scope = p.scope
@@ -1715,7 +1736,17 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   // a templated workflow origin must not leak back through recall.
   const seen = new Set<string>();
   const currentProjectId = projectId ?? '__unknown_current_project__';
-  const results: Array<{ id: string; projectId: string; class: string; summary: string; updatedAt: number; score: number; source: 'personal' | 'enterprise'; originServerId: string }> = [];
+  const results: Array<{
+    id: string;
+    projectId: string;
+    class: string;
+    summary: string;
+    updatedAt: number;
+    score: number;
+    source: 'personal' | 'enterprise';
+    originServerId: string;
+    matchKind: 'exact' | 'semantic' | 'trigram';
+  }> = [];
   for (const row of personalRows) {
     if (seen.has(row.id)) continue;
     seen.add(row.id);
@@ -1736,6 +1767,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
       }, runtimeConfig.memoryScoringWeights),
       source: 'personal',
       originServerId: row.origin_server_id,
+      matchKind: row.match_kind ?? 'semantic',
     });
   }
   for (const row of enterpriseRows) {
@@ -1760,6 +1792,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
       }, runtimeConfig.memoryScoringWeights),
       source: 'enterprise',
       originServerId: row.origin_server_id,
+      matchKind: row.match_kind ?? 'semantic',
     });
   }
   // Content-level dedup: projections stored before the writer's store-time
@@ -1769,7 +1802,9 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   // Related-history cards at the same score. Collapse by normalized summary
   // here — keep the highest-scoring representative, then prefer personal
   // over enterprise on ties (personal is closer to the current user's work).
+  const matchKindRank = { exact: 0, semantic: 1, trigram: 2 } satisfies Record<'exact' | 'semantic' | 'trigram', number>;
   results.sort((a, b) => {
+    if (a.matchKind !== b.matchKind) return matchKindRank[a.matchKind] - matchKindRank[b.matchKind];
     if (b.score !== a.score) return b.score - a.score;
     if (a.source !== b.source) return a.source === 'personal' ? -1 : 1;
     return b.updatedAt - a.updatedAt;
@@ -1789,11 +1824,13 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   // a client asking for >=5 keeps the default extend cap.
   const cappedDefault = Math.min(limit, 3);
   const cappedExtend = Math.min(Math.max(limit, cappedDefault), 5);
-  const topResults = applyRecallCapRule(dedupedResults, {
-    minFloor: runtimeConfig.memoryRecallMinScore,
-    defaultCap: cappedDefault,
-    extendCap: cappedExtend,
-  });
+  const topResults = searchMode
+    ? dedupedResults.slice(0, limit)
+    : applyRecallCapRule(dedupedResults, {
+      minFloor: runtimeConfig.memoryRecallMinScore,
+      defaultCap: cappedDefault,
+      extendCap: cappedExtend,
+    });
 
   // Record hits only for projections that actually survived the cap rule —
   // items dropped by floor or session-side filtering never reached the

@@ -69,6 +69,7 @@ describe('memory MCP shared contracts', () => {
     const projectionId = getSources.inputSchema.properties?.projectionId as { description?: string } | undefined;
 
     expect(search.description).toContain('call get_memory_sources');
+    expect(search.description).toContain('sourceLookup.projectionId');
     expect(search.description).toMatch(/projection id/i);
     expect(getSources.description).toContain('Use it after search_memory');
     expect(getSources.description).toContain('provenance-sensitive answers');

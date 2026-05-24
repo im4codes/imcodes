@@ -98,6 +98,7 @@ describe('memory MCP tool schema firewall', () => {
           projectId: 'repo-1',
           scope: 'user_private',
           projectionClass: 'recent_summary',
+          matchKind: 'exact',
           summary: 'MCP provider readiness fixed for Gemini, Copilot, and Qwen.',
           createdAt: 100,
           updatedAt: 200,
@@ -116,8 +117,10 @@ describe('memory MCP tool schema firewall', () => {
       items: [
         {
           projectionId: 'proj-1',
+          sourceLookup: { tool: 'get_memory_sources', projectionId: 'proj-1' },
           summary: 'MCP provider readiness fixed for Gemini, Copilot, and Qwen.',
           projectionClass: 'recent_summary',
+          matchKind: 'exact',
           projectId: 'repo-1',
           scope: 'user_private',
           createdAt: 100,

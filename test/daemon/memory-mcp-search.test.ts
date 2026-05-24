@@ -34,6 +34,7 @@ describe('memory MCP recall search', () => {
             summary: 'Cloud MCP recall memory',
             updatedAt: 200,
             score: 0.91,
+            matchKind: 'exact',
             source: 'personal',
           },
         ],
@@ -63,7 +64,7 @@ describe('memory MCP recall search', () => {
             Authorization: 'Bearer server-token',
             'X-Server-Id': 'srv-1',
           }),
-          body: JSON.stringify({ query: 'MCP recall memory', projectId: 'repo-1', limit: 5 }),
+          body: JSON.stringify({ query: 'MCP recall memory', projectId: 'repo-1', limit: 5, mode: 'search' }),
         }),
       );
       const requestBody = JSON.parse(String(fetchImpl.mock.calls[0][1]?.body));
@@ -72,6 +73,7 @@ describe('memory MCP recall search', () => {
       expect(result.items[0]).toMatchObject({
         projectionId: 'cloud-proj-1',
         summary: 'Cloud MCP recall memory',
+        matchKind: 'exact',
         source: 'cloud',
       });
       expect(result.items.some((item) => item.summary === 'Local MCP fallback memory')).toBe(true);

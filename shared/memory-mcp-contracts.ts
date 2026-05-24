@@ -33,7 +33,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
 ] as const satisfies readonly MemoryMcpToolName[];
 
 export const MEMORY_MCP_CAPS = {
-  SEARCH_MEMORY_DEFAULT_LIMIT: 10,
+  SEARCH_MEMORY_DEFAULT_LIMIT: 20,
   SEARCH_MEMORY_MAX_LIMIT: 100,
   OBSERVATION_CONTENT_MAX_BYTES: 16 * 1024,
   OBSERVATION_TAGS_MAX_COUNT: 8,
@@ -140,14 +140,14 @@ const statusSchema = objectSchema({
 export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, MemoryMcpToolContract>> = {
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: {
     name: MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
-    description: 'Search the caller-bound memory namespace with a text query. Use it before answering when prior project or user context may matter; returns compact hits with projection ids and summaries for optional source lookup. If a relevant summary may affect the answer but is not enough, call get_memory_sources with its projection id. The query is text only; embeddings and vectors are computed internally when available.',
+    description: 'Search the caller-bound memory namespace with a text query. Use it before answering when prior project or user context may matter; returns compact hits with projection ids, summaries, match kind, and a sourceLookup object that shows exactly how to fetch details. If a relevant summary may affect the answer but is not enough, call get_memory_sources with sourceLookup.projectionId. The query is text only; embeddings and vectors are computed internally when available.',
     inputSchema: objectSchema({
       query: stringSchema('Required text query to search for. Do not send embeddings, vectors, identity, or namespace fields.'),
       limit: numberSchema(`Optional maximum hit count; defaults to ${MEMORY_MCP_CAPS.SEARCH_MEMORY_DEFAULT_LIMIT} and is clamped to ${MEMORY_MCP_CAPS.SEARCH_MEMORY_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.SEARCH_MEMORY_MAX_LIMIT }),
     }, ['query']),
     outputSchema: objectSchema({
       status: stringSchema('ok, disabled, or error.'),
-      items: { type: 'array', description: 'Compact same-namespace memory hits.', items: { type: 'object', additionalProperties: true } },
+      items: { type: 'array', description: 'Compact same-namespace memory hits. Each item includes projectionId plus sourceLookup: { tool: "get_memory_sources", projectionId } for exact source expansion.', items: { type: 'object', additionalProperties: true } },
     }),
   },
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: {

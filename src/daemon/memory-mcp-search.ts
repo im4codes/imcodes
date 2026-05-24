@@ -7,6 +7,7 @@ export interface MemoryMcpSearchHit {
   projectionId: string;
   summary: string;
   projectionClass?: ProcessedContextClass | string;
+  matchKind?: 'exact' | 'semantic' | 'trigram';
   projectId?: string;
   scope?: string;
   createdAt?: number;
@@ -46,6 +47,7 @@ interface CloudRecallResponse {
     summary?: string;
     updatedAt?: number;
     score?: number;
+    matchKind?: 'exact' | 'semantic' | 'trigram';
     source?: 'personal' | 'enterprise';
     /**
      * Added by the server in support of cross-server source resolution. The
@@ -103,6 +105,7 @@ async function searchCloudMemoryRecall(
       query: query.query,
       projectId: requestedProjectId,
       limit: clampLimit(query.limit),
+      mode: 'search',
     }),
   });
   if (!response.ok) return [];
@@ -120,6 +123,7 @@ async function searchCloudMemoryRecall(
       projectionId: item.id,
       summary: item.summary,
       projectionClass: item.class,
+      matchKind: item.matchKind,
       projectId: item.projectId,
       updatedAt: item.updatedAt,
       relevanceScore: item.score,

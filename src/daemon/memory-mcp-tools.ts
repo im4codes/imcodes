@@ -165,8 +165,13 @@ function memorySurfaceGate(deps: MemoryMcpToolDeps, extra: Record<string, unknow
 function compactSearchHit(item: MemoryMcpSearchHit) {
   return {
     projectionId: item.projectionId,
+    sourceLookup: {
+      tool: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+      projectionId: item.projectionId,
+    },
     summary: item.summary,
     projectionClass: item.projectionClass,
+    matchKind: item.matchKind,
     projectId: item.projectId,
     scope: item.scope,
     createdAt: item.createdAt,
@@ -417,7 +422,7 @@ function toolResult(result: ToolResult): CallToolResult {
 
 const schemas = {
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: z.object({
-    query: z.string().describe('Required text query to search for. Results include projectionId values for get_memory_sources when more detail is needed.'),
+    query: z.string().describe('Required text query to search for. Results include sourceLookup.projectionId values for get_memory_sources when more detail is needed.'),
     limit: z.number().int().min(1).max(100).optional().describe('Optional maximum hit count.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: z.object({
