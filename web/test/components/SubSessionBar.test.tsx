@@ -355,7 +355,7 @@ describe('SubSessionBar', () => {
         desktopLayoutCapable={false}
         discussions={[{
           id: 'p2p_run_1',
-          topic: 'P2P audit',
+          topic: 'Team audit',
           state: 'running',
           currentRound: 1,
           maxRounds: 1,

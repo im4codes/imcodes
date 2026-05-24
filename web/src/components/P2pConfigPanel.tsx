@@ -811,7 +811,7 @@ export function P2pConfigPanel({
         ).length;
         if (currentlyEnabledCount >= MAX_P2P_PARTICIPANTS) {
           setSaveError(
-            t('p2p.settings_max_participants', 'P2P is limited to {{max}} participants. Disable one before enabling another.', {
+            t('p2p.settings_max_participants', 'Team is limited to {{max}} participants. Disable one before enabling another.', {
               max: MAX_P2P_PARTICIPANTS,
             }),
           );
@@ -836,7 +836,7 @@ export function P2pConfigPanel({
         ).length;
         if (currentlyEnabledCount >= MAX_P2P_PARTICIPANTS) {
           setSaveError(
-            t('p2p.settings_max_participants', 'P2P is limited to {{max}} participants. Disable one before enabling another.', {
+            t('p2p.settings_max_participants', 'Team is limited to {{max}} participants. Disable one before enabling another.', {
               max: MAX_P2P_PARTICIPANTS,
             }),
           );
@@ -878,7 +878,7 @@ export function P2pConfigPanel({
     const enabledCount = Object.values(merged).filter((entry) => entry.enabled === true && entry.mode !== 'skip').length;
     if (enabledCount > MAX_P2P_PARTICIPANTS) {
       setSaveError(
-        t('p2p.settings_max_participants', 'P2P is limited to {{max}} participants. Disable {{over}} before saving.', {
+        t('p2p.settings_max_participants', 'Team is limited to {{max}} participants. Disable {{over}} before saving.', {
           max: MAX_P2P_PARTICIPANTS,
           over: enabledCount - MAX_P2P_PARTICIPANTS,
         }),
@@ -966,7 +966,7 @@ export function P2pConfigPanel({
       if (!options.keepOpen) onClose();
       return;
     } catch {
-      setSaveError(t('p2p.settings_save_error', 'Failed to save P2P settings. Check your connection and try again.'));
+      setSaveError(t('p2p.settings_save_error', 'Failed to save Team settings. Check your connection and try again.'));
     }
     setSaving(false);
   };
@@ -1219,7 +1219,7 @@ export function P2pConfigPanel({
                   style={{ ...sectionCardStyle, marginTop: 0, color: '#94a3b8', fontSize: 12, lineHeight: 1.5 }}
                   data-testid="p2p-advanced-tab-intro"
                 >
-                  {t('p2p.tab.advanced_workflow_intro', 'Design a directed P2P workflow. Nodes are agent rounds (LLM, script, or logic gates); edges control routing. Edits here override the simple round/mode pipeline configured under Agents.')}
+                  {t('p2p.tab.advanced_workflow_intro', 'Design a directed Team workflow. Nodes are agent rounds (LLM, script, or logic gates); edges control routing. Edits here override the simple round/mode pipeline configured under Agents.')}
                 </div>
 
                 {(advancedMigrationNeeded || workflowLaunchEnvelope) && (
@@ -1240,7 +1240,7 @@ export function P2pConfigPanel({
                     style={{ ...sectionCardStyle, marginTop: 12, color: '#94a3b8', fontSize: 12, lineHeight: 1.5 }}
                     data-testid="p2p-advanced-empty-hint"
                   >
-                    {t('p2p.tab.advanced_workflow_empty_hint', 'Initializing a blank workflow draft. Add nodes and edges in the canvas below to design your P2P pipeline.')}
+                    {t('p2p.tab.advanced_workflow_empty_hint', 'Initializing a blank workflow draft. Add nodes and edges in the canvas below to design your Team pipeline.')}
                   </div>
                 )}
 
@@ -1344,7 +1344,7 @@ export function P2pConfigPanel({
                       </div>
                     </div>
                     <div style={{ fontSize: 11, color: '#94a3b8', lineHeight: 1.5, marginTop: 6 }}>
-                      {t('p2p.workflow.library.hint', 'Saved workflows for this session. The active one is sent to P2P launches. Up to {{max}} entries.', { max: P2P_WORKFLOW_LIBRARY_MAX_ENTRIES })}
+                      {t('p2p.workflow.library.hint', 'Saved workflows for this session. The active one is sent to Team launches. Up to {{max}} entries.', { max: P2P_WORKFLOW_LIBRARY_MAX_ENTRIES })}
                     </div>
                     <ul
                       style={{ margin: '8px 0 0', padding: 0, listStyle: 'none', display: 'grid', gap: 4 }}

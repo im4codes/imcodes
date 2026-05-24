@@ -5,7 +5,7 @@
 
 **El IM para agentes. Memoria compartida, herramientas MCP gestionadas, ejecución supervisada y auditoría cruzada entre proveedores de IA.**
 
-IM.codes ofrece a los coding agents una capa de memoria compartida entre proveedores y una superficie MCP gestionada. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent), además de terminal, archivos, vistas Git, localhost preview, notificaciones, flujos multiagente y streaming nativo para agentes transport. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión P2P integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.
+IM.codes ofrece a los coding agents una capa de memoria compartida entre proveedores y una superficie MCP gestionada. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent), además de terminal, archivos, vistas Git, localhost preview, notificaciones, flujos multiagente y streaming nativo para agentes transport. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión Team integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.
 
 > **Nota:** Este archivo es una traducción. **El README en inglés (`../README.md`) es la versión canónica.** Si hay alguna diferencia, prevalece la versión en inglés.
 
@@ -66,7 +66,7 @@ Cuando te alejas del escritorio, la mayoría de los flujos con coding agents se 
 
 Ese problema de acceso es solo la mitad. El trabajo complejo con coding agents también necesita un criterio más estable: un solo modelo puede caer en patrones familiares, pasar por alto problemas o producir respuestas inestables en tareas difíciles. Cambiar de provider puede aportar otra perspectiva, pero sin contexto compartido también puede perder el hilo.
 
-[IM.codes](https://im.codes) está pensado para ambas necesidades. Mantiene esas sesiones al alcance desde móvil o web: abrir el terminal, inspeccionar archivos y cambios Git, previsualizar localhost desde otro dispositivo, recibir notificaciones cuando el trabajo termina y mantener varios agentes en marcha sobre tu propia infraestructura. También combina "Shared Agent Context y memoria" con "Auditoría cross-modelo y discusiones P2P": la recuperación duradera viene de resúmenes del trabajo completado, mientras que la discusión P2P es revisión cross-modelo estructurada antes de que el código aterrice. No vuelve perfecto el resultado, pero reduce puntos ciegos de un solo modelo y ayuda a que el trabajo complejo converja con más revisión.
+[IM.codes](https://im.codes) está pensado para ambas necesidades. Mantiene esas sesiones al alcance desde móvil o web: abrir el terminal, inspeccionar archivos y cambios Git, previsualizar localhost desde otro dispositivo, recibir notificaciones cuando el trabajo termina y mantener varios agentes en marcha sobre tu propia infraestructura. También combina "Shared Agent Context y memoria" con "Auditoría cross-modelo y discusiones Team": la recuperación duradera viene de resúmenes del trabajo completado, mientras que la discusión Team es revisión cross-modelo estructurada antes de que el código aterrice. No vuelve perfecto el resultado, pero reduce puntos ciegos de un solo modelo y ayuda a que el trabajo complejo converja con más revisión.
 
 No es otro IDE de IA ni un cliente genérico de terminal remota. Es la capa de mensajería, memoria y revisión alrededor de coding agents basados en terminal.
 
@@ -90,7 +90,7 @@ IM.codes expone un servidor stdio MCP gestionado por el daemon a los providers b
 - **Recuperación de memoria y procedencia.** `search_memory` busca en el namespace de memoria ligado al llamador: trabajo previo, historial del proyecto, decisiones, preferencias, bugs, commits, despliegues y contexto discutido anteriormente. Los resultados incluyen resúmenes compactos y `projectionId`; `get_memory_sources` expande un hit relevante en fragmentos de procedencia cuando el modelo necesita instrucciones previas exactas, detalles de bugs, contexto de commit/despliegue o evidencia fuente.
 - **Escrituras de memoria.** `save_observation` guarda hechos útiles, decisiones o notas de implementación como candidatos de memoria privada del usuario; `save_preference` guarda preferencias estables por la ruta explícita de preferencias.
 - **Mensajería de agentes.** `send_list_targets` enumera sesiones hermanas del proyecto actual, y `send_message` envía mensajes con alcance, referencias opcionales a rutas de archivos, solicitudes de respuesta o broadcasts mediante el mismo pipeline protegido de `imcodes send`.
-- **Programación Cron.** `cron_create`, `cron_list`, `cron_update` y `cron_delete` gestionan envíos estructurados futuros para recordatorios, comprobaciones recurrentes, reviews delegadas o seguimientos P2P programados, con campos de target/session/project y datos opcionales de expiración/zona horaria.
+- **Programación Cron.** `cron_create`, `cron_list`, `cron_update` y `cron_delete` gestionan envíos estructurados futuros para recordatorios, comprobaciones recurrentes, reviews delegadas o seguimientos Team programados, con campos de target/session/project y datos opcionales de expiración/zona horaria.
 - **Identidad de runtime y seguridad.** Las llamadas se vinculan en runtime a la session, project, user y server actuales de IM.codes. Los agentes no pueden falsificar namespace, user, server, token ni campos de routing; Memory, Send y Cron quedan protegidos por sus feature gates base y por kill-switches MCP.
 - **Visibilidad operativa.** La UI de Shared Context muestra disponibilidad MCP por provider, estado de tool-family gates, razones de degradación, hora de actualización y llamadas recientes redactadas por el daemon para confirmar si el modelo realmente tiene Memory, Send y Cron disponibles.
 
@@ -103,7 +103,7 @@ IM.codes puede conducir sesiones de agent compatibles turno a turno — un super
 - **Automatización fail-closed.** Auto supervision permanece visible en la timeline y en el footer, usa decisiones estructuradas y te devuelve el control si hay timeout, salida inválida o mala configuración.
 - **Bucle opcional audit → rework.** En `supervised_audit`, un turno completado puede entrar automáticamente en un pipeline de auditoría y reenviar un brief de retrabajo a la misma sesión antes de devolverte el control.
 - **Valores globales + overrides por sesión.** Define una vez el backend/modelo/timeout por defecto del supervisor y, cuando haga falta, sobrescribe backend/modelo/timeout, modo de auditoría e instrucciones personalizadas en cada sesión.
-- **Pensado para flujos reales de IM.codes.** Auto supervision entiende flujos de OpenSpec, revisiones P2P y coordinación entre agentes con `imcodes send` como pasos válidos del agente, no como una razón inmediata para parar y pedir a un humano.
+- **Pensado para flujos reales de IM.codes.** Auto supervision entiende flujos de OpenSpec, revisiones Team y coordinación entre agentes con `imcodes send` como pasos válidos del agente, no como una razón inmediata para parar y pedir a un humano.
 
 ## Funciones
 
@@ -119,8 +119,8 @@ Previsualiza tu servidor de desarrollo local desde cualquier dispositivo sin des
 ### Móvil, reloj y notificaciones
 Soporte completo para móvil, autenticación biométrica, notificaciones push, entrada interactiva para sesiones shell y respuestas rápidas desde Apple Watch.
 
-### Auditoría cross-modelo y discusiones P2P
-La salida de un solo modelo no debería confiarse ciegamente. Las discusiones P2P permiten que múltiples agentes — de distintos proveedores y estilos de pensamiento — colaboren en el análisis del mismo código antes de escribir una sola línea. Cada ronda sigue un pipeline multifase personalizable, donde cada agente lee todas las contribuciones anteriores. Diferentes modelos detectan diferentes tipos de problemas. Esta revisión cruzada entre proveedores encuentra problemas que un solo modelo suele pasar por alto antes de la implementación, reduciendo el retrabajo.
+### Auditoría cross-modelo y discusiones Team
+La salida de un solo modelo no debería confiarse ciegamente. Las discusiones Team permiten que múltiples agentes — de distintos proveedores y estilos de pensamiento — colaboren en el análisis del mismo código antes de escribir una sola línea. Cada ronda sigue un pipeline multifase personalizable, donde cada agente lee todas las contribuciones anteriores. Diferentes modelos detectan diferentes tipos de problemas. Esta revisión cruzada entre proveedores encuentra problemas que un solo modelo suele pasar por alto antes de la implementación, reduciendo el retrabajo.
 
 Modos integrados: `audit` (pipeline estructurado audit → review → plan), `review`, `discuss` y `brainstorm` — o define tu propia secuencia de fases. Funciona con Claude Code, Codex, Gemini CLI y Qwen.
 
@@ -169,7 +169,7 @@ imcodes send "Claude" "tests failed on main, check CI log at /tmp/ci.log and fix
 ```
 
 ### Selector `@` inteligente
-`@` busca archivos del proyecto; `@@` selecciona agentes para despacho P2P.
+`@` busca archivos del proyecto; `@@` selecciona agentes para despacho Team.
 
 ### Gestión de múltiples servidores y sesiones
 Conecta varias máquinas de desarrollo a un único panel.

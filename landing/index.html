@@ -236,7 +236,7 @@ footer {
 </header>
 
 <section>
-  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.</p>
+  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.</p>
   <div class="prompt">imcodes bind https://app.im.codes/bind/&lt;key&gt;<span class="cursor"></span></div>
   <div class="output" data-i18n="hero_output">bound to app.im.codes &middot; daemon started &middot; registered as system service</div>
 </section>
@@ -282,7 +282,7 @@ footer {
 <section>
   <h2 data-i18n="h_why">why</h2>
   <p style="color:var(--fg); margin-bottom:16px;" data-i18n="why_text">
-    When you leave your desk, most coding-agent workflows fall apart. The agent is still running in a terminal, but continuing usually means SSH, tmux attach, remote desktop, or waiting for your laptop. That is only half the problem. Hard agent work also needs better judgment: one model can fall into patterns, miss issues, or lose context when you switch providers. IM.codes pairs always-reachable sessions with shared memory for summarized completed work and structured P2P cross-model review, so multiple agents can challenge plans before code lands. It does not make output perfect, but it reduces single-model blind spots while keeping the work continuous.
+    When you leave your desk, most coding-agent workflows fall apart. The agent is still running in a terminal, but continuing usually means SSH, tmux attach, remote desktop, or waiting for your laptop. That is only half the problem. Hard agent work also needs better judgment: one model can fall into patterns, miss issues, or lose context when you switch providers. IM.codes pairs always-reachable sessions with shared memory for summarized completed work and structured Team cross-model review, so multiple agents can challenge plans before code lands. It does not make output perfect, but it reduces single-model blind spots while keeping the work continuous.
   </p>
 </section>
 
@@ -343,7 +343,7 @@ footer {
     <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser & git</div><div class="feat-desc" data-i18n="f_file_desc">tree view, upload/download, +/- stats, floating preview</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_preview_name">local web preview</div><div class="feat-desc" data-i18n="f_preview_desc">preview localhost from any device via secure tunnel, supports HMR</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_mobile_name">mobile, watch & notifications</div><div class="feat-desc" data-i18n="f_mobile_desc">biometric auth, push notifications, shell keyboard input, watch quick replies</div></div>
-    <div class="feat"><div class="feat-name" data-i18n="f_discuss_name">cross-provider audit</div><div class="feat-desc" data-i18n="f_discuss_desc">multi-agent P2P discussions with customizable phases (audit, review, brainstorm…) — different models catch different issues before code is written, reducing rework</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_discuss_name">cross-provider audit</div><div class="feat-desc" data-i18n="f_discuss_desc">multi-agent Team discussions with customizable phases (audit, review, brainstorm…) — different models catch different issues before code is written, reducing rework</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_streaming_name">CLI + SDK access</div><div class="feat-desc" data-i18n="f_streaming_desc">Access multiple agents through both CLI and SDK integrations. OpenClaw and Qwen also stream natively with real-time deltas, tool tracking, and session restore.</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_chat_name">terminal + chat</div><div class="feat-desc" data-i18n="f_chat_desc">raw CLI or structured view with parsed tool calls</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_sidebar_name">Discord-style sidebar</div><div class="feat-desc" data-i18n="f_sidebar_desc">server icons, session tree, unread badges, idle flash</div></div>
@@ -498,7 +498,7 @@ const I18N = {
   en: {
     watch_intro: 'Watch support covers quick session monitoring, unread counts, OTA update visibility, push notifications, and quick replies from the wrist.',
     tagline: 'The IM for agents. Shared memory, managed MCP tools, supervised execution, and cross-agent audit across AI providers.',
-    hero_intro: "IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. P2P discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.",
+    hero_intro: "IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.",
     watch_badge: 'iPhone · iPad · Apple Watch',
     watch_download: 'Watch app includes session list, unread counts, and quick replies.',
     agents_intro: 'Multiple agents support both CLI and SDK integrations.',
@@ -541,7 +541,7 @@ const I18N = {
   },
   'zh-CN': {
     tagline: '给 AI agent 的 IM。共享记忆、托管 MCP 工具、受监督执行，以及跨模型审计。',
-    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层，以及一套托管 MCP 工具面。它会把已完成的工作沉淀成可复用上下文，再在后续 session 中注入或召回合适的历史，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。内置 Auto supervision 可在每轮完成后判断任务是否完成、是否继续自动执行，并可选进入审计/返工闭环后再把控制权交还给你。P2P 讨论功能让多个模型相互审阅对方的方案和实现——能有效减少单模型的遗漏、盲点和偏差。',
+    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层，以及一套托管 MCP 工具面。它会把已完成的工作沉淀成可复用上下文，再在后续 session 中注入或召回合适的历史，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。内置 Auto supervision 可在每轮完成后判断任务是否完成、是否继续自动执行，并可选进入审计/返工闭环后再把控制权交还给你。团队讨论功能让多个模型相互审阅对方的方案和实现——能有效减少单模型的遗漏、盲点和偏差。',
     hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
     self_host_warning: '<strong>强烈建议自行部署。</strong><code>app.im.codes</code> 是共享测试实例，无可用性保证，可能被限流、攻击或不可用。这是个人项目，不提供商用保障。正式使用请部署到自己的服务器。',
     h_screenshots: '截图', h_why: '为什么', h_memory: '共享代理上下文', h_mcp: '托管 MCP 工具', h_not: '它不是什么', h_features: '功能', h_arch: '架构', h_download: '下载', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
@@ -572,11 +572,11 @@ const I18N = {
     f_mcp_desc: '十个运行时作用域工具：记忆搜索/来源、偏好、Scoped Send 和 Cron 调度',
     f_auto_name: '受监督执行',
     f_auto_desc: '逐轮完成判定、自动继续，以及可选的审计→返工闭环，适用于 transport agent',
-    why_text: '离开桌面后，大多数 coding agent 工作流就断了。代理还在终端里运行，但你通常只能靠 SSH、tmux attach、远程桌面，或者等回到电脑前。这只是问题的一半。复杂 agent 工作还需要更稳的判断：单个模型可能陷入定式、漏掉问题，切换 provider 时也可能丢上下文。IM.codes 把始终可达的会话、已完成工作的共享记忆摘要，以及结构化 P2P 跨模型审阅放在一起，让多个 agent 在代码落地前互相挑战方案。它不能让输出完美，但能减少单模型盲点，并让工作保持连续。',
+    why_text: '离开桌面后，大多数 coding agent 工作流就断了。代理还在终端里运行，但你通常只能靠 SSH、tmux attach、远程桌面，或者等回到电脑前。这只是问题的一半。复杂 agent 工作还需要更稳的判断：单个模型可能陷入定式、漏掉问题，切换 provider 时也可能丢上下文。IM.codes 把始终可达的会话、已完成工作的共享记忆摘要，以及结构化团队跨模型审阅放在一起，让多个 agent 在代码落地前互相挑战方案。它不能让输出完美，但能减少单模型盲点，并让工作保持连续。',
     not_1: '不是另一个 AI IDE', not_2: '不只是聊天壳', not_3: '不只是远程终端客户端', not_4: '不是 Claude Code、Codex、Gemini CLI、OpenClaw 或 Qwen 的替代品', not_5: '它是围绕这些 agent 的消息/控制层',
     f_remote_name: '远程终端', f_remote_desc: '浏览器和手机访问，无需 SSH/VPN，实时 PTY 推流',
     f_chat_name: '终端 + 聊天', f_chat_desc: '原生 CLI 或结构化视图，解析工具调用',
-    f_discuss_name: '跨模型审计', f_discuss_desc: '多 Agent P2P 讨论，可自定义阶段（audit、review、brainstorm…）— 不同模型在写代码前交叉审查，减少单模型常漏掉的问题和返工',
+    f_discuss_name: '跨模型审计', f_discuss_desc: '多 Agent 团队讨论，可自定义阶段（audit、review、brainstorm…）— 不同模型在写代码前交叉审查，减少单模型常漏掉的问题和返工',
     f_multi_name: '多服务器', f_multi_desc: '一个面板管理所有机器上的代理',
     f_sub_name: '子会话', f_sub_desc: '随时启动并行代理',
     f_file_name: '文件浏览器', f_file_desc: '浏览、上传下载、Git 差异、浮动预览',
@@ -625,7 +625,7 @@ const I18N = {
   },
   'zh-TW': {
     tagline: '給 AI agent 的 IM。共享記憶、託管 MCP 工具、受監督執行，以及跨模型審計。',
-    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層，以及一套託管 MCP 工具面。它會把已完成的工作沉澱成可重用上下文，再在後續 session 中注入或召回合適的歷史，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。P2P 討論功能讓多個模型互相審閱對方的方案和實作——能有效減少單模型的遺漏、盲點和偏差。',
+    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層，以及一套託管 MCP 工具面。它會把已完成的工作沉澱成可重用上下文，再在後續 session 中注入或召回合適的歷史，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。團隊討論功能讓多個模型互相審閱對方的方案和實作——能有效減少單模型的遺漏、盲點和偏差。',
     hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
     self_host_warning: '<strong>強烈建議自行部署。</strong><code>app.im.codes</code> 是共享測試實例，無可用性保證，可能被限流、攻擊或不可用。這是個人專案，不提供商用保障。正式使用請部署到自己的伺服器。',
     h_screenshots: '截圖', h_why: '為什麼', h_memory: '共享代理上下文', h_mcp: '託管 MCP 工具', h_not: '它不是什麼', h_features: '功能', h_arch: '架構', h_download: '下載', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
@@ -656,11 +656,11 @@ const I18N = {
     f_mcp_desc: '十個執行時作用域工具：記憶搜尋/來源、偏好、Scoped Send 和 Cron 調度',
     f_auto_name: '受監督執行',
     f_auto_desc: '逐輪完成判定、自動繼續，以及可選的審計→返工閉環，適用於 transport agent',
-    why_text: '離開桌面後，大多數 coding agent 工作流就斷了。代理還在終端機裡運行，但你通常只能靠 SSH、tmux attach、遠端桌面，或者等回到電腦前。這只是問題的一半。複雜 agent 工作還需要更穩的判斷：單一模型可能陷入固定模式、漏掉問題，切換 provider 時也可能遺失上下文。IM.codes 把始終可達的 session、已完成工作的共享記憶摘要，以及結構化 P2P 跨模型審閱放在一起，讓多個 agent 在程式碼落地前互相檢視方案。它不能讓輸出完美，但能減少單一模型盲點，並讓工作保持連續。',
+    why_text: '離開桌面後，大多數 coding agent 工作流就斷了。代理還在終端機裡運行，但你通常只能靠 SSH、tmux attach、遠端桌面，或者等回到電腦前。這只是問題的一半。複雜 agent 工作還需要更穩的判斷：單一模型可能陷入固定模式、漏掉問題，切換 provider 時也可能遺失上下文。IM.codes 把始終可達的 session、已完成工作的共享記憶摘要，以及結構化團隊跨模型審閱放在一起，讓多個 agent 在程式碼落地前互相檢視方案。它不能讓輸出完美，但能減少單一模型盲點，並讓工作保持連續。',
     not_1: '不是另一個 AI IDE', not_2: '不只是聊天殼', not_3: '不只是遠端終端客戶端', not_4: '不是 Claude Code、Codex、Gemini CLI、OpenClaw 或 Qwen 的替代品', not_5: '它是圍繞這些 agent 的訊息/控制層',
     f_remote_name: '遠端終端機', f_remote_desc: '瀏覽器和手機存取，無需 SSH/VPN，即時 PTY 串流',
     f_chat_name: '終端機 + 聊天', f_chat_desc: '原生 CLI 或結構化檢視，解析工具呼叫',
-    f_discuss_name: '跨模型稽核', f_discuss_desc: '多 Agent P2P 討論，可自訂階段（audit、review、brainstorm…）— 不同模型在寫程式前交叉審查，減少單一模型常漏掉的問題和返工',
+    f_discuss_name: '跨模型稽核', f_discuss_desc: '多 Agent 團隊討論，可自訂階段（audit、review、brainstorm…）— 不同模型在寫程式前交叉審查，減少單一模型常漏掉的問題和返工',
     f_multi_name: '多伺服器', f_multi_desc: '一個面板管理所有機器上的代理',
     f_sub_name: '子會話', f_sub_desc: '隨時啟動並行代理',
     f_file_name: '檔案瀏覽器', f_file_desc: '瀏覽、上傳下載、Git 差異、浮動預覽',
@@ -709,7 +709,7 @@ const I18N = {
   },
   ja: {
     tagline: 'エージェントのための IM。共有メモリ、managed MCP tools、監督付き実行、そして AI プロバイダー横断の監査。',
-    hero_intro: 'IM.codes は coding agent に、プロバイダーをまたぐ共有メモリレイヤーと managed MCP tool surface を提供します。完了した作業を再利用可能なコンテキストとして蓄積し、Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw などの後続 session に適切な履歴を注入またはリコールします。Built-in Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。P2P ディスカッションを内蔵 — 複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。',
+    hero_intro: 'IM.codes は coding agent に、プロバイダーをまたぐ共有メモリレイヤーと managed MCP tool surface を提供します。完了した作業を再利用可能なコンテキストとして蓄積し、Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw などの後続 session に適切な履歴を注入またはリコールします。Built-in Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。Team ディスカッションを内蔵 — 複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。',
     hero_output: 'app.im.codes にバインド完了 · デーモン起動 · システムサービスとして登録',
     self_host_warning: '<strong>セルフホスティングを強く推奨します。</strong><code>app.im.codes</code> は共有テストインスタンスであり、稼働保証はありません。レート制限、攻撃対象、利用不可の可能性があります。個人プロジェクトのため商用サポートはありません。評価以外の用途では自社インフラにデプロイしてください。',
     h_screenshots: 'スクリーンショット', h_why: '背景', h_memory: '共有エージェントコンテキスト', h_mcp: 'managed MCP tools', h_not: 'これは何ではないか', h_features: '機能', h_arch: 'アーキテクチャ', h_download: 'ダウンロード', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
@@ -740,11 +740,11 @@ const I18N = {
     f_mcp_desc: '10 runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling',
     f_auto_name: '監督付き実行',
     f_auto_desc: 'transport 系エージェント向けのターン単位完了判定、自動継続、任意の audit→rework ループ',
-    why_text: 'デスクを離れると、多くの coding agent ワークフローは途切れます。エージェントはまだターミナルで動いていても、作業を続けるには SSH、tmux attach、リモートデスクトップ、あるいはラップトップに戻るまで待つしかありません。それは問題の半分にすぎません。難しい agent 作業には、より安定した判断も必要です。単一モデルは型にはまった判断に寄り、問題を見落としたり、provider を切り替えた時に文脈を失ったりします。IM.codes は、常に手元から届く session、完了作業の共有メモリ要約、構造化 P2P クロスモデルレビューを組み合わせ、コードが入る前に複数の agent が計画を検証できるようにします。出力を完璧にはしませんが、単一モデルの盲点を減らし、作業の連続性を保ちます。',
+    why_text: 'デスクを離れると、多くの coding agent ワークフローは途切れます。エージェントはまだターミナルで動いていても、作業を続けるには SSH、tmux attach、リモートデスクトップ、あるいはラップトップに戻るまで待つしかありません。それは問題の半分にすぎません。難しい agent 作業には、より安定した判断も必要です。単一モデルは型にはまった判断に寄り、問題を見落としたり、provider を切り替えた時に文脈を失ったりします。IM.codes は、常に手元から届く session、完了作業の共有メモリ要約、構造化 Team クロスモデルレビューを組み合わせ、コードが入る前に複数の agent が計画を検証できるようにします。出力を完璧にはしませんが、単一モデルの盲点を減らし、作業の連続性を保ちます。',
     not_1: '別の AI IDE ではありません', not_2: '単なるチャットラッパーではありません', not_3: '単なるリモートターミナルクライアントではありません', not_4: 'Claude Code、Codex、Gemini CLI、OpenClaw、Qwen の置き換えではありません', not_5: 'それらを取り巻くメッセージング／コントロール層です',
     f_remote_name: 'リモートターミナル', f_remote_desc: 'ブラウザ＆モバイル、SSH/VPN不要、リアルタイムPTYストリーミング',
     f_chat_name: 'ターミナル＋チャット', f_chat_desc: 'ネイティブCLIまたは構造化ビュー',
-    f_discuss_name: 'クロスモデル監査', f_discuss_desc: 'カスタマイズ可能なフェーズ（audit、review、brainstorm…）のマルチエージェント P2P 議論 — 異なるモデルが実装前に交差レビューし、単一モデルが見落としがちな問題と手戻りを減らします',
+    f_discuss_name: 'クロスモデル監査', f_discuss_desc: 'カスタマイズ可能なフェーズ（audit、review、brainstorm…）のマルチエージェント Team 議論 — 異なるモデルが実装前に交差レビューし、単一モデルが見落としがちな問題と手戻りを減らします',
     f_multi_name: 'マルチサーバー', f_multi_desc: '複数マシンのエージェントを一元管理',
     f_sub_name: 'サブセッション', f_sub_desc: '並列エージェントを即座に起動',
     f_file_name: 'ファイルブラウザ', f_file_desc: '閲覧、アップロード/ダウンロード、Git差分、フローティングプレビュー',
@@ -793,7 +793,7 @@ const I18N = {
   },
   ko: {
     tagline: '에이전트를 위한 IM. 공유 메모리, managed MCP tools, 감독된 실행, 그리고 AI 제공자 전반의 교차 감사.',
-    hero_intro: 'IM.codes는 coding agent를 위한 provider 간 공유 메모리 레이어와 managed MCP tool surface를 제공합니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw 등 이후 session에 적절한 기록을 주입하거나 다시 recall합니다. 내장된 Auto supervision은 완료된 턴을 판정하고, 자동 계속과 감사/재작업 루프까지 수행한 뒤 제어를 돌려줄 수 있습니다. P2P 토론 기능 내장 — 여러 모델이 서로의 계획과 구현을 리뷰하고 감사하여, 단일 모델의 누락·맹점·편향을 효과적으로 줄입니다.',
+    hero_intro: 'IM.codes는 coding agent를 위한 provider 간 공유 메모리 레이어와 managed MCP tool surface를 제공합니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw 등 이후 session에 적절한 기록을 주입하거나 다시 recall합니다. 내장된 Auto supervision은 완료된 턴을 판정하고, 자동 계속과 감사/재작업 루프까지 수행한 뒤 제어를 돌려줄 수 있습니다. Team 토론 기능 내장 — 여러 모델이 서로의 계획과 구현을 리뷰하고 감사하여, 단일 모델의 누락·맹점·편향을 효과적으로 줄입니다.',
     hero_output: 'app.im.codes에 바인딩 완료 · 데몬 시작됨 · 시스템 서비스로 등록됨',
     self_host_warning: '<strong>셀프 호스팅을 강력히 권장합니다.</strong> <code>app.im.codes</code>는 공유 테스트 인스턴스로 가동 보장이 없으며, 속도 제한, 공격 대상이 되거나 사용 불가할 수 있습니다. 개인 프로젝트로 상업적 지원은 제공되지 않습니다. 평가 이외의 용도에는 자체 인프라에 배포하세요.',
     h_screenshots: '스크린샷', h_why: '배경', h_memory: '공유 에이전트 컨텍스트', h_mcp: 'managed MCP tools', h_not: '무엇이 아닌가', h_features: '기능', h_arch: '아키텍처', h_download: '다운로드', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
@@ -824,11 +824,11 @@ const I18N = {
     f_mcp_desc: '10 runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling',
     f_auto_name: '감독된 실행',
     f_auto_desc: 'transport 에이전트를 위한 턴 단위 완료 판정, 자동 계속, 선택적 audit→rework 루프',
-    why_text: '책상을 떠나면 대부분의 coding agent 워크플로우는 끊깁니다. 에이전트는 여전히 터미널에서 돌아가지만, 작업을 이어가려면 보통 SSH, tmux attach, 원격 데스크톱을 쓰거나 노트북 앞으로 돌아갈 때까지 기다려야 합니다. 그것은 문제의 절반일 뿐입니다. 어려운 agent 작업에는 더 안정적인 판단도 필요합니다. 단일 모델은 익숙한 패턴에 갇히거나 문제를 놓치고, provider를 바꿀 때 컨텍스트가 끊길 수 있습니다. IM.codes는 언제든 닿을 수 있는 session, 완료된 작업의 공유 메모리 요약, 구조화된 P2P 크로스 모델 리뷰를 함께 제공해 코드가 반영되기 전 여러 agent가 계획을 검토하게 합니다. 출력을 완벽하게 만들지는 않지만 단일 모델의 맹점을 줄이고 작업의 연속성을 지킵니다.',
+    why_text: '책상을 떠나면 대부분의 coding agent 워크플로우는 끊깁니다. 에이전트는 여전히 터미널에서 돌아가지만, 작업을 이어가려면 보통 SSH, tmux attach, 원격 데스크톱을 쓰거나 노트북 앞으로 돌아갈 때까지 기다려야 합니다. 그것은 문제의 절반일 뿐입니다. 어려운 agent 작업에는 더 안정적인 판단도 필요합니다. 단일 모델은 익숙한 패턴에 갇히거나 문제를 놓치고, provider를 바꿀 때 컨텍스트가 끊길 수 있습니다. IM.codes는 언제든 닿을 수 있는 session, 완료된 작업의 공유 메모리 요약, 구조화된 Team 크로스 모델 리뷰를 함께 제공해 코드가 반영되기 전 여러 agent가 계획을 검토하게 합니다. 출력을 완벽하게 만들지는 않지만 단일 모델의 맹점을 줄이고 작업의 연속성을 지킵니다.',
     not_1: '또 다른 AI IDE가 아닙니다', not_2: '단순한 채팅 래퍼가 아닙니다', not_3: '단순한 원격 터미널 클라이언트가 아닙니다', not_4: 'Claude Code, Codex, Gemini CLI, OpenClaw, Qwen의 대체품이 아닙니다', not_5: '그들을 둘러싼 메시징/컨트롤 레이어입니다',
     f_remote_name: '원격 터미널', f_remote_desc: '브라우저 & 모바일, SSH/VPN 불필요, 실시간 PTY 스트리밍',
     f_chat_name: '터미널 + 채팅', f_chat_desc: '네이티브 CLI 또는 구조화된 뷰',
-    f_discuss_name: '크로스 모델 감사', f_discuss_desc: '커스터마이징 가능한 페이즈(audit, review, brainstorm…)의 멀티 에이전트 P2P 토론 — 서로 다른 모델이 코드 작성 전 교차 검토해 단일 모델이 자주 놓치는 문제와 재작업을 줄입니다',
+    f_discuss_name: '크로스 모델 감사', f_discuss_desc: '커스터마이징 가능한 페이즈(audit, review, brainstorm…)의 멀티 에이전트 Team 토론 — 서로 다른 모델이 코드 작성 전 교차 검토해 단일 모델이 자주 놓치는 문제와 재작업을 줄입니다',
     f_multi_name: '멀티 서버', f_multi_desc: '하나의 대시보드에서 모든 머신의 에이전트 관리',
     f_sub_name: '서브 세션', f_sub_desc: '병렬 에이전트 즉시 생성',
     f_file_name: '파일 브라우저', f_file_desc: '탐색, 업로드/다운로드, Git 차이, 플로팅 미리보기',
@@ -877,7 +877,7 @@ const I18N = {
   },
   es: {
     tagline: 'El IM para agentes. Memoria compartida, herramientas MCP gestionadas, ejecución supervisada y auditoría cruzada entre proveedores de IA.',
-    hero_intro: 'IM.codes da a los coding agents una capa de memoria compartida y una superficie de herramientas MCP gestionadas entre proveedores. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras de Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw y más. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión P2P integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.',
+    hero_intro: 'IM.codes da a los coding agents una capa de memoria compartida y una superficie de herramientas MCP gestionadas entre proveedores. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras de Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw y más. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión Team integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.',
     hero_output: 'vinculado a app.im.codes · daemon iniciado · registrado como servicio del sistema',
     self_host_warning: '<strong>Se recomienda encarecidamente el autoalojamiento.</strong> <code>app.im.codes</code> es una instancia de prueba compartida sin garantías de disponibilidad — puede tener límites, ser objetivo de ataques o no estar disponible. Este es un proyecto personal sin soporte comercial. Para uso más allá de la evaluación, despliega en tu propia infraestructura.',
     h_screenshots: 'capturas', h_why: 'por qué', h_memory: 'contexto compartido para agentes', h_mcp: 'herramientas MCP gestionadas', h_not: 'qué no es', h_features: 'características', h_arch: 'arquitectura', h_download: 'descargar', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
@@ -908,11 +908,11 @@ const I18N = {
     f_mcp_desc: 'diez herramientas con alcance de runtime para búsqueda/fuentes de memoria, preferencias, Send con alcance y programación Cron',
     f_auto_name: 'ejecución supervisada',
     f_auto_desc: 'comprobaciones de finalización por turno, auto-continue y bucles opcionales audit→rework para agentes transport',
-    why_text: 'Cuando te alejas del escritorio, la mayoría de los flujos con coding agents se rompen. El agente sigue ejecutándose en una terminal, pero continuar suele significar usar SSH, tmux attach, escritorio remoto o esperar a volver al portátil. Esa es solo la mitad del problema. El trabajo difícil con agents también necesita mejor criterio: un solo modelo puede caer en patrones, pasar por alto problemas o perder contexto al cambiar de provider. IM.codes combina sesiones siempre accesibles, memoria compartida de trabajo completado resumido y revisión P2P estructurada entre modelos para que varios agentes cuestionen los planes antes de que el código aterrice. No vuelve perfecto el resultado, pero reduce puntos ciegos de un solo modelo y mantiene la continuidad.',
+    why_text: 'Cuando te alejas del escritorio, la mayoría de los flujos con coding agents se rompen. El agente sigue ejecutándose en una terminal, pero continuar suele significar usar SSH, tmux attach, escritorio remoto o esperar a volver al portátil. Esa es solo la mitad del problema. El trabajo difícil con agents también necesita mejor criterio: un solo modelo puede caer en patrones, pasar por alto problemas o perder contexto al cambiar de provider. IM.codes combina sesiones siempre accesibles, memoria compartida de trabajo completado resumido y revisión Team estructurada entre modelos para que varios agentes cuestionen los planes antes de que el código aterrice. No vuelve perfecto el resultado, pero reduce puntos ciegos de un solo modelo y mantiene la continuidad.',
     not_1: 'No es otro AI IDE', not_2: 'No es solo un wrapper de chat', not_3: 'No es solo un cliente de terminal remota', not_4: 'No reemplaza a Claude Code, Codex, Gemini CLI, OpenClaw ni Qwen', not_5: 'Es la capa de mensajería/control alrededor de ellos',
     f_remote_name: 'terminal remota', f_remote_desc: 'navegador y móvil, sin SSH/VPN, streaming PTY en tiempo real',
     f_chat_name: 'terminal + chat', f_chat_desc: 'CLI nativo o vista estructurada con llamadas de herramientas',
-    f_discuss_name: 'auditoría cross-modelo', f_discuss_desc: 'discusiones P2P multi-agente con fases personalizables (audit, review, brainstorm…) — distintos modelos detectan distintos problemas antes de escribir código, reduciendo retrabajo',
+    f_discuss_name: 'auditoría cross-modelo', f_discuss_desc: 'discusiones Team multi-agente con fases personalizables (audit, review, brainstorm…) — distintos modelos detectan distintos problemas antes de escribir código, reduciendo retrabajo',
     f_multi_name: 'multi-servidor', f_multi_desc: 'gestiona agentes en todas las máquinas desde un panel',
     f_sub_name: 'sub-sesiones', f_sub_desc: 'lanza agentes paralelos al instante',
     f_file_name: 'explorador de archivos', f_file_desc: 'explorar, subir/descargar, diffs de Git, vista previa flotante',
@@ -961,7 +961,7 @@ const I18N = {
   },
   ru: {
     tagline: 'IM для агентов. Общая память, управляемые MCP tools, контролируемое выполнение и кросс-модельный аудит поверх AI-провайдеров.',
-    hero_intro: 'IM.codes даёт coding agents единый слой памяти и управляемую поверхность MCP tools поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает или recall нужную историю в будущие session для Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw и других. Встроенный Auto supervision умеет оценивать завершённые ходы, продолжать работу автономно и при необходимости запускать цикл audit/rework перед возвратом контроля. P2P-обсуждение — несколько моделей взаимно проверяют и аудируют планы и реализации друг друга, эффективно уменьшая пропуски, «слепые зоны» и смещения одной модели.',
+    hero_intro: 'IM.codes даёт coding agents единый слой памяти и управляемую поверхность MCP tools поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает или recall нужную историю в будущие session для Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw и других. Встроенный Auto supervision умеет оценивать завершённые ходы, продолжать работу автономно и при необходимости запускать цикл audit/rework перед возвратом контроля. Team-обсуждение — несколько моделей взаимно проверяют и аудируют планы и реализации друг друга, эффективно уменьшая пропуски, «слепые зоны» и смещения одной модели.',
     hero_output: 'привязан к app.im.codes · демон запущен · зарегистрирован как системная служба',
     self_host_warning: '<strong>Настоятельно рекомендуется самостоятельный хостинг.</strong> <code>app.im.codes</code> — общий тестовый экземпляр без гарантий доступности. Может быть ограничен, атакован или недоступен. Это личный проект без коммерческой поддержки. Для использования помимо тестирования разверните на собственной инфраструктуре.',
     h_screenshots: 'скриншоты', h_why: 'зачем', h_memory: 'общий контекст агентов', h_mcp: 'управляемые MCP tools', h_not: 'чем это не является', h_features: 'возможности', h_arch: 'архитектура', h_download: 'скачать', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
@@ -992,11 +992,11 @@ const I18N = {
     f_mcp_desc: 'десять runtime-scoped tools для memory search/sources, preferences, scoped Send и Cron scheduling',
     f_auto_name: 'контролируемое выполнение',
     f_auto_desc: 'проверка завершения по ходам, auto-continue и необязательные циклы audit→rework для transport-агентов',
-    why_text: 'Когда вы отходите от рабочего стола, большинство workflows с coding agents ломается. Агент всё ещё работает в терминале, но продолжение обычно означает SSH, tmux attach, удалённый рабочий стол или ожидание, пока вы вернётесь к ноутбуку. Это только половина проблемы. Сложная работа с agents требует более устойчивого суждения: одна модель может застрять в шаблонах, пропустить проблемы или потерять контекст при смене provider. IM.codes объединяет всегда доступные session, общую память с резюме завершённой работы и структурированный P2P кросс-модельный review, чтобы несколько agents проверяли планы до попадания кода. Это не делает вывод идеальным, но уменьшает слепые зоны одной модели и сохраняет непрерывность работы.',
+    why_text: 'Когда вы отходите от рабочего стола, большинство workflows с coding agents ломается. Агент всё ещё работает в терминале, но продолжение обычно означает SSH, tmux attach, удалённый рабочий стол или ожидание, пока вы вернётесь к ноутбуку. Это только половина проблемы. Сложная работа с agents требует более устойчивого суждения: одна модель может застрять в шаблонах, пропустить проблемы или потерять контекст при смене provider. IM.codes объединяет всегда доступные session, общую память с резюме завершённой работы и структурированный Team кросс-модельный review, чтобы несколько agents проверяли планы до попадания кода. Это не делает вывод идеальным, но уменьшает слепые зоны одной модели и сохраняет непрерывность работы.',
     not_1: 'Это не ещё один AI IDE', not_2: 'Это не просто чат-обёртка', not_3: 'Это не просто клиент удалённого терминала', not_4: 'Это не замена Claude Code, Codex, Gemini CLI, OpenClaw или Qwen', not_5: 'Это слой сообщений/управления вокруг них',
     f_remote_name: 'удалённый терминал', f_remote_desc: 'браузер и мобильный, без SSH/VPN, PTY-стриминг в реальном времени',
     f_chat_name: 'терминал + чат', f_chat_desc: 'нативный CLI или структурированный вид',
-    f_discuss_name: 'кросс-модельный аудит', f_discuss_desc: 'мульти-агентные P2P обсуждения с настраиваемыми фазами (audit, review, brainstorm…) — разные модели перекрёстно проверяют до написания кода, сокращая переделки',
+    f_discuss_name: 'кросс-модельный аудит', f_discuss_desc: 'мульти-агентные Team обсуждения с настраиваемыми фазами (audit, review, brainstorm…) — разные модели перекрёстно проверяют до написания кода, сокращая переделки',
     f_multi_name: 'мульти-сервер', f_multi_desc: 'управление агентами на всех машинах с одной панели',
     f_sub_name: 'под-сессии', f_sub_desc: 'мгновенный запуск параллельных агентов',
     f_file_name: 'файловый браузер', f_file_desc: 'просмотр, загрузка/скачивание, Git-диффы, плавающий превью',

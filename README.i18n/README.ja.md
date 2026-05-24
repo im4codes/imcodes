@@ -4,7 +4,7 @@
 
 **エージェントのための IM。共有メモリ、管理対象 MCP ツール、監督付き実行、そして AI プロバイダー横断の監査。**
 
-IM.codes は coding agent のための、プロバイダーをまたぐ共有メモリレイヤーと管理対象 MCP tool surface です。完了した作業を再利用可能なコンテキストとして蓄積し、適切な履歴を後続 session に注入または recall します。対応先は Claude Code、Codex、Gemini CLI、GitHub Copilot、Cursor、OpenCode、OpenClaw、Qwen などで、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携、transport 系 agent のネイティブストリーミングも備えています。内蔵の Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。P2P ディスカッションを内蔵——複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。
+IM.codes は coding agent のための、プロバイダーをまたぐ共有メモリレイヤーと管理対象 MCP tool surface です。完了した作業を再利用可能なコンテキストとして蓄積し、適切な履歴を後続 session に注入または recall します。対応先は Claude Code、Codex、Gemini CLI、GitHub Copilot、Cursor、OpenCode、OpenClaw、Qwen などで、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携、transport 系 agent のネイティブストリーミングも備えています。内蔵の Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。Team ディスカッションを内蔵——複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。
 
 > これは翻訳版です。**正式な内容は英語版 README（`../README.md`）です。** 差異がある場合は英語版を優先してください。
 
@@ -64,7 +64,7 @@ iPhone、iPad、Apple Watch に対応しています。[Web App](https://app.im.
 
 それは問題の半分にすぎません。複雑な coding-agent 作業には、より安定した判断も必要です。単一モデルは慣れた型に寄り、問題を見落としたり、難しいタスクで出力が不安定になったりします。provider を切り替えると新しい視点は得られますが、共有コンテキストがなければ流れやプロジェクト記憶も失われます。
 
-[IM.codes](https://im.codes) はその両方のために作られています。そうした session をモバイルや Web から手の届く場所に保ち、ターミナルを開き、ファイルや Git 変更を確認し、別デバイスで localhost をプレビューし、作業完了時に通知を受け取り、複数の agent を並行して動かせます。さらに、下の「Shared Agent Context とメモリ」と「クロスモデル監査と P2P ディスカッション」を組み合わせます。永続的なリコールは完了作業の要約メモリから来て、P2P ディスカッションはコードが入る前の構造化されたクロスモデルレビューです。出力を完璧にはしませんが、単一モデルの盲点を減らし、複雑な作業をより多くのレビューで収束しやすくします。
+[IM.codes](https://im.codes) はその両方のために作られています。そうした session をモバイルや Web から手の届く場所に保ち、ターミナルを開き、ファイルや Git 変更を確認し、別デバイスで localhost をプレビューし、作業完了時に通知を受け取り、複数の agent を並行して動かせます。さらに、下の「Shared Agent Context とメモリ」と「クロスモデル監査と Team ディスカッション」を組み合わせます。永続的なリコールは完了作業の要約メモリから来て、Team ディスカッションはコードが入る前の構造化されたクロスモデルレビューです。出力を完璧にはしませんが、単一モデルの盲点を減らし、複雑な作業をより多くのレビューで収束しやすくします。
 
 これは別の AI IDE ではなく、単なる遠隔ターミナルでもありません。端末ベースの coding agents を取り巻くメッセージング、メモリ、レビューのレイヤーです。
 
@@ -86,7 +86,7 @@ IM.codes は、対応する SDK 型 provider に daemon 管理の stdio MCP serv
 - **メモリ検索と provenance。** `search_memory` は caller-bound memory namespace から、過去の作業、project history、decisions、preferences、bugs、commits、deployments、以前の議論コンテキストを検索します。結果には compact summary と `projectionId` が含まれます。正確な過去指示、bug detail、commit/deployment context、source evidence が必要なときは、`get_memory_sources` が関連 hit を provenance snippets に展開します。
 - **メモリ書き込み。** `save_observation` は有用な事実、決定、実装メモを user-private memory candidate として保存します。`save_preference` は安定したユーザー preference を明示的な preference path で保存します。
 - **Agent messaging。** `send_list_targets` は現在 project 内の sibling sessions を列挙し、`send_message` は同じ guarded `imcodes send` pipeline で scoped message、任意の file path reference、reply request、broadcast を送信します。
-- **Cron scheduling。** `cron_create`、`cron_list`、`cron_update`、`cron_delete` は、reminder、recurring check、delegated review、scheduled P2P follow-up のための future structured sends を管理し、target/session/project、expiration、timezone fields を扱えます。
+- **Cron scheduling。** `cron_create`、`cron_list`、`cron_update`、`cron_delete` は、reminder、recurring check、delegated review、scheduled Team follow-up のための future structured sends を管理し、target/session/project、expiration、timezone fields を扱えます。
 - **Runtime-bound identity と安全性。** Tool call は runtime で現在の IM.codes session、project、user、server に束縛されます。Agent は namespace、user、server、token、routing fields を偽造できません。Memory、Send、Cron は underlying feature gates と MCP kill-switch の両方で保護されます。
 - **運用上の可視性。** Shared Context UI は provider ごとの MCP readiness、tool-family gate、degraded reason、update time、daemon-redacted recent tool calls を表示し、その model が本当に Memory、Send、Cron を使えるか確認できます。
 
@@ -99,7 +99,7 @@ IM.codes は、自分で書いた supervisor の指示で、対応する agent s
 - **fail-closed な自動化。** Auto supervision は timeline/footer に可視のまま残り、構造化された判定を使い、タイムアウト・不正出力・設定不備時には推測せずユーザーへ制御を返します。
 - **任意の audit → rework ループ。** `supervised_audit` では、完了ターンを自動で監査パイプラインに通し、必要なら同じ session に手戻り brief を戻してから制御を返せます。
 - **グローバル既定値 + セッションごとの上書き。** 既定の supervisor backend/model/timeout を一度決めておき、必要に応じて backend/model/timeout・監査モード・カスタム指示を各 session で上書きできます。
-- **実際の IM.codes workflow を前提。** Auto supervision は OpenSpec 作業、P2P レビュー/議論、`imcodes send` によるエージェント間連携を「人間待ち」の理由ではなく、エージェントが続けるべき正当な次の一手として扱います。
+- **実際の IM.codes workflow を前提。** Auto supervision は OpenSpec 作業、Team レビュー/議論、`imcodes send` によるエージェント間連携を「人間待ち」の理由ではなく、エージェントが続けるべき正当な次の一手として扱います。
 
 ## 主な機能
 
@@ -115,8 +115,8 @@ SSH、VPN、ポート開放なしで、任意のブラウザから agent session
 ### モバイル、Watch、通知
 生体認証、push 通知、shell session の入力、Apple Watch での素早い確認と返信に対応します。
 
-### クロスモデル監査と P2P ディスカッション
-単一モデルの出力を盲信すべきではありません。P2P ディスカッションでは、異なるプロバイダーや思考スタイルを持つ複数の agent が、コードを書く前に同じコードベースで協調分析を行います。各ラウンドはカスタマイズ可能なマルチフェーズパイプラインに従い、各 agent は前の貢献をすべて読んだ上で出力します。異なるモデルは異なる種類の問題を発見します。このクロスプロバイダー相互審査により、実装前に単一モデルが見落としがちな問題を発見し、手戻りを減らせます。
+### クロスモデル監査と Team ディスカッション
+単一モデルの出力を盲信すべきではありません。Team ディスカッションでは、異なるプロバイダーや思考スタイルを持つ複数の agent が、コードを書く前に同じコードベースで協調分析を行います。各ラウンドはカスタマイズ可能なマルチフェーズパイプラインに従い、各 agent は前の貢献をすべて読んだ上で出力します。異なるモデルは異なる種類の問題を発見します。このクロスプロバイダー相互審査により、実装前に単一モデルが見落としがちな問題を発見し、手戻りを減らせます。
 
 組み込みモードは `audit`（構造化された audit → review → plan パイプライン）、`review`、`discuss`、`brainstorm` で、独自のフェーズ構成も定義可能。Claude Code、Codex、Gemini CLI、Qwen で動作します。
 
@@ -162,7 +162,7 @@ imcodes send "Claude" "tests failed on main, check CI log at /tmp/ci.log and fix
 ```
 
 ### スマート `@` ピッカー
-`@` でファイル検索、`@@` で P2P 対象の agent を選択できます。
+`@` でファイル検索、`@@` で Team 対象の agent を選択できます。
 
 ### 複数サーバー / 複数セッション管理
 複数の開発マシンをひとつのダッシュボードで扱えます。

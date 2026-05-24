@@ -196,7 +196,7 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
     fileId: typeof source.discussion_id === 'string' && source.discussion_id
       ? source.discussion_id
       : undefined,
-    topic: `P2P ${currentRoundMode} · ${initiatorLabel}`,
+    topic: `Team ${currentRoundMode} · ${initiatorLabel}`,
     state,
     mainSession,
     initiatorSession,

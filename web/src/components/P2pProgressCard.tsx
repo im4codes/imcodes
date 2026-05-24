@@ -325,7 +325,7 @@ export const P2pProgressCard = memo(function P2pProgressCard({
         onClick={onClick}
       >
         <div class="discussions-progress-mobile-row">
-          <span class="discussions-progress-kicker">P2P</span>
+          <span class="discussions-progress-kicker">Team</span>
           <span class="discussions-progress-badge">{roundText}</span>
           {stepText && <span class="discussions-progress-badge">{stepText}</span>}
           {hopText && <span class="discussions-progress-badge">{hopText}</span>}
@@ -418,7 +418,7 @@ export const P2pProgressCard = memo(function P2pProgressCard({
     >
       <div class="discussions-progress-head">
         <div class="discussions-progress-titlewrap">
-          <div class="discussions-progress-kicker">P2P</div>
+          <div class="discussions-progress-kicker">Team</div>
           <div class="discussions-progress-title">{discussion.topic || t('p2p.discussions.untitled')}</div>
         </div>
         <ElapsedTimer timerKey={runKey} startMs={discussion.startedAt} active={isRunning} className="p2p-timer p2p-timer-total" />

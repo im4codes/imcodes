@@ -311,7 +311,7 @@ const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p
 const P2P_SINGLE_COLORS: Record<string, string> = { solo: '#dbe7f5', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
 
 function getP2pSoloDisplayLabel(): string {
-  return 'P2P';
+  return 'Team';
 }
 
 function getP2pModeColor(mode: string): string {
@@ -3106,10 +3106,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             data-onboarding="p2p-mode"
             onClick={() => setP2pOpen((o) => !o)}
             disabled={disabled}
-            title={p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `P2P: ${getP2pModeLabel(p2pMode, t)}`}
+            title={p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `Team: ${getP2pModeLabel(p2pMode, t)}`}
             style={{ color: getP2pModeColor(p2pMode), fontSize: 10, fontWeight: p2pMode === 'solo' ? 600 : 700 }}
           >
-            {p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `P2P:${getP2pModeLabel(p2pMode, t)}`}
+            {p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `Team:${getP2pModeLabel(p2pMode, t)}`}
           </button>
           <button
             class="shortcut-btn p2p-settings-btn"

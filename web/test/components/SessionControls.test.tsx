@@ -493,7 +493,7 @@ afterEach(() => {
       />,
     );
     expect(screen.getByText('OpenSpec')).toBeDefined();
-    expect(screen.getByText('P2P')).toBeDefined();
+    expect(screen.getByText('Team')).toBeDefined();
     expect(screen.getByLabelText('settings_button')).toBeDefined();
     expect(document.querySelector('.shortcuts')).toBeNull();
   });
@@ -751,12 +751,12 @@ afterEach(() => {
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'run combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
     expect(screen.getAllByRole('button', { name: /^send$/i }).length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByRole('button', { name: /^p2p$/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^team$/i })).toBeDefined();
   });
 
   it('asks for confirmation before directly sending from a combo dropdown item', async () => {
@@ -767,7 +767,7 @@ afterEach(() => {
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'run combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
@@ -776,7 +776,7 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: /^send$/i })).toBeDefined();
-    expect(screen.getByRole('button', { name: /^p2p$/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^team$/i })).toBeDefined();
   });
 
   it('blocks combo sends that only contain routing markup and shows a warning', () => {
@@ -809,7 +809,7 @@ afterEach(() => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
 
     expect(screen.getByText('combo_requires_participants_hint')).toBeDefined();
     const comboBtn = screen.getByRole('button', { name: /mode_audit→mode_plan/i }) as HTMLButtonElement;
@@ -914,9 +914,9 @@ afterEach(() => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
 
-    expect(screen.getByText('P2P')).toBeDefined();
+    expect(screen.getByText('Team')).toBeDefined();
     expect(screen.queryByText(/^mode_audit$/i)).toBeNull();
     expect(screen.queryByText(/^mode_review$/i)).toBeNull();
     expect(screen.queryByText(/^mode_plan$/i)).toBeNull();
@@ -930,11 +930,11 @@ afterEach(() => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
 
     const menu = screen.getByTestId('p2p-dropdown');
     const rounds = within(menu).getByTestId('p2p-dropdown-rounds');
-    const solo = within(menu).getByRole('button', { name: /P2P$/i });
+    const solo = within(menu).getByRole('button', { name: /Team$/i });
     expect(rounds.compareDocumentPosition(solo) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 
     fireEvent.click(within(rounds).getByTestId('p2p-dropdown-round-2'));
@@ -969,7 +969,7 @@ afterEach(() => {
     fireEvent.click(screen.getByText('✓'));
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
     expect(screen.getAllByText(/mode_brainstorm→mode_review/i).length).toBeGreaterThanOrEqual(1);
   });
 
@@ -981,7 +981,7 @@ afterEach(() => {
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'first combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
@@ -1005,7 +1005,7 @@ afterEach(() => {
 
     input.textContent = 'second combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     expect(screen.queryByText('combo_send_confirm_title')).toBeNull();
@@ -1033,7 +1033,7 @@ afterEach(() => {
     input.textContent = 'direct combo';
     fireEvent.input(input);
 
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
@@ -1058,7 +1058,7 @@ afterEach(() => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
 
     const menu = document.querySelector('.menu-dropdown-p2p') as HTMLElement;
     fireEvent.click(within(menu).getByRole('button', { name: 'settings_button' }));

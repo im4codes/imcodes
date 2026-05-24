@@ -744,7 +744,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             title={p2pHidden ? t('subsessionBar.p2p_compact_show') : t('subsessionBar.p2p_compact_hide')}
             aria-label={p2pHidden ? t('subsessionBar.p2p_compact_show') : t('subsessionBar.p2p_compact_hide')}
           >
-            P2P {p2pHidden ? '▾' : '▴'}
+            Team {p2pHidden ? '▾' : '▴'}
           </button>
         )}
         {!collapsed && (
@@ -834,7 +834,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             data-onboarding="discussion-history"
             data-running-discussions={totalRunningDiscussions}
             onClick={onViewDiscussions}
-            // Tooltip: "View P2P discussions" with running count when > 0,
+            // Tooltip: "View Team discussions" with running count when > 0,
             // so the user knows how many runs exist daemon-wide even
             // when this session's bar shows none (the scoped
             // discussions list filters to participants only).
@@ -859,7 +859,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                   'subsessionBar.p2p_running_count_aria',
                   {
                     count: totalRunningDiscussions,
-                    defaultValue: '{{count}} P2P discussions running',
+                    defaultValue: '{{count}} Team discussions running',
                   },
                 )}
                 style={{

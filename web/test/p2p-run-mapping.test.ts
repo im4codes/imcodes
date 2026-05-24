@@ -377,7 +377,7 @@ describe('mapP2pRunToDiscussion', () => {
   it('preserves existing timer anchors when later run updates omit them', () => {
     const existing = {
       id: 'p2p_run_anchor',
-      topic: 'P2P audit · brain',
+      topic: 'Team audit · brain',
       state: 'setup',
       currentRound: 0,
       maxRounds: 2,
@@ -389,7 +389,7 @@ describe('mapP2pRunToDiscussion', () => {
 
     const incoming = {
       id: 'p2p_run_anchor',
-      topic: 'P2P audit · brain',
+      topic: 'Team audit · brain',
       state: 'running',
       currentRound: 1,
       maxRounds: 2,
@@ -410,7 +410,7 @@ describe('mapP2pRunToDiscussion', () => {
   it('ignores stale non-terminal updates so progress cannot roll back', () => {
     const existing = {
       id: 'p2p_run_progress',
-      topic: 'P2P audit · brain',
+      topic: 'Team audit · brain',
       state: 'running',
       currentRound: 3,
       maxRounds: 3,
@@ -421,7 +421,7 @@ describe('mapP2pRunToDiscussion', () => {
 
     const incoming = {
       id: 'p2p_run_progress',
-      topic: 'P2P audit · brain',
+      topic: 'Team audit · brain',
       state: 'running',
       currentRound: 1,
       maxRounds: 3,
@@ -440,7 +440,7 @@ describe('mapP2pRunToDiscussion', () => {
   it('does not resurrect terminal P2P entries from later stale running snapshots', () => {
     const existing = {
       id: 'p2p_run_done',
-      topic: 'P2P audit · brain',
+      topic: 'Team audit · brain',
       state: 'done',
       currentRound: 3,
       maxRounds: 3,
@@ -451,7 +451,7 @@ describe('mapP2pRunToDiscussion', () => {
 
     const incoming = {
       id: 'p2p_run_done',
-      topic: 'P2P audit · brain',
+      topic: 'Team audit · brain',
       state: 'running',
       currentRound: 1,
       maxRounds: 3,
@@ -470,7 +470,7 @@ describe('mapP2pRunToDiscussion', () => {
   it('still accepts terminal updates immediately', () => {
     const existing = {
       id: 'p2p_run_finishes',
-      topic: 'P2P audit · brain',
+      topic: 'Team audit · brain',
       state: 'running',
       currentRound: 3,
       maxRounds: 3,
@@ -481,7 +481,7 @@ describe('mapP2pRunToDiscussion', () => {
 
     const incoming = {
       id: 'p2p_run_finishes',
-      topic: 'P2P audit · brain',
+      topic: 'Team audit · brain',
       state: 'done',
       currentRound: 3,
       maxRounds: 3,
@@ -499,7 +499,7 @@ describe('mapP2pRunToDiscussion', () => {
     const existing = [
       {
         id: 'p2p_run_alpha',
-        topic: 'P2P audit · alpha',
+        topic: 'Team audit · alpha',
         state: 'running',
         currentRound: 1,
         maxRounds: 2,
@@ -508,7 +508,7 @@ describe('mapP2pRunToDiscussion', () => {
       },
       {
         id: 'p2p_run_beta',
-        topic: 'P2P review · beta',
+        topic: 'Team review · beta',
         state: 'running',
         currentRound: 1,
         maxRounds: 1,
@@ -526,7 +526,7 @@ describe('mapP2pRunToDiscussion', () => {
     const existing = [
       {
         id: 'p2p_run_alpha',
-        topic: 'P2P audit · alpha',
+        topic: 'Team audit · alpha',
         state: 'running',
         currentRound: 1,
         maxRounds: 2,
@@ -535,7 +535,7 @@ describe('mapP2pRunToDiscussion', () => {
       },
       {
         id: 'p2p_run_beta',
-        topic: 'P2P review · beta',
+        topic: 'Team review · beta',
         state: 'running',
         currentRound: 1,
         maxRounds: 1,

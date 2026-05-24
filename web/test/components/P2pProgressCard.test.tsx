@@ -38,7 +38,7 @@ describe('P2pProgressCard', () => {
       <P2pProgressCard
         discussion={{
           id: 'p2p_run_1',
-          topic: 'P2P audit · brain',
+          topic: 'Team audit · brain',
           state: 'running',
           modeKey: 'audit',
           currentRound: 2,
@@ -62,7 +62,7 @@ describe('P2pProgressCard', () => {
       <P2pProgressCard
         discussion={{
           id: 'p2p_run_combo_cycle',
-          topic: 'P2P brainstorm · brain',
+          topic: 'Team brainstorm · brain',
           state: 'running',
           modeKey: 'brainstorm',
           currentRound: 3,
@@ -93,7 +93,7 @@ describe('P2pProgressCard', () => {
         mobile
         discussion={{
           id: 'p2p_run_combo_cycle_mobile',
-          topic: 'P2P discuss · brain',
+          topic: 'Team discuss · brain',
           state: 'running',
           modeKey: 'discuss',
           currentRound: 4,
@@ -121,7 +121,7 @@ describe('P2pProgressCard', () => {
       <P2pProgressCard
         discussion={{
           id: 'p2p_run_execution_marker',
-          topic: 'P2P plan · brain',
+          topic: 'Team plan · brain',
           state: 'running',
           modeKey: 'plan',
           currentRound: 1,
@@ -148,7 +148,7 @@ describe('P2pProgressCard', () => {
       <P2pProgressCard
         discussion={{
           id: 'p2p_run_failed',
-          topic: 'P2P audit · brain',
+          topic: 'Team audit · brain',
           state: 'failed',
           modeKey: 'audit',
           currentRound: 1,
@@ -176,7 +176,7 @@ describe('P2pProgressCard', () => {
       <P2pProgressCard
         discussion={{
           id: 'p2p_run_active',
-          topic: 'P2P audit · brain',
+          topic: 'Team audit · brain',
           state: 'running',
           modeKey: 'audit',
           currentRound: 1,
@@ -202,7 +202,7 @@ describe('P2pProgressCard', () => {
       <P2pProgressCard
         discussion={{
           id: 'p2p_run_failed',
-          topic: 'P2P audit · brain',
+          topic: 'Team audit · brain',
           state: 'failed',
           modeKey: 'audit',
           currentRound: 1,
@@ -229,7 +229,7 @@ describe('P2pProgressCard', () => {
       <P2pProgressCard
         discussion={{
           id: 'p2p_run_running',
-          topic: 'P2P audit · brain',
+          topic: 'Team audit · brain',
           state: 'running',
           modeKey: 'audit',
           currentRound: 1,
@@ -257,7 +257,7 @@ describe('P2pProgressCard', () => {
       <P2pProgressCard
         discussion={{
           id: 'p2p_run_timers',
-          topic: 'P2P audit · brain',
+          topic: 'Team audit · brain',
           state: 'running',
           modeKey: 'audit',
           currentRound: 1,
@@ -290,7 +290,7 @@ describe('P2pProgressCard', () => {
       <P2pProgressCard
         discussion={{
           id: 'p2p_run_setup_timers',
-          topic: 'P2P audit · brain',
+          topic: 'Team audit · brain',
           state: 'setup',
           modeKey: 'audit',
           currentRound: 1,
@@ -430,7 +430,7 @@ describe('P2pProgressCard', () => {
       <P2pProgressCard
         discussion={{
           id: 'p2p_run_parallel',
-          topic: 'P2P audit · brain',
+          topic: 'Team audit · brain',
           state: 'running',
           modeKey: 'audit',
           currentRound: 1,
@@ -459,7 +459,7 @@ describe('P2pProgressCard', () => {
       <P2pProgressCard
         discussion={{
           id: 'p2p_run_parallel_stale',
-          topic: 'P2P audit · brain',
+          topic: 'Team audit · brain',
           state: 'running',
           modeKey: 'audit',
           currentRound: 2,
