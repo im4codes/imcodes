@@ -281,15 +281,28 @@ describe('useTimeline global cache bounds', () => {
     // load. The new code does NOT cancel, so the load still fires.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(20);
-      connectedState = true;
-      rerender(h(Probe, { rev: 1 }));
+    });
+    connectedState = true;
+    rerender(h(Probe, { rev: 1 }));
+    await act(async () => {
+      await flushMicrotasks();
       await vi.advanceTimersByTimeAsync(20);
-      connectedState = false;
-      rerender(h(Probe, { rev: 2 }));
-      // Now wait out the full stagger window for the latest effect run.
-      await vi.advanceTimersByTimeAsync(120);
+    });
+    connectedState = false;
+    rerender(h(Probe, { rev: 2 }));
+    await act(async () => {
       await flushMicrotasks();
     });
+
+    // Let the latest effect's 80ms inactive stagger and async IDB read settle.
+    // Coverage instrumentation can delay effect scheduling enough that a
+    // single fixed advance races the assertion.
+    for (let attempt = 0; attempt < 6 && screen.getByTestId('churn-probe').textContent !== 'survived dep churn'; attempt += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(40);
+        await flushMicrotasks();
+      });
+    }
 
     expect(screen.getByTestId('churn-probe').textContent).toBe('survived dep churn');
   });
