@@ -158,6 +158,82 @@ describe('memory MCP interface e2e', () => {
     expect(listContextObservations()).toHaveLength(0);
   });
 
+  it('saves an observation, finds it by exact MCP search, and expands source text by observationId or short ref', async () => {
+    const text = 'mock server alpha lives at alpha.test.im.codes for MCP observation recall e2e';
+    await withStdioClient(childEnv(), async (client) => {
+      const saved = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
+        arguments: {
+          content: text,
+          tags: ['e2e'],
+          turnId: 'turn-observation-e2e',
+        },
+      }));
+      expect(saved).toMatchObject({ status: 'ok', state: 'candidate' });
+      const observationId = String(saved.observationId);
+
+      const search = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
+        arguments: {
+          query: 'alpha.test.im.codes',
+          limit: 5,
+        },
+      }));
+      expect(search).toMatchObject({ status: 'ok' });
+      const items = search.items as Array<Record<string, unknown>>;
+      const expectedRef = `obs:${observationId.replace(/[^a-f0-9]/gi, '').slice(0, 10)}`;
+      expect(items[0]).toMatchObject({
+        observationId,
+        ref: expectedRef,
+        recordKind: 'observation',
+        matchKind: 'exact',
+        sourceLookup: {
+          tool: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+          kind: 'observation',
+          observationId,
+        },
+      });
+      expect(items[0].ref).not.toBe(observationId);
+
+      const sources = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+        arguments: items[0].sourceLookup as Record<string, unknown>,
+      }));
+      expect(sources).toMatchObject({
+        status: 'ok',
+        observationId,
+        sourceEventCount: 1,
+        sources: [
+          expect.objectContaining({
+            eventId: 'turn-observation-e2e',
+            status: 'observation',
+            content: text,
+          }),
+        ],
+      });
+
+      const shortRefSources = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+        arguments: {
+          ref: expectedRef,
+          kind: 'observation',
+        },
+      }));
+      expect(shortRefSources).toMatchObject({
+        status: 'ok',
+        observationId,
+        sourceEventCount: 1,
+        sources: [
+          expect.objectContaining({
+            eventId: 'turn-observation-e2e',
+            status: 'observation',
+            content: text,
+          }),
+        ],
+      });
+    });
+  });
+
   it('covers sub-session send and cron scope through the MCP handlers', async () => {
     const runId = Math.random().toString(36).slice(2, 8);
     const mainSession = `deck_e2emcp_${runId}_brain`;

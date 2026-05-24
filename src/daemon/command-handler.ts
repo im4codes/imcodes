@@ -6189,7 +6189,7 @@ log "[step 2] installing ${pkgSpec}"
 # --ignore-scripts again for the same reason.
 #
 # ── Retry on publish propagation / transient network failures ──────────
-# Real-world failure mode caught on 116.62.239.78: server publishes a
+# Real-world failure mode caught on a production daemon: server publishes a
 # new dev release to npm and broadcasts \`daemon.upgrade { targetVersion }\`
 # almost immediately. npm origin has the version but the regional CDN
 # edge serving this daemon hasn't replicated yet — so the packument
@@ -6357,7 +6357,7 @@ log "[step 3] version comparator: installed > current → restart"
 #     prefix (homebrew vs nvm vs system) leaves the symlink dangling.
 #   * any reorg of node versions where the bin sits at a new absolute path.
 #
-# Real-world hit: 116.62.239.78 daemon stuck on dev.1922 because the
+# Real-world hit: a production daemon stuck on an older dev build because the
 # unit's ExecStart pointed at /home/k/.nvm/versions/node/v22.22.2/bin/imcodes
 # from a prior install — \`systemctl restart imcodes\` succeeds in the
 # upgrade script's eyes but the spawned process crashes "Cannot find
@@ -10390,17 +10390,38 @@ async function handleMemoryGetSourcesRequest(cmd: Record<string, unknown>, serve
         createdAt: eventInScope ? event!.createdAt : undefined,
       };
     });
+    const manualProjectionText = projection.origin === 'user_note'
+      || projection.content.manual === true
+      || projection.sourceEventIds.some((eventId) => eventId.startsWith('manual-memory:'))
+      ? (typeof projection.content.text === 'string' && projection.content.text.trim()
+        ? projection.content.text.trim()
+        : projection.summary.trim())
+      : '';
+    const fallbackSource = manualProjectionText
+      ? [{
+        eventId: projection.sourceEventIds[0] ?? `projection:${projection.id}`,
+        status: 'projection' as const,
+        content: manualProjectionText,
+        eventType: 'memory.projection',
+        createdAt: projection.createdAt,
+      }]
+      : undefined;
+    const resolvedSources = (sources.length === 0 || sources.every((source) => source.content === null)) && fallbackSource
+      ? fallbackSource
+      : sources;
 
-    const partial = sources.length !== projection.sourceEventIds.length
-      || sources.some((source) => source.content === null);
+    const partial = !fallbackSource && (
+      sources.length !== projection.sourceEventIds.length
+      || sources.some((source) => source.content === null)
+    );
 
     serverLink.send({
       type: MEMORY_WS.GET_SOURCES_RESPONSE,
       requestId,
       status: 'ok',
       projectionId,
-      sourceEventCount: projection.sourceEventIds.length,
-      sources,
+      sourceEventCount: Math.max(projection.sourceEventIds.length, resolvedSources.length),
+      sources: resolvedSources,
       partial,
       originServerId,
     });

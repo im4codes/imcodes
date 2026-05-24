@@ -16,6 +16,7 @@ import {
   STARTUP_MEMORY_TOTAL_LIMIT,
   selectStartupMemoryByPolicy,
   selectStartupMemoryItems,
+  selectStartupObservationItems,
   type StartupMemoryCandidate,
 } from '../context/startup-memory.js';
 import { collectSkillStartupCandidates } from '../context/skill-startup-context.js';
@@ -27,6 +28,7 @@ import {
   formatRelatedPastWorkSummary,
 } from '../../shared/memory-recall-format.js';
 import { isMemoryScope } from '../../shared/memory-scope.js';
+import { registerMemoryShortRef } from '../context/memory-short-ref.js';
 
 export interface TransportContextBootstrapInput {
   projectDir?: string;
@@ -165,6 +167,8 @@ export function buildTransportStartupMemory(
       totalLimit: limit,
       extraItems: remoteItems,
     });
+    const observationItems = selectStartupObservationItems(namespace);
+    const memoryById = new Map([...processedItems, ...observationItems].map((item) => [item.id, item]));
     const processedById = new Map(processedItems.map((item) => [item.id, item]));
     const skillCandidates = collectSkillStartupCandidates({
       namespace,
@@ -174,14 +178,18 @@ export function buildTransportStartupMemory(
     });
     const selected = selectStartupMemoryByPolicy([
       ...processedItems.map(memorySearchItemToStartupCandidate),
+      ...observationItems.map(memorySearchItemToStartupCandidate),
       ...skillCandidates,
     ]);
     const selectedCandidates = selected.selected.slice(0, limit);
     const items = selectedCandidates.map((candidate) => {
       const processed = processedById.get(candidate.id);
-      return processed
-        ? toTransportMemoryRecallItem(processed, remoteIds.has(processed.id) ? 'remote_processed' : 'local_processed')
-        : startupCandidateToTransportMemoryRecallItem(candidate, namespace);
+      if (processed) {
+        return toTransportMemoryRecallItem(processed, remoteIds.has(processed.id) ? 'remote_processed' : 'local_processed');
+      }
+      const memory = memoryById.get(candidate.id);
+      if (memory) return toTransportMemoryRecallItem(memory, 'local_processed');
+      return startupCandidateToTransportMemoryRecallItem(candidate, namespace);
     });
     if (items.length === 0 || selectedCandidates.length === 0) return undefined;
     const sourceKind = resolveStartupMemorySourceKind(items);
@@ -192,7 +200,7 @@ export function buildTransportStartupMemory(
       sourceKind,
       injectionSurface: 'message-preamble',
       items,
-      injectedText: renderStartupMemoryText(selectedCandidates, processedById),
+      injectedText: renderStartupMemoryText(selectedCandidates, memoryById),
     };
   } catch {
     return undefined;
@@ -208,6 +216,15 @@ function resolveStartupMemorySourceKind(items: readonly TransportMemoryRecallIte
 }
 
 function memorySearchItemToStartupCandidate(item: MemorySearchResultItem): StartupMemoryCandidate {
+  if (item.type === 'observation') {
+    return {
+      id: item.id,
+      source: item.observationClass === 'preference' ? 'preference' : 'user_context',
+      text: item.summary,
+      updatedAt: item.updatedAt ?? item.createdAt,
+      fingerprint: `observation\u0000${item.observationClass ?? 'note'}\u0000${item.summary}`,
+    };
+  }
   return {
     id: item.id,
     source: item.projectionClass === 'durable_memory_candidate' ? 'durable' : 'recent',
@@ -237,7 +254,7 @@ function startupCandidateToTransportMemoryRecallItem(
 function toTransportMemoryRecallItem(item: MemorySearchResultItem, sourceKind: MemoryRecallSourceKind = 'local_processed'): TransportMemoryRecallItem {
   return {
     id: item.id,
-    type: 'processed',
+    type: item.type === 'observation' ? 'observation' : 'processed',
     projectId: item.projectId,
     scope: item.scope,
     ...(item.enterpriseId ? { enterpriseId: item.enterpriseId } : {}),
@@ -257,15 +274,23 @@ function toTransportMemoryRecallItem(item: MemorySearchResultItem, sourceKind: M
 
 function renderStartupMemoryText(
   selected: readonly StartupMemoryCandidate[],
-  processedById: ReadonlyMap<string, MemorySearchResultItem>,
+  memoryById: ReadonlyMap<string, MemorySearchResultItem>,
 ): string {
   const memoryItems = selected
-    .map((candidate) => processedById.get(candidate.id))
+    .map((candidate) => memoryById.get(candidate.id))
     .filter((item): item is MemorySearchResultItem => !!item)
+    .filter((item) => item.type === 'processed')
     .map((item) => toTransportMemoryRecallItem(item));
+  const observationItems = selected
+    .map((candidate) => memoryById.get(candidate.id))
+    .filter((item): item is MemorySearchResultItem => !!item)
+    .filter((item) => item.type === 'observation');
   const sections: string[] = [];
   if (memoryItems.length > 0) {
     sections.push(buildStartupProjectMemoryText(memoryItems));
+  }
+  if (observationItems.length > 0) {
+    sections.push(renderStartupObservationIndexText(observationItems));
   }
   const skillBlocks = selected.filter((candidate) => candidate.source === 'skill');
   if (skillBlocks.length > 0) {
@@ -281,6 +306,27 @@ function renderStartupMemoryText(
     ].join('\n'));
   }
   return sections.join('\n\n');
+}
+
+function renderStartupObservationIndexText(items: readonly MemorySearchResultItem[]): string {
+  return [
+    '# Persistent memory index (reference only)',
+    '<persistent-memory-index advisory="true">',
+    'These are trusted saved observations or preferences. The ref is a compact handle; call get_memory_sources with { "ref": "obs:..." } for exact wording, or use search_memory to get full sourceLookup.',
+    ...items.map((item) => {
+      const label = item.observationClass === 'preference' ? 'preference' : 'observation';
+      const namespace: ContextNamespace = {
+        scope: item.scope as ContextNamespace['scope'],
+        projectId: item.projectId,
+        userId: item.userId,
+        workspaceId: item.workspaceId,
+        enterpriseId: item.enterpriseId,
+      };
+      const ref = registerMemoryShortRef({ kind: 'observation', id: item.id, namespace });
+      return `- [${label}] ${formatRelatedPastWorkSummary(item.summary, 240)} (ref: ${ref})`;
+    }),
+    '</persistent-memory-index>',
+  ].join('\n');
 }
 
 function parseExplicitContextNamespace(

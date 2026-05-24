@@ -1,5 +1,5 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { homedir } from 'os';
 import type { QwenAuthType } from '../../shared/qwen-auth.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
@@ -8,9 +8,15 @@ import type { SessionContextBootstrapState } from '../../shared/session-context-
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 
-const STORE_DIR = join(homedir(), '.imcodes');
-const STORE_PATH = join(STORE_DIR, 'sessions.json');
 const DEBOUNCE_MS = 500;
+
+function storeDir(): string {
+  return join(homedir(), '.imcodes');
+}
+
+function storePath(): string {
+  return join(storeDir(), 'sessions.json');
+}
 
 export type SessionState = 'running' | 'idle' | 'error' | 'stopped';
 
@@ -125,6 +131,7 @@ export interface SessionStore {
 }
 
 let writeTimer: ReturnType<typeof setTimeout> | null = null;
+let writeTimerPath: string | null = null;
 let writeQueue: Promise<void> = Promise.resolve();
 let pendingWrite: Promise<void> | null = null;
 let store: SessionStore = { sessions: {} };
@@ -155,9 +162,9 @@ function pruneNonPersistableSessions(): boolean {
 
 export async function loadStore(): Promise<SessionStore> {
   await drainPendingWritesForRead();
-  await mkdir(STORE_DIR, { recursive: true });
+  await mkdir(storeDir(), { recursive: true });
   try {
-    const raw = await readFile(STORE_PATH, 'utf8');
+    const raw = await readFile(storePath(), 'utf8');
     store = JSON.parse(raw) as SessionStore;
   } catch {
     store = { sessions: {} };
@@ -239,16 +246,19 @@ async function probeSessionStates(): Promise<void> {
 
 function scheduleWrite(): void {
   if (writeTimer) clearTimeout(writeTimer);
+  writeTimerPath = storePath();
   writeTimer = setTimeout(() => {
+    const targetPath = writeTimerPath ?? storePath();
     writeTimer = null;
-    void enqueueWrite(true);
+    writeTimerPath = null;
+    void enqueueWrite(true, targetPath);
   }, DEBOUNCE_MS);
 }
 
-async function writeStoreToDisk(bestEffort: boolean): Promise<void> {
+async function writeStoreToDisk(bestEffort: boolean, targetPath = storePath()): Promise<void> {
   try {
-    await mkdir(STORE_DIR, { recursive: true });
-    await writeFile(STORE_PATH, serializeStore(), 'utf8');
+    await mkdir(dirname(targetPath), { recursive: true });
+    await writeFile(targetPath, serializeStore(), 'utf8');
   } catch (error) {
     if (!bestEffort) throw error;
     // Tests may tear down temp HOME dirs while a debounced write is pending.
@@ -256,10 +266,10 @@ async function writeStoreToDisk(bestEffort: boolean): Promise<void> {
   }
 }
 
-function enqueueWrite(bestEffort: boolean): Promise<void> {
+function enqueueWrite(bestEffort: boolean, targetPath = storePath()): Promise<void> {
   const queued = writeQueue.then(
-    () => writeStoreToDisk(bestEffort),
-    () => writeStoreToDisk(bestEffort),
+    () => writeStoreToDisk(bestEffort, targetPath),
+    () => writeStoreToDisk(bestEffort, targetPath),
   );
   const tracked = queued.finally(() => {
     if (pendingWrite === tracked) pendingWrite = null;
@@ -271,9 +281,11 @@ function enqueueWrite(bestEffort: boolean): Promise<void> {
 
 async function drainPendingWritesForRead(): Promise<void> {
   if (writeTimer) {
+    const targetPath = writeTimerPath ?? storePath();
     clearTimeout(writeTimer);
     writeTimer = null;
-    void enqueueWrite(true);
+    writeTimerPath = null;
+    void enqueueWrite(true, targetPath);
   }
   if (pendingWrite) await pendingWrite.catch(() => {});
   await writeQueue;
@@ -312,9 +324,11 @@ export function updateSessionState(name: string, state: SessionState): void {
 }
 
 export async function flushStore(): Promise<void> {
+  const targetPath = writeTimerPath ?? storePath();
   if (writeTimer) {
     clearTimeout(writeTimer);
     writeTimer = null;
+    writeTimerPath = null;
   }
-  await enqueueWrite(false);
+  await enqueueWrite(false, targetPath);
 }

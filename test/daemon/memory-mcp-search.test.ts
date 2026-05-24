@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { searchMcpMemoryRecall } from '../../src/daemon/memory-mcp-search.js';
-import { writeProcessedProjection } from '../../src/store/context-store.js';
+import { ensureContextNamespace, writeContextObservation, writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { projectionOwnerCache } from '../../src/daemon/memory-projection-owner-cache.js';
 
@@ -106,6 +106,54 @@ describe('memory MCP recall search', () => {
 
       expect(result.items.map((item) => item.summary)).toContain('Only local recall memory');
       expect(result.items.every((item) => item.source === 'local')).toBe(true);
+    } finally {
+      await cleanupIsolatedSharedContextDb(tempDir);
+    }
+  });
+
+  it('returns exact local observation hits with observationId before semantic projection hits', async () => {
+    const tempDir = await createIsolatedSharedContextDb('memory-mcp-search-observation');
+    try {
+      const namespaceRow = ensureContextNamespace({ scope: 'user_private', projectId: 'repo-1', userId: 'daemon-local' }, 100);
+      const observation = writeContextObservation({
+        namespaceId: namespaceRow.id,
+        scope: 'user_private',
+        class: 'note',
+        origin: 'agent_learned',
+        fingerprint: 'mcp-observation-fp',
+        content: { text: 'mock server alpha lives at alpha.test.im.codes' },
+        text: 'mock server alpha lives at alpha.test.im.codes',
+        sourceEventIds: ['turn-observation'],
+        state: 'candidate',
+        now: 200,
+      });
+      writeProcessedProjection({
+        namespace: { scope: 'user_private', projectId: 'repo-1', userId: 'daemon-local' },
+        class: 'recent_summary',
+        sourceEventIds: ['evt-local'],
+        summary: 'Semantic neighbor about local recall memory',
+        content: {},
+        updatedAt: 300,
+      });
+
+      const result = await searchMcpMemoryRecall({
+        query: 'alpha.test.im.codes',
+        namespace: { scope: 'user_private', projectId: 'repo-1', userId: 'daemon-local' },
+        repo: 'repo-1',
+        includeLegacyPersonalOwner: true,
+        limit: 5,
+      }, {
+        credentials: null,
+      });
+
+      expect(result.items[0]).toMatchObject({
+        recordKind: 'observation',
+        observationId: observation.id,
+        observationClass: 'note',
+        observationState: 'candidate',
+        matchKind: 'exact',
+        source: 'local',
+      });
     } finally {
       await cleanupIsolatedSharedContextDb(tempDir);
     }

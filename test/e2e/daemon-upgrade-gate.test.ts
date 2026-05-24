@@ -488,7 +488,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
 
 // ── Generated upgrade.sh contract (Linux/macOS) ─────────────────────────
 //
-// Captured production failure on 116.62.239.78 (2026-04-27 23:46): the
+// Captured production failure from April 2026: the
 // server published `imcodes@2026.4.1951-dev.1930` to npm and broadcast
 // `daemon.upgrade { targetVersion }` immediately. The daemon's upgrade
 // script ran `npm install -g imcodes@<that version>`, npm hit a regional

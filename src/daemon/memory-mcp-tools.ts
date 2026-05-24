@@ -37,6 +37,7 @@ import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagVa
 import { listSessions as listStoredSessions } from '../store/session-store.js';
 import { dispatchSendMessage, listSendTargets, type SendToolDeps } from './send-tool.js';
 import { cronMcpCreate, cronMcpDelete, cronMcpList, cronMcpUpdate, type CronMcpClientOptions } from './cron-mcp-client.js';
+import { registerMemoryShortRef, resolveMemoryShortRef } from '../context/memory-short-ref.js';
 
 type ToolResult = Record<string, unknown>;
 export type MemoryMcpToolHandler = (input?: unknown) => Promise<ToolResult> | ToolResult;
@@ -162,11 +163,39 @@ function memorySurfaceGate(deps: MemoryMcpToolDeps, extra: Record<string, unknow
   return isMcpMemorySurfaceEnabled(deps) ? null : disabled(MEMORY_MCP_DISABLED_FLAGS.MEMORY_SURFACE, extra);
 }
 
-function compactSearchHit(item: MemoryMcpSearchHit) {
+function compactSearchHit(item: MemoryMcpSearchHit, namespace: Parameters<typeof registerMemoryShortRef>[0]['namespace']) {
+  if (item.observationId) {
+    const observationId = item.observationId;
+    const ref = registerMemoryShortRef({ kind: 'observation', id: observationId, namespace });
+    return {
+      observationId,
+      ref,
+      recordKind: 'observation',
+      sourceLookup: {
+        tool: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+        kind: 'observation',
+        observationId,
+      },
+      summary: item.summary,
+      observationClass: item.observationClass,
+      observationState: item.observationState,
+      matchKind: item.matchKind,
+      projectId: item.projectId,
+      scope: item.scope,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      relevanceScore: item.relevanceScore,
+      source: item.source,
+    };
+  }
+  const ref = registerMemoryShortRef({ kind: 'projection', id: item.projectionId, namespace });
   return {
     projectionId: item.projectionId,
+    ref,
+    recordKind: 'projection',
     sourceLookup: {
       tool: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+      kind: 'projection',
       projectionId: item.projectionId,
     },
     summary: item.summary,
@@ -261,7 +290,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           includeLegacyPersonalOwner: true,
           limit,
         });
-        const items = result.items.map(compactSearchHit);
+        const items = result.items.map((item) => compactSearchHit(item, scopedCaller.namespace));
         return { status: 'ok', items };
       } catch (err) {
         return sanitizeCaughtError(err);
@@ -274,11 +303,39 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       // shared/memory-mcp-contracts.ts. Callers cannot influence routing
       // by supplying any identity-binding field; the orchestrator resolves
       // `originServerId` from cache or cloud, never from input.
-      const args = pickAllowedMcpArgs(input, ['projectionId']);
-      const projectionId = stringArg(args, 'projectionId');
-      if (!projectionId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'projectionId is required');
+      const args = pickAllowedMcpArgs(input, ['projectionId', 'observationId', 'kind', 'ref']);
+      let projectionId = stringArg(args, 'projectionId');
+      let observationId = stringArg(args, 'observationId');
+      let kind = stringArg(args, 'kind');
+      const ref = stringArg(args, 'ref');
+      if (kind && kind !== 'projection' && kind !== 'observation') {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'kind must be projection or observation');
+      }
+      if (ref && (projectionId || observationId)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'ref cannot be combined with projectionId or observationId');
+      }
+      const scopedCaller = memoryCaller();
+      if (ref) {
+        const resolved = resolveMemoryShortRef(ref, scopedCaller.namespace);
+        if (!resolved) return { status: 'ok', ref, sourceEventCount: 0, sources: [] };
+        if (kind && kind !== resolved.kind) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'source lookup kind does not match the supplied ref');
+        }
+        kind = resolved.kind;
+        if (resolved.kind === 'observation') observationId = resolved.id;
+        else projectionId = resolved.id;
+      }
+      if ((projectionId && observationId) || (!projectionId && !observationId)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'projectionId, observationId, or ref is required');
+      }
+      if ((kind === 'observation' && !observationId) || (kind === 'projection' && !projectionId)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'source lookup kind does not match the supplied id');
+      }
       try {
-        const result = await orchestrator(projectionId, memoryCaller());
+        if (observationId) {
+          return { status: 'ok', ...memoryGetSources({ observationId, kind: 'observation' }, scopedCaller) };
+        }
+        const result = await orchestrator(projectionId!, scopedCaller);
         if (result.status === 'error') {
           // Orchestrator reason values are the same string literals declared
           // in MCP_ERROR_REASONS, so they are valid MCPErrorReason values.
@@ -422,11 +479,14 @@ function toolResult(result: ToolResult): CallToolResult {
 
 const schemas = {
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: z.object({
-    query: z.string().describe('Required text query to search for. Results include sourceLookup.projectionId values for get_memory_sources when more detail is needed.'),
+    query: z.string().describe('Required text query to search for. Results include sourceLookup values for get_memory_sources when more detail is needed.'),
     limit: z.number().int().min(1).max(100).optional().describe('Optional maximum hit count.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: z.object({
-    projectionId: z.string().describe('Projection id returned by search_memory for a relevant hit whose summary is insufficient.'),
+    projectionId: z.string().optional().describe('Projection id returned by search_memory for a relevant projection hit.'),
+    observationId: z.string().optional().describe('Observation id returned by search_memory for a relevant observation hit.'),
+    ref: z.string().optional().describe('Compact ref returned by search_memory or startup memory, such as obs:abc123 or proj:abc123.'),
+    kind: z.enum(['projection', 'observation']).optional().describe('Optional source lookup kind copied from search_memory.sourceLookup.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: z.object({
     content: z.string().describe('Observation text to persist as a candidate memory.'),

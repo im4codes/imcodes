@@ -3,7 +3,7 @@ import type { ContextNamespace, ContextTargetRef } from '../../shared/context-ty
 import { searchLocalMemory, searchLocalMemoryAuthorized, formatSearchResults } from '../../src/context/memory-search.js';
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
 import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
-import { writeProcessedProjection } from '../../src/store/context-store.js';
+import { ensureContextNamespace, writeContextObservation, writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
 describe('memory-search', () => {
@@ -122,6 +122,57 @@ describe('memory-search', () => {
 
     expect(result.items.map((item) => item.summary)).toEqual(['User one personal memory']);
     expect(result.stats.matchedRecords).toBe(1);
+  });
+
+  it('searches first-class observations with exact matches and keeps rejected observations out', () => {
+    const namespaceRow = ensureContextNamespace({ scope: 'user_private', projectId: 'github.com/acme/repo', userId: 'user-1' }, 100);
+    writeContextObservation({
+      namespaceId: namespaceRow.id,
+      scope: 'user_private',
+      class: 'note',
+      origin: 'agent_learned',
+      fingerprint: 'obs-fp-alpha',
+      content: { text: 'mock server alpha lives at alpha.test.im.codes for local e2e checks' },
+      text: 'mock server alpha lives at alpha.test.im.codes for local e2e checks',
+      sourceEventIds: ['turn-alpha'],
+      state: 'candidate',
+      now: 200,
+    });
+    writeContextObservation({
+      namespaceId: namespaceRow.id,
+      scope: 'user_private',
+      class: 'note',
+      origin: 'agent_learned',
+      fingerprint: 'obs-fp-rejected',
+      content: { text: 'alpha.test.im.codes rejected stale detail' },
+      text: 'alpha.test.im.codes rejected stale detail',
+      sourceEventIds: ['turn-rejected'],
+      state: 'rejected',
+      now: 300,
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'user_private', projectId: 'github.com/acme/repo', userId: 'user-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-recent'],
+      summary: 'Recent summary also mentions alpha.test.im.codes',
+      content: {},
+      updatedAt: 400,
+    });
+
+    const result = searchLocalMemory({
+      namespace: { scope: 'user_private', projectId: 'github.com/acme/repo', userId: 'user-1' },
+      query: 'alpha.test.im.codes',
+      limit: 10,
+    });
+
+    expect(result.items[0]).toMatchObject({
+      type: 'observation',
+      observationClass: 'note',
+      observationState: 'candidate',
+      matchKind: 'exact',
+      summary: expect.stringContaining('alpha.test.im.codes'),
+    });
+    expect(result.items.map((item) => item.summary).join('\n')).not.toContain('rejected stale detail');
   });
 
 

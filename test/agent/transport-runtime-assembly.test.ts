@@ -70,7 +70,7 @@ describe('buildProviderContextPayload', () => {
     expect(payload.systemText).toContain('Never edit generated files');
     expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
     expect(payload.systemText).toContain('get_memory_sources');
-    expect(payload.systemText).toContain('projectionId');
+    expect(payload.systemText).toContain('sourceLookup fields');
   });
 
   it('adds MCP memory search guidance for every managed SDK provider id', () => {
@@ -92,7 +92,7 @@ describe('buildProviderContextPayload', () => {
 
       expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
       expect(payload.systemText).toContain('Do not call memory for bare control messages');
-      expect(payload.systemText).toContain('call get_memory_sources with sourceLookup.projectionId');
+      expect(payload.systemText).toContain('call get_memory_sources with the returned sourceLookup fields');
       expect(payload.systemText).toContain('do not invent details from summaries alone');
       expect(payload.assembledMessage).toBe('What did we decide about memory recall last week?');
     }

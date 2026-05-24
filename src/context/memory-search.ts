@@ -11,6 +11,7 @@ import type {
   ProcessedContextProjectionStatus,
   ContextMemoryStatsView,
 } from '../../shared/context-types.js';
+import type { ObservationClass, ObservationState } from '../../shared/memory-observation.js';
 import { projectionSemanticContent } from '../../shared/memory-content-hash.js';
 import { computeRelevanceScore, type ProjectionClass } from '../../shared/memory-scoring.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
@@ -20,10 +21,14 @@ import { resolveMemoryConfigForNamespace, type MemoryConfigResolver } from './me
 import {
   listContextEvents,
   listDirtyTargets,
+  listContextNamespaces,
+  listContextObservations,
   queryProcessedProjections,
   LEGACY_DAEMON_LOCAL_USER_ID,
   getProjectionEmbeddings,
   saveProjectionEmbedding,
+  type ContextNamespaceRow,
+  type ContextObservationRow,
 } from '../store/context-store.js';
 
 // ── Query types ──────────────────────────────────────────────────────────────
@@ -57,6 +62,12 @@ export interface MemorySearchQuery {
   limit?: number;
   /** Include archived processed projections. */
   includeArchived?: boolean;
+  /** Include first-class observation rows alongside processed projections. */
+  includeObservations?: boolean;
+  /** Filter observation rows by state. Defaults to candidate/active/promoted for search. */
+  observationStates?: readonly ObservationState[];
+  /** Filter observation rows by class. */
+  observationClass?: ObservationClass;
   /** Result offset for pagination. */
   offset?: number;
   /** Optional project/namespace-aware config resolver for embedding-source redaction. */
@@ -68,7 +79,7 @@ export interface MemorySearchQuery {
 export type MemorySearchFormat = 'json' | 'document' | 'table';
 
 export interface MemorySearchResultItem {
-  type: 'raw' | 'processed';
+  type: 'raw' | 'processed' | 'observation';
   id: string;
   projectId: string;
   scope: string;
@@ -84,6 +95,9 @@ export interface MemorySearchResultItem {
   hitCount?: number;
   lastUsedAt?: number;
   status?: ProcessedContextProjectionStatus;
+  observationClass?: ObservationClass;
+  observationState?: ObservationState;
+  matchKind?: 'exact' | 'semantic' | 'trigram';
   sourceEventCount?: number;
   sourceEventIds?: string[];
   processingModel?: string;
@@ -173,8 +187,8 @@ export function dedupByNormalizedSummary<T extends { item: MemorySearchResultIte
       out.push(entry);
       continue;
     }
-    const projectionClass = entry.item.projectionClass ?? 'recent_summary';
-    const key = `${projectionClass}\u0000${normalizeSummaryForFingerprint(summary)}`;
+    const itemClass = entry.item.projectionClass ?? entry.item.observationClass ?? entry.item.eventType ?? 'recent_summary';
+    const key = `${entry.item.type}\u0000${itemClass}\u0000${normalizeSummaryForFingerprint(summary)}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(entry);
@@ -272,15 +286,18 @@ export async function searchLocalMemorySemantic(query: MemorySearchQuery): Promi
           memoryEnterpriseId: item.enterpriseId,
           currentEnterpriseId,
         }, scoringWeights);
+        const matchKind = itemMatchesText(item, query.query) ? 'exact' : 'semantic';
         scored.push({
           item: {
             ...item,
             relevanceScore,
+            matchKind,
           },
-          score: relevanceScore,
+          score: relevanceScore + (matchKind === 'exact' ? 100 : 0),
         });
       } else {
-        scored.push({ item, score: 0 });
+        const matchKind = itemMatchesText(item, query.query) ? 'exact' : undefined;
+        scored.push({ item: matchKind ? { ...item, matchKind } : item, score: matchKind === 'exact' ? 100 : 0 });
       }
     }
 
@@ -313,7 +330,16 @@ export function searchLocalMemory(query: MemorySearchQuery): MemorySearchResult 
   for (const projection of processedByNs) {
     const item = projectionToItem(projection);
     if (matchesQuery(item, query)) {
-      allItems.push(item);
+      allItems.push(withMatchKind(item, query));
+    }
+  }
+
+  if (query.includeObservations !== false && !query.projectionClass) {
+    const observationItems = collectObservationItems(query);
+    for (const item of observationItems) {
+      if (matchesQuery(item, query)) {
+        allItems.push(withMatchKind(item, query));
+      }
     }
   }
 
@@ -327,8 +353,7 @@ export function searchLocalMemory(query: MemorySearchQuery): MemorySearchResult 
     }
   }
 
-  // Sort by createdAt descending (newest first)
-  allItems.sort((a, b) => (b.updatedAt ?? b.createdAt) - (a.updatedAt ?? a.createdAt));
+  allItems.sort(compareSearchItems);
 
   // Compute stats before pagination
   const stats = computeStats(allItems);
@@ -353,6 +378,7 @@ export function searchLocalMemory(query: MemorySearchQuery): MemorySearchResult 
 export function searchLocalMemoryAuthorized(query: AuthorizedMemorySearchQuery): MemorySearchResult {
   const allItems: MemorySearchResultItem[] = [];
   const seenProjectionIds = new Set<string>();
+  const seenObservationIds = new Set<string>();
   const requestedWindow = Math.max((query.limit ?? 50) + (query.offset ?? 0), query.limit ?? 50, 50);
 
   for (const namespace of query.authorizedNamespaces) {
@@ -373,12 +399,21 @@ export function searchLocalMemoryAuthorized(query: AuthorizedMemorySearchQuery):
       seenProjectionIds.add(projection.id);
       const item = projectionToItem(projection);
       if (matchesQuery(item, query)) {
-        allItems.push(item);
+        allItems.push(withMatchKind(item, query));
+      }
+    }
+    if (!query.projectionClass) {
+      for (const item of collectObservationItems({ ...query, namespace })) {
+        if (seenObservationIds.has(item.id)) continue;
+        seenObservationIds.add(item.id);
+        if (matchesQuery(item, { ...query, namespace })) {
+          allItems.push(withMatchKind(item, query));
+        }
       }
     }
   }
 
-  allItems.sort((a, b) => (b.updatedAt ?? b.createdAt) - (a.updatedAt ?? a.createdAt));
+  allItems.sort(compareSearchItems);
   const stats = computeStats(allItems);
   const offset = query.offset ?? 0;
   const limit = query.limit ?? 50;
@@ -481,6 +516,61 @@ function collectRawEvents(query: MemorySearchQuery): MemorySearchResultItem[] {
   return items;
 }
 
+function observationNamespace(row: ContextNamespaceRow | undefined, fallbackScope: string): ContextNamespace {
+  return {
+    scope: (row?.scope ?? fallbackScope) as ContextNamespace['scope'],
+    projectId: row?.projectId,
+    userId: row?.userId,
+    workspaceId: row?.workspaceId,
+    enterpriseId: row?.orgId,
+  };
+}
+
+function observationNamespacesForQuery(query: MemorySearchQuery): Map<string, ContextNamespaceRow> {
+  const rows = listContextNamespaces();
+  const out = new Map<string, ContextNamespaceRow>();
+  for (const row of rows) {
+    const namespace = observationNamespace(row, row.scope);
+    if (matchesNamespace(namespace, query)) {
+      out.set(row.id, row);
+      continue;
+    }
+    const requested = query.namespace;
+    // Manual MCP observations are stored as user_private rows. Runtime startup
+    // and some legacy recall paths may search the corresponding personal
+    // namespace, so allow same-owner, same-project user_private observations
+    // to remain discoverable without exposing cross-user or cross-project data.
+    if (
+      requested
+      && row.scope === 'user_private'
+      && row.userId
+      && row.userId === requested.userId
+      && (!requested.projectId || row.projectId === requested.projectId)
+    ) {
+      out.set(row.id, row);
+    }
+  }
+  return out;
+}
+
+function collectObservationItems(query: MemorySearchQuery): MemorySearchResultItem[] {
+  const namespaceRows = observationNamespacesForQuery(query);
+  if (namespaceRows.size === 0) return [];
+  const states: readonly ObservationState[] = query.observationStates ?? ['candidate', 'active', 'promoted'];
+  const rows = listContextObservations({
+    class: query.observationClass,
+    state: states,
+  });
+  const items: MemorySearchResultItem[] = [];
+  for (const row of rows) {
+    if (row.projectionId) continue;
+    const namespaceRow = namespaceRows.get(row.namespaceId);
+    if (!namespaceRow) continue;
+    items.push(observationToItem(row, namespaceRow));
+  }
+  return items;
+}
+
 function projectionToItem(projection: ProcessedContextProjection): MemorySearchResultItem {
   const content = projectionSemanticContent(projection.content);
   const contentRecord = content && typeof content === 'object' && !Array.isArray(content)
@@ -505,6 +595,41 @@ function projectionToItem(projection: ProcessedContextProjection): MemorySearchR
     sourceEventCount: typeof contentRecord?.eventCount === 'number' ? contentRecord.eventCount : undefined,
     sourceEventIds: projection.sourceEventIds,
     processingModel: typeof contentRecord?.primaryContextModel === 'string' ? contentRecord.primaryContextModel : undefined,
+  };
+}
+
+function observationText(observation: ContextObservationRow): string {
+  const rawText = observation.content.text;
+  if (typeof rawText === 'string' && rawText.trim()) return rawText.trim();
+  const title = observation.content.title;
+  if (typeof title === 'string' && title.trim()) return title.trim();
+  return JSON.stringify(observation.content);
+}
+
+function observationSummary(observation: ContextObservationRow): string {
+  const text = observationText(observation).replace(/\s+/g, ' ').trim();
+  const title = typeof observation.content.title === 'string' ? observation.content.title.trim() : '';
+  const base = title && !text.startsWith(title) ? `${title}: ${text}` : text;
+  return base.length > 500 ? `${base.slice(0, 497)}...` : base;
+}
+
+function observationToItem(observation: ContextObservationRow, namespaceRow: ContextNamespaceRow): MemorySearchResultItem {
+  return {
+    type: 'observation',
+    id: observation.id,
+    projectId: namespaceRow.projectId ?? '',
+    scope: observation.scope,
+    enterpriseId: namespaceRow.orgId,
+    workspaceId: namespaceRow.workspaceId,
+    userId: namespaceRow.userId,
+    observationClass: observation.class,
+    observationState: observation.state,
+    summary: observationSummary(observation),
+    content: JSON.stringify(observation.content),
+    createdAt: observation.createdAt,
+    updatedAt: observation.updatedAt,
+    sourceEventCount: observation.sourceEventIds.length || 1,
+    sourceEventIds: observation.sourceEventIds,
   };
 }
 
@@ -536,15 +661,46 @@ function itemNamespace(item: MemorySearchResultItem): ContextNamespace {
 function matchesQuery(item: MemorySearchResultItem, query: MemorySearchQuery): boolean {
   if (!matchesNamespace(item, query)) return false;
   if (query.projectionClass && item.projectionClass !== query.projectionClass) return false;
+  if (query.observationClass && item.observationClass !== query.observationClass) return false;
+  if (query.observationStates && item.observationState && !query.observationStates.includes(item.observationState)) return false;
   if (query.eventType && item.type === 'raw' && item.eventType !== query.eventType) return false;
   if (query.after && item.createdAt < query.after) return false;
   if (query.before && item.createdAt > query.before) return false;
-  if (query.query) {
-    const needle = query.query.toLowerCase();
-    const haystack = `${item.summary} ${item.content ?? ''}`.toLowerCase();
-    if (!haystack.includes(needle)) return false;
-  }
+  if (query.query && !itemMatchesText(item, query.query)) return false;
   return true;
+}
+
+function itemMatchesText(item: MemorySearchResultItem, query: string | undefined): boolean {
+  if (!query?.trim()) return false;
+  const needle = query.toLowerCase();
+  const haystack = itemHaystack(item);
+  return haystack.includes(needle);
+}
+
+function itemHaystack(item: MemorySearchResultItem): string {
+  return [
+    item.summary,
+    item.content,
+    item.projectionClass,
+    item.observationClass,
+    item.eventType,
+    ...(item.sourceEventIds ?? []),
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0).join(' ').toLowerCase();
+}
+
+function withMatchKind(item: MemorySearchResultItem, query: MemorySearchQuery): MemorySearchResultItem {
+  if (!query.query?.trim()) return item;
+  return itemMatchesText(item, query.query) ? { ...item, matchKind: 'exact' } : item;
+}
+
+function compareSearchItems(a: MemorySearchResultItem, b: MemorySearchResultItem): number {
+  const matchRank = (item: MemorySearchResultItem) => item.matchKind === 'exact' ? 0 : item.matchKind === 'semantic' ? 1 : item.matchKind === 'trigram' ? 2 : 3;
+  const typeRank = (item: MemorySearchResultItem) => item.type === 'observation' ? 0 : item.projectionClass === 'durable_memory_candidate' ? 1 : item.type === 'processed' ? 2 : 3;
+  const matchDiff = matchRank(a) - matchRank(b);
+  if (matchDiff !== 0) return matchDiff;
+  const typeDiff = typeRank(a) - typeRank(b);
+  if (typeDiff !== 0) return typeDiff;
+  return (b.updatedAt ?? b.createdAt) - (a.updatedAt ?? a.createdAt);
 }
 
 function matchesNamespace(
@@ -554,6 +710,15 @@ function matchesNamespace(
 ): boolean {
   const namespace = query.namespace;
   if (namespace) {
+    if (
+      item.scope === 'user_private'
+      && namespace.scope !== 'user_private'
+      && namespace.userId
+      && item.userId === namespace.userId
+      && (!namespace.projectId || item.projectId === namespace.projectId)
+    ) {
+      return true;
+    }
     if (item.projectId !== namespace.projectId) return false;
     if (item.scope !== namespace.scope) return false;
     if ((item.enterpriseId ?? undefined) !== (namespace.enterpriseId ?? undefined)) return false;

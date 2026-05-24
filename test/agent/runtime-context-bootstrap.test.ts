@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SKILL_REGISTRY_FILE_NAME, SKILL_REGISTRY_SCHEMA_VERSION, makeSkillUri } from '../../shared/skill-registry-types.js';
 import { configureSharedContextRuntime } from '../../src/context/shared-context-runtime.js';
-import { writeProcessedProjection } from '../../src/store/context-store.js';
+import { resetMemoryShortRefsForTests, resolveMemoryShortRef } from '../../src/context/memory-short-ref.js';
+import { ensureContextNamespace, writeContextObservation, writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
 const detectRepoMock = vi.hoisted(() => vi.fn());
@@ -25,6 +26,7 @@ describe('resolveTransportContextBootstrap', () => {
 
   beforeEach(() => {
     detectRepoMock.mockReset();
+    resetMemoryShortRefsForTests();
     configureSharedContextRuntime(null);
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
@@ -583,6 +585,81 @@ describe('resolveTransportContextBootstrap', () => {
     ]);
     expect(startup?.injectedText).toContain('[important] Important architecture memory');
     expect(startup?.injectedText).toContain('[recent] Recent startup memory');
+  });
+
+  it('injects only active or promoted observations as a lightweight startup index', () => {
+    const namespace = {
+      scope: 'personal' as const,
+      projectId: 'github.com/acme/repo',
+      userId: 'user-1',
+    };
+    const observationNamespace = ensureContextNamespace({
+      scope: 'user_private',
+      projectId: 'github.com/acme/repo',
+      userId: 'user-1',
+    }, 100);
+    const active = writeContextObservation({
+      namespaceId: observationNamespace.id,
+      scope: 'user_private',
+      class: 'note',
+      origin: 'agent_learned',
+      fingerprint: 'startup-observation-active',
+      content: { text: 'Active saved observation should appear in the startup index.' },
+      text: 'Active saved observation should appear in the startup index.',
+      state: 'active',
+      now: 300,
+    });
+    const promoted = writeContextObservation({
+      namespaceId: observationNamespace.id,
+      scope: 'user_private',
+      class: 'note',
+      origin: 'user_note',
+      fingerprint: 'startup-observation-promoted',
+      content: { text: 'Promoted saved observation should appear in the startup index.' },
+      text: 'Promoted saved observation should appear in the startup index.',
+      state: 'promoted',
+      now: 250,
+    });
+    writeContextObservation({
+      namespaceId: observationNamespace.id,
+      scope: 'user_private',
+      class: 'note',
+      origin: 'agent_learned',
+      fingerprint: 'startup-observation-candidate',
+      content: { text: 'Candidate saved observation should not be injected.' },
+      text: 'Candidate saved observation should not be injected.',
+      state: 'candidate',
+      now: 400,
+    });
+
+    const startup = buildTransportStartupMemory(namespace);
+
+    expect(startup?.items).toEqual([
+      expect.objectContaining({
+        id: active.id,
+        type: 'observation',
+        summary: expect.stringContaining('Active saved observation'),
+      }),
+      expect.objectContaining({
+        id: promoted.id,
+        type: 'observation',
+        summary: expect.stringContaining('Promoted saved observation'),
+      }),
+    ]);
+    expect(startup?.injectedText).toContain('<persistent-memory-index advisory="true">');
+    const activeRef = `obs:${active.id.slice(0, 10)}`;
+    const promotedRef = `obs:${promoted.id.slice(0, 10)}`;
+    expect(startup?.injectedText).toContain(`ref: ${activeRef}`);
+    expect(startup?.injectedText).toContain(`ref: ${promotedRef}`);
+    expect(startup?.injectedText).not.toContain(active.id);
+    expect(startup?.injectedText).not.toContain(promoted.id);
+    expect(startup?.injectedText).not.toContain('Candidate saved observation');
+    expect(startup?.injectedText).toContain('call get_memory_sources with { "ref": "obs:..." }');
+    expect(resolveMemoryShortRef(activeRef, {
+      scope: 'user_private',
+      projectId: 'github.com/acme/repo',
+      userId: 'user-1',
+    })).toMatchObject({ kind: 'observation', id: active.id });
   });
 
   it('buildTransportStartupMemory renders registry skill references without reading skill markdown bodies', async () => {

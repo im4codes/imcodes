@@ -625,7 +625,7 @@ describe('memory recall endpoint — I.5', () => {
       personalRows: [
         {
           id: 'semantic-neighbor',
-          project_id: 'github.com/im4codes/imcodes',
+          project_id: 'app.im.codes/project',
           projection_class: 'recent_summary',
           summary: 'Deployment workflow notes for IM.codes server upgrades',
           updated_at: now,
@@ -635,9 +635,9 @@ describe('memory recall endpoint — I.5', () => {
       lexicalPersonalRows: [
         {
           id: 'infra-exact',
-          project_id: 'github.com/im4codes/imcodes',
+          project_id: 'app.im.codes/project',
           projection_class: 'durable_memory_candidate',
-          summary: 'im服务器(78服务器): ssh root@116.62.239.78',
+          summary: 'mock infra server alpha: ssh user@alpha.test.im.codes',
           updated_at: now - 1_000,
           score: 1,
           match_kind: 'exact',
@@ -647,8 +647,8 @@ describe('memory recall endpoint — I.5', () => {
     const app = await buildTestApp(db);
 
     const res = await postRecall(app, {
-      query: 'im服务器 78服务器 116.62.239.78',
-      projectId: 'github.com/im4codes/imcodes',
+      query: 'mock infra server alpha alpha.test.im.codes',
+      projectId: 'app.im.codes/project',
     });
     expect(res.status).toBe(200);
     const json = await res.json() as { vectorSearch: boolean; results: Array<{ id: string; summary: string; class: string }> };
@@ -657,7 +657,7 @@ describe('memory recall endpoint — I.5', () => {
       id: 'infra-exact',
       class: 'durable_memory_candidate',
       matchKind: 'exact',
-      summary: expect.stringContaining('116.62.239.78'),
+      summary: expect.stringContaining('alpha.test.im.codes'),
     });
   });
 
@@ -689,7 +689,7 @@ describe('memory recall endpoint — I.5', () => {
       personalRows: [
         {
           id: 'semantic-top',
-          project_id: 'github.com/im4codes/imcodes',
+          project_id: 'app.im.codes/project',
           projection_class: 'recent_summary',
           summary: 'Deployment workflow notes for IM.codes server upgrades',
           updated_at: now,
@@ -700,9 +700,9 @@ describe('memory recall endpoint — I.5', () => {
       lexicalPersonalRows: [
         {
           id: 'exact-ip',
-          project_id: 'github.com/im4codes/imcodes',
+          project_id: 'app.im.codes/project',
           projection_class: 'durable_memory_candidate',
-          summary: 'im服务器(78服务器): ssh root@116.62.239.78',
+          summary: 'mock infra server alpha: ssh user@alpha.test.im.codes',
           updated_at: now - 1_000,
           score: 1,
           match_kind: 'exact',
@@ -712,8 +712,8 @@ describe('memory recall endpoint — I.5', () => {
     const app = await buildTestApp(db);
 
     const res = await postRecall(app, {
-      query: '116.62.239.78',
-      projectId: 'github.com/im4codes/imcodes',
+      query: 'alpha.test.im.codes',
+      projectId: 'app.im.codes/project',
       limit: 1,
       mode: 'search',
     });
@@ -721,6 +721,51 @@ describe('memory recall endpoint — I.5', () => {
     const json = await res.json() as { results: Array<{ id: string; matchKind: string }> };
     expect(json.results).toHaveLength(1);
     expect(json.results[0]).toMatchObject({ id: 'exact-ip', matchKind: 'exact' });
+  });
+
+  it('prioritizes exact durable memories before exact recent summaries for MCP search', async () => {
+    generateEmbeddingMock.mockResolvedValueOnce(new Float32Array([0.4, 0.2, 0.1]));
+    embeddingToSqlMock.mockReturnValue('[0.4,0.2,0.1]');
+    const now = Date.now();
+    const { db } = makeMockDb({
+      lexicalPersonalRows: [
+        {
+          id: 'recent-about-fix',
+          project_id: 'app.im.codes/project',
+          projection_class: 'recent_summary',
+          summary: 'Recent fix summary mentions mock server alpha and mock server beta while debugging MCP search',
+          updated_at: now,
+          score: 1,
+          match_kind: 'exact',
+        },
+        {
+          id: 'manual-server-memory',
+          project_id: 'app.im.codes/project',
+          projection_class: 'durable_memory_candidate',
+          summary: 'mock infra server alpha: ssh user@alpha.test.im.codes\nmock infra server beta: ssh user@beta.test.im.codes',
+          updated_at: now - 10_000,
+          score: 1,
+          match_kind: 'exact',
+        },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, {
+      query: 'mock server alpha beta alpha.test.im.codes beta.test.im.codes',
+      projectId: 'app.im.codes/project',
+      limit: 1,
+      mode: 'search',
+    });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: Array<{ id: string; class: string; matchKind: string; summary: string }> };
+    expect(json.results).toHaveLength(1);
+    expect(json.results[0]).toMatchObject({
+      id: 'manual-server-memory',
+      class: 'durable_memory_candidate',
+      matchKind: 'exact',
+      summary: expect.stringContaining('beta.test.im.codes'),
+    });
   });
 
   // ── originServerId — memory-source-server-routing change ───────────────

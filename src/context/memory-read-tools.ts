@@ -6,8 +6,10 @@ import { buildMemoryMcpSourceProvenance, type MemoryMcpSourceProvenance, type Me
 import { serializeContextNamespace } from './context-keys.js';
 import {
   getArchivedEvent,
+  getContextObservationById,
   getProcessedProjectionById,
   getStagedEvent,
+  listContextNamespaces,
   listProjectionSources,
   searchArchiveFts,
 } from '../store/context-store.js';
@@ -164,14 +166,107 @@ export function chatGetEvent(id: string, caller: MemoryToolCaller): ReturnType<t
 }
 
 export interface MemoryGetSourcesResult {
-  projectionId: string;
+  projectionId?: string;
+  observationId?: string;
   sourceEventCount: number;
   note?: string;
-  sources?: Array<{ eventId: string; status: 'archived' | 'staged' | 'missing'; content: string | null; eventType?: string; createdAt?: number }>;
+  sources?: Array<{ eventId: string; status: 'archived' | 'staged' | 'missing' | 'projection' | 'observation'; content: string | null; eventType?: string; createdAt?: number }>;
   partial?: boolean;
 }
 
-export function memoryGetSources(projectionId: string, caller: MemoryToolCaller): MemoryGetSourcesResult {
+export type MemoryGetSourcesInput =
+  | string
+  | {
+    projectionId?: string;
+    observationId?: string;
+    kind?: 'projection' | 'observation';
+  };
+
+function projectionFallbackSource(projection: ReturnType<typeof getProcessedProjectionById>): NonNullable<MemoryGetSourcesResult['sources']>[number] | undefined {
+  if (!projection) return undefined;
+  const isManualMemory = projection.origin === 'user_note'
+    || projection.content.manual === true
+    || projection.sourceEventIds.some((eventId) => eventId.startsWith('manual-memory:'));
+  if (!isManualMemory) return undefined;
+  const text = typeof projection.content.text === 'string' && projection.content.text.trim()
+    ? projection.content.text.trim()
+    : projection.summary.trim();
+  if (!text) return undefined;
+  return {
+    eventId: projection.sourceEventIds[0] ?? `projection:${projection.id}`,
+    status: 'projection',
+    content: text,
+    eventType: 'memory.projection',
+    createdAt: projection.createdAt,
+  };
+}
+
+function observationNamespaceById(namespaceId: string, scope: ContextNamespace['scope']): ContextNamespace | undefined {
+  const row = listContextNamespaces().find((candidate) => candidate.id === namespaceId);
+  if (!row) return undefined;
+  return {
+    scope,
+    projectId: row.projectId,
+    userId: row.userId,
+    workspaceId: row.workspaceId,
+    enterpriseId: row.orgId,
+  };
+}
+
+function canAccessObservationNamespace(namespace: ContextNamespace | undefined, caller: AnyCaller): namespace is ContextNamespace {
+  if (!namespace) return false;
+  if (namespace.userId !== caller.userId) return false;
+  if (isInternalCaller(caller)) return true;
+  if (sameNamespace(namespace, caller.namespace)) return true;
+  return namespace.scope === 'user_private'
+    && caller.namespace.userId === caller.userId
+    && namespace.userId === caller.userId
+    && (!caller.namespace.projectId || namespace.projectId === caller.namespace.projectId);
+}
+
+function observationText(content: Record<string, unknown>): string {
+  const text = content.text;
+  if (typeof text === 'string' && text.trim()) return text.trim();
+  return JSON.stringify(content);
+}
+
+function memoryGetObservationSources(observationId: string, caller: MemoryToolCaller): MemoryGetSourcesResult {
+  const checkedCaller = assertOwner(assertPublicCallerHasNamespace(caller));
+  const observation = getContextObservationById(observationId);
+  const namespace = observation ? observationNamespaceById(observation.namespaceId, observation.scope) : undefined;
+  if (!observation || !canAccessObservationNamespace(namespace, checkedCaller)) {
+    return { observationId, sourceEventCount: 0, sources: [] };
+  }
+  const sourceId = observation.sourceEventIds[0] ?? `observation:${observation.id}`;
+  return {
+    observationId,
+    sourceEventCount: Math.max(1, observation.sourceEventIds.length),
+    sources: [{
+      eventId: sourceId,
+      status: 'observation',
+      content: observationText(observation.content),
+      eventType: `memory.observation.${observation.class}`,
+      createdAt: observation.createdAt,
+    }],
+    partial: false,
+  };
+}
+
+function resolveGetSourcesInput(input: MemoryGetSourcesInput): { projectionId?: string; observationId?: string } {
+  if (typeof input === 'string') return { projectionId: input };
+  const projectionId = typeof input.projectionId === 'string' && input.projectionId.trim() ? input.projectionId.trim() : undefined;
+  const observationId = typeof input.observationId === 'string' && input.observationId.trim() ? input.observationId.trim() : undefined;
+  if (input.kind === 'observation' && observationId) return { observationId };
+  if (input.kind === 'projection' && projectionId) return { projectionId };
+  return { projectionId, observationId };
+}
+
+export function memoryGetSources(input: MemoryGetSourcesInput, caller: MemoryToolCaller): MemoryGetSourcesResult {
+  const resolved = resolveGetSourcesInput(input);
+  if (resolved.observationId && !resolved.projectionId) {
+    return memoryGetObservationSources(resolved.observationId, caller);
+  }
+  const projectionId = resolved.projectionId ?? '';
   const checkedCaller = assertOwner(assertPublicCallerHasNamespace(caller));
   const projection = getProcessedProjectionById(projectionId);
   if (!projection) return { projectionId, sourceEventCount: 0, sources: [] };
@@ -191,11 +286,15 @@ export function memoryGetSources(projectionId: string, caller: MemoryToolCaller)
       createdAt: event?.createdAt,
     };
   });
+  const fallback = sources.length === 0 || sources.every((source) => source.content === null)
+    ? projectionFallbackSource(projection)
+    : undefined;
+  const resolvedSources = fallback ? [fallback] : sources;
   return {
     projectionId,
-    sourceEventCount: projection.sourceEventIds.length,
-    sources,
-    partial: sources.length !== projection.sourceEventIds.length || sources.some((source) => source.content === null),
+    sourceEventCount: Math.max(projection.sourceEventIds.length, resolvedSources.length),
+    sources: resolvedSources,
+    partial: !fallback && (sources.length !== projection.sourceEventIds.length || sources.some((source) => source.content === null)),
   };
 }
 

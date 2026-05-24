@@ -52,7 +52,7 @@ export interface TransportRuntimeAssemblyInput {
 export const MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE = [
   'Use memory MCP search when the user asks about prior work, project history, past decisions, preferences, bugs, commits, deployments, or previously discussed context.',
   'Before answering those requests, call search_memory with a concise query based on the user message and current project.',
-  'After search_memory, inspect each hit\'s sourceLookup object. If a relevant hit may affect the answer and its summary is not enough, call get_memory_sources with sourceLookup.projectionId before answering.',
+  'After search_memory, inspect each hit\'s sourceLookup object. If a relevant hit may affect the answer and its summary is not enough, call get_memory_sources with the returned sourceLookup fields before answering. If startup memory gives only a compact ref such as obs:abc123, call get_memory_sources with that ref.',
   'Use get_memory_sources for exact prior instructions, decisions, preferences, bug details, commit/deployment facts, or provenance-sensitive answers; do not invent details from summaries alone.',
   'Do not call memory for bare control messages like "continue", "go on", "ok", "yes", "commit", "push", "run tests", or other short commands without searchable context.',
 ].join('\n');

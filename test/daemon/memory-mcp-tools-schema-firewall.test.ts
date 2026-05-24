@@ -1,10 +1,11 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import { MCP_FEATURE_FLAGS_BY_NAME } from '../../shared/memory-mcp-feature-flags.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME, type MemoryFeatureFlag } from '../../shared/feature-flags.js';
 import { MEMORY_MCP_DISABLED_FLAGS, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
+import { resetMemoryShortRefsForTests } from '../../src/context/memory-short-ref.js';
 
 function caller(overrides: Partial<McpRuntimeCaller> = {}): McpRuntimeCaller {
   const namespace: ContextNamespace = { scope: 'user_private', userId: 'user-1', projectId: 'repo-1' };
@@ -21,6 +22,10 @@ function caller(overrides: Partial<McpRuntimeCaller> = {}): McpRuntimeCaller {
 }
 
 describe('memory MCP tool schema firewall', () => {
+  beforeEach(() => {
+    resetMemoryShortRefsForTests();
+  });
+
   it('strips forged memory authority fields before search and write helpers', async () => {
     const searchMemory = vi.fn(async () => ({
       items: [],
@@ -91,10 +96,12 @@ describe('memory MCP tool schema firewall', () => {
   });
 
   it('returns compact hits from the same recall search used by message memory recall', async () => {
+    const projectionId = '1111111111222222222233333333334444444444555555555566666666667777';
     const searchMemory = vi.fn(async () => ({
       items: [
         {
-          projectionId: 'proj-1',
+          projectionId,
+          recordKind: 'projection',
           projectId: 'repo-1',
           scope: 'user_private',
           projectionClass: 'recent_summary',
@@ -107,8 +114,15 @@ describe('memory MCP tool schema firewall', () => {
         },
       ],
     }));
+    const orchestrator = vi.fn(async (id: string) => ({
+      status: 'ok' as const,
+      projectionId: id,
+      sourceEventCount: 1,
+      sources: [{ eventId: 'evt-1', status: 'archived', content: 'expanded source' }],
+    }));
     const handlers = createMemoryMcpToolHandlers(caller(), {
       searchMemory,
+      getMemorySourcesOrchestrator: orchestrator,
       isMemoryFeatureEnabled: () => true,
     });
 
@@ -116,8 +130,10 @@ describe('memory MCP tool schema firewall', () => {
       status: 'ok',
       items: [
         {
-          projectionId: 'proj-1',
-          sourceLookup: { tool: 'get_memory_sources', projectionId: 'proj-1' },
+          projectionId,
+          ref: 'proj:1111111111',
+          recordKind: 'projection',
+          sourceLookup: { tool: 'get_memory_sources', kind: 'projection', projectionId },
           summary: 'MCP provider readiness fixed for Gemini, Copilot, and Qwen.',
           projectionClass: 'recent_summary',
           matchKind: 'exact',
@@ -136,6 +152,77 @@ describe('memory MCP tool schema firewall', () => {
       repo: 'repo-1',
       limit: 5,
     }));
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({
+      ref: 'proj:1111111111',
+      kind: 'projection',
+    })).resolves.toMatchObject({
+      status: 'ok',
+      projectionId,
+      sourceEventCount: 1,
+    });
+    expect(orchestrator).toHaveBeenCalledWith(projectionId, expect.any(Object));
+  });
+
+  it('returns observation sourceLookup objects and expands them without the projection orchestrator', async () => {
+    const observationId = 'aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffff00000000';
+    const searchMemory = vi.fn(async () => ({
+      items: [
+        {
+          recordKind: 'observation' as const,
+          projectionId: observationId,
+          observationId,
+          projectId: 'repo-1',
+          scope: 'user_private',
+          observationClass: 'note',
+          observationState: 'candidate',
+          matchKind: 'exact' as const,
+          summary: 'Saved observation about alpha.test.im.codes.',
+          createdAt: 100,
+          updatedAt: 200,
+          source: 'local' as const,
+        },
+      ],
+    }));
+    const orchestrator = vi.fn();
+    const handlers = createMemoryMcpToolHandlers(caller({
+      userId: 'daemon-local',
+      namespace: { scope: 'user_private', userId: 'daemon-local', projectId: 'repo-1' },
+    }), {
+      searchMemory,
+      getMemorySourcesOrchestrator: orchestrator,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]({ query: 'alpha.test.im.codes' })).resolves.toMatchObject({
+      status: 'ok',
+      items: [
+        {
+          observationId,
+          ref: 'obs:aaaaaaaaaa',
+          recordKind: 'observation',
+          sourceLookup: { tool: 'get_memory_sources', kind: 'observation', observationId },
+          observationClass: 'note',
+          observationState: 'candidate',
+          matchKind: 'exact',
+        },
+      ],
+    });
+
+    await handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({
+      observationId,
+      kind: 'observation',
+      serverId: 'attacker-srv',
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({
+      ref: 'obs:aaaaaaaaaa',
+      kind: 'observation',
+    })).resolves.toMatchObject({
+      status: 'ok',
+      observationId,
+      sourceEventCount: 0,
+      sources: [],
+    });
+    expect(orchestrator).not.toHaveBeenCalled();
   });
 
   it('does not treat local send and cron MCP feature flags as auth gates', async () => {

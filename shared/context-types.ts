@@ -84,7 +84,7 @@ export interface ContextAuthorityDecision {
 
 export interface TransportMemoryRecallItem {
   id: string;
-  type?: 'raw' | 'processed';
+  type?: 'raw' | 'processed' | 'observation';
   projectId: string;
   scope?: string;
   enterpriseId?: string;

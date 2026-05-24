@@ -67,13 +67,19 @@ describe('memory MCP shared contracts', () => {
     const search = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY];
     const getSources = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES];
     const projectionId = getSources.inputSchema.properties?.projectionId as { description?: string } | undefined;
+    const observationId = getSources.inputSchema.properties?.observationId as { description?: string } | undefined;
+    const ref = getSources.inputSchema.properties?.ref as { description?: string } | undefined;
 
     expect(search.description).toContain('call get_memory_sources');
-    expect(search.description).toContain('sourceLookup.projectionId');
-    expect(search.description).toMatch(/projection id/i);
+    expect(search.description).toContain('sourceLookup');
+    expect(search.description).toMatch(/typed sourceLookup/i);
     expect(getSources.description).toContain('Use it after search_memory');
+    expect(getSources.description).toContain('observation id');
+    expect(getSources.description).toContain('compact ref');
     expect(getSources.description).toContain('provenance-sensitive answers');
     expect(projectionId?.description).toContain('search_memory');
+    expect(observationId?.description).toContain('search_memory');
+    expect(ref?.description).toContain('startup memory');
   });
 
   it('pins locked caps and disabled response shape', () => {
@@ -170,10 +176,10 @@ describe('memory MCP shared contracts', () => {
 
   it('strips serverId from get_memory_sources input via pickAllowedMcpArgs', () => {
     const stripped = pickAllowedMcpArgs(
-      { projectionId: 'p1', serverId: 'attacker-srv', userId: 'mallory' },
-      ['projectionId'],
+      { ref: 'proj:abc123', serverId: 'attacker-srv', userId: 'mallory' },
+      ['projectionId', 'observationId', 'kind', 'ref'],
     );
-    expect(stripped).toEqual({ projectionId: 'p1' });
+    expect(stripped).toEqual({ ref: 'proj:abc123' });
     expect(stripped).not.toHaveProperty('serverId');
   });
 

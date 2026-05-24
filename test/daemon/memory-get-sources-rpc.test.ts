@@ -153,6 +153,47 @@ describe('daemon WS handler: memory.get_sources_request', () => {
     expect(reply.partial).toBe(false);
   });
 
+  it('returns manual memory projection text when no archived source event exists', async () => {
+    const namespace = { scope: 'personal' as const, projectId: 'repo-1', userId: 'user-1' };
+    const manualMemoryText = [
+      'mock infra server alpha: ssh user@alpha.test.im.codes',
+      'mock infra server beta: ssh user@beta.test.im.codes',
+    ].join('\n');
+    const projection = writeProcessedProjection({
+      namespace,
+      class: 'durable_memory_candidate',
+      sourceEventIds: ['manual-memory:req-1'],
+      summary: manualMemoryText,
+      content: { text: manualMemoryText, manual: true, origin: 'user_note' },
+      origin: 'user_note',
+      updatedAt: 4_000,
+    });
+
+    const link = makeFakeServerLink();
+    handleWebCommand({
+      type: MEMORY_WS.GET_SOURCES_REQUEST,
+      requestId: 'req-manual',
+      projectionId: projection.id,
+      expectedServerId: 'srv-self',
+    }, link);
+    for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+
+    expect(link.sent).toHaveLength(1);
+    const reply = link.sent[0];
+    expect(reply.status).toBe('ok');
+    expect(reply.sourceEventCount).toBe(1);
+    expect(reply.partial).toBe(false);
+    const sources = reply.sources as Array<{ eventId: string; content: string | null; status: string; eventType?: string }>;
+    expect(sources).toHaveLength(1);
+    expect(sources[0]).toMatchObject({
+      eventId: 'manual-memory:req-1',
+      status: 'projection',
+      eventType: 'memory.projection',
+      content: expect.stringContaining('alpha.test.im.codes'),
+    });
+    expect(sources[0].content).toContain('beta.test.im.codes');
+  });
+
   it('sets partial=true when some source events are missing from the archive', async () => {
     const namespace = { scope: 'personal' as const, projectId: 'repo-1', userId: 'user-1' };
     const target = { namespace, kind: 'session' as const, name: 'deck_repo1_brain' };
@@ -239,4 +280,3 @@ describe('daemon WS handler: memory.get_sources_request', () => {
     expect(sources[0].content).toBeNull(); // namespace mismatch → no content
   });
 });
-

@@ -1803,8 +1803,12 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   // here — keep the highest-scoring representative, then prefer personal
   // over enterprise on ties (personal is closer to the current user's work).
   const matchKindRank = { exact: 0, semantic: 1, trigram: 2 } satisfies Record<'exact' | 'semantic' | 'trigram', number>;
+  const projectionClassRank = { durable_memory_candidate: 0, recent_summary: 1, master_summary: 2 } satisfies Record<ProjectionClass, number>;
   results.sort((a, b) => {
     if (a.matchKind !== b.matchKind) return matchKindRank[a.matchKind] - matchKindRank[b.matchKind];
+    const aClassRank = projectionClassRank[a.class as ProjectionClass] ?? 9;
+    const bClassRank = projectionClassRank[b.class as ProjectionClass] ?? 9;
+    if (aClassRank !== bClassRank) return aClassRank - bClassRank;
     if (b.score !== a.score) return b.score - a.score;
     if (a.source !== b.source) return a.source === 'personal' ? -1 : 1;
     return b.updatedAt - a.updatedAt;

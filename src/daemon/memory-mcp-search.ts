@@ -1,12 +1,17 @@
 import type { ProcessedContextClass } from '../../shared/context-types.js';
+import type { ObservationClass, ObservationState } from '../../shared/memory-observation.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 import { searchLocalMemorySemantic, type MemorySearchQuery } from '../context/memory-search.js';
 import { projectionOwnerCache } from './memory-projection-owner-cache.js';
 
 export interface MemoryMcpSearchHit {
+  recordKind?: 'projection' | 'observation';
   projectionId: string;
+  observationId?: string;
   summary: string;
   projectionClass?: ProcessedContextClass | string;
+  observationClass?: ObservationClass | string;
+  observationState?: ObservationState | string;
   matchKind?: 'exact' | 'semantic' | 'trigram';
   projectId?: string;
   scope?: string;
@@ -141,11 +146,15 @@ async function searchLocalRecall(
 ): Promise<MemoryMcpSearchHit[]> {
   const result = await searchLocalMemorySemantic(query);
   return result.items
-    .filter((item) => item.type === 'processed')
     .map((item) => ({
+      recordKind: item.type === 'observation' ? 'observation' as const : 'projection' as const,
       projectionId: item.id,
+      ...(item.type === 'observation' ? { observationId: item.id } : {}),
       summary: item.summary,
       projectionClass: item.projectionClass,
+      observationClass: item.observationClass,
+      observationState: item.observationState,
+      matchKind: item.matchKind,
       projectId: item.projectId,
       scope: item.scope,
       createdAt: item.createdAt,
@@ -162,11 +171,28 @@ async function searchLocalRecall(
 }
 
 function dedupeAndLimit(items: MemoryMcpSearchHit[], limit: number): MemoryMcpSearchHit[] {
+  const matchKindRank = { exact: 0, semantic: 1, trigram: 2 } satisfies Record<'exact' | 'semantic' | 'trigram', number>;
+  const itemRank = (item: MemoryMcpSearchHit): number => {
+    if (item.observationId || item.recordKind === 'observation') return item.observationClass === 'preference' ? 0 : 1;
+    if (item.projectionClass === 'durable_memory_candidate') return 2;
+    return 3;
+  };
+  items.sort((a, b) => {
+    const aMatch = a.matchKind ? matchKindRank[a.matchKind] : 3;
+    const bMatch = b.matchKind ? matchKindRank[b.matchKind] : 3;
+    if (aMatch !== bMatch) return aMatch - bMatch;
+    const itemDiff = itemRank(a) - itemRank(b);
+    if (itemDiff !== 0) return itemDiff;
+    if ((b.relevanceScore ?? 0) !== (a.relevanceScore ?? 0)) return (b.relevanceScore ?? 0) - (a.relevanceScore ?? 0);
+    return (b.updatedAt ?? b.createdAt ?? 0) - (a.updatedAt ?? a.createdAt ?? 0);
+  });
   const seen = new Set<string>();
   const out: MemoryMcpSearchHit[] = [];
   for (const item of items) {
     const key = item.projectionId
       ? `id:${item.projectionId}`
+      : item.observationId
+        ? `observation:${item.observationId}`
       : `summary:${item.projectionClass ?? ''}:${normalizeSummaryForFingerprint(item.summary)}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -201,7 +227,7 @@ export async function searchMcpMemoryRecall(query: MemorySearchQuery, options: M
   // populated — keeps the orchestrator's branch decision purely on the
   // map without needing a "did this come from cloud or local" check.
   for (const item of items) {
-    if (item.projectionId && item.originServerId) {
+    if (item.recordKind !== 'observation' && item.projectionId && item.originServerId) {
       projectionOwnerCache.set(item.projectionId, item.originServerId);
     }
   }

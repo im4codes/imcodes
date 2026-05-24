@@ -148,7 +148,7 @@ describe('TransportSessionRuntime', () => {
       systemText: expect.stringContaining('get_memory_sources'),
     }));
     expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
-      systemText: expect.stringContaining('projectionId'),
+      systemText: expect.stringContaining('sourceLookup fields'),
     }));
   });
 

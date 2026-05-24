@@ -3,7 +3,7 @@ import { writeFile, mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { ContextNamespace } from '../../shared/context-types.js';
-import { archiveEventsForMaterialization, recordContextEvent, resetContextStoreForTests, writeProcessedProjection } from '../../src/store/context-store.js';
+import { archiveEventsForMaterialization, ensureContextNamespace, recordContextEvent, resetContextStoreForTests, writeContextObservation, writeProcessedProjection } from '../../src/store/context-store.js';
 import { chatGetEvent, chatSearchFts, createMemoryToolCaller, memoryGetSources } from '../../src/context/memory-read-tools.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
@@ -97,6 +97,87 @@ describe('memory read tools', () => {
     expect(sources.sourceEventCount).toBe(1);
     expect(sources.sources?.[0]).toMatchObject({ eventId: 'evt-2', status: 'archived', content: 'done' });
     expect(sources.partial).toBe(false);
+  });
+
+  it('returns manual memory projection text when no raw source event exists', () => {
+    const manualMemoryText = [
+      'mock infra server alpha: ssh user@alpha.test.im.codes',
+      'mock infra server beta: ssh user@beta.test.im.codes',
+    ].join('\n');
+    const projection = writeProcessedProjection({
+      namespace: bobRepo,
+      class: 'durable_memory_candidate',
+      sourceEventIds: ['manual-memory:req-1'],
+      summary: manualMemoryText,
+      content: { text: manualMemoryText, manual: true, origin: 'user_note' },
+      origin: 'user_note',
+      createdAt: 1,
+      updatedAt: 1,
+    });
+
+    const sources = memoryGetSources(projection.id, caller('bob', bobRepo));
+    expect(sources.sourceEventCount).toBe(1);
+    expect(sources.partial).toBe(false);
+    expect(sources.sources).toHaveLength(1);
+    expect(sources.sources?.[0]).toMatchObject({
+      eventId: 'manual-memory:req-1',
+      status: 'projection',
+      eventType: 'memory.projection',
+      content: expect.stringContaining('alpha.test.im.codes'),
+    });
+    expect(sources.sources?.[0]?.content).toContain('beta.test.im.codes');
+  });
+
+  it('returns exact observation text by observationId without requiring a projection', () => {
+    const namespace = ensureContextNamespace({ scope: 'user_private', projectId: 'repo', userId: 'bob' }, 10);
+    const observation = writeContextObservation({
+      namespaceId: namespace.id,
+      scope: 'user_private',
+      class: 'note',
+      origin: 'agent_learned',
+      fingerprint: 'obs-source-fp',
+      content: { text: 'mock server alpha credential note uses alpha.test.im.codes' },
+      text: 'mock server alpha credential note uses alpha.test.im.codes',
+      sourceEventIds: ['turn-observation'],
+      state: 'candidate',
+      now: 20,
+    });
+
+    const sources = memoryGetSources({ observationId: observation.id, kind: 'observation' }, caller('bob', { scope: 'user_private', projectId: 'repo', userId: 'bob' }));
+    expect(sources).toMatchObject({
+      observationId: observation.id,
+      sourceEventCount: 1,
+      partial: false,
+      sources: [
+        {
+          eventId: 'turn-observation',
+          status: 'observation',
+          eventType: 'memory.observation.note',
+          content: 'mock server alpha credential note uses alpha.test.im.codes',
+        },
+      ],
+    });
+  });
+
+  it('does not leak observation existence across namespaces', () => {
+    const namespace = ensureContextNamespace({ scope: 'user_private', projectId: 'repo', userId: 'bob' }, 10);
+    const observation = writeContextObservation({
+      namespaceId: namespace.id,
+      scope: 'user_private',
+      class: 'note',
+      origin: 'agent_learned',
+      fingerprint: 'obs-hidden-fp',
+      content: { text: 'hidden observation text' },
+      text: 'hidden observation text',
+      state: 'candidate',
+      now: 20,
+    });
+
+    expect(memoryGetSources({ observationId: observation.id, kind: 'observation' }, caller('bob', bobOtherRepo))).toEqual({
+      observationId: observation.id,
+      sourceEventCount: 0,
+      sources: [],
+    });
   });
 
   it('does not leak cross-namespace projection source counts beyond recency caps', () => {
