@@ -768,7 +768,7 @@ describe('P2pConfigPanel', () => {
     expect(onPersistDaemonConfig).not.toHaveBeenCalled();
     expect(onSave).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
-    expect(screen.getByText(/failed to save p2p settings/i)).toBeDefined();
+    expect(screen.getByText(/failed to save team settings/i)).toBeDefined();
   });
 
   it('reloads panel state when the session P2P preference changes externally', async () => {

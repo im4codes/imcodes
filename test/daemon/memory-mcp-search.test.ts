@@ -4,6 +4,15 @@ import { writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { projectionOwnerCache } from '../../src/daemon/memory-projection-owner-cache.js';
 
+const generateEmbeddingMock = vi.hoisted(() => vi.fn(async () => new Float32Array([1])));
+
+vi.mock('../../src/context/embedding.js', () => ({
+  generateEmbedding: generateEmbeddingMock,
+  cosineSimilarity: (_query: Float32Array, emb: Float32Array) => emb[0] ?? 0,
+  encodeEmbedding: (vec: Float32Array) => Buffer.from(new Uint8Array(vec.buffer.slice(0))),
+  decodeEmbedding: (_buf: Buffer | null) => null,
+}));
+
 describe('memory MCP recall search', () => {
   it('queries cloud memory recall with daemon server credentials and merges local recall fallback', async () => {
     const tempDir = await createIsolatedSharedContextDb('memory-mcp-search');

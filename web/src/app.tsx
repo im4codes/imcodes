@@ -2500,20 +2500,20 @@ export function App() {
         ]);
         if (knownP2pErrors.has(errorCode)) {
           const titleMap: Record<string, string> = {
-            no_configured_targets: 'P2P: no configured participants',
-            no_sessions: 'P2P: no eligible sessions',
-            no_valid_targets: 'P2P: targets not found',
-            no_saved_config: 'P2P: no saved configuration',
-            no_enabled_participants: 'P2P: no participants selected',
-            too_many_participants: 'P2P: too many participants',
+            no_configured_targets: 'Team: no configured participants',
+            no_sessions: 'Team: no eligible sessions',
+            no_valid_targets: 'Team: targets not found',
+            no_saved_config: 'Team: no saved configuration',
+            no_enabled_participants: 'Team: no participants selected',
+            too_many_participants: 'Team: too many participants',
           };
           const bodyMap: Record<string, string> = {
-            no_configured_targets: 'All eligible sessions are opt-out or absent from your saved P2P config. Open the P2P panel and enable the sessions you want to include.',
+            no_configured_targets: 'All eligible sessions are opt-out or absent from your saved Team config. Open the Team panel and enable the sessions you want to include.',
             no_sessions: 'No other active sessions in this project/domain to dispatch to.',
             no_valid_targets: 'The @@ targets you referenced do not match any active sessions.',
-            no_saved_config: 'P2P needs a saved configuration before it can start. Open the P2P settings panel and pick the members you want.',
-            no_enabled_participants: 'Your saved P2P config has no enabled members. Open the panel and check at least one session.',
-            too_many_participants: 'P2P is limited to 5 participants. Open the panel and reduce your selection.',
+            no_saved_config: 'Team needs a saved configuration before it can start. Open the Team settings panel and pick the members you want.',
+            no_enabled_participants: 'Your saved Team config has no enabled members. Open the panel and check at least one session.',
+            too_many_participants: 'Team is limited to 5 participants. Open the panel and reduce your selection.',
           };
           const id = Date.now() + Math.random();
           setToasts((prev) => [...prev, {
@@ -2521,7 +2521,7 @@ export function App() {
             sessionName: '',
             project: '',
             kind: 'notification',
-            title: titleMap[errorCode] ?? 'P2P send failed',
+            title: titleMap[errorCode] ?? 'Team send failed',
             message: bodyMap[errorCode] ?? errorCode,
           }]);
           setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
