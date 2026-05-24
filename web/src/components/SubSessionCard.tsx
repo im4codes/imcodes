@@ -39,6 +39,7 @@ const TYPE_ICON: Record<string, string> = {
   'qwen': '千',
   'gemini': '♊',
   'gemini-sdk': '♊',
+  'kimi-sdk': '月',
   'shell': '🐚',
   'script': '🔄',
 };

@@ -96,16 +96,17 @@ describe('NewSessionDialog', () => {
     const optgroups = Array.from(select.querySelectorAll('optgroup'));
     expect(optgroups.map((group) => group.label)).toEqual(['SDK', 'CLI']);
     const options = Array.from(select.options).map((o) => o.value);
-    expect(options.slice(0, 7)).toEqual([
+    expect(options.slice(0, 8)).toEqual([
       'claude-code-sdk',
       'codex-sdk',
       'copilot-sdk',
       'cursor-headless',
       'gemini-sdk',
+      'kimi-sdk',
       'qwen',
       'openclaw',
     ]);
-    expect(options.slice(7)).toEqual([
+    expect(options.slice(8)).toEqual([
       'claude-code',
       'codex',
       'opencode',
@@ -627,6 +628,45 @@ describe('NewSessionDialog', () => {
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'gemini-sdk',
       requestedModel: 'auto',
+    }));
+  });
+
+  it('uses dynamically discovered kimi-sdk models when starting a session', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    agentTypeSelect.value = 'kimi-sdk';
+    fireEvent.input(agentTypeSelect, { target: { value: 'kimi-sdk' } });
+
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((call) => (
+        call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'kimi-sdk'
+      ))).toBe(true);
+    });
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'kimi-sdk'
+    ))?.[0];
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'kimi-sdk',
+      requestId: request?.requestId,
+      models: [
+        { id: 'moonshot-v1-auto', name: 'Moonshot Auto' },
+        { id: 'moonshot-v1-auto,thinking', name: 'Moonshot Auto Thinking' },
+      ],
+    }));
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'moonshot-v1-auto,thinking' })).toBeDefined());
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[1], { target: { value: 'moonshot-v1-auto,thinking' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'kimi-sdk',
+      requestedModel: 'moonshot-v1-auto,thinking',
     }));
   });
 });

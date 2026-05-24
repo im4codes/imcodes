@@ -945,11 +945,13 @@ export async function relaunchSessionWithSettings(
     && record.agentType === targetAgentType
     // Qwen uses providerSessionId as its real resume key, so explicit restart must
     // preserve it. Claude/Codex SDKs keep their provider continuity in ccSessionId /
-    // codexSessionId and therefore use a fresh local route key on relaunch.
+    // codexSessionId; Kimi uses providerResumeId, so these providers use a fresh
+    // local route key on relaunch.
     && targetAgentType !== 'claude-code-sdk'
     && targetAgentType !== 'codex-sdk'
     && targetAgentType !== 'copilot-sdk'
     && targetAgentType !== 'cursor-headless'
+    && targetAgentType !== 'kimi-sdk'
     && typeof record.providerSessionId === 'string'
     && record.providerSessionId.length > 0;
 
@@ -973,6 +975,9 @@ export async function relaunchSessionWithSettings(
       bindExistingKey: record.providerSessionId,
       skipCreate: true,
     } : {}),
+    ...((targetAgentType === 'copilot-sdk' || targetAgentType === 'cursor-headless' || targetAgentType === 'kimi-sdk') && record.providerResumeId
+      ? { providerResumeId: record.providerResumeId }
+      : {}),
     ...compatibleIds,
     ...(record.parentSession ? { parentSession: record.parentSession } : {}),
     ...(record.userCreated ? { userCreated: true } : {}),
@@ -1111,7 +1116,7 @@ async function recoverTransportRuntimeAfterError(
       ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
       ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
       ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
-      ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk') && record.providerResumeId
+      ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk' || record.agentType === 'kimi-sdk') && record.providerResumeId
         ? { providerResumeId: record.providerResumeId }
         : {}),
       ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
@@ -1252,7 +1257,7 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
         next.codexSessionId = info.resumeId;
         changed = true;
       }
-      if ((agentType === 'cursor-headless' || agentType === 'copilot-sdk') && next.providerResumeId !== info.resumeId) {
+      if ((agentType === 'cursor-headless' || agentType === 'copilot-sdk' || agentType === 'kimi-sdk') && next.providerResumeId !== info.resumeId) {
         next.providerResumeId = info.resumeId;
         changed = true;
       }
@@ -1411,13 +1416,14 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk'
         || s.providerId === 'codex-sdk'
         || s.providerId === 'cursor-headless'
-        || s.providerId === 'copilot-sdk';
+        || s.providerId === 'copilot-sdk'
+        || s.providerId === 'kimi-sdk';
       const effectiveSessionKey = freshAfterCancel || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
       const resumeId = s.providerId === 'claude-code-sdk'
         ? s.ccSessionId
         : s.providerId === 'codex-sdk'
           ? s.codexSessionId
-          : (s.providerId === 'cursor-headless' || s.providerId === 'copilot-sdk')
+          : (s.providerId === 'cursor-headless' || s.providerId === 'copilot-sdk' || s.providerId === 'kimi-sdk')
             ? s.providerResumeId
             : undefined;
       let extraEnv: Record<string, string> | undefined;
@@ -1790,7 +1796,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
       await getCodexRuntimeConfig().catch(() => ({})),
       existing,
     );
-  } else if (agentType === 'cursor-headless' || agentType === 'copilot-sdk') {
+  } else if (agentType === 'cursor-headless' || agentType === 'copilot-sdk' || agentType === 'kimi-sdk') {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
     transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
@@ -1854,7 +1860,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         runtimeType: RUNTIME_TYPES.TRANSPORT,
         providerId: provider.id,
         providerSessionId: runtime.providerSessionId ?? undefined,
-        ...((agentType === 'copilot-sdk' || agentType === 'cursor-headless') && transportResumeId
+        ...((agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'kimi-sdk') && transportResumeId
           ? { providerResumeId: transportResumeId }
           : {}),
         ...(agentType === 'claude-code-sdk' && transportResumeId ? { ccSessionId: transportResumeId } : {}),

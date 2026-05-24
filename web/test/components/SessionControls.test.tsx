@@ -4308,4 +4308,44 @@ afterEach(() => {
       text: '/model gemini-2.5-flash',
     });
   });
+
+  it('shows dynamically discovered kimi-sdk models and sends /model', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'kimi-sdk-session',
+          agentType: 'kimi-sdk',
+          runtimeType: 'transport',
+          activeModel: 'moonshot-v1-auto',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = ws.send.mock.calls.find((call) => call[0]?.type === 'transport.list_models')?.[0];
+    expect(request).toMatchObject({ type: 'transport.list_models', agentType: 'kimi-sdk' });
+
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'kimi-sdk',
+      requestId: request?.requestId,
+      models: [
+        { id: 'moonshot-v1-auto', name: 'Moonshot Auto' },
+        { id: 'moonshot-v1-auto,thinking', name: 'Moonshot Auto Thinking' },
+      ],
+      defaultModel: 'moonshot-v1-auto,thinking',
+      isAuthenticated: true,
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: /^moonshot-v1-auto$/i }));
+    const menu = document.querySelector('.menu-dropdown') as HTMLElement;
+    fireEvent.click(within(menu).getByRole('button', { name: /moonshot-v1-auto,thinking/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'kimi-sdk-session',
+      text: '/model moonshot-v1-auto,thinking',
+    });
+  });
 });

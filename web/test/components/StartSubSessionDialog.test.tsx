@@ -400,6 +400,29 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
+  it('passes requestedModel for kimi-sdk sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /kimi_sdk/i }));
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'moonshot-v1-auto,thinking' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('kimi-sdk', undefined, '/tmp', undefined, {
+      requestedModel: 'moonshot-v1-auto,thinking',
+    });
+  });
+
   it('passes requestedModel for cursor-headless sub-sessions', () => {
     const onStart = vi.fn();
     render(

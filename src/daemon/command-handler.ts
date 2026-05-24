@@ -610,13 +610,14 @@ function supportsEffort(agentType: string | undefined): agentType is 'claude-cod
     || agentType === 'qwen';
 }
 
-function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' {
+function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' | 'kimi-sdk' {
   return agentType === 'claude-code-sdk'
     || agentType === 'codex-sdk'
     || agentType === 'copilot-sdk'
     || agentType === 'cursor-headless'
     || agentType === 'openclaw'
-    || agentType === 'qwen';
+    || agentType === 'qwen'
+    || agentType === 'kimi-sdk';
 }
 
 // `/compact` is provider-dispatched, not daemon-synthesized. Provider adapters
@@ -636,7 +637,7 @@ async function relaunchFreshTransportConversation(record: SessionRecord): Promis
     name: record.name,
     projectName: record.projectName,
     role: record.role,
-    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen',
+    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' | 'kimi-sdk',
     projectDir: record.projectDir,
     label: record.label,
     description: record.description,
@@ -671,7 +672,7 @@ async function resumeTransportRuntimeAfterLoss(record: SessionRecord): Promise<v
     name: record.name,
     projectName: record.projectName,
     role: record.role,
-    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen',
+    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' | 'kimi-sdk',
     projectDir: record.projectDir,
     label: record.label,
     description: record.description,
@@ -682,7 +683,7 @@ async function resumeTransportRuntimeAfterLoss(record: SessionRecord): Promise<v
     // Thread resume ids back so the provider reuses the same conversation.
     ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
     ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
-    ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk') && record.providerResumeId
+    ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk' || record.agentType === 'kimi-sdk') && record.providerResumeId
       ? { providerResumeId: record.providerResumeId } : {}),
     ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
     ...(record.agentType === 'qwen' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
@@ -1747,7 +1748,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
       return;
     }
-    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'gemini-sdk') {
+    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
       removeSession(`deck_${project}_brain`);
     }
@@ -1757,7 +1758,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       label,
-      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'gemini-sdk',
+      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk',
       extraEnv,
       ccPreset: ccPresetName,
       effort,
@@ -1804,16 +1805,16 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         label,
         effort,
       });
-    } else if (agentType === 'gemini-sdk') {
-      // Gemini SDK shares the codex-sdk shape: fresh launch, optional requested
-      // model, no ccPreset, no resume id (ACP issues a fresh sessionId on the
-      // first turn and persists it via ~/.gemini/tmp/<project>/chats/).
-      logger.info({ project }, 'SDK fresh session.start launching new Gemini SDK main session');
+    } else if (agentType === 'gemini-sdk' || agentType === 'kimi-sdk') {
+      // ACP SDK providers share the codex-sdk shape: fresh launch, optional
+      // requested model, no ccPreset. The provider emits a durable resume id
+      // after the first real ACP session is created.
+      logger.info({ project, agentType }, 'SDK fresh session.start launching ACP SDK main session');
       await launchTransportSession({
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',
-        agentType: 'gemini-sdk',
+        agentType: agentType as 'gemini-sdk' | 'kimi-sdk',
         projectDir: dir,
         fresh: true,
         ...(requestedModel ? { requestedModel } : {}),
@@ -3371,7 +3372,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
-      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'gemini-sdk') && modelMatch) {
+      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk') && modelMatch) {
         const nextModel = modelMatch[1];
         transportRuntime.setAgentId(nextModel);
         const nextRecord = {
@@ -4834,7 +4835,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         bindExistingKey,
         ...(ccPreset ? { ccPreset } : {}),
         ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
-        ...(type === 'codex-sdk' ? { fresh: true } : {}),
+        ...(type === 'codex-sdk' || type === 'kimi-sdk' ? { fresh: true } : {}),
         ...(effort ? { effort } : {}),
         userCreated: true,
         parentSession: parentSession || undefined,
@@ -8330,7 +8331,7 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
   let provider = getProvider(agentType);
 
   // Auto-connect local providers if missing, so we can probe for models
-  if (!provider && (agentType === 'gemini-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
+  if (!provider && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
     try {
       provider = await ensureProviderConnected(agentType, {});
     } catch (err) {

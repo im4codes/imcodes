@@ -66,6 +66,7 @@ type AgentType =
   | "opencode"
   | "gemini"
   | "gemini-sdk"
+  | "kimi-sdk"
   | "openclaw"
   | "qwen";
 type OpenClawMode = "new" | "bind";
@@ -403,6 +404,7 @@ export function NewSessionDialog({
           || agentType === "copilot-sdk"
           || agentType === "cursor-headless"
           || agentType === "gemini-sdk"
+          || agentType === "kimi-sdk"
           || agentType === "qwen") &&
         requestedModel.trim()
       ) {
@@ -426,7 +428,7 @@ export function NewSessionDialog({
   const agentFlavor =
     agentType === "claude-code" || agentType === "codex"
       ? "cli"
-      : agentType === "claude-code-sdk" || agentType === "codex-sdk"
+      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "kimi-sdk"
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
@@ -449,6 +451,7 @@ export function NewSessionDialog({
     || agentType === "copilot-sdk"
     || agentType === "cursor-headless"
     || agentType === "gemini-sdk"
+    || agentType === "kimi-sdk"
     || (agentType === "qwen" && !!selectedCcPreset);
   const dynamicModelsAgentType = supportsDynamicTransportModels(agentType)
     ? agentType

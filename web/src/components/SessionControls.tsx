@@ -939,7 +939,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isCopilot = activeSession?.agentType === 'copilot-sdk';
   const isCursorHeadless = activeSession?.agentType === 'cursor-headless';
   const isGeminiSdk = activeSession?.agentType === 'gemini-sdk';
-  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isGeminiSdk;
+  const isKimiSdk = activeSession?.agentType === 'kimi-sdk';
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isGeminiSdk || isKimiSdk;
   // Source-of-truth priority for the model picker:
   //   1. `useTransportModels` — live daemon probe via `transport.list_models`
   //      WS round-trip. Works uniformly for main sessions AND sub-sessions
@@ -973,12 +974,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (isGeminiSdk) {
       return GEMINI_SDK_MODEL_SUGGESTIONS;
     }
+    if (isKimiSdk) {
+      return dynamicTransportModels.models.map((m) => m.id);
+    }
     return [];
   }, [
     dynamicTransportModels.models,
     isCopilot,
     isCursorHeadless,
     isGeminiSdk,
+    isKimiSdk,
     activeSession?.copilotAvailableModels,
     activeSession?.cursorAvailableModels,
   ]);

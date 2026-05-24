@@ -113,6 +113,8 @@ const BADGE_MAP: Record<string, string> = {
   'openclaw': 'oc',
   'qwen': 'qw',
   'gemini': 'gm',
+  'gemini-sdk': 'gm',
+  'kimi-sdk': 'km',
   'shell': 'sh',
   'script': 'sc',
 };

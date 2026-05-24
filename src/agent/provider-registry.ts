@@ -92,6 +92,10 @@ async function createProvider(id: string): Promise<TransportProvider> {
       const { GeminiSdkProvider } = await import('./providers/gemini-sdk.js');
       return new GeminiSdkProvider();
     }
+    case 'kimi-sdk': {
+      const { KimiSdkProvider } = await import('./providers/kimi-sdk.js');
+      return new KimiSdkProvider();
+    }
     case 'claude-code-sdk': {
       const { ClaudeCodeSdkProvider } = await import('./providers/claude-code-sdk.js');
       return new ClaudeCodeSdkProvider();

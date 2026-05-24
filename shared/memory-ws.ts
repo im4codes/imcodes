@@ -68,6 +68,7 @@ export type MemoryWsType = typeof MEMORY_WS[keyof typeof MEMORY_WS];
 export const MEMORY_MCP_PROVIDER_ID = {
   CLAUDE_CODE_SDK: 'claude-code-sdk',
   GEMINI_SDK: 'gemini-sdk',
+  KIMI_SDK: 'kimi-sdk',
   COPILOT_SDK: 'copilot-sdk',
   CODEX_SDK: 'codex-sdk',
   CURSOR_HEADLESS: 'cursor-headless',
@@ -77,6 +78,7 @@ export const MEMORY_MCP_PROVIDER_ID = {
 export const MEMORY_MCP_PROVIDER_IDS = [
   MEMORY_MCP_PROVIDER_ID.CLAUDE_CODE_SDK,
   MEMORY_MCP_PROVIDER_ID.GEMINI_SDK,
+  MEMORY_MCP_PROVIDER_ID.KIMI_SDK,
   MEMORY_MCP_PROVIDER_ID.COPILOT_SDK,
   MEMORY_MCP_PROVIDER_ID.CODEX_SDK,
   MEMORY_MCP_PROVIDER_ID.CURSOR_HEADLESS,

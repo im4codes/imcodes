@@ -10,6 +10,7 @@ export const SESSION_AGENT_TYPES = [
   'gemini',
   'qwen',
   'openclaw',
+  'kimi-sdk',
   'shell',
   'script',
 ] as const;
@@ -24,6 +25,7 @@ export const TRANSPORT_SESSION_AGENT_TYPES = [
   'copilot-sdk',
   'cursor-headless',
   'gemini-sdk',
+  'kimi-sdk',
   'qwen',
   'openclaw',
 ] as const;

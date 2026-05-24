@@ -302,7 +302,8 @@
       "codex_cli": "Codex CLI",
       "copilot_sdk": "Copilot",
       "cursor_headless": "Cursor",
-      "gemini_sdk": "Gemini SDK"
+      "gemini_sdk": "Gemini SDK",
+      "kimi_sdk": "Kimi Code"
     },
     "agentGroup": {
       "transport_sdk": "SDK",
@@ -1673,6 +1674,7 @@
       "mcpProviderStatusHint": "MCP 固有の状態はプロバイダー接続とは別に報告されます。",
       "mcpProviderClaudeSdk": "Claude SDK",
       "mcpProviderGeminiAcp": "Gemini ACP",
+      "mcpProviderKimiAcp": "Kimi ACP",
       "mcpProviderCopilotSdk": "Copilot SDK",
       "mcpProviderCodexSdk": "Codex SDK",
       "mcpProviderCursorHeadless": "Cursor headless",

@@ -722,6 +722,25 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('passes requestedModel when starting a kimi-sdk main session', async () => {
+    handleWebCommand({
+      type: 'session.start',
+      project: 'transport',
+      dir: '/proj',
+      agentType: 'kimi-sdk',
+      requestedModel: 'moonshot-v1-auto,thinking',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'kimi-sdk',
+      projectDir: '/proj',
+      fresh: true,
+      requestedModel: 'moonshot-v1-auto,thinking',
+    }));
+  });
+
   it('dispatches /clear as a fresh openclaw relaunch that preserves the provider key', async () => {
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',
@@ -3129,6 +3148,38 @@ describe('handleWebCommand transport queue behavior', () => {
       requestedModel: 'auto',
       activeModel: 'auto',
       modelDisplay: 'auto',
+    }));
+  });
+
+  it('switches model for kimi-sdk transport sessions via /model', async () => {
+    const setAgentId = vi.fn();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'kimi-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      requestedModel: 'moonshot-v1-auto',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-1',
+      setAgentId,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model moonshot-v1-auto,thinking',
+      commandId: 'cmd-model-kimi',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setAgentId).toHaveBeenCalledWith('moonshot-v1-auto,thinking');
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      requestedModel: 'moonshot-v1-auto,thinking',
+      activeModel: 'moonshot-v1-auto,thinking',
+      modelDisplay: 'moonshot-v1-auto,thinking',
     }));
   });
 

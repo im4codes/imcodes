@@ -77,6 +77,7 @@ describe('buildProviderContextPayload', () => {
     const providerIds = [
       'claude-code-sdk',
       'gemini-sdk',
+      'kimi-sdk',
       'copilot-sdk',
       'codex-sdk',
       'cursor-headless',

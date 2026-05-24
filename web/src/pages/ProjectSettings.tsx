@@ -29,7 +29,7 @@ export function ProjectSettings({ apiKey, serverId, projectName, onSaved, onCanc
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const agentTypes = ['claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'copilot-sdk', 'cursor-headless', 'opencode', 'gemini', 'qwen'];
+  const agentTypes = ['claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'copilot-sdk', 'cursor-headless', 'opencode', 'gemini', 'gemini-sdk', 'kimi-sdk', 'qwen'];
 
   useEffect(() => {
     fetch(`/api/server/${serverId}/projects/${projectName}`, {
