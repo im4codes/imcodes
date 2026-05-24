@@ -81,6 +81,8 @@ function makeEnv(db: Database): Env {
 function makeMockDb(opts: {
   personalRows?: MockRow[];
   enterpriseRows?: (MockRow & { enterprise_id: string })[];
+  lexicalPersonalRows?: MockRow[];
+  lexicalEnterpriseRows?: (MockRow & { enterprise_id: string })[];
   runtimeConfig?: Record<string, unknown> | null;
 } = {}) {
   const executeLog: Array<{ sql: string; params: unknown[] }> = [];
@@ -95,6 +97,15 @@ function makeMockDb(opts: {
     },
     query: async <T = unknown>(sql: string, _params: unknown[] = []) => {
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+      // Lexical fallback queries
+      if (normalized.includes('lower(p.summary) like')) {
+        if (normalized.includes("p.scope = 'personal' and p.user_id =")) {
+          return (opts.lexicalPersonalRows ?? opts.personalRows ?? []) as T[];
+        }
+        if (normalized.includes('join team_members tm on')) {
+          return (opts.lexicalEnterpriseRows ?? opts.enterpriseRows ?? []) as T[];
+        }
+      }
       // Personal memory query
       if (normalized.includes("where scope = 'personal' and user_id =") || normalized.includes("where p.scope = 'personal' and p.user_id =")) {
         return (opts.personalRows ?? []) as T[];
@@ -603,6 +614,48 @@ describe('memory recall endpoint — I.5', () => {
     expect(json.vectorSearch).toBe(true);
     expect(json.results[0].id).toBe('en-result');
     expect(json.results[0].summary).toContain('Resolved WebSocket reconnect race');
+  });
+
+  it('keeps exact lexical matches when vector search misses durable infrastructure facts', async () => {
+    generateEmbeddingMock.mockResolvedValueOnce(new Float32Array([0.4, 0.2, 0.1]));
+    embeddingToSqlMock.mockReturnValue('[0.4,0.2,0.1]');
+    const now = Date.now();
+    const { db } = makeMockDb({
+      personalRows: [
+        {
+          id: 'semantic-neighbor',
+          project_id: 'github.com/im4codes/imcodes',
+          projection_class: 'recent_summary',
+          summary: 'Deployment workflow notes for IM.codes server upgrades',
+          updated_at: now,
+          score: 0.72,
+        },
+      ],
+      lexicalPersonalRows: [
+        {
+          id: 'infra-exact',
+          project_id: 'github.com/im4codes/imcodes',
+          projection_class: 'durable_memory_candidate',
+          summary: 'im服务器(78服务器): ssh root@116.62.239.78',
+          updated_at: now - 1_000,
+          score: 1,
+        },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, {
+      query: 'im服务器 78服务器 116.62.239.78',
+      projectId: 'github.com/im4codes/imcodes',
+    });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { vectorSearch: boolean; results: Array<{ id: string; summary: string; class: string }> };
+    expect(json.vectorSearch).toBe(true);
+    expect(json.results[0]).toMatchObject({
+      id: 'infra-exact',
+      class: 'durable_memory_candidate',
+      summary: expect.stringContaining('116.62.239.78'),
+    });
   });
 
   // ── originServerId — memory-source-server-routing change ───────────────

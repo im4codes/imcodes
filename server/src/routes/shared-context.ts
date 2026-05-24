@@ -204,6 +204,10 @@ function matchesMemoryQuery(summary: string, content: unknown, query: string): b
   return `${summary}\n${JSON.stringify(content ?? {})}`.toLowerCase().includes(normalized);
 }
 
+function escapeSqlLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
 type MemoryStatsRow = {
   total_records?: number | null;
   recent_summary_count?: number | null;
@@ -1507,12 +1511,14 @@ sharedContextRoutes.post('/document-bindings/:bindingId/deactivate', async (c) =
   return c.json({ ok: true, bindingId, status: 'inactive' });
 });
 
-// ── Memory recall — pgvector cosine search with pg_trgm fallback ────────────
+// ── Memory recall — pgvector cosine search with lexical/pg_trgm fallback ────
 
 /**
  * POST /:id/shared-context/memory/recall
  * Searches personal + enterprise memory using pgvector embedding similarity.
- * Falls back to pg_trgm when embedding model is unavailable.
+ * Always merges an exact lexical fallback so durable facts like hostnames,
+ * IPs, ports, IDs, and shell commands cannot be missed by vector ranking.
+ * Falls back further to pg_trgm when embedding model is unavailable.
  * Used by daemon send path to auto-inject relevant memories into agent prompts.
  */
 sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
@@ -1593,12 +1599,49 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
 
   let personalRows: RecallRow[];
   let enterpriseRows: RecallRow[];
+  const escapedLikeQuery = `%${escapeSqlLikePattern(query.trim().toLowerCase())}%`;
+
+  const loadPersonalLexicalRows = () => c.env.DB.query<RecallRow>(
+    `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
+            p.hit_count, p.last_used_at, p.enterprise_id, p.server_id AS origin_server_id,
+            1.0 AS score
+       FROM shared_context_projections p
+      WHERE p.scope = 'personal' AND p.user_id = $1
+        AND COALESCE(p.status, 'active') = 'active'
+        ${projectId ? 'AND p.project_id = $2' : ''}
+        AND (
+          LOWER(p.summary) LIKE $${projectId ? 3 : 2} ESCAPE '\\'
+          OR LOWER(COALESCE(p.content_json::text, '')) LIKE $${projectId ? 3 : 2} ESCAPE '\\'
+        )
+      ORDER BY p.updated_at DESC
+      LIMIT $${projectId ? 4 : 3}`,
+    [userId, ...(projectId ? [projectId] : []), escapedLikeQuery, candidateLimit],
+  );
+
+  const loadEnterpriseLexicalRows = () => c.env.DB.query<RecallRow>(
+    `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
+            p.hit_count, p.last_used_at, p.enterprise_id, p.server_id AS origin_server_id,
+            1.0 AS score
+       FROM shared_context_projections p
+       JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $1
+       JOIN unnest($2::text[]) AS allowed_scope(scope) ON allowed_scope.scope = p.scope
+      WHERE COALESCE(p.status, 'active') = 'active'
+        ${projectId ? 'AND p.project_id = $3' : ''}
+        AND (
+          LOWER(p.summary) LIKE $${projectId ? 4 : 3} ESCAPE '\\'
+          OR LOWER(COALESCE(p.content_json::text, '')) LIKE $${projectId ? 4 : 3} ESCAPE '\\'
+        )
+      ORDER BY p.updated_at DESC
+      LIMIT $${projectId ? 5 : 4}`,
+    [userId, [...REPLICABLE_SHARED_PROJECTION_SCOPES], ...(projectId ? [projectId] : []), escapedLikeQuery, candidateLimit],
+  );
 
   if (queryEmbedding) {
     const vecSql = embeddingToSql(queryEmbedding);
 
     // pgvector cosine distance: <=> returns distance (0 = identical), convert to similarity
-    personalRows = await c.env.DB.query<RecallRow>(
+    const [personalVectorRows, enterpriseVectorRows, personalLexicalRows, enterpriseLexicalRows] = await Promise.all([
+      c.env.DB.query<RecallRow>(
       `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
               p.hit_count, p.last_used_at, p.enterprise_id, p.server_id AS origin_server_id,
               1 - (e.embedding <=> $1::vector) AS score
@@ -1610,9 +1653,8 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
        ORDER BY e.embedding <=> $1::vector
        LIMIT $${projectId ? 4 : 3}`,
       [vecSql, userId, ...(projectId ? [projectId] : []), candidateLimit],
-    );
-
-    enterpriseRows = await c.env.DB.query<RecallRow>(
+      ),
+      c.env.DB.query<RecallRow>(
       `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
               p.hit_count, p.last_used_at, p.enterprise_id, p.server_id AS origin_server_id,
               1 - (e.embedding <=> $1::vector) AS score
@@ -1625,10 +1667,18 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
        ORDER BY e.embedding <=> $1::vector
        LIMIT $${projectId ? 5 : 4}`,
       [vecSql, userId, [...REPLICABLE_SHARED_PROJECTION_SCOPES], ...(projectId ? [projectId] : []), candidateLimit],
-    );
+      ),
+      loadPersonalLexicalRows(),
+      loadEnterpriseLexicalRows(),
+    ]);
+    personalRows = [...personalLexicalRows, ...personalVectorRows];
+    enterpriseRows = [...enterpriseLexicalRows, ...enterpriseVectorRows];
   } else {
-    // Fallback: pg_trgm text similarity (for when embedding model is unavailable)
-    personalRows = await c.env.DB.query<RecallRow>(
+    // Fallback: exact lexical + pg_trgm text similarity (for when embedding model is unavailable)
+    const [personalLexicalRows, enterpriseLexicalRows, personalTrigramRows, enterpriseTrigramRows] = await Promise.all([
+      loadPersonalLexicalRows(),
+      loadEnterpriseLexicalRows(),
+      c.env.DB.query<RecallRow>(
       `SELECT id, project_id, projection_class, summary, updated_at,
               hit_count, last_used_at, enterprise_id, server_id AS origin_server_id,
               similarity(summary, $1) AS score
@@ -1640,9 +1690,8 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
        ORDER BY score DESC
        LIMIT $${projectId ? 4 : 3}`,
       [query, userId, ...(projectId ? [projectId] : []), candidateLimit],
-    );
-
-    enterpriseRows = await c.env.DB.query<RecallRow>(
+      ),
+      c.env.DB.query<RecallRow>(
       `SELECT p.id, p.project_id, p.projection_class, p.summary, p.updated_at,
               p.hit_count, p.last_used_at, p.enterprise_id, p.server_id AS origin_server_id,
               similarity(p.summary, $1) AS score
@@ -1655,7 +1704,10 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
        ORDER BY score DESC
        LIMIT $${projectId ? 5 : 4}`,
       [query, userId, [...REPLICABLE_SHARED_PROJECTION_SCOPES], ...(projectId ? [projectId] : []), candidateLimit],
-    );
+      ),
+    ]);
+    personalRows = [...personalLexicalRows, ...personalTrigramRows];
+    enterpriseRows = [...enterpriseLexicalRows, ...enterpriseTrigramRows];
   }
 
   // Merge, deduplicate by id, sort by composite relevance score.
