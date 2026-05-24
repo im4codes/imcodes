@@ -3203,7 +3203,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   data-active={dropdownActiveTab === 'workflows' ? 'true' : 'false'}
                   onClick={() => setDropdownActiveTab('workflows')}
                 >
-                  {t('p2p.dropdown.tab_workflows', 'Workflows')}
+                  <span>{t('p2p.dropdown.tab_workflows', 'Workflows')}</span>
+                  <span class="p2p-alpha-badge" title={t('p2p.alpha_hint', 'Experimental capability; not formally validated yet.')}>
+                    {t('p2p.alpha_badge', 'Alpha')}
+                  </span>
                 </button>
               </div>
               {dropdownActiveTab === 'combos' ? (

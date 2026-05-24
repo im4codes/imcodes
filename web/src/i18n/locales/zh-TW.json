@@ -735,7 +735,7 @@
       "brainstorm": "腦力激盪",
       "discuss": "討論"
     },
-    "team_button": "Team",
+    "team_button": "團隊",
     "mode_config": "配置",
     "dropdown": {
       "tab_combos": "組合流程",
@@ -750,10 +750,13 @@
     "settings_title": "團隊討論設定",
     "settings_process_title": "團隊討論流程",
     "settings_process_body": "Team 模式會執行「討論 → 總結 → 實施 → 複核」閉環。1 輪只跑一次閉環；多輪會把上一輪實施結果作為新上下文繼續稽核/複核，讓代理補齊遺漏需求、回歸風險、邊界場景和測試缺口，再視為任務完成。",
+    "alpha_badge": "Alpha",
+    "alpha_hint": "實驗能力，尚未正式投入驗證。",
     "cross_session": "包含其他專案的工作階段",
     "tab": {
       "advanced_workflow": "進階工作流",
       "advanced_workflow_intro": "設計有向 團隊 工作流。節點為智慧代理輪次（LLM、腳本或邏輯判定），邊用於控制路由。在此編輯會覆寫「智慧代理」分頁中設定的簡易輪次/模式流水線。",
+      "advanced_workflow_alpha_notice": "實驗能力，尚未正式投入驗證。關鍵任務建議優先使用預設組合流程。",
       "advanced_workflow_empty_hint": "正在初始化空白工作流草稿。請在下方畫布中加入節點與邊，編排你的 團隊 流程。",
       "advanced_workflow_starter_title": "未命名工作流",
       "advanced_workflow_starter_node_title": "起始節點"

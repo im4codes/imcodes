@@ -734,7 +734,7 @@
       "brainstorm": "Lluvia de ideas",
       "discuss": "Discusión"
     },
-    "team_button": "Team",
+    "team_button": "Equipo",
     "mode_config": "Config",
     "dropdown": {
       "tab_combos": "Combos",
@@ -749,10 +749,13 @@
     "settings_title": "Ajustes de discusión Team",
     "settings_process_title": "Flujo de discusión Team",
     "settings_process_body": "El modo Team ejecuta un ciclo de discusión, resumen, implementación y revisión. Una ronda completa el ciclo una vez; las rondas adicionales usan el resultado anterior como contexto para otra auditoría/revisión, de modo que los agentes puedan detectar requisitos omitidos, riesgos de regresión, casos límite y huecos de pruebas antes de dar el trabajo por terminado.",
+    "alpha_badge": "Alpha",
+    "alpha_hint": "Capacidad experimental; aún no está validada formalmente.",
     "cross_session": "Incluir sesiones de otros proyectos",
     "tab": {
       "advanced_workflow": "Flujo de trabajo avanzado",
       "advanced_workflow_intro": "Diseña un flujo de trabajo Team dirigido. Los nodos son rondas de agentes (LLM, script o puertas lógicas); las aristas controlan el enrutamiento. Las ediciones aquí anulan la canalización simple de rondas/modos configurada en Agentes.",
+      "advanced_workflow_alpha_notice": "Capacidad experimental; aún no está validada formalmente. Para trabajo crítico, usa los combos predefinidos.",
       "advanced_workflow_empty_hint": "Inicializando un borrador de flujo de trabajo en blanco. Añade nodos y aristas en el lienzo de abajo para diseñar tu canalización Team.",
       "advanced_workflow_starter_title": "Flujo de trabajo sin título",
       "advanced_workflow_starter_node_title": "Inicio"

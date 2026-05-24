@@ -734,7 +734,7 @@
       "brainstorm": "ブレインストーミング",
       "discuss": "ディスカッション"
     },
-    "team_button": "Team",
+    "team_button": "チーム",
     "mode_config": "設定",
     "dropdown": {
       "tab_combos": "コンボ",
@@ -749,10 +749,13 @@
     "settings_title": "Team ディスカッション設定",
     "settings_process_title": "Team ディスカッションの流れ",
     "settings_process_body": "Team モードは、討議・要約・実装・レビューのループを実行します。1 ラウンドはこのループを 1 回完了し、追加ラウンドでは前回の実装結果を文脈としてもう一度監査/レビューを行い、漏れた要件、回帰リスク、境界ケース、テスト不足を検出してから完了とみなします。",
+    "alpha_badge": "Alpha",
+    "alpha_hint": "実験的な機能で、まだ正式には検証されていません。",
     "cross_session": "他のプロジェクトのセッションを含める",
     "tab": {
       "advanced_workflow": "高度なワークフロー",
       "advanced_workflow_intro": "有向 Team ワークフローを設計します。ノードはエージェントのラウンド（LLM・スクリプト・論理ゲート）、エッジはルーティングを制御します。ここでの編集は「エージェント」タブで構成された簡易ラウンド/モードパイプラインを上書きします。",
+      "advanced_workflow_alpha_notice": "実験的な機能で、まだ正式には検証されていません。重要な作業ではプリセットコンボを優先してください。",
       "advanced_workflow_empty_hint": "空のワークフロー下書きを初期化中です。下のキャンバスでノードとエッジを追加し、Team パイプラインを設計してください。",
       "advanced_workflow_starter_title": "無題のワークフロー",
       "advanced_workflow_starter_node_title": "開始"

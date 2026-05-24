@@ -1037,7 +1037,10 @@ export function P2pConfigPanel({
             onClick={() => setActiveTab('advanced')}
             data-testid="p2p-tab-advanced"
           >
-            {t('p2p.tab.advanced_workflow', '高级工作流')}
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <span>{t('p2p.tab.advanced_workflow', '高级工作流')}</span>
+              <span class="p2p-alpha-badge">{t('p2p.alpha_badge', 'Alpha')}</span>
+            </span>
           </button>
         </div>
 
@@ -1227,6 +1230,14 @@ export function P2pConfigPanel({
                   data-testid="p2p-advanced-tab-intro"
                 >
                   {t('p2p.tab.advanced_workflow_intro', 'Design a directed Team workflow. Nodes are agent rounds (LLM, script, or logic gates); edges control routing. Edits here override the simple round/mode pipeline configured under Agents.')}
+                </div>
+                <div
+                  class="p2p-alpha-notice"
+                  data-testid="p2p-advanced-alpha-notice"
+                  title={t('p2p.alpha_hint', 'Experimental capability; not formally validated yet.')}
+                >
+                  <span class="p2p-alpha-badge">{t('p2p.alpha_badge', 'Alpha')}</span>
+                  <span>{t('p2p.tab.advanced_workflow_alpha_notice', 'Experimental capability; not formally validated yet. Prefer preset combos for critical work.')}</span>
                 </div>
 
                 {(advancedMigrationNeeded || workflowLaunchEnvelope) && (

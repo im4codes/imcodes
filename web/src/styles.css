@@ -538,6 +538,10 @@ body {
   flex: 1;
   margin: 0;
   padding: 6px 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
   text-align: center;
   color: #94a3b8;
   font-size: 11px;
@@ -550,6 +554,35 @@ body {
   box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.2);
 }
 .p2p-dropdown-tab.menu-item:hover { color: #e2e8f0; }
+.p2p-alpha-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 5px;
+  border: 1px solid rgba(251, 191, 36, 0.38);
+  border-radius: 999px;
+  background: rgba(251, 191, 36, 0.12);
+  color: #fbbf24;
+  font-size: 9px;
+  font-weight: 850;
+  line-height: 1.2;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.p2p-alpha-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 9px 11px;
+  border: 1px solid rgba(251, 191, 36, 0.34);
+  border-radius: 8px;
+  background: rgba(120, 53, 15, 0.18);
+  color: #fef3c7;
+  font-size: 12px;
+  line-height: 1.45;
+}
 .p2p-dropdown-combo-item {
   display: flex;
   align-items: center;

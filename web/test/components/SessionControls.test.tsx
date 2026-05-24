@@ -926,6 +926,7 @@ afterEach(() => {
     expect(screen.queryByText(/^mode_audit→mode_plan$/i)).toBeNull();
     expect(screen.queryByText(/^mode_review→mode_plan$/i)).toBeNull();
     expect(screen.getByText(/mode_audit→mode_review→mode_plan/i)).toBeDefined();
+    expect(within(screen.getByTestId('p2p-dropdown-tab-workflows')).getByText('alpha_badge')).toBeDefined();
   });
 
   it('puts the global rounds selector at the top of the P2P dropdown and saves changes', async () => {

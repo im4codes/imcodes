@@ -734,7 +734,7 @@
       "brainstorm": "브레인스토밍",
       "discuss": "토론"
     },
-    "team_button": "Team",
+    "team_button": "팀",
     "mode_config": "설정",
     "dropdown": {
       "tab_combos": "콤보",
@@ -749,10 +749,13 @@
     "settings_title": "Team 토론 설정",
     "settings_process_title": "Team 토론 흐름",
     "settings_process_body": "Team 모드는 토론, 요약, 구현, 검토 루프를 실행합니다. 1라운드는 루프를 한 번 완료하며, 추가 라운드는 이전 구현 결과를 새 컨텍스트로 삼아 다시 감사/검토하므로 누락된 요구사항, 회귀 위험, 경계 사례, 테스트 공백을 더 잘 잡아낸 뒤 작업을 완료 상태로 봅니다.",
+    "alpha_badge": "Alpha",
+    "alpha_hint": "실험 기능이며 아직 공식 검증되지 않았습니다.",
     "cross_session": "다른 프로젝트의 세션 포함",
     "tab": {
       "advanced_workflow": "고급 워크플로",
       "advanced_workflow_intro": "유향 Team 워크플로를 설계합니다. 노드는 에이전트 라운드(LLM, 스크립트, 논리 게이트)이며 엣지가 라우팅을 제어합니다. 여기에서 편집한 내용은 「에이전트」 탭에서 구성한 간단한 라운드/모드 파이프라인을 재정의합니다.",
+      "advanced_workflow_alpha_notice": "실험 기능이며 아직 공식 검증되지 않았습니다. 중요한 작업에는 기본 콤보를 우선 사용하세요.",
       "advanced_workflow_empty_hint": "빈 워크플로 초안을 초기화하는 중입니다. 아래 캔버스에서 노드와 엣지를 추가해 Team 파이프라인을 설계하세요.",
       "advanced_workflow_starter_title": "이름 없는 워크플로",
       "advanced_workflow_starter_node_title": "시작"

@@ -735,7 +735,7 @@
       "brainstorm": "头脑风暴",
       "discuss": "讨论"
     },
-    "team_button": "Team",
+    "team_button": "团队",
     "mode_config": "配置",
     "dropdown": {
       "tab_combos": "组合流程",
@@ -750,10 +750,13 @@
     "settings_title": "团队讨论设置",
     "settings_process_title": "团队讨论流程",
     "settings_process_body": "Team 模式会执行「讨论 → 总结 → 实施 → 复核」闭环。1 轮只跑一次闭环；多轮会把上一轮实施结果作为新上下文继续审计/复核，让代理补齐遗漏需求、回归风险、边界场景和测试缺口，再认为任务完成。",
+    "alpha_badge": "Alpha",
+    "alpha_hint": "实验能力，尚未正式投入验证。",
     "cross_session": "包含其他项目的会话",
     "tab": {
       "advanced_workflow": "高级工作流",
       "advanced_workflow_intro": "设计有向 团队 工作流。节点为智能体轮次（LLM、脚本或逻辑判定），边用于控制路由。在此编辑会覆盖「智能体」标签页里配置的简易轮次/模式流水线。",
+      "advanced_workflow_alpha_notice": "实验能力，尚未正式投入验证。关键任务建议优先使用预设组合流程。",
       "advanced_workflow_empty_hint": "正在初始化空白工作流草稿。请在下方画布中添加节点与边以编排你的 团队 流程。",
       "advanced_workflow_starter_title": "未命名工作流",
       "advanced_workflow_starter_node_title": "起始节点"
