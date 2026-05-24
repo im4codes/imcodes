@@ -710,6 +710,7 @@
     "combo_custom": "我的組合",
     "combo_custom_empty": "還沒有自訂組合。",
     "combo_builder": "新增組合",
+    "combo_recommended_hint": "適合大多數稽核任務，效果比較穩定。",
     "exclude_same_type": "排除同類型",
     "picker": {
       "back": "返回",
@@ -734,15 +735,21 @@
       "brainstorm": "腦力激盪",
       "discuss": "討論"
     },
+    "team_button": "Team",
     "mode_config": "配置",
     "dropdown": {
       "tab_combos": "組合流程",
       "tab_workflows": "進階工作流",
+      "team_intro_title": "團隊討論",
+      "team_intro_body": "多代理先討論並總結，再落實使用者請求；增加輪數會基於上一輪結果繼續複核與加固。",
+      "team_intro_tooltip": "討論 → 總結 → 實施 → 複核；多輪會把上一輪結果帶入下一輪。",
       "workflows_empty": "尚未保存任何工作流。前往「設定 → 進階工作流」開始設計。",
       "workflows_manage": "管理工作流"
     },
-    "settings_button": "團隊設定",
-    "settings_title": "團隊 參與者設定",
+    "settings_button": "設定",
+    "settings_title": "團隊討論設定",
+    "settings_process_title": "團隊討論流程",
+    "settings_process_body": "Team 模式會執行「討論 → 總結 → 實施 → 複核」閉環。1 輪只跑一次閉環；多輪會把上一輪實施結果作為新上下文繼續稽核/複核，讓代理補齊遺漏需求、回歸風險、邊界場景和測試缺口，再視為任務完成。",
     "cross_session": "包含其他專案的工作階段",
     "tab": {
       "advanced_workflow": "進階工作流",

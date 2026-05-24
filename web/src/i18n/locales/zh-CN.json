@@ -710,6 +710,7 @@
     "combo_custom": "我的组合",
     "combo_custom_empty": "还没有自定义组合。",
     "combo_builder": "添加新组合",
+    "combo_recommended_hint": "适合大多数审计任务，效果比较稳定。",
     "exclude_same_type": "排除同类型",
     "picker": {
       "back": "返回",
@@ -734,15 +735,21 @@
       "brainstorm": "头脑风暴",
       "discuss": "讨论"
     },
+    "team_button": "Team",
     "mode_config": "配置",
     "dropdown": {
       "tab_combos": "组合流程",
       "tab_workflows": "高级工作流",
+      "team_intro_title": "团队讨论",
+      "team_intro_body": "多代理先讨论并总结，再实施用户请求；增加轮数会基于上一轮结果继续复核和加固。",
+      "team_intro_tooltip": "讨论 → 总结 → 实施 → 复核；多轮会把上一轮结果带入下一轮。",
       "workflows_empty": "还没有保存的工作流。打开「设置 → 高级工作流」开始设计。",
       "workflows_manage": "管理工作流"
     },
-    "settings_button": "团队设置",
-    "settings_title": "团队 参与者设置",
+    "settings_button": "设置",
+    "settings_title": "团队讨论设置",
+    "settings_process_title": "团队讨论流程",
+    "settings_process_body": "Team 模式会执行「讨论 → 总结 → 实施 → 复核」闭环。1 轮只跑一次闭环；多轮会把上一轮实施结果作为新上下文继续审计/复核，让代理补齐遗漏需求、回归风险、边界场景和测试缺口，再认为任务完成。",
     "cross_session": "包含其他项目的会话",
     "tab": {
       "advanced_workflow": "高级工作流",

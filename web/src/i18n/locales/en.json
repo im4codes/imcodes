@@ -710,6 +710,7 @@
     "combo_custom": "My Combos",
     "combo_custom_empty": "No custom combos yet.",
     "combo_builder": "Add New Combo",
+    "combo_recommended_hint": "Recommended for most audit tasks.",
     "exclude_same_type": "Exclude same type",
     "picker": {
       "back": "Back",
@@ -734,15 +735,21 @@
       "brainstorm": "Brainstorm",
       "discuss": "Discuss"
     },
+    "team_button": "Team",
     "mode_config": "Config",
     "dropdown": {
       "tab_combos": "Combos",
       "tab_workflows": "Workflows",
+      "team_intro_title": "Team discussion",
+      "team_intro_body": "Agents discuss, summarize, implement, then review the result. Extra rounds repeat the loop to harden the outcome.",
+      "team_intro_tooltip": "Discussion → summary → implementation → review. More rounds repeat the loop on the previous result.",
       "workflows_empty": "No saved workflows yet. Open Settings → Advanced Workflow to design one.",
       "workflows_manage": "Manage workflows"
     },
-    "settings_button": "Team Settings",
-    "settings_title": "Team Participant Settings",
+    "settings_button": "Settings",
+    "settings_title": "Team Discussion Settings",
+    "settings_process_title": "Team discussion flow",
+    "settings_process_body": "Team mode runs a discussion-summary-implementation-review loop. One round completes the loop once; additional rounds use the previous implementation result as context for another audit/review pass so agents can catch missed requirements, regression risks, edge cases, and test gaps before the work is considered done.",
     "cross_session": "Include sessions from other projects",
     "tab": {
       "advanced_workflow": "Advanced Workflow",

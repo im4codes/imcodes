@@ -1105,6 +1105,13 @@ export function P2pConfigPanel({
                   </div>
                 </div>
 
+                <div style={{ ...sectionCardStyle, marginTop: 12 }}>
+                  <div style={{ ...sectionLabelStyle, marginTop: 0 }}>{t('p2p.settings_process_title', 'Team discussion flow')}</div>
+                  <div style={{ fontSize: 12, color: '#94a3b8', lineHeight: 1.5 }}>
+                    {t('p2p.settings_process_body', 'Team mode runs a discussion-summary-implementation-review loop. One round completes the loop once; additional rounds use the previous implementation result as context for another audit/review pass so agents can catch missed requirements, regression risks, edge cases, and test gaps before the work is considered done.')}
+                  </div>
+                </div>
+
                 <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(2, minmax(0, 1fr))', gap: 12, marginTop: 12 }}>
                   <div style={sectionCardStyle}>
                     <div style={{ ...sectionLabelStyle, marginTop: 0 }}>{t('p2p.settings_rounds')}</div>

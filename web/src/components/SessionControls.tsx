@@ -19,7 +19,7 @@ import {
   P2P_CAPABILITY_FRESHNESS_TTL_MS,
   P2P_WORKFLOW_CAPABILITY_V1,
 } from '@shared/p2p-workflow-constants.js';
-import { useP2pCustomCombos } from './p2p-combos.js';
+import { isRecommendedCombo, useP2pCustomCombos } from './p2p-combos.js';
 import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
@@ -3106,10 +3106,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             data-onboarding="p2p-mode"
             onClick={() => setP2pOpen((o) => !o)}
             disabled={disabled}
-            title={p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `Team: ${getP2pModeLabel(p2pMode, t)}`}
+            title={p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `${t('p2p.team_button', 'Team')}: ${getP2pModeLabel(p2pMode, t)}`}
             style={{ color: getP2pModeColor(p2pMode), fontSize: 10, fontWeight: p2pMode === 'solo' ? 600 : 700 }}
           >
-            {p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `Team:${getP2pModeLabel(p2pMode, t)}`}
+            {p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `${t('p2p.team_button', 'Team')}:${getP2pModeLabel(p2pMode, t)}`}
           </button>
           <button
             class="shortcut-btn p2p-settings-btn"
@@ -3155,6 +3155,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   })}
                 </div>
               </div>
+              <div
+                class="p2p-dropdown-intro"
+                title={t('p2p.dropdown.team_intro_tooltip', 'Discussion → summary → implementation → review. More rounds repeat the loop on the previous result.')}
+              >
+                <div class="p2p-dropdown-intro-title">{t('p2p.dropdown.team_intro_title', 'Team discussion')}</div>
+                <div class="p2p-dropdown-intro-body">
+                  {t('p2p.dropdown.team_intro_body', 'Agents discuss, summarize, implement, then review the result. Extra rounds repeat the loop to harden the outcome.')}
+                </div>
+              </div>
               <div class="menu-divider" />
               <button
                 class={`menu-item ${p2pMode === 'solo' ? 'menu-item-active' : ''}`}
@@ -3176,7 +3185,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                */}
               <div
                 class="p2p-dropdown-tabs"
-                style={{ display: 'flex', gap: 4, padding: '4px 8px' }}
                 data-testid="p2p-dropdown-tabs"
               >
                 <button
@@ -3185,12 +3193,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   data-testid="p2p-dropdown-tab-combos"
                   data-active={dropdownActiveTab === 'combos' ? 'true' : 'false'}
                   onClick={() => setDropdownActiveTab('combos')}
-                  style={{
-                    flex: 1, fontSize: 11, padding: '4px 8px', borderRadius: 4,
-                    background: dropdownActiveTab === 'combos' ? '#1d4ed840' : 'transparent',
-                    color: dropdownActiveTab === 'combos' ? '#bfdbfe' : '#94a3b8',
-                    fontWeight: dropdownActiveTab === 'combos' ? 600 : 500,
-                  }}
                 >
                   {t('p2p.dropdown.tab_combos', t('p2p.combo_label', 'Combos'))}
                 </button>
@@ -3200,12 +3202,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   data-testid="p2p-dropdown-tab-workflows"
                   data-active={dropdownActiveTab === 'workflows' ? 'true' : 'false'}
                   onClick={() => setDropdownActiveTab('workflows')}
-                  style={{
-                    flex: 1, fontSize: 11, padding: '4px 8px', borderRadius: 4,
-                    background: dropdownActiveTab === 'workflows' ? '#1d4ed840' : 'transparent',
-                    color: dropdownActiveTab === 'workflows' ? '#bfdbfe' : '#94a3b8',
-                    fontWeight: dropdownActiveTab === 'workflows' ? 600 : 500,
-                  }}
                 >
                   {t('p2p.dropdown.tab_workflows', 'Workflows')}
                 </button>
@@ -3220,16 +3216,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   {comboMenuItems.map((key) => (
                     <button
                       key={key}
-                      class="menu-item"
+                      class={`menu-item p2p-dropdown-combo-item ${isRecommendedCombo(key) ? 'p2p-dropdown-combo-recommended' : ''}`}
                       onClick={() => {
                         if (!hasConfiguredP2pParticipants) return;
                         handleDirectComboSelect(key);
                       }}
                       disabled={!hasConfiguredP2pParticipants}
-                      title={!hasConfiguredP2pParticipants ? t('p2p.combo_requires_participants_hint') : undefined}
+                      title={!hasConfiguredP2pParticipants
+                        ? t('p2p.combo_requires_participants_hint')
+                        : isRecommendedCombo(key)
+                          ? t('p2p.combo_recommended_hint', 'Recommended for most audit tasks.')
+                          : undefined}
                       style={{ color: getP2pModeColor(key), fontSize: 12, opacity: hasConfiguredP2pParticipants ? 1 : 0.45, cursor: hasConfiguredP2pParticipants ? 'pointer' : 'not-allowed' }}
                     >
-                      ○ {getP2pModeLabel(key, t)}
+                      <span class="p2p-dropdown-combo-name">○ {getP2pModeLabel(key, t)}</span>
+                      {isRecommendedCombo(key) && (
+                        <span class="p2p-recommended-icon" aria-hidden="true">★</span>
+                      )}
                     </button>
                   ))}
                   <div class="menu-divider" />

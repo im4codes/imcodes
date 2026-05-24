@@ -709,6 +709,7 @@
     "combo_custom": "マイコンボ",
     "combo_custom_empty": "カスタムコンボはまだありません。",
     "combo_builder": "新しいコンボを追加",
+    "combo_recommended_hint": "ほとんどの監査タスクにおすすめです。",
     "exclude_same_type": "同タイプを除外",
     "picker": {
       "back": "戻る",
@@ -733,15 +734,21 @@
       "brainstorm": "ブレインストーミング",
       "discuss": "ディスカッション"
     },
+    "team_button": "Team",
     "mode_config": "設定",
     "dropdown": {
       "tab_combos": "コンボ",
       "tab_workflows": "ワークフロー",
+      "team_intro_title": "Team ディスカッション",
+      "team_intro_body": "エージェントが討議、要約、実装を行い、その結果をレビューします。ラウンドを増やすとこのループを繰り返して成果を強化します。",
+      "team_intro_tooltip": "討議 → 要約 → 実装 → レビュー。ラウンドを増やすと前回の結果をもとにループを繰り返します。",
       "workflows_empty": "保存済みのワークフローはまだありません。設定 → 高度なワークフローで作成してください。",
       "workflows_manage": "ワークフローを管理"
     },
-    "settings_button": "Team設定",
-    "settings_title": "Team参加者設定",
+    "settings_button": "設定",
+    "settings_title": "Team ディスカッション設定",
+    "settings_process_title": "Team ディスカッションの流れ",
+    "settings_process_body": "Team モードは、討議・要約・実装・レビューのループを実行します。1 ラウンドはこのループを 1 回完了し、追加ラウンドでは前回の実装結果を文脈としてもう一度監査/レビューを行い、漏れた要件、回帰リスク、境界ケース、テスト不足を検出してから完了とみなします。",
     "cross_session": "他のプロジェクトのセッションを含める",
     "tab": {
       "advanced_workflow": "高度なワークフロー",

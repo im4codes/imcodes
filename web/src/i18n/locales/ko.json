@@ -709,6 +709,7 @@
     "combo_custom": "내 콤보",
     "combo_custom_empty": "아직 사용자 콤보가 없습니다.",
     "combo_builder": "새 콤보 추가",
+    "combo_recommended_hint": "대부분의 감사 작업에 추천합니다.",
     "exclude_same_type": "같은 유형 제외",
     "picker": {
       "back": "뒤로",
@@ -733,15 +734,21 @@
       "brainstorm": "브레인스토밍",
       "discuss": "토론"
     },
+    "team_button": "Team",
     "mode_config": "설정",
     "dropdown": {
       "tab_combos": "콤보",
       "tab_workflows": "워크플로",
+      "team_intro_title": "Team 토론",
+      "team_intro_body": "에이전트가 토론하고 요약한 뒤 구현하고 결과를 검토합니다. 라운드를 늘리면 이 루프를 반복해 결과를 강화합니다.",
+      "team_intro_tooltip": "토론 → 요약 → 구현 → 검토. 라운드를 늘리면 이전 결과를 바탕으로 루프를 반복합니다.",
       "workflows_empty": "저장된 워크플로가 없습니다. 설정 → 고급 워크플로에서 새로 만들어 보세요.",
       "workflows_manage": "워크플로 관리"
     },
-    "settings_button": "Team 설정",
-    "settings_title": "Team 참가자 설정",
+    "settings_button": "설정",
+    "settings_title": "Team 토론 설정",
+    "settings_process_title": "Team 토론 흐름",
+    "settings_process_body": "Team 모드는 토론, 요약, 구현, 검토 루프를 실행합니다. 1라운드는 루프를 한 번 완료하며, 추가 라운드는 이전 구현 결과를 새 컨텍스트로 삼아 다시 감사/검토하므로 누락된 요구사항, 회귀 위험, 경계 사례, 테스트 공백을 더 잘 잡아낸 뒤 작업을 완료 상태로 봅니다.",
     "cross_session": "다른 프로젝트의 세션 포함",
     "tab": {
       "advanced_workflow": "고급 워크플로",
