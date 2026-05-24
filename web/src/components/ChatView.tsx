@@ -530,7 +530,7 @@ const TOOL_LIKE_EVENT_TYPES = new Set<string>([
   'assistant.thinking',
 ]);
 
-function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
+function isVisibleChatTimelineEvent(event: TimelineEvent, showToolCalls: boolean): boolean {
   // Filter out transient/noisy event types that don't belong in the chat log:
   // - agent.status, usage.update: stats, not chat content
   // - mode.state: shown elsewhere (tabs/header)
@@ -539,17 +539,36 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   // - TOOL_LIKE_EVENT_TYPES: optional developer details — hidden only when
   //   the user has explicitly turned the wrench preference off. Undecided
   //   users default to ON and see the first-run prompt.
-  const visible = events.filter(
-    (e) =>
-      !e.hidden &&
-      e.type !== 'agent.status' &&
-      e.type !== 'usage.update' &&
-      e.type !== 'mode.state' &&
-      e.type !== 'command.ack' &&
-      e.type !== 'terminal.snapshot' &&
-      !(e.type === 'session.state' && (e.payload.state === 'running' || e.payload.state === 'idle' || e.payload.state === 'queued')) &&
-      (showToolCalls || !TOOL_LIKE_EVENT_TYPES.has(e.type)),
+  return (
+    !event.hidden &&
+    event.type !== 'agent.status' &&
+    event.type !== 'usage.update' &&
+    event.type !== 'mode.state' &&
+    event.type !== 'command.ack' &&
+    event.type !== 'terminal.snapshot' &&
+    !(event.type === 'session.state' && (event.payload.state === 'running' || event.payload.state === 'idle' || event.payload.state === 'queued')) &&
+    (showToolCalls || !TOOL_LIKE_EVENT_TYPES.has(event.type))
   );
+}
+
+function getFinalVisibleEventIds(events: TimelineEvent[], showToolCalls: boolean): string[] {
+  const visible = events.filter((event) => isVisibleChatTimelineEvent(event, showToolCalls));
+  const lastByEventId = new Map<string, number>();
+  for (let i = 0; i < visible.length; i++) {
+    lastByEventId.set(visible[i].eventId, i);
+  }
+  const ids: string[] = [];
+  for (let i = 0; i < visible.length; i++) {
+    const event = visible[i];
+    if (lastByEventId.get(event.eventId) !== i) continue;
+    if (event.payload.streaming === true || event.payload.pending === true) continue;
+    ids.push(event.eventId);
+  }
+  return ids;
+}
+
+function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
+  const visible = events.filter((event) => isVisibleChatTimelineEvent(event, showToolCalls));
 
   // Pre-pass: merge tool.call+tool.result pairs, dedup session.state,
   // and dedup stable-eventId streaming events (keep last occurrence only)
@@ -920,6 +939,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // session switch).
   const newSinceUnfollowRef = useRef(0);
   const [newSinceUnfollow, setNewSinceUnfollow] = useState(0);
+  const countedFinalEventIdsRef = useRef<Set<string>>(new Set());
 
   // ── Pinned last-sent user message (appears only when scrolled off top) ──
   // When the user scrolls back through a long chat we want them to see what
@@ -1104,6 +1124,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     [preview, events],
   );
   const viewItems = useMemo(() => buildViewItems(sourceEvents, showToolCalls), [sourceEvents, showToolCalls]);
+  const finalVisibleEventIds = useMemo(
+    () => getFinalVisibleEventIds(sourceEvents, showToolCalls),
+    [sourceEvents, showToolCalls],
+  );
   const effectiveRenderLimit = preview ? PREVIEW_RENDER_ITEM_LIMIT : renderItemLimit;
   const hiddenRenderedItemCount = Math.max(0, viewItems.length - effectiveRenderLimit);
   const renderedViewItems = useMemo(
@@ -1138,6 +1162,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       autoScrollRef.current = true;
       newSinceUnfollowRef.current = 0;
       setNewSinceUnfollow(0);
+      countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
     }
     suppressLoadOlder();
     markProgrammaticScroll();
@@ -1156,6 +1181,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     hasInitialScrolledRef.current = false;
     newSinceUnfollowRef.current = 0;
     setNewSinceUnfollow(0);
+    countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
     setShowScrollBtn(false);
     // Force scroll to bottom on tab switch — the auto-scroll effect may not fire
     // if no new events arrived while this tab was inactive.
@@ -1338,15 +1364,27 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     const shouldFollow = preview || autoScrollRef.current;
     if (!shouldFollow) {
       // User is reading older content; do not yank the viewport. Surface the
-      // arrival via the unread counter on the "↓" affordance.
-      newSinceUnfollowRef.current += 1;
-      setNewSinceUnfollow(newSinceUnfollowRef.current);
+      // arrival via the unread counter on the "↓" affordance. Count only
+      // newly-finalized visible events: streaming updates for the same
+      // eventId should not inflate the badge on every chunk.
+      let addedFinalEvents = 0;
+      const nextCounted = new Set(countedFinalEventIdsRef.current);
+      for (const eventId of finalVisibleEventIds) {
+        if (nextCounted.has(eventId)) continue;
+        nextCounted.add(eventId);
+        addedFinalEvents += 1;
+      }
+      countedFinalEventIdsRef.current = nextCounted;
+      if (addedFinalEvents > 0) {
+        newSinceUnfollowRef.current += addedFinalEvents;
+        setNewSinceUnfollow(newSinceUnfollowRef.current);
+      }
       layoutHandledVisibleTsRef.current = lastVisibleTs;
       return;
     }
     scrollToBottom(false);
     layoutHandledVisibleTsRef.current = lastVisibleTs;
-  }, [preview, renderedRevision, loading, loadingOlder, lastVisibleTs]);
+  }, [preview, renderedRevision, loading, loadingOlder, lastVisibleTs, finalVisibleEventIds]);
 
   // Restore scroll position after Load Older prepends events
   useLayoutEffect(() => {
@@ -1432,10 +1470,12 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       // Reset count so it starts fresh from this pause
       newSinceUnfollowRef.current = 0;
       setNewSinceUnfollow(0);
+      countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
     } else if (!wasAutoFollowing && distance < reengageThreshold) {
       autoScrollRef.current = true;
       newSinceUnfollowRef.current = 0;
       setNewSinceUnfollow(0);
+      countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
     }
     setShowScrollBtn(!autoScrollRef.current);
     if (!autoScrollRef.current) lastScrollActivityRef.current = Date.now();

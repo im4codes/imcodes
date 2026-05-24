@@ -769,10 +769,81 @@ describe('ChatView', () => {
     await waitFor(() => {
       const btn = container.querySelector('.chat-scroll-btn') as HTMLButtonElement;
       expect(btn).toBeTruthy();
-      // Either the layout effect (viewItems) or the timestamp effect bumps the
-      // counter on each new event. We don't pin the exact number because both
-      // effects can fire — what matters is the button reports a count > 0.
-      expect(btn.textContent ?? '').toMatch(/^↓\s+\d+/);
+      expect(btn.textContent ?? '').toBe('↓ 2');
+      expect(btn.getAttribute('aria-label')).toBe('Jump to bottom (2 new)');
+    });
+  });
+
+  it('counts one new message for many streamed updates of the same event while follow is paused', async () => {
+    const initialEvents = [
+      { eventId: 'evt-1', type: 'assistant.text', ts: 1000, payload: { text: 'one' } },
+    ] as any;
+
+    const { container, rerender } = render(
+      <ChatView events={initialEvents} loading={false} sessionId="deck_main_brain" />,
+    );
+
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    Object.defineProperty(scrollEl, 'scrollTop', { configurable: true, writable: true, value: 0 });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1200 });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 200 });
+
+    await waitFor(() => {
+      expect(scrollEl.scrollTop).toBe(1200);
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 1300));
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
+    scrollEl.scrollTop = 1300;
+    fireEvent.scroll(scrollEl);
+
+    await waitFor(() => {
+      expect(container.querySelector('.chat-scroll-btn')?.textContent ?? '').toBe('↓');
+    });
+
+    rerender(
+      <ChatView
+        events={[
+          { eventId: 'evt-1', type: 'assistant.text', ts: 1000, payload: { text: 'one' } },
+          { eventId: 'evt-2', type: 'assistant.text', ts: 2000, payload: { text: 'two', streaming: true } },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(container.querySelector('.chat-scroll-btn')?.textContent ?? '').toBe('↓');
+
+    rerender(
+      <ChatView
+        events={[
+          { eventId: 'evt-1', type: 'assistant.text', ts: 1000, payload: { text: 'one' } },
+          { eventId: 'evt-2', type: 'assistant.text', ts: 2000, payload: { text: 'two chunks', streaming: true } },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(container.querySelector('.chat-scroll-btn')?.textContent ?? '').toBe('↓');
+
+    rerender(
+      <ChatView
+        events={[
+          { eventId: 'evt-1', type: 'assistant.text', ts: 1000, payload: { text: 'one' } },
+          { eventId: 'evt-2', type: 'assistant.text', ts: 2000, payload: { text: 'two final' } },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    await waitFor(() => {
+      const btn = container.querySelector('.chat-scroll-btn') as HTMLButtonElement;
+      expect(btn.textContent ?? '').toBe('↓ 1');
+      expect(btn.getAttribute('aria-label')).toBe('Jump to bottom (1 new)');
     });
   });
 
