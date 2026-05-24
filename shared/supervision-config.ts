@@ -10,7 +10,6 @@ import {
   normalizeSharedContextPresetValue,
   normalizeSharedContextRuntimeBackend,
 } from './shared-context-runtime-config.js';
-import { COMBO_PRESETS } from './p2p-modes.js';
 import { PROCESS_SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES } from './agent-types.js';
 import { PROVIDER_STATUS_REASON } from './provider-status-reasons.js';
 
@@ -45,10 +44,9 @@ const SUPERVISION_AUDIT_MODE_ALLOWLIST = [
   'audit>review>plan',
 ] as const;
 
-export const SUPERVISION_AUDIT_MODES = SUPERVISION_AUDIT_MODE_ALLOWLIST.filter((mode) => {
-  if (!mode.includes('>')) return true;
-  return COMBO_PRESETS.some((preset) => preset.key === mode);
-}) as SupervisionAuditMode[];
+// Supervision keeps accepting historical two-step audit modes even when they are
+// no longer promoted as default Team/P2P combo presets.
+export const SUPERVISION_AUDIT_MODES = SUPERVISION_AUDIT_MODE_ALLOWLIST;
 
 // Default supervisor timeout aligns with design.md §5 (12_000 ms). Queue wait time
 // counts against the same budget, so this must stay conservative.
