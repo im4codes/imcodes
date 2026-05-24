@@ -752,7 +752,7 @@ afterEach(() => {
     input.textContent = 'run combo';
     fireEvent.input(input);
     fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
-    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+    fireEvent.click(screen.getByText(/mode_audit→mode_review→mode_plan/i));
 
     expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
     expect(screen.getAllByRole('button', { name: /^send$/i }).length).toBeGreaterThanOrEqual(1);
@@ -768,7 +768,7 @@ afterEach(() => {
     input.textContent = 'run combo';
     fireEvent.input(input);
     fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
-    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+    fireEvent.click(screen.getByText(/mode_audit→mode_review→mode_plan/i));
 
     expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
@@ -812,7 +812,7 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
 
     expect(screen.getByText('combo_requires_participants_hint')).toBeDefined();
-    const comboBtn = screen.getByRole('button', { name: /mode_audit→mode_plan/i }) as HTMLButtonElement;
+    const comboBtn = screen.getByRole('button', { name: /mode_audit→mode_review→mode_plan/i }) as HTMLButtonElement;
     expect(comboBtn.disabled).toBe(true);
     expect(comboBtn.title).toBe('combo_requires_participants_hint');
   });
@@ -923,7 +923,9 @@ afterEach(() => {
     expect(screen.queryByText(/^mode_brainstorm$/i)).toBeNull();
     expect(screen.queryByText(/^mode_discuss$/i)).toBeNull();
     expect(screen.queryByText(/^mode_config$/i)).toBeNull();
-    expect(screen.getByText(/mode_audit→mode_plan/i)).toBeDefined();
+    expect(screen.queryByText(/^mode_audit→mode_plan$/i)).toBeNull();
+    expect(screen.queryByText(/^mode_review→mode_plan$/i)).toBeNull();
+    expect(screen.getByText(/mode_audit→mode_review→mode_plan/i)).toBeDefined();
   });
 
   it('puts the global rounds selector at the top of the P2P dropdown and saves changes', async () => {
@@ -982,7 +984,7 @@ afterEach(() => {
     input.textContent = 'first combo';
     fireEvent.input(input);
     fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
-    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+    fireEvent.click(screen.getByText(/mode_audit→mode_review→mode_plan/i));
 
     const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
     fireEvent.click(within(dialog).getByRole('checkbox'));
@@ -994,7 +996,7 @@ afterEach(() => {
       p2pAtTargets: [
         { session: '__all__', mode: 'config' },
       ],
-      p2pMode: 'audit>plan',
+      p2pMode: 'audit>review>plan',
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },
@@ -1006,7 +1008,7 @@ afterEach(() => {
     input.textContent = 'second combo';
     fireEvent.input(input);
     fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
-    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+    fireEvent.click(screen.getByText(/mode_audit→mode_review→mode_plan/i));
 
     expect(screen.queryByText('combo_send_confirm_title')).toBeNull();
     expectLastSendPayload(ws, {
@@ -1015,7 +1017,7 @@ afterEach(() => {
       p2pAtTargets: [
         { session: '__all__', mode: 'config' },
       ],
-      p2pMode: 'audit>plan',
+      p2pMode: 'audit>review>plan',
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },
@@ -1034,7 +1036,7 @@ afterEach(() => {
     fireEvent.input(input);
 
     fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
-    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+    fireEvent.click(screen.getByText(/mode_audit→mode_review→mode_plan/i));
 
     const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
     fireEvent.click(within(dialog).getByRole('button', { name: /^send$/i }));
@@ -1045,7 +1047,7 @@ afterEach(() => {
       p2pAtTargets: [
         { session: '__all__', mode: 'config' },
       ],
-      p2pMode: 'audit>plan',
+      p2pMode: 'audit>review>plan',
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },
