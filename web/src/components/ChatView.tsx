@@ -109,6 +109,8 @@ interface AssistantBlockProps {
   onHtmlPreview?: (path: string) => void;
 }
 
+const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
+
 /** Extract a chat event's visible text while preserving block/list/code
  *  formatting. Uses `domNodeToPlainText` rather than `textContent` so that
  *  copying a multi-paragraph assistant message keeps its paragraph and list
@@ -2392,7 +2394,15 @@ const ChatEvent = memo(function ChatEvent({
           {attachments && serverId && attachments.map((att) => (
             <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
           ))}
-          {userText && <div class="chat-bubble-content">{splitPathsAndUrls(userText, onPathClick, onUrlClick, onDownload, onHtmlPreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</div>}
+          {userText && (
+            <UserMessageText
+              text={userText}
+              onPathClick={onPathClick}
+              onUrlClick={onUrlClick}
+              onDownload={onDownload}
+              onHtmlPreview={onHtmlPreview}
+            />
+          )}
           {isPending && (
             <span
               class="chat-user-status chat-user-status-pending"
@@ -2877,6 +2887,49 @@ function SnapshotEvent({ event }: { event: TimelineEvent }) {
         <pre class="chat-snapshot-content">
           {lines.join('\n')}
         </pre>
+      )}
+    </div>
+  );
+}
+
+function countHardLines(text: string): number {
+  if (!text) return 0;
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').length;
+}
+
+function UserMessageText({
+  text,
+  onPathClick,
+  onUrlClick,
+  onDownload,
+  onHtmlPreview,
+}: {
+  text: string;
+  onPathClick?: (p: string) => void;
+  onUrlClick?: (url: string) => void;
+  onDownload?: (path: string) => void;
+  onHtmlPreview?: (path: string) => void;
+}) {
+  const { t } = useTranslation();
+  const lineCount = countHardLines(text);
+  const shouldFold = lineCount > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const [expanded, setExpanded] = useState(false);
+  const folded = shouldFold && !expanded;
+
+  return (
+    <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}`}>
+      <div class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}`}>
+        {splitPathsAndUrls(text, onPathClick, onUrlClick, onDownload, onHtmlPreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}
+      </div>
+      {shouldFold && (
+        <button
+          type="button"
+          class="chat-user-message-fold-toggle"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((value) => !value)}
+        >
+          {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
+        </button>
       )}
     </div>
   );

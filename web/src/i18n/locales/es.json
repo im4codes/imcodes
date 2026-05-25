@@ -90,6 +90,8 @@
     "memory_summary_sync_busy": "Sincronizando resúmenes...",
     "memory_summary_sync_instruction": "Solo sincronización de contexto. Integra estos resúmenes recientes como contexto de fondo. No ejecutes tareas, no cambies archivos, no llames herramientas ni respondas a este mensaje; espera la siguiente instrucción del usuario.",
     "memory_summary_sync_heading": "Resúmenes recientes:",
+    "user_message_expand": "Mostrar completo",
+    "user_message_collapse": "Contraer",
     "tool_chooser_title": "¿Cómo mostrar la actividad de la IA?",
     "tool_chooser_subtitle": "Las llamadas a herramientas, cambios de archivos y razonamiento aportan detalle pero pueden saturar.",
     "tool_chooser_simple_label": "Sencillo",

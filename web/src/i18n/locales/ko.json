@@ -90,6 +90,8 @@
     "memory_summary_sync_busy": "summary 동기화 중...",
     "memory_summary_sync_instruction": "컨텍스트 동기화 전용입니다. 아래 최근 summary를 배경 컨텍스트로만 소화하세요. 작업 실행, 파일 변경, 도구 호출, 이 메시지에 대한 답변을 하지 말고 다음 사용자 지시를 기다리세요.",
     "memory_summary_sync_heading": "최근 summary:",
+    "user_message_expand": "전체 보기",
+    "user_message_collapse": "접기",
     "tool_chooser_title": "AI 활동을 어떻게 표시할까요?",
     "tool_chooser_subtitle": "도구 호출, 파일 변경, 사고 과정은 상세하지만 화면이 복잡해집니다.",
     "tool_chooser_simple_label": "간단",

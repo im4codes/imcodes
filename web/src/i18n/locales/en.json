@@ -90,6 +90,8 @@
     "memory_summary_sync_busy": "Syncing summaries...",
     "memory_summary_sync_instruction": "Context sync only. Digest these recent summaries as background context. Do not execute tasks, change files, call tools, or respond to this message; wait for the next user instruction.",
     "memory_summary_sync_heading": "Recent summaries:",
+    "user_message_expand": "Show full",
+    "user_message_collapse": "Collapse",
     "tool_chooser_title": "How should AI activity show?",
     "tool_chooser_subtitle": "Tool calls, file changes, and reasoning add detail but can feel busy.",
     "tool_chooser_simple_label": "Simple",

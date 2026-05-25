@@ -1084,6 +1084,15 @@ body {
 .chat-user-retry-btn { background: #7f1d1d; color: #fecaca; border: 1px solid #b91c1c; border-radius: 4px; padding: 2px 10px; font-size: 11px; cursor: pointer; font-family: inherit; }
 .chat-user-retry-btn:hover { background: #991b1b; color: #fff; border-color: #dc2626; }
 .chat-user-retry-btn:active { background: #7f1d1d; }
+.chat-user-message-fold { position: relative; min-width: 0; }
+.chat-user-message-fold-content { line-height: 1.45; }
+.chat-user-message-fold-content.is-folded { max-height: calc(1.45em * 10); overflow: hidden; }
+.chat-user-message-fold.is-folded::after { content: ''; position: absolute; left: 0; right: 0; bottom: 28px; height: 28px; background: linear-gradient(transparent, #1e3a5f); pointer-events: none; border-radius: 0 0 8px 8px; }
+.chat-user.chat-pending .chat-user-message-fold.is-folded::after { background: linear-gradient(transparent, rgba(30, 58, 95, 0.5)); }
+.chat-user.chat-failed .chat-user-message-fold.is-folded::after { background: linear-gradient(transparent, #3a1a1a); }
+.chat-user-message-fold-toggle { position: relative; z-index: 1; display: inline-flex; align-items: center; justify-content: center; margin-top: 6px; padding: 2px 8px; border: 1px solid rgba(147, 197, 253, 0.35); border-radius: 999px; background: rgba(15, 23, 42, 0.18); color: #bfdbfe; font-family: inherit; font-size: 11px; line-height: 1.4; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.chat-user-message-fold-toggle:hover { background: rgba(15, 23, 42, 0.32); border-color: rgba(147, 197, 253, 0.6); color: #e0f2fe; }
+.chat-user-message-fold-toggle:active { transform: translateY(1px); }
 .chat-assistant { padding: 6px 10px; word-break: break-word; overflow-wrap: break-word; line-height: 1.5; background: #161b22; border-radius: 8px; border-left: 2px solid #1e293b; }
 .chat-assistant-automation { border-left-color: #10b981; background: #101a19; }
 .chat-rich-text { white-space: pre-wrap; }

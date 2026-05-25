@@ -38,6 +38,7 @@ const IGNORED_CLASSES: ReadonlySet<string> = new Set([
   'chat-user-status-failed',
   'chat-user-status-icon',
   'chat-user-retry-btn',
+  'chat-user-message-fold-toggle',
   'chat-sel-menu',
 ]);
 

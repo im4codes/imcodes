@@ -168,6 +168,56 @@ describe('ChatView', () => {
     expect(screen.getByText('message-0')).toBeTruthy();
   });
 
+  it('collapses sent user messages longer than ten hard lines by default', () => {
+    const longText = Array.from({ length: 11 }, (_, index) => `sent-line-${index + 1}`).join('\n');
+
+    const { container } = render(
+      <ChatView
+        events={[{
+          eventId: 'evt-user-long',
+          type: 'user.message',
+          ts: 1_700_000_000_000,
+          payload: { text: longText },
+        }] as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_long_user_message"
+      />,
+    );
+
+    const fold = container.querySelector('.chat-user-message-fold');
+    const content = container.querySelector('.chat-user-message-fold-content');
+    expect(fold?.classList.contains('is-folded')).toBe(true);
+    expect(content?.classList.contains('is-folded')).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'chat.user_message_expand' }));
+
+    expect(fold?.classList.contains('is-folded')).toBe(false);
+    expect(content?.classList.contains('is-folded')).toBe(false);
+    expect(screen.getByRole('button', { name: 'chat.user_message_collapse' })).toBeTruthy();
+  });
+
+  it('does not collapse sent user messages with ten hard lines', () => {
+    const tenLineText = Array.from({ length: 10 }, (_, index) => `sent-line-${index + 1}`).join('\n');
+
+    const { container } = render(
+      <ChatView
+        events={[{
+          eventId: 'evt-user-ten-lines',
+          type: 'user.message',
+          ts: 1_700_000_000_000,
+          payload: { text: tenLineText },
+        }] as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_ten_line_user_message"
+      />,
+    );
+
+    expect(container.querySelector('.chat-user-message-fold')?.classList.contains('is-foldable')).toBe(false);
+    expect(screen.queryByText('chat.user_message_expand')).toBeNull();
+  });
+
   it('suppresses the "no events" placeholder while bootstrap history is still loading (SubSessionWindow flash fix)', () => {
     // Regression test for "本地历史还是没有瞬间加载" / 暂无消息 flash:
     // SubSessionWindow forces `loading={false}` so its ChatView doesn't

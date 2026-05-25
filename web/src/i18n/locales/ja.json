@@ -90,6 +90,8 @@
     "memory_summary_sync_busy": "summary を同期中...",
     "memory_summary_sync_instruction": "これはコンテキスト同期のみです。以下の最近の summary を背景情報として消化してください。タスク実行、ファイル変更、ツール呼び出し、このメッセージへの返信はせず、次のユーザー指示を待ってください。",
     "memory_summary_sync_heading": "最近の summary:",
+    "user_message_expand": "全文を表示",
+    "user_message_collapse": "折りたたむ",
     "tool_chooser_title": "AI の動作をどう表示しますか？",
     "tool_chooser_subtitle": "ツール呼び出し・ファイル変更・推論は詳細ですが画面が混み合います。",
     "tool_chooser_simple_label": "シンプル",
