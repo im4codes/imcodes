@@ -1165,8 +1165,9 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.sending).toBe(false);
   });
 
-  it('cancel() delegates to provider.cancel and preserves pending', () => {
+  it('cancel() delegates to provider.cancel without queueing behind pending messages', async () => {
     runtime.send('first');
+    await flushDispatch();
     runtime.send('queued1', 'msg-q1');
     runtime.send('queued2', 'msg-q2');
     expect(runtime.pendingCount).toBe(2);
@@ -1178,6 +1179,35 @@ ${PREFERENCE_CONTEXT_END}`;
     runtime.cancel();
     expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
     expect(runtime.pendingCount).toBe(2);
+  });
+
+  it('cancel() stops a turn before provider.send starts when context bootstrap is still running', async () => {
+    const resolveBootstraps: Array<() => void> = [];
+    runtime.setContextBootstrapResolver(() => new Promise((resolve) => {
+      resolveBootstraps.push(() => resolve({
+        namespace: { scope: 'personal', projectId: 'test' },
+        diagnostics: [],
+      }));
+    }));
+
+    runtime.send('first');
+    runtime.send('queued after cancel', 'msg-q1');
+    runtime.cancel();
+    resolveBootstraps[0]?.();
+    await flushDispatch();
+    resolveBootstraps[1]?.();
+    await flushDispatch();
+
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(mock.provider.send).not.toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      userMessage: 'first',
+    }));
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      userMessage: 'queued after cancel',
+      assembledMessage: 'queued after cancel',
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
   });
 
   it('can edit and remove queued messages by clientMessageId', async () => {

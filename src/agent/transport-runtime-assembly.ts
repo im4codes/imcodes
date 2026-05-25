@@ -75,6 +75,12 @@ export interface DispatchSharedContextSendOptions {
    * request. A value <= 0 disables the watchdog.
    */
   sendTimeoutMs?: number;
+  /** Called immediately before provider.send() is invoked.
+   *  TransportSessionRuntime uses this boundary to keep STOP highest-priority:
+   *  a cancel that arrives during context assembly can still abort before the
+   *  provider sees the turn, while a cancel after this callback delegates to
+   *  the provider interrupt/abort implementation. */
+  onBeforeProviderSend?: () => void;
 }
 
 export interface DispatchSharedContextSendResult {
@@ -116,11 +122,11 @@ export function dispatchSharedContextSend(
       options?.onShadowDiagnostics?.(payload.diagnostics);
     }
     if (!flags.runtimeSend) {
-      await sendProviderWithTimeout(provider, sessionId, input.userMessage, options?.sendTimeoutMs);
+      await sendProviderWithTimeout(provider, sessionId, input.userMessage, options);
       return { disposition: 'legacy-sent', payload };
     }
     enforceDispatchAuthority(payload);
-    await sendProviderWithTimeout(provider, sessionId, payload, options?.sendTimeoutMs);
+    await sendProviderWithTimeout(provider, sessionId, payload, options);
     return { disposition: 'sent', payload };
   });
 }
@@ -129,8 +135,10 @@ async function sendProviderWithTimeout(
   provider: TransportProvider,
   sessionId: string,
   payload: string | ProviderContextPayload,
-  timeoutMs: number | undefined,
+  options: Pick<DispatchSharedContextSendOptions, 'sendTimeoutMs' | 'onBeforeProviderSend'> | undefined,
 ): Promise<void> {
+  const timeoutMs = options?.sendTimeoutMs;
+  options?.onBeforeProviderSend?.();
   const sendPromise = provider.send(sessionId, payload);
   if (!timeoutMs || timeoutMs <= 0 || !Number.isFinite(timeoutMs)) {
     await sendPromise;

@@ -1979,11 +1979,12 @@ function resolveSessionCommandName(cmd: Record<string, unknown>): string | undef
 }
 
 function markTransportCancelIdle(sessionName: string, error?: string): void {
+  const runtime = getTransportRuntime(sessionName);
   timelineEmitter.emit(sessionName, 'session.state', {
     state: 'idle',
-    pendingCount: 0,
-    pendingMessages: [],
-    pendingMessageEntries: [],
+    pendingCount: runtime?.pendingCount ?? 0,
+    pendingMessages: runtime?.pendingMessages ?? [],
+    pendingMessageEntries: runtime?.pendingEntries ?? [],
     ...(error ? { error } : {}),
   }, { source: 'daemon', confidence: 'high' });
 }
@@ -2016,6 +2017,14 @@ function cancelTransportTurnNow(
 
   if (!stopRuntime) return true;
 
+  // STOP IS THE PRIORITY LANE.
+  // Do not acquire getMutex(sessionName), do not call transportRuntime.send('/stop'),
+  // and do not wait for provider/model/context work here. This path must cut
+  // in front of queued sends and long pre-send work (startup memory, semantic
+  // recall, authored context, provider send-start). Regressions are locked by:
+  // - test/daemon/command-handler-transport-queue.test.ts
+  // - test/daemon/transport-session-runtime.test.ts
+  // - web/test/components/SessionControls.test.tsx
   void (async () => {
     try {
       supervisionAutomation.cancelSession(sessionName);

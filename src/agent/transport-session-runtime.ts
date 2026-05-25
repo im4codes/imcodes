@@ -4,6 +4,7 @@ import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate } from './transport-provider.js';
+import { PROVIDER_ERROR_CODES } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import {
@@ -129,6 +130,14 @@ function isTransportSlashControl(message: string | undefined): boolean {
   return message?.trim().startsWith('/') === true;
 }
 
+function makeCancelledProviderError(): ProviderError {
+  return {
+    code: PROVIDER_ERROR_CODES.CANCELLED,
+    message: 'Transport turn cancelled',
+    recoverable: true,
+  };
+}
+
 /**
  * Transport session runtime — manages a single conversation with a remote provider.
  *
@@ -189,6 +198,13 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _pendingMessages: PendingTransportMessage[] = [];
   /** Original message entries for the currently in-flight dispatch. */
   private _activeDispatchEntries: PendingTransportMessage[] = [];
+  /** True after a user stop request until the active provider turn settles. */
+  private _activeDispatchCancelled = false;
+  /** True once the active dispatch has crossed into provider.send(). */
+  private _activeDispatchProviderStarted = false;
+  private _activeDispatchId: number | null = null;
+  private _nextDispatchId = 0;
+  private readonly _locallyCancelledDispatchIds = new Set<number>();
 
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void;
@@ -206,10 +222,27 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._unsubscribes.push(
       this.provider.onDelta((sid: string, _delta: MessageDelta) => {
         if (sid !== this._providerSessionId) return;
+        if (this._activeDispatchCancelled) return;
         this.setStatus('streaming');
       }),
       this.provider.onComplete((sid: string, message: AgentMessage) => {
         if (sid !== this._providerSessionId) return;
+        if (this._activeDispatchCancelled) {
+          this._sending = false;
+          this._activeTurn?.reject(makeCancelledProviderError());
+          this._activeTurn = null;
+          this._activeDispatchEntries = [];
+          this._activeDispatchCancelled = false;
+          this._activeDispatchProviderStarted = false;
+          if (this._activeDispatchId !== null) {
+            this._locallyCancelledDispatchIds.delete(this._activeDispatchId);
+          }
+          this._activeDispatchId = null;
+          if (!this._drainPending()) {
+            this.setStatus('idle');
+          }
+          return;
+        }
         if (isTransportCompactionCompletion(message)) {
           this._lastInjectedPreferenceContextSignature = null;
         }
@@ -218,6 +251,8 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._activeTurn?.resolve();
         this._activeTurn = null;
         this._activeDispatchEntries = [];
+        this._activeDispatchProviderStarted = false;
+        this._activeDispatchId = null;
         // Drain pending messages before transitioning to idle.
         // If there are queued messages, merge and send — status stays running.
         if (!this._drainPending()) {
@@ -229,9 +264,15 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._sending = false;
         this._activeTurn?.reject(error);
         this._activeTurn = null;
+        this._activeDispatchProviderStarted = false;
+        if (this._activeDispatchId !== null) {
+          this._locallyCancelledDispatchIds.delete(this._activeDispatchId);
+        }
+        this._activeDispatchId = null;
         // Only drain pending on recoverable/cancel errors — unrecoverable errors
         // (auth failure, provider down) would just fail again and consume queued messages.
         const canDrain = error.code === 'CANCELLED' || error.recoverable;
+        this._activeDispatchCancelled = false;
         if (canDrain) {
           this._activeDispatchEntries = [];
           if (this._drainPending()) return;
@@ -425,7 +466,27 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
-    if (!this.provider.cancel) return;
+    // STOP/CANCEL is a cut-in-line operation, not a queued transport turn.
+    // It must be effective while the active turn is still in the async
+    // pre-provider phase (context bootstrap, memory recall, authored context
+    // assembly) as well as after provider.send() has started. If provider.send()
+    // has not started yet, cancel locally and skip that send entirely; if it
+    // has started, delegate to the provider-specific interrupt/abort path.
+    // Keep queued user messages intact so they may drain after the cancelled
+    // turn settles; only the currently active turn is being interrupted.
+    const dispatchId = this._activeDispatchId;
+    if (dispatchId !== null) {
+      this._locallyCancelledDispatchIds.add(dispatchId);
+      this._activeDispatchCancelled = true;
+    }
+    if (this._activeTurn && !this._activeDispatchProviderStarted) {
+      this.cancelActiveDispatchLocally(dispatchId);
+      return;
+    }
+    if (!this.provider.cancel) {
+      this.cancelActiveDispatchLocally(dispatchId);
+      return;
+    }
     await this.provider.cancel(this._providerSessionId);
   }
 
@@ -446,6 +507,10 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._sending = false;
     this._activeTurn = null;
     this._activeDispatchEntries = [];
+    this._activeDispatchCancelled = false;
+    this._activeDispatchProviderStarted = false;
+    this._activeDispatchId = null;
+    this._locallyCancelledDispatchIds.clear();
     this._pendingMessages = [];
     // Per-session memory injection history is daemon-scoped to this session;
     // a kill ends that scope. clear() is called on session.clear separately.
@@ -485,6 +550,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     attachments?: TransportAttachment[],
     dispatchedEntries?: PendingTransportMessage[],
   ): void {
+    const dispatchId = ++this._nextDispatchId;
     this._history.push({
       id: randomUUID(),
       sessionId: this._providerSessionId!,
@@ -497,6 +563,9 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     this.setStatus('thinking');
     this._sending = true;
+    this._activeDispatchCancelled = false;
+    this._activeDispatchProviderStarted = false;
+    this._activeDispatchId = dispatchId;
     this._activeDispatchEntries = (dispatchedEntries ?? [{
       clientMessageId: clientMessageId ?? randomUUID(),
       text: message,
@@ -518,6 +587,10 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     void (async () => {
       await this.refreshContextBootstrap({ phase: 'dispatch' });
+      if (this.isDispatchLocallyCancelled(dispatchId)) {
+        this.cancelActiveDispatchLocally(dispatchId);
+        return;
+      }
       const isSlashControl = isTransportSlashControl(message);
       const authority = resolveTransportDispatchAuthority(this.provider, {
         namespace: this._contextNamespace,
@@ -543,6 +616,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         : await this.buildTransportMessageRecallResultWithinBudget(message, authority.authoritySource);
       const memoryRecall = memoryRecallResult.artifact;
       const messagePreamble = isSlashControl ? undefined : this.mergeMessagePreambles(dispatchedEntries, message);
+      if (this.isDispatchLocallyCancelled(dispatchId)) {
+        this.cancelActiveDispatchLocally(dispatchId);
+        return;
+      }
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: message,
         messagePreamble,
@@ -572,7 +649,21 @@ export class TransportSessionRuntime implements SessionRuntime {
           });
         },
         sendTimeoutMs: getTransportProviderSendTimeoutMs(),
+        onBeforeProviderSend: () => {
+          if (this.isDispatchLocallyCancelled(dispatchId)) {
+            throw makeCancelledProviderError();
+          }
+          if (this._activeDispatchId === dispatchId) {
+            this._activeDispatchProviderStarted = true;
+          }
+        },
       });
+      if (this.isDispatchLocallyCancelled(dispatchId)) {
+        await this.provider.cancel?.(this._providerSessionId!).catch((err: unknown) => {
+          logger.warn({ err, providerSessionId: this._providerSessionId }, 'runtime dispatch noticed late cancel after provider send accepted');
+        });
+        return;
+      }
       if (dispatchResult.payload?.memoryRecall) {
         const hitIds = dispatchResult.payload.memoryRecall.items.map((item) => item.id);
         if (hitIds.length > 0) {
@@ -611,7 +702,10 @@ export class TransportSessionRuntime implements SessionRuntime {
           this._lastInjectedPreferenceContextSignature = this._preferenceContextInjectionAttempt.previous;
           this._preferenceContextInjectionAttempt = null;
         }
-        if (!this._sending || !this._activeTurn) return;
+        if (this._activeDispatchId !== dispatchId || !this._sending || !this._activeTurn) {
+          this._locallyCancelledDispatchIds.delete(dispatchId);
+          return;
+        }
         this.setStatus('error');
         this._sending = false;
         this._activeTurn.reject(
@@ -622,6 +716,12 @@ export class TransportSessionRuntime implements SessionRuntime {
                 : { code: 'PROVIDER_ERROR', message: String(err), recoverable: false }),
         );
         this._activeTurn = null;
+        this._activeDispatchProviderStarted = false;
+        this._activeDispatchCancelled = false;
+        if (this._activeDispatchId === dispatchId) {
+          this._activeDispatchId = null;
+        }
+        this._locallyCancelledDispatchIds.delete(dispatchId);
         // Preserve the in-flight payload so session-manager can replay it
         // after automatically rebuilding the transport runtime.
         // Don't drain on async send failure — the provider is likely broken.
@@ -685,6 +785,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._sending = false;
       this._activeTurn = null;
       this._activeDispatchEntries = [];
+      this._activeDispatchProviderStarted = false;
+      this._activeDispatchCancelled = false;
+      this._activeDispatchId = null;
       // Last-resort status update; `setStatus` itself is isolated post-C1b
       // but wrap defensively in case future code regresses that contract.
       try { this.setStatus('error'); } catch { /* swallow */ }
@@ -693,6 +796,34 @@ export class TransportSessionRuntime implements SessionRuntime {
       // The user must resend; the error status notifies them.
     }
     return true;
+  }
+
+  private isDispatchLocallyCancelled(dispatchId: number): boolean {
+    return this._locallyCancelledDispatchIds.has(dispatchId);
+  }
+
+  private cancelActiveDispatchLocally(dispatchId: number | null = this._activeDispatchId): void {
+    if (dispatchId !== null && this._activeDispatchId !== dispatchId) {
+      this._locallyCancelledDispatchIds.delete(dispatchId);
+      return;
+    }
+    if (!this._activeTurn && !this._sending) {
+      if (dispatchId !== null) this._locallyCancelledDispatchIds.delete(dispatchId);
+      this._activeDispatchCancelled = false;
+      this._activeDispatchProviderStarted = false;
+      this._activeDispatchId = null;
+      return;
+    }
+    this._sending = false;
+    this._activeTurn?.reject(makeCancelledProviderError());
+    this._activeTurn = null;
+    this._activeDispatchEntries = [];
+    this._activeDispatchCancelled = false;
+    this._activeDispatchProviderStarted = false;
+    this._activeDispatchId = null;
+    if (!this._drainPending()) {
+      this.setStatus('idle');
+    }
   }
 
   private mergeMessagePreambles(entries: PendingTransportMessage[] | undefined, userMessage?: string): string | undefined {

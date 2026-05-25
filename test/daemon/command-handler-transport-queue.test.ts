@@ -885,8 +885,8 @@ describe('handleWebCommand transport queue behavior', () => {
       'session.state',
       {
         state: 'idle',
-        pendingCount: 0,
-        pendingMessages: [],
+        pendingCount: 3,
+        pendingMessages: ['a', 'b', 'c'],
         pendingMessageEntries: [],
       },
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
@@ -1023,6 +1023,59 @@ describe('handleWebCommand transport queue behavior', () => {
 
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
       commandId: 'cmd-stop-priority',
+      status: 'accepted',
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(setAgentId).not.toHaveBeenCalled();
+
+    resolveRuntimeConfig?.({ availableModels: ['qwen-plus', 'qwen-max'] });
+    await flushAsync();
+    await flushAsync();
+  });
+
+  it('keeps legacy /stop on the priority lane while a transport model switch holds the send lock', async () => {
+    let resolveRuntimeConfig: ((value: unknown) => void) | null = null;
+    getQwenRuntimeConfigMock.mockReturnValueOnce(new Promise((resolve) => {
+      resolveRuntimeConfig = resolve;
+    }));
+    const setAgentId = vi.fn();
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      state: 'running',
+      qwenAvailableModels: ['qwen-plus', 'qwen-max'],
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      setAgentId,
+      cancel,
+      send: vi.fn(() => 'sent'),
+      pendingCount: 0,
+      pendingMessages: [],
+      pendingEntries: [],
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model qwen-max',
+      commandId: 'cmd-stop-priority-model-legacy',
+    }, serverLink as any);
+    await flushAsync();
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/stop',
+      commandId: 'cmd-stop-priority-legacy',
+    }, serverLink as any);
+
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-stop-priority-legacy',
       status: 'accepted',
     });
     expect(cancel).toHaveBeenCalledTimes(1);
@@ -1303,6 +1356,7 @@ describe('handleWebCommand transport queue behavior', () => {
       commandId: 'cmd-normal-during-lock',
     }, serverLink as any);
     await flushAsync();
+    await flushAsync();
 
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
       commandId: 'cmd-normal-during-lock',
@@ -1338,6 +1392,7 @@ describe('handleWebCommand transport queue behavior', () => {
       text: 'ordinary provider send-start should not hold ack',
       commandId: 'cmd-provider-start-hang',
     }, serverLink as any);
+    await flushAsync();
     await flushAsync();
 
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {

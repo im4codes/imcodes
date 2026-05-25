@@ -20,6 +20,29 @@ const childProcessMock = vi.hoisted(() => {
   };
 
   const children: ChildRecord[] = [];
+  const heldThreadStarts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
+  const heldTurnStarts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
+  const heldTurnInterrupts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
+  let holdThreadStart = false;
+  let holdTurnStart = false;
+  let holdTurnInterrupt = false;
+
+  const emitThreadStartResult = (childRecord: ChildRecord, msg: Request) => {
+    childRecord.emits({
+      id: msg.id,
+      result: { thread: { id: 'thread-1' } },
+    });
+    childRecord.emits({ method: 'thread/started', params: { thread: { id: 'thread-1' } } });
+  };
+  const emitTurnStartResult = (childRecord: ChildRecord, msg: Request) => {
+    childRecord.emits({
+      id: msg.id,
+      result: { turn: { id: 'turn-1', status: 'inProgress', items: [], error: null } },
+    });
+  };
+  const emitTurnInterruptResult = (childRecord: ChildRecord, msg: Request) => {
+    childRecord.emits({ id: msg.id, result: {} });
+  };
 
   const spawn = vi.fn(() => {
     const stdout = new PassThrough();
@@ -35,11 +58,11 @@ const childProcessMock = vi.hoisted(() => {
             childRecord.emits({ id: msg.id, result: { userAgent: 'test' } });
           }
           if (msg.method === 'thread/start' && typeof msg.id === 'number') {
-            childRecord.emits({
-              id: msg.id,
-              result: { thread: { id: 'thread-1' } },
-            });
-            childRecord.emits({ method: 'thread/started', params: { thread: { id: 'thread-1' } } });
+            if (holdThreadStart) {
+              heldThreadStarts.push({ childRecord, msg });
+            } else {
+              emitThreadStartResult(childRecord, msg);
+            }
           }
           if (msg.method === 'thread/resume' && typeof msg.id === 'number') {
             if (msg.params?.threadId === 'thread-corrupt') {
@@ -57,16 +80,21 @@ const childProcessMock = vi.hoisted(() => {
             }
           }
           if (msg.method === 'turn/start' && typeof msg.id === 'number') {
-            childRecord.emits({
-              id: msg.id,
-              result: { turn: { id: 'turn-1', status: 'inProgress', items: [], error: null } },
-            });
+            if (holdTurnStart) {
+              heldTurnStarts.push({ childRecord, msg });
+            } else {
+              emitTurnStartResult(childRecord, msg);
+            }
           }
           if (msg.method === 'thread/compact/start' && typeof msg.id === 'number') {
             childRecord.emits({ id: msg.id, result: {} });
           }
           if (msg.method === 'turn/interrupt' && typeof msg.id === 'number') {
-            childRecord.emits({ id: msg.id, result: {} });
+            if (holdTurnInterrupt) {
+              heldTurnInterrupts.push({ childRecord, msg });
+            } else {
+              emitTurnInterruptResult(childRecord, msg);
+            }
           }
           if (msg.method === 'thread/unsubscribe' && typeof msg.id === 'number') {
             childRecord.emits({ id: msg.id, result: { status: 'unsubscribed' } });
@@ -108,7 +136,32 @@ const childProcessMock = vi.hoisted(() => {
     return {} as never;
   });
 
-  return { spawn, execFile, children };
+  return {
+    spawn,
+    execFile,
+    children,
+    setHoldThreadStart(value: boolean) {
+      holdThreadStart = value;
+    },
+    setHoldTurnStart(value: boolean) {
+      holdTurnStart = value;
+    },
+    setHoldTurnInterrupt(value: boolean) {
+      holdTurnInterrupt = value;
+    },
+    releaseHeldTurnStarts() {
+      const held = heldTurnStarts.splice(0);
+      for (const entry of held) emitTurnStartResult(entry.childRecord, entry.msg);
+    },
+    releaseHeldThreadStarts() {
+      const held = heldThreadStarts.splice(0);
+      for (const entry of held) emitThreadStartResult(entry.childRecord, entry.msg);
+    },
+    releaseHeldTurnInterrupts() {
+      const held = heldTurnInterrupts.splice(0);
+      for (const entry of held) emitTurnInterruptResult(entry.childRecord, entry.msg);
+    },
+  };
 });
 
 vi.mock('node:child_process', () => ({
@@ -196,6 +249,12 @@ describe('CodexSdkProvider', () => {
     childProcessMock.spawn.mockClear();
     childProcessMock.execFile.mockClear();
     childProcessMock.children.length = 0;
+    childProcessMock.setHoldThreadStart(false);
+    childProcessMock.setHoldTurnStart(false);
+    childProcessMock.setHoldTurnInterrupt(false);
+    childProcessMock.releaseHeldThreadStarts();
+    childProcessMock.releaseHeldTurnStarts();
+    childProcessMock.releaseHeldTurnInterrupts();
   });
 
   afterEach(() => {
@@ -1006,6 +1065,97 @@ describe('CodexSdkProvider', () => {
     const child = childProcessMock.children[0];
     await provider.cancel('route-cancel');
     expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(true);
+  });
+
+  it('interrupts a Codex turn when cancel arrives before turn/start returns a turn id', async () => {
+    childProcessMock.setHoldTurnStart(true);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cancel-pending-start', cwd: '/tmp/project' });
+
+    const sendPromise = provider.send('route-cancel-pending-start', 'hello');
+    const child = childProcessMock.children[0];
+    await waitForCondition(() => child.requests.some((req) => req.method === 'turn/start'));
+
+    await provider.cancel('route-cancel-pending-start');
+    expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
+
+    childProcessMock.releaseHeldTurnStarts();
+    await sendPromise;
+    await waitForCondition(() => child.requests.some((req) => req.method === 'turn/interrupt'));
+
+    const interrupt = child.requests.find((req) => req.method === 'turn/interrupt');
+    expect(interrupt?.params).toMatchObject({ threadId: 'thread-1', turnId: 'turn-1' });
+  });
+
+  it('remembers Codex cancel when it arrives before thread/start returns a thread id', async () => {
+    childProcessMock.setHoldThreadStart(true);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cancel-pending-thread', cwd: '/tmp/project' });
+
+    const sendPromise = provider.send('route-cancel-pending-thread', 'hello');
+    const child = childProcessMock.children[0];
+    await waitForCondition(() => child.requests.some((req) => req.method === 'thread/start'));
+
+    await provider.cancel('route-cancel-pending-thread');
+    expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
+
+    childProcessMock.releaseHeldThreadStarts();
+    await sendPromise;
+    await waitForCondition(() => child.requests.some((req) => req.method === 'turn/interrupt'));
+
+    const interrupt = child.requests.find((req) => req.method === 'turn/interrupt');
+    expect(interrupt?.params).toMatchObject({ threadId: 'thread-1', turnId: 'turn-1' });
+  });
+
+  it('ignores late Codex deltas and completed output after cancel', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cancel-late-output', cwd: '/tmp/project' });
+
+    const deltas: string[] = [];
+    const completes: string[] = [];
+    const errors: string[] = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+    provider.onComplete((_sid, message) => completes.push(message.content));
+    provider.onError((_sid, err) => errors.push(err.code));
+
+    await provider.send('route-cancel-late-output', 'hello');
+    const child = childProcessMock.children[0];
+    await provider.cancel('route-cancel-late-output');
+    child.emits({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', itemId: 'msg-late', delta: 'late text' },
+    });
+    child.emits({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } },
+    });
+    await flush();
+
+    expect(deltas).toEqual([]);
+    expect(completes).toEqual([]);
+    expect(errors).toContain(PROVIDER_ERROR_CODES.CANCELLED);
+  });
+
+  it('starts the Codex cancel watchdog even when turn/interrupt never acknowledges', async () => {
+    vi.useFakeTimers();
+    childProcessMock.setHoldTurnInterrupt(true);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cancel-interrupt-hangs', cwd: '/tmp/project' });
+
+    const errors: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.code));
+
+    await provider.send('route-cancel-interrupt-hangs', 'hello');
+    const child = childProcessMock.children[0];
+    await provider.cancel('route-cancel-interrupt-hangs');
+
+    expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_600);
+    expect(errors).toContain(PROVIDER_ERROR_CODES.CANCELLED);
   });
 
   it('recovers the session when turn/interrupt never produces an interrupted completion', async () => {

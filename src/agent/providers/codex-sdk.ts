@@ -733,9 +733,15 @@ export class CodexSdkProvider implements TransportProvider {
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    if (!state?.threadId) return;
+    if (!state) return;
+    // Mark cancellation before checking threadId/runningTurnId. STOP can land
+    // while Codex app-server is still answering thread/start or turn/start; in
+    // that window there is not yet a turn id to interrupt. The cancelled flag
+    // carries the request across those async boundaries so startTurn() issues
+    // turn/interrupt as soon as Codex exposes the id.
+    state.cancelled = true;
+    if (!state.threadId) return;
     if (state.runningCompact) {
-      state.cancelled = true;
       const turnId = state.runningTurnId;
       if (turnId) {
         void this.request('turn/interrupt', {
@@ -746,13 +752,25 @@ export class CodexSdkProvider implements TransportProvider {
       this.cancelCompactLocally(sessionId, state);
       return;
     }
-    if (!state.runningTurnId) return;
-    state.cancelled = true;
     const turnId = state.runningTurnId;
-    await this.request('turn/interrupt', {
+    if (!turnId) return;
+    await this.interruptRunningTurn(sessionId, state, turnId);
+  }
+
+  private async interruptRunningTurn(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    turnId: string,
+  ): Promise<void> {
+    state.cancelled = true;
+    if (!state.threadId) return;
+    // Fire-and-watchdog. Do not await turn/interrupt acknowledgement before
+    // arming the local cancellation timer; an app-server/RPC hang must not
+    // leave the UI stuck in "stopping" forever.
+    void this.request('turn/interrupt', {
       threadId: state.threadId,
       turnId,
-    }).catch(() => {});
+    }, CANCEL_INTERRUPT_TIMEOUT_MS).catch(() => {});
     this.clearCancelTimer(state);
     state.cancelTimer = setTimeout(() => {
       if (!this.sessions.has(sessionId)) return;
@@ -920,6 +938,9 @@ export class CodexSdkProvider implements TransportProvider {
         ...(state.effort ? { effort: state.effort } : {}),
       });
       state.runningTurnId = result?.turn?.id;
+      if (state.cancelled && state.runningTurnId) {
+        await this.interruptRunningTurn(sessionId, state, state.runningTurnId);
+      }
     } catch (err) {
       state.runningTurnId = undefined;
       const error = this.normalizeError(err);
@@ -1179,6 +1200,7 @@ export class CodexSdkProvider implements TransportProvider {
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
+      if (state.cancelled) return;
       this.clearStatus(sessionId, state);
       state.currentMessageId = params.itemId;
       state.currentText += String(params.delta ?? '');
@@ -1216,6 +1238,8 @@ export class CodexSdkProvider implements TransportProvider {
         });
         return;
       }
+
+      if (state.cancelled) return;
 
       if (item.type === 'reasoning') {
         this.emitStatus(sessionId, state, {
@@ -1292,6 +1316,18 @@ export class CodexSdkProvider implements TransportProvider {
 
       if (state.runningCompact) {
         this.completeCompact(sessionId, state, typeof turn.id === 'string' ? turn.id : undefined);
+        return;
+      }
+
+      if (state.cancelled) {
+        this.clearCancelTimer(state);
+        this.clearStatus(sessionId, state);
+        state.runningTurnId = undefined;
+        state.pendingComplete = undefined;
+        state.currentMessageId = null;
+        state.currentText = '';
+        state.cancelled = false;
+        this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
       }
 

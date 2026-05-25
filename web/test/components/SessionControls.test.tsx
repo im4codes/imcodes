@@ -326,6 +326,14 @@ function expectCancelPayload(ws: ReturnType<typeof makeWs>, payload: Record<stri
   }));
 }
 
+function expectUrgentCancelPayload(ws: ReturnType<typeof makeWs>, payload: Record<string, unknown>): void {
+  expect(ws.sendSessionCommandUrgent).toHaveBeenCalledWith('cancel', expect.objectContaining({
+    ...payload,
+    commandId: expect.any(String),
+  }));
+  expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('cancel', expect.objectContaining(payload));
+}
+
 function expectLastSendPayload(ws: ReturnType<typeof makeWs>, payload: Record<string, unknown>): void {
   const calls = gatherSendCalls(ws);
   expect(calls.length).toBeGreaterThan(0);
@@ -1928,7 +1936,7 @@ afterEach(() => {
     });
   });
 
-  it('typing /stop in a transport input sends direct cancel instead of chat text', () => {
+  it('typing /stop in a transport input sends direct urgent cancel instead of chat text', () => {
     const ws = makeWs();
     const onSend = vi.fn();
     render(
@@ -1944,7 +1952,10 @@ afterEach(() => {
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
 
-    expectCancelPayload(ws, { sessionName: 'qwen-session' });
+    // STOP must stay on the urgent lane. A regular session.cancel would be
+    // gated by ws-client probe state and can be dropped during tab/focus
+    // resume, which is the regression this test locks down.
+    expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
     expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({ text: '/stop' }));
     expect(onSend).not.toHaveBeenCalled();
   });
@@ -2678,7 +2689,7 @@ afterEach(() => {
 
     // Transport sessions cancel the SDK turn directly instead of sending
     // `/stop` as chat text.
-    expectCancelPayload(ws, { sessionName: 'qwen-session' });
+    expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
     expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({
       sessionName: 'qwen-session',
       text: '/stop',
@@ -2705,7 +2716,7 @@ afterEach(() => {
     expect(stopBtn.textContent).toBe('■');
     expect(stopBtn.disabled).toBe(false);
     fireEvent.click(stopBtn);
-    expectCancelPayload(ws, { sessionName: 'codex-sdk-session' });
+    expectUrgentCancelPayload(ws, { sessionName: 'codex-sdk-session' });
     expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({
       sessionName: 'codex-sdk-session',
       text: '/stop',
