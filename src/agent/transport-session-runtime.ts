@@ -284,6 +284,19 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._onSessionInfoChange?.(info);
       })] : []),
     );
+    const unsubscribeToolCall = this.provider.onToolCall?.((sid: string) => {
+      if (sid !== this._providerSessionId) return;
+      if (this._activeDispatchId === null || !this._activeTurn) return;
+      // Provider-visible tool events mean the SDK has already accepted work,
+      // even if the shared-context dispatcher has not crossed its provider.send
+      // callback boundary yet. STOP must then delegate to provider.cancel so
+      // SDKs can abort/rotate poisoned sessions instead of taking the purely
+      // local pre-send skip path.
+      this._activeDispatchProviderStarted = true;
+    }) as unknown;
+    if (typeof unsubscribeToolCall === 'function') {
+      this._unsubscribes.push(unsubscribeToolCall as () => void);
+    }
     if (this.provider.onApprovalRequest) {
       this.provider.onApprovalRequest((sid: string, req: ApprovalRequest) => {
         if (sid !== this._providerSessionId) return;
