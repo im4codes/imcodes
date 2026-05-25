@@ -729,6 +729,10 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     setShowSizePanel(false);
   };
 
+  const discussionButtonLabel = t('subsessionBar.p2p_discussions');
+  const repoButtonLabel = t('repo.info_title', { defaultValue: t('subsessionBar.repository') });
+  const cronButtonLabel = t('subsessionBar.scheduled_tasks');
+
   return (
     <div class="subcard-bar">
       {/* Toolbar */}
@@ -837,7 +841,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         </button>
         {onViewDiscussions && (
           <button
-            class="subcard-toolbar-btn"
+            class={`subcard-toolbar-btn${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
             data-onboarding="discussion-history"
             data-running-discussions={totalRunningDiscussions}
             onClick={onViewDiscussions}
@@ -858,7 +862,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             }
             style={{ marginLeft: 4, fontSize: 11, position: 'relative' }}
           >
-            👥
+            <span aria-hidden="true">👥</span>
+            {desktopLayoutCapable && <span class="subcard-toolbar-btn-label">{discussionButtonLabel}</span>}
             {totalRunningDiscussions > 0 && (
               <span
                 data-testid="p2p-discussions-running-badge"
@@ -894,21 +899,31 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         )}
         {onViewRepo && (
           <button
-            class="subcard-toolbar-btn"
+            class={`subcard-toolbar-btn${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
             data-onboarding="repo-page"
             onClick={() => onViewRepo()}
-            title={t('subsessionBar.repository')}
+            title={repoButtonLabel}
+            aria-label={repoButtonLabel}
             style={{
               marginLeft: 4,
               fontSize: 11,
             }}
           >
-            🗂️
+            <span aria-hidden="true">🗂️</span>
+            {desktopLayoutCapable && <span class="subcard-toolbar-btn-label">{repoButtonLabel}</span>}
           </button>
         )}
         {onViewCron && (
-          <button class="subcard-toolbar-btn" data-onboarding="cron-manager" onClick={onViewCron} title={t('subsessionBar.scheduled_tasks')} style={{ marginLeft: 4, fontSize: 11 }}>
-            ⏰
+          <button
+            class={`subcard-toolbar-btn${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
+            data-onboarding="cron-manager"
+            onClick={onViewCron}
+            title={cronButtonLabel}
+            aria-label={cronButtonLabel}
+            style={{ marginLeft: 4, fontSize: 11 }}
+          >
+            <span aria-hidden="true">⏰</span>
+            {desktopLayoutCapable && <span class="subcard-toolbar-btn-label">{cronButtonLabel}</span>}
           </button>
         )}
       </div>

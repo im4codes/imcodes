@@ -10,6 +10,9 @@ vi.mock('react-i18next', () => ({
     t: (key: string, vars?: Record<string, unknown>) => {
       if (key === 'subsessionBar.subs_count') return `Subs (${vars?.count ?? 0})`;
       if (key === 'subsessionBar.add_sub_session_short') return '+ sub-session';
+      if (key === 'subsessionBar.p2p_discussions') return 'Team discussions';
+      if (key === 'repo.info_title') return 'Repository information';
+      if (key === 'subsessionBar.scheduled_tasks') return 'Scheduled Tasks';
       return key;
     },
   }),
@@ -699,12 +702,21 @@ describe('SubSessionBar', () => {
     const desktop = renderBar(true);
     expect(desktop.container.querySelector('[data-onboarding="new-sub-session"]')?.textContent?.trim()).toBe('+ sub-session');
     expect(desktop.container.querySelector('[data-onboarding="discussion-history"]')?.textContent).toContain('👥');
+    expect(desktop.container.querySelector('[data-onboarding="discussion-history"]')?.textContent).toContain('Team discussions');
     expect(desktop.container.querySelector('[data-onboarding="repo-page"]')?.textContent).toContain('🗂️');
+    expect(desktop.container.querySelector('[data-onboarding="repo-page"]')?.textContent).toContain('Repository information');
     expect(desktop.container.querySelector('[data-onboarding="cron-manager"]')?.textContent).toContain('⏰');
+    expect(desktop.container.querySelector('[data-onboarding="cron-manager"]')?.textContent).toContain('Scheduled Tasks');
     desktop.unmount();
 
     const mobile = renderBar(false);
     expect(mobile.container.querySelector('[data-onboarding="new-sub-session"]')?.textContent?.trim()).toBe('+');
+    expect(mobile.container.querySelector('[data-onboarding="discussion-history"]')?.textContent).toContain('👥');
+    expect(mobile.container.querySelector('[data-onboarding="discussion-history"]')?.textContent).not.toContain('Team discussions');
+    expect(mobile.container.querySelector('[data-onboarding="repo-page"]')?.textContent).toContain('🗂️');
+    expect(mobile.container.querySelector('[data-onboarding="repo-page"]')?.textContent).not.toContain('Repository information');
+    expect(mobile.container.querySelector('[data-onboarding="cron-manager"]')?.textContent).toContain('⏰');
+    expect(mobile.container.querySelector('[data-onboarding="cron-manager"]')?.textContent).not.toContain('Scheduled Tasks');
   });
 
   // Audit fix (P2P bar scoping follow-up) — pin the contract that the

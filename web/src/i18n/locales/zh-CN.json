@@ -1148,7 +1148,7 @@
     "subs_count": "Subs（{{count}}）",
     "new_sub_session": "新建子会话",
     "add_sub_session_short": "+ 子会话",
-    "p2p_discussions": "团队 讨论",
+    "p2p_discussions": "团队讨论",
     "p2p_compact_show": "显示 团队 紧凑栏",
     "p2p_compact_hide": "收起 团队 为紧凑栏",
     "p2p_discussions_with_running_one": "{{count}} 个进行中的讨论 — 查看全部",
