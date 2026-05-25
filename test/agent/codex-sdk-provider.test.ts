@@ -170,6 +170,19 @@ import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+async function waitForCondition(
+  check: () => boolean,
+  timeoutMs = 3000,
+  intervalMs = 10,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error('Timed out waiting for condition');
+}
+
 async function writeCodexAuthFile(codexHome: string, version: number): Promise<void> {
   await writeFile(
     join(codexHome, 'auth.json'),
@@ -285,7 +298,7 @@ describe('CodexSdkProvider', () => {
         },
       },
     });
-    await flush();
+    await waitForCondition(() => errors.length === 1 && childProcessMock.children.length === 2);
 
     expect(errors).toMatchObject([{
       code: PROVIDER_ERROR_CODES.AUTH_FAILED,
@@ -351,7 +364,14 @@ describe('CodexSdkProvider', () => {
       params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'OK' } },
     });
     child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
-    await flush();
+    await waitForCondition(
+      () =>
+        tools.length === 2 &&
+        deltas.length === 2 &&
+        usageUpdates.length === 1 &&
+        completed.length === 1 &&
+        sessionInfo.some((info) => info.resumeId === 'thread-1'),
+    );
 
     expect(tools).toEqual([
       {
