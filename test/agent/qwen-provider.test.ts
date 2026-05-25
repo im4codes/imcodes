@@ -943,6 +943,7 @@ describe('QwenProvider', () => {
     first.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: true, error: { message: 'API Error: Premature close' } })}\n`);
     await new Promise((resolve) => setTimeout(resolve, 350));
     await waitForSpawnCount(2);
+    first.child.emit('close', 0, null);
 
     const second = lastSpawn();
     second.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-retry-ok', content: [{ type: 'text', text: 'OK' }] } })}\n`);

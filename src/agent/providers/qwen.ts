@@ -598,6 +598,7 @@ export class QwenProvider implements TransportProvider {
       if (sawVisibleTurnProgress()) return false;
       if (!this.isRetryableTransientError(messageText)) return false;
       retryScheduled = true;
+      completed = true;
       state.child = null;
       logger.info({ provider: this.id, sessionId, message: messageText }, 'Qwen transient provider error; retrying turn once');
       await new Promise((resolve) => setTimeout(resolve, TRANSIENT_RETRY_DELAY_MS));
@@ -907,40 +908,42 @@ export class QwenProvider implements TransportProvider {
     });
 
     child.once('close', (code, signal) => {
-      rl.close();
-      state.child = null;
-      if (state.cancelled) {
-        emitError('Cancelled');
-        return;
-      }
-      if (!completed && !sawError && code === 0) {
-        if (state.pendingFinalText) {
-          emitComplete(state.pendingFinalText, state.currentMessageId ?? undefined, state.pendingFinalMetadata);
+      setTimeout(() => {
+        rl.close();
+        if (state.child === child) state.child = null;
+        if (state.cancelled) {
+          emitError('Cancelled');
           return;
         }
-        logger.warn(
-          { provider: this.id, sessionId, code, signal, stderr: stderrBuf.trim() || undefined },
-          'Qwen process exited successfully without a terminal response',
-        );
-        recoverOrEmitProviderError(QWEN_EMPTY_RESPONSE_MESSAGE, { code, signal, stderr: stderrBuf });
-        return;
-      }
-      if (!completed && !sawError) {
-        if (allowResumeFallback && state.started && /No saved session found with ID/i.test(stderrBuf)) {
-          state.started = false;
-          state.qwenConversationId = randomUUID();
-          this.emitSessionInfo(sessionId, { resumeId: state.qwenConversationId });
-          void this.send(sessionId, payload, _attachments, extraSystemPrompt, false).catch((err) => {
-            const providerError = typeof err === 'object' && err && 'code' in err
-              ? err as ProviderError
-              : this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, String(err), false, err);
-            emitError(providerError.message, providerError.details ?? providerError);
-          });
+        if (!completed && !sawError && code === 0) {
+          if (state.pendingFinalText) {
+            emitComplete(state.pendingFinalText, state.currentMessageId ?? undefined, state.pendingFinalMetadata);
+            return;
+          }
+          logger.warn(
+            { provider: this.id, sessionId, code, signal, stderr: stderrBuf.trim() || undefined },
+            'Qwen process exited successfully without a terminal response',
+          );
+          recoverOrEmitProviderError(QWEN_EMPTY_RESPONSE_MESSAGE, { code, signal, stderr: stderrBuf });
           return;
         }
-        const errorText = stderrBuf.trim() || `Qwen exited with code ${code ?? 'null'}${signal ? ` (${signal})` : ''}`;
-        recoverOrEmitProviderError(errorText, { code, signal, stderr: stderrBuf });
-      }
+        if (!completed && !sawError) {
+          if (allowResumeFallback && state.started && /No saved session found with ID/i.test(stderrBuf)) {
+            state.started = false;
+            state.qwenConversationId = randomUUID();
+            this.emitSessionInfo(sessionId, { resumeId: state.qwenConversationId });
+            void this.send(sessionId, payload, _attachments, extraSystemPrompt, false).catch((err) => {
+              const providerError = typeof err === 'object' && err && 'code' in err
+                ? err as ProviderError
+                : this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, String(err), false, err);
+              emitError(providerError.message, providerError.details ?? providerError);
+            });
+            return;
+          }
+          const errorText = stderrBuf.trim() || `Qwen exited with code ${code ?? 'null'}${signal ? ` (${signal})` : ''}`;
+          recoverOrEmitProviderError(errorText, { code, signal, stderr: stderrBuf });
+        }
+      }, 0);
     });
 
     await new Promise<void>((resolve, reject) => {
