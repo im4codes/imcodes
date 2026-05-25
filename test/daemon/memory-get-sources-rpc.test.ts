@@ -194,6 +194,43 @@ describe('daemon WS handler: memory.get_sources_request', () => {
     expect(sources[0].content).toContain('beta.test.im.codes');
   });
 
+  it('returns projection summary fallback for non-manual projections whose raw events are unavailable', async () => {
+    const namespace = { scope: 'personal' as const, projectId: 'repo-1', userId: 'user-1' };
+    const projection = writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-missing-summary'],
+      summary: 'mock deployment note: alpha.test.im.codes is the canary host',
+      content: { eventCount: 2, ownerUserId: 'user-1' },
+      origin: 'chat_compacted',
+      updatedAt: 4_000,
+    });
+
+    const link = makeFakeServerLink();
+    handleWebCommand({
+      type: MEMORY_WS.GET_SOURCES_REQUEST,
+      requestId: 'req-summary-fallback',
+      projectionId: projection.id,
+      expectedServerId: 'srv-self',
+    }, link);
+    for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+
+    expect(link.sent).toHaveLength(1);
+    const reply = link.sent[0];
+    expect(reply.status).toBe('ok');
+    expect(reply.sourceEventCount).toBe(1);
+    expect(reply.partial).toBe(false);
+    const sources = reply.sources as Array<{ eventId: string; content: string | null; status: string; eventType?: string }>;
+    expect(sources).toHaveLength(1);
+    expect(sources[0]).toMatchObject({
+      eventId: 'evt-missing-summary',
+      status: 'projection',
+      eventType: 'memory.projection',
+      content: 'mock deployment note: alpha.test.im.codes is the canary host',
+    });
+    expect(JSON.stringify(sources[0])).not.toContain('ownerUserId');
+  });
+
   it('sets partial=true when some source events are missing from the archive', async () => {
     const namespace = { scope: 'personal' as const, projectId: 'repo-1', userId: 'user-1' };
     const target = { namespace, kind: 'session' as const, name: 'deck_repo1_brain' };

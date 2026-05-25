@@ -96,7 +96,49 @@ describe('memory read tools', () => {
     const sources = memoryGetSources(projection.id, caller('bob', bobRepo));
     expect(sources.sourceEventCount).toBe(1);
     expect(sources.sources?.[0]).toMatchObject({ eventId: 'evt-2', status: 'archived', content: 'done' });
+    expect(sources.projectionSource).toMatchObject({ eventId: 'evt-2', status: 'projection', content: 'done' });
     expect(sources.partial).toBe(false);
+  });
+
+  it('returns legacy personal projection sources for the same project owner namespace', () => {
+    const legacyRepo: ContextNamespace = { scope: 'personal', projectId: 'repo' };
+    const target = { namespace: legacyRepo, kind: 'session' as const, sessionName: 'deck_repo_brain' };
+    const event = recordContextEvent({
+      id: 'evt-legacy-personal',
+      target,
+      eventType: 'assistant.text',
+      content: 'legacy personal source content',
+      createdAt: 1,
+    });
+    archiveEventsForMaterialization([event], 2);
+    const projection = writeProcessedProjection({
+      namespace: legacyRepo,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-legacy-personal'],
+      summary: 'legacy personal summary',
+      content: {},
+    });
+
+    const sources = memoryGetSources(projection.id, caller('bob', bobRepo));
+    expect(sources).toMatchObject({
+      projectionId: projection.id,
+      sourceEventCount: 1,
+      projectionSource: {
+        eventId: 'evt-legacy-personal',
+        status: 'projection',
+        content: 'legacy personal summary',
+      },
+      partial: false,
+      sources: [
+        {
+          eventId: 'evt-legacy-personal',
+          status: 'archived',
+          content: 'legacy personal source content',
+          eventType: 'assistant.text',
+          createdAt: 1,
+        },
+      ],
+    });
   });
 
   it('returns manual memory projection text when no raw source event exists', () => {
@@ -126,6 +168,30 @@ describe('memory read tools', () => {
       content: expect.stringContaining('alpha.test.im.codes'),
     });
     expect(sources.sources?.[0]?.content).toContain('beta.test.im.codes');
+  });
+
+  it('returns projection summary when non-manual raw source events are unavailable', () => {
+    const projection = writeProcessedProjection({
+      namespace: bobRepo,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-missing-summary'],
+      summary: 'mock deployment note: alpha.test.im.codes promoted to canary',
+      content: { eventCount: 3, ownerUserId: 'bob' },
+      origin: 'chat_compacted',
+      createdAt: 10,
+      updatedAt: 10,
+    });
+
+    const sources = memoryGetSources(projection.id, caller('bob', bobRepo));
+    expect(sources.sourceEventCount).toBe(1);
+    expect(sources.partial).toBe(false);
+    expect(sources.sources).toHaveLength(1);
+    expect(sources.sources?.[0]).toMatchObject({
+      eventId: 'evt-missing-summary',
+      status: 'projection',
+      eventType: 'memory.projection',
+      content: 'mock deployment note: alpha.test.im.codes promoted to canary',
+    });
   });
 
   it('returns exact observation text by observationId without requiring a projection', () => {

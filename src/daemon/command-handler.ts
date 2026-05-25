@@ -106,6 +106,7 @@ import {
   type MemoryMcpProviderStatusView,
   type MemoryMcpToolFamilyGateView,
 } from '../../shared/memory-ws.js';
+import { buildMemoryProjectionFallbackSource } from '../../shared/memory-projection-source-fallback.js';
 import { FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { P2P_PRESET_DEFAULT_SUMMARY_PROMPT, P2P_WORKFLOW_SCHEMA_VERSION } from '../../shared/p2p-workflow-constants.js';
@@ -10390,27 +10391,14 @@ async function handleMemoryGetSourcesRequest(cmd: Record<string, unknown>, serve
         createdAt: eventInScope ? event!.createdAt : undefined,
       };
     });
-    const manualProjectionText = projection.origin === 'user_note'
-      || projection.content.manual === true
-      || projection.sourceEventIds.some((eventId) => eventId.startsWith('manual-memory:'))
-      ? (typeof projection.content.text === 'string' && projection.content.text.trim()
-        ? projection.content.text.trim()
-        : projection.summary.trim())
-      : '';
-    const fallbackSource = manualProjectionText
-      ? [{
-        eventId: projection.sourceEventIds[0] ?? `projection:${projection.id}`,
-        status: 'projection' as const,
-        content: manualProjectionText,
-        eventType: 'memory.projection',
-        createdAt: projection.createdAt,
-      }]
-      : undefined;
-    const resolvedSources = (sources.length === 0 || sources.every((source) => source.content === null)) && fallbackSource
-      ? fallbackSource
+    const projectionSource = buildMemoryProjectionFallbackSource(projection);
+    const shouldFallback = sources.length === 0
+      || sources.every((source) => source.content === null && source.status === 'missing');
+    const resolvedSources = shouldFallback && projectionSource
+      ? [projectionSource]
       : sources;
 
-    const partial = !fallbackSource && (
+    const partial = !(resolvedSources.length === 1 && resolvedSources[0]?.status === 'projection') && (
       sources.length !== projection.sourceEventIds.length
       || sources.some((source) => source.content === null)
     );
@@ -10422,6 +10410,7 @@ async function handleMemoryGetSourcesRequest(cmd: Record<string, unknown>, serve
       projectionId,
       sourceEventCount: Math.max(projection.sourceEventIds.length, resolvedSources.length),
       sources: resolvedSources,
+      ...(projectionSource ? { projectionSource } : {}),
       partial,
       originServerId,
     });

@@ -117,6 +117,7 @@ interface RemoteSourcesEnvelope {
   projectionId?: string;
   sourceEventCount?: number;
   sources?: MemoryGetSourcesResult['sources'];
+  projectionSource?: MemoryGetSourcesResult['projectionSource'];
   partial?: boolean;
   originServerId?: string;
   reason?: string;
@@ -182,6 +183,7 @@ async function fetchRemoteSources(
     projectionId,
     sourceEventCount: typeof body.sourceEventCount === 'number' ? body.sourceEventCount : 0,
     sources: Array.isArray(body.sources) ? body.sources : [],
+    ...(body.projectionSource ? { projectionSource: body.projectionSource } : {}),
     ...(typeof body.partial === 'boolean' ? { partial: body.partial } : {}),
     originServerId: body.originServerId && typeof body.originServerId === 'string' ? body.originServerId : ownerServerId,
   };

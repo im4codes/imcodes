@@ -22,11 +22,123 @@ import type { Env } from '../env.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
+import { buildMemoryProjectionFallbackSource } from '../../../shared/memory-projection-source-fallback.js';
 import logger from '../util/logger.js';
 
 export const memoryRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
 const SOURCES_REQUEST_TIMEOUT_MS = 8_000;
+
+type MemorySourcesPayload = Record<string, unknown> & {
+  status?: string;
+  projectionId?: string;
+  sourceEventCount?: number;
+  sources?: Array<Record<string, unknown>>;
+  projectionSource?: Record<string, unknown>;
+  partial?: boolean;
+  originServerId?: string;
+};
+
+interface SharedProjectionSourceFallbackRow {
+  id: string;
+  server_id: string;
+  source_event_ids_json: unknown;
+  summary: string | null;
+  content_json: unknown;
+  origin?: string | null;
+  created_at?: number | string | null;
+}
+
+function parseJsonish(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return value;
+  }
+}
+
+function parseSourceEventIds(value: unknown): string[] {
+  const parsed = parseJsonish(value);
+  if (!Array.isArray(parsed)) return [];
+  return parsed.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0);
+}
+
+function hasUsableSource(payload: MemorySourcesPayload): boolean {
+  return Array.isArray(payload.sources)
+    && payload.sources.some((source) => typeof source.content === 'string' && source.content.trim().length > 0);
+}
+
+function canUseProjectionFallback(payload: MemorySourcesPayload): boolean {
+  if (!Array.isArray(payload.sources) || payload.sources.length === 0) return true;
+  return payload.sources.every((source) => source.content == null && source.status === 'missing');
+}
+
+async function loadProjectionFallbackPayload(
+  db: Env['DB'],
+  input: { projectionId: string; userId: string; originServerId: string },
+): Promise<MemorySourcesPayload | undefined> {
+  const row = await db.queryOne<SharedProjectionSourceFallbackRow>(
+    `SELECT id, server_id, source_event_ids_json, summary, content_json, origin, created_at
+       FROM shared_context_projections
+      WHERE id = $1
+        AND ((scope = 'personal' AND user_id = $2)
+             OR EXISTS (
+               SELECT 1
+                 FROM team_members tm
+                WHERE tm.team_id = shared_context_projections.enterprise_id
+                  AND tm.user_id = $2
+             ))
+      LIMIT 1`,
+    [input.projectionId, input.userId],
+  );
+  if (!row?.id) return undefined;
+  const sourceEventIds = parseSourceEventIds(row.source_event_ids_json);
+  const content = parseJsonish(row.content_json);
+  const createdAt = typeof row.created_at === 'number'
+    ? row.created_at
+    : typeof row.created_at === 'string'
+      ? Number(row.created_at)
+      : undefined;
+  const fallback = buildMemoryProjectionFallbackSource({
+    id: row.id,
+    sourceEventIds,
+    summary: row.summary ?? '',
+    content,
+    origin: row.origin,
+    createdAt: typeof createdAt === 'number' && Number.isFinite(createdAt) ? createdAt : undefined,
+  });
+  if (!fallback) return undefined;
+  return {
+    status: 'ok',
+    projectionId: input.projectionId,
+    sourceEventCount: Math.max(sourceEventIds.length, 1),
+    sources: [fallback],
+    projectionSource: fallback,
+    partial: false,
+    originServerId: row.server_id || input.originServerId,
+  };
+}
+
+async function withProjectionFallback(
+  db: Env['DB'],
+  input: { payload: MemorySourcesPayload; projectionId: string; userId: string; originServerId: string },
+): Promise<MemorySourcesPayload> {
+  if (input.payload.status !== 'ok' || hasUsableSource(input.payload) || !canUseProjectionFallback(input.payload)) return input.payload;
+  const fallback = await loadProjectionFallbackPayload(db, input);
+  if (!fallback) return input.payload;
+  return {
+    ...input.payload,
+    sourceEventCount: Math.max(
+      typeof input.payload.sourceEventCount === 'number' ? input.payload.sourceEventCount : 0,
+      typeof fallback.sourceEventCount === 'number' ? fallback.sourceEventCount : 0,
+    ),
+    sources: fallback.sources,
+    projectionSource: input.payload.projectionSource || fallback.projectionSource,
+    partial: false,
+    originServerId: input.payload.originServerId || fallback.originServerId,
+  };
+}
 
 // ── projection-owner resolver ───────────────────────────────────────────
 //
@@ -86,6 +198,8 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
 
   const bridge = WsBridge.get(serverId);
   if (!bridge.isDaemonConnected()) {
+    const fallback = await loadProjectionFallbackPayload(c.env.DB, { projectionId, userId, originServerId: serverId });
+    if (fallback) return c.json(fallback);
     // Match the daemon-offline contract the file-transfer / Watch API
     // routes return so the MCP error mapping on the caller side stays
     // uniform.
@@ -103,19 +217,22 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
     // Stamp serverId on the reply when daemon didn't include it. The
     // route's serverId IS the canonical origin (pod-sticky-routed here).
     if (!('originServerId' in payload)) {
-      (payload as Record<string, unknown>).originServerId = serverId;
+      payload.originServerId = serverId;
     }
-    return c.json(payload);
+    const hydrated = await withProjectionFallback(c.env.DB, { payload, projectionId, userId, originServerId: serverId });
+    return c.json(hydrated);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (message === 'timeout') {
       // Treat timeout the same as daemon offline so the MCP caller can
       // surface a recoverable error and try again later.
       logger.warn({ serverId, projectionId }, 'memory.get_sources timed out');
-      return c.json({ error: 'daemon_offline' }, 409);
+      const fallback = await loadProjectionFallbackPayload(c.env.DB, { projectionId, userId, originServerId: serverId });
+      return fallback ? c.json(fallback) : c.json({ error: 'daemon_offline' }, 409);
     }
     if (message === 'daemon_offline' || message === 'daemon_disconnected' || message === 'daemon_error') {
-      return c.json({ error: 'daemon_offline' }, 409);
+      const fallback = await loadProjectionFallbackPayload(c.env.DB, { projectionId, userId, originServerId: serverId });
+      return fallback ? c.json(fallback) : c.json({ error: 'daemon_offline' }, 409);
     }
     logger.warn({ serverId, projectionId, err: message }, 'memory.get_sources failed');
     return c.json({ error: FS_GENERIC_ERROR_CODES.INTERNAL_ERROR, message }, 500);

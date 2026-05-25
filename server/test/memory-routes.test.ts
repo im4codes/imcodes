@@ -278,4 +278,102 @@ describe('GET /api/memory/sources', () => {
     const body = await res.json() as { originServerId: string };
     expect(body.originServerId).toBe(serverId);
   });
+
+  it('falls back to the cloud projection summary when daemon returns no source content', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    await authDaemon(bridge, daemon, makeDb());
+    const db = makeDb({
+      queryOne: async <T>(sql: string) => {
+        if (sql.toLowerCase().includes('from shared_context_projections')) {
+          return {
+            id: 'proj-cloud-fallback',
+            server_id: serverId,
+            source_event_ids_json: ['evt-missing-cloud'],
+            summary: 'mock cloud memory says alpha.test.im.codes is canary',
+            content_json: { ownerUserId: 'user-1' },
+            origin: 'chat_compacted',
+            created_at: 123,
+          } as T;
+        }
+        return null;
+      },
+    });
+    const app = await buildTestApp(db);
+
+    const requestArrived = new Promise<{ requestId: string }>((resolve) => {
+      const tick = () => {
+        const sent = daemon.sent.find((s) => s.includes(MEMORY_WS.GET_SOURCES_REQUEST));
+        if (sent) resolve(JSON.parse(sent) as { requestId: string });
+        else setImmediate(tick);
+      };
+      tick();
+    });
+    const resPromise = app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-cloud-fallback`);
+    const { requestId } = await requestArrived;
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: MEMORY_WS.GET_SOURCES_RESPONSE,
+      requestId,
+      status: 'ok',
+      projectionId: 'proj-cloud-fallback',
+      sourceEventCount: 0,
+      sources: [],
+      originServerId: serverId,
+    })));
+    await flushAsync();
+
+    const res = await resPromise;
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      sourceEventCount: number;
+      partial: boolean;
+      projectionSource: { eventId: string; status: string; content: string };
+      sources: Array<{ eventId: string; status: string; content: string }>;
+    };
+    expect(body.sourceEventCount).toBe(1);
+    expect(body.partial).toBe(false);
+    expect(body.projectionSource).toMatchObject({
+      eventId: 'evt-missing-cloud',
+      status: 'projection',
+      content: 'mock cloud memory says alpha.test.im.codes is canary',
+    });
+    expect(body.sources).toEqual([
+      expect.objectContaining({
+        eventId: 'evt-missing-cloud',
+        status: 'projection',
+        content: 'mock cloud memory says alpha.test.im.codes is canary',
+      }),
+    ]);
+    expect(JSON.stringify(body.sources)).not.toContain('ownerUserId');
+  });
+
+  it('can return cloud projection summary even when the daemon is offline', async () => {
+    WsBridge.get(serverId);
+    const db = makeDb({
+      queryOne: async <T>(sql: string) => {
+        if (sql.toLowerCase().includes('from shared_context_projections')) {
+          return {
+            id: 'proj-offline-fallback',
+            server_id: serverId,
+            source_event_ids_json: [],
+            summary: 'mock offline memory remains expandable from cloud DB',
+            content_json: {},
+            origin: 'chat_compacted',
+            created_at: 456,
+          } as T;
+        }
+        return null;
+      },
+    });
+    const app = await buildTestApp(db);
+
+    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-offline-fallback`);
+    expect(res.status).toBe(200);
+    const body = await res.json() as { sources: Array<{ eventId: string; content: string }>; originServerId: string };
+    expect(body.originServerId).toBe(serverId);
+    expect(body.sources[0]).toMatchObject({
+      eventId: 'projection:proj-offline-fallback',
+      content: 'mock offline memory remains expandable from cloud DB',
+    });
+  });
 });

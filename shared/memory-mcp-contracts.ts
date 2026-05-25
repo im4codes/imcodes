@@ -163,6 +163,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       projectionId: stringSchema('Requested projection id when expanding a projection hit.'),
       observationId: stringSchema('Requested observation id when expanding an observation hit.'),
       sources: { type: 'array', description: 'Source snippets visible to the caller namespace.', items: { type: 'object', additionalProperties: true } },
+      projectionSource: { type: 'object', description: 'Processed projection summary snippet, included when available so callers can cite compacted memories even when raw source events are unavailable or less informative.', additionalProperties: true },
     }),
   },
   [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: {

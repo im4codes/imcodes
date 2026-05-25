@@ -3,8 +3,10 @@ import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import type { ContextNamespace, LocalContextEvent } from '../../shared/context-types.js';
 import { buildMemoryMcpSourceProvenance, type MemoryMcpSourceProvenance, type MemoryMcpSourceProvenanceInput } from '../../shared/memory-mcp-provenance.js';
+import { buildMemoryProjectionFallbackSource } from '../../shared/memory-projection-source-fallback.js';
 import { serializeContextNamespace } from './context-keys.js';
 import {
+  LEGACY_DAEMON_LOCAL_USER_ID,
   getArchivedEvent,
   getContextObservationById,
   getProcessedProjectionById,
@@ -135,6 +137,16 @@ function sameNamespace(a: ContextNamespace, b: ContextNamespace): boolean {
 }
 
 function canAccessNamespace(namespace: ContextNamespace, caller: AnyCaller): boolean {
+  if (
+    namespace.scope === 'personal'
+    && (!namespace.userId || namespace.userId === LEGACY_DAEMON_LOCAL_USER_ID)
+  ) {
+    if (isInternalCaller(caller)) return true;
+    return caller.namespace.scope === 'personal'
+      && namespace.projectId === caller.namespace.projectId
+      && (namespace.enterpriseId ?? undefined) === (caller.namespace.enterpriseId ?? undefined)
+      && (namespace.workspaceId ?? undefined) === (caller.namespace.workspaceId ?? undefined);
+  }
   if (namespace.userId !== caller.userId) return false;
   if (isInternalCaller(caller)) return true;
   // Public callers carry a required namespace; cross-namespace reads are forbidden.
@@ -171,6 +183,7 @@ export interface MemoryGetSourcesResult {
   sourceEventCount: number;
   note?: string;
   sources?: Array<{ eventId: string; status: 'archived' | 'staged' | 'missing' | 'projection' | 'observation'; content: string | null; eventType?: string; createdAt?: number }>;
+  projectionSource?: { eventId: string; status: 'projection'; content: string; eventType: 'memory.projection'; createdAt?: number };
   partial?: boolean;
 }
 
@@ -181,25 +194,6 @@ export type MemoryGetSourcesInput =
     observationId?: string;
     kind?: 'projection' | 'observation';
   };
-
-function projectionFallbackSource(projection: ReturnType<typeof getProcessedProjectionById>): NonNullable<MemoryGetSourcesResult['sources']>[number] | undefined {
-  if (!projection) return undefined;
-  const isManualMemory = projection.origin === 'user_note'
-    || projection.content.manual === true
-    || projection.sourceEventIds.some((eventId) => eventId.startsWith('manual-memory:'));
-  if (!isManualMemory) return undefined;
-  const text = typeof projection.content.text === 'string' && projection.content.text.trim()
-    ? projection.content.text.trim()
-    : projection.summary.trim();
-  if (!text) return undefined;
-  return {
-    eventId: projection.sourceEventIds[0] ?? `projection:${projection.id}`,
-    status: 'projection',
-    content: text,
-    eventType: 'memory.projection',
-    createdAt: projection.createdAt,
-  };
-}
 
 function observationNamespaceById(namespaceId: string, scope: ContextNamespace['scope']): ContextNamespace | undefined {
   const row = listContextNamespaces().find((candidate) => candidate.id === namespaceId);
@@ -228,6 +222,11 @@ function observationText(content: Record<string, unknown>): string {
   const text = content.text;
   if (typeof text === 'string' && text.trim()) return text.trim();
   return JSON.stringify(content);
+}
+
+function shouldUseProjectionFallback(sources: NonNullable<MemoryGetSourcesResult['sources']>): boolean {
+  return sources.length === 0
+    || sources.every((source) => source.content === null && source.status === 'missing');
 }
 
 function memoryGetObservationSources(observationId: string, caller: MemoryToolCaller): MemoryGetSourcesResult {
@@ -286,14 +285,14 @@ export function memoryGetSources(input: MemoryGetSourcesInput, caller: MemoryToo
       createdAt: event?.createdAt,
     };
   });
-  const fallback = sources.length === 0 || sources.every((source) => source.content === null)
-    ? projectionFallbackSource(projection)
-    : undefined;
+  const projectionSource = buildMemoryProjectionFallbackSource(projection);
+  const fallback = shouldUseProjectionFallback(sources) ? projectionSource : undefined;
   const resolvedSources = fallback ? [fallback] : sources;
   return {
     projectionId,
     sourceEventCount: Math.max(projection.sourceEventIds.length, resolvedSources.length),
     sources: resolvedSources,
+    ...(projectionSource ? { projectionSource } : {}),
     partial: !fallback && (sources.length !== projection.sourceEventIds.length || sources.some((source) => source.content === null)),
   };
 }

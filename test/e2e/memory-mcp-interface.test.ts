@@ -14,7 +14,13 @@ import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../sha
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
-import { listContextObservations, resetContextStoreForTests } from '../../src/store/context-store.js';
+import {
+  archiveEventsForMaterialization,
+  listContextObservations,
+  recordContextEvent,
+  resetContextStoreForTests,
+  writeProcessedProjection,
+} from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
 const USER_ID = 'memory-mcp-e2e-user';
@@ -228,6 +234,157 @@ describe('memory MCP interface e2e', () => {
             eventId: 'turn-observation-e2e',
             status: 'observation',
             content: text,
+          }),
+        ],
+      });
+    });
+  });
+
+  it('finds a projection by MCP search and expands summary fallback by projectionId or short ref', async () => {
+    const projection = writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-missing-projection-e2e'],
+      summary: 'mock projection fallback source mentions alpha.test.im.codes for MCP expansion',
+      content: { ownerUserId: USER_ID, eventCount: 2 },
+      origin: 'chat_compacted',
+      createdAt: 1_000,
+      updatedAt: 1_000,
+    });
+
+    await withStdioClient(childEnv(), async (client) => {
+      const search = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
+        arguments: {
+          query: 'alpha.test.im.codes MCP expansion',
+          limit: 5,
+        },
+      }));
+      expect(search).toMatchObject({ status: 'ok' });
+      const items = search.items as Array<Record<string, unknown>>;
+      const hit = items.find((item) => item.projectionId === projection.id);
+      expect(hit).toMatchObject({
+        projectionId: projection.id,
+        recordKind: 'projection',
+        sourceLookup: {
+          tool: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+          kind: 'projection',
+          projectionId: projection.id,
+        },
+      });
+      expect(['exact', 'semantic', 'trigram']).toContain(hit?.matchKind);
+      const expectedRef = `proj:${projection.id.replace(/[^a-f0-9]/gi, '').slice(0, 10)}`;
+      expect(hit?.ref).toBe(expectedRef);
+
+      const sources = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+        arguments: hit?.sourceLookup as Record<string, unknown>,
+      }));
+      expect(sources).toMatchObject({
+        status: 'ok',
+        projectionId: projection.id,
+        sourceEventCount: 1,
+        partial: false,
+        projectionSource: expect.objectContaining({
+          eventId: 'evt-missing-projection-e2e',
+          status: 'projection',
+          content: projection.summary,
+        }),
+        sources: [
+          expect.objectContaining({
+            eventId: 'evt-missing-projection-e2e',
+            status: 'projection',
+            content: projection.summary,
+          }),
+        ],
+      });
+      expect(JSON.stringify(sources)).not.toContain('ownerUserId');
+
+      const shortRefSources = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+        arguments: {
+          ref: expectedRef,
+          kind: 'projection',
+        },
+      }));
+      expect(shortRefSources).toMatchObject({
+        status: 'ok',
+        projectionId: projection.id,
+        sourceEventCount: 1,
+        projectionSource: expect.objectContaining({
+          eventId: 'evt-missing-projection-e2e',
+          status: 'projection',
+          content: projection.summary,
+        }),
+        sources: [
+          expect.objectContaining({
+            eventId: 'evt-missing-projection-e2e',
+            status: 'projection',
+            content: projection.summary,
+          }),
+        ],
+      });
+    });
+  });
+
+  it('expands legacy personal projection raw sources after MCP search', async () => {
+    const legacyNamespace = { scope: 'personal' as const, projectId: PROJECT_NAME };
+    const event = recordContextEvent({
+      id: 'evt-legacy-projection-e2e',
+      target: { namespace: legacyNamespace, kind: 'session' as const, sessionName: SESSION_NAME },
+      eventType: 'assistant.turn',
+      content: 'legacy personal MCP source content for alpha.test.im.codes',
+      createdAt: 2_000,
+    });
+    archiveEventsForMaterialization([event], 2_100);
+    const projection = writeProcessedProjection({
+      namespace: legacyNamespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-legacy-projection-e2e'],
+      summary: 'legacy personal MCP summary alpha.test.im.codes',
+      content: {},
+      origin: 'chat_compacted',
+      createdAt: 2_000,
+      updatedAt: 2_000,
+    });
+
+    await withStdioClient({
+      ...childEnv(),
+      [MEMORY_MCP_ENV_KEYS.NAMESPACE]: JSON.stringify({ scope: 'personal', userId: USER_ID, projectId: PROJECT_NAME }),
+    }, async (client) => {
+      const search = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
+        arguments: {
+          query: 'legacy personal MCP summary',
+          limit: 5,
+        },
+      }));
+      const items = search.items as Array<Record<string, unknown>>;
+      const hit = items.find((item) => item.projectionId === projection.id);
+      expect(hit).toMatchObject({
+        projectionId: projection.id,
+        recordKind: 'projection',
+      });
+
+      const sources = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+        arguments: hit?.sourceLookup as Record<string, unknown>,
+      }));
+      expect(sources).toMatchObject({
+        status: 'ok',
+        projectionId: projection.id,
+        sourceEventCount: 1,
+        projectionSource: expect.objectContaining({
+          eventId: 'evt-legacy-projection-e2e',
+          status: 'projection',
+          content: 'legacy personal MCP summary alpha.test.im.codes',
+        }),
+        partial: false,
+        sources: [
+          expect.objectContaining({
+            eventId: 'evt-legacy-projection-e2e',
+            status: 'archived',
+            content: 'legacy personal MCP source content for alpha.test.im.codes',
           }),
         ],
       });
