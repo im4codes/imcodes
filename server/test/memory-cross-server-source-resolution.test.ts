@@ -106,9 +106,33 @@ function makeEnv(db: Database): Env {
   } as Env;
 }
 
-function makeDb(): Database {
+function makeProjectionRow(input: {
+  id: string;
+  serverId: string;
+  summary?: string | null;
+  sourceEventIds?: string[];
+}): Record<string, unknown> {
   return {
-    queryOne: async () => ({ token_hash: 'valid-hash' }),
+    id: input.id,
+    server_id: input.serverId,
+    source_event_ids_json: input.sourceEventIds ?? [`evt-${input.id}`],
+    summary: input.summary === undefined ? `authorized projection ${input.id}` : input.summary,
+    content_json: {},
+    origin: 'chat_compacted',
+    created_at: 123,
+  };
+}
+
+function makeDb(projectionRow?: Record<string, unknown>): Database {
+  return {
+    queryOne: async <T>(sql: string, params: unknown[] = []) => {
+      if (sql.toLowerCase().includes('from shared_context_projections')) {
+        return projectionRow && params[0] === projectionRow.id && (!params[2] || params[2] === projectionRow.server_id)
+          ? projectionRow as T
+          : null as T;
+      }
+      return { token_hash: 'valid-hash' } as T;
+    },
     query: async () => [],
     execute: async () => ({ changes: 0 }),
     exec: async () => {},
@@ -154,7 +178,7 @@ describe('end-to-end cross-server source resolution', () => {
     const daemon = new MockDaemonWs();
     await authDaemon(bridge, daemon, makeDb());
 
-    const app = await buildApp(makeDb());
+    const app = await buildApp(makeDb(makeProjectionRow({ id: 'proj-e2e', serverId })));
     const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-e2e`);
     expect(res.status).toBe(200);
     const body = await res.json() as {
@@ -187,7 +211,7 @@ describe('end-to-end cross-server source resolution', () => {
     daemon.autoReply = { sourceEventCount: 0, partial: true };
     await authDaemon(bridge, daemon, makeDb());
 
-    const app = await buildApp(makeDb());
+    const app = await buildApp(makeDb(makeProjectionRow({ id: 'proj-partial', serverId })));
     const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-partial`);
     expect(res.status).toBe(200);
     const body = await res.json() as { partial: boolean };
@@ -202,7 +226,12 @@ describe('end-to-end cross-server source resolution', () => {
       daemon.autoReply = null; // don't auto-respond — force timeout
       await authDaemon(bridge, daemon, makeDb());
 
-      const app = await buildApp(makeDb());
+      const app = await buildApp(makeDb(makeProjectionRow({
+        id: 'proj-stuck',
+        serverId,
+        summary: null,
+        sourceEventIds: [],
+      })));
       const requestPromise = app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-stuck`);
       // Advance past the route's 8s timeout.
       await vi.advanceTimersByTimeAsync(9000);

@@ -49,6 +49,28 @@ interface SharedProjectionSourceFallbackRow {
   created_at?: number | string | null;
 }
 
+async function loadAuthorizedProjectionSourceRow(
+  db: Env['DB'],
+  input: { projectionId: string; userId: string; originServerId?: string },
+): Promise<SharedProjectionSourceFallbackRow | undefined> {
+  const row = await db.queryOne<SharedProjectionSourceFallbackRow>(
+    `SELECT id, server_id, source_event_ids_json, summary, content_json, origin, created_at
+       FROM shared_context_projections
+      WHERE id = $1
+        ${input.originServerId ? 'AND server_id = $3' : ''}
+        AND ((scope = 'personal' AND user_id = $2)
+             OR (scope <> 'personal' AND EXISTS (
+               SELECT 1
+                 FROM team_members tm
+                WHERE tm.team_id = shared_context_projections.enterprise_id
+                  AND tm.user_id = $2
+             )))
+      LIMIT 1`,
+    [input.projectionId, input.userId, ...(input.originServerId ? [input.originServerId] : [])],
+  );
+  return row?.id ? row : undefined;
+}
+
 function parseJsonish(value: unknown): unknown {
   if (typeof value !== 'string') return value;
   try {
@@ -74,25 +96,11 @@ function canUseProjectionFallback(payload: MemorySourcesPayload): boolean {
   return payload.sources.every((source) => source.content == null && source.status === 'missing');
 }
 
-async function loadProjectionFallbackPayload(
-  db: Env['DB'],
-  input: { projectionId: string; userId: string; originServerId: string },
-): Promise<MemorySourcesPayload | undefined> {
-  const row = await db.queryOne<SharedProjectionSourceFallbackRow>(
-    `SELECT id, server_id, source_event_ids_json, summary, content_json, origin, created_at
-       FROM shared_context_projections
-      WHERE id = $1
-        AND ((scope = 'personal' AND user_id = $2)
-             OR EXISTS (
-               SELECT 1
-                 FROM team_members tm
-                WHERE tm.team_id = shared_context_projections.enterprise_id
-                  AND tm.user_id = $2
-             ))
-      LIMIT 1`,
-    [input.projectionId, input.userId],
-  );
-  if (!row?.id) return undefined;
+function buildProjectionFallbackPayload(
+  projectionId: string,
+  row: SharedProjectionSourceFallbackRow,
+  originServerId: string,
+): MemorySourcesPayload | undefined {
   const sourceEventIds = parseSourceEventIds(row.source_event_ids_json);
   const content = parseJsonish(row.content_json);
   const createdAt = typeof row.created_at === 'number'
@@ -111,21 +119,21 @@ async function loadProjectionFallbackPayload(
   if (!fallback) return undefined;
   return {
     status: 'ok',
-    projectionId: input.projectionId,
+    projectionId,
     sourceEventCount: Math.max(sourceEventIds.length, 1),
     sources: [fallback],
     projectionSource: fallback,
     partial: false,
-    originServerId: row.server_id || input.originServerId,
+    originServerId: row.server_id || originServerId,
   };
 }
 
 async function withProjectionFallback(
-  db: Env['DB'],
-  input: { payload: MemorySourcesPayload; projectionId: string; userId: string; originServerId: string },
+  input: { payload: MemorySourcesPayload; projectionId: string; originServerId: string; row: SharedProjectionSourceFallbackRow },
 ): Promise<MemorySourcesPayload> {
+  if (input.payload.partial === true) return input.payload;
   if (input.payload.status !== 'ok' || hasUsableSource(input.payload) || !canUseProjectionFallback(input.payload)) return input.payload;
-  const fallback = await loadProjectionFallbackPayload(db, input);
+  const fallback = buildProjectionFallbackPayload(input.projectionId, input.row, input.originServerId);
   if (!fallback) return input.payload;
   return {
     ...input.payload,
@@ -162,12 +170,12 @@ memoryRoutes.get('/memory/projection-owner', requireAuth(), async (c) => {
        FROM shared_context_projections
       WHERE id = $1
         AND ((scope = 'personal' AND user_id = $2)
-             OR EXISTS (
+             OR (scope <> 'personal' AND EXISTS (
                SELECT 1
                  FROM team_members tm
                 WHERE tm.team_id = shared_context_projections.enterprise_id
                   AND tm.user_id = $2
-             ))
+             )))
       LIMIT 1`,
     [projectionId, userId],
   );
@@ -196,9 +204,16 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
 
+  const projectionRow = await loadAuthorizedProjectionSourceRow(c.env.DB, {
+    projectionId,
+    userId,
+    originServerId: serverId,
+  });
+  if (!projectionRow) return c.json({ error: 'not_found' }, 404);
+
   const bridge = WsBridge.get(serverId);
   if (!bridge.isDaemonConnected()) {
-    const fallback = await loadProjectionFallbackPayload(c.env.DB, { projectionId, userId, originServerId: serverId });
+    const fallback = buildProjectionFallbackPayload(projectionId, projectionRow, serverId);
     if (fallback) return c.json(fallback);
     // Match the daemon-offline contract the file-transfer / Watch API
     // routes return so the MCP error mapping on the caller side stays
@@ -216,10 +231,9 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
     const { requestId: _r, type: _t, ...payload } = reply as Record<string, unknown>;
     // Stamp serverId on the reply when daemon didn't include it. The
     // route's serverId IS the canonical origin (pod-sticky-routed here).
-    if (!('originServerId' in payload)) {
-      payload.originServerId = serverId;
-    }
-    const hydrated = await withProjectionFallback(c.env.DB, { payload, projectionId, userId, originServerId: serverId });
+    payload.originServerId = serverId;
+    payload.projectionId = projectionId;
+    const hydrated = await withProjectionFallback({ payload, projectionId, originServerId: serverId, row: projectionRow });
     return c.json(hydrated);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -227,11 +241,11 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
       // Treat timeout the same as daemon offline so the MCP caller can
       // surface a recoverable error and try again later.
       logger.warn({ serverId, projectionId }, 'memory.get_sources timed out');
-      const fallback = await loadProjectionFallbackPayload(c.env.DB, { projectionId, userId, originServerId: serverId });
+      const fallback = buildProjectionFallbackPayload(projectionId, projectionRow, serverId);
       return fallback ? c.json(fallback) : c.json({ error: 'daemon_offline' }, 409);
     }
     if (message === 'daemon_offline' || message === 'daemon_disconnected' || message === 'daemon_error') {
-      const fallback = await loadProjectionFallbackPayload(c.env.DB, { projectionId, userId, originServerId: serverId });
+      const fallback = buildProjectionFallbackPayload(projectionId, projectionRow, serverId);
       return fallback ? c.json(fallback) : c.json({ error: 'daemon_offline' }, 409);
     }
     logger.warn({ serverId, projectionId, err: message }, 'memory.get_sources failed');

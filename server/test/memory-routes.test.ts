@@ -66,6 +66,37 @@ function makeDb(overrides: Partial<Database> = {}): Database {
   } as unknown as Database;
 }
 
+function makeProjectionRow(input: {
+  id: string;
+  serverId: string;
+  summary?: string | null;
+  contentJson?: Record<string, unknown>;
+  sourceEventIds?: string[];
+}): Record<string, unknown> {
+  return {
+    id: input.id,
+    server_id: input.serverId,
+    source_event_ids_json: input.sourceEventIds ?? [`evt-${input.id}`],
+    summary: input.summary === undefined ? `authorized projection ${input.id}` : input.summary,
+    content_json: input.contentJson ?? {},
+    origin: 'chat_compacted',
+    created_at: 123,
+  };
+}
+
+function makeDbWithProjection(row: Record<string, unknown>): Database {
+  return makeDb({
+    queryOne: async <T>(sql: string, params: unknown[] = []) => {
+      if (sql.toLowerCase().includes('from shared_context_projections')) {
+        return params[0] === row.id && (!params[2] || params[2] === row.server_id)
+          ? row as T
+          : null as T;
+      }
+      return null as T;
+    },
+  });
+}
+
 function makeEnv(db: Database): Env {
   return {
     DB: db,
@@ -188,11 +219,48 @@ describe('GET /api/memory/sources', () => {
   it('409s when no daemon is connected for the target serverId', async () => {
     // No WsBridge.handleDaemonConnection — daemon is offline.
     WsBridge.get(serverId); // create the bridge but no socket attached
-    const app = await buildTestApp(makeDb());
+    const app = await buildTestApp(makeDbWithProjection(makeProjectionRow({
+      id: 'proj-1',
+      serverId,
+      summary: null,
+      contentJson: {},
+      sourceEventIds: [],
+    })));
     const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-1`);
     expect(res.status).toBe(409);
     const body = await res.json() as { error: string };
     expect(body.error).toBe('daemon_offline');
+  });
+
+  it('404s and does not contact daemon when the projection is not cloud-authorized for the caller', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    await authDaemon(bridge, daemon, makeDb());
+    const app = await buildTestApp(makeDb());
+
+    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=foreign-proj`);
+    expect(res.status).toBe(404);
+    const body = await res.json() as { error: string };
+    expect(body.error).toBe('not_found');
+    const sourceRequests = daemon.sent.filter((message) => message.includes(MEMORY_WS.GET_SOURCES_REQUEST));
+    expect(sourceRequests).toHaveLength(0);
+  });
+
+  it('does not allow team membership to authorize personal projection rows', async () => {
+    let projectionSql = '';
+    const db = makeDb({
+      queryOne: async <T>(sql: string) => {
+        if (sql.toLowerCase().includes('from shared_context_projections')) {
+          projectionSql = sql;
+        }
+        return null as T;
+      },
+    });
+    const app = await buildTestApp(db);
+
+    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=foreign-personal-proj`);
+    expect(res.status).toBe(404);
+    expect(projectionSql).toContain("OR (scope <> 'personal' AND EXISTS");
   });
 
   it('proxies the request to the daemon and returns the response', async () => {
@@ -201,7 +269,7 @@ describe('GET /api/memory/sources', () => {
     await authDaemon(bridge, daemon, makeDb());
     expect(bridge.isDaemonConnected()).toBe(true);
 
-    const app = await buildTestApp(makeDb());
+    const app = await buildTestApp(makeDbWithProjection(makeProjectionRow({ id: 'proj-42', serverId })));
 
     // Snoop the daemon-side message so we can synthesize a reply with the
     // matching requestId. The route assigns a random requestId; we read it
@@ -251,7 +319,7 @@ describe('GET /api/memory/sources', () => {
     const bridge = WsBridge.get(serverId);
     const daemon = new MockWs();
     await authDaemon(bridge, daemon, makeDb());
-    const app = await buildTestApp(makeDb());
+    const app = await buildTestApp(makeDbWithProjection(makeProjectionRow({ id: 'proj-1', serverId })));
 
     const requestArrived = new Promise<{ requestId: string }>((resolve) => {
       const tick = () => {
@@ -284,8 +352,9 @@ describe('GET /api/memory/sources', () => {
     const daemon = new MockWs();
     await authDaemon(bridge, daemon, makeDb());
     const db = makeDb({
-      queryOne: async <T>(sql: string) => {
+      queryOne: async <T>(sql: string, params: unknown[] = []) => {
         if (sql.toLowerCase().includes('from shared_context_projections')) {
+          if (params[0] !== 'proj-cloud-fallback' || params[2] !== serverId) return null as T;
           return {
             id: 'proj-cloud-fallback',
             server_id: serverId,
@@ -350,8 +419,9 @@ describe('GET /api/memory/sources', () => {
   it('can return cloud projection summary even when the daemon is offline', async () => {
     WsBridge.get(serverId);
     const db = makeDb({
-      queryOne: async <T>(sql: string) => {
+      queryOne: async <T>(sql: string, params: unknown[] = []) => {
         if (sql.toLowerCase().includes('from shared_context_projections')) {
+          if (params[0] !== 'proj-offline-fallback' || params[2] !== serverId) return null as T;
           return {
             id: 'proj-offline-fallback',
             server_id: serverId,

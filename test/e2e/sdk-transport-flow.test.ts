@@ -1360,6 +1360,7 @@ describe('sdk transport flow e2e', () => {
       commandId: 'cmd-cxsdk-e2e',
     }, serverLink);
     await flushAsync();
+    await waitForCondition(() => mocks.store.get(SESSION_CX)?.codexSessionId === 'thread-codex-e2e');
 
     const record = mocks.store.get(SESSION_CX);
     expect(record?.runtimeType).toBe('transport');
