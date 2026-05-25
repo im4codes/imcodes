@@ -143,6 +143,12 @@ body {
 .shortcut-btn-tools.is-on { background: #052e1a; border-color: #22c55e; color: #86efac; opacity: 1; filter: none; box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.35); }
 .shortcut-btn-tools.is-on:hover:not(:disabled) { background: #0a3d24; border-color: #4ade80; color: #bbf7d0; }
 .shortcut-btn-tools.is-undecided { animation: shortcut-btn-tools-pulse 2.4s ease-in-out infinite; }
+.shortcut-btn-memory-sync { font-size: 14px; line-height: 1; border-color: #334155; color: #93c5fd; }
+.shortcut-btn-memory-sync:hover:not(:disabled) { background: #10213a; border-color: #3b82f6; color: #bfdbfe; }
+.shortcut-btn-memory-sync.is-busy { animation: shortcut-btn-memory-sync-spin 0.9s linear infinite; }
+@keyframes shortcut-btn-memory-sync-spin {
+  to { transform: rotate(360deg); }
+}
 @keyframes shortcut-btn-tools-pulse {
   0%, 100% { opacity: 0.6; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
   50%      { opacity: 1;   box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.25); }

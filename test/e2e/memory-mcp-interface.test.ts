@@ -102,7 +102,7 @@ describe('memory MCP interface e2e', () => {
     };
   }
 
-  it('runs the real stdio server, exposes exactly ten tools, and persists runtime-derived preference provenance', async () => {
+  it('runs the real stdio server, exposes exactly eleven tools, and persists runtime-derived preference provenance', async () => {
     await withStdioClient(childEnv(), async (client) => {
       const listed = await client.listTools();
       expect(listed.tools.map((tool) => tool.name)).toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
@@ -253,6 +253,26 @@ describe('memory MCP interface e2e', () => {
     });
 
     await withStdioClient(childEnv(), async (client) => {
+      const listed = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
+        arguments: {
+          limit: 5,
+        },
+      }));
+      expect(listed).toMatchObject({ status: 'ok' });
+      const listedItems = listed.items as Array<Record<string, unknown>>;
+      expect(listedItems.find((item) => item.projectionId === projection.id)).toMatchObject({
+        projectionId: projection.id,
+        ref: `proj:${projection.id.replace(/[^a-f0-9]/gi, '').slice(0, 10)}`,
+        recordKind: 'projection',
+        projectionClass: 'recent_summary',
+        sourceLookup: {
+          tool: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+          kind: 'projection',
+          projectionId: projection.id,
+        },
+      });
+
       const search = structured(await client.callTool({
         name: MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
         arguments: {

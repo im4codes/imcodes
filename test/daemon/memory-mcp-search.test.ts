@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { searchMcpMemoryRecall } from '../../src/daemon/memory-mcp-search.js';
+import { listMcpMemorySummaries, searchMcpMemoryRecall } from '../../src/daemon/memory-mcp-search.js';
 import { ensureContextNamespace, writeContextObservation, writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { projectionOwnerCache } from '../../src/daemon/memory-projection-owner-cache.js';
@@ -14,6 +14,71 @@ vi.mock('../../src/context/embedding.js', () => ({
 }));
 
 describe('memory MCP recall search', () => {
+  it('lists newest recent summaries from cloud and local memory without a query', async () => {
+    const tempDir = await createIsolatedSharedContextDb('memory-mcp-list-summaries');
+    try {
+      writeProcessedProjection({
+        namespace: { scope: 'personal', projectId: 'repo-1', userId: 'daemon-local' },
+        class: 'recent_summary',
+        sourceEventIds: ['evt-local-old'],
+        summary: 'Local older MCP summary',
+        content: {},
+        updatedAt: 100,
+      });
+      writeProcessedProjection({
+        namespace: { scope: 'personal', projectId: 'repo-1', userId: 'daemon-local' },
+        class: 'durable_memory_candidate',
+        sourceEventIds: ['evt-durable'],
+        summary: 'Durable candidate should not appear by default',
+        content: {},
+        updatedAt: 500,
+      });
+      const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+        records: [
+          {
+            id: 'cloud-recent-new',
+            projectId: 'repo-1',
+            projectionClass: 'recent_summary',
+            summary: 'Cloud newest recent summary',
+            updatedAt: 300,
+          },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as unknown as typeof fetch;
+
+      const result = await listMcpMemorySummaries({
+        namespace: { scope: 'personal', projectId: 'repo-1', userId: 'daemon-local' },
+        repo: 'repo-1',
+        includeLegacyPersonalOwner: true,
+        limit: 5,
+      }, {
+        fetchImpl,
+        credentials: {
+          workerUrl: 'https://example.im.codes/',
+          serverId: 'srv-1',
+          token: 'server-token',
+        },
+      });
+
+      expect(fetchImpl).toHaveBeenCalledWith(
+        'https://example.im.codes/api/shared-context/personal-memory?projectId=repo-1&projectionClass=recent_summary&limit=5',
+        expect.objectContaining({
+          method: 'GET',
+          headers: expect.objectContaining({
+            Authorization: 'Bearer server-token',
+            'X-Server-Id': 'srv-1',
+          }),
+        }),
+      );
+      expect(result.items.map((item) => item.summary)).toEqual([
+        'Cloud newest recent summary',
+        'Local older MCP summary',
+      ]);
+      expect(result.items.map((item) => item.summary)).not.toContain('Durable candidate should not appear by default');
+    } finally {
+      await cleanupIsolatedSharedContextDb(tempDir);
+    }
+  });
+
   it('queries cloud memory recall with daemon server credentials and merges local recall fallback', async () => {
     const tempDir = await createIsolatedSharedContextDb('memory-mcp-search');
     try {

@@ -30,9 +30,13 @@ describe('memory MCP tool schema firewall', () => {
     const searchMemory = vi.fn(async () => ({
       items: [],
     }));
+    const listMemorySummaries = vi.fn(async () => ({
+      items: [],
+    }));
     const saveObservation = vi.fn(() => ({ status: 'ok', observationId: 'obs-1', fingerprint: 'fp', state: 'candidate' }));
     const handlers = createMemoryMcpToolHandlers(caller(), {
       searchMemory,
+      listMemorySummaries,
       saveObservation,
       isMemoryFeatureEnabled: () => true,
     });
@@ -44,6 +48,15 @@ describe('memory MCP tool schema firewall', () => {
       namespace: { scope: 'org_shared' },
       embedding: [1, 2, 3],
       vector: [4, 5, 6],
+    });
+    await handlers[MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]({
+      limit: 2,
+      projectionClass: 'recent_summary',
+      projectOnly: false,
+      userId: 'mallory',
+      namespace: { scope: 'org_shared' },
+      projectId: 'evil-project',
+      query: 'must not be forwarded',
     });
     await handlers[MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]({
       content: 'remember this',
@@ -65,6 +78,15 @@ describe('memory MCP tool schema firewall', () => {
     expect(searchMemory.mock.calls[0][0]).not.toHaveProperty('userId', 'mallory');
     expect(searchMemory.mock.calls[0][0]).not.toHaveProperty('embedding');
     expect(searchMemory.mock.calls[0][0]).not.toHaveProperty('vector');
+    expect(listMemorySummaries).toHaveBeenCalledWith(expect.objectContaining({
+      limit: 2,
+      projectionClass: 'recent_summary',
+      projectOnly: false,
+      namespace: expect.objectContaining({ userId: 'user-1' }),
+      userId: 'user-1',
+    }));
+    expect(listMemorySummaries.mock.calls[0][0]).not.toHaveProperty('query');
+    expect(listMemorySummaries.mock.calls[0][0]).not.toHaveProperty('projectId', 'evil-project');
     expect(saveObservation).toHaveBeenCalledWith({ content: 'remember this' }, expect.objectContaining({
       userId: 'user-1',
       sourceSessionName: 'deck_proj_brain',

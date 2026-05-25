@@ -6,6 +6,7 @@ import { PREFERENCE_MAX_BYTES } from './preference-ingest.js';
 
 export const MEMORY_MCP_TOOL_NAMES = {
   SEARCH_MEMORY: 'search_memory',
+  LIST_MEMORY_SUMMARIES: 'list_memory_summaries',
   GET_MEMORY_SOURCES: 'get_memory_sources',
   SAVE_OBSERVATION: 'save_observation',
   SAVE_PREFERENCE: 'save_preference',
@@ -21,6 +22,7 @@ export type MemoryMcpToolName = (typeof MEMORY_MCP_TOOL_NAMES)[keyof typeof MEMO
 
 export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
+  MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
   MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
   MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
   MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
@@ -35,6 +37,8 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
 export const MEMORY_MCP_CAPS = {
   SEARCH_MEMORY_DEFAULT_LIMIT: 20,
   SEARCH_MEMORY_MAX_LIMIT: 100,
+  LIST_MEMORY_SUMMARIES_DEFAULT_LIMIT: 20,
+  LIST_MEMORY_SUMMARIES_MAX_LIMIT: 100,
   OBSERVATION_CONTENT_MAX_BYTES: 16 * 1024,
   OBSERVATION_TAGS_MAX_COUNT: 8,
   OBSERVATION_TAG_MAX_CHARS: 64,
@@ -148,6 +152,19 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     outputSchema: objectSchema({
       status: stringSchema('ok, disabled, or error.'),
       items: { type: 'array', description: 'Compact same-namespace memory hits. Each item includes ref plus sourceLookup: { tool: "get_memory_sources", kind, projectionId | observationId } for exact source expansion.', items: { type: 'object', additionalProperties: true } },
+    }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]: {
+    name: MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
+    description: 'List recent processed memory summaries visible to the caller without requiring a text query. Use it when the user asks for recent task summaries, recent project context, or a compact memory digest; each returned item includes a compact ref plus sourceLookup so details can be fetched with get_memory_sources only when needed.',
+    inputSchema: objectSchema({
+      projectionClass: { type: 'string', enum: ['recent_summary', 'durable_memory_candidate'], description: 'Optional processed memory class to list. Defaults to recent_summary for the newest task summaries; durable_memory_candidate lists promoted durable facts.' },
+      limit: numberSchema(`Optional maximum summary count; defaults to ${MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_DEFAULT_LIMIT} and is clamped to ${MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_MAX_LIMIT }),
+      projectOnly: booleanSchema('Optional scope control. Defaults to true, which lists only the caller project; false may include same-user memories from other projects visible to the caller.'),
+    }),
+    outputSchema: objectSchema({
+      status: stringSchema('ok, disabled, or error.'),
+      items: { type: 'array', description: 'Newest compact processed memory summaries. Each item includes ref plus sourceLookup: { tool: "get_memory_sources", kind: "projection", projectionId } for exact source expansion.', items: { type: 'object', additionalProperties: true } },
     }),
   },
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: {

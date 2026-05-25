@@ -14,6 +14,12 @@ const useTimelineMock = vi.fn();
 const terminalViewSpy = vi.fn(() => null);
 const chatViewSpy = vi.fn(() => null);
 
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string) => key,
+  }),
+}));
+
 vi.mock('../../src/components/TerminalView.js', () => ({ TerminalView: (props: any) => terminalViewSpy(props) }));
 vi.mock('../../src/components/ChatView.js', () => ({ ChatView: (props: any) => chatViewSpy(props) }));
 vi.mock('../../src/components/SessionControls.js', () => ({

@@ -144,6 +144,33 @@ describe('UsageFooter', () => {
     expect(toolPref.save).toHaveBeenCalledWith(false);
   });
 
+  it('renders memory summary sync button before the tools toggle and calls the sync handler', () => {
+    const onSync = vi.fn();
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        onSyncMemorySummaries={onSync}
+      />,
+    );
+
+    const syncButton = container.querySelector('.shortcut-btn-memory-sync') as HTMLButtonElement | null;
+    const toolsButton = container.querySelector('.shortcut-btn-tools') as HTMLButtonElement | null;
+    expect(syncButton).toBeTruthy();
+    expect(syncButton?.getAttribute('aria-label')).toBe('chat.memory_summary_sync');
+    expect(Array.from(syncButton!.parentElement!.children).indexOf(syncButton!)).toBeLessThan(
+      Array.from(toolsButton!.parentElement!.parentElement!.children).indexOf(toolsButton!.parentElement!),
+    );
+
+    fireEvent.click(syncButton!);
+    expect(onSync).toHaveBeenCalledTimes(1);
+  });
+
   it('prioritizes active thinking over stale idle state and renders running states inline', () => {
     const { container, rerender } = render(
       <UsageFooter

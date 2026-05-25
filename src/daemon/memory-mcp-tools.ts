@@ -30,7 +30,7 @@ import {
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
 import { memoryGetSources } from '../context/memory-read-tools.js';
 import { getMemorySourcesOrchestrated, type GetSourcesOrchestratorResult, type OrchestratorDeps } from './memory-get-sources-orchestrator.js';
-import { searchMcpMemoryRecall, type MemoryMcpSearchHit, type MemoryMcpSearchResult } from './memory-mcp-search.js';
+import { listMcpMemorySummaries, searchMcpMemoryRecall, type MemoryMcpListProjectionClass, type MemoryMcpSearchHit, type MemoryMcpSearchResult } from './memory-mcp-search.js';
 import type { MemorySearchQuery } from '../context/memory-search.js';
 import { saveObservation, savePreference } from '../context/memory-write-tools.js';
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
@@ -42,11 +42,22 @@ import { registerMemoryShortRef, resolveMemoryShortRef } from '../context/memory
 type ToolResult = Record<string, unknown>;
 export type MemoryMcpToolHandler = (input?: unknown) => Promise<ToolResult> | ToolResult;
 type MemoryMcpSearch = (query: MemorySearchQuery) => Promise<MemoryMcpSearchResult> | MemoryMcpSearchResult;
+type MemoryMcpListSummaries = (query: {
+  namespace?: MemorySearchQuery['namespace'];
+  currentEnterpriseId?: string;
+  repo?: string;
+  userId?: string;
+  includeLegacyPersonalOwner?: boolean;
+  projectionClass?: MemoryMcpListProjectionClass;
+  limit?: number;
+  projectOnly?: boolean;
+}) => Promise<MemoryMcpSearchResult> | MemoryMcpSearchResult;
 
 export interface MemoryMcpToolDeps {
   featureFlags?: MCPFeatureFlagValues;
   isMemoryFeatureEnabled?: (flag: MemoryFeatureFlag) => boolean;
   searchMemory?: MemoryMcpSearch;
+  listMemorySummaries?: MemoryMcpListSummaries;
   /**
    * @deprecated kept for tests that want to short-circuit local lookups.
    * Production code uses the orchestrator which itself delegates to
@@ -122,6 +133,11 @@ function numberArg(args: Record<string, unknown>, key: string): number | undefin
 
 function boolArg(args: Record<string, unknown>, key: string): boolean | undefined {
   return typeof args[key] === 'boolean' ? args[key] : undefined;
+}
+
+function listProjectionClassArg(args: Record<string, unknown>): MemoryMcpListProjectionClass | undefined {
+  const value = args.projectionClass;
+  return value === 'recent_summary' || value === 'durable_memory_candidate' ? value : undefined;
 }
 
 function stringArrayArg(args: Record<string, unknown>, key: string): string[] | undefined {
@@ -254,6 +270,7 @@ function cronOptionsForCaller(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps)
 
 export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
   const searchMemory = deps.searchMemory ?? searchMcpMemoryRecall;
+  const listMemorySummaries = deps.listMemorySummaries ?? listMcpMemorySummaries;
   // Orchestrated path is the production wiring; the legacy `getMemorySources`
   // dep is retained for tests that only want to verify the local SQLite
   // branch without involving cache/cloud resolution.
@@ -289,6 +306,29 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           repo: scopedCaller.namespace.projectId,
           includeLegacyPersonalOwner: true,
           limit,
+        });
+        const items = result.items.map((item) => compactSearchHit(item, scopedCaller.namespace));
+        return { status: 'ok', items };
+      } catch (err) {
+        return sanitizeCaughtError(err);
+      }
+    },
+    [MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]: async (input) => {
+      const gate = memorySurfaceGate(deps, { items: [] });
+      if (gate) return gate;
+      const args = pickAllowedMcpArgs(input, ['projectionClass', 'limit', 'projectOnly']);
+      const limit = numberArg(args, 'limit');
+      const scopedCaller = memoryCaller();
+      try {
+        const result = await listMemorySummaries({
+          namespace: scopedCaller.namespace,
+          currentEnterpriseId: scopedCaller.namespace.enterpriseId,
+          repo: scopedCaller.namespace.projectId,
+          userId: scopedCaller.userId,
+          includeLegacyPersonalOwner: true,
+          projectionClass: listProjectionClassArg(args),
+          limit,
+          projectOnly: boolArg(args, 'projectOnly'),
         });
         const items = result.items.map((item) => compactSearchHit(item, scopedCaller.namespace));
         return { status: 'ok', items };
@@ -481,6 +521,11 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: z.object({
     query: z.string().describe('Required text query to search for. Results include sourceLookup values for get_memory_sources when more detail is needed.'),
     limit: z.number().int().min(1).max(100).optional().describe('Optional maximum hit count.'),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]: z.object({
+    projectionClass: z.enum(['recent_summary', 'durable_memory_candidate']).optional().describe('Optional processed summary class. Defaults to recent_summary.'),
+    limit: z.number().int().min(1).max(100).optional().describe('Optional maximum summary count.'),
+    projectOnly: z.boolean().optional().describe('When true, list only the caller project. Defaults to true.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: z.object({
     projectionId: z.string().optional().describe('Projection id returned by search_memory for a relevant projection hit.'),

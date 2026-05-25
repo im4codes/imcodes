@@ -39,6 +39,7 @@ import {
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
+import { buildMemorySummarySyncMessage } from '../memory-summary-sync.js';
 
 type GetMaximizeBounds = () => WorkspaceBounds | null;
 
@@ -240,6 +241,7 @@ export function SubSessionWindow({
   }, [showFileBrowser, isMobile, onDesktopFileBrowserOpen, onDesktopFileBrowserClose]);
 
   const [quotes, setQuotes] = useState<string[]>([]);
+  const [syncingMemorySummaries, setSyncingMemorySummaries] = useState(false);
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
 
@@ -394,6 +396,24 @@ export function SubSessionWindow({
       else termScrollRef.current?.();
     }, 50);
   }, []);
+
+  const handleSyncMemorySummaries = useCallback(async () => {
+    if (!ws || !connected || syncingMemorySummaries) return;
+    setSyncingMemorySummaries(true);
+    try {
+      const text = await buildMemorySummarySyncMessage(t, sub.cwd ?? sub.label ?? null);
+      if (!text) return;
+      const commandId = globalThis.crypto?.randomUUID?.()
+        ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, commandId });
+      addOptimisticUserMessage(text, commandId);
+      scrollToBottom();
+    } catch {
+      // Non-blocking context sync: leave normal chat/send controls untouched.
+    } finally {
+      setSyncingMemorySummaries(false);
+    }
+  }, [addOptimisticUserMessage, connected, scrollToBottom, sub.cwd, sub.label, sub.sessionName, syncingMemorySummaries, t, ws]);
 
   // ── Dragging ──────────────────────────────────────────────────────────────
   const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
@@ -684,6 +704,9 @@ export function SubSessionWindow({
           statusText={statusText}
           activeToolCall={activeToolCall}
           now={thinkingNow}
+          onSyncMemorySummaries={handleSyncMemorySummaries}
+          syncMemorySummariesBusy={syncingMemorySummaries}
+          syncMemorySummariesDisabled={!connected || !ws || syncingMemorySummaries}
         />
       )}
 

@@ -1,8 +1,10 @@
 import type { ProcessedContextClass } from '../../shared/context-types.js';
 import type { ObservationClass, ObservationState } from '../../shared/memory-observation.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
-import { searchLocalMemorySemantic, type MemorySearchQuery } from '../context/memory-search.js';
+import { searchLocalMemory, searchLocalMemorySemantic, type MemorySearchQuery } from '../context/memory-search.js';
 import { projectionOwnerCache } from './memory-projection-owner-cache.js';
+
+export type MemoryMcpListProjectionClass = Extract<ProcessedContextClass, 'recent_summary' | 'durable_memory_candidate'>;
 
 export interface MemoryMcpSearchHit {
   recordKind?: 'projection' | 'observation';
@@ -34,6 +36,17 @@ export interface MemoryMcpSearchResult {
   items: MemoryMcpSearchHit[];
 }
 
+export interface MemoryMcpListSummariesQuery {
+  namespace?: MemorySearchQuery['namespace'];
+  currentEnterpriseId?: string;
+  repo?: string;
+  userId?: string;
+  includeLegacyPersonalOwner?: boolean;
+  projectionClass?: MemoryMcpListProjectionClass;
+  limit?: number;
+  projectOnly?: boolean;
+}
+
 export interface MemoryMcpSearchOptions {
   fetchImpl?: typeof fetch;
   credentials?: {
@@ -63,6 +76,18 @@ interface CloudRecallResponse {
   }>;
 }
 
+interface CloudMemoryListResponse {
+  records?: Array<{
+    id?: string;
+    projectId?: string;
+    projectionClass?: string;
+    summary?: string;
+    updatedAt?: number;
+    hitCount?: number;
+    lastUsedAt?: number;
+  }>;
+}
+
 function cleanBaseUrl(workerUrl: string): string {
   return workerUrl.replace(/\/+$/, '');
 }
@@ -81,8 +106,25 @@ function clampLimit(limit: number | undefined): number {
   return Math.min(Math.max(1, Math.trunc(limit)), 100);
 }
 
+function clampListLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) return 20;
+  return Math.min(Math.max(1, Math.trunc(limit)), 100);
+}
+
 function cloudRecallUrl(workerUrl: string, serverId: string): string {
   return `${cleanBaseUrl(workerUrl)}/api/shared-context/${encodeURIComponent(serverId)}/shared-context/memory/recall`;
+}
+
+function cloudPersonalMemoryUrl(workerUrl: string, query: {
+  projectId?: string;
+  projectionClass?: MemoryMcpListProjectionClass;
+  limit: number;
+}): string {
+  const params = new URLSearchParams();
+  if (query.projectId) params.set('projectId', query.projectId);
+  if (query.projectionClass) params.set('projectionClass', query.projectionClass);
+  params.set('limit', String(query.limit));
+  return `${cleanBaseUrl(workerUrl)}/api/shared-context/personal-memory?${params.toString()}`;
 }
 
 async function resolveCredentialsOnce(options: MemoryMcpSearchOptions): Promise<MemoryMcpSearchOptions['credentials']> {
@@ -140,6 +182,52 @@ async function searchCloudMemoryRecall(
     }));
 }
 
+async function listCloudMemorySummaries(
+  query: MemoryMcpListSummariesQuery,
+  options: MemoryMcpSearchOptions,
+  credentials: NonNullable<MemoryMcpSearchOptions['credentials']>,
+  limit: number,
+): Promise<MemoryMcpSearchHit[]> {
+  if (!credentials?.workerUrl || !credentials.serverId || !credentials.token) return [];
+  const requestedProjectId = query.projectOnly === false ? undefined : (query.repo ?? query.namespace?.projectId);
+  const projectionClass = query.projectionClass ?? 'recent_summary';
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const response = await fetchImpl(cloudPersonalMemoryUrl(credentials.workerUrl, {
+    projectId: requestedProjectId,
+    projectionClass,
+    limit,
+  }), {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${credentials.token}`,
+      'X-Server-Id': credentials.serverId,
+    },
+  });
+  if (!response.ok) return [];
+  const body = await response.json().catch(() => null) as CloudMemoryListResponse | null;
+  if (!Array.isArray(body?.records)) return [];
+  return body.records
+    .filter((item): item is Required<Pick<NonNullable<CloudMemoryListResponse['records']>[number], 'id' | 'summary'>> & NonNullable<CloudMemoryListResponse['records']>[number] => (
+      typeof item?.id === 'string'
+      && item.id.trim().length > 0
+      && typeof item.summary === 'string'
+      && item.summary.trim().length > 0
+    ))
+    .filter((item) => !requestedProjectId || item.projectId === requestedProjectId)
+    .filter((item) => !item.projectionClass || item.projectionClass === projectionClass)
+    .map((item) => ({
+      recordKind: 'projection' as const,
+      projectionId: item.id,
+      summary: item.summary,
+      projectionClass: item.projectionClass ?? projectionClass,
+      matchKind: 'exact' as const,
+      projectId: item.projectId,
+      updatedAt: item.updatedAt,
+      scope: 'personal',
+      source: 'cloud' as const,
+    }));
+}
+
 async function searchLocalRecall(
   query: MemorySearchQuery,
   localServerId: string | undefined,
@@ -166,6 +254,41 @@ async function searchLocalRecall(
       // serverId here keeps the hit shape uniform with cloud results — every
       // hit a consumer sees can be routed (eventually) to the right daemon
       // without per-source-type branching downstream.
+      ...(localServerId ? { originServerId: localServerId } : {}),
+    }));
+}
+
+function listLocalMemorySummaries(
+  query: MemoryMcpListSummariesQuery,
+  localServerId: string | undefined,
+  limit: number,
+): MemoryMcpSearchHit[] {
+  const projectOnly = query.projectOnly !== false;
+  const local = searchLocalMemory({
+    namespace: projectOnly ? query.namespace : undefined,
+    scope: projectOnly ? undefined : query.namespace?.scope,
+    currentEnterpriseId: query.currentEnterpriseId,
+    repo: projectOnly ? (query.repo ?? query.namespace?.projectId) : undefined,
+    userId: projectOnly ? undefined : (query.userId ?? query.namespace?.userId),
+    includeLegacyPersonalOwner: query.includeLegacyPersonalOwner,
+    projectionClass: query.projectionClass ?? 'recent_summary',
+    includeObservations: false,
+    limit: Math.max(limit * 2, limit),
+  });
+  return local.items
+    .filter((item) => item.type === 'processed')
+    .map((item) => ({
+      recordKind: 'projection' as const,
+      projectionId: item.id,
+      summary: item.summary,
+      projectionClass: item.projectionClass,
+      matchKind: 'exact' as const,
+      projectId: item.projectId,
+      scope: item.scope,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      relevanceScore: item.relevanceScore,
+      source: 'local' as const,
       ...(localServerId ? { originServerId: localServerId } : {}),
     }));
 }
@@ -202,6 +325,22 @@ function dedupeAndLimit(items: MemoryMcpSearchHit[], limit: number): MemoryMcpSe
   return out;
 }
 
+function dedupeSummaryListAndLimit(items: MemoryMcpSearchHit[], limit: number): MemoryMcpSearchHit[] {
+  items.sort((a, b) => (b.updatedAt ?? b.createdAt ?? 0) - (a.updatedAt ?? a.createdAt ?? 0));
+  const seen = new Set<string>();
+  const out: MemoryMcpSearchHit[] = [];
+  for (const item of items) {
+    const key = item.projectionId
+      ? `id:${item.projectionId}`
+      : `summary:${item.projectionClass ?? ''}:${normalizeSummaryForFingerprint(item.summary)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 export async function searchMcpMemoryRecall(query: MemorySearchQuery, options: MemoryMcpSearchOptions = {}): Promise<MemoryMcpSearchResult> {
   const limit = clampLimit(query.limit);
   // Resolve credentials once so cloud and local paths share the same
@@ -226,6 +365,27 @@ export async function searchMcpMemoryRecall(query: MemorySearchQuery, options: M
   // hits stamp the local serverId so cache lookups are uniformly
   // populated — keeps the orchestrator's branch decision purely on the
   // map without needing a "did this come from cloud or local" check.
+  for (const item of items) {
+    if (item.recordKind !== 'observation' && item.projectionId && item.originServerId) {
+      projectionOwnerCache.set(item.projectionId, item.originServerId);
+    }
+  }
+  return { items };
+}
+
+export async function listMcpMemorySummaries(query: MemoryMcpListSummariesQuery, options: MemoryMcpSearchOptions = {}): Promise<MemoryMcpSearchResult> {
+  const limit = clampListLimit(query.limit);
+  const credentials = await resolveCredentialsOnce(options).catch(() => null);
+  const localServerId = credentials?.serverId && credentials.serverId.trim()
+    ? credentials.serverId.trim()
+    : undefined;
+  const [cloud, local] = await Promise.all([
+    credentials
+      ? listCloudMemorySummaries(query, options, credentials, limit).catch(() => [])
+      : Promise.resolve([] as MemoryMcpSearchHit[]),
+    Promise.resolve().then(() => listLocalMemorySummaries(query, localServerId, limit)).catch(() => []),
+  ]);
+  const items = dedupeSummaryListAndLimit([...cloud, ...local], limit);
   for (const item of items) {
     if (item.recordKind !== 'observation' && item.projectionId && item.originServerId) {
       projectionOwnerCache.set(item.projectionId, item.originServerId);

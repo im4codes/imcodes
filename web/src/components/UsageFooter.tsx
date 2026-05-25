@@ -33,6 +33,10 @@ interface Props {
   activeToolCall?: boolean;
   /** Current timestamp for thinking timer (updated every second). */
   now?: number;
+  /** Sends recent memory summaries into the current agent as sync-only context. */
+  onSyncMemorySummaries?: () => void;
+  syncMemorySummariesBusy?: boolean;
+  syncMemorySummariesDisabled?: boolean;
 }
 
 const fmt = (n: number) =>
@@ -40,7 +44,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled }: Props) {
   const { t } = useTranslation();
   const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
   // Wrench pill: tri-state toggle for "show developer details in chat timeline".
@@ -193,6 +197,18 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           </span>
         )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          {onSyncMemorySummaries && (
+            <button
+              type="button"
+              class={`shortcut-btn shortcut-btn-icon shortcut-btn-memory-sync${syncMemorySummariesBusy ? ' is-busy' : ''}`}
+              title={syncMemorySummariesBusy ? t('chat.memory_summary_sync_busy') : t('chat.memory_summary_sync')}
+              aria-label={syncMemorySummariesBusy ? t('chat.memory_summary_sync_busy') : t('chat.memory_summary_sync')}
+              disabled={syncMemorySummariesDisabled}
+              onClick={onSyncMemorySummaries}
+            >
+              ↻
+            </button>
+          )}
           <span class="shortcut-btn-tools-wrapper">
             {/* Undecided-state bubble. Points the user at the wrench so the
              *  first-run choice surface is obvious even before they scroll

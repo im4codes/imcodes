@@ -3309,6 +3309,7 @@ describe('handleWebCommand transport queue behavior', () => {
         status: MEMORY_MCP_STATUS.READY,
         tools: [
           MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
+          MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
           MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
           MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
           MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,

@@ -21,9 +21,10 @@ function collectDescriptions(schema: { description?: string; properties?: Readon
 }
 
 describe('memory MCP shared contracts', () => {
-  it('exposes exactly the ten MVP tool names', () => {
+  it('exposes exactly the eleven MVP tool names', () => {
     expect(MEMORY_MCP_TOOL_NAME_LIST).toEqual([
       'search_memory',
+      'list_memory_summaries',
       'get_memory_sources',
       'save_observation',
       'save_preference',
@@ -42,6 +43,10 @@ describe('memory MCP shared contracts', () => {
     expect(Object.keys(search)).toEqual(['query', 'limit']);
     expect(search).not.toHaveProperty('embedding');
     expect(search).not.toHaveProperty('vector');
+
+    const summaries = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES].inputSchema.properties ?? {};
+    expect(Object.keys(summaries)).toEqual(['projectionClass', 'limit', 'projectOnly']);
+    expect(summaries).not.toHaveProperty('query');
 
     const send = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
     const files = send.inputSchema.properties?.files as { description?: string } | undefined;
@@ -94,6 +99,8 @@ describe('memory MCP shared contracts', () => {
       SEND_FILE_PATH_MAX_CHARS: 512,
       CRON_EXPIRES_AT_MAX_DAYS: 90,
       CRON_LIST_MAX_LIMIT: 100,
+      LIST_MEMORY_SUMMARIES_DEFAULT_LIMIT: 20,
+      LIST_MEMORY_SUMMARIES_MAX_LIMIT: 100,
     });
     expect(buildMcpDisabledResult('mem.feature.quick_search', { items: [] })).toEqual({
       status: 'disabled',
