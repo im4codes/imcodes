@@ -1146,7 +1146,7 @@
     "card_size": "카드 크기",
     "subs_count": "Subs ({{count}})",
     "new_sub_session": "새 하위 세션",
-    "sub_session_short": "하위 세션",
+    "add_sub_session_short": "+ 하위 세션",
     "p2p_discussions": "Team 토론",
     "p2p_compact_show": "컴팩트 Team 바 표시",
     "p2p_compact_hide": "Team 바 컴팩트로 접기",

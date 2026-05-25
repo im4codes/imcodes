@@ -1147,7 +1147,7 @@
     "card_size": "卡片尺寸",
     "subs_count": "Subs（{{count}}）",
     "new_sub_session": "新建子会话",
-    "sub_session_short": "子会话",
+    "add_sub_session_short": "+ 子会话",
     "p2p_discussions": "团队 讨论",
     "p2p_compact_show": "显示 团队 紧凑栏",
     "p2p_compact_hide": "收起 团队 为紧凑栏",

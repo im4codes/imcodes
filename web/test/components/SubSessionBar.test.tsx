@@ -9,7 +9,7 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, vars?: Record<string, unknown>) => {
       if (key === 'subsessionBar.subs_count') return `Subs (${vars?.count ?? 0})`;
-      if (key === 'subsessionBar.sub_session_short') return 'sub-session';
+      if (key === 'subsessionBar.add_sub_session_short') return '+ sub-session';
       return key;
     },
   }),
@@ -699,7 +699,7 @@ describe('SubSessionBar', () => {
     const desktop = renderBar(true);
     expect(desktop.container.querySelector('[data-onboarding="new-sub-session"]')?.textContent?.trim()).toBe('+ sub-session');
     expect(desktop.container.querySelector('[data-onboarding="discussion-history"]')?.textContent).toContain('👥');
-    expect(desktop.container.querySelector('[data-onboarding="repo-page"]')?.textContent).toContain('📦');
+    expect(desktop.container.querySelector('[data-onboarding="repo-page"]')?.textContent).toContain('🗂️');
     expect(desktop.container.querySelector('[data-onboarding="cron-manager"]')?.textContent).toContain('⏰');
     desktop.unmount();
 

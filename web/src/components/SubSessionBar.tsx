@@ -833,7 +833,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           onClick={onNew}
           title={t('subsessionBar.new_sub_session')}
         >
-          {desktopLayoutCapable ? `+ ${t('subsessionBar.sub_session_short')}` : '+'}
+          {desktopLayoutCapable ? t('subsessionBar.add_sub_session_short') : '+'}
         </button>
         {onViewDiscussions && (
           <button
@@ -903,7 +903,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               fontSize: 11,
             }}
           >
-            📦
+            🗂️
           </button>
         )}
         {onViewCron && (

@@ -1146,7 +1146,7 @@
     "card_size": "Размер карточки",
     "subs_count": "Subs ({{count}})",
     "new_sub_session": "Новая подсессия",
-    "sub_session_short": "подсессия",
+    "add_sub_session_short": "+ подсессия",
     "p2p_discussions": "Team-обсуждения",
     "p2p_compact_show": "Показать компактную Team-панель",
     "p2p_compact_hide": "Свернуть Team-панель",

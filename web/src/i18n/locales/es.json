@@ -1146,7 +1146,7 @@
     "card_size": "Tamaño de tarjeta",
     "subs_count": "Subs ({{count}})",
     "new_sub_session": "Nueva sub-sesión",
-    "sub_session_short": "sub-sesión",
+    "add_sub_session_short": "+ sub-sesión",
     "p2p_discussions": "Discusiones Team",
     "p2p_compact_show": "Mostrar barra Team compacta",
     "p2p_compact_hide": "Compactar barra Team",

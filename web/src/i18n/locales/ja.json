@@ -1146,7 +1146,7 @@
     "card_size": "カードサイズ",
     "subs_count": "Subs ({{count}})",
     "new_sub_session": "新しいサブセッション",
-    "sub_session_short": "サブセッション",
+    "add_sub_session_short": "+ サブセッション",
     "p2p_discussions": "Team ディスカッション",
     "p2p_compact_show": "コンパクトな Team バーを表示",
     "p2p_compact_hide": "Team バーをコンパクト化",
