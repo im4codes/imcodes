@@ -1,4 +1,4 @@
-import { access, copyFile, readFile, writeFile } from 'node:fs/promises';
+import { access, copyFile, readFile, stat, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve, sep } from 'node:path';
@@ -52,6 +52,30 @@ const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function isCodexAuthFailureMessage(message: string): boolean {
+  return /401\s+Unauthorized/i.test(message)
+    || /Missing bearer or basic authentication/i.test(message)
+    || /not authenticated/i.test(message)
+    || /authentication required/i.test(message);
+}
+
+function getCodexAuthPath(env: Record<string, string | undefined>): string {
+  const codexHome = typeof env.CODEX_HOME === 'string' && env.CODEX_HOME.trim()
+    ? resolve(env.CODEX_HOME.trim())
+    : resolve(homedir(), '.codex');
+  return resolve(codexHome, 'auth.json');
+}
+
+async function readCodexAuthFingerprint(env: Record<string, string | undefined>): Promise<string | null> {
+  try {
+    const authPath = getCodexAuthPath(env);
+    const stats = await stat(authPath);
+    return `${authPath}:${Math.trunc(stats.mtimeMs)}:${stats.size}`;
+  } catch {
+    return null;
+  }
 }
 
 function isCodexThreadHistoryUnreadableError(err: unknown): boolean {
@@ -538,6 +562,8 @@ export class CodexSdkProvider implements TransportProvider {
   private rl: ReadlineInterface | null = null;
   private nextRequestId = 1;
   private pendingRequests = new Map<number, PendingRequest>();
+  private appServerAuthFingerprint: string | null = null;
+  private appServerRestart: Promise<void> | null = null;
 
   async connect(config: ProviderConfig): Promise<void> {
     const binaryPath = this.resolveBinaryPath(config);
@@ -550,8 +576,7 @@ export class CodexSdkProvider implements TransportProvider {
         execFile(resolved.executable, [...resolved.prependArgs, '--version'], { windowsHide: true }, (err) => (err ? reject(err) : resolve()));
       });
     });
-    await this.startAppServer(binaryPath, config);
-    this.config = config;
+    await this.startAppServer(binaryPath, config, { clearSessions: true });
     logger.info({ provider: this.id, resolved: resolved.executable, prepend: resolved.prependArgs }, 'Codex SDK provider connected via app-server');
   }
 
@@ -565,27 +590,11 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
-    this.rejectPending(new Error('Codex app-server disconnected'));
-    this.rl?.close();
-    this.rl = null;
-    for (const state of this.sessions.values()) {
-      this.clearCancelTimer(state);
-      this.clearCompactTimers(state);
-    }
-    // `child.kill('SIGTERM')` only terminates the node wrapper; the native
-    // codex binary it spawned lives on and leaks ~60MB per abandoned pair.
-    // Walk the descendant tree and tree-kill instead. Fire-and-forget is
-    // fine — the caller does not await teardown reaping.
-    if (this.child && !this.child.killed) {
-      void killProcessTree(this.child);
-    }
-    this.child = null;
-    this.threadToSession.clear();
-    this.sessions.clear();
-    this.config = null;
+    await this.stopAppServer({ clearSessions: true });
   }
 
   async createSession(config: SessionConfig): Promise<string> {
+    await this.refreshAppServerForLatestAuth('create-session');
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const existing = config.fresh ? undefined : this.sessions.get(routeId);
     this.sessions.set(routeId, {
@@ -702,6 +711,10 @@ export class CodexSdkProvider implements TransportProvider {
     if (state.runningTurnId || state.runningCompact) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Codex SDK session is already busy', true);
     }
+    await this.refreshAppServerForLatestAuth('send');
+    if (!this.config || !this.child) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
+    }
 
     state.currentText = '';
     state.currentMessageId = null;
@@ -752,15 +765,61 @@ export class CodexSdkProvider implements TransportProvider {
     state.cancelTimer.unref?.();
   }
 
-  private async startAppServer(binaryPath: string, config: ProviderConfig): Promise<void> {
-    await this.disconnect().catch(() => {});
+  private buildSpawnEnv(config: ProviderConfig): Record<string, string | undefined> {
+    return { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) };
+  }
+
+  private async stopAppServer(options: { clearSessions: boolean }): Promise<void> {
+    this.rejectPending(new Error('Codex app-server disconnected'));
+    this.rl?.close();
+    this.rl = null;
+    for (const [sessionId, state] of this.sessions) {
+      this.clearCancelTimer(state);
+      this.clearCompactTimers(state);
+      if (!options.clearSessions) {
+        this.clearStatus(sessionId, state);
+        state.loaded = false;
+        state.runningTurnId = undefined;
+        state.runningCompact = false;
+        state.compactObserved = false;
+        state.currentMessageId = null;
+        state.currentText = '';
+        state.pendingComplete = undefined;
+        state.cancelled = false;
+        state.lastStatusSignature = null;
+      }
+    }
+    // `child.kill('SIGTERM')` only terminates the node wrapper; the native
+    // codex binary it spawned lives on and leaks ~60MB per abandoned pair.
+    // Walk the descendant tree and tree-kill instead.
+    const child = this.child;
+    this.child = null;
+    if (child && !child.killed) {
+      void killProcessTree(child);
+    }
+    this.threadToSession.clear();
+    this.appServerAuthFingerprint = null;
+    if (options.clearSessions) {
+      this.sessions.clear();
+      this.config = null;
+    }
+  }
+
+  private async startAppServer(
+    binaryPath: string,
+    config: ProviderConfig,
+    options: { clearSessions: boolean },
+  ): Promise<void> {
+    await this.stopAppServer({ clearSessions: options.clearSessions }).catch(() => {});
     // Resolve npm .cmd shims into (node.exe, [scriptPath]) so spawn works
     // without shell:true (which has its own quoting issues on Windows).
     const resolved = resolveExecutableForSpawn(binaryPath);
     const args = [...resolved.prependArgs, ...getDefaultCodexMcpArgs(), 'app-server'];
+    const spawnEnv = this.buildSpawnEnv(config);
+    const authFingerprint = await readCodexAuthFingerprint(spawnEnv);
     const child = spawn(resolved.executable, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) },
+      env: spawnEnv,
       windowsHide: true,
     });
     this.child = child;
@@ -771,6 +830,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (text.trim()) logger.debug({ provider: this.id, stderr: text.trim() }, 'Codex app-server stderr');
     });
     child.on('exit', (code) => {
+      if (this.child !== child) return;
       const err = new Error(`Codex app-server exited with code ${code ?? 'unknown'}`);
       this.rejectPending(err);
       const sessions = [...this.sessions.keys()];
@@ -778,10 +838,12 @@ export class CodexSdkProvider implements TransportProvider {
         this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
       }
       this.child = null;
+      this.appServerAuthFingerprint = null;
     });
     // CRITICAL: must listen for 'error' or spawn failures (e.g. ENOENT) become
     // uncaughtException and crash the daemon.
     child.on('error', (err) => {
+      if (this.child !== child) return;
       logger.error({ provider: this.id, err }, 'Codex app-server spawn error');
       this.rejectPending(err);
       const sessions = [...this.sessions.keys()];
@@ -789,13 +851,58 @@ export class CodexSdkProvider implements TransportProvider {
         this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
       }
       this.child = null;
+      this.appServerAuthFingerprint = null;
     });
 
-    await this.request('initialize', {
-      clientInfo: { name: 'imcodes', title: 'IM.codes', version: '0.1.0' },
-      capabilities: { experimentalApi: true },
+    try {
+      await this.request('initialize', {
+        clientInfo: { name: 'imcodes', title: 'IM.codes', version: '0.1.0' },
+        capabilities: { experimentalApi: true },
+      });
+      this.notify('initialized', {});
+      this.config = config;
+      this.appServerAuthFingerprint = authFingerprint;
+    } catch (err) {
+      await this.stopAppServer({ clearSessions: options.clearSessions }).catch(() => {});
+      throw err;
+    }
+  }
+
+  private async refreshAppServerForLatestAuth(reason: string): Promise<void> {
+    if (this.appServerRestart) await this.appServerRestart;
+    if (!this.config || !this.child) return;
+    const current = await readCodexAuthFingerprint(this.buildSpawnEnv(this.config));
+    if (current === this.appServerAuthFingerprint) return;
+    logger.info({
+      provider: this.id,
+      reason,
+      previousAuthPresent: this.appServerAuthFingerprint !== null,
+      currentAuthPresent: current !== null,
+    }, 'Codex auth file changed; restarting app-server to load latest authentication');
+    await this.restartAppServerPreservingSessions(reason);
+  }
+
+  private async restartAppServerPreservingSessions(reason: string): Promise<void> {
+    if (this.appServerRestart) return this.appServerRestart;
+    const config = this.config;
+    if (!config) return;
+    const binaryPath = this.resolveBinaryPath(config);
+    this.appServerRestart = (async () => {
+      await this.startAppServer(binaryPath, config, { clearSessions: false });
+    })().finally(() => {
+      this.appServerRestart = null;
     });
-    this.notify('initialized', {});
+    return this.appServerRestart;
+  }
+
+  private async restartAppServerAfterAuthFailure(reason: string, error: ProviderError): Promise<void> {
+    logger.warn({
+      provider: this.id,
+      reason,
+      code: error.code,
+      message: error.message,
+    }, 'Codex app-server authentication failed; restarting to load latest authentication');
+    await this.restartAppServerPreservingSessions(reason);
   }
 
   private async startTurn(sessionId: string, state: CodexSdkSessionState, payload: ProviderContextPayload): Promise<void> {
@@ -815,7 +922,13 @@ export class CodexSdkProvider implements TransportProvider {
       state.runningTurnId = result?.turn?.id;
     } catch (err) {
       state.runningTurnId = undefined;
-      this.emitError(sessionId, this.normalizeError(err));
+      const error = this.normalizeError(err);
+      if (this.isCodexAuthError(error)) {
+        await this.restartAppServerAfterAuthFailure('start-turn', error).catch((restartErr) => {
+          logger.warn({ provider: this.id, err: restartErr }, 'Codex app-server auth refresh restart failed');
+        });
+      }
+      this.emitError(sessionId, error);
     }
   }
 
@@ -1153,7 +1266,13 @@ export class CodexSdkProvider implements TransportProvider {
         state.runningCompact = false;
         state.compactObserved = false;
         state.runningTurnId = undefined;
-        this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, turn.error?.message ?? 'Codex turn failed', false, turn.error));
+        const error = this.normalizeError(turn.error?.message ?? 'Codex turn failed', turn.error);
+        if (this.isCodexAuthError(error)) {
+          void this.restartAppServerAfterAuthFailure('turn-failed', error).catch((restartErr) => {
+            logger.warn({ provider: this.id, err: restartErr }, 'Codex app-server auth refresh restart failed');
+          });
+        }
+        this.emitError(sessionId, error);
         return;
       }
       if (status === 'interrupted') {
@@ -1274,6 +1393,7 @@ export class CodexSdkProvider implements TransportProvider {
   async readRateLimits(): Promise<Record<string, unknown> | undefined> {
     if (!this.child || !this.child.stdin.writable) return undefined;
     try {
+      await this.refreshAppServerForLatestAuth('rate-limits').catch(() => {});
       const result = await this.request('account/rateLimits/read', {});
       if (result && typeof result === 'object' && 'rateLimits' in (result as Record<string, unknown>)) {
         const payload = (result as Record<string, unknown>).rateLimits;
@@ -1307,6 +1427,7 @@ export class CodexSdkProvider implements TransportProvider {
   async readModelList(): Promise<CodexDiscoveredModel[] | undefined> {
     if (!this.child || !this.child.stdin.writable) return undefined;
     try {
+      await this.refreshAppServerForLatestAuth('model-list').catch(() => {});
       const discovered: CodexDiscoveredModel[] = [];
       const seen = new Set<string>();
       let cursor: string | null = null;
@@ -1396,15 +1517,22 @@ export class CodexSdkProvider implements TransportProvider {
     return typeof config?.binaryPath === 'string' && config.binaryPath.trim() ? config.binaryPath : CODEX_BIN;
   }
 
-  private normalizeError(err: unknown): ProviderError {
+  private normalizeError(err: unknown, details?: unknown): ProviderError {
     const message = errorMessage(err);
     if (/ENOENT|not found|spawn .*codex/i.test(message)) {
       return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND, `Codex binary not found: ${message}`, false, err);
+    }
+    if (isCodexAuthFailureMessage(message)) {
+      return this.makeError(PROVIDER_ERROR_CODES.AUTH_FAILED, message, false, details ?? err);
     }
     if (isCodexThreadHistoryUnreadableError(err) || (/resume|thread/i.test(message) && /not found|invalid|unknown/i.test(message))) {
       return this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, message, true, err);
     }
     return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, false, err);
+  }
+
+  private isCodexAuthError(error: ProviderError): boolean {
+    return error.code === PROVIDER_ERROR_CODES.AUTH_FAILED || isCodexAuthFailureMessage(error.message);
   }
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {

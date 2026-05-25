@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 
 const childProcessMock = vi.hoisted(() => {
@@ -151,6 +154,7 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
 }));
 
 import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
+import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import {
@@ -165,6 +169,13 @@ import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-n
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+async function writeCodexAuthFile(codexHome: string, version: number): Promise<void> {
+  await writeFile(
+    join(codexHome, 'auth.json'),
+    JSON.stringify({ version, pad: 'x'.repeat(version) }),
+  );
+}
 
 describe('CodexSdkProvider', () => {
   beforeEach(() => {
@@ -195,6 +206,94 @@ describe('CodexSdkProvider', () => {
       connected: true,
       degradedReasons: [],
     });
+  });
+
+  it('restarts the app-server before creating a session when Codex auth changes', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-auth-'));
+    const provider = new CodexSdkProvider();
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      await writeCodexAuthFile(codexHome, 1);
+
+      await provider.connect({ binaryPath: 'codex' });
+      expect(childProcessMock.children).toHaveLength(1);
+
+      await writeCodexAuthFile(codexHome, 2);
+      await provider.createSession({ sessionKey: 'route-1', cwd: '/tmp/project' });
+
+      expect(childProcessMock.children).toHaveLength(2);
+      expect(childProcessMock.children[0]!.child.killed).toBe(true);
+      expect(childProcessMock.children[1]!.requests.some((req) => req.method === 'initialize')).toBe(true);
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves Codex thread ids across auth-change app-server restarts', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-auth-'));
+    const provider = new CodexSdkProvider();
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      await writeCodexAuthFile(codexHome, 1);
+
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-1', cwd: '/tmp/project', resumeId: 'thread-keep' });
+      await provider.send('route-1', 'first');
+      const firstChild = childProcessMock.children[0]!;
+      expect(firstChild.requests.some((req) => req.method === 'thread/resume' && req.params?.threadId === 'thread-keep')).toBe(true);
+      firstChild.emits({ method: 'turn/completed', params: { threadId: 'thread-keep', turn: { id: 'turn-1', status: 'completed', error: null } } });
+      await flush();
+
+      await writeCodexAuthFile(codexHome, 3);
+      await provider.send('route-1', 'second');
+
+      expect(childProcessMock.children).toHaveLength(2);
+      const secondChild = childProcessMock.children[1]!;
+      expect(secondChild.requests.some((req) => req.method === 'thread/resume' && req.params?.threadId === 'thread-keep')).toBe(true);
+      expect(secondChild.requests.some((req) => req.method === 'turn/start')).toBe(true);
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('restarts the app-server when Codex reports a bearer auth failure', async () => {
+    const provider = new CodexSdkProvider();
+    const errors: Array<{ code: string; recoverable: boolean; message: string }> = [];
+    provider.onError((_sid, error) => errors.push({
+      code: error.code,
+      recoverable: error.recoverable,
+      message: error.message,
+    }));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-1', cwd: '/tmp/project' });
+    await provider.send('route-1', 'hello');
+    const firstChild = childProcessMock.children[0]!;
+
+    firstChild.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: {
+          id: 'turn-1',
+          status: 'failed',
+          error: {
+            message: 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header',
+          },
+        },
+      },
+    });
+    await flush();
+
+    expect(errors).toMatchObject([{
+      code: PROVIDER_ERROR_CODES.AUTH_FAILED,
+      recoverable: false,
+    }]);
+    expect(childProcessMock.children).toHaveLength(2);
+    expect(firstChild.child.killed).toBe(true);
+    await provider.disconnect();
   });
 
   it('starts a thread, captures resume id, emits tool calls, streams message deltas, and completes', async () => {
@@ -441,6 +540,7 @@ describe('CodexSdkProvider', () => {
     await provider.connect({ binaryPath: 'codex' });
 
     const resultPromise = provider.readModelList();
+    await flush();
     const child = childProcessMock.children[0];
     const firstRequest = child.requests.find((req) => req.method === 'model/list');
     expect(firstRequest?.params).toMatchObject({ includeHidden: false, limit: 100 });
