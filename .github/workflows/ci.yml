@@ -320,8 +320,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
           cache-dependency-path: server/package-lock.json
-      - run: npm ci
-        working-directory: server
+      - run: ./scripts/ci-npm-ci.sh server
       - name: Run DB integration tests
         run: npm run test:integration
         working-directory: server
