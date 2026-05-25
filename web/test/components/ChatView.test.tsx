@@ -312,6 +312,14 @@ describe('ChatView', () => {
 
   it('renders plain-text HTML path action only outside preview mode', () => {
     const onPreviewFile = vi.fn();
+    const wsListeners = new Set<(msg: any) => void>();
+    const ws = {
+      fsReadFile: vi.fn(() => 'read-html-preview'),
+      onMessage: vi.fn((handler: (msg: any) => void) => {
+        wsListeners.add(handler);
+        return () => wsListeners.delete(handler);
+      }),
+    };
     const events = [{
       eventId: 'user-html-path',
       type: 'user.message',
@@ -324,7 +332,7 @@ describe('ChatView', () => {
         events={events as any}
         loading={false}
         sessionId="deck_main_brain"
-        ws={{} as any}
+        ws={ws as any}
         workdir="/repo"
         onPreviewFile={onPreviewFile}
       />,
@@ -333,14 +341,42 @@ describe('ChatView', () => {
     const htmlButton = container.querySelector('.chat-html-preview-btn') as HTMLButtonElement | null;
     expect(htmlButton).not.toBeNull();
     fireEvent.click(htmlButton!);
-    expect(onPreviewFile).toHaveBeenCalledWith(expect.objectContaining({
-      path: '/repo/./dist/index.HTML',
-      preferDiff: false,
-      previewViewMode: 'html-render',
-      preview: { status: 'loading', path: '/repo/./dist/index.HTML' },
-      rootPath: '/repo',
-      sourcePreviewLive: false,
-    }));
+    expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./dist/index.HTML');
+    expect(onPreviewFile).not.toHaveBeenCalled();
+    expect(container.querySelector('.html-fullscreen-preview')).not.toBeNull();
+
+    act(() => {
+      for (const listener of wsListeners) {
+        listener({
+          type: 'fs.read_response',
+          requestId: 'read-html-preview',
+          path: '/repo/./dist/index.HTML',
+          status: 'ok',
+          content: '<!doctype html><title>Preview</title><main>Hello</main>',
+        });
+      }
+    });
+    expect(container.querySelector('.html-safe-preview-frame')).not.toBeNull();
+
+    fireEvent.click(container.querySelector('.html-fullscreen-preview-close') as HTMLButtonElement);
+    expect(container.querySelector('.html-fullscreen-preview')).toBeNull();
+
+    fireEvent.click(htmlButton!);
+    act(() => {
+      for (const listener of wsListeners) {
+        listener({
+          type: 'fs.read_response',
+          requestId: 'read-html-preview',
+          path: '/repo/./dist/index.HTML',
+          status: 'ok',
+          content: '<!doctype html><title>Preview again</title>',
+        });
+      }
+    });
+    expect(container.querySelector('.html-safe-preview-frame')).not.toBeNull();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(container.querySelector('.html-fullscreen-preview')).toBeNull();
 
     rerender(
       <ChatView

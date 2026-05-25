@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/preact';
+import { act, render, screen, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 
 if (!HTMLElement.prototype.scrollIntoView) {
   HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -153,6 +153,14 @@ describe('ChatView attachment download', () => {
 
   it('shows daemonPath HTML render after download while primary click opens source preview', () => {
     const onPreviewFile = vi.fn();
+    const wsListeners = new Set<(msg: any) => void>();
+    const ws = {
+      fsReadFile: vi.fn(() => 'read-attachment-html'),
+      onMessage: vi.fn((handler: (msg: any) => void) => {
+        wsListeners.add(handler);
+        return () => wsListeners.delete(handler);
+      }),
+    };
     const events = [makeEvent({
       type: 'user.message',
       payload: {
@@ -168,7 +176,7 @@ describe('ChatView attachment download', () => {
         events={events}
         loading={false}
         serverId="srv-1"
-        ws={{} as any}
+        ws={ws as any}
         workdir="/repo"
         onPreviewFile={onPreviewFile}
       />,
@@ -191,14 +199,22 @@ describe('ChatView attachment download', () => {
     expect(onPreviewFile.mock.calls[0][0].previewViewMode).not.toBe('html-render');
 
     fireEvent.click(buttons[2]);
-    expect(onPreviewFile).toHaveBeenLastCalledWith(expect.objectContaining({
-      path: '/repo/./page.HTML',
-      preferDiff: false,
-      previewViewMode: 'html-render',
-      preview: { status: 'loading', path: '/repo/./page.HTML' },
-      rootPath: '/repo',
-      sourcePreviewLive: false,
-    }));
+    expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./page.HTML');
+    expect(onPreviewFile).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('.html-fullscreen-preview')).not.toBeNull();
+
+    act(() => {
+      for (const listener of wsListeners) {
+        listener({
+          type: 'fs.read_response',
+          requestId: 'read-attachment-html',
+          path: '/repo/./page.HTML',
+          status: 'ok',
+          content: '<!doctype html><title>Attachment</title>',
+        });
+      }
+    });
+    expect(container.querySelector('.html-safe-preview-frame')).not.toBeNull();
   });
 
   it('does not show a render action for HTML attachments without daemonPath', async () => {

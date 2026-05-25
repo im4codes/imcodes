@@ -20,6 +20,7 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
+import { HtmlSafePreview } from './HtmlSafePreview.js';
 import { isLikelyDomainPath, renderChatPathActions } from '../chat-path-actions.js';
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
 import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
@@ -92,6 +93,11 @@ interface ViewItem {
   ts?: number;
   lastTs?: number;
 }
+
+type HtmlFullscreenPreview =
+  | { status: 'loading'; path: string; requestId: string }
+  | { status: 'ok'; path: string; content: string }
+  | { status: 'error'; path: string; error: string };
 
 interface AssistantBlockProps {
   text: string;
@@ -904,6 +910,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const selMenuRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
+  const [htmlFullscreenPreview, setHtmlFullscreenPreview] = useState<HtmlFullscreenPreview | null>(null);
   const [highlightEl, setHighlightEl] = useState<HTMLElement | null>(null);
   const highlightElRef = useRef(highlightEl);
   highlightElRef.current = highlightEl;
@@ -1060,8 +1067,41 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [openFilePreview]);
 
   const handleHtmlPreview = useCallback((path: string) => {
-    openFilePreview(path, false, 'html-render');
-  }, [openFilePreview]);
+    if (!ws || typeof ws.fsReadFile !== 'function') return;
+    const resolvedPath = resolvePreviewPath(path, workdir);
+    const requestId = ws.fsReadFile(resolvedPath);
+    setHtmlFullscreenPreview({ status: 'loading', path: resolvedPath, requestId });
+  }, [workdir, ws]);
+
+  const closeHtmlFullscreenPreview = useCallback(() => {
+    setHtmlFullscreenPreview(null);
+  }, []);
+
+  useEffect(() => {
+    if (!ws || typeof ws.onMessage !== 'function') return undefined;
+    return ws.onMessage((msg) => {
+      if (msg.type !== 'fs.read_response') return;
+      setHtmlFullscreenPreview((current) => {
+        if (!current || current.status !== 'loading' || current.requestId !== msg.requestId) return current;
+        if (msg.status === 'error') {
+          const error = msg.error === 'file_too_large'
+            ? t('chat.html_preview_too_large', 'HTML file is too large to render safely.')
+            : t('file_browser.preview_error', 'Preview unavailable');
+          return { status: 'error', path: current.path, error };
+        }
+        return { status: 'ok', path: current.path, content: msg.content ?? '' };
+      });
+    });
+  }, [t, ws]);
+
+  useEffect(() => {
+    if (!htmlFullscreenPreview) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeHtmlFullscreenPreview();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [closeHtmlFullscreenPreview, htmlFullscreenPreview]);
 
   const handleUrlClick = useCallback((url: string) => {
     setPendingUrl(url);
@@ -1083,7 +1123,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [serverId, ws]);
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
-  const htmlPreviewHandler = ws && !preview && onPreviewFile ? handleHtmlPreview : undefined;
+  const htmlPreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleHtmlPreview : undefined;
   const fileChangeOpenHandler = ws && !preview && onPreviewFile ? handleFileChangeOpen : undefined;
   const urlClickHandler = !preview ? handleUrlClick : undefined;
   const downloadHandler = serverId && ws ? handleDownload : undefined;
@@ -2143,6 +2183,37 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           specific portion. */}
       {zoomText && (
         <ZoomedTextDialog text={zoomText} onClose={() => setZoomText(null)} onQuote={onQuote} />
+      )}
+      {htmlFullscreenPreview && (
+        <div
+          class="html-fullscreen-preview"
+          role="dialog"
+          aria-modal="true"
+          aria-label={t('chat.html_preview_title', 'Render HTML preview')}
+        >
+          <button
+            type="button"
+            class="html-fullscreen-preview-close"
+            onClick={closeHtmlFullscreenPreview}
+            title={t('common.close', 'Close')}
+            aria-label={t('common.close', 'Close')}
+          >
+            ✕
+          </button>
+          <div class="html-fullscreen-preview-body">
+            {htmlFullscreenPreview.status === 'loading' && (
+              <div class="html-fullscreen-preview-status">{t('file_browser.preview_loading', 'Loading…')}</div>
+            )}
+            {htmlFullscreenPreview.status === 'error' && (
+              <div class="html-fullscreen-preview-status html-fullscreen-preview-error">
+                {htmlFullscreenPreview.error}
+              </div>
+            )}
+            {htmlFullscreenPreview.status === 'ok' && (
+              <HtmlSafePreview path={htmlFullscreenPreview.path} content={htmlFullscreenPreview.content} />
+            )}
+          </div>
+        </div>
       )}
       {/* External link confirm dialog */}
       {pendingUrl && (

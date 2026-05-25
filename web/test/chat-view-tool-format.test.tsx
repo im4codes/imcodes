@@ -314,11 +314,13 @@ describe('ChatView tool payload formatting', () => {
     fireEvent.click(button!);
 
     expect(fsReadFile).toHaveBeenCalledWith('C:\\Users\\admin\\screenshot.png');
-    onMessage.mock.calls[0][0]({
-      type: 'fs.read_response',
-      requestId: 'req-win-path',
-      downloadId: 'dl-win-path',
-    });
+    for (const [handler] of onMessage.mock.calls) {
+      handler({
+        type: 'fs.read_response',
+        requestId: 'req-win-path',
+        downloadId: 'dl-win-path',
+      });
+    }
     await waitFor(() => {
       expect(downloadAttachment).toHaveBeenCalledWith('server-1', 'dl-win-path');
     });
