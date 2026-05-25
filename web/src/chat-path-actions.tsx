@@ -1,5 +1,8 @@
 import { h, type ComponentChildren } from 'preact';
+import { useState } from 'preact/hooks';
 import { isHtmlPreviewPath } from '@shared/html-preview.js';
+
+export type ChatPathDownloadHandler = (path: string) => void | Promise<void>;
 
 export interface ChatPathActionLabels {
   download: string;
@@ -8,7 +11,7 @@ export interface ChatPathActionLabels {
 
 export interface ChatPathActionHandlers {
   onPathClick?: (path: string) => void;
-  onDownload?: (path: string) => void;
+  onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
 }
 
@@ -23,7 +26,7 @@ export interface ChatPathActionOptions {
   labels?: ChatPathActionLabels;
   handlers?: ChatPathActionHandlers;
   onPathClick?: (path: string) => void;
-  onDownload?: (path: string) => void;
+  onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   downloadLabel?: string;
   htmlPreviewLabel?: string;
@@ -55,8 +58,7 @@ export function canRenderHtmlPreviewAction(
   return !!handlers.onPathClick && !!handlers.onHtmlPreview && isLocalChatPath(path) && isHtmlPreviewPath(path);
 }
 
-export function renderChatPathActions({
-  key,
+function ChatPathActions({
   path,
   children,
   content,
@@ -71,6 +73,8 @@ export function renderChatPathActions({
   downloadLabel,
   htmlPreviewLabel,
 }: ChatPathActionOptions): h.JSX.Element {
+  const [downloadState, setDownloadState] = useState<'idle' | 'busy' | 'error'>('idle');
+  const [downloadError, setDownloadError] = useState('');
   const resolvedHandlers = handlers ?? { onPathClick, onDownload, onHtmlPreview };
   const resolvedLabels = labels ?? {
     download: downloadLabel ?? '',
@@ -88,22 +92,37 @@ export function renderChatPathActions({
       : <span class={resolvedPathClass} title={path}>{nodeContent}</span>;
   const showDownload = !!resolvedHandlers.onDownload && chatPathHasFileExtension(path);
   const showHtmlPreview = canRenderHtmlPreviewAction(path, resolvedHandlers);
+  const downloadTitle = downloadState === 'error' && downloadError
+    ? downloadError
+    : resolvedLabels.download;
 
   return (
-    <span key={key} class="chat-path-actions">
+    <span class="chat-path-actions">
       {pathLabel}
       {showDownload && (
         <button
           type="button"
-          class="chat-dl-btn"
-          title={resolvedLabels.download}
-          aria-label={resolvedLabels.download}
-          onClick={(e: Event) => {
+          class={`chat-dl-btn${downloadState === 'busy' ? ' is-busy' : ''}${downloadState === 'error' ? ' is-error' : ''}`}
+          title={downloadTitle}
+          aria-label={downloadTitle}
+          aria-busy={downloadState === 'busy'}
+          disabled={downloadState === 'busy'}
+          onClick={async (e: Event) => {
             e.stopPropagation();
-            resolvedHandlers.onDownload?.(path);
+            if (!resolvedHandlers.onDownload) return;
+            setDownloadState('busy');
+            setDownloadError('');
+            try {
+              await resolvedHandlers.onDownload(path);
+              setDownloadState('idle');
+            } catch (err) {
+              const message = err instanceof Error ? err.message : String(err);
+              setDownloadError(message || resolvedLabels.download);
+              setDownloadState('error');
+            }
           }}
         >
-          ⬇
+          {downloadState === 'busy' ? '…' : downloadState === 'error' ? '!' : '⬇'}
         </button>
       )}
       {showHtmlPreview && (
@@ -122,4 +141,9 @@ export function renderChatPathActions({
       )}
     </span>
   );
+}
+
+export function renderChatPathActions(options: ChatPathActionOptions): h.JSX.Element {
+  const { key, ...rest } = options;
+  return <ChatPathActions key={key} {...rest} />;
 }

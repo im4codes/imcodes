@@ -22,7 +22,7 @@ import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-previe
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
-import { isLikelyDomainPath, renderChatPathActions } from '../chat-path-actions.js';
+import { isLikelyDomainPath, renderChatPathActions, type ChatPathDownloadHandler } from '../chat-path-actions.js';
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
 import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
@@ -111,7 +111,7 @@ interface AssistantBlockProps {
   eventId?: string;
   onPathClick?: (p: string) => void;
   onUrlClick?: (url: string) => void;
-  onDownload?: (path: string) => void;
+  onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
 }
 
@@ -1098,20 +1098,70 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     setPendingUrl(url);
   }, []);
 
-  const handleDownload = useCallback((path: string) => {
-    if (!serverId || !ws) return;
-    const reqId = ws.fsReadFile(path);
-    const unsub = ws.onMessage((msg) => {
-      if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
-      unsub();
-      if (msg.downloadId) {
-        import('../api.js').then(({ downloadAttachment }) => {
-          downloadAttachment(serverId, msg.downloadId as string).catch(() => {});
-        });
+  const mapDownloadError = useCallback((err: unknown): string => {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('daemon_offline') || msg.includes('503')) return t('upload.daemon_offline');
+    if (msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404')) return t('upload.download_expired');
+    if (msg.includes('504') || msg.includes('timeout')) return t('upload.download_timeout');
+    return t('upload.download_failed');
+  }, [t]);
+
+  const requestPathDownloadId = useCallback((path: string): Promise<string> => (
+    new Promise((resolve, reject) => {
+      if (!ws) {
+        reject(new Error(t('upload.daemon_offline')));
+        return;
       }
-    });
-    setTimeout(unsub, 30_000);
-  }, [serverId, ws]);
+      let unsub: (() => void) | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        unsub?.();
+      };
+      try {
+        const reqId = ws.fsReadFile(path);
+        timer = setTimeout(() => {
+          cleanup();
+          reject(new Error(t('upload.download_timeout')));
+        }, 30_000);
+        unsub = ws.onMessage((msg) => {
+          if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
+          cleanup();
+          if (typeof msg.downloadId === 'string' && msg.downloadId.trim()) {
+            resolve(msg.downloadId);
+            return;
+          }
+          if (msg.status === 'error') {
+            reject(new Error(mapDownloadError(new Error(String(msg.error ?? 'download_failed')))));
+            return;
+          }
+          reject(new Error(t('upload.download_failed')));
+        });
+      } catch (err) {
+        cleanup();
+        reject(new Error(mapDownloadError(err)));
+      }
+    })
+  ), [mapDownloadError, t, ws]);
+
+  const handleDownload = useCallback<ChatPathDownloadHandler>(async (path: string) => {
+    if (!serverId) throw new Error(t('upload.daemon_offline'));
+    let downloadId = await requestPathDownloadId(path);
+    const { downloadAttachment } = await import('../api.js');
+    try {
+      await downloadAttachment(serverId, downloadId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
+      if (!isStaleHandle) throw new Error(mapDownloadError(err));
+      downloadId = await requestPathDownloadId(path);
+      try {
+        await downloadAttachment(serverId, downloadId);
+      } catch (retryErr) {
+        throw new Error(mapDownloadError(retryErr));
+      }
+    }
+  }, [mapDownloadError, requestPathDownloadId, serverId, t]);
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
   const htmlPreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleHtmlPreview : undefined;
@@ -2248,7 +2298,7 @@ function ToolCallGroup({
   events: TimelineEvent[];
   onPathClick?: (p: string) => void;
   onUrlClick?: (url: string) => void;
-  onDownload?: (path: string) => void;
+  onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   serverId?: string;
 }) {
@@ -2395,7 +2445,7 @@ const ChatEvent = memo(function ChatEvent({
   onPathClick?: (p: string) => void;
   onUrlClick?: (url: string) => void;
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
-  onDownload?: (path: string) => void;
+  onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   serverId?: string;
   onResendFailed?: (commandId: string, text: string) => void;
@@ -2938,7 +2988,7 @@ function UserMessageText({
   text: string;
   onPathClick?: (p: string) => void;
   onUrlClick?: (url: string) => void;
-  onDownload?: (path: string) => void;
+  onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
 }) {
   const { t } = useTranslation();
@@ -2985,7 +3035,7 @@ function splitPathsAndUrls(
   text: string,
   onPathClick?: (p: string) => void,
   onUrlClick?: (url: string) => void,
-  onDownload?: (path: string) => void,
+  onDownload?: ChatPathDownloadHandler,
   onHtmlPreview?: (path: string) => void,
   downloadLabel = '',
   htmlPreviewLabel = '',

@@ -104,6 +104,22 @@ vi.mock('../../src/daemon/file-transfer-handler.js', () => ({
   lookupAttachment: vi.fn(() => undefined),
 }));
 
+vi.mock('../../src/context/memory-search.js', () => ({
+  searchLocalMemorySemantic: vi.fn().mockResolvedValue({
+    items: [],
+    stats: {
+      totalRecords: 0,
+      matchedRecords: 0,
+      recentSummaryCount: 0,
+      durableCandidateCount: 0,
+      projectCount: 0,
+      stagedEventCount: 0,
+      dirtyTargetCount: 0,
+      pendingJobCount: 0,
+    },
+  }),
+}));
+
 vi.mock('../../src/util/logger.js', () => ({
   default: {
     info: vi.fn(),
@@ -591,9 +607,10 @@ describe('structured P2P routing via WS fields', () => {
         commandId: 'cmd-attachment-path-rewrite',
       }, mockServerLink as any);
 
-      await vi.waitFor(() => {
-        expect(sendKeysDelayedEnter).toHaveBeenCalled();
-      });
+      await vi.waitFor(
+        () => expect(sendKeysDelayedEnter).toHaveBeenCalled(),
+        { timeout: 5_000, interval: 50 },
+      );
 
       const sentText = vi.mocked(sendKeysDelayedEnter).mock.calls.at(-1)?.[1] as string;
       expect(sentText).toContain(`#1:(${refsDir}/`);

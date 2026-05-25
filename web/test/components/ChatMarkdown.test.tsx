@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { fireEvent, render } from '@testing-library/preact';
+import { fireEvent, render, waitFor } from '@testing-library/preact';
 
 // ChatMarkdown's CodeBlock uses react-i18next for the per-block copy button's
 // tooltip. The runtime build aliases react → preact/compat via @preact/preset-vite,
@@ -69,6 +69,28 @@ describe('ChatMarkdown', () => {
     expect(button).not.toBeNull();
     fireEvent.click(button!);
     expect(onDownload).toHaveBeenCalledWith('./README.md');
+  });
+
+  it('shows download progress and failure state for async path downloads', async () => {
+    const onDownload = vi.fn().mockRejectedValue(new Error('missing download handle'));
+    const { container } = render(
+      <ChatMarkdown
+        text="Open ./missing.pdf"
+        onPathClick={() => {}}
+        onDownload={onDownload}
+      />
+    );
+
+    const button = container.querySelector('.chat-dl-btn') as HTMLButtonElement | null;
+    expect(button).not.toBeNull();
+    fireEvent.click(button!);
+
+    expect(button!.disabled).toBe(true);
+    expect(button!.textContent).toBe('…');
+    await waitFor(() => expect(button!.disabled).toBe(false));
+    expect(button!.classList.contains('is-error')).toBe(true);
+    expect(button!.textContent).toBe('!');
+    expect(button!.title).toBe('missing download handle');
   });
 
   it('renders a download button for backtick file paths and calls onDownload', () => {

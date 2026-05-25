@@ -19,6 +19,7 @@ import {
   isLikelyDomainPath,
   isLocalChatPath,
   renderChatPathActions,
+  type ChatPathDownloadHandler,
 } from '../chat-path-actions.js';
 
 interface Props {
@@ -26,14 +27,14 @@ interface Props {
   onPathClick?: (path: string) => void;
   onUrlClick?: (url: string) => void;
   /** Called to download a file path. Only shown for paths with extensions. */
-  onDownload?: (path: string) => void;
+  onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
 }
 
 interface RenderContext {
   onPathClick?: (path: string) => void;
   onUrlClick?: (url: string) => void;
-  onDownload?: (path: string) => void;
+  onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   downloadLabel: string;
   htmlPreviewLabel: string;
@@ -55,7 +56,7 @@ function CodeBlock({
   text: string;
   onPathClick?: (path: string) => void;
   onUrlClick?: (url: string) => void;
-  onDownload?: (path: string) => void;
+  onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   downloadLabel: string;
   htmlPreviewLabel: string;

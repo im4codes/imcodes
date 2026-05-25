@@ -36,10 +36,9 @@ describe('memory feature flags and counters', () => {
       expect(isMemoryFeatureFlag(flag)).toBe(true);
       expect(MEMORY_FEATURE_FLAG_REGISTRY[flag].disabledBehavior.length).toBeGreaterThan(0);
     }
-    expect(MEMORY_FEATURE_FLAG_REGISTRY['mem.feature.namespace_registry'].defaultValue).toBe(true);
-    expect(MEMORY_FEATURE_FLAG_REGISTRY['mem.feature.quick_search'].defaultValue).toBe(true);
-    for (const flag of MEMORY_FEATURE_FLAGS.filter((item) => item !== 'mem.feature.namespace_registry' && item !== 'mem.feature.quick_search')) {
-      expect(MEMORY_FEATURE_FLAG_REGISTRY[flag].defaultValue).toBe(false);
+    expect(MEMORY_FEATURE_FLAG_REGISTRY['mem.feature.skill_auto_creation'].defaultValue).toBe(false);
+    for (const flag of MEMORY_FEATURE_FLAGS.filter((item) => item !== 'mem.feature.skill_auto_creation')) {
+      expect(MEMORY_FEATURE_FLAG_REGISTRY[flag].defaultValue).toBe(true);
     }
   });
 
@@ -86,7 +85,9 @@ describe('memory feature flags and counters', () => {
 
   it('resolves layered flag values through dependency folding at runtime use sites', () => {
     expect(resolveEffectiveMemoryFeatureFlagValue('mem.feature.md_ingest', {
-      environmentStartupDefault: {
+      runtimeConfigOverride: {
+        'mem.feature.namespace_registry': false,
+        'mem.feature.observation_store': false,
         'mem.feature.md_ingest': true,
       },
     })).toBe(false);

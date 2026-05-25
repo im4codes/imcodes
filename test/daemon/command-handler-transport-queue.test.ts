@@ -3612,6 +3612,8 @@ describe('handleWebCommand transport queue behavior', () => {
   });
 
   it('rejects preference create while the preference feature is disabled', async () => {
+    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.preferences), '0');
+
     handleWebCommand({ type: MEMORY_WS.PREF_CREATE, requestId: 'pref-create-disabled', text: 'Prefer pnpm' }, serverLink as any);
     await flushAsync();
 
