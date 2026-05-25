@@ -66,6 +66,33 @@ describe('QuickInputPanel history scope', () => {
     Object.defineProperty(window, 'innerHeight', { configurable: true, value: defaultHeight });
   });
 
+  it('shows the built-in workflow fixed phrases', () => {
+    render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="codex-sdk"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'commit&push' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'CI failed, fix' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'LGTM, commit' })).toBeNull();
+  });
+
   it('opens below the trigger when the quick-input trigger is high in the viewport', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
     Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
