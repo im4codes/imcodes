@@ -5,7 +5,7 @@
  */
 import { h } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
-import { memo } from 'preact/compat';
+import { createPortal, memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type {
   TimelineEvent,
@@ -1812,6 +1812,37 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [historyStatus, t]);
   const showHistoryProgress = !preview && historySteps.some((step) => step.state === 'pending' || step.state === 'running');
   const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
+  const htmlFullscreenPreviewNode = htmlFullscreenPreview ? (
+    <div
+      class="html-fullscreen-preview"
+      role="dialog"
+      aria-modal="true"
+      aria-label={t('chat.html_preview_title', 'Render HTML preview')}
+    >
+      <button
+        type="button"
+        class="html-fullscreen-preview-close"
+        onClick={closeHtmlFullscreenPreview}
+        title={t('common.close', 'Close')}
+        aria-label={t('common.close', 'Close')}
+      >
+        ✕
+      </button>
+      <div class="html-fullscreen-preview-body">
+        {htmlFullscreenPreview.status === 'loading' && (
+          <div class="html-fullscreen-preview-status">{t('file_browser.preview_loading', 'Loading…')}</div>
+        )}
+        {htmlFullscreenPreview.status === 'error' && (
+          <div class="html-fullscreen-preview-status html-fullscreen-preview-error">
+            {htmlFullscreenPreview.error}
+          </div>
+        )}
+        {htmlFullscreenPreview.status === 'ok' && (
+          <HtmlSafePreview path={htmlFullscreenPreview.path} content={htmlFullscreenPreview.content} />
+        )}
+      </div>
+    </div>
+  ) : null;
 
   return (
     <div class={`chat-view-wrap${canShowFilePanel && showFilePanel ? ' chat-split' : ''}`}>
@@ -2185,37 +2216,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       {zoomText && (
         <ZoomedTextDialog text={zoomText} onClose={() => setZoomText(null)} onQuote={onQuote} />
       )}
-      {htmlFullscreenPreview && (
-        <div
-          class="html-fullscreen-preview"
-          role="dialog"
-          aria-modal="true"
-          aria-label={t('chat.html_preview_title', 'Render HTML preview')}
-        >
-          <button
-            type="button"
-            class="html-fullscreen-preview-close"
-            onClick={closeHtmlFullscreenPreview}
-            title={t('common.close', 'Close')}
-            aria-label={t('common.close', 'Close')}
-          >
-            ✕
-          </button>
-          <div class="html-fullscreen-preview-body">
-            {htmlFullscreenPreview.status === 'loading' && (
-              <div class="html-fullscreen-preview-status">{t('file_browser.preview_loading', 'Loading…')}</div>
-            )}
-            {htmlFullscreenPreview.status === 'error' && (
-              <div class="html-fullscreen-preview-status html-fullscreen-preview-error">
-                {htmlFullscreenPreview.error}
-              </div>
-            )}
-            {htmlFullscreenPreview.status === 'ok' && (
-              <HtmlSafePreview path={htmlFullscreenPreview.path} content={htmlFullscreenPreview.content} />
-            )}
-          </div>
-        </div>
-      )}
+      {htmlFullscreenPreviewNode && createPortal(htmlFullscreenPreviewNode, document.body)}
       {/* External link confirm dialog */}
       {pendingUrl && (
         <div class="dialog-overlay external-link-overlay" onClick={() => setPendingUrl(null)}>

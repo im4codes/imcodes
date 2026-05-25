@@ -201,7 +201,8 @@ describe('ChatView attachment download', () => {
     fireEvent.click(buttons[2]);
     expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./page.HTML');
     expect(onPreviewFile).toHaveBeenCalledTimes(1);
-    expect(container.querySelector('.html-fullscreen-preview')).not.toBeNull();
+    expect(container.querySelector('.html-fullscreen-preview')).toBeNull();
+    expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
 
     act(() => {
       for (const listener of wsListeners) {
@@ -214,7 +215,7 @@ describe('ChatView attachment download', () => {
         });
       }
     });
-    expect(container.querySelector('.html-safe-preview-frame')).not.toBeNull();
+    expect(document.body.querySelector('.html-safe-preview-frame')).not.toBeNull();
   });
 
   it('does not show a render action for HTML attachments without daemonPath', async () => {

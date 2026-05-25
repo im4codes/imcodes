@@ -343,7 +343,8 @@ describe('ChatView', () => {
     fireEvent.click(htmlButton!);
     expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./dist/index.HTML');
     expect(onPreviewFile).not.toHaveBeenCalled();
-    expect(container.querySelector('.html-fullscreen-preview')).not.toBeNull();
+    expect(container.querySelector('.html-fullscreen-preview')).toBeNull();
+    expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
 
     act(() => {
       for (const listener of wsListeners) {
@@ -356,10 +357,10 @@ describe('ChatView', () => {
         });
       }
     });
-    expect(container.querySelector('.html-safe-preview-frame')).not.toBeNull();
+    expect(document.body.querySelector('.html-safe-preview-frame')).not.toBeNull();
 
-    fireEvent.click(container.querySelector('.html-fullscreen-preview-close') as HTMLButtonElement);
-    expect(container.querySelector('.html-fullscreen-preview')).toBeNull();
+    fireEvent.click(document.body.querySelector('.html-fullscreen-preview-close') as HTMLButtonElement);
+    expect(document.body.querySelector('.html-fullscreen-preview')).toBeNull();
 
     fireEvent.click(htmlButton!);
     act(() => {
@@ -373,10 +374,10 @@ describe('ChatView', () => {
         });
       }
     });
-    expect(container.querySelector('.html-safe-preview-frame')).not.toBeNull();
+    expect(document.body.querySelector('.html-safe-preview-frame')).not.toBeNull();
 
     fireEvent.keyDown(window, { key: 'Escape' });
-    expect(container.querySelector('.html-fullscreen-preview')).toBeNull();
+    expect(document.body.querySelector('.html-fullscreen-preview')).toBeNull();
 
     rerender(
       <ChatView

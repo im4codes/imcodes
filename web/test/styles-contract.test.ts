@@ -132,4 +132,22 @@ describe('styles.css regression contracts', () => {
     expect(innerTreeRule![0]).toMatch(/overflow-y:\s*auto/);
     expect(innerTreeRule![0]).toMatch(/min-height:\s*0/);
   });
+
+  it('fullscreen HTML preview must be clamped to the browser viewport', () => {
+    const overlayRule = css.match(/\.html-fullscreen-preview\s*\{[^}]*\}/);
+    expect(overlayRule).not.toBeNull();
+    expect(overlayRule![0]).toMatch(/width:\s*100vw/);
+    expect(overlayRule![0]).toMatch(/max-width:\s*100vw/);
+    expect(overlayRule![0]).toMatch(/overflow:\s*hidden/);
+
+    const bodyRule = css.match(/\.html-fullscreen-preview-body\s*\{[^}]*\}/);
+    expect(bodyRule).not.toBeNull();
+    expect(bodyRule![0]).toMatch(/max-width:\s*100vw/);
+    expect(bodyRule![0]).toMatch(/min-width:\s*0/);
+
+    const iframeRule = css.match(/\.html-safe-preview-frame\s*\{[^}]*\}/);
+    expect(iframeRule).not.toBeNull();
+    expect(iframeRule![0]).toMatch(/max-width:\s*100%/);
+    expect(iframeRule![0]).toMatch(/min-width:\s*0/);
+  });
 });

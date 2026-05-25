@@ -129,7 +129,10 @@ script:window.parent.__pwned = true">bad</a>
     expect(fitStyle?.textContent).toBe(HTML_PREVIEW_FIT_CSS);
     expect(doc.head.lastElementChild).toBe(fitStyle);
     expect(srcDoc).toContain('width: 100% !important;');
-    expect(srcDoc).toContain('max-width: 100%;');
+    expect(srcDoc).toContain('max-width: 100vw !important;');
+    expect(srcDoc).toContain('body * {');
+    expect(srcDoc).toContain('max-width: 100% !important;');
+    expect(srcDoc).toContain('overflow-x: hidden !important;');
   });
 
   it('returns oversize before constructing DOMParser', () => {
