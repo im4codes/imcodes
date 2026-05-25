@@ -66,7 +66,7 @@ body {
 .tab.active { color: #f8fafc; background: linear-gradient(180deg, rgba(34,211,238,0.16), rgba(15,23,42,0.92)); border-color: rgba(34,211,238,0.32); box-shadow: 0 0 0 1px rgba(34,211,238,0.10), 0 0 18px rgba(34,211,238,0.14), inset 0 1px 0 rgba(255,255,255,0.06); }
 .tab.active::before { background: linear-gradient(90deg, var(--chrome-accent), var(--chrome-accent-2)); box-shadow: 0 0 10px rgba(34,211,238,0.62); }
 .tab.brain { color: #c4b5fd; }
-.tab.brain.active { color: #ede9fe; background: linear-gradient(180deg, rgba(167,139,250,0.18), rgba(15,23,42,0.94)); border-color: rgba(167,139,250,0.34); box-shadow: 0 0 0 1px rgba(167,139,250,0.12), 0 0 18px rgba(167,139,250,0.16), inset 0 1px 0 rgba(255,255,255,0.06); }
+.tab.brain.active { color: #ede9fe; background: linear-gradient(180deg, rgba(167,139,250,0.18), rgba(15,23,42,0.94)); border-color: rgba(167,139,250,0.34); border-top-color: transparent; border-bottom-color: #8b5cf6; border-bottom-width: 4px; box-shadow: 0 0 0 1px rgba(167,139,250,0.12), 0 0 18px rgba(167,139,250,0.16), inset 0 1px 0 rgba(255,255,255,0.06); }
 .tab.brain.active::before { background: linear-gradient(90deg, var(--chrome-accent-3), var(--chrome-accent)); box-shadow: 0 0 10px rgba(167,139,250,0.62); }
 @media (pointer: coarse) { .tab { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; touch-action: pan-x; } }
 .tab.idle::after { content: '●'; margin-left: 6px; color: var(--chrome-accent-2); font-size: 7px; vertical-align: middle; text-shadow: 0 0 8px rgba(52,211,153,0.75); }
