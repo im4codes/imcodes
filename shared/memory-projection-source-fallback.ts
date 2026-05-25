@@ -10,7 +10,7 @@ export interface MemoryProjectionFallbackInput {
   createdAt?: number;
 }
 
-export interface MemoryProjectionFallbackSource {
+export interface MemoryProjectionFallbackSource extends Record<string, unknown> {
   eventId: string;
   status: 'projection';
   content: string;
