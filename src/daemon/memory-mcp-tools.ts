@@ -27,6 +27,7 @@ import {
   isMcpFeatureEnabled,
   type MCPFeatureFlagValues,
 } from '../../shared/memory-mcp-feature-flags.js';
+import type { ContextNamespace } from '../../shared/context-types.js';
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
 import { memoryGetSources } from '../context/memory-read-tools.js';
 import { getMemorySourcesOrchestrated, type GetSourcesOrchestratorResult, type OrchestratorDeps } from './memory-get-sources-orchestrator.js';
@@ -34,10 +35,11 @@ import { listMcpMemorySummaries, searchMcpMemoryRecall, type MemoryMcpListProjec
 import type { MemorySearchQuery } from '../context/memory-search.js';
 import { saveObservation, savePreference } from '../context/memory-write-tools.js';
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
-import { listSessions as listStoredSessions } from '../store/session-store.js';
+import { listSessions as listStoredSessions, type SessionRecord } from '../store/session-store.js';
 import { dispatchSendMessage, listSendTargets, type SendToolDeps } from './send-tool.js';
 import { cronMcpCreate, cronMcpDelete, cronMcpList, cronMcpUpdate, type CronMcpClientOptions } from './cron-mcp-client.js';
 import { registerMemoryShortRef, resolveMemoryShortRef } from '../context/memory-short-ref.js';
+import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
 
 type ToolResult = Record<string, unknown>;
 export type MemoryMcpToolHandler = (input?: unknown) => Promise<ToolResult> | ToolResult;
@@ -51,6 +53,8 @@ type MemoryMcpListSummaries = (query: {
   projectionClass?: MemoryMcpListProjectionClass;
   limit?: number;
 }) => Promise<MemoryMcpSearchResult> | MemoryMcpSearchResult;
+
+const repositoryIdentityService = new GitOriginRepositoryIdentityService();
 
 export interface MemoryMcpToolDeps {
   featureFlags?: MCPFeatureFlagValues;
@@ -231,11 +235,42 @@ function compactSearchHit(item: MemoryMcpSearchHit, namespace: Parameters<typeof
   };
 }
 
+function fallbackProjectIdFromRoot(projectRoot: string | null | undefined): string | undefined {
+  const root = projectRoot?.trim();
+  if (!root) return undefined;
+  return repositoryIdentityService.resolve({ cwd: root }).key;
+}
+
+function projectScopedNamespace(
+  caller: McpRuntimeCaller,
+  session: SessionRecord | undefined,
+  projectRoot: string | null,
+): ContextNamespace {
+  const sessionProjectId = session?.contextNamespace?.projectId?.trim();
+  const callerProjectId = caller.namespace.projectId?.trim();
+  const fallbackProjectId = fallbackProjectIdFromRoot(projectRoot);
+  const projectId = sessionProjectId ?? callerProjectId ?? fallbackProjectId;
+  const base = sessionProjectId ? (session?.contextNamespace ?? caller.namespace) : caller.namespace;
+  if (!projectId) return base;
+  const scope = base.scope === 'user_private' ? 'personal' : base.scope;
+  const userId = base.userId?.trim() || caller.userId;
+  return {
+    ...base,
+    scope,
+    projectId,
+    ...(scope === 'personal' ? { userId } : {}),
+  };
+}
+
 function scopedCallerForDeps(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps): McpRuntimeCaller {
   const sessions = deps.sendDeps?.listSessions ? deps.sendDeps.listSessions() : listStoredSessions();
+  const session = caller.sessionName
+    ? sessions.find((candidate) => candidate.name === caller.sessionName)
+    : undefined;
   const scope = resolveRuntimeScope(caller, sessions);
   return {
     ...caller,
+    namespace: projectScopedNamespace(caller, session, scope.projectRoot),
     projectName: scope.projectName,
     projectRoot: scope.projectRoot,
     serverId: scope.serverId,

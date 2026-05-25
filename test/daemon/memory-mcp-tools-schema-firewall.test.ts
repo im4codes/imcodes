@@ -6,6 +6,7 @@ import { MEMORY_MCP_DISABLED_FLAGS, MEMORY_MCP_TOOL_NAMES } from '../../shared/m
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { resetMemoryShortRefsForTests } from '../../src/context/memory-short-ref.js';
+import type { SessionRecord } from '../../src/store/session-store.js';
 
 function caller(overrides: Partial<McpRuntimeCaller> = {}): McpRuntimeCaller {
   const namespace: ContextNamespace = { scope: 'user_private', userId: 'user-1', projectId: 'repo-1' };
@@ -17,6 +18,22 @@ function caller(overrides: Partial<McpRuntimeCaller> = {}): McpRuntimeCaller {
     projectRoot: '/tmp/proj',
     serverId: 'srv-1',
     transport: 'in_process',
+    ...overrides,
+  };
+}
+
+function sessionRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
+  return {
+    name: 'deck_proj_brain',
+    projectName: 'proj',
+    role: 'brain',
+    agentType: 'codex-sdk',
+    projectDir: '/tmp/proj',
+    state: 'idle',
+    restarts: 0,
+    restartTimestamps: [],
+    createdAt: 1,
+    updatedAt: 1,
     ...overrides,
   };
 }
@@ -117,6 +134,62 @@ describe('memory MCP tool schema firewall', () => {
     expect(savePreference).not.toHaveBeenCalled();
   });
 
+  it('recovers the project namespace from the stored session before searching memory', async () => {
+    const searchMemory = vi.fn(async () => ({ items: [] }));
+    const handlers = createMemoryMcpToolHandlers(caller({
+      namespace: { scope: 'user_private', userId: 'user-1' },
+      sessionName: 'deck_proj_brain',
+    }), {
+      searchMemory,
+      isMemoryFeatureEnabled: () => true,
+      sendDeps: {
+        listSessions: () => [sessionRecord({
+          contextNamespace: { scope: 'personal', userId: 'user-1', projectId: 'github.com/im4codes/imcodes' },
+          contextNamespaceDiagnostics: ['namespace:git-origin'],
+        })],
+      },
+    });
+
+    await handlers[MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]({ query: 'recent task', limit: 5 });
+
+    expect(searchMemory).toHaveBeenCalledWith(expect.objectContaining({
+      repo: 'github.com/im4codes/imcodes',
+      namespace: expect.objectContaining({
+        scope: 'personal',
+        userId: 'user-1',
+        projectId: 'github.com/im4codes/imcodes',
+      }),
+    }));
+  });
+
+  it('derives a local project id from the project path when no namespace project id is available', async () => {
+    const searchMemory = vi.fn(async () => ({ items: [] }));
+    const handlers = createMemoryMcpToolHandlers(caller({
+      namespace: { scope: 'user_private', userId: 'user-1' },
+      sessionName: 'deck_proj_brain',
+      projectRoot: null,
+    }), {
+      searchMemory,
+      isMemoryFeatureEnabled: () => true,
+      sendDeps: {
+        listSessions: () => [sessionRecord({
+          projectDir: '/workspace/example-project',
+          contextNamespace: undefined,
+        })],
+      },
+    });
+
+    await handlers[MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]({ query: 'recent task', limit: 5 });
+
+    const forwarded = searchMemory.mock.calls[0]?.[0];
+    expect(forwarded?.repo).toMatch(/^local\/[0-9a-f]{12}$/);
+    expect(forwarded?.namespace).toMatchObject({
+      scope: 'personal',
+      userId: 'user-1',
+      projectId: forwarded?.repo,
+    });
+  });
+
   it('returns compact hits from the same recall search used by message memory recall', async () => {
     const projectionId = '1111111111222222222233333333334444444444555555555566666666667777';
     const searchMemory = vi.fn(async () => ({
@@ -170,7 +243,7 @@ describe('memory MCP tool schema firewall', () => {
     });
     expect(searchMemory).toHaveBeenCalledWith(expect.objectContaining({
       query: 'provider readiness',
-      namespace: expect.objectContaining({ scope: 'user_private', userId: 'user-1', projectId: 'repo-1' }),
+      namespace: expect.objectContaining({ scope: 'personal', userId: 'user-1', projectId: 'repo-1' }),
       repo: 'repo-1',
       limit: 5,
     }));
