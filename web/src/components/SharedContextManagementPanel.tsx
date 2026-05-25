@@ -359,6 +359,136 @@ const resourceCardStyle = {
   minWidth: 0,
 } as const;
 
+const memorySectionStyle = {
+  ...sectionStyle,
+  gap: SC_IS_MOBILE ? DT.space.md : DT.space.lg,
+  background: 'linear-gradient(180deg, rgba(22,32,51,0.96), rgba(17,24,39,0.98))',
+  border: '1px solid rgba(96,165,250,0.18)',
+  boxShadow: '0 14px 34px rgba(0,0,0,0.24)',
+} as const;
+
+const memoryFormPanelStyle = {
+  ...resourceCardStyle,
+  background: 'linear-gradient(180deg, rgba(15,23,42,0.98), rgba(13,20,35,0.98))',
+  border: '1px solid rgba(96,165,250,0.16)',
+  boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.025)',
+} as const;
+
+const memorySoftPanelStyle = {
+  color: DT.text.secondary,
+  fontSize: 12,
+  lineHeight: 1.5,
+  padding: `${DT.space.sm}px ${DT.space.md}px`,
+  borderRadius: DT.radius.sm,
+  background: 'linear-gradient(90deg, rgba(37,99,235,0.09), rgba(13,20,35,0.82))',
+  border: '1px solid rgba(96,165,250,0.18)',
+} as const;
+
+const memoryToolbarStyle = {
+  display: 'grid',
+  gridTemplateColumns: SC_IS_MOBILE ? '1fr' : 'minmax(160px, 0.6fr) minmax(260px, 1.4fr) auto',
+  gap: DT.space.sm,
+  alignItems: 'stretch',
+} as const;
+
+const memoryTabStackStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: DT.space.sm,
+  padding: SC_IS_MOBILE ? DT.space.xs : DT.space.sm,
+  borderRadius: DT.radius.lg,
+  border: `1px solid ${DT.border.subtle}`,
+  background: 'rgba(13,20,35,0.82)',
+} as const;
+
+const memoryToolTabBarStyle = {
+  ...tabBarStyle,
+  background: 'rgba(10,14,26,0.58)',
+  borderColor: 'rgba(96,165,250,0.16)',
+} as const;
+
+const memoryRecordGroupStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: DT.space.sm,
+  padding: SC_IS_MOBILE ? 0 : DT.space.sm,
+  borderRadius: DT.radius.lg,
+  background: SC_IS_MOBILE ? 'transparent' : 'rgba(10,14,26,0.28)',
+} as const;
+
+const memoryRecordListStyle = {
+  display: 'grid',
+  gap: SC_IS_MOBILE ? DT.space.sm : DT.space.md,
+} as const;
+
+function memoryRecordCardStyle(isArchived = false) {
+  return {
+    ...resourceCardStyle,
+    gap: SC_IS_MOBILE ? DT.space.sm : DT.space.md,
+    padding: SC_IS_MOBILE ? DT.space.md : DT.space.lg,
+    borderLeft: isArchived
+      ? '3px solid rgba(251,191,36,0.36)'
+      : '3px solid rgba(96,165,250,0.38)',
+    background: isArchived
+      ? 'linear-gradient(180deg, rgba(30,41,59,0.72), rgba(15,23,42,0.86))'
+      : 'linear-gradient(180deg, rgba(22,32,51,0.98), rgba(15,23,42,0.98))',
+    opacity: isArchived ? 0.76 : 1,
+  };
+}
+
+const memoryRecordToplineStyle = {
+  display: 'flex',
+  alignItems: 'flex-start',
+  justifyContent: 'space-between',
+  gap: DT.space.sm,
+  flexWrap: 'wrap',
+} as const;
+
+const memoryRecordMetaRowStyle = {
+  display: 'flex',
+  gap: 6,
+  flexWrap: 'wrap',
+  alignItems: 'center',
+  minWidth: 0,
+  flex: '1 1 260px',
+} as const;
+
+const memoryRecordTimestampStyle = {
+  color: DT.text.muted,
+  fontSize: 10,
+  flexShrink: 0,
+  paddingTop: 2,
+} as const;
+
+const memoryRecordActionsStyle = {
+  display: 'flex',
+  gap: DT.space.sm,
+  alignItems: 'center',
+  flexWrap: 'wrap',
+  justifyContent: 'space-between',
+} as const;
+
+const memoryInlineActionsStyle = {
+  display: 'inline-flex',
+  gap: 6,
+  flexWrap: 'wrap',
+  justifyContent: SC_IS_MOBILE ? 'stretch' : 'flex-end',
+  marginLeft: SC_IS_MOBILE ? 0 : 'auto',
+} as const;
+
+const memoryToggleRowStyle = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: DT.space.sm,
+  cursor: 'pointer',
+  userSelect: 'none',
+  width: 'fit-content',
+  padding: `${DT.space.xs}px ${DT.space.sm}px`,
+  borderRadius: DT.radius.pill,
+  border: `1px solid ${DT.border.subtle}`,
+  background: 'rgba(13,20,35,0.72)',
+} as const;
+
 const memoryContentCollapsedStyle = {
   maxHeight: '4.8em',
   overflowY: 'hidden',
@@ -978,7 +1108,7 @@ function adminSubCardStyle(enabled: boolean | null) {
       ? `3px solid rgba(52,211,153,0.4)`
       : `3px solid ${DT.border.subtle}`;
   return {
-    ...resourceCardStyle,
+    ...memoryFormPanelStyle,
     borderLeft: leftAccent,
     paddingLeft: SC_IS_MOBILE ? DT.space.md : DT.space.lg,
   };
@@ -1695,48 +1825,52 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     }
 
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: DT.space.md }}>
         {sections.map((section) => (
-          <div key={section.key} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <SectionHeading title={section.title} description={section.description} />
-            <div style={resourceListStyle}>
+          <div key={section.key} style={memoryRecordGroupStyle}>
+            <SectionHeading
+              title={section.title}
+              description={section.description}
+              action={<span style={pillStyle}>{section.records.length}</span>}
+            />
+            <div style={memoryRecordListStyle}>
               {section.records.map((record) => {
                 const isArchived = (record.status ?? 'active') !== 'active';
                 return (
-                  <div key={record.id} style={{ ...resourceCardStyle, ...(isArchived ? { opacity: 0.6 } : {}) }}>
-                    {/* Compact meta: inline chips */}
-                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-                      <span style={metaChipStyle} title={record.projectId}>{record.projectId.split('/').pop()}</span>
-                      <span style={metaChipStyle}>{getMemoryRecordClassLabel(t, record.projectionClass)}</span>
-                      <span style={metaChipStyle}>{record.sourceEventCount} {t('sharedContext.management.memoryRecordSources').toLowerCase()}</span>
-                      {record.ownerUserId ? (
-                        <span style={metaChipStyle}>{t('sharedContext.management.memoryRecordOwner')}: {record.ownerUserId}</span>
-                      ) : null}
-                      {record.createdByUserId && record.createdByUserId !== record.ownerUserId ? (
-                        <span style={metaChipStyle}>{t('sharedContext.management.memoryRecordCreatedBy')}: {record.createdByUserId}</span>
-                      ) : null}
-                      {record.updatedByUserId && record.updatedByUserId !== (record.createdByUserId ?? record.ownerUserId) ? (
-                        <span style={metaChipStyle}>{t('sharedContext.management.memoryRecordUpdatedBy')}: {record.updatedByUserId}</span>
-                      ) : null}
-                      {isArchived ? (
-                        <span style={archiveBadgeStyle}>{t('sharedContext.management.memoryArchived')}</span>
-                      ) : null}
-                      {(record.hitCount ?? 0) > 0 ? (
-                        <span style={recallChipStyle}>{t('sharedContext.management.memoryRecalls', { count: record.hitCount })}</span>
-                      ) : null}
-                      <span style={{ color: DT.text.muted, fontSize: 10, marginLeft: 'auto', flexShrink: 0 }}>
+                  <div key={record.id} style={memoryRecordCardStyle(isArchived)}>
+                    <div style={memoryRecordToplineStyle}>
+                      <div style={memoryRecordMetaRowStyle}>
+                        <span style={metaChipStyle} title={record.projectId}>{record.projectId.split('/').pop()}</span>
+                        <span style={metaChipStyle}>{getMemoryRecordClassLabel(t, record.projectionClass)}</span>
+                        <span style={metaChipStyle}>{record.sourceEventCount} {t('sharedContext.management.memoryRecordSources').toLowerCase()}</span>
+                        {record.ownerUserId ? (
+                          <span style={metaChipStyle}>{t('sharedContext.management.memoryRecordOwner')}: {record.ownerUserId}</span>
+                        ) : null}
+                        {record.createdByUserId && record.createdByUserId !== record.ownerUserId ? (
+                          <span style={metaChipStyle}>{t('sharedContext.management.memoryRecordCreatedBy')}: {record.createdByUserId}</span>
+                        ) : null}
+                        {record.updatedByUserId && record.updatedByUserId !== (record.createdByUserId ?? record.ownerUserId) ? (
+                          <span style={metaChipStyle}>{t('sharedContext.management.memoryRecordUpdatedBy')}: {record.updatedByUserId}</span>
+                        ) : null}
+                        {isArchived ? (
+                          <span style={archiveBadgeStyle}>{t('sharedContext.management.memoryArchived')}</span>
+                        ) : null}
+                        {(record.hitCount ?? 0) > 0 ? (
+                          <span style={recallChipStyle}>{t('sharedContext.management.memoryRecalls', { count: record.hitCount })}</span>
+                        ) : null}
+                      </div>
+                      <span style={memoryRecordTimestampStyle}>
                         {new Date(record.updatedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                       </span>
                     </div>
-                    {/* Recall time + archive/restore action row */}
-                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <div style={memoryRecordActionsStyle}>
                       <span style={{ color: DT.text.muted, fontSize: 10 }}>
                         {record.lastUsedAt
                           ? t('sharedContext.management.memoryLastRecalled', { time: formatRelativeTime(record.lastUsedAt, t) })
                           : t('sharedContext.management.memoryNeverRecalled')}
                       </span>
                       {allowActions || allowDelete || allowEdit || allowPin ? (
-                        <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
+                        <span style={memoryInlineActionsStyle}>
                           {allowEdit ? (
                             <button
                               type="button"
@@ -1790,7 +1924,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         </span>
                       ) : null}
                     </div>
-                    {/* Summary with integrated expand */}
                     {record.summary ? (
                       <MemoryRecordContent
                         id={record.id}
@@ -2962,7 +3095,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     : t('sharedContext.management.mcpUpdatedNever');
 
   const renderMemoryProjectPicker = () => (
-    <div style={{ ...resourceCardStyle, gap: DT.space.sm }}>
+    <div style={{ ...memoryFormPanelStyle, gap: DT.space.sm }}>
       <SectionHeading
         title={t('sharedContext.management.memoryProjectPickerTitle')}
         description={t('sharedContext.management.memoryProjectPickerDescription')}
@@ -3064,7 +3197,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             style={inputStyle}
           />
         </div>
-      <div style={{ ...resourceListStyle, maxHeight: 220, overflowY: 'auto' }}>
+      <div style={{ ...memoryRecordListStyle, maxHeight: 220, overflowY: 'auto' }}>
         {filteredMemoryProjectOptions.length > 0 ? filteredMemoryProjectOptions.map((option) => {
           const active = selectedMemoryProject?.id === option.id;
           const resolving = Boolean(option.projectDir && resolvingMemoryProjectIds.has(option.projectDir));
@@ -3073,11 +3206,11 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               key={option.id}
               type="button"
               style={{
-                ...resourceCardStyle,
+                ...memoryFormPanelStyle,
                 textAlign: 'left',
                 cursor: 'pointer',
-                border: active ? `1px solid ${DT.text.accent}` : resourceCardStyle.border,
-                background: active ? 'rgba(37,99,235,0.12)' : resourceCardStyle.background,
+                border: active ? `1px solid ${DT.text.accent}` : memoryFormPanelStyle.border,
+                background: active ? 'rgba(37,99,235,0.12)' : memoryFormPanelStyle.background,
               }}
               onClick={() => {
                 setSelectedMemoryProjectId(option.id);
@@ -4001,7 +4134,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <div>{t('sharedContext.management.memorySummaryLine3')}</div>
           </InfoCard>
 
-          <div style={sectionStyle}>
+          <div style={memorySectionStyle}>
             <SectionHeading
               title={t('sharedContext.management.personalSyncTitle')}
               description={t('sharedContext.management.personalSyncDescription')}
@@ -4057,7 +4190,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             )}
           </div>
 
-          <div style={sectionStyle}>
+          <div style={memorySectionStyle}>
             <SectionHeading
               title={t('sharedContext.management.memoryRecallThresholdTitle')}
               description={t('sharedContext.management.memoryRecallThresholdDescription')}
@@ -4115,7 +4248,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             )}
           </div>
 
-          <div style={sectionStyle}>
+          <div style={memorySectionStyle}>
             <SectionHeading
               title={t('sharedContext.management.memoryAdvancedScoringTitle')}
               description={t('sharedContext.management.memoryAdvancedScoringDescription')}
@@ -4243,26 +4376,26 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             ) : null}
           </div>
 
-          <div style={sectionStyle}>
+          <div style={memorySectionStyle}>
             <SectionHeading
               title={t('sharedContext.management.memoryQueryTitle')}
               description={t('sharedContext.management.memoryQueryDescription')}
               action={<button style={buttonStyle} onClick={() => void loadMemoryViews()}>{t('sharedContext.refresh')}</button>}
             />
             {renderMemoryProjectPicker()}
-            <div style={memoryProcessedNoteStyle}>
+            <div style={memorySoftPanelStyle}>
               {t('sharedContext.management.memoryPersonalBreakdown', {
                 processed: localPersonalMemory.stats.totalRecords,
                 pending: localPersonalMemory.pendingRecords?.length ?? 0,
                 cloud: cloudPersonalMemory.stats.totalRecords,
               })}
             </div>
-            <div style={rowStyle}>
+            <div style={memoryToolbarStyle}>
               <input
                 value={memoryQuery}
                 onInput={(e) => setMemoryQuery((e.currentTarget as HTMLInputElement).value)}
                 placeholder={t('sharedContext.management.memoryQueryPlaceholder')}
-                style={inputStyle}
+                style={{ ...inputStyle, gridColumn: SC_IS_MOBILE ? undefined : 'span 2' }}
               />
               <select
                 value={memoryProjectionClass}
@@ -4275,17 +4408,17 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               </select>
             </div>
             {memoryLoading ? <div style={helperTextStyle}>{t('sharedContext.loading')}</div> : null}
-            <div style={memoryProcessedNoteStyle}>{t('sharedContext.management.memoryProcessedNote')}</div>
+            <div style={memorySoftPanelStyle}>{t('sharedContext.management.memoryProcessedNote')}</div>
           </div>
 
-          <div style={sectionStyle}>
+          <div style={memorySectionStyle}>
             <SectionHeading
               title={t('sharedContext.management.memoryToolsTitle')}
               description={t('sharedContext.management.memoryToolsDescription')}
               action={<button style={subtleButtonStyle} onClick={() => loadMemoryAdminViews()} disabled={!ws}>{t('sharedContext.refresh')}</button>}
             />
             {!ws ? <div style={helperTextStyle}>{t('sharedContext.management.memoryAdminDaemonRequired')}</div> : null}
-            <div style={tabBarStyle}>
+            <div style={memoryToolTabBarStyle}>
               {[
                 { id: 'status' as const, label: t('sharedContext.management.memoryToolTabStatus') },
                 { id: 'preferences' as const, label: t('sharedContext.management.memoryToolTabPreferences'), count: preferenceRecords.length },
@@ -4303,7 +4436,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 </button>
               ))}
             </div>
-            <div style={{ ...resourceCardStyle, display: memoryToolTab === 'status' ? 'flex' : 'none' }}>
+            <div style={{ ...memoryFormPanelStyle, display: memoryToolTab === 'status' ? 'flex' : 'none' }}>
               <SectionHeading
                 title={t('sharedContext.management.memoryFeatureStatusTitle')}
                 description={t('sharedContext.management.memoryFeatureStatusDescription')}
@@ -4343,7 +4476,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 })}
               </div>
             </div>
-            <div style={{ ...cardGridStyle, display: memoryToolTab === 'preferences' || memoryToolTab === 'skills' ? 'grid' : 'none' }}>
+            <div style={{ ...cardGridStyle, display: memoryToolTab === 'preferences' || memoryToolTab === 'skills' ? 'grid' : 'none', alignItems: 'start' }}>
               <div style={{ ...adminSubCardStyle(preferenceFeatureEnabled), display: memoryToolTab === 'preferences' ? 'flex' : 'none' }}>
                 <SectionHeading
                   title={t('sharedContext.management.memoryPreferencesTitle')}
@@ -4417,9 +4550,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   placeholder={t('sharedContext.management.memoryPreferenceSearchPlaceholder')}
                   style={inputStyle}
                 />
-                <div style={resourceListStyle}>
+                <div style={memoryRecordListStyle}>
                   {filteredPreferenceRecords.length > 0 ? filteredPreferenceRecords.map((record) => (
-                    <div key={record.id} style={resourceCardStyle}>
+                    <div key={record.id} style={memoryRecordCardStyle(record.state !== 'active')}>
                       <div style={metaGridStyle}>
                         <MetaCard label={t('sharedContext.management.memoryPreferenceUser')} value={record.ownerUserId ?? record.userId} />
                         {record.createdByUserId ? (
@@ -4525,9 +4658,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 {!selectedMemoryProjectCapabilities.canRunLocalTools ? (
                   <div style={helperTextStyle}>{t('sharedContext.management.memoryProjectLocalToolsDisabled')}</div>
                 ) : null}
-                <div style={resourceListStyle}>
+                <div style={memoryRecordListStyle}>
                   {filteredSkillEntries.length > 0 ? filteredSkillEntries.map((entry) => (
-                    <div key={`${entry.layer}:${entry.key}:${entry.displayPath}`} style={resourceCardStyle}>
+                    <div key={`${entry.layer}:${entry.key}:${entry.displayPath}`} style={memoryFormPanelStyle}>
                       <div style={metaGridStyle}>
                         <MetaCard label={t('sharedContext.management.memorySkillName')} value={entry.name} />
                         <MetaCard label={t('sharedContext.management.memorySkillLayer')} value={entry.layer} />
@@ -4577,7 +4710,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   )) : <div style={helperTextStyle}>{t('sharedContext.management.memorySkillsEmpty')}</div>}
                 </div>
                 {skillPreview ? (
-                  <div style={resourceCardStyle}>
+                  <div style={memoryFormPanelStyle}>
                     <SectionHeading
                       title={t('sharedContext.management.memorySkillPreviewTitle')}
                       description={`${skillPreview.layer}:${skillPreview.key}`}
@@ -4589,7 +4722,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               </div>
             </div>
 
-            <div style={{ ...cardGridStyle, display: memoryToolTab === 'md-ingest' || memoryToolTab === 'observations' ? 'grid' : 'none' }}>
+            <div style={{ ...cardGridStyle, display: memoryToolTab === 'md-ingest' || memoryToolTab === 'observations' ? 'grid' : 'none', alignItems: 'start' }}>
               <div style={{ ...adminSubCardStyle(mdIngestFeatureEnabled), display: memoryToolTab === 'md-ingest' ? 'flex' : 'none' }}>
                 <SectionHeading
                   title={t('sharedContext.management.memoryMdIngestTitle')}
@@ -4691,7 +4824,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     {t('sharedContext.refresh')}
                   </button>
                 </div>
-                <div style={memoryProcessedNoteStyle}>
+                <div style={memorySoftPanelStyle}>
                   {t('sharedContext.management.memoryPromotionHelp')}
                 </div>
                 <input
@@ -4700,7 +4833,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   placeholder={t('sharedContext.management.memoryObservationSearchPlaceholder')}
                   style={inputStyle}
                 />
-                <div style={resourceListStyle}>
+                <div style={memoryRecordListStyle}>
                   {filteredObservationRecords.length > 0 ? filteredObservationRecords.map((record) => {
                     const fromScopeLabel = t(`sharedContext.management.memoryScope.${record.scope}`);
                     const toScopeLabel = t(`sharedContext.management.memoryScope.${promotionTargetScope}`);
@@ -4719,7 +4852,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                       ? t(`sharedContext.management.memoryScope.${pendingPromotionForRecord.toScope}`)
                       : toScopeLabel;
                     return (
-                    <div key={record.id} style={resourceCardStyle}>
+                    <div key={record.id} style={memoryRecordCardStyle(record.state !== 'active')}>
                       <div style={metaGridStyle}>
                         <MetaCard label={t('sharedContext.management.memoryRecordClass')} value={t(`sharedContext.management.memoryObservationClass.${record.class}`)} />
                         <MetaCard label={t('sharedContext.management.memoryRecordStatus')} value={record.state} />
@@ -4890,52 +5023,51 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           </div>
 
 
-          <div style={{ ...sectionStyle, gap: 12 }}>
-            {/* Top level: Personal | Enterprise */}
-            <div style={tabBarStyle}>
-              {memoryTopTabs.map((tab) => (
-                <button
-                  key={tab.id}
-                  type="button"
-                  style={memoryTopTab === tab.id ? tabActiveStyle : tabStyle}
-                  onClick={() => setMemoryTopTab(tab.id)}
-                >
-                  {tab.label}{tab.count != null ? <span style={tabBadgeStyle}>{tab.count}</span> : null}
-                </button>
-              ))}
-            </div>
-
-            {/* Sub-tabs for Personal */}
-            {memoryTopTab === 'personal' ? (
-              <div style={tabBarStyle}>
-                {memoryPersonalSubTabs.map((tab) => (
+          <div style={{ ...memorySectionStyle, gap: DT.space.md }}>
+            <div style={memoryTabStackStyle}>
+              <div style={memoryToolTabBarStyle}>
+                {memoryTopTabs.map((tab) => (
                   <button
                     key={tab.id}
                     type="button"
-                    style={memoryPersonalSubTab === tab.id ? tabActiveStyle : tabStyle}
-                    onClick={() => setMemoryPersonalSubTab(tab.id)}
+                    style={memoryTopTab === tab.id ? tabActiveStyle : tabStyle}
+                    onClick={() => setMemoryTopTab(tab.id)}
                   >
                     {tab.label}{tab.count != null ? <span style={tabBadgeStyle}>{tab.count}</span> : null}
                   </button>
                 ))}
               </div>
-            ) : null}
 
-            {/* Sub-tabs for Enterprise */}
-            {memoryTopTab === 'enterprise-memory' ? (
-              <div style={tabBarStyle}>
-                {memoryEnterpriseSubTabs.map((tab) => (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    style={memoryEnterpriseSubTab === tab.id ? tabActiveStyle : tabStyle}
-                    onClick={() => setMemoryEnterpriseSubTab(tab.id)}
-                  >
-                    {tab.label}{'count' in tab && tab.count != null ? <span style={tabBadgeStyle}>{tab.count}</span> : null}
-                  </button>
-                ))}
-              </div>
-            ) : null}
+              {memoryTopTab === 'personal' ? (
+                <div style={memoryToolTabBarStyle}>
+                  {memoryPersonalSubTabs.map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      style={memoryPersonalSubTab === tab.id ? tabActiveStyle : tabStyle}
+                      onClick={() => setMemoryPersonalSubTab(tab.id)}
+                    >
+                      {tab.label}{tab.count != null ? <span style={tabBadgeStyle}>{tab.count}</span> : null}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+
+              {memoryTopTab === 'enterprise-memory' ? (
+                <div style={memoryToolTabBarStyle}>
+                  {memoryEnterpriseSubTabs.map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      style={memoryEnterpriseSubTab === tab.id ? tabActiveStyle : tabStyle}
+                      onClick={() => setMemoryEnterpriseSubTab(tab.id)}
+                    >
+                      {tab.label}{'count' in tab && tab.count != null ? <span style={tabBadgeStyle}>{tab.count}</span> : null}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
 
             {memoryTopTab === 'personal' && memoryPersonalSubTab === 'processed' ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -4966,7 +5098,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     </button>
                   </div>
                 ) : null}
-                <div style={{ ...resourceCardStyle, gap: DT.space.sm }}>
+                <div style={{ ...memoryFormPanelStyle, gap: DT.space.sm }}>
                   <SectionHeading
                     title={t('sharedContext.management.memoryManualAddTitle')}
                     description={t('sharedContext.management.memoryManualAddDescription')}
@@ -4974,7 +5106,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   {manualMemoryDisabledReason ? (
                     <div style={memoryProcessedNoteStyle}>{manualMemoryDisabledReason}</div>
                   ) : null}
-                  <div style={adminFormRowStyle}>
+                  <div style={memoryToolbarStyle}>
                     <select
                       value={manualMemoryProjectionClass}
                       onChange={(e) => setManualMemoryProjectionClass((e.currentTarget as HTMLSelectElement).value as 'recent_summary' | 'durable_memory_candidate')}
@@ -5003,13 +5135,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   </div>
                 </div>
                 <div
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: DT.space.sm,
-                    cursor: 'pointer',
-                    userSelect: 'none',
-                  }}
+                  style={memoryToggleRowStyle}
                   onClick={() => setShowArchived((v) => !v)}
                 >
                   <IOSToggle checked={showArchived} disabled={false} />
@@ -5062,9 +5188,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   </div>
                 ) : null}
                 {localMemoryUnavailable ? null : localPersonalMemory.pendingRecords && localPersonalMemory.pendingRecords.length > 0 ? (
-                  <div style={resourceListStyle}>
+                  <div style={memoryRecordListStyle}>
                     {localPersonalMemory.pendingRecords.map((record) => (
-                      <div key={record.id} style={resourceCardStyle}>
+                      <div key={record.id} style={memoryRecordCardStyle()}>
                         <div style={metaGridStyle}>
                           <MetaCard label={t('sharedContext.management.memoryRecordProject')} value={record.projectId} />
                           <MetaCard label={t('sharedContext.management.memoryRecordStatus')} value={t('sharedContext.management.memoryStatusPending')} />
