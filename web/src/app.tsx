@@ -614,10 +614,10 @@ export function App() {
     const splash = document.getElementById('splash');
     if (!splash) { setSplashDone(true); return; }
     if (nativeCallback) { splash.remove(); setSplashDone(true); return; }
-    const minMs = 1800; // let full animation play on all platforms
+    const minMs = 1100; // keep the startup splash lively without holding the app back
     const t = setTimeout(() => {
       splash.classList.add('splash-exit');
-      setTimeout(() => { splash.remove(); setSplashDone(true); }, 500);
+      setTimeout(() => { splash.remove(); setSplashDone(true); }, 320);
     }, minMs);
     return () => clearTimeout(t);
   }, []);
