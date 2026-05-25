@@ -17,6 +17,19 @@ function newestRecords(records: ContextMemoryRecordView[], limit: number): Conte
     .slice(0, limit);
 }
 
+function projectionRef(projectionId: string): string {
+  const compact = projectionId.replace(/[^a-f0-9]/gi, '').slice(0, 10) || projectionId.slice(0, 10);
+  return `proj:${compact.toLowerCase()}`;
+}
+
+function sourceLookupLine(projectionId: string): string {
+  return `sourceLookup: ${JSON.stringify({
+    tool: 'get_memory_sources',
+    kind: 'projection',
+    projectionId,
+  })}`;
+}
+
 export async function buildMemorySummarySyncMessage(
   t: Translate,
   projectId?: string | null,
@@ -34,7 +47,7 @@ export async function buildMemorySummarySyncMessage(
 
   const lines = records.map((record, index) => {
     const project = record.projectId ? `[${record.projectId}] ` : '';
-    return `${index + 1}. ${project}${record.summary.trim()}`;
+    return `${index + 1}. [ref: ${projectionRef(record.id)}] ${project}${record.summary.trim()}\n   ${sourceLookupLine(record.id)}`;
   });
   return [
     t('chat.memory_summary_sync_instruction'),
