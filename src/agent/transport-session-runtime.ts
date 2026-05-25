@@ -549,6 +549,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         description: isSlashControl ? undefined : this._description,
         systemPrompt: isSlashControl ? undefined : this._systemPrompt,
         suppressMcpMemorySearchGuidance: isSlashControl,
+        suppressAgentProgressGuidance: isSlashControl,
         attachments,
         namespace: this._contextNamespace,
         namespaceDiagnostics: this._contextNamespaceDiagnostics,

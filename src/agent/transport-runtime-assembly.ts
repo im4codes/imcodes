@@ -26,6 +26,7 @@ export interface TransportRuntimeAssemblyInput {
   description?: string;
   systemPrompt?: string;
   suppressMcpMemorySearchGuidance?: boolean;
+  suppressAgentProgressGuidance?: boolean;
   messagePreamble?: string;
   attachments?: TransportAttachment[];
   namespace?: ContextNamespace;
@@ -55,6 +56,13 @@ export const MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE = [
   'After search_memory, inspect each hit\'s sourceLookup object. If a relevant hit may affect the answer and its summary is not enough, call get_memory_sources with the returned sourceLookup fields before answering. If startup memory gives only a compact ref such as obs:abc123, call get_memory_sources with that ref.',
   'Use get_memory_sources for exact prior instructions, decisions, preferences, bug details, commit/deployment facts, or provenance-sensitive answers; do not invent details from summaries alone.',
   'Do not call memory for bare control messages like "continue", "go on", "ok", "yes", "commit", "push", "run tests", or other short commands without searchable context.',
+].join('\n');
+
+const AGENT_PROGRESS_SYSTEM_GUIDANCE = [
+  'Work transparently while you act.',
+  'For non-trivial tasks, briefly state what you are checking or changing before long scans, edits, tests, or waits.',
+  'Keep updates short and useful; do not narrate every tiny step.',
+  'Continue working without asking for confirmation unless blocked or the user asked for a plan first.',
 ].join('\n');
 
 export interface DispatchSharedContextSendOptions {
@@ -311,8 +319,9 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   }
   const renderedAuthoredSystemText = renderAuthoredSystemText(authoredContext.required, authoredContext.advisory);
   const memorySearchGuidance = input.suppressMcpMemorySearchGuidance ? undefined : MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE;
+  const agentProgressGuidance = input.suppressAgentProgressGuidance ? undefined : AGENT_PROGRESS_SYSTEM_GUIDANCE;
   return {
-    systemText: [input.description?.trim(), input.systemPrompt?.trim(), memorySearchGuidance, renderedAuthoredSystemText].filter(Boolean).join('\n\n') || undefined,
+    systemText: [input.description?.trim(), input.systemPrompt?.trim(), memorySearchGuidance, agentProgressGuidance, renderedAuthoredSystemText].filter(Boolean).join('\n\n') || undefined,
     messagePreamble: input.messagePreamble?.trim() || undefined,
     requiredAuthoredContext: authoredContext.required,
     advisoryAuthoredContext: authoredContext.advisory,

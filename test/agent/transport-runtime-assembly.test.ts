@@ -71,9 +71,11 @@ describe('buildProviderContextPayload', () => {
     expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
     expect(payload.systemText).toContain('get_memory_sources');
     expect(payload.systemText).toContain('sourceLookup fields');
+    expect(payload.systemText).toContain('Work transparently while you act.');
+    expect(payload.systemText).toContain('briefly state what you are checking or changing');
   });
 
-  it('adds MCP memory search guidance for every managed SDK provider id', () => {
+  it('adds shared system guidance for every managed SDK provider id', () => {
     const providerIds = [
       'claude-code-sdk',
       'gemini-sdk',
@@ -94,19 +96,33 @@ describe('buildProviderContextPayload', () => {
       expect(payload.systemText).toContain('Do not call memory for bare control messages');
       expect(payload.systemText).toContain('call get_memory_sources with the returned sourceLookup fields');
       expect(payload.systemText).toContain('do not invent details from summaries alone');
+      expect(payload.systemText).toContain('Work transparently while you act.');
+      expect(payload.systemText).toContain('Keep updates short and useful');
       expect(payload.assembledMessage).toBe('What did we decide about memory recall last week?');
     }
   });
 
-  it('can suppress MCP memory search guidance for raw slash controls', () => {
+  it('can suppress shared guidance for raw slash controls', () => {
     const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
       userMessage: '/compact',
       suppressMcpMemorySearchGuidance: true,
+      suppressAgentProgressGuidance: true,
       namespace: { scope: 'personal', projectId: 'repo-1' },
     });
 
     expect(payload.systemText).toBeUndefined();
     expect(payload.assembledMessage).toBe('/compact');
+  });
+
+  it('keeps agent progress guidance independent from memory guidance suppression', () => {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'Run tests',
+      suppressMcpMemorySearchGuidance: true,
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+    });
+
+    expect(payload.systemText).not.toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+    expect(payload.systemText).toContain('Work transparently while you act.');
   });
 
   it('renders startup memory and message recall into messagePreamble without mutating userMessage', () => {
