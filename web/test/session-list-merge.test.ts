@@ -188,11 +188,29 @@ describe('mergeSessionListEntry — general field behavior', () => {
       label: 'Main Brain',
       modelDisplay: 'gpt-5.4',
       effort: 'high',
+      contextNamespace: { scope: 'personal', projectId: 'repo-existing' },
+      contextNamespaceDiagnostics: ['namespace:existing'],
     }));
 
     expect(merged.label).toBe('Main Brain');
     expect(merged.modelDisplay).toBe('gpt-5.4');
     expect(merged.effort).toBe('high');
+    expect(merged.contextNamespace).toEqual({ scope: 'personal', projectId: 'repo-existing' });
+    expect(merged.contextNamespaceDiagnostics).toEqual(['namespace:existing']);
+  });
+
+  it('copies incoming context namespace for project-scoped memory tools', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      contextNamespace: { scope: 'personal', projectId: 'repo-current' },
+      contextNamespaceDiagnostics: ['namespace:explicit'],
+    }, makeExisting({
+      contextNamespace: { scope: 'personal', projectId: 'repo-old' },
+      contextNamespaceDiagnostics: ['namespace:old'],
+    }));
+
+    expect(merged.contextNamespace).toEqual({ scope: 'personal', projectId: 'repo-current' });
+    expect(merged.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
   });
 
   it('preserves codex quota display when a transient broadcast omits or nulls it', () => {

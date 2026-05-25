@@ -45,7 +45,7 @@ describe('memory MCP shared contracts', () => {
     expect(search).not.toHaveProperty('vector');
 
     const summaries = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES].inputSchema.properties ?? {};
-    expect(Object.keys(summaries)).toEqual(['projectionClass', 'limit', 'projectOnly']);
+    expect(Object.keys(summaries)).toEqual(['projectionClass', 'limit']);
     expect(summaries).not.toHaveProperty('query');
 
     const send = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];

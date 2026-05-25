@@ -396,12 +396,22 @@ export function SubSessionWindow({
       else termScrollRef.current?.();
     }, 50);
   }, []);
+  const memorySummaryProjectId = useMemo(() => {
+    const parent = sub.parentSession
+      ? sessions?.find((session) => session.name === sub.parentSession)
+      : undefined;
+    return sub.contextNamespace?.projectId
+      ?? parent?.contextNamespace?.projectId
+      ?? parent?.project
+      ?? sub.cwd
+      ?? null;
+  }, [sessions, sub.contextNamespace?.projectId, sub.cwd, sub.parentSession]);
 
   const handleSyncMemorySummaries = useCallback(async () => {
     if (!ws || !connected || syncingMemorySummaries) return;
     setSyncingMemorySummaries(true);
     try {
-      const text = await buildMemorySummarySyncMessage(t, sub.cwd ?? sub.label ?? null);
+      const text = await buildMemorySummarySyncMessage(t, memorySummaryProjectId);
       if (!text) return;
       const commandId = globalThis.crypto?.randomUUID?.()
         ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -413,7 +423,7 @@ export function SubSessionWindow({
     } finally {
       setSyncingMemorySummaries(false);
     }
-  }, [addOptimisticUserMessage, connected, scrollToBottom, sub.cwd, sub.label, sub.sessionName, syncingMemorySummaries, t, ws]);
+  }, [addOptimisticUserMessage, connected, memorySummaryProjectId, scrollToBottom, sub.sessionName, syncingMemorySummaries, t, ws]);
 
   // ── Dragging ──────────────────────────────────────────────────────────────
   const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);

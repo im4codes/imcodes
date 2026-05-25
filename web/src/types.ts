@@ -1,3 +1,5 @@
+import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
+
 export type Priority = 0 | 1 | 2 | 3;
 
 export interface TrackerIssue {
@@ -58,6 +60,8 @@ export interface SessionInfo {
   quotaUsageLabel?: string;
   quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
+  contextNamespace?: SessionContextBootstrapState['contextNamespace'];
+  contextNamespaceDiagnostics?: string[];
   transportConfig?: Record<string, unknown> | null;
   transportPendingMessages?: string[];
   transportPendingMessageEntries?: import('./transport-queue.js').TransportPendingMessageEntry[];

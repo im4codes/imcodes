@@ -58,6 +58,8 @@ export interface IncomingSessionListEntry {
   quotaUsageLabel?: string | null;
   quotaMeta?: SessionInfo['quotaMeta'];
   effort?: SessionInfo['effort'];
+  contextNamespace?: SessionInfo['contextNamespace'];
+  contextNamespaceDiagnostics?: string[];
   transportConfig?: Record<string, unknown> | null;
   transportPendingMessages?: unknown;
   transportPendingMessageEntries?: unknown;
@@ -146,6 +148,8 @@ export function mergeSessionListEntry(
     quotaUsageLabel: incoming.quotaUsageLabel ?? (isCodexFamily ? existing?.quotaUsageLabel : undefined),
     quotaMeta: incoming.quotaMeta ?? (isCodexFamily ? existing?.quotaMeta : undefined),
     effort: incoming.effort ?? existing?.effort,
+    contextNamespace: incoming.contextNamespace ?? existing?.contextNamespace,
+    contextNamespaceDiagnostics: incoming.contextNamespaceDiagnostics ?? existing?.contextNamespaceDiagnostics,
     transportConfig: mergeTransportConfigPreservingSupervision(
       incoming.transportConfig,
       existing?.transportConfig,

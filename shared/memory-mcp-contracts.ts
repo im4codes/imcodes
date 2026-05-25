@@ -156,11 +156,10 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]: {
     name: MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
-    description: 'List recent processed memory summaries visible to the caller without requiring a text query. Use it when the user asks for recent task summaries, recent project context, or a compact memory digest; each returned item includes a compact ref plus sourceLookup so details can be fetched with get_memory_sources only when needed.',
+    description: 'List recent processed memory summaries for the caller-bound project without requiring a text query. Use it when the user asks for recent task summaries, recent project context, or a compact memory digest; each returned item includes a compact ref plus sourceLookup so details can be fetched with get_memory_sources only when needed.',
     inputSchema: objectSchema({
       projectionClass: { type: 'string', enum: ['recent_summary', 'durable_memory_candidate'], description: 'Optional processed memory class to list. Defaults to recent_summary for the newest task summaries; durable_memory_candidate lists promoted durable facts.' },
       limit: numberSchema(`Optional maximum summary count; defaults to ${MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_DEFAULT_LIMIT} and is clamped to ${MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_MAX_LIMIT }),
-      projectOnly: booleanSchema('Optional scope control. Defaults to true, which lists only the caller project; false may include same-user memories from other projects visible to the caller.'),
     }),
     outputSchema: objectSchema({
       status: stringSchema('ok, disabled, or error.'),

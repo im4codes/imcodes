@@ -1,4 +1,4 @@
-import type { ProcessedContextClass } from '../../shared/context-types.js';
+import type { ContextNamespace, ProcessedContextClass } from '../../shared/context-types.js';
 import type { ObservationClass, ObservationState } from '../../shared/memory-observation.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 import { searchLocalMemory, searchLocalMemorySemantic, type MemorySearchQuery } from '../context/memory-search.js';
@@ -44,7 +44,6 @@ export interface MemoryMcpListSummariesQuery {
   includeLegacyPersonalOwner?: boolean;
   projectionClass?: MemoryMcpListProjectionClass;
   limit?: number;
-  projectOnly?: boolean;
 }
 
 export interface MemoryMcpSearchOptions {
@@ -116,15 +115,22 @@ function cloudRecallUrl(workerUrl: string, serverId: string): string {
 }
 
 function cloudPersonalMemoryUrl(workerUrl: string, query: {
-  projectId?: string;
+  projectId: string;
   projectionClass?: MemoryMcpListProjectionClass;
   limit: number;
 }): string {
   const params = new URLSearchParams();
-  if (query.projectId) params.set('projectId', query.projectId);
+  params.set('projectId', query.projectId);
   if (query.projectionClass) params.set('projectionClass', query.projectionClass);
   params.set('limit', String(query.limit));
   return `${cleanBaseUrl(workerUrl)}/api/shared-context/personal-memory?${params.toString()}`;
+}
+
+function currentProjectId(query: { repo?: string; namespace?: Pick<ContextNamespace, 'projectId'> }): string | undefined {
+  const repo = query.repo?.trim();
+  if (repo) return repo;
+  const namespaceProjectId = query.namespace?.projectId?.trim();
+  return namespaceProjectId || undefined;
 }
 
 async function resolveCredentialsOnce(options: MemoryMcpSearchOptions): Promise<MemoryMcpSearchOptions['credentials']> {
@@ -189,7 +195,8 @@ async function listCloudMemorySummaries(
   limit: number,
 ): Promise<MemoryMcpSearchHit[]> {
   if (!credentials?.workerUrl || !credentials.serverId || !credentials.token) return [];
-  const requestedProjectId = query.projectOnly === false ? undefined : (query.repo ?? query.namespace?.projectId);
+  const requestedProjectId = currentProjectId(query);
+  if (!requestedProjectId) return [];
   const projectionClass = query.projectionClass ?? 'recent_summary';
   const fetchImpl = options.fetchImpl ?? fetch;
   const response = await fetchImpl(cloudPersonalMemoryUrl(credentials.workerUrl, {
@@ -263,13 +270,16 @@ function listLocalMemorySummaries(
   localServerId: string | undefined,
   limit: number,
 ): MemoryMcpSearchHit[] {
-  const projectOnly = query.projectOnly !== false;
+  const requestedProjectId = currentProjectId(query);
+  if (!requestedProjectId) return [];
+  const namespace = query.namespace
+    ? { ...query.namespace, projectId: requestedProjectId }
+    : undefined;
   const local = searchLocalMemory({
-    namespace: projectOnly ? query.namespace : undefined,
-    scope: projectOnly ? undefined : query.namespace?.scope,
+    namespace,
     currentEnterpriseId: query.currentEnterpriseId,
-    repo: projectOnly ? (query.repo ?? query.namespace?.projectId) : undefined,
-    userId: projectOnly ? undefined : (query.userId ?? query.namespace?.userId),
+    repo: requestedProjectId,
+    userId: namespace?.userId ?? query.userId,
     includeLegacyPersonalOwner: query.includeLegacyPersonalOwner,
     projectionClass: query.projectionClass ?? 'recent_summary',
     includeObservations: false,

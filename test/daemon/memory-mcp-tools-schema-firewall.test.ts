@@ -81,11 +81,11 @@ describe('memory MCP tool schema firewall', () => {
     expect(listMemorySummaries).toHaveBeenCalledWith(expect.objectContaining({
       limit: 2,
       projectionClass: 'recent_summary',
-      projectOnly: false,
       namespace: expect.objectContaining({ userId: 'user-1' }),
       userId: 'user-1',
     }));
     expect(listMemorySummaries.mock.calls[0][0]).not.toHaveProperty('query');
+    expect(listMemorySummaries.mock.calls[0][0]).not.toHaveProperty('projectOnly');
     expect(listMemorySummaries.mock.calls[0][0]).not.toHaveProperty('projectId', 'evil-project');
     expect(saveObservation).toHaveBeenCalledWith({ content: 'remember this' }, expect.objectContaining({
       userId: 'user-1',

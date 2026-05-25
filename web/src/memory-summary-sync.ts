@@ -10,9 +10,13 @@ function cleanProjectId(projectId: string | null | undefined): string | undefine
   return trimmed || undefined;
 }
 
-function newestRecords(records: ContextMemoryRecordView[], limit: number): ContextMemoryRecordView[] {
+function newestRecords(records: ContextMemoryRecordView[], projectId: string, limit: number): ContextMemoryRecordView[] {
   return [...records]
-    .filter((record) => record.projectionClass === 'recent_summary' && record.summary.trim().length > 0)
+    .filter((record) => (
+      record.projectId === projectId
+      && record.projectionClass === 'recent_summary'
+      && record.summary.trim().length > 0
+    ))
     .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
     .slice(0, limit);
 }
@@ -36,13 +40,9 @@ export async function buildMemorySummarySyncMessage(
   limit = DEFAULT_SUMMARY_SYNC_LIMIT,
 ): Promise<string | null> {
   const scopedProjectId = cleanProjectId(projectId);
-  const scoped = scopedProjectId
-    ? await getPersonalCloudMemory({ projectId: scopedProjectId, projectionClass: 'recent_summary', limit })
-    : null;
-  const fallback = !scoped || scoped.records.length === 0
-    ? await getPersonalCloudMemory({ projectionClass: 'recent_summary', limit })
-    : null;
-  const records = newestRecords(scoped?.records.length ? scoped.records : (fallback?.records ?? []), limit);
+  if (!scopedProjectId) return null;
+  const scoped = await getPersonalCloudMemory({ projectId: scopedProjectId, projectionClass: 'recent_summary', limit });
+  const records = newestRecords(scoped.records, scopedProjectId, limit);
   if (records.length === 0) return null;
 
   const lines = records.map((record, index) => {

@@ -33,6 +33,14 @@ describe('memory MCP recall search', () => {
         content: {},
         updatedAt: 500,
       });
+      writeProcessedProjection({
+        namespace: { scope: 'personal', projectId: 'repo-2', userId: 'daemon-local' },
+        class: 'recent_summary',
+        sourceEventIds: ['evt-local-other-project'],
+        summary: 'Local other project summary must stay out',
+        content: {},
+        updatedAt: 600,
+      });
       const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
         records: [
           {
@@ -41,6 +49,13 @@ describe('memory MCP recall search', () => {
             projectionClass: 'recent_summary',
             summary: 'Cloud newest recent summary',
             updatedAt: 300,
+          },
+          {
+            id: 'cloud-wrong-project',
+            projectId: 'repo-2',
+            projectionClass: 'recent_summary',
+            summary: 'Cloud other project summary must stay out',
+            updatedAt: 700,
           },
         ],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as unknown as typeof fetch;
@@ -74,6 +89,51 @@ describe('memory MCP recall search', () => {
         'Local older MCP summary',
       ]);
       expect(result.items.map((item) => item.summary)).not.toContain('Durable candidate should not appear by default');
+      expect(result.items.map((item) => item.summary)).not.toContain('Local other project summary must stay out');
+      expect(result.items.map((item) => item.summary)).not.toContain('Cloud other project summary must stay out');
+    } finally {
+      await cleanupIsolatedSharedContextDb(tempDir);
+    }
+  });
+
+  it('does not list global summaries when the caller has no project id', async () => {
+    const tempDir = await createIsolatedSharedContextDb('memory-mcp-list-summaries-no-project');
+    try {
+      writeProcessedProjection({
+        namespace: { scope: 'user_private', userId: 'daemon-local' },
+        class: 'recent_summary',
+        sourceEventIds: ['evt-global-local'],
+        summary: 'Unscoped local summary must not leak',
+        content: {},
+        updatedAt: 100,
+      });
+      const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+        records: [
+          {
+            id: 'cloud-global',
+            projectId: 'repo-elsewhere',
+            projectionClass: 'recent_summary',
+            summary: 'Unscoped cloud summary must not leak',
+            updatedAt: 300,
+          },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as unknown as typeof fetch;
+
+      const result = await listMcpMemorySummaries({
+        namespace: { scope: 'user_private', userId: 'daemon-local' },
+        includeLegacyPersonalOwner: true,
+        limit: 5,
+      }, {
+        fetchImpl,
+        credentials: {
+          workerUrl: 'https://example.im.codes/',
+          serverId: 'srv-1',
+          token: 'server-token',
+        },
+      });
+
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(result.items).toEqual([]);
     } finally {
       await cleanupIsolatedSharedContextDb(tempDir);
     }

@@ -50,7 +50,6 @@ type MemoryMcpListSummaries = (query: {
   includeLegacyPersonalOwner?: boolean;
   projectionClass?: MemoryMcpListProjectionClass;
   limit?: number;
-  projectOnly?: boolean;
 }) => Promise<MemoryMcpSearchResult> | MemoryMcpSearchResult;
 
 export interface MemoryMcpToolDeps {
@@ -316,7 +315,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]: async (input) => {
       const gate = memorySurfaceGate(deps, { items: [] });
       if (gate) return gate;
-      const args = pickAllowedMcpArgs(input, ['projectionClass', 'limit', 'projectOnly']);
+      const args = pickAllowedMcpArgs(input, ['projectionClass', 'limit']);
       const limit = numberArg(args, 'limit');
       const scopedCaller = memoryCaller();
       try {
@@ -328,7 +327,6 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           includeLegacyPersonalOwner: true,
           projectionClass: listProjectionClassArg(args),
           limit,
-          projectOnly: boolArg(args, 'projectOnly'),
         });
         const items = result.items.map((item) => compactSearchHit(item, scopedCaller.namespace));
         return { status: 'ok', items };
@@ -525,7 +523,6 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]: z.object({
     projectionClass: z.enum(['recent_summary', 'durable_memory_candidate']).optional().describe('Optional processed summary class. Defaults to recent_summary.'),
     limit: z.number().int().min(1).max(100).optional().describe('Optional maximum summary count.'),
-    projectOnly: z.boolean().optional().describe('When true, list only the caller project. Defaults to true.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: z.object({
     projectionId: z.string().optional().describe('Projection id returned by search_memory for a relevant projection hit.'),

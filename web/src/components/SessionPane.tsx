@@ -273,7 +273,10 @@ export function SessionPane({
     if (!ws || !connected || syncingMemorySummaries) return;
     setSyncingMemorySummaries(true);
     try {
-      const text = await buildMemorySummarySyncMessage(t, session.project ?? session.projectDir ?? null);
+      const text = await buildMemorySummarySyncMessage(
+        t,
+        session.contextNamespace?.projectId ?? session.project ?? session.projectDir ?? null,
+      );
       if (!text) return;
       const commandId = globalThis.crypto?.randomUUID?.()
         ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -288,7 +291,7 @@ export function SessionPane({
     } finally {
       setSyncingMemorySummaries(false);
     }
-  }, [addOptimisticUserMessage, connected, hasChatTimeline, scrollToBottom, session.project, session.projectDir, sessionName, syncingMemorySummaries, t, ws]);
+  }, [addOptimisticUserMessage, connected, hasChatTimeline, scrollToBottom, session.contextNamespace?.projectId, session.project, session.projectDir, sessionName, syncingMemorySummaries, t, ws]);
 
   const terminalVisible = isActive && effectiveViewMode === 'terminal';
   const chatVisible = isActive && effectiveViewMode === 'chat';
