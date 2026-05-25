@@ -30,7 +30,7 @@ const DEFAULT_COMMANDS: Record<string, string[]> = {
   'kimi-sdk':    ['/compact', '/clear', '/model'],
   'openclaw':    ['/compact', '/stop', '/clear', '/thinking'],
 };
-const DEFAULT_PHRASES = ['continue', 'fix', 'explain', 'refactor this', 'write tests', 'check errors', 'commit&push', 'CI failed, fix', 'test & push', 'yes'];
+const DEFAULT_PHRASES = ['continue', 'fix', 'explain', 'refactor this', 'write tests', 'check errors', 'pull', 'commit&push', 'CI failed, fix', 'test & push', 'yes'];
 
 const SESSION_HISTORY_MAX = 50;
 const GLOBAL_HISTORY_MAX = 50;

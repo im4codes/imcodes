@@ -89,6 +89,7 @@ describe('QuickInputPanel history scope', () => {
     );
 
     expect(screen.getByRole('button', { name: 'commit&push' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'pull' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'CI failed, fix' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'LGTM, commit' })).toBeNull();
   });
