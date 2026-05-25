@@ -619,12 +619,16 @@ describe('CodexSdkProvider', () => {
     await provider.connect({ binaryPath: 'codex' });
 
     const resultPromise = provider.readModelList();
-    await flush();
-    const child = childProcessMock.children[0];
-    const firstRequest = child.requests.find((req) => req.method === 'model/list');
+    const modelListRequests = () => childProcessMock.children.flatMap((child) =>
+      child.requests
+        .filter((req) => req.method === 'model/list')
+        .map((req) => ({ child, req })),
+    );
+    await waitForCondition(() => modelListRequests().length >= 1);
+    const { child: firstChild, req: firstRequest } = modelListRequests()[0]!;
     expect(firstRequest?.params).toMatchObject({ includeHidden: false, limit: 100 });
 
-    child.emits({
+    firstChild.emits({
       id: firstRequest?.id,
       result: {
         data: [
@@ -639,11 +643,11 @@ describe('CodexSdkProvider', () => {
         nextCursor: 'cursor-2',
       },
     });
-    await flush();
+    await waitForCondition(() => modelListRequests().length >= 2);
 
-    const secondRequest = child.requests.filter((req) => req.method === 'model/list')[1];
+    const { child: secondChild, req: secondRequest } = modelListRequests()[1]!;
     expect(secondRequest?.params).toMatchObject({ cursor: 'cursor-2', includeHidden: false, limit: 100 });
-    child.emits({
+    secondChild.emits({
       id: secondRequest?.id,
       result: {
         data: [
