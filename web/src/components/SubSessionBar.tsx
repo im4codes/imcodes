@@ -97,7 +97,7 @@ interface Props {
    * daemon (NOT scoped to the active session). The scoped
    * `discussions` array shows only those relevant to the current
    * session view; this number is rendered as a badge on the
-   * "View Discussions" (📋) button so the user can see at a glance
+   * "View Discussions" (👥) button so the user can see at a glance
    * that more runs exist elsewhere even when this session has none.
    */
   totalRunningDiscussions?: number;
@@ -827,7 +827,14 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             </span>
           );
         })()}
-        <button class="subcard-toolbar-add" data-onboarding="new-sub-session" onClick={onNew} title={t('subsessionBar.new_sub_session')}>+</button>
+        <button
+          class={`subcard-toolbar-add${desktopLayoutCapable ? ' subcard-toolbar-add-desktop' : ''}`}
+          data-onboarding="new-sub-session"
+          onClick={onNew}
+          title={t('subsessionBar.new_sub_session')}
+        >
+          {desktopLayoutCapable ? `+ ${t('subsessionBar.sub_session_short')}` : '+'}
+        </button>
         {onViewDiscussions && (
           <button
             class="subcard-toolbar-btn"
@@ -851,7 +858,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             }
             style={{ marginLeft: 4, fontSize: 11, position: 'relative' }}
           >
-            📋
+            👥
             {totalRunningDiscussions > 0 && (
               <span
                 data-testid="p2p-discussions-running-badge"
@@ -896,7 +903,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               fontSize: 11,
             }}
           >
-            🔀
+            📦
           </button>
         )}
         {onViewCron && (

@@ -9,6 +9,7 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, vars?: Record<string, unknown>) => {
       if (key === 'subsessionBar.subs_count') return `Subs (${vars?.count ?? 0})`;
+      if (key === 'subsessionBar.sub_session_short') return 'sub-session';
       return key;
     },
   }),
@@ -675,8 +676,39 @@ describe('SubSessionBar', () => {
     expect(card.title).not.toContain('ctx 11%');
   });
 
+  it('uses beginner-friendly desktop toolbar labels and compact mobile icons', () => {
+    const renderBar = (desktopLayoutCapable: boolean) => render(
+      <SubSessionBar
+        subSessions={[]}
+        openIds={new Set()}
+        desktopLayoutCapable={desktopLayoutCapable}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        onViewDiscussions={vi.fn()}
+        onViewRepo={vi.fn()}
+        onViewCron={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const desktop = renderBar(true);
+    expect(desktop.container.querySelector('[data-onboarding="new-sub-session"]')?.textContent?.trim()).toBe('+ sub-session');
+    expect(desktop.container.querySelector('[data-onboarding="discussion-history"]')?.textContent).toContain('👥');
+    expect(desktop.container.querySelector('[data-onboarding="repo-page"]')?.textContent).toContain('📦');
+    expect(desktop.container.querySelector('[data-onboarding="cron-manager"]')?.textContent).toContain('⏰');
+    desktop.unmount();
+
+    const mobile = renderBar(false);
+    expect(mobile.container.querySelector('[data-onboarding="new-sub-session"]')?.textContent?.trim()).toBe('+');
+  });
+
   // Audit fix (P2P bar scoping follow-up) — pin the contract that the
-  // View Discussions (📋) button shows a numeric badge when there are
+  // View Discussions (👥) button shows a numeric badge when there are
   // running discussions ANYWHERE on the daemon, not just in this
   // session's bar. Without it, scoping the bar to a single session
   // hides the existence of runs in other sessions and the user loses
