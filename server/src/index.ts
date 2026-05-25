@@ -204,6 +204,7 @@ export function buildApp(env: Env) {
       "script-src 'self' 'unsafe-inline'",   // Vite bundles inline runtime; tighten with hashes in future
       "style-src 'self' 'unsafe-inline'",
       "connect-src 'self' wss: ws: https://api.github.com",
+      "worker-src 'self' blob:",
       "img-src 'self' data: https:",
       "font-src 'self'",
       "frame-ancestors 'none'",

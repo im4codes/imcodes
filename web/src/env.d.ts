@@ -20,11 +20,6 @@ declare module '*?raw' {
   export default src;
 }
 
-declare module 'pdfjs-dist/build/pdf.worker.min.mjs?url' {
-  const src: string;
-  export default src;
-}
-
 declare module 'pdfjs-dist' {
   export function getDocument(src: unknown): { promise: Promise<any> };
   export const GlobalWorkerOptions: { workerSrc: string };

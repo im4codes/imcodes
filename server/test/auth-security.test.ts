@@ -433,6 +433,7 @@ describe('Security headers on HTML responses', () => {
     expect(source).toContain("'Referrer-Policy': 'no-referrer'");
     expect(source).toContain('Permissions-Policy');
     expect(source).toContain('Content-Security-Policy');
+    expect(source).toContain("worker-src 'self' blob:");
     expect(source).toContain("frame-ancestors 'none'");
   });
 
