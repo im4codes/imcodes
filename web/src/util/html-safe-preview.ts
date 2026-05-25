@@ -14,6 +14,30 @@ export const HTML_PREVIEW_CSP = [
   'media-src data:',
 ].join('; ');
 
+export const HTML_PREVIEW_VIEWPORT_CONTENT = 'width=device-width, initial-scale=1';
+
+export const HTML_PREVIEW_FIT_CSS = [
+  'html, body {',
+  '  width: 100% !important;',
+  '  max-width: 100% !important;',
+  '  min-width: 0 !important;',
+  '  box-sizing: border-box;',
+  '}',
+  'body {',
+  '  margin: 0;',
+  '  overflow-wrap: anywhere;',
+  '}',
+  '*, *::before, *::after {',
+  '  box-sizing: border-box;',
+  '}',
+  'img, video, canvas, table, pre {',
+  '  max-width: 100%;',
+  '}',
+  'img, video, canvas {',
+  '  height: auto;',
+  '}',
+].join('\n');
+
 export type HtmlPreviewDocumentResult =
   | { status: 'ok'; srcDoc: string }
   | { status: 'too-large'; maxBytes: number }
@@ -121,6 +145,19 @@ function injectPolicy(doc: Document): void {
   const base = doc.createElement('base');
   base.setAttribute('href', 'about:blank');
   head.insertBefore(base, csp.nextSibling);
+
+  const existingViewport = Array.from(head.querySelectorAll('meta')).find((node) => (
+    (node.getAttribute('name') ?? '').trim().toLowerCase() === 'viewport'
+  ));
+  const viewport = existingViewport ?? doc.createElement('meta');
+  viewport.setAttribute('name', 'viewport');
+  viewport.setAttribute('content', HTML_PREVIEW_VIEWPORT_CONTENT);
+  head.insertBefore(viewport, base.nextSibling);
+
+  const fitStyle = doc.createElement('style');
+  fitStyle.setAttribute('data-imcodes-preview-fit', 'true');
+  fitStyle.textContent = HTML_PREVIEW_FIT_CSS;
+  head.appendChild(fitStyle);
 }
 
 export function createSafeHtmlPreviewDocument(content: string | null | undefined): HtmlPreviewDocumentResult {

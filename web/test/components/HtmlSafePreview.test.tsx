@@ -11,6 +11,8 @@ import { HtmlSafePreview } from '../../src/components/HtmlSafePreview.js';
 import {
   createSafeHtmlPreviewDocument,
   HTML_PREVIEW_CSP,
+  HTML_PREVIEW_FIT_CSS,
+  HTML_PREVIEW_VIEWPORT_CONTENT,
   type HtmlPreviewDocumentResult,
 } from '../../src/util/html-safe-preview.js';
 
@@ -105,6 +107,29 @@ script:window.parent.__pwned = true">bad</a>
     expect(first?.getAttribute('content')).toBe(HTML_PREVIEW_CSP);
     expect(second?.tagName).toBe('BASE');
     expect(second?.getAttribute('href')).toBe('about:blank');
+  });
+
+  it('fits rendered HTML to the sandbox iframe viewport width', () => {
+    const srcDoc = okSrcDoc(createSafeHtmlPreviewDocument(`
+      <html>
+        <head>
+          <meta name="viewport" content="width=1200">
+          <style>html, body { width: 1200px; }</style>
+        </head>
+        <body><main style="width:100%">preview</main></body>
+      </html>
+    `));
+    const doc = parsePreviewDocument(srcDoc);
+    const viewport = Array.from(doc.head.querySelectorAll('meta')).find((node) => (
+      (node.getAttribute('name') ?? '').trim().toLowerCase() === 'viewport'
+    ));
+    const fitStyle = doc.head.querySelector('style[data-imcodes-preview-fit="true"]');
+
+    expect(viewport?.getAttribute('content')).toBe(HTML_PREVIEW_VIEWPORT_CONTENT);
+    expect(fitStyle?.textContent).toBe(HTML_PREVIEW_FIT_CSS);
+    expect(doc.head.lastElementChild).toBe(fitStyle);
+    expect(srcDoc).toContain('width: 100% !important;');
+    expect(srcDoc).toContain('max-width: 100%;');
   });
 
   it('returns oversize before constructing DOMParser', () => {
