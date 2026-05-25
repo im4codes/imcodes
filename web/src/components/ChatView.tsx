@@ -5,7 +5,7 @@
  */
 import { h } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
-import { createPortal, memo } from 'preact/compat';
+import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type {
   TimelineEvent,
@@ -21,7 +21,7 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
-import { HtmlSafePreview } from './HtmlSafePreview.js';
+import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { isLikelyDomainPath, renderChatPathActions } from '../chat-path-actions.js';
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
 import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
@@ -95,10 +95,9 @@ interface ViewItem {
   lastTs?: number;
 }
 
-type HtmlFullscreenPreview =
-  | { status: 'loading'; path: string; requestId: string }
-  | { status: 'ok'; path: string; content: string }
-  | { status: 'error'; path: string; error: string };
+type ChatHtmlFullscreenPreviewState =
+  | (HtmlFullscreenPreviewState & { status: 'loading'; requestId: string })
+  | Extract<HtmlFullscreenPreviewState, { status: 'ok' | 'error' }>;
 
 interface AssistantBlockProps {
   text: string;
@@ -911,7 +910,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const selMenuRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
-  const [htmlFullscreenPreview, setHtmlFullscreenPreview] = useState<HtmlFullscreenPreview | null>(null);
+  const [htmlFullscreenPreview, setHtmlFullscreenPreview] = useState<ChatHtmlFullscreenPreviewState | null>(null);
   const [highlightEl, setHighlightEl] = useState<HTMLElement | null>(null);
   const highlightElRef = useRef(highlightEl);
   highlightElRef.current = highlightEl;
@@ -1094,15 +1093,6 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       });
     });
   }, [t, ws]);
-
-  useEffect(() => {
-    if (!htmlFullscreenPreview) return undefined;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') closeHtmlFullscreenPreview();
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [closeHtmlFullscreenPreview, htmlFullscreenPreview]);
 
   const handleUrlClick = useCallback((url: string) => {
     setPendingUrl(url);
@@ -1812,38 +1802,6 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [historyStatus, t]);
   const showHistoryProgress = !preview && historySteps.some((step) => step.state === 'pending' || step.state === 'running');
   const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
-  const htmlFullscreenPreviewNode = htmlFullscreenPreview ? (
-    <div
-      class="html-fullscreen-preview"
-      role="dialog"
-      aria-modal="true"
-      aria-label={t('chat.html_preview_title', 'Render HTML preview')}
-    >
-      <button
-        type="button"
-        class="html-fullscreen-preview-close"
-        onClick={closeHtmlFullscreenPreview}
-        title={t('common.close', 'Close')}
-        aria-label={t('common.close', 'Close')}
-      >
-        ✕
-      </button>
-      <div class="html-fullscreen-preview-body">
-        {htmlFullscreenPreview.status === 'loading' && (
-          <div class="html-fullscreen-preview-status">{t('file_browser.preview_loading', 'Loading…')}</div>
-        )}
-        {htmlFullscreenPreview.status === 'error' && (
-          <div class="html-fullscreen-preview-status html-fullscreen-preview-error">
-            {htmlFullscreenPreview.error}
-          </div>
-        )}
-        {htmlFullscreenPreview.status === 'ok' && (
-          <HtmlSafePreview path={htmlFullscreenPreview.path} content={htmlFullscreenPreview.content} />
-        )}
-      </div>
-    </div>
-  ) : null;
-
   return (
     <div class={`chat-view-wrap${canShowFilePanel && showFilePanel ? ' chat-split' : ''}`}>
       {canShowFilePanel && (
@@ -2216,7 +2174,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       {zoomText && (
         <ZoomedTextDialog text={zoomText} onClose={() => setZoomText(null)} onQuote={onQuote} />
       )}
-      {htmlFullscreenPreviewNode && createPortal(htmlFullscreenPreviewNode, document.body)}
+      <HtmlFullscreenPreview preview={htmlFullscreenPreview} onClose={closeHtmlFullscreenPreview} />
       {/* External link confirm dialog */}
       {pendingUrl && (
         <div class="dialog-overlay external-link-overlay" onClick={() => setPendingUrl(null)}>

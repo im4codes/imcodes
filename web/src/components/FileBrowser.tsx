@@ -22,7 +22,7 @@ import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import { FileEditor, FileEditorContent } from './file-editor-lazy.js';
 const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
-import { HtmlSafePreview } from './HtmlSafePreview.js';
+import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { downloadAttachment, getApiBaseUrl } from '../api.js';
 import {
   getSharedChangesKey,
@@ -436,6 +436,10 @@ export function FileBrowser({
     initialPreviewViewMode ?? (autoPreviewPreferDiff ? 'diff' : 'source')
   ));
   const [lightbox, setLightbox] = useState<string | null>(null);
+  const [htmlFullscreenPreview, setHtmlFullscreenPreview] = useState<HtmlFullscreenPreviewState | null>(null);
+  const closeHtmlFullscreenPreview = useCallback(() => {
+    setHtmlFullscreenPreview(null);
+  }, []);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   // Transient "Copied!" label flips back to the default after 1.5s. Keyed by
   // path so rapidly switching between previews never shows a stale "Copied!"
@@ -1299,7 +1303,6 @@ export function FileBrowser({
   const canRenderDiff = preview.status === 'ok' && !!preview.diffHtml;
   const isHtmlRenderMode = previewViewMode === 'html-render';
   const canRenderHtml = preview.status === 'ok' && isHtmlPreviewPath(preview.path);
-  const shouldRenderHtml = canRenderHtml && isHtmlRenderMode && !isEditing;
   const previewScrollMode = getPreviewScrollMode(preview, isEditing, previewViewMode, canRenderDiff);
   const activePreviewScrollKey = previewScrollMode && preview.status !== 'idle'
     ? previewScrollKey((preview as { path: string }).path, previewScrollMode)
@@ -1330,6 +1333,13 @@ export function FileBrowser({
     if (el.scrollTop !== snapshot.scrollTop) el.scrollTop = snapshot.scrollTop;
     if (el.scrollLeft !== snapshot.scrollLeft) el.scrollLeft = snapshot.scrollLeft;
   }, [activePreviewScrollKey, preview]);
+
+  useEffect(() => {
+    if (!canRenderHtml || !isHtmlRenderMode || isEditing) return;
+    setHtmlFullscreenPreview({ status: 'ok', path: preview.path, content: preview.content });
+    setPreviewViewMode('source');
+    setShowDiff(false);
+  }, [canRenderHtml, isEditing, isHtmlRenderMode, preview]);
 
   const previewPane = hasInlinePreview ? (
     <div class="fb-preview">
@@ -1374,14 +1384,15 @@ export function FileBrowser({
         )}
         {!isEditing && canRenderHtml && (
           <button
-            class={`fb-diff-toggle${isHtmlRenderMode ? ' active' : ''}`}
+            class="fb-diff-toggle"
             onClick={() => {
               previewTabOverridePathRef.current = preview.path;
-              setPreviewViewMode((mode) => (mode === 'html-render' ? 'source' : 'html-render'));
+              setHtmlFullscreenPreview({ status: 'ok', path: preview.path, content: preview.content });
+              setPreviewViewMode('source');
               setShowDiff(false);
             }}
-            title={isHtmlRenderMode ? t('file_browser.view_source') : t('file_browser.view_rendered')}
-            aria-label={isHtmlRenderMode ? t('file_browser.view_source') : t('file_browser.view_rendered')}
+            title={t('file_browser.view_rendered')}
+            aria-label={t('file_browser.view_rendered')}
           >
             👁
           </button>
@@ -1545,18 +1556,16 @@ export function FileBrowser({
             />
           </Suspense>
         )}
-        {preview.status === 'ok' && shouldRenderHtml && (
-          <HtmlSafePreview path={preview.path} content={preview.content} />
-        )}
-        {preview.status === 'ok' && !isEditing && !shouldRenderHtml && (!showDiff || !canRenderDiff) && (
+        {preview.status === 'ok' && !isEditing && (!showDiff || !canRenderDiff) && (
           <Suspense fallback={<div class="fb-preview-loading"><div class="fb-loading-spinner" /></div>}>
             <FilePreviewPane content={preview.content} path={preview.path} />
           </Suspense>
         )}
-        {preview.status === 'ok' && !isEditing && !shouldRenderHtml && showDiff && canRenderDiff && (
+        {preview.status === 'ok' && !isEditing && showDiff && canRenderDiff && (
           <div class="fb-diff" dangerouslySetInnerHTML={{ __html: preview.diffHtml ?? '' }} />
         )}
       </div>
+      <HtmlFullscreenPreview preview={htmlFullscreenPreview} onClose={closeHtmlFullscreenPreview} />
     </div>
   ) : null;
 

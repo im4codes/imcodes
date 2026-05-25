@@ -1901,7 +1901,7 @@ describe('FileBrowser', () => {
 
   it('opens eligible HTML files in rendered mode without requesting a git diff', async () => {
     const { ws, respond, sendMsg } = makeWsFactory();
-    render(
+    const { container } = render(
       <FileBrowser
         ws={ws}
         mode="file-single"
@@ -1927,10 +1927,22 @@ describe('FileBrowser', () => {
       });
     });
 
-    expect(document.querySelector('iframe.html-safe-preview-frame')).not.toBeNull();
-    const renderToggle = screen.getByTitle('file_browser.view_source');
+    expect(container.querySelector('iframe.html-safe-preview-frame')).toBeNull();
+    expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
+    expect(document.body.querySelector('iframe.html-safe-preview-frame')).not.toBeNull();
+
+    const closeFullscreen = document.body.querySelector('.html-fullscreen-preview-close') as HTMLButtonElement;
+    fireEvent.click(closeFullscreen);
+    expect(document.body.querySelector('.html-fullscreen-preview')).toBeNull();
+
+    const renderToggle = screen.getByTitle('file_browser.view_rendered');
     expect(renderToggle.textContent).toBe('👁');
     fireEvent.click(renderToggle);
+    expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
+    expect(document.body.querySelector('iframe.html-safe-preview-frame')).not.toBeNull();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(document.body.querySelector('.html-fullscreen-preview')).toBeNull();
     expect(screen.getByTestId('mock-file-preview').textContent).toContain('<!doctype html><h1>Hello</h1>');
   });
 
