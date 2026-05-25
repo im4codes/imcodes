@@ -15,6 +15,7 @@ import type {
   MemoryContextTimelinePreferenceItem,
 } from '../ws-client.js';
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
+import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import { SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL } from '@shared/session-control-commands.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
@@ -1084,7 +1085,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       setHtmlFullscreenPreview((current) => {
         if (!current || current.status !== 'loading' || current.requestId !== msg.requestId) return current;
         if (msg.status === 'error') {
-          const error = msg.error === 'file_too_large'
+          const error = msg.error === FS_READ_ERROR_CODES.FILE_TOO_LARGE
             ? t('chat.html_preview_too_large', 'HTML file is too large to render safely.')
             : t('file_browser.preview_error', 'Preview unavailable');
           return { status: 'error', path: current.path, error };
