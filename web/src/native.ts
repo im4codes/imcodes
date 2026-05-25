@@ -15,56 +15,81 @@ export const isNative = (): boolean =>
 
 /** Returns null on native when no URL has been saved yet (first launch). */
 export async function getServerUrl(): Promise<string | null> {
-  if (!isNative()) return window.location.origin;
-  const { Preferences } = await import('@capacitor/preferences');
-  const { value } = await Preferences.get({ key: PREFS_SERVER_URL_KEY });
-  return value; // null = not configured yet → show ServerSetupPage
+  if (!isNative()) return getCurrentOrigin();
+  try {
+    const { Preferences } = await import('@capacitor/preferences');
+    const { value } = await Preferences.get({ key: PREFS_SERVER_URL_KEY });
+    return normalizeServerUrl(value ?? readLocalStorageValue(PREFS_SERVER_URL_KEY));
+  } catch {
+    return normalizeServerUrl(readLocalStorageValue(PREFS_SERVER_URL_KEY));
+  }
 }
 
 /** Returns the saved list of server URLs. Always includes DEFAULT_SERVER_URL first. */
 export async function getServerList(): Promise<string[]> {
-  if (!isNative()) return [];
+  const localList = readLocalStorageValue(PREFS_SERVER_LIST_KEY);
+  const localCurrent = readLocalStorageValue(PREFS_SERVER_URL_KEY);
+  if (!isNative()) {
+    return mergeServerUrlList([DEFAULT_SERVER_URL, getCurrentOrigin(), ...parseServerListValue(localList), localCurrent]);
+  }
+
+  let persistedList: string | null = null;
+  let persistedCurrent: string | null = null;
   try {
     const { Preferences } = await import('@capacitor/preferences');
-    const { value } = await Preferences.get({ key: PREFS_SERVER_LIST_KEY });
-    const saved = value ? JSON.parse(value) as string[] : [];
-    // Ensure default server is always present at the top
-    if (!saved.includes(DEFAULT_SERVER_URL)) {
-      return [DEFAULT_SERVER_URL, ...saved];
-    }
-    return saved;
+    persistedList = (await Preferences.get({ key: PREFS_SERVER_LIST_KEY })).value;
+    persistedCurrent = (await Preferences.get({ key: PREFS_SERVER_URL_KEY })).value;
   } catch {
-    return [DEFAULT_SERVER_URL];
+    // Keep going with the localStorage mirror below. The server picker should
+    // never become empty just because the native Preferences bridge is late.
   }
+
+  const merged = mergeServerUrlList([
+    DEFAULT_SERVER_URL,
+    persistedCurrent,
+    ...parseServerListValue(persistedList),
+    localCurrent,
+    ...parseServerListValue(localList),
+  ]);
+  persistServerListMirror(merged);
+  return merged;
 }
 
 /** Add a URL to the saved server list (no-op if already present). */
 export async function addServerToList(url: string): Promise<void> {
+  const normalized = normalizeServerUrl(url);
+  if (!normalized) return;
+  const list = mergeServerUrlList([...(await getServerList()), normalized]);
+  persistServerListMirror(list);
   if (!isNative()) return;
-  const list = await getServerList();
-  if (list.includes(url)) return;
   const { Preferences } = await import('@capacitor/preferences');
-  await Preferences.set({ key: PREFS_SERVER_LIST_KEY, value: JSON.stringify([...list, url]) });
+  await Preferences.set({ key: PREFS_SERVER_LIST_KEY, value: JSON.stringify(list) });
 }
 
 /** Remove a URL from the saved server list. Cannot remove the default server. */
 export async function removeServerFromList(url: string): Promise<void> {
-  if (!isNative() || url === DEFAULT_SERVER_URL) return;
-  const list = await getServerList();
-  const updated = list.filter((u) => u !== url);
+  const normalized = normalizeServerUrl(url);
+  if (!normalized || normalized === DEFAULT_SERVER_URL) return;
+  const updated = (await getServerList()).filter((u) => u !== normalized);
+  persistServerListMirror(updated);
+  if (!isNative()) return;
   const { Preferences } = await import('@capacitor/preferences');
   await Preferences.set({ key: PREFS_SERVER_LIST_KEY, value: JSON.stringify(updated) });
 }
 
-/** Only stores on native; on web, server URL is always window.location.origin. */
+/** Stores the selected native server URL and mirrors it locally for recovery. */
 export async function setServerUrl(url: string): Promise<void> {
+  const normalized = normalizeServerUrl(url);
+  if (!normalized) return;
+  writeLocalStorageValue(PREFS_SERVER_URL_KEY, normalized);
+  await addServerToList(normalized);
   if (!isNative()) return;
-  const normalized = url.replace(/\/$/, '');
   const { Preferences } = await import('@capacitor/preferences');
   await Preferences.set({ key: PREFS_SERVER_URL_KEY, value: normalized });
 }
 
 export async function clearServerUrl(): Promise<void> {
+  removeLocalStorageValue(PREFS_SERVER_URL_KEY);
   if (!isNative()) return;
   const { Preferences } = await import('@capacitor/preferences');
   await Preferences.remove({ key: PREFS_SERVER_URL_KEY });
@@ -79,4 +104,75 @@ export function isValidServerUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+function getCurrentOrigin(): string {
+  try {
+    return globalThis.location?.origin ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function normalizeServerUrl(url: string | null | undefined): string | null {
+  const trimmed = String(url ?? '').trim();
+  if (!trimmed) return null;
+  const normalized = trimmed.replace(/\/+$/, '');
+  return isValidServerUrl(normalized) ? normalized : null;
+}
+
+function parseServerListValue(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed.flatMap((item) => typeof item === 'string' ? [item] : []);
+    }
+    if (parsed && typeof parsed === 'object') {
+      const record = parsed as { servers?: unknown; urls?: unknown };
+      const list = Array.isArray(record.servers) ? record.servers : record.urls;
+      if (Array.isArray(list)) {
+        return list.flatMap((item) => typeof item === 'string' ? [item] : []);
+      }
+    }
+  } catch {
+    return value.split(/[\n,]/g);
+  }
+  return [];
+}
+
+function mergeServerUrlList(values: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const normalized = normalizeServerUrl(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function readLocalStorageValue(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalStorageValue(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch { /* ignore restricted storage */ }
+}
+
+function removeLocalStorageValue(key: string): void {
+  try {
+    localStorage.removeItem(key);
+  } catch { /* ignore restricted storage */ }
+}
+
+function persistServerListMirror(list: string[]): void {
+  writeLocalStorageValue(PREFS_SERVER_LIST_KEY, JSON.stringify(mergeServerUrlList([DEFAULT_SERVER_URL, ...list])));
 }
