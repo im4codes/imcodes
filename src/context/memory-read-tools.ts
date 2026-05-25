@@ -149,6 +149,15 @@ function canAccessNamespace(namespace: ContextNamespace, caller: AnyCaller): boo
   }
   if (namespace.userId !== caller.userId) return false;
   if (isInternalCaller(caller)) return true;
+  if (
+    namespace.scope === 'user_private'
+    && caller.namespace.scope !== 'user_private'
+    && caller.namespace.userId === caller.userId
+    && namespace.userId === caller.userId
+    && (!caller.namespace.projectId || namespace.projectId === caller.namespace.projectId)
+  ) {
+    return true;
+  }
   // Public callers carry a required namespace; cross-namespace reads are forbidden.
   return sameNamespace(namespace, caller.namespace);
 }

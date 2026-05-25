@@ -141,6 +141,46 @@ describe('memory read tools', () => {
     });
   });
 
+  it('returns same-owner user_private projection sources through the project personal namespace', () => {
+    const privateRepo: ContextNamespace = { scope: 'user_private', projectId: 'repo', userId: 'bob' };
+    const target = { namespace: privateRepo, kind: 'session' as const, sessionName: 'deck_repo_brain' };
+    const event = recordContextEvent({
+      id: 'evt-user-private-projection',
+      target,
+      eventType: 'assistant.text',
+      content: 'private projection source content',
+      createdAt: 1,
+    });
+    archiveEventsForMaterialization([event], 2);
+    const projection = writeProcessedProjection({
+      namespace: privateRepo,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-user-private-projection'],
+      summary: 'private projection summary',
+      content: {},
+    });
+
+    const sources = memoryGetSources(projection.id, caller('bob', bobRepo));
+    expect(sources).toMatchObject({
+      projectionId: projection.id,
+      sourceEventCount: 1,
+      partial: false,
+      sources: [
+        {
+          eventId: 'evt-user-private-projection',
+          status: 'archived',
+          content: 'private projection source content',
+        },
+      ],
+    });
+    expect(memoryGetSources(projection.id, caller('bob', bobOtherRepo))).toEqual({
+      projectionId: projection.id,
+      sourceEventCount: 0,
+      sources: [],
+    });
+    expectForbidden(() => memoryGetSources(projection.id, caller('alice', aliceRepo)));
+  });
+
   it('returns manual memory projection text when no raw source event exists', () => {
     const manualMemoryText = [
       'mock infra server alpha: ssh user@alpha.test.im.codes',

@@ -489,7 +489,7 @@ function formatAge(timestamp: number): string {
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 function collectProcessedProjections(query: MemorySearchQuery): ProcessedContextProjection[] {
-  return queryProcessedProjections({
+  const baseFilters = {
     scope: query.namespace?.scope ?? query.scope,
     enterpriseId: query.namespace?.enterpriseId,
     workspaceId: query.namespace?.workspaceId,
@@ -499,7 +499,37 @@ function collectProcessedProjections(query: MemorySearchQuery): ProcessedContext
     projectionClass: query.projectionClass,
     query: query.query,
     includeArchived: query.includeArchived,
+  };
+  const projections = queryProcessedProjections(baseFilters);
+  const namespace = query.namespace;
+  if (
+    !namespace
+    || namespace.scope === 'user_private'
+    || !namespace.userId?.trim()
+    || !namespace.projectId?.trim()
+  ) {
+    return projections;
+  }
+
+  const bridged = queryProcessedProjections({
+    ...baseFilters,
+    scope: 'user_private',
+    enterpriseId: undefined,
+    workspaceId: undefined,
+    userId: namespace.userId,
+    projectId: namespace.projectId,
+    includeLegacyPersonalOwner: false,
   });
+  if (bridged.length === 0) return projections;
+
+  const seen = new Set(projections.map((projection) => projection.id));
+  const out = [...projections];
+  for (const projection of bridged) {
+    if (seen.has(projection.id)) continue;
+    seen.add(projection.id);
+    out.push(projection);
+  }
+  return out;
 }
 
 function collectRawEvents(query: MemorySearchQuery): MemorySearchResultItem[] {

@@ -80,6 +80,39 @@ describe('memory-search', () => {
     expect(sharedResult.items[0]?.summary).toContain('Shared');
   });
 
+  it('includes same-owner user_private processed summaries when searching the project personal namespace', () => {
+    writeProcessedProjection({
+      namespace: { scope: 'user_private', projectId: 'github.com/acme/repo', userId: 'user-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-user-private-bridge'],
+      summary: 'User-private summary should remain visible through project MCP scope',
+      content: {},
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'user_private', projectId: 'github.com/acme/repo', userId: 'user-2' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-other-user-private'],
+      summary: 'Other private summary must stay hidden',
+      content: {},
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'user_private', projectId: 'github.com/other/repo', userId: 'user-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-other-project-private'],
+      summary: 'Other project private summary must stay hidden',
+      content: {},
+    });
+
+    const result = searchLocalMemory({
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' },
+      projectionClass: 'recent_summary',
+    });
+
+    expect(result.items.map((item) => item.summary)).toEqual([
+      'User-private summary should remain visible through project MCP scope',
+    ]);
+  });
+
   it('filters by scope, owner, and repo without requiring an exact namespace object', () => {
     writeProcessedProjection({
       namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' },
