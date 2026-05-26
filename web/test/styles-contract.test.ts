@@ -293,4 +293,28 @@ describe('styles.css regression contracts', () => {
     expect(closeRule![0]).toMatch(/top:\s*calc\(var\(--sat,\s*0px\) \+ 16px\)/);
     expect(closeRule![0]).toMatch(/right:\s*calc\(env\(safe-area-inset-right,\s*0px\) \+ 16px\)/);
   });
+
+  it('mobile server switcher remains a roomy primary control', () => {
+    const barRule = Array.from(css.matchAll(/\.mobile-server-bar\s*\{[^}]*\}/g))
+      .map((match) => match[0])
+      .find((rule) => /gap:\s*8px/.test(rule));
+    expect(barRule).not.toBeNull();
+    expect(barRule!).toMatch(/gap:\s*8px/);
+
+    const wrapRule = css.match(/\.mobile-server-switcher-wrap\s*\{[^}]*\}/);
+    expect(wrapRule).not.toBeNull();
+    expect(wrapRule![0]).toMatch(/flex:\s*1\s+1\s+auto/);
+    expect(wrapRule![0]).toMatch(/min-width:\s*0/);
+
+    const buttonRule = css.match(/\.mobile-server-btn\s*\{[^}]*\}/);
+    expect(buttonRule).not.toBeNull();
+    expect(buttonRule![0]).toMatch(/width:\s*100%/);
+    expect(buttonRule![0]).toMatch(/min-height:\s*38px/);
+    expect(buttonRule![0]).toMatch(/border-radius:\s*13px/);
+
+    const nameRule = css.match(/\.mobile-server-btn-name\s*\{[^}]*\}/);
+    expect(nameRule).not.toBeNull();
+    expect(nameRule![0]).toMatch(/text-overflow:\s*ellipsis/);
+    expect(nameRule![0]).toMatch(/white-space:\s*nowrap/);
+  });
 });

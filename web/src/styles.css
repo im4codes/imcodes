@@ -1101,15 +1101,19 @@ body {
      shows up as ~80-100px of black space under the iOS status bar on
      iPhone X+ devices. Regression landed in commit 6f9a5e0 and reverted
      here. */
-  .mobile-server-bar { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; background: linear-gradient(180deg, #0d1422 0%, #09111d 100%); border-bottom: 1px solid rgba(34,211,238,0.18); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 4px 16px rgba(0,0,0,0.24); flex-shrink: 0; position: relative; z-index: 50; }
+  .mobile-server-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 9px; background: linear-gradient(180deg, #0d1422 0%, #09111d 100%); border-bottom: 1px solid rgba(34,211,238,0.18); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 4px 16px rgba(0,0,0,0.24); flex-shrink: 0; position: relative; z-index: 50; }
   .mobile-server-bar::before { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(34,211,238,0.72), rgba(52,211,153,0.55), transparent); pointer-events: none; }
-  .mobile-sidebar-toggle { display: block; background: rgba(15,23,42,0.55); border: 1px solid rgba(125,211,252,0.16); border-radius: 7px; color: #94a3b8; font-size: 18px; cursor: pointer; padding: 4px 8px; line-height: 1; flex-shrink: 0; }
+  .mobile-sidebar-toggle { display: block; width: 36px; height: 36px; background: rgba(15,23,42,0.55); border: 1px solid rgba(125,211,252,0.16); border-radius: 10px; color: #94a3b8; font-size: 18px; cursor: pointer; padding: 0; line-height: 1; flex-shrink: 0; }
   .mobile-sidebar-toggle:active { color: var(--chrome-accent); border-color: rgba(34,211,238,0.5); background: rgba(8,145,178,0.16); }
-  .mobile-server-switcher-wrap { position: relative; }
-  .mobile-server-btn { background: rgba(15,23,42,0.50); border: 1px solid rgba(125,211,252,0.14); border-radius: 999px; color: #cbd5e1; font-family: inherit; font-size: 12px; cursor: pointer; padding: 5px 10px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
-  .mobile-server-btn:active { color: var(--chrome-accent); border-color: rgba(34,211,238,0.42); }
+  .mobile-server-switcher-wrap { position: relative; flex: 1 1 auto; min-width: 0; }
+  .mobile-server-btn { width: 100%; min-height: 38px; display: flex; align-items: center; gap: 8px; background: linear-gradient(135deg, rgba(8,145,178,0.24), rgba(15,23,42,0.78) 46%, rgba(76,29,149,0.22)); border: 1px solid rgba(125,211,252,0.24); border-radius: 13px; color: #dbeafe; font-family: inherit; font-size: 13px; font-weight: 700; cursor: pointer; padding: 6px 7px 6px 9px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.06), 0 0 18px rgba(34,211,238,0.10); }
+  .mobile-server-btn:active { color: var(--chrome-accent); border-color: rgba(34,211,238,0.58); background: linear-gradient(135deg, rgba(8,145,178,0.34), rgba(15,23,42,0.86) 46%, rgba(76,29,149,0.30)); }
+  .mobile-server-btn-icon { width: 24px; height: 24px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; background: rgba(34,211,238,0.12); border: 1px solid rgba(34,211,238,0.18); box-shadow: 0 0 12px rgba(34,211,238,0.16); }
+  .mobile-server-btn-name { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; letter-spacing: 0; }
+  .mobile-server-btn-chevron { width: 24px; height: 24px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; color: #67e8f9; background: rgba(15,23,42,0.52); }
+  .mobile-server-actions { display: flex; gap: 5px; align-items: center; flex: 0 0 auto; }
   .mobile-server-backdrop { position: fixed; inset: 0; z-index: 49; }
-  .mobile-server-menu { position: absolute; top: calc(100% + 4px); left: 0; background: #1e293b; border: 1px solid #334155; border-radius: 6px; min-width: 180px; box-shadow: 0 8px 24px #00000080; z-index: 50; overflow: hidden; }
+  .mobile-server-menu { position: absolute; top: calc(100% + 8px); left: 0; width: min(300px, calc(100vw - 18px)); background: #1e293b; border: 1px solid rgba(125,211,252,0.20); border-radius: 12px; min-width: min(240px, calc(100vw - 18px)); box-shadow: 0 14px 34px #00000090, 0 0 20px rgba(34,211,238,0.10); z-index: 50; overflow: hidden; }
   .mobile-server-menu-item { display: block; width: 100%; padding: 10px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; }
   .mobile-server-menu-item:hover, .mobile-server-menu-item:active { background: #334155; }
   .mobile-server-menu-item.active { color: #93c5fd; background: #1d4ed820; }

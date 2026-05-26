@@ -3848,8 +3848,11 @@ export function App() {
                 <button
                   class="mobile-server-btn"
                   onClick={() => setShowMobileServerMenu((o) => !o)}
+                  title={resolvedSelectedServerName ?? 'Server'}
                 >
-                  {resolvedSelectedServerName ?? 'Server'} ▾
+                  <span class="mobile-server-btn-icon" aria-hidden="true">☁</span>
+                  <span class="mobile-server-btn-name">{resolvedSelectedServerName ?? 'Server'}</span>
+                  <span class="mobile-server-btn-chevron" aria-hidden="true">▾</span>
                 </button>
                 {showMobileServerMenu && (
                   <>
@@ -3882,7 +3885,7 @@ export function App() {
                   </>
                 )}
               </div>
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <div class="mobile-server-actions">
                 {activeSession && (
                   <button
                     class="view-toggle"
