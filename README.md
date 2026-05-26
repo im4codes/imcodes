@@ -119,7 +119,7 @@ Full terminal access to your agent sessions from any browser — no SSH, no VPN,
 
 ### File Browser & Git Changes
 
-Browse project files with a tree view. Upload files, images, and photos from any device — download files directly from the server. Changes tab shows git status with per-file `+additions`/`-deletions` line counts in color. Click a file to open a floating preview window with syntax highlighting, diff view, and auto-refresh every 5s. Pin the file browser to the sidebar — it follows the active tab's project directory automatically.
+Browse project files with a tree view. Upload files, images, and photos from any device — download files directly from the server. Changes tab shows git status with per-file `+additions`/`-deletions` line counts in color. Click a file to open a floating preview window with syntax highlighting, diff view, rendered HTML quick preview, and auto-refresh every 5s. Chat-rendered local file links get quick actions too: HTML files can open a safe rendered preview, and local image paths render inline thumbnails that expand in a floating lightbox. Pin the file browser to the sidebar — it follows the active tab's project directory automatically.
 
 ### Local Web Preview
 

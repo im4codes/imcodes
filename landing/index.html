@@ -340,7 +340,7 @@ footer {
     <div class="feat"><div class="feat-name" data-i18n="f_mcp_name">managed MCP tools</div><div class="feat-desc" data-i18n="f_mcp_desc">ten runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_auto_name">supervised execution</div><div class="feat-desc" data-i18n="f_auto_desc">turn-level completion checks, auto-continue, and optional audit→rework loops for transport-backed agents</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_remote_name">remote terminal</div><div class="feat-desc" data-i18n="f_remote_desc">browser & mobile, no SSH/VPN, real-time PTY streaming at 12fps</div></div>
-    <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser & git</div><div class="feat-desc" data-i18n="f_file_desc">tree view, upload/download, +/- stats, floating preview</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser & git</div><div class="feat-desc" data-i18n="f_file_desc">tree view, upload/download, +/- stats, safe HTML quick preview, inline image previews with lightbox zoom</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_preview_name">local web preview</div><div class="feat-desc" data-i18n="f_preview_desc">preview localhost from any device via secure tunnel, supports HMR</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_mobile_name">mobile, watch & notifications</div><div class="feat-desc" data-i18n="f_mobile_desc">biometric auth, push notifications, shell keyboard input, watch quick replies</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_discuss_name">cross-provider audit</div><div class="feat-desc" data-i18n="f_discuss_desc">multi-agent Team discussions with customizable phases (audit, review, brainstorm…) — different models catch different issues before code is written, reducing rework</div></div>
@@ -579,7 +579,7 @@ const I18N = {
     f_discuss_name: '跨模型审计', f_discuss_desc: '多 Agent 团队讨论，可自定义阶段（audit、review、brainstorm…）— 不同模型在写代码前交叉审查，减少单模型常漏掉的问题和返工',
     f_multi_name: '多服务器', f_multi_desc: '一个面板管理所有机器上的代理',
     f_sub_name: '子会话', f_sub_desc: '随时启动并行代理',
-    f_file_name: '文件浏览器', f_file_desc: '浏览、上传下载、Git 差异、浮动预览',
+    f_file_name: '文件浏览器', f_file_desc: '浏览、上传下载、Git 差异、HTML 快速预览、本地图片原地预览和悬浮放大',
     f_mobile_name: '移动端和通知', f_mobile_desc: '生物认证，代理需要注意时推送通知',
     f_ota_name: 'OTA 更新', f_ota_desc: '从 Web UI 升级守护进程',
     f_stream_name: '实时推流', f_stream_desc: '零轮询、零消息限制',
@@ -663,7 +663,7 @@ const I18N = {
     f_discuss_name: '跨模型稽核', f_discuss_desc: '多 Agent 團隊討論，可自訂階段（audit、review、brainstorm…）— 不同模型在寫程式前交叉審查，減少單一模型常漏掉的問題和返工',
     f_multi_name: '多伺服器', f_multi_desc: '一個面板管理所有機器上的代理',
     f_sub_name: '子會話', f_sub_desc: '隨時啟動並行代理',
-    f_file_name: '檔案瀏覽器', f_file_desc: '瀏覽、上傳下載、Git 差異、浮動預覽',
+    f_file_name: '檔案瀏覽器', f_file_desc: '瀏覽、上傳下載、Git 差異、HTML 快速預覽、本地圖片原地預覽和懸浮放大',
     f_mobile_name: '行動版和通知', f_mobile_desc: '生物辨識認證，代理需要關注時推播通知',
     f_ota_name: 'OTA 更新', f_ota_desc: '從 Web UI 升級守護程序',
     f_stream_name: '即時串流', f_stream_desc: '零輪詢、零訊息限制',
@@ -747,7 +747,7 @@ const I18N = {
     f_discuss_name: 'クロスモデル監査', f_discuss_desc: 'カスタマイズ可能なフェーズ（audit、review、brainstorm…）のマルチエージェント Team 議論 — 異なるモデルが実装前に交差レビューし、単一モデルが見落としがちな問題と手戻りを減らします',
     f_multi_name: 'マルチサーバー', f_multi_desc: '複数マシンのエージェントを一元管理',
     f_sub_name: 'サブセッション', f_sub_desc: '並列エージェントを即座に起動',
-    f_file_name: 'ファイルブラウザ', f_file_desc: '閲覧、アップロード/ダウンロード、Git差分、フローティングプレビュー',
+    f_file_name: 'ファイルブラウザ', f_file_desc: '閲覧、アップロード/ダウンロード、Git差分、安全なHTMLクイックプレビュー、ローカル画像のインラインプレビューと拡大表示',
     f_mobile_name: 'モバイル＆通知', f_mobile_desc: '生体認証、エージェントが注意を必要とする時にプッシュ通知',
     f_ota_name: 'OTAアップデート', f_ota_desc: 'Web UIからデーモンを更新',
     f_stream_name: 'リアルタイムストリーム', f_stream_desc: 'ポーリングなし、メッセージ制限なし',
@@ -831,7 +831,7 @@ const I18N = {
     f_discuss_name: '크로스 모델 감사', f_discuss_desc: '커스터마이징 가능한 페이즈(audit, review, brainstorm…)의 멀티 에이전트 Team 토론 — 서로 다른 모델이 코드 작성 전 교차 검토해 단일 모델이 자주 놓치는 문제와 재작업을 줄입니다',
     f_multi_name: '멀티 서버', f_multi_desc: '하나의 대시보드에서 모든 머신의 에이전트 관리',
     f_sub_name: '서브 세션', f_sub_desc: '병렬 에이전트 즉시 생성',
-    f_file_name: '파일 브라우저', f_file_desc: '탐색, 업로드/다운로드, Git 차이, 플로팅 미리보기',
+    f_file_name: '파일 브라우저', f_file_desc: '탐색, 업로드/다운로드, Git 차이, 안전한 HTML 빠른 미리보기, 로컬 이미지 인라인 미리보기와 확대',
     f_mobile_name: '모바일 & 알림', f_mobile_desc: '생체 인증, 에이전트가 주의를 필요로 할 때 푸시 알림',
     f_ota_name: 'OTA 업데이트', f_ota_desc: '웹 UI에서 데몬 업그레이드',
     f_stream_name: '실시간 스트림', f_stream_desc: '폴링 없음, 메시지 제한 없음',
@@ -915,7 +915,7 @@ const I18N = {
     f_discuss_name: 'auditoría cross-modelo', f_discuss_desc: 'discusiones Team multi-agente con fases personalizables (audit, review, brainstorm…) — distintos modelos detectan distintos problemas antes de escribir código, reduciendo retrabajo',
     f_multi_name: 'multi-servidor', f_multi_desc: 'gestiona agentes en todas las máquinas desde un panel',
     f_sub_name: 'sub-sesiones', f_sub_desc: 'lanza agentes paralelos al instante',
-    f_file_name: 'explorador de archivos', f_file_desc: 'explorar, subir/descargar, diffs de Git, vista previa flotante',
+    f_file_name: 'explorador de archivos', f_file_desc: 'explorar, subir/descargar, diffs de Git, vista previa HTML segura, imágenes locales en línea con zoom flotante',
     f_mobile_name: 'móvil, watch y notificaciones', f_mobile_desc: 'auth biométrica, push y respuestas rápidas desde el watch',
     f_ota_name: 'actualizaciones OTA', f_ota_desc: 'actualiza daemons desde la interfaz web',
     f_stream_name: 'stream en tiempo real', f_stream_desc: 'sin polling, sin límite de mensajes',
@@ -999,7 +999,7 @@ const I18N = {
     f_discuss_name: 'кросс-модельный аудит', f_discuss_desc: 'мульти-агентные Team обсуждения с настраиваемыми фазами (audit, review, brainstorm…) — разные модели перекрёстно проверяют до написания кода, сокращая переделки',
     f_multi_name: 'мульти-сервер', f_multi_desc: 'управление агентами на всех машинах с одной панели',
     f_sub_name: 'под-сессии', f_sub_desc: 'мгновенный запуск параллельных агентов',
-    f_file_name: 'файловый браузер', f_file_desc: 'просмотр, загрузка/скачивание, Git-диффы, плавающий превью',
+    f_file_name: 'файловый браузер', f_file_desc: 'просмотр, загрузка/скачивание, Git-диффы, безопасный HTML-превью, локальные изображения inline с увеличением',
     f_mobile_name: 'мобильная версия, Watch и уведомления', f_mobile_desc: 'биометрия, push-уведомления и быстрые ответы с Watch',
     f_ota_name: 'OTA-обновления', f_ota_desc: 'обновление демонов через веб-интерфейс',
     f_stream_name: 'стриминг в реальном времени', f_stream_desc: 'без опроса, без лимитов сообщений',

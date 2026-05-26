@@ -111,7 +111,7 @@ IM.codes puede conducir sesiones de agent compatibles turno a turno — un super
 Acceso completo al terminal de tus sesiones de agente desde cualquier navegador, sin SSH, VPN ni port forwarding. Puedes alternar entre modo terminal bruto y una vista de chat estructurada con tool calls, bloques de thinking y salida en streaming.
 
 ### Navegador de archivos y cambios Git
-Explora archivos del proyecto en árbol, sube y descarga archivos, revisa estado Git con conteo de líneas añadidas y eliminadas, y abre vistas previas flotantes con resaltado de sintaxis y diff.
+Explora archivos del proyecto en árbol, sube y descarga archivos, revisa estado Git con conteo de líneas añadidas y eliminadas, y abre vistas previas flotantes con resaltado de sintaxis, diff y vista previa HTML segura. Los enlaces locales en el chat también pueden mostrar imágenes en línea y ampliarlas en un lightbox flotante.
 
 ### Vista previa web local
 Previsualiza tu servidor de desarrollo local desde cualquier dispositivo sin desplegar nada. El daemon hace proxy del tráfico `localhost` a través de un túnel WebSocket seguro.

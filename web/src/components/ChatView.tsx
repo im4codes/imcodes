@@ -21,6 +21,7 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
+import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
 import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { isLikelyDomainPath, renderChatPathActions, type ChatPathDownloadHandler } from '../chat-path-actions.js';
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
@@ -113,6 +114,7 @@ interface AssistantBlockProps {
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
 }
 
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
@@ -1144,6 +1146,50 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     })
   ), [mapDownloadError, t, ws]);
 
+  const handleImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => (
+    new Promise((resolve, reject) => {
+      if (!ws || typeof ws.fsReadFile !== 'function' || typeof ws.onMessage !== 'function') {
+        reject(new Error(t('file_browser.preview_error')));
+        return;
+      }
+
+      let unsub: (() => void) | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const resolvedPath = resolvePreviewPath(path, workdir);
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        unsub?.();
+      };
+
+      try {
+        const reqId = ws.fsReadFile(resolvedPath);
+        timer = setTimeout(() => {
+          cleanup();
+          reject(new Error(t('upload.download_timeout')));
+        }, 30_000);
+        unsub = ws.onMessage((msg) => {
+          if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
+          cleanup();
+          if (msg.status === 'error') {
+            reject(new Error(t('file_browser.preview_error')));
+            return;
+          }
+          if (msg.encoding === 'base64' && typeof msg.mimeType === 'string' && msg.mimeType.startsWith('image/')) {
+            resolve({
+              dataUrl: `data:${msg.mimeType};base64,${msg.content ?? ''}`,
+              alt: resolvedPath.split(/[/\\]/).pop() || resolvedPath,
+            });
+            return;
+          }
+          reject(new Error(t('file_browser.preview_error')));
+        });
+      } catch (err) {
+        cleanup();
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    })
+  ), [t, workdir, ws]);
+
   const handleDownload = useCallback<ChatPathDownloadHandler>(async (path: string) => {
     if (!serverId) throw new Error(t('upload.daemon_offline'));
     let downloadId = await requestPathDownloadId(path);
@@ -1165,6 +1211,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
   const htmlPreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleHtmlPreview : undefined;
+  const imagePreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleImagePreview : undefined;
   const fileChangeOpenHandler = ws && !preview && onPreviewFile ? handleFileChangeOpen : undefined;
   const urlClickHandler = !preview ? handleUrlClick : undefined;
   const downloadHandler = serverId && ws ? handleDownload : undefined;
@@ -2059,19 +2106,20 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                   onUrlClick={urlClickHandler}
                   onDownload={downloadHandler}
                   onHtmlPreview={htmlPreviewHandler}
+                  onImagePreview={imagePreviewHandler}
                 />
               );
             }
             if (item.type === 'tool-group') {
-              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} serverId={serverId} />;
+              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} />;
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
@@ -2081,6 +2129,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                     onFileChangeOpen={fileChangeOpenHandler}
                     onDownload={downloadHandler}
                     onHtmlPreview={htmlPreviewHandler}
+                    onImagePreview={imagePreviewHandler}
                     serverId={serverId}
                     onResendFailed={onResendFailed}
                   />
@@ -2293,6 +2342,7 @@ function ToolCallGroup({
   onUrlClick,
   onDownload,
   onHtmlPreview,
+  onImagePreview,
   serverId,
 }: {
   events: TimelineEvent[];
@@ -2300,6 +2350,7 @@ function ToolCallGroup({
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
   serverId?: string;
 }) {
   const { t } = useTranslation();
@@ -2310,18 +2361,18 @@ function ToolCallGroup({
 
   return (
     <div class="chat-tool-group">
-      <ChatEvent event={first} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} serverId={serverId} />
+      <ChatEvent event={first} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} serverId={serverId} />
       <div class="chat-tool-group-indent">
         {middle.length > 0 && (
           expanded ? (
-            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} serverId={serverId} />)
+            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} serverId={serverId} />)
           ) : (
             <button class="chat-tool-fold-btn" onClick={() => setExpanded(true)}>
               {t('chat.tool_group_more', { count: middle.length })}
             </button>
           )
         )}
-        {last && <ChatEvent event={last} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} serverId={serverId} showTime />}
+        {last && <ChatEvent event={last} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} serverId={serverId} showTime />}
         {expanded && middle.length > 0 && (
           <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
             {t('chat.tool_group_collapse')}
@@ -2343,13 +2394,14 @@ const AssistantBlock = memo(function AssistantBlock({
   onUrlClick,
   onDownload,
   onHtmlPreview,
+  onImagePreview,
 }: AssistantBlockProps) {
   return (
     <div
       class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}`}
       data-event-id={eventId}
     >
-      <ChatMarkdown text={text} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} />
+      <ChatMarkdown text={text} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} />
       <ChatTime ts={ts} />
     </div>
   );
@@ -2437,6 +2489,7 @@ const ChatEvent = memo(function ChatEvent({
   onFileChangeOpen,
   onDownload,
   onHtmlPreview,
+  onImagePreview,
   serverId,
   onResendFailed,
   showTime,
@@ -2447,6 +2500,7 @@ const ChatEvent = memo(function ChatEvent({
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
   serverId?: string;
   onResendFailed?: (commandId: string, text: string) => void;
   showTime?: boolean;
@@ -2482,6 +2536,7 @@ const ChatEvent = memo(function ChatEvent({
               onUrlClick={onUrlClick}
               onDownload={onDownload}
               onHtmlPreview={onHtmlPreview}
+              onImagePreview={onImagePreview}
             />
           )}
           {isPending && (
@@ -2529,12 +2584,12 @@ const ChatEvent = memo(function ChatEvent({
           <div class="chat-event chat-tool">
             <span class="chat-tool-icon">{'>'}</span>
             <span class="chat-tool-name">{toolName}</span>
-            {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, onUrlClick, onDownload, onHtmlPreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>}
+            {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>}
             {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
           </div>
           {toolOutput && (
             <div class="chat-event chat-tool chat-tool-result-preview">
-              <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, onUrlClick, onDownload, onHtmlPreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
+              <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
             </div>
           )}
           <MergedToolDetailPanel toolName={toolName} callDetail={callDetail} resultDetail={resultDetail} />
@@ -2554,7 +2609,7 @@ const ChatEvent = memo(function ChatEvent({
             {error ? (
             <span class="chat-tool-error">{`error: ${String(error)}`}</span>
           ) : output ? (
-              <span class="chat-tool-output">{splitPathsAndUrls(output, onPathClick, onUrlClick, onDownload, onHtmlPreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
+              <span class="chat-tool-output">{splitPathsAndUrls(output, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
             ) : (
               <span class="chat-tool-output">done</span>
             )}
@@ -2984,12 +3039,14 @@ function UserMessageText({
   onUrlClick,
   onDownload,
   onHtmlPreview,
+  onImagePreview,
 }: {
   text: string;
   onPathClick?: (p: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
 }) {
   const { t } = useTranslation();
   const lineCount = countHardLines(text);
@@ -3000,7 +3057,7 @@ function UserMessageText({
   return (
     <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}`}>
       <div class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}`}>
-        {splitPathsAndUrls(text, onPathClick, onUrlClick, onDownload, onHtmlPreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}
+        {splitPathsAndUrls(text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}
       </div>
       {shouldFold && (
         <button
@@ -3037,10 +3094,11 @@ function splitPathsAndUrls(
   onUrlClick?: (url: string) => void,
   onDownload?: ChatPathDownloadHandler,
   onHtmlPreview?: (path: string) => void,
+  onImagePreview?: ChatLocalImagePreviewLoader,
   downloadLabel = '',
   htmlPreviewLabel = '',
 ): h.JSX.Element[] {
-  if (!onPathClick && !onUrlClick && !onDownload && !onHtmlPreview) return [<span>{text}</span>];
+  if (!onPathClick && !onUrlClick && !onDownload && !onHtmlPreview && !onImagePreview) return [<span>{text}</span>];
   if (shouldSkipRichTextEnhancement(text)) return [<span>{text}</span>];
 
   // Step 1: Split by URLs first (URLs take priority over path detection)
@@ -3067,7 +3125,7 @@ function splitPathsAndUrls(
           {chunk.value}
         </a>,
       );
-    } else if (onPathClick) {
+    } else if (onPathClick || onImagePreview) {
       // Apply path detection only on non-URL text
       let pathLast = 0;
       PATH_REGEX.lastIndex = 0;
@@ -3081,7 +3139,7 @@ function splitPathsAndUrls(
           key: `p${chunk.start + pm.index}`,
           path,
           labels: { download: downloadLabel, htmlPreview: htmlPreviewLabel },
-          handlers: { onPathClick, onDownload, onHtmlPreview },
+          handlers: { onPathClick, onDownload, onHtmlPreview, onImagePreview },
         }));
         pathLast = pm.index + pm[0].length;
       }

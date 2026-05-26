@@ -23,6 +23,7 @@ import { FileEditor, FileEditorContent } from './file-editor-lazy.js';
 const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
 import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
+import { ImageLightbox } from './ImageLightbox.js';
 import { downloadAttachment, getApiBaseUrl } from '../api.js';
 import {
   getSharedChangesKey,
@@ -1798,10 +1799,7 @@ export function FileBrowser({
   ) : null;
 
   const lightboxOverlay = lightbox ? (
-    <div class="fb-lightbox" onClick={() => setLightbox(null)}>
-      <img src={lightbox} onClick={(e) => e.stopPropagation()} />
-      <button class="fb-lightbox-close" onClick={() => setLightbox(null)}>✕</button>
-    </div>
+    <ImageLightbox src={lightbox} onClose={() => setLightbox(null)} />
   ) : null;
 
   if (layout === 'panel') {

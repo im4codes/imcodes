@@ -393,6 +393,57 @@ describe('ChatView', () => {
     expect(container.querySelector('.chat-html-preview-btn')).toBeNull();
   });
 
+  it('loads inline local image previews from resolved chat file paths', async () => {
+    const wsListeners = new Set<(msg: any) => void>();
+    const ws = {
+      fsReadFile: vi.fn(() => 'read-image-preview'),
+      onMessage: vi.fn((handler: (msg: any) => void) => {
+        wsListeners.add(handler);
+        return () => wsListeners.delete(handler);
+      }),
+    };
+    const events = [{
+      eventId: 'user-image-path',
+      type: 'user.message',
+      ts: Date.now(),
+      payload: { text: 'See ./screenshots/result.png' },
+    }];
+
+    const { container } = render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        sessionId="deck_image_preview"
+        ws={ws as any}
+        workdir="/repo"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./screenshots/result.png');
+    });
+
+    act(() => {
+      for (const listener of wsListeners) {
+        listener({
+          type: 'fs.read_response',
+          requestId: 'read-image-preview',
+          path: '/repo/./screenshots/result.png',
+          status: 'ok',
+          encoding: 'base64',
+          mimeType: 'image/png',
+          content: 'aW1n',
+        });
+      }
+    });
+
+    await waitFor(() => {
+      expect(container.querySelector('.chat-local-image-preview-img')).not.toBeNull();
+    });
+    const image = container.querySelector('.chat-local-image-preview-img') as HTMLImageElement;
+    expect(image.src).toBe('data:image/png;base64,aW1n');
+  });
+
   it('always hides thinking events from the timeline regardless of preference', () => {
     // Thinking events (both live and finished) are unconditionally hidden —
     // the agent's running state and memory-context card already give enough

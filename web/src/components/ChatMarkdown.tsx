@@ -16,11 +16,13 @@ import { splitTextByHttpUrls, trimDetectedUrl } from '../link-detection.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import { shouldSkipRichTextEnhancement } from '../chat-render-limits.js';
 import {
+  isImagePreviewPath,
   isLikelyDomainPath,
   isLocalChatPath,
   renderChatPathActions,
   type ChatPathDownloadHandler,
 } from '../chat-path-actions.js';
+import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
 
 interface Props {
   text: string;
@@ -29,6 +31,7 @@ interface Props {
   /** Called to download a file path. Only shown for paths with extensions. */
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
 }
 
 interface RenderContext {
@@ -36,6 +39,7 @@ interface RenderContext {
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
   downloadLabel: string;
   htmlPreviewLabel: string;
 }
@@ -49,6 +53,7 @@ function CodeBlock({
   onUrlClick,
   onDownload,
   onHtmlPreview,
+  onImagePreview,
   downloadLabel,
   htmlPreviewLabel,
 }: {
@@ -58,6 +63,7 @@ function CodeBlock({
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
   downloadLabel: string;
   htmlPreviewLabel: string;
 }) {
@@ -77,6 +83,7 @@ function CodeBlock({
     onUrlClick,
     onDownload,
     onHtmlPreview,
+    onImagePreview,
     downloadLabel,
     htmlPreviewLabel,
   };
@@ -185,7 +192,7 @@ function renderToken(
       }
       // Detect file paths inside backtick code spans — agents commonly wrap paths in backticks
       PATH_REGEX_INLINE.lastIndex = 0;
-      if (ctx.onPathClick && PATH_REGEX_INLINE.test(t.text)) {
+      if ((ctx.onPathClick || ctx.onImagePreview) && PATH_REGEX_INLINE.test(t.text)) {
         PATH_REGEX_INLINE.lastIndex = 0;
         return renderChatPathActions({
           key,
@@ -194,6 +201,7 @@ function renderToken(
           onPathClick: ctx.onPathClick,
           onDownload: ctx.onDownload,
           onHtmlPreview: ctx.onHtmlPreview,
+          onImagePreview: ctx.onImagePreview,
           downloadLabel: ctx.downloadLabel,
           htmlPreviewLabel: ctx.htmlPreviewLabel,
         });
@@ -212,6 +220,7 @@ function renderToken(
           onUrlClick={ctx.onUrlClick}
           onDownload={ctx.onDownload}
           onHtmlPreview={ctx.onHtmlPreview}
+          onImagePreview={ctx.onImagePreview}
           downloadLabel={ctx.downloadLabel}
           htmlPreviewLabel={ctx.htmlPreviewLabel}
         />
@@ -228,6 +237,7 @@ function renderToken(
           onPathClick: ctx.onPathClick,
           onDownload: ctx.onDownload,
           onHtmlPreview: ctx.onHtmlPreview,
+          onImagePreview: ctx.onImagePreview,
           downloadLabel: ctx.downloadLabel,
           htmlPreviewLabel: ctx.htmlPreviewLabel,
         });
@@ -279,6 +289,19 @@ function renderToken(
 
     case 'image': {
       const t = token as Tokens.Image;
+      if (isLocalChatPath(t.href) && isImagePreviewPath(t.href)) {
+        return renderChatPathActions({
+          key,
+          path: t.href,
+          content: t.text || t.href,
+          onPathClick: ctx.onPathClick,
+          onDownload: ctx.onDownload,
+          onHtmlPreview: ctx.onHtmlPreview,
+          onImagePreview: ctx.onImagePreview,
+          downloadLabel: ctx.downloadLabel,
+          htmlPreviewLabel: ctx.htmlPreviewLabel,
+        });
+      }
       return <img key={key} src={t.href} alt={t.text} title={t.title ?? undefined} style={{ maxWidth: '100%' }} />;
     }
 
@@ -364,7 +387,7 @@ function splitPathsAndUrlsInternal(
   text: string,
   ctx: RenderContext,
 ): h.JSX.Element[] {
-  if (!ctx.onPathClick && !ctx.onUrlClick) return [<span>{text}</span>];
+  if (!ctx.onPathClick && !ctx.onUrlClick && !ctx.onImagePreview) return [<span>{text}</span>];
 
   const parts: h.JSX.Element[] = [];
   const chunks = splitTextByHttpUrls(text);
@@ -388,7 +411,7 @@ function splitPathsAndUrlsInternal(
           {chunk.value}
         </a>,
       );
-    } else if (ctx.onPathClick) {
+    } else if (ctx.onPathClick || ctx.onImagePreview) {
       let pathLast = 0;
       PATH_REGEX_INLINE.lastIndex = 0;
       let pm: RegExpExecArray | null;
@@ -404,6 +427,7 @@ function splitPathsAndUrlsInternal(
             onPathClick: ctx.onPathClick,
             onDownload: ctx.onDownload,
             onHtmlPreview: ctx.onHtmlPreview,
+            onImagePreview: ctx.onImagePreview,
             downloadLabel: ctx.downloadLabel,
             htmlPreviewLabel: ctx.htmlPreviewLabel,
           }),
@@ -421,7 +445,7 @@ function splitPathsAndUrlsInternal(
 
 // ── Public component ────────────────────────────────────────────────────────
 
-export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload, onHtmlPreview }: Props) {
+export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview }: Props) {
   const { t } = useTranslation();
   const skipRichTextEnhancement = shouldSkipRichTextEnhancement(text);
   const tokens = useMemo(() => (
@@ -432,9 +456,10 @@ export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload, onHtml
     onUrlClick,
     onDownload,
     onHtmlPreview,
+    onImagePreview,
     downloadLabel: t('upload.download_file'),
     htmlPreviewLabel: t('chat.html_preview', 'Render HTML'),
-  }), [onPathClick, onUrlClick, onDownload, onHtmlPreview, t]);
+  }), [onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t]);
 
   if (skipRichTextEnhancement) {
     return (

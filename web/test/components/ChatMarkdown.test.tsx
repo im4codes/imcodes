@@ -238,6 +238,50 @@ describe('ChatMarkdown', () => {
     expect(withoutCallback.container.querySelector('.chat-html-preview-btn')).toBeNull();
   });
 
+  it('renders local image paths inline and reuses the shared lightbox zoom', async () => {
+    const onImagePreview = vi.fn().mockResolvedValue({
+      dataUrl: 'data:image/png;base64,aW1n',
+      alt: 'result.png',
+    });
+    const { container } = render(
+      <ChatMarkdown
+        text="Open ./screenshots/result.png"
+        onPathClick={() => {}}
+        onImagePreview={onImagePreview}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('.chat-local-image-preview-img')).not.toBeNull();
+    });
+    expect(onImagePreview).toHaveBeenCalledWith('./screenshots/result.png');
+
+    const image = container.querySelector('.chat-local-image-preview-img') as HTMLImageElement;
+    expect(image.src).toBe('data:image/png;base64,aW1n');
+
+    fireEvent.click(image);
+    expect(container.querySelector('.fb-lightbox')).not.toBeNull();
+    fireEvent.click(container.querySelector('.fb-lightbox-close') as HTMLButtonElement);
+    expect(container.querySelector('.fb-lightbox')).toBeNull();
+  });
+
+  it('renders local markdown image links through the same inline preview path', async () => {
+    const onImagePreview = vi.fn().mockResolvedValue('data:image/webp;base64,d2VicA==');
+    const { container } = render(
+      <ChatMarkdown
+        text="![rendered preview](./out/page.webp)"
+        onPathClick={() => {}}
+        onImagePreview={onImagePreview}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('.chat-local-image-preview-img')).not.toBeNull();
+    });
+    expect(container.querySelector('.chat-path-link')?.textContent).toBe('rendered preview');
+    expect(onImagePreview).toHaveBeenCalledWith('./out/page.webp');
+  });
+
   it('does not detect paths inside URLs', () => {
     const { container } = render(
       <ChatMarkdown 
