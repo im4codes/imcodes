@@ -1,19 +1,44 @@
 import { defineConfig } from 'vite';
 import preact from '@preact/preset-vite';
 import path from 'path';
+import { createHash } from 'node:crypto';
 
 // VITE_REGION selects the regional push channel at compile time:
 //   - 'global' (default) — FCM on Android via @capacitor/push-notifications
 //   - 'china'             — 极光推送 JPush on Android via our custom plugin
 // On iOS the value is ignored (APNs is used regardless).
 const pushRegion = process.env.VITE_REGION === 'china' ? 'china' : 'global';
+const buildTime = process.env.BUILD_TIME ?? new Date().toISOString();
+const webBuildId = process.env.WEB_BUILD_ID
+  ?? createHash('sha256')
+    .update(`${process.env.npm_package_version ?? '0.0.0'}|${buildTime}|${pushRegion}`)
+    .digest('hex')
+    .slice(0, 12);
 
 export default defineConfig({
   define: {
-    __BUILD_TIME__: JSON.stringify(process.env.BUILD_TIME ?? new Date().toISOString()),
+    __BUILD_TIME__: JSON.stringify(buildTime),
+    __WEB_BUILD_ID__: JSON.stringify(webBuildId),
     __PUSH_REGION__: JSON.stringify(pushRegion),
   },
-  plugins: [preact()],
+  plugins: [
+    preact(),
+    {
+      name: 'imcodes-app-build-manifest',
+      generateBundle() {
+        this.emitFile({
+          type: 'asset',
+          fileName: 'app-build.json',
+          source: `${JSON.stringify({
+            buildId: webBuildId,
+            builtAt: buildTime,
+            packageVersion: process.env.npm_package_version ?? null,
+            pushRegion,
+          }, null, 2)}\n`,
+        });
+      },
+    },
+  ],
   resolve: {
     alias: {
       '@shared': path.resolve(__dirname, '../shared'),

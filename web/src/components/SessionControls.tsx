@@ -136,6 +136,8 @@ interface Props {
   onOverlayOpenChange?: (open: boolean) => void;
   /** Optional local optimistic update when transport config changes through quick controls. */
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
+  /** Gate version-sensitive panels when the loaded frontend is stale. */
+  onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
 }
 
 const MAX_UPLOAD_SIZE_MB = Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024));
@@ -605,7 +607,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -1525,9 +1527,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [openSpecChangesPath]);
 
   const openP2pConfigPanel = useCallback((tab: P2pConfigTab = 'participants') => {
-    setP2pConfigInitialTab(tab);
-    setP2pConfigOpen(true);
-  }, []);
+    const open = () => {
+      setP2pConfigInitialTab(tab);
+      setP2pConfigOpen(true);
+    };
+    if (onVersionSensitiveAction) onVersionSensitiveAction(t('p2p.settings_title', 'Team settings'), open);
+    else open();
+  }, [onVersionSensitiveAction, t]);
 
   const refreshOpenSpecChanges = useCallback(() => {
     clearOpenSpecRequestTimer();

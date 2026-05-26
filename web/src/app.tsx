@@ -151,9 +151,19 @@ import { isImeComposingKeyEvent } from './ime-keyboard.js';
 import { markServerDaemonActivity, markServerOffline, touchServerHeartbeat } from './server-online-state.js';
 import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
 import { markSessionRunningIfNeeded } from './session-state-updates.js';
+import {
+  APP_UPDATE_REQUIRED_EVENT,
+  fetchCurrentAppBuildInfo,
+  getLoadedWebBuildId,
+  isAppBuildMismatch,
+  isChunkLoadFailure,
+  lazyImportWithAppUpdateNotice,
+  type AppUpdateReason,
+  type AppUpdateRequiredDetail,
+} from './app-update.js';
 
-const DashboardPage = lazy(() => import('./pages/DashboardPage.js').then((m) => ({ default: m.DashboardPage })));
-const DiscussionsPage = lazy(() => import('./pages/DiscussionsPage.js').then((m) => ({ default: m.DiscussionsPage })));
+const DashboardPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DashboardPage.js')).then((m) => ({ default: m.DashboardPage })));
+const DiscussionsPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DiscussionsPage.js')).then((m) => ({ default: m.DiscussionsPage })));
 
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
@@ -173,6 +183,16 @@ type AppToast = {
   openRepoLatest?: boolean;
   failedJobName?: string;
   failedStepName?: string;
+};
+
+type AppUpdateNotice = {
+  required: boolean;
+  blocking: boolean;
+  reason: AppUpdateReason;
+  currentBuildId?: string;
+  loadedBuildId: string;
+  featureLabel?: string;
+  dismissed?: boolean;
 };
 
 export function isTextEntryElement(el: HTMLElement | null): boolean {
@@ -892,11 +912,110 @@ export function App() {
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
   const [idleFlashTokens, setIdleFlashTokens] = useState<Map<string, number>>(() => new Map());
   const [toasts, setToasts] = useState<AppToast[]>([]);
+  const loadedWebBuildId = useMemo(() => getLoadedWebBuildId(), []);
+  const [appUpdateNotice, setAppUpdateNotice] = useState<AppUpdateNotice | null>(null);
+  const appUpdateRequiredRef = useRef(false);
+  const markAppUpdateRequired = useCallback((detail: AppUpdateRequiredDetail) => {
+    appUpdateRequiredRef.current = true;
+    setAppUpdateNotice((prev) => ({
+      required: true,
+      blocking: Boolean(detail.blocking) || prev?.blocking === true,
+      reason: detail.reason,
+      currentBuildId: detail.currentBuildId ?? prev?.currentBuildId,
+      loadedBuildId: detail.loadedBuildId ?? prev?.loadedBuildId ?? loadedWebBuildId,
+      featureLabel: detail.featureLabel ?? prev?.featureLabel,
+      dismissed: detail.blocking ? false : prev?.dismissed,
+    }));
+  }, [loadedWebBuildId]);
+  const checkForAppUpdate = useCallback(async (options?: { blocking?: boolean; featureLabel?: string }) => {
+    const current = await fetchCurrentAppBuildInfo();
+    if (!current || !isAppBuildMismatch(loadedWebBuildId, current.buildId)) return false;
+    markAppUpdateRequired({
+      reason: 'build_mismatch',
+      currentBuildId: current.buildId,
+      loadedBuildId: loadedWebBuildId,
+      blocking: options?.blocking,
+      featureLabel: options?.featureLabel,
+    });
+    return true;
+  }, [loadedWebBuildId, markAppUpdateRequired]);
+  const showAppUpdateBlocker = useCallback((featureLabel?: string, reason: AppUpdateReason = 'version_sensitive_feature') => {
+    markAppUpdateRequired({
+      reason,
+      loadedBuildId: loadedWebBuildId,
+      blocking: true,
+      featureLabel,
+    });
+  }, [loadedWebBuildId, markAppUpdateRequired]);
+  const runVersionSensitiveAction = useCallback((featureLabel: string, action: () => void) => {
+    if (appUpdateRequiredRef.current) {
+      showAppUpdateBlocker(featureLabel);
+      return;
+    }
+    void checkForAppUpdate({ blocking: true, featureLabel }).then((blocked) => {
+      if (!blocked) action();
+    });
+  }, [checkForAppUpdate, showAppUpdateBlocker]);
+  const reloadForAppUpdate = useCallback(() => {
+    try {
+      sessionStorage.setItem('imcodes:reload-intent', JSON.stringify({
+        serverId: selectedServerId,
+        session: activeSession,
+        featureLabel: appUpdateNotice?.featureLabel,
+        at: Date.now(),
+      }));
+    } catch { /* ignore */ }
+    window.location.reload();
+  }, [activeSession, appUpdateNotice?.featureLabel, selectedServerId]);
   const showSuccessToast = useCallback((title: string) => {
     const id = Date.now() + Math.random();
     setToasts((prev) => [...prev, { id, kind: 'success', title }]);
     setTimeout(() => setToasts((prev) => prev.filter((toast) => toast.id !== id)), 4000);
   }, []);
+  useEffect(() => {
+    void checkForAppUpdate();
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') void checkForAppUpdate();
+    };
+    const handleFocus = () => { void checkForAppUpdate(); };
+    const handleUpdateRequired = (event: Event) => {
+      markAppUpdateRequired((event as CustomEvent<AppUpdateRequiredDetail>).detail ?? {
+        reason: 'chunk_load_failed',
+        loadedBuildId: loadedWebBuildId,
+        blocking: true,
+      });
+    };
+    const handleError = (event: ErrorEvent) => {
+      if (isChunkLoadFailure(event.error ?? event.message)) {
+        markAppUpdateRequired({
+          reason: 'chunk_load_failed',
+          loadedBuildId: loadedWebBuildId,
+          blocking: true,
+        });
+      }
+    };
+    const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
+      if (isChunkLoadFailure(event.reason)) {
+        markAppUpdateRequired({
+          reason: 'chunk_load_failed',
+          loadedBuildId: loadedWebBuildId,
+          blocking: true,
+        });
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener(APP_UPDATE_REQUIRED_EVENT, handleUpdateRequired);
+    window.addEventListener('error', handleError);
+    window.addEventListener('unhandledrejection', handleUnhandledRejection);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener(APP_UPDATE_REQUIRED_EVENT, handleUpdateRequired);
+      window.removeEventListener('error', handleError);
+      window.removeEventListener('unhandledrejection', handleUnhandledRejection);
+    };
+  }, [checkForAppUpdate, loadedWebBuildId, markAppUpdateRequired]);
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
   const detectedModelsRef = useRef<Map<string, string>>(new Map());
   const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string }>>(new Map());
@@ -1782,15 +1901,17 @@ export function App() {
   }, [setPinnedPanels]);
 
   const handlePreviewFileRequest = useCallback((request: FileBrowserPreviewRequest) => {
-    const cached = previewFileCache[request.path];
-    const previewViewMode = normalizePreviewViewMode(request.previewViewMode ?? cached?.previewViewMode);
-    setPreviewFileRequest({
-      ...request,
-      preview: request.preview ?? cached?.preview,
-      preferDiff: previewViewMode === 'diff' ? (request.preferDiff ?? cached?.preferDiff) : false,
-      previewViewMode,
+    runVersionSensitiveAction(trans('picker.files'), () => {
+      const cached = previewFileCache[request.path];
+      const previewViewMode = normalizePreviewViewMode(request.previewViewMode ?? cached?.previewViewMode);
+      setPreviewFileRequest({
+        ...request,
+        preview: request.preview ?? cached?.preview,
+        preferDiff: previewViewMode === 'diff' ? (request.preferDiff ?? cached?.preferDiff) : false,
+        previewViewMode,
+      });
     });
-  }, [previewFileCache]);
+  }, [previewFileCache, runVersionSensitiveAction, trans]);
 
   const handlePreviewStateChange = useCallback((update: FileBrowserPreviewUpdate) => {
     setPreviewFileCache((prev) => updateFilePreviewCache(prev, update));
@@ -1799,28 +1920,39 @@ export function App() {
 
   /** Generic unpin: remove from pinnedPanels + reopen the source floating window. */
   const unpinPanel = useCallback((panel: PinnedPanel) => {
-    setPinnedPanels((prev) => prev.filter((p) => p.id !== panel.id));
+    const removePanel = () => setPinnedPanels((prev) => prev.filter((p) => p.id !== panel.id));
     // Reopen source window based on type
     if (panel.type === 'filebrowser' || panel.type === 'repo') {
-      setShowDesktopFileBrowser(true);
+      runVersionSensitiveAction(trans('picker.files'), () => {
+        removePanel();
+        setShowDesktopFileBrowser(true);
+      });
     } else if (panel.type === 'repopage') {
       const projectDir = typeof panel.props?.projectDir === 'string' ? panel.props.projectDir : undefined;
       const sessionId = typeof panel.props?.sessionName === 'string' ? panel.props.sessionName : activeSession ?? null;
       if (projectDir) {
-        repoPanelOpenTokenRef.current += 1;
-        setRepoPanelTarget({
-          sessionId,
-          projectDir,
-          initialTabToken: repoPanelOpenTokenRef.current,
+        runVersionSensitiveAction(trans('repo.info_title', { defaultValue: 'Repository information' }), () => {
+          removePanel();
+          repoPanelOpenTokenRef.current += 1;
+          setRepoPanelTarget({
+            sessionId,
+            projectDir,
+            initialTabToken: repoPanelOpenTokenRef.current,
+          });
+          setShowRepoPage(true);
         });
       }
-      setShowRepoPage(true);
     } else if (panel.type === 'cronmanager') {
-      setShowCronManager(true);
+      runVersionSensitiveAction(trans('cron.title'), () => {
+        removePanel();
+        setShowCronManager(true);
+      });
     } else if (panel.type === SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE) {
+      removePanel();
       setSharedContextManagementProps(panel.props);
       setShowSharedContextManagement(true);
     } else if (panel.type === SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE) {
+      removePanel();
       setSharedContextDiagnosticsProps({
         enterpriseId: typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined,
         canonicalRepoId: typeof panel.props?.canonicalRepoId === 'string' ? panel.props.canonicalRepoId : undefined,
@@ -1831,17 +1963,19 @@ export function App() {
       });
       setShowSharedContextDiagnostics(true);
     } else if (panel.type === LOCAL_WEB_PREVIEW_PANEL_TYPE) {
+      removePanel();
       setLocalWebPreviewPort(String(panel.props?.port ?? ''));
       setLocalWebPreviewPath(String(panel.props?.path ?? '/'));
       setShowDesktopLocalWebPreview(true);
     } else if (panel.type === 'subsession') {
+      removePanel();
       const sub = subSessions.find((s) => s.sessionName === (panel.props?.sessionName as string));
       if (sub) {
         setOpenSubIds((prev) => new Set([...prev, sub.id]));
         bringSubToFront(sub.id);
       }
     }
-  }, [activeSession, setPinnedPanels, subSessions, bringSubToFront]);
+  }, [activeSession, bringSubToFront, runVersionSensitiveAction, setPinnedPanels, subSessions, trans]);
 
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   isMobileRef.current = isMobile;
@@ -1910,6 +2044,7 @@ export function App() {
         if (msg.event === 'connected') {
           setConnected(true);
           setConnecting(false);
+          void checkForAppUpdate();
           if (msg.reason === 'probe_recovered') return;
           ws.requestSessionList();
           // Migrate to scoped p2p list. The active session is captured via the
@@ -2443,6 +2578,7 @@ export function App() {
         }, RECONNECT_GRACE_MS);
       }
       if (msg.type === MSG_DAEMON_ONLINE || msg.type === DAEMON_MSG.RECONNECTED) {
+        void checkForAppUpdate();
         if (daemonOfflineGraceTimerRef.current) {
           clearTimeout(daemonOfflineGraceTimerRef.current);
           daemonOfflineGraceTimerRef.current = null;
@@ -2528,6 +2664,7 @@ export function App() {
         }
       }
       if (msg.type === DAEMON_MSG.RECONNECTED) {
+        void checkForAppUpdate();
         // Daemon came back within (or after) the grace window — cancel any
         // pending "flip to offline" so the badge never flashes red for a
         // reconnect that actually succeeded.
@@ -3066,12 +3203,17 @@ export function App() {
 
     const discussionHandler = (e: Event) => {
       const { fileId } = (e as CustomEvent).detail ?? {};
-      if (fileId) { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }
+      if (fileId) {
+        runVersionSensitiveAction(trans('p2p.discussions.title'), () => {
+          setDiscussionInitialId(fileId);
+          setShowDiscussionsPage(true);
+        });
+      }
     };
     window.addEventListener('deck:view-discussion', discussionHandler);
 
     return () => { window.removeEventListener('deck:navigate', handler); window.removeEventListener('deck:view-discussion', discussionHandler); };
-  }, [handleSelectServer, navigateToSession]);
+  }, [handleSelectServer, navigateToSession, runVersionSensitiveAction, trans]);
 
   const handleBackToDashboard = useCallback(() => {
     autoEntryRunRef.current++;
@@ -3158,45 +3300,47 @@ export function App() {
   }, [activeSessionInfo?.projectDir, sessions, subSessions]);
 
   const openRepoPage = useCallback((target?: { sessionId?: string | null; projectDir?: string | null; initialTab?: RepoPageTabKey; parentSubId?: string | null }) => {
-    const sessionId = target?.sessionId ?? activeSession ?? null;
-    const projectDir = target?.projectDir ?? resolveRepoProjectDir(sessionId);
-    if (!projectDir) return;
-    const subSessionTarget = sessionId ? subSessions.find((sub) => sub.sessionName === sessionId) : null;
-    const parentSubId = target?.parentSubId ?? subSessionTarget?.id ?? null;
-    const parentServerId = subSessionTarget?.serverId ?? selectedServerId ?? null;
-    const previousWindowId = getRepoDesktopWindowId(repoPanelTarget?.parentSubId);
-    const nextWindowId = getRepoDesktopWindowId(parentSubId);
-    if (previousWindowId !== nextWindowId) {
-      removeDesktopWindow(previousWindowId);
-    }
-    if (parentSubId) {
-      const parentId = DESKTOP_WINDOW_IDS.subSession(parentSubId);
-      ensureDesktopWindow(parentId, {
-        kind: DESKTOP_WINDOW_KINDS.subSession,
-        subId: parentSubId,
+    runVersionSensitiveAction(trans('repo.info_title', { defaultValue: 'Repository information' }), () => {
+      const sessionId = target?.sessionId ?? activeSession ?? null;
+      const projectDir = target?.projectDir ?? resolveRepoProjectDir(sessionId);
+      if (!projectDir) return;
+      const subSessionTarget = sessionId ? subSessions.find((sub) => sub.sessionName === sessionId) : null;
+      const parentSubId = target?.parentSubId ?? subSessionTarget?.id ?? null;
+      const parentServerId = subSessionTarget?.serverId ?? selectedServerId ?? null;
+      const previousWindowId = getRepoDesktopWindowId(repoPanelTarget?.parentSubId);
+      const nextWindowId = getRepoDesktopWindowId(parentSubId);
+      if (previousWindowId !== nextWindowId) {
+        removeDesktopWindow(previousWindowId);
+      }
+      if (parentSubId) {
+        const parentId = DESKTOP_WINDOW_IDS.subSession(parentSubId);
+        ensureDesktopWindow(parentId, {
+          kind: DESKTOP_WINDOW_KINDS.subSession,
+          subId: parentSubId,
+          serverId: parentServerId ?? undefined,
+        });
+      }
+      ensureDesktopWindow(nextWindowId, {
+        kind: parentSubId ? DESKTOP_WINDOW_KINDS.subsessionRepo : DESKTOP_WINDOW_KINDS.repo,
+        parentId: parentSubId ? DESKTOP_WINDOW_IDS.subSession(parentSubId) : undefined,
+        subId: parentSubId ?? undefined,
         serverId: parentServerId ?? undefined,
+      }, { bringToFront: true });
+      repoPanelOpenTokenRef.current += 1;
+      setRepoPanelTarget({
+        sessionId,
+        projectDir,
+        ...(target?.initialTab ? { initialTab: target.initialTab } : {}),
+        initialTabToken: repoPanelOpenTokenRef.current,
+        parentSubId,
+        parentServerId,
       });
-    }
-    ensureDesktopWindow(nextWindowId, {
-      kind: parentSubId ? DESKTOP_WINDOW_KINDS.subsessionRepo : DESKTOP_WINDOW_KINDS.repo,
-      parentId: parentSubId ? DESKTOP_WINDOW_IDS.subSession(parentSubId) : undefined,
-      subId: parentSubId ?? undefined,
-      serverId: parentServerId ?? undefined,
-    }, { bringToFront: true });
-    repoPanelOpenTokenRef.current += 1;
-    setRepoPanelTarget({
-      sessionId,
-      projectDir,
-      ...(target?.initialTab ? { initialTab: target.initialTab } : {}),
-      initialTabToken: repoPanelOpenTokenRef.current,
-      parentSubId,
-      parentServerId,
+      if (target?.initialTab !== 'actions') {
+        setRepoFocusLatestAction(null);
+      }
+      setShowRepoPage(true);
     });
-    if (target?.initialTab !== 'actions') {
-      setRepoFocusLatestAction(null);
-    }
-    setShowRepoPage(true);
-  }, [activeSession, ensureDesktopWindow, removeDesktopWindow, repoPanelTarget?.parentSubId, resolveRepoProjectDir, selectedServerId, subSessions]);
+  }, [activeSession, ensureDesktopWindow, removeDesktopWindow, repoPanelTarget?.parentSubId, resolveRepoProjectDir, runVersionSensitiveAction, selectedServerId, subSessions, trans]);
 
   const repoPanelSessionId = repoPanelTarget?.sessionId ?? activeSession ?? null;
   const repoPanelProjectDir = repoPanelTarget?.projectDir ?? activeSessionInfo?.projectDir;
@@ -3550,7 +3694,7 @@ export function App() {
                 activeRoundHop={d.activeRoundHop}
                 status={d.state}
                 modeKey={d.modeKey}
-                onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); }}
+                onClick={() => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); })}
               />
             ))}
 
@@ -3740,7 +3884,15 @@ export function App() {
               </div>
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                 {activeSession && (
-                  <button class="view-toggle" title="Files" onClick={() => setShowMobileFileBrowser((o) => !o)} style={{ position: 'relative' }}>
+                  <button
+                    class="view-toggle"
+                    title="Files"
+                    onClick={() => {
+                      if (showMobileFileBrowser) setShowMobileFileBrowser(false);
+                      else runVersionSensitiveAction(trans('picker.files'), () => setShowMobileFileBrowser(true));
+                    }}
+                    style={{ position: 'relative' }}
+                  >
                     📁
                     {gitChangesCount > 0 && <span class="file-badge">{gitChangesCount}</span>}
                   </button>
@@ -3811,7 +3963,15 @@ export function App() {
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
             {!isMobile && resolvedActiveSessionExists && (
               <div class="desktop-view-toggle">
-                <button class="view-toggle" title={trans('picker.files')} onClick={() => setShowDesktopFileBrowser(o => !o)} style={{ position: 'relative' }}>
+                <button
+                  class="view-toggle"
+                  title={trans('picker.files')}
+                  onClick={() => {
+                    if (showDesktopFileBrowser) setShowDesktopFileBrowser(false);
+                    else runVersionSensitiveAction(trans('picker.files'), () => setShowDesktopFileBrowser(true));
+                  }}
+                  style={{ position: 'relative' }}
+                >
                   📁
                   {gitChangesCount > 0 && <span class="file-badge">{gitChangesCount}</span>}
                 </button>
@@ -3882,6 +4042,7 @@ export function App() {
                   delete next[s.name];
                   return next;
                 })}
+                onVersionSensitiveAction={runVersionSensitiveAction}
               />
               </ErrorBoundary>
             ))}
@@ -4000,8 +4161,8 @@ export function App() {
                 onRestoreThenClose={minimizeSubSessionWindow}
                 onRestart={restartSubSession}
                 onNew={() => setShowSubDialog(true)}
-                onViewDiscussions={() => { setDiscussionInitialId(null); setShowDiscussionsPage(true); }}
-                onViewDiscussion={(fileId) => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }}
+                onViewDiscussions={() => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(null); setShowDiscussionsPage(true); })}
+                onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); })}
                 discussions={discussions.filter((d) => isP2pDiscussionVisibleInSubSessionBar(d, {
                   activeSession,
                   activeRootSession,
@@ -4029,7 +4190,7 @@ export function App() {
                 onHistory={registerHistoryApplyer}
                 serverId={selectedServerId}
                 onViewRepo={() => openRepoPage()}
-                onViewCron={() => setShowCronManager(true)}
+                onViewCron={() => runVersionSensitiveAction(trans('cron.title'), () => setShowCronManager(true))}
                 subUsages={subUsages}
                 detectedModels={detectedModels}
                 focusedSubId={focusedSubId}
@@ -4147,7 +4308,7 @@ export function App() {
                   activeRoundHop={d.activeRoundHop}
                   status={d.state}
                   modeKey={d.modeKey}
-                  onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); closeSidebar(); }}
+                  onClick={() => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); closeSidebar(); })}
                 />
               ))}
               {/* Pinned panels — same as desktop sidebar */}
@@ -4388,7 +4549,7 @@ export function App() {
                 window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: sessionName, quote } }));
               }}
               onBack={() => setShowCronManager(false)}
-              onViewDiscussion={(fileId) => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }}
+              onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); })}
               servers={servers.map(s => ({ id: s.id, name: s.name }))}
             />
           </FloatingPanel>
@@ -4570,17 +4731,19 @@ export function App() {
               onFocus={() => bringSubToFront(sub.id)}
               desktopFileBrowserZIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id), getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000) + 1)}
               onDesktopFileBrowserOpen={() => {
-                ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(sub.id), {
-                  kind: DESKTOP_WINDOW_KINDS.subSession,
-                  subId: sub.id,
-                  serverId: sub.serverId ?? selectedServerId ?? undefined,
+                runVersionSensitiveAction(trans('picker.files'), () => {
+                  ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(sub.id), {
+                    kind: DESKTOP_WINDOW_KINDS.subSession,
+                    subId: sub.id,
+                    serverId: sub.serverId ?? selectedServerId ?? undefined,
+                  });
+                  ensureDesktopWindow(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id), {
+                    kind: DESKTOP_WINDOW_KINDS.subsessionFileBrowser,
+                    parentId: DESKTOP_WINDOW_IDS.subSession(sub.id),
+                    subId: sub.id,
+                    serverId: sub.serverId ?? selectedServerId ?? undefined,
+                  }, { bringToFront: true });
                 });
-                ensureDesktopWindow(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id), {
-                  kind: DESKTOP_WINDOW_KINDS.subsessionFileBrowser,
-                  parentId: DESKTOP_WINDOW_IDS.subSession(sub.id),
-                  subId: sub.id,
-                  serverId: sub.serverId ?? selectedServerId ?? undefined,
-                }, { bringToFront: true });
               }}
               onDesktopFileBrowserFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
               onDesktopFileBrowserClose={() => removeDesktopWindow(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
@@ -4598,6 +4761,7 @@ export function App() {
                 delete next[sub.sessionName];
                 return next;
               })}
+              onVersionSensitiveAction={runVersionSensitiveAction}
             />
           </div>
         );
@@ -4710,6 +4874,98 @@ export function App() {
             }
           }}
         />
+      )}
+
+      {appUpdateNotice?.required && !appUpdateNotice.blocking && !appUpdateNotice.dismissed && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            position: 'fixed',
+            right: 16,
+            bottom: 16,
+            zIndex: 10050,
+            width: 'min(360px, calc(100vw - 32px))',
+            background: '#0f172a',
+            border: '1px solid #38bdf8',
+            borderRadius: 10,
+            boxShadow: '0 18px 42px rgba(0,0,0,0.45)',
+            padding: 14,
+            color: '#e2e8f0',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 10,
+          }}
+        >
+          <div style={{ fontSize: 13, fontWeight: 700 }}>{trans('appUpdate.banner_title', { defaultValue: 'IM.codes has been updated' })}</div>
+          <div style={{ fontSize: 12, color: '#94a3b8', lineHeight: 1.45 }}>
+            {trans('appUpdate.banner_body', { defaultValue: 'Refresh to use the latest version. Your sessions will stay available.' })}
+          </div>
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <button class="btn btn-secondary" style={{ fontSize: 12, padding: '4px 10px' }} onClick={() => setAppUpdateNotice((prev) => prev ? { ...prev, dismissed: true } : prev)}>
+              {trans('appUpdate.later', { defaultValue: 'Later' })}
+            </button>
+            <button class="btn btn-primary" style={{ fontSize: 12, padding: '4px 10px' }} onClick={reloadForAppUpdate}>
+              {trans('appUpdate.refresh', { defaultValue: 'Refresh' })}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {appUpdateNotice?.required && appUpdateNotice.blocking && (
+        <div
+          role="alertdialog"
+          aria-modal="true"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 10060,
+            background: 'rgba(2, 6, 23, 0.72)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 20,
+          }}
+        >
+          <div
+            style={{
+              width: 'min(460px, 100%)',
+              background: '#111827',
+              border: '1px solid #38bdf8',
+              borderRadius: 12,
+              boxShadow: '0 24px 60px rgba(0,0,0,0.55)',
+              padding: 20,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 14,
+              color: '#e2e8f0',
+            }}
+          >
+            <div style={{ fontSize: 16, fontWeight: 800 }}>
+              {appUpdateNotice.reason === 'chunk_load_failed'
+                ? trans('appUpdate.chunk_title', { defaultValue: 'Refresh required' })
+                : trans('appUpdate.blocking_title', { defaultValue: 'Refresh before continuing' })}
+            </div>
+            <div style={{ fontSize: 13, color: '#cbd5e1', lineHeight: 1.55 }}>
+              {appUpdateNotice.reason === 'chunk_load_failed'
+                ? trans('appUpdate.chunk_body', { defaultValue: 'This page is running an older frontend and could not load a required app file. Refresh to recover cleanly.' })
+                : trans('appUpdate.blocking_body', {
+                  defaultValue: '{{feature}} needs the latest frontend after the backend update. Refresh to continue without the panel getting stuck.',
+                  feature: appUpdateNotice.featureLabel ?? trans('common.this_feature', { defaultValue: 'This feature' }),
+                })}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+              {appUpdateNotice.reason !== 'chunk_load_failed' && (
+                <button class="btn btn-secondary" onClick={() => setAppUpdateNotice((prev) => prev ? { ...prev, blocking: false, dismissed: true } : prev)}>
+                  {trans('common.cancel', { defaultValue: 'Cancel' })}
+                </button>
+              )}
+              <button class="btn btn-primary" onClick={reloadForAppUpdate}>
+                {trans('appUpdate.refresh_continue', { defaultValue: 'Refresh and continue' })}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Toasts: idle completions + CC notifications */}

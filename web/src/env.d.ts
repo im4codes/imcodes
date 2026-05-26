@@ -1,4 +1,5 @@
 declare const __BUILD_TIME__: string;
+declare const __WEB_BUILD_ID__: string;
 
 /**
  * Compile-time push channel selector, set by vite.config.ts based on the

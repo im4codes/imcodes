@@ -1,9 +1,11 @@
 import { lazy, Suspense } from 'preact/compat';
 import type { JSX } from 'preact';
 import type { FileBrowserProps } from './FileBrowser.js';
+import { lazyImportWithAppUpdateNotice } from '../app-update.js';
 
 const LazyFileBrowser = lazy(() =>
-  import('./FileBrowser.js').then((m) => ({ default: m.FileBrowser })),
+  lazyImportWithAppUpdateNotice(() => import('./FileBrowser.js'))
+    .then((m) => ({ default: m.FileBrowser })),
 );
 
 export function FileBrowser(props: FileBrowserProps): JSX.Element {

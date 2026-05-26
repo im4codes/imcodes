@@ -90,6 +90,8 @@ export interface SessionPaneProps {
   pendingPrefillText?: string | null;
   /** Called after pendingPrefillText has been consumed by the input. */
   onPendingPrefillApplied?: () => void;
+  /** Gate version-sensitive panels when the loaded frontend is stale. */
+  onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
 }
 
 export function SessionPane({
@@ -121,6 +123,7 @@ export function SessionPane({
   onMobileFileBrowserClose,
   pendingPrefillText,
   onPendingPrefillApplied,
+  onVersionSensitiveAction,
 }: SessionPaneProps) {
   const { t } = useTranslation();
   const sessionName = session.name;
@@ -434,6 +437,7 @@ export function SessionPane({
           onRemoveQuote={removeQuote}
           pendingPrefillText={pendingPrefillText}
           onPendingPrefillApplied={onPendingPrefillApplied}
+          onVersionSensitiveAction={onVersionSensitiveAction}
         />
       )}
     </div>

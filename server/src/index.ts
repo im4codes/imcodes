@@ -183,6 +183,22 @@ export function buildApp(env: Env) {
 
   app.get('/health', (c) => c.json({ ok: true, ts: Date.now() }));
 
+  app.get('/api/app-build', async (c) => {
+    try {
+      const content = await readFile(join(WEB_DIST, 'app-build.json'), 'utf8');
+      return new Response(content, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store',
+        },
+      });
+    } catch {
+      return c.json({ error: 'not_found' }, 404, {
+        'Cache-Control': 'no-store',
+      });
+    }
+  });
+
   // Apple App Site Association — required for iOS Associated Domains (webcredentials) to work.
   // Allows the Capacitor app (M675E26Q67.app.imcodes) to use passkeys in WKWebView.
   app.get('/.well-known/apple-app-site-association', (c) => {
