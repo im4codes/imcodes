@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace, ContextTargetRef } from '../../shared/context-types.js';
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
-import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
+import { localOnlyCompressor, type CompressionInput } from '../../src/context/summary-compressor.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import { getArchivedEvent, getReplicationState, listContextEvents, queryProcessedProjections } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
@@ -135,6 +135,45 @@ describe('MaterializationCoordinator', () => {
         result.durableProjection?.id,
       ]),
     }));
+  });
+
+  it('keeps automatic recent summaries delta-only instead of feeding prior summaries back into compression', async () => {
+    const calls: CompressionInput[] = [];
+    const coordinator = new MaterializationCoordinator({
+      compressor: async (input) => {
+        calls.push(input);
+        return {
+          summary: [
+            '## Problem',
+            `Batch ${calls.length}`,
+            '',
+            '## Done',
+            `Compressed ${input.events.length} new events.`,
+          ].join('\n'),
+          model: 'test-model',
+          backend: 'test-backend',
+          usedBackup: false,
+          fromSdk: true,
+          inputTokens: 10,
+          outputTokens: 5,
+          targetTokens: 100,
+          durationMs: 1,
+        };
+      },
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200, minIntervalMs: 0 },
+    });
+
+    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'first ask', createdAt: 100 });
+    const first = await coordinator.materializeTarget(target, 'manual', 200);
+
+    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'second ask', createdAt: 300 });
+    const second = await coordinator.materializeTarget(target, 'manual', 400);
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0].previousSummary).toBeUndefined();
+    expect(calls[1].previousSummary).toBeUndefined();
+    expect(first.summaryProjection.content.hadPreviousSummary).toBe(false);
+    expect(second.summaryProjection.content.hadPreviousSummary).toBe(true);
   });
 
   it('excludes tool.call and assistant.delta from materialized summaries even when present in staged events', async () => {

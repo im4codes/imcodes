@@ -260,10 +260,12 @@ export class MaterializationCoordinator {
       };
     }
 
-    // Fetch previous summary for iterative update (like Hermes's _previous_summary)
+    // Recent summaries are delta-only. Do not feed the previous recent summary
+    // back into the compressor, or every small batch snowballs into another
+    // full handoff and burns tokens when synced into sub-sessions.
     const previousProjections = listProcessedProjections(target.namespace, 'recent_summary')
       .filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup');
-    const previousSummary = previousProjections.length > 0 ? previousProjections[0].summary : undefined;
+    const hadPreviousSummary = previousProjections.length > 0;
 
     // Compress with SDK (primary → backup). When all SDK attempts fail the
     // compressor still returns a CompressionResult (with `fromSdk: false` and
@@ -277,7 +279,7 @@ export class MaterializationCoordinator {
       const pinnedNotes = collectPinnedNotesForNamespace(target.namespace);
       compression = await compressFn({
         events,
-        previousSummary,
+        previousSummary: undefined,
         modelConfig: this.modelConfig,
         mode: 'auto',
         targetTokens: memoryConfig.autoMaterializationTargetTokens > 0
@@ -544,7 +546,7 @@ export class MaterializationCoordinator {
         compressionUsedBackup: compression.usedBackup,
         compressionFromSdk: compression.fromSdk,
         eventCount: events.length,
-        hadPreviousSummary: !!previousSummary,
+        hadPreviousSummary,
       },
       createdAt: now,
       updatedAt: now,
@@ -898,7 +900,7 @@ function queryBatchSummariesForMaster(sessionName: string, namespace: ContextNam
 
 function isHighSignalMasterEvent(event: LocalContextEvent): boolean {
   if (event.eventType === 'user.message' || event.eventType === 'user.turn') return true;
-  if ((event.eventType === 'assistant.text' || event.eventType === 'assistant.turn') && /^##\s+(User Problem|Resolution|Key Decisions|User-Pinned Notes|Active State|Active Task|Learned Facts|State Snapshot|Critical Context)/m.test(event.content ?? '')) {
+  if ((event.eventType === 'assistant.text' || event.eventType === 'assistant.turn') && /^##\s+(Problem|Done|Decisions|Next\/Risks|User Problem|Resolution|Key Decisions|User-Pinned Notes|Active State|Active Task|Learned Facts|State Snapshot|Critical Context)/m.test(event.content ?? '')) {
     return true;
   }
   if (event.eventType === 'tool.result') {
@@ -974,7 +976,8 @@ type DurableSignals = {
 function extractDurableSignalsFromSummary(summary: string): DurableSignals {
   const signals: DurableSignals = { decisions: [], constraints: [], preferences: [] };
 
-  const decisionsSection = extractSummarySection(summary, 'Key Decisions');
+  const decisionsSection = extractSummarySection(summary, 'Decisions')
+    ?? extractSummarySection(summary, 'Key Decisions');
   if (decisionsSection) {
     const lines = decisionsSection
       .split('\n')
