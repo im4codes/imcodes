@@ -1192,7 +1192,8 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
 
   const handleDownload = useCallback<ChatPathDownloadHandler>(async (path: string) => {
     if (!serverId) throw new Error(t('upload.daemon_offline'));
-    let downloadId = await requestPathDownloadId(path);
+    const resolvedPath = resolvePreviewPath(path, workdir);
+    let downloadId = await requestPathDownloadId(resolvedPath);
     const { downloadAttachment } = await import('../api.js');
     try {
       await downloadAttachment(serverId, downloadId);
@@ -1200,14 +1201,14 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       const msg = err instanceof Error ? err.message : String(err);
       const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
       if (!isStaleHandle) throw new Error(mapDownloadError(err));
-      downloadId = await requestPathDownloadId(path);
+      downloadId = await requestPathDownloadId(resolvedPath);
       try {
         await downloadAttachment(serverId, downloadId);
       } catch (retryErr) {
         throw new Error(mapDownloadError(retryErr));
       }
     }
-  }, [mapDownloadError, requestPathDownloadId, serverId, t]);
+  }, [mapDownloadError, requestPathDownloadId, serverId, t, workdir]);
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
   const htmlPreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleHtmlPreview : undefined;

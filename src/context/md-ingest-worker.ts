@@ -25,7 +25,20 @@ import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { serializeContextNamespace } from './context-keys.js';
 
-const scheduledKeys = new Set<string>();
+interface ScheduledMarkdownMemoryIngestInput {
+  projectDir: string | undefined;
+  namespace: ContextNamespace;
+}
+
+interface ScheduledMarkdownMemoryIngestState {
+  input: ScheduledMarkdownMemoryIngestInput;
+  pending: boolean;
+  running: boolean;
+  timer?: ReturnType<typeof setTimeout>;
+  idleResolvers: Set<() => void>;
+}
+
+const scheduledRuns = new Map<string, ScheduledMarkdownMemoryIngestState>();
 const MD_INGEST_ALLOWED_SCOPES: ReadonlySet<MemoryScope> = new Set(['personal', 'project_shared']);
 
 function isMdIngestEnabled(): boolean {
@@ -122,30 +135,74 @@ export async function runMarkdownMemoryIngest(input: {
   return { filesChecked, observationsWritten };
 }
 
-export function scheduleMarkdownMemoryIngest(input: {
-  projectDir: string | undefined;
-  namespace: ContextNamespace;
-}): void {
+function notifyMarkdownMemoryIngestIdle(state: ScheduledMarkdownMemoryIngestState): void {
+  const resolvers = [...state.idleResolvers];
+  state.idleResolvers.clear();
+  for (const resolve of resolvers) resolve();
+}
+
+function handleScheduledMarkdownMemoryIngestError(error: unknown): void {
+  incrementCounter('mem.ingest.skipped_unsafe', { reason: 'worker_failed' });
+  warnOncePerHour('md_ingest.worker_failed', {
+    error: error instanceof Error ? error.message : String(error),
+  });
+}
+
+async function runScheduledMarkdownMemoryIngest(key: string, state: ScheduledMarkdownMemoryIngestState): Promise<void> {
+  state.timer = undefined;
+  while (state.pending) {
+    state.pending = false;
+    state.running = true;
+    try {
+      await runMarkdownMemoryIngest(state.input);
+    } catch (error) {
+      handleScheduledMarkdownMemoryIngestError(error);
+    } finally {
+      state.running = false;
+    }
+  }
+  if (scheduledRuns.get(key) === state) scheduledRuns.delete(key);
+  notifyMarkdownMemoryIngestIdle(state);
+}
+
+export function scheduleMarkdownMemoryIngest(input: ScheduledMarkdownMemoryIngestInput): void {
   const projectDir = input.projectDir?.trim();
   if (!projectDir || !isMdIngestEnabled()) return;
   const key = `${projectDir}\u0000${serializeContextNamespace(input.namespace)}`;
-  if (scheduledKeys.has(key)) return;
-  scheduledKeys.add(key);
+  const existing = scheduledRuns.get(key);
+  if (existing) {
+    existing.input = input;
+    existing.pending = true;
+    return;
+  }
+  const state: ScheduledMarkdownMemoryIngestState = {
+    input,
+    pending: true,
+    running: false,
+    idleResolvers: new Set(),
+  };
+  scheduledRuns.set(key, state);
   const timer = setTimeout(() => {
-    void runMarkdownMemoryIngest(input)
-      .catch((error) => {
-        incrementCounter('mem.ingest.skipped_unsafe', { reason: 'worker_failed' });
-        warnOncePerHour('md_ingest.worker_failed', {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      })
-      .finally(() => {
-        scheduledKeys.delete(key);
-      });
+    void runScheduledMarkdownMemoryIngest(key, state);
   }, 0);
+  state.timer = timer;
   timer.unref?.();
 }
 
+export async function flushMarkdownMemoryIngestForTests(): Promise<void> {
+  while (scheduledRuns.size > 0) {
+    await Promise.all([...scheduledRuns.values()].map((state) => (
+      new Promise<void>((resolve) => {
+        state.idleResolvers.add(resolve);
+      })
+    )));
+  }
+}
+
 export function resetMarkdownMemoryIngestForTests(): void {
-  scheduledKeys.clear();
+  for (const state of scheduledRuns.values()) {
+    if (state.timer) clearTimeout(state.timer);
+    notifyMarkdownMemoryIngestIdle(state);
+  }
+  scheduledRuns.clear();
 }
