@@ -133,6 +133,23 @@ describe('styles.css regression contracts', () => {
     expect(mobileTransportShortcutRule!).toMatch(/max-width:\s*none/);
   });
 
+  it('server rail buttons stay rounded rectangles and do not clip status dots', () => {
+    const serverIconRule = css.match(/\.server-icon\s*\{[^}]*\}/);
+    expect(serverIconRule).not.toBeNull();
+    expect(serverIconRule![0]).toMatch(/width:\s*38px/);
+    expect(serverIconRule![0]).toMatch(/height:\s*34px/);
+    expect(serverIconRule![0]).toMatch(/border-radius:\s*11px/);
+    expect(serverIconRule![0]).toMatch(/overflow:\s*visible/);
+    expect(serverIconRule![0]).not.toMatch(/border-radius:\s*50%/);
+    expect(serverIconRule![0]).not.toMatch(/overflow:\s*hidden/);
+
+    const dotRule = css.match(/\.server-icon-dot\s*\{[^}]*\}/);
+    expect(dotRule).not.toBeNull();
+    expect(dotRule![0]).toMatch(/bottom:\s*3px/);
+    expect(dotRule![0]).toMatch(/right:\s*3px/);
+    expect(dotRule![0]).toMatch(/z-index:\s*1/);
+  });
+
   it('mobile OpenSpec dropdown is a body-level viewport sheet, not an inline clipped menu', () => {
     const sessionControls = readFileSync(resolve(__dirname, '../src/components/SessionControls.tsx'), 'utf8');
     const helper = sessionControls.match(/const renderOpenSpecDropdown = useCallback\([\s\S]*?\}, \[clearOpenSpecRequestTimer, isOpenSpecMobile, openSpecDropdownStyle, t\]\);/);
