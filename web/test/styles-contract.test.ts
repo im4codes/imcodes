@@ -198,4 +198,16 @@ describe('styles.css regression contracts', () => {
     expect(iframeRule![0]).toMatch(/max-width:\s*100%/);
     expect(iframeRule![0]).toMatch(/min-width:\s*0/);
   });
+
+  it('shared image lightbox keeps the close button out of mobile safe areas', () => {
+    const overlayRule = css.match(/\.fb-lightbox\s*\{[^}]*\}/);
+    expect(overlayRule).not.toBeNull();
+    expect(overlayRule![0]).toMatch(/padding:\s*calc\(var\(--sat,\s*0px\) \+ 12px\)/);
+    expect(overlayRule![0]).toMatch(/env\(safe-area-inset-bottom,\s*0px\)/);
+
+    const closeRule = css.match(/\.fb-lightbox-close\s*\{[^}]*\}/);
+    expect(closeRule).not.toBeNull();
+    expect(closeRule![0]).toMatch(/top:\s*calc\(var\(--sat,\s*0px\) \+ 16px\)/);
+    expect(closeRule![0]).toMatch(/right:\s*calc\(env\(safe-area-inset-right,\s*0px\) \+ 16px\)/);
+  });
 });
