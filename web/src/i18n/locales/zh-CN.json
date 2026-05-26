@@ -105,7 +105,7 @@
     "memory_summary_sync": "同步最近 summary",
     "memory_summary_sync_busy": "正在同步 summary...",
     "memory_summary_sync_instruction": "仅同步上下文。请把这些最近 summary 消化为背景信息；不要执行任务、不要改文件、不要调用工具，也不要回复这条消息，等待下一条用户指令。",
-    "memory_summary_sync_heading": "最近 summary：",
+    "memory_summary_sync_heading": "最近 summary（{{count}}/{{limit}}，最多约 {{maxChars}} 字）：",
     "user_message_expand": "展开全文",
     "user_message_collapse": "收起",
     "tool_chooser_title": "AI 活动如何显示？",

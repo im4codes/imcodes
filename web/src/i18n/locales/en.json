@@ -105,7 +105,7 @@
     "memory_summary_sync": "Sync recent summaries",
     "memory_summary_sync_busy": "Syncing summaries...",
     "memory_summary_sync_instruction": "Context sync only. Digest these recent summaries as background context. Do not execute tasks, change files, call tools, or respond to this message; wait for the next user instruction.",
-    "memory_summary_sync_heading": "Recent summaries:",
+    "memory_summary_sync_heading": "Recent summaries ({{count}}/{{limit}}, capped at ~{{maxChars}} chars):",
     "user_message_expand": "Show full",
     "user_message_collapse": "Collapse",
     "tool_chooser_title": "How should AI activity show?",

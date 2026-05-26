@@ -8,9 +8,9 @@ vi.mock('../src/api.js', () => ({
 
 import { buildMemorySummarySyncMessage } from '../src/memory-summary-sync.js';
 
-const t = (key: string) => ({
+const t = (key: string, options?: Record<string, unknown>) => ({
   'chat.memory_summary_sync_instruction': 'SYNC ONLY',
-  'chat.memory_summary_sync_heading': 'Recent summaries:',
+  'chat.memory_summary_sync_heading': `Recent summaries (${options?.count}/${options?.limit}, max ${options?.maxChars} chars):`,
 }[key] ?? key);
 
 describe('memory summary sync message', () => {
@@ -36,6 +36,7 @@ describe('memory summary sync message', () => {
       limit: 5,
     });
     expect(message).toContain('SYNC ONLY');
+    expect(message).toContain('Recent summaries (2/5, max 3600 chars):');
     expect(message).toContain('1. [ref: proj:aaaaaaaaaa] [repo-1] Newest summary');
     expect(message).toContain('2. [ref: proj:1111111111] [repo-1] Older summary');
     expect(message).toContain('"tool":"get_memory_sources"');
@@ -57,5 +58,30 @@ describe('memory summary sync message', () => {
       limit: 3,
     });
     expect(message).toBeNull();
+  });
+
+  it('defaults to a small bounded sync and truncates oversized summaries', async () => {
+    const hugeSummary = `${'A'.repeat(2_000)}\nSHOULD_NOT_APPEAR`;
+    getPersonalCloudMemory.mockResolvedValueOnce({
+      records: [
+        { id: 'oldest', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Oldest summary', updatedAt: 100 },
+        { id: 'newest', projectId: 'repo-1', projectionClass: 'recent_summary', summary: hugeSummary, updatedAt: 400 },
+        { id: 'middle-2', projectId: 'repo-1', projectionClass: 'recent_summary', summary: hugeSummary, updatedAt: 300 },
+        { id: 'middle-1', projectId: 'repo-1', projectionClass: 'recent_summary', summary: hugeSummary, updatedAt: 200 },
+      ],
+    });
+
+    const message = await buildMemorySummarySyncMessage(t, 'repo-1');
+
+    expect(getPersonalCloudMemory).toHaveBeenCalledWith({
+      projectId: 'repo-1',
+      projectionClass: 'recent_summary',
+      limit: 3,
+    });
+    expect(message).toContain('Recent summaries (3/3, max 3600 chars):');
+    expect(message).toContain('[truncated for token budget; use get_memory_sources with the sourceLookup below for exact details]');
+    expect(message).not.toContain('Oldest summary');
+    expect(message).not.toContain('SHOULD_NOT_APPEAR');
+    expect(message!.length).toBeLessThan(5_000);
   });
 });

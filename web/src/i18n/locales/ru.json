@@ -105,7 +105,7 @@
     "memory_summary_sync": "Синхронизировать последние summary",
     "memory_summary_sync_busy": "Синхронизация summary...",
     "memory_summary_sync_instruction": "Только синхронизация контекста. Усвой эти последние summary как фоновый контекст. Не выполняй задачи, не изменяй файлы, не вызывай инструменты и не отвечай на это сообщение; жди следующую инструкцию пользователя.",
-    "memory_summary_sync_heading": "Последние summary:",
+    "memory_summary_sync_heading": "Последние summary ({{count}}/{{limit}}, до ~{{maxChars}} символов):",
     "user_message_expand": "Показать полностью",
     "user_message_collapse": "Свернуть",
     "tool_chooser_title": "Как показывать активность ИИ?",
