@@ -1900,10 +1900,14 @@ body {
 .dialog {
   background: #1e293b; border: 1px solid #334155; border-radius: 8px;
   width: 100%;
+  max-width: calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px);
+  min-width: 0;
+  box-sizing: border-box;
   max-height: 100%;
   display: flex; flex-direction: column;
   overflow: hidden;
 }
+.dialog, .dialog * { box-sizing: border-box; }
 .dialog-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 0; flex-shrink: 0; }
 .dialog-header h2 { margin: 0; font-size: 15px; color: #f1f5f9; }
 .dialog-close { background: none; border: none; color: #64748b; font-size: 20px; cursor: pointer; line-height: 1; padding: 0; }

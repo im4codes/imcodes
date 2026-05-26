@@ -33,6 +33,15 @@ const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const CODEX_SDK_MODEL_SUGGESTIONS = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
+const responsiveDialogStyle = {
+  // Hard-cap against the visual viewport instead of relying on flex padding.
+  // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
+  // which clips the custom-provider help text into one-character columns.
+  width: 'calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)',
+  maxWidth: 380,
+  minWidth: 0,
+  boxSizing: 'border-box',
+} as const;
 
 interface Props {
   ws: WsClient | null;
@@ -346,7 +355,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
 
   return (
     <div class="dialog-overlay">
-      <div class="dialog" style={{ width: '100%', maxWidth: 380 }}>
+      <div class="dialog" style={responsiveDialogStyle}>
         <div class="dialog-header">
           <span>New Sub-Session</span>
           <button class="dialog-close" onClick={onClose}>×</button>
@@ -397,6 +406,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   gap: 2,
                   flex: 1,
                   minWidth: 0,
+                  overflowWrap: 'anywhere',
                 }}
               >
                 <span style={{ color: '#e2e8f0', fontSize: 13 }}>
@@ -408,6 +418,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                     fontSize: 12,
                     lineHeight: 1.35,
                     wordBreak: 'break-word',
+                    overflowWrap: 'anywhere',
                   }}
                 >
                   {t('new_session.custom_provider_sdk_help')}

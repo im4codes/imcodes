@@ -47,6 +47,15 @@ const CURSOR_HEADLESS_MODEL_FALLBACK = ["auto", "composer-2-fast", "gpt-5.2"] as
 const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5.4", "gpt-5.4-mini"] as const;
 const CODEX_SDK_MODEL_FALLBACK = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_FALLBACK = [...GEMINI_MODEL_IDS];
+const responsiveDialogStyle = {
+  // Hard-cap against the visual viewport instead of relying on flex padding.
+  // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
+  // which clips the custom-provider help text into one-character columns.
+  width: "calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)",
+  maxWidth: 380,
+  minWidth: 0,
+  boxSizing: "border-box",
+} as const;
 
 interface Props {
   ws: WsClient | null;
@@ -553,7 +562,7 @@ export function NewSessionDialog({
 
   return (
     <div class="dialog-overlay" onKeyDown={handleKey} role="dialog">
-      <div class="dialog" style={{ width: "100%", maxWidth: 380 }}>
+      <div class="dialog" style={responsiveDialogStyle}>
         <div class="dialog-header">
           <h2>{t("new_session.title")}</h2>
           <button
@@ -689,6 +698,7 @@ export function NewSessionDialog({
                 gap: 2,
                 flex: 1,
                 minWidth: 0,
+                overflowWrap: "anywhere",
               }}
             >
               <span style={{ color: "#e2e8f0", fontSize: 13 }}>
@@ -700,6 +710,7 @@ export function NewSessionDialog({
                   fontSize: 12,
                   lineHeight: 1.35,
                   wordBreak: "break-word",
+                  overflowWrap: "anywhere",
                 }}
               >
                 {t("new_session.custom_provider_sdk_help")}

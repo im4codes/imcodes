@@ -347,4 +347,23 @@ describe('styles.css regression contracts', () => {
     expect(tabHoverRule).not.toBeNull();
     expect(tabHoverRule![0]).toMatch(/rgba\(8,\s*145,\s*178,\s*0\.16\)/);
   });
+
+  it('session creation dialogs cannot exceed narrow mobile viewports', () => {
+    const dialogRule = css.match(/\.dialog\s*\{[^}]*\}/);
+    expect(dialogRule).not.toBeNull();
+    expect(dialogRule![0]).toMatch(/max-width:\s*calc\(100vw - env\(safe-area-inset-left/);
+    expect(dialogRule![0]).toMatch(/min-width:\s*0/);
+    expect(dialogRule![0]).toMatch(/box-sizing:\s*border-box/);
+
+    const newSessionDialog = readFileSync(resolve(__dirname, '../src/components/NewSessionDialog.tsx'), 'utf8');
+    const subSessionDialog = readFileSync(resolve(__dirname, '../src/components/StartSubSessionDialog.tsx'), 'utf8');
+    for (const source of [newSessionDialog, subSessionDialog]) {
+      expect(source).toContain('responsiveDialogStyle');
+      expect(source).toContain('calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)');
+      expect(source).toContain('boxSizing');
+      expect(source).toContain('overflowWrap');
+      expect(source).not.toContain('style={{ width: "100%", maxWidth: 380 }}');
+      expect(source).not.toContain("style={{ width: '100%', maxWidth: 380 }}");
+    }
+  });
 });
