@@ -20,7 +20,8 @@
     "reconnecting": "重新连接中…",
     "refresh": "刷新",
     "show": "显示",
-    "hide": "隐藏"
+    "hide": "隐藏",
+    "this_feature": "此功能"
   },
   "window": {
     "maximize": "最大化",
@@ -28,6 +29,21 @@
     "minimize": "最小化",
     "close": "关闭",
     "hide": "隐藏"
+  },
+  "appUpdate": {
+    "banner_title": "IM.codes 已更新",
+    "banner_body": "刷新后即可使用最新版本。你的会话仍会保留。",
+    "later": "稍后",
+    "refresh": "刷新",
+    "chunk_title": "需要刷新",
+    "blocking_title": "继续前请刷新",
+    "chunk_body": "当前页面运行的是旧版前端，无法加载所需的应用文件。刷新后可干净恢复。",
+    "blocking_body": "服务器代码已更新，{{feature}} 需要最新前端。刷新后继续，避免面板卡住。",
+    "refresh_continue": "刷新并继续",
+    "error_reload_message": "应用已更新，请重新加载后继续",
+    "error_retry_message": "组件错误，点击重试",
+    "reload": "重新加载",
+    "retry": "重试"
   },
   "chat": {
     "sendFailedReason": {

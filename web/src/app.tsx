@@ -4950,7 +4950,7 @@ export function App() {
               {appUpdateNotice.reason === 'chunk_load_failed'
                 ? trans('appUpdate.chunk_body', { defaultValue: 'This page is running an older frontend and could not load a required app file. Refresh to recover cleanly.' })
                 : trans('appUpdate.blocking_body', {
-                  defaultValue: '{{feature}} needs the latest frontend after the backend update. Refresh to continue without the panel getting stuck.',
+                  defaultValue: '{{feature}} needs the latest frontend after the server update. Refresh to continue without the panel getting stuck.',
                   feature: appUpdateNotice.featureLabel ?? trans('common.this_feature', { defaultValue: 'This feature' }),
                 })}
             </div>

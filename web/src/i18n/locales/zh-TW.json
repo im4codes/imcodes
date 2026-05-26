@@ -20,7 +20,8 @@
     "reconnecting": "重新連線中…",
     "refresh": "重新整理",
     "show": "顯示",
-    "hide": "隱藏"
+    "hide": "隱藏",
+    "this_feature": "此功能"
   },
   "window": {
     "maximize": "最大化",
@@ -28,6 +29,21 @@
     "minimize": "最小化",
     "close": "關閉",
     "hide": "隱藏"
+  },
+  "appUpdate": {
+    "banner_title": "IM.codes 已更新",
+    "banner_body": "重新整理後即可使用最新版本。你的工作階段仍會保留。",
+    "later": "稍後",
+    "refresh": "重新整理",
+    "chunk_title": "需要重新整理",
+    "blocking_title": "繼續前請重新整理",
+    "chunk_body": "目前頁面仍在執行舊版前端，無法載入必要的應用程式檔案。重新整理後即可乾淨恢復。",
+    "blocking_body": "伺服器程式碼已更新，{{feature}} 需要最新前端。重新整理後再繼續，避免面板卡住。",
+    "refresh_continue": "重新整理並繼續",
+    "error_reload_message": "應用程式已更新，請重新載入後繼續",
+    "error_retry_message": "元件錯誤，點一下重試",
+    "reload": "重新載入",
+    "retry": "重試"
   },
   "chat": {
     "sendFailedReason": {

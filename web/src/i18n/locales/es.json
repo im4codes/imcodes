@@ -20,7 +20,8 @@
     "reconnecting": "Reconectando…",
     "refresh": "Actualizar",
     "show": "Mostrar",
-    "hide": "Ocultar"
+    "hide": "Ocultar",
+    "this_feature": "Esta función"
   },
   "window": {
     "maximize": "Maximizar",
@@ -28,6 +29,21 @@
     "minimize": "Minimizar",
     "close": "Cerrar",
     "hide": "Ocultar"
+  },
+  "appUpdate": {
+    "banner_title": "IM.codes se ha actualizado",
+    "banner_body": "Actualiza para usar la versión más reciente. Tus sesiones seguirán disponibles.",
+    "later": "Más tarde",
+    "refresh": "Actualizar",
+    "chunk_title": "Actualización requerida",
+    "blocking_title": "Actualiza antes de continuar",
+    "chunk_body": "Esta página está ejecutando un frontend antiguo y no pudo cargar un archivo necesario de la app. Actualiza para recuperarte limpiamente.",
+    "blocking_body": "{{feature}} necesita el frontend más reciente después de la actualización del servidor. Actualiza para continuar sin que el panel se quede bloqueado.",
+    "refresh_continue": "Actualizar y continuar",
+    "error_reload_message": "La app se actualizó; recarga para continuar",
+    "error_retry_message": "Error del componente; toca para reintentar",
+    "reload": "Recargar",
+    "retry": "Reintentar"
   },
   "chat": {
     "sendFailedReason": {

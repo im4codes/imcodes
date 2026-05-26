@@ -20,7 +20,8 @@
     "reconnecting": "재연결 중…",
     "refresh": "새로고침",
     "show": "표시",
-    "hide": "숨기기"
+    "hide": "숨기기",
+    "this_feature": "이 기능"
   },
   "window": {
     "maximize": "최대화",
@@ -28,6 +29,21 @@
     "minimize": "최소화",
     "close": "닫기",
     "hide": "숨기기"
+  },
+  "appUpdate": {
+    "banner_title": "IM.codes가 업데이트되었습니다",
+    "banner_body": "최신 버전을 사용하려면 새로고침하세요. 세션은 계속 사용할 수 있습니다.",
+    "later": "나중에",
+    "refresh": "새로고침",
+    "chunk_title": "새로고침 필요",
+    "blocking_title": "계속하기 전에 새로고침하세요",
+    "chunk_body": "이 페이지는 오래된 프런트엔드에서 실행 중이라 필요한 앱 파일을 불러오지 못했습니다. 새로고침하면 깨끗하게 복구됩니다.",
+    "blocking_body": "서버 업데이트 후 {{feature}}에는 최신 프런트엔드가 필요합니다. 패널이 멈추지 않도록 새로고침한 뒤 계속하세요.",
+    "refresh_continue": "새로고침 후 계속",
+    "error_reload_message": "앱이 업데이트되었습니다. 다시 로드한 뒤 계속하세요",
+    "error_retry_message": "컴포넌트 오류입니다. 탭하여 다시 시도하세요",
+    "reload": "다시 로드",
+    "retry": "다시 시도"
   },
   "chat": {
     "sendFailedReason": {

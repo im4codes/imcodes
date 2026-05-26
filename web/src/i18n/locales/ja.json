@@ -20,7 +20,8 @@
     "reconnecting": "再接続中…",
     "refresh": "更新",
     "show": "表示",
-    "hide": "隠す"
+    "hide": "隠す",
+    "this_feature": "この機能"
   },
   "window": {
     "maximize": "最大化",
@@ -28,6 +29,21 @@
     "minimize": "最小化",
     "close": "閉じる",
     "hide": "隠す"
+  },
+  "appUpdate": {
+    "banner_title": "IM.codes が更新されました",
+    "banner_body": "最新バージョンを使うには更新してください。セッションは引き続き利用できます。",
+    "later": "後で",
+    "refresh": "更新",
+    "chunk_title": "更新が必要です",
+    "blocking_title": "続行する前に更新してください",
+    "chunk_body": "このページは古いフロントエンドで動作しており、必要なアプリファイルを読み込めませんでした。更新すると正常に復旧できます。",
+    "blocking_body": "サーバー更新後、{{feature}} には最新のフロントエンドが必要です。パネルが固まらないよう、更新してから続行してください。",
+    "refresh_continue": "更新して続行",
+    "error_reload_message": "アプリが更新されました。再読み込みして続行してください",
+    "error_retry_message": "コンポーネントエラーです。タップして再試行してください",
+    "reload": "再読み込み",
+    "retry": "再試行"
   },
   "chat": {
     "sendFailedReason": {

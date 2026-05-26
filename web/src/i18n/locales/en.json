@@ -20,7 +20,8 @@
     "reconnecting": "Reconnecting…",
     "refresh": "Refresh",
     "show": "Show",
-    "hide": "Hide"
+    "hide": "Hide",
+    "this_feature": "This feature"
   },
   "window": {
     "maximize": "Maximize",
@@ -28,6 +29,21 @@
     "minimize": "Minimize",
     "close": "Close",
     "hide": "Hide"
+  },
+  "appUpdate": {
+    "banner_title": "IM.codes has been updated",
+    "banner_body": "Refresh to use the latest version. Your sessions will stay available.",
+    "later": "Later",
+    "refresh": "Refresh",
+    "chunk_title": "Refresh required",
+    "blocking_title": "Refresh before continuing",
+    "chunk_body": "This page is running an older frontend and could not load a required app file. Refresh to recover cleanly.",
+    "blocking_body": "{{feature}} needs the latest frontend after the server update. Refresh to continue without the panel getting stuck.",
+    "refresh_continue": "Refresh and continue",
+    "error_reload_message": "App updated — reload to continue",
+    "error_retry_message": "Component error — tap to retry",
+    "reload": "Reload",
+    "retry": "Retry"
   },
   "chat": {
     "sendFailedReason": {
