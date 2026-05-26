@@ -175,16 +175,24 @@ describe('SubSessionBar', () => {
     });
 
     const getStatsText = () => view.container.querySelector('.daemon-stats-inline')?.textContent ?? '';
-    expect(getStatsText()).toContain('2026-05-12 07:08:09');
+    expect(view.container.querySelector('.daemon-local-clock-date')?.textContent).toBe('2026-05-12');
+    expect(view.container.querySelector('.daemon-local-clock-time')?.textContent).toBe('07:08:09');
+    expect(getStatsText()).toContain('2026-05-12');
+    expect(getStatsText()).toContain('07:08:09');
+    const stableDateDigit = view.container.querySelector('.daemon-local-clock-date .daemon-local-clock-digit') as HTMLSpanElement;
+    const changingSecondDigit = Array.from(view.container.querySelectorAll('.daemon-local-clock-time .daemon-local-clock-digit')).at(-1) as HTMLSpanElement;
 
     act(() => {
       vi.advanceTimersByTime(1000);
     });
 
-    expect(getStatsText()).toContain('2026-05-12 07:08:10');
+    expect(view.container.querySelector('.daemon-local-clock-date')?.textContent).toBe('2026-05-12');
+    expect(view.container.querySelector('.daemon-local-clock-time')?.textContent).toBe('07:08:10');
+    expect(view.container.querySelector('.daemon-local-clock-date .daemon-local-clock-digit')).toBe(stableDateDigit);
+    expect(Array.from(view.container.querySelectorAll('.daemon-local-clock-time .daemon-local-clock-digit')).at(-1)).not.toBe(changingSecondDigit);
   });
 
-  it('shows a compact mobile daemon version and local clock', async () => {
+  it('shows a compact mobile daemon version without a local clock', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 4, 12, 7, 8, 9));
     const statsWs = makeStatsWs();
@@ -213,7 +221,8 @@ describe('SubSessionBar', () => {
     const statsText = view.container.querySelector('.daemon-stats-inline')?.textContent ?? '';
     expect(statsText).toContain('5.2161-dev');
     expect(statsText).not.toContain('v2026.');
-    expect(statsText).toMatch(/07:08:\d{2}/);
+    expect(statsText).not.toMatch(/07:08:\d{2}/);
+    expect(view.container.querySelector('.daemon-local-clock')).toBeNull();
   });
 
   it('only applies the running pulse to collapsed mini cards while the sub-session is running', () => {

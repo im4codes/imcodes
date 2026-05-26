@@ -1412,6 +1412,9 @@ body {
 .daemon-stat-mem { color: #60a5fa; text-shadow: 0 0 9px rgba(96,165,250,0.28); }
 .daemon-stat-load { color: #c084fc; text-shadow: 0 0 9px rgba(192,132,252,0.32); }
 .daemon-local-clock { color: #67e8f9; font-variant-numeric: tabular-nums; white-space: nowrap; display: inline-flex; align-items: baseline; gap: 0; padding-left: 2px; text-shadow: 0 0 10px rgba(34,211,238,0.38); }
+.daemon-local-clock-date,
+.daemon-local-clock-time { display: inline-flex; align-items: baseline; gap: 0; }
+.daemon-local-clock-space { white-space: pre; width: 0.5em; }
 .daemon-local-clock-digit { display: inline-block; min-width: 0.62em; text-align: center; animation: daemon-clock-tick 0.28s cubic-bezier(0.2, 0.85, 0.25, 1); }
 .daemon-local-clock-separator { color: #38bdf8; opacity: 0.72; }
 @keyframes daemon-clock-tick {

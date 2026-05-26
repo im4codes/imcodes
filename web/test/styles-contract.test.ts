@@ -143,6 +143,16 @@ describe('styles.css regression contracts', () => {
     expect(clockRule).not.toBeNull();
     expect(clockRule![0]).toMatch(/font-variant-numeric:\s*tabular-nums/);
     expect(clockRule![0]).toMatch(/display:\s*inline-flex/);
+    expect(clockRule![0]).toMatch(/gap:\s*0/);
+
+    const dateTimeGroupRule = css.match(/\.daemon-local-clock-date,\s*[\s\S]*?\.daemon-local-clock-time\s*\{[^}]*\}/);
+    expect(dateTimeGroupRule).not.toBeNull();
+    expect(dateTimeGroupRule![0]).toMatch(/display:\s*inline-flex/);
+    expect(dateTimeGroupRule![0]).toMatch(/align-items:\s*baseline/);
+
+    const spaceRule = css.match(/\.daemon-local-clock-space\s*\{[^}]*\}/);
+    expect(spaceRule).not.toBeNull();
+    expect(spaceRule![0]).toMatch(/white-space:\s*pre/);
 
     const digitRule = css.match(/\.daemon-local-clock-digit\s*\{[^}]*\}/);
     expect(digitRule).not.toBeNull();

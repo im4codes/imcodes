@@ -162,23 +162,31 @@ function formatLocalDateTime(timestamp: number): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-function formatLocalTime(timestamp: number): string {
-  const date = new Date(timestamp);
-  const pad = (value: number) => String(value).padStart(2, '0');
-  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-}
-
-function renderTechClock(text: string): JSX.Element {
+function renderTechClockDigits(text: string, keyPrefix: string): JSX.Element {
   return (
     <>
       {Array.from(text).map((char, index) => (
         <span
-          key={`${index}-${char}-${text}`}
+          key={`${keyPrefix}-${index}-${char}`}
           class={/\d/.test(char) ? 'daemon-local-clock-digit' : 'daemon-local-clock-separator'}
         >
           {char}
         </span>
       ))}
+    </>
+  );
+}
+
+function renderTechClock(text: string): JSX.Element {
+  const [dateText, timeText] = text.includes(' ') ? text.split(' ', 2) : ['', text];
+  if (!dateText) {
+    return <span class="daemon-local-clock-time">{renderTechClockDigits(timeText, 'time')}</span>;
+  }
+  return (
+    <>
+      <span class="daemon-local-clock-date">{renderTechClockDigits(dateText, 'date')}</span>
+      <span class="daemon-local-clock-space" aria-hidden="true"> </span>
+      <span class="daemon-local-clock-time">{renderTechClockDigits(timeText, 'time')}</span>
     </>
   );
 }
@@ -270,9 +278,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const [draftW, setDraftW] = useState(String(cardSize.w));
   const [draftH, setDraftH] = useState(String(cardSize.h));
   const [stats, setStats] = useState<DaemonStats | null>(null);
-  const localClockNow = useNowTicker(!!stats);
+  const localClockNow = useNowTicker(desktopLayoutCapable && !!stats);
   const localClockText = useMemo(() => formatLocalDateTime(localClockNow), [localClockNow]);
-  const localClockCompactText = useMemo(() => formatLocalTime(localClockNow), [localClockNow]);
   // DB sort_order is the authority — subSessions arrive pre-sorted from server.
   // Local dragOrder only tracks in-session drag reorder (synced back to DB via reorderSubSessions).
   const [dragOrder, setDragOrder] = useState<string[] | null>(null);
@@ -800,7 +807,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             <span class="subcard-toolbar-label">{t('subsessionBar.subs_count', { count: subSessions.length })}</span>
             {/* Desktop: full stats in expanded toolbar */}
             {stats && (
-              <span class="daemon-stats-inline daemon-stats-inline-tech" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)} | ${localClockText}`}>
+              <span class="daemon-stats-inline daemon-stats-inline-tech" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}>
                 {stats.daemonVersion && (
                   <>
                     {/* Display the short form (strips trailing -dev.NNN counter); the
@@ -826,8 +833,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 <span class="daemon-stat-uptime">
                   {formatUptime(stats.uptime)}
                 </span>
-                <span class="daemon-stat-sep"> · </span>
-                <span class="daemon-local-clock">{renderTechClock(localClockText)}</span>
+                {desktopLayoutCapable && (
+                  <>
+                    <span class="daemon-stat-sep"> · </span>
+                    <span class="daemon-local-clock">{renderTechClock(localClockText)}</span>
+                  </>
+                )}
               </span>
             )}
           </>
@@ -841,9 +852,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           const memUsed = (stats.memUsed / div).toFixed(1);
           const memTotal = useG ? totalGb.toFixed(1) : (stats.memTotal / div).toFixed(0);
           const ei = { fontSize: '0.65em', verticalAlign: 'middle' } as const;
-          const compactClockText = desktopLayoutCapable ? localClockText : localClockCompactText;
           return (
-            <span class={`daemon-stats-inline daemon-stats-inline-tech daemon-stats-compact${desktopLayoutCapable ? '' : ' daemon-stats-mobile'}`} title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)} | ${localClockText}`}>
+            <span class={`daemon-stats-inline daemon-stats-inline-tech daemon-stats-compact${desktopLayoutCapable ? '' : ' daemon-stats-mobile'}`} title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}>
               {/* Mobile-narrow stat strip — show short version; full string in title above. */}
               {stats.daemonVersion && <span class="daemon-stat-version">{desktopLayoutCapable ? `v${formatDaemonVersionShort(stats.daemonVersion)}` : formatDaemonVersionMobile(stats.daemonVersion)} </span>}
               <span class={`daemon-stat-cpu${stats.cpu > 80 ? ' danger' : stats.cpu > 50 ? ' warn' : ''}`}><span style={ei}>⚙️</span>{stats.cpu}%</span>
@@ -853,8 +863,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               <span class="daemon-stat-load">≡{Number(stats.load1).toFixed(1)}</span>
               {' '}
               <EmbeddingStatusIcon status={stats.embedding} compact />
-              {' '}
-              <span class="daemon-local-clock">{renderTechClock(compactClockText)}</span>
+              {desktopLayoutCapable && (
+                <>
+                  {' '}
+                  <span class="daemon-local-clock">{renderTechClock(localClockText)}</span>
+                </>
+              )}
             </span>
           );
         })()}
