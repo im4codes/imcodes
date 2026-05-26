@@ -93,6 +93,25 @@ describe('styles.css regression contracts', () => {
     expect(mobileP2pRule![0]).toMatch(/overflow-y:\s*auto/);
   });
 
+  it('context meters keep the segmented static tech styling', () => {
+    const meterRule = css.match(/\.session-ctx-bar,\s*[\s\S]*?\.subsession-card-ctx\s*\{[^}]*\}/);
+    expect(meterRule).not.toBeNull();
+    expect(meterRule![0]).toMatch(/repeating-linear-gradient\(90deg/);
+    expect(meterRule![0]).toMatch(/isolation:\s*isolate/);
+    expect(meterRule![0]).toMatch(/rgba\(34,\s*211,\s*238,\s*0\.16\)/);
+
+    const fillRule = css.match(/\.session-ctx-input,\s*[\s\S]*?\.subsession-card-ctx-fill\s*\{[^}]*\}/);
+    expect(fillRule).not.toBeNull();
+    expect(fillRule![0]).toMatch(/repeating-linear-gradient\(135deg/);
+    expect(fillRule![0]).toMatch(/transition:\s*width\s+0\.32s/);
+    expect(fillRule![0]).toMatch(/left\s+0\.32s/);
+    expect(fillRule![0]).not.toMatch(/animation\s*:/);
+
+    const cacheRule = css.match(/\.session-ctx-cache,\s*[\s\S]*?\.subcard-ctx-cache\s*\{[^}]*\}/);
+    expect(cacheRule).not.toBeNull();
+    expect(cacheRule![0]).toMatch(/transition:\s*width\s+0\.32s/);
+  });
+
   it('mobile OpenSpec dropdown is a body-level viewport sheet, not an inline clipped menu', () => {
     const sessionControls = readFileSync(resolve(__dirname, '../src/components/SessionControls.tsx'), 'utf8');
     const helper = sessionControls.match(/const renderOpenSpecDropdown = useCallback\([\s\S]*?\}, \[clearOpenSpecRequestTimer, isOpenSpecMobile, openSpecDropdownStyle, t\]\);/);
