@@ -957,6 +957,8 @@
     "file_too_large": "Файл слишком большой (макс. {{max}}МБ)",
     "long_text_attached": "Большой вставленный текст прикреплен как {{name}}",
     "long_text_requires_attachment": "Эта вставка слишком большая для поля ввода. Загрузите ее как файл.",
+    "drop_overlay_title": "Отпустите файлы для загрузки",
+    "drop_overlay_hint": "Отпустите в любом месте этого окна сеанса",
     "download_file": "Скачать",
     "downloading": "Скачивание...",
     "preview_unavailable": "Предпросмотр недоступен",

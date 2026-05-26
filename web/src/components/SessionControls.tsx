@@ -118,6 +118,8 @@ interface Props {
   subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
   /** Server ID — required for file upload. */
   serverId?: string;
+  /** Optional larger drop target that should behave like the composer upload area. */
+  fileDropTargetRef?: RefObject<HTMLElement>;
   /** Quoted text segments from chat messages. */
   quotes?: string[];
   /** Called to remove a quote by index. */
@@ -603,7 +605,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -662,6 +664,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [rememberComboSendChoice, setRememberComboSendChoice] = useState(false);
   const [pendingTransportApproval, setPendingTransportApproval] = useState<PendingTransportApproval | null>(null);
   const [fileDragActive, setFileDragActive] = useState(false);
+  const controlsWrapperRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
   const autoRef = useRef<HTMLDivElement>(null);
@@ -2524,6 +2527,21 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     void handleFileUpload(e.dataTransfer?.files ?? null);
   }, [handleFileUpload, inputDisabled]);
 
+  useEffect(() => {
+    const target = fileDropTargetRef?.current;
+    if (!target) return;
+    target.addEventListener('dragenter', handleFileDragEnter, true);
+    target.addEventListener('dragover', handleFileDragOver, true);
+    target.addEventListener('dragleave', handleFileDragLeave, true);
+    target.addEventListener('drop', handleFileDrop, true);
+    return () => {
+      target.removeEventListener('dragenter', handleFileDragEnter, true);
+      target.removeEventListener('dragover', handleFileDragOver, true);
+      target.removeEventListener('dragleave', handleFileDragLeave, true);
+      target.removeEventListener('drop', handleFileDrop, true);
+    };
+  }, [fileDropTargetRef, handleFileDragEnter, handleFileDragLeave, handleFileDragOver, handleFileDrop]);
+
   // Paste: upload files from clipboard, or insert plain text
   const handlePaste = (e: Event) => {
     const ce = e as ClipboardEvent;
@@ -2676,6 +2694,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       ? basePlaceholder
       : t('session.send_placeholder_desktop_upload', { placeholder: basePlaceholder });
 
+  const dropOverlayStyle = (() => {
+    if (!fileDragActive) return null;
+    const target = fileDropTargetRef?.current ?? controlsWrapperRef.current;
+    const rect = target?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return { inset: '0px' };
+    return {
+      left: `${Math.max(0, rect.left)}px`,
+      top: `${Math.max(0, rect.top)}px`,
+      width: `${Math.min(window.innerWidth - Math.max(0, rect.left), rect.width)}px`,
+      height: `${Math.min(window.innerHeight - Math.max(0, rect.top), rect.height)}px`,
+    };
+  })();
+
   useEffect(() => {
     if (!isMobileLayout) {
       setMobileComposerExpanded(false);
@@ -2738,7 +2769,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
       </div>
     )}
-    <div class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}${mobileComposerExpanded ? ' controls-wrapper-mobile-expanded' : ''}`}>
+    <div ref={controlsWrapperRef} class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}${mobileComposerExpanded ? ' controls-wrapper-mobile-expanded' : ''}`}>
+      {dropOverlayStyle && createPortal(
+        <div class="session-file-drop-overlay" style={dropOverlayStyle}>
+          <div class="session-file-drop-card">
+            <div class="session-file-drop-icon">📎</div>
+            <div class="session-file-drop-title">{t('upload.drop_overlay_title')}</div>
+            <div class="session-file-drop-hint">{t('upload.drop_overlay_hint')}</div>
+          </div>
+        </div>,
+        document.body,
+      )}
       {/* Header control row — compact mode keeps meta controls but still hides terminal shortcuts */}
       {!hideShortcuts && (!compact || showCompactMetaControls) && <div class="shortcuts-row">
         {!compact && <div class={`shortcuts${isTransport ? ' shortcuts-transport' : ''}`}>

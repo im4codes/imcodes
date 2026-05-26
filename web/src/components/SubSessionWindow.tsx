@@ -294,6 +294,7 @@ export function SubSessionWindow({
   // confirmClose removed — × now minimizes instead of terminating
 
   const inputRef = useRef<HTMLDivElement>(null);
+  const fileDropTargetRef = useRef<HTMLDivElement>(null);
   const termFitFnRef = useRef<(() => void) | null>(null);
   const geomRef = useRef(geom);
   geomRef.current = geom;
@@ -662,6 +663,7 @@ export function SubSessionWindow({
         </div>
       </div>
 
+      <div ref={fileDropTargetRef} class="subsession-session-surface">
       {/* Content */}
       <div class="subsession-content">
         <div style={{ display: viewMode === 'terminal' ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}>
@@ -765,12 +767,14 @@ export function SubSessionWindow({
         sessions={sessions}
         subSessions={subSessions}
         serverId={serverId}
+        fileDropTargetRef={fileDropTargetRef}
         detectedModel={effectiveDetectedModel ?? lastUsage?.model}
         quotes={quotes}
         onRemoveQuote={removeQuote}
         pendingPrefillText={pendingPrefillText}
         onPendingPrefillApplied={onPendingPrefillApplied}
       />
+      </div>
 
       {/* Per-sub-session file browser. Mobile: full-screen overlay.
           Desktop: floating panel layered via the shared desktop window stack

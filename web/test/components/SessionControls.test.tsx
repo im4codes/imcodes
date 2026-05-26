@@ -4,7 +4,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, within, waitFor, act } from '@testing-library/preact';
-import { useState } from 'preact/hooks';
+import { useRef, useState } from 'preact/hooks';
 import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js';
 
 const DEFAULT_INNER_WIDTH = 1280;
@@ -63,6 +63,8 @@ vi.mock('react-i18next', () => ({
       if (key === 'upload.long_text_attached') {
         return `Large pasted text attached as ${String(opts?.name ?? '')}`;
       }
+      if (key === 'upload.drop_overlay_title') return 'Drop files to upload';
+      if (key === 'upload.drop_overlay_hint') return 'Release anywhere in this session window';
       if (key === 'upload.file_too_large') {
         return `File too large (max ${String(opts?.max ?? '')}MB)`;
       }
@@ -3434,6 +3436,48 @@ afterEach(() => {
       expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('dropped-image.png');
     });
     expect(input.classList.contains('controls-input-file-drag-over')).toBe(false);
+  });
+
+  it('uploads files dropped anywhere in the session drop target with a visible overlay', async () => {
+    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/session-drop.pdf' } });
+    function Harness() {
+      const dropTargetRef = useRef<HTMLDivElement>(null);
+      return (
+        <div ref={dropTargetRef} data-testid="session-drop-target">
+          <div data-testid="session-body">chat body</div>
+          <SessionControls
+            ws={makeWs() as any}
+            activeSession={makeSession()}
+            quickData={makeQuickData() as any}
+            serverId="srv-1"
+            fileDropTargetRef={dropTargetRef}
+          />
+        </div>
+      );
+    }
+
+    render(<Harness />);
+
+    const target = screen.getByTestId('session-drop-target') as HTMLDivElement;
+    const droppedFile = new File(['pdf'], 'session-drop.pdf', { type: 'application/pdf' });
+    const dataTransfer = {
+      files: [droppedFile],
+      types: ['Files'],
+      dropEffect: 'none',
+    };
+
+    fireEvent.dragEnter(target, { dataTransfer });
+
+    expect(document.querySelector('.session-file-drop-overlay')).toBeTruthy();
+    expect(document.querySelector('.session-file-drop-title')?.textContent).toBe('Drop files to upload');
+    expect(dataTransfer.dropEffect).toBe('copy');
+
+    fireEvent.drop(target, { dataTransfer });
+
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
+    expect(uploadFileMock.mock.calls[0]?.[0]).toBe('srv-1');
+    expect(uploadFileMock.mock.calls[0]?.[1]).toBe(droppedFile);
+    await waitFor(() => expect(document.querySelector('.session-file-drop-overlay')).toBeFalsy());
   });
 
   it('converts oversized plain-text paste into an attachment upload', async () => {

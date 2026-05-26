@@ -246,6 +246,7 @@ export function SessionPane({
 
   // inputRef for SessionControls — expose to app.tsx via onInputRef
   const inputRef = useRef<HTMLDivElement>(null);
+  const fileDropTargetRef = useRef<HTMLDivElement>(null);
   // Re-register with app.tsx when session becomes active/inactive
   useEffect(() => {
     if (!onInputRef) return;
@@ -306,7 +307,10 @@ export function SessionPane({
 
 
   return (
-    <div class={isShellTerminal ? 'shell-terminal-pane' : undefined} style={{ display: 'contents' }}>
+    <div
+      ref={fileDropTargetRef}
+      class={`session-pane${isActive ? '' : ' session-pane-inactive'}${isShellTerminal ? ' shell-terminal-pane' : ''}`}
+    >
       {/* Terminal view: kept alive, shown/hidden via CSS display */}
       <div
         key={`term-${sessionName}`}
@@ -425,6 +429,7 @@ export function SessionPane({
           sessions={sessions}
           subSessions={subSessions}
           serverId={serverId}
+          fileDropTargetRef={fileDropTargetRef}
           quotes={quotes}
           onRemoveQuote={removeQuote}
           pendingPrefillText={pendingPrefillText}

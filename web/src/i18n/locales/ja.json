@@ -957,6 +957,8 @@
     "file_too_large": "ファイルが大きすぎます（最大 {{max}}MB）",
     "long_text_attached": "長い貼り付けテキストを {{name}} として添付しました",
     "long_text_requires_attachment": "この貼り付け内容は入力欄に直接入れるには長すぎます。ファイルとしてアップロードしてください。",
+    "drop_overlay_title": "ドロップしてアップロード",
+    "drop_overlay_hint": "このセッションウィンドウ内ならどこでも離せます",
     "download_file": "ダウンロード",
     "downloading": "ダウンロード中...",
     "preview_unavailable": "プレビューできません",

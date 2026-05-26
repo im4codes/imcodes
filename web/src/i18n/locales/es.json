@@ -957,6 +957,8 @@
     "file_too_large": "Archivo demasiado grande (máx. {{max}}MB)",
     "long_text_attached": "El texto pegado largo se adjuntó como {{name}}",
     "long_text_requires_attachment": "Este pegado es demasiado grande para el cuadro de texto. Súbelo como archivo.",
+    "drop_overlay_title": "Suelta para subir archivos",
+    "drop_overlay_hint": "Suelta en cualquier lugar de esta sesión",
     "download_file": "Descargar",
     "downloading": "Descargando...",
     "preview_unavailable": "Vista previa no disponible",
