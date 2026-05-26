@@ -1500,7 +1500,7 @@ export function App() {
         parentId: repoPanelParentSubId ? DESKTOP_WINDOW_IDS.subSession(repoPanelParentSubId) : undefined,
         subId: repoPanelParentSubId ?? undefined,
         serverId: repoPanelStackServerId,
-      }, { bringToFront: true });
+      });
     } else {
       removeDesktopWindow(repoPanelDesktopWindowId);
     }
