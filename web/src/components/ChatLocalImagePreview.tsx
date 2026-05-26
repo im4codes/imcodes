@@ -1,4 +1,3 @@
-import { h } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { ImageLightbox } from './ImageLightbox.js';
 
