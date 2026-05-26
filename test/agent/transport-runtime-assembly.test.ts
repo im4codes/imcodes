@@ -540,4 +540,94 @@ describe('buildProviderContextPayload', () => {
 
     expect(provider.send).not.toHaveBeenCalled();
   });
+
+  // ── Identity + Generated Image Reporting injection (p2p 37bfbb85-430 N-A) ────
+  describe('sessionIdentity / includeGeneratedImageReporting', () => {
+    it('injects identity + image-reporting into sessionSystemText, intact and untruncated', () => {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+        userMessage: 'hi',
+        description: 'short user description',
+        systemPrompt: 'short user system prompt',
+        sessionIdentity: { sessionName: 'deck_myapp_brain', label: 'My App Brain' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+      const systemText = payload.sessionSystemText ?? '';
+      expect(systemText).toContain('short user description');
+      expect(systemText).toContain('short user system prompt');
+      expect(systemText).toContain('IM.codes session identity:');
+      expect(systemText).toContain('Exact session name: deck_myapp_brain');
+      expect(systemText).toContain('Display label: My App Brain');
+      expect(systemText).toContain('imcodes send');
+      expect(systemText).toContain('Generated Image Reporting:');
+      expect(systemText).toContain('MUST report the local file path');
+      expect(systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+    });
+
+    it('falls back to the exact session name when label is null / undefined / blank', () => {
+      const cases: Array<string | null | undefined> = [null, undefined, '', '   '];
+      for (const label of cases) {
+        const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+          userMessage: 'hi',
+          sessionIdentity: { sessionName: 'deck_unlabeled_brain', label },
+          namespace: { scope: 'personal', projectId: 'repo-1' },
+        });
+        const systemText = payload.sessionSystemText ?? '';
+        expect(systemText).toContain('Exact session name: deck_unlabeled_brain');
+        expect(systemText).toContain('Display label: deck_unlabeled_brain');
+      }
+    });
+
+    it('does not inject identity / image-reporting when sessionIdentity is absent (process/tmux agents)', () => {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+        userMessage: 'hi',
+        description: 'some text',
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+      const systemText = payload.sessionSystemText ?? '';
+      expect(systemText).not.toContain('IM.codes session identity:');
+      expect(systemText).not.toContain('Generated Image Reporting:');
+      expect(systemText).toContain('some text');
+    });
+
+    it('omits the image-reporting block when includeGeneratedImageReporting is false but still injects identity', () => {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+        userMessage: 'hi',
+        sessionIdentity: { sessionName: 'deck_quiet_brain', label: 'Quiet' },
+        includeGeneratedImageReporting: false,
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+      const systemText = payload.sessionSystemText ?? '';
+      expect(systemText).toContain('IM.codes session identity:');
+      expect(systemText).toContain('Exact session name: deck_quiet_brain');
+      expect(systemText).not.toContain('Generated Image Reporting:');
+    });
+
+    it('emits identity / image-reporting peer-level with memory + progress guidance — single contiguous sessionSystemText', () => {
+      // Order matters for prefix-cache friendliness: stable session-level
+      // blocks should appear in a deterministic order so the model's
+      // prompt cache hits across turns. The assembly order is:
+      //   description -> systemPrompt -> identity -> image-reporting
+      //   -> memory-search guidance -> agent progress guidance.
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+        userMessage: 'hi',
+        description: 'desc-here',
+        systemPrompt: 'sp-here',
+        sessionIdentity: { sessionName: 'deck_order_brain', label: 'Order' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+      const systemText = payload.sessionSystemText ?? '';
+      const descIdx = systemText.indexOf('desc-here');
+      const spIdx = systemText.indexOf('sp-here');
+      const identityIdx = systemText.indexOf('IM.codes session identity:');
+      const imageIdx = systemText.indexOf('Generated Image Reporting:');
+      const memoryIdx = systemText.indexOf('Use memory MCP search');
+      const progressIdx = systemText.indexOf('Work transparently while you act.');
+      expect(descIdx).toBeGreaterThanOrEqual(0);
+      expect(spIdx).toBeGreaterThan(descIdx);
+      expect(identityIdx).toBeGreaterThan(spIdx);
+      expect(imageIdx).toBeGreaterThan(identityIdx);
+      expect(memoryIdx).toBeGreaterThan(imageIdx);
+      expect(progressIdx).toBeGreaterThan(memoryIdx);
+    });
+  });
 });

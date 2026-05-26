@@ -165,6 +165,20 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _sending = false;
   private _description: string | undefined;
   private _systemPrompt: string | undefined;
+  /**
+   * Session-stable IM.codes identity (exact session name + display label).
+   * Injected at assembly-time into `sessionSystemText`, peer-level with
+   * `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE`, so it lives OUTSIDE the
+   * `USER_SESSION_TEXT_MAX_CHARS` cap that bounds user-authored
+   * `_description` / `_systemPrompt`. See p2p audit 37bfbb85-430 N-A.
+   */
+  private _sessionIdentity: { sessionName: string; label: string | null } | undefined;
+  /**
+   * Whether to inject the Generated Image Reporting protocol alongside
+   * the identity block. Defaults to true; only opt out for niche callers
+   * that explicitly want to suppress the daemon-side image protocol.
+   */
+  private _includeGeneratedImageReporting = true;
   private _agentId: string | undefined;
   private _effort: TransportEffortLevel | undefined;
   private _contextNamespace: ContextNamespace | undefined;
@@ -323,6 +337,20 @@ export class TransportSessionRuntime implements SessionRuntime {
   setProviderSessionId(id: string): void { this._providerSessionId = id; }
   setDescription(desc: string): void { this._description = clampUserSessionText(desc); }
   setSystemPrompt(prompt: string): void { this._systemPrompt = clampUserSessionText(prompt); }
+  /**
+   * Update the session-stable IM.codes identity injected into every
+   * transport turn's `sessionSystemText`. Daemon-injected and NOT subject
+   * to `USER_SESSION_TEXT_MAX_CHARS` — see p2p audit 37bfbb85-430 N-A.
+   */
+  setSessionIdentity(sessionName: string, label: string | null | undefined): void {
+    const exact = sessionName.trim();
+    if (!exact) return;
+    this._sessionIdentity = { sessionName: exact, label: label?.trim() || null };
+  }
+  /** Toggle the Generated Image Reporting protocol injection. */
+  setIncludeGeneratedImageReporting(enabled: boolean): void {
+    this._includeGeneratedImageReporting = enabled;
+  }
   setAgentId(agentId: string): void {
     this._agentId = agentId;
     if (this._providerSessionId) {
@@ -372,6 +400,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     // every model call. See `shared/user-session-text-caps.ts`.
     this._description = clampUserSessionText(config.description);
     this._systemPrompt = clampUserSessionText(config.systemPrompt);
+    // Capture identity for assembly-time injection. Daemon-injected and
+    // NOT subject to the user-authored cap — see p2p audit 37bfbb85-430 N-A.
+    if (config.sessionName) {
+      this.setSessionIdentity(config.sessionName, config.label);
+    }
     this._projectDir = config.cwd;
     this._agentId = config.agentId;
     this._effort = config.effort;
@@ -637,6 +670,15 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.cancelActiveDispatchLocally(dispatchId);
         return;
       }
+      // Daemon-injected identity / image-reporting are stable session
+      // metadata — same on every turn, NOT user-authored — so we always
+      // pass them through. Slash control commands still get them: they
+      // are cheap (one short block), they reinforce the model's identity
+      // for control replies, and skipping them on `/foo` would leak the
+      // exact session name out of the model's awareness on follow-up
+      // turns when the cached system text is rebuilt from a slash-only
+      // tail. The 300-char user-authored cap stays in force on
+      // `description` / `systemPrompt`; identity is peer-level.
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: message,
         messagePreamble,
@@ -654,6 +696,8 @@ export class TransportSessionRuntime implements SessionRuntime {
         authoredContextRepository: isSlashControl ? undefined : this.resolveAuthoredContextRepository(),
         authoredContextLanguage: isSlashControl ? undefined : this._contextAuthoredContextLanguage,
         authoredContextFilePath: isSlashControl ? undefined : this._contextAuthoredContextFilePath,
+        ...(this._sessionIdentity ? { sessionIdentity: this._sessionIdentity } : {}),
+        includeGeneratedImageReporting: this._includeGeneratedImageReporting,
         ...(startupMemory ? { startupMemory } : {}),
         ...(memoryRecall ? { memoryRecall } : {}),
       }, {

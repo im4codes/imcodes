@@ -1453,4 +1453,70 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(initXCount).toBe(600);
     expect(initSystemText).not.toMatch(/X{301}/);
   });
+
+  it('injects IM.codes identity and Generated Image Reporting blocks intact alongside oversize user-authored text', async () => {
+    // p2p audit 37bfbb85-430 N-A regression: before this fix, the
+    // IM.codes identity prompt (~350 chars) and Generated Image Reporting
+    // protocol (~650 chars) were merged into `systemPrompt` by
+    // session-manager and then silently truncated by `clampUserSessionText(300)`.
+    // After the fix, identity + image-reporting are injected at the
+    // assembly layer peer-level with `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE`
+    // and live OUTSIDE the user-authored 300-char cap. They must survive
+    // intact even when the user pastes 2000 chars into description AND
+    // systemPrompt simultaneously.
+    const oversized = 'Y'.repeat(2000);
+    const freshProvider = makeMockProvider();
+    const fresh = new TransportSessionRuntime(freshProvider.provider, 'deck_identity_brain');
+    await fresh.initialize({
+      ...defaultConfig,
+      sessionKey: 'deck_identity_brain',
+      sessionName: 'deck_identity_brain',
+      label: 'Identity Brain',
+      description: oversized,
+      systemPrompt: oversized,
+    });
+    fresh.send('hello identity', 'identity-1');
+    await flushDispatch();
+    const sent = freshProvider.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const systemText = String(sent.systemText ?? '');
+
+    // User-authored cap still enforced: total Y count is 2 * 300 = 600.
+    const yCount = (systemText.match(/Y/g) ?? []).length;
+    expect(yCount).toBe(600);
+    expect(systemText).not.toMatch(/Y{301}/);
+
+    // Identity block present in full, including the exact session name
+    // and the display label. None of these strings exist in the user
+    // text (Y's only), so any match must come from the daemon-injected
+    // block — proving it survived the user cap.
+    expect(systemText).toMatch(/IM\.codes session identity:/);
+    expect(systemText).toMatch(/Exact session name: deck_identity_brain/);
+    expect(systemText).toMatch(/Display label: Identity Brain/);
+    expect(systemText).toMatch(/imcodes send/);
+
+    // Generated Image Reporting protocol present in full.
+    expect(systemText).toMatch(/Generated Image Reporting:/);
+    expect(systemText).toMatch(/MUST report the local file path/);
+    expect(systemText).toMatch(/Never finish an image-generation task/);
+  });
+
+  it('uses exact session name when no label is provided to setSessionIdentity', async () => {
+    // When the user has not labeled the session, the daemon block must
+    // still render a valid identity header — falling back to the exact
+    // session name as the display label so the model never sees an empty
+    // identity field.
+    const freshProvider = makeMockProvider();
+    const fresh = new TransportSessionRuntime(freshProvider.provider, 'deck_unlabeled_brain');
+    await fresh.initialize({
+      ...defaultConfig,
+      sessionKey: 'deck_unlabeled_brain',
+      sessionName: 'deck_unlabeled_brain',
+    });
+    fresh.send('hello', 'unlabeled-1');
+    await flushDispatch();
+    const sent = freshProvider.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const systemText = String(sent.systemText ?? '');
+    expect(systemText).toMatch(/Exact session name: deck_unlabeled_brain/);
+    expect(systemText).toMatch(/Display label: deck_unlabeled_brain/);
+  });
 });

@@ -1014,41 +1014,11 @@ async function loadBoundServerIdForManagedMcp(): Promise<string | undefined> {
   }
 }
 
-function buildTransportImcodesIdentityPrompt(
-  sessionName: string,
-  label: string | null | undefined,
-): string {
-  const displayLabel = label?.trim() || sessionName;
-  return [
-    'IM.codes session identity:',
-    `- Exact session name: ${sessionName}`,
-    `- Display label: ${displayLabel}`,
-    `- When invoking \`imcodes send\`, prefer $${IMCODES_SESSION_ENV}. If a SDK/tool environment lacks it, prefix the command with ${IMCODES_SESSION_ENV}=${sessionName}. Do not use display labels as sender identity unless the exact session name is unavailable, because labels can be duplicated.`,
-  ].join('\n');
-}
-
-function buildGeneratedImageReportingPrompt(): string {
-  return [
-    'Generated Image Reporting:',
-    'When you generate, edit, save, or otherwise create any image file, you MUST report the local file path of every generated image in your final response.',
-    '- If multiple images are created, list each path.',
-    '- Use repository-relative paths when the image is inside the workspace; otherwise use absolute paths.',
-    '- Do not only say that the image was generated.',
-    '- If image generation succeeds but no file path is available, explicitly say that no path was returned.',
-    '- If the image is intended for use in the app/site/docs, also mention where it was added or how it should be referenced.',
-    'Never finish an image-generation task without telling the user where the generated image file is located.',
-  ].join('\n');
-}
-
-function mergeTransportSystemPromptWithIdentity(
-  systemPrompt: string | undefined,
-  sessionName: string,
-  label: string | null | undefined,
-): string {
-  return [systemPrompt?.trim(), buildTransportImcodesIdentityPrompt(sessionName, label), buildGeneratedImageReportingPrompt()]
-    .filter(Boolean)
-    .join('\n\n');
-}
+// IM.codes identity + Generated Image Reporting prompts now live in
+// `shared/transport-runtime-prompts.ts` and are injected at the
+// assembly layer via `runtime.setSessionIdentity`. They are NOT subject
+// to the 300-char user-authored cap that bounds `description` /
+// `systemPrompt`. See p2p audit 37bfbb85-430 N-A.
 
 function queueTransportErrorResendEntries(sessionName: string, entries: PendingTransportMessage[]): number {
   if (entries.length === 0) return getResendCount(sessionName);
@@ -1493,7 +1463,13 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         cwd: s.projectDir,
         label: s.label ?? s.name,
         description: s.description,
-        systemPrompt: mergeTransportSystemPromptWithIdentity(systemPrompt, s.name, s.label),
+        // User-authored systemPrompt only; the IM.codes identity block and
+        // Generated Image Reporting protocol are injected at the assembly
+        // layer (peer-level with `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE`) via
+        // `runtime.initialize` -> `setSessionIdentity`. They are NOT
+        // subject to `clampUserSessionText`'s 300-char cap. See p2p
+        // audit 37bfbb85-430 N-A.
+        systemPrompt,
         ...(transportSettings ? { settings: transportSettings } : {}),
         contextNamespace: contextBootstrap.namespace,
         contextNamespaceDiagnostics: contextBootstrap.diagnostics,
@@ -1510,7 +1486,8 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         startupMemoryAlreadyInjected: s.startupMemoryInjected === true,
       });
       if (s.description) runtime.setDescription(s.description);
-      runtime.setSystemPrompt(mergeTransportSystemPromptWithIdentity(systemPrompt, s.name, s.label));
+      if (systemPrompt) runtime.setSystemPrompt(systemPrompt);
+      runtime.setSessionIdentity(s.name, s.label);
       if (effectiveRequestedModel) runtime.setAgentId(effectiveRequestedModel);
       if (s.effort) runtime.setEffort(s.effort);
       transportRuntimes.set(s.name, runtime);
@@ -1837,7 +1814,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     cwd: projectDir,
     label: label || name,
     description,
-    systemPrompt: mergeTransportSystemPromptWithIdentity(transportSystemPrompt, name, label),
+    // User-authored only. Identity + image-reporting are injected at
+    // the assembly layer via `SessionConfig.sessionName` / `label` ->
+    // `runtime.setSessionIdentity`, peer-level with
+    // `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE` and outside the 300-char user
+    // cap. See p2p audit 37bfbb85-430 N-A.
+    systemPrompt: transportSystemPrompt,
     ...(transportSettings ? { settings: transportSettings } : {}),
     contextNamespace: contextBootstrap.namespace,
     contextNamespaceDiagnostics: contextBootstrap.diagnostics,
