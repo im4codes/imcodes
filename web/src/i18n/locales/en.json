@@ -199,7 +199,7 @@
     "transport_send_queued_collapsed": "{{count}} queued · showing latest only",
     "transport_send_queued_count": "{{count}} queued",
     "send_placeholder": "Send to {{name}}…",
-    "send_placeholder_desktop_upload": "{{placeholder}} Supports fast multi-file paste upload",
+    "send_placeholder_desktop_upload": "{{placeholder}} Supports fast multi-file paste or drag upload",
     "actions": "Session actions",
     "new_btn": "New session",
     "clone": {

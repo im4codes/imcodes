@@ -199,7 +199,7 @@
     "transport_send_queued_collapsed": "{{count}}개 대기 중 · 마지막 메시지만 표시",
     "transport_send_queued_count": "{{count}}개 대기 중",
     "send_placeholder": "{{name}}에게 전송…",
-    "send_placeholder_desktop_upload": "{{placeholder}} 여러 파일 붙여넣기 빠른 업로드 지원",
+    "send_placeholder_desktop_upload": "{{placeholder}} 여러 파일 붙여넣기 또는 드래그 빠른 업로드 지원",
     "actions": "세션 작업",
     "new_btn": "새 세션",
     "clone": {

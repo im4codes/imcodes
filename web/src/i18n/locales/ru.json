@@ -199,7 +199,7 @@
     "transport_send_queued_collapsed": "В очереди: {{count}} · показано только последнее",
     "transport_send_queued_count": "В очереди: {{count}}",
     "send_placeholder": "Отправить в {{name}}…",
-    "send_placeholder_desktop_upload": "{{placeholder}} Поддерживается быстрая загрузка вставкой нескольких файлов",
+    "send_placeholder_desktop_upload": "{{placeholder}} Поддерживается быстрая загрузка нескольких файлов вставкой или перетаскиванием",
     "actions": "Действия с сессией",
     "new_btn": "Новая сессия",
     "clone": {

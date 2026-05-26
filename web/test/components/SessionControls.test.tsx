@@ -58,7 +58,7 @@ vi.mock('react-i18next', () => ({
         return `Send to ${String(opts?.name ?? 'session')}…`;
       }
       if (key === 'session.send_placeholder_desktop_upload') {
-        return `${String(opts?.placeholder ?? '')} Supports fast multi-file paste upload`;
+        return `${String(opts?.placeholder ?? '')} Supports fast multi-file paste or drag upload`;
       }
       if (key === 'upload.long_text_attached') {
         return `Large pasted text attached as ${String(opts?.name ?? '')}`;
@@ -529,7 +529,7 @@ afterEach(() => {
   it('shows the desktop upload hint in the placeholder on desktop', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: DEFAULT_INNER_WIDTH });
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
-    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project… Supports fast multi-file paste upload');
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project… Supports fast multi-file paste or drag upload');
   });
 
   it('keeps the placeholder short on mobile', () => {
@@ -3399,6 +3399,41 @@ afterEach(() => {
     expect(execCommandMock).toHaveBeenCalledWith('insertText', false, 'short inline paste');
     expect(input.textContent).toBe('short inline paste');
     expect(uploadFileMock).not.toHaveBeenCalled();
+  });
+
+  it('uploads dropped files through the same composer attachment path as paste', async () => {
+    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/dropped-image.png' } });
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const droppedFile = new File(['png'], 'dropped-image.png', { type: 'image/png' });
+    const dataTransfer = {
+      files: [droppedFile],
+      types: ['Files'],
+      dropEffect: 'none',
+    };
+
+    fireEvent.dragEnter(input, { dataTransfer });
+    expect(input.classList.contains('controls-input-file-drag-over')).toBe(true);
+    expect(dataTransfer.dropEffect).toBe('copy');
+
+    fireEvent.drop(input, { dataTransfer });
+
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
+    expect(uploadFileMock.mock.calls[0]?.[0]).toBe('srv-1');
+    expect(uploadFileMock.mock.calls[0]?.[1]).toBe(droppedFile);
+    await waitFor(() => {
+      expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1');
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('dropped-image.png');
+    });
+    expect(input.classList.contains('controls-input-file-drag-over')).toBe(false);
   });
 
   it('converts oversized plain-text paste into an attachment upload', async () => {

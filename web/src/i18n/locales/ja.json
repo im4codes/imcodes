@@ -199,7 +199,7 @@
     "transport_send_queued_collapsed": "{{count}} 件キュー中 · 最新のみ表示",
     "transport_send_queued_count": "{{count}} 件キュー中",
     "send_placeholder": "{{name}} へ送信…",
-    "send_placeholder_desktop_upload": "{{placeholder}} 複数ファイルの貼り付けによる高速アップロードに対応",
+    "send_placeholder_desktop_upload": "{{placeholder}} 複数ファイルの貼り付け/ドラッグによる高速アップロードに対応",
     "actions": "セッション操作",
     "new_btn": "新規セッション",
     "clone": {

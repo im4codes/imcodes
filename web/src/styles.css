@@ -438,6 +438,7 @@ body {
 .quote-badge .attachment-badge-icon { color: #a78bfa; }
 .controls-input { flex: 1; min-width: 0; background: linear-gradient(180deg, rgba(15,23,42,0.92), rgba(8,13,22,0.94)); border: 1px solid rgba(125,211,252,0.18); color: #e2e8f0; padding: 7px 11px; border-radius: 7px; font-family: inherit; font-size: 13px; outline: none; overflow-y: auto; min-height: 32px; max-height: 120px; line-height: 1.45; word-break: break-word; white-space: pre-wrap; text-align: left !important; direction: ltr; -webkit-user-modify: read-write-plaintext-only; box-shadow: inset 0 1px 0 rgba(255,255,255,0.035), inset 0 0 18px rgba(34,211,238,0.025); transition: border-color 0.14s, box-shadow 0.14s, background 0.14s; }
 .controls-input:focus { border-color: rgba(34,211,238,0.62); box-shadow: 0 0 0 1px rgba(34,211,238,0.14), 0 0 16px rgba(34,211,238,0.12), inset 0 1px 0 rgba(255,255,255,0.055); background: linear-gradient(180deg, rgba(15,40,62,0.72), rgba(8,13,22,0.94)); }
+.controls-input-file-drag-over { border-color: rgba(96,165,250,0.82); box-shadow: 0 0 0 1px rgba(96,165,250,0.42), 0 0 18px rgba(59,130,246,0.2), inset 0 1px 0 rgba(255,255,255,0.06); background: linear-gradient(180deg, rgba(20,53,82,0.74), rgba(8,13,22,0.94)); }
 .controls-input-p2p { background: linear-gradient(180deg, rgba(44,27,60,0.64), rgba(15,18,32,0.94)); }
 .controls-input-p2p:focus { border-color: inherit; }
 .controls-input-disabled { opacity: 0.4; pointer-events: none; }

@@ -206,6 +206,16 @@ function buildPastedTextFileName(now = new Date()): string {
   return `pasted-text-${compact}.txt`;
 }
 
+function dataTransferHasFiles(dataTransfer: DataTransfer | null | undefined): boolean {
+  if (!dataTransfer) return false;
+  if (dataTransfer.files && dataTransfer.files.length > 0) return true;
+  try {
+    return Array.from(dataTransfer.types ?? []).includes('Files');
+  } catch {
+    return false;
+  }
+}
+
 function normalizeQueuedText(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
@@ -651,6 +661,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [pendingComboSendConfirm, setPendingComboSendConfirm] = useState<PendingComboSendConfirmation | null>(null);
   const [rememberComboSendChoice, setRememberComboSendChoice] = useState(false);
   const [pendingTransportApproval, setPendingTransportApproval] = useState<PendingTransportApproval | null>(null);
+  const [fileDragActive, setFileDragActive] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
   const autoRef = useRef<HTMLDivElement>(null);
@@ -2478,6 +2489,41 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     await uploadAttachmentFiles(Array.from(files));
   }, [uploadAttachmentFiles]);
 
+  const handleFileDragEnter = useCallback((e: DragEvent) => {
+    if (inputDisabled || !dataTransferHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = serverId ? 'copy' : 'none';
+    setFileDragActive(true);
+  }, [inputDisabled, serverId]);
+
+  const handleFileDragOver = useCallback((e: DragEvent) => {
+    if (inputDisabled || !dataTransferHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = serverId ? 'copy' : 'none';
+    setFileDragActive(true);
+  }, [inputDisabled, serverId]);
+
+  const handleFileDragLeave = useCallback((e: DragEvent) => {
+    if (!dataTransferHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const current = e.currentTarget as Node | null;
+    const related = e.relatedTarget as Node | null;
+    if (current && related && current.contains(related)) return;
+    setFileDragActive(false);
+  }, []);
+
+  const handleFileDrop = useCallback((e: DragEvent) => {
+    if (!dataTransferHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setFileDragActive(false);
+    if (inputDisabled) return;
+    void handleFileUpload(e.dataTransfer?.files ?? null);
+  }, [handleFileUpload, inputDisabled]);
+
   // Paste: upload files from clipboard, or insert plain text
   const handlePaste = (e: Event) => {
     const ce = e as ClipboardEvent;
@@ -3651,7 +3697,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
           <div
             ref={divRef}
-            class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}`}
+            class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}${fileDragActive ? ' controls-input-file-drag-over' : ''}`}
             data-onboarding="chat-input"
             contenteditable={inputDisabled ? 'false' : 'true'}
             role="textbox"
@@ -3713,6 +3759,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
+            onDragEnter={handleFileDragEnter}
+            onDragOver={handleFileDragOver}
+            onDragLeave={handleFileDragLeave}
+            onDrop={handleFileDrop}
           />
           {showEmbeddedVoiceButton && (
             <button
