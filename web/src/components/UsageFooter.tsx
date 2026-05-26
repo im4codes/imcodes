@@ -2,7 +2,7 @@
  * UsageFooter — shared context bar + usage stats + cost display.
  * Used by both main session (app.tsx) and SubSessionWindow.
  */
-import { useEffect, useMemo, useState, useCallback } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
@@ -79,6 +79,8 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const hasActiveLiveWork = !isAgentless && (!!activeToolCall || !!activeThinkingTs);
   const showLiveStatus = !isAgentless;
   const [quotaNow, setQuotaNow] = useState(() => Date.now());
+  const [ctxBurning, setCtxBurning] = useState(false);
+  const previousCtxSignatureRef = useRef<string | null>(null);
 
   const displayModel = modelOverride ?? usage.model;
   useEffect(() => {
@@ -134,9 +136,6 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     return { ctx, total, totalPct, cachePct, newPct, pctStr, tip };
   }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, usage.contextWindowSource, displayModel, displayPlanLabel, displayQuotaLabel, quotaUsageLabel, t]);
 
-  const sessionCost = showCost ? getSessionCost(sessionName) : 0;
-  const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
-  const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(displayModel);
   // Keep the ctx meter visible even before the first non-zero usage event when
   // the session/model is known. A zero-token session still has useful context
@@ -144,6 +143,26 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   // SDK sessions look like ctx tracking had disappeared after stale cumulative
   // usage snapshots were filtered out.
   const hasContextInfo = total > 0 || (usage.contextWindow ?? 0) > 0 || !!modelLabel;
+
+  useEffect(() => {
+    if (!hasContextInfo) {
+      previousCtxSignatureRef.current = null;
+      setCtxBurning(false);
+      return;
+    }
+    const signature = `${total}:${cachePct.toFixed(3)}:${newPct.toFixed(3)}:${ctx}`;
+    const previousSignature = previousCtxSignatureRef.current;
+    previousCtxSignatureRef.current = signature;
+    if (!previousSignature || previousSignature === signature) return;
+
+    setCtxBurning(true);
+    const timeoutId = window.setTimeout(() => setCtxBurning(false), 780);
+    return () => window.clearTimeout(timeoutId);
+  }, [cachePct, ctx, hasContextInfo, newPct, total]);
+
+  const sessionCost = showCost ? getSessionCost(sessionName) : 0;
+  const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
+  const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const inlineQuotaText = displayQuotaLabel;
   const liveStatusMode = isAgentless
     ? null
@@ -171,9 +190,10 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   return (
     <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
       {hasContextInfo && (
-        <div class="session-ctx-bar">
+        <div class={`session-ctx-bar${ctxBurning ? ' is-burning' : ''}`}>
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
+          {ctxBurning && <span class="session-ctx-burn" aria-hidden="true" />}
         </div>
       )}
       {codexQuotaLines.length > 0 && (

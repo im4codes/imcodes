@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, cleanup, fireEvent } from '@testing-library/preact';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 
 const toolPref = vi.hoisted(() => ({
@@ -82,6 +82,39 @@ describe('UsageFooter', () => {
     expect(liveStatus?.textContent).toContain('Agent working...');
     expect(container.querySelector('.session-repo-branch-summary')).toBeNull();
     expect(children.indexOf(ctxBar as Element)).toBeLessThan(children.indexOf(statsRow as Element));
+  });
+
+  it('briefly shows a compact burning effect when ctx usage changes', async () => {
+    const { container, rerender } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 1000,
+          cacheTokens: 2000,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    expect(container.querySelector('.session-ctx-bar')?.className).not.toContain('is-burning');
+
+    rerender(
+      <UsageFooter
+        usage={{
+          inputTokens: 5000,
+          cacheTokens: 3000,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('.session-ctx-bar')?.className).toContain('is-burning');
+    });
+    expect(container.querySelector('.session-ctx-burn')).toBeTruthy();
   });
 
   it('keeps the robot status visible for idle or unknown agent states', () => {
