@@ -384,47 +384,37 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 </div>
               ))}
             </div>
-            <label
-              style={{
-                display: 'flex',
-                alignItems: 'flex-start',
-                gap: 8,
-                marginTop: 10,
-                cursor: 'pointer',
-              }}
-            >
-              <input
-                type="checkbox"
-                checked={customProviderSdk}
-                onChange={(e) => toggleCustomProviderSdk((e.target as HTMLInputElement).checked)}
-                style={{ marginTop: 2, flexShrink: 0 }}
-              />
-              <span
+            <div style={{ marginTop: 10 }}>
+              <label
                 style={{
                   display: 'flex',
-                  flexDirection: 'column',
-                  gap: 2,
-                  flex: 1,
-                  minWidth: 0,
-                  overflowWrap: 'anywhere',
+                  alignItems: 'center',
+                  gap: 8,
+                  cursor: 'pointer',
                 }}
               >
+                <input
+                  type="checkbox"
+                  checked={customProviderSdk}
+                  onChange={(e) => toggleCustomProviderSdk((e.target as HTMLInputElement).checked)}
+                  style={{ flexShrink: 0 }}
+                />
                 <span style={{ color: '#e2e8f0', fontSize: 13 }}>
                   {t('new_session.custom_provider_sdk')}
                 </span>
-                <span
-                  style={{
-                    color: '#94a3b8',
-                    fontSize: 12,
-                    lineHeight: 1.35,
-                    wordBreak: 'break-word',
-                    overflowWrap: 'anywhere',
-                  }}
-                >
-                  {t('new_session.custom_provider_sdk_help')}
-                </span>
-              </span>
-            </label>
+              </label>
+              <div
+                style={{
+                  marginLeft: 24,
+                  marginTop: 4,
+                  color: '#94a3b8',
+                  fontSize: 12,
+                  lineHeight: 1.35,
+                }}
+              >
+                {t('new_session.custom_provider_sdk_help')}
+              </div>
+            </div>
             <QwenCodingPlanHint selected={type === 'qwen'} />
           </div>
 
