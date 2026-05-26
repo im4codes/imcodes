@@ -4209,6 +4209,32 @@ afterEach(() => {
     expect(screen.getByRole('button', { name: /gpt-5.5/i })).toBeDefined();
   });
 
+  it('closes the model selector on outside touchstart before mobile click synthesis', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.4$/i }));
+    await waitFor(() => expect(document.querySelector('.menu-dropdown')).toBeTruthy());
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    fireEvent.touchStart(document.body);
+
+    await waitFor(() => expect(document.querySelector('.menu-dropdown')).toBeFalsy());
+  });
+
   it('shows a model selector for copilot-sdk and sends /model', () => {
     const ws = makeWs();
     render(
