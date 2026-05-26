@@ -393,7 +393,7 @@ describe('NewSessionDialog', () => {
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     agentTypeSelect.value = 'qwen';
     fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
-    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
     expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined();
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
@@ -410,6 +410,47 @@ describe('NewSessionDialog', () => {
       ccPreset: 'MiniMax',
       requestedModel: 'MiniMax-M2.7',
       thinking: 'high',
+    }));
+  });
+
+  it('custom provider SDK locks the main-session agent to qwen and uses a preset', async () => {
+    const ws = makeWs();
+    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
+      handler({
+        type: 'cc.presets.list_response',
+        presets: [
+          {
+            name: 'MiniMax',
+            env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+            defaultModel: 'MiniMax-M2.7',
+            availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-Text-01' }],
+          },
+        ],
+      });
+      return () => {};
+    });
+
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
+
+    await waitFor(() => expect(agentTypeSelect.value).toBe('qwen'));
+    expect(agentTypeSelect.disabled).toBe(true);
+    expect(screen.getByText('custom_provider_preset')).toBeDefined();
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'qwen',
+      ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M2.7',
+      thinking: 'high',
+    }));
+    expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'custom-provider-sdk',
     }));
   });
 
@@ -448,7 +489,7 @@ describe('NewSessionDialog', () => {
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     agentTypeSelect.value = 'qwen';
     fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
-    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
 
     fireEvent.click(screen.getByText('api_provider_add_edit'));
     fireEvent.click(screen.getByRole('button', { name: 'api_provider_export_json' }));
@@ -467,7 +508,7 @@ describe('NewSessionDialog', () => {
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     agentTypeSelect.value = 'qwen';
     fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
-    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
 
     fireEvent.click(screen.getByText('api_provider_add_edit'));
     fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'MiniMax' } });

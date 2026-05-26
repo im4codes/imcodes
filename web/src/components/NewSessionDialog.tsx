@@ -92,6 +92,8 @@ export function NewSessionDialog({
   const [project, setProject] = useState("");
   const [dir, setDir] = useState("~/");
   const [agentType, setAgentType] = useState<AgentType>("claude-code-sdk");
+  const [lastUnlockedAgentType, setLastUnlockedAgentType] = useState<AgentType>("claude-code-sdk");
+  const [customProviderSdk, setCustomProviderSdk] = useState(false);
   const [requestedModel, setRequestedModel] = useState("");
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
@@ -160,6 +162,22 @@ export function NewSessionDialog({
       ws?.send({ type: CC_PRESET_MSG.SAVE, requestId: `cc-preset-save-${Date.now()}`, presets: updated });
     } catch {}
     return preset;
+  };
+  const selectAgentType = (nextAgentType: AgentType) => {
+    setAgentType(nextAgentType);
+    if (!customProviderSdk) setLastUnlockedAgentType(nextAgentType);
+    setError("");
+  };
+  const toggleCustomProviderSdk = (enabled: boolean) => {
+    setCustomProviderSdk(enabled);
+    setError("");
+    setPresetError("");
+    if (enabled) {
+      if (agentType !== "qwen") setLastUnlockedAgentType(agentType);
+      setAgentType("qwen");
+      return;
+    }
+    setAgentType(lastUnlockedAgentType);
   };
   const selectedCcPreset = useMemo(
     () => ccPresets.find((preset) => preset.name === ccPreset),
@@ -348,6 +366,12 @@ export function NewSessionDialog({
     return () => clearTimeout(timeout);
   }, [starting, ws]);
 
+  useEffect(() => {
+    if (!customProviderSdk) return;
+    if (agentType !== "qwen") setAgentType("qwen");
+    if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
+  }, [agentType, ccPreset, ccPresets, customProviderSdk]);
+
   const handleStart = () => {
     if (!project.trim()) {
       setError(t("new_session.project_required"));
@@ -363,6 +387,11 @@ export function NewSessionDialog({
     }
     if (!ws.connected) {
       setError(t("new_session.daemon_offline"));
+      return;
+    }
+    if (customProviderSdk && !ccPreset) {
+      setError(t("new_session.custom_provider_preset_required"));
+      setShowPresetEditor(true);
       return;
     }
 
@@ -445,6 +474,11 @@ export function NewSessionDialog({
               ? OPENCLAW_THINKING_LEVELS
               : [];
   const supportsCcPreset = agentType === "claude-code" || agentType === "qwen";
+  const providerPresetLabel = customProviderSdk
+    ? t("new_session.custom_provider_preset")
+    : agentType === "qwen"
+      ? t("new_session.compatible_api_via_qwen")
+      : t("new_session.api_provider");
   const supportsModelSelection =
     agentType === "claude-code-sdk"
     || agentType === "codex-sdk"
@@ -618,9 +652,9 @@ export function NewSessionDialog({
           <label>{t("new_session.agent_type")}</label>
           <select
             value={agentType}
-            disabled={starting}
+            disabled={starting || customProviderSdk}
             onInput={(e) =>
-              setAgentType((e.target as HTMLSelectElement).value as AgentType)
+              selectAgentType((e.target as HTMLSelectElement).value as AgentType)
             }
             style={{
               width: "100%",
@@ -642,6 +676,33 @@ export function NewSessionDialog({
               </optgroup>
             ))}
           </select>
+          <label
+            style={{
+              display: "flex",
+              alignItems: "flex-start",
+              gap: 8,
+              marginTop: 10,
+              cursor: starting ? "not-allowed" : "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={customProviderSdk}
+              disabled={starting}
+              onChange={(e) =>
+                toggleCustomProviderSdk((e.target as HTMLInputElement).checked)
+              }
+              style={{ marginTop: 2 }}
+            />
+            <span style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              <span style={{ color: "#e2e8f0", fontSize: 13 }}>
+                {t("new_session.custom_provider_sdk")}
+              </span>
+              <span style={{ color: "#94a3b8", fontSize: 12, lineHeight: 1.35 }}>
+                {t("new_session.custom_provider_sdk_help")}
+              </span>
+            </span>
+          </label>
           {agentFlavor && (
             <div
               style={{
@@ -758,7 +819,7 @@ export function NewSessionDialog({
                   alignItems: "center",
                 }}
               >
-                <span>{agentType === "qwen" ? "Compatible API (via Qwen)" : t("new_session.api_provider")}</span>
+                <span>{providerPresetLabel}</span>
                 <button
                   type="button"
                   style={{
