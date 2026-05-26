@@ -656,6 +656,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const autoRef = useRef<HTMLDivElement>(null);
   const thinkingRef = useRef<HTMLDivElement>(null);
   const p2pRef = useRef<HTMLDivElement>(null);
+  const p2pDropdownRef = useRef<HTMLDivElement | null>(null);
   const openSpecRef = useRef<HTMLDivElement>(null);
   const openSpecDropdownRef = useRef<HTMLDivElement | null>(null);
   const openSpecSubmenuRef = useRef<HTMLDivElement | null>(null);
@@ -1279,7 +1280,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (thinkingOpen && thinkingRef.current && !thinkingRef.current.contains(e.target as Node)) {
         setThinkingOpen(false);
       }
-      if (p2pOpen && p2pRef.current && !p2pRef.current.contains(e.target as Node)) {
+      if (
+        p2pOpen
+        && p2pRef.current
+        && !p2pRef.current.contains(e.target as Node)
+        && !p2pDropdownRef.current?.contains(e.target as Node)
+      ) {
         setP2pOpen(false);
       }
       if (
@@ -1601,9 +1607,22 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     );
   }, [getOpenSpecSubmenuStyle, isOpenSpecMobile]);
 
+  const renderP2pDropdown = useCallback((content: ComponentChildren) => {
+    const dropdown = (
+      <div class="menu-dropdown menu-dropdown-p2p" ref={p2pDropdownRef} data-testid="p2p-dropdown">
+        {content}
+      </div>
+    );
+    if (isOpenSpecMobile && typeof document !== 'undefined') {
+      return createPortal(dropdown, document.body);
+    }
+    return dropdown;
+  }, [isOpenSpecMobile]);
+
   const renderOpenSpecDropdown = useCallback((content: ComponentChildren) => {
     if (isOpenSpecMobile) {
-      return (
+      if (typeof document === 'undefined') return null;
+      return createPortal(
         <div
           class="menu-dropdown menu-dropdown-openspec menu-dropdown-openspec-inline"
           ref={openSpecDropdownRef}
@@ -1625,7 +1644,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
           </div>
           {content}
-        </div>
+        </div>,
+        document.body,
       );
     }
     if (typeof document === 'undefined') return null;
@@ -3121,8 +3141,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             <span class="p2p-settings-icon" aria-hidden="true">⚙</span>
             <span class="p2p-settings-label">{t('p2p.settings_button')}</span>
           </button>
-          {p2pOpen && (
-            <div class="menu-dropdown menu-dropdown-p2p" data-testid="p2p-dropdown">
+          {p2pOpen && renderP2pDropdown(
+            <>
               <div
                 class="p2p-dropdown-rounds"
                 data-testid="p2p-dropdown-rounds"
@@ -3318,7 +3338,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   </button>
                 </>
               )}
-            </div>
+            </>
           )}
         </div>}
       </div>}

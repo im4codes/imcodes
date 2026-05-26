@@ -79,6 +79,35 @@ describe('styles.css regression contracts', () => {
     expect(roundButtonRule![0]).toMatch(/border:\s*1px solid rgba\(34,\s*197,\s*94/);
   });
 
+  it('mobile Team/P2P dropdown is portaled and clamped to the visual viewport', () => {
+    const sessionControls = readFileSync(resolve(__dirname, '../src/components/SessionControls.tsx'), 'utf8');
+    const helper = sessionControls.match(/const renderP2pDropdown = useCallback\([\s\S]*?\}, \[isOpenSpecMobile\]\);/);
+    expect(helper?.[0]).toContain('createPortal');
+    expect(helper?.[0]).toContain('document.body');
+    expect(sessionControls).toMatch(/p2pDropdownRef\.current\?\.contains/);
+
+    const mobileP2pRule = css.match(/\.menu-dropdown-p2p\s*\{[^}]*position:\s*fixed[^}]*\}/);
+    expect(mobileP2pRule).not.toBeNull();
+    expect(mobileP2pRule![0]).toMatch(/z-index:\s*2147483646/);
+    expect(mobileP2pRule![0]).toMatch(/max-height:\s*min\(72vh,\s*calc\(var\(--vvh,\s*100dvh\)/);
+    expect(mobileP2pRule![0]).toMatch(/overflow-y:\s*auto/);
+  });
+
+  it('mobile OpenSpec dropdown is a body-level viewport sheet, not an inline clipped menu', () => {
+    const sessionControls = readFileSync(resolve(__dirname, '../src/components/SessionControls.tsx'), 'utf8');
+    const helper = sessionControls.match(/const renderOpenSpecDropdown = useCallback\([\s\S]*?\}, \[clearOpenSpecRequestTimer, isOpenSpecMobile, openSpecDropdownStyle, t\]\);/);
+    expect(helper?.[0]).toContain('createPortal');
+    expect(helper?.[0]).toContain('document.body');
+    expect(helper?.[0]).toContain('menu-dropdown-openspec-inline');
+
+    const inlineRules = [...css.matchAll(/\.menu-dropdown-openspec-inline\s*\{[^}]*\}/g)].map((match) => match[0]);
+    const mobileRule = inlineRules.find((rule) => /position:\s*fixed/.test(rule));
+    expect(mobileRule).toBeTruthy();
+    expect(mobileRule!).toMatch(/top:\s*var\(--sat,\s*0px\)/);
+    expect(mobileRule!).toMatch(/height:\s*calc\(var\(--vvh,\s*100dvh\)/);
+    expect(mobileRule!).toMatch(/overflow:\s*hidden/);
+  });
+
   it('.fb-changes-section must NOT cap height — list must scroll past 10 items', () => {
     // User reported: file browser changes list silently hides items
     // beyond ~10 even though the DOM has them. Root cause:
