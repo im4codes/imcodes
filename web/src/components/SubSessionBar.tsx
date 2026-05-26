@@ -22,7 +22,7 @@ import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { EmbeddingStatusIcon } from './EmbeddingStatusIcon.js';
 import type { EmbeddingStatus } from '@shared/embedding-status.js';
-import { formatDaemonVersionShort } from '../util/format-version.js';
+import { formatDaemonVersionMobile, formatDaemonVersionShort } from '../util/format-version.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES, type UsageContextWindowSource } from '@shared/usage-context-window.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
@@ -80,6 +80,7 @@ interface Props {
   idleFlashTokens?: Map<string, number>;
   onOpen: (id: string) => void;
   onClose: (id: string) => void;
+  onCloseAllOpen?: () => void;
   onOpenMaximized?: (id: string) => void;
   onMaximize?: (id: string) => void;
   onRestore?: (id: string) => void;
@@ -161,6 +162,27 @@ function formatLocalDateTime(timestamp: number): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
+function formatLocalTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function renderTechClock(text: string): JSX.Element {
+  return (
+    <>
+      {Array.from(text).map((char, index) => (
+        <span
+          key={`${index}-${char}-${text}`}
+          class={/\d/.test(char) ? 'daemon-local-clock-digit' : 'daemon-local-clock-separator'}
+        >
+          {char}
+        </span>
+      ))}
+    </>
+  );
+}
+
 function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, usage, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
@@ -236,7 +258,7 @@ function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, inP2p, t }:
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onClose, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onClose, onCloseAllOpen, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
@@ -248,8 +270,9 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const [draftW, setDraftW] = useState(String(cardSize.w));
   const [draftH, setDraftH] = useState(String(cardSize.h));
   const [stats, setStats] = useState<DaemonStats | null>(null);
-  const localClockNow = useNowTicker(desktopLayoutCapable && !!stats);
+  const localClockNow = useNowTicker(!!stats);
   const localClockText = useMemo(() => formatLocalDateTime(localClockNow), [localClockNow]);
+  const localClockCompactText = useMemo(() => formatLocalTime(localClockNow), [localClockNow]);
   // DB sort_order is the authority — subSessions arrive pre-sorted from server.
   // Local dragOrder only tracks in-session drag reorder (synced back to DB via reorderSubSessions).
   const [dragOrder, setDragOrder] = useState<string[] | null>(null);
@@ -355,6 +378,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     getEntryGestureController(id).handleDoubleClick(event, event.currentTarget as Element);
   }, [getEntryGestureController]);
 
+  const handleCloseAllOpenSubWindows = useCallback((event: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    onCloseAllOpen?.();
+  }, [onCloseAllOpen]);
+
   const handleExpandedEntryTouchStart = useCallback((id: string, event: JSX.TargetedTouchEvent<HTMLElement>) => {
     handleEntryTouchStart(id);
     const touch = event.touches[0];
@@ -433,6 +462,11 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     () => new Set(orderedSessions.slice(0, currentExpandedPreviewBudget).map((sub) => sub.id)),
     [currentExpandedPreviewBudget, orderedSessions],
   );
+  const openSubWindowCount = useMemo(
+    () => orderedSessions.filter((sub) => openIds.has(sub.id)).length,
+    [openIds, orderedSessions],
+  );
+  const showCloseAllOpenSubs = desktopLayoutCapable && openSubWindowCount > 1 && !!onCloseAllOpen;
 
   const moveSubSessionInDragOrder = useCallback((draggedId: string, overId: string) => {
     if (draggedId === overId) return;
@@ -766,38 +800,34 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             <span class="subcard-toolbar-label">{t('subsessionBar.subs_count', { count: subSessions.length })}</span>
             {/* Desktop: full stats in expanded toolbar */}
             {stats && (
-              <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}>
+              <span class="daemon-stats-inline daemon-stats-inline-tech" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)} | ${localClockText}`}>
                 {stats.daemonVersion && (
                   <>
                     {/* Display the short form (strips trailing -dev.NNN counter); the
                         full version stays available in the title tooltip above. */}
-                    <span style={{ color: '#94a3b8' }}>v{formatDaemonVersionShort(stats.daemonVersion)}</span>
-                    <span style={{ color: '#94a3b8' }}> · </span>
+                    <span class="daemon-stat-version">v{formatDaemonVersionShort(stats.daemonVersion)}</span>
+                    <span class="daemon-stat-sep"> · </span>
                   </>
                 )}
-                <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>
+                <span class={`daemon-stat-cpu${stats.cpu > 80 ? ' danger' : stats.cpu > 50 ? ' warn' : ''}`}>
                   CPU {stats.cpu}%
                 </span>
-                <span style={{ color: '#94a3b8' }}> · </span>
-                <span style={{ color: '#60a5fa' }}>
+                <span class="daemon-stat-sep"> · </span>
+                <span class="daemon-stat-mem">
                   Mem {(() => { const gb = stats.memUsed / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(stats.memUsed / (1024 ** 2)).toFixed(0)}M`; })()}
                 </span>
-                <span style={{ color: '#94a3b8' }}> · </span>
-                <span style={{ color: '#a78bfa' }}>
+                <span class="daemon-stat-sep"> · </span>
+                <span class="daemon-stat-load">
                   Load {stats.load1}
                 </span>
-                <span style={{ color: '#94a3b8' }}> · </span>
+                <span class="daemon-stat-sep"> · </span>
                 <EmbeddingStatusIcon status={stats.embedding} />
-                <span style={{ color: '#94a3b8' }}> · </span>
-                <span style={{ color: '#94a3b8' }}>
+                <span class="daemon-stat-sep"> · </span>
+                <span class="daemon-stat-uptime">
                   {formatUptime(stats.uptime)}
                 </span>
-                {desktopLayoutCapable && (
-                  <>
-                    <span style={{ color: '#94a3b8' }}> · </span>
-                    <span class="daemon-local-clock">{localClockText}</span>
-                  </>
-                )}
+                <span class="daemon-stat-sep"> · </span>
+                <span class="daemon-local-clock">{renderTechClock(localClockText)}</span>
               </span>
             )}
           </>
@@ -811,23 +841,20 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           const memUsed = (stats.memUsed / div).toFixed(1);
           const memTotal = useG ? totalGb.toFixed(1) : (stats.memTotal / div).toFixed(0);
           const ei = { fontSize: '0.65em', verticalAlign: 'middle' } as const;
+          const compactClockText = desktopLayoutCapable ? localClockText : localClockCompactText;
           return (
-            <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`} style={{ whiteSpace: 'nowrap', fontSize: 10 }}>
+            <span class={`daemon-stats-inline daemon-stats-inline-tech daemon-stats-compact${desktopLayoutCapable ? '' : ' daemon-stats-mobile'}`} title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)} | ${localClockText}`}>
               {/* Mobile-narrow stat strip — show short version; full string in title above. */}
-              {stats.daemonVersion && <span style={{ color: '#94a3b8' }}>v{formatDaemonVersionShort(stats.daemonVersion)} </span>}
-              <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}><span style={ei}>⚙️</span>{stats.cpu}%</span>
+              {stats.daemonVersion && <span class="daemon-stat-version">{desktopLayoutCapable ? `v${formatDaemonVersionShort(stats.daemonVersion)}` : formatDaemonVersionMobile(stats.daemonVersion)} </span>}
+              <span class={`daemon-stat-cpu${stats.cpu > 80 ? ' danger' : stats.cpu > 50 ? ' warn' : ''}`}><span style={ei}>⚙️</span>{stats.cpu}%</span>
               {' '}
-              <span style={{ color: '#60a5fa' }}><span style={ei}>🧠</span>{memUsed}/{memTotal}{unit}</span>
+              <span class="daemon-stat-mem"><span style={ei}>🧠</span>{memUsed}/{memTotal}{unit}</span>
               {' '}
-              <span style={{ color: '#a78bfa' }}>≡{Number(stats.load1).toFixed(1)}</span>
+              <span class="daemon-stat-load">≡{Number(stats.load1).toFixed(1)}</span>
               {' '}
               <EmbeddingStatusIcon status={stats.embedding} compact />
-              {desktopLayoutCapable && (
-                <>
-                  {' '}
-                  <span class="daemon-local-clock">{localClockText}</span>
-                </>
-              )}
+              {' '}
+              <span class="daemon-local-clock">{renderTechClock(compactClockText)}</span>
             </span>
           );
         })()}
@@ -986,115 +1013,141 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
 
       {/* Collapsed: compact buttons (all platforms) — drag on desktop, long-press on touch */}
       {collapsed && subSessions.length > 0 && (
-        <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}>
-          {orderedSessions.map((sub) => (
-            <CollapsedSubSessionButton
-              key={sub.id}
-              sub={sub}
-              accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
-              isOpen={openIds.has(sub.id)}
-              idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
-              usage={subUsages?.get(`deck_sub_${sub.id}`)}
-              detectedModel={detectedModels?.get(sub.sessionName)}
-              inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
-              draggable={desktopLayoutCapable}
-              onEntryPointerDown={handleEntryPointerDown}
-              onEntryTouchStart={handleEntryTouchStart}
-              onEntryClick={handleEntryClick}
-              onEntryDoubleClick={handleEntryDoubleClick}
-              onEntryDragStart={handleCollapsedEntryDragStart}
-              onEntryDragOver={handleCollapsedEntryDragOver}
-              onEntryDragEnd={handleCollapsedEntryDragEnd}
-              t={t}
-            />
-          ))}
+        <div class="subsession-row-with-close">
+          {showCloseAllOpenSubs && (
+            <button
+              type="button"
+              class="subsession-close-all-strip"
+              title={t('subsessionBar.close_all_open')}
+              aria-label={t('subsessionBar.close_all_open')}
+              onClick={handleCloseAllOpenSubWindows}
+            >
+              <span class="subsession-close-all-arrow" aria-hidden="true">↓</span>
+            </button>
+          )}
+          <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}>
+            {orderedSessions.map((sub) => (
+              <CollapsedSubSessionButton
+                key={sub.id}
+                sub={sub}
+                accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
+                isOpen={openIds.has(sub.id)}
+                idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
+                usage={subUsages?.get(`deck_sub_${sub.id}`)}
+                detectedModel={detectedModels?.get(sub.sessionName)}
+                inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
+                draggable={desktopLayoutCapable}
+                onEntryPointerDown={handleEntryPointerDown}
+                onEntryTouchStart={handleEntryTouchStart}
+                onEntryClick={handleEntryClick}
+                onEntryDoubleClick={handleEntryDoubleClick}
+                onEntryDragStart={handleCollapsedEntryDragStart}
+                onEntryDragOver={handleCollapsedEntryDragOver}
+                onEntryDragEnd={handleCollapsedEntryDragEnd}
+                t={t}
+              />
+            ))}
+          </div>
         </div>
       )}
 
       {/* Expanded: preview cards (all platforms) */}
       {!collapsed && orderedSessions.length > 0 && (
-        <div
-          ref={expandedScrollRef}
-          class={`subcard-scroll ${layout === 'double' ? 'subcard-double' : 'subcard-single'}`}
-          style={layout === 'double' ? { gridAutoColumns: 'max-content' } : undefined}
-        >
-          {orderedSessions.map((sub, index) => (
-            <div
-              key={sub.id}
-              class="subcard-drag-wrap"
-              draggable
-              onPointerDown={(event) => handleEntryPointerDown(sub.id, event)}
-              onTouchStart={(event) => handleExpandedEntryTouchStart(sub.id, event)}
-              onTouchMove={(event) => handleExpandedEntryTouchMove(sub.id, event)}
-              onTouchEnd={(event) => handleExpandedEntryTouchEnd(sub.id, event)}
-              onTouchCancel={() => handleExpandedEntryTouchCancel(sub.id)}
-              onClick={(event) => handleEntryClick(sub.id, event)}
-              onDblClick={(event) => handleEntryDoubleClick(sub.id, event)}
-              onDragStart={(e) => {
-                dragIdRef.current = sub.id;
-                suppressEntryClickRef.current = true;
-                e.dataTransfer!.effectAllowed = 'move';
-                (e.currentTarget as HTMLElement).style.opacity = '0.5';
-                // Initialize dragOrder from current displayed order
-                if (!dragOrder) setDragOrder(orderedSessions.map((s) => s.id));
-              }}
-              onDragOver={(e) => {
-                e.preventDefault();
-                e.dataTransfer!.dropEffect = 'move';
-                if (!dragIdRef.current || dragIdRef.current === sub.id) return;
-                setDragOrder((prev) => {
-                  const ids = prev ?? orderedSessions.map((s) => s.id);
-                  const from = ids.indexOf(dragIdRef.current!);
-                  const to = ids.indexOf(sub.id);
-                  if (from === -1 || to === -1) return prev;
-                  const next = [...ids];
-                  next.splice(from, 1);
-                  next.splice(to, 0, dragIdRef.current!);
-                  return next;
-                });
-              }}
-              onDragEnd={(e) => {
-                dragIdRef.current = null;
-                setTimeout(() => { suppressEntryClickRef.current = false; }, 0);
-                (e.currentTarget as HTMLElement).style.opacity = '';
-                if (dragOrder) syncOrderToServer(dragOrder);
-              }}
+        <div class="subsession-row-with-close">
+          {showCloseAllOpenSubs && (
+            <button
+              type="button"
+              class="subsession-close-all-strip"
+              title={t('subsessionBar.close_all_open')}
+              aria-label={t('subsessionBar.close_all_open')}
+              onClick={handleCloseAllOpenSubWindows}
             >
-              {hydratedExpandedPreviewIds.has(sub.id) || openIds.has(sub.id) || focusedSubId === sub.id ? (
-                <SubSessionCard
-                  sub={sub}
-                  ws={ws}
-                  connected={connected}
-                  isOpen={openIds.has(sub.id)}
-                  isFocused={focusedSubId === sub.id}
-                  idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
-                  onOpen={() => {}}
-                  onClose={() => onClose(sub.id)}
-                  onRestart={() => onRestart(sub.id)}
-                  onDiff={onDiff}
-                  onHistory={onHistory}
-                  cardW={cardSize.w}
-                  cardH={cardSize.h}
-                  quickData={quickData}
-                  sessions={sessions}
-                  subSessions={allSubSessions}
-                  serverId={serverId}
-                  onTransportConfigSaved={onSubTransportConfigSaved}
-                  inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
-                  accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
-                  previewHydrateDelayMs={Math.min(1200, 120 + index * 60)}
-                />
-              ) : (
-                <ExpandedSubSessionPlaceholder
-                  sub={sub}
-                  accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
-                  cardSize={cardSize}
-                  inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
-                  t={t}
-                />
-              )}
-            </div>
-          ))}
+              <span class="subsession-close-all-arrow" aria-hidden="true">↓</span>
+            </button>
+          )}
+          <div
+            ref={expandedScrollRef}
+            class={`subcard-scroll ${layout === 'double' ? 'subcard-double' : 'subcard-single'}`}
+            style={layout === 'double' ? { gridAutoColumns: 'max-content' } : undefined}
+          >
+            {orderedSessions.map((sub, index) => (
+              <div
+                key={sub.id}
+                class="subcard-drag-wrap"
+                draggable
+                onPointerDown={(event) => handleEntryPointerDown(sub.id, event)}
+                onTouchStart={(event) => handleExpandedEntryTouchStart(sub.id, event)}
+                onTouchMove={(event) => handleExpandedEntryTouchMove(sub.id, event)}
+                onTouchEnd={(event) => handleExpandedEntryTouchEnd(sub.id, event)}
+                onTouchCancel={() => handleExpandedEntryTouchCancel(sub.id)}
+                onClick={(event) => handleEntryClick(sub.id, event)}
+                onDblClick={(event) => handleEntryDoubleClick(sub.id, event)}
+                onDragStart={(e) => {
+                  dragIdRef.current = sub.id;
+                  suppressEntryClickRef.current = true;
+                  e.dataTransfer!.effectAllowed = 'move';
+                  (e.currentTarget as HTMLElement).style.opacity = '0.5';
+                  // Initialize dragOrder from current displayed order
+                  if (!dragOrder) setDragOrder(orderedSessions.map((s) => s.id));
+                }}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.dataTransfer!.dropEffect = 'move';
+                  if (!dragIdRef.current || dragIdRef.current === sub.id) return;
+                  setDragOrder((prev) => {
+                    const ids = prev ?? orderedSessions.map((s) => s.id);
+                    const from = ids.indexOf(dragIdRef.current!);
+                    const to = ids.indexOf(sub.id);
+                    if (from === -1 || to === -1) return prev;
+                    const next = [...ids];
+                    next.splice(from, 1);
+                    next.splice(to, 0, dragIdRef.current!);
+                    return next;
+                  });
+                }}
+                onDragEnd={(e) => {
+                  dragIdRef.current = null;
+                  setTimeout(() => { suppressEntryClickRef.current = false; }, 0);
+                  (e.currentTarget as HTMLElement).style.opacity = '';
+                  if (dragOrder) syncOrderToServer(dragOrder);
+                }}
+              >
+                {hydratedExpandedPreviewIds.has(sub.id) || openIds.has(sub.id) || focusedSubId === sub.id ? (
+                  <SubSessionCard
+                    sub={sub}
+                    ws={ws}
+                    connected={connected}
+                    isOpen={openIds.has(sub.id)}
+                    isFocused={focusedSubId === sub.id}
+                    idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
+                    onOpen={() => {}}
+                    onClose={() => onClose(sub.id)}
+                    onRestart={() => onRestart(sub.id)}
+                    onDiff={onDiff}
+                    onHistory={onHistory}
+                    cardW={cardSize.w}
+                    cardH={cardSize.h}
+                    quickData={quickData}
+                    sessions={sessions}
+                    subSessions={allSubSessions}
+                    serverId={serverId}
+                    onTransportConfigSaved={onSubTransportConfigSaved}
+                    inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
+                    accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
+                    previewHydrateDelayMs={Math.min(1200, 120 + index * 60)}
+                  />
+                ) : (
+                  <ExpandedSubSessionPlaceholder
+                    sub={sub}
+                    accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
+                    cardSize={cardSize}
+                    inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
+                    t={t}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>

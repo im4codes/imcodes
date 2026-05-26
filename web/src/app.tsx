@@ -4155,6 +4155,7 @@ export function App() {
                 idleFlashTokens={idleFlashTokens}
                 onOpen={toggleSubSession}
                 onClose={closeSubSessionAndClearMaximized}
+                onCloseAllOpen={closeAllSubSessionWindows}
                 onOpenMaximized={openSubSessionMaximized}
                 onMaximize={maximizeOpenSubSession}
                 onRestore={restoreSubSession}

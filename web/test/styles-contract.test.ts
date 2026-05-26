@@ -133,6 +133,41 @@ describe('styles.css regression contracts', () => {
     expect(mobileTransportShortcutRule!).toMatch(/max-width:\s*none/);
   });
 
+  it('daemon stats strip keeps the compact tech styling and animated clock digits', () => {
+    const statsRule = css.match(/\.daemon-stats-inline-tech\s*\{[^}]*\}/);
+    expect(statsRule).not.toBeNull();
+    expect(statsRule![0]).toMatch(/repeating-linear-gradient\(90deg/);
+    expect(statsRule![0]).toMatch(/border-radius:\s*999px/);
+
+    const clockRule = css.match(/\.daemon-local-clock\s*\{[^}]*\}/);
+    expect(clockRule).not.toBeNull();
+    expect(clockRule![0]).toMatch(/font-variant-numeric:\s*tabular-nums/);
+    expect(clockRule![0]).toMatch(/display:\s*inline-flex/);
+
+    const digitRule = css.match(/\.daemon-local-clock-digit\s*\{[^}]*\}/);
+    expect(digitRule).not.toBeNull();
+    expect(digitRule![0]).toMatch(/animation:\s*daemon-clock-tick\s+0\.28s/);
+    expect(css).toMatch(/@keyframes daemon-clock-tick/);
+  });
+
+  it('sub-session close-all control stays a narrow strip at the left of the row', () => {
+    const rowRule = css.match(/\.subsession-row-with-close\s*\{[^}]*\}/);
+    expect(rowRule).not.toBeNull();
+    expect(rowRule![0]).toMatch(/display:\s*flex/);
+    expect(rowRule![0]).toMatch(/align-items:\s*stretch/);
+
+    const childRule = css.match(/\.subsession-row-with-close \.subsession-bar,\s*[\s\S]*?\.subsession-row-with-close \.subcard-scroll\s*\{[^}]*\}/);
+    expect(childRule).not.toBeNull();
+    expect(childRule![0]).toMatch(/flex:\s*1\s+1\s+auto/);
+    expect(childRule![0]).toMatch(/min-width:\s*0/);
+
+    const stripRule = css.match(/\.subsession-close-all-strip\s*\{[^}]*\}/);
+    expect(stripRule).not.toBeNull();
+    expect(stripRule![0]).toMatch(/flex:\s*0\s+0\s+18px/);
+    expect(stripRule![0]).toMatch(/width:\s*18px/);
+    expect(stripRule![0]).toMatch(/border-radius:\s*8px/);
+  });
+
   it('server rail buttons stay rounded rectangles and do not clip status dots', () => {
     const serverIconRule = css.match(/\.server-icon\s*\{[^}]*\}/);
     expect(serverIconRule).not.toBeNull();

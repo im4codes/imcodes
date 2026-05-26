@@ -184,7 +184,7 @@ describe('SubSessionBar', () => {
     expect(getStatsText()).toContain('2026-05-12 07:08:10');
   });
 
-  it('does not add the local clock to mobile daemon stats', async () => {
+  it('shows a compact mobile daemon version and local clock', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 4, 12, 7, 8, 9));
     const statsWs = makeStatsWs();
@@ -210,7 +210,10 @@ describe('SubSessionBar', () => {
       statsWs.emit(daemonStatsMessage);
     });
 
-    expect(view.container.querySelector('.daemon-stats-inline')?.textContent).not.toContain('2026-05-12');
+    const statsText = view.container.querySelector('.daemon-stats-inline')?.textContent ?? '';
+    expect(statsText).toContain('5.2161-dev');
+    expect(statsText).not.toContain('v2026.');
+    expect(statsText).toMatch(/07:08:\d{2}/);
   });
 
   it('only applies the running pulse to collapsed mini cards while the sub-session is running', () => {
@@ -284,6 +287,76 @@ describe('SubSessionBar', () => {
     expect(buttons[0].style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[0]);
     expect(buttons[14].style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[14]);
     expect(buttons[15].style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[0]);
+  });
+
+  it('shows a desktop close-all strip for multiple open sub-session windows and reuses the shared close-all handler', () => {
+    const onCloseAllOpen = vi.fn();
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+      makeSubSession({ id: 'sub-c', sessionName: 'deck_sub_sub-c', label: 'c' }),
+    ];
+
+    const view = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set(['sub-a', 'sub-b'])}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onCloseAllOpen={onCloseAllOpen}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const strip = view.container.querySelector('.subsession-close-all-strip') as HTMLButtonElement;
+    expect(strip).not.toBeNull();
+    expect(strip.getAttribute('aria-label')).toBe('subsessionBar.close_all_open');
+
+    fireEvent.click(strip);
+
+    expect(onCloseAllOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('hides the close-all strip on mobile, with one open sub-session, or without the shared handler', () => {
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+    ];
+    const renderBar = (props: { openIds: Set<string>; desktopLayoutCapable?: boolean; onCloseAllOpen?: () => void }) => render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={props.openIds}
+        collapsed={true}
+        desktopLayoutCapable={props.desktopLayoutCapable ?? true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onCloseAllOpen={props.onCloseAllOpen}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const oneOpen = renderBar({ openIds: new Set(['sub-a']), onCloseAllOpen: vi.fn() });
+    expect(oneOpen.container.querySelector('.subsession-close-all-strip')).toBeNull();
+    oneOpen.unmount();
+
+    const mobile = renderBar({ openIds: new Set(['sub-a', 'sub-b']), desktopLayoutCapable: false, onCloseAllOpen: vi.fn() });
+    expect(mobile.container.querySelector('.subsession-close-all-strip')).toBeNull();
+    mobile.unmount();
+
+    const noHandler = renderBar({ openIds: new Set(['sub-a', 'sub-b']) });
+    expect(noHandler.container.querySelector('.subsession-close-all-strip')).toBeNull();
   });
 
   it('passes the same ordered accent colors to expanded preview cards', () => {

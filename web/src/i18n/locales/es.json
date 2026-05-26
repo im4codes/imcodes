@@ -1170,6 +1170,7 @@
     "subs_count": "Subs ({{count}})",
     "new_sub_session": "Nueva sub-sesión",
     "add_sub_session_short": "+ sub-sesión",
+    "close_all_open": "Cerrar todas las ventanas de sub-sesión abiertas",
     "p2p_discussions": "Discusiones Team",
     "p2p_compact_show": "Mostrar barra Team compacta",
     "p2p_compact_hide": "Compactar barra Team",
