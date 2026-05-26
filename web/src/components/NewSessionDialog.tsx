@@ -55,6 +55,9 @@ const responsiveDialogStyle = {
   maxWidth: 380,
   minWidth: 0,
   boxSizing: "border-box",
+  // Long help/preset labels (e.g. Qwen provider URLs) must wrap inside the
+  // narrow viewport instead of forcing the dialog to grow past max-width.
+  overflowWrap: "anywhere",
 } as const;
 
 interface Props {
