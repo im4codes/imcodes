@@ -396,13 +396,29 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   cursor: 'pointer',
                 }}
               >
+                {/*
+                 * Mirror NewSessionDialog: width:auto + margin:0 defend
+                 * against any global `input { width: 100% }` rule (this
+                 * dialog doesn't currently use .form-group but the
+                 * regression must stay symmetric). flex:1 1 auto + minWidth:0
+                 * on the span lets the label text wrap normally inside the
+                 * dialog instead of overflowing.
+                 */}
                 <input
                   type="checkbox"
                   checked={customProviderSdk}
                   onChange={(e) => toggleCustomProviderSdk((e.target as HTMLInputElement).checked)}
-                  style={{ flexShrink: 0 }}
+                  style={{ flex: '0 0 auto', width: 'auto', margin: 0 }}
                 />
-                <span style={{ color: '#e2e8f0', fontSize: 13 }}>
+                <span
+                  style={{
+                    color: '#e2e8f0',
+                    fontSize: 13,
+                    overflowWrap: 'break-word',
+                    minWidth: 0,
+                    flex: '1 1 auto',
+                  }}
+                >
                   {t('new_session.custom_provider_sdk')}
                 </span>
               </label>

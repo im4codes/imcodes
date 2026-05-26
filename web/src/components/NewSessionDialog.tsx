@@ -696,6 +696,17 @@ export function NewSessionDialog({
                 cursor: starting ? "not-allowed" : "pointer",
               }}
             >
+              {/*
+               * width:auto is REQUIRED to override the global
+               * `.form-group input { width: 100% }` rule. Without it the
+               * checkbox stretches to the full label width (≈340 px),
+               * pushing the span past the dialog's right edge. The span
+               * then inherits `overflow-wrap: anywhere` from the dialog
+               * root and wraps the "Custom provider SDK" label as a
+               * one-character-per-line vertical strip on the screen edge.
+               * Setting margin:0 is paired defense in case form-group ever
+               * grows side margins on inputs.
+               */}
               <input
                 type="checkbox"
                 checked={customProviderSdk}
@@ -703,9 +714,19 @@ export function NewSessionDialog({
                 onChange={(e) =>
                   toggleCustomProviderSdk((e.target as HTMLInputElement).checked)
                 }
-                style={{ flexShrink: 0 }}
+                style={{ flex: "0 0 auto", width: "auto", margin: 0 }}
               />
-              <span style={{ color: "#e2e8f0", fontSize: 13 }}>
+              <span
+                style={{
+                  color: "#e2e8f0",
+                  fontSize: 13,
+                  // Match the help text: break at word boundaries, not
+                  // characters, in case the label ever grows to overflow.
+                  overflowWrap: "break-word",
+                  minWidth: 0,
+                  flex: "1 1 auto",
+                }}
+              >
                 {t("new_session.custom_provider_sdk")}
               </span>
             </label>

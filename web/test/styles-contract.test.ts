@@ -366,4 +366,26 @@ describe('styles.css regression contracts', () => {
       expect(source).not.toContain("style={{ width: '100%', maxWidth: 380 }}");
     }
   });
+
+  it('custom-provider checkbox cannot be stretched to 100% by .form-group input', () => {
+    // Regression: the global rule `.form-group input { width: 100% }`
+    // stretched the custom-provider <input type="checkbox"> to the full
+    // label width inside its `display:flex` parent, pushing the span text
+    // past the dialog's right edge. The span then inherited the dialog's
+    // `overflow-wrap: anywhere` and the "Custom provider SDK" label
+    // rendered as a one-character-per-line vertical strip outside the
+    // dialog. Both dialogs MUST explicitly size the checkbox so the rule
+    // can't clobber it.
+    const formGroupInputRule = css.match(/\.form-group input\s*\{[^}]*\}/);
+    expect(formGroupInputRule).not.toBeNull();
+    expect(formGroupInputRule![0]).toMatch(/width:\s*100%/);
+
+    const newSessionDialog = readFileSync(resolve(__dirname, '../src/components/NewSessionDialog.tsx'), 'utf8');
+    const subSessionDialog = readFileSync(resolve(__dirname, '../src/components/StartSubSessionDialog.tsx'), 'utf8');
+    for (const source of [newSessionDialog, subSessionDialog]) {
+      // Inline width:auto on the checkbox is the override that beats the
+      // global rule's specificity.
+      expect(source).toMatch(/type=['"]checkbox['"][\s\S]{0,600}?width:\s*['"]auto['"]/);
+    }
+  });
 });
