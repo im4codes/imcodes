@@ -113,7 +113,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     return planLabel;
   }, [planLabel, t]);
 
-  const { ctx, total, cachePct, newPct, pctStr, tip } = useMemo(() => {
+  const { ctx, total, totalPct, cachePct, newPct, pctStr, tip } = useMemo(() => {
     const ctx = resolveContextWindow(
       usage.contextWindow,
       displayModel,
@@ -193,7 +193,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         <div class={`session-ctx-bar${ctxBurning ? ' is-burning' : ''}`}>
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
-          {ctxBurning && <span class="session-ctx-burn" aria-hidden="true" />}
+          {ctxBurning && <span class="session-ctx-burn" style={{ width: `${totalPct}%` }} aria-hidden="true" />}
         </div>
       )}
       {codexQuotaLines.length > 0 && (

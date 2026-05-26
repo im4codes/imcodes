@@ -114,7 +114,9 @@ describe('UsageFooter', () => {
     await waitFor(() => {
       expect(container.querySelector('.session-ctx-bar')?.className).toContain('is-burning');
     });
-    expect(container.querySelector('.session-ctx-burn')).toBeTruthy();
+    const burn = container.querySelector('.session-ctx-burn') as HTMLElement | null;
+    expect(burn).toBeTruthy();
+    expect(burn?.style.width).toBe('0.8%');
   });
 
   it('keeps the robot status visible for idle or unknown agent states', () => {
