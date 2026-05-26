@@ -39,6 +39,7 @@ import {
 } from '../context/recent-injection-history.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
+import { clampUserSessionText } from '../../shared/user-session-text-caps.js';
 import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
 import { buildTransportStartupMemory, type TransportContextBootstrap } from './runtime-context-bootstrap.js';
 import { recordMemoryHits } from '../store/context-store.js';
@@ -320,8 +321,8 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   /** Set providerSessionId directly (restore from store without initialize). */
   setProviderSessionId(id: string): void { this._providerSessionId = id; }
-  setDescription(desc: string): void { this._description = desc; }
-  setSystemPrompt(prompt: string): void { this._systemPrompt = prompt; }
+  setDescription(desc: string): void { this._description = clampUserSessionText(desc); }
+  setSystemPrompt(prompt: string): void { this._systemPrompt = clampUserSessionText(prompt); }
   setAgentId(agentId: string): void {
     this._agentId = agentId;
     if (this._providerSessionId) {
@@ -366,8 +367,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
 
     this._providerSessionId = await this.provider.createSession(config);
-    this._description = config.description;
-    this._systemPrompt = config.systemPrompt;
+    // Cap user-authored text so a single oversized paste can't bloat every
+    // subsequent turn — these get re-injected into the system prompt on
+    // every model call. See `shared/user-session-text-caps.ts`.
+    this._description = clampUserSessionText(config.description);
+    this._systemPrompt = clampUserSessionText(config.systemPrompt);
     this._projectDir = config.cwd;
     this._agentId = config.agentId;
     this._effort = config.effort;

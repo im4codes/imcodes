@@ -1421,4 +1421,36 @@ ${PREFERENCE_CONTEXT_END}`;
     // provider.send called once more (the merged drain turn), NOT twice.
     expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(earlierProviderSendCalls + 1);
   });
+
+  it('truncates user-authored description and systemPrompt to USER_SESSION_TEXT_MAX_CHARS', async () => {
+    // Defense in depth: a user paste larger than the 300-char cap (from
+    // shared/user-session-text-caps.ts) must not bloat every subsequent
+    // turn's system prompt. Tests both `setDescription` / `setSystemPrompt`
+    // (live edit) and `initialize()` (cold start).
+    const oversized = 'X'.repeat(2000);
+    runtime.setDescription(oversized);
+    runtime.setSystemPrompt(oversized);
+    runtime.send('hi after oversize set', 'cap-after-set');
+    await flushDispatch();
+    const sentAfter = mock.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const systemText = String(sentAfter.systemText ?? '');
+    // The description+systemPrompt contributions both should be exactly 300
+    // 'X's, not 2000. Since they're joined by `\n\n`, the total 'X' chars in
+    // systemText should be 600.
+    const xCount = (systemText.match(/X/g) ?? []).length;
+    expect(xCount).toBe(600);
+    expect(systemText).not.toMatch(/X{301}/);
+
+    // Same enforcement when the values come from initialize() config.
+    const freshProvider = makeMockProvider();
+    const fresh = new TransportSessionRuntime(freshProvider.provider, 'deck_cap_brain');
+    await fresh.initialize({ ...defaultConfig, description: oversized, systemPrompt: oversized });
+    fresh.send('hi after init', 'cap-after-init');
+    await flushDispatch();
+    const sentInit = freshProvider.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const initSystemText = String(sentInit.systemText ?? '');
+    const initXCount = (initSystemText.match(/X/g) ?? []).length;
+    expect(initXCount).toBe(600);
+    expect(initSystemText).not.toMatch(/X{301}/);
+  });
 });
