@@ -317,4 +317,34 @@ describe('styles.css regression contracts', () => {
     expect(nameRule![0]).toMatch(/text-overflow:\s*ellipsis/);
     expect(nameRule![0]).toMatch(/white-space:\s*nowrap/);
   });
+
+  it('Shared Context management keeps the sci-fi chrome styling hooks', () => {
+    const app = readFileSync(resolve(__dirname, '../src/app.tsx'), 'utf8');
+    expect(app).toContain('className="shared-context-floating-panel"');
+
+    const floatingPanel = readFileSync(resolve(__dirname, '../src/components/FloatingPanel.tsx'), 'utf8');
+    expect(floatingPanel).toContain('className?: string');
+    expect(floatingPanel).toContain('floating-panel-titlebar');
+    expect(floatingPanel).toContain('floating-panel-content');
+
+    const panel = readFileSync(resolve(__dirname, '../src/components/SharedContextManagementPanel.tsx'), 'utf8');
+    expect(panel).toContain('shared-context-shell-tech');
+    expect(panel).toContain('shared-context-hero-tech');
+    expect(panel).toContain('shared-context-tabbar-tech');
+    expect(panel).toContain('shared-context-tab-tech');
+    expect(panel).toContain('repeating-linear-gradient(90deg');
+
+    const floatRule = css.match(/\.shared-context-floating-panel\s*\{[^}]*\}/);
+    expect(floatRule).not.toBeNull();
+    expect(floatRule![0]).toMatch(/linear-gradient\(180deg,\s*#08111d/);
+    expect(floatRule![0]).toMatch(/rgba\(34,\s*211,\s*238,\s*0\.24\)/);
+
+    const focusRule = css.match(/\.shared-context-shell-tech input:focus,\s*[\s\S]*?\.shared-context-shell-tech textarea:focus\s*\{[^}]*\}/);
+    expect(focusRule).not.toBeNull();
+    expect(focusRule![0]).toMatch(/rgba\(34,\s*211,\s*238,\s*0\.70\)/);
+
+    const tabHoverRule = css.match(/\.shared-context-tab-tech:hover\s*\{[^}]*\}/);
+    expect(tabHoverRule).not.toBeNull();
+    expect(tabHoverRule![0]).toMatch(/rgba\(8,\s*145,\s*178,\s*0\.16\)/);
+  });
 });

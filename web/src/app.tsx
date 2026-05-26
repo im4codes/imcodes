@@ -4575,6 +4575,7 @@ export function App() {
           defaultH={620}
           zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.sharedContextManagement, 5080)}
           onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.sharedContextManagement)}
+          className="shared-context-floating-panel"
         >
           <SharedContextManagementPanel
             enterpriseId={typeof sharedContextManagementProps.enterpriseId === 'string' ? sharedContextManagementProps.enterpriseId : undefined}

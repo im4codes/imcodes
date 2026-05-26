@@ -104,22 +104,22 @@ const SC_IS_MOBILE = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Andro
 
 const DT = {
   bg: {
-    base: '#0a0e1a',          // deep canvas
-    surface: '#111827',       // card background
-    surfaceElev: '#162033',   // elevated card
-    input: '#0d1423',         // input fields
-    muted: 'rgba(148,163,184,0.06)', // subtle overlay
+    base: '#08111d',          // deep canvas
+    surface: 'rgba(15,23,42,0.84)',       // card background
+    surfaceElev: 'rgba(15,23,42,0.92)',   // elevated card
+    input: 'rgba(8,13,22,0.78)',         // input fields
+    muted: 'rgba(125,211,252,0.07)', // subtle overlay
   },
   border: {
-    subtle: 'rgba(51,65,85,0.55)',
-    default: 'rgba(71,85,105,0.6)',
-    strong: 'rgba(96,165,250,0.3)',
+    subtle: 'rgba(125,211,252,0.16)',
+    default: 'rgba(125,211,252,0.26)',
+    strong: 'rgba(34,211,238,0.44)',
   },
   text: {
     primary: '#e6edf3',
-    secondary: '#9ca3af',
-    muted: '#6b7280',
-    accent: '#60a5fa',
+    secondary: '#a8b3c7',
+    muted: '#64748b',
+    accent: '#67e8f9',
     success: '#34d399',
     warn: '#fbbf24',
     error: '#f87171',
@@ -127,9 +127,9 @@ const DT = {
   radius: { sm: 6, md: 10, lg: 14, xl: 18, pill: 999 },
   space: { xs: 4, sm: 8, md: 12, lg: 16, xl: 20, xxl: 24 },
   shadow: {
-    sm: '0 1px 2px rgba(0,0,0,0.3)',
-    md: '0 4px 16px rgba(0,0,0,0.35)',
-    accent: '0 8px 24px rgba(37,99,235,0.2)',
+    sm: 'inset 0 1px 0 rgba(255,255,255,0.035), 0 10px 24px rgba(0,0,0,0.24)',
+    md: 'inset 0 1px 0 rgba(255,255,255,0.04), 0 18px 36px rgba(0,0,0,0.34)',
+    accent: 'inset 0 1px 0 rgba(255,255,255,0.06), 0 0 0 1px rgba(34,211,238,0.12), 0 18px 42px rgba(8,145,178,0.20)',
   },
 } as const;
 
@@ -144,9 +144,11 @@ const shellStyle = {
   overflowY: 'auto',
   overflowX: 'hidden',
   WebkitOverflowScrolling: 'touch',
-  background: `radial-gradient(ellipse at top, rgba(37,99,235,0.08), transparent 40%), ${DT.bg.base}`,
+  background: `repeating-linear-gradient(90deg, transparent 0 24px, rgba(125,211,252,0.024) 24px 25px), repeating-linear-gradient(0deg, transparent 0 24px, rgba(129,140,248,0.018) 24px 25px), radial-gradient(circle at 18% 0%, rgba(34,211,238,0.16), transparent 38%), radial-gradient(circle at 88% 12%, rgba(168,85,247,0.12), transparent 34%), linear-gradient(180deg, #08111d 0%, #090e19 100%)`,
   fontSize: SC_IS_MOBILE ? 12 : 13,
   lineHeight: 1.5,
+  position: 'relative',
+  isolation: 'isolate',
 } as const;
 
 const sectionStyle = {
@@ -156,14 +158,15 @@ const sectionStyle = {
   display: 'flex',
   flexDirection: 'column',
   gap: DT.space.md,
-  background: DT.bg.surface,
+  background: `linear-gradient(180deg, rgba(15,23,42,0.90), rgba(8,13,22,0.86))`,
   boxShadow: DT.shadow.sm,
+  backdropFilter: 'blur(18px)',
 } as const;
 
 const heroStyle = {
   ...sectionStyle,
   gap: DT.space.md,
-  background: `linear-gradient(135deg, rgba(37,99,235,0.08) 0%, ${DT.bg.surface} 60%)`,
+  background: `linear-gradient(135deg, rgba(34,211,238,0.14) 0%, rgba(15,23,42,0.92) 46%, rgba(76,29,149,0.18) 100%)`,
   border: `1px solid ${DT.border.strong}`,
   boxShadow: DT.shadow.accent,
   overflow: 'hidden',
@@ -179,14 +182,15 @@ const rowStyle = {
 const inputStyle = {
   flex: SC_IS_MOBILE ? '1 1 100%' : '1 1 180px',
   minWidth: 0,
-  background: DT.bg.input,
+  background: 'linear-gradient(180deg, rgba(8,13,22,0.88), rgba(15,23,42,0.76))',
   color: DT.text.primary,
   border: `1px solid ${DT.border.default}`,
-  borderRadius: DT.radius.sm,
+  borderRadius: DT.radius.md,
   padding: SC_IS_MOBILE ? '10px 12px' : '8px 12px',
   fontSize: SC_IS_MOBILE ? 14 : 13,
-  transition: 'border-color 0.15s, box-shadow 0.15s',
+  transition: 'border-color 0.15s, box-shadow 0.15s, background 0.15s',
   outline: 'none',
+  boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.035), 0 0 0 1px rgba(8,13,22,0.28)',
 } as const;
 
 // Compact style for numeric inputs like a recall threshold or scoring weight.
@@ -206,35 +210,37 @@ const numberInputStyle = {
 } as const;
 
 const buttonStyle = {
-  background: '#2563eb',
+  background: 'linear-gradient(135deg, rgba(8,145,178,0.95), rgba(37,99,235,0.94) 58%, rgba(124,58,237,0.9))',
   color: '#ffffff',
-  border: 'none',
-  borderRadius: DT.radius.sm,
+  border: '1px solid rgba(125,211,252,0.32)',
+  borderRadius: DT.radius.md,
   padding: SC_IS_MOBILE ? '10px 16px' : '8px 14px',
   cursor: 'pointer',
   fontSize: SC_IS_MOBILE ? 14 : 13,
-  fontWeight: 500,
-  transition: 'background 0.15s, transform 0.1s',
+  fontWeight: 700,
+  transition: 'background 0.15s, transform 0.1s, border-color 0.15s, box-shadow 0.15s',
+  boxShadow: '0 0 18px rgba(34,211,238,0.12), inset 0 1px 0 rgba(255,255,255,0.12)',
   ...(SC_IS_MOBILE ? { width: '100%' } : {}),
 } as const;
 
 const subtleButtonStyle = {
   ...buttonStyle,
-  background: 'rgba(71,85,105,0.4)',
+  background: 'linear-gradient(180deg, rgba(15,23,42,0.72), rgba(8,13,22,0.80))',
   color: DT.text.primary,
   border: `1px solid ${DT.border.subtle}`,
+  boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.04), 0 0 12px rgba(34,211,238,0.06)',
 } as const;
 
 const tabStyle = {
-  background: 'transparent',
+  background: 'rgba(15,23,42,0.34)',
   color: DT.text.secondary,
-  border: 'none',
+  border: '1px solid rgba(125,211,252,0.10)',
   padding: SC_IS_MOBILE ? '10px 12px' : '8px 14px',
   fontSize: SC_IS_MOBILE ? 12 : 13,
   fontWeight: 500,
   borderRadius: DT.radius.md,
   cursor: 'pointer',
-  transition: 'background 0.15s, color 0.15s',
+  transition: 'background 0.15s, color 0.15s, border-color 0.15s, box-shadow 0.15s, transform 0.12s',
   display: 'inline-flex',
   alignItems: 'center',
   justifyContent: 'center',
@@ -249,9 +255,11 @@ const tabStyle = {
 
 const tabActiveStyle = {
   ...tabStyle,
-  background: 'rgba(37,99,235,0.15)',
+  background: 'linear-gradient(135deg, rgba(8,145,178,0.32), rgba(37,99,235,0.24) 55%, rgba(124,58,237,0.22))',
   color: DT.text.primary,
-  fontWeight: 600,
+  fontWeight: 700,
+  border: '1px solid rgba(103,232,249,0.46)',
+  boxShadow: '0 0 16px rgba(34,211,238,0.14), inset 0 1px 0 rgba(255,255,255,0.08)',
 } as const;
 
 const tabBarStyle = {
@@ -262,11 +270,13 @@ const tabBarStyle = {
   alignItems: 'stretch',
   padding: SC_IS_MOBILE ? 6 : DT.space.xs,
   borderRadius: DT.radius.md,
-  background: DT.bg.input,
+  background: 'linear-gradient(180deg, rgba(8,13,22,0.88), rgba(15,23,42,0.72))',
   border: `1px solid ${DT.border.subtle}`,
   width: '100%',
   boxSizing: 'border-box',
   overflow: 'visible',
+  boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.035), 0 0 18px rgba(34,211,238,0.08)',
+  backdropFilter: 'blur(16px)',
 } as const;
 
 const tabBadgeStyle = {
@@ -278,7 +288,7 @@ const tabBadgeStyle = {
   borderRadius: DT.radius.pill,
   fontSize: 11,
   fontWeight: 600,
-  background: 'rgba(96,165,250,0.18)',
+  background: 'rgba(34,211,238,0.16)',
   color: DT.text.accent,
   minWidth: 20,
 } as const;
@@ -289,7 +299,7 @@ const pillStyle = {
   gap: DT.space.xs,
   padding: '3px 10px',
   borderRadius: DT.radius.pill,
-  background: DT.bg.input,
+  background: 'linear-gradient(180deg, rgba(8,13,22,0.86), rgba(15,23,42,0.74))',
   border: `1px solid ${DT.border.subtle}`,
   color: DT.text.secondary,
   fontSize: 12,
@@ -307,7 +317,7 @@ const policyOptionStyle = {
   padding: DT.space.md,
   borderRadius: DT.radius.md,
   border: `1px solid ${DT.border.subtle}`,
-  background: DT.bg.input,
+  background: 'linear-gradient(180deg, rgba(8,13,22,0.82), rgba(15,23,42,0.72))',
   display: 'flex',
   flexDirection: 'column',
   gap: DT.space.xs,
@@ -334,7 +344,7 @@ const statCardStyle = {
   borderRadius: DT.radius.md,
   padding: SC_IS_MOBILE ? `${DT.space.sm}px ${DT.space.md}px` : `${DT.space.md}px ${DT.space.lg}px`,
   border: `1px solid ${DT.border.subtle}`,
-  background: DT.bg.input,
+  background: 'linear-gradient(180deg, rgba(8,13,22,0.82), rgba(15,23,42,0.76))',
   display: 'flex',
   flexDirection: 'column',
   gap: 2,
@@ -350,11 +360,13 @@ const resourceCardStyle = {
   borderRadius: SC_IS_MOBILE ? DT.radius.md : DT.radius.lg,
   padding: SC_IS_MOBILE ? DT.space.sm : DT.space.lg,
   border: `1px solid ${DT.border.subtle}`,
-  background: DT.bg.surfaceElev,
+  background: 'linear-gradient(180deg, rgba(15,23,42,0.92), rgba(8,13,22,0.88))',
   display: 'flex',
   flexDirection: 'column',
   gap: SC_IS_MOBILE ? DT.space.sm : DT.space.md,
-  transition: 'border-color 0.15s, transform 0.1s',
+  transition: 'border-color 0.15s, transform 0.1s, box-shadow 0.15s',
+  boxShadow: DT.shadow.sm,
+  backdropFilter: 'blur(14px)',
   overflow: 'hidden',
   minWidth: 0,
 } as const;
@@ -3278,11 +3290,11 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   );
 
   return (
-    <div style={shellStyle}>
-      <div style={heroStyle}>
+    <div className="shared-context-shell-tech" style={shellStyle}>
+      <div className="shared-context-hero-tech" style={heroStyle}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: DT.space.md, flexWrap: 'wrap' }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: DT.space.xs, flex: '1 1 auto', minWidth: SC_IS_MOBILE ? 0 : 240 }}>
-            <strong style={{ fontSize: SC_IS_MOBILE ? 16 : 20, fontWeight: 600, letterSpacing: '-0.01em', color: DT.text.primary }}>
+            <strong style={{ fontSize: SC_IS_MOBILE ? 16 : 20, fontWeight: 700, letterSpacing: 0, color: DT.text.primary }}>
               {t('sharedContext.management.title')}
             </strong>
             <span style={{ ...helperTextStyle, fontSize: 13 }}>
@@ -3338,17 +3350,18 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         </div>
       </div>
 
-      <div style={{
+      <div className="shared-context-tabbar-tech" style={{
         ...tabBarStyle,
         position: SC_IS_MOBILE ? 'relative' : 'sticky',
         top: SC_IS_MOBILE ? undefined : 0,
         zIndex: 10,
-        background: DT.bg.base,
-        boxShadow: SC_IS_MOBILE ? 'none' : '0 2px 8px rgba(0,0,0,0.4)',
+        background: 'linear-gradient(180deg, rgba(8,13,22,0.94), rgba(15,23,42,0.82))',
+        boxShadow: SC_IS_MOBILE ? 'inset 0 1px 0 rgba(255,255,255,0.035)' : '0 10px 24px rgba(0,0,0,0.30), inset 0 1px 0 rgba(255,255,255,0.04)',
       }}>
         {tabs.map((tab) => (
           <button
             key={tab.id}
+            className={`shared-context-tab-tech${activeTab === tab.id ? ' is-active' : ''}`}
             style={activeTab === tab.id ? tabActiveStyle : tabStyle}
             onClick={() => setActiveTab(tab.id)}
           >

@@ -34,6 +34,7 @@ interface Props {
   onToggleMaximized?: () => void;
   getMaximizeBounds?: () => WorkspaceBounds | null;
   desktopLayoutCapable?: boolean;
+  className?: string;
 }
 
 const MIN_W = 360;
@@ -100,6 +101,7 @@ export function FloatingPanel({
   onToggleMaximized,
   getMaximizeBounds,
   desktopLayoutCapable = true,
+  className,
 }: Props) {
   const { t } = useTranslation();
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -212,9 +214,9 @@ export function FloatingPanel({
   // Mobile: fullscreen with title bar
   if (isMobile) {
     return (
-      <div style={{ position: 'fixed', inset: 0, zIndex, background: '#0f172a', display: 'flex', flexDirection: 'column' }}>
-        <div style={{ height: 'env(safe-area-inset-top, 0px)', flexShrink: 0, background: '#0f172a' }} />
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: '#1e293b', borderBottom: '1px solid #334155', flexShrink: 0 }}>
+      <div className={['floating-panel', className].filter(Boolean).join(' ')} style={{ position: 'fixed', inset: 0, zIndex, background: '#0f172a', display: 'flex', flexDirection: 'column' }}>
+        <div className="floating-panel-safe-area" style={{ height: 'env(safe-area-inset-top, 0px)', flexShrink: 0, background: '#0f172a' }} />
+        <div className="floating-panel-titlebar" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: '#1e293b', borderBottom: '1px solid #334155', flexShrink: 0 }}>
           <span
             title={title}
             style={{
@@ -237,7 +239,7 @@ export function FloatingPanel({
             style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', fontSize: 18, padding: '4px 8px', flexShrink: 0 }}
           >✕</button>
         </div>
-        <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+        <div className="floating-panel-content" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           {children}
         </div>
       </div>
@@ -251,6 +253,7 @@ export function FloatingPanel({
     : geom;
   return (
     <div
+      className={['floating-panel', className].filter(Boolean).join(' ')}
       data-testid={`floating-panel-${id}`}
       style={{
         position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h,
@@ -264,6 +267,7 @@ export function FloatingPanel({
     >
       {/* Title bar — draggable */}
       <div
+        className="floating-panel-titlebar"
         onMouseDown={startDrag}
         style={{
           display: 'flex', alignItems: 'center', gap: 8,
@@ -315,7 +319,7 @@ export function FloatingPanel({
       </div>
 
       {/* Content */}
-      <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+      <div className="floating-panel-content" style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         {children}
       </div>
 
