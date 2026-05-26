@@ -653,6 +653,28 @@ body {
   .controls { align-items: center; }
   .controls-mobile-multiline { align-items: flex-end; }
   .controls-composer { min-height: 32px; }
+  .shortcuts-row { overflow: visible; }
+  .shortcuts { gap: 3px; padding: 4px 4px 4px 6px; }
+  .shortcuts-transport { flex: 0 0 auto; min-width: 30px; max-width: 44px; }
+  .shortcuts-model { padding: 4px 4px 4px 0; }
+  .shortcuts-model .shortcut-btn {
+    max-width: 82px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding-left: 6px;
+    padding-right: 6px;
+    font-size: 10px !important;
+  }
+  .shortcut-btn-icon {
+    width: 26px;
+    min-width: 26px;
+    padding-left: 0;
+    padding-right: 0;
+  }
+  .p2p-settings-btn { gap: 0; padding-left: 6px; padding-right: 6px; min-width: auto; }
+  .p2p-settings-label { display: none; }
+  .session-ctx-wrap { gap: 3px; padding: 4px 5px 4px 0; }
+  .session-ctx-bar { width: 44px; }
   .controls-composer-mobile-expanded {
     position: fixed;
     inset: calc(var(--sat, 0px) + 8px) 8px 8px;
@@ -700,6 +722,10 @@ body {
     border-color: rgba(34,211,238,0.5);
     color: #f8fafc;
   }
+  .controls { padding: 5px 6px; gap: 4px; }
+  .controls .btn { padding: 7px 8px; }
+  .controls .btn-voice { padding: 4px 6px; }
+  .controls .controls-icon-btn { padding: 6px 8px; }
   .menu-dropdown { max-width: calc(100vw - 16px); }
   .menu-dropdown-openspec { width: 100vw; min-width: 100vw; max-width: 100vw; max-height: none; border-radius: 0; border: none; }
   .menu-dropdown-openspec-inline { position: fixed; top: var(--sat, 0px); left: 0; right: 0; bottom: env(safe-area-inset-bottom, 0px); z-index: 2147483646; height: calc(var(--vvh, 100dvh) - var(--sat, 0px) - env(safe-area-inset-bottom, 0px)); max-height: calc(var(--vvh, 100dvh) - var(--sat, 0px) - env(safe-area-inset-bottom, 0px)); overflow: hidden; box-sizing: border-box; border-radius: 12px 12px 0 0; }
@@ -788,6 +814,7 @@ body {
   .p2p-menu-section-label { white-space: normal; }
 }
 .btn { padding: 6px 12px; border-radius: 7px; border: 1px solid transparent; cursor: pointer; font-size: 12px; font-family: inherit; font-weight: 600; transition: color 0.15s, background 0.15s, border-color 0.15s, box-shadow 0.15s, transform 0.15s; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
+.controls-icon-btn { padding: 6px 10px; }
 .btn-primary { background: linear-gradient(180deg, rgba(34,211,238,0.92), rgba(37,99,235,0.92)); border-color: rgba(125,211,252,0.38); color: #f8fafc; box-shadow: 0 0 14px rgba(34,211,238,0.16), inset 0 1px 0 rgba(255,255,255,0.16); }
 .btn-primary:hover:not(:disabled) { background: linear-gradient(180deg, rgba(103,232,249,0.96), rgba(37,99,235,0.96)); border-color: rgba(165,243,252,0.62); box-shadow: 0 0 18px rgba(34,211,238,0.28), inset 0 1px 0 rgba(255,255,255,0.20); }
 .btn:active:not(:disabled) { transform: translateY(1px); }
@@ -1038,10 +1065,10 @@ body {
   .mobile-server-menu-item:hover, .mobile-server-menu-item:active { background: #334155; }
   .mobile-server-menu-item.active { color: #93c5fd; background: #1d4ed820; }
   .mobile-server-menu-change { color: #f59e0b !important; border-top: 1px solid #334155; }
-  .controls { padding: 6px 8px; gap: 6px; }
+  .controls { padding: 5px 6px; gap: 4px; }
   .controls-input { font-size: 16px; } /* prevent iOS zoom on focus */
-  .btn { padding: 8px 10px; font-size: 13px; }
-  .p2p-settings-btn { gap: 0; padding: 6px 7px; min-width: auto; }
+  .btn { padding: 7px 8px; font-size: 13px; }
+  .p2p-settings-btn { gap: 0; padding: 6px 6px; min-width: auto; }
   .p2p-settings-label { display: none; }
 }
 

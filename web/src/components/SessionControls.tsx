@@ -1262,46 +1262,60 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     openSpecRequestIdRef.current = null;
   }, [activeSession?.projectDir, clearOpenSpecRequestTimer]);
 
-  // Close menus when clicking outside
+  // Close menus as soon as the pointer starts outside. On Android Chrome, waiting
+  // for the synthesized click can leave a model dropdown in front of the next
+  // sub-session tap after the viewport/layout shifts.
   useEffect(() => {
     if (!menuOpen && !modelOpen && !autoOpen && !p2pOpen && !thinkingOpen && !openSpecOpen) return;
-    const handleClick = (e: MouseEvent) => {
-      if (menuOpen && menuRef.current && !menuRef.current.contains(e.target as Node)) {
+    const handleOutsidePointer = (target: EventTarget | null) => {
+      if (!(target instanceof Node)) return;
+      if (menuOpen && menuRef.current && !menuRef.current.contains(target)) {
         setMenuOpen(false);
         setConfirm(null);
         setConfirmLevel(0);
       }
-      if (modelOpen && modelRef.current && !modelRef.current.contains(e.target as Node)) {
+      if (modelOpen && modelRef.current && !modelRef.current.contains(target)) {
         setModelOpen(false);
       }
-      if (autoOpen && autoRef.current && !autoRef.current.contains(e.target as Node)) {
+      if (autoOpen && autoRef.current && !autoRef.current.contains(target)) {
         setAutoOpen(false);
       }
-      if (thinkingOpen && thinkingRef.current && !thinkingRef.current.contains(e.target as Node)) {
+      if (thinkingOpen && thinkingRef.current && !thinkingRef.current.contains(target)) {
         setThinkingOpen(false);
       }
       if (
         p2pOpen
         && p2pRef.current
-        && !p2pRef.current.contains(e.target as Node)
-        && !p2pDropdownRef.current?.contains(e.target as Node)
+        && !p2pRef.current.contains(target)
+        && !p2pDropdownRef.current?.contains(target)
       ) {
         setP2pOpen(false);
       }
       if (
         openSpecOpen
         && openSpecRef.current
-        && !openSpecRef.current.contains(e.target as Node)
-        && !openSpecDropdownRef.current?.contains(e.target as Node)
-        && !openSpecSubmenuRef.current?.contains(e.target as Node)
+        && !openSpecRef.current.contains(target)
+        && !openSpecDropdownRef.current?.contains(target)
+        && !openSpecSubmenuRef.current?.contains(target)
       ) {
         setOpenSpecOpen(false);
         setOpenSpecAuditMenu(null);
         setOpenSpecProposeMenuOpen(false);
       }
     };
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
+    const handlePointerDown = (e: PointerEvent) => handleOutsidePointer(e.target);
+    const handleTouchStart = (e: TouchEvent) => handleOutsidePointer(e.target);
+    const handleMouseDown = (e: MouseEvent) => handleOutsidePointer(e.target);
+    const pointerOptions = { capture: true } as AddEventListenerOptions;
+    const touchOptions = { capture: true, passive: true } as AddEventListenerOptions;
+    document.addEventListener('pointerdown', handlePointerDown, pointerOptions);
+    document.addEventListener('touchstart', handleTouchStart, touchOptions);
+    document.addEventListener('mousedown', handleMouseDown, pointerOptions);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, pointerOptions);
+      document.removeEventListener('touchstart', handleTouchStart, touchOptions);
+      document.removeEventListener('mousedown', handleMouseDown, pointerOptions);
+    };
   }, [autoOpen, menuOpen, modelOpen, openSpecOpen, p2pOpen, thinkingOpen]);
 
   const quickAutoColor = quickSupervisionMode === SUPERVISION_MODE.SUPERVISED
@@ -2681,7 +2695,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     <div class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}${mobileComposerExpanded ? ' controls-wrapper-mobile-expanded' : ''}`}>
       {/* Header control row — compact mode keeps meta controls but still hides terminal shortcuts */}
       {!hideShortcuts && (!compact || showCompactMetaControls) && <div class="shortcuts-row">
-        {!compact && <div class="shortcuts">
+        {!compact && <div class={`shortcuts${isTransport ? ' shortcuts-transport' : ''}`}>
           {/* Quick input trigger — shown here (before Esc) when shell terminal hides input row */}
           {isShellLike && (
             <button
@@ -3757,11 +3771,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         {/* Config mode: show gear to open settings panel inline with send row */}
         {p2pMode === P2P_CONFIG_MODE && (
           <button
-            class="btn btn-secondary"
+            class="btn btn-secondary controls-icon-btn"
             onClick={() => openP2pConfigPanel('participants')}
             disabled={disabled}
             title={t('p2p.settings_title')}
-            style={{ padding: '6px 10px' }}
           >
             ⚙
           </button>
@@ -3770,11 +3783,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         {/* Menu button — hidden in compact mode */}
         {!compact && <div class="menu-wrap" ref={menuRef}>
           <button
-            class="btn btn-secondary"
+            class="btn btn-secondary controls-icon-btn"
             onClick={() => { setMenuOpen((o) => !o); resetConfirm(); }}
             disabled={disabled}
             title={t('session.actions')}
-            style={{ padding: '6px 10px' }}
           >
             ⋯
           </button>
