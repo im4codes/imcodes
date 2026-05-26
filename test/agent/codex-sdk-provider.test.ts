@@ -708,6 +708,111 @@ describe('CodexSdkProvider', () => {
     );
   });
 
+  it('moves split stable IM.codes context into codex baseInstructions and keeps only turn context in turn/start', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-split-context', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+
+    const payload: ProviderContextPayload = {
+      userMessage: 'ship it',
+      assembledMessage: 'Relevant context\n\nship it',
+      sessionSystemText: 'Stable IM.codes runtime rules',
+      turnSystemText: 'Required shared context:\n- Current file rule',
+      systemText: 'Stable IM.codes runtime rules\n\nRequired shared context:\n- Current file rule',
+      messagePreamble: 'Relevant context',
+      attachments: [],
+      context: {
+        sessionSystemText: 'Stable IM.codes runtime rules',
+        turnSystemText: 'Required shared context:\n- Current file rule',
+        systemText: 'Stable IM.codes runtime rules\n\nRequired shared context:\n- Current file rule',
+        messagePreamble: 'Relevant context',
+        requiredAuthoredContext: ['Current file rule'],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: ['doc-v1'],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-split-context' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+
+    await provider.send('route-split-context', payload);
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    const turnStartReq = child.requests.find((req) => req.method === 'turn/start');
+
+    expect(threadStartReq?.params?.baseInstructions).toContain('[catalog-prompt:gpt-5.4]');
+    expect(threadStartReq?.params?.baseInstructions).toContain('# IM.codes runtime instructions');
+    expect(threadStartReq?.params?.baseInstructions).toContain('Stable IM.codes runtime rules');
+    expect(threadStartReq?.params?.baseInstructions).not.toContain('Current file rule');
+    expect(turnStartReq?.params?.input?.[0]?.text).toBe(
+      'Context instructions:\nRequired shared context:\n- Current file rule\n\nRelevant context\n\nship it',
+    );
+  });
+
+  it('delivers changed split stable IM.codes context once after a Codex thread is loaded', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-stable-change', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+
+    const makePayload = (stable: string, turn: string): ProviderContextPayload => ({
+      userMessage: 'ship it',
+      assembledMessage: 'Relevant context\n\nship it',
+      sessionSystemText: stable,
+      turnSystemText: turn,
+      systemText: `${stable}\n\n${turn}`,
+      messagePreamble: 'Relevant context',
+      attachments: [],
+      context: {
+        sessionSystemText: stable,
+        turnSystemText: turn,
+        systemText: `${stable}\n\n${turn}`,
+        messagePreamble: 'Relevant context',
+        requiredAuthoredContext: [turn],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: ['doc-v1'],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-stable-change' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    await provider.send('route-stable-change', makePayload('Stable runtime v1', 'Required shared context:\n- First rule'));
+    const child = childProcessMock.children[0];
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    await provider.send('route-stable-change', makePayload('Stable runtime v2', 'Required shared context:\n- Second rule'));
+    const secondTurnStart = child.requests.filter((req) => req.method === 'turn/start').at(-1);
+    expect(secondTurnStart?.params?.input?.[0]?.text).toContain('# IM.codes runtime instructions updated:\nStable runtime v2');
+    expect(secondTurnStart?.params?.input?.[0]?.text).toContain('Required shared context:\n- Second rule');
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    await provider.send('route-stable-change', makePayload('Stable runtime v2', 'Required shared context:\n- Third rule'));
+    const thirdTurnStart = child.requests.filter((req) => req.method === 'turn/start').at(-1);
+    expect(thirdTurnStart?.params?.input?.[0]?.text).not.toContain('# IM.codes runtime instructions updated');
+    expect(thirdTurnStart?.params?.input?.[0]?.text).not.toContain('Stable runtime v2');
+    expect(thirdTurnStart?.params?.input?.[0]?.text).toContain('Required shared context:\n- Third rule');
+  });
+
   it('caps Codex SDK injected context while preserving the user turn text', async () => {
     vi.stubEnv('IMCODES_CODEX_SDK_CONTEXT_MAX_CHARS', '4000');
     const provider = new CodexSdkProvider();

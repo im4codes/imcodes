@@ -511,6 +511,65 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(run.options.appendSystemPrompt).toBe('Normalized system text');
   });
 
+  it('keeps split stable system text in appendSystemPrompt and moves turn text into the prompt', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-split', model: 'claude-sonnet-4-6' },
+      { type: 'result', session_id: 'session-split', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-split',
+      cwd: '/tmp/project',
+      resumeId: 'session-split',
+    });
+
+    const makePayload = (turnSystemText: string): ProviderContextPayload => ({
+      userMessage: 'ship it',
+      assembledMessage: 'Relevant history\n\nship it',
+      sessionSystemText: 'Stable IM.codes runtime rules',
+      turnSystemText,
+      systemText: `Stable IM.codes runtime rules\n\n${turnSystemText}`,
+      messagePreamble: 'Relevant history',
+      attachments: undefined,
+      context: {
+        sessionSystemText: 'Stable IM.codes runtime rules',
+        turnSystemText,
+        systemText: `Stable IM.codes runtime rules\n\n${turnSystemText}`,
+        messagePreamble: 'Relevant history',
+        requiredAuthoredContext: [turnSystemText],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-split' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    });
+
+    await provider.send('route-split', makePayload('Required shared context:\n- First file rule'));
+    await flush();
+    await provider.send('route-split', makePayload('Required shared context:\n- Second file rule'));
+    await flush();
+
+    const [first, second] = sdkMock.runs.slice(-2);
+    expect(first.options.appendSystemPrompt).toBe('Stable IM.codes runtime rules');
+    expect(second.options.appendSystemPrompt).toBe('Stable IM.codes runtime rules');
+    expect(first.prompt).toContain('Required shared context:\n- First file rule');
+    expect(first.prompt).not.toContain('Second file rule');
+    expect(second.prompt).toContain('Required shared context:\n- Second file rule');
+    expect(second.prompt).not.toContain('First file rule');
+    expect(second.prompt).not.toContain('Stable IM.codes runtime rules');
+  });
+
   it('accepts a normalized provider payload', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-payload', model: 'claude-sonnet-4-6' },

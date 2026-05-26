@@ -66,6 +66,10 @@ describe('buildProviderContextPayload', () => {
     expect(payload.userMessage).toBe('Run tests');
     expect(payload.assembledMessage).toBe('Run tests');
     expect(payload.supportClass).toBe('full-normalized-context-injection');
+    expect(payload.sessionSystemText).toContain('Be concise');
+    expect(payload.sessionSystemText).toContain('Never edit generated files');
+    expect(payload.sessionSystemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+    expect(payload.turnSystemText).toBeUndefined();
     expect(payload.systemText).toContain('Be concise');
     expect(payload.systemText).toContain('Never edit generated files');
     expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
@@ -498,8 +502,11 @@ describe('buildProviderContextPayload', () => {
       }),
     }));
     expect(provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      sessionSystemText: expect.stringContaining(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE),
+      turnSystemText: 'Required shared context:\n- Project coding standard',
       systemText: expect.stringContaining('Required shared context:\n- Project coding standard'),
       context: expect.objectContaining({
+        turnSystemText: 'Required shared context:\n- Project coding standard',
         requiredAuthoredContext: ['Project coding standard'],
         appliedDocumentVersionIds: ['doc-v2'],
       }),

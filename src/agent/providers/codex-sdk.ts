@@ -35,6 +35,7 @@ import logger from '../../util/logger.js';
 import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getCodexBaseInstructions } from '../codex-runtime-config.js';
+import { composeProviderSystemText, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { getDefaultCodexMcpArgs } from './getDefaultCodexMcpArgs.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
@@ -48,6 +49,7 @@ const COMPACT_HARD_TIMEOUT_MS = 120_000;
 const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
+const IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER = '# IM.codes runtime instructions';
 
 
 function errorMessage(err: unknown): string {
@@ -142,10 +144,17 @@ function capCodexSdkContextInjection(text: string, maxChars = getCodexSdkContext
   return `${text.slice(0, maxChars - marker.length).trimEnd()}${marker}`;
 }
 
-function buildCodexTurnInput(payload: ProviderContextPayload): string {
+function buildCodexTurnInput(payload: ProviderContextPayload, sessionSystemTextUpdate?: string): string {
   const contextParts: string[] = [];
-  const systemText = payload.systemText?.trim();
+  const split = getProviderSystemTextParts(payload);
+  const systemText = split.hasSplitSystemText
+    ? composeProviderSystemText(payload, { includeSession: false, includeTurn: true })
+    : payload.systemText?.trim();
   const messagePreamble = payload.messagePreamble?.trim();
+  const stableUpdate = sessionSystemTextUpdate?.trim();
+  if (stableUpdate) {
+    contextParts.push(`${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER} updated:\n${stableUpdate}`);
+  }
   if (systemText) contextParts.push(`Context instructions:\n${systemText}`);
   if (messagePreamble) contextParts.push(messagePreamble);
   if (contextParts.length === 0) return payload.assembledMessage;
@@ -154,6 +163,13 @@ function buildCodexTurnInput(payload: ProviderContextPayload): string {
   const userMessage = messagePreamble ? payload.userMessage : payload.assembledMessage;
   const trimmedUserMessage = userMessage.trim();
   return trimmedUserMessage ? `${contextText}\n\n${trimmedUserMessage}` : contextText;
+}
+
+function appendImcodesBaseInstructions(baseInstructions: string, payload: ProviderContextPayload): string {
+  const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
+  if (!sessionSystemText) return baseInstructions;
+  if (baseInstructions.includes(IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER)) return baseInstructions;
+  return `${baseInstructions.trimEnd()}\n\n${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER}\n\n${capCodexSdkContextInjection(sessionSystemText)}`;
 }
 
 /**
@@ -243,6 +259,7 @@ interface CodexSdkSessionState {
   compactSettleTimer: ReturnType<typeof setTimeout> | null;
   compactHardTimer: ReturnType<typeof setTimeout> | null;
   compactObserved: boolean;
+  lastInjectedSessionSystemText?: string;
   lastUsage?: {
     /**
      * Context-bar usage must represent the current prompt/window occupancy,
@@ -616,6 +633,7 @@ export class CodexSdkProvider implements TransportProvider {
       compactSettleTimer: null,
       compactHardTimer: null,
       compactObserved: false,
+      lastInjectedSessionSystemText: existing?.lastInjectedSessionSystemText,
       lastUsage: undefined,
       lastStatusSignature: null,
     });
@@ -925,8 +943,15 @@ export class CodexSdkProvider implements TransportProvider {
 
   private async startTurn(sessionId: string, state: CodexSdkSessionState, payload: ProviderContextPayload): Promise<void> {
     try {
-      await this.ensureThreadLoaded(sessionId, state);
-      const inputText = buildCodexTurnInput(payload);
+      const desiredSessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
+      const shouldInjectStableUpdate = !!(
+        state.threadId
+        && state.loaded
+        && desiredSessionSystemText
+        && state.lastInjectedSessionSystemText !== desiredSessionSystemText
+      );
+      await this.ensureThreadLoaded(sessionId, state, payload);
+      const inputText = buildCodexTurnInput(payload, shouldInjectStableUpdate ? desiredSessionSystemText : undefined);
       const result = await this.request('turn/start', {
         threadId: state.threadId,
         input: [{ type: 'text', text: inputText }],
@@ -937,6 +962,7 @@ export class CodexSdkProvider implements TransportProvider {
         ...(state.model ? { model: state.model } : {}),
         ...(state.effort ? { effort: state.effort } : {}),
       });
+      if (desiredSessionSystemText) state.lastInjectedSessionSystemText = desiredSessionSystemText;
       state.runningTurnId = result?.turn?.id;
       if (state.cancelled && state.runningTurnId) {
         await this.interruptRunningTurn(sessionId, state, state.runningTurnId);
@@ -1000,7 +1026,7 @@ export class CodexSdkProvider implements TransportProvider {
     }
   }
 
-  private async ensureThreadLoaded(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+  private async ensureThreadLoaded(sessionId: string, state: CodexSdkSessionState, payload?: ProviderContextPayload): Promise<void> {
     if (state.threadId && state.loaded) return;
 
     // Always send `baseInstructions`. Catalog models get codex's full
@@ -1009,11 +1035,16 @@ export class CodexSdkProvider implements TransportProvider {
     // Responses API never sees an empty `instructions` field, which it now
     // rejects with `{"type":"invalid_request_error","message":"Instructions
     // are required"}`.
-    const baseInstructions = await resolveBaseInstructionsOverride(state.model);
+    const resolvedBaseInstructions = await resolveBaseInstructionsOverride(state.model);
+    const baseInstructions = payload
+      ? appendImcodesBaseInstructions(resolvedBaseInstructions, payload)
+      : resolvedBaseInstructions;
+    const sessionSystemText = payload ? getProviderSystemTextParts(payload).sessionSystemText : undefined;
 
     if (state.threadId) {
       try {
         await this.resumeThread(sessionId, state, baseInstructions);
+        state.lastInjectedSessionSystemText = sessionSystemText;
         return;
       } catch (err) {
         if (!isCodexThreadHistoryUnreadableError(err)) throw err;
@@ -1025,6 +1056,7 @@ export class CodexSdkProvider implements TransportProvider {
         if (repaired) {
           try {
             await this.resumeThread(sessionId, state, baseInstructions);
+            state.lastInjectedSessionSystemText = sessionSystemText;
             return;
           } catch (retryErr) {
             logger.warn({ provider: this.id, sessionId, threadId: state.threadId, err: retryErr }, 'Codex SDK resume still failed after thread history repair');
@@ -1040,6 +1072,7 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     await this.startNewThread(sessionId, state, baseInstructions);
+    state.lastInjectedSessionSystemText = sessionSystemText;
   }
 
   private async resumeThread(sessionId: string, state: CodexSdkSessionState, baseInstructions: string): Promise<void> {

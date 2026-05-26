@@ -90,6 +90,7 @@ import type { TransportAttachment } from '../../../shared/transport-attachments.
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import logger from '../../util/logger.js';
 import type { TransportEffortLevel } from '../../../shared/effort-levels.js';
+import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getDefaultAcpMcpServers } from './getDefaultMcpServers.js';
 
@@ -130,6 +131,8 @@ interface KimiSdkSessionState {
   /** Track last emitted signature per tool to deduplicate identical updates. */
   emittedToolSignatures: Map<string, string>;
   lastStatusSignature: string | null;
+  /** Stable IM.codes context already injected into this ACP history. */
+  sessionSystemTextInjected?: string;
   /** Most recent ACP `usage_update.tokens` for this session — captured here so
    *  the onComplete `metadata.usage` can carry per-turn token counts to the
    *  daemon's transport-relay. */
@@ -238,6 +241,7 @@ export class KimiSdkProvider implements TransportProvider {
       toolCalls: new Map(),
       emittedToolSignatures: new Map(),
       lastStatusSignature: null,
+      sessionSystemTextInjected: existing?.sessionSystemTextInjected,
     };
     this.sessions.set(routeId, state);
     if (state.acpSessionId) {
@@ -516,7 +520,9 @@ export class KimiSdkProvider implements TransportProvider {
       // before settleTurn ran.)
       state.currentText = '';
       state.currentMessageId = null;
-      const promptBlocks = this.buildPromptContent(payload);
+      const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
+      const includeSessionSystemText = !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
+      const promptBlocks = this.buildPromptContent(payload, includeSessionSystemText);
 
       // Long-lived call — agent streams sessionUpdate notifications until this
       // resolves with { stopReason }.
@@ -524,7 +530,7 @@ export class KimiSdkProvider implements TransportProvider {
         sessionId: state.acpSessionId!,
         prompt: promptBlocks,
       });
-      this.settleTurn(sessionId, state, result.stopReason);
+      this.settleTurn(sessionId, state, result.stopReason, includeSessionSystemText ? sessionSystemText : undefined);
     } catch (err) {
       state.promptInFlight = false;
       this.clearStatus(sessionId, state);
@@ -621,6 +627,7 @@ export class KimiSdkProvider implements TransportProvider {
     state.acpSessionId = result.sessionId;
     state.loaded = true;
     state.modeApplied = false;
+    state.sessionSystemTextInjected = undefined;
     this.acpToRoute.set(state.acpSessionId, sessionId);
     this.cacheModelsFromSessionResponse(result);
     this.applySessionMetadata(sessionId, state, result);
@@ -698,20 +705,17 @@ export class KimiSdkProvider implements TransportProvider {
     }
   }
 
-  private buildPromptContent(payload: ProviderContextPayload): ContentBlock[] {
-    // ACP has no separate system-prompt slot. Follow the CodexSdkProvider
-    // convention and prepend the resolved systemText as a context preamble so
-    // the agent sees the persona/description alongside the user turn.
-    const userText = payload.systemText
-      ? `Context instructions:\n${payload.systemText}\n\n${payload.assembledMessage}`
-      : payload.assembledMessage;
-    return [{ type: 'text', text: userText }];
+  private buildPromptContent(payload: ProviderContextPayload, includeSessionSystemText: boolean): ContentBlock[] {
+    // ACP has no separate system-prompt slot. Inject stable IM.codes context
+    // once per ACP history, then only per-turn authored context thereafter.
+    return [{ type: 'text', text: composeMessageSideProviderPrompt(payload, { includeSessionSystemText }) }];
   }
 
   private settleTurn(
     sessionId: string,
     state: KimiSdkSessionState,
     stopReason: StopReason,
+    sessionSystemTextToCommit?: string,
   ): void {
     state.promptInFlight = false;
     this.clearStatus(sessionId, state);
@@ -741,6 +745,7 @@ export class KimiSdkProvider implements TransportProvider {
     // → recorded in context_turn_usage with the turn's eventId.
     const turnUsage = state.lastTurnUsage;
     state.lastTurnUsage = undefined;
+    if (sessionSystemTextToCommit) state.sessionSystemTextInjected = sessionSystemTextToCommit;
 
     if (stopReason === 'max_tokens' || stopReason === 'max_turn_requests') {
       // Still emit whatever text we accumulated — it's a partial but useful

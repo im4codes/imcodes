@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { getProviderSystemTextParts } from '../../src/agent/provider-context-routing.js';
 import { normalizeProviderPayload } from '../../src/agent/transport-provider.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 
@@ -63,5 +64,18 @@ describe('normalizeProviderPayload', () => {
     expect(() => normalizeProviderPayload(payload, undefined, 'legacy raw context')).toThrow(
       /must not be combined with legacy extraSystemPrompt/i,
     );
+  });
+
+  it('keeps raw string sends on the legacy combined system text path', () => {
+    const payload = normalizeProviderPayload('hello', undefined, 'legacy raw context');
+
+    expect(payload.systemText).toBe('legacy raw context');
+    expect(payload.sessionSystemText).toBeUndefined();
+    expect(payload.context.sessionSystemText).toBeUndefined();
+    expect(getProviderSystemTextParts(payload)).toMatchObject({
+      hasSplitSystemText: false,
+      sessionSystemText: 'legacy raw context',
+      combinedSystemText: 'legacy raw context',
+    });
   });
 });

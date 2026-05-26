@@ -219,6 +219,8 @@ export function buildProviderContextPayload(
   return {
     userMessage: input.userMessage,
     assembledMessage: renderAssembledMessage(input.userMessage, compiledContext.messagePreamble),
+    sessionSystemText: compiledContext.sessionSystemText,
+    turnSystemText: compiledContext.turnSystemText,
     systemText: compiledContext.systemText,
     messagePreamble: compiledContext.messagePreamble,
     attachments: input.attachments,
@@ -328,8 +330,12 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   const renderedAuthoredSystemText = renderAuthoredSystemText(authoredContext.required, authoredContext.advisory);
   const memorySearchGuidance = input.suppressMcpMemorySearchGuidance ? undefined : MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE;
   const agentProgressGuidance = input.suppressAgentProgressGuidance ? undefined : AGENT_PROGRESS_SYSTEM_GUIDANCE;
+  const sessionSystemText = [input.description?.trim(), input.systemPrompt?.trim(), memorySearchGuidance, agentProgressGuidance].filter(Boolean).join('\n\n') || undefined;
+  const turnSystemText = renderedAuthoredSystemText;
   return {
-    systemText: [input.description?.trim(), input.systemPrompt?.trim(), memorySearchGuidance, agentProgressGuidance, renderedAuthoredSystemText].filter(Boolean).join('\n\n') || undefined,
+    sessionSystemText,
+    turnSystemText,
+    systemText: [sessionSystemText, turnSystemText].filter(Boolean).join('\n\n') || undefined,
     messagePreamble: input.messagePreamble?.trim() || undefined,
     requiredAuthoredContext: authoredContext.required,
     advisoryAuthoredContext: authoredContext.advisory,

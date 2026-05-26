@@ -28,6 +28,7 @@ import type { TransportAttachment } from '../../../shared/transport-attachments.
 import { DEFAULT_TRANSPORT_EFFORT, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import logger from '../../util/logger.js';
 import { inferContextWindow } from '../../util/model-context.js';
+import { composeProviderSystemText, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import {
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
@@ -98,8 +99,22 @@ function extractSyntheticApiError(text: string | undefined): string | undefined 
 }
 
 function toQwenCompactPayload(payload: ProviderContextPayload): ProviderContextPayload {
-  const { systemText: _systemText, messagePreamble: _messagePreamble, startupMemory: _startupMemory, memoryRecall: _memoryRecall, ...rest } = payload;
-  const { systemText: _contextSystemText, messagePreamble: _contextMessagePreamble, ...contextRest } = payload.context;
+  const {
+    sessionSystemText: _sessionSystemText,
+    turnSystemText: _turnSystemText,
+    systemText: _systemText,
+    messagePreamble: _messagePreamble,
+    startupMemory: _startupMemory,
+    memoryRecall: _memoryRecall,
+    ...rest
+  } = payload;
+  const {
+    sessionSystemText: _contextSessionSystemText,
+    turnSystemText: _contextTurnSystemText,
+    systemText: _contextSystemText,
+    messagePreamble: _contextMessagePreamble,
+    ...contextRest
+  } = payload.context;
   return {
     ...rest,
     userMessage: QWEN_COMPACT_SLASH_COMMAND,
@@ -137,6 +152,8 @@ interface QwenSessionState {
   toolUseById: Map<string, { id: string; name: string; input?: unknown; partialJson: string }>;
   emittedToolSignatures: Map<string, string>;
   lastStatusSignature: string | null;
+  /** Stable IM.codes context already injected into this Qwen conversation. */
+  sessionSystemTextInjected?: string;
 }
 
 function toQwenReasoning(effort: TransportEffortLevel): false | { effort: 'low' | 'medium' | 'high' } {
@@ -390,6 +407,7 @@ export class QwenProvider implements TransportProvider {
       toolUseById: existing?.toolUseById ?? new Map(),
       emittedToolSignatures: existing?.emittedToolSignatures ?? new Map(),
       lastStatusSignature: existing?.lastStatusSignature ?? null,
+      sessionSystemTextInjected: existing?.sessionSystemTextInjected,
     });
     return sessionId;
   }
@@ -528,9 +546,11 @@ export class QwenProvider implements TransportProvider {
       '--include-partial-messages',
       '--approval-mode', 'yolo',
     ];
+    const sessionSystemText = getProviderSystemTextParts(providerPayload).sessionSystemText;
+    const includeSessionSystemText = !isCompactControl && !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
     const effectivePrompt = isCompactControl
       ? undefined
-      : (providerPayload.systemText?.trim() || state.description?.trim());
+      : (composeProviderSystemText(providerPayload, { includeSession: includeSessionSystemText, includeTurn: true }) || state.description?.trim());
     if (effectivePrompt) {
       args.push('--append-system-prompt', effectivePrompt);
     }
@@ -615,6 +635,7 @@ export class QwenProvider implements TransportProvider {
       state.child = null;
       state.started = false;
       state.qwenConversationId = randomUUID();
+      state.sessionSystemTextInjected = undefined;
       this.emitSessionInfo(sessionId, { resumeId: state.qwenConversationId });
       await this.ensureSettingsPath(state);
       logger.warn(
@@ -664,6 +685,11 @@ export class QwenProvider implements TransportProvider {
       state.pendingFinalMetadata = undefined;
       const finalMessageId = messageId || randomUUID();
       const isCompactCompletion = metadata?.[SESSION_CONTROL_METADATA_COMMAND_FIELD] === 'compact';
+      if (isCompactCompletion) {
+        state.sessionSystemTextInjected = undefined;
+      } else if (includeSessionSystemText) {
+        state.sessionSystemTextInjected = sessionSystemText;
+      }
       const msg: AgentMessage = {
         id: finalMessageId,
         sessionId,
@@ -931,6 +957,7 @@ export class QwenProvider implements TransportProvider {
           if (allowResumeFallback && state.started && /No saved session found with ID/i.test(stderrBuf)) {
             state.started = false;
             state.qwenConversationId = randomUUID();
+            state.sessionSystemTextInjected = undefined;
             this.emitSessionInfo(sessionId, { resumeId: state.qwenConversationId });
             void this.send(sessionId, payload, _attachments, extraSystemPrompt, false).catch((err) => {
               const providerError = typeof err === 'object' && err && 'code' in err
@@ -976,6 +1003,7 @@ export class QwenProvider implements TransportProvider {
     // instead of --resume on the conversation stuck in a tool-call loop.
     state.started = false;
     state.qwenConversationId = randomUUID();
+    state.sessionSystemTextInjected = undefined;
   }
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {

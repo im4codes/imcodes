@@ -485,10 +485,14 @@ export function normalizeProviderPayload(
   return {
     userMessage: payload,
     assembledMessage: payload,
+    sessionSystemText: undefined,
+    turnSystemText: undefined,
     systemText,
     messagePreamble: undefined,
     attachments,
     context: {
+      sessionSystemText: undefined,
+      turnSystemText: undefined,
       systemText,
       messagePreamble: undefined,
       requiredAuthoredContext: [],

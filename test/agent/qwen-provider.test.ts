@@ -733,6 +733,61 @@ describe('QwenProvider', () => {
     expect(run.args).toContain('Enterprise standard');
   });
 
+  it('injects split stable context only once and keeps per-turn context on later sends', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-split-context',
+      cwd: '/tmp/project',
+    });
+
+    const makePayload = (turnSystemText: string): ProviderContextPayload => ({
+      userMessage: 'hello',
+      assembledMessage: 'Shared history\n\nhello',
+      sessionSystemText: 'Stable IM.codes runtime rules',
+      turnSystemText,
+      systemText: `Stable IM.codes runtime rules\n\n${turnSystemText}`,
+      messagePreamble: 'Shared history',
+      attachments: undefined,
+      context: {
+        sessionSystemText: 'Stable IM.codes runtime rules',
+        turnSystemText,
+        systemText: `Stable IM.codes runtime rules\n\n${turnSystemText}`,
+        messagePreamble: 'Shared history',
+        requiredAuthoredContext: [turnSystemText],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'project_shared', projectId: 'repo' },
+        authoritySource: 'processed_remote',
+        freshness: 'fresh',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    await provider.send('sess-split-context', makePayload('Required shared context:\n- First rule'));
+    const first = lastSpawn();
+    const firstPrompt = first.args[first.args.indexOf('--append-system-prompt') + 1];
+    expect(firstPrompt).toContain('Stable IM.codes runtime rules');
+    expect(firstPrompt).toContain('First rule');
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-split-context', makePayload('Required shared context:\n- Second rule'));
+    const second = lastSpawn();
+    const secondPrompt = second.args[second.args.indexOf('--append-system-prompt') + 1];
+    expect(secondPrompt).not.toContain('Stable IM.codes runtime rules');
+    expect(secondPrompt).toContain('Second rule');
+  });
+
   it('normalizes Windows cwd before spawning qwen', async () => {
     const origPlatform = process.platform;
     Object.defineProperty(process, 'platform', { value: 'win32' });
