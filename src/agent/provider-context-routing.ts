@@ -13,17 +13,18 @@ function trimOrUndefined(value: string | undefined): string | undefined {
 }
 
 export function getProviderSystemTextParts(payload: ProviderContextPayload): ProviderSystemTextParts {
+  const legacySystemText = trimOrUndefined(payload.systemText)
+    ?? trimOrUndefined(payload.context.systemText);
   const hasSplitSystemText = payload.sessionSystemText !== undefined
     || payload.turnSystemText !== undefined
     || payload.context.sessionSystemText !== undefined
     || payload.context.turnSystemText !== undefined;
 
   if (!hasSplitSystemText) {
-    const systemText = trimOrUndefined(payload.systemText);
     return {
       hasSplitSystemText: false,
-      sessionSystemText: systemText,
-      combinedSystemText: systemText,
+      sessionSystemText: legacySystemText,
+      combinedSystemText: legacySystemText,
     };
   }
 
@@ -31,6 +32,13 @@ export function getProviderSystemTextParts(payload: ProviderContextPayload): Pro
     ?? trimOrUndefined(payload.context.sessionSystemText);
   const turnSystemText = trimOrUndefined(payload.turnSystemText)
     ?? trimOrUndefined(payload.context.turnSystemText);
+  if (!sessionSystemText && !turnSystemText && legacySystemText) {
+    return {
+      hasSplitSystemText: false,
+      sessionSystemText: legacySystemText,
+      combinedSystemText: legacySystemText,
+    };
+  }
   return {
     hasSplitSystemText: true,
     sessionSystemText,

@@ -813,6 +813,79 @@ describe('CodexSdkProvider', () => {
     expect(thirdTurnStart?.params?.input?.[0]?.text).toContain('Required shared context:\n- Third rule');
   });
 
+  it('re-sends a changed split stable context when the Codex update turn fails before completion', async () => {
+    const provider = new CodexSdkProvider();
+    const errors: string[] = [];
+    provider.onError((_sid, error) => errors.push(error.message));
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-stable-failed-update', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+
+    const makePayload = (stable: string, turn: string): ProviderContextPayload => ({
+      userMessage: 'ship it',
+      assembledMessage: 'Relevant context\n\nship it',
+      sessionSystemText: stable,
+      turnSystemText: turn,
+      systemText: `${stable}\n\n${turn}`,
+      messagePreamble: 'Relevant context',
+      attachments: [],
+      context: {
+        sessionSystemText: stable,
+        turnSystemText: turn,
+        systemText: `${stable}\n\n${turn}`,
+        messagePreamble: 'Relevant context',
+        requiredAuthoredContext: [turn],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: ['doc-v1'],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-stable-failed-update' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    await provider.send('route-stable-failed-update', makePayload('Stable runtime v1', 'Required shared context:\n- First rule'));
+    const child = childProcessMock.children[0];
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    await provider.send('route-stable-failed-update', makePayload('Stable runtime v2', 'Required shared context:\n- Second rule'));
+    const failedTurnStart = child.requests.filter((req) => req.method === 'turn/start').at(-1);
+    expect(failedTurnStart?.params?.input?.[0]?.text).toContain('# IM.codes runtime instructions updated:\nStable runtime v2');
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: {
+          id: 'turn-1',
+          status: 'failed',
+          error: { message: 'synthetic failure' },
+        },
+      },
+    });
+    await flush();
+    expect(errors).toContain('synthetic failure');
+
+    await provider.send('route-stable-failed-update', makePayload('Stable runtime v2', 'Required shared context:\n- Retry rule'));
+    const retryTurnStart = child.requests.filter((req) => req.method === 'turn/start').at(-1);
+    expect(retryTurnStart?.params?.input?.[0]?.text).toContain('# IM.codes runtime instructions updated:\nStable runtime v2');
+    expect(retryTurnStart?.params?.input?.[0]?.text).toContain('Required shared context:\n- Retry rule');
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    await provider.send('route-stable-failed-update', makePayload('Stable runtime v2', 'Required shared context:\n- Later rule'));
+    const finalTurnStart = child.requests.filter((req) => req.method === 'turn/start').at(-1);
+    expect(finalTurnStart?.params?.input?.[0]?.text).not.toContain('# IM.codes runtime instructions updated');
+    expect(finalTurnStart?.params?.input?.[0]?.text).toContain('Required shared context:\n- Later rule');
+  });
+
   it('caps Codex SDK injected context while preserving the user turn text', async () => {
     vi.stubEnv('IMCODES_CODEX_SDK_CONTEXT_MAX_CHARS', '4000');
     const provider = new CodexSdkProvider();

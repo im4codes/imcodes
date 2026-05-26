@@ -118,4 +118,55 @@ describe('provider context routing', () => {
       combinedSystemText: 'Context stable rules\n\nContext turn rules',
     });
   });
+
+  it('falls back to legacy system text when split fields are present but empty', () => {
+    const payload = makePayload({
+      sessionSystemText: '',
+      turnSystemText: '   ',
+      systemText: 'Legacy combined system rules',
+      context: {
+        sessionSystemText: '',
+        turnSystemText: ' ',
+        systemText: 'Legacy combined system rules',
+        messagePreamble: 'Relevant history',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+    });
+
+    expect(getProviderSystemTextParts(payload)).toMatchObject({
+      hasSplitSystemText: false,
+      sessionSystemText: 'Legacy combined system rules',
+      combinedSystemText: 'Legacy combined system rules',
+    });
+    expect(composeProviderSystemText(payload, { includeSession: false })).toBe('Legacy combined system rules');
+  });
+
+  it('does not merge legacy system text when split fields contain real content', () => {
+    const payload = makePayload({
+      sessionSystemText: 'Stable split rules',
+      turnSystemText: '',
+      systemText: 'Legacy combined system rules',
+      context: {
+        sessionSystemText: 'Stable split rules',
+        turnSystemText: '',
+        systemText: 'Legacy combined system rules',
+        messagePreamble: 'Relevant history',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+    });
+
+    expect(getProviderSystemTextParts(payload)).toMatchObject({
+      hasSplitSystemText: true,
+      sessionSystemText: 'Stable split rules',
+      turnSystemText: undefined,
+      combinedSystemText: 'Stable split rules',
+    });
+    expect(composeProviderSystemText(payload)).toBe('Stable split rules');
+  });
 });

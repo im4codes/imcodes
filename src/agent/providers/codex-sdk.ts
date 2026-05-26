@@ -283,6 +283,8 @@ interface CodexSdkSessionState {
     codex_last_output_tokens?: number;
   };
   lastStatusSignature: string | null;
+  pendingSessionSystemTextUpdate?: string;
+  pendingSessionSystemTextUpdateTurnId?: string;
 }
 
 function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
@@ -636,6 +638,8 @@ export class CodexSdkProvider implements TransportProvider {
       lastInjectedSessionSystemText: existing?.lastInjectedSessionSystemText,
       lastUsage: undefined,
       lastStatusSignature: null,
+      pendingSessionSystemTextUpdate: undefined,
+      pendingSessionSystemTextUpdateTurnId: undefined,
     });
     if (config.resumeId || config.effort) this.emitSessionInfo(routeId, { ...(config.resumeId ? { resumeId: config.resumeId } : {}), ...(config.effort ? { effort: config.effort } : {}) });
     return routeId;
@@ -796,6 +800,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearStatus(sessionId, state);
       state.runningTurnId = undefined;
       state.pendingComplete = undefined;
+      this.clearPendingSessionSystemTextUpdate(state);
       this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
     }, CANCEL_INTERRUPT_TIMEOUT_MS);
     state.cancelTimer.unref?.();
@@ -823,6 +828,7 @@ export class CodexSdkProvider implements TransportProvider {
         state.pendingComplete = undefined;
         state.cancelled = false;
         state.lastStatusSignature = null;
+        this.clearPendingSessionSystemTextUpdate(state);
       }
     }
     // `child.kill('SIGTERM')` only terminates the node wrapper; the native
@@ -962,13 +968,17 @@ export class CodexSdkProvider implements TransportProvider {
         ...(state.model ? { model: state.model } : {}),
         ...(state.effort ? { effort: state.effort } : {}),
       });
-      if (desiredSessionSystemText) state.lastInjectedSessionSystemText = desiredSessionSystemText;
       state.runningTurnId = result?.turn?.id;
+      if (shouldInjectStableUpdate) {
+        state.pendingSessionSystemTextUpdate = desiredSessionSystemText;
+        state.pendingSessionSystemTextUpdateTurnId = state.runningTurnId;
+      }
       if (state.cancelled && state.runningTurnId) {
         await this.interruptRunningTurn(sessionId, state, state.runningTurnId);
       }
     } catch (err) {
       state.runningTurnId = undefined;
+      this.clearPendingSessionSystemTextUpdate(state);
       const error = this.normalizeError(err);
       if (this.isCodexAuthError(error)) {
         await this.restartAppServerAfterAuthFailure('start-turn', error).catch((restartErr) => {
@@ -993,6 +1003,7 @@ export class CodexSdkProvider implements TransportProvider {
   private async startCompact(sessionId: string, state: CodexSdkSessionState): Promise<void> {
     try {
       await this.ensureThreadLoaded(sessionId, state);
+      this.clearPendingSessionSystemTextUpdate(state);
       state.runningCompact = true;
       state.compactObserved = false;
       state.currentText = '';
@@ -1323,6 +1334,7 @@ export class CodexSdkProvider implements TransportProvider {
         state.runningCompact = false;
         state.compactObserved = false;
         state.runningTurnId = undefined;
+        this.clearPendingSessionSystemTextUpdate(state);
         const error = this.normalizeError(turn.error?.message ?? 'Codex turn failed', turn.error);
         if (this.isCodexAuthError(error)) {
           void this.restartAppServerAfterAuthFailure('turn-failed', error).catch((restartErr) => {
@@ -1339,10 +1351,12 @@ export class CodexSdkProvider implements TransportProvider {
         state.compactObserved = false;
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
+          this.clearPendingSessionSystemTextUpdate(state);
           return;
         }
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
+        this.clearPendingSessionSystemTextUpdate(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
       }
@@ -1360,12 +1374,14 @@ export class CodexSdkProvider implements TransportProvider {
         state.currentMessageId = null;
         state.currentText = '';
         state.cancelled = false;
+        this.clearPendingSessionSystemTextUpdate(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
       }
 
       this.clearCancelTimer(state);
       this.clearStatus(sessionId, state);
+      this.commitPendingSessionSystemTextUpdate(state, typeof turn.id === 'string' ? turn.id : undefined);
       state.pendingComplete = {
         id: state.currentMessageId ?? `${sessionId}:agent-message`,
         sessionId,
@@ -1426,6 +1442,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.runningCompact = false;
     state.runningTurnId = undefined;
     state.compactObserved = false;
+    this.clearPendingSessionSystemTextUpdate(state);
     state.currentMessageId = null;
     state.currentText = '';
     const completed: AgentMessage = {
@@ -1565,6 +1582,21 @@ export class CodexSdkProvider implements TransportProvider {
     this.emitStatus(sessionId, state, { status: null, label: null });
   }
 
+  private clearPendingSessionSystemTextUpdate(state: CodexSdkSessionState): void {
+    state.pendingSessionSystemTextUpdate = undefined;
+    state.pendingSessionSystemTextUpdateTurnId = undefined;
+  }
+
+  private commitPendingSessionSystemTextUpdate(state: CodexSdkSessionState, turnId?: string): void {
+    if (!state.pendingSessionSystemTextUpdate) return;
+    if (state.pendingSessionSystemTextUpdateTurnId && turnId && state.pendingSessionSystemTextUpdateTurnId !== turnId) {
+      this.clearPendingSessionSystemTextUpdate(state);
+      return;
+    }
+    state.lastInjectedSessionSystemText = state.pendingSessionSystemTextUpdate;
+    this.clearPendingSessionSystemTextUpdate(state);
+  }
+
   private cancelCompactLocally(sessionId: string, state: CodexSdkSessionState): void {
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
@@ -1572,6 +1604,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.runningCompact = false;
     state.runningTurnId = undefined;
     state.compactObserved = false;
+    this.clearPendingSessionSystemTextUpdate(state);
     state.currentMessageId = null;
     state.currentText = '';
     state.pendingComplete = undefined;
@@ -1634,6 +1667,7 @@ export class CodexSdkProvider implements TransportProvider {
       state.runningCompact = false;
       state.runningTurnId = undefined;
       state.compactObserved = false;
+      this.clearPendingSessionSystemTextUpdate(state);
       state.currentMessageId = null;
       state.currentText = '';
       this.emitError(sessionId, this.makeError(

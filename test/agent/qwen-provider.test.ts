@@ -788,6 +788,73 @@ describe('QwenProvider', () => {
     expect(secondPrompt).toContain('Second rule');
   });
 
+  it('does not fall back to the session description after split stable context is injected', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-split-stable-only',
+      cwd: '/tmp/project',
+      description: 'Legacy description must not repeat after split injection',
+    });
+
+    const payload: ProviderContextPayload = {
+      userMessage: 'hello',
+      assembledMessage: 'hello',
+      sessionSystemText: 'Stable IM.codes runtime rules',
+      systemText: 'Stable IM.codes runtime rules',
+      messagePreamble: undefined,
+      attachments: undefined,
+      context: {
+        sessionSystemText: 'Stable IM.codes runtime rules',
+        systemText: 'Stable IM.codes runtime rules',
+        messagePreamble: undefined,
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'project_shared', projectId: 'repo' },
+        authoritySource: 'processed_remote',
+        freshness: 'fresh',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+
+    await provider.send('sess-split-stable-only', payload);
+    const first = lastSpawn();
+    expect(first.args).toContain('--append-system-prompt');
+    expect(first.args).toContain('Stable IM.codes runtime rules');
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-split-stable-only', payload);
+    const second = lastSpawn();
+    expect(second.args).not.toContain('--append-system-prompt');
+    expect(second.args).not.toContain('Legacy description must not repeat after split injection');
+  });
+
+  it('keeps the legacy description fallback for raw string sends', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-legacy-description',
+      cwd: '/tmp/project',
+      description: 'Legacy description fallback',
+    });
+
+    await provider.send('sess-legacy-description', 'hello');
+    const run = lastSpawn();
+    expect(run.args).toContain('--append-system-prompt');
+    expect(run.args).toContain('Legacy description fallback');
+  });
+
   it('normalizes Windows cwd before spawning qwen', async () => {
     const origPlatform = process.platform;
     Object.defineProperty(process, 'platform', { value: 'win32' });

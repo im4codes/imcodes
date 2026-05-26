@@ -546,11 +546,16 @@ export class QwenProvider implements TransportProvider {
       '--include-partial-messages',
       '--approval-mode', 'yolo',
     ];
-    const sessionSystemText = getProviderSystemTextParts(providerPayload).sessionSystemText;
+    const systemParts = getProviderSystemTextParts(providerPayload);
+    const sessionSystemText = systemParts.sessionSystemText;
     const includeSessionSystemText = !isCompactControl && !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
     const effectivePrompt = isCompactControl
       ? undefined
-      : (composeProviderSystemText(providerPayload, { includeSession: includeSessionSystemText, includeTurn: true }) || state.description?.trim());
+      : (
+          systemParts.hasSplitSystemText
+            ? composeProviderSystemText(providerPayload, { includeSession: includeSessionSystemText, includeTurn: true })
+            : (composeProviderSystemText(providerPayload) || state.description?.trim())
+        );
     if (effectivePrompt) {
       args.push('--append-system-prompt', effectivePrompt);
     }
