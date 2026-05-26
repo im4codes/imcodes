@@ -4,7 +4,7 @@
 import { h } from 'preact';
 import { act, render, waitFor, cleanup, fireEvent, screen } from '@testing-library/preact';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { ChatView } from '../../src/components/ChatView.js';
+import { ChatView, __clearChatLocalImagePreviewCacheForTests } from '../../src/components/ChatView.js';
 import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_STATE_STOPPING,
@@ -135,6 +135,7 @@ describe('ChatView', () => {
     clipboardWriteText.mockClear();
     visualViewportMock.height = 800;
     visualViewportListeners.clear();
+    __clearChatLocalImagePreviewCacheForTests();
     __resetSessionRepoContextStoreForTests();
   });
 
@@ -409,7 +410,7 @@ describe('ChatView', () => {
       payload: { text: 'See ./screenshots/result.png' },
     }];
 
-    const { container } = render(
+    const { container, unmount } = render(
       <ChatView
         events={events as any}
         loading={false}
@@ -442,6 +443,23 @@ describe('ChatView', () => {
     });
     const image = container.querySelector('.chat-local-image-preview-img') as HTMLImageElement;
     expect(image.src).toBe('data:image/png;base64,aW1n');
+
+    unmount();
+
+    const second = render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        sessionId="deck_image_preview"
+        ws={ws as any}
+        workdir="/repo"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(second.container.querySelector('.chat-local-image-preview-img')).not.toBeNull();
+    });
+    expect(ws.fsReadFile).toHaveBeenCalledTimes(1);
   });
 
   it('always hides thinking events from the timeline regardless of preference', () => {

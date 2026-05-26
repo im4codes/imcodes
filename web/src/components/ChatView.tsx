@@ -21,7 +21,7 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
-import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
+import type { ChatLocalImagePreviewLoader, ChatLocalImagePreviewResult } from './ChatLocalImagePreview.js';
 import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { isLikelyDomainPath, renderChatPathActions, type ChatPathDownloadHandler } from '../chat-path-actions.js';
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
@@ -118,6 +118,38 @@ interface AssistantBlockProps {
 }
 
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
+const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT = 64;
+const chatLocalImagePreviewCache = new Map<string, Promise<ChatLocalImagePreviewResult>>();
+
+function getCachedChatLocalImagePreview(
+  cacheKey: string,
+  load: () => Promise<ChatLocalImagePreviewResult>,
+): Promise<ChatLocalImagePreviewResult> {
+  const existing = chatLocalImagePreviewCache.get(cacheKey);
+  if (existing) {
+    chatLocalImagePreviewCache.delete(cacheKey);
+    chatLocalImagePreviewCache.set(cacheKey, existing);
+    return existing;
+  }
+
+  const pending = load().catch((err) => {
+    if (chatLocalImagePreviewCache.get(cacheKey) === pending) {
+      chatLocalImagePreviewCache.delete(cacheKey);
+    }
+    throw err;
+  });
+  chatLocalImagePreviewCache.set(cacheKey, pending);
+  while (chatLocalImagePreviewCache.size > CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT) {
+    const oldestKey = chatLocalImagePreviewCache.keys().next().value;
+    if (typeof oldestKey !== 'string') break;
+    chatLocalImagePreviewCache.delete(oldestKey);
+  }
+  return pending;
+}
+
+export function __clearChatLocalImagePreviewCacheForTests() {
+  chatLocalImagePreviewCache.clear();
+}
 
 /** Extract a chat event's visible text while preserving block/list/code
  *  formatting. Uses `domNodeToPlainText` rather than `textContent` so that
@@ -1156,39 +1188,43 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       let unsub: (() => void) | undefined;
       let timer: ReturnType<typeof setTimeout> | undefined;
       const resolvedPath = resolvePreviewPath(path, workdir);
+      const cacheScope = serverId ? `server:${serverId}` : `session:${sessionId ?? 'unknown'}`;
+      const cacheKey = `${cacheScope}\0${resolvedPath}`;
       const cleanup = () => {
         if (timer) clearTimeout(timer);
         unsub?.();
       };
 
-      try {
-        const reqId = ws.fsReadFile(resolvedPath);
-        timer = setTimeout(() => {
+      getCachedChatLocalImagePreview(cacheKey, () => new Promise<ChatLocalImagePreviewResult>((resolveCached, rejectCached) => {
+        try {
+          const reqId = ws.fsReadFile(resolvedPath);
+          timer = setTimeout(() => {
+            cleanup();
+            rejectCached(new Error(t('upload.download_timeout')));
+          }, 30_000);
+          unsub = ws.onMessage((msg) => {
+            if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
+            cleanup();
+            if (msg.status === 'error') {
+              rejectCached(new Error(t('file_browser.preview_error')));
+              return;
+            }
+            if (msg.encoding === 'base64' && typeof msg.mimeType === 'string' && msg.mimeType.startsWith('image/')) {
+              resolveCached({
+                dataUrl: `data:${msg.mimeType};base64,${msg.content ?? ''}`,
+                alt: resolvedPath.split(/[/\\]/).pop() || resolvedPath,
+              });
+              return;
+            }
+            rejectCached(new Error(t('file_browser.preview_error')));
+          });
+        } catch (err) {
           cleanup();
-          reject(new Error(t('upload.download_timeout')));
-        }, 30_000);
-        unsub = ws.onMessage((msg) => {
-          if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
-          cleanup();
-          if (msg.status === 'error') {
-            reject(new Error(t('file_browser.preview_error')));
-            return;
-          }
-          if (msg.encoding === 'base64' && typeof msg.mimeType === 'string' && msg.mimeType.startsWith('image/')) {
-            resolve({
-              dataUrl: `data:${msg.mimeType};base64,${msg.content ?? ''}`,
-              alt: resolvedPath.split(/[/\\]/).pop() || resolvedPath,
-            });
-            return;
-          }
-          reject(new Error(t('file_browser.preview_error')));
-        });
-      } catch (err) {
-        cleanup();
-        reject(err instanceof Error ? err : new Error(String(err)));
-      }
+          rejectCached(err instanceof Error ? err : new Error(String(err)));
+        }
+      })).then(resolve, reject);
     })
-  ), [t, workdir, ws]);
+  ), [serverId, sessionId, t, workdir, ws]);
 
   const handleDownload = useCallback<ChatPathDownloadHandler>(async (path: string) => {
     if (!serverId) throw new Error(t('upload.daemon_offline'));
