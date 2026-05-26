@@ -388,13 +388,28 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 type="checkbox"
                 checked={customProviderSdk}
                 onChange={(e) => toggleCustomProviderSdk((e.target as HTMLInputElement).checked)}
-                style={{ marginTop: 2 }}
+                style={{ marginTop: 2, flexShrink: 0 }}
               />
-              <span style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <span
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 2,
+                  flex: 1,
+                  minWidth: 0,
+                }}
+              >
                 <span style={{ color: '#e2e8f0', fontSize: 13 }}>
                   {t('new_session.custom_provider_sdk')}
                 </span>
-                <span style={{ color: '#94a3b8', fontSize: 12, lineHeight: 1.35 }}>
+                <span
+                  style={{
+                    color: '#94a3b8',
+                    fontSize: 12,
+                    lineHeight: 1.35,
+                    wordBreak: 'break-word',
+                  }}
+                >
                   {t('new_session.custom_provider_sdk_help')}
                 </span>
               </span>

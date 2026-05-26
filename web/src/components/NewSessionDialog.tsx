@@ -552,32 +552,20 @@ export function NewSessionDialog({
   };
 
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "#00000080",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        zIndex: 9999,
-      }}
-      onKeyDown={handleKey}
-      role="dialog"
-    >
-      <div
-        style={{
-          background: "#1e293b",
-          border: "1px solid #334155",
-          borderRadius: 8,
-          padding: 24,
-          width: 400,
-        }}
-      >
-        <h2 style={{ margin: "0 0 20px", fontSize: 16, color: "#f1f5f9" }}>
-          {t("new_session.title")}
-        </h2>
+    <div class="dialog-overlay" onKeyDown={handleKey} role="dialog">
+      <div class="dialog" style={{ width: 380 }}>
+        <div class="dialog-header">
+          <h2>{t("new_session.title")}</h2>
+          <button
+            class="dialog-close"
+            onClick={onClose}
+            disabled={starting}
+          >
+            ×
+          </button>
+        </div>
 
+        <div class="dialog-body">
         <div class="form-group">
           <label>{t("new_session.project_name")}</label>
           <input
@@ -692,13 +680,28 @@ export function NewSessionDialog({
               onChange={(e) =>
                 toggleCustomProviderSdk((e.target as HTMLInputElement).checked)
               }
-              style={{ marginTop: 2 }}
+              style={{ marginTop: 2, flexShrink: 0 }}
             />
-            <span style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 2,
+                flex: 1,
+                minWidth: 0,
+              }}
+            >
               <span style={{ color: "#e2e8f0", fontSize: 13 }}>
                 {t("new_session.custom_provider_sdk")}
               </span>
-              <span style={{ color: "#94a3b8", fontSize: 12, lineHeight: 1.35 }}>
+              <span
+                style={{
+                  color: "#94a3b8",
+                  fontSize: 12,
+                  lineHeight: 1.35,
+                  wordBreak: "break-word",
+                }}
+              >
                 {t("new_session.custom_provider_sdk_help")}
               </span>
             </span>
@@ -1589,7 +1592,19 @@ export function NewSessionDialog({
           </p>
         )}
 
-        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+        </div>
+
+        <div
+          class="dialog-footer"
+          style={{
+            display: "flex",
+            gap: 8,
+            justifyContent: "flex-end",
+            padding: "12px 20px 16px",
+            borderTop: "1px solid #334155",
+            flexShrink: 0,
+          }}
+        >
           <button
             class="btn btn-secondary"
             onClick={onClose}
