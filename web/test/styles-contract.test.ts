@@ -109,7 +109,24 @@ describe('styles.css regression contracts', () => {
 
     const cacheRule = css.match(/\.session-ctx-cache,\s*[\s\S]*?\.subcard-ctx-cache\s*\{[^}]*\}/);
     expect(cacheRule).not.toBeNull();
+    expect(cacheRule![0]).toMatch(/#c084fc/);
+    expect(cacheRule![0]).toMatch(/#a855f7/);
+    expect(cacheRule![0]).toMatch(/rgba\(168,\s*85,\s*247,\s*0\.56\)/);
     expect(cacheRule![0]).toMatch(/transition:\s*width\s+0\.32s/);
+  });
+
+  it('transport stop shortcut stays left while meta header controls stay right', () => {
+    const transportShortcutRule = css.match(/\.shortcuts-transport\s*\{[^}]*\}/);
+    expect(transportShortcutRule).not.toBeNull();
+    expect(transportShortcutRule![0]).toMatch(/flex:\s*1\s+1\s+auto/);
+    expect(transportShortcutRule![0]).toMatch(/margin-left:\s*0/);
+
+    const mobileTransportShortcutRule = Array.from(css.matchAll(/\.shortcuts-transport\s*\{[^}]*\}/g))
+      .map((match) => match[0])
+      .find((rule) => /max-width:\s*none/.test(rule));
+    expect(mobileTransportShortcutRule).not.toBeNull();
+    expect(mobileTransportShortcutRule!).toMatch(/flex:\s*1\s+1\s+auto/);
+    expect(mobileTransportShortcutRule!).toMatch(/max-width:\s*none/);
   });
 
   it('mobile OpenSpec dropdown is a body-level viewport sheet, not an inline clipped menu', () => {
