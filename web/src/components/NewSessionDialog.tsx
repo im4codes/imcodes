@@ -553,7 +553,7 @@ export function NewSessionDialog({
 
   return (
     <div class="dialog-overlay" onKeyDown={handleKey} role="dialog">
-      <div class="dialog" style={{ width: 380 }}>
+      <div class="dialog" style={{ width: "100%", maxWidth: 380 }}>
         <div class="dialog-header">
           <h2>{t("new_session.title")}</h2>
           <button
