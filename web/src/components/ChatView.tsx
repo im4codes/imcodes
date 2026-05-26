@@ -118,7 +118,7 @@ interface AssistantBlockProps {
 }
 
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
-const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT = 64;
+const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT = 256;
 const chatLocalImagePreviewCache = new Map<string, Promise<ChatLocalImagePreviewResult>>();
 
 function getCachedChatLocalImagePreview(
