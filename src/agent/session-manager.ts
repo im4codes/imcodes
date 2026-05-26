@@ -1027,12 +1027,25 @@ function buildTransportImcodesIdentityPrompt(
   ].join('\n');
 }
 
+function buildGeneratedImageReportingPrompt(): string {
+  return [
+    'Generated Image Reporting:',
+    'When you generate, edit, save, or otherwise create any image file, you MUST report the local file path of every generated image in your final response.',
+    '- If multiple images are created, list each path.',
+    '- Use repository-relative paths when the image is inside the workspace; otherwise use absolute paths.',
+    '- Do not only say that the image was generated.',
+    '- If image generation succeeds but no file path is available, explicitly say that no path was returned.',
+    '- If the image is intended for use in the app/site/docs, also mention where it was added or how it should be referenced.',
+    'Never finish an image-generation task without telling the user where the generated image file is located.',
+  ].join('\n');
+}
+
 function mergeTransportSystemPromptWithIdentity(
   systemPrompt: string | undefined,
   sessionName: string,
   label: string | null | undefined,
 ): string {
-  return [systemPrompt?.trim(), buildTransportImcodesIdentityPrompt(sessionName, label)]
+  return [systemPrompt?.trim(), buildTransportImcodesIdentityPrompt(sessionName, label), buildGeneratedImageReportingPrompt()]
     .filter(Boolean)
     .join('\n\n');
 }
