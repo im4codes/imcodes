@@ -5,6 +5,8 @@ import {
   getSessionControlTimelineFeedbackById,
   isDaemonHandledSessionControlSend,
   isSessionControlCommandText,
+  SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+  SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_STATE_STOPPING,
   shouldHideOptimisticUserMessageForSessionControl,
@@ -20,10 +22,21 @@ describe('session control command abstraction', () => {
       handling: 'provider-dispatched',
       timelineUserMessage: 'hidden',
       optimisticUserMessage: 'hidden',
-      timelineFeedback: null,
+      timelineFeedback: {
+        state: SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
+        reason: SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+      },
       daemonHandledReceiptAck: false,
       resetsProcessPreferenceContext: true,
       resetsTransportPreferenceContextOnSend: true,
+    });
+    expect(getSessionControlTimelineFeedback('/compact')).toEqual({
+      state: SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
+      reason: SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+    });
+    expect(getSessionControlTimelineFeedbackById('compact')).toEqual({
+      state: SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
+      reason: SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
     });
     expect(shouldHideTimelineUserMessageForSessionControl('/compact')).toBe(true);
     expect(shouldHideOptimisticUserMessageForSessionControl('/compact')).toBe(true);

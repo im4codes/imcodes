@@ -193,6 +193,7 @@
     "unpin_to_stop": "請先取消釘選分頁",
     "state_stop_requested": "已請求停止",
     "state_stopping": "正在停止…",
+    "state_compacting": "正在壓縮上下文…",
     "confirm_stop": "確認停止？",
     "confirm_stop_dialog": "確定要停止此工作階段嗎？此操作無法復原。",
     "confirm_sub_stop_2": "⚠ 確定停止 {{label}}？",

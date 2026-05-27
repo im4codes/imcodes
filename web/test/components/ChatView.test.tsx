@@ -7,6 +7,8 @@ import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { ChatView, __clearChatLocalImagePreviewCacheForTests } from '../../src/components/ChatView.js';
 import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+  SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+  SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
   SESSION_CONTROL_TIMELINE_STATE_STOPPING,
 } from '../../../shared/session-control-commands.js';
 import {
@@ -1523,6 +1525,28 @@ describe('ChatView', () => {
     );
 
     expect(container.textContent).toContain('session.state_stop_requested');
+  });
+
+  it('renders transport Compact feedback as a visible system block', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-compact-requested',
+            type: 'session.state',
+            ts: 1000,
+            payload: {
+              state: SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
+              reason: SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.textContent).toContain('session.state_compacting');
   });
 
   it('opens external URLs in the themed confirmation dialog', () => {

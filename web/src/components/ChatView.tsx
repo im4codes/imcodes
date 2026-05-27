@@ -16,7 +16,10 @@ import type {
 } from '../ws-client.js';
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
-import { SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL } from '@shared/session-control-commands.js';
+import {
+  SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+  SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+} from '@shared/session-control-commands.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
@@ -2667,15 +2670,21 @@ const ChatEvent = memo(function ChatEvent({
     case 'session.state': {
       const state = String(event.payload.state ?? '');
       const isUserCancelFeedback = event.payload.reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL;
+      const isUserCompactFeedback = event.payload.reason === SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT;
       const stateLabel: Record<string, string> = {
         idle: 'Agent idle — waiting for input',
         running: 'Agent working...',
         started: 'Session started',
         starting: 'Session starting...',
+        compacting: t('session.state_compacting'),
         stopping: t('session.state_stopping'),
         stopped: 'Session stopped',
       };
-      const label = isUserCancelFeedback ? t('session.state_stop_requested') : (stateLabel[state] ?? state);
+      const label = isUserCancelFeedback
+        ? t('session.state_stop_requested')
+        : isUserCompactFeedback
+          ? t('session.state_compacting')
+          : (stateLabel[state] ?? state);
       const inline = state === 'idle' || state === 'running';
       return (
         <div class="chat-event chat-system" style={inline ? { display: 'flex', alignItems: 'center', gap: 8 } : undefined}>

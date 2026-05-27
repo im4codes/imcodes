@@ -5,7 +5,11 @@ import type { TransportProvider, ProviderError, SessionConfig } from '../../src/
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
-import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
+import {
+  SESSION_CONTROL_METADATA_COMMAND_FIELD,
+  SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+  SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
+} from '../../shared/session-control-commands.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
@@ -214,6 +218,24 @@ describe('TransportSessionRuntime', () => {
     expect(String(afterCompactPayload.assembledMessage)).toContain('Use pnpm');
   });
 
+  it('emits a visible timeline block when /compact starts dispatching', async () => {
+    expect(runtime.send('/compact', 'compact-block-1')).toBe('sent');
+
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'session.state',
+      {
+        state: SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
+        reason: SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+      },
+      { source: 'daemon', confidence: 'high' },
+    );
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      userMessage: '/compact',
+    }));
+  });
+
   it('rejects /compact before dispatch when provider compact capability is unsupported', () => {
     (mock.provider.capabilities as Record<string, unknown>).compact = {
       execution: 'unsupported',
@@ -225,6 +247,12 @@ describe('TransportSessionRuntime', () => {
 
     expect(() => runtime.send('/compact')).toThrow('mock provider does not support compact');
     expect(mock.provider.send).not.toHaveBeenCalled();
+    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+      'deck_test_brain',
+      'session.state',
+      expect.objectContaining({ state: SESSION_CONTROL_TIMELINE_STATE_COMPACTING }),
+      expect.anything(),
+    );
   });
 
   it('keeps slash controls raw for every transport by suppressing startup, recall, authored, and preference context', async () => {

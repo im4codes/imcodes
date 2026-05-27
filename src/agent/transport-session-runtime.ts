@@ -8,6 +8,8 @@ import { PROVIDER_ERROR_CODES } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import {
+  SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+  SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
   isSessionCompactCommandText,
   shouldResetTransportPreferenceContextForSessionControl,
@@ -623,6 +625,13 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     if (shouldResetTransportPreferenceContextForSessionControl(message)) {
       this._lastInjectedPreferenceContextSignature = null;
+    }
+
+    if (isSessionCompactCommandText(message)) {
+      timelineEmitter.emit(this.sessionKey, 'session.state', {
+        state: SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
+        reason: SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+      }, { source: 'daemon', confidence: 'high' });
     }
 
     void (async () => {
