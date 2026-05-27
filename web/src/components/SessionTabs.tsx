@@ -38,10 +38,18 @@ interface CtxMenu { x: number; y: number; session: SessionInfo }
 const LEGACY_LS_ORDER = 'rcc_tab_order';
 const TAB_LONG_PRESS_MS = 520;
 const TAB_LONG_PRESS_MOVE_CANCEL_PX = 10;
+const TAB_MOUSE_CLICK_MOVE_CANCEL_PX = 6;
 
 interface LongPressState {
   timer: number;
   pointerId: number;
+  startX: number;
+  startY: number;
+}
+
+interface MousePressState {
+  pointerId: number;
+  sessionName: string;
   startX: number;
   startY: number;
 }
@@ -61,6 +69,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   const renameRef = useRef<HTMLInputElement>(null);
   const tabBarRef = useRef<HTMLDivElement>(null);
   const longPressRef = useRef<LongPressState | null>(null);
+  const mousePressRef = useRef<MousePressState | null>(null);
   const suppressNextClickRef = useRef(false);
   const suppressNextClickResetRef = useRef<number | null>(null);
 
@@ -128,7 +137,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     longPressRef.current = null;
   }, []);
 
-  const suppressNextSyntheticClick = useCallback(() => {
+  const suppressNextSyntheticClick = useCallback((resetAfterMs = 800) => {
     suppressNextClickRef.current = true;
     if (suppressNextClickResetRef.current !== null) {
       window.clearTimeout(suppressNextClickResetRef.current);
@@ -136,11 +145,12 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     suppressNextClickResetRef.current = window.setTimeout(() => {
       suppressNextClickRef.current = false;
       suppressNextClickResetRef.current = null;
-    }, 800);
+    }, resetAfterMs);
   }, []);
 
   useEffect(() => () => {
     clearLongPress();
+    mousePressRef.current = null;
     if (suppressNextClickResetRef.current !== null) {
       window.clearTimeout(suppressNextClickResetRef.current);
       suppressNextClickResetRef.current = null;
@@ -201,9 +211,22 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     openCtxAt(e.clientX, e.clientY, session);
   }, [openCtxAt]);
 
+  const selectTab = useCallback((name: string) => {
+    onSelect(name);
+    if (idleAlerts?.has(name)) onAlertDismiss?.(name);
+  }, [idleAlerts, onAlertDismiss, onSelect]);
+
   const onTabPointerDown = useCallback((e: PointerEvent, session: SessionInfo) => {
-    if (e.pointerType === 'mouse') return;
     if (typeof e.button === 'number' && e.button !== 0) return;
+    if (e.pointerType === 'mouse') {
+      mousePressRef.current = {
+        pointerId: e.pointerId,
+        sessionName: session.name,
+        startX: e.clientX,
+        startY: e.clientY,
+      };
+      return;
+    }
     clearLongPress();
 
     const target = e.currentTarget as HTMLElement;
@@ -227,17 +250,34 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
 
   const onTabPointerMove = useCallback((e: PointerEvent) => {
     const state = longPressRef.current;
-    if (!state || state.pointerId !== e.pointerId) return;
-    const dx = e.clientX - state.startX;
-    const dy = e.clientY - state.startY;
-    if (Math.hypot(dx, dy) > TAB_LONG_PRESS_MOVE_CANCEL_PX) clearLongPress();
+    if (state && state.pointerId === e.pointerId) {
+      const dx = e.clientX - state.startX;
+      const dy = e.clientY - state.startY;
+      if (Math.hypot(dx, dy) > TAB_LONG_PRESS_MOVE_CANCEL_PX) clearLongPress();
+    }
+
+    const mouseState = mousePressRef.current;
+    if (!mouseState || mouseState.pointerId !== e.pointerId) return;
+    const dx = e.clientX - mouseState.startX;
+    const dy = e.clientY - mouseState.startY;
+    if (Math.hypot(dx, dy) > TAB_MOUSE_CLICK_MOVE_CANCEL_PX) {
+      mousePressRef.current = null;
+    }
   }, [clearLongPress]);
 
   const onTabPointerEnd = useCallback((e: PointerEvent) => {
     const state = longPressRef.current;
-    if (!state || state.pointerId !== e.pointerId) return;
-    clearLongPress();
-  }, [clearLongPress]);
+    if (state && state.pointerId === e.pointerId) clearLongPress();
+
+    const mouseState = mousePressRef.current;
+    if (!mouseState || mouseState.pointerId !== e.pointerId) return;
+    mousePressRef.current = null;
+    const dx = e.clientX - mouseState.startX;
+    const dy = e.clientY - mouseState.startY;
+    if (Math.hypot(dx, dy) > TAB_MOUSE_CLICK_MOVE_CANCEL_PX) return;
+    suppressNextSyntheticClick(180);
+    selectTab(mouseState.sessionName);
+  }, [clearLongPress, selectTab, suppressNextSyntheticClick]);
 
   const startRename = (s: SessionInfo) => {
     setCtx(null);
@@ -263,6 +303,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
 
   // Drag handlers — reorder only within the same group (pinned or unpinned).
   const onDragStart = useCallback((e: DragEvent, idx: number) => {
+    mousePressRef.current = null;
     dragIdx.current = idx;
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = 'move';
@@ -371,8 +412,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                     }
                     return;
                   }
-                  onSelect(s.name);
-                  if (hasAlert) onAlertDismiss?.(s.name);
+                  selectTab(s.name);
                 }}
                 onContextMenu={(e) => openCtx(e, s)}
                 onPointerDown={(e) => onTabPointerDown(e as PointerEvent, s)}

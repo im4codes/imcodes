@@ -144,6 +144,101 @@ describe('SessionTabs', () => {
     expect(onSelect).toHaveBeenCalledWith('session_w2');
   });
 
+  it('selects a pinned tab on mouse pointer-up even if the browser suppresses the click', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }, { name: 'session_w2' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={onSelect}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set(['session_w2'])}
+      />,
+    );
+
+    const pinnedTab = screen.getAllByRole('tab')[0];
+    fireEvent.pointerDown(pinnedTab, {
+      pointerId: 11,
+      pointerType: 'mouse',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.pointerUp(pinnedTab, {
+      pointerId: 11,
+      pointerType: 'mouse',
+      button: 0,
+      clientX: 25,
+      clientY: 13,
+    });
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(onSelect).toHaveBeenCalledWith('session_w2');
+  });
+
+  it('does not double-select when the normal mouse click follows pointer-up activation', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    fireEvent.pointerDown(tab, {
+      pointerId: 12,
+      pointerType: 'mouse',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.pointerUp(tab, {
+      pointerId: 12,
+      pointerType: 'mouse',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.click(tab);
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(onSelect).toHaveBeenCalledWith('session_w1');
+  });
+
+  it('does not activate from the mouse pointer fallback after a drag-sized move', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    fireEvent.pointerDown(tab, {
+      pointerId: 13,
+      pointerType: 'mouse',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.pointerMove(tab, {
+      pointerId: 13,
+      pointerType: 'mouse',
+      button: 0,
+      clientX: 40,
+      clientY: 12,
+    });
+    fireEvent.pointerUp(tab, {
+      pointerId: 13,
+      pointerType: 'mouse',
+      button: 0,
+      clientX: 40,
+      clientY: 12,
+    });
+
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
   it('opens the tab context menu from a touch long-press without selecting the tab', () => {
     vi.useFakeTimers();
     const onSelect = vi.fn();
