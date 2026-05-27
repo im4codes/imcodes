@@ -13,6 +13,11 @@ const toolPref = vi.hoisted(() => ({
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, opts?: Record<string, unknown>) => {
+      const translations: Record<string, string> = {
+        'session.state_idle': 'Agent idle — waiting for input',
+        'session.state_running': 'Agent working...',
+      };
+      if (translations[key]) return translations[key];
       if (key === 'session.provider_plan_title') return `Plan: ${String(opts?.value ?? '')}`;
       if (key === 'session.provider_quota_title') return `Quota: ${String(opts?.value ?? '')}`;
       if (key === 'session.provider_quota_usage_title') return `Quota usage: ${String(opts?.value ?? '')}`;

@@ -65,7 +65,19 @@ function selectText(node: Text, start: number, end: number) {
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string) => key,
+    t: (key: string) => {
+      const translations: Record<string, string> = {
+        'session.state_idle': 'Agent idle — waiting for input',
+        'session.state_running': 'Agent working...',
+        'session.state_started': 'Session started',
+        'session.state_starting': 'Session starting...',
+        'session.state_stopped': 'Session stopped',
+        'session.state_stop_requested': 'Stop requested',
+        'session.state_stopping': 'Stopping...',
+        'session.state_compacting': 'Compacting context...',
+      };
+      return translations[key] ?? key;
+    },
   }),
 }));
 
@@ -1524,7 +1536,7 @@ describe('ChatView', () => {
       />,
     );
 
-    expect(container.textContent).toContain('session.state_stop_requested');
+    expect(container.textContent).toContain('Stop requested');
   });
 
   it('renders transport Compact feedback as a visible system block', () => {
@@ -1546,7 +1558,7 @@ describe('ChatView', () => {
       />,
     );
 
-    expect(container.textContent).toContain('session.state_compacting');
+    expect(container.textContent).toContain('Compacting context...');
   });
 
   it('opens external URLs in the themed confirmation dialog', () => {
