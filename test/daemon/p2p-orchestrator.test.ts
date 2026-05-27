@@ -855,6 +855,9 @@ describe('P2P orchestrator — parallel rounds', () => {
   });
 
   it('cancellation preserves completed hop outcomes and cancels unfinished hops', async () => {
+    let resolveW1Completed!: () => void;
+    const w1Completed = new Promise<void>((resolve) => { resolveW1Completed = resolve; });
+
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
     if (await writeExecutionMarkerFromPrompt(prompt)) {
       setTimeout(() => notifySessionIdle(session), 20);
@@ -866,13 +869,11 @@ describe('P2P orchestrator — parallel rounds', () => {
         setTimeout(async () => {
           await appendFile(filePath, `\n## ${heading}\n\nDONE-${session}\n`, 'utf8');
           notifySessionIdle(session);
+          resolveW1Completed();
         }, 20);
         return;
       }
       if (session === 'deck_proj_w2') {
-        setTimeout(async () => {
-          try { await appendFile(filePath, `\n## ${heading}\n\nLATE-${session}\n`, 'utf8'); } catch {}
-        }, 200);
         return;
       }
       await appendFile(filePath, `\n## ${heading}\n\nINIT-${session}\n`, 'utf8');
@@ -890,10 +891,15 @@ describe('P2P orchestrator — parallel rounds', () => {
       serverLinkMock as any,
     );
 
+    await Promise.race([
+      w1Completed,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('w1 did not complete before cancellation test timeout')), 1000)),
+    ]);
     const start = Date.now();
-    while (Date.now() - start < 500 && !run.hopStates.some((h) => h.session === 'deck_proj_w1' && h.status === 'completed')) {
+    while (Date.now() - start < 1000 && !run.hopStates.some((h) => h.session === 'deck_proj_w1' && h.status === 'completed')) {
       await new Promise((r) => setTimeout(r, 20));
     }
+    expect(run.hopStates.some((h) => h.session === 'deck_proj_w1' && h.status === 'completed')).toBe(true);
     const cancelled = await cancelP2pRun(run.id, serverLinkMock as any);
     expect(cancelled).toBe(true);
 
