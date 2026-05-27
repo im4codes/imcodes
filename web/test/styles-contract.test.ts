@@ -67,6 +67,13 @@ describe('styles.css regression contracts', () => {
     expect(activeBrainRule![0]).toMatch(/border-bottom-width:\s*4px/);
   });
 
+  it('ctx live-status robot avatar stays legible in the compact footer', () => {
+    const robotRule = css.match(/\.session-live-status-robot-avatar\s*\{[^}]*\}/);
+    expect(robotRule).not.toBeNull();
+    expect(robotRule![0]).toMatch(/width:\s*18px/);
+    expect(robotRule![0]).toMatch(/height:\s*18px/);
+  });
+
   it('P2P dropdown rounds selector uses a blue background with green borders', () => {
     const selectorRule = css.match(/\.menu-dropdown-p2p \.p2p-dropdown-rounds\s*\{[^}]*\}/);
     expect(selectorRule).not.toBeNull();
