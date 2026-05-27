@@ -91,6 +91,7 @@
     "hide_file_panel": "파일 패널 닫기",
     "html_preview": "HTML 렌더링",
     "html_preview_title": "렌더링된 HTML 미리보기",
+    "html_preview_open_new_window": "새 창에서 미리보기 열기",
     "html_preview_too_large": "HTML 파일이 너무 커서 안전하게 렌더링할 수 없습니다.",
     "html_preview_unavailable": "HTML 미리보기를 사용할 수 없습니다",
     "html_preview_frame": "렌더링된 HTML 미리보기",

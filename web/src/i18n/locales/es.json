@@ -91,6 +91,7 @@
     "hide_file_panel": "Cerrar panel de archivos",
     "html_preview": "Renderizar HTML",
     "html_preview_title": "Vista previa HTML renderizada",
+    "html_preview_open_new_window": "Abrir vista previa en una nueva ventana",
     "html_preview_too_large": "El archivo HTML es demasiado grande para renderizarlo de forma segura.",
     "html_preview_unavailable": "La vista previa HTML no está disponible",
     "html_preview_frame": "Vista previa HTML renderizada",

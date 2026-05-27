@@ -91,6 +91,7 @@
     "hide_file_panel": "Закрыть панель файлов",
     "html_preview": "Отрисовать HTML",
     "html_preview_title": "Отрисованный предпросмотр HTML",
+    "html_preview_open_new_window": "Открыть предпросмотр в новом окне",
     "html_preview_too_large": "HTML-файл слишком большой для безопасной отрисовки.",
     "html_preview_unavailable": "Предпросмотр HTML недоступен",
     "html_preview_frame": "Отрисованный предпросмотр HTML",

@@ -91,6 +91,7 @@
     "hide_file_panel": "Close file panel",
     "html_preview": "Render HTML",
     "html_preview_title": "Render HTML preview",
+    "html_preview_open_new_window": "Open preview in new window",
     "html_preview_too_large": "HTML file is too large to render safely.",
     "html_preview_unavailable": "HTML preview unavailable",
     "html_preview_frame": "Rendered HTML preview",

@@ -91,6 +91,7 @@
     "hide_file_panel": "ファイルパネルを閉じる",
     "html_preview": "HTML をレンダー",
     "html_preview_title": "レンダー済み HTML プレビュー",
+    "html_preview_open_new_window": "プレビューを新しいウィンドウで開く",
     "html_preview_too_large": "HTML ファイルが大きすぎるため安全にレンダーできません。",
     "html_preview_unavailable": "HTML プレビューは利用できません",
     "html_preview_frame": "レンダー済み HTML プレビュー",

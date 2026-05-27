@@ -2852,10 +2852,10 @@ body {
 .html-safe-preview-frame { display: block; width: 100%; max-width: 100%; min-width: 0; height: 100%; min-height: 100%; border: 0; background: #fff; color-scheme: light; overflow: hidden; }
 .html-fullscreen-preview { position: fixed; inset: 0; width: 100vw; max-width: 100vw; height: 100vh; height: var(--vvh, 100dvh); max-height: 100vh; max-height: var(--vvh, 100dvh); z-index: 2147483646; overflow: hidden; background: #fff; box-sizing: border-box; }
 .html-fullscreen-preview-body { position: absolute; inset: 0; width: 100%; max-width: 100vw; min-width: 0; height: 100%; max-height: 100%; overflow: hidden; background: #fff; box-sizing: border-box; }
-.html-fullscreen-preview-close {
+.html-fullscreen-preview-close,
+.html-fullscreen-preview-open-window {
   position: fixed;
   top: calc(env(safe-area-inset-top, 0px) + 12px);
-  right: calc(env(safe-area-inset-right, 0px) + 12px);
   z-index: 1;
   width: 38px;
   height: 38px;
@@ -2874,8 +2874,13 @@ body {
   -webkit-backdrop-filter: blur(8px);
   box-shadow: 0 8px 28px rgba(15, 23, 42, 0.24);
 }
+.html-fullscreen-preview-close { right: calc(env(safe-area-inset-right, 0px) + 12px); }
+.html-fullscreen-preview-open-window { right: calc(env(safe-area-inset-right, 0px) + 58px); font-size: 17px; }
+.html-fullscreen-preview-open-window:disabled { opacity: 0.36; cursor: default; }
 .html-fullscreen-preview-close:hover,
-.html-fullscreen-preview-close:focus-visible { opacity: 1; background: rgba(15, 23, 42, 0.56); outline: none; }
+.html-fullscreen-preview-close:focus-visible,
+.html-fullscreen-preview-open-window:not(:disabled):hover,
+.html-fullscreen-preview-open-window:not(:disabled):focus-visible { opacity: 1; background: rgba(15, 23, 42, 0.56); outline: none; }
 .html-fullscreen-preview-status {
   height: 100%;
   display: flex;
