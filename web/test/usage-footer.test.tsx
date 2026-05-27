@@ -55,6 +55,13 @@ vi.mock('../src/hooks/usePref.js', () => ({
 import { UsageFooter } from '../src/components/UsageFooter.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 
+function expectRobotAvatar(root: ParentNode | null | undefined) {
+  const avatar = root?.querySelector('.session-live-status-robot-avatar') as HTMLImageElement | null;
+  expect(avatar).toBeTruthy();
+  expect(avatar?.getAttribute('src')).toBe('/imcodes-robot-avatar.png');
+  expect(avatar?.getAttribute('alt')).toBe('');
+}
+
 afterEach(() => {
   cleanup();
   toolPref.value = true;
@@ -82,7 +89,7 @@ describe('UsageFooter', () => {
     const liveStatus = container.querySelector('.session-live-status-inline.running');
     const children = Array.from(footer.children);
 
-    expect(liveStatus?.textContent).toContain('🤖');
+    expectRobotAvatar(liveStatus);
     expect(liveStatus?.textContent).toContain('⚙️');
     expect(liveStatus?.textContent).toContain('Agent working...');
     expect(container.querySelector('.session-repo-branch-summary')).toBeNull();
@@ -137,7 +144,7 @@ describe('UsageFooter', () => {
     );
 
     let status = container.querySelector('.session-live-status-inline.idle') as HTMLSpanElement | null;
-    expect(status?.textContent).toContain('🤖');
+    expectRobotAvatar(status);
     expect(status?.textContent).toContain('💤');
     expect(status?.getAttribute('aria-label')).toContain('Agent idle');
 
@@ -154,7 +161,7 @@ describe('UsageFooter', () => {
     );
 
     status = container.querySelector('.session-live-status-inline.idle') as HTMLSpanElement | null;
-    expect(status?.textContent).toContain('🤖');
+    expectRobotAvatar(status);
     expect(status?.textContent).toContain('💤');
     expect(status?.getAttribute('aria-label')).toContain('Agent idle');
   });
@@ -227,7 +234,7 @@ describe('UsageFooter', () => {
     );
 
     const staleIdleStatus = container.querySelector('.session-live-status-inline') as HTMLSpanElement | null;
-    expect(staleIdleStatus?.textContent).toContain('🤖');
+    expectRobotAvatar(staleIdleStatus);
     expect(staleIdleStatus?.textContent).toContain('💭');
     expect(staleIdleStatus?.getAttribute('aria-label')).toContain('thinking');
     expect(container.querySelector('.session-live-status-inline.thinking .session-live-status-emoji.thought')).toBeTruthy();
@@ -248,7 +255,7 @@ describe('UsageFooter', () => {
     );
 
     const runningStatus = container.querySelector('.session-live-status-inline') as HTMLSpanElement | null;
-    expect(runningStatus?.textContent).toContain('🤖');
+    expectRobotAvatar(runningStatus);
     expect(runningStatus?.textContent).toContain('💭');
     expect(runningStatus?.getAttribute('aria-label')).toContain('thinking');
     expect(container.querySelector('.session-live-status-inline.thinking')).toBeTruthy();
@@ -269,7 +276,7 @@ describe('UsageFooter', () => {
     );
 
     const plainRunningStatus = container.querySelector('.session-live-status-inline') as HTMLSpanElement | null;
-    expect(plainRunningStatus?.textContent).toContain('🤖');
+    expectRobotAvatar(plainRunningStatus);
     expect(plainRunningStatus?.textContent).toContain('⚙️');
     expect(container.querySelector('.session-live-status-inline.running .session-live-status-emoji.gear')).toBeTruthy();
   });

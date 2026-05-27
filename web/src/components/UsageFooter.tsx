@@ -206,7 +206,13 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
       <div class="session-usage-stats">
         {showLiveStatus && liveStatusText && liveStatusMode && (
           <span class={`session-live-status-inline ${liveStatusMode}`} title={liveStatusText} aria-label={liveStatusText}>
-            <span class="session-live-status-emoji robot">🤖</span>
+            <img
+              class="session-live-status-emoji robot session-live-status-robot-avatar"
+              src="/imcodes-robot-avatar.png"
+              alt=""
+              aria-hidden="true"
+              draggable={false}
+            />
             {liveStatusMode === 'running' && <span class="session-live-status-emoji gear">⚙️</span>}
             {liveStatusMode === 'thinking' && <span class="session-live-status-emoji thought">💭</span>}
             {liveStatusMode === 'tool' && <span class="session-live-status-emoji tool">🔍</span>}
