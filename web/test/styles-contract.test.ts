@@ -67,11 +67,15 @@ describe('styles.css regression contracts', () => {
     expect(activeBrainRule![0]).toMatch(/border-bottom-width:\s*4px/);
   });
 
-  it('ctx live-status robot avatar stays legible in the compact footer', () => {
+  it('ctx live-status robot avatar stays legible without changing the compact footer layout', () => {
     const robotRule = css.match(/\.session-live-status-robot-avatar\s*\{[^}]*\}/);
     expect(robotRule).not.toBeNull();
-    expect(robotRule![0]).toMatch(/width:\s*18px/);
-    expect(robotRule![0]).toMatch(/height:\s*18px/);
+    expect(robotRule![0]).toMatch(/width:\s*16px/);
+    expect(robotRule![0]).toMatch(/height:\s*16px/);
+
+    const scaledRobotRule = css.match(/\.session-live-status-emoji\.robot\.session-live-status-robot-avatar\s*\{[^}]*\}/);
+    expect(scaledRobotRule).not.toBeNull();
+    expect(scaledRobotRule![0]).toMatch(/scale\(1\.125\)/);
   });
 
   it('P2P dropdown rounds selector uses a blue background with green borders', () => {
