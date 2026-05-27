@@ -75,8 +75,8 @@ describe('buildProviderContextPayload', () => {
     expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
     expect(payload.systemText).toContain('get_memory_sources');
     expect(payload.systemText).toContain('sourceLookup fields');
-    expect(payload.systemText).toContain('Work transparently while you act.');
-    expect(payload.systemText).toContain('briefly state what you are checking or changing');
+    expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
+    expect(payload.systemText).toContain('At key boundaries only');
   });
 
   it('adds shared system guidance for every managed SDK provider id', () => {
@@ -100,8 +100,8 @@ describe('buildProviderContextPayload', () => {
       expect(payload.systemText).toContain('Do not call memory for bare control messages');
       expect(payload.systemText).toContain('call get_memory_sources with the returned sourceLookup fields');
       expect(payload.systemText).toContain('do not invent details from summaries alone');
-      expect(payload.systemText).toContain('Work transparently while you act.');
-      expect(payload.systemText).toContain('Keep updates short and useful');
+      expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
+      expect(payload.systemText).toContain('skip routine narration and repeated summaries');
       expect(payload.assembledMessage).toBe('What did we decide about memory recall last week?');
     }
   });
@@ -126,7 +126,7 @@ describe('buildProviderContextPayload', () => {
     });
 
     expect(payload.systemText).not.toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
-    expect(payload.systemText).toContain('Work transparently while you act.');
+    expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
   });
 
   it('renders startup memory and message recall into messagePreamble without mutating userMessage', () => {
@@ -619,7 +619,7 @@ describe('buildProviderContextPayload', () => {
       const spIdx = systemText.indexOf('sp-here');
       const identityIdx = systemText.indexOf('IM.codes session identity:');
       const memoryIdx = systemText.indexOf('Use memory MCP search');
-      const progressIdx = systemText.indexOf('Work transparently while you act.');
+      const progressIdx = systemText.indexOf('Keep work updates sparse and high-signal.');
       expect(descIdx).toBeGreaterThanOrEqual(0);
       expect(spIdx).toBeGreaterThan(descIdx);
       expect(identityIdx).toBeGreaterThan(spIdx);

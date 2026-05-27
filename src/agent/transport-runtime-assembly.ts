@@ -68,10 +68,9 @@ export const MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE = [
 ].join('\n');
 
 const AGENT_PROGRESS_SYSTEM_GUIDANCE = [
-  'Work transparently while you act.',
-  'For non-trivial tasks, briefly state what you are checking or changing before long scans, edits, tests, or waits.',
-  'Keep updates short and useful; do not narrate every tiny step.',
-  'Continue working without asking for confirmation unless blocked or the user asked for a plan first.',
+  'Keep work updates sparse and high-signal.',
+  'At key boundaries only (long scans, edits, tests, waits, blockers, commit/push), send one short status; skip routine narration and repeated summaries.',
+  'Do not paste logs or diffs unless asked; continue without confirmation unless blocked or the user requested a plan.',
 ].join('\n');
 
 export interface DispatchSharedContextSendOptions {
