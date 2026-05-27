@@ -173,12 +173,6 @@ export class TransportSessionRuntime implements SessionRuntime {
    * `_description` / `_systemPrompt`. See p2p audit 37bfbb85-430 N-A.
    */
   private _sessionIdentity: { sessionName: string; label: string | null } | undefined;
-  /**
-   * Whether to inject the Generated Image Reporting protocol alongside
-   * the identity block. Defaults to true; only opt out for niche callers
-   * that explicitly want to suppress the daemon-side image protocol.
-   */
-  private _includeGeneratedImageReporting = true;
   private _agentId: string | undefined;
   private _effort: TransportEffortLevel | undefined;
   private _contextNamespace: ContextNamespace | undefined;
@@ -346,10 +340,6 @@ export class TransportSessionRuntime implements SessionRuntime {
     const exact = sessionName.trim();
     if (!exact) return;
     this._sessionIdentity = { sessionName: exact, label: label?.trim() || null };
-  }
-  /** Toggle the Generated Image Reporting protocol injection. */
-  setIncludeGeneratedImageReporting(enabled: boolean): void {
-    this._includeGeneratedImageReporting = enabled;
   }
   setAgentId(agentId: string): void {
     this._agentId = agentId;
@@ -670,15 +660,17 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.cancelActiveDispatchLocally(dispatchId);
         return;
       }
-      // Daemon-injected identity / image-reporting are stable session
-      // metadata — same on every turn, NOT user-authored — so we always
-      // pass them through. Slash control commands still get them: they
-      // are cheap (one short block), they reinforce the model's identity
-      // for control replies, and skipping them on `/foo` would leak the
-      // exact session name out of the model's awareness on follow-up
-      // turns when the cached system text is rebuilt from a slash-only
-      // tail. The 300-char user-authored cap stays in force on
-      // `description` / `systemPrompt`; identity is peer-level.
+      // Daemon-injected identity is stable session metadata — same on
+      // every turn, NOT user-authored — so we always pass it through.
+      // Slash control commands still get it: it is cheap, reinforces the
+      // model's identity for control replies, and skipping it on `/foo`
+      // would leak the exact session name out of the model's awareness
+      // on follow-up turns when the cached system text is rebuilt from
+      // a slash-only tail. The 300-char user-authored cap stays in
+      // force on `description` / `systemPrompt`; identity is peer-level.
+      // Generated Image Reporting is now appended in Codex SDK's own
+      // `baseInstructions` tail (Codex-only, once per thread/start) —
+      // it does NOT ride the per-turn payload at all.
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: message,
         messagePreamble,
@@ -697,7 +689,6 @@ export class TransportSessionRuntime implements SessionRuntime {
         authoredContextLanguage: isSlashControl ? undefined : this._contextAuthoredContextLanguage,
         authoredContextFilePath: isSlashControl ? undefined : this._contextAuthoredContextFilePath,
         ...(this._sessionIdentity ? { sessionIdentity: this._sessionIdentity } : {}),
-        includeGeneratedImageReporting: this._includeGeneratedImageReporting,
         ...(startupMemory ? { startupMemory } : {}),
         ...(memoryRecall ? { memoryRecall } : {}),
       }, {

@@ -541,9 +541,9 @@ describe('buildProviderContextPayload', () => {
     expect(provider.send).not.toHaveBeenCalled();
   });
 
-  // ── Identity + Generated Image Reporting injection (p2p 37bfbb85-430 N-A) ────
-  describe('sessionIdentity / includeGeneratedImageReporting', () => {
-    it('injects identity + image-reporting into sessionSystemText, intact and untruncated', () => {
+  // ── IM.codes identity injection (p2p 37bfbb85-430 N-A) ────────────────
+  describe('sessionIdentity', () => {
+    it('injects identity into sessionSystemText, intact and untruncated', () => {
       const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
         userMessage: 'hi',
         description: 'short user description',
@@ -558,9 +558,22 @@ describe('buildProviderContextPayload', () => {
       expect(systemText).toContain('Exact session name: deck_myapp_brain');
       expect(systemText).toContain('Display label: My App Brain');
       expect(systemText).toContain('imcodes send');
-      expect(systemText).toContain('Generated Image Reporting:');
-      expect(systemText).toContain('MUST report the local file path');
       expect(systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+    });
+
+    it('does NOT inject Generated Image Reporting at assembly layer (it lives in Codex baseInstructions tail now)', () => {
+      // p2p 37bfbb85-430 N-A follow-up: image-reporting is Codex-only,
+      // sent once per thread/start via `appendImcodesBaseInstructions`.
+      // Other providers must not pay the per-turn token cost.
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+        userMessage: 'hi',
+        sessionIdentity: { sessionName: 'deck_no_image_brain', label: 'No Image' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+      const systemText = payload.sessionSystemText ?? '';
+      expect(systemText).not.toContain('Generated images:');
+      expect(systemText).not.toContain('Generated Image Reporting:');
+      expect(systemText).not.toContain('repo-relative inside workspace');
     });
 
     it('falls back to the exact session name when label is null / undefined / blank', () => {
@@ -577,7 +590,7 @@ describe('buildProviderContextPayload', () => {
       }
     });
 
-    it('does not inject identity / image-reporting when sessionIdentity is absent (process/tmux agents)', () => {
+    it('does not inject identity when sessionIdentity is absent (process/tmux agents)', () => {
       const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
         userMessage: 'hi',
         description: 'some text',
@@ -585,29 +598,15 @@ describe('buildProviderContextPayload', () => {
       });
       const systemText = payload.sessionSystemText ?? '';
       expect(systemText).not.toContain('IM.codes session identity:');
-      expect(systemText).not.toContain('Generated Image Reporting:');
       expect(systemText).toContain('some text');
     });
 
-    it('omits the image-reporting block when includeGeneratedImageReporting is false but still injects identity', () => {
-      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
-        userMessage: 'hi',
-        sessionIdentity: { sessionName: 'deck_quiet_brain', label: 'Quiet' },
-        includeGeneratedImageReporting: false,
-        namespace: { scope: 'personal', projectId: 'repo-1' },
-      });
-      const systemText = payload.sessionSystemText ?? '';
-      expect(systemText).toContain('IM.codes session identity:');
-      expect(systemText).toContain('Exact session name: deck_quiet_brain');
-      expect(systemText).not.toContain('Generated Image Reporting:');
-    });
-
-    it('emits identity / image-reporting peer-level with memory + progress guidance — single contiguous sessionSystemText', () => {
+    it('emits identity peer-level with memory + progress guidance — single contiguous sessionSystemText', () => {
       // Order matters for prefix-cache friendliness: stable session-level
       // blocks should appear in a deterministic order so the model's
       // prompt cache hits across turns. The assembly order is:
-      //   description -> systemPrompt -> identity -> image-reporting
-      //   -> memory-search guidance -> agent progress guidance.
+      //   description -> systemPrompt -> identity -> memory-search
+      //   guidance -> agent progress guidance.
       const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
         userMessage: 'hi',
         description: 'desc-here',
@@ -619,14 +618,12 @@ describe('buildProviderContextPayload', () => {
       const descIdx = systemText.indexOf('desc-here');
       const spIdx = systemText.indexOf('sp-here');
       const identityIdx = systemText.indexOf('IM.codes session identity:');
-      const imageIdx = systemText.indexOf('Generated Image Reporting:');
       const memoryIdx = systemText.indexOf('Use memory MCP search');
       const progressIdx = systemText.indexOf('Work transparently while you act.');
       expect(descIdx).toBeGreaterThanOrEqual(0);
       expect(spIdx).toBeGreaterThan(descIdx);
       expect(identityIdx).toBeGreaterThan(spIdx);
-      expect(imageIdx).toBeGreaterThan(identityIdx);
-      expect(memoryIdx).toBeGreaterThan(imageIdx);
+      expect(memoryIdx).toBeGreaterThan(identityIdx);
       expect(progressIdx).toBeGreaterThan(memoryIdx);
     });
   });

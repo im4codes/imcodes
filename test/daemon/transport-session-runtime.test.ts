@@ -1454,16 +1454,20 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(initSystemText).not.toMatch(/X{301}/);
   });
 
-  it('injects IM.codes identity and Generated Image Reporting blocks intact alongside oversize user-authored text', async () => {
+  it('injects IM.codes identity block intact alongside oversize user-authored text', async () => {
     // p2p audit 37bfbb85-430 N-A regression: before this fix, the
-    // IM.codes identity prompt (~350 chars) and Generated Image Reporting
-    // protocol (~650 chars) were merged into `systemPrompt` by
-    // session-manager and then silently truncated by `clampUserSessionText(300)`.
-    // After the fix, identity + image-reporting are injected at the
-    // assembly layer peer-level with `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE`
-    // and live OUTSIDE the user-authored 300-char cap. They must survive
+    // IM.codes identity prompt (~350 chars) was merged into `systemPrompt`
+    // by session-manager and then silently truncated by
+    // `clampUserSessionText(300)`. After the fix, identity is injected
+    // at the assembly layer peer-level with `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE`
+    // and lives OUTSIDE the user-authored 300-char cap. It must survive
     // intact even when the user pastes 2000 chars into description AND
     // systemPrompt simultaneously.
+    //
+    // The Generated Image Reporting prompt used to ride alongside the
+    // identity block at the assembly layer, but now lives in Codex SDK's
+    // `appendImcodesBaseInstructions` — Codex-only, once per thread.
+    // It must NOT appear in the per-turn payload here.
     const oversized = 'Y'.repeat(2000);
     const freshProvider = makeMockProvider();
     const fresh = new TransportSessionRuntime(freshProvider.provider, 'deck_identity_brain');
@@ -1494,10 +1498,10 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(systemText).toMatch(/Display label: Identity Brain/);
     expect(systemText).toMatch(/imcodes send/);
 
-    // Generated Image Reporting protocol present in full.
-    expect(systemText).toMatch(/Generated Image Reporting:/);
-    expect(systemText).toMatch(/MUST report the local file path/);
-    expect(systemText).toMatch(/Never finish an image-generation task/);
+    // Generated Image Reporting must NOT be in the per-turn assembly
+    // payload — it now lives in Codex SDK baseInstructions tail.
+    expect(systemText).not.toMatch(/Generated images:/);
+    expect(systemText).not.toMatch(/Generated Image Reporting:/);
   });
 
   it('uses exact session name when no label is provided to setSessionIdentity', async () => {

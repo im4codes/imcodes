@@ -20,10 +20,7 @@ import type {
   TransportMemoryRecallItem,
 } from '../../shared/context-types.js';
 import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
-import {
-  buildGeneratedImageReportingPrompt,
-  buildTransportImcodesIdentityPrompt,
-} from '../../shared/transport-runtime-prompts.js';
+import { buildTransportImcodesIdentityPrompt } from '../../shared/transport-runtime-prompts.js';
 
 export interface TransportRuntimeAssemblyInput {
   userMessage: string;
@@ -60,13 +57,6 @@ export interface TransportRuntimeAssemblyInput {
    * 300-char cap. See p2p audit 37bfbb85-430 N-A.
    */
   sessionIdentity?: { sessionName: string; label?: string | null };
-  /**
-   * Whether to append the Generated Image Reporting protocol to
-   * `sessionSystemText`. Defaults to true when `sessionIdentity` is
-   * provided; falsy callers (process/tmux agents) get no daemon block
-   * to preserve their existing prompt shape.
-   */
-  includeGeneratedImageReporting?: boolean;
 }
 
 export const MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE = [
@@ -349,29 +339,28 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   const renderedAuthoredSystemText = renderAuthoredSystemText(authoredContext.required, authoredContext.advisory);
   const memorySearchGuidance = input.suppressMcpMemorySearchGuidance ? undefined : MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE;
   const agentProgressGuidance = input.suppressAgentProgressGuidance ? undefined : AGENT_PROGRESS_SYSTEM_GUIDANCE;
-  // Daemon-injected, session-stable blocks. These are NOT subject to
-  // `USER_SESSION_TEXT_MAX_CHARS` because they encode IM.codes runtime
-  // behaviour the model must always follow. p2p audit 37bfbb85-430 N-A:
-  // they used to be folded into `systemPrompt` by session-manager and
-  // were then silently truncated by `clampUserSessionText(300)`.
+  // Daemon-injected, session-stable identity block. NOT subject to
+  // `USER_SESSION_TEXT_MAX_CHARS` — encodes IM.codes runtime behaviour
+  // the model must always follow. p2p audit 37bfbb85-430 N-A: this used
+  // to be folded into `systemPrompt` by session-manager and was then
+  // silently truncated by `clampUserSessionText(300)`.
+  //
+  // The Generated Image Reporting protocol used to ride alongside the
+  // identity block here, but it only applies to providers with native
+  // image generation (currently Codex only). It now lives in Codex
+  // SDK's `appendImcodesBaseInstructions` — sent once per thread, in
+  // baseInstructions tail, picked up by prefix cache, zero cost for
+  // non-Codex providers.
   const identityPart = input.sessionIdentity
     ? buildTransportImcodesIdentityPrompt(
         input.sessionIdentity.sessionName,
         input.sessionIdentity.label ?? undefined,
       )
     : undefined;
-  // Default-on when `sessionIdentity` is present (transport agents);
-  // process/tmux agents pass no `sessionIdentity` and therefore get no
-  // image-reporting block automatically — preserves prior behaviour.
-  const includeImageReporting = input.sessionIdentity
-    ? (input.includeGeneratedImageReporting ?? true)
-    : false;
-  const imageReportingPart = includeImageReporting ? buildGeneratedImageReportingPrompt() : undefined;
   const sessionSystemText = [
     input.description?.trim(),
     input.systemPrompt?.trim(),
     identityPart,
-    imageReportingPart,
     memorySearchGuidance,
     agentProgressGuidance,
   ].filter(Boolean).join('\n\n') || undefined;

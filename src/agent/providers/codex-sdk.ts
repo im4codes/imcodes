@@ -35,6 +35,7 @@ import logger from '../../util/logger.js';
 import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getCodexBaseInstructions } from '../codex-runtime-config.js';
+import { buildGeneratedImageReportingPrompt } from '../../../shared/transport-runtime-prompts.js';
 import { composeProviderSystemText, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { getDefaultCodexMcpArgs } from './getDefaultCodexMcpArgs.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
@@ -167,9 +168,16 @@ function buildCodexTurnInput(payload: ProviderContextPayload, sessionSystemTextU
 
 function appendImcodesBaseInstructions(baseInstructions: string, payload: ProviderContextPayload): string {
   const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
-  if (!sessionSystemText) return baseInstructions;
+  // Generated Image Reporting belongs in Codex's baseInstructions tail
+  // (Codex is currently the only transport agent with native image-gen
+  // tools). Living here means: sent once per thread/start|resume, picked
+  // up by Codex prefix cache, NOT re-rendered every turn, and zero cost
+  // for non-Codex providers. See p2p audit 37bfbb85-430 N-A follow-up.
+  const imageReporting = buildGeneratedImageReportingPrompt();
+  const tailParts = [sessionSystemText, imageReporting].filter((s): s is string => Boolean(s));
+  if (tailParts.length === 0) return baseInstructions;
   if (baseInstructions.includes(IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER)) return baseInstructions;
-  return `${baseInstructions.trimEnd()}\n\n${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER}\n\n${capCodexSdkContextInjection(sessionSystemText)}`;
+  return `${baseInstructions.trimEnd()}\n\n${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER}\n\n${capCodexSdkContextInjection(tailParts.join('\n\n'))}`;
 }
 
 /**

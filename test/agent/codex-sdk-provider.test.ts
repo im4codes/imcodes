@@ -555,7 +555,13 @@ describe('CodexSdkProvider', () => {
     expect(threadStartReq?.params?.model).toBe('gpt-5.4');
     // Catalog hit → mock returns sentinel `[catalog-prompt:gpt-5.4]`. In
     // production this would be the real 14 KB codex base_instructions.
-    expect(threadStartReq?.params?.baseInstructions).toBe('[catalog-prompt:gpt-5.4]');
+    // baseInstructions also has the IM.codes runtime tail (Generated
+    // Image Reporting block) appended for every Codex thread, so use
+    // toContain instead of toBe.
+    const tStart = threadStartReq?.params?.baseInstructions as string;
+    expect(tStart).toContain('[catalog-prompt:gpt-5.4]');
+    expect(tStart).toContain('# IM.codes runtime instructions');
+    expect(tStart).toContain('Generated images:');
     codexRuntimeConfigMock.reset();
   });
 
@@ -610,7 +616,11 @@ describe('CodexSdkProvider', () => {
     await provider.send('route-resume-cat', 'hello');
     const child = childProcessMock.children[0];
     const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
-    expect(resumeReq?.params?.baseInstructions).toBe('[catalog-prompt:gpt-5.4]');
+    // Resume also gets the IM.codes runtime tail (image-reporting block).
+    const tResume = resumeReq?.params?.baseInstructions as string;
+    expect(tResume).toContain('[catalog-prompt:gpt-5.4]');
+    expect(tResume).toContain('# IM.codes runtime instructions');
+    expect(tResume).toContain('Generated images:');
     codexRuntimeConfigMock.reset();
   });
 
@@ -756,6 +766,104 @@ describe('CodexSdkProvider', () => {
     expect(turnStartReq?.params?.input?.[0]?.text).toBe(
       'Context instructions:\nRequired shared context:\n- Current file rule\n\nRelevant context\n\nship it',
     );
+  });
+
+  it('appends Generated Image Reporting protocol into codex baseInstructions tail (Codex is the only image-capable transport agent)', async () => {
+    // p2p audit 37bfbb85-430 N-A follow-up: image-reporting belongs in
+    // Codex's baseInstructions tail because (a) Codex is the only
+    // transport agent with native image generation today, (b) sending it
+    // once per thread/start beats sending it every turn, (c) it joins
+    // Codex's prefix cache, (d) zero token cost for non-Codex providers.
+    codexRuntimeConfigMock.set(['gpt-5.4']);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-image', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+
+    const payload: ProviderContextPayload = {
+      userMessage: 'draw something',
+      assembledMessage: 'draw something',
+      sessionSystemText: 'Stable IM.codes runtime rules',
+      systemText: 'Stable IM.codes runtime rules',
+      attachments: [],
+      context: {
+        sessionSystemText: 'Stable IM.codes runtime rules',
+        systemText: 'Stable IM.codes runtime rules',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-image' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+
+    await provider.send('route-image', payload);
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    const base = threadStartReq?.params?.baseInstructions as string;
+    expect(typeof base).toBe('string');
+    // Codex's own per-model prompt is preserved at the head.
+    expect(base).toContain('[catalog-prompt:gpt-5.4]');
+    // IM.codes marker sits between codex's prompt and the daemon tail.
+    expect(base).toContain('# IM.codes runtime instructions');
+    // sessionSystemText still flows through.
+    expect(base).toContain('Stable IM.codes runtime rules');
+    // Compressed Generated Image Reporting block lives here now — every
+    // semantic point present.
+    expect(base).toContain('Generated images:');
+    expect(base).toContain('file path of every image you create/edit/save');
+    expect(base).toContain('repo-relative inside workspace, else absolute');
+    expect(base).toContain('If no path returned, say so');
+    expect(base).toContain('app/site/docs');
+    codexRuntimeConfigMock.reset();
+  });
+
+  it('still appends image-reporting when sessionSystemText is absent (image-reporting is Codex-static, not gated on identity)', async () => {
+    codexRuntimeConfigMock.set(['gpt-5.4']);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-image-only', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+
+    const payload: ProviderContextPayload = {
+      userMessage: 'draw something',
+      assembledMessage: 'draw something',
+      attachments: [],
+      context: {
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-image-only' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+
+    await provider.send('route-image-only', payload);
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    const base = threadStartReq?.params?.baseInstructions as string;
+    expect(base).toContain('[catalog-prompt:gpt-5.4]');
+    expect(base).toContain('# IM.codes runtime instructions');
+    expect(base).toContain('Generated images:');
+    codexRuntimeConfigMock.reset();
   });
 
   it('delivers changed split stable IM.codes context once after a Codex thread is loaded', async () => {
