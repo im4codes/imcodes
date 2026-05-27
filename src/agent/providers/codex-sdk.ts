@@ -1,7 +1,7 @@
-import { access, copyFile, readFile, stat, writeFile } from 'node:fs/promises';
+import { access, copyFile, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { homedir } from 'node:os';
-import { resolve, sep } from 'node:path';
+import { extname, resolve, sep } from 'node:path';
 import { TextDecoder } from 'node:util';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import readline, { type Interface as ReadlineInterface } from 'node:readline';
@@ -51,10 +51,17 @@ const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
 const IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER = '# IM.codes runtime instructions';
+const GENERATED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
 
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function getCodexHome(env: Record<string, string | undefined>): string {
+  return typeof env.CODEX_HOME === 'string' && env.CODEX_HOME.trim()
+    ? resolve(env.CODEX_HOME.trim())
+    : resolve(homedir(), '.codex');
 }
 
 function isCodexAuthFailureMessage(message: string): boolean {
@@ -65,10 +72,7 @@ function isCodexAuthFailureMessage(message: string): boolean {
 }
 
 function getCodexAuthPath(env: Record<string, string | undefined>): string {
-  const codexHome = typeof env.CODEX_HOME === 'string' && env.CODEX_HOME.trim()
-    ? resolve(env.CODEX_HOME.trim())
-    : resolve(homedir(), '.codex');
-  return resolve(codexHome, 'auth.json');
+  return resolve(getCodexHome(env), 'auth.json');
 }
 
 async function readCodexAuthFingerprint(env: Record<string, string | undefined>): Promise<string | null> {
@@ -178,6 +182,16 @@ function appendImcodesBaseInstructions(baseInstructions: string, payload: Provid
   if (tailParts.length === 0) return baseInstructions;
   if (baseInstructions.includes(IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER)) return baseInstructions;
   return `${baseInstructions.trimEnd()}\n\n${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER}\n\n${capCodexSdkContextInjection(tailParts.join('\n\n'))}`;
+}
+
+function appendDetectedGeneratedImagePaths(content: string, paths: string[]): string {
+  const missingPaths = paths.filter((path) => !content.includes(path));
+  if (missingPaths.length === 0) return content;
+  const heading = missingPaths.length === 1
+    ? 'Generated image path detected by IM.codes:'
+    : 'Generated image paths detected by IM.codes:';
+  const pathLines = missingPaths.map((path) => `- ${path}`).join('\n');
+  return `${content.trimEnd()}${content.trimEnd() ? '\n\n' : ''}${heading}\n${pathLines}`;
 }
 
 /**
@@ -293,6 +307,8 @@ interface CodexSdkSessionState {
   lastStatusSignature: string | null;
   pendingSessionSystemTextUpdate?: string;
   pendingSessionSystemTextUpdateTurnId?: string;
+  generatedImageKnownPaths: Set<string>;
+  generatedImagePaths: string[];
 }
 
 function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
@@ -648,6 +664,8 @@ export class CodexSdkProvider implements TransportProvider {
       lastStatusSignature: null,
       pendingSessionSystemTextUpdate: undefined,
       pendingSessionSystemTextUpdateTurnId: undefined,
+      generatedImageKnownPaths: new Set(),
+      generatedImagePaths: [],
     });
     if (config.resumeId || config.effort) this.emitSessionInfo(routeId, { ...(config.resumeId ? { resumeId: config.resumeId } : {}), ...(config.effort ? { effort: config.effort } : {}) });
     return routeId;
@@ -753,6 +771,8 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearCancelTimer(state);
     state.lastUsage = undefined;
     state.lastStatusSignature = null;
+    state.generatedImageKnownPaths = new Set();
+    state.generatedImagePaths = [];
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
     if (this.isCompactCommand(payload)) {
       await this.startCompact(sessionId, state);
@@ -965,6 +985,7 @@ export class CodexSdkProvider implements TransportProvider {
         && state.lastInjectedSessionSystemText !== desiredSessionSystemText
       );
       await this.ensureThreadLoaded(sessionId, state, payload);
+      await this.prepareGeneratedImageTracking(sessionId, state);
       const inputText = buildCodexTurnInput(payload, shouldInjectStableUpdate ? desiredSessionSystemText : undefined);
       const result = await this.request('turn/start', {
         threadId: state.threadId,
@@ -1161,6 +1182,60 @@ export class CodexSdkProvider implements TransportProvider {
     return state.mcpConfig ? { config: state.mcpConfig } : {};
   }
 
+  private codexGeneratedImageEnv(state: CodexSdkSessionState): Record<string, string | undefined> {
+    return {
+      ...process.env,
+      ...((this.config?.env as Record<string, string | undefined> | undefined) ?? {}),
+      ...(state.env ?? {}),
+    };
+  }
+
+  private codexGeneratedImageDir(state: CodexSdkSessionState): string | null {
+    if (!state.threadId) return null;
+    return resolve(getCodexHome(this.codexGeneratedImageEnv(state)), 'generated_images', state.threadId);
+  }
+
+  private async listGeneratedImagePaths(state: CodexSdkSessionState): Promise<string[]> {
+    const dir = this.codexGeneratedImageDir(state);
+    if (!dir) return [];
+    try {
+      const entries = await readdir(dir, { withFileTypes: true });
+      return entries
+        .filter((entry) => entry.isFile() && GENERATED_IMAGE_EXTENSIONS.has(extname(entry.name).toLowerCase()))
+        .map((entry) => resolve(dir, entry.name))
+        .sort();
+    } catch {
+      return [];
+    }
+  }
+
+  private async prepareGeneratedImageTracking(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+    const existingPaths = await this.listGeneratedImagePaths(state);
+    state.generatedImageKnownPaths = new Set(existingPaths);
+    state.generatedImagePaths = [];
+    logger.debug({
+      provider: this.id,
+      sessionId,
+      threadId: state.threadId,
+      knownGeneratedImages: existingPaths.length,
+    }, 'Codex SDK prepared generated image path tracking');
+  }
+
+  private async refreshGeneratedImageTracking(sessionId: string, state: CodexSdkSessionState): Promise<string[]> {
+    const paths = await this.listGeneratedImagePaths(state);
+    const nextPaths = paths.filter((path) => !state.generatedImageKnownPaths.has(path));
+    if (nextPaths.length === 0) return state.generatedImagePaths;
+    for (const path of nextPaths) state.generatedImageKnownPaths.add(path);
+    state.generatedImagePaths = [...state.generatedImagePaths, ...nextPaths];
+    logger.info({
+      provider: this.id,
+      sessionId,
+      threadId: state.threadId,
+      generatedImagePaths: nextPaths,
+    }, 'Codex SDK detected generated image output paths');
+    return state.generatedImagePaths;
+  }
+
   private handleLine(line: string): void {
     const trimmed = line.trim();
     if (!trimmed) return;
@@ -1185,10 +1260,12 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (!msg.method) return;
-    this.handleNotification(msg.method, msg.params ?? {});
+    void this.handleNotification(msg.method, msg.params ?? {}).catch((err) => {
+      logger.warn({ provider: this.id, method: msg.method, err }, 'Codex app-server notification handler failed');
+    });
   }
 
-  private handleNotification(method: string, params: Record<string, any>): void {
+  private async handleNotification(method: string, params: Record<string, any>): Promise<void> {
     if (method === 'thread/started') {
       const threadId = params.thread?.id;
       if (!threadId) return;
@@ -1390,12 +1467,14 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearCancelTimer(state);
       this.clearStatus(sessionId, state);
       this.commitPendingSessionSystemTextUpdate(state, typeof turn.id === 'string' ? turn.id : undefined);
+      const generatedImagePaths = await this.refreshGeneratedImageTracking(sessionId, state);
+      const content = appendDetectedGeneratedImagePaths(state.currentText, generatedImagePaths);
       state.pendingComplete = {
         id: state.currentMessageId ?? `${sessionId}:agent-message`,
         sessionId,
         kind: 'text',
         role: 'assistant',
-        content: state.currentText,
+        content,
         timestamp: Date.now(),
         status: 'complete',
         metadata: {

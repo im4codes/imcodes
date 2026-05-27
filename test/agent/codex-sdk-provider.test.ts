@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
@@ -864,6 +864,51 @@ describe('CodexSdkProvider', () => {
     expect(base).toContain('# IM.codes runtime instructions');
     expect(base).toContain('Generated images:');
     codexRuntimeConfigMock.reset();
+  });
+
+  it('appends exact Codex generated image file paths to the completed assistant message', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-images-'));
+    const provider = new CodexSdkProvider();
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-image-path', cwd: '/tmp/project' });
+
+      const completed: string[] = [];
+      provider.onComplete((_sid, msg) => completed.push(msg.content));
+      const imageDir = join(codexHome, 'generated_images', 'thread-1');
+      await mkdir(imageDir, { recursive: true });
+      const staleImagePath = join(imageDir, 'ig_previous.png');
+      await writeFile(staleImagePath, 'old-png');
+
+      await provider.send('route-image-path', 'draw a cat');
+      const child = childProcessMock.children[0]!;
+      const imagePath = join(imageDir, 'ig_07d4759a673646ae016a1650951d848198b675e585a0b7b1e4.png');
+      await writeFile(imagePath, 'fake-png');
+
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            id: 'msg-1',
+            type: 'agentMessage',
+            text: '生成好了，但工具没有返回本地文件路径。',
+          },
+        },
+      });
+      child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+
+      await waitForCondition(() => completed.length === 1);
+      expect(completed[0]).toContain('生成好了，但工具没有返回本地文件路径。');
+      expect(completed[0]).toContain('Generated image path detected by IM.codes:');
+      expect(completed[0]).toContain(imagePath);
+      expect(completed[0]).not.toContain(staleImagePath);
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
   });
 
   it('delivers changed split stable IM.codes context once after a Codex thread is loaded', async () => {
