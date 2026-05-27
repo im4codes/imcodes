@@ -178,10 +178,10 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     if (hasActiveLiveWork || sessionState === 'running' || sessionState === 'queued') {
       if (activeToolCall) return statusText || 'Tool running...';
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
-      return 'Agent working...';
+      return t('session.state_running');
     }
     if (statusText) return statusText;
-    return 'Agent idle — waiting for input';
+    return t('session.state_idle');
   }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, isAgentless, now, sessionState, statusText, t]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result';
   const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')

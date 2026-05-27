@@ -2672,13 +2672,13 @@ const ChatEvent = memo(function ChatEvent({
       const isUserCancelFeedback = event.payload.reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL;
       const isUserCompactFeedback = event.payload.reason === SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT;
       const stateLabel: Record<string, string> = {
-        idle: 'Agent idle — waiting for input',
-        running: 'Agent working...',
-        started: 'Session started',
-        starting: 'Session starting...',
+        idle: t('session.state_idle'),
+        running: t('session.state_running'),
+        started: t('session.state_started'),
+        starting: t('session.state_starting'),
         compacting: t('session.state_compacting'),
         stopping: t('session.state_stopping'),
-        stopped: 'Session stopped',
+        stopped: t('session.state_stopped'),
       };
       const label = isUserCancelFeedback
         ? t('session.state_stop_requested')
