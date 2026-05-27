@@ -66,7 +66,31 @@ describe('memory summary sync message', () => {
     expect(getPersonalCloudMemory).not.toHaveBeenCalled();
   });
 
-  it('defaults to a small bounded sync and truncates oversized summaries', async () => {
+  it('defaults to syncing 10 recent summaries', async () => {
+    getPersonalCloudMemory.mockResolvedValueOnce({
+      records: Array.from({ length: 12 }, (_, index) => ({
+        id: `summary-${index + 1}`,
+        projectId: 'repo-1',
+        projectionClass: 'recent_summary',
+        summary: `Summary ${index + 1}`,
+        updatedAt: index + 1,
+      })),
+    });
+
+    const message = await buildMemorySummarySyncMessage(t, 'repo-1');
+
+    expect(getPersonalCloudMemory).toHaveBeenCalledWith({
+      projectId: 'repo-1',
+      projectionClass: 'recent_summary',
+      limit: 10,
+    });
+    expect(message).toContain('Recent summaries (10/10, max 3600 chars):');
+    expect(message).toContain('1. [ref: proj:a12] [repo-1] Summary 12');
+    expect(message).toContain('10. [ref: proj:a3] [repo-1] Summary 3');
+    expect(message).not.toContain('Summary 2');
+  });
+
+  it('keeps the default sync bounded and truncates oversized summaries', async () => {
     const hugeSummary = `${'A'.repeat(2_000)}\nSHOULD_NOT_APPEAR`;
     getPersonalCloudMemory.mockResolvedValueOnce({
       records: [
@@ -82,9 +106,9 @@ describe('memory summary sync message', () => {
     expect(getPersonalCloudMemory).toHaveBeenCalledWith({
       projectId: 'repo-1',
       projectionClass: 'recent_summary',
-      limit: 3,
+      limit: 10,
     });
-    expect(message).toContain('Recent summaries (3/3, max 3600 chars):');
+    expect(message).toContain('Recent summaries (3/10, max 3600 chars):');
     expect(message).toContain('[truncated for token budget; use get_memory_sources with the sourceLookup below for exact details]');
     expect(message).not.toContain('Oldest summary');
     expect(message).not.toContain('SHOULD_NOT_APPEAR');

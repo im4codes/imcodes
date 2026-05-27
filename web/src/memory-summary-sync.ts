@@ -1,7 +1,7 @@
 import { getPersonalCloudMemory } from './api.js';
 import type { ContextMemoryRecordView } from '@shared/context-types.js';
 
-const DEFAULT_SUMMARY_SYNC_LIMIT = 3;
+const DEFAULT_SUMMARY_SYNC_LIMIT = 10;
 const SUMMARY_SYNC_MAX_RECORD_CHARS = 1_200;
 const SUMMARY_SYNC_MAX_TOTAL_SUMMARY_CHARS = 3_600;
 const SUMMARY_SYNC_TRUNCATED_NOTE = '[truncated for token budget; use get_memory_sources with the sourceLookup below for exact details]';
