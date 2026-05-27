@@ -8,6 +8,7 @@ describe('startup splash screen contract', () => {
 
   it('keeps the logo centered while the codes text reveals', () => {
     expect(indexHtml).toContain('--splash-avatar-size');
+    expect(indexHtml).toContain('--splash-avatar-size: clamp(96px, 18vw, 156px)');
     expect(indexHtml).toContain('class="splash-avatar" src="/imcodes-robot-avatar.png"');
     expect(indexHtml).toMatch(/\.splash-avatar\s*\{[^}]*width:\s*var\(--splash-avatar-size\)/);
     expect(indexHtml).toContain('--splash-logo-width');
