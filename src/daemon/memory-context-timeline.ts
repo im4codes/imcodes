@@ -2,6 +2,7 @@ import type { MemorySearchResultItem } from '../context/memory-search.js';
 import type {
   MemoryContextTimelinePayload,
   MemoryContextTimelineItem,
+  MemoryContextTimelinePreferenceItem,
   MemoryContextTimelineStatus,
 } from '../shared/timeline/types.js';
 import { buildRelatedPastWorkText } from '../../shared/memory-recall-format.js';
@@ -9,6 +10,7 @@ import type {
   ContextAuthorityDecision,
   MemoryRecallInjectionSurface,
   MemoryRecallRuntimeFamily,
+  MemoryRecallSourceKind,
   TransportMemoryRecallItem,
 } from '../../shared/context-types.js';
 
@@ -21,10 +23,14 @@ export function buildMemoryContextTimelinePayload(
     injectionSurface?: MemoryRecallInjectionSurface;
     injectedText?: string;
     authoritySource?: ContextAuthorityDecision['authoritySource'];
-    sourceKind?: 'local_processed' | 'remote_processed';
+    sourceKind?: MemoryRecallSourceKind;
+    preferenceItems?: MemoryContextTimelinePreferenceItem[];
   },
 ): Omit<MemoryContextTimelinePayload, 'relatedToEventId'> | null {
-  if (items.length === 0) return null;
+  const preferenceItems = (options?.preferenceItems ?? [])
+    .map((item) => ({ ...item, text: item.text.trim() }))
+    .filter((item) => item.text);
+  if (items.length === 0 && preferenceItems.length === 0) return null;
   const timelineItems: MemoryContextTimelineItem[] = items.map((item) => ({
     id: item.id,
     projectId: item.projectId,
@@ -39,10 +45,13 @@ export function buildMemoryContextTimelinePayload(
     status: item.status,
     relevanceScore: item.relevanceScore,
   }));
+  const injectedText = options?.injectedText
+    ?? (timelineItems.length > 0 ? buildRelatedPastWorkText(timelineItems) : undefined);
   return {
     ...(query ? { query } : {}),
-    injectedText: options?.injectedText ?? buildRelatedPastWorkText(timelineItems),
+    ...(injectedText ? { injectedText } : {}),
     items: timelineItems,
+    ...(preferenceItems.length > 0 ? { preferenceItems } : {}),
     reason,
     ...(options?.runtimeFamily ? { runtimeFamily: options.runtimeFamily } : {}),
     ...(options?.injectionSurface ? { injectionSurface: options.injectionSurface } : {}),
@@ -59,7 +68,7 @@ export function buildMemoryContextStatusPayload(
     runtimeFamily?: MemoryRecallRuntimeFamily;
     injectionSurface?: MemoryRecallInjectionSurface;
     authoritySource?: ContextAuthorityDecision['authoritySource'];
-    sourceKind?: 'local_processed' | 'remote_processed';
+    sourceKind?: MemoryRecallSourceKind;
     matchedCount?: number;
     dedupedCount?: number;
   },

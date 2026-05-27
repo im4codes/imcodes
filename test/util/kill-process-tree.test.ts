@@ -79,6 +79,35 @@ describeOrSkip('killProcessTree (POSIX)', () => {
     expect(pidAlive(grandchildPid)).toBe(false);
   });
 
+  it('SIGKILLs the root ChildProcess even after Node marks SIGTERM as sent', async () => {
+    const child = spawn('bash', ['-c', 'trap "" TERM; while true; do sleep 1; done'], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    if (child.pid == null) throw new Error('spawn returned no pid');
+    const pid = child.pid;
+    await new Promise((r) => setTimeout(r, 100));
+
+    try {
+      expect(pidAlive(pid)).toBe(true);
+      const closePromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+        child.once('close', (code, signal) => resolve({ code, signal }));
+      });
+      await killProcessTree(child, { gracefulMs: 100 });
+      const closed = await Promise.race([
+        closePromise,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 1_000)),
+      ]);
+
+      expect(closed).not.toBeNull();
+      expect(closed?.signal).toBe('SIGKILL');
+      expect(pidAlive(pid)).toBe(false);
+    } finally {
+      if (pidAlive(pid)) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
+  });
+
   it('is a no-op on invalid pids', async () => {
     // Must not throw on undefined / negative / non-integer input.
     await expect(killProcessTree(undefined)).resolves.toBeUndefined();

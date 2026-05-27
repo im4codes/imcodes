@@ -19,6 +19,7 @@ vi.mock('react-i18next', () => ({
         'quick_input.loading': 'Loading',
         'quick_input.commands': 'Commands',
         'quick_input.phrases': 'Phrases',
+        'quick_input.tab_files': 'Files',
         'quick_input.history': 'History',
         'quick_input.this_session': 'This session',
         'quick_input.all': 'All',
@@ -36,7 +37,13 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
-vi.mock('../../src/components/FileBrowser.js', () => ({ FileBrowser: () => null }));
+vi.mock('../../src/components/file-browser-lazy.js', async () => {
+  const { h } = await import('preact');
+  return {
+    FileBrowser: (props: { onConfirm: (paths: string[]) => void }) =>
+      h('button', { type: 'button', onClick: () => props.onConfirm(['/repo/src/a.ts']) }, 'mock-file-confirm'),
+  };
+});
 vi.mock('../../src/api.js', () => ({
   apiFetch: (...args: unknown[]) => apiFetchMock(...args),
 }));
@@ -57,6 +64,34 @@ describe('QuickInputPanel history scope', () => {
     cleanup();
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: defaultWidth });
     Object.defineProperty(window, 'innerHeight', { configurable: true, value: defaultHeight });
+  });
+
+  it('shows the built-in workflow fixed phrases', () => {
+    render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="codex-sdk"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'commit&push' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'pull' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'CI failed, fix' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'LGTM, commit' })).toBeNull();
   });
 
   it('opens below the trigger when the quick-input trigger is high in the viewport', () => {
@@ -274,6 +309,41 @@ describe('QuickInputPanel history scope', () => {
     expect(screen.getByText('session a newest')).toBeDefined();
     expect(screen.getByText('session b newest')).toBeDefined();
     expect(screen.getByText('session b older')).toBeDefined();
+  });
+
+  it('closes after inserting paths from the Files tab', () => {
+    const onClose = vi.fn();
+    const onAppendPaths = vi.fn();
+
+    render(
+      <QuickInputPanel
+        open
+        onClose={onClose}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="claude-code"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+        ws={{} as never}
+        sessionCwd="/repo"
+        onAppendPaths={onAppendPaths}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Files/ }));
+    fireEvent.click(screen.getByText('mock-file-confirm'));
+
+    expect(onAppendPaths).toHaveBeenCalledWith(['@src/a.ts ']);
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   it('shows ten history rows on the first page before paginating', () => {

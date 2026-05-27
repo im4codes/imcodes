@@ -102,6 +102,31 @@ describe('MutableDesktopWindowStack', () => {
         s.getZIndex(DESKTOP_WINDOW_IDS.subSession(subB))!,
       );
     });
+
+    it('raising a child also raises it above sibling children', () => {
+      const s = new MutableDesktopWindowStack();
+      const subId = 'A';
+      const parent = DESKTOP_WINDOW_IDS.subSession(subId);
+      const fileBrowser = DESKTOP_WINDOW_IDS.subsessionFileBrowser(subId);
+      const repo = DESKTOP_WINDOW_IDS.subsessionRepo(subId);
+      s.ensureWindow(parent, { kind: DESKTOP_WINDOW_KINDS.subSession, subId });
+      s.ensureWindow(repo, {
+        kind: DESKTOP_WINDOW_KINDS.subsessionRepo,
+        parentId: parent,
+        subId,
+      });
+      s.ensureWindow(fileBrowser, {
+        kind: DESKTOP_WINDOW_KINDS.subsessionFileBrowser,
+        parentId: parent,
+        subId,
+      });
+      expect(s.getZIndex(fileBrowser)!).toBeGreaterThan(s.getZIndex(repo)!);
+
+      expect(s.bringToFront(repo)).toBe(true);
+
+      expect(s.getZIndex(repo)!).toBeGreaterThan(s.getZIndex(fileBrowser)!);
+      expect(s.getZIndex(repo)!).toBeGreaterThan(s.getZIndex(parent)!);
+    });
   });
 
   describe('removeWindow', () => {
@@ -207,6 +232,12 @@ describe('MutableDesktopWindowStack', () => {
       expect(s.getZIndex('a')).toBe(DESKTOP_WINDOW_STACK_BASE_Z + 1 * DESKTOP_WINDOW_STACK_STRIDE);
       expect(s.getZIndex('b')).toBe(DESKTOP_WINDOW_STACK_BASE_Z + 2 * DESKTOP_WINDOW_STACK_STRIDE);
       expect(s.getZIndex('c')).toBe(DESKTOP_WINDOW_STACK_BASE_Z + 3 * DESKTOP_WINDOW_STACK_STRIDE);
+    });
+
+    it('keeps first managed root above legacy floating fallback layers', () => {
+      const s = new MutableDesktopWindowStack();
+      s.ensureWindow(DESKTOP_WINDOW_IDS.repo, { kind: DESKTOP_WINDOW_KINDS.repo });
+      expect(s.getZIndex(DESKTOP_WINDOW_IDS.repo)!).toBeGreaterThan(6500);
     });
 
     it('returns null for unknown id', () => {

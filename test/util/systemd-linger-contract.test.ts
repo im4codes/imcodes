@@ -9,18 +9,9 @@
  * server set up by `imcodes bind` — exactly the 212/213/215 family of
  * incidents on 2026-05-09 ("怎么又挂了").
  *
- * `setup-flow.ts.installSystemdService` had this since 2026-04 (line
- * 415); `bind-flow.ts.installSystemdService` was missing it,
- * fingerprint-mapping every server installed via `imcodes bind` to
- * the same recurring outage. Adding the line is one trivial edit, but
- * the FAILURE MODE is "silent until the user is offline for a few
- * hours" — exactly the kind of thing that regresses unnoticed if a
- * future refactor removes the call.
- *
- * jsdom-style mock-the-world tests would need a heavy execSync mock
- * harness for a single line. A source-content scan catches the
- * regression with one regex per file — cheap, deterministic, no
- * runtime dependencies on systemctl/loginctl actually existing.
+ * The install flows share `src/util/systemd-linger.ts` so they also
+ * share the explicit-user and passwordless-sudo fallback behavior
+ * needed on servers where plain `loginctl enable-linger` fails.
  */
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -38,18 +29,20 @@ describe('systemd user-service install paths must enable lingering', () => {
   ];
 
   for (const rel of targets) {
-    it(`${rel} calls loginctl enable-linger`, () => {
+    it(`${rel} calls the shared linger helper`, () => {
       const src = readFileSync(resolve(REPO_ROOT, rel), 'utf8');
-      // Must reference loginctl enable-linger somewhere in the file.
-      // Allow both with and without an explicit user argument
-      // (`loginctl enable-linger` defaults to the calling user, and
-      // both call sites today rely on that default).
-      expect(src).toMatch(/loginctl\s+enable-linger\b/);
-      // And it must be passed to execSync (so it actually runs at
-      // install time — not just in a comment).
-      expect(src).toMatch(/execSync\([^)]*loginctl\s+enable-linger/);
+      expect(src).toMatch(/enableSystemdUserLinger\(/);
+      expect(src).toMatch(/formatSystemdLingerFailureMessage/);
     });
   }
+
+  it('the shared helper tries explicit-user loginctl plus sudo fallback', () => {
+    const src = readFileSync(resolve(REPO_ROOT, 'src/util/systemd-linger.ts'), 'utf8');
+    expect(src).toMatch(/loginctl/);
+    expect(src).toMatch(/enable-linger/);
+    expect(src).toMatch(/sudo/);
+    expect(src).toMatch(/'-n'/);
+  });
 
   it('the contract test itself names the failure mode (so future readers know why)', () => {
     // Self-pin: if someone deletes the rationale comment, the test

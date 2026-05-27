@@ -324,6 +324,13 @@ describe('COMBO_PRESETS', () => {
     expect(presetKeys).not.toContain('brainstorm>plan');
   });
 
+  it('omits shallow two-step presets from the default combo list', () => {
+    const presetKeys = COMBO_PRESETS.map((preset) => preset.key);
+    expect(presetKeys).not.toContain('audit>plan');
+    expect(presetKeys).not.toContain('review>plan');
+    expect(COMBO_PRESETS.every((preset) => preset.pipeline.length >= 3)).toBe(true);
+  });
+
   it('all presets have valid mode keys in their pipeline', () => {
     for (const preset of COMBO_PRESETS) {
       for (const modeKey of preset.pipeline) {

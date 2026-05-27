@@ -13,7 +13,7 @@
  * Task 2.6: Main click → onSelectSession; sub-session click → onSelectSubSession.
  */
 
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useMemo, useState } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { SessionInfo } from '../types.js';
@@ -214,6 +214,22 @@ function SessionTreeInner({
   };
 
   const allCollapsed = sessions.length > 0 && sessions.every(s => collapsed.has(s.name));
+  const subSessionsByParent = useMemo(() => {
+    const byParent = new Map<string, SubSession[]>();
+    const unparented: SubSession[] = [];
+    for (const sub of subSessions) {
+      if (!sub.parentSession) {
+        unparented.push(sub);
+        continue;
+      }
+      const existing = byParent.get(sub.parentSession);
+      if (existing) existing.push(sub);
+      else byParent.set(sub.parentSession, [sub]);
+    }
+    return { byParent, unparented };
+  }, [subSessions]);
+  // Check if any session has subs
+  const hasSubs = subSessions.length > 0;
 
   if (sessions.length === 0) {
     return (
@@ -222,9 +238,6 @@ function SessionTreeInner({
       </div>
     );
   }
-
-  // Check if any session has subs
-  const hasSubs = subSessions.length > 0;
 
   return (
     <div class="session-tree" role="tree" aria-label={t('sidebar.sessionTree', 'Session tree')}>
@@ -251,10 +264,14 @@ function SessionTreeInner({
         const unread = unreadCounts.get(session.name) ?? 0;
         const idleFlashToken = idleFlashTokens?.get(session.name) ?? 0;
 
-        // Sub-sessions belonging to this main session
-        const children = subSessions.filter(
-          (s) => !s.parentSession || s.parentSession === session.name,
-        );
+        // Sub-sessions belonging to this main session. Unparented legacy
+        // entries remain visible under every main session, matching the old
+        // `filter(!parentSession || parentSession === session.name)` behavior
+        // without doing an O(main sessions * sub-sessions) scan each render.
+        const parentedChildren = subSessionsByParent.byParent.get(session.name) ?? [];
+        const children = subSessionsByParent.unparented.length > 0
+          ? [...parentedChildren, ...subSessionsByParent.unparented]
+          : parentedChildren;
         const isCollapsed = collapsed.has(session.name);
 
         return (

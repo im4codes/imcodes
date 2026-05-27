@@ -9,6 +9,10 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, vars?: Record<string, unknown>) => {
       if (key === 'subsessionBar.subs_count') return `Subs (${vars?.count ?? 0})`;
+      if (key === 'subsessionBar.add_sub_session_short') return '+ sub-session';
+      if (key === 'subsessionBar.p2p_discussions') return 'Team discussions';
+      if (key === 'repo.info_title') return 'Repository information';
+      if (key === 'subsessionBar.scheduled_tasks') return 'Scheduled Tasks';
       return key;
     },
   }),
@@ -171,16 +175,24 @@ describe('SubSessionBar', () => {
     });
 
     const getStatsText = () => view.container.querySelector('.daemon-stats-inline')?.textContent ?? '';
-    expect(getStatsText()).toContain('2026-05-12 07:08:09');
+    expect(view.container.querySelector('.daemon-local-clock-date')?.textContent).toBe('2026-05-12');
+    expect(view.container.querySelector('.daemon-local-clock-time')?.textContent).toBe('07:08:09');
+    expect(getStatsText()).toContain('2026-05-12');
+    expect(getStatsText()).toContain('07:08:09');
+    const stableDateDigit = view.container.querySelector('.daemon-local-clock-date .daemon-local-clock-digit') as HTMLSpanElement;
+    const changingSecondDigit = Array.from(view.container.querySelectorAll('.daemon-local-clock-time .daemon-local-clock-digit')).at(-1) as HTMLSpanElement;
 
     act(() => {
       vi.advanceTimersByTime(1000);
     });
 
-    expect(getStatsText()).toContain('2026-05-12 07:08:10');
+    expect(view.container.querySelector('.daemon-local-clock-date')?.textContent).toBe('2026-05-12');
+    expect(view.container.querySelector('.daemon-local-clock-time')?.textContent).toBe('07:08:10');
+    expect(view.container.querySelector('.daemon-local-clock-date .daemon-local-clock-digit')).toBe(stableDateDigit);
+    expect(Array.from(view.container.querySelectorAll('.daemon-local-clock-time .daemon-local-clock-digit')).at(-1)).not.toBe(changingSecondDigit);
   });
 
-  it('does not add the local clock to mobile daemon stats', async () => {
+  it('shows a compact mobile daemon version without a local clock', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 4, 12, 7, 8, 9));
     const statsWs = makeStatsWs();
@@ -206,7 +218,11 @@ describe('SubSessionBar', () => {
       statsWs.emit(daemonStatsMessage);
     });
 
-    expect(view.container.querySelector('.daemon-stats-inline')?.textContent).not.toContain('2026-05-12');
+    const statsText = view.container.querySelector('.daemon-stats-inline')?.textContent ?? '';
+    expect(statsText).toContain('5.2161-dev');
+    expect(statsText).not.toContain('v2026.');
+    expect(statsText).not.toMatch(/07:08:\d{2}/);
+    expect(view.container.querySelector('.daemon-local-clock')).toBeNull();
   });
 
   it('only applies the running pulse to collapsed mini cards while the sub-session is running', () => {
@@ -282,6 +298,76 @@ describe('SubSessionBar', () => {
     expect(buttons[15].style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[0]);
   });
 
+  it('shows a desktop close-all strip for multiple open sub-session windows and reuses the shared close-all handler', () => {
+    const onCloseAllOpen = vi.fn();
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+      makeSubSession({ id: 'sub-c', sessionName: 'deck_sub_sub-c', label: 'c' }),
+    ];
+
+    const view = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set(['sub-a', 'sub-b'])}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onCloseAllOpen={onCloseAllOpen}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const strip = view.container.querySelector('.subsession-close-all-strip') as HTMLButtonElement;
+    expect(strip).not.toBeNull();
+    expect(strip.getAttribute('aria-label')).toBe('subsessionBar.close_all_open');
+
+    fireEvent.click(strip);
+
+    expect(onCloseAllOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('hides the close-all strip on mobile, with one open sub-session, or without the shared handler', () => {
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+    ];
+    const renderBar = (props: { openIds: Set<string>; desktopLayoutCapable?: boolean; onCloseAllOpen?: () => void }) => render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={props.openIds}
+        collapsed={true}
+        desktopLayoutCapable={props.desktopLayoutCapable ?? true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onCloseAllOpen={props.onCloseAllOpen}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const oneOpen = renderBar({ openIds: new Set(['sub-a']), onCloseAllOpen: vi.fn() });
+    expect(oneOpen.container.querySelector('.subsession-close-all-strip')).toBeNull();
+    oneOpen.unmount();
+
+    const mobile = renderBar({ openIds: new Set(['sub-a', 'sub-b']), desktopLayoutCapable: false, onCloseAllOpen: vi.fn() });
+    expect(mobile.container.querySelector('.subsession-close-all-strip')).toBeNull();
+    mobile.unmount();
+
+    const noHandler = renderBar({ openIds: new Set(['sub-a', 'sub-b']) });
+    expect(noHandler.container.querySelector('.subsession-close-all-strip')).toBeNull();
+  });
+
   it('passes the same ordered accent colors to expanded preview cards', () => {
     const subSessions = [
       makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
@@ -308,6 +394,45 @@ describe('SubSessionBar', () => {
     expect((view.getByTestId('subsession-preview-sub-b') as HTMLElement).style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[1]);
   });
 
+  it('progressively mounts expanded preview cards instead of mounting every card in the first render', async () => {
+    vi.useFakeTimers();
+    const subSessions = Array.from({ length: 8 }, (_, index) => makeSubSession({
+      id: `sub-${index + 1}`,
+      sessionName: `deck_sub_sub-${index + 1}`,
+      label: `worker-${index + 1}`,
+    }));
+
+    const view = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={false}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(2);
+    expect(view.container.querySelectorAll('.subcard-preview-placeholder')).toHaveLength(6);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(6);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(32);
+    });
+    expect(view.container.querySelectorAll('[data-testid^="subsession-preview-"]')).toHaveLength(8);
+    expect(view.container.querySelectorAll('.subcard-preview-placeholder')).toHaveLength(0);
+  });
+
   it('toggles the mobile P2P compact bar from the toolbar', () => {
     const view = render(
       <SubSessionBar
@@ -316,7 +441,7 @@ describe('SubSessionBar', () => {
         desktopLayoutCapable={false}
         discussions={[{
           id: 'p2p_run_1',
-          topic: 'P2P audit',
+          topic: 'Team audit',
           state: 'running',
           currentRound: 1,
           maxRounds: 1,
@@ -419,6 +544,69 @@ describe('SubSessionBar', () => {
     await waitFor(() => {
       expect(vi.mocked(reorderSubSessions)).toHaveBeenCalledWith('srv-1', ['sub-b', 'sub-a']);
     });
+  });
+
+  it('keeps mobile long-press drag reorder working without opening the sub-session', async () => {
+    vi.useFakeTimers();
+    const onOpen = vi.fn();
+    const onVisualOrderChange = vi.fn();
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+    ];
+
+    const view = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={false}
+        serverId="srv-1"
+        onVisualOrderChange={onVisualOrderChange}
+        onOpen={onOpen}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const first = view.container.querySelector('[data-sub-id="sub-a"]') as HTMLElement;
+    const second = view.container.querySelector('[data-sub-id="sub-b"]') as HTMLElement;
+    const originalElementFromPoint = document.elementFromPoint;
+    Object.defineProperty(document, 'elementFromPoint', {
+      configurable: true,
+      value: vi.fn(() => second),
+    });
+
+    try {
+      fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => {
+        vi.advanceTimersByTime(401);
+      });
+      fireEvent.touchMove(first, { touches: [{ clientX: 80, clientY: 10 }] });
+
+      await waitFor(() => {
+        expect(Array.from(view.container.querySelectorAll('.subsession-card')).map((node) => (node as HTMLElement).dataset.subId)).toEqual(['sub-b', 'sub-a']);
+        expect(onVisualOrderChange).toHaveBeenLastCalledWith(['sub-b', 'sub-a']);
+      });
+
+      fireEvent.touchEnd(first);
+      act(() => {
+        vi.advanceTimersByTime(151);
+      });
+
+      expect(onOpen).not.toHaveBeenCalled();
+      expect(vi.mocked(reorderSubSessions)).toHaveBeenCalledWith('srv-1', ['sub-b', 'sub-a']);
+    } finally {
+      Object.defineProperty(document, 'elementFromPoint', {
+        configurable: true,
+        value: originalElementFromPoint,
+      });
+    }
   });
 
   it('shows idle flash on collapsed buttons only when the token increments after mount', () => {
@@ -573,8 +761,48 @@ describe('SubSessionBar', () => {
     expect(card.title).not.toContain('ctx 11%');
   });
 
+  it('uses beginner-friendly desktop toolbar labels and compact mobile icons', () => {
+    const renderBar = (desktopLayoutCapable: boolean) => render(
+      <SubSessionBar
+        subSessions={[]}
+        openIds={new Set()}
+        desktopLayoutCapable={desktopLayoutCapable}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        onViewDiscussions={vi.fn()}
+        onViewRepo={vi.fn()}
+        onViewCron={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const desktop = renderBar(true);
+    expect(desktop.container.querySelector('[data-onboarding="new-sub-session"]')?.textContent?.trim()).toBe('+ sub-session');
+    expect(desktop.container.querySelector('[data-onboarding="discussion-history"]')?.textContent).toContain('👥');
+    expect(desktop.container.querySelector('[data-onboarding="discussion-history"]')?.textContent).toContain('Team discussions');
+    expect(desktop.container.querySelector('[data-onboarding="repo-page"]')?.textContent).toContain('🗂️');
+    expect(desktop.container.querySelector('[data-onboarding="repo-page"]')?.textContent).toContain('Repository information');
+    expect(desktop.container.querySelector('[data-onboarding="cron-manager"]')?.textContent).toContain('⏰');
+    expect(desktop.container.querySelector('[data-onboarding="cron-manager"]')?.textContent).toContain('Scheduled Tasks');
+    desktop.unmount();
+
+    const mobile = renderBar(false);
+    expect(mobile.container.querySelector('[data-onboarding="new-sub-session"]')?.textContent?.trim()).toBe('+');
+    expect(mobile.container.querySelector('[data-onboarding="discussion-history"]')?.textContent).toContain('👥');
+    expect(mobile.container.querySelector('[data-onboarding="discussion-history"]')?.textContent).not.toContain('Team discussions');
+    expect(mobile.container.querySelector('[data-onboarding="repo-page"]')?.textContent).toContain('🗂️');
+    expect(mobile.container.querySelector('[data-onboarding="repo-page"]')?.textContent).not.toContain('Repository information');
+    expect(mobile.container.querySelector('[data-onboarding="cron-manager"]')?.textContent).toContain('⏰');
+    expect(mobile.container.querySelector('[data-onboarding="cron-manager"]')?.textContent).not.toContain('Scheduled Tasks');
+  });
+
   // Audit fix (P2P bar scoping follow-up) — pin the contract that the
-  // View Discussions (📋) button shows a numeric badge when there are
+  // View Discussions (👥) button shows a numeric badge when there are
   // running discussions ANYWHERE on the daemon, not just in this
   // session's bar. Without it, scoping the bar to a single session
   // hides the existence of runs in other sessions and the user loses

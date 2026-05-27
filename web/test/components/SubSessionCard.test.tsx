@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import { useEffect } from 'preact/hooks';
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
 const chatScrollBottomSpy = vi.fn();
 const chatViewPropsSpy = vi.fn();
@@ -43,18 +43,22 @@ vi.mock('../../src/components/TerminalView.js', () => ({
 const addOptimisticUserMessageSpy = vi.fn();
 const markOptimisticFailedSpy = vi.fn();
 const retryOptimisticMessageSpy = vi.fn();
+const useTimelineSpy = vi.fn();
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
-  useTimeline: () => ({
-    events: timelineEvents,
-    refreshing: false,
-    // Exposed so the card's onSend / handleResendFailed handlers exercise
-    // real wiring. Shell sub-sessions deliberately skip useTimeline and the
-    // card falls back to no-op; that path is covered by its own test.
-    addOptimisticUserMessage: addOptimisticUserMessageSpy,
-    markOptimisticFailed: markOptimisticFailedSpy,
-    retryOptimisticMessage: retryOptimisticMessageSpy,
-  }),
+  useTimeline: (...args: unknown[]) => {
+    useTimelineSpy(...args);
+    return {
+      events: timelineEvents,
+      refreshing: false,
+      // Exposed so the card's onSend / handleResendFailed handlers exercise
+      // real wiring. Shell sub-sessions deliberately skip useTimeline and the
+      // card falls back to no-op; that path is covered by its own test.
+      addOptimisticUserMessage: addOptimisticUserMessageSpy,
+      markOptimisticFailed: markOptimisticFailedSpy,
+      retryOptimisticMessage: retryOptimisticMessageSpy,
+    };
+  },
 }));
 
 const sessionControlsSpy = vi.fn((props: any) => (
@@ -99,6 +103,36 @@ describe('SubSessionCard', () => {
   afterEach(() => {
     cleanup();
     localStorage.clear();
+    vi.useRealTimers();
+  });
+
+  it('defers timeline hydration for closed preview cards until after first paint', async () => {
+    vi.useFakeTimers();
+    render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        isFocused={false}
+        previewHydrateDelayMs={200}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(useTimelineSpy).toHaveBeenLastCalledWith(null, null, undefined, {
+      isActiveSession: false,
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+
+    expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
+      isActiveSession: false,
+    });
   });
 
   it('forces preview scroll to bottom after sending from the card input', async () => {

@@ -6,13 +6,16 @@
  */
 import { lazy } from 'preact/compat';
 import type { FileEditorProps } from './FileEditor.js';
+import { lazyImportWithAppUpdateNotice } from '../app-update.js';
 
 export const FileEditor = lazy(() =>
-  import('./FileEditor.js').then(m => ({ default: m.FileEditor }))
+  lazyImportWithAppUpdateNotice(() => import('./FileEditor.js'))
+    .then(m => ({ default: m.FileEditor }))
 );
 
 export const FileEditorContent = lazy(() =>
-  import('./FileEditor.js').then(m => ({ default: m.FileEditorContent }))
+  lazyImportWithAppUpdateNotice(() => import('./FileEditor.js'))
+    .then(m => ({ default: m.FileEditorContent }))
 );
 
 export type { FileEditorProps };

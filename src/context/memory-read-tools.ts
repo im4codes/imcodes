@@ -3,11 +3,15 @@ import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import type { ContextNamespace, LocalContextEvent } from '../../shared/context-types.js';
 import { buildMemoryMcpSourceProvenance, type MemoryMcpSourceProvenance, type MemoryMcpSourceProvenanceInput } from '../../shared/memory-mcp-provenance.js';
+import { buildMemoryProjectionFallbackSource } from '../../shared/memory-projection-source-fallback.js';
 import { serializeContextNamespace } from './context-keys.js';
 import {
+  LEGACY_DAEMON_LOCAL_USER_ID,
   getArchivedEvent,
+  getContextObservationById,
   getProcessedProjectionById,
   getStagedEvent,
+  listContextNamespaces,
   listProjectionSources,
   searchArchiveFts,
 } from '../store/context-store.js';
@@ -133,8 +137,28 @@ function sameNamespace(a: ContextNamespace, b: ContextNamespace): boolean {
 }
 
 function canAccessNamespace(namespace: ContextNamespace, caller: AnyCaller): boolean {
+  if (
+    namespace.scope === 'personal'
+    && (!namespace.userId || namespace.userId === LEGACY_DAEMON_LOCAL_USER_ID)
+  ) {
+    if (isInternalCaller(caller)) return true;
+    return caller.namespace.scope === 'personal'
+      && namespace.projectId === caller.namespace.projectId
+      && (namespace.enterpriseId ?? undefined) === (caller.namespace.enterpriseId ?? undefined)
+      && (namespace.workspaceId ?? undefined) === (caller.namespace.workspaceId ?? undefined);
+  }
   if (namespace.userId !== caller.userId) return false;
   if (isInternalCaller(caller)) return true;
+  if (
+    namespace.scope === 'user_private'
+    && caller.namespace.scope !== 'user_private'
+    && caller.namespace.userId === caller.userId
+    && namespace.userId === caller.userId
+    && !!caller.namespace.projectId
+    && namespace.projectId === caller.namespace.projectId
+  ) {
+    return true;
+  }
   // Public callers carry a required namespace; cross-namespace reads are forbidden.
   return sameNamespace(namespace, caller.namespace);
 }
@@ -164,14 +188,95 @@ export function chatGetEvent(id: string, caller: MemoryToolCaller): ReturnType<t
 }
 
 export interface MemoryGetSourcesResult {
-  projectionId: string;
+  projectionId?: string;
+  observationId?: string;
   sourceEventCount: number;
   note?: string;
-  sources?: Array<{ eventId: string; status: 'archived' | 'staged' | 'missing'; content: string | null; eventType?: string; createdAt?: number }>;
+  sources?: Array<{ eventId: string; status: 'archived' | 'staged' | 'missing' | 'projection' | 'observation'; content: string | null; eventType?: string; createdAt?: number }>;
+  projectionSource?: { eventId: string; status: 'projection'; content: string; eventType: 'memory.projection'; createdAt?: number };
   partial?: boolean;
 }
 
-export function memoryGetSources(projectionId: string, caller: MemoryToolCaller): MemoryGetSourcesResult {
+export type MemoryGetSourcesInput =
+  | string
+  | {
+    projectionId?: string;
+    observationId?: string;
+    kind?: 'projection' | 'observation';
+  };
+
+function observationNamespaceById(namespaceId: string, scope: ContextNamespace['scope']): ContextNamespace | undefined {
+  const row = listContextNamespaces().find((candidate) => candidate.id === namespaceId);
+  if (!row) return undefined;
+  return {
+    scope,
+    projectId: row.projectId,
+    userId: row.userId,
+    workspaceId: row.workspaceId,
+    enterpriseId: row.orgId,
+  };
+}
+
+function canAccessObservationNamespace(namespace: ContextNamespace | undefined, caller: AnyCaller): namespace is ContextNamespace {
+  if (!namespace) return false;
+  if (namespace.userId !== caller.userId) return false;
+  if (isInternalCaller(caller)) return true;
+  if (sameNamespace(namespace, caller.namespace)) return true;
+  return namespace.scope === 'user_private'
+    && caller.namespace.userId === caller.userId
+    && namespace.userId === caller.userId
+    && !!caller.namespace.projectId
+    && namespace.projectId === caller.namespace.projectId;
+}
+
+function observationText(content: Record<string, unknown>): string {
+  const text = content.text;
+  if (typeof text === 'string' && text.trim()) return text.trim();
+  return JSON.stringify(content);
+}
+
+function shouldUseProjectionFallback(sources: NonNullable<MemoryGetSourcesResult['sources']>): boolean {
+  return sources.length === 0
+    || sources.every((source) => source.content === null && source.status === 'missing');
+}
+
+function memoryGetObservationSources(observationId: string, caller: MemoryToolCaller): MemoryGetSourcesResult {
+  const checkedCaller = assertOwner(assertPublicCallerHasNamespace(caller));
+  const observation = getContextObservationById(observationId);
+  const namespace = observation ? observationNamespaceById(observation.namespaceId, observation.scope) : undefined;
+  if (!observation || !canAccessObservationNamespace(namespace, checkedCaller)) {
+    return { observationId, sourceEventCount: 0, sources: [] };
+  }
+  const sourceId = observation.sourceEventIds[0] ?? `observation:${observation.id}`;
+  return {
+    observationId,
+    sourceEventCount: Math.max(1, observation.sourceEventIds.length),
+    sources: [{
+      eventId: sourceId,
+      status: 'observation',
+      content: observationText(observation.content),
+      eventType: `memory.observation.${observation.class}`,
+      createdAt: observation.createdAt,
+    }],
+    partial: false,
+  };
+}
+
+function resolveGetSourcesInput(input: MemoryGetSourcesInput): { projectionId?: string; observationId?: string } {
+  if (typeof input === 'string') return { projectionId: input };
+  const projectionId = typeof input.projectionId === 'string' && input.projectionId.trim() ? input.projectionId.trim() : undefined;
+  const observationId = typeof input.observationId === 'string' && input.observationId.trim() ? input.observationId.trim() : undefined;
+  if (input.kind === 'observation' && observationId) return { observationId };
+  if (input.kind === 'projection' && projectionId) return { projectionId };
+  return { projectionId, observationId };
+}
+
+export function memoryGetSources(input: MemoryGetSourcesInput, caller: MemoryToolCaller): MemoryGetSourcesResult {
+  const resolved = resolveGetSourcesInput(input);
+  if (resolved.observationId && !resolved.projectionId) {
+    return memoryGetObservationSources(resolved.observationId, caller);
+  }
+  const projectionId = resolved.projectionId ?? '';
   const checkedCaller = assertOwner(assertPublicCallerHasNamespace(caller));
   const projection = getProcessedProjectionById(projectionId);
   if (!projection) return { projectionId, sourceEventCount: 0, sources: [] };
@@ -191,11 +296,15 @@ export function memoryGetSources(projectionId: string, caller: MemoryToolCaller)
       createdAt: event?.createdAt,
     };
   });
+  const projectionSource = buildMemoryProjectionFallbackSource(projection);
+  const fallback = shouldUseProjectionFallback(sources) ? projectionSource : undefined;
+  const resolvedSources = fallback ? [fallback] : sources;
   return {
     projectionId,
-    sourceEventCount: projection.sourceEventIds.length,
-    sources,
-    partial: sources.length !== projection.sourceEventIds.length || sources.some((source) => source.content === null),
+    sourceEventCount: Math.max(projection.sourceEventIds.length, resolvedSources.length),
+    sources: resolvedSources,
+    ...(projectionSource ? { projectionSource } : {}),
+    partial: !fallback && (sources.length !== projection.sourceEventIds.length || sources.some((source) => source.content === null)),
   };
 }
 

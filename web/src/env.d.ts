@@ -1,4 +1,5 @@
 declare const __BUILD_TIME__: string;
+declare const __WEB_BUILD_ID__: string;
 
 /**
  * Compile-time push channel selector, set by vite.config.ts based on the
@@ -16,11 +17,6 @@ declare module '*?url' {
 
 // Vite ?raw suffix — returns file content as a string
 declare module '*?raw' {
-  const src: string;
-  export default src;
-}
-
-declare module 'pdfjs-dist/build/pdf.worker.min.mjs?url' {
   const src: string;
   export default src;
 }

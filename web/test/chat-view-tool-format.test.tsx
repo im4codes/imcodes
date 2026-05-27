@@ -314,13 +314,61 @@ describe('ChatView tool payload formatting', () => {
     fireEvent.click(button!);
 
     expect(fsReadFile).toHaveBeenCalledWith('C:\\Users\\admin\\screenshot.png');
-    onMessage.mock.calls[0][0]({
-      type: 'fs.read_response',
-      requestId: 'req-win-path',
-      downloadId: 'dl-win-path',
-    });
+    for (const [handler] of onMessage.mock.calls) {
+      handler({
+        type: 'fs.read_response',
+        requestId: 'req-win-path',
+        downloadId: 'dl-win-path',
+      });
+    }
     await waitFor(() => {
       expect(downloadAttachment).toHaveBeenCalledWith('server-1', 'dl-win-path');
+    });
+  });
+
+  it('downloads relative Chinese file paths from chat text through the current workdir', async () => {
+    vi.mocked(downloadAttachment).mockClear();
+    const fsReadFile = vi.fn(() => 'req-cn-ppt');
+    const onMessage = vi.fn(() => vi.fn());
+    const events = [
+      makeEvent({
+        type: 'assistant.text',
+        payload: {
+          text: '文件： ppt/qisi_antidrug/广西缉毒AI嗅觉方案_政企4K.pptx!',
+          streaming: false,
+        },
+      }),
+    ];
+
+    const { container } = render(
+      <ChatView
+        events={events}
+        loading={false}
+        ws={{ fsReadFile, onMessage } as any}
+        serverId="server-1"
+        workdir="/repo/project"
+      />,
+    );
+
+    const link = container.querySelector('.chat-path-link') as HTMLElement | null;
+    const button = container.querySelector('.chat-dl-btn') as HTMLButtonElement | null;
+    expect(link?.textContent).toBe('ppt/qisi_antidrug/广西缉毒AI嗅觉方案_政企4K.pptx');
+    expect(link?.title).toBe('ppt/qisi_antidrug/广西缉毒AI嗅觉方案_政企4K.pptx');
+    expect(container.textContent).toContain('!');
+    expect(button).not.toBeNull();
+
+    fireEvent.click(button!);
+
+    expect(fsReadFile).toHaveBeenCalledWith('/repo/project/ppt/qisi_antidrug/广西缉毒AI嗅觉方案_政企4K.pptx');
+    for (const [handler] of onMessage.mock.calls) {
+      handler({
+        type: 'fs.read_response',
+        requestId: 'req-cn-ppt',
+        downloadId: 'dl-cn-ppt',
+      });
+    }
+    await waitFor(() => {
+      expect(downloadAttachment).toHaveBeenCalledWith('server-1', 'dl-cn-ppt');
     });
   });
 

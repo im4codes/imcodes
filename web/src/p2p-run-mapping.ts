@@ -116,9 +116,11 @@ function mapAdvancedNodes(source: Record<string, any>) {
 
 export function mapP2pRunToDiscussion(r: Record<string, any>) {
   const snapshot = parseSnapshot(r.progress_snapshot);
-  const source = { ...r, ...snapshot } as Record<string, any>;
+  const source = { ...snapshot, ...r } as Record<string, any>;
   const diagnostics = extractDiagnostics(source);
   const receivedAt = Date.now();
+  const updatedAt = parseTimestamp(source.updated_at ?? source.updatedAt);
+  const completedAt = parseTimestamp(source.completed_at ?? source.completedAt);
   const advancedEnabled = source.advanced_p2p_enabled === true;
   const id = `p2p_${source.id}`;
   const status = String(source.status ?? '');
@@ -194,7 +196,7 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
     fileId: typeof source.discussion_id === 'string' && source.discussion_id
       ? source.discussion_id
       : undefined,
-    topic: `P2P ${currentRoundMode} · ${initiatorLabel}`,
+    topic: `Team ${currentRoundMode} · ${initiatorLabel}`,
     state,
     mainSession,
     initiatorSession,
@@ -224,6 +226,8 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
     error: state === 'failed' ? (source.error ?? source.terminal_reason ?? '') : '',
     nodes: useAdvancedNodes ? advancedNodes : legacyNodes,
     hopStates,
+    updatedAt,
+    completedAt,
     startedAt: normalizeTimerAnchor(
       source.created_at ?? source.startedAt,
       source.updated_at ?? source.updatedAt,
@@ -238,8 +242,31 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
   };
 }
 
-export function mergeP2pDiscussionUpdate<T extends { startedAt?: number; hopStartedAt?: number }>(existing: T | undefined, incoming: T): T {
+function isTerminalDiscussionState(state: unknown): boolean {
+  return state === 'done' || state === 'failed';
+}
+
+function finiteTimestamp(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+export function mergeP2pDiscussionUpdate<T extends {
+  startedAt?: number;
+  hopStartedAt?: number;
+  updatedAt?: number;
+  state?: unknown;
+}>(existing: T | undefined, incoming: T): T {
   if (!existing) return incoming;
+  const existingTerminal = isTerminalDiscussionState(existing.state);
+  const incomingTerminal = isTerminalDiscussionState(incoming.state);
+  if (existingTerminal && !incomingTerminal) return existing;
+
+  const existingUpdatedAt = finiteTimestamp(existing.updatedAt);
+  const incomingUpdatedAt = finiteTimestamp(incoming.updatedAt);
+  if (!incomingTerminal && existingUpdatedAt !== undefined && incomingUpdatedAt !== undefined && incomingUpdatedAt < existingUpdatedAt) {
+    return existing;
+  }
+
   return {
     ...existing,
     ...incoming,

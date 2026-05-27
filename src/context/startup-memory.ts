@@ -3,10 +3,18 @@ import type { MemorySearchResultItem } from './memory-search.js';
 import { searchLocalMemory } from './memory-search.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 import { MEMORY_DEFAULTS } from '../../shared/memory-defaults.js';
+import {
+  listContextNamespaces,
+  listContextObservations,
+  LEGACY_DAEMON_LOCAL_USER_ID,
+  type ContextNamespaceRow,
+  type ContextObservationRow,
+} from '../store/context-store.js';
 
-export const STARTUP_MEMORY_DURABLE_LIMIT = 7;
-export const STARTUP_MEMORY_RECENT_LIMIT = 8;
-export const STARTUP_MEMORY_TOTAL_LIMIT = 15;
+export const STARTUP_MEMORY_DURABLE_LIMIT = 20;
+export const STARTUP_MEMORY_RECENT_LIMIT = 30;
+export const STARTUP_MEMORY_TOTAL_LIMIT = 50;
+export const STARTUP_OBSERVATION_INDEX_LIMIT = 12;
 export const STARTUP_MEMORY_STAGES = ['collect', 'prioritize', 'apply_quotas', 'trim', 'dedup', 'render'] as const;
 export const STARTUP_BOOTSTRAP_SOURCES = [
   'startup_memory',
@@ -48,7 +56,9 @@ export interface StartupMemorySelectionReport {
 export interface StartupMemorySelectionOptions {
   durableLimit?: number;
   recentLimit?: number;
+  observationLimit?: number;
   totalLimit?: number;
+  extraItems?: readonly MemorySearchResultItem[];
 }
 
 function tokenEstimate(candidate: StartupMemoryCandidate): number {
@@ -193,17 +203,28 @@ export function selectStartupMemoryItems(
   // the resulting summary is part of the project's history. Template-prompt
   // filtering is applied only on the recall/search paths.
 
-  const durable = searchLocalMemory({
+  const localDurable = searchLocalMemory({
     namespace,
     projectionClass: 'durable_memory_candidate',
     limit: durableLimit,
   }).items.filter((item): item is MemorySearchResultItem => item.type === 'processed');
 
-  const recent = searchLocalMemory({
+  const localRecent = searchLocalMemory({
     namespace,
     projectionClass: 'recent_summary',
-    limit: Math.max(recentLimit, totalLimit),
+    limit: recentLimit,
   }).items.filter((item): item is MemorySearchResultItem => item.type === 'processed');
+  const extraItems = (options.extraItems ?? []).filter((item) => item.type === 'processed');
+  const sortByUpdatedDesc = (a: MemorySearchResultItem, b: MemorySearchResultItem): number =>
+    (b.updatedAt ?? b.createdAt ?? 0) - (a.updatedAt ?? a.createdAt ?? 0);
+  const durable = [
+    ...localDurable,
+    ...extraItems.filter((item) => item.projectionClass === 'durable_memory_candidate'),
+  ].sort(sortByUpdatedDesc);
+  const recent = [
+    ...localRecent,
+    ...extraItems.filter((item) => item.projectionClass === 'recent_summary'),
+  ].sort(sortByUpdatedDesc);
 
   // ID-based dedup was failing against duplicates produced by the old
   // writeProcessedProjection path that generated fresh UUIDs on every turn
@@ -228,7 +249,7 @@ export function selectStartupMemoryItems(
   }
 
   const selectedDurable = dedupedDurable.slice(0, Math.min(durableLimit, totalLimit));
-  const remaining = Math.max(0, totalLimit - selectedDurable.length);
+  const remaining = Math.min(recentLimit, Math.max(0, totalLimit - selectedDurable.length));
   const selectedRecent: MemorySearchResultItem[] = [];
   for (const item of recent) {
     if (seenIds.has(item.id)) continue;
@@ -241,4 +262,93 @@ export function selectStartupMemoryItems(
   }
 
   return [...selectedDurable, ...selectedRecent];
+}
+
+function rowToNamespace(row: ContextNamespaceRow): ContextNamespace {
+  return {
+    scope: row.scope,
+    projectId: row.projectId,
+    userId: row.userId,
+    workspaceId: row.workspaceId,
+    enterpriseId: row.orgId,
+  };
+}
+
+function sameStartupNamespace(a: ContextNamespace, b: ContextNamespace): boolean {
+  return a.scope === b.scope
+    && (a.projectId ?? undefined) === (b.projectId ?? undefined)
+    && (a.userId ?? undefined) === (b.userId ?? undefined)
+    && (a.workspaceId ?? undefined) === (b.workspaceId ?? undefined)
+    && (a.enterpriseId ?? undefined) === (b.enterpriseId ?? undefined);
+}
+
+function canUseObservationForStartup(row: ContextNamespaceRow, namespace: ContextNamespace): boolean {
+  const observationNamespace = rowToNamespace(row);
+  if (sameStartupNamespace(observationNamespace, namespace)) return true;
+  const userMatches = row.userId === namespace.userId
+    || (!namespace.userId && row.userId === LEGACY_DAEMON_LOCAL_USER_ID);
+  return row.scope === 'user_private'
+    && !!row.userId
+    && userMatches
+    && !!namespace.projectId
+    && row.projectId === namespace.projectId;
+}
+
+function observationText(observation: ContextObservationRow): string {
+  const text = observation.content.text;
+  if (typeof text === 'string' && text.trim()) return text.trim();
+  return JSON.stringify(observation.content);
+}
+
+function observationSummary(observation: ContextObservationRow): string {
+  const text = observationText(observation).replace(/\s+/g, ' ').trim();
+  const title = typeof observation.content.title === 'string' ? observation.content.title.trim() : '';
+  const base = title && !text.startsWith(title) ? `${title}: ${text}` : text;
+  return base.length > 420 ? `${base.slice(0, 417)}...` : base;
+}
+
+function observationToItem(observation: ContextObservationRow, namespaceRow: ContextNamespaceRow): MemorySearchResultItem {
+  return {
+    type: 'observation',
+    id: observation.id,
+    projectId: namespaceRow.projectId ?? '',
+    scope: observation.scope,
+    enterpriseId: namespaceRow.orgId,
+    workspaceId: namespaceRow.workspaceId,
+    userId: namespaceRow.userId,
+    observationClass: observation.class,
+    observationState: observation.state,
+    summary: observationSummary(observation),
+    content: JSON.stringify(observation.content),
+    createdAt: observation.createdAt,
+    updatedAt: observation.updatedAt,
+    sourceEventCount: observation.sourceEventIds.length || 1,
+    sourceEventIds: observation.sourceEventIds,
+  };
+}
+
+export function selectStartupObservationItems(
+  namespace: ContextNamespace,
+  options: Pick<StartupMemorySelectionOptions, 'observationLimit'> = {},
+): MemorySearchResultItem[] {
+  const limit = options.observationLimit ?? STARTUP_OBSERVATION_INDEX_LIMIT;
+  const namespaceRows = listContextNamespaces();
+  const allowedRows = new Map(
+    namespaceRows
+      .filter((row) => canUseObservationForStartup(row, namespace))
+      .map((row) => [row.id, row]),
+  );
+  if (allowedRows.size === 0) return [];
+  return listContextObservations({
+    state: ['active', 'promoted'],
+  })
+    .filter((observation) => !observation.projectionId)
+    .filter((observation) => observation.class !== 'skill_candidate')
+    .map((observation) => {
+      const row = allowedRows.get(observation.namespaceId);
+      return row ? observationToItem(observation, row) : undefined;
+    })
+    .filter((item): item is MemorySearchResultItem => !!item)
+    .sort((a, b) => (b.updatedAt ?? b.createdAt) - (a.updatedAt ?? a.createdAt))
+    .slice(0, limit);
 }

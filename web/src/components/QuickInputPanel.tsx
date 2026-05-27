@@ -27,9 +27,10 @@ const DEFAULT_COMMANDS: Record<string, string[]> = {
   'cursor-headless': ['/compact', '/clear', '/model'],
   'opencode':    ['/compact', '/clear', '/model', '/help'],
   'qwen':        ['/compact', '/stop', '/clear', '/model', '/thinking'],
+  'kimi-sdk':    ['/compact', '/clear', '/model'],
   'openclaw':    ['/compact', '/stop', '/clear', '/thinking'],
 };
-const DEFAULT_PHRASES = ['continue', 'fix', 'explain', 'refactor this', 'write tests', 'check errors', 'LGTM, commit', 'test & push', 'yes'];
+const DEFAULT_PHRASES = ['continue', 'fix', 'explain', 'refactor this', 'write tests', 'check errors', 'pull', 'commit&push', 'CI failed, fix', 'test & push', 'yes'];
 
 const SESSION_HISTORY_MAX = 50;
 const GLOBAL_HISTORY_MAX = 50;
@@ -612,6 +613,7 @@ export function QuickInputPanel({
                 ? paths.map((p) => '@' + (p.startsWith(cwd + '/') ? p.slice(cwd.length + 1) : p) + ' ')
                 : paths.map((p) => '@' + p + ' ');
               onAppendPaths?.(rel);
+              onClose();
             }}
           />
         )}

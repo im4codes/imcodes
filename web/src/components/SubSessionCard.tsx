@@ -39,6 +39,7 @@ const TYPE_ICON: Record<string, string> = {
   'qwen': '千',
   'gemini': '♊',
   'gemini-sdk': '♊',
+  'kimi-sdk': '月',
   'shell': '🐚',
   'script': '🔄',
 };
@@ -74,6 +75,7 @@ interface Props {
   /** Whether this sub-session is participating in an active P2P discussion. */
   inP2p?: boolean;
   accentColor?: string;
+  previewHydrateDelayMs?: number;
 }
 
 function loadCardW(id: string, fallback: number): number {
@@ -112,10 +114,20 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
   };
 }
 
-export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR }: Props) {
+export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const isShell = sub.type === 'shell' || sub.type === 'script';
+  const [timelineHydrated, setTimelineHydrated] = useState(() => isOpen || isFocused === true);
+  useEffect(() => {
+    if (isShell || timelineHydrated) return;
+    if (isOpen || isFocused) {
+      setTimelineHydrated(true);
+      return;
+    }
+    const timer = setTimeout(() => setTimelineHydrated(true), Math.max(0, previewHydrateDelayMs));
+    return () => clearTimeout(timer);
+  }, [isFocused, isOpen, isShell, previewHydrateDelayMs, timelineHydrated]);
   // Shell/script sub-sessions are terminal-only; they have no chat timeline
   // to attach optimistic bubbles to. For everything else we pull the
   // optimistic helpers so the card input behaves like the main-session pane
@@ -123,7 +135,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   // daemon echo).
   const timeline = isShell
     ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, retryOptimisticMessage: undefined }
-    : useTimeline(sub.sessionName, ws, serverId, {
+    : useTimeline(timelineHydrated ? sub.sessionName : null, ws, serverId, {
       isActiveSession: !!isFocused,
     });
   const { events, refreshing } = timeline;

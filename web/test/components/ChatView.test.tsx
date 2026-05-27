@@ -4,16 +4,22 @@
 import { h } from 'preact';
 import { act, render, waitFor, cleanup, fireEvent, screen } from '@testing-library/preact';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { ChatView } from '../../src/components/ChatView.js';
+import { ChatView, __clearChatLocalImagePreviewCacheForTests } from '../../src/components/ChatView.js';
 import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+  SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+  SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
   SESSION_CONTROL_TIMELINE_STATE_STOPPING,
 } from '../../../shared/session-control-commands.js';
 import {
   __resetSessionRepoContextStoreForTests,
   ingestSessionRepoContext,
 } from '../../src/session-repo-context-store.js';
-import { CHAT_INITIAL_RENDER_ITEM_LIMIT } from '../../src/chat-render-limits.js';
+import {
+  CHAT_INITIAL_RENDER_ITEM_LIMIT,
+  PREVIEW_EVENT_TAIL_LIMIT,
+  PREVIEW_RENDER_ITEM_LIMIT,
+} from '../../src/chat-render-limits.js';
 
 const chatMarkdownRenderSpy = vi.hoisted(() => vi.fn());
 const showToolCallsPref = vi.hoisted(() => ({
@@ -131,6 +137,7 @@ describe('ChatView', () => {
     clipboardWriteText.mockClear();
     visualViewportMock.height = 800;
     visualViewportListeners.clear();
+    __clearChatLocalImagePreviewCacheForTests();
     __resetSessionRepoContextStoreForTests();
   });
 
@@ -162,6 +169,299 @@ describe('ChatView', () => {
     fireEvent.click(screen.getByText('chat.load_older'));
 
     expect(screen.getByText('message-0')).toBeTruthy();
+  });
+
+  it('collapses sent user messages longer than ten hard lines by default', () => {
+    const longText = Array.from({ length: 11 }, (_, index) => `sent-line-${index + 1}`).join('\n');
+
+    const { container } = render(
+      <ChatView
+        events={[{
+          eventId: 'evt-user-long',
+          type: 'user.message',
+          ts: 1_700_000_000_000,
+          payload: { text: longText },
+        }] as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_long_user_message"
+      />,
+    );
+
+    const fold = container.querySelector('.chat-user-message-fold');
+    const content = container.querySelector('.chat-user-message-fold-content');
+    expect(fold?.classList.contains('is-folded')).toBe(true);
+    expect(content?.classList.contains('is-folded')).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'chat.user_message_expand' }));
+
+    expect(fold?.classList.contains('is-folded')).toBe(false);
+    expect(content?.classList.contains('is-folded')).toBe(false);
+    expect(screen.getByRole('button', { name: 'chat.user_message_collapse' })).toBeTruthy();
+  });
+
+  it('does not collapse sent user messages with ten hard lines', () => {
+    const tenLineText = Array.from({ length: 10 }, (_, index) => `sent-line-${index + 1}`).join('\n');
+
+    const { container } = render(
+      <ChatView
+        events={[{
+          eventId: 'evt-user-ten-lines',
+          type: 'user.message',
+          ts: 1_700_000_000_000,
+          payload: { text: tenLineText },
+        }] as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_ten_line_user_message"
+      />,
+    );
+
+    expect(container.querySelector('.chat-user-message-fold')?.classList.contains('is-foldable')).toBe(false);
+    expect(screen.queryByText('chat.user_message_expand')).toBeNull();
+  });
+
+  it('suppresses the "no events" placeholder while bootstrap history is still loading (SubSessionWindow flash fix)', () => {
+    // Regression test for "本地历史还是没有瞬间加载" / 暂无消息 flash:
+    // SubSessionWindow forces `loading={false}` so its ChatView doesn't
+    // flicker on minimize/restore. Combined with an empty cache, this
+    // used to surface the "no events" placeholder while the
+    // 历史 → 本地缓存 → daemon overlay was still spinning. The placeholder
+    // must defer to the overlay during the bootstrap phase.
+    const { container, rerender } = render(
+      <ChatView
+        events={[] as any}
+        loading={false}
+        sessionId="deck_sub_bootstrap"
+        historyStatus={{
+          phase: 'bootstrap',
+          steps: {
+            cache: 'running',
+            textTail: 'skipped',
+            daemon: 'pending',
+            http: 'pending',
+            older: 'skipped',
+          },
+        }}
+      />,
+    );
+
+    // Overlay must be visible, placeholder must be hidden.
+    expect(container.querySelector('.chat-history-overlay')).not.toBeNull();
+    expect(screen.queryByText('chat.no_events')).toBeNull();
+
+    // Once bootstrap finishes AND events are still empty, the placeholder
+    // returns (so users on a truly-empty session don't sit looking at a
+    // blank pane after the overlay disappears).
+    rerender(
+      <ChatView
+        events={[] as any}
+        loading={false}
+        sessionId="deck_sub_bootstrap"
+        historyStatus={{
+          phase: 'idle',
+          steps: {
+            cache: 'done',
+            textTail: 'skipped',
+            daemon: 'done',
+            http: 'done',
+            older: 'skipped',
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText('chat.no_events')).toBeTruthy();
+  });
+
+  it('preview mode caps rendered items to PREVIEW_RENDER_ITEM_LIMIT (sub-session thumbnails)', () => {
+    // Regression test for "本地消息都没有立即显示. 空白半天 + sub-session 按钮无反应"
+    // (slow refresh + unresponsive buttons on mobile). Without the cap, every
+    // SubSessionCard would rebuild viewItems over PREVIEW_EVENT_TAIL_LIMIT + N
+    // events on mount, freezing the main thread when many sub-sessions exist.
+    const totalEvents = PREVIEW_EVENT_TAIL_LIMIT + 100; // well above both caps
+    const events = Array.from({ length: totalEvents }, (_, index) => ({
+      eventId: `user-${index}`,
+      type: 'user.message',
+      ts: 1_700_000_000_000 + index,
+      payload: { text: `preview-msg-${index}` },
+    }));
+
+    render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_preview_brain"
+        preview
+      />,
+    );
+
+    // Last message must be visible — preview cards are tail-anchored.
+    expect(screen.getByText(`preview-msg-${totalEvents - 1}`)).toBeTruthy();
+    // Earliest tail entry within the preview render limit must be visible.
+    expect(
+      screen.getByText(`preview-msg-${totalEvents - PREVIEW_RENDER_ITEM_LIMIT}`),
+    ).toBeTruthy();
+    // Anything older than the render limit must NOT be rendered — that's the
+    // savings that keeps the main thread free.
+    expect(
+      screen.queryByText(`preview-msg-${totalEvents - PREVIEW_RENDER_ITEM_LIMIT - 1}`),
+    ).toBeNull();
+    expect(screen.queryByText('preview-msg-0')).toBeNull();
+    // Preview mode never shows the "Load older" affordance.
+    expect(screen.queryByText('chat.load_older')).toBeNull();
+  });
+
+  it('renders plain-text HTML path action only outside preview mode', () => {
+    const onPreviewFile = vi.fn();
+    const wsListeners = new Set<(msg: any) => void>();
+    const ws = {
+      fsReadFile: vi.fn(() => 'read-html-preview'),
+      onMessage: vi.fn((handler: (msg: any) => void) => {
+        wsListeners.add(handler);
+        return () => wsListeners.delete(handler);
+      }),
+    };
+    const events = [{
+      eventId: 'user-html-path',
+      type: 'user.message',
+      ts: Date.now(),
+      payload: { text: 'Open ./dist/index.HTML' },
+    }];
+
+    const { container, rerender } = render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        sessionId="deck_main_brain"
+        ws={ws as any}
+        workdir="/repo"
+        onPreviewFile={onPreviewFile}
+      />,
+    );
+
+    const htmlButton = container.querySelector('.chat-html-preview-btn') as HTMLButtonElement | null;
+    expect(htmlButton).not.toBeNull();
+    fireEvent.click(htmlButton!);
+    expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./dist/index.HTML');
+    expect(onPreviewFile).not.toHaveBeenCalled();
+    expect(container.querySelector('.html-fullscreen-preview')).toBeNull();
+    expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
+
+    act(() => {
+      for (const listener of wsListeners) {
+        listener({
+          type: 'fs.read_response',
+          requestId: 'read-html-preview',
+          path: '/repo/./dist/index.HTML',
+          status: 'ok',
+          content: '<!doctype html><title>Preview</title><main>Hello</main>',
+        });
+      }
+    });
+    expect(document.body.querySelector('.html-safe-preview-frame')).not.toBeNull();
+
+    fireEvent.click(document.body.querySelector('.html-fullscreen-preview-close') as HTMLButtonElement);
+    expect(document.body.querySelector('.html-fullscreen-preview')).toBeNull();
+
+    fireEvent.click(htmlButton!);
+    act(() => {
+      for (const listener of wsListeners) {
+        listener({
+          type: 'fs.read_response',
+          requestId: 'read-html-preview',
+          path: '/repo/./dist/index.HTML',
+          status: 'ok',
+          content: '<!doctype html><title>Preview again</title>',
+        });
+      }
+    });
+    expect(document.body.querySelector('.html-safe-preview-frame')).not.toBeNull();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(document.body.querySelector('.html-fullscreen-preview')).toBeNull();
+
+    rerender(
+      <ChatView
+        events={events as any}
+        loading={false}
+        sessionId="deck_preview_brain"
+        preview
+        ws={{} as any}
+        workdir="/repo"
+        onPreviewFile={onPreviewFile}
+      />,
+    );
+    expect(container.querySelector('.chat-html-preview-btn')).toBeNull();
+  });
+
+  it('loads inline local image previews from resolved chat file paths', async () => {
+    const wsListeners = new Set<(msg: any) => void>();
+    const ws = {
+      fsReadFile: vi.fn(() => 'read-image-preview'),
+      onMessage: vi.fn((handler: (msg: any) => void) => {
+        wsListeners.add(handler);
+        return () => wsListeners.delete(handler);
+      }),
+    };
+    const events = [{
+      eventId: 'user-image-path',
+      type: 'user.message',
+      ts: Date.now(),
+      payload: { text: 'See ./screenshots/result.png' },
+    }];
+
+    const { container, unmount } = render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        sessionId="deck_image_preview"
+        ws={ws as any}
+        workdir="/repo"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./screenshots/result.png');
+    });
+
+    act(() => {
+      for (const listener of wsListeners) {
+        listener({
+          type: 'fs.read_response',
+          requestId: 'read-image-preview',
+          path: '/repo/./screenshots/result.png',
+          status: 'ok',
+          encoding: 'base64',
+          mimeType: 'image/png',
+          content: 'aW1n',
+        });
+      }
+    });
+
+    await waitFor(() => {
+      expect(container.querySelector('.chat-local-image-preview-img')).not.toBeNull();
+    });
+    const image = container.querySelector('.chat-local-image-preview-img') as HTMLImageElement;
+    expect(image.src).toBe('data:image/png;base64,aW1n');
+
+    unmount();
+
+    const second = render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        sessionId="deck_image_preview"
+        ws={ws as any}
+        workdir="/repo"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(second.container.querySelector('.chat-local-image-preview-img')).not.toBeNull();
+    });
+    expect(ws.fsReadFile).toHaveBeenCalledTimes(1);
   });
 
   it('always hides thinking events from the timeline regardless of preference', () => {
@@ -449,6 +749,54 @@ describe('ChatView', () => {
     });
   });
 
+  it('does not force bottom scroll for non-rendered status updates', async () => {
+    const initialEvents = [
+      {
+        eventId: 'evt-1',
+        type: 'assistant.text',
+        ts: 1000,
+        payload: { text: 'hello' },
+      },
+    ] as any;
+
+    const { container, rerender } = render(
+      <ChatView
+        events={initialEvents}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    Object.defineProperty(scrollEl, 'scrollTop', { configurable: true, writable: true, value: 0 });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1200 });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 200 });
+
+    await waitFor(() => {
+      expect(scrollEl.scrollTop).toBe(1200);
+    });
+
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
+    rerender(
+      <ChatView
+        events={[
+          ...initialEvents,
+          {
+            eventId: 'usage-1',
+            type: 'usage.update',
+            ts: 2000,
+            payload: { inputTokens: 10, outputTokens: 20 },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(scrollEl.scrollTop).toBe(1200);
+  });
+
   it('does not move the main chat viewport when a newer-timestamp message arrives while follow is paused', async () => {
     // Pins the fallback `lastVisibleTs` effect path. If only the layout
     // effect were gated, the timestamp-driven effect could still snap.
@@ -579,10 +927,81 @@ describe('ChatView', () => {
     await waitFor(() => {
       const btn = container.querySelector('.chat-scroll-btn') as HTMLButtonElement;
       expect(btn).toBeTruthy();
-      // Either the layout effect (viewItems) or the timestamp effect bumps the
-      // counter on each new event. We don't pin the exact number because both
-      // effects can fire — what matters is the button reports a count > 0.
-      expect(btn.textContent ?? '').toMatch(/^↓\s+\d+/);
+      expect(btn.textContent ?? '').toBe('↓ 2');
+      expect(btn.getAttribute('aria-label')).toBe('Jump to bottom (2 new)');
+    });
+  });
+
+  it('counts one new message for many streamed updates of the same event while follow is paused', async () => {
+    const initialEvents = [
+      { eventId: 'evt-1', type: 'assistant.text', ts: 1000, payload: { text: 'one' } },
+    ] as any;
+
+    const { container, rerender } = render(
+      <ChatView events={initialEvents} loading={false} sessionId="deck_main_brain" />,
+    );
+
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    Object.defineProperty(scrollEl, 'scrollTop', { configurable: true, writable: true, value: 0 });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1200 });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 200 });
+
+    await waitFor(() => {
+      expect(scrollEl.scrollTop).toBe(1200);
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 1300));
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
+    scrollEl.scrollTop = 1300;
+    fireEvent.scroll(scrollEl);
+
+    await waitFor(() => {
+      expect(container.querySelector('.chat-scroll-btn')?.textContent ?? '').toBe('↓');
+    });
+
+    rerender(
+      <ChatView
+        events={[
+          { eventId: 'evt-1', type: 'assistant.text', ts: 1000, payload: { text: 'one' } },
+          { eventId: 'evt-2', type: 'assistant.text', ts: 2000, payload: { text: 'two', streaming: true } },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(container.querySelector('.chat-scroll-btn')?.textContent ?? '').toBe('↓');
+
+    rerender(
+      <ChatView
+        events={[
+          { eventId: 'evt-1', type: 'assistant.text', ts: 1000, payload: { text: 'one' } },
+          { eventId: 'evt-2', type: 'assistant.text', ts: 2000, payload: { text: 'two chunks', streaming: true } },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(container.querySelector('.chat-scroll-btn')?.textContent ?? '').toBe('↓');
+
+    rerender(
+      <ChatView
+        events={[
+          { eventId: 'evt-1', type: 'assistant.text', ts: 1000, payload: { text: 'one' } },
+          { eventId: 'evt-2', type: 'assistant.text', ts: 2000, payload: { text: 'two final' } },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    await waitFor(() => {
+      const btn = container.querySelector('.chat-scroll-btn') as HTMLButtonElement;
+      expect(btn.textContent ?? '').toBe('↓ 1');
+      expect(btn.getAttribute('aria-label')).toBe('Jump to bottom (1 new)');
     });
   });
 
@@ -698,11 +1117,21 @@ describe('ChatView', () => {
             payload: {
               reason: 'startup',
               injectedText: '[Related past work]\n- [codedeck] Fix websocket reconnect loop',
+              preferenceItems: [
+                { id: 'pref-1', text: 'Use pnpm for project commands' },
+              ],
               items: [
                 {
                   id: 'mem-1',
                   projectId: 'codedeck',
                   summary: 'Fix websocket reconnect loop',
+                  projectionClass: 'durable_memory_candidate',
+                },
+                {
+                  id: 'mem-2',
+                  projectId: 'codedeck',
+                  summary: 'Recent MCP startup injection work',
+                  projectionClass: 'recent_summary',
                 },
               ],
             },
@@ -722,7 +1151,12 @@ describe('ChatView', () => {
 
     await waitFor(() => {
       expect(container.textContent).toContain('chat.memory_context_startup_reason');
+      expect(container.textContent).toContain('chat.memory_context_section_preferences');
+      expect(container.textContent).toContain('Use pnpm for project commands');
+      expect(container.textContent).toContain('chat.memory_context_section_durable');
       expect(container.textContent).toContain('Fix websocket reconnect loop');
+      expect(container.textContent).toContain('chat.memory_context_section_recent');
+      expect(container.textContent).toContain('Recent MCP startup injection work');
     });
   });
 
@@ -1091,6 +1525,28 @@ describe('ChatView', () => {
     );
 
     expect(container.textContent).toContain('session.state_stop_requested');
+  });
+
+  it('renders transport Compact feedback as a visible system block', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-compact-requested',
+            type: 'session.state',
+            ts: 1000,
+            payload: {
+              state: SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
+              reason: SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.textContent).toContain('session.state_compacting');
   });
 
   it('opens external URLs in the themed confirmation dialog', () => {

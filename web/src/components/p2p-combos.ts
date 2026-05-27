@@ -6,6 +6,7 @@ import { parseJsonValue, usePref } from '../hooks/usePref.js';
 export const CUSTOM_COMBOS_PREF_KEY = PREF_KEY_P2P_CUSTOM_COMBOS;
 export const BUILDER_MODES = ['audit', 'review', 'plan', 'brainstorm', 'discuss'] as const;
 export const MAX_CUSTOM_COMBOS = 5;
+export const RECOMMENDED_COMBO_KEY = 'audit>review>plan';
 
 const MODE_COLORS: Record<string, string> = {
   config: '#94a3b8',
@@ -28,6 +29,10 @@ export function comboModeLabel(key: string, t: (key: string) => string): string 
     .split(COMBO_SEPARATOR)
     .map((mode) => t(`p2p.mode_${mode.trim()}`))
     .join('→');
+}
+
+export function isRecommendedCombo(key: string): boolean {
+  return key === RECOMMENDED_COMBO_KEY;
 }
 
 export function normalizeCustomCombos(raw: unknown): string[] {

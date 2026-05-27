@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatDaemonVersionShort } from '../src/util/format-version.js';
+import { formatDaemonVersionMobile, formatDaemonVersionShort } from '../src/util/format-version.js';
 
 describe('formatDaemonVersionShort', () => {
   it('strips the trailing .NNN counter after a -dev tag', () => {
@@ -36,5 +36,15 @@ describe('formatDaemonVersionShort', () => {
     // truncation rule is anchored to a *letter* prefix to avoid eating
     // those — we only collapse human-named tags like dev / rc / beta.
     expect(formatDaemonVersionShort('1.0.0-1.2')).toBe('1.0.0-1.2');
+  });
+
+  it('hides the leading year segment for mobile dev builds', () => {
+    expect(formatDaemonVersionMobile('2026.5.2359-dev.61')).toBe('5.2359-dev');
+    expect(formatDaemonVersionMobile('2026.5.2359-dev')).toBe('5.2359-dev');
+  });
+
+  it('keeps non-dev mobile versions unchanged after normal shortening', () => {
+    expect(formatDaemonVersionMobile('2026.5.2359')).toBe('2026.5.2359');
+    expect(formatDaemonVersionMobile('2026.5.2359-rc.2')).toBe('2026.5.2359-rc');
   });
 });

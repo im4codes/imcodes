@@ -33,6 +33,18 @@ const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const CODEX_SDK_MODEL_SUGGESTIONS = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_SUGGESTIONS = [...GEMINI_MODEL_IDS] as const;
+const responsiveDialogStyle = {
+  // Hard-cap against the visual viewport instead of relying on flex padding.
+  // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
+  // which clips the custom-provider help text into one-character columns.
+  width: 'calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)',
+  maxWidth: 380,
+  minWidth: 0,
+  boxSizing: 'border-box',
+  // Long help/preset labels (e.g. Qwen provider URLs) must wrap inside the
+  // narrow viewport instead of forcing the dialog to grow past max-width.
+  overflowWrap: 'anywhere',
+} as const;
 
 interface Props {
   ws: WsClient | null;
@@ -50,6 +62,8 @@ type OpenClawMode = 'new' | 'bind';
 export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose, onToast }: Props) {
   const { t } = useTranslation();
   const [type, setType] = useState('claude-code-sdk');
+  const [lastUnlockedType, setLastUnlockedType] = useState('claude-code-sdk');
+  const [customProviderSdk, setCustomProviderSdk] = useState(false);
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>('/bin/bash');
   const [cwd, setCwd] = useState(defaultCwd ?? '');
@@ -111,6 +125,22 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     setCcPresets(updated);
     try { ws?.send({ type: CC_PRESET_MSG.SAVE, requestId: `cc-preset-save-${Date.now()}`, presets: updated }); } catch {}
     return preset;
+  };
+  const selectType = (nextType: string) => {
+    if (customProviderSdk && nextType !== 'qwen') return;
+    setType(nextType);
+    if (!customProviderSdk) setLastUnlockedType(nextType);
+    setPresetError('');
+  };
+  const toggleCustomProviderSdk = (enabled: boolean) => {
+    setCustomProviderSdk(enabled);
+    setPresetError('');
+    if (enabled) {
+      if (type !== 'qwen') setLastUnlockedType(type);
+      setType('qwen');
+      return;
+    }
+    setType(lastUnlockedType);
   };
   const selectedCcPreset = useMemo(
     () => ccPresets.find((preset) => preset.name === ccPreset),
@@ -209,6 +239,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   }, [type]);
 
   useEffect(() => {
+    if (!customProviderSdk) return;
+    if (type !== 'qwen') setType('qwen');
+    if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
+  }, [ccPreset, ccPresets, customProviderSdk, type]);
+
+  useEffect(() => {
     if (type !== 'qwen') return;
     const fallbackModel = selectedCcPreset ? (getCcPresetEffectiveModel(selectedCcPreset) ?? '') : '';
     setRequestedModel((current) => {
@@ -232,6 +268,11 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
 
   const handleStart = () => {
     const desc = description.trim() || undefined;
+    if (customProviderSdk && !ccPreset) {
+      setPresetError(t('new_session.custom_provider_preset_required'));
+      setShowPresetEditor(true);
+      return;
+    }
     if (type === 'script') {
       if (!scriptCmd.trim()) return;
       const interval = Math.max(1, parseInt(scriptInterval, 10) || 5);
@@ -256,7 +297,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || type === 'qwen')) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if ((type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'kimi-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -273,9 +314,14 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             ? OPENCLAW_THINKING_LEVELS
             : [];
   const supportsCcPreset = type === 'claude-code' || type === 'qwen';
+  const providerPresetLabel = customProviderSdk
+    ? t('new_session.custom_provider_preset')
+    : type === 'qwen'
+      ? t('new_session.compatible_api_via_qwen')
+      : t('new_session.api_provider');
   const dynamicModelsAgentType = supportsDynamicTransportModels(type) ? type : null;
   const transportModels = useTransportModels(ws, dynamicModelsAgentType);
-  const supportsModelSelection = type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || (type === 'qwen' && !!selectedCcPreset);
+  const supportsModelSelection = type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'kimi-sdk' || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = useMemo(() => (
     type === 'qwen' && selectedCcPreset
       ? qwenPresetModels
@@ -312,7 +358,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
 
   return (
     <div class="dialog-overlay">
-      <div class="dialog" style={{ width: 380 }}>
+      <div class="dialog" style={responsiveDialogStyle}>
         <div class="dialog-header">
           <span>New Sub-Session</span>
           <button class="dialog-close" onClick={onClose}>×</button>
@@ -331,7 +377,8 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                       <button
                         key={choice.id}
                         class={`subsession-type-btn${type === choice.id ? ' active' : ''}`}
-                        onClick={() => setType(choice.id)}
+                        disabled={customProviderSdk && choice.id !== 'qwen'}
+                        onClick={() => selectType(choice.id)}
                       >
                         <span>{choice.icon}</span> {getSessionAgentLabel(t, choice)}
                       </button>
@@ -339,6 +386,53 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   </div>
                 </div>
               ))}
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  cursor: 'pointer',
+                }}
+              >
+                {/*
+                 * Mirror NewSessionDialog: width:auto + margin:0 defend
+                 * against any global `input { width: 100% }` rule (this
+                 * dialog doesn't currently use .form-group but the
+                 * regression must stay symmetric). flex:1 1 auto + minWidth:0
+                 * on the span lets the label text wrap normally inside the
+                 * dialog instead of overflowing.
+                 */}
+                <input
+                  type="checkbox"
+                  checked={customProviderSdk}
+                  onChange={(e) => toggleCustomProviderSdk((e.target as HTMLInputElement).checked)}
+                  style={{ flex: '0 0 auto', width: 'auto', margin: 0 }}
+                />
+                <span
+                  style={{
+                    color: '#e2e8f0',
+                    fontSize: 13,
+                    overflowWrap: 'break-word',
+                    minWidth: 0,
+                    flex: '1 1 auto',
+                  }}
+                >
+                  {t('new_session.custom_provider_sdk')}
+                </span>
+              </label>
+              <div
+                style={{
+                  marginLeft: 24,
+                  marginTop: 4,
+                  color: '#94a3b8',
+                  fontSize: 12,
+                  lineHeight: 1.35,
+                }}
+              >
+                {t('new_session.custom_provider_sdk_help')}
+              </div>
             </div>
             <QwenCodingPlanHint selected={type === 'qwen'} />
           </div>
@@ -477,7 +571,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             <>
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                  <span style={{ fontSize: 12, color: '#94a3b8' }}>{type === 'qwen' ? 'Compatible API (via Qwen)' : t('new_session.api_provider')}</span>
+                  <span style={{ fontSize: 12, color: '#94a3b8' }}>{providerPresetLabel}</span>
                   <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 11, padding: 0 }} onClick={() => setShowPresetEditor(!showPresetEditor)}>
                     {showPresetEditor ? `▾ ${t('common.close')}` : t('new_session.api_provider_add_edit')}
                   </button>

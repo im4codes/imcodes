@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact';
+import { act, render, screen, fireEvent, cleanup } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -65,6 +65,7 @@ describe('SessionTabs', () => {
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
   });
 
   beforeEach(() => {
@@ -141,6 +142,113 @@ describe('SessionTabs', () => {
 
     expect(onSelect).toHaveBeenCalledOnce();
     expect(onSelect).toHaveBeenCalledWith('session_w2');
+  });
+
+  it('selects a pinned tab on mouse pointer-up even if the browser suppresses the click', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }, { name: 'session_w2' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={onSelect}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set(['session_w2'])}
+      />,
+    );
+
+    const pinnedTab = screen.getAllByRole('tab')[0];
+    fireEvent.mouseDown(pinnedTab, {
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.mouseUp(pinnedTab, {
+      button: 0,
+      clientX: 25,
+      clientY: 13,
+    });
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(onSelect).toHaveBeenCalledWith('session_w2');
+  });
+
+  it('does not double-select when the normal mouse click follows pointer-up activation', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    fireEvent.mouseDown(tab, {
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.mouseUp(tab, {
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.click(tab);
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(onSelect).toHaveBeenCalledWith('session_w1');
+  });
+
+  it('does not activate from the mouse pointer fallback after a drag-sized move', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    fireEvent.mouseDown(tab, {
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.mouseMove(tab, {
+      button: 0,
+      clientX: 40,
+      clientY: 12,
+    });
+    fireEvent.mouseUp(tab, {
+      button: 0,
+      clientX: 40,
+      clientY: 12,
+    });
+
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('opens the tab context menu from a touch long-press without selecting the tab', () => {
+    vi.useFakeTimers();
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    fireEvent.pointerDown(tab, {
+      pointerId: 7,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    act(() => {
+      vi.advanceTimersByTime(520);
+    });
+
+    expect(screen.getByText('📌 Pin')).toBeDefined();
+
+    fireEvent.click(tab);
+    expect(onSelect).not.toHaveBeenCalled();
   });
 
   it('renders brain tab with brain class and project name', () => {

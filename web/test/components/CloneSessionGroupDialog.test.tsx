@@ -56,10 +56,10 @@ vi.mock('react-i18next', () => ({
         'session.clone.errorCode.invalid_cwd': 'The working directory is invalid on the daemon host.',
         'session.clone.errorCode.name_taken': 'That target session name is already in use.',
         'session.clone.errorCode.cleanup_required': 'The copy needs manual cleanup before retrying.',
-        'session.clone.errorCode.server_p2p_commit_failed': 'The server could not copy the P2P settings.',
-        'session.clone.warningCode.p2p_prompt_session_reference': 'Free-text P2P reference may still mention the source',
+        'session.clone.errorCode.server_p2p_commit_failed': 'The server could not copy the Team settings.',
+        'session.clone.warningCode.p2p_prompt_session_reference': 'Free-text Team reference may still mention the source',
         'session.clone.warningCode.scheduled_work_skipped': 'Scheduled work was not copied',
-        'session.clone.cleanupResourceKind.server_p2p_pref': 'server P2P preference',
+        'session.clone.cleanupResourceKind.server_p2p_pref': 'server Team preference',
         'session.clone.cleanupResourceKind.daemon_session': 'daemon session',
         'session.clone.skippedReason.stopped': 'stopped',
         'session.clone.skippedReason.unsupported': 'unsupported',
@@ -342,7 +342,7 @@ describe('CloneSessionGroupDialog', () => {
     expect(screen.getByText('Cleanup required')).toBeDefined();
     expect(screen.getByText('Manual cleanup may be required.')).toBeDefined();
     expect(screen.getByText('The copy needs manual cleanup before retrying.')).toBeDefined();
-    expect(screen.getByText('server P2P preference: p2p_session_config:server-1:deck_cd_1_brain')).toBeDefined();
+    expect(screen.getByText('server Team preference: p2p_session_config:server-1:deck_cd_1_brain')).toBeDefined();
     expect(screen.getByText('daemon session: deck_cd_1_brain')).toBeDefined();
   });
 
@@ -373,7 +373,7 @@ describe('CloneSessionGroupDialog', () => {
     }));
 
     expect(screen.getByText('2 warning(s)')).toBeDefined();
-    expect(screen.getByText('Free-text P2P reference may still mention the source: deck_cd_brain / workflowLibrary[0].nodes[0].promptAppend')).toBeDefined();
+    expect(screen.getByText('Free-text Team reference may still mention the source: deck_cd_brain / workflowLibrary[0].nodes[0].promptAppend')).toBeDefined();
     expect(screen.getByText('Scheduled work was not copied')).toBeDefined();
     expect(screen.getByText('2 skipped member(s)')).toBeDefined();
     expect(screen.getByText('deck_sub_stopped_worker: stopped')).toBeDefined();
@@ -388,7 +388,7 @@ describe('CloneSessionGroupDialog', () => {
       ['forbidden', 'Only owners and admins can copy groups.'],
       ['invalid_cwd', 'The working directory is invalid on the daemon host.'],
       ['name_taken', 'That target session name is already in use.'],
-      ['server_p2p_commit_failed', 'The server could not copy the P2P settings.'],
+      ['server_p2p_commit_failed', 'The server could not copy the Team settings.'],
     ] as const;
 
     for (const [errorCode, expectedText] of cases) {

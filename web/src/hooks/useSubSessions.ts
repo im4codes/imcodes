@@ -99,10 +99,10 @@ export function useSubSessions(
           if (gen !== loadGenRef.current) return;
           console.warn(`[sub-sessions] loaded ${list.length} for server ${serverId}`);
           loadedGenRef.current = gen;
-          setSubSessions((prev) => list.map((s) => mergeLoadedSubSession(
-            s,
-            prev.find((existing) => existing.id === s.id),
-          )));
+          setSubSessions((prev) => {
+            const previousById = new Map(prev.map((existing) => [existing.id, existing] as const));
+            return list.map((s) => mergeLoadedSubSession(s, previousById.get(s.id)));
+          });
           setLoadedServerId(serverId);
         })
         .catch((err) => {
@@ -180,6 +180,8 @@ export function useSubSessions(
                 ...((m.quotaUsageLabel != null || (!preserveQuota && m.quotaUsageLabel === null)) ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
                 ...((m.quotaMeta != null || (!preserveQuota && m.quotaMeta === null)) ? { quotaMeta: m.quotaMeta } : {}),
                 ...(m.effort != null && { effort: m.effort }),
+                ...(m.contextNamespace !== undefined && { contextNamespace: m.contextNamespace }),
+                ...(m.contextNamespaceDiagnostics !== undefined && { contextNamespaceDiagnostics: m.contextNamespaceDiagnostics }),
                 ...(m.transportConfig !== undefined && {
                   transportConfig: mergeTransportConfigPreservingSupervision(
                     m.transportConfig,
@@ -229,6 +231,8 @@ export function useSubSessions(
               quotaUsageLabel: m.quotaUsageLabel ?? null,
               quotaMeta: m.quotaMeta ?? null,
               effort: m.effort ?? null,
+              contextNamespace: m.contextNamespace ?? null,
+              contextNamespaceDiagnostics: m.contextNamespaceDiagnostics ?? null,
               transportConfig: m.transportConfig ?? null,
               transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages),
               transportPendingMessageEntries: normalizeTransportPendingEntries(
@@ -272,6 +276,8 @@ export function useSubSessions(
               ...((m.quotaUsageLabel != null || (!preserveQuota && m.quotaUsageLabel === null)) ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
               ...((m.quotaMeta != null || (!preserveQuota && m.quotaMeta === null)) ? { quotaMeta: m.quotaMeta } : {}),
               ...(m.effort !== undefined ? { effort: m.effort } : {}),
+              ...(m.contextNamespace !== undefined ? { contextNamespace: m.contextNamespace } : {}),
+              ...(m.contextNamespaceDiagnostics !== undefined ? { contextNamespaceDiagnostics: m.contextNamespaceDiagnostics } : {}),
               ...(m.transportConfig !== undefined ? {
                 transportConfig: mergeTransportConfigPreservingSupervision(
                   m.transportConfig,

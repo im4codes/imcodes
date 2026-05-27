@@ -25,3 +25,10 @@ export function formatDaemonVersionShort(version: string | null | undefined): st
   //   '2026.4.1873'          → '2026.4.1873'
   return version.replace(/(-[A-Za-z]+)\.\d+$/, '$1');
 }
+
+export function formatDaemonVersionMobile(version: string | null | undefined): string {
+  const short = formatDaemonVersionShort(version);
+  if (!short) return '';
+  if (!/-dev(?:$|\.)/.test(short)) return short;
+  return short.replace(/^[^.]+\./, '');
+}

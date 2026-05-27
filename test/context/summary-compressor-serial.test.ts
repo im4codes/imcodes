@@ -124,7 +124,7 @@ describe('summary-compressor — concurrent compressWithSdk calls serialize', ()
 
     expect(results).toHaveLength(3);
     for (const r of results) {
-      expect(r.summary).toBe('SUMMARY');
+      expect(r.summary).toBe('## Done\nSUMMARY');
       expect(r.fromSdk).toBe(true);
     }
 
@@ -227,7 +227,7 @@ describe('summary-compressor — concurrent compressWithSdk calls serialize', ()
     try {
       const { compressWithSdk } = await import('../../src/context/summary-compressor.js');
       const result = await compressWithSdk(makeInput('windows-path'));
-      expect(result.summary).toBe('SUMMARY');
+      expect(result.summary).toBe('## Done\nSUMMARY');
       expect(result.fromSdk).toBe(true);
     } finally {
       Object.defineProperty(process, 'platform', { value: origPlatform });

@@ -15,6 +15,34 @@ import { useTranslation } from 'react-i18next';
 import { splitTextByHttpUrls, trimDetectedUrl } from '../link-detection.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import { shouldSkipRichTextEnhancement } from '../chat-render-limits.js';
+import {
+  isImagePreviewPath,
+  isLikelyDomainPath,
+  isLocalChatPath,
+  renderChatPathActions,
+  type ChatPathDownloadHandler,
+} from '../chat-path-actions.js';
+import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
+
+interface Props {
+  text: string;
+  onPathClick?: (path: string) => void;
+  onUrlClick?: (url: string) => void;
+  /** Called to download a file path. Only shown for paths with extensions. */
+  onDownload?: ChatPathDownloadHandler;
+  onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
+}
+
+interface RenderContext {
+  onPathClick?: (path: string) => void;
+  onUrlClick?: (url: string) => void;
+  onDownload?: ChatPathDownloadHandler;
+  onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
+  downloadLabel: string;
+  htmlPreviewLabel: string;
+}
 
 // ── Code block with copy button ────────────────────────────────────────────
 
@@ -24,12 +52,20 @@ function CodeBlock({
   onPathClick,
   onUrlClick,
   onDownload,
+  onHtmlPreview,
+  onImagePreview,
+  downloadLabel,
+  htmlPreviewLabel,
 }: {
   lang?: string;
   text: string;
   onPathClick?: (path: string) => void;
   onUrlClick?: (url: string) => void;
-  onDownload?: (path: string) => void;
+  onDownload?: ChatPathDownloadHandler;
+  onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
+  downloadLabel: string;
+  htmlPreviewLabel: string;
 }) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
@@ -40,6 +76,16 @@ function CodeBlock({
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     });
+  };
+
+  const renderContext: RenderContext = {
+    onPathClick,
+    onUrlClick,
+    onDownload,
+    onHtmlPreview,
+    onImagePreview,
+    downloadLabel,
+    htmlPreviewLabel,
   };
 
   return (
@@ -67,157 +113,134 @@ function CodeBlock({
           </button>
         </div>
       </div>
-      <pre><code>{splitPathsAndUrlsInternal(text, onPathClick, onUrlClick, onDownload)}</code></pre>
+      <pre><code>{splitPathsAndUrlsInternal(text, renderContext)}</code></pre>
     </div>
   );
 }
 
-interface Props {
-  text: string;
-  onPathClick?: (path: string) => void;
-  onUrlClick?: (url: string) => void;
-  /** Called to download a file path. Only shown for paths with extensions. */
-  onDownload?: (path: string) => void;
-}
-
-/** Returns true if the path has a file extension (not a directory). */
-function hasFileExtension(path: string): boolean {
-  const basename = path.split(/[/\\]/).pop() ?? '';
-  return /\.\w{1,10}$/.test(basename);
-}
-
-function isLikelyDomainPath(value: string): boolean {
-  return /^(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/|$)/i.test(value);
-}
-
 // ── Token rendering ─────────────────────────────────────────────────────────
-
-function isLocalPath(href: string): boolean {
-  if (/^https?:\/\//i.test(href)) return false;
-  if (/^mailto:/i.test(href)) return false;
-  if (/^[a-z]+:/i.test(href)) return false; // any other scheme
-  return true;
-}
 
 function renderTokens(
   tokens: Token[],
-  onPathClick?: (p: string) => void,
-  onUrlClick?: (url: string) => void,
+  ctx: RenderContext,
   inLink = false,
-  onDownload?: (p: string) => void,
 ): h.JSX.Element[] {
-  return tokens.map((token, i) => renderToken(token, i, onPathClick, onUrlClick, inLink, onDownload));
+  return tokens.map((token, i) => renderToken(token, i, ctx, inLink));
 }
 
 function renderInlineTokens(
   tokens: Token[] | undefined,
-  onPathClick?: (p: string) => void,
-  onUrlClick?: (url: string) => void,
+  ctx: RenderContext,
   inLink = false,
-  onDownload?: (p: string) => void,
 ): h.JSX.Element[] {
   if (!tokens || tokens.length === 0) return [];
-  return renderTokens(tokens, onPathClick, onUrlClick, inLink, onDownload);
+  return renderTokens(tokens, ctx, inLink);
 }
 
 function renderToken(
   token: Token,
   key: number,
-  onPathClick?: (p: string) => void,
-  onUrlClick?: (url: string) => void,
+  ctx: RenderContext,
   inLink = false,
-  onDownload?: (p: string) => void,
 ): h.JSX.Element {
   switch (token.type) {
     case 'heading': {
       const t = token as Tokens.Heading;
       const Tag = `h${t.depth}` as keyof h.JSX.IntrinsicElements;
-      return <Tag key={key} class="chat-heading">{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink, onDownload)}</Tag>;
+      return <Tag key={key} class="chat-heading">{renderInlineTokens(t.tokens, ctx, inLink)}</Tag>;
     }
 
     case 'paragraph': {
       const t = token as Tokens.Paragraph;
       const plainEscapedParagraph = !inLink && Array.isArray(t.tokens) && t.tokens.every((child) => child.type === 'text' || child.type === 'escape');
       if (plainEscapedParagraph) {
-        return <p key={key}>{splitPathsAndUrlsInternal(t.raw, onPathClick, onUrlClick, onDownload)}</p>;
+        return <p key={key}>{splitPathsAndUrlsInternal(t.raw, ctx)}</p>;
       }
-      return <p key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink, onDownload)}</p>;
+      return <p key={key}>{renderInlineTokens(t.tokens, ctx, inLink)}</p>;
     }
 
     case 'text': {
       const t = token as Tokens.Text;
       // Text tokens may have sub-tokens (e.g. from inline parsing)
       if ('tokens' in t && t.tokens && t.tokens.length > 0) {
-        return <span key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink, onDownload)}</span>;
+        return <span key={key}>{renderInlineTokens(t.tokens, ctx, inLink)}</span>;
       }
       // Plain text — apply path/URL detection IF NOT already inside a link
       if (inLink) return <span key={key}>{t.raw}</span>;
-      return <span key={key}>{splitPathsAndUrlsInternal(t.raw, onPathClick, onUrlClick, onDownload)}</span>;
+      return <span key={key}>{splitPathsAndUrlsInternal(t.raw, ctx)}</span>;
     }
 
     case 'strong': {
       const t = token as Tokens.Strong;
-      return <strong key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink, onDownload)}</strong>;
+      return <strong key={key}>{renderInlineTokens(t.tokens, ctx, inLink)}</strong>;
     }
 
     case 'em': {
       const t = token as Tokens.Em;
-      return <em key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink, onDownload)}</em>;
+      return <em key={key}>{renderInlineTokens(t.tokens, ctx, inLink)}</em>;
     }
 
     case 'del': {
       const t = token as Tokens.Del;
-      return <del key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink, onDownload)}</del>;
+      return <del key={key}>{renderInlineTokens(t.tokens, ctx, inLink)}</del>;
     }
 
     case 'codespan': {
       const t = token as Tokens.Codespan;
       if (!inLink && splitTextByHttpUrls(t.text).some((chunk) => chunk.type === 'url')) {
-        return <code key={key} class="chat-inline-code">{splitPathsAndUrlsInternal(t.text, onPathClick, onUrlClick, onDownload)}</code>;
+        return <code key={key} class="chat-inline-code">{splitPathsAndUrlsInternal(t.text, ctx)}</code>;
       }
       // Detect file paths inside backtick code spans — agents commonly wrap paths in backticks
       PATH_REGEX_INLINE.lastIndex = 0;
-      if (onPathClick && PATH_REGEX_INLINE.test(t.text)) {
+      if ((ctx.onPathClick || ctx.onImagePreview) && PATH_REGEX_INLINE.test(t.text)) {
         PATH_REGEX_INLINE.lastIndex = 0;
-        return <span key={key}>
-          <code class="chat-inline-code chat-path-link" onClick={() => onPathClick(t.text)} title={t.text}>{t.text}</code>
-          {onDownload && hasFileExtension(t.text) && <button class="chat-dl-btn" title="Download" onClick={(e: Event) => { e.stopPropagation(); onDownload(t.text); }}>⬇</button>}
-        </span>;
+        return renderChatPathActions({
+          key,
+          path: t.text,
+          code: true,
+          onPathClick: ctx.onPathClick,
+          onDownload: ctx.onDownload,
+          onHtmlPreview: ctx.onHtmlPreview,
+          onImagePreview: ctx.onImagePreview,
+          downloadLabel: ctx.downloadLabel,
+          htmlPreviewLabel: ctx.htmlPreviewLabel,
+        });
       }
       return <code key={key} class="chat-inline-code">{t.text}</code>;
     }
 
     case 'code': {
       const t = token as Tokens.Code;
-      return <CodeBlock key={key} lang={t.lang} text={t.text} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} />;
+      return (
+        <CodeBlock
+          key={key}
+          lang={t.lang}
+          text={t.text}
+          onPathClick={ctx.onPathClick}
+          onUrlClick={ctx.onUrlClick}
+          onDownload={ctx.onDownload}
+          onHtmlPreview={ctx.onHtmlPreview}
+          onImagePreview={ctx.onImagePreview}
+          downloadLabel={ctx.downloadLabel}
+          htmlPreviewLabel={ctx.htmlPreviewLabel}
+        />
+      );
     }
 
     case 'link': {
       const t = token as Tokens.Link;
-      if (isLocalPath(t.href)) {
-        return (
-          <span key={key}>
-            <span
-              class="chat-path-link"
-              onClick={() => onPathClick?.(t.href)}
-              title={t.href}
-            >
-              {renderInlineTokens(t.tokens, onPathClick, onUrlClick, true, onDownload)}
-            </span>
-            {onDownload && hasFileExtension(t.href) && (
-              <button
-                class="chat-dl-btn"
-                title="Download"
-                onClick={(e: Event) => {
-                  e.stopPropagation();
-                  onDownload(t.href);
-                }}
-              >
-                ⬇
-              </button>
-            )}
-          </span>
-        );
+      if (isLocalChatPath(t.href)) {
+        return renderChatPathActions({
+          key,
+          path: t.href,
+          content: renderInlineTokens(t.tokens, ctx, true),
+          onPathClick: ctx.onPathClick,
+          onDownload: ctx.onDownload,
+          onHtmlPreview: ctx.onHtmlPreview,
+          onImagePreview: ctx.onImagePreview,
+          downloadLabel: ctx.downloadLabel,
+          htmlPreviewLabel: ctx.htmlPreviewLabel,
+        });
       }
       const sanitizedHref = trimDetectedUrl(t.href);
       const inlineText = typeof (t as { text?: unknown }).text === 'string' ? String((t as { text?: unknown }).text) : '';
@@ -225,7 +248,7 @@ function renderToken(
       const trailingText = isAutoLinkLike && inlineText.startsWith(sanitizedHref)
         ? inlineText.slice(sanitizedHref.length)
         : '';
-      const linkText = isAutoLinkLike ? sanitizedHref : renderInlineTokens(t.tokens, onPathClick, onUrlClick, true, onDownload);
+      const linkText = isAutoLinkLike ? sanitizedHref : renderInlineTokens(t.tokens, ctx, true);
       const link = (
         <a
           class="chat-external-link"
@@ -234,9 +257,9 @@ function renderToken(
           target="_blank"
           rel="noopener noreferrer"
           onClick={(e: Event) => {
-            if (!onUrlClick) return;
+            if (!ctx.onUrlClick) return;
             e.preventDefault();
-            onUrlClick(sanitizedHref);
+            ctx.onUrlClick(sanitizedHref);
           }}
         >
           {linkText}
@@ -254,9 +277,9 @@ function renderToken(
           target="_blank"
           rel="noopener noreferrer"
           onClick={(e: Event) => {
-            if (!onUrlClick) return;
+            if (!ctx.onUrlClick) return;
             e.preventDefault();
-            onUrlClick(sanitizedHref);
+            ctx.onUrlClick(sanitizedHref);
           }}
         >
           {linkText}
@@ -266,6 +289,19 @@ function renderToken(
 
     case 'image': {
       const t = token as Tokens.Image;
+      if (isLocalChatPath(t.href) && isImagePreviewPath(t.href)) {
+        return renderChatPathActions({
+          key,
+          path: t.href,
+          content: t.text || t.href,
+          onPathClick: ctx.onPathClick,
+          onDownload: ctx.onDownload,
+          onHtmlPreview: ctx.onHtmlPreview,
+          onImagePreview: ctx.onImagePreview,
+          downloadLabel: ctx.downloadLabel,
+          htmlPreviewLabel: ctx.htmlPreviewLabel,
+        });
+      }
       return <img key={key} src={t.href} alt={t.text} title={t.title ?? undefined} style={{ maxWidth: '100%' }} />;
     }
 
@@ -277,7 +313,7 @@ function renderToken(
             <tr>
               {t.header.map((cell, ci) => (
                 <th key={ci} style={cell.align ? { textAlign: cell.align } : undefined}>
-                  {renderInlineTokens(cell.tokens, onPathClick, onUrlClick, false, onDownload)}
+                  {renderInlineTokens(cell.tokens, ctx, false)}
                 </th>
               ))}
             </tr>
@@ -287,7 +323,7 @@ function renderToken(
               <tr key={ri}>
                 {row.map((cell, ci) => (
                   <td key={ci} style={cell.align ? { textAlign: cell.align } : undefined}>
-                    {renderInlineTokens(cell.tokens, onPathClick, onUrlClick, false, onDownload)}
+                    {renderInlineTokens(cell.tokens, ctx, false)}
                   </td>
                 ))}
               </tr>
@@ -305,7 +341,7 @@ function renderToken(
           {t.items.map((item, li) => (
             <li key={li}>
               {item.task && <input type="checkbox" checked={item.checked} disabled style={{ marginRight: 4 }} />}
-              {renderTokens(item.tokens, onPathClick, onUrlClick, false, onDownload)}
+              {renderTokens(item.tokens, ctx, false)}
             </li>
           ))}
         </Tag>
@@ -314,7 +350,7 @@ function renderToken(
 
     case 'blockquote': {
       const t = token as Tokens.Blockquote;
-      return <blockquote key={key} class="chat-blockquote">{renderTokens(t.tokens, onPathClick, onUrlClick, false, onDownload)}</blockquote>;
+      return <blockquote key={key} class="chat-blockquote">{renderTokens(t.tokens, ctx, false)}</blockquote>;
     }
 
     case 'hr':
@@ -349,11 +385,9 @@ const PATH_REGEX_INLINE = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\
 
 function splitPathsAndUrlsInternal(
   text: string,
-  onPathClick?: (p: string) => void,
-  onUrlClick?: (url: string) => void,
-  onDownload?: (p: string) => void,
+  ctx: RenderContext,
 ): h.JSX.Element[] {
-  if (!onPathClick && !onUrlClick) return [<span>{text}</span>];
+  if (!ctx.onPathClick && !ctx.onUrlClick && !ctx.onImagePreview) return [<span>{text}</span>];
 
   const parts: h.JSX.Element[] = [];
   const chunks = splitTextByHttpUrls(text);
@@ -369,15 +403,15 @@ function splitPathsAndUrlsInternal(
           target="_blank"
           rel="noopener noreferrer"
           onClick={(e: Event) => {
-            if (!onUrlClick) return;
+            if (!ctx.onUrlClick) return;
             e.preventDefault();
-            onUrlClick(chunk.value);
+            ctx.onUrlClick(chunk.value);
           }}
         >
           {chunk.value}
         </a>,
       );
-    } else if (onPathClick) {
+    } else if (ctx.onPathClick || ctx.onImagePreview) {
       let pathLast = 0;
       PATH_REGEX_INLINE.lastIndex = 0;
       let pm: RegExpExecArray | null;
@@ -387,10 +421,16 @@ function splitPathsAndUrlsInternal(
         if (isLikelyDomainPath(path)) continue;
         if (pm.index > pathLast) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast, pm.index)}</span>);
         parts.push(
-          <span key={`p${chunk.start + pm.index}`}>
-            <span class="chat-path-link" onClick={() => onPathClick(path)} title={path}>{path}</span>
-            {onDownload && hasFileExtension(path) && <button class="chat-dl-btn" title="Download" onClick={(e: Event) => { e.stopPropagation(); onDownload(path); }}>⬇</button>}
-          </span>,
+          renderChatPathActions({
+            key: `p${chunk.start + pm.index}`,
+            path,
+            onPathClick: ctx.onPathClick,
+            onDownload: ctx.onDownload,
+            onHtmlPreview: ctx.onHtmlPreview,
+            onImagePreview: ctx.onImagePreview,
+            downloadLabel: ctx.downloadLabel,
+            htmlPreviewLabel: ctx.htmlPreviewLabel,
+          }),
         );
         pathLast = pm.index + pm[0].length;
       }
@@ -405,11 +445,21 @@ function splitPathsAndUrlsInternal(
 
 // ── Public component ────────────────────────────────────────────────────────
 
-export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload }: Props) {
+export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview }: Props) {
+  const { t } = useTranslation();
   const skipRichTextEnhancement = shouldSkipRichTextEnhancement(text);
   const tokens = useMemo(() => (
     skipRichTextEnhancement ? [] : marked.lexer(text)
   ), [skipRichTextEnhancement, text]);
+  const renderContext = useMemo<RenderContext>(() => ({
+    onPathClick,
+    onUrlClick,
+    onDownload,
+    onHtmlPreview,
+    onImagePreview,
+    downloadLabel: t('upload.download_file'),
+    htmlPreviewLabel: t('chat.html_preview', 'Render HTML'),
+  }), [onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t]);
 
   if (skipRichTextEnhancement) {
     return (
@@ -421,7 +471,7 @@ export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload }: Prop
 
   return (
     <div class="chat-rich-text">
-      {renderTokens(tokens, onPathClick, onUrlClick, false, onDownload)}
+      {renderTokens(tokens, renderContext, false)}
     </div>
   );
 }

@@ -242,13 +242,58 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
-    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
     expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined();
     const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
       .find((select) => Array.from(select.options).some((option) => option.value === 'MiniMax'));
     expect(presetSelect).toBeDefined();
     presetSelect!.value = 'MiniMax';
     fireEvent.input(presetSelect!, { target: { value: presetSelect!.value } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('qwen', undefined, '/tmp', undefined, {
+      ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M2.7',
+      thinking: 'high',
+    });
+  });
+
+  it('custom provider SDK locks sub-sessions to qwen and passes the selected preset', async () => {
+    const onStart = vi.fn();
+    const ws = makeWs();
+    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
+      handler({
+        type: 'cc.presets.list_response',
+        presets: [
+          {
+            name: 'MiniMax',
+            env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+            defaultModel: 'MiniMax-M2.7',
+            availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-Text-01' }],
+          },
+        ],
+      });
+      return () => {};
+    });
+
+    render(
+      <StartSubSessionDialog
+        ws={ws as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /qwen/i }).className).toContain('active'));
+    expect((screen.getByRole('button', { name: /codex_sdk/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText('custom_provider_preset')).toBeDefined();
+
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('qwen', undefined, '/tmp', undefined, {
@@ -294,7 +339,7 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
-    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
 
     fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
     fireEvent.click(screen.getByRole('button', { name: 'api_provider_export_json' }));
@@ -320,7 +365,7 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
-    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
 
     expect(screen.getByDisplayValue('https://api.minimax.io/anthropic')).toBeDefined();
@@ -397,6 +442,29 @@ describe('StartSubSessionDialog', () => {
 
     expect(onStart).toHaveBeenCalledWith('gemini-sdk', undefined, '/tmp', undefined, {
       requestedModel: 'auto',
+    });
+  });
+
+  it('passes requestedModel for kimi-sdk sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /kimi_sdk/i }));
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'moonshot-v1-auto,thinking' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('kimi-sdk', undefined, '/tmp', undefined, {
+      requestedModel: 'moonshot-v1-auto,thinking',
     });
   });
 

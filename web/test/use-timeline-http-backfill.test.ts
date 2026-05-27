@@ -1040,6 +1040,60 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
+  it('short browser visibility tab switches do not reset the active refresh cooldown', async () => {
+    const sessionName = `deck_short_visibility_${Date.now()}`;
+    const serverId = `srv-short-visibility-${Date.now()}`;
+
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history'),
+    } as unknown as WsClient;
+
+    function setVisibility(value: DocumentVisibilityState): void {
+      Object.defineProperty(document, 'visibilityState', {
+        configurable: true,
+        value,
+      });
+      document.dispatchEvent(new Event('visibilitychange'));
+    }
+
+    function Probe() {
+      useTimeline(sessionName, ws, serverId, { isActiveSession: true });
+      return h('div', { 'data-testid': 'probe' }, 'mounted');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    fetchSpy.mockClear();
+
+    await act(async () => {
+      setVisibility('hidden');
+      await vi.advanceTimersByTimeAsync(1000);
+      setVisibility('visible');
+      await vi.advanceTimersByTimeAsync(50);
+    });
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it('activation backfill is SILENT (does not flip refreshing) to keep the chat scroll smooth', async () => {
     // Pins the perf-regression we hit when activation backfill was made
     // visible: every focus/visibility/appStateChange tick that fired a

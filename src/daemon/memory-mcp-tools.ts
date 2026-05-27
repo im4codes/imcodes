@@ -20,6 +20,7 @@ import {
   type MemoryMcpToolName,
 } from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
+import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { resolveRuntimeScope } from '../../shared/session-scope.js';
 import {
@@ -27,25 +28,58 @@ import {
   isMcpFeatureEnabled,
   type MCPFeatureFlagValues,
 } from '../../shared/memory-mcp-feature-flags.js';
+import type { ContextNamespace } from '../../shared/context-types.js';
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
 import { memoryGetSources } from '../context/memory-read-tools.js';
-import { searchMcpMemoryRecall, type MemoryMcpSearchHit, type MemoryMcpSearchResult } from './memory-mcp-search.js';
+import { getMemorySourcesOrchestrated, type GetSourcesOrchestratorResult, type OrchestratorDeps } from './memory-get-sources-orchestrator.js';
+import { listMcpMemorySummaries, searchMcpMemoryRecall, type MemoryMcpListProjectionClass, type MemoryMcpSearchHit, type MemoryMcpSearchResult } from './memory-mcp-search.js';
 import type { MemorySearchQuery } from '../context/memory-search.js';
 import { saveObservation, savePreference } from '../context/memory-write-tools.js';
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
-import { listSessions as listStoredSessions } from '../store/session-store.js';
+import { listSessions as listStoredSessions, type SessionRecord } from '../store/session-store.js';
 import { dispatchSendMessage, listSendTargets, type SendToolDeps } from './send-tool.js';
 import { cronMcpCreate, cronMcpDelete, cronMcpList, cronMcpUpdate, type CronMcpClientOptions } from './cron-mcp-client.js';
+import { registerMemoryShortRef, resolveMemoryShortRef } from '../context/memory-short-ref.js';
+import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
 
 type ToolResult = Record<string, unknown>;
 export type MemoryMcpToolHandler = (input?: unknown) => Promise<ToolResult> | ToolResult;
 type MemoryMcpSearch = (query: MemorySearchQuery) => Promise<MemoryMcpSearchResult> | MemoryMcpSearchResult;
+type MemoryMcpListSummaries = (query: {
+  namespace?: MemorySearchQuery['namespace'];
+  currentEnterpriseId?: string;
+  repo?: string;
+  userId?: string;
+  includeLegacyPersonalOwner?: boolean;
+  projectionClass?: MemoryMcpListProjectionClass;
+  limit?: number;
+}) => Promise<MemoryMcpSearchResult> | MemoryMcpSearchResult;
+
+const repositoryIdentityService = new GitOriginRepositoryIdentityService();
 
 export interface MemoryMcpToolDeps {
   featureFlags?: MCPFeatureFlagValues;
   isMemoryFeatureEnabled?: (flag: MemoryFeatureFlag) => boolean;
   searchMemory?: MemoryMcpSearch;
+  listMemorySummaries?: MemoryMcpListSummaries;
+  /**
+   * @deprecated kept for tests that want to short-circuit local lookups.
+   * Production code uses the orchestrator which itself delegates to
+   * `memoryGetSources` for the same-server path.
+   */
   getMemorySources?: typeof memoryGetSources;
+  /**
+   * Orchestrator override. Tests inject a fake to exercise local-vs-remote
+   * branching without going through the cache or HTTP. When absent, the
+   * real `getMemorySourcesOrchestrated` is used.
+   */
+  getMemorySourcesOrchestrator?: (
+    projectionId: string,
+    caller: Parameters<typeof memoryGetSources>[1],
+    deps?: OrchestratorDeps,
+  ) => Promise<GetSourcesOrchestratorResult>;
+  /** Deps forwarded to the orchestrator (fetchImpl, loadCredentials, cache). */
+  orchestratorDeps?: OrchestratorDeps;
   saveObservation?: typeof saveObservation;
   savePreference?: typeof savePreference;
   sendDeps?: SendToolDeps;
@@ -105,6 +139,11 @@ function boolArg(args: Record<string, unknown>, key: string): boolean | undefine
   return typeof args[key] === 'boolean' ? args[key] : undefined;
 }
 
+function listProjectionClassArg(args: Record<string, unknown>): MemoryMcpListProjectionClass | undefined {
+  const value = args.projectionClass;
+  return value === 'recent_summary' || value === 'durable_memory_candidate' ? value : undefined;
+}
+
 function stringArrayArg(args: Record<string, unknown>, key: string): string[] | undefined {
   const value = args[key];
   if (!Array.isArray(value)) return undefined;
@@ -144,25 +183,95 @@ function memorySurfaceGate(deps: MemoryMcpToolDeps, extra: Record<string, unknow
   return isMcpMemorySurfaceEnabled(deps) ? null : disabled(MEMORY_MCP_DISABLED_FLAGS.MEMORY_SURFACE, extra);
 }
 
-function compactSearchHit(item: MemoryMcpSearchHit) {
+function compactSearchHit(item: MemoryMcpSearchHit, namespace: Parameters<typeof registerMemoryShortRef>[0]['namespace']) {
+  if (item.observationId) {
+    const observationId = item.observationId;
+    const ref = registerMemoryShortRef({ kind: 'observation', id: observationId, namespace });
+    return {
+      observationId,
+      ref,
+      recordKind: 'observation',
+      sourceLookup: {
+        tool: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+        kind: 'observation',
+        observationId,
+      },
+      summary: item.summary,
+      observationClass: item.observationClass,
+      observationState: item.observationState,
+      matchKind: item.matchKind,
+      projectId: item.projectId,
+      scope: item.scope,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      relevanceScore: item.relevanceScore,
+      source: item.source,
+    };
+  }
+  const ref = registerMemoryShortRef({ kind: 'projection', id: item.projectionId, namespace });
   return {
     projectionId: item.projectionId,
+    ref,
+    recordKind: 'projection',
+    sourceLookup: {
+      tool: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+      kind: 'projection',
+      projectionId: item.projectionId,
+    },
     summary: item.summary,
     projectionClass: item.projectionClass,
+    matchKind: item.matchKind,
     projectId: item.projectId,
     scope: item.scope,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     relevanceScore: item.relevanceScore,
     source: item.source,
+    // Surface the originating daemon so callers can locate the raw events
+    // for follow-up source resolution. Omitted (not null) when unknown, to
+    // keep the wire shape minimal for older clients that ignore the field.
+    ...(typeof item.originServerId === 'string' && item.originServerId
+      ? { originServerId: item.originServerId }
+      : {}),
+  };
+}
+
+function fallbackProjectIdFromRoot(projectRoot: string | null | undefined): string | undefined {
+  const root = projectRoot?.trim();
+  if (!root) return undefined;
+  return repositoryIdentityService.resolve({ cwd: root }).key;
+}
+
+function projectScopedNamespace(
+  caller: McpRuntimeCaller,
+  session: SessionRecord | undefined,
+  projectRoot: string | null,
+): ContextNamespace {
+  const sessionProjectId = session?.contextNamespace?.projectId?.trim();
+  const callerProjectId = caller.namespace.projectId?.trim();
+  const fallbackProjectId = fallbackProjectIdFromRoot(projectRoot);
+  const projectId = sessionProjectId ?? callerProjectId ?? fallbackProjectId;
+  const base = sessionProjectId ? (session?.contextNamespace ?? caller.namespace) : caller.namespace;
+  if (!projectId) return base;
+  const scope = base.scope === 'user_private' ? 'personal' : base.scope;
+  const userId = base.userId?.trim() || caller.userId;
+  return {
+    ...base,
+    scope,
+    projectId,
+    ...(scope === 'personal' ? { userId } : {}),
   };
 }
 
 function scopedCallerForDeps(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps): McpRuntimeCaller {
   const sessions = deps.sendDeps?.listSessions ? deps.sendDeps.listSessions() : listStoredSessions();
+  const session = caller.sessionName
+    ? sessions.find((candidate) => candidate.name === caller.sessionName)
+    : undefined;
   const scope = resolveRuntimeScope(caller, sessions);
   return {
     ...caller,
+    namespace: projectScopedNamespace(caller, session, scope.projectRoot),
     projectName: scope.projectName,
     projectRoot: scope.projectRoot,
     serverId: scope.serverId,
@@ -194,9 +303,23 @@ function cronOptionsForCaller(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps)
   };
 }
 
+function callerProjectId(caller: { namespace: Pick<ContextNamespace, 'projectId'> }): string | undefined {
+  const projectId = caller.namespace.projectId?.trim();
+  return projectId || undefined;
+}
+
 export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
   const searchMemory = deps.searchMemory ?? searchMcpMemoryRecall;
-  const getMemorySources = deps.getMemorySources ?? memoryGetSources;
+  const listMemorySummaries = deps.listMemorySummaries ?? listMcpMemorySummaries;
+  // Orchestrated path is the production wiring; the legacy `getMemorySources`
+  // dep is retained for tests that only want to verify the local SQLite
+  // branch without involving cache/cloud resolution.
+  const orchestrator = deps.getMemorySourcesOrchestrator
+    ?? ((projectionId, mcpCaller, orchDeps) => getMemorySourcesOrchestrated(
+      projectionId,
+      mcpCaller,
+      { ...(deps.orchestratorDeps ?? {}), ...(orchDeps ?? {}) },
+    ));
   const saveObservationTool = deps.saveObservation ?? saveObservation;
   const savePreferenceTool = deps.savePreference ?? savePreference;
   const cronCreate = deps.cronCreate ?? cronMcpCreate;
@@ -216,28 +339,113 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const limit = numberArg(args, 'limit');
       try {
         const scopedCaller = memoryCaller();
+        const projectId = callerProjectId(scopedCaller);
+        if (!projectId) return { status: 'ok', reason: MEMORY_PROJECT_SCOPE_REASON.UNAVAILABLE, items: [] };
         const result = await searchMemory({
           query,
           namespace: scopedCaller.namespace,
           currentEnterpriseId: scopedCaller.namespace.enterpriseId,
-          repo: scopedCaller.namespace.projectId,
+          repo: projectId,
           includeLegacyPersonalOwner: true,
           limit,
         });
-        const items = result.items.map(compactSearchHit);
+        const items = result.items
+          .filter((item) => item.projectId === projectId)
+          .map((item) => compactSearchHit(item, scopedCaller.namespace));
         return { status: 'ok', items };
       } catch (err) {
         return sanitizeCaughtError(err);
       }
     },
-    [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: (input) => {
+    [MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]: async (input) => {
+      const gate = memorySurfaceGate(deps, { items: [] });
+      if (gate) return gate;
+      const args = pickAllowedMcpArgs(input, ['projectionClass', 'limit']);
+      const limit = numberArg(args, 'limit');
+      const scopedCaller = memoryCaller();
+      try {
+        const projectId = callerProjectId(scopedCaller);
+        if (!projectId) return { status: 'ok', reason: MEMORY_PROJECT_SCOPE_REASON.UNAVAILABLE, items: [] };
+        const result = await listMemorySummaries({
+          namespace: scopedCaller.namespace,
+          currentEnterpriseId: scopedCaller.namespace.enterpriseId,
+          repo: projectId,
+          userId: scopedCaller.userId,
+          includeLegacyPersonalOwner: true,
+          projectionClass: listProjectionClassArg(args),
+          limit,
+        });
+        const items = result.items
+          .filter((item) => item.projectId === projectId)
+          .map((item) => compactSearchHit(item, scopedCaller.namespace));
+        return { status: 'ok', items };
+      } catch (err) {
+        return sanitizeCaughtError(err);
+      }
+    },
+    [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: async (input) => {
       const gate = memorySurfaceGate(deps, { sources: [] });
       if (gate) return gate;
-      const args = pickAllowedMcpArgs(input, ['projectionId']);
-      const projectionId = stringArg(args, 'projectionId');
-      if (!projectionId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'projectionId is required');
+      // `serverId` stays in MEMORY_MCP_FORBIDDEN_ARG_NAMES — see
+      // shared/memory-mcp-contracts.ts. Callers cannot influence routing
+      // by supplying any identity-binding field; the orchestrator resolves
+      // `originServerId` from cache or cloud, never from input.
+      const args = pickAllowedMcpArgs(input, ['projectionId', 'observationId', 'kind', 'ref']);
+      let projectionId = stringArg(args, 'projectionId');
+      let observationId = stringArg(args, 'observationId');
+      let kind = stringArg(args, 'kind');
+      const ref = stringArg(args, 'ref');
+      if (kind && kind !== 'projection' && kind !== 'observation') {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'kind must be projection or observation');
+      }
+      if (ref && (projectionId || observationId)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'ref cannot be combined with projectionId or observationId');
+      }
+      const scopedCaller = memoryCaller();
+      const projectId = callerProjectId(scopedCaller);
+      const emptySources = () => ({
+        status: 'ok',
+        reason: MEMORY_PROJECT_SCOPE_REASON.UNAVAILABLE,
+        ...(ref ? { ref } : {}),
+        ...(projectionId ? { projectionId } : {}),
+        ...(observationId ? { observationId } : {}),
+        sourceEventCount: 0,
+        sources: [],
+      });
+      if (!projectId && !ref && !projectionId && !observationId) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'projectionId, observationId, or ref is required');
+      }
+      if (!projectId) return emptySources();
+      if (ref) {
+        const resolved = resolveMemoryShortRef(ref, scopedCaller.namespace);
+        if (!resolved) return { status: 'ok', ref, sourceEventCount: 0, sources: [] };
+        if (kind && kind !== resolved.kind) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'source lookup kind does not match the supplied ref');
+        }
+        kind = resolved.kind;
+        if (resolved.kind === 'observation') observationId = resolved.id;
+        else projectionId = resolved.id;
+      }
+      if ((projectionId && observationId) || (!projectionId && !observationId)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'projectionId, observationId, or ref is required');
+      }
+      if ((kind === 'observation' && !observationId) || (kind === 'projection' && !projectionId)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'source lookup kind does not match the supplied id');
+      }
       try {
-        return { status: 'ok', ...getMemorySources(projectionId, memoryCaller()) };
+        if (observationId) {
+          return { status: 'ok', ...memoryGetSources({ observationId, kind: 'observation' }, scopedCaller) };
+        }
+        const result = await orchestrator(projectionId!, scopedCaller);
+        if (result.status === 'error') {
+          // Orchestrator reason values are the same string literals declared
+          // in MCP_ERROR_REASONS, so they are valid MCPErrorReason values.
+          return error(result.reason as MCPErrorReason, result.message);
+        }
+        // status === 'ok' branch. Spread directly so output preserves
+        // `originServerId`, `partial`, `sources`, etc.
+        const { status: _status, ...payload } = result;
+        return { status: 'ok', ...payload };
       } catch (err) {
         return sanitizeCaughtError(err);
       }
@@ -372,11 +580,18 @@ function toolResult(result: ToolResult): CallToolResult {
 
 const schemas = {
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: z.object({
-    query: z.string().describe('Required text query to search for.'),
+    query: z.string().describe('Required text query to search for. Results include sourceLookup values for get_memory_sources when more detail is needed.'),
     limit: z.number().int().min(1).max(100).optional().describe('Optional maximum hit count.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]: z.object({
+    projectionClass: z.enum(['recent_summary', 'durable_memory_candidate']).optional().describe('Optional processed summary class. Defaults to recent_summary.'),
+    limit: z.number().int().min(1).max(100).optional().describe('Optional maximum summary count.'),
+  }),
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: z.object({
-    projectionId: z.string().describe('Projection id returned by search_memory.'),
+    projectionId: z.string().optional().describe('Projection id returned by search_memory for a relevant projection hit.'),
+    observationId: z.string().optional().describe('Observation id returned by search_memory for a relevant observation hit.'),
+    ref: z.string().optional().describe('Compact ref returned by search_memory or startup memory, such as obs:abc123 or proj:abc123.'),
+    kind: z.enum(['projection', 'observation']).optional().describe('Optional source lookup kind copied from search_memory.sourceLookup.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: z.object({
     content: z.string().describe('Observation text to persist as a candidate memory.'),

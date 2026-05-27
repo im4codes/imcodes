@@ -2,18 +2,22 @@
  * Daemon-side file transfer handler.
  * Handles upload persistence, download resolution, and lifecycle cleanup.
  */
-import { realpathSync } from 'node:fs';
+import { createWriteStream, realpathSync } from 'node:fs';
 import { mkdir, writeFile, readFile, readdir, stat, unlink, realpath as fsRealpath } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import logger from '../util/logger.js';
 import {
   FILE_TRANSFER_LIMITS,
   type AttachmentRef,
   type FileUploadRequest,
+  type FileUploadFetchRequest,
   type FileUploadDone,
   type FileUploadError,
+  type FileUploadProgress,
   type FileDownloadRequest,
   type FileDownloadDone,
   type FileDownloadError,
@@ -82,6 +86,145 @@ function sanitizeLocalDownloadError(err: unknown): LocalDownloadErrorMessage {
   return isNotFoundError(err) ? 'not_found' : 'download_failed';
 }
 
+function resolveUploadPath(filename: string): string {
+  const filePath = path.join(UPLOAD_DIR, filename);
+  const resolved = path.resolve(filePath);
+  if (!resolved.startsWith(path.resolve(UPLOAD_DIR) + path.sep)) {
+    throw new Error('path_traversal');
+  }
+  return resolved;
+}
+
+async function finalizeUploadedFile(params: {
+  uploadId: string;
+  filename: string;
+  originalName?: string;
+  mime?: string;
+  resolved: string;
+  size: number;
+  serverLink: ServerLink;
+}): Promise<void> {
+  const { uploadId, filename, originalName, mime, resolved, size, serverLink } = params;
+
+  const metaPath = resolved + '.meta.json';
+  await writeFile(metaPath, JSON.stringify({ originalName: originalName || filename, mime })).catch(() => {});
+
+  const now = Date.now();
+  const attachment: AttachmentRef = {
+    id: filename,
+    source: 'upload',
+    serverId: '', // server fills this before returning to client
+    daemonPath: resolved,
+    originalName: originalName || filename,
+    mime,
+    size,
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS).toISOString(),
+    downloadable: true,
+  };
+
+  attachmentRegistry.set(filename, {
+    id: filename,
+    daemonPath: resolved,
+    source: 'upload',
+    originalName: originalName || filename,
+    mime,
+    size,
+    createdAt: now,
+    expiresAt: now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
+  });
+
+  const response: FileUploadDone = {
+    type: 'file.upload_done',
+    uploadId,
+    attachment,
+  };
+  serverLink.send(response);
+
+  logger.info({ uploadId, filename, size }, 'File upload complete');
+}
+
+function sendUploadError(serverLink: ServerLink, uploadId: string, filename: string | undefined, err: unknown): void {
+  const errMsg = err instanceof Error ? err.message : String(err);
+  logger.error({ uploadId, filename, err }, 'File upload failed');
+  const response: FileUploadError = {
+    type: 'file.upload_error',
+    uploadId,
+    message: errMsg,
+  };
+  serverLink.send(response);
+}
+
+function sendUploadProgress(serverLink: ServerLink, uploadId: string, loaded: number, total: number): void {
+  const response: FileUploadProgress = {
+    type: 'file.upload_progress',
+    uploadId,
+    loaded: Math.max(0, Math.min(loaded, total)),
+    total,
+  };
+  serverLink.send(response);
+}
+
+async function fetchRelayUpload(
+  downloadUrl: string,
+  resolved: string,
+  expectedSize: number,
+  onProgress?: (loaded: number, total: number) => void,
+): Promise<number> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await fetch(downloadUrl);
+      if (!response.ok) {
+        throw new Error(`relay_fetch_${response.status}`);
+      }
+      if (!response.body) {
+        throw new Error('relay_fetch_empty_body');
+      }
+      let loaded = 0;
+      let lastPct = -1;
+      let lastSentAt = 0;
+      const reportProgress = (force = false) => {
+        const total = Math.max(1, expectedSize);
+        const pct = Math.floor((loaded / total) * 100);
+        const now = Date.now();
+        if (force || pct !== lastPct && (now - lastSentAt >= 250 || pct >= 100)) {
+          lastPct = pct;
+          lastSentAt = now;
+          onProgress?.(loaded, expectedSize);
+        }
+      };
+      reportProgress(true);
+      const progress = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          loaded += chunk.length;
+          reportProgress();
+          callback(null, chunk);
+        },
+      });
+      await pipeline(
+        Readable.fromWeb(response.body as never),
+        progress,
+        createWriteStream(resolved),
+      );
+      const fileStat = await stat(resolved);
+      if (fileStat.size !== expectedSize) {
+        throw new Error('size_mismatch');
+      }
+      loaded = fileStat.size;
+      reportProgress(true);
+      return fileStat.size;
+    } catch (err) {
+      lastErr = err;
+      await unlink(resolved).catch(() => {});
+      if (attempt < 3) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+      }
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
 // ── Init ────────────────────────────────────────────────────────────────────
 
 let initialized = false;
@@ -148,64 +291,61 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
     // Opportunistic cleanup before writing
     await cleanupExpiredUploads();
 
-    const filePath = path.join(UPLOAD_DIR, filename);
-
-    // Safety: ensure the resolved path is inside UPLOAD_DIR
-    const resolved = path.resolve(filePath);
-    if (!resolved.startsWith(path.resolve(UPLOAD_DIR) + path.sep)) {
-      throw new Error('path_traversal');
-    }
+    const resolved = resolveUploadPath(filename);
 
     const buffer = Buffer.from(content, 'base64');
+    if (buffer.length > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
+      throw new Error(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
+    }
+    if (typeof msg.size === 'number' && buffer.length !== msg.size) {
+      throw new Error('size_mismatch');
+    }
     await writeFile(resolved, buffer);
 
-    // Write metadata sidecar for recovery after daemon restart
-    const metaPath = resolved + '.meta.json';
-    await writeFile(metaPath, JSON.stringify({ originalName: originalName || filename, mime })).catch(() => {});
-
-    const now = Date.now();
-    const attachment: AttachmentRef = {
-      id: filename,
-      source: 'upload',
-      serverId: '', // server fills this before returning to client
-      daemonPath: resolved,
-      originalName: originalName || filename,
+    await finalizeUploadedFile({
+      uploadId,
+      filename,
+      originalName,
       mime,
+      resolved,
       size: buffer.length,
-      createdAt: new Date(now).toISOString(),
-      expiresAt: new Date(now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS).toISOString(),
-      downloadable: true,
-    };
-
-    // Register in memory
-    attachmentRegistry.set(filename, {
-      id: filename,
-      daemonPath: resolved,
-      source: 'upload',
-      originalName: originalName || filename,
-      mime,
-      size: buffer.length,
-      createdAt: now,
-      expiresAt: now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
+      serverLink,
     });
-
-    const response: FileUploadDone = {
-      type: 'file.upload_done',
-      uploadId,
-      attachment,
-    };
-    serverLink.send(response);
-
-    logger.info({ uploadId, filename, size: buffer.length }, 'File upload complete');
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    logger.error({ uploadId, filename, err }, 'File upload failed');
-    const response: FileUploadError = {
-      type: 'file.upload_error',
+    sendUploadError(serverLink, uploadId, filename, err);
+  }
+}
+
+export async function handleFileUploadFetch(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const msg = cmd as unknown as FileUploadFetchRequest;
+  const { uploadId, filename, originalName, mime, downloadUrl } = msg;
+
+  try {
+    await initFileTransfer();
+    await cleanupExpiredUploads();
+
+    const resolved = resolveUploadPath(filename);
+    if (typeof msg.size !== 'number' || msg.size < 0 || msg.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
+      throw new Error(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
+    }
+    if (!downloadUrl || typeof downloadUrl !== 'string') {
+      throw new Error('missing_download_url');
+    }
+
+    const size = await fetchRelayUpload(downloadUrl, resolved, msg.size, (loaded, total) => {
+      sendUploadProgress(serverLink, uploadId, loaded, total);
+    });
+    await finalizeUploadedFile({
       uploadId,
-      message: errMsg,
-    };
-    serverLink.send(response);
+      filename,
+      originalName,
+      mime,
+      resolved,
+      size,
+      serverLink,
+    });
+  } catch (err) {
+    sendUploadError(serverLink, uploadId, filename, err);
   }
 }
 

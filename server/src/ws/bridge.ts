@@ -970,6 +970,20 @@ export class WsBridge {
     resolve: (msg: Record<string, unknown>) => void;
     reject: (err: Error) => void;
     timer: ReturnType<typeof setTimeout>;
+    onProgress?: (msg: Record<string, unknown>) => void;
+  }>();
+
+  /**
+   * Cross-server projection source resolution correlation: requestId →
+   * pending resolver. Populated by `sendMemorySourcesRequest()` (the
+   * `/api/memory/sources` HTTP route's helper) and drained when the daemon
+   * replies with `MEMORY_WS.GET_SOURCES_RESPONSE`. See
+   * openspec/changes/memory-source-server-routing.
+   */
+  private pendingMemorySourcesRequests = new Map<string, {
+    resolve: (msg: Record<string, unknown>) => void;
+    reject: (err: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
   }>();
 
   private pendingPreviewRequests = new Map<string, PendingPreviewRequest>();
@@ -1967,6 +1981,22 @@ export class WsBridge {
             }],
           };
         }
+        if (projectDir) {
+          const localSession = await this.db.queryOne<{ name?: string }>(
+            'SELECT name FROM sessions WHERE server_id = $1 AND project_dir = $2 LIMIT 1',
+            [this.serverId, projectDir],
+          );
+          const localSubSession = localSession ? null : await this.db.queryOne<{ id?: string }>(
+            'SELECT id FROM sub_sessions WHERE server_id = $1 AND cwd = $2 AND closed_at IS NULL LIMIT 1',
+            [this.serverId, projectDir],
+          );
+          if (localSession || localSubSession) {
+            return {
+              role: 'user',
+              boundProjects: [{ projectDir, canonicalRepoId }],
+            };
+          }
+        }
         return { role: 'user', boundProjects: [] };
       }
 
@@ -2323,6 +2353,7 @@ export class WsBridge {
         this.activeSubSessions.clear();
         this.hasActiveMainSessionSnapshot = false;
         this.rejectAllPendingFileTransfers('daemon_disconnected');
+        this.rejectAllPendingMemorySourcesRequests('daemon_disconnected');
         this.rejectAllPendingHttpTimelineRequests('daemon_disconnected');
         this.rejectAllPendingPreviewRequests('daemon_disconnected');
         // Close all preview WS tunnels — daemon is gone
@@ -2354,6 +2385,7 @@ export class WsBridge {
     ws.on('error', (err) => {
       logger.error({ serverId: this.serverId, err }, 'Daemon WS error');
       this.rejectAllPendingFileTransfers('daemon_error');
+      this.rejectAllPendingMemorySourcesRequests('daemon_error');
       this.rejectAllPendingHttpTimelineRequests('daemon_error');
       this.rejectAllPendingPreviewRequests('daemon_error');
     });
@@ -3205,6 +3237,11 @@ export class WsBridge {
     }
 
     // ── File transfer responses: resolve HTTP handler Promises ─────────────────
+    if (type === 'file.upload_progress') {
+      const requestId = msg.uploadId as string | undefined;
+      if (requestId) this.notifyFileTransferProgress(requestId, msg);
+      return;
+    }
     if (type === 'file.upload_done' || type === 'file.upload_error') {
       const requestId = msg.uploadId as string | undefined;
       if (requestId) this.resolveFileTransfer(requestId, msg);
@@ -3213,6 +3250,16 @@ export class WsBridge {
     if (type === 'file.download_done' || type === 'file.download_error') {
       const requestId = msg.downloadId as string | undefined;
       if (requestId) this.resolveFileTransfer(requestId, msg);
+      return;
+    }
+
+    // ── memory.get_sources response: resolve HTTP /api/memory/sources caller ─
+    // Mirrors the file-transfer pattern: a server-side route awaits a daemon
+    // reply via a requestId-keyed pending map. See
+    // openspec/changes/memory-source-server-routing.
+    if (type === MEMORY_WS.GET_SOURCES_RESPONSE) {
+      const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
+      if (requestId) this.resolveMemorySources(requestId, msg);
       return;
     }
 
@@ -4707,7 +4754,12 @@ export class WsBridge {
    * Send a file transfer request to daemon and await the correlated response.
    * Rejects if daemon is offline or the request times out.
    */
-  sendFileTransferRequest(requestId: string, message: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+  sendFileTransferRequest(
+    requestId: string,
+    message: Record<string, unknown>,
+    timeoutMs: number,
+    onProgress?: (msg: Record<string, unknown>) => void,
+  ): Promise<Record<string, unknown>> {
     if (!this.isDaemonConnected()) {
       return Promise.reject(new Error('daemon_offline'));
     }
@@ -4717,7 +4769,7 @@ export class WsBridge {
         reject(new Error('timeout'));
       }, timeoutMs);
 
-      this.pendingFileTransfers.set(requestId, { resolve, reject, timer });
+      this.pendingFileTransfers.set(requestId, { resolve, reject, timer, onProgress });
 
       try {
         this.daemonWs!.send(JSON.stringify(message));
@@ -4757,6 +4809,80 @@ export class WsBridge {
     this.pendingFileTransfers.delete(requestId);
     pending.resolve(msg);
     return true;
+  }
+
+  notifyFileTransferProgress(requestId: string, msg: Record<string, unknown>): boolean {
+    const pending = this.pendingFileTransfers.get(requestId);
+    if (!pending) return false;
+    pending.onProgress?.(msg);
+    return true;
+  }
+
+  // ── Memory source resolution correlation ───────────────────────────────
+  //
+  // Mirrors sendFileTransferRequest — a unicast request/response over the
+  // daemon WS gated by requestId. The `/api/memory/sources` HTTP route
+  // calls this after the ingress has pod-sticky-routed the request to this
+  // pod (the one holding the target daemon's WS).
+
+  /**
+   * Send a memory source resolution request to the daemon and await the
+   * correlated reply. Rejects with 'daemon_offline' when the WS is not
+   * authenticated, 'timeout' on slow daemons.
+   */
+  sendMemorySourcesRequest(requestId: string, projectionId: string, expectedProjectId: string, timeoutMs: number): Promise<Record<string, unknown>> {
+    if (!this.isDaemonConnected()) {
+      return Promise.reject(new Error('daemon_offline'));
+    }
+    return new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingMemorySourcesRequests.delete(requestId);
+        reject(new Error('timeout'));
+      }, timeoutMs);
+
+      this.pendingMemorySourcesRequests.set(requestId, { resolve, reject, timer });
+
+      try {
+        this.daemonWs!.send(JSON.stringify({
+          type: MEMORY_WS.GET_SOURCES_REQUEST,
+          requestId,
+          projectionId,
+          expectedProjectId,
+          // The daemon stamps its own bound serverId on the reply, but we
+          // also tell it our expected serverId so its log can flag mis-
+          // routing when present.
+          expectedServerId: this.serverId,
+        }));
+      } catch (err) {
+        this.pendingMemorySourcesRequests.delete(requestId);
+        clearTimeout(timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  }
+
+  /**
+   * Try to resolve a pending memory.get_sources request.
+   * Returns true if a matching pending request was found and resolved.
+   */
+  resolveMemorySources(requestId: string, msg: Record<string, unknown>): boolean {
+    const pending = this.pendingMemorySourcesRequests.get(requestId);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    this.pendingMemorySourcesRequests.delete(requestId);
+    pending.resolve(msg);
+    return true;
+  }
+
+  /**
+   * Reject all pending memory.get_sources requests (e.g. on daemon disconnect).
+   */
+  private rejectAllPendingMemorySourcesRequests(reason: string): void {
+    for (const [, pending] of this.pendingMemorySourcesRequests) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(reason));
+    }
+    this.pendingMemorySourcesRequests.clear();
   }
 
   private resolvePreviewStart(msg: PreviewResponseStartMessage): void {

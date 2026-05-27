@@ -11,9 +11,17 @@ const MockWebSocket = vi.fn(() => mockWsInstance);
 MockWebSocket.OPEN = 1;
 vi.stubGlobal('WebSocket', MockWebSocket);
 
+vi.mock('../../src/util/daemon-status.js', () => ({
+  recordDaemonServerLinkStatus: vi.fn(),
+}));
+
 import { ServerLink, __setServerLinkDataPlaneQueueConfigForTests } from '../../src/daemon/server-link.js';
+import { recordDaemonServerLinkStatus } from '../../src/util/daemon-status.js';
 import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_EVENT } from '../../shared/transport-events.js';
+import { FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../shared/transport/file-transfer.js';
+
+const recordDaemonServerLinkStatusMock = vi.mocked(recordDaemonServerLinkStatus);
 
 describe('ServerLink', () => {
   let link: ServerLink;
@@ -69,6 +77,10 @@ describe('ServerLink', () => {
 
   it('advertises the shared timeline protocol capability in daemon hello capabilities', () => {
     expect(link.getDaemonCapabilities()).toContain(TIMELINE_PROTOCOL_CAPABILITY);
+  });
+
+  it('advertises relay upload fetch capability for server-side compatibility gating', () => {
+    expect(link.getDaemonCapabilities()).toContain(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
   });
 
   it('send() adds monotonic seq counter', () => {
@@ -142,6 +154,41 @@ describe('ServerLink', () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(mockWsInstance.send).toHaveBeenCalledTimes(2);
     expect(JSON.parse(mockWsInstance.send.mock.calls[1][0] as string).type).toBe('chat.history');
+  });
+
+  it('records heartbeat ack proof even when runtime status was just written', () => {
+    link.connect();
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    expect(messageHandler).toBeDefined();
+
+    const writesBeforeAck = recordDaemonServerLinkStatusMock.mock.calls.length;
+    messageHandler?.({ data: JSON.stringify({ type: 'heartbeat_ack' }) } as MessageEvent);
+
+    expect(recordDaemonServerLinkStatusMock).toHaveBeenCalledTimes(writesBeforeAck + 1);
+    expect(recordDaemonServerLinkStatusMock.mock.calls.at(-1)?.[0]).toMatchObject({
+      state: 'connected',
+      lastHeartbeatAckAt: expect.any(Number),
+      clearError: true,
+    });
+  });
+
+  it('accepts Blob binary messages from Node WebSocket without throwing', async () => {
+    link.connect();
+    const binaryHandler = vi.fn();
+    link.onBinaryMessage(binaryHandler);
+
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    expect(messageHandler).toBeDefined();
+
+    messageHandler?.({ data: new Blob([Uint8Array.from([1, 2, 3])]) } as MessageEvent);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(binaryHandler).toHaveBeenCalledOnce();
+    expect(binaryHandler.mock.calls[0][0]).toEqual(Buffer.from([1, 2, 3]));
   });
 
   it('drops stale queued data-plane sends without blocking later control-plane sends', async () => {

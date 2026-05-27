@@ -37,6 +37,8 @@ export const FILE_TRANSFER_LIMITS = {
   MAX_FILE_SIZE: 2 * 1024 * 1024 * 1024,
   /** Server waits this long for daemon upload ack (ms). */
   UPLOAD_TIMEOUT_MS: 300_000,
+  /** Relay-staged uploads expire after this duration (ms). */
+  STAGED_UPLOAD_TTL_MS: 10 * 60 * 1000,
   /** Server waits this long for daemon download response (ms). */
   DOWNLOAD_TIMEOUT_MS: 300_000,
   /** Temporary uploaded files are cleaned after this duration (ms). 24 hours. */
@@ -46,6 +48,10 @@ export const FILE_TRANSFER_LIMITS = {
   /** Directory for temporary uploads on daemon. */
   UPLOAD_DIR: '/tmp/imcodes-uploads',
 } as const;
+
+// ── Capability advertisement ────────────────────────────────────────────────
+
+export const FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY = 'file.transfer.upload_fetch.v1' as const;
 
 // ── Server → Daemon messages ──────────────────────────────────────────────────
 
@@ -57,6 +63,16 @@ export interface FileUploadRequest {
   mime?: string;
   size: number;
   content: string; // base64
+}
+
+export interface FileUploadFetchRequest {
+  type: 'file.upload_fetch';
+  uploadId: string;
+  filename: string;
+  originalName?: string;
+  mime?: string;
+  size: number;
+  downloadUrl: string;
 }
 
 export interface FileDownloadRequest {
@@ -79,6 +95,13 @@ export interface FileUploadError {
   message: string;
 }
 
+export interface FileUploadProgress {
+  type: 'file.upload_progress';
+  uploadId: string;
+  loaded: number;
+  total: number;
+}
+
 export interface FileDownloadDone {
   type: 'file.download_done';
   downloadId: string;
@@ -97,11 +120,13 @@ export interface FileDownloadError {
 export type FileTransferDaemonMessage =
   | FileUploadDone
   | FileUploadError
+  | FileUploadProgress
   | FileDownloadDone
   | FileDownloadError;
 
 export type FileTransferServerMessage =
   | FileUploadRequest
+  | FileUploadFetchRequest
   | FileDownloadRequest;
 
 // ── FileBrowser extensions ────────────────────────────────────────────────────

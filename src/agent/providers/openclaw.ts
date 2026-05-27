@@ -30,6 +30,7 @@ import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
 import { normalizeOpenClawDisplayName } from '../openclaw-display.js';
+import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { OPENCLAW_THINKING_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 
 // ── Internal frame types ─────────────────────────────────────────────────────
@@ -174,14 +175,21 @@ export class OpenClawProvider implements TransportProvider {
     const payload = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
     const ocKey = unsanitizeKey(sessionId);
     const thinking = this.sessionThinking.get(sessionId) ?? 'off';
+    const systemParts = getProviderSystemTextParts(payload);
+    const message = systemParts.hasSplitSystemText && systemParts.turnSystemText
+      ? composeMessageSideProviderPrompt(payload, { includeSessionSystemText: false })
+      : payload.assembledMessage;
+    const routedExtraSystemPrompt = systemParts.hasSplitSystemText
+      ? systemParts.sessionSystemText
+      : systemParts.combinedSystemText;
     try {
       // Prefer sessions.send (v2026.3.24+): auto canonicalKey, messageSeq, subagent reactivation
       await this.rpc('sessions.send', {
         key: ocKey,
-        message: payload.assembledMessage,
+        message,
         thinking,
         idempotencyKey: randomUUID(),
-        ...(payload.systemText ? { extraSystemPrompt: payload.systemText } : {}),
+        ...(routedExtraSystemPrompt ? { extraSystemPrompt: routedExtraSystemPrompt } : {}),
       });
       logger.info({ provider: this.id, ocKey }, 'sessions.send succeeded');
     } catch (err) {
@@ -189,11 +197,11 @@ export class OpenClawProvider implements TransportProvider {
       // Fallback to agent RPC (v2026.3.7+)
       await this.rpc('agent', {
         sessionKey: ocKey,
-        message: payload.assembledMessage,
+        message,
         agentId: this.agentId,
         thinking,
         idempotencyKey: randomUUID(),
-        ...(payload.systemText ? { extraSystemPrompt: payload.systemText } : {}),
+        ...(routedExtraSystemPrompt ? { extraSystemPrompt: routedExtraSystemPrompt } : {}),
       });
       logger.info({ provider: this.id, ocKey }, 'agent RPC fallback succeeded');
     }

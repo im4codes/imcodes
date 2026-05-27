@@ -8,19 +8,26 @@ import type { ProviderError } from './transport-provider.js';
 import { incrementCounter } from '../util/metrics.js';
 import type {
   CompiledAgentContextArtifact,
+  ContextAuthorityDecision,
   ContextNamespace,
   ContextSendSurface,
   MemoryRecallInjectionSurface,
+  MemoryRecallSourceKind,
   ProviderContextPayload,
   ProviderSupportClass,
   RuntimeAuthoredContextBinding,
   TransportMemoryRecallArtifact,
+  TransportMemoryRecallItem,
 } from '../../shared/context-types.js';
+import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { buildTransportImcodesIdentityPrompt } from '../../shared/transport-runtime-prompts.js';
 
 export interface TransportRuntimeAssemblyInput {
   userMessage: string;
   description?: string;
   systemPrompt?: string;
+  suppressMcpMemorySearchGuidance?: boolean;
+  suppressAgentProgressGuidance?: boolean;
   messagePreamble?: string;
   attachments?: TransportAttachment[];
   namespace?: ContextNamespace;
@@ -42,7 +49,29 @@ export interface TransportRuntimeAssemblyInput {
   sourceSurface?: ContextSendSurface;
   startupMemory?: TransportMemoryRecallArtifact;
   memoryRecall?: TransportMemoryRecallArtifact;
+  /**
+   * Session-stable IM.codes identity injection. When present, the
+   * identity block (exact session name + display label + `imcodes send`
+   * guidance) is appended to `sessionSystemText` peer-level with
+   * `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE` — outside the user-authored
+   * 300-char cap. See p2p audit 37bfbb85-430 N-A.
+   */
+  sessionIdentity?: { sessionName: string; label?: string | null };
 }
+
+export const MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE = [
+  'Use memory MCP search when the user asks about prior work, project history, past decisions, preferences, bugs, commits, deployments, or previously discussed context.',
+  'Before answering those requests, call search_memory with a concise query based on the user message and current project.',
+  'After search_memory, inspect each hit\'s sourceLookup object. If a relevant hit may affect the answer and its summary is not enough, call get_memory_sources with the returned sourceLookup fields before answering. If startup memory gives only a compact ref such as obs:abc123, call get_memory_sources with that ref.',
+  'Use get_memory_sources for exact prior instructions, decisions, preferences, bug details, commit/deployment facts, or provenance-sensitive answers; do not invent details from summaries alone.',
+  'Do not call memory for bare control messages like "continue", "go on", "ok", "yes", "commit", "push", "run tests", or other short commands without searchable context.',
+].join('\n');
+
+const AGENT_PROGRESS_SYSTEM_GUIDANCE = [
+  'Keep work updates sparse and high-signal.',
+  'At key boundaries only (long scans, edits, tests, waits, blockers, commit/push), send one short status; skip routine narration and repeated summaries.',
+  'Do not paste logs or diffs unless asked; continue without confirmation unless blocked or the user requested a plan.',
+].join('\n');
 
 export interface DispatchSharedContextSendOptions {
   flags?: SharedContextCutoverFlags;
@@ -54,6 +83,12 @@ export interface DispatchSharedContextSendOptions {
    * request. A value <= 0 disables the watchdog.
    */
   sendTimeoutMs?: number;
+  /** Called immediately before provider.send() is invoked.
+   *  TransportSessionRuntime uses this boundary to keep STOP highest-priority:
+   *  a cancel that arrives during context assembly can still abort before the
+   *  provider sees the turn, while a cancel after this callback delegates to
+   *  the provider interrupt/abort implementation. */
+  onBeforeProviderSend?: () => void;
 }
 
 export interface DispatchSharedContextSendResult {
@@ -95,11 +130,11 @@ export function dispatchSharedContextSend(
       options?.onShadowDiagnostics?.(payload.diagnostics);
     }
     if (!flags.runtimeSend) {
-      await sendProviderWithTimeout(provider, sessionId, input.userMessage, options?.sendTimeoutMs);
+      await sendProviderWithTimeout(provider, sessionId, input.userMessage, options);
       return { disposition: 'legacy-sent', payload };
     }
     enforceDispatchAuthority(payload);
-    await sendProviderWithTimeout(provider, sessionId, payload, options?.sendTimeoutMs);
+    await sendProviderWithTimeout(provider, sessionId, payload, options);
     return { disposition: 'sent', payload };
   });
 }
@@ -108,8 +143,10 @@ async function sendProviderWithTimeout(
   provider: TransportProvider,
   sessionId: string,
   payload: string | ProviderContextPayload,
-  timeoutMs: number | undefined,
+  options: Pick<DispatchSharedContextSendOptions, 'sendTimeoutMs' | 'onBeforeProviderSend'> | undefined,
 ): Promise<void> {
+  const timeoutMs = options?.sendTimeoutMs;
+  options?.onBeforeProviderSend?.();
   const sendPromise = provider.send(sessionId, payload);
   if (!timeoutMs || timeoutMs <= 0 || !Number.isFinite(timeoutMs)) {
     await sendPromise;
@@ -148,8 +185,9 @@ export function buildProviderContextPayload(
   input: TransportRuntimeAssemblyInput,
 ): ProviderContextPayload {
   const { supportClass, authority } = resolveTransportDispatchAuthority(provider, input);
+  const sanitizedStartupMemory = filterStartupMemoryForAuthority(input.startupMemory, authority);
   const sanitizedRecall = {
-    startupMemory: authority.authoritySource === 'processed_local' ? input.startupMemory : undefined,
+    startupMemory: sanitizedStartupMemory,
     memoryRecall: input.memoryRecall,
   };
   const compiledContextInput = composeTransportMemoryInputs({
@@ -169,7 +207,13 @@ export function buildProviderContextPayload(
   for (const entry of input.namespaceDiagnostics ?? []) {
     if (!diagnostics.includes(entry)) diagnostics.push(entry);
   }
-  if (input.startupMemory) diagnostics.push(authority.authoritySource === 'processed_local' ? 'memory:start' : 'memory:start:suppressed-authority');
+  if (input.startupMemory) {
+    diagnostics.push(sanitizedStartupMemory
+      ? (authority.authoritySource === 'processed_remote' && sanitizedStartupMemory.sourceKind === 'local_processed'
+          ? 'memory:start:local-auxiliary'
+          : 'memory:start')
+      : 'memory:start:suppressed-authority');
+  }
   if (input.memoryRecall) diagnostics.push(authority.authoritySource === 'processed_local' ? 'memory:message' : 'memory:message:local-auxiliary');
   const recallInjectionSurface: MemoryRecallInjectionSurface = supportClass === 'degraded-message-side-context-mapping'
     ? 'degraded-message-side'
@@ -183,6 +227,8 @@ export function buildProviderContextPayload(
   return {
     userMessage: input.userMessage,
     assembledMessage: renderAssembledMessage(input.userMessage, compiledContext.messagePreamble),
+    sessionSystemText: compiledContext.sessionSystemText,
+    turnSystemText: compiledContext.turnSystemText,
     systemText: compiledContext.systemText,
     messagePreamble: compiledContext.messagePreamble,
     attachments: input.attachments,
@@ -193,6 +239,37 @@ export function buildProviderContextPayload(
     supportClass,
     diagnostics,
   };
+}
+
+function filterStartupMemoryForAuthority(
+  startupMemory: TransportMemoryRecallArtifact | undefined,
+  authority: ContextAuthorityDecision,
+): TransportMemoryRecallArtifact | undefined {
+  if (!startupMemory) return undefined;
+  if (authority.authoritySource === 'processed_local') return startupMemory;
+  if (authority.authoritySource !== 'processed_remote') return undefined;
+  const remoteItems = startupMemory.items.filter((item) => (
+    item.sourceKind === 'remote_processed'
+    || (!item.sourceKind && startupMemory.sourceKind === 'remote_processed')
+  ));
+  if (remoteItems.length === 0) {
+    return authority.namespace.scope === 'personal' ? startupMemory : undefined;
+  }
+  return {
+    ...startupMemory,
+    authoritySource: 'processed_remote',
+    sourceKind: resolveRecallSourceKind(remoteItems),
+    items: remoteItems,
+    injectedText: buildStartupProjectMemoryText(remoteItems),
+  };
+}
+
+function resolveRecallSourceKind(items: readonly TransportMemoryRecallItem[]): MemoryRecallSourceKind {
+  const hasRemote = items.some((item) => item.sourceKind === 'remote_processed');
+  const hasLocal = items.some((item) => item.sourceKind !== 'remote_processed');
+  if (hasRemote && hasLocal) return 'mixed_processed';
+  if (hasRemote) return 'remote_processed';
+  return 'local_processed';
 }
 
 export function resolveTransportDispatchAuthority(
@@ -259,8 +336,38 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     });
   }
   const renderedAuthoredSystemText = renderAuthoredSystemText(authoredContext.required, authoredContext.advisory);
+  const memorySearchGuidance = input.suppressMcpMemorySearchGuidance ? undefined : MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE;
+  const agentProgressGuidance = input.suppressAgentProgressGuidance ? undefined : AGENT_PROGRESS_SYSTEM_GUIDANCE;
+  // Daemon-injected, session-stable identity block. NOT subject to
+  // `USER_SESSION_TEXT_MAX_CHARS` — encodes IM.codes runtime behaviour
+  // the model must always follow. p2p audit 37bfbb85-430 N-A: this used
+  // to be folded into `systemPrompt` by session-manager and was then
+  // silently truncated by `clampUserSessionText(300)`.
+  //
+  // The Generated Image Reporting protocol used to ride alongside the
+  // identity block here, but it only applies to providers with native
+  // image generation (currently Codex only). It now lives in Codex
+  // SDK's `appendImcodesBaseInstructions` — sent once per thread, in
+  // baseInstructions tail, picked up by prefix cache, zero cost for
+  // non-Codex providers.
+  const identityPart = input.sessionIdentity
+    ? buildTransportImcodesIdentityPrompt(
+        input.sessionIdentity.sessionName,
+        input.sessionIdentity.label ?? undefined,
+      )
+    : undefined;
+  const sessionSystemText = [
+    input.description?.trim(),
+    input.systemPrompt?.trim(),
+    identityPart,
+    memorySearchGuidance,
+    agentProgressGuidance,
+  ].filter(Boolean).join('\n\n') || undefined;
+  const turnSystemText = renderedAuthoredSystemText;
   return {
-    systemText: [input.description?.trim(), input.systemPrompt?.trim(), renderedAuthoredSystemText].filter(Boolean).join('\n\n') || undefined,
+    sessionSystemText,
+    turnSystemText,
+    systemText: [sessionSystemText, turnSystemText].filter(Boolean).join('\n\n') || undefined,
     messagePreamble: input.messagePreamble?.trim() || undefined,
     requiredAuthoredContext: authoredContext.required,
     advisoryAuthoredContext: authoredContext.advisory,
@@ -274,11 +381,11 @@ function composeTransportMemoryInputs(input: TransportRuntimeAssemblyInput): Tra
   const memoryRecallText = input.memoryRecall?.injectedText?.trim();
   const uniqueMessagePreambleParts = dedupeTransportMemorySections([
     input.messagePreamble?.trim(),
+    startupMemoryText,
     memoryRecallText,
   ]);
   const uniqueSystemPromptParts = dedupeTransportMemorySections([
     input.systemPrompt?.trim(),
-    startupMemoryText,
   ]);
   return {
     ...input,

@@ -290,6 +290,39 @@ describe('mapP2pRunToDiscussion', () => {
     expect(roundTimeout.error).toContain('timed_out');
   });
 
+  it('keeps authoritative row status over stale progress snapshots', () => {
+    const updatedAt = '2026-04-09T00:03:00.000Z';
+    const completedAt = '2026-04-09T00:03:10.000Z';
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_done_stale_snapshot',
+      status: 'completed',
+      mode_key: 'audit',
+      current_round: 3,
+      total_rounds: 3,
+      total_hops: 2,
+      completed_hops_count: 2,
+      active_phase: 'summary',
+      updated_at: updatedAt,
+      completed_at: completedAt,
+      progress_snapshot: JSON.stringify({
+        projectionVersion: 1,
+        runId: 'run_done_stale_snapshot',
+        workflowId: 'audit',
+        status: 'running',
+        currentRound: 1,
+        completedNodeIds: [],
+        diagnostics: [],
+        updatedAt: '2026-04-09T00:01:00.000Z',
+      }),
+    });
+
+    expect(discussion.state).toBe('done');
+    expect(discussion.currentRound).toBe(3);
+    expect(discussion.maxRounds).toBe(3);
+    expect(discussion.updatedAt).toBe(Date.parse(updatedAt));
+    expect(discussion.completedAt).toBe(Date.parse(completedAt));
+  });
+
   it('maps timer timestamps from both string and numeric payload fields', () => {
     const startedAt = 1_775_692_800_000;
     const hopStartedAt = startedAt + 5_000;
@@ -344,7 +377,7 @@ describe('mapP2pRunToDiscussion', () => {
   it('preserves existing timer anchors when later run updates omit them', () => {
     const existing = {
       id: 'p2p_run_anchor',
-      topic: 'P2P audit · brain',
+      topic: 'Team audit · brain',
       state: 'setup',
       currentRound: 0,
       maxRounds: 2,
@@ -356,7 +389,7 @@ describe('mapP2pRunToDiscussion', () => {
 
     const incoming = {
       id: 'p2p_run_anchor',
-      topic: 'P2P audit · brain',
+      topic: 'Team audit · brain',
       state: 'running',
       currentRound: 1,
       maxRounds: 2,
@@ -374,11 +407,99 @@ describe('mapP2pRunToDiscussion', () => {
     expect(merged.currentRound).toBe(1);
   });
 
+  it('ignores stale non-terminal updates so progress cannot roll back', () => {
+    const existing = {
+      id: 'p2p_run_progress',
+      topic: 'Team audit · brain',
+      state: 'running',
+      currentRound: 3,
+      maxRounds: 3,
+      completedHops: 2,
+      totalHops: 2,
+      updatedAt: Date.parse('2026-04-09T00:03:00.000Z'),
+    };
+
+    const incoming = {
+      id: 'p2p_run_progress',
+      topic: 'Team audit · brain',
+      state: 'running',
+      currentRound: 1,
+      maxRounds: 3,
+      completedHops: 0,
+      totalHops: 2,
+      updatedAt: Date.parse('2026-04-09T00:01:00.000Z'),
+    };
+
+    const merged = mergeP2pDiscussionUpdate(existing, incoming);
+
+    expect(merged.currentRound).toBe(3);
+    expect(merged.completedHops).toBe(2);
+    expect(merged.updatedAt).toBe(existing.updatedAt);
+  });
+
+  it('does not resurrect terminal P2P entries from later stale running snapshots', () => {
+    const existing = {
+      id: 'p2p_run_done',
+      topic: 'Team audit · brain',
+      state: 'done',
+      currentRound: 3,
+      maxRounds: 3,
+      completedHops: 2,
+      totalHops: 2,
+      updatedAt: Date.parse('2026-04-09T00:03:00.000Z'),
+    };
+
+    const incoming = {
+      id: 'p2p_run_done',
+      topic: 'Team audit · brain',
+      state: 'running',
+      currentRound: 1,
+      maxRounds: 3,
+      completedHops: 0,
+      totalHops: 2,
+      updatedAt: Date.parse('2026-04-09T00:01:00.000Z'),
+    };
+
+    const merged = mergeP2pDiscussionUpdate(existing, incoming);
+
+    expect(merged.state).toBe('done');
+    expect(merged.currentRound).toBe(3);
+    expect(merged.completedHops).toBe(2);
+  });
+
+  it('still accepts terminal updates immediately', () => {
+    const existing = {
+      id: 'p2p_run_finishes',
+      topic: 'Team audit · brain',
+      state: 'running',
+      currentRound: 3,
+      maxRounds: 3,
+      completedHops: 2,
+      totalHops: 2,
+      updatedAt: Date.parse('2026-04-09T00:03:00.000Z'),
+    };
+
+    const incoming = {
+      id: 'p2p_run_finishes',
+      topic: 'Team audit · brain',
+      state: 'done',
+      currentRound: 3,
+      maxRounds: 3,
+      completedHops: 2,
+      totalHops: 2,
+      updatedAt: Date.parse('2026-04-09T00:02:59.000Z'),
+    };
+
+    const merged = mergeP2pDiscussionUpdate(existing, incoming);
+
+    expect(merged.state).toBe('done');
+  });
+
   it('keeps existing P2P entries that are absent from a scoped status response', () => {
     const existing = [
       {
         id: 'p2p_run_alpha',
-        topic: 'P2P audit · alpha',
+        topic: 'Team audit · alpha',
         state: 'running',
         currentRound: 1,
         maxRounds: 2,
@@ -387,7 +508,7 @@ describe('mapP2pRunToDiscussion', () => {
       },
       {
         id: 'p2p_run_beta',
-        topic: 'P2P review · beta',
+        topic: 'Team review · beta',
         state: 'running',
         currentRound: 1,
         maxRounds: 1,
@@ -405,7 +526,7 @@ describe('mapP2pRunToDiscussion', () => {
     const existing = [
       {
         id: 'p2p_run_alpha',
-        topic: 'P2P audit · alpha',
+        topic: 'Team audit · alpha',
         state: 'running',
         currentRound: 1,
         maxRounds: 2,
@@ -414,7 +535,7 @@ describe('mapP2pRunToDiscussion', () => {
       },
       {
         id: 'p2p_run_beta',
-        topic: 'P2P review · beta',
+        topic: 'Team review · beta',
         state: 'running',
         currentRound: 1,
         maxRounds: 1,

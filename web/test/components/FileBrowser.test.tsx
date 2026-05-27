@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, act, cleanup } from '@testing-library/preact';
+import { render, screen, fireEvent, act, cleanup, waitFor } from '@testing-library/preact';
 
 // Mock FileEditor.js to prevent Vitest's SSR module graph from evaluating
 // 17 CodeMirror/Lezer imports (causes OOM in jsdom). vi.mock is hoisted but
@@ -55,6 +55,8 @@ vi.mock('react-i18next', () => {
     'file_browser.mkdir_failed': 'Failed to create folder',
     'file_browser.create_file_failed': 'Failed to create file',
     'file_browser.file_exists': 'File already exists',
+    'fileBrowser.copyPath': 'Copy path',
+    'fileBrowser.copied': 'Copied!',
     'common.cancel': 'Cancel',
     'chat.new_file': 'New file',
     'chat.new_file_name': 'File name',
@@ -277,7 +279,7 @@ describe('FileBrowser', () => {
     render(
       <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="~/projects" onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
-    expect(fsListDir).toHaveBeenCalledWith('~/projects', false, false);
+    expect(fsListDir).toHaveBeenCalledWith('~/projects', false, true);
   });
 
   it('does NOT include files for dir-only mode', () => {
@@ -290,6 +292,20 @@ describe('FileBrowser', () => {
     const { ws, getIncludeFiles } = makeWsFactory();
     render(<FileBrowser ws={ws} mode="file-multi" layout="panel" onConfirm={vi.fn()} />);
     expect(getIncludeFiles()).toBe(true);
+  });
+
+  it('shows hidden files by default and renders distinct create buttons', () => {
+    const { ws, fsListDir } = makeWsFactory();
+    const { getByTitle } = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />,
+    );
+
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, true);
+    expect(getByTitle('Hidden').querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(true);
+    expect(getByTitle('New file').querySelector('.fb-create-icon-file')).not.toBeNull();
+    expect(getByTitle('New folder').querySelector('.fb-create-icon-folder')).not.toBeNull();
+    expect(getByTitle('New file').querySelector('.fb-create-plus')?.textContent).toBe('+');
+    expect(getByTitle('New folder').querySelector('.fb-create-plus')?.textContent).toBe('+');
   });
 
   // ── Tree rendering ─────────────────────────────────────────────────────
@@ -313,7 +329,7 @@ describe('FileBrowser', () => {
 
   it('renders cached root entries immediately before refreshing live data', () => {
     localStorage.setItem(
-      'rcc_fb_snapshot_v1:local:dirs:visible:/home/user',
+      'rcc_fb_snapshot_v1:local:dirs:hidden:/home/user',
       JSON.stringify({
         savedAt: Date.now(),
         currentLabel: '/home/user',
@@ -330,7 +346,7 @@ describe('FileBrowser', () => {
 
     expect(getByText('projects')).toBeDefined();
     expect(getByText('documents')).toBeDefined();
-    expect(fsListDir).toHaveBeenCalledWith('/home/user', false, false);
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', false, true);
   });
 
   it('keeps the initial list request lightweight even when downloads are enabled', () => {
@@ -346,7 +362,7 @@ describe('FileBrowser', () => {
       />,
     );
 
-    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, false);
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, true);
   });
 
   it('uses entry.path from a Windows drive root listing', async () => {
@@ -476,8 +492,17 @@ describe('FileBrowser', () => {
 
   it('creates a new folder and refreshes the parent directory after fs.mkdir_response', async () => {
     const { ws, respond, sendMsg, fsMkdir, fsListDir } = makeWsFactory();
+    const onDirectoryCreated = vi.fn();
     const { getByTitle, getByPlaceholderText, getByText } = render(
-      <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="/home/user" onConfirm={vi.fn()} onClose={vi.fn()} />,
+      <FileBrowser
+        ws={ws}
+        mode="dir-only"
+        layout="modal"
+        initialPath="/home/user"
+        onConfirm={vi.fn()}
+        onClose={vi.fn()}
+        onDirectoryCreated={onDirectoryCreated}
+      />,
     );
 
     await act(async () => {
@@ -500,7 +525,8 @@ describe('FileBrowser', () => {
       sendMsg({ type: 'fs.mkdir_response', requestId: 'mock-mkdir-id', path: '/home/user/newdir', resolvedPath: '/home/user/newdir', status: 'ok' } as any);
     });
 
-    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, false);
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, true);
+    expect(onDirectoryCreated).toHaveBeenCalledWith('/home/user/newdir');
   });
 
   it('creates a new file, refreshes the parent directory, and opens the new file preview', async () => {
@@ -530,7 +556,7 @@ describe('FileBrowser', () => {
       sendMsg({ type: 'fs.write_response', requestId: 'mock-write-id', path: '/home/user/new-file.ts', resolvedPath: '/home/user/new-file.ts', status: 'ok', mtime: 2000 } as any);
     });
 
-    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', true, false);
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', true, true);
     expect(fsReadFile).toHaveBeenCalledWith('/home/user/new-file.ts');
   });
 
@@ -617,6 +643,71 @@ describe('FileBrowser', () => {
     expect(onConfirm).toHaveBeenCalledWith(
       expect.arrayContaining(['/home/user/a.ts', '/home/user/b.ts']),
     );
+  });
+
+  it('shortens long breadcrumb segments while keeping each level clickable', async () => {
+    const currentPath = '/home/user/some-extremely-long-folder-name-that-would-dominate-mobile/project';
+    const factory = makeWsFactory();
+    const rendered = render(
+      <FileBrowser ws={factory.ws} mode="file-multi" layout="panel" initialPath={currentPath} onConfirm={vi.fn()} />,
+    );
+
+    await act(async () => {
+      factory.respond([{ name: 'proposal.md', isDir: false }], currentPath);
+    });
+
+    const longSegmentPath = '/home/user/some-extremely-long-folder-name-that-would-dominate-mobile';
+    const longSegment = rendered.container.querySelector(`.fb-breadcrumb-seg[title="${longSegmentPath}"]`) as HTMLElement;
+    const nav = rendered.container.querySelector('.fb-nav') as HTMLElement;
+    const breadcrumbRow = rendered.container.querySelector('.fb-breadcrumb-row') as HTMLElement;
+    expect(breadcrumbRow.previousElementSibling).toBe(nav);
+    expect(breadcrumbRow.contains(longSegment)).toBe(true);
+    expect(nav.contains(longSegment)).toBe(false);
+    expect(breadcrumbRow.getAttribute('title')).toBe(currentPath);
+    expect(longSegment).toBeTruthy();
+    expect(longSegment.textContent).toContain('…');
+    expect(longSegment.textContent).not.toContain('some-extremely-long-folder-name-that-would-dominate-mobile');
+
+    const callsBefore = factory.fsListDir.mock.calls.length;
+    await act(async () => {
+      fireEvent.click(longSegment);
+    });
+
+    expect(factory.fsListDir.mock.calls.length).toBe(callsBefore + 1);
+    expect(factory.fsListDir).toHaveBeenLastCalledWith(longSegmentPath, true, true);
+  });
+
+  it('copies the current directory path from the footer next to Select', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const currentPath = '/home/user/some-extremely-long-folder-name-that-would-dominate-mobile/project';
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    const { ws, respond } = makeWsFactory();
+    const { getByText, container } = render(
+      <FileBrowser ws={ws} mode="file-multi" layout="panel" initialPath={currentPath} onConfirm={vi.fn()} />,
+    );
+
+    await act(async () => {
+      respond([{ name: 'proposal.md', isDir: false }], currentPath);
+    });
+
+    const footer = container.querySelector('.fb-footer') as HTMLElement;
+    const copyButton = getByText('Copy path') as HTMLButtonElement;
+    const selectButton = getByText('Select') as HTMLButtonElement;
+
+    expect(container.querySelector('.fb-current-path-strip')).toBeNull();
+    expect(copyButton.parentElement).toBe(footer);
+    expect(copyButton.nextElementSibling).toBe(selectButton);
+
+    await act(async () => {
+      fireEvent.click(copyButton);
+      await Promise.resolve();
+    });
+
+    expect(writeText).toHaveBeenCalledWith(currentPath);
+    await waitFor(() => expect(getByText('Copied!')).toBeDefined());
   });
 
   it('deselects a path when clicked again in multi-select', async () => {
@@ -1147,6 +1238,7 @@ describe('FileBrowser', () => {
     expect(onPreviewFile).toHaveBeenCalledWith({
       path: '/home/user/foo.ts',
       preferDiff: true,
+      previewViewMode: 'diff',
       preview: { status: 'loading', path: '/home/user/foo.ts' },
     });
   });
@@ -1190,6 +1282,7 @@ describe('FileBrowser', () => {
     expect(onPreviewFile).toHaveBeenLastCalledWith({
       path: '/home/user/foo.ts',
       preferDiff: true,
+      previewViewMode: 'diff',
       preview: { status: 'loading', path: '/home/user/foo.ts' },
     });
   });
@@ -1257,6 +1350,7 @@ describe('FileBrowser', () => {
     expect(onPreviewFile).toHaveBeenCalledWith({
       path: '/home/user/foo.ts',
       preferDiff: false,
+      previewViewMode: 'source',
       preview: { status: 'loading', path: '/home/user/foo.ts' },
     });
     expect(document.querySelector('.fb-preview')).toBeNull();
@@ -1339,7 +1433,7 @@ describe('FileBrowser', () => {
       />,
     );
 
-    const toggle = screen.getByTitle('Toggle diff view');
+    const toggle = screen.getByTitle('file_browser.view_diff');
     expect(document.querySelector('.fb-diff')).toBeNull();
     expect(toggle.className).not.toContain('active');
 
@@ -1369,7 +1463,7 @@ describe('FileBrowser', () => {
     );
 
     expect(document.querySelector('.fb-diff')?.textContent).toContain('diff after');
-    expect(screen.getByTitle('Toggle diff view').className).toContain('active');
+    expect(screen.getByTitle('file_browser.view_source').className).toContain('active');
   });
 
   it('fetches preview data when a floating preview is hydrated with a loading state', () => {
@@ -1697,6 +1791,8 @@ describe('FileBrowser', () => {
 
     expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
     expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+    expect(screen.getByTestId('mock-file-preview').textContent).toContain('const x = 1;');
+    expect(document.querySelector('.fb-diff')).toBeNull();
 
     await act(async () => {
       vi.advanceTimersByTime(8_000);
@@ -1801,6 +1897,117 @@ describe('FileBrowser', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
     expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
     expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+  });
+
+  it('opens eligible HTML files in rendered mode without requesting a git diff', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const { container } = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/page.html"
+        initialPreviewViewMode="html-render"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'page.html', isDir: false }], '/home/user'); });
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/page.html',
+        status: 'ok',
+        content: '<!doctype html><h1>Hello</h1>',
+      });
+    });
+
+    expect(container.querySelector('iframe.html-safe-preview-frame')).toBeNull();
+    expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
+    expect(document.body.querySelector('iframe.html-safe-preview-frame')).not.toBeNull();
+
+    const closeFullscreen = document.body.querySelector('.html-fullscreen-preview-close') as HTMLButtonElement;
+    fireEvent.click(closeFullscreen);
+    expect(document.body.querySelector('.html-fullscreen-preview')).toBeNull();
+
+    const renderToggle = screen.getByTitle('file_browser.view_rendered');
+    expect(renderToggle.textContent).toBe('👁');
+    fireEvent.click(renderToggle);
+    expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
+    expect(document.body.querySelector('iframe.html-safe-preview-frame')).not.toBeNull();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(document.body.querySelector('.html-fullscreen-preview')).toBeNull();
+    expect(screen.getByTestId('mock-file-preview').textContent).toContain('<!doctype html><h1>Hello</h1>');
+  });
+
+  it('keeps HTML render refreshes read-only and does not issue git diff polling', async () => {
+    vi.useFakeTimers();
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/page.html"
+        initialPreviewViewMode="html-render"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'page.html', isDir: false }], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/page.html',
+        status: 'ok',
+        content: '<h1>before</h1>',
+      });
+    });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
+
+    await act(async () => {
+      vi.advanceTimersByTime(8_000);
+    });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(2);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
+    vi.useRealTimers();
+  });
+
+  it('emits html-render preview mode through preview state updates', async () => {
+    const { ws, respond } = makeWsFactory();
+    const onPreviewStateChange = vi.fn();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/page.html"
+        initialPreviewViewMode="html-render"
+        onPreviewStateChange={onPreviewStateChange}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'page.html', isDir: false }], '/home/user'); });
+
+    expect(onPreviewStateChange).toHaveBeenCalledWith(expect.objectContaining({
+      path: '/home/user/page.html',
+      preferDiff: false,
+      previewViewMode: 'html-render',
+      preview: { status: 'loading', path: '/home/user/page.html' },
+    }));
   });
 
   // ── Expand ────────────────────────────────────────────────────────────

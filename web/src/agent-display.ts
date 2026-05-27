@@ -16,6 +16,7 @@ export const AGENT_BADGE_CONFIG: Record<string, AgentBadgeConfig> = {
   'qwen': { label: 'qw', color: '#0f766e', autoLabelPrefix: 'Qw' },
   'gemini': { label: 'gm', color: '#1d4ed8', autoLabelPrefix: 'Gm' },
   'gemini-sdk': { label: 'gm', color: '#1d4ed8', autoLabelPrefix: 'Gm' },
+  'kimi-sdk': { label: 'km', color: '#8b5cf6', autoLabelPrefix: 'Km' },
   'shell': { label: 'sh', color: '#475569', autoLabelPrefix: 'Sh' },
   'script': { label: 'sc', color: '#64748b', autoLabelPrefix: 'Sc' },
 };
@@ -26,6 +27,7 @@ const LEGACY_AUTO_LABEL_PATTERNS: Array<{ pattern: RegExp; prefix: string }> = [
   { pattern: /^copilot-sdk(\d+)?$/i, prefix: 'Co' },
   { pattern: /^cursor-headless(\d+)?$/i, prefix: 'Cu' },
   { pattern: /^gemini-sdk(\d+)?$/i, prefix: 'Gm' },
+  { pattern: /^kimi-sdk(\d+)?$/i, prefix: 'Km' },
 ];
 
 export function getAgentBadgeConfig(agentType: string | null | undefined): AgentBadgeConfig | null {

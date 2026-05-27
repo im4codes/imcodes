@@ -972,6 +972,37 @@ describe('SharedContextManagementPanel', () => {
     expect((await screen.findAllByText('sharedContext.management.memoryToolDisabledNoDaemon')).length).toBeGreaterThan(0);
   });
 
+  it('surfaces manual memory save validation instead of silently ignoring clicks', async () => {
+    listSharedProjectsMock.mockResolvedValueOnce([]);
+    const sent: Array<Record<string, unknown>> = [];
+    const ws = {
+      send(message: Record<string, unknown>) {
+        sent.push(message);
+      },
+      onMessage() {
+        return () => {};
+      },
+    };
+
+    render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+    await act(async () => {
+      fireEvent.input(screen.getByLabelText('sharedContext.management.memoryManualAddTextLabel'), {
+        target: { value: 'Remember this project-specific decision.' },
+      });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryManualAddSave'));
+    });
+
+    expect(sent.some((message) => message.type === MEMORY_WS.CREATE)).toBe(false);
+    expect((await screen.findAllByText('sharedContext.management.memoryManualAddProjectRequired')).length).toBeGreaterThan(1);
+  });
+
   it('renders requested-on dependency-blocked memory features as blocked instead of plain disabled', async () => {
     listTeamsMock.mockResolvedValueOnce([]);
     const sent: Array<Record<string, unknown>> = [];
@@ -1582,6 +1613,7 @@ describe('SharedContextManagementPanel', () => {
       text: 'Remember the local test command.',
       projectionClass: 'durable_memory_candidate',
       canonicalRepoId: 'github.com/acme/repo',
+      projectDir: '/work/repo',
     });
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.memoryPreferenceSave'));

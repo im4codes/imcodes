@@ -84,7 +84,7 @@ export interface ContextAuthorityDecision {
 
 export interface TransportMemoryRecallItem {
   id: string;
-  type?: 'raw' | 'processed';
+  type?: 'raw' | 'processed' | 'observation';
   projectId: string;
   scope?: string;
   enterpriseId?: string;
@@ -98,9 +98,11 @@ export interface TransportMemoryRecallItem {
   relevanceScore?: number;
   createdAt?: number;
   updatedAt?: number;
+  sourceKind?: MemoryRecallSourceKind;
 }
 
 export type MemoryRecallRuntimeFamily = 'process' | 'transport';
+export type MemoryRecallSourceKind = 'local_processed' | 'remote_processed' | 'mixed_processed';
 export type MemoryRecallInjectionSurface =
   | 'text-prepend'
   | 'normalized-payload'
@@ -116,10 +118,19 @@ export interface TransportMemoryRecallArtifact {
   runtimeFamily?: MemoryRecallRuntimeFamily;
   injectionSurface?: MemoryRecallInjectionSurface;
   authoritySource?: ContextAuthorityDecision['authoritySource'];
-  sourceKind?: 'local_processed' | 'remote_processed';
+  sourceKind?: MemoryRecallSourceKind;
 }
 
 export interface CompiledAgentContextArtifact {
+  /** Stable instructions that can be attached once per provider session/thread. */
+  sessionSystemText?: string;
+  /** Instructions that may vary per turn, such as authored context selected by file/language. */
+  turnSystemText?: string;
+  /**
+   * Combined legacy view of sessionSystemText + turnSystemText.
+   * Normalized providers should prefer the split fields so stable session
+   * rules can be cached or injected once without dropping turn-scoped context.
+   */
   systemText?: string;
   messagePreamble?: string;
   requiredAuthoredContext: string[];
@@ -136,6 +147,12 @@ export type ProviderSupportClass =
 export interface ProviderContextPayload {
   userMessage: string;
   assembledMessage: string;
+  sessionSystemText?: string;
+  turnSystemText?: string;
+  /**
+   * Compatibility-only combined prompt. Providers that support normalized
+   * context should not use this for session-persistent system prompt injection.
+   */
   systemText?: string;
   messagePreamble?: string;
   attachments?: TransportAttachment[];

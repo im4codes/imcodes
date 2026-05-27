@@ -103,7 +103,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       skipCreate: !!sub.providerSessionId,
       ...(sub.providerSessionId ? { ccSessionId: sub.ccSessionId ?? undefined, codexSessionId: sub.codexSessionId ?? undefined, fresh: sub.fresh } : {}),
       ...(!sub.providerSessionId && agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
-      ...(!sub.providerSessionId && agentType === 'codex-sdk' ? { fresh: true } : {}),
+      ...(!sub.providerSessionId && (agentType === 'codex-sdk' || agentType === 'kimi-sdk') ? { fresh: true } : {}),
       ...(sub.effort ? { effort: sub.effort } : {}),
       // Carry the preset through the transport launch so Qwen doesn't revert
       // to the OAuth `coder-model` when the sub-session record says the run

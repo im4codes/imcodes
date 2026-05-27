@@ -78,7 +78,7 @@ export const MEMORY_FEATURE_FLAGS_BY_NAME = FLAG;
 export const MEMORY_FEATURE_FLAG_REGISTRY = {
   [FLAG.scopeRegistryExtensions]: {
     flag: FLAG.scopeRegistryExtensions,
-    defaultValue: false,
+    defaultValue: true,
     runtimeSource: 'user_global_config',
     dependencies: [],
     requiredPrerequisites: [],
@@ -87,7 +87,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   },
   [FLAG.userPrivateSync]: {
     flag: FLAG.userPrivateSync,
-    defaultValue: false,
+    defaultValue: true,
     runtimeSource: 'user_global_config',
     dependencies: [FLAG.scopeRegistryExtensions, FLAG.namespaceRegistry, FLAG.observationStore],
     requiredPrerequisites: [],
@@ -96,7 +96,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   },
   [FLAG.selfLearning]: {
     flag: FLAG.selfLearning,
-    defaultValue: false,
+    defaultValue: true,
     runtimeSource: 'user_global_config',
     dependencies: [FLAG.namespaceRegistry, FLAG.observationStore],
     requiredPrerequisites: [],
@@ -114,7 +114,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   },
   [FLAG.observationStore]: {
     flag: FLAG.observationStore,
-    defaultValue: false,
+    defaultValue: true,
     runtimeSource: 'user_global_config',
     dependencies: [FLAG.namespaceRegistry],
     requiredPrerequisites: [],
@@ -132,7 +132,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   },
   [FLAG.citation]: {
     flag: FLAG.citation,
-    defaultValue: false,
+    defaultValue: true,
     runtimeSource: 'user_global_config',
     dependencies: [FLAG.quickSearch],
     requiredPrerequisites: [],
@@ -141,7 +141,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   },
   [FLAG.citeCount]: {
     flag: FLAG.citeCount,
-    defaultValue: false,
+    defaultValue: true,
     runtimeSource: 'user_global_config',
     dependencies: [FLAG.citation],
     requiredPrerequisites: [],
@@ -150,7 +150,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   },
   [FLAG.citeDriftBadge]: {
     flag: FLAG.citeDriftBadge,
-    defaultValue: false,
+    defaultValue: true,
     runtimeSource: 'user_global_config',
     dependencies: [FLAG.citation],
     requiredPrerequisites: [],
@@ -159,7 +159,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   },
   [FLAG.mdIngest]: {
     flag: FLAG.mdIngest,
-    defaultValue: false,
+    defaultValue: true,
     runtimeSource: 'user_global_config',
     dependencies: [FLAG.namespaceRegistry, FLAG.observationStore],
     requiredPrerequisites: [],
@@ -168,7 +168,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   },
   [FLAG.preferences]: {
     flag: FLAG.preferences,
-    defaultValue: false,
+    defaultValue: true,
     runtimeSource: 'user_global_config',
     dependencies: [FLAG.namespaceRegistry, FLAG.observationStore],
     requiredPrerequisites: [],
@@ -177,7 +177,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   },
   [FLAG.skills]: {
     flag: FLAG.skills,
-    defaultValue: false,
+    defaultValue: true,
     runtimeSource: 'user_global_config',
     dependencies: [FLAG.namespaceRegistry, FLAG.observationStore],
     requiredPrerequisites: [],
@@ -195,7 +195,7 @@ export const MEMORY_FEATURE_FLAG_REGISTRY = {
   },
   [FLAG.orgSharedAuthoredStandards]: {
     flag: FLAG.orgSharedAuthoredStandards,
-    defaultValue: false,
+    defaultValue: true,
     runtimeSource: 'user_global_config',
     dependencies: [FLAG.scopeRegistryExtensions],
     requiredPrerequisites: ['shared_context_document_migrations', 'shared_context_version_migrations', 'shared_context_binding_migrations'],

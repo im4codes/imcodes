@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { COMBO_PRESETS, COMBO_SEPARATOR } from '@shared/p2p-modes.js';
-import { BUILDER_MODES, MAX_CUSTOM_COMBOS, comboModeColor, comboModeLabel } from './p2p-combos.js';
+import { BUILDER_MODES, MAX_CUSTOM_COMBOS, comboModeColor, comboModeLabel, isRecommendedCombo } from './p2p-combos.js';
 
 interface Props {
   customCombos: string[];
@@ -99,15 +99,40 @@ export function P2pComboManager({
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
           {COMBO_PRESETS.map((combo) => {
             const color = comboModeColor(combo.key);
+            const recommended = isRecommendedCombo(combo.key);
             return (
               <button
                 key={combo.key}
                 type="button"
-                style={comboChipStyle(color, compact, highlightedComboKey === combo.key)}
+                title={recommended ? t('p2p.combo_recommended_hint', 'Recommended for most audit tasks.') : undefined}
+                style={{
+                  ...comboChipStyle(color, compact, highlightedComboKey === combo.key),
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: compact ? 4 : 6,
+                }}
                 onClick={() => onSelectCombo?.(combo.key)}
                 onMouseEnter={() => onHoverCombo?.(combo.key)}
               >
-                {comboModeLabel(combo.key, t)}
+                <span>{comboModeLabel(combo.key, t)}</span>
+                {recommended && (
+                  <span style={{
+                    width: compact ? 14 : 16,
+                    height: compact ? 14 : 16,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    borderRadius: 999,
+                    border: '1px solid rgba(34, 197, 94, 0.34)',
+                    background: 'rgba(34, 197, 94, 0.14)',
+                    color: '#86efac',
+                    fontSize: compact ? 9 : 10,
+                    fontWeight: 800,
+                    lineHeight: 1,
+                  }} aria-hidden="true">
+                    ★
+                  </span>
+                )}
               </button>
             );
           })}

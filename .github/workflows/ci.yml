@@ -69,7 +69,44 @@ jobs:
       matrix:
         node: ['22', '24']
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        id: checkout_1
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Wait before checkout retry 2
+        if: steps.checkout_1.outcome == 'failure'
+        run: |
+          echo "::warning::actions/checkout failed on attempt 1; retrying in 15s"
+          sleep 15
+
+      - name: Checkout (retry 2)
+        id: checkout_2
+        if: steps.checkout_1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Wait before checkout retry 3
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure'
+        run: |
+          echo "::warning::actions/checkout failed on attempt 2; retrying in 30s"
+          sleep 30
+
+      - name: Checkout (retry 3)
+        id: checkout_3
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Wait before checkout retry 4
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure' && steps.checkout_3.outcome == 'failure'
+        run: |
+          echo "::warning::actions/checkout failed on attempt 3; retrying in 60s"
+          sleep 60
+
+      - name: Checkout (retry 4)
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure' && steps.checkout_3.outcome == 'failure'
+        uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
@@ -164,7 +201,47 @@ jobs:
     name: Unit Tests (Windows ConPTY)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        id: checkout_1
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Wait before checkout retry 2
+        if: steps.checkout_1.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::actions/checkout failed on attempt 1; retrying in 15s"
+          sleep 15
+
+      - name: Checkout (retry 2)
+        id: checkout_2
+        if: steps.checkout_1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Wait before checkout retry 3
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::actions/checkout failed on attempt 2; retrying in 30s"
+          sleep 30
+
+      - name: Checkout (retry 3)
+        id: checkout_3
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Wait before checkout retry 4
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure' && steps.checkout_3.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::actions/checkout failed on attempt 3; retrying in 60s"
+          sleep 60
+
+      - name: Checkout (retry 4)
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure' && steps.checkout_3.outcome == 'failure'
+        uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
@@ -243,8 +320,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
           cache-dependency-path: server/package-lock.json
-      - run: npm ci
-        working-directory: server
+      - run: ./scripts/ci-npm-ci.sh server
       - name: Run DB integration tests
         run: npm run test:integration
         working-directory: server
@@ -258,7 +334,61 @@ jobs:
     runs-on: ubuntu-latest
     needs: [unit-tests]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        id: checkout_1
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Wait before checkout retry 2
+        if: steps.checkout_1.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::actions/checkout failed on attempt 1; retrying in 15s"
+          sleep 15
+
+      - name: Checkout (retry 2)
+        id: checkout_2
+        if: steps.checkout_1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Wait before checkout retry 3
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::actions/checkout failed on attempt 2; retrying in 30s"
+          sleep 30
+
+      - name: Checkout (retry 3)
+        id: checkout_3
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Wait before checkout retry 4
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure' && steps.checkout_3.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::actions/checkout failed on attempt 3; retrying in 60s"
+          sleep 60
+
+      - name: Checkout (retry 4)
+        id: checkout_4
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure' && steps.checkout_3.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/checkout@v4
+
+      - name: Wait before checkout retry 5
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure' && steps.checkout_3.outcome == 'failure' && steps.checkout_4.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::actions/checkout failed on attempt 4; retrying in 90s"
+          sleep 90
+
+      - name: Checkout (retry 5)
+        if: steps.checkout_1.outcome == 'failure' && steps.checkout_2.outcome == 'failure' && steps.checkout_3.outcome == 'failure' && steps.checkout_4.outcome == 'failure'
+        uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
@@ -390,14 +520,39 @@ jobs:
         run: npm version ${{ needs.docker.outputs.npm_version }} --no-git-tag-version
       - name: Publish (skip if version already on npm)
         run: |
+          set -euo pipefail
           VERSION=${{ needs.docker.outputs.npm_version }}
+          PUBLISH_ARGS=(--access public)
+          if [ "${{ github.ref }}" = "refs/heads/dev" ]; then
+            PUBLISH_ARGS=(--tag dev "${PUBLISH_ARGS[@]}")
+          fi
+
           if npm view "imcodes@${VERSION}" version >/dev/null 2>&1; then
             echo "::warning::Version ${VERSION} already published — skipping"
-          elif [ "${{ github.ref }}" = "refs/heads/dev" ]; then
-            npm publish --tag dev --provenance --access public
-          else
-            npm publish --provenance --access public
+            exit 0
           fi
+
+          set +e
+          npm publish "${PUBLISH_ARGS[@]}" --provenance 2>&1 | tee npm-publish.log
+          publish_status=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${publish_status}" -eq 0 ]; then
+            exit 0
+          fi
+
+          if npm view "imcodes@${VERSION}" version >/dev/null 2>&1; then
+            echo "::warning::Version ${VERSION} was published despite npm publish exiting ${publish_status}; treating as success"
+            exit 0
+          fi
+
+          if grep -q 'TLOG_CREATE_ENTRY_ERROR' npm-publish.log; then
+            echo "::warning::npm provenance transparency-log entry already exists, but ${VERSION} is not published; retrying once without --provenance"
+            npm publish "${PUBLISH_ARGS[@]}"
+            exit 0
+          fi
+
+          exit "${publish_status}"
 
   # ── Build & push Docker image ─────────────────────────────────────────────
 

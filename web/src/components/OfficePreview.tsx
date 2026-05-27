@@ -3,7 +3,6 @@
  * Libraries are dynamically imported on first render to avoid bloating the main bundle.
  */
 import { useEffect, useRef, useState } from 'preact/hooks';
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
 interface Props {
   /** Base64-encoded file content. */
@@ -19,6 +18,31 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes.buffer;
+}
+
+let pdfWorkerBlobUrl: string | null = null;
+let pdfWorkerSrcPromise: Promise<string> | null = null;
+
+export function getPdfWorkerSrc(): Promise<string> {
+  if (pdfWorkerBlobUrl) return Promise.resolve(pdfWorkerBlobUrl);
+  if (!pdfWorkerSrcPromise) {
+    pdfWorkerSrcPromise = (async () => {
+      if (
+        typeof Blob === 'undefined'
+        || typeof URL === 'undefined'
+        || typeof URL.createObjectURL !== 'function'
+      ) {
+        throw new Error('PDF worker Blob URLs are unavailable in this browser');
+      }
+      const { default: pdfWorkerSource } = await import('pdfjs-dist/build/pdf.worker.min.mjs?raw');
+      pdfWorkerBlobUrl = URL.createObjectURL(new Blob([pdfWorkerSource], { type: 'text/javascript' }));
+      return pdfWorkerBlobUrl;
+    })().catch((err) => {
+      pdfWorkerSrcPromise = null;
+      throw err;
+    });
+  }
+  return pdfWorkerSrcPromise;
 }
 
 function PdfPreview({ data }: { data: string }) {
@@ -68,7 +92,9 @@ function PdfPreview({ data }: { data: string }) {
     (async () => {
       try {
         const pdfjsLib = await import('pdfjs-dist');
-        pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+        const workerSrc = await getPdfWorkerSrc();
+        if (cancelled) return;
+        pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
         pdfDoc = await pdfjsLib.getDocument({ data: base64ToArrayBuffer(data) }).promise;
         if (cancelled) return;
         // Initial render at current width

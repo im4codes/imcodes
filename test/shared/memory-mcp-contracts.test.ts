@@ -21,9 +21,10 @@ function collectDescriptions(schema: { description?: string; properties?: Readon
 }
 
 describe('memory MCP shared contracts', () => {
-  it('exposes exactly the ten MVP tool names', () => {
+  it('exposes exactly the eleven MVP tool names', () => {
     expect(MEMORY_MCP_TOOL_NAME_LIST).toEqual([
       'search_memory',
+      'list_memory_summaries',
       'get_memory_sources',
       'save_observation',
       'save_preference',
@@ -42,6 +43,10 @@ describe('memory MCP shared contracts', () => {
     expect(Object.keys(search)).toEqual(['query', 'limit']);
     expect(search).not.toHaveProperty('embedding');
     expect(search).not.toHaveProperty('vector');
+
+    const summaries = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES].inputSchema.properties ?? {};
+    expect(Object.keys(summaries)).toEqual(['projectionClass', 'limit']);
+    expect(summaries).not.toHaveProperty('query');
 
     const send = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
     const files = send.inputSchema.properties?.files as { description?: string } | undefined;
@@ -63,6 +68,25 @@ describe('memory MCP shared contracts', () => {
     }
   });
 
+  it('documents when search_memory results should be expanded through get_memory_sources', () => {
+    const search = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY];
+    const getSources = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES];
+    const projectionId = getSources.inputSchema.properties?.projectionId as { description?: string } | undefined;
+    const observationId = getSources.inputSchema.properties?.observationId as { description?: string } | undefined;
+    const ref = getSources.inputSchema.properties?.ref as { description?: string } | undefined;
+
+    expect(search.description).toContain('call get_memory_sources');
+    expect(search.description).toContain('sourceLookup');
+    expect(search.description).toMatch(/typed sourceLookup/i);
+    expect(getSources.description).toContain('Use it after search_memory');
+    expect(getSources.description).toContain('observation id');
+    expect(getSources.description).toContain('compact ref');
+    expect(getSources.description).toContain('provenance-sensitive answers');
+    expect(projectionId?.description).toContain('search_memory');
+    expect(observationId?.description).toContain('search_memory');
+    expect(ref?.description).toContain('startup memory');
+  });
+
   it('pins locked caps and disabled response shape', () => {
     expect(MEMORY_MCP_CAPS).toMatchObject({
       OBSERVATION_CONTENT_MAX_BYTES: 16 * 1024,
@@ -75,6 +99,8 @@ describe('memory MCP shared contracts', () => {
       SEND_FILE_PATH_MAX_CHARS: 512,
       CRON_EXPIRES_AT_MAX_DAYS: 90,
       CRON_LIST_MAX_LIMIT: 100,
+      LIST_MEMORY_SUMMARIES_DEFAULT_LIMIT: 20,
+      LIST_MEMORY_SUMMARIES_MAX_LIMIT: 100,
     });
     expect(buildMcpDisabledResult('mem.feature.quick_search', { items: [] })).toEqual({
       status: 'disabled',
@@ -142,5 +168,34 @@ describe('memory MCP shared contracts', () => {
     ]);
     expect(cronUpdate.required).toEqual(['id']);
     expect(cronUpdate.properties ?? {}).not.toHaveProperty('schedule');
+  });
+
+  // ── memory-source-server-routing change ─────────────────────────────
+  //
+  // `serverId` must stay in MEMORY_MCP_FORBIDDEN_ARG_NAMES so callers
+  // cannot forge routing by claiming a different daemon. The daemon's
+  // get_memory_sources orchestrator resolves originServerId from cache
+  // or the cloud projection-owner endpoint, never from tool input.
+
+  it('keeps serverId in the forbidden args list (cross-server routing safety)', () => {
+    expect(MEMORY_MCP_FORBIDDEN_ARG_NAMES).toContain('serverId');
+  });
+
+  it('strips serverId from get_memory_sources input via pickAllowedMcpArgs', () => {
+    const stripped = pickAllowedMcpArgs(
+      { ref: 'proj:abc123', serverId: 'attacker-srv', userId: 'mallory' },
+      ['projectionId', 'observationId', 'kind', 'ref'],
+    );
+    expect(stripped).toEqual({ ref: 'proj:abc123' });
+    expect(stripped).not.toHaveProperty('serverId');
+  });
+
+  it('also strips serverId via the broader stripForbiddenMcpArgs helper', () => {
+    const stripped = stripForbiddenMcpArgs({
+      projectionId: 'p1',
+      serverId: 'attacker-srv',
+      sourceServerId: 'attacker-2',
+    });
+    expect(stripped).toEqual({ projectionId: 'p1' });
   });
 });

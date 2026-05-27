@@ -945,11 +945,13 @@ export async function relaunchSessionWithSettings(
     && record.agentType === targetAgentType
     // Qwen uses providerSessionId as its real resume key, so explicit restart must
     // preserve it. Claude/Codex SDKs keep their provider continuity in ccSessionId /
-    // codexSessionId and therefore use a fresh local route key on relaunch.
+    // codexSessionId; Kimi uses providerResumeId, so these providers use a fresh
+    // local route key on relaunch.
     && targetAgentType !== 'claude-code-sdk'
     && targetAgentType !== 'codex-sdk'
     && targetAgentType !== 'copilot-sdk'
     && targetAgentType !== 'cursor-headless'
+    && targetAgentType !== 'kimi-sdk'
     && typeof record.providerSessionId === 'string'
     && record.providerSessionId.length > 0;
 
@@ -973,6 +975,9 @@ export async function relaunchSessionWithSettings(
       bindExistingKey: record.providerSessionId,
       skipCreate: true,
     } : {}),
+    ...((targetAgentType === 'copilot-sdk' || targetAgentType === 'cursor-headless' || targetAgentType === 'kimi-sdk') && record.providerResumeId
+      ? { providerResumeId: record.providerResumeId }
+      : {}),
     ...compatibleIds,
     ...(record.parentSession ? { parentSession: record.parentSession } : {}),
     ...(record.userCreated ? { userCreated: true } : {}),
@@ -1009,28 +1014,11 @@ async function loadBoundServerIdForManagedMcp(): Promise<string | undefined> {
   }
 }
 
-function buildTransportImcodesIdentityPrompt(
-  sessionName: string,
-  label: string | null | undefined,
-): string {
-  const displayLabel = label?.trim() || sessionName;
-  return [
-    'IM.codes session identity:',
-    `- Exact session name: ${sessionName}`,
-    `- Display label: ${displayLabel}`,
-    `- When invoking \`imcodes send\`, prefer $${IMCODES_SESSION_ENV}. If a SDK/tool environment lacks it, prefix the command with ${IMCODES_SESSION_ENV}=${sessionName}. Do not use display labels as sender identity unless the exact session name is unavailable, because labels can be duplicated.`,
-  ].join('\n');
-}
-
-function mergeTransportSystemPromptWithIdentity(
-  systemPrompt: string | undefined,
-  sessionName: string,
-  label: string | null | undefined,
-): string {
-  return [systemPrompt?.trim(), buildTransportImcodesIdentityPrompt(sessionName, label)]
-    .filter(Boolean)
-    .join('\n\n');
-}
+// IM.codes identity + Generated Image Reporting prompts now live in
+// `shared/transport-runtime-prompts.ts` and are injected at the
+// assembly layer via `runtime.setSessionIdentity`. They are NOT subject
+// to the 300-char user-authored cap that bounds `description` /
+// `systemPrompt`. See p2p audit 37bfbb85-430 N-A.
 
 function queueTransportErrorResendEntries(sessionName: string, entries: PendingTransportMessage[]): number {
   if (entries.length === 0) return getResendCount(sessionName);
@@ -1111,7 +1099,7 @@ async function recoverTransportRuntimeAfterError(
       ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
       ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
       ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
-      ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk') && record.providerResumeId
+      ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk' || record.agentType === 'kimi-sdk') && record.providerResumeId
         ? { providerResumeId: record.providerResumeId }
         : {}),
       ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
@@ -1252,7 +1240,7 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
         next.codexSessionId = info.resumeId;
         changed = true;
       }
-      if ((agentType === 'cursor-headless' || agentType === 'copilot-sdk') && next.providerResumeId !== info.resumeId) {
+      if ((agentType === 'cursor-headless' || agentType === 'copilot-sdk' || agentType === 'kimi-sdk') && next.providerResumeId !== info.resumeId) {
         next.providerResumeId = info.resumeId;
         changed = true;
       }
@@ -1411,13 +1399,14 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk'
         || s.providerId === 'codex-sdk'
         || s.providerId === 'cursor-headless'
-        || s.providerId === 'copilot-sdk';
+        || s.providerId === 'copilot-sdk'
+        || s.providerId === 'kimi-sdk';
       const effectiveSessionKey = freshAfterCancel || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
       const resumeId = s.providerId === 'claude-code-sdk'
         ? s.ccSessionId
         : s.providerId === 'codex-sdk'
           ? s.codexSessionId
-          : (s.providerId === 'cursor-headless' || s.providerId === 'copilot-sdk')
+          : (s.providerId === 'cursor-headless' || s.providerId === 'copilot-sdk' || s.providerId === 'kimi-sdk')
             ? s.providerResumeId
             : undefined;
       let extraEnv: Record<string, string> | undefined;
@@ -1474,7 +1463,13 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         cwd: s.projectDir,
         label: s.label ?? s.name,
         description: s.description,
-        systemPrompt: mergeTransportSystemPromptWithIdentity(systemPrompt, s.name, s.label),
+        // User-authored systemPrompt only; the IM.codes identity block and
+        // Generated Image Reporting protocol are injected at the assembly
+        // layer (peer-level with `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE`) via
+        // `runtime.initialize` -> `setSessionIdentity`. They are NOT
+        // subject to `clampUserSessionText`'s 300-char cap. See p2p
+        // audit 37bfbb85-430 N-A.
+        systemPrompt,
         ...(transportSettings ? { settings: transportSettings } : {}),
         contextNamespace: contextBootstrap.namespace,
         contextNamespaceDiagnostics: contextBootstrap.diagnostics,
@@ -1491,7 +1486,8 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         startupMemoryAlreadyInjected: s.startupMemoryInjected === true,
       });
       if (s.description) runtime.setDescription(s.description);
-      runtime.setSystemPrompt(mergeTransportSystemPromptWithIdentity(systemPrompt, s.name, s.label));
+      if (systemPrompt) runtime.setSystemPrompt(systemPrompt);
+      runtime.setSessionIdentity(s.name, s.label);
       if (effectiveRequestedModel) runtime.setAgentId(effectiveRequestedModel);
       if (s.effort) runtime.setEffort(s.effort);
       transportRuntimes.set(s.name, runtime);
@@ -1790,7 +1786,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
       await getCodexRuntimeConfig().catch(() => ({})),
       existing,
     );
-  } else if (agentType === 'cursor-headless' || agentType === 'copilot-sdk') {
+  } else if (agentType === 'cursor-headless' || agentType === 'copilot-sdk' || agentType === 'kimi-sdk') {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
     transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
@@ -1818,7 +1814,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     cwd: projectDir,
     label: label || name,
     description,
-    systemPrompt: mergeTransportSystemPromptWithIdentity(transportSystemPrompt, name, label),
+    // User-authored only. Identity + image-reporting are injected at
+    // the assembly layer via `SessionConfig.sessionName` / `label` ->
+    // `runtime.setSessionIdentity`, peer-level with
+    // `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE` and outside the 300-char user
+    // cap. See p2p audit 37bfbb85-430 N-A.
+    systemPrompt: transportSystemPrompt,
     ...(transportSettings ? { settings: transportSettings } : {}),
     contextNamespace: contextBootstrap.namespace,
     contextNamespaceDiagnostics: contextBootstrap.diagnostics,
@@ -1854,7 +1855,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         runtimeType: RUNTIME_TYPES.TRANSPORT,
         providerId: provider.id,
         providerSessionId: runtime.providerSessionId ?? undefined,
-        ...((agentType === 'copilot-sdk' || agentType === 'cursor-headless') && transportResumeId
+        ...((agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'kimi-sdk') && transportResumeId
           ? { providerResumeId: transportResumeId }
           : {}),
         ...(agentType === 'claude-code-sdk' && transportResumeId ? { ccSessionId: transportResumeId } : {}),

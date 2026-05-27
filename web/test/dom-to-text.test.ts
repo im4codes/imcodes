@@ -115,6 +115,18 @@ describe('domNodeToPlainText', () => {
     expect(domNodeToPlainText(el)).toBe('hello\nworld');
   });
 
+  it('omits inline local image preview chrome while preserving the path text', () => {
+    const el = makeEl(
+      '<div class="chat-event chat-assistant">' +
+        '<div class="chat-rich-text">' +
+          '<p><span class="chat-path-actions"><span class="chat-path-link">./shots/result.png</span></span>' +
+          '<span class="chat-local-image-preview"><img alt="result.png" src="data:image/png;base64,aW1n"></span></p>' +
+        '</div>' +
+      '</div>',
+    );
+    expect(domNodeToPlainText(el)).toBe('./shots/result.png');
+  });
+
   it('round-trips a marked-style multi-paragraph assistant message', () => {
     // Shape mirrors what ChatMarkdown renders for:
     //   First paragraph.

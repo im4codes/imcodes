@@ -32,6 +32,7 @@ import { cronApiRoutes } from './routes/cron-api.js';
 import { pushRoutes } from './routes/push.js';
 import { quickDataRoutes } from './routes/quick-data.js';
 import { watchRoutes } from './routes/watch.js';
+import { memoryRoutes } from './routes/memory.js';
 import { sessionMgmtRoutes } from './routes/session-mgmt.js';
 import { subSessionRoutes } from './routes/sub-sessions.js';
 import { discussionRoutes } from './routes/discussions.js';
@@ -163,6 +164,10 @@ export function buildApp(env: Env) {
   app.route('/api/push', pushRoutes);
   app.route('/api/quick-data', quickDataRoutes);
   app.route('/api', watchRoutes);
+  // Pod-sticky memory routes: serverId is read from the `?serverId=` query
+  // string by the ingress for pod routing; the projection-owner resolver
+  // ignores serverId entirely (cloud-only PG lookup).
+  app.route('/api', memoryRoutes);
   // fileTransferRoutes MUST be first — its token-auth middleware bypasses requireAuth
   // for iOS downloads (SFSafariViewController has no cookies/Bearer). If mounted after
   // sessionMgmtRoutes (which has blanket requireAuth on /*), the token path is shadowed.
@@ -177,6 +182,22 @@ export function buildApp(env: Env) {
   app.route('/api/admin', adminRoutes);
 
   app.get('/health', (c) => c.json({ ok: true, ts: Date.now() }));
+
+  app.get('/api/app-build', async (c) => {
+    try {
+      const content = await readFile(join(WEB_DIST, 'app-build.json'), 'utf8');
+      return new Response(content, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store',
+        },
+      });
+    } catch {
+      return c.json({ error: 'not_found' }, 404, {
+        'Cache-Control': 'no-store',
+      });
+    }
+  });
 
   // Apple App Site Association — required for iOS Associated Domains (webcredentials) to work.
   // Allows the Capacitor app (M675E26Q67.app.imcodes) to use passkeys in WKWebView.
@@ -199,6 +220,7 @@ export function buildApp(env: Env) {
       "script-src 'self' 'unsafe-inline'",   // Vite bundles inline runtime; tighten with hashes in future
       "style-src 'self' 'unsafe-inline'",
       "connect-src 'self' wss: ws: https://api.github.com",
+      "worker-src 'self' blob:",
       "img-src 'self' data: https:",
       "font-src 'self'",
       "frame-ancestors 'none'",

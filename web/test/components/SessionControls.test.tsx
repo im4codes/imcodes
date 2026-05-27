@@ -4,7 +4,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, within, waitFor, act } from '@testing-library/preact';
-import { useState } from 'preact/hooks';
+import { useRef, useState } from 'preact/hooks';
 import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js';
 
 const DEFAULT_INNER_WIDTH = 1280;
@@ -58,11 +58,13 @@ vi.mock('react-i18next', () => ({
         return `Send to ${String(opts?.name ?? 'session')}…`;
       }
       if (key === 'session.send_placeholder_desktop_upload') {
-        return `${String(opts?.placeholder ?? '')} Supports fast multi-file paste upload`;
+        return `${String(opts?.placeholder ?? '')} Supports fast multi-file paste or drag upload`;
       }
       if (key === 'upload.long_text_attached') {
         return `Large pasted text attached as ${String(opts?.name ?? '')}`;
       }
+      if (key === 'upload.drop_overlay_title') return 'Drop files to upload';
+      if (key === 'upload.drop_overlay_hint') return 'Release anywhere in this session window';
       if (key === 'upload.file_too_large') {
         return `File too large (max ${String(opts?.max ?? '')}MB)`;
       }
@@ -150,6 +152,26 @@ vi.mock('../../src/components/AtPicker.js', () => ({
       </div>
     );
   },
+}));
+
+vi.mock('../../src/components/file-browser-lazy.js', () => ({
+  FileBrowser: ({ initialPath, mode, defaultTab, changesRootPath, onConfirm }: {
+    initialPath?: string;
+    mode: string;
+    defaultTab?: string;
+    changesRootPath?: string;
+    onConfirm: (paths: string[]) => void;
+  }) => (
+    <div
+      data-testid="mock-file-browser"
+      data-initial-path={initialPath ?? ''}
+      data-mode={mode}
+      data-default-tab={defaultTab ?? ''}
+      data-changes-root-path={changesRootPath ?? ''}
+    >
+      <button onClick={() => onConfirm([`${initialPath ?? ''}/proposal.md`])}>mock-file-confirm</button>
+    </div>
+  ),
 }));
 
 const uploadFileMock = vi.fn();
@@ -304,6 +326,14 @@ function expectCancelPayload(ws: ReturnType<typeof makeWs>, payload: Record<stri
     ...payload,
     commandId: expect.any(String),
   }));
+}
+
+function expectUrgentCancelPayload(ws: ReturnType<typeof makeWs>, payload: Record<string, unknown>): void {
+  expect(ws.sendSessionCommandUrgent).toHaveBeenCalledWith('cancel', expect.objectContaining({
+    ...payload,
+    commandId: expect.any(String),
+  }));
+  expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('cancel', expect.objectContaining(payload));
 }
 
 function expectLastSendPayload(ws: ReturnType<typeof makeWs>, payload: Record<string, unknown>): void {
@@ -473,7 +503,7 @@ afterEach(() => {
       />,
     );
     expect(screen.getByText('OpenSpec')).toBeDefined();
-    expect(screen.getByText('P2P')).toBeDefined();
+    expect(screen.getByText('Team')).toBeDefined();
     expect(screen.getByLabelText('settings_button')).toBeDefined();
     expect(document.querySelector('.shortcuts')).toBeNull();
   });
@@ -501,7 +531,7 @@ afterEach(() => {
   it('shows the desktop upload hint in the placeholder on desktop', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: DEFAULT_INNER_WIDTH });
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
-    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project… Supports fast multi-file paste upload');
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project… Supports fast multi-file paste or drag upload');
   });
 
   it('keeps the placeholder short on mobile', () => {
@@ -731,12 +761,12 @@ afterEach(() => {
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'run combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
-    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_review→mode_plan/i));
 
     expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
     expect(screen.getAllByRole('button', { name: /^send$/i }).length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByRole('button', { name: /^p2p$/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^team$/i })).toBeDefined();
   });
 
   it('asks for confirmation before directly sending from a combo dropdown item', async () => {
@@ -747,8 +777,8 @@ afterEach(() => {
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'run combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
-    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_review→mode_plan/i));
 
     expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
@@ -756,7 +786,7 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: /^send$/i })).toBeDefined();
-    expect(screen.getByRole('button', { name: /^p2p$/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^team$/i })).toBeDefined();
   });
 
   it('blocks combo sends that only contain routing markup and shows a warning', () => {
@@ -789,10 +819,10 @@ afterEach(() => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
 
     expect(screen.getByText('combo_requires_participants_hint')).toBeDefined();
-    const comboBtn = screen.getByRole('button', { name: /mode_audit→mode_plan/i }) as HTMLButtonElement;
+    const comboBtn = screen.getByRole('button', { name: /mode_audit→mode_review→mode_plan/i }) as HTMLButtonElement;
     expect(comboBtn.disabled).toBe(true);
     expect(comboBtn.title).toBe('combo_requires_participants_hint');
   });
@@ -894,27 +924,30 @@ afterEach(() => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
 
-    expect(screen.getByText('P2P')).toBeDefined();
+    expect(screen.getByText('Team')).toBeDefined();
     expect(screen.queryByText(/^mode_audit$/i)).toBeNull();
     expect(screen.queryByText(/^mode_review$/i)).toBeNull();
     expect(screen.queryByText(/^mode_plan$/i)).toBeNull();
     expect(screen.queryByText(/^mode_brainstorm$/i)).toBeNull();
     expect(screen.queryByText(/^mode_discuss$/i)).toBeNull();
     expect(screen.queryByText(/^mode_config$/i)).toBeNull();
-    expect(screen.getByText(/mode_audit→mode_plan/i)).toBeDefined();
+    expect(screen.queryByText(/^mode_audit→mode_plan$/i)).toBeNull();
+    expect(screen.queryByText(/^mode_review→mode_plan$/i)).toBeNull();
+    expect(screen.getByText(/mode_audit→mode_review→mode_plan/i)).toBeDefined();
+    expect(within(screen.getByTestId('p2p-dropdown-tab-workflows')).getByText('alpha_badge')).toBeDefined();
   });
 
   it('puts the global rounds selector at the top of the P2P dropdown and saves changes', async () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
 
     const menu = screen.getByTestId('p2p-dropdown');
     const rounds = within(menu).getByTestId('p2p-dropdown-rounds');
-    const solo = within(menu).getByRole('button', { name: /P2P$/i });
+    const solo = within(menu).getByRole('button', { name: /Team$/i });
     expect(rounds.compareDocumentPosition(solo) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 
     fireEvent.click(within(rounds).getByTestId('p2p-dropdown-round-2'));
@@ -949,7 +982,7 @@ afterEach(() => {
     fireEvent.click(screen.getByText('✓'));
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
     expect(screen.getAllByText(/mode_brainstorm→mode_review/i).length).toBeGreaterThanOrEqual(1);
   });
 
@@ -961,8 +994,8 @@ afterEach(() => {
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'first combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
-    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_review→mode_plan/i));
 
     const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
     fireEvent.click(within(dialog).getByRole('checkbox'));
@@ -974,7 +1007,7 @@ afterEach(() => {
       p2pAtTargets: [
         { session: '__all__', mode: 'config' },
       ],
-      p2pMode: 'audit>plan',
+      p2pMode: 'audit>review>plan',
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },
@@ -985,8 +1018,8 @@ afterEach(() => {
 
     input.textContent = 'second combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
-    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_review→mode_plan/i));
 
     expect(screen.queryByText('combo_send_confirm_title')).toBeNull();
     expectLastSendPayload(ws, {
@@ -995,7 +1028,7 @@ afterEach(() => {
       p2pAtTargets: [
         { session: '__all__', mode: 'config' },
       ],
-      p2pMode: 'audit>plan',
+      p2pMode: 'audit>review>plan',
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },
@@ -1013,8 +1046,8 @@ afterEach(() => {
     input.textContent = 'direct combo';
     fireEvent.input(input);
 
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
-    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_review→mode_plan/i));
 
     const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
     fireEvent.click(within(dialog).getByRole('button', { name: /^send$/i }));
@@ -1025,7 +1058,7 @@ afterEach(() => {
       p2pAtTargets: [
         { session: '__all__', mode: 'config' },
       ],
-      p2pMode: 'audit>plan',
+      p2pMode: 'audit>review>plan',
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },
@@ -1038,7 +1071,7 @@ afterEach(() => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^team$/i }));
 
     const menu = document.querySelector('.menu-dropdown-p2p') as HTMLElement;
     fireEvent.click(within(menu).getByRole('button', { name: 'settings_button' }));
@@ -1067,6 +1100,7 @@ afterEach(() => {
       status: 'ok',
       resolvedPath: '/repo/openspec/changes',
       entries: [
+        { name: 'archive', path: '/repo/openspec/changes/archive', isDir: true, hidden: false },
         { name: 'change-b', path: '/repo/openspec/changes/change-b', isDir: true, hidden: false },
         { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
         { name: 'README.md', path: '/repo/openspec/changes/README.md', isDir: false, hidden: false },
@@ -1074,9 +1108,51 @@ afterEach(() => {
     });
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: 'change-a' }));
+    const changeButton = screen.getByRole('button', { name: 'change-a' });
+    expect(changeButton.textContent).toContain('@');
+    expect(screen.queryByRole('button', { name: 'archive' })).toBeNull();
+
+    fireEvent.click(changeButton);
 
     expect(screen.getByRole('textbox').textContent).toBe('@openspec/changes/change-a');
+  });
+
+  it('opens an openspec change folder in the file browser and can insert files from it', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'archive', path: '/repo/openspec/changes/archive', isDir: true, hidden: false },
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    expect(screen.queryByRole('button', { name: 'archive' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'pinned_repo' }));
+
+    const browser = await screen.findByTestId('mock-file-browser');
+    expect(browser.getAttribute('data-initial-path')).toBe('/repo/openspec/changes/change-a');
+    expect(browser.getAttribute('data-mode')).toBe('file-multi');
+    expect(browser.getAttribute('data-default-tab')).toBe('files');
+    expect(browser.getAttribute('data-changes-root-path')).toBe('');
+
+    fireEvent.click(screen.getByRole('button', { name: 'mock-file-confirm' }));
+
+    expect(screen.getByRole('textbox').textContent).toBe('@openspec/changes/change-a/proposal.md');
+    expect(screen.queryByTestId('mock-file-browser')).toBeNull();
   });
 
   it('does not leave openspec changes loading when the list request cannot be sent', async () => {
@@ -1862,7 +1938,7 @@ afterEach(() => {
     });
   });
 
-  it('typing /stop in a transport input sends direct cancel instead of chat text', () => {
+  it('typing /stop in a transport input sends direct urgent cancel instead of chat text', () => {
     const ws = makeWs();
     const onSend = vi.fn();
     render(
@@ -1878,7 +1954,10 @@ afterEach(() => {
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
 
-    expectCancelPayload(ws, { sessionName: 'qwen-session' });
+    // STOP must stay on the urgent lane. A regular session.cancel would be
+    // gated by ws-client probe state and can be dropped during tab/focus
+    // resume, which is the regression this test locks down.
+    expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
     expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({ text: '/stop' }));
     expect(onSend).not.toHaveBeenCalled();
   });
@@ -2404,6 +2483,25 @@ afterEach(() => {
     });
   });
 
+  it('forces qwen compatible API sessions to high thinking mode', () => {
+    render(<SessionControls
+      ws={makeWs() as any}
+      activeSession={makeSession({
+        name: 'qwen-compatible-session',
+        agentType: 'qwen',
+        runtimeType: 'transport',
+        effort: 'high',
+        ccPreset: 'MiniMax',
+        qwenAuthType: 'api-key',
+      })}
+      quickData={makeQuickData() as any}
+    />);
+
+    expect(screen.getByRole('button', { name: /^high$/i })).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: /^high$/i }));
+    expect(screen.queryByRole('button', { name: /^○ off$/i })).toBeNull();
+  });
+
 
   it('shows queued transport messages at the bottom', () => {
     const runningSession = makeSession({
@@ -2593,7 +2691,7 @@ afterEach(() => {
 
     // Transport sessions cancel the SDK turn directly instead of sending
     // `/stop` as chat text.
-    expectCancelPayload(ws, { sessionName: 'qwen-session' });
+    expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
     expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({
       sessionName: 'qwen-session',
       text: '/stop',
@@ -2620,7 +2718,7 @@ afterEach(() => {
     expect(stopBtn.textContent).toBe('■');
     expect(stopBtn.disabled).toBe(false);
     fireEvent.click(stopBtn);
-    expectCancelPayload(ws, { sessionName: 'codex-sdk-session' });
+    expectUrgentCancelPayload(ws, { sessionName: 'codex-sdk-session' });
     expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({
       sessionName: 'codex-sdk-session',
       text: '/stop',
@@ -3305,6 +3403,83 @@ afterEach(() => {
     expect(uploadFileMock).not.toHaveBeenCalled();
   });
 
+  it('uploads dropped files through the same composer attachment path as paste', async () => {
+    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/dropped-image.png' } });
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const droppedFile = new File(['png'], 'dropped-image.png', { type: 'image/png' });
+    const dataTransfer = {
+      files: [droppedFile],
+      types: ['Files'],
+      dropEffect: 'none',
+    };
+
+    fireEvent.dragEnter(input, { dataTransfer });
+    expect(input.classList.contains('controls-input-file-drag-over')).toBe(true);
+    expect(dataTransfer.dropEffect).toBe('copy');
+
+    fireEvent.drop(input, { dataTransfer });
+
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
+    expect(uploadFileMock.mock.calls[0]?.[0]).toBe('srv-1');
+    expect(uploadFileMock.mock.calls[0]?.[1]).toBe(droppedFile);
+    await waitFor(() => {
+      expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1');
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('dropped-image.png');
+    });
+    expect(input.classList.contains('controls-input-file-drag-over')).toBe(false);
+  });
+
+  it('uploads files dropped anywhere in the session drop target with a visible overlay', async () => {
+    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/session-drop.pdf' } });
+    function Harness() {
+      const dropTargetRef = useRef<HTMLDivElement>(null);
+      return (
+        <div ref={dropTargetRef} data-testid="session-drop-target">
+          <div data-testid="session-body">chat body</div>
+          <SessionControls
+            ws={makeWs() as any}
+            activeSession={makeSession()}
+            quickData={makeQuickData() as any}
+            serverId="srv-1"
+            fileDropTargetRef={dropTargetRef}
+          />
+        </div>
+      );
+    }
+
+    render(<Harness />);
+
+    const target = screen.getByTestId('session-drop-target') as HTMLDivElement;
+    const droppedFile = new File(['pdf'], 'session-drop.pdf', { type: 'application/pdf' });
+    const dataTransfer = {
+      files: [droppedFile],
+      types: ['Files'],
+      dropEffect: 'none',
+    };
+
+    fireEvent.dragEnter(target, { dataTransfer });
+
+    expect(document.querySelector('.session-file-drop-overlay')).toBeTruthy();
+    expect(document.querySelector('.session-file-drop-title')?.textContent).toBe('Drop files to upload');
+    expect(dataTransfer.dropEffect).toBe('copy');
+
+    fireEvent.drop(target, { dataTransfer });
+
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
+    expect(uploadFileMock.mock.calls[0]?.[0]).toBe('srv-1');
+    expect(uploadFileMock.mock.calls[0]?.[1]).toBe(droppedFile);
+    await waitFor(() => expect(document.querySelector('.session-file-drop-overlay')).toBeFalsy());
+  });
+
   it('converts oversized plain-text paste into an attachment upload', async () => {
     uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/pasted-text.txt' } });
     const ws = makeWs();
@@ -3574,6 +3749,61 @@ afterEach(() => {
 
     await waitFor(() => {
       expect(document.querySelector('.attachment-badge-name')?.textContent).toBe(badgeName);
+    });
+  });
+
+  it('keeps an in-flight upload bound to its original composer when switching windows', async () => {
+    let resolveUpload: ((value: { attachment: { daemonPath: string } }) => void) | null = null;
+    uploadFileMock.mockImplementation(() => new Promise((resolve) => {
+      resolveUpload = resolve;
+    }));
+    const ws = makeWs();
+    const { rerender } = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_upload-1' })}
+        subSessionId="upload-1"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [new File(['large'], 'large.bin')],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_upload-2' })}
+        subSessionId="upload-2"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+    expect(document.querySelector('.attachment-badge-name')).toBeNull();
+
+    await act(async () => {
+      resolveUpload?.({ attachment: { daemonPath: '/tmp/large.bin' } });
+    });
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_upload-1' })}
+        subSessionId="upload-1"
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('large.bin');
     });
   });
 
@@ -4058,6 +4288,32 @@ afterEach(() => {
     expect(screen.getByRole('button', { name: /gpt-5.5/i })).toBeDefined();
   });
 
+  it('closes the model selector on outside touchstart before mobile click synthesis', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.4$/i }));
+    await waitFor(() => expect(document.querySelector('.menu-dropdown')).toBeTruthy());
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    fireEvent.touchStart(document.body);
+
+    await waitFor(() => expect(document.querySelector('.menu-dropdown')).toBeFalsy());
+  });
+
   it('shows a model selector for copilot-sdk and sends /model', () => {
     const ws = makeWs();
     render(
@@ -4169,6 +4425,46 @@ afterEach(() => {
     expectSendPayload(ws, {
       sessionName: 'gemini-sdk-session',
       text: '/model gemini-2.5-flash',
+    });
+  });
+
+  it('shows dynamically discovered kimi-sdk models and sends /model', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'kimi-sdk-session',
+          agentType: 'kimi-sdk',
+          runtimeType: 'transport',
+          activeModel: 'moonshot-v1-auto',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = ws.send.mock.calls.find((call) => call[0]?.type === 'transport.list_models')?.[0];
+    expect(request).toMatchObject({ type: 'transport.list_models', agentType: 'kimi-sdk' });
+
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'kimi-sdk',
+      requestId: request?.requestId,
+      models: [
+        { id: 'moonshot-v1-auto', name: 'Moonshot Auto' },
+        { id: 'moonshot-v1-auto,thinking', name: 'Moonshot Auto Thinking' },
+      ],
+      defaultModel: 'moonshot-v1-auto,thinking',
+      isAuthenticated: true,
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: /^moonshot-v1-auto$/i }));
+    const menu = document.querySelector('.menu-dropdown') as HTMLElement;
+    fireEvent.click(within(menu).getByRole('button', { name: /moonshot-v1-auto,thinking/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'kimi-sdk-session',
+      text: '/model moonshot-v1-auto,thinking',
     });
   });
 });

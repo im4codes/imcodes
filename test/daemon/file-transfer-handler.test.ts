@@ -2,14 +2,27 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, realpath, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { FILE_TRANSFER_LIMITS } from '../../shared/transport/file-transfer.js';
 
-async function loadFileTransferHandler(fakeHome: string) {
+async function loadFileTransferHandler(fakeHome: string, options?: { maxFileSize?: number }) {
   vi.resetModules();
   vi.doMock('node:os', async (importOriginal) => {
     const actual = await importOriginal<typeof import('node:os')>();
     return { ...actual, homedir: () => fakeHome };
   });
+  if (options?.maxFileSize !== undefined) {
+    vi.doMock('../../shared/transport/file-transfer.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../shared/transport/file-transfer.js')>();
+      return {
+        ...actual,
+        FILE_TRANSFER_LIMITS: {
+          ...actual.FILE_TRANSFER_LIMITS,
+          MAX_FILE_SIZE: options.maxFileSize,
+        },
+      };
+    });
+  }
   vi.doMock('../../src/util/logger.js', () => ({
     default: {
       info: vi.fn(),
@@ -46,7 +59,9 @@ describe('file-transfer local handle hardening', () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     vi.doUnmock('node:os');
+    vi.doUnmock('../../shared/transport/file-transfer.js');
     vi.doUnmock('../../src/util/logger.js');
     vi.resetModules();
     await rm(rootDir, { recursive: true, force: true });
@@ -187,5 +202,115 @@ describe('file-transfer local handle hardening', () => {
       downloadId: 'download-expired',
       message: 'expired',
     });
+  });
+
+  it('rejects legacy uploads over the active single-frame cap', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome, { maxFileSize: 4 });
+    const failed = createServerLinkMock();
+
+    await transfer.handleFileUpload(
+      {
+        type: 'file.upload',
+        uploadId: 'upload-too-large',
+        filename: 'safe.txt',
+        size: 5,
+        content: Buffer.from('hello').toString('base64'),
+      },
+      failed.serverLink as never,
+    );
+
+    expect(failed.sent[0]).toMatchObject({
+      type: 'file.upload_error',
+      uploadId: 'upload-too-large',
+      message: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE,
+    });
+  });
+
+  it('rejects legacy upload payloads whose decoded byte count does not match the declared size', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const failed = createServerLinkMock();
+
+    await transfer.handleFileUpload(
+      {
+        type: 'file.upload',
+        uploadId: 'upload-size-mismatch',
+        filename: 'safe.txt',
+        size: 99,
+        content: Buffer.from('hello').toString('base64'),
+      },
+      failed.serverLink as never,
+    );
+
+    expect(failed.sent[0]).toMatchObject({
+      type: 'file.upload_error',
+      uploadId: 'upload-size-mismatch',
+      message: 'size_mismatch',
+    });
+  });
+
+  it('downloads relay-staged uploads over HTTP and registers the attachment', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const fetchMock = vi.fn().mockResolvedValue(new Response('hello', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const done = createServerLinkMock();
+
+    await transfer.handleFileUploadFetch(
+      {
+        type: 'file.upload_fetch',
+        uploadId: 'upload-fetch',
+        filename: 'safe.txt',
+        originalName: 'safe.txt',
+        mime: 'text/plain',
+        size: 5,
+        downloadUrl: 'https://relay.example/upload-staged/upload-fetch?token=reusable',
+      },
+      done.serverLink as never,
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith('https://relay.example/upload-staged/upload-fetch?token=reusable');
+    expect(done.sent).toContainEqual(expect.objectContaining({
+      type: 'file.upload_progress',
+      uploadId: 'upload-fetch',
+      loaded: 0,
+      total: 5,
+    }));
+    expect(done.sent).toContainEqual(expect.objectContaining({
+      type: 'file.upload_done',
+      uploadId: 'upload-fetch',
+      attachment: expect.objectContaining({
+        id: 'safe.txt',
+        originalName: 'safe.txt',
+        mime: 'text/plain',
+        size: 5,
+        downloadable: true,
+      }),
+    }));
+  });
+
+  it('retries relay-staged upload downloads with the same URL before failing', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('try again', { status: 503 }))
+      .mockResolvedValueOnce(new Response('hello', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const done = createServerLinkMock();
+
+    await transfer.handleFileUploadFetch(
+      {
+        type: 'file.upload_fetch',
+        uploadId: 'upload-fetch-retry',
+        filename: 'retry.txt',
+        size: 5,
+        downloadUrl: 'https://relay.example/upload-staged/upload-fetch-retry?token=reusable',
+      },
+      done.serverLink as never,
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(2, 'https://relay.example/upload-staged/upload-fetch-retry?token=reusable');
+    expect(done.sent).toContainEqual(expect.objectContaining({
+      type: 'file.upload_done',
+      uploadId: 'upload-fetch-retry',
+    }));
   });
 });

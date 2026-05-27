@@ -116,6 +116,20 @@ describe('memory MCP write tools', () => {
     expect(writeContextObservation).not.toHaveBeenCalled();
   });
 
+  it('rejects agent observations when the caller has no project scope', () => {
+    const scopedOutCaller = createMemoryToolCaller({
+      userId: 'user-1',
+      namespace: { scope: 'personal', userId: 'user-1' },
+    });
+    const writeContextObservation = vi.fn();
+
+    expect(saveObservation({ content: 'projectless observation' }, scopedOutCaller, { writeContextObservation })).toMatchObject({
+      status: 'error',
+      reason: 'scope_forbidden',
+    });
+    expect(writeContextObservation).not.toHaveBeenCalled();
+  });
+
   it('saves preferences through explicit observation writes without @pref parsing authority', () => {
     const ensureContextNamespace = vi.fn(() => namespaceRow());
     const writeContextObservation = vi.fn((input) => observationRow({

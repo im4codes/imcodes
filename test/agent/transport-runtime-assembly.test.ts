@@ -1,12 +1,19 @@
 import { describe, expect, it, vi } from 'vitest';
-import { buildProviderContextPayload, dispatchSharedContextSend } from '../../src/agent/transport-runtime-assembly.js';
+import {
+  buildProviderContextPayload,
+  dispatchSharedContextSend,
+  MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE,
+} from '../../src/agent/transport-runtime-assembly.js';
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { TransportMemoryRecallArtifact } from '../../shared/context-types.js';
 
-function makeProvider(contextSupport: NonNullable<TransportProvider['capabilities']['contextSupport']>): TransportProvider {
+function makeProvider(
+  contextSupport: NonNullable<TransportProvider['capabilities']['contextSupport']>,
+  id = 'mock',
+): TransportProvider {
   const send = vi.fn(async () => {});
   return {
-    id: 'mock',
+    id,
     connectionMode: 'local-sdk',
     sessionOwnership: 'shared',
     capabilities: {
@@ -56,15 +63,73 @@ describe('buildProviderContextPayload', () => {
       namespace: { scope: 'personal', projectId: 'repo-1' },
     });
 
-    expect(payload).toMatchObject({
-      userMessage: 'Run tests',
-      assembledMessage: 'Run tests',
-      systemText: 'Be concise\n\nNever edit generated files',
-      supportClass: 'full-normalized-context-injection',
-    });
+    expect(payload.userMessage).toBe('Run tests');
+    expect(payload.assembledMessage).toBe('Run tests');
+    expect(payload.supportClass).toBe('full-normalized-context-injection');
+    expect(payload.sessionSystemText).toContain('Be concise');
+    expect(payload.sessionSystemText).toContain('Never edit generated files');
+    expect(payload.sessionSystemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+    expect(payload.turnSystemText).toBeUndefined();
+    expect(payload.systemText).toContain('Be concise');
+    expect(payload.systemText).toContain('Never edit generated files');
+    expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+    expect(payload.systemText).toContain('get_memory_sources');
+    expect(payload.systemText).toContain('sourceLookup fields');
+    expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
+    expect(payload.systemText).toContain('At key boundaries only');
   });
 
-  it('renders startup memory into systemText and message recall into messagePreamble without mutating userMessage', () => {
+  it('adds shared system guidance for every managed SDK provider id', () => {
+    const providerIds = [
+      'claude-code-sdk',
+      'gemini-sdk',
+      'kimi-sdk',
+      'copilot-sdk',
+      'codex-sdk',
+      'cursor-headless',
+      'qwen',
+    ];
+
+    for (const providerId of providerIds) {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', providerId), {
+        userMessage: 'What did we decide about memory recall last week?',
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+
+      expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+      expect(payload.systemText).toContain('Do not call memory for bare control messages');
+      expect(payload.systemText).toContain('call get_memory_sources with the returned sourceLookup fields');
+      expect(payload.systemText).toContain('do not invent details from summaries alone');
+      expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
+      expect(payload.systemText).toContain('skip routine narration and repeated summaries');
+      expect(payload.assembledMessage).toBe('What did we decide about memory recall last week?');
+    }
+  });
+
+  it('can suppress shared guidance for raw slash controls', () => {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: '/compact',
+      suppressMcpMemorySearchGuidance: true,
+      suppressAgentProgressGuidance: true,
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+    });
+
+    expect(payload.systemText).toBeUndefined();
+    expect(payload.assembledMessage).toBe('/compact');
+  });
+
+  it('keeps agent progress guidance independent from memory guidance suppression', () => {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'Run tests',
+      suppressMcpMemorySearchGuidance: true,
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+    });
+
+    expect(payload.systemText).not.toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+    expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
+  });
+
+  it('renders startup memory and message recall into messagePreamble without mutating userMessage', () => {
     const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
       userMessage: 'Run tests',
       namespace: { scope: 'personal', projectId: 'repo-1' },
@@ -77,8 +142,10 @@ describe('buildProviderContextPayload', () => {
     });
 
     expect(payload.userMessage).toBe('Run tests');
-    expect(payload.systemText).toContain('# Recent project memory');
+    expect(payload.systemText ?? '').not.toContain('# Recent project memory');
+    expect(payload.messagePreamble).toContain('# Recent project memory');
     expect(payload.messagePreamble).toContain('[Related past work]');
+    expect(payload.assembledMessage).toContain('# Recent project memory');
     expect(payload.assembledMessage).toContain('[Related past work]');
     expect(payload.startupMemory?.injectionSurface).toBe('normalized-payload');
     expect(payload.memoryRecall?.injectionSurface).toBe('normalized-payload');
@@ -200,6 +267,78 @@ describe('buildProviderContextPayload', () => {
     expect(payload.messagePreamble).toContain('[Related past work]');
     expect(payload.diagnostics).toContain('memory:start:suppressed-authority');
     expect(payload.diagnostics).toContain('memory:message:local-auxiliary');
+  });
+
+  it('keeps personal local startup memory as auxiliary when remote authority has no startup hits', () => {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'Run tests',
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      remoteProcessedFreshness: 'fresh',
+      retryExhausted: true,
+      startupMemory: makeRecall({
+        reason: 'startup',
+        injectedText: '# Recent project memory (reference only)\n<recent-project-memory advisory="true">\n- Local personal startup memory\n</recent-project-memory>',
+      }),
+    });
+
+    expect(payload.authority.authoritySource).toBe('processed_remote');
+    expect(payload.startupMemory).toEqual(expect.objectContaining({
+      sourceKind: 'local_processed',
+      authoritySource: 'processed_local',
+      injectionSurface: 'normalized-payload',
+    }));
+    expect(payload.messagePreamble).toContain('Local personal startup memory');
+    expect(payload.assembledMessage).toContain('Local personal startup memory');
+    expect(payload.diagnostics).toContain('memory:start:local-auxiliary');
+  });
+
+  it('injects remote startup memory when remote processed context is authoritative', () => {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'Run tests',
+      namespace: { scope: 'project_shared', projectId: 'repo-1', enterpriseId: 'ent-1' },
+      remoteProcessedFreshness: 'fresh',
+      retryExhausted: true,
+      startupMemory: makeRecall({
+        reason: 'startup',
+        authoritySource: 'processed_remote',
+        sourceKind: 'mixed_processed',
+        injectedText: '# Recent project memory (reference only)\n<recent-project-memory advisory=\"true\">\n- [important] Cloud startup memory\n- [recent] Local startup memory\n</recent-project-memory>',
+        items: [
+          {
+            id: 'cloud-startup',
+            projectId: 'repo-1',
+            summary: 'Cloud startup memory',
+            projectionClass: 'durable_memory_candidate',
+            sourceKind: 'remote_processed',
+          },
+          {
+            id: 'local-startup',
+            projectId: 'repo-1',
+            summary: 'Local startup memory',
+            projectionClass: 'recent_summary',
+            sourceKind: 'local_processed',
+          },
+        ],
+      }),
+    });
+
+    expect(payload.authority.authoritySource).toBe('processed_remote');
+    expect(payload.startupMemory).toEqual(expect.objectContaining({
+      sourceKind: 'remote_processed',
+      authoritySource: 'processed_remote',
+      injectionSurface: 'normalized-payload',
+      items: [
+        expect.objectContaining({
+          id: 'cloud-startup',
+          sourceKind: 'remote_processed',
+        }),
+      ],
+    }));
+    expect(payload.messagePreamble).toContain('Cloud startup memory');
+    expect(payload.assembledMessage).toContain('Cloud startup memory');
+    expect(payload.systemText ?? '').not.toContain('Cloud startup memory');
+    expect(payload.systemText ?? '').not.toContain('Local startup memory');
+    expect(payload.diagnostics).toContain('memory:start');
   });
 
   it('allows shared local processed fallback only when explicit policy permits it', () => {
@@ -363,8 +502,11 @@ describe('buildProviderContextPayload', () => {
       }),
     }));
     expect(provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      sessionSystemText: expect.stringContaining(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE),
+      turnSystemText: 'Required shared context:\n- Project coding standard',
       systemText: expect.stringContaining('Required shared context:\n- Project coding standard'),
       context: expect.objectContaining({
+        turnSystemText: 'Required shared context:\n- Project coding standard',
         requiredAuthoredContext: ['Project coding standard'],
         appliedDocumentVersionIds: ['doc-v2'],
       }),
@@ -397,5 +539,92 @@ describe('buildProviderContextPayload', () => {
     })).rejects.toThrow(/shared context authority is unavailable/i);
 
     expect(provider.send).not.toHaveBeenCalled();
+  });
+
+  // ── IM.codes identity injection (p2p 37bfbb85-430 N-A) ────────────────
+  describe('sessionIdentity', () => {
+    it('injects identity into sessionSystemText, intact and untruncated', () => {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+        userMessage: 'hi',
+        description: 'short user description',
+        systemPrompt: 'short user system prompt',
+        sessionIdentity: { sessionName: 'deck_myapp_brain', label: 'My App Brain' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+      const systemText = payload.sessionSystemText ?? '';
+      expect(systemText).toContain('short user description');
+      expect(systemText).toContain('short user system prompt');
+      expect(systemText).toContain('IM.codes session identity:');
+      expect(systemText).toContain('Exact session name: deck_myapp_brain');
+      expect(systemText).toContain('Display label: My App Brain');
+      expect(systemText).toContain('imcodes send');
+      expect(systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+    });
+
+    it('does NOT inject Generated Image Reporting at assembly layer (it lives in Codex baseInstructions tail now)', () => {
+      // p2p 37bfbb85-430 N-A follow-up: image-reporting is Codex-only,
+      // sent once per thread/start via `appendImcodesBaseInstructions`.
+      // Other providers must not pay the per-turn token cost.
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+        userMessage: 'hi',
+        sessionIdentity: { sessionName: 'deck_no_image_brain', label: 'No Image' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+      const systemText = payload.sessionSystemText ?? '';
+      expect(systemText).not.toContain('Generated images:');
+      expect(systemText).not.toContain('Generated Image Reporting:');
+      expect(systemText).not.toContain('repo-relative inside workspace');
+    });
+
+    it('falls back to the exact session name when label is null / undefined / blank', () => {
+      const cases: Array<string | null | undefined> = [null, undefined, '', '   '];
+      for (const label of cases) {
+        const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+          userMessage: 'hi',
+          sessionIdentity: { sessionName: 'deck_unlabeled_brain', label },
+          namespace: { scope: 'personal', projectId: 'repo-1' },
+        });
+        const systemText = payload.sessionSystemText ?? '';
+        expect(systemText).toContain('Exact session name: deck_unlabeled_brain');
+        expect(systemText).toContain('Display label: deck_unlabeled_brain');
+      }
+    });
+
+    it('does not inject identity when sessionIdentity is absent (process/tmux agents)', () => {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+        userMessage: 'hi',
+        description: 'some text',
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+      const systemText = payload.sessionSystemText ?? '';
+      expect(systemText).not.toContain('IM.codes session identity:');
+      expect(systemText).toContain('some text');
+    });
+
+    it('emits identity peer-level with memory + progress guidance — single contiguous sessionSystemText', () => {
+      // Order matters for prefix-cache friendliness: stable session-level
+      // blocks should appear in a deterministic order so the model's
+      // prompt cache hits across turns. The assembly order is:
+      //   description -> systemPrompt -> identity -> memory-search
+      //   guidance -> agent progress guidance.
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+        userMessage: 'hi',
+        description: 'desc-here',
+        systemPrompt: 'sp-here',
+        sessionIdentity: { sessionName: 'deck_order_brain', label: 'Order' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+      const systemText = payload.sessionSystemText ?? '';
+      const descIdx = systemText.indexOf('desc-here');
+      const spIdx = systemText.indexOf('sp-here');
+      const identityIdx = systemText.indexOf('IM.codes session identity:');
+      const memoryIdx = systemText.indexOf('Use memory MCP search');
+      const progressIdx = systemText.indexOf('Keep work updates sparse and high-signal.');
+      expect(descIdx).toBeGreaterThanOrEqual(0);
+      expect(spIdx).toBeGreaterThan(descIdx);
+      expect(identityIdx).toBeGreaterThan(spIdx);
+      expect(memoryIdx).toBeGreaterThan(identityIdx);
+      expect(progressIdx).toBeGreaterThan(memoryIdx);
+    });
   });
 });

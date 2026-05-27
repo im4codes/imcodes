@@ -367,7 +367,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
   ),
 }));
 vi.mock('../src/components/SubSessionWindow.js', () => ({
-  SubSessionWindow: ({ sub, active, zIndex, onFocus }: any) => (
+  SubSessionWindow: ({ sub, active, zIndex, onFocus, onViewRepo }: any) => (
     <div
       data-testid={`sub-session-window-${sub?.id}`}
       data-active={String(active)}
@@ -375,6 +375,7 @@ vi.mock('../src/components/SubSessionWindow.js', () => ({
       onMouseDown={onFocus}
     >
       sub-session-window
+      <button onClick={onViewRepo}>sub-window-repo-{sub?.id}</button>
     </div>
   ),
 }));
@@ -438,8 +439,8 @@ vi.mock('../src/components/ServerContextMenu.js', () => ({
   ),
 }));
 vi.mock('../src/components/FloatingPanel.js', () => ({
-  FloatingPanel: ({ children, onClose, onFocus, onPin, onToggleMaximized }: any) => (
-    <div>
+  FloatingPanel: ({ children, id, zIndex, onClose, onFocus, onPin, onToggleMaximized }: any) => (
+    <div data-testid={`floating-panel-${id}`} style={{ zIndex }}>
       floating-panel
       <button onClick={onFocus}>floating-focus</button>
       <button onClick={onPin}>floating-pin</button>
@@ -668,6 +669,131 @@ describe('App shell', () => {
     });
   }, 20_000);
 
+  it('brings an already-open repository panel above a sub-session when the sub-session branch action opens it', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem('rcc_open_subs_deck_alpha_brain', JSON.stringify(['sub-1']));
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    const subWindow = await screen.findByTestId('sub-session-window-sub-1');
+
+    fireEvent.click(screen.getByText('subbar-repo'));
+    expect(await screen.findByText('repo-page')).toBeTruthy();
+
+    const repoZ = () => Number((screen.getByTestId('floating-panel-repo') as HTMLElement).style.zIndex);
+    const subZ = () => Number((subWindow as HTMLElement).style.zIndex);
+
+    await waitFor(() => expect(repoZ()).toBeGreaterThan(subZ()));
+
+    fireEvent.mouseDown(subWindow);
+    await waitFor(() => expect(subZ()).toBeGreaterThan(repoZ()));
+
+    fireEvent.click(screen.getByText('sub-window-repo-sub-1'));
+    await waitFor(() => expect(repoZ()).toBe(subZ() + 1));
+  }, 20_000);
+
+  it('keeps an existing sub-session window open when selecting its session-tree button', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem('rcc_open_subs_deck_alpha_brain', JSON.stringify(['sub-1']));
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('tree-select-sub'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeTruthy();
+      expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBe(JSON.stringify(['sub-1']));
+    });
+  }, 20_000);
+
+  it('toggles a mobile bottom sub-session button open and closed', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      useSubSessionsState.subSessions = [
+        {
+          id: 'sub-1',
+          sessionName: 'deck_sub_alpha_helper',
+          parentSession: 'deck_alpha_brain',
+          label: 'Helper',
+          description: 'Helper session',
+          cwd: '/work/alpha',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'idle',
+          serverId: 'srv-1',
+        },
+      ];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
+
+      fireEvent.click(screen.getByText('subbar-open-sub-1'));
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('sub-session-window-sub-1')).toBeTruthy();
+        expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBe(JSON.stringify(['sub-1']));
+      });
+
+      fireEvent.click(screen.getByText('subbar-open-sub-1'));
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
+        expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBeNull();
+      });
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
   it('closes all open sub-session windows when clicking the active main session tab', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
@@ -715,10 +841,55 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('tabs-select'));
 
     await waitFor(() => {
-      expect(first.getAttribute('data-active')).toBe('false');
-      expect(second.getAttribute('data-active')).toBe('false');
+      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
+      expect(screen.queryByTestId('sub-session-window-sub-2')).toBeNull();
       expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBeNull();
     });
+  }, 20_000);
+
+  it('does not mount closed sub-session windows after sub-sessions load', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+      {
+        id: 'sub-2',
+        sessionName: 'deck_sub_alpha_reviewer',
+        parentSession: 'deck_alpha_brain',
+        label: 'Reviewer',
+        description: 'Reviewer session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
+    expect(screen.queryByTestId('sub-session-window-sub-2')).toBeNull();
+
+    fireEvent.click(screen.getByText('subbar-open-sub-2'));
+    expect(await screen.findByTestId('sub-session-window-sub-2')).toBeTruthy();
+    expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
   }, 20_000);
 
   it('executes app-level shell callbacks and websocket message reducers', async () => {

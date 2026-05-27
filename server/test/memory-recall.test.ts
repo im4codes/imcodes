@@ -54,6 +54,12 @@ interface MockRow {
   last_used_at?: number;
   status?: 'active' | 'archived';
   enterprise_id?: string;
+  match_kind?: 'exact' | 'semantic' | 'trigram';
+  // Optional in the test fixture; the recall route SELECTs the column and
+  // surfaces it as `originServerId` in the response. Tests that don't care
+  // about routing leave it omitted (response field will be undefined and
+  // dropped from JSON).
+  origin_server_id?: string;
 }
 
 function makeEnv(db: Database): Env {
@@ -76,6 +82,8 @@ function makeEnv(db: Database): Env {
 function makeMockDb(opts: {
   personalRows?: MockRow[];
   enterpriseRows?: (MockRow & { enterprise_id: string })[];
+  lexicalPersonalRows?: MockRow[];
+  lexicalEnterpriseRows?: (MockRow & { enterprise_id: string })[];
   runtimeConfig?: Record<string, unknown> | null;
 } = {}) {
   const executeLog: Array<{ sql: string; params: unknown[] }> = [];
@@ -90,6 +98,15 @@ function makeMockDb(opts: {
     },
     query: async <T = unknown>(sql: string, _params: unknown[] = []) => {
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+      // Lexical fallback queries
+      if (normalized.includes('lower(p.summary) like')) {
+        if (normalized.includes("p.scope = 'personal' and p.user_id =")) {
+          return (opts.lexicalPersonalRows ?? opts.personalRows ?? []) as T[];
+        }
+        if (normalized.includes('join team_members tm on')) {
+          return (opts.lexicalEnterpriseRows ?? opts.enterpriseRows ?? []) as T[];
+        }
+      }
       // Personal memory query
       if (normalized.includes("where scope = 'personal' and user_id =") || normalized.includes("where p.scope = 'personal' and p.user_id =")) {
         return (opts.personalRows ?? []) as T[];
@@ -125,7 +142,7 @@ async function buildTestApp(db: Database) {
 
 async function postRecall(
   app: Hono<{ Bindings: Env }>,
-  body: { query: string; projectId?: string; limit?: number },
+  body: { query: string; projectId?: string; limit?: number; mode?: 'recall' | 'search'; sessionKind?: string },
 ) {
   return app.request('/api/shared-context/srv-1/shared-context/memory/recall', {
     method: 'POST',
@@ -392,7 +409,7 @@ describe('memory recall endpoint — I.5', () => {
     expect(ids).toContain('extra-1');
   });
 
-  it('drops rows that fail the configured composite floor even for a normal query', async () => {
+  it('does not run prompt recall without a project id for project-bound sessions', async () => {
     // Ancient timestamps + no project match → composite scores collapse
     // below floor regardless of raw similarity.
     const { db } = makeMockDb({
@@ -403,10 +420,10 @@ describe('memory recall endpoint — I.5', () => {
     });
     const app = await buildTestApp(db);
 
-    // No matching projectId → projectBoost = 0.1, old updated_at → recency ≈ 0
     const res = await postRecall(app, { query: 'test' });
-    const json = await res.json() as { results: unknown[] };
+    const json = await res.json() as { results: unknown[]; skipped?: string };
     expect(json.results).toEqual([]);
+    expect(json.skipped).toBe('project_required');
   });
 
   it('uses the saved memory recall threshold from server runtime config', async () => {
@@ -432,7 +449,7 @@ describe('memory recall endpoint — I.5', () => {
     });
     const app = await buildTestApp(db);
 
-    const res = await postRecall(app, { query: '相关历史 recall threshold test' });
+    const res = await postRecall(app, { query: '相关历史 recall threshold test', projectId: 'proj-1' });
     expect(res.status).toBe(200);
     const json = await res.json() as { results: Array<{ id: string }> };
     expect(json.results.map((row) => row.id)).toEqual(['p-threshold']);
@@ -598,5 +615,231 @@ describe('memory recall endpoint — I.5', () => {
     expect(json.vectorSearch).toBe(true);
     expect(json.results[0].id).toBe('en-result');
     expect(json.results[0].summary).toContain('Resolved WebSocket reconnect race');
+  });
+
+  it('keeps exact lexical matches when vector search misses durable infrastructure facts', async () => {
+    generateEmbeddingMock.mockResolvedValueOnce(new Float32Array([0.4, 0.2, 0.1]));
+    embeddingToSqlMock.mockReturnValue('[0.4,0.2,0.1]');
+    const now = Date.now();
+    const { db } = makeMockDb({
+      personalRows: [
+        {
+          id: 'semantic-neighbor',
+          project_id: 'app.im.codes/project',
+          projection_class: 'recent_summary',
+          summary: 'Deployment workflow notes for IM.codes server upgrades',
+          updated_at: now,
+          score: 0.72,
+        },
+      ],
+      lexicalPersonalRows: [
+        {
+          id: 'infra-exact',
+          project_id: 'app.im.codes/project',
+          projection_class: 'durable_memory_candidate',
+          summary: 'mock infra server alpha: ssh user@alpha.test.im.codes',
+          updated_at: now - 1_000,
+          score: 1,
+          match_kind: 'exact',
+        },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, {
+      query: 'mock infra server alpha alpha.test.im.codes',
+      projectId: 'app.im.codes/project',
+    });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { vectorSearch: boolean; results: Array<{ id: string; summary: string; class: string }> };
+    expect(json.vectorSearch).toBe(true);
+    expect(json.results[0]).toMatchObject({
+      id: 'infra-exact',
+      class: 'durable_memory_candidate',
+      matchKind: 'exact',
+      summary: expect.stringContaining('alpha.test.im.codes'),
+    });
+  });
+
+  it('lets explicit MCP search requests retrieve more than prompt-recall caps', async () => {
+    const now = Date.now();
+    const rows = Array.from({ length: 12 }, (_, index): MockRow => ({
+      id: `mcp-search-${index}`,
+      project_id: 'proj',
+      projection_class: 'recent_summary',
+      summary: `MCP search result ${index}`,
+      updated_at: now - index,
+      score: 0.95 - index * 0.01,
+      match_kind: 'semantic',
+    }));
+    const { db } = makeMockDb({ personalRows: rows });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: 'mcp search result', projectId: 'proj', limit: 12, mode: 'search' });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: Array<{ id: string }> };
+    expect(json.results).toHaveLength(12);
+  });
+
+  it('does not run explicit MCP search without a project id', async () => {
+    const { db, executeLog } = makeMockDb({
+      personalRows: [
+        {
+          id: 'other-project-memory',
+          project_id: 'other-project',
+          projection_class: 'recent_summary',
+          summary: 'Other project memory must not leak into unscoped search',
+          updated_at: Date.now(),
+          score: 1,
+        },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: 'other project memory', mode: 'search' });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: unknown[]; skipped?: string };
+    expect(json.results).toEqual([]);
+    expect(json.skipped).toBe('project_required');
+    expect(executeLog.find((entry) => entry.sql.toLowerCase().includes('hit_count'))).toBeUndefined();
+  });
+
+  it('prioritizes exact matches before semantic rows for explicit MCP search', async () => {
+    generateEmbeddingMock.mockResolvedValueOnce(new Float32Array([0.4, 0.2, 0.1]));
+    embeddingToSqlMock.mockReturnValue('[0.4,0.2,0.1]');
+    const now = Date.now();
+    const { db } = makeMockDb({
+      personalRows: [
+        {
+          id: 'semantic-top',
+          project_id: 'app.im.codes/project',
+          projection_class: 'recent_summary',
+          summary: 'Deployment workflow notes for IM.codes server upgrades',
+          updated_at: now,
+          score: 0.99,
+          match_kind: 'semantic',
+        },
+      ],
+      lexicalPersonalRows: [
+        {
+          id: 'exact-ip',
+          project_id: 'app.im.codes/project',
+          projection_class: 'durable_memory_candidate',
+          summary: 'mock infra server alpha: ssh user@alpha.test.im.codes',
+          updated_at: now - 1_000,
+          score: 1,
+          match_kind: 'exact',
+        },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, {
+      query: 'alpha.test.im.codes',
+      projectId: 'app.im.codes/project',
+      limit: 1,
+      mode: 'search',
+    });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: Array<{ id: string; matchKind: string }> };
+    expect(json.results).toHaveLength(1);
+    expect(json.results[0]).toMatchObject({ id: 'exact-ip', matchKind: 'exact' });
+  });
+
+  it('prioritizes exact durable memories before exact recent summaries for MCP search', async () => {
+    generateEmbeddingMock.mockResolvedValueOnce(new Float32Array([0.4, 0.2, 0.1]));
+    embeddingToSqlMock.mockReturnValue('[0.4,0.2,0.1]');
+    const now = Date.now();
+    const { db } = makeMockDb({
+      lexicalPersonalRows: [
+        {
+          id: 'recent-about-fix',
+          project_id: 'app.im.codes/project',
+          projection_class: 'recent_summary',
+          summary: 'Recent fix summary mentions mock server alpha and mock server beta while debugging MCP search',
+          updated_at: now,
+          score: 1,
+          match_kind: 'exact',
+        },
+        {
+          id: 'manual-server-memory',
+          project_id: 'app.im.codes/project',
+          projection_class: 'durable_memory_candidate',
+          summary: 'mock infra server alpha: ssh user@alpha.test.im.codes\nmock infra server beta: ssh user@beta.test.im.codes',
+          updated_at: now - 10_000,
+          score: 1,
+          match_kind: 'exact',
+        },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, {
+      query: 'mock server alpha beta alpha.test.im.codes beta.test.im.codes',
+      projectId: 'app.im.codes/project',
+      limit: 1,
+      mode: 'search',
+    });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: Array<{ id: string; class: string; matchKind: string; summary: string }> };
+    expect(json.results).toHaveLength(1);
+    expect(json.results[0]).toMatchObject({
+      id: 'manual-server-memory',
+      class: 'durable_memory_candidate',
+      matchKind: 'exact',
+      summary: expect.stringContaining('beta.test.im.codes'),
+    });
+  });
+
+  // ── originServerId — memory-source-server-routing change ───────────────
+  //
+  // The route reads `shared_context_projections.server_id` for each hit and
+  // surfaces it as `originServerId`. Daemons consume that field to follow
+  // `get_memory_sources` back to the machine whose local SQLite holds the
+  // raw events. Without it, cross-daemon source resolution is impossible.
+
+  it('threads server_id through each hit as originServerId', async () => {
+    const now = Date.now();
+    const { db } = makeMockDb({
+      personalRows: [
+        { id: 'p-srv-A', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Personal hit produced by daemon A', updated_at: now, score: 0.95, origin_server_id: 'srv-A' },
+        { id: 'p-srv-B', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Personal hit produced by daemon B', updated_at: now, score: 0.9, origin_server_id: 'srv-B' },
+      ],
+      enterpriseRows: [
+        { id: 'e-srv-C', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Enterprise hit produced by daemon C', updated_at: now, score: 0.88, enterprise_id: 'ent-1', origin_server_id: 'srv-C' },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: 'origin server tagging', projectId: 'proj-a' });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: Array<{ id: string; originServerId: string }> };
+    expect(json.results).toHaveLength(3);
+    const byId = Object.fromEntries(json.results.map((r) => [r.id, r]));
+    expect(byId['p-srv-A'].originServerId).toBe('srv-A');
+    expect(byId['p-srv-B'].originServerId).toBe('srv-B');
+    expect(byId['e-srv-C'].originServerId).toBe('srv-C');
+  });
+
+  it('preserves originServerId on personal-vs-enterprise dedup', async () => {
+    // When the same projection id surfaces via both personal and enterprise
+    // queries, personal wins (existing behavior). The retained hit must
+    // carry the personal row's originServerId, not the enterprise one.
+    const now = Date.now();
+    const { db } = makeMockDb({
+      personalRows: [
+        { id: 'shared-1', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Personal version', updated_at: now, score: 0.95, origin_server_id: 'srv-personal' },
+      ],
+      enterpriseRows: [
+        { id: 'shared-1', project_id: 'proj-a', projection_class: 'recent_summary', summary: 'Enterprise version', updated_at: now, score: 0.95, enterprise_id: 'ent-1', origin_server_id: 'srv-enterprise' },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: 'dedup test', projectId: 'proj-a' });
+    const json = await res.json() as { results: Array<{ id: string; source: string; originServerId: string }> };
+    expect(json.results).toHaveLength(1);
+    expect(json.results[0].source).toBe('personal');
+    expect(json.results[0].originServerId).toBe('srv-personal');
   });
 });

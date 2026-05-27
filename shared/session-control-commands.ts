@@ -2,6 +2,8 @@ export const SESSION_COMPACT_COMMAND = '/compact' as const;
 export const SESSION_CLEAR_COMMAND = '/clear' as const;
 export const SESSION_STOP_COMMAND = '/stop' as const;
 export const SESSION_CONTROL_METADATA_COMMAND_FIELD = 'controlCommand' as const;
+export const SESSION_CONTROL_TIMELINE_STATE_COMPACTING = 'compacting' as const;
+export const SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT = 'user_compact' as const;
 export const SESSION_CONTROL_TIMELINE_STATE_STOPPING = 'stopping' as const;
 export const SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL = 'user_cancel' as const;
 
@@ -9,6 +11,10 @@ export type SessionControlCommandId = 'compact' | 'clear' | 'stop';
 export type SessionControlHandling = 'provider-dispatched' | 'daemon-managed';
 export type SessionControlVisibility = 'visible' | 'hidden';
 export type SessionControlTimelineFeedback =
+  | {
+      state: typeof SESSION_CONTROL_TIMELINE_STATE_COMPACTING;
+      reason: typeof SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT;
+    }
   | {
       state: typeof SESSION_CONTROL_TIMELINE_STATE_STOPPING;
       reason: typeof SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL;
@@ -34,7 +40,10 @@ export const SESSION_CONTROL_COMMANDS = [
     handling: 'provider-dispatched',
     timelineUserMessage: 'hidden',
     optimisticUserMessage: 'hidden',
-    timelineFeedback: null,
+    timelineFeedback: {
+      state: SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
+      reason: SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+    },
     daemonHandledReceiptAck: false,
     resetsProcessPreferenceContext: true,
     resetsTransportPreferenceContextOnSend: true,

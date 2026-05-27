@@ -34,6 +34,7 @@ describe('watch projection store', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
@@ -211,6 +212,92 @@ describe('watch projection store', () => {
     const fourth = store.getSnapshot().sessions[0];
     expect(fourth.previewText).toHaveLength(120);
     expect(fourth.previewUpdatedAt).toBe(3_222);
+  });
+
+  it('keeps streaming assistant text off the snapshot hot path until final text arrives', async () => {
+    const { store, pushes } = makeSnapshotStore(3_000);
+    const getItemSpy = vi.spyOn(localStorage, 'getItem');
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [
+        { name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'claude-code', state: 'running' },
+      ],
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pushes).toHaveLength(1);
+    getItemSpy.mockClear();
+
+    for (let i = 0; i < 100; i += 1) {
+      store.handleTimelineEvent({
+        eventId: 'streaming-text',
+        sessionId: 'deck_proj_brain',
+        ts: 3_000 + i,
+        seq: i + 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: `Streaming update ${i} ${'x'.repeat(2_000)}`, streaming: true },
+      });
+    }
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(pushes).toHaveLength(1);
+    expect(getItemSpy).not.toHaveBeenCalled();
+
+    store.handleTimelineEvent({
+      eventId: 'streaming-text',
+      sessionId: 'deck_proj_brain',
+      ts: 4_000,
+      seq: 101,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'Completed final summary with enough detail to preview', streaming: false },
+    });
+    expect(getItemSpy).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(pushes).toHaveLength(2);
+    expect(pushes.at(-1)?.sessions[0]?.previewText).toBe('Completed final summary with enough detail to preview');
+    expect(getItemSpy).toHaveBeenCalled();
+  });
+
+  it('derives the idle preview from the last raw streaming text when no final text arrives', async () => {
+    const { store, pushes } = makeSnapshotStore(3_500);
+    const getItemSpy = vi.spyOn(localStorage, 'getItem');
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [
+        { name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'claude-code', state: 'running' },
+      ],
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    getItemSpy.mockClear();
+
+    store.handleTimelineEvent({
+      eventId: 'streaming-only',
+      sessionId: 'deck_proj_brain',
+      ts: 3_500,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'Streaming only answer still becomes the idle preview', streaming: true },
+    });
+    expect(getItemSpy).not.toHaveBeenCalled();
+
+    store.onSessionIdle('deck_proj_brain', 3_600);
+    expect(getItemSpy).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(pushes.at(-1)?.sessions[0]).toMatchObject({
+      state: 'idle',
+      previewText: 'Streaming only answer still becomes the idle preview',
+      previewUpdatedAt: 3_600,
+    });
   });
 
   it('marks sessions working on assistant/tool timeline events and returns to idle on session idle', () => {

@@ -29,6 +29,7 @@ import {
 } from '../../../shared/session-control-commands.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
+import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { resolveBinaryWithWindowsFallbacks } from '../transport-paths.js';
 import { type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
@@ -130,6 +131,10 @@ interface CopilotSessionState {
   rotationInProgress: boolean;
   generation: number;
   lastStatusSignature: string | null;
+  /** Stable IM.codes context already injected into this Copilot chat history. */
+  sessionSystemTextInjected?: string;
+  /** Stable IM.codes context carried by the accepted turn until Copilot reports it durable. */
+  sessionSystemTextPending?: string;
   pendingApprovals: Map<string, PendingApproval>;
   unsubscribes: Array<() => void>;
 }
@@ -426,6 +431,8 @@ export class CopilotSdkProvider implements TransportProvider {
       rotationInProgress: false,
       generation: 0,
       lastStatusSignature: null,
+      sessionSystemTextInjected: undefined,
+      sessionSystemTextPending: undefined,
       pendingApprovals: new Map(),
       unsubscribes: [],
     };
@@ -556,11 +563,14 @@ export class CopilotSdkProvider implements TransportProvider {
       await this.compactHistory(state);
       return;
     }
-    const prompt = [payload.systemText?.trim(), payload.assembledMessage?.trim()].filter(Boolean).join('\n\n');
+    const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
+    const includeSessionSystemText = !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
+    const prompt = composeMessageSideProviderPrompt(payload, { includeSessionSystemText, labelContextInstructions: false });
     const sdkAttachments = toAttachmentPayload(payload.attachments);
     this.resetTurnState(state);
     state.operation = 'turn';
     state.busy = true;
+    state.sessionSystemTextPending = includeSessionSystemText ? sessionSystemText : undefined;
     try {
       if (state.model) {
         await state.session.setModel(state.model, {
@@ -573,6 +583,7 @@ export class CopilotSdkProvider implements TransportProvider {
         mode: 'immediate',
       });
     } catch (error) {
+      state.sessionSystemTextPending = undefined;
       state.busy = false;
       state.operation = 'idle';
       throw error;
@@ -594,6 +605,7 @@ export class CopilotSdkProvider implements TransportProvider {
     state.cancelErrorEmitted = false;
     state.compactCompletionEmitted = false;
     state.rotationInProgress = false;
+    state.sessionSystemTextPending = undefined;
   }
 
   private async compactHistory(state: CopilotSessionState): Promise<void> {
@@ -640,6 +652,8 @@ export class CopilotSdkProvider implements TransportProvider {
       ));
       return;
     }
+    state.sessionSystemTextInjected = undefined;
+    state.sessionSystemTextPending = undefined;
     const complete: AgentMessage = {
       id: `${state.sessionId}:context-compaction:${Date.now()}`,
       sessionId: state.routeId,
@@ -697,6 +711,7 @@ export class CopilotSdkProvider implements TransportProvider {
       state.busy = false;
       state.operation = 'idle';
       this.emitStatus(state.routeId, { status: null, label: null });
+      state.sessionSystemTextPending = undefined;
       if (wasCompact) state.compactCompletionEmitted = true;
       if (!state.cancelErrorEmitted) {
         state.cancelErrorEmitted = true;
@@ -892,12 +907,18 @@ export class CopilotSdkProvider implements TransportProvider {
         if (state.operation === 'compact') {
           return;
         }
+        const wasTurn = state.operation === 'turn';
         state.busy = false;
         state.operation = 'idle';
         if (state.cancelRequested && !state.cancelErrorEmitted) {
           state.cancelErrorEmitted = true;
+          state.sessionSystemTextPending = undefined;
           this.emitError(routeId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Copilot turn cancelled', true));
           return;
+        }
+        if (wasTurn && state.sessionSystemTextPending) {
+          state.sessionSystemTextInjected = state.sessionSystemTextPending;
+          state.sessionSystemTextPending = undefined;
         }
         if (!state.completionEmittedForCurrentTurn && state.currentMessageId && state.currentText) {
           state.completionEmittedForCurrentTurn = true;
@@ -950,6 +971,7 @@ export class CopilotSdkProvider implements TransportProvider {
       case 'session.error': {
         state.busy = false;
         state.operation = 'idle';
+        state.sessionSystemTextPending = undefined;
         const error = this.makeError(
           PROVIDER_ERROR_CODES.PROVIDER_ERROR,
           String(event.data?.message ?? 'Copilot session error'),
@@ -1094,6 +1116,7 @@ export class CopilotSdkProvider implements TransportProvider {
     state.cancelErrorEmitted = false;
     state.compactCompletionEmitted = false;
     state.rotationInProgress = false;
+    state.sessionSystemTextInjected = undefined;
     this.attachSession(state);
     try {
       await oldSession.disconnect?.();

@@ -8,6 +8,7 @@ import {
   parseMdIngestDocument,
 } from '../../shared/md-ingest.js';
 import {
+  flushMarkdownMemoryIngestForTests,
   resetMarkdownMemoryIngestForTests,
   runMarkdownMemoryIngest,
   scheduleMarkdownMemoryIngest,
@@ -188,10 +189,10 @@ describe('bounded markdown ingest contract', () => {
     const namespace = { scope: 'personal' as const, projectId: 'github.com/acme/repo', userId: 'user-1' };
 
     scheduleMarkdownMemoryIngest({ projectDir: tempProjectDir, namespace });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await flushMarkdownMemoryIngestForTests();
     await writeFile(join(tempProjectDir, 'AGENTS.md'), '# Notes\nSecond note.\n');
     scheduleMarkdownMemoryIngest({ projectDir: tempProjectDir, namespace });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await flushMarkdownMemoryIngestForTests();
 
     expect(listProcessedProjections(namespace, 'durable_memory_candidate').map((entry) => entry.summary).sort()).toEqual([
       'First note.',

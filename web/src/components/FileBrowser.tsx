@@ -16,11 +16,14 @@ import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { lazy, Suspense } from 'preact/compat';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
+import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FS_WRITE_ERROR } from '../../../src/shared/transport/fs.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import { FileEditor, FileEditorContent } from './file-editor-lazy.js';
 const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
+import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
+import { ImageLightbox } from './ImageLightbox.js';
 import { downloadAttachment, getApiBaseUrl } from '../api.js';
 import {
   getSharedChangesKey,
@@ -107,6 +110,8 @@ export interface FileBrowserProps {
   autoPreviewPath?: string;
   /** When autoPreviewPath is set, start in diff mode instead of source mode. */
   autoPreviewPreferDiff?: boolean;
+  /** When autoPreviewPath is set, start in source/diff/rendered HTML mode. */
+  initialPreviewViewMode?: HtmlPreviewViewMode;
   /** Paths already inserted — shown with a badge to avoid duplicates */
   alreadyInserted?: string[];
   /** Hide the footer (select/confirm buttons) — for embedded panel views */
@@ -119,6 +124,8 @@ export interface FileBrowserProps {
   serverId?: string;
   onConfirm: (paths: string[]) => void;
   onClose?: () => void;
+  /** Called after a new directory is successfully created. */
+  onDirectoryCreated?: (path: string) => void;
   /** Seed external preview state so a new host can reuse an existing load. */
   initialPreview?: FileBrowserPreviewState;
   /** Keep an external preview host in sync with this FileBrowser's preview state. */
@@ -244,6 +251,7 @@ export type FileBrowserPreviewState =
 export interface FileBrowserPreviewRequest {
   path: string;
   preferDiff?: boolean;
+  previewViewMode?: HtmlPreviewViewMode;
   preview?: FileBrowserPreviewState;
   sourcePreviewLive?: boolean;
   /** Project/root directory used to keep the floating preview's Changes tab available. */
@@ -253,6 +261,7 @@ export interface FileBrowserPreviewRequest {
 export interface FileBrowserPreviewUpdate {
   path: string;
   preferDiff?: boolean;
+  previewViewMode?: HtmlPreviewViewMode;
   preview: FileBrowserPreviewState;
 }
 
@@ -332,7 +341,7 @@ function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): 
 type PendingPreviewReason = 'interactive' | 'refresh';
 type PendingPreviewRequest = { path: string; cycleId: number; reason?: PendingPreviewReason; startedAt?: number };
 type PendingPreviewDiff = PendingPreviewRequest & { diff: string; diffHtml: string };
-type PreviewScrollMode = Exclude<FileBrowserPreviewState['status'], 'idle' | 'ok'> | 'source' | 'diff' | 'edit';
+type PreviewScrollMode = Exclude<FileBrowserPreviewState['status'], 'idle' | 'ok'> | HtmlPreviewViewMode | 'edit';
 type PreviewScrollSnapshot = { key: string; scrollTop: number; scrollLeft: number };
 
 function previewCycleKey(path: string, cycleId: number): string {
@@ -342,13 +351,14 @@ function previewCycleKey(path: string, cycleId: number): string {
 function getPreviewScrollMode(
   preview: FileBrowserPreviewState,
   isEditing: boolean,
-  showDiff: boolean,
+  previewViewMode: HtmlPreviewViewMode,
   canRenderDiff: boolean,
 ): PreviewScrollMode | null {
   if (preview.status === 'idle') return null;
   if (preview.status === 'ok') {
     if (isEditing) return 'edit';
-    return showDiff && canRenderDiff ? 'diff' : 'source';
+    if (previewViewMode === 'html-render') return 'html-render';
+    return previewViewMode === 'diff' && canRenderDiff ? 'diff' : 'source';
   }
   return preview.status;
 }
@@ -361,7 +371,16 @@ function previewScrollKey(path: string, mode: PreviewScrollMode): string {
  *  working after the shared-changes cache moved to `git-status-store.ts`. */
 export const __resetFileBrowserSharedChangesForTests = __resetSharedChangesForTests;
 
+const DEFAULT_SHOW_HIDDEN_FILES = true;
+
 type NewEntryKind = 'file' | 'folder';
+
+function shortenPathSegment(segment: string, maxLength: number): string {
+  if (segment.length <= maxLength) return segment;
+  const head = Math.max(6, Math.floor((maxLength - 1) * 0.55));
+  const tail = Math.max(4, maxLength - 1 - head);
+  return `${segment.slice(0, head)}…${segment.slice(-tail)}`;
+}
 
 export function FileBrowser({
   ws,
@@ -371,6 +390,7 @@ export function FileBrowser({
   highlightPath,
   autoPreviewPath,
   autoPreviewPreferDiff = false,
+  initialPreviewViewMode,
   alreadyInserted = [],
   hideFooter = false,
   changesRootPath,
@@ -378,6 +398,7 @@ export function FileBrowser({
   serverId,
   onConfirm,
   onClose,
+  onDirectoryCreated,
   initialPreview,
   onPreviewStateChange,
   skipAutoPreviewIfLoading = false,
@@ -390,7 +411,7 @@ export function FileBrowser({
   const isMulti = mode === 'file-multi';
 
   const startPath = initialPath || '~';
-  const initialTreeSnapshot = loadFileBrowserSnapshot(startPath, includeFiles, false, serverId);
+  const initialTreeSnapshot = loadFileBrowserSnapshot(startPath, includeFiles, DEFAULT_SHOW_HIDDEN_FILES, serverId);
   const [data, setData] = useState<FsNode[]>([
     {
       id: startPath,
@@ -404,7 +425,7 @@ export function FileBrowser({
   );
   const [currentLabel, setCurrentLabel] = useState(initialTreeSnapshot?.currentLabel ?? startPath);
   const [error, setError] = useState<string | null>(null);
-  const [showHidden, setShowHidden] = useState(false);
+  const [showHidden, setShowHidden] = useState(DEFAULT_SHOW_HIDDEN_FILES);
   const [preview, setPreview] = useState<FileBrowserPreviewState>(() => initialPreview ?? { status: 'idle' });
   const previewRef = useRef<FileBrowserPreviewState>(preview);
   useEffect(() => { previewRef.current = preview; }, [preview]);
@@ -412,7 +433,14 @@ export function FileBrowser({
     if (initialPreview?.status === 'ok' && initialPreview.diffHtml && autoPreviewPreferDiff) return true;
     return false;
   });
+  const [previewViewMode, setPreviewViewMode] = useState<HtmlPreviewViewMode>(() => (
+    initialPreviewViewMode ?? (autoPreviewPreferDiff ? 'diff' : 'source')
+  ));
   const [lightbox, setLightbox] = useState<string | null>(null);
+  const [htmlFullscreenPreview, setHtmlFullscreenPreview] = useState<HtmlFullscreenPreviewState | null>(null);
+  const closeHtmlFullscreenPreview = useCallback(() => {
+    setHtmlFullscreenPreview(null);
+  }, []);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   // Transient "Copied!" label flips back to the default after 1.5s. Keyed by
   // path so rapidly switching between previews never shows a stale "Copied!"
@@ -580,7 +608,7 @@ export function FileBrowser({
       // Keep the initial directory list lightweight. The tree currently only
       // renders names/dir flags, so per-file metadata (size/mime/downloadId)
       // just adds avoidable stat work on first open, especially on mobile.
-      requestId = ws.fsListDir(nodePath, includeFiles, false);
+      requestId = ws.fsListDir(nodePath, includeFiles, showHidden);
     } catch {
       setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
       return;
@@ -602,7 +630,7 @@ export function FileBrowser({
       }
     }, REQUEST_TIMEOUT_MS);
     timersRef.current.set(requestId, timer);
-  }, [includeFiles, serverId, t, ws]);
+  }, [includeFiles, showHidden, t, ws]);
 
   // Listen for fs.ls_response and fs.read_response
   // IMPORTANT: Every setState call is guarded by mountedRef to prevent crashes
@@ -868,19 +896,33 @@ export function FileBrowser({
         }
 
         loadedRef.current.delete(pending.parentPath);
+        const createdPath = msg.resolvedPath ?? pending.targetPath;
         setError(null);
+        setSelectedPaths(new Set([createdPath]));
         fetchDir(pending.parentPath);
+        onDirectoryCreated?.(createdPath);
         return;
       }
     });
-  }, [clearAllPendingPreviewRequests, clearPendingPreviewRequest, fetchDir, getActivePreviewCycle, startPath, showHidden, highlightPath, t, ws]);
+  }, [clearAllPendingPreviewRequests, clearPendingPreviewRequest, fetchDir, getActivePreviewCycle, onDirectoryCreated, startPath, showHidden, highlightPath, t, ws]);
 
-  const fetchPreview = useCallback((filePath: string, preferDiff = false) => {
+  const fetchPreview = useCallback((
+    filePath: string,
+    preferDiff = false,
+    requestedViewMode?: HtmlPreviewViewMode,
+  ) => {
+    const nextViewMode = requestedViewMode ?? (preferDiff ? 'diff' : 'source');
+    const shouldFetchDiff = nextViewMode !== 'html-render';
     if (editDirtyRef.current) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
     }
     if (onPreviewFile) {
-      onPreviewFile({ path: filePath, preferDiff, preview: { status: 'loading', path: filePath } });
+      onPreviewFile({
+        path: filePath,
+        preferDiff,
+        previewViewMode: nextViewMode,
+        preview: { status: 'loading', path: filePath },
+      });
       return;
     }
     dismissedAutoPreviewPathRef.current = autoPreviewPath && filePath !== autoPreviewPath
@@ -899,13 +941,19 @@ export function FileBrowser({
     activePreviewCycleRef.current = { path: filePath, cycleId };
     const loadingPreview: FileBrowserPreviewState = { status: 'loading', path: filePath };
     setPreview(loadingPreview);
-    setShowDiff(preferDiff);
-    onPreviewStateChange?.({ path: filePath, preferDiff, preview: loadingPreview });
+    setPreviewViewMode(nextViewMode);
+    setShowDiff(nextViewMode === 'diff');
+    onPreviewStateChange?.({
+      path: filePath,
+      preferDiff,
+      previewViewMode: nextViewMode,
+      preview: loadingPreview,
+    });
     if (!hasPendingPreviewWork('read', filePath, cycleId)) {
       const requestId = ws.fsReadFile(filePath);
       trackPendingPreviewRequest('read', requestId, { path: filePath, cycleId, reason: 'interactive' });
     }
-    if (!hasPendingPreviewWork('diff', filePath, cycleId)) {
+    if (shouldFetchDiff && !hasPendingPreviewWork('diff', filePath, cycleId)) {
       const diffId = ws.fsGitDiff(filePath);
       trackPendingPreviewRequest('diff', diffId, { path: filePath, cycleId, reason: 'interactive' });
     }
@@ -1032,6 +1080,12 @@ export function FileBrowser({
   }, [initialPreview]);
 
   useEffect(() => {
+    const nextMode = initialPreviewViewMode ?? (autoPreviewPreferDiff ? 'diff' : 'source');
+    setPreviewViewMode(nextMode);
+    setShowDiff(nextMode === 'diff');
+  }, [autoPreviewPreferDiff, initialPreviewViewMode]);
+
+  useEffect(() => {
     if (!autoPreviewPath) {
       dismissedAutoPreviewPathRef.current = null;
       return;
@@ -1046,10 +1100,11 @@ export function FileBrowser({
     if (preview.status === 'idle') return;
     onPreviewStateChange({
       path: (preview as { path: string }).path,
-      preferDiff: showDiff,
+      preferDiff: previewViewMode === 'diff' && showDiff,
+      previewViewMode,
       preview,
     });
-  }, [onPreviewStateChange, preview, showDiff]);
+  }, [onPreviewStateChange, preview, previewViewMode, showDiff]);
 
   // Auto-preview file on open (e.g. when clicking a path link in chat)
   useEffect(() => {
@@ -1058,16 +1113,18 @@ export function FileBrowser({
     const currentPreviewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
     if (currentPreviewPath === autoPreviewPath && preview.status !== 'idle') {
       if (previewTabOverridePathRef.current !== autoPreviewPath) {
-        setShowDiff(autoPreviewPreferDiff);
+        const nextMode = initialPreviewViewMode ?? (autoPreviewPreferDiff ? 'diff' : 'source');
+        setPreviewViewMode(nextMode);
+        setShowDiff(nextMode === 'diff');
       }
       if (preview.status === 'loading' && initialPreview?.status === 'loading' && !skipAutoPreviewIfLoading) {
         const hasPendingRead = hasPendingPreviewWork('read', autoPreviewPath);
-        if (!hasPendingRead) fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
+        if (!hasPendingRead) fetchPreview(autoPreviewPath, autoPreviewPreferDiff, initialPreviewViewMode);
       }
       return;
     }
-    fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
-  }, [autoPreviewPath, autoPreviewPreferDiff, fetchPreview, hasPendingPreviewWork, initialPreview, preview, skipAutoPreviewIfLoading]);
+    fetchPreview(autoPreviewPath, autoPreviewPreferDiff, initialPreviewViewMode);
+  }, [autoPreviewPath, autoPreviewPreferDiff, fetchPreview, hasPendingPreviewWork, initialPreview, initialPreviewViewMode, preview, skipAutoPreviewIfLoading]);
 
   const dismissPreview = useCallback(() => {
     if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
@@ -1093,20 +1150,21 @@ export function FileBrowser({
     const timer = setInterval(() => {
       if (!mountedRef.current) return;
       if (Date.now() < previewRefreshBackoffUntilRef.current) return;
-      if (hasPendingPreviewWork('read', path) || hasPendingPreviewWork('diff', path)) return;
+      const shouldRefreshDiff = previewViewMode === 'diff' && showDiff;
+      if (hasPendingPreviewWork('read', path) || (shouldRefreshDiff && hasPendingPreviewWork('diff', path))) return;
       try {
         const cycleId = nextPreviewCycleIdRef.current++;
         activePreviewCycleRef.current = { path, cycleId };
         const reqId = ws.fsReadFile(path);
         trackPendingPreviewRequest('read', reqId, { path, cycleId, reason: 'refresh' });
-        if (showDiff) {
+        if (shouldRefreshDiff) {
           const diffId = ws.fsGitDiff(path);
           trackPendingPreviewRequest('diff', diffId, { path, cycleId, reason: 'refresh' });
         }
       } catch { /* ws disconnected */ }
     }, PREVIEW_REFRESH_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [preview.status, (preview as any).path, ws, onPreviewFile, isEditing, hasPendingPreviewWork, showDiff, trackPendingPreviewRequest]);
+  }, [preview.status, (preview as any).path, ws, onPreviewFile, isEditing, hasPendingPreviewWork, previewViewMode, showDiff, trackPendingPreviewRequest]);
 
   // Rate-limited git status refresh for the changes panel
   const CHANGES_RATE_LIMIT_MS = 5_000;
@@ -1244,7 +1302,9 @@ export function FileBrowser({
 
   const hasDiff = preview.status === 'ok' && (!!preview.diff || !!preview.diffHtml);
   const canRenderDiff = preview.status === 'ok' && !!preview.diffHtml;
-  const previewScrollMode = getPreviewScrollMode(preview, isEditing, showDiff, canRenderDiff);
+  const isHtmlRenderMode = previewViewMode === 'html-render';
+  const canRenderHtml = preview.status === 'ok' && isHtmlPreviewPath(preview.path);
+  const previewScrollMode = getPreviewScrollMode(preview, isEditing, previewViewMode, canRenderDiff);
   const activePreviewScrollKey = previewScrollMode && preview.status !== 'idle'
     ? previewScrollKey((preview as { path: string }).path, previewScrollMode)
     : null;
@@ -1274,6 +1334,13 @@ export function FileBrowser({
     if (el.scrollTop !== snapshot.scrollTop) el.scrollTop = snapshot.scrollTop;
     if (el.scrollLeft !== snapshot.scrollLeft) el.scrollLeft = snapshot.scrollLeft;
   }, [activePreviewScrollKey, preview]);
+
+  useEffect(() => {
+    if (!canRenderHtml || !isHtmlRenderMode || isEditing) return;
+    setHtmlFullscreenPreview({ status: 'ok', path: preview.path, content: preview.content });
+    setPreviewViewMode('source');
+    setShowDiff(false);
+  }, [canRenderHtml, isEditing, isHtmlRenderMode, preview]);
 
   const previewPane = hasInlinePreview ? (
     <div class="fb-preview">
@@ -1316,14 +1383,30 @@ export function FileBrowser({
             />
           </Suspense>
         )}
-        {!isEditing && hasDiff && (
+        {!isEditing && canRenderHtml && (
+          <button
+            class="fb-diff-toggle"
+            onClick={() => {
+              previewTabOverridePathRef.current = preview.path;
+              setHtmlFullscreenPreview({ status: 'ok', path: preview.path, content: preview.content });
+              setPreviewViewMode('source');
+              setShowDiff(false);
+            }}
+            title={t('file_browser.view_rendered')}
+            aria-label={t('file_browser.view_rendered')}
+          >
+            👁
+          </button>
+        )}
+        {!isEditing && hasDiff && !isHtmlRenderMode && (
           <button
             class={`fb-diff-toggle${showDiff ? ' active' : ''}`}
             onClick={() => {
               previewTabOverridePathRef.current = preview.path;
+              setPreviewViewMode((mode) => (mode === 'diff' ? 'source' : 'diff'));
               setShowDiff((v) => !v);
             }}
-            title="Toggle diff view"
+            title={showDiff ? t('file_browser.view_source') : t('file_browser.view_diff')}
           >
             {showDiff ? t('file_browser.view_source') : t('file_browser.view_diff')}
           </button>
@@ -1483,6 +1566,7 @@ export function FileBrowser({
           <div class="fb-diff" dangerouslySetInnerHTML={{ __html: preview.diffHtml ?? '' }} />
         )}
       </div>
+      <HtmlFullscreenPreview preview={htmlFullscreenPreview} onClose={closeHtmlFullscreenPreview} />
     </div>
   ) : null;
 
@@ -1495,6 +1579,25 @@ export function FileBrowser({
       {layout === 'modal' && (
         <button class="btn btn-secondary" onClick={onClose}>{t('common.cancel')}</button>
       )}
+      <button
+        class="btn btn-secondary fb-footer-copy-path"
+        title={currentLabel}
+        onClick={() => {
+          const path = currentLabel;
+          void (async () => {
+            try {
+              await navigator.clipboard.writeText(path);
+              setCopiedPath(path);
+              setTimeout(() => setCopiedPath((cur) => (cur === path ? null : cur)), 1500);
+            } catch {
+              // Clipboard access can be blocked in insecure contexts; keep the
+              // file picker usable and leave the path visible in the title.
+            }
+          })();
+        }}
+      >
+        {copiedPath === currentLabel ? t('fileBrowser.copied') : t('fileBrowser.copyPath')}
+      </button>
       <button
         class="btn btn-primary"
         disabled={mode !== 'dir-only' && selectedPaths.size === 0}
@@ -1610,53 +1713,65 @@ export function FileBrowser({
   const isAtDrives = currentLabel === thisPcLabel;
 
   const breadcrumb = (
-    <div class="fb-nav">
-      <button class="fb-nav-btn" disabled={!canGoBack} onClick={goBack}>←</button>
-      <button class="fb-nav-btn" onClick={goUp} title="Go up">⬆</button>
-      {looksLikeWindows && (
+    <div class="fb-nav-stack">
+      <div class="fb-nav">
+        <button class="fb-nav-btn" disabled={!canGoBack} onClick={goBack}>←</button>
+        <button class="fb-nav-btn" onClick={goUp} title="Go up">⬆</button>
+        {looksLikeWindows && (
+          <button
+            class="fb-nav-btn"
+            onClick={() => navigateTo(isAtDrives ? '~' : WINDOWS_DRIVES_PATH)}
+            title={isAtDrives ? t('file_browser.home') : t('file_browser.this_pc')}
+          >{isAtDrives ? '🏠' : '💾'}</button>
+        )}
+        <div class="fb-nav-spacer" />
         <button
-          class="fb-nav-btn"
-          onClick={() => navigateTo(isAtDrives ? '~' : WINDOWS_DRIVES_PATH)}
-          title={isAtDrives ? t('file_browser.home') : t('file_browser.this_pc')}
-        >{isAtDrives ? '🏠' : '💾'}</button>
-      )}
-      <div class="fb-breadcrumb-segments">
-        {breadcrumbSegments.map((seg, i) => {
-          const isLast = i === breadcrumbSegments.length - 1;
-          return (
-            <>
-              {i > 0 && <span class="fb-breadcrumb-sep">›</span>}
-              <span
-                class={`fb-breadcrumb-seg${isLast ? ' active' : ''}`}
-                onClick={isLast ? undefined : () => navigateTo(seg.path)}
-              >{seg.label}</span>
-            </>
-          );
-        })}
+          class={`fb-nav-btn${error ? ' fb-nav-btn-error' : ''}`}
+          title={error || 'Refresh'}
+          onClick={() => { loadedRef.current.clear(); setError(null); fetchDir(currentLabel); }}
+        >{error ? '⚠' : '↻'}</button>
+        <label class="fb-nav-hidden-toggle" title={t('file_browser.show_hidden')}>
+          <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden((e.target as HTMLInputElement).checked)} />
+          {' ·'}
+        </label>
+        {includeFiles && (
+          <button
+            class="fb-create-btn fb-create-file-btn"
+            title={t('chat.new_file')}
+            aria-label={t('chat.new_file')}
+            onClick={() => { setNewEntry({ kind: 'file', parentPath: currentLabel }); setNewEntryName(''); }}
+          >
+            <span class="fb-create-icon fb-create-icon-file" aria-hidden="true" />
+            <span class="fb-create-plus" aria-hidden="true">+</span>
+          </button>
+        )}
+        <button
+          class="fb-create-btn fb-create-folder-btn"
+          title={t('chat.new_folder')}
+          aria-label={t('chat.new_folder')}
+          onClick={() => { setNewEntry({ kind: 'folder', parentPath: currentLabel }); setNewEntryName(''); }}
+        >
+          <span class="fb-create-icon fb-create-icon-folder" aria-hidden="true" />
+          <span class="fb-create-plus" aria-hidden="true">+</span>
+        </button>
       </div>
-      <button
-        class={`fb-nav-btn${error ? ' fb-nav-btn-error' : ''}`}
-        title={error || 'Refresh'}
-        onClick={() => { loadedRef.current.clear(); setError(null); fetchDir(currentLabel); }}
-      >{error ? '⚠' : '↻'}</button>
-      <label class="fb-nav-hidden-toggle" title={t('file_browser.show_hidden')}>
-        <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden((e.target as HTMLInputElement).checked)} />
-        {' ·'}
-      </label>
-      {includeFiles && (
-        <button
-          class="fb-create-btn fb-create-file-btn"
-          title={t('chat.new_file')}
-          aria-label={t('chat.new_file')}
-          onClick={() => { setNewEntry({ kind: 'file', parentPath: currentLabel }); setNewEntryName(''); }}
-        >＋</button>
-      )}
-      <button
-        class="fb-create-btn fb-create-folder-btn"
-        title={t('chat.new_folder')}
-        aria-label={t('chat.new_folder')}
-        onClick={() => { setNewEntry({ kind: 'folder', parentPath: currentLabel }); setNewEntryName(''); }}
-      >＋</button>
+      <div class="fb-breadcrumb-row" title={currentLabel}>
+        <div class="fb-breadcrumb-segments">
+          {breadcrumbSegments.map((seg, i) => {
+            const isLast = i === breadcrumbSegments.length - 1;
+            return (
+              <>
+                {i > 0 && <span class="fb-breadcrumb-sep">›</span>}
+                <span
+                  class={`fb-breadcrumb-seg${isLast ? ' active' : ''}`}
+                  title={seg.path}
+                  onClick={isLast ? undefined : () => navigateTo(seg.path)}
+                >{shortenPathSegment(seg.label, isLast ? 26 : 16)}</span>
+              </>
+            );
+          })}
+        </div>
+      </div>
     </div>
   );
 
@@ -1684,10 +1799,7 @@ export function FileBrowser({
   ) : null;
 
   const lightboxOverlay = lightbox ? (
-    <div class="fb-lightbox" onClick={() => setLightbox(null)}>
-      <img src={lightbox} onClick={(e) => e.stopPropagation()} />
-      <button class="fb-lightbox-close" onClick={() => setLightbox(null)}>✕</button>
-    </div>
+    <ImageLightbox src={lightbox} onClose={() => setLightbox(null)} />
   ) : null;
 
   if (layout === 'panel') {

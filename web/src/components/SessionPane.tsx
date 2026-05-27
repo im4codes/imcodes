@@ -7,6 +7,7 @@
  */
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
 import { SessionControls } from './SessionControls.js';
@@ -24,6 +25,7 @@ import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
+import { buildMemorySummarySyncMessage } from '../memory-summary-sync.js';
 
 type ViewMode = 'terminal' | 'chat';
 
@@ -88,6 +90,8 @@ export interface SessionPaneProps {
   pendingPrefillText?: string | null;
   /** Called after pendingPrefillText has been consumed by the input. */
   onPendingPrefillApplied?: () => void;
+  /** Gate version-sensitive panels when the loaded frontend is stale. */
+  onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
 }
 
 export function SessionPane({
@@ -119,9 +123,12 @@ export function SessionPane({
   onMobileFileBrowserClose,
   pendingPrefillText,
   onPendingPrefillApplied,
+  onVersionSensitiveAction,
 }: SessionPaneProps) {
+  const { t } = useTranslation();
   const sessionName = session.name;
   const hasChatTimeline = session.agentType !== 'shell' && session.agentType !== 'script';
+  const [syncingMemorySummaries, setSyncingMemorySummaries] = useState(false);
 
   // ── Timeline ────────────────────────────────────────────────────────────────
   const {
@@ -242,6 +249,7 @@ export function SessionPane({
 
   // inputRef for SessionControls — expose to app.tsx via onInputRef
   const inputRef = useRef<HTMLDivElement>(null);
+  const fileDropTargetRef = useRef<HTMLDivElement>(null);
   // Re-register with app.tsx when session becomes active/inactive
   useEffect(() => {
     if (!onInputRef) return;
@@ -265,6 +273,30 @@ export function SessionPane({
     }
   }, [effectiveViewMode]);
 
+  const handleSyncMemorySummaries = useCallback(async () => {
+    if (!ws || !connected || syncingMemorySummaries) return;
+    setSyncingMemorySummaries(true);
+    try {
+      const text = await buildMemorySummarySyncMessage(
+        t,
+        session.contextNamespace?.projectId ?? null,
+      );
+      if (!text) return;
+      const commandId = globalThis.crypto?.randomUUID?.()
+        ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      ws.sendSessionCommand('send', { sessionName, text, commandId });
+      if (hasChatTimeline) {
+        addOptimisticUserMessage(text, commandId);
+        scrollToBottom();
+      }
+    } catch {
+      // Keep the footer button non-intrusive; a failed sync should not block
+      // normal chat controls or surface stale memory as if it were sent.
+    } finally {
+      setSyncingMemorySummaries(false);
+    }
+  }, [addOptimisticUserMessage, connected, hasChatTimeline, scrollToBottom, session.contextNamespace?.projectId, sessionName, syncingMemorySummaries, t, ws]);
+
   const terminalVisible = isActive && effectiveViewMode === 'terminal';
   const chatVisible = isActive && effectiveViewMode === 'chat';
   const isShellTerminal = terminalVisible && (session.agentType === 'shell' || session.agentType === 'script');
@@ -278,7 +310,10 @@ export function SessionPane({
 
 
   return (
-    <div class={isShellTerminal ? 'shell-terminal-pane' : undefined} style={{ display: 'contents' }}>
+    <div
+      ref={fileDropTargetRef}
+      class={`session-pane${isActive ? '' : ' session-pane-inactive'}${isShellTerminal ? ' shell-terminal-pane' : ''}`}
+    >
       {/* Terminal view: kept alive, shown/hidden via CSS display */}
       <div
         key={`term-${sessionName}`}
@@ -339,6 +374,9 @@ export function SessionPane({
           statusText={statusText}
           activeToolCall={activeToolCall}
           now={thinkingNow}
+          onSyncMemorySummaries={handleSyncMemorySummaries}
+          syncMemorySummariesBusy={syncingMemorySummaries}
+          syncMemorySummariesDisabled={!connected || !ws || syncingMemorySummaries}
         />
       )}
 
@@ -394,10 +432,12 @@ export function SessionPane({
           sessions={sessions}
           subSessions={subSessions}
           serverId={serverId}
+          fileDropTargetRef={fileDropTargetRef}
           quotes={quotes}
           onRemoveQuote={removeQuote}
           pendingPrefillText={pendingPrefillText}
           onPendingPrefillApplied={onPendingPrefillApplied}
+          onVersionSensitiveAction={onVersionSensitiveAction}
         />
       )}
     </div>

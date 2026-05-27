@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, cleanup, fireEvent } from '@testing-library/preact';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 
 const toolPref = vi.hoisted(() => ({
@@ -84,6 +84,41 @@ describe('UsageFooter', () => {
     expect(children.indexOf(ctxBar as Element)).toBeLessThan(children.indexOf(statsRow as Element));
   });
 
+  it('briefly shows a compact burning effect when ctx usage changes', async () => {
+    const { container, rerender } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 1000,
+          cacheTokens: 2000,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    expect(container.querySelector('.session-ctx-bar')?.className).not.toContain('is-burning');
+
+    rerender(
+      <UsageFooter
+        usage={{
+          inputTokens: 5000,
+          cacheTokens: 3000,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('.session-ctx-bar')?.className).toContain('is-burning');
+    });
+    const burn = container.querySelector('.session-ctx-burn') as HTMLElement | null;
+    expect(burn).toBeTruthy();
+    expect(burn?.style.width).toBe('0.8%');
+  });
+
   it('keeps the robot status visible for idle or unknown agent states', () => {
     const { container, rerender } = render(
       <UsageFooter
@@ -142,6 +177,33 @@ describe('UsageFooter', () => {
     fireEvent.click(button!);
 
     expect(toolPref.save).toHaveBeenCalledWith(false);
+  });
+
+  it('renders memory summary sync button before the tools toggle and calls the sync handler', () => {
+    const onSync = vi.fn();
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        onSyncMemorySummaries={onSync}
+      />,
+    );
+
+    const syncButton = container.querySelector('.shortcut-btn-memory-sync') as HTMLButtonElement | null;
+    const toolsButton = container.querySelector('.shortcut-btn-tools') as HTMLButtonElement | null;
+    expect(syncButton).toBeTruthy();
+    expect(syncButton?.getAttribute('aria-label')).toBe('chat.memory_summary_sync');
+    expect(Array.from(syncButton!.parentElement!.children).indexOf(syncButton!)).toBeLessThan(
+      Array.from(toolsButton!.parentElement!.parentElement!.children).indexOf(toolsButton!.parentElement!),
+    );
+
+    fireEvent.click(syncButton!);
+    expect(onSync).toHaveBeenCalledTimes(1);
   });
 
   it('prioritizes active thinking over stale idle state and renders running states inline', () => {

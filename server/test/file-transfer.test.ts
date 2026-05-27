@@ -147,6 +147,40 @@ describe('WsBridge file transfer', () => {
     expect(result.message).toBe('disk_full');
   });
 
+  it('routes upload progress without resolving the pending transfer', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    await authDaemon(bridge, daemon, makeDb('valid-hash'));
+    const onProgress = vi.fn();
+
+    const promise = bridge.sendFileTransferRequest('upload-progress', {
+      type: 'file.upload_fetch',
+      uploadId: 'upload-progress',
+    }, 5000, onProgress);
+
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: 'file.upload_progress',
+      uploadId: 'upload-progress',
+      loaded: 5,
+      total: 10,
+    })));
+    await flushAsync();
+
+    expect(onProgress).toHaveBeenCalledWith({
+      type: 'file.upload_progress',
+      uploadId: 'upload-progress',
+      loaded: 5,
+      total: 10,
+    });
+
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: 'file.upload_done',
+      uploadId: 'upload-progress',
+      attachment: { id: 'test.txt', daemonPath: '/tmp/imcodes-uploads/test.txt', downloadable: true },
+    })));
+    await expect(promise).resolves.toMatchObject({ type: 'file.upload_done' });
+  });
+
   it('sendFileTransferRequest times out', async () => {
     vi.useFakeTimers();
     const bridge = WsBridge.get(serverId);

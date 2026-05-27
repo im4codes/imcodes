@@ -143,7 +143,7 @@ if (!distReady && distRequired) {
       const env: NodeJS.ProcessEnv = {
         ...process.env,
         NODE_ENV: 'test',
-        IMCODES_TEST_PREVIEW_WORKER_DELAY_MS: '150',
+        IMCODES_TEST_PREVIEW_WORKER_DELAY_MS: '750',
         FILE_ONE: one,
         FILE_TWO: two,
         PROJECT_DIR: project,
@@ -165,7 +165,7 @@ if (!distReady && distRequired) {
       expect(listing).toMatchObject({ requestId: 'ls-1', status: 'ok' });
       expect(readResponses).toHaveLength(2);
       expect(Number(listing?.at)).toBeLessThan(firstReadAt);
-      expect(firstReadAt).toBeGreaterThanOrEqual(100);
+      expect(firstReadAt).toBeGreaterThanOrEqual(500);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

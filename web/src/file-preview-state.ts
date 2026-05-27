@@ -3,8 +3,25 @@ import type {
   FileBrowserPreviewState,
   FileBrowserPreviewUpdate,
 } from './components/file-browser-lazy.js';
+import type { HtmlPreviewViewMode } from '@shared/html-preview.js';
 
-export type FilePreviewCache = Record<string, { preferDiff?: boolean; preview: FileBrowserPreviewState }>;
+export type FilePreviewRequestWithViewMode = FileBrowserPreviewRequest & {
+  previewViewMode?: HtmlPreviewViewMode;
+};
+
+export type FilePreviewUpdateWithViewMode = FileBrowserPreviewUpdate & {
+  previewViewMode?: HtmlPreviewViewMode;
+};
+
+export type FilePreviewCache = Record<string, {
+  preferDiff?: boolean;
+  previewViewMode?: HtmlPreviewViewMode;
+  preview: FileBrowserPreviewState;
+}>;
+
+export function normalizePreviewViewMode(mode: HtmlPreviewViewMode | undefined): HtmlPreviewViewMode {
+  return mode ?? 'source';
+}
 
 export function filePreviewStatesEqual(a: FileBrowserPreviewState, b: FileBrowserPreviewState): boolean {
   if (a === b) return true;
@@ -48,12 +65,14 @@ export function filePreviewStatesEqual(a: FileBrowserPreviewState, b: FileBrowse
 
 export function updateFilePreviewCache(
   prev: FilePreviewCache,
-  update: FileBrowserPreviewUpdate,
+  update: FilePreviewUpdateWithViewMode,
 ): FilePreviewCache {
   const existing = prev[update.path];
+  const previewViewMode = normalizePreviewViewMode(update.previewViewMode);
   if (
     existing
     && existing.preferDiff === update.preferDiff
+    && normalizePreviewViewMode(existing.previewViewMode) === previewViewMode
     && filePreviewStatesEqual(existing.preview, update.preview)
   ) {
     return prev;
@@ -62,24 +81,31 @@ export function updateFilePreviewCache(
     ...prev,
     [update.path]: {
       preferDiff: update.preferDiff,
+      previewViewMode,
       preview: update.preview,
     },
   };
 }
 
 export function applyFilePreviewRequestUpdate(
-  prev: FileBrowserPreviewRequest | null,
-  update: FileBrowserPreviewUpdate,
-): FileBrowserPreviewRequest | null {
+  prev: FilePreviewRequestWithViewMode | null,
+  update: FilePreviewUpdateWithViewMode,
+): FilePreviewRequestWithViewMode | null {
   if (!prev) return prev;
   if (prev.path === update.path) {
     const preferDiff = prev.preferDiff ?? update.preferDiff;
-    if (prev.preferDiff === preferDiff && filePreviewStatesEqual(prev.preview ?? { status: 'idle' }, update.preview)) {
+    const previewViewMode = normalizePreviewViewMode(update.previewViewMode ?? prev.previewViewMode);
+    if (
+      prev.preferDiff === preferDiff
+      && normalizePreviewViewMode(prev.previewViewMode) === previewViewMode
+      && filePreviewStatesEqual(prev.preview ?? { status: 'idle' }, update.preview)
+    ) {
       return prev;
     }
     return {
       ...prev,
       preferDiff,
+      previewViewMode,
       preview: update.preview,
     };
   }
@@ -95,6 +121,7 @@ export function applyFilePreviewRequestUpdate(
     ...prev,
     path: update.path,
     preferDiff: update.preferDiff,
+    previewViewMode: normalizePreviewViewMode(update.previewViewMode),
     preview: update.preview,
   };
 }

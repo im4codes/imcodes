@@ -19,8 +19,10 @@ class MockChild extends EventEmitter {
 
   kill(signal?: string): boolean {
     this.signals.push(signal ?? 'SIGTERM');
+    // Match Node's ChildProcess semantics: `child.killed` becomes true as soon
+    // as a signal is sent, even if the process ignores SIGTERM and never exits.
+    this.killed = true;
     if (signal === 'SIGKILL') {
-      this.killed = true;
       // SIGKILL always works — schedule close
       setTimeout(() => this.emit('close', null, 'SIGKILL'), 0);
     }

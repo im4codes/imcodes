@@ -5,7 +5,11 @@ import type { TransportProvider, ProviderError, SessionConfig } from '../../src/
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
-import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
+import {
+  SESSION_CONTROL_METADATA_COMMAND_FIELD,
+  SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+  SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
+} from '../../shared/session-control-commands.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
@@ -142,7 +146,13 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
       userMessage: 'hi',
       assembledMessage: 'hi',
-      systemText: undefined,
+      systemText: expect.stringContaining('Use memory MCP search'),
+    }));
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      systemText: expect.stringContaining('get_memory_sources'),
+    }));
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      systemText: expect.stringContaining('sourceLookup fields'),
     }));
   });
 
@@ -208,6 +218,24 @@ describe('TransportSessionRuntime', () => {
     expect(String(afterCompactPayload.assembledMessage)).toContain('Use pnpm');
   });
 
+  it('emits a visible timeline block when /compact starts dispatching', async () => {
+    expect(runtime.send('/compact', 'compact-block-1')).toBe('sent');
+
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'session.state',
+      {
+        state: SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
+        reason: SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+      },
+      { source: 'daemon', confidence: 'high' },
+    );
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      userMessage: '/compact',
+    }));
+  });
+
   it('rejects /compact before dispatch when provider compact capability is unsupported', () => {
     (mock.provider.capabilities as Record<string, unknown>).compact = {
       execution: 'unsupported',
@@ -219,6 +247,12 @@ describe('TransportSessionRuntime', () => {
 
     expect(() => runtime.send('/compact')).toThrow('mock provider does not support compact');
     expect(mock.provider.send).not.toHaveBeenCalled();
+    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+      'deck_test_brain',
+      'session.state',
+      expect.objectContaining({ state: SESSION_CONTROL_TIMELINE_STATE_COMPACTING }),
+      expect.anything(),
+    );
   });
 
   it('keeps slash controls raw for every transport by suppressing startup, recall, authored, and preference context', async () => {
@@ -314,7 +348,13 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
       userMessage: 'help',
       assembledMessage: 'help',
-      systemText: 'expert\n\nruntime only',
+      systemText: expect.stringContaining('expert\n\nruntime only'),
+    }));
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      systemText: expect.stringContaining('Use memory MCP search'),
+    }));
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      systemText: expect.stringContaining('do not invent details from summaries alone'),
     }));
   });
 
@@ -542,7 +582,7 @@ describe('TransportSessionRuntime', () => {
       runtimeFamily: 'transport' as const,
       authoritySource: 'processed_local' as const,
       sourceKind: 'local_processed' as const,
-      injectionSurface: 'system-text' as const,
+      injectionSurface: 'message-preamble' as const,
       injectedText: '# Recent project memory\n\n- Should not be re-injected on restart',
       items: [startupItem],
     };
@@ -589,7 +629,7 @@ describe('TransportSessionRuntime', () => {
       runtimeFamily: 'transport' as const,
       authoritySource: 'processed_local' as const,
       sourceKind: 'local_processed' as const,
-      injectionSurface: 'system-text' as const,
+      injectionSurface: 'message-preamble' as const,
       injectedText: '# Recent project memory\n\n- Persist that we injected startup memory',
       items: [startupItem],
     };
@@ -631,7 +671,7 @@ describe('TransportSessionRuntime', () => {
       runtimeFamily: 'transport' as const,
       authoritySource: 'processed_local' as const,
       sourceKind: 'local_processed' as const,
-      injectionSurface: 'system-text' as const,
+      injectionSurface: 'message-preamble' as const,
       injectedText: '# Recent project memory\n\n- Remember to keep transport recall parity visible',
       items: [startupItem],
     };
@@ -655,7 +695,11 @@ describe('TransportSessionRuntime', () => {
       reason: 'startup',
     }), expect.any(Object));
 
-    r.send('Need a transport recall test');
+    const preferencePreamble = `${PREFERENCE_CONTEXT_START}
+User-authored preferences for this and future turns.
+- Use pnpm for project commands
+${PREFERENCE_CONTEXT_END}`;
+    r.send('Need a transport recall test', 'startup-pref-turn', undefined, preferencePreamble);
     await flushDispatch();
 
     expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
@@ -666,7 +710,13 @@ describe('TransportSessionRuntime', () => {
         sourceKind: 'local_processed',
         injectionSurface: 'normalized-payload',
       }),
+      messagePreamble: expect.stringContaining('transport recall parity visible'),
+      assembledMessage: expect.stringContaining('transport recall parity visible'),
     }));
+    const firstPayload = localMock.provider.send.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(String(firstPayload.messagePreamble)).toContain('Use pnpm for project commands');
+    const sentPayload = localMock.provider.send.mock.calls[0]?.[1] as { systemText?: string } | undefined;
+    expect(sentPayload?.systemText ?? '').not.toContain('transport recall parity visible');
     // Exactly ONE startup card — fired when the provider payload actually
     // carried the preamble, same boundary as the persisted flag.
     const startupCardsAfterSend = timelineEmitterEmitMock.mock.calls.filter(
@@ -676,6 +726,9 @@ describe('TransportSessionRuntime', () => {
     expect(startupCardsAfterSend[0][2]).toEqual(expect.objectContaining({
       reason: 'startup',
       injectedText: expect.stringContaining('transport recall parity visible'),
+      preferenceItems: [
+        { id: 'preference-1', text: 'Use pnpm for project commands' },
+      ],
     }));
 
     timelineEmitterEmitMock.mockClear();
@@ -684,6 +737,57 @@ describe('TransportSessionRuntime', () => {
     expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith('deck_test_brain', 'memory.context', expect.objectContaining({
       reason: 'startup',
     }), expect.any(Object));
+  });
+
+  it('carries personal local startup memory when remote context is authoritative but has no startup hits', async () => {
+    const startupItem = makeSearchItem({
+      projectId: 'repo-1',
+      summary: 'Local personal startup memory should still be visible',
+    });
+    const startupMemory = {
+      reason: 'startup' as const,
+      runtimeFamily: 'transport' as const,
+      authoritySource: 'processed_local' as const,
+      sourceKind: 'local_processed' as const,
+      injectionSurface: 'message-preamble' as const,
+      injectedText: '# Recent project memory\n\n- Local personal startup memory should still be visible',
+      items: [startupItem],
+    };
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:server-personal-fallback', 'remote-processed:fresh'],
+      remoteProcessedFreshness: 'fresh',
+      retryExhausted: true,
+      startupMemory,
+    }));
+
+    await r.initialize(defaultConfig);
+    timelineEmitterEmitMock.mockClear();
+
+    r.send('first remote-authoritative personal turn');
+    await flushDispatch();
+
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      startupMemory: expect.objectContaining({
+        reason: 'startup',
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+        injectedText: expect.stringContaining('Local personal startup memory'),
+      }),
+      messagePreamble: expect.stringContaining('Local personal startup memory'),
+      diagnostics: expect.arrayContaining(['memory:start:local-auxiliary']),
+    }));
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'memory.context',
+      expect.objectContaining({
+        reason: 'startup',
+        injectedText: expect.stringContaining('Local personal startup memory'),
+      }),
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
   });
 
   it('does not stack duplicate startup cards across restart-before-first-message cycles', async () => {
@@ -701,7 +805,7 @@ describe('TransportSessionRuntime', () => {
       runtimeFamily: 'transport' as const,
       authoritySource: 'processed_local' as const,
       sourceKind: 'local_processed' as const,
-      injectionSurface: 'system-text' as const,
+      injectionSurface: 'message-preamble' as const,
       injectedText: '# Recent project memory\n\n- Do not emit card until provider accepts preamble',
       items: [startupItem],
     };
@@ -1089,8 +1193,9 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.sending).toBe(false);
   });
 
-  it('cancel() delegates to provider.cancel and preserves pending', () => {
+  it('cancel() delegates to provider.cancel without queueing behind pending messages', async () => {
     runtime.send('first');
+    await flushDispatch();
     runtime.send('queued1', 'msg-q1');
     runtime.send('queued2', 'msg-q2');
     expect(runtime.pendingCount).toBe(2);
@@ -1102,6 +1207,35 @@ describe('TransportSessionRuntime', () => {
     runtime.cancel();
     expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
     expect(runtime.pendingCount).toBe(2);
+  });
+
+  it('cancel() stops a turn before provider.send starts when context bootstrap is still running', async () => {
+    const resolveBootstraps: Array<() => void> = [];
+    runtime.setContextBootstrapResolver(() => new Promise((resolve) => {
+      resolveBootstraps.push(() => resolve({
+        namespace: { scope: 'personal', projectId: 'test' },
+        diagnostics: [],
+      }));
+    }));
+
+    runtime.send('first');
+    runtime.send('queued after cancel', 'msg-q1');
+    runtime.cancel();
+    resolveBootstraps[0]?.();
+    await flushDispatch();
+    resolveBootstraps[1]?.();
+    await flushDispatch();
+
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(mock.provider.send).not.toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      userMessage: 'first',
+    }));
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      userMessage: 'queued after cancel',
+      assembledMessage: 'queued after cancel',
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
   });
 
   it('can edit and remove queued messages by clientMessageId', async () => {
@@ -1159,6 +1293,27 @@ describe('TransportSessionRuntime', () => {
       assembledMessage: 'queued1\n\nqueued2',
     }));
     expect(runtime.pendingCount).toBe(0);
+  });
+
+  it('recoverable provider errors drain pending messages into the next turn', async () => {
+    runtime.send('first');
+    await flushDispatch();
+    runtime.send('queued after empty response', 'msg-q1');
+
+    mock.fireError('sess-1', {
+      code: 'PROVIDER_ERROR',
+      message: 'Qwen exited without producing a response',
+      recoverable: true,
+    });
+    await flushDispatch();
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after empty response',
+      assembledMessage: 'queued after empty response',
+    }));
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.sending).toBe(true);
   });
 
   it('CANCELLED error → idle (not error)', () => {
@@ -1293,5 +1448,107 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toContain('cmd-reentrant');
     // provider.send called once more (the merged drain turn), NOT twice.
     expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(earlierProviderSendCalls + 1);
+  });
+
+  it('truncates user-authored description and systemPrompt to USER_SESSION_TEXT_MAX_CHARS', async () => {
+    // Defense in depth: a user paste larger than the 300-char cap (from
+    // shared/user-session-text-caps.ts) must not bloat every subsequent
+    // turn's system prompt. Tests both `setDescription` / `setSystemPrompt`
+    // (live edit) and `initialize()` (cold start).
+    const oversized = 'X'.repeat(2000);
+    runtime.setDescription(oversized);
+    runtime.setSystemPrompt(oversized);
+    runtime.send('hi after oversize set', 'cap-after-set');
+    await flushDispatch();
+    const sentAfter = mock.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const systemText = String(sentAfter.systemText ?? '');
+    // The description+systemPrompt contributions both should be exactly 300
+    // 'X's, not 2000. Since they're joined by `\n\n`, the total 'X' chars in
+    // systemText should be 600.
+    const xCount = (systemText.match(/X/g) ?? []).length;
+    expect(xCount).toBe(600);
+    expect(systemText).not.toMatch(/X{301}/);
+
+    // Same enforcement when the values come from initialize() config.
+    const freshProvider = makeMockProvider();
+    const fresh = new TransportSessionRuntime(freshProvider.provider, 'deck_cap_brain');
+    await fresh.initialize({ ...defaultConfig, description: oversized, systemPrompt: oversized });
+    fresh.send('hi after init', 'cap-after-init');
+    await flushDispatch();
+    const sentInit = freshProvider.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const initSystemText = String(sentInit.systemText ?? '');
+    const initXCount = (initSystemText.match(/X/g) ?? []).length;
+    expect(initXCount).toBe(600);
+    expect(initSystemText).not.toMatch(/X{301}/);
+  });
+
+  it('injects IM.codes identity block intact alongside oversize user-authored text', async () => {
+    // p2p audit 37bfbb85-430 N-A regression: before this fix, the
+    // IM.codes identity prompt (~350 chars) was merged into `systemPrompt`
+    // by session-manager and then silently truncated by
+    // `clampUserSessionText(300)`. After the fix, identity is injected
+    // at the assembly layer peer-level with `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE`
+    // and lives OUTSIDE the user-authored 300-char cap. It must survive
+    // intact even when the user pastes 2000 chars into description AND
+    // systemPrompt simultaneously.
+    //
+    // The Generated Image Reporting prompt used to ride alongside the
+    // identity block at the assembly layer, but now lives in Codex SDK's
+    // `appendImcodesBaseInstructions` — Codex-only, once per thread.
+    // It must NOT appear in the per-turn payload here.
+    const oversized = 'Y'.repeat(2000);
+    const freshProvider = makeMockProvider();
+    const fresh = new TransportSessionRuntime(freshProvider.provider, 'deck_identity_brain');
+    await fresh.initialize({
+      ...defaultConfig,
+      sessionKey: 'deck_identity_brain',
+      sessionName: 'deck_identity_brain',
+      label: 'Identity Brain',
+      description: oversized,
+      systemPrompt: oversized,
+    });
+    fresh.send('hello identity', 'identity-1');
+    await flushDispatch();
+    const sent = freshProvider.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const systemText = String(sent.systemText ?? '');
+
+    // User-authored cap still enforced: total Y count is 2 * 300 = 600.
+    const yCount = (systemText.match(/Y/g) ?? []).length;
+    expect(yCount).toBe(600);
+    expect(systemText).not.toMatch(/Y{301}/);
+
+    // Identity block present in full, including the exact session name
+    // and the display label. None of these strings exist in the user
+    // text (Y's only), so any match must come from the daemon-injected
+    // block — proving it survived the user cap.
+    expect(systemText).toMatch(/IM\.codes session identity:/);
+    expect(systemText).toMatch(/Exact session name: deck_identity_brain/);
+    expect(systemText).toMatch(/Display label: Identity Brain/);
+    expect(systemText).toMatch(/imcodes send/);
+
+    // Generated Image Reporting must NOT be in the per-turn assembly
+    // payload — it now lives in Codex SDK baseInstructions tail.
+    expect(systemText).not.toMatch(/Generated images:/);
+    expect(systemText).not.toMatch(/Generated Image Reporting:/);
+  });
+
+  it('uses exact session name when no label is provided to setSessionIdentity', async () => {
+    // When the user has not labeled the session, the daemon block must
+    // still render a valid identity header — falling back to the exact
+    // session name as the display label so the model never sees an empty
+    // identity field.
+    const freshProvider = makeMockProvider();
+    const fresh = new TransportSessionRuntime(freshProvider.provider, 'deck_unlabeled_brain');
+    await fresh.initialize({
+      ...defaultConfig,
+      sessionKey: 'deck_unlabeled_brain',
+      sessionName: 'deck_unlabeled_brain',
+    });
+    fresh.send('hello', 'unlabeled-1');
+    await flushDispatch();
+    const sent = freshProvider.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const systemText = String(sent.systemText ?? '');
+    expect(systemText).toMatch(/Exact session name: deck_unlabeled_brain/);
+    expect(systemText).toMatch(/Display label: deck_unlabeled_brain/);
   });
 });

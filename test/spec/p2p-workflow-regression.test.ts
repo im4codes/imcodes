@@ -2319,8 +2319,9 @@ describe('p2p-workflow reverse-regression', () => {
    *   1. `ComposerAttachment` type declares `seq: number`.
    *   2. `renumberAttachments` helper exists so removal renumbers the
    *      surviving entries 1..N consecutively (no gaps).
-   *   3. `setAttachments` upload path appends with
-   *      `seq: prev.length + 1`.
+   *   3. Upload completion appends through the persisted composer draft
+   *      helper and renumbers `current + attachment`, so in-flight uploads
+   *      still land in the original composer after switching windows.
    *   4. The badge UI renders the seq via testid `attachment-tag-${seq}`
    *      with text `#N`.
    *   5. The send-payload text-prepend uses `#${seq}:(${path})` (NOT
@@ -2469,10 +2470,15 @@ describe('p2p-workflow reverse-regression', () => {
       'renumberAttachments helper must exist for delete-and-renumber semantics',
     ).toBe(true);
 
-    // (3) Upload path assigns next seq.
+    // (3) Upload completion appends through the persisted composer
+    // draft helper, which renumbers current + attachment in upload order.
     expect(
-      /seq:\s*prev\.length\s*\+\s*1/.test(file.text),
-      'Upload path must assign seq = prev.length + 1 to keep upload order = tag order',
+      /function\s+appendStoredComposerAttachment\([\s\S]{0,500}renumberAttachments\(\[\.\.\.current,\s*attachment\]\)/.test(file.text),
+      'appendStoredComposerAttachment must renumber current + attachment to keep upload order = tag order',
+    ).toBe(true);
+    expect(
+      /appendStoredComposerAttachment\(uploadAttachmentDraftKey,\s*attachment\)/.test(file.text),
+      'Upload completion must append to the original composer draft key so switching windows does not drop the attachment',
     ).toBe(true);
 
     // (4) Badge renders the seq via testid.

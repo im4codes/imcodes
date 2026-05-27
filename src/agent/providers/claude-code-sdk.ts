@@ -28,6 +28,7 @@ import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../sh
 import logger from '../../util/logger.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveClaudeCodePathForSdk, resolveExecutableForSpawn } from '../transport-paths.js';
+import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 
 const CLAUDE_BIN = 'claude';
@@ -327,7 +328,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     state.lastStatusSignature = null;
 
     const resolvedBinary = this.resolveBinaryPath(this.config);
-    const baseSystemPrompt = payload.systemText ?? ([state.description, state.systemPrompt].filter(Boolean).join('\n\n') || undefined);
+    const systemParts = getProviderSystemTextParts(payload);
+    const fallbackSystemPrompt = [state.description, state.systemPrompt].filter(Boolean).join('\n\n') || undefined;
+    const baseSystemPrompt = systemParts.hasSplitSystemText
+      ? systemParts.sessionSystemText
+      : (systemParts.combinedSystemText ?? fallbackSystemPrompt);
+    const prompt = systemParts.hasSplitSystemText
+      ? composeMessageSideProviderPrompt(payload, { includeSessionSystemText: false })
+      : payload.assembledMessage;
     const options: Record<string, unknown> = {
       cwd: state.cwd,
       ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
@@ -369,7 +377,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       return child;
     };
 
-    const q = query({ prompt: payload.assembledMessage, options: options as any });
+    const q = query({ prompt, options: options as any });
     state.currentQuery = q;
     void this.consumeQuery(sessionId, state, q, payload, allowResumeFallback);
   }

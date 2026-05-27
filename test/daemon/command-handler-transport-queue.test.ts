@@ -227,6 +227,7 @@ vi.mock('../../src/daemon/repo-handler.js', () => ({
 
 vi.mock('../../src/daemon/file-transfer-handler.js', () => ({
   handleFileUpload: vi.fn(),
+  handleFileUploadFetch: vi.fn(),
   handleFileDownload: vi.fn(),
   createProjectFileHandle: vi.fn(),
   createProjectFileHandleFromValidatedPath: vi.fn(),
@@ -721,6 +722,25 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('passes requestedModel when starting a kimi-sdk main session', async () => {
+    handleWebCommand({
+      type: 'session.start',
+      project: 'transport',
+      dir: '/proj',
+      agentType: 'kimi-sdk',
+      requestedModel: 'moonshot-v1-auto,thinking',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'kimi-sdk',
+      projectDir: '/proj',
+      fresh: true,
+      requestedModel: 'moonshot-v1-auto,thinking',
+    }));
+  });
+
   it('dispatches /clear as a fresh openclaw relaunch that preserves the provider key', async () => {
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',
@@ -865,8 +885,8 @@ describe('handleWebCommand transport queue behavior', () => {
       'session.state',
       {
         state: 'idle',
-        pendingCount: 0,
-        pendingMessages: [],
+        pendingCount: 3,
+        pendingMessages: ['a', 'b', 'c'],
         pendingMessageEntries: [],
       },
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
@@ -1003,6 +1023,59 @@ describe('handleWebCommand transport queue behavior', () => {
 
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
       commandId: 'cmd-stop-priority',
+      status: 'accepted',
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(setAgentId).not.toHaveBeenCalled();
+
+    resolveRuntimeConfig?.({ availableModels: ['qwen-plus', 'qwen-max'] });
+    await flushAsync();
+    await flushAsync();
+  });
+
+  it('keeps legacy /stop on the priority lane while a transport model switch holds the send lock', async () => {
+    let resolveRuntimeConfig: ((value: unknown) => void) | null = null;
+    getQwenRuntimeConfigMock.mockReturnValueOnce(new Promise((resolve) => {
+      resolveRuntimeConfig = resolve;
+    }));
+    const setAgentId = vi.fn();
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      state: 'running',
+      qwenAvailableModels: ['qwen-plus', 'qwen-max'],
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      setAgentId,
+      cancel,
+      send: vi.fn(() => 'sent'),
+      pendingCount: 0,
+      pendingMessages: [],
+      pendingEntries: [],
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model qwen-max',
+      commandId: 'cmd-stop-priority-model-legacy',
+    }, serverLink as any);
+    await flushAsync();
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/stop',
+      commandId: 'cmd-stop-priority-legacy',
+    }, serverLink as any);
+
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+      commandId: 'cmd-stop-priority-legacy',
       status: 'accepted',
     });
     expect(cancel).toHaveBeenCalledTimes(1);
@@ -1283,6 +1356,7 @@ describe('handleWebCommand transport queue behavior', () => {
       commandId: 'cmd-normal-during-lock',
     }, serverLink as any);
     await flushAsync();
+    await flushAsync();
 
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
       commandId: 'cmd-normal-during-lock',
@@ -1318,6 +1392,7 @@ describe('handleWebCommand transport queue behavior', () => {
       text: 'ordinary provider send-start should not hold ack',
       commandId: 'cmd-provider-start-hang',
     }, serverLink as any);
+    await flushAsync();
     await flushAsync();
 
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
@@ -3131,6 +3206,38 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('switches model for kimi-sdk transport sessions via /model', async () => {
+    const setAgentId = vi.fn();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'kimi-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      requestedModel: 'moonshot-v1-auto',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-1',
+      setAgentId,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model moonshot-v1-auto,thinking',
+      commandId: 'cmd-model-kimi',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setAgentId).toHaveBeenCalledWith('moonshot-v1-auto,thinking');
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      requestedModel: 'moonshot-v1-auto,thinking',
+      activeModel: 'moonshot-v1-auto,thinking',
+      modelDisplay: 'moonshot-v1-auto,thinking',
+    }));
+  });
+
   it('switches model for cursor-headless transport sessions via /model', async () => {
     const setAgentId = vi.fn();
     getSessionMock.mockReturnValue({
@@ -3257,6 +3364,7 @@ describe('handleWebCommand transport queue behavior', () => {
         status: MEMORY_MCP_STATUS.READY,
         tools: [
           MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
+          MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
           MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
           MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
           MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
@@ -3559,6 +3667,8 @@ describe('handleWebCommand transport queue behavior', () => {
   });
 
   it('rejects preference create while the preference feature is disabled', async () => {
+    vi.stubEnv(memoryFeatureFlagEnvKey(MEMORY_FEATURE_FLAGS_BY_NAME.preferences), '0');
+
     handleWebCommand({ type: MEMORY_WS.PREF_CREATE, requestId: 'pref-create-disabled', text: 'Prefer pnpm' }, serverLink as any);
     await flushAsync();
 

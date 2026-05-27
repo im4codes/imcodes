@@ -306,8 +306,6 @@ export interface P2pComboPreset {
 
 export const COMBO_PRESETS: P2pComboPreset[] = [
   { key: 'brainstorm>discuss>plan',         pipeline: ['brainstorm', 'discuss', 'plan'] },
-  { key: 'audit>plan',                     pipeline: ['audit', 'plan'] },
-  { key: 'review>plan',                    pipeline: ['review', 'plan'] },
   { key: 'audit>review>plan',              pipeline: ['audit', 'review', 'plan'] },
 ];
 

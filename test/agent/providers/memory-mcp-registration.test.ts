@@ -45,10 +45,11 @@ const sessionConfig = {
 };
 
 describe('managed provider MCP registration helpers', () => {
-  it('pins the exact six managed provider matrix and excludes process/OpenClaw providers', () => {
+  it('pins the exact seven managed provider matrix and excludes process/OpenClaw providers', () => {
     expect(MEMORY_MCP_PROVIDER_IDS).toEqual([
       MEMORY_MCP_PROVIDER_ID.CLAUDE_CODE_SDK,
       MEMORY_MCP_PROVIDER_ID.GEMINI_SDK,
+      MEMORY_MCP_PROVIDER_ID.KIMI_SDK,
       MEMORY_MCP_PROVIDER_ID.COPILOT_SDK,
       MEMORY_MCP_PROVIDER_ID.CODEX_SDK,
       MEMORY_MCP_PROVIDER_ID.CURSOR_HEADLESS,

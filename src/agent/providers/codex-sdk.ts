@@ -1,7 +1,7 @@
-import { access, copyFile, readFile, writeFile } from 'node:fs/promises';
+import { access, copyFile, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { homedir } from 'node:os';
-import { resolve, sep } from 'node:path';
+import { extname, resolve, sep } from 'node:path';
 import { TextDecoder } from 'node:util';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import readline, { type Interface as ReadlineInterface } from 'node:readline';
@@ -35,6 +35,8 @@ import logger from '../../util/logger.js';
 import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getCodexBaseInstructions } from '../codex-runtime-config.js';
+import { buildGeneratedImageReportingPrompt } from '../../../shared/transport-runtime-prompts.js';
+import { composeProviderSystemText, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { getDefaultCodexMcpArgs } from './getDefaultCodexMcpArgs.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
@@ -48,10 +50,39 @@ const COMPACT_HARD_TIMEOUT_MS = 120_000;
 const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
+const IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER = '# IM.codes runtime instructions';
+const GENERATED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
 
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function getCodexHome(env: Record<string, string | undefined>): string {
+  return typeof env.CODEX_HOME === 'string' && env.CODEX_HOME.trim()
+    ? resolve(env.CODEX_HOME.trim())
+    : resolve(homedir(), '.codex');
+}
+
+function isCodexAuthFailureMessage(message: string): boolean {
+  return /401\s+Unauthorized/i.test(message)
+    || /Missing bearer or basic authentication/i.test(message)
+    || /not authenticated/i.test(message)
+    || /authentication required/i.test(message);
+}
+
+function getCodexAuthPath(env: Record<string, string | undefined>): string {
+  return resolve(getCodexHome(env), 'auth.json');
+}
+
+async function readCodexAuthFingerprint(env: Record<string, string | undefined>): Promise<string | null> {
+  try {
+    const authPath = getCodexAuthPath(env);
+    const stats = await stat(authPath);
+    return `${authPath}:${Math.trunc(stats.mtimeMs)}:${stats.size}`;
+  } catch {
+    return null;
+  }
 }
 
 function isCodexThreadHistoryUnreadableError(err: unknown): boolean {
@@ -118,10 +149,17 @@ function capCodexSdkContextInjection(text: string, maxChars = getCodexSdkContext
   return `${text.slice(0, maxChars - marker.length).trimEnd()}${marker}`;
 }
 
-function buildCodexTurnInput(payload: ProviderContextPayload): string {
+function buildCodexTurnInput(payload: ProviderContextPayload, sessionSystemTextUpdate?: string): string {
   const contextParts: string[] = [];
-  const systemText = payload.systemText?.trim();
+  const split = getProviderSystemTextParts(payload);
+  const systemText = split.hasSplitSystemText
+    ? composeProviderSystemText(payload, { includeSession: false, includeTurn: true })
+    : payload.systemText?.trim();
   const messagePreamble = payload.messagePreamble?.trim();
+  const stableUpdate = sessionSystemTextUpdate?.trim();
+  if (stableUpdate) {
+    contextParts.push(`${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER} updated:\n${stableUpdate}`);
+  }
   if (systemText) contextParts.push(`Context instructions:\n${systemText}`);
   if (messagePreamble) contextParts.push(messagePreamble);
   if (contextParts.length === 0) return payload.assembledMessage;
@@ -130,6 +168,30 @@ function buildCodexTurnInput(payload: ProviderContextPayload): string {
   const userMessage = messagePreamble ? payload.userMessage : payload.assembledMessage;
   const trimmedUserMessage = userMessage.trim();
   return trimmedUserMessage ? `${contextText}\n\n${trimmedUserMessage}` : contextText;
+}
+
+function appendImcodesBaseInstructions(baseInstructions: string, payload: ProviderContextPayload): string {
+  const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
+  // Generated Image Reporting belongs in Codex's baseInstructions tail
+  // (Codex is currently the only transport agent with native image-gen
+  // tools). Living here means: sent once per thread/start|resume, picked
+  // up by Codex prefix cache, NOT re-rendered every turn, and zero cost
+  // for non-Codex providers. See p2p audit 37bfbb85-430 N-A follow-up.
+  const imageReporting = buildGeneratedImageReportingPrompt();
+  const tailParts = [sessionSystemText, imageReporting].filter((s): s is string => Boolean(s));
+  if (tailParts.length === 0) return baseInstructions;
+  if (baseInstructions.includes(IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER)) return baseInstructions;
+  return `${baseInstructions.trimEnd()}\n\n${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER}\n\n${capCodexSdkContextInjection(tailParts.join('\n\n'))}`;
+}
+
+function appendDetectedGeneratedImagePaths(content: string, paths: string[]): string {
+  const missingPaths = paths.filter((path) => !content.includes(path));
+  if (missingPaths.length === 0) return content;
+  const heading = missingPaths.length === 1
+    ? 'Generated image path detected by IM.codes:'
+    : 'Generated image paths detected by IM.codes:';
+  const pathLines = missingPaths.map((path) => `- ${path}`).join('\n');
+  return `${content.trimEnd()}${content.trimEnd() ? '\n\n' : ''}${heading}\n${pathLines}`;
 }
 
 /**
@@ -219,6 +281,7 @@ interface CodexSdkSessionState {
   compactSettleTimer: ReturnType<typeof setTimeout> | null;
   compactHardTimer: ReturnType<typeof setTimeout> | null;
   compactObserved: boolean;
+  lastInjectedSessionSystemText?: string;
   lastUsage?: {
     /**
      * Context-bar usage must represent the current prompt/window occupancy,
@@ -242,6 +305,10 @@ interface CodexSdkSessionState {
     codex_last_output_tokens?: number;
   };
   lastStatusSignature: string | null;
+  pendingSessionSystemTextUpdate?: string;
+  pendingSessionSystemTextUpdateTurnId?: string;
+  generatedImageKnownPaths: Set<string>;
+  generatedImagePaths: string[];
 }
 
 function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
@@ -538,6 +605,8 @@ export class CodexSdkProvider implements TransportProvider {
   private rl: ReadlineInterface | null = null;
   private nextRequestId = 1;
   private pendingRequests = new Map<number, PendingRequest>();
+  private appServerAuthFingerprint: string | null = null;
+  private appServerRestart: Promise<void> | null = null;
 
   async connect(config: ProviderConfig): Promise<void> {
     const binaryPath = this.resolveBinaryPath(config);
@@ -550,8 +619,7 @@ export class CodexSdkProvider implements TransportProvider {
         execFile(resolved.executable, [...resolved.prependArgs, '--version'], { windowsHide: true }, (err) => (err ? reject(err) : resolve()));
       });
     });
-    await this.startAppServer(binaryPath, config);
-    this.config = config;
+    await this.startAppServer(binaryPath, config, { clearSessions: true });
     logger.info({ provider: this.id, resolved: resolved.executable, prepend: resolved.prependArgs }, 'Codex SDK provider connected via app-server');
   }
 
@@ -565,27 +633,11 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
-    this.rejectPending(new Error('Codex app-server disconnected'));
-    this.rl?.close();
-    this.rl = null;
-    for (const state of this.sessions.values()) {
-      this.clearCancelTimer(state);
-      this.clearCompactTimers(state);
-    }
-    // `child.kill('SIGTERM')` only terminates the node wrapper; the native
-    // codex binary it spawned lives on and leaks ~60MB per abandoned pair.
-    // Walk the descendant tree and tree-kill instead. Fire-and-forget is
-    // fine — the caller does not await teardown reaping.
-    if (this.child && !this.child.killed) {
-      void killProcessTree(this.child);
-    }
-    this.child = null;
-    this.threadToSession.clear();
-    this.sessions.clear();
-    this.config = null;
+    await this.stopAppServer({ clearSessions: true });
   }
 
   async createSession(config: SessionConfig): Promise<string> {
+    await this.refreshAppServerForLatestAuth('create-session');
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const existing = config.fresh ? undefined : this.sessions.get(routeId);
     this.sessions.set(routeId, {
@@ -607,8 +659,13 @@ export class CodexSdkProvider implements TransportProvider {
       compactSettleTimer: null,
       compactHardTimer: null,
       compactObserved: false,
+      lastInjectedSessionSystemText: existing?.lastInjectedSessionSystemText,
       lastUsage: undefined,
       lastStatusSignature: null,
+      pendingSessionSystemTextUpdate: undefined,
+      pendingSessionSystemTextUpdateTurnId: undefined,
+      generatedImageKnownPaths: new Set(),
+      generatedImagePaths: [],
     });
     if (config.resumeId || config.effort) this.emitSessionInfo(routeId, { ...(config.resumeId ? { resumeId: config.resumeId } : {}), ...(config.effort ? { effort: config.effort } : {}) });
     return routeId;
@@ -702,6 +759,10 @@ export class CodexSdkProvider implements TransportProvider {
     if (state.runningTurnId || state.runningCompact) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Codex SDK session is already busy', true);
     }
+    await this.refreshAppServerForLatestAuth('send');
+    if (!this.config || !this.child) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
+    }
 
     state.currentText = '';
     state.currentMessageId = null;
@@ -710,6 +771,8 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearCancelTimer(state);
     state.lastUsage = undefined;
     state.lastStatusSignature = null;
+    state.generatedImageKnownPaths = new Set();
+    state.generatedImagePaths = [];
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
     if (this.isCompactCommand(payload)) {
       await this.startCompact(sessionId, state);
@@ -720,9 +783,15 @@ export class CodexSdkProvider implements TransportProvider {
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    if (!state?.threadId) return;
+    if (!state) return;
+    // Mark cancellation before checking threadId/runningTurnId. STOP can land
+    // while Codex app-server is still answering thread/start or turn/start; in
+    // that window there is not yet a turn id to interrupt. The cancelled flag
+    // carries the request across those async boundaries so startTurn() issues
+    // turn/interrupt as soon as Codex exposes the id.
+    state.cancelled = true;
+    if (!state.threadId) return;
     if (state.runningCompact) {
-      state.cancelled = true;
       const turnId = state.runningTurnId;
       if (turnId) {
         void this.request('turn/interrupt', {
@@ -733,13 +802,25 @@ export class CodexSdkProvider implements TransportProvider {
       this.cancelCompactLocally(sessionId, state);
       return;
     }
-    if (!state.runningTurnId) return;
-    state.cancelled = true;
     const turnId = state.runningTurnId;
-    await this.request('turn/interrupt', {
+    if (!turnId) return;
+    await this.interruptRunningTurn(sessionId, state, turnId);
+  }
+
+  private async interruptRunningTurn(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    turnId: string,
+  ): Promise<void> {
+    state.cancelled = true;
+    if (!state.threadId) return;
+    // Fire-and-watchdog. Do not await turn/interrupt acknowledgement before
+    // arming the local cancellation timer; an app-server/RPC hang must not
+    // leave the UI stuck in "stopping" forever.
+    void this.request('turn/interrupt', {
       threadId: state.threadId,
       turnId,
-    }).catch(() => {});
+    }, CANCEL_INTERRUPT_TIMEOUT_MS).catch(() => {});
     this.clearCancelTimer(state);
     state.cancelTimer = setTimeout(() => {
       if (!this.sessions.has(sessionId)) return;
@@ -747,20 +828,68 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearStatus(sessionId, state);
       state.runningTurnId = undefined;
       state.pendingComplete = undefined;
+      this.clearPendingSessionSystemTextUpdate(state);
       this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
     }, CANCEL_INTERRUPT_TIMEOUT_MS);
     state.cancelTimer.unref?.();
   }
 
-  private async startAppServer(binaryPath: string, config: ProviderConfig): Promise<void> {
-    await this.disconnect().catch(() => {});
+  private buildSpawnEnv(config: ProviderConfig): Record<string, string | undefined> {
+    return { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) };
+  }
+
+  private async stopAppServer(options: { clearSessions: boolean }): Promise<void> {
+    this.rejectPending(new Error('Codex app-server disconnected'));
+    this.rl?.close();
+    this.rl = null;
+    for (const [sessionId, state] of this.sessions) {
+      this.clearCancelTimer(state);
+      this.clearCompactTimers(state);
+      if (!options.clearSessions) {
+        this.clearStatus(sessionId, state);
+        state.loaded = false;
+        state.runningTurnId = undefined;
+        state.runningCompact = false;
+        state.compactObserved = false;
+        state.currentMessageId = null;
+        state.currentText = '';
+        state.pendingComplete = undefined;
+        state.cancelled = false;
+        state.lastStatusSignature = null;
+        this.clearPendingSessionSystemTextUpdate(state);
+      }
+    }
+    // `child.kill('SIGTERM')` only terminates the node wrapper; the native
+    // codex binary it spawned lives on and leaks ~60MB per abandoned pair.
+    // Walk the descendant tree and tree-kill instead.
+    const child = this.child;
+    this.child = null;
+    if (child && !child.killed) {
+      void killProcessTree(child);
+    }
+    this.threadToSession.clear();
+    this.appServerAuthFingerprint = null;
+    if (options.clearSessions) {
+      this.sessions.clear();
+      this.config = null;
+    }
+  }
+
+  private async startAppServer(
+    binaryPath: string,
+    config: ProviderConfig,
+    options: { clearSessions: boolean },
+  ): Promise<void> {
+    await this.stopAppServer({ clearSessions: options.clearSessions }).catch(() => {});
     // Resolve npm .cmd shims into (node.exe, [scriptPath]) so spawn works
     // without shell:true (which has its own quoting issues on Windows).
     const resolved = resolveExecutableForSpawn(binaryPath);
     const args = [...resolved.prependArgs, ...getDefaultCodexMcpArgs(), 'app-server'];
+    const spawnEnv = this.buildSpawnEnv(config);
+    const authFingerprint = await readCodexAuthFingerprint(spawnEnv);
     const child = spawn(resolved.executable, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) },
+      env: spawnEnv,
       windowsHide: true,
     });
     this.child = child;
@@ -771,6 +900,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (text.trim()) logger.debug({ provider: this.id, stderr: text.trim() }, 'Codex app-server stderr');
     });
     child.on('exit', (code) => {
+      if (this.child !== child) return;
       const err = new Error(`Codex app-server exited with code ${code ?? 'unknown'}`);
       this.rejectPending(err);
       const sessions = [...this.sessions.keys()];
@@ -778,10 +908,12 @@ export class CodexSdkProvider implements TransportProvider {
         this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
       }
       this.child = null;
+      this.appServerAuthFingerprint = null;
     });
     // CRITICAL: must listen for 'error' or spawn failures (e.g. ENOENT) become
     // uncaughtException and crash the daemon.
     child.on('error', (err) => {
+      if (this.child !== child) return;
       logger.error({ provider: this.id, err }, 'Codex app-server spawn error');
       this.rejectPending(err);
       const sessions = [...this.sessions.keys()];
@@ -789,19 +921,72 @@ export class CodexSdkProvider implements TransportProvider {
         this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
       }
       this.child = null;
+      this.appServerAuthFingerprint = null;
     });
 
-    await this.request('initialize', {
-      clientInfo: { name: 'imcodes', title: 'IM.codes', version: '0.1.0' },
-      capabilities: { experimentalApi: true },
+    try {
+      await this.request('initialize', {
+        clientInfo: { name: 'imcodes', title: 'IM.codes', version: '0.1.0' },
+        capabilities: { experimentalApi: true },
+      });
+      this.notify('initialized', {});
+      this.config = config;
+      this.appServerAuthFingerprint = authFingerprint;
+    } catch (err) {
+      await this.stopAppServer({ clearSessions: options.clearSessions }).catch(() => {});
+      throw err;
+    }
+  }
+
+  private async refreshAppServerForLatestAuth(reason: string): Promise<void> {
+    if (this.appServerRestart) await this.appServerRestart;
+    if (!this.config || !this.child) return;
+    const current = await readCodexAuthFingerprint(this.buildSpawnEnv(this.config));
+    if (current === this.appServerAuthFingerprint) return;
+    logger.info({
+      provider: this.id,
+      reason,
+      previousAuthPresent: this.appServerAuthFingerprint !== null,
+      currentAuthPresent: current !== null,
+    }, 'Codex auth file changed; restarting app-server to load latest authentication');
+    await this.restartAppServerPreservingSessions(reason);
+  }
+
+  private async restartAppServerPreservingSessions(reason: string): Promise<void> {
+    if (this.appServerRestart) return this.appServerRestart;
+    const config = this.config;
+    if (!config) return;
+    const binaryPath = this.resolveBinaryPath(config);
+    this.appServerRestart = (async () => {
+      await this.startAppServer(binaryPath, config, { clearSessions: false });
+    })().finally(() => {
+      this.appServerRestart = null;
     });
-    this.notify('initialized', {});
+    return this.appServerRestart;
+  }
+
+  private async restartAppServerAfterAuthFailure(reason: string, error: ProviderError): Promise<void> {
+    logger.warn({
+      provider: this.id,
+      reason,
+      code: error.code,
+      message: error.message,
+    }, 'Codex app-server authentication failed; restarting to load latest authentication');
+    await this.restartAppServerPreservingSessions(reason);
   }
 
   private async startTurn(sessionId: string, state: CodexSdkSessionState, payload: ProviderContextPayload): Promise<void> {
     try {
-      await this.ensureThreadLoaded(sessionId, state);
-      const inputText = buildCodexTurnInput(payload);
+      const desiredSessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
+      const shouldInjectStableUpdate = !!(
+        state.threadId
+        && state.loaded
+        && desiredSessionSystemText
+        && state.lastInjectedSessionSystemText !== desiredSessionSystemText
+      );
+      await this.ensureThreadLoaded(sessionId, state, payload);
+      await this.prepareGeneratedImageTracking(sessionId, state);
+      const inputText = buildCodexTurnInput(payload, shouldInjectStableUpdate ? desiredSessionSystemText : undefined);
       const result = await this.request('turn/start', {
         threadId: state.threadId,
         input: [{ type: 'text', text: inputText }],
@@ -813,9 +998,23 @@ export class CodexSdkProvider implements TransportProvider {
         ...(state.effort ? { effort: state.effort } : {}),
       });
       state.runningTurnId = result?.turn?.id;
+      if (shouldInjectStableUpdate) {
+        state.pendingSessionSystemTextUpdate = desiredSessionSystemText;
+        state.pendingSessionSystemTextUpdateTurnId = state.runningTurnId;
+      }
+      if (state.cancelled && state.runningTurnId) {
+        await this.interruptRunningTurn(sessionId, state, state.runningTurnId);
+      }
     } catch (err) {
       state.runningTurnId = undefined;
-      this.emitError(sessionId, this.normalizeError(err));
+      this.clearPendingSessionSystemTextUpdate(state);
+      const error = this.normalizeError(err);
+      if (this.isCodexAuthError(error)) {
+        await this.restartAppServerAfterAuthFailure('start-turn', error).catch((restartErr) => {
+          logger.warn({ provider: this.id, err: restartErr }, 'Codex app-server auth refresh restart failed');
+        });
+      }
+      this.emitError(sessionId, error);
     }
   }
 
@@ -833,6 +1032,7 @@ export class CodexSdkProvider implements TransportProvider {
   private async startCompact(sessionId: string, state: CodexSdkSessionState): Promise<void> {
     try {
       await this.ensureThreadLoaded(sessionId, state);
+      this.clearPendingSessionSystemTextUpdate(state);
       state.runningCompact = true;
       state.compactObserved = false;
       state.currentText = '';
@@ -866,7 +1066,7 @@ export class CodexSdkProvider implements TransportProvider {
     }
   }
 
-  private async ensureThreadLoaded(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+  private async ensureThreadLoaded(sessionId: string, state: CodexSdkSessionState, payload?: ProviderContextPayload): Promise<void> {
     if (state.threadId && state.loaded) return;
 
     // Always send `baseInstructions`. Catalog models get codex's full
@@ -875,11 +1075,16 @@ export class CodexSdkProvider implements TransportProvider {
     // Responses API never sees an empty `instructions` field, which it now
     // rejects with `{"type":"invalid_request_error","message":"Instructions
     // are required"}`.
-    const baseInstructions = await resolveBaseInstructionsOverride(state.model);
+    const resolvedBaseInstructions = await resolveBaseInstructionsOverride(state.model);
+    const baseInstructions = payload
+      ? appendImcodesBaseInstructions(resolvedBaseInstructions, payload)
+      : resolvedBaseInstructions;
+    const sessionSystemText = payload ? getProviderSystemTextParts(payload).sessionSystemText : undefined;
 
     if (state.threadId) {
       try {
         await this.resumeThread(sessionId, state, baseInstructions);
+        state.lastInjectedSessionSystemText = sessionSystemText;
         return;
       } catch (err) {
         if (!isCodexThreadHistoryUnreadableError(err)) throw err;
@@ -891,6 +1096,7 @@ export class CodexSdkProvider implements TransportProvider {
         if (repaired) {
           try {
             await this.resumeThread(sessionId, state, baseInstructions);
+            state.lastInjectedSessionSystemText = sessionSystemText;
             return;
           } catch (retryErr) {
             logger.warn({ provider: this.id, sessionId, threadId: state.threadId, err: retryErr }, 'Codex SDK resume still failed after thread history repair');
@@ -906,6 +1112,7 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     await this.startNewThread(sessionId, state, baseInstructions);
+    state.lastInjectedSessionSystemText = sessionSystemText;
   }
 
   private async resumeThread(sessionId: string, state: CodexSdkSessionState, baseInstructions: string): Promise<void> {
@@ -975,6 +1182,53 @@ export class CodexSdkProvider implements TransportProvider {
     return state.mcpConfig ? { config: state.mcpConfig } : {};
   }
 
+  private codexGeneratedImageEnv(state: CodexSdkSessionState): Record<string, string | undefined> {
+    return {
+      ...process.env,
+      ...((this.config?.env as Record<string, string | undefined> | undefined) ?? {}),
+      ...(state.env ?? {}),
+    };
+  }
+
+  private codexGeneratedImageDir(state: CodexSdkSessionState): string | null {
+    if (!state.threadId) return null;
+    return resolve(getCodexHome(this.codexGeneratedImageEnv(state)), 'generated_images', state.threadId);
+  }
+
+  private async listGeneratedImagePaths(state: CodexSdkSessionState): Promise<string[]> {
+    const dir = this.codexGeneratedImageDir(state);
+    if (!dir) return [];
+    try {
+      const entries = await readdir(dir, { withFileTypes: true });
+      return entries
+        .filter((entry) => entry.isFile() && GENERATED_IMAGE_EXTENSIONS.has(extname(entry.name).toLowerCase()))
+        .map((entry) => resolve(dir, entry.name))
+        .sort();
+    } catch {
+      return [];
+    }
+  }
+
+  private async prepareGeneratedImageTracking(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+    const existingPaths = await this.listGeneratedImagePaths(state);
+    state.generatedImageKnownPaths = new Set(existingPaths);
+    state.generatedImagePaths = [];
+    logger.debug({
+      provider: this.id,
+      sessionId,
+      threadId: state.threadId,
+      knownGeneratedImages: existingPaths.length,
+    }, 'Codex SDK prepared generated image path tracking');
+  }
+
+  private async detectNewGeneratedImagePaths(
+    state: CodexSdkSessionState,
+    knownPaths: ReadonlySet<string>,
+  ): Promise<string[]> {
+    const paths = await this.listGeneratedImagePaths(state);
+    return paths.filter((path) => !knownPaths.has(path));
+  }
+
   private handleLine(line: string): void {
     const trimmed = line.trim();
     if (!trimmed) return;
@@ -999,10 +1253,12 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (!msg.method) return;
-    this.handleNotification(msg.method, msg.params ?? {});
+    void this.handleNotification(msg.method, msg.params ?? {}).catch((err) => {
+      logger.warn({ provider: this.id, method: msg.method, err }, 'Codex app-server notification handler failed');
+    });
   }
 
-  private handleNotification(method: string, params: Record<string, any>): void {
+  private async handleNotification(method: string, params: Record<string, any>): Promise<void> {
     if (method === 'thread/started') {
       const threadId = params.thread?.id;
       if (!threadId) return;
@@ -1066,6 +1322,7 @@ export class CodexSdkProvider implements TransportProvider {
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
+      if (state.cancelled) return;
       this.clearStatus(sessionId, state);
       state.currentMessageId = params.itemId;
       state.currentText += String(params.delta ?? '');
@@ -1103,6 +1360,8 @@ export class CodexSdkProvider implements TransportProvider {
         });
         return;
       }
+
+      if (state.cancelled) return;
 
       if (item.type === 'reasoning') {
         this.emitStatus(sessionId, state, {
@@ -1153,7 +1412,14 @@ export class CodexSdkProvider implements TransportProvider {
         state.runningCompact = false;
         state.compactObserved = false;
         state.runningTurnId = undefined;
-        this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, turn.error?.message ?? 'Codex turn failed', false, turn.error));
+        this.clearPendingSessionSystemTextUpdate(state);
+        const error = this.normalizeError(turn.error?.message ?? 'Codex turn failed', turn.error);
+        if (this.isCodexAuthError(error)) {
+          void this.restartAppServerAfterAuthFailure('turn-failed', error).catch((restartErr) => {
+            logger.warn({ provider: this.id, err: restartErr }, 'Codex app-server auth refresh restart failed');
+          });
+        }
+        this.emitError(sessionId, error);
         return;
       }
       if (status === 'interrupted') {
@@ -1163,10 +1429,12 @@ export class CodexSdkProvider implements TransportProvider {
         state.compactObserved = false;
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
+          this.clearPendingSessionSystemTextUpdate(state);
           return;
         }
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
+        this.clearPendingSessionSystemTextUpdate(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
       }
@@ -1176,28 +1444,61 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
 
+      if (state.cancelled) {
+        this.clearCancelTimer(state);
+        this.clearStatus(sessionId, state);
+        state.runningTurnId = undefined;
+        state.pendingComplete = undefined;
+        state.currentMessageId = null;
+        state.currentText = '';
+        state.cancelled = false;
+        this.clearPendingSessionSystemTextUpdate(state);
+        this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
+        return;
+      }
+
       this.clearCancelTimer(state);
       this.clearStatus(sessionId, state);
-      state.pendingComplete = {
-        id: state.currentMessageId ?? `${sessionId}:agent-message`,
+      this.commitPendingSessionSystemTextUpdate(state, typeof turn.id === 'string' ? turn.id : undefined);
+      const messageId = state.currentMessageId ?? `${sessionId}:agent-message`;
+      const currentText = state.currentText;
+      const usage = state.lastUsage;
+      const model = state.model;
+      const resumeId = state.threadId;
+      const knownGeneratedImagePaths = new Set(state.generatedImageKnownPaths);
+      const alreadyDetectedImagePaths = [...state.generatedImagePaths];
+      state.runningTurnId = undefined;
+      const newlyDetectedImagePaths = await this.detectNewGeneratedImagePaths(state, knownGeneratedImagePaths);
+      const generatedImagePaths = [
+        ...alreadyDetectedImagePaths,
+        ...newlyDetectedImagePaths.filter((path) => !alreadyDetectedImagePaths.includes(path)),
+      ];
+      if (newlyDetectedImagePaths.length > 0) {
+        logger.info({
+          provider: this.id,
+          sessionId,
+          threadId: resumeId,
+          generatedImagePaths: newlyDetectedImagePaths,
+        }, 'Codex SDK detected generated image output paths');
+      }
+      const content = appendDetectedGeneratedImagePaths(currentText, generatedImagePaths);
+      const completed: AgentMessage = {
+        id: messageId,
         sessionId,
         kind: 'text',
         role: 'assistant',
-        content: state.currentText,
+        content,
         timestamp: Date.now(),
         status: 'complete',
         metadata: {
-          ...(state.lastUsage ? { usage: state.lastUsage } : {}),
-          ...(state.model ? { model: state.model } : {}),
-          ...(state.threadId ? { resumeId: state.threadId } : {}),
+          ...(usage ? { usage } : {}),
+          ...(model ? { model } : {}),
+          ...(resumeId ? { resumeId } : {}),
         },
       };
-      state.runningTurnId = undefined;
-      const completed = state.pendingComplete;
+      state.pendingComplete = completed;
       state.pendingComplete = undefined;
-      if (completed) {
-        for (const cb of this.completeCallbacks) cb(sessionId, completed);
-      }
+      for (const cb of this.completeCallbacks) cb(sessionId, completed);
       return;
     }
   }
@@ -1238,6 +1539,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.runningCompact = false;
     state.runningTurnId = undefined;
     state.compactObserved = false;
+    this.clearPendingSessionSystemTextUpdate(state);
     state.currentMessageId = null;
     state.currentText = '';
     const completed: AgentMessage = {
@@ -1274,6 +1576,7 @@ export class CodexSdkProvider implements TransportProvider {
   async readRateLimits(): Promise<Record<string, unknown> | undefined> {
     if (!this.child || !this.child.stdin.writable) return undefined;
     try {
+      await this.refreshAppServerForLatestAuth('rate-limits').catch(() => {});
       const result = await this.request('account/rateLimits/read', {});
       if (result && typeof result === 'object' && 'rateLimits' in (result as Record<string, unknown>)) {
         const payload = (result as Record<string, unknown>).rateLimits;
@@ -1307,6 +1610,7 @@ export class CodexSdkProvider implements TransportProvider {
   async readModelList(): Promise<CodexDiscoveredModel[] | undefined> {
     if (!this.child || !this.child.stdin.writable) return undefined;
     try {
+      await this.refreshAppServerForLatestAuth('model-list').catch(() => {});
       const discovered: CodexDiscoveredModel[] = [];
       const seen = new Set<string>();
       let cursor: string | null = null;
@@ -1375,6 +1679,21 @@ export class CodexSdkProvider implements TransportProvider {
     this.emitStatus(sessionId, state, { status: null, label: null });
   }
 
+  private clearPendingSessionSystemTextUpdate(state: CodexSdkSessionState): void {
+    state.pendingSessionSystemTextUpdate = undefined;
+    state.pendingSessionSystemTextUpdateTurnId = undefined;
+  }
+
+  private commitPendingSessionSystemTextUpdate(state: CodexSdkSessionState, turnId?: string): void {
+    if (!state.pendingSessionSystemTextUpdate) return;
+    if (state.pendingSessionSystemTextUpdateTurnId && turnId && state.pendingSessionSystemTextUpdateTurnId !== turnId) {
+      this.clearPendingSessionSystemTextUpdate(state);
+      return;
+    }
+    state.lastInjectedSessionSystemText = state.pendingSessionSystemTextUpdate;
+    this.clearPendingSessionSystemTextUpdate(state);
+  }
+
   private cancelCompactLocally(sessionId: string, state: CodexSdkSessionState): void {
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
@@ -1382,6 +1701,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.runningCompact = false;
     state.runningTurnId = undefined;
     state.compactObserved = false;
+    this.clearPendingSessionSystemTextUpdate(state);
     state.currentMessageId = null;
     state.currentText = '';
     state.pendingComplete = undefined;
@@ -1396,15 +1716,22 @@ export class CodexSdkProvider implements TransportProvider {
     return typeof config?.binaryPath === 'string' && config.binaryPath.trim() ? config.binaryPath : CODEX_BIN;
   }
 
-  private normalizeError(err: unknown): ProviderError {
+  private normalizeError(err: unknown, details?: unknown): ProviderError {
     const message = errorMessage(err);
     if (/ENOENT|not found|spawn .*codex/i.test(message)) {
       return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND, `Codex binary not found: ${message}`, false, err);
+    }
+    if (isCodexAuthFailureMessage(message)) {
+      return this.makeError(PROVIDER_ERROR_CODES.AUTH_FAILED, message, false, details ?? err);
     }
     if (isCodexThreadHistoryUnreadableError(err) || (/resume|thread/i.test(message) && /not found|invalid|unknown/i.test(message))) {
       return this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, message, true, err);
     }
     return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, false, err);
+  }
+
+  private isCodexAuthError(error: ProviderError): boolean {
+    return error.code === PROVIDER_ERROR_CODES.AUTH_FAILED || isCodexAuthFailureMessage(error.message);
   }
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {
@@ -1437,6 +1764,7 @@ export class CodexSdkProvider implements TransportProvider {
       state.runningCompact = false;
       state.runningTurnId = undefined;
       state.compactObserved = false;
+      this.clearPendingSessionSystemTextUpdate(state);
       state.currentMessageId = null;
       state.currentText = '';
       this.emitError(sessionId, this.makeError(

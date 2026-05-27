@@ -52,6 +52,15 @@ export const MEMORY_WS = {
   OBSERVATION_PROMOTE_RESPONSE: 'memory.observations.promote_response',
   MCP_STATUS_QUERY: 'memory.mcp_status.query',
   MCP_STATUS_RESPONSE: 'memory.mcp_status.response',
+  // ── cross-server projection source resolution ──────────────────────────
+  // Server → daemon (over the daemon WS): fetch the raw events behind a
+  // projection that lives on this daemon's local SQLite. Issued by the
+  // pod-sticky `/api/memory/sources` HTTP route after the ingress routes
+  // the request to the pod holding the target daemon's WS. The daemon
+  // replies with GET_SOURCES_RESPONSE keyed by requestId. See
+  // openspec/changes/memory-source-server-routing.
+  GET_SOURCES_REQUEST: 'memory.get_sources_request',
+  GET_SOURCES_RESPONSE: 'memory.get_sources_response',
 } as const;
 
 export type MemoryWsType = typeof MEMORY_WS[keyof typeof MEMORY_WS];
@@ -59,6 +68,7 @@ export type MemoryWsType = typeof MEMORY_WS[keyof typeof MEMORY_WS];
 export const MEMORY_MCP_PROVIDER_ID = {
   CLAUDE_CODE_SDK: 'claude-code-sdk',
   GEMINI_SDK: 'gemini-sdk',
+  KIMI_SDK: 'kimi-sdk',
   COPILOT_SDK: 'copilot-sdk',
   CODEX_SDK: 'codex-sdk',
   CURSOR_HEADLESS: 'cursor-headless',
@@ -68,6 +78,7 @@ export const MEMORY_MCP_PROVIDER_ID = {
 export const MEMORY_MCP_PROVIDER_IDS = [
   MEMORY_MCP_PROVIDER_ID.CLAUDE_CODE_SDK,
   MEMORY_MCP_PROVIDER_ID.GEMINI_SDK,
+  MEMORY_MCP_PROVIDER_ID.KIMI_SDK,
   MEMORY_MCP_PROVIDER_ID.COPILOT_SDK,
   MEMORY_MCP_PROVIDER_ID.CODEX_SDK,
   MEMORY_MCP_PROVIDER_ID.CURSOR_HEADLESS,

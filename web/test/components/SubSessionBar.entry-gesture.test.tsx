@@ -63,6 +63,12 @@ function makeMouseEvent(target: Element): Event {
   return event;
 }
 
+function firePointerDown(target: Element, pointerType: string): void {
+  const event = new Event('pointerdown', { bubbles: true, cancelable: true });
+  Object.defineProperty(event, 'pointerType', { configurable: true, value: pointerType });
+  fireEvent(target, event);
+}
+
 describe('sub-session entry gesture helper', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -189,6 +195,7 @@ describe('sub-session entry gesture helper', () => {
 
     controller.handlePointerDown({ pointerType: 'touch' });
     controller.handleClick(makeMouseEvent(root), root);
+    expect(log).toEqual(['openNormal']);
     controller.handleDoubleClick(makeMouseEvent(root), root);
     vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS);
 
@@ -206,10 +213,50 @@ describe('sub-session entry gesture helper', () => {
 
     controller.handlePointerDown({ pointerType: 'mouse' });
     controller.handleClick(makeMouseEvent(root), root);
+    expect(log).toEqual(['openNormal']);
     controller.handleDoubleClick(makeMouseEvent(root), root);
     vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS);
 
     expect(log).toEqual(['openNormal']);
+  });
+
+  it('uses touchend as a fallback when mobile browsers do not synthesize click', () => {
+    const log: string[] = [];
+    const root = document.createElement('div');
+    const controller = createSubSessionEntryGestureController({
+      getState: () => ({ isOpen: false, isMaximized: false }),
+      actions: makeActions(log),
+    });
+
+    controller.handlePointerDown({ pointerType: 'touch' });
+    controller.handleTouchEndFallback(makeMouseEvent(root), root);
+    expect(log).toEqual(['openNormal']);
+
+    controller.handleTouchEndFallback(makeMouseEvent(root), root);
+    expect(log).toEqual(['openNormal']);
+
+    controller.handleClick(makeMouseEvent(root), root);
+    expect(log).toEqual(['openNormal']);
+
+    vi.advanceTimersByTime(800);
+    controller.handlePointerDown({ pointerType: 'touch' });
+    controller.handleClick(makeMouseEvent(root), root);
+    expect(log).toEqual(['openNormal', 'openNormal']);
+  });
+
+  it('suppresses synthetic click after a canceled touch sequence', () => {
+    const log: string[] = [];
+    const root = document.createElement('div');
+    const controller = createSubSessionEntryGestureController({
+      getState: () => ({ isOpen: false, isMaximized: false }),
+      actions: makeActions(log),
+    });
+
+    controller.handlePointerDown({ pointerType: 'touch' });
+    controller.cancelTouchSequence();
+    controller.handleClick(makeMouseEvent(root), root);
+
+    expect(log).toEqual([]);
   });
 });
 
@@ -239,6 +286,7 @@ function renderBar(props: Partial<Parameters<typeof SubSessionBar>[0]> = {}) {
       subSessions={subSessions}
       openIds={props.openIds ?? new Set()}
       maximizedIds={props.maximizedIds}
+      collapsed={props.collapsed}
       idleFlashTokens={new Map()}
       onOpen={props.onOpen ?? vi.fn()}
       onClose={props.onClose ?? vi.fn()}
@@ -277,7 +325,7 @@ describe('SubSessionBar component entry gestures', () => {
     renderBar({ onOpen });
 
     const entry = screen.getByRole('button', { name: /worker/ });
-    fireEvent.pointerDown(entry, { pointerType: 'mouse' });
+    firePointerDown(entry, 'mouse');
     fireEvent.click(entry);
 
     vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS - 1);
@@ -293,7 +341,7 @@ describe('SubSessionBar component entry gestures', () => {
     renderBar({ onOpen, onOpenMaximized });
 
     const entry = screen.getByRole('button', { name: /worker/ });
-    fireEvent.pointerDown(entry, { pointerType: 'mouse' });
+    firePointerDown(entry, 'mouse');
     fireEvent.click(entry);
     fireEvent.click(entry);
     fireEvent.dblClick(entry);
@@ -312,7 +360,7 @@ describe('SubSessionBar component entry gestures', () => {
     });
 
     const entry = screen.getByRole('button', { name: /worker/ });
-    fireEvent.pointerDown(entry, { pointerType: 'mouse' });
+    firePointerDown(entry, 'mouse');
     fireEvent.click(entry);
     vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS);
 
@@ -325,12 +373,76 @@ describe('SubSessionBar component entry gestures', () => {
     renderBar({ desktopLayoutCapable: false, onOpen, onOpenMaximized });
 
     const entry = screen.getByRole('button', { name: /worker/ });
-    fireEvent.pointerDown(entry, { pointerType: 'mouse' });
+    firePointerDown(entry, 'mouse');
     fireEvent.click(entry);
+    expect(onOpen).toHaveBeenCalledWith('sub-1');
     fireEvent.dblClick(entry);
     vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS);
 
     expect(onOpenMaximized).not.toHaveBeenCalled();
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens touch entries immediately without waiting for the double-click delay', () => {
+    const onOpen = vi.fn();
+    renderBar({ onOpen });
+
+    const entry = screen.getByRole('button', { name: /worker/ });
+    fireEvent.touchStart(entry);
+    fireEvent.click(entry);
+
     expect(onOpen).toHaveBeenCalledWith('sub-1');
+    vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS);
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens collapsed mobile entries on touchend even if no synthetic click follows', () => {
+    const onOpen = vi.fn();
+    renderBar({ desktopLayoutCapable: false, onOpen });
+
+    const entry = screen.getByRole('button', { name: /worker/ });
+    fireEvent.touchStart(entry, { touches: [{ clientX: 10, clientY: 10 }] });
+    fireEvent.touchEnd(entry);
+
+    expect(onOpen).toHaveBeenCalledWith('sub-1');
+    fireEvent.click(entry);
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not open collapsed mobile entries when the touch becomes a horizontal scroll gesture', () => {
+    const onOpen = vi.fn();
+    renderBar({ desktopLayoutCapable: false, onOpen });
+
+    const entry = screen.getByRole('button', { name: /worker/ });
+    fireEvent.touchStart(entry, { touches: [{ clientX: 10, clientY: 10 }] });
+    fireEvent.touchMove(entry, { touches: [{ clientX: 40, clientY: 12 }] });
+    fireEvent.touchEnd(entry);
+
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('opens expanded mobile preview entries on touchend even if no synthetic click follows', () => {
+    const onOpen = vi.fn();
+    renderBar({ desktopLayoutCapable: false, collapsed: false, onOpen });
+
+    const entry = screen.getByTestId('subsession-card-preview-sub-1').parentElement as HTMLElement;
+    fireEvent.touchStart(entry, { touches: [{ clientX: 10, clientY: 10 }] });
+    fireEvent.touchEnd(entry);
+
+    expect(onOpen).toHaveBeenCalledWith('sub-1');
+    fireEvent.click(entry);
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not open expanded mobile preview entries on touchcancel', () => {
+    const onOpen = vi.fn();
+    renderBar({ desktopLayoutCapable: false, collapsed: false, onOpen });
+
+    const entry = screen.getByTestId('subsession-card-preview-sub-1').parentElement as HTMLElement;
+    fireEvent.touchStart(entry, { touches: [{ clientX: 10, clientY: 10 }] });
+    fireEvent.touchCancel(entry);
+    fireEvent.click(entry);
+
+    expect(onOpen).not.toHaveBeenCalled();
   });
 });

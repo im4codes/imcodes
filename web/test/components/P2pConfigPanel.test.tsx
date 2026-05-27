@@ -330,6 +330,7 @@ describe('P2pConfigPanel', () => {
       const tabButton = screen.getByTestId('p2p-tab-advanced');
       expect(tabButton).toBeDefined();
       expect(tabButton.tagName).toBe('BUTTON');
+      expect(tabButton.textContent).toContain('Alpha');
     });
 
     it('clicking the advanced tab on a fresh panel auto-bootstraps a starter draft and renders the canvas', async () => {
@@ -352,6 +353,8 @@ describe('P2pConfigPanel', () => {
       // injected. The canvas root + a single seed node MUST be rendered.
       expect(screen.getByTestId('p2p-editor-canvas')).toBeDefined();
       expect(screen.getByTestId('p2p-editor-node-shape-node_1')).toBeDefined();
+      expect(screen.getByTestId('p2p-advanced-alpha-notice')).toBeDefined();
+      expect(screen.getByText('Experimental capability; not formally validated yet. Prefer preset combos for critical work.')).toBeDefined();
 
       // The participants tab content (agent grid header, rounds, hop-timeout)
       // must NOT be in the DOM — we have switched away.
@@ -768,7 +771,7 @@ describe('P2pConfigPanel', () => {
     expect(onPersistDaemonConfig).not.toHaveBeenCalled();
     expect(onSave).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
-    expect(screen.getByText(/failed to save p2p settings/i)).toBeDefined();
+    expect(screen.getByText(/failed to save team settings/i)).toBeDefined();
   });
 
   it('reloads panel state when the session P2P preference changes externally', async () => {

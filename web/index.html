@@ -12,7 +12,10 @@
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <style>
       /* ── IM.codes Splash ── */
-      :root { --splash-bg: #0a0e1a; }
+      :root {
+        --splash-bg: #0a0e1a;
+        --splash-logo-width: clamp(176px, 40vw, 264px);
+      }
       body { margin: 0; background: var(--splash-bg); }
 
       #splash {
@@ -21,7 +24,7 @@
         background: var(--splash-bg);
         font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'JetBrains Mono', monospace;
         overflow: hidden;
-        transition: opacity 0.5s ease, visibility 0.5s ease;
+        transition: opacity 0.32s ease, visibility 0.32s ease;
       }
       #splash.splash-exit { opacity: 0; visibility: hidden; pointer-events: none; }
 
@@ -44,7 +47,7 @@
           linear-gradient(rgba(0, 255, 180, 0.03) 1px, transparent 1px),
           linear-gradient(90deg, rgba(0, 255, 180, 0.03) 1px, transparent 1px);
         background-size: 60px 60px;
-        animation: gridPulse 4s ease-in-out infinite;
+        animation: gridPulse 2.4s ease-in-out infinite;
       }
 
       @keyframes gridPulse {
@@ -56,6 +59,7 @@
       .splash-logo {
         position: relative; z-index: 2;
         display: flex; flex-direction: column; align-items: center; gap: 0;
+        width: var(--splash-logo-width);
         font-weight: 700;
         letter-spacing: -0.02em;
         line-height: 1;
@@ -63,7 +67,8 @@
 
       /* Top line: "IM." */
       .splash-top {
-        display: flex; align-items: baseline;
+        display: flex; align-items: baseline; justify-content: center;
+        width: 100%;
         font-size: clamp(56px, 14vw, 96px);
       }
 
@@ -73,7 +78,7 @@
         text-shadow:
           0 0 20px rgba(96, 165, 250, 0.5),
           0 0 60px rgba(96, 165, 250, 0.2);
-        animation: glitchIn 0.8s ease-out both;
+        animation: glitchIn 0.45s ease-out both;
       }
 
       /* "." — cursor blink then stay */
@@ -82,18 +87,20 @@
         text-shadow:
           0 0 12px rgba(0, 255, 180, 0.8),
           0 0 40px rgba(0, 255, 180, 0.3);
-        animation: dotAppear 0.15s ease-out 0.7s both;
+        animation: dotAppear 0.12s ease-out 0.36s both;
       }
 
       /* Bottom line: "codes" — type out */
       .splash-codes {
         display: inline-block;
+        width: 3.08em;
         font-size: clamp(40px, 10vw, 68px);
         color: #94a3b8;
         overflow: hidden;
         white-space: nowrap;
-        width: 0;
-        animation: typeOut 0.5s steps(5, end) 0.85s forwards;
+        text-align: center;
+        clip-path: inset(0 100% 0 0);
+        animation: revealCodes 0.32s steps(5, end) 0.5s forwards;
         margin-top: 4px;
       }
 
@@ -104,9 +111,10 @@
         font-size: 13px;
         color: #475569;
         letter-spacing: 0.2em;
+        text-indent: 0.2em;
         text-transform: uppercase;
         opacity: 0;
-        animation: fadeUp 0.6s ease-out 1.4s forwards;
+        animation: fadeUp 0.34s ease-out 0.88s forwards;
       }
 
       /* Progress beam */
@@ -117,7 +125,7 @@
       .splash-beam::after {
         content: ''; position: absolute; top: 0; left: -40%; width: 40%; height: 100%;
         background: linear-gradient(90deg, transparent, #00ffb4, transparent);
-        animation: beamSweep 1.5s ease-in-out infinite;
+        animation: beamSweep 0.9s ease-in-out infinite;
       }
 
       /* Horizontal scan line */
@@ -125,7 +133,7 @@
         position: absolute; left: 0; right: 0; height: 1px;
         z-index: 3; pointer-events: none;
         background: linear-gradient(90deg, transparent 10%, rgba(0, 255, 180, 0.15) 50%, transparent 90%);
-        animation: scanDown 3s linear infinite;
+        animation: scanDown 1.7s linear infinite;
       }
 
       @keyframes glitchIn {
@@ -140,9 +148,9 @@
         100% { opacity: 1; transform: scale(1); }
       }
 
-      @keyframes typeOut {
-        0% { width: 0; }
-        100% { width: 3.4em; }
+      @keyframes revealCodes {
+        0% { clip-path: inset(0 100% 0 0); }
+        100% { clip-path: inset(0 0 0 0); }
       }
 
       @keyframes fadeUp {

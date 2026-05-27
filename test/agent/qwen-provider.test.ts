@@ -108,7 +108,7 @@ async function flushIO(): Promise<void> {
 }
 
 async function waitForSpawnCount(count: number): Promise<void> {
-  for (let i = 0; i < 20; i += 1) {
+  for (let i = 0; i < 80; i += 1) {
     if (childProcessMock.spawn.mock.calls.length >= count) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -179,7 +179,7 @@ describe('QwenProvider', () => {
     });
   });
 
-  it('merges provided qwen settings with reasoning settings', async () => {
+  it('preserves compatible API preset settings while forcing high qwen reasoning', async () => {
     const provider = new QwenProvider();
     await provider.connect({});
     await provider.createSession({
@@ -332,7 +332,7 @@ describe('QwenProvider', () => {
       security: { auth: { selectedType: 'anthropic' } },
       model: {
         name: 'MiniMax-M2.7',
-        generationConfig: { reasoning: { effort: 'medium' } },
+        generationConfig: { reasoning: { effort: 'high' } },
       },
       modelProviders: {
         anthropic: [
@@ -459,6 +459,34 @@ describe('QwenProvider', () => {
     expect(second.args).toContain('--resume');
     expect(second.args).toContain(firstSessionId);
     expect(second.args).not.toContain('--session-id');
+  });
+
+  it('turns an empty zero-exit qwen run into a recoverable terminal error when retry budget is exhausted', async () => {
+    const provider = new QwenProvider();
+    const errors: Array<{ sid: string; error: unknown }> = [];
+    provider.onError((sid, error) => errors.push({ sid, error }));
+
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-empty-zero',
+      cwd: '/tmp/project',
+    });
+
+    await provider.send('sess-empty-zero', 'hello', undefined, undefined, true, 0);
+    const first = lastSpawn();
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(1);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      sid: 'sess-empty-zero',
+      error: {
+        code: 'PROVIDER_ERROR',
+        message: 'Qwen exited without producing a response',
+        recoverable: true,
+      },
+    });
   });
 
   it('uses a provided UUID resumeId when restoring qwen sessions', async () => {
@@ -705,6 +733,128 @@ describe('QwenProvider', () => {
     expect(run.args).toContain('Enterprise standard');
   });
 
+  it('injects split stable context only once and keeps per-turn context on later sends', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-split-context',
+      cwd: '/tmp/project',
+    });
+
+    const makePayload = (turnSystemText: string): ProviderContextPayload => ({
+      userMessage: 'hello',
+      assembledMessage: 'Shared history\n\nhello',
+      sessionSystemText: 'Stable IM.codes runtime rules',
+      turnSystemText,
+      systemText: `Stable IM.codes runtime rules\n\n${turnSystemText}`,
+      messagePreamble: 'Shared history',
+      attachments: undefined,
+      context: {
+        sessionSystemText: 'Stable IM.codes runtime rules',
+        turnSystemText,
+        systemText: `Stable IM.codes runtime rules\n\n${turnSystemText}`,
+        messagePreamble: 'Shared history',
+        requiredAuthoredContext: [turnSystemText],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'project_shared', projectId: 'repo' },
+        authoritySource: 'processed_remote',
+        freshness: 'fresh',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    await provider.send('sess-split-context', makePayload('Required shared context:\n- First rule'));
+    const first = lastSpawn();
+    const firstPrompt = first.args[first.args.indexOf('--append-system-prompt') + 1];
+    expect(firstPrompt).toContain('Stable IM.codes runtime rules');
+    expect(firstPrompt).toContain('First rule');
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-split-context', makePayload('Required shared context:\n- Second rule'));
+    const second = lastSpawn();
+    const secondPrompt = second.args[second.args.indexOf('--append-system-prompt') + 1];
+    expect(secondPrompt).not.toContain('Stable IM.codes runtime rules');
+    expect(secondPrompt).toContain('Second rule');
+  });
+
+  it('does not fall back to the session description after split stable context is injected', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-split-stable-only',
+      cwd: '/tmp/project',
+      description: 'Legacy description must not repeat after split injection',
+    });
+
+    const payload: ProviderContextPayload = {
+      userMessage: 'hello',
+      assembledMessage: 'hello',
+      sessionSystemText: 'Stable IM.codes runtime rules',
+      systemText: 'Stable IM.codes runtime rules',
+      messagePreamble: undefined,
+      attachments: undefined,
+      context: {
+        sessionSystemText: 'Stable IM.codes runtime rules',
+        systemText: 'Stable IM.codes runtime rules',
+        messagePreamble: undefined,
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'project_shared', projectId: 'repo' },
+        authoritySource: 'processed_remote',
+        freshness: 'fresh',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+
+    await provider.send('sess-split-stable-only', payload);
+    const first = lastSpawn();
+    expect(first.args).toContain('--append-system-prompt');
+    expect(first.args).toContain('Stable IM.codes runtime rules');
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-split-stable-only', payload);
+    const second = lastSpawn();
+    expect(second.args).not.toContain('--append-system-prompt');
+    expect(second.args).not.toContain('Legacy description must not repeat after split injection');
+  });
+
+  it('keeps the legacy description fallback for raw string sends', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-legacy-description',
+      cwd: '/tmp/project',
+      description: 'Legacy description fallback',
+    });
+
+    await provider.send('sess-legacy-description', 'hello');
+    const run = lastSpawn();
+    expect(run.args).toContain('--append-system-prompt');
+    expect(run.args).toContain('Legacy description fallback');
+  });
+
   it('normalizes Windows cwd before spawning qwen', async () => {
     const origPlatform = process.platform;
     Object.defineProperty(process, 'platform', { value: 'win32' });
@@ -915,15 +1065,76 @@ describe('QwenProvider', () => {
     first.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: true, error: { message: 'API Error: Premature close' } })}\n`);
     await new Promise((resolve) => setTimeout(resolve, 350));
     await waitForSpawnCount(2);
+    first.child.emit('close', 0, null);
 
     const second = lastSpawn();
     second.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-retry-ok', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    await flushIO();
     second.child.emit('close', 0, null);
     await flushIO();
     await flushIO();
 
-    expect(childProcessMock.spawn).toHaveBeenCalledTimes(2);
+    const retryMeSpawns = childProcessMock.spawn.mock.calls.filter(
+      (call) => (call[1] as string[]).includes('retry me'),
+    );
+    expect(retryMeSpawns).toHaveLength(2);
     expect(completed).toEqual(['OK']);
+    expect(errors).toEqual([]);
+  });
+
+  it('retries qwen reasoning_content replay errors in a fresh high-thinking conversation', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-reasoning-replay-error',
+      cwd: '/tmp/project',
+      effort: 'high',
+    });
+
+    const errors: string[] = [];
+    const completed: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.message));
+    provider.onComplete((_sid, msg) => completed.push(String(msg.content)));
+
+    await provider.send('sess-reasoning-replay-error', 'first turn');
+    await waitForSpawnCount(1);
+    const first = lastSpawn();
+    const settingsPath = first.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH;
+    expect(JSON.parse(await readFile(String(settingsPath), 'utf8'))).toEqual({
+      model: { generationConfig: { reasoning: { effort: 'high' } } },
+    });
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-first-ok', content: [{ type: 'text', text: 'First OK' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-reasoning-replay-error', 'retry with a fresh conversation');
+    await waitForSpawnCount(2);
+    const second = lastSpawn();
+    expect(second.args).toContain('--resume');
+
+    second.child.stdout.write(`${JSON.stringify({
+      type: 'result',
+      is_error: true,
+      error: {
+        message: 'API Error: 400 {"error":{"code":"400","message":"Param Incorrect","param":"The reasoning_content in the thinking mode must be passed back to the API.","type":""}}',
+      },
+    })}\n`);
+    await waitForSpawnCount(3);
+
+    const third = lastSpawn();
+    expect(third.args).toContain('--session-id');
+    expect(third.args).not.toContain('--resume');
+    expect(third.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH).toBe(String(settingsPath));
+    expect(JSON.parse(await readFile(String(settingsPath), 'utf8'))).toEqual({
+      model: { generationConfig: { reasoning: { effort: 'high' } } },
+    });
+    third.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-reasoning-fallback-ok', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    third.child.emit('close', 0, null);
+    await flushIO();
+    await flushIO();
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(3);
+    expect(completed).toEqual(['First OK', 'OK']);
     expect(errors).toEqual([]);
   });
 

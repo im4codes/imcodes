@@ -39,6 +39,10 @@ function makeEvents(sessionId: string, count: number): TimelineEvent[] {
   }));
 }
 
+async function flushMicrotasks(count = 6): Promise<void> {
+  for (let i = 0; i < count; i += 1) await Promise.resolve();
+}
+
 describe('useTimeline global cache bounds', () => {
   beforeEach(() => {
     __resetTimelineCacheForTests();
@@ -102,6 +106,351 @@ describe('useTimeline global cache bounds', () => {
 
     expect(screen.getByTestId('card').textContent).toBe('3');
     expect(screen.getByTestId('window').textContent).toBe('3');
+  });
+
+  it('seeds events synchronously from the memory cache on first paint (no blank flash)', () => {
+    // Regression test for "本地缓存还是没有立即显示" — useTimeline used to
+    // initialise `events` to `[]` and only fill it from cache in a useEffect
+    // that runs AFTER the first paint, so a fresh mount painted a blank pane
+    // before flashing the cached messages in. Seeding from memCache in the
+    // useState initialiser closes that gap.
+    __setTimelineCacheForTests('srv:deck_sub_seeded', makeEvents('deck_sub_seeded', 7));
+
+    function Probe() {
+      const { events, loading } = useTimeline('deck_sub_seeded', null, 'srv');
+      return h(
+        'div',
+        {
+          'data-testid': 'probe',
+          'data-loading': String(loading),
+        },
+        String(events.length),
+      );
+    }
+
+    render(h(Probe));
+
+    // FIRST PAINT must already show the cached events, NOT 0.
+    const probe = screen.getByTestId('probe');
+    expect(probe.textContent).toBe('7');
+    // Loading flag must start false when the seed had data (so consumers
+    // that gate on `loading` don't show a spinner over the just-painted
+    // content).
+    expect(probe.getAttribute('data-loading')).toBe('false');
+  });
+
+  it('seeds events synchronously from the localStorage tail snapshot on first paint', () => {
+    // Sibling of the memCache seed test, covering the cold-process case:
+    // after a full page refresh memCache is empty (module-scope) so the
+    // synchronous seed has to fall back to the localStorage tail. Without
+    // this path the user sees a blank pane between paint #1 and the
+    // bootstrap effect's first setEvents.
+    const events = makeEvents('deck_sub_persisted', 4);
+    localStorage.setItem(
+      'rcc_timeline_snapshot:srv:deck_sub_persisted',
+      JSON.stringify(events),
+    );
+
+    function Probe() {
+      const { events: seen, loading } = useTimeline('deck_sub_persisted', null, 'srv');
+      return h(
+        'div',
+        {
+          'data-testid': 'probe',
+          'data-loading': String(loading),
+        },
+        String(seen.length),
+      );
+    }
+
+    render(h(Probe));
+
+    const probe = screen.getByTestId('probe');
+    expect(probe.textContent).toBe('4');
+    expect(probe.getAttribute('data-loading')).toBe('false');
+  });
+
+  it('inactive sessions still load IDB history after a short stagger (not just visible ones)', async () => {
+    // Regression: SubSessionCard previews and hidden tabs went empty
+    // after commit 90cd30ec gated path-3 behind isActiveSession.
+    // Commit 90cd30ec gated path-3 IDB load behind `isActiveSession` and
+    // deferred inactive instances to `requestIdleCallback` with a 500ms
+    // fallback — and cancelled the pending handle on every effect cleanup.
+    // Under real-world dep churn (ws (re)connect, callback identity flips)
+    // the cancel-then-reschedule loop never resolved, so non-active
+    // chat windows showed empty history forever.
+    //
+    // This test mounts a useTimeline instance with isActiveSession=false,
+    // advances fake timers past the 80ms stagger, and asserts the IDB
+    // history actually surfaces.
+    vi.useFakeTimers();
+    const sessionName = `deck_inactive_load_${Date.now()}`;
+    const serverId = `srv-inactive-${Date.now()}`;
+    const stored: TimelineEvent[] = [{
+      eventId: `${sessionName}-stored-1`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'inactive history is loaded too' },
+    }];
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue(stored);
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, null, serverId, {
+        // Crucial: inactive, like a SubSessionCard / hidden tab.
+        isActiveSession: false,
+      });
+      return h(
+        'div',
+        { 'data-testid': 'inactive-probe' },
+        events.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    render(h(Probe));
+    // Sanity: synchronous render is empty (no memCache or localStorage seed
+    // for this session) — proves the IDB path is what loads the history.
+    expect(screen.getByTestId('inactive-probe').textContent).toBe('');
+
+    // Advance past the 80ms stagger. After this the load() should run,
+    // open IDB, getLastSeqAndEpoch, getRecentEvents, and setEvents.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByTestId('inactive-probe').textContent).toBe('inactive history is loaded too');
+  });
+
+  it('inactive load survives effect-cleanup dep churn', async () => {
+    // Hardening regression. Even if React re-runs the bootstrap effect
+    // (which would have cancelled the pending requestIdleCallback in the
+    // old code), the new staggered setTimeout must NOT be cancelled and
+    // the IDB load must still surface for the now-current closure.
+    vi.useFakeTimers();
+    const sessionName = `deck_inactive_dep_churn_${Date.now()}`;
+    const serverId = `srv-churn-${Date.now()}`;
+    const stored: TimelineEvent[] = [{
+      eventId: `${sessionName}-stored-1`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'survived dep churn' },
+    }];
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue(stored);
+
+    // Stub WsClient whose `connected` we'll flip between renders. The
+    // bootstrap effect deps include `wsConnected`, so each flip re-runs
+    // the effect and the old code would cancel the pending idle handle.
+    let connectedState = false;
+    const ws: WsClient = {
+      get connected() { return connectedState; },
+      onMessage: () => () => { /* noop */ },
+      sendTimelineHistoryRequest: () => 'history-churn',
+    } as unknown as WsClient;
+
+    function Probe({ rev }: { rev: number }) {
+      const { events } = useTimeline(sessionName, ws, serverId, {
+        isActiveSession: false,
+      });
+      return h(
+        'div',
+        { 'data-testid': 'churn-probe', 'data-rev': String(rev) },
+        events.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    const { rerender } = render(h(Probe, { rev: 0 }));
+
+    // Churn the deps before the stagger expires — flip wsConnected so the
+    // effect re-runs and the old cleanup would have cancelled the pending
+    // load. The new code does NOT cancel, so the load still fires.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20);
+    });
+    connectedState = true;
+    rerender(h(Probe, { rev: 1 }));
+    await act(async () => {
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(20);
+    });
+    connectedState = false;
+    rerender(h(Probe, { rev: 2 }));
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    // Let the latest effect's 80ms inactive stagger and async IDB read settle.
+    // Coverage instrumentation can delay effect scheduling enough that a
+    // single fixed advance races the assertion.
+    for (let attempt = 0; attempt < 6 && screen.getByTestId('churn-probe').textContent !== 'survived dep churn'; attempt += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(40);
+        await flushMicrotasks();
+      });
+    }
+
+    expect(screen.getByTestId('churn-probe').textContent).toBe('survived dep churn');
+  });
+
+  it('cold-cache inactive sessions do not fan out daemon or HTTP history requests', async () => {
+    // SubSessionCard previews and hidden tabs can mount dozens of inactive
+    // timelines immediately after /sub-sessions returns. If cold-cache
+    // inactive hooks force daemon + HTTP history, first paint and browser
+    // tab resume both turn into an N-session network fan-out. Cold inactive
+    // hooks should read local caches only; the network path runs when that
+    // session actually becomes active.
+    vi.useFakeTimers();
+    const sessionName = `deck_cold_inactive_${Date.now()}`;
+    const serverId = `srv-cold-${Date.now()}`;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-cold-inactive');
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => { /* noop */ },
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    // Cold IDB: open succeeds, getLastSeqAndEpoch returns null (no rows).
+    // This drives the bootstrap effect into the `else` branch of path 3.
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+
+    function Probe({ active }: { active: boolean }) {
+      const { events, loading } = useTimeline(sessionName, ws, serverId, {
+        isActiveSession: active,
+      });
+      return h(
+        'div',
+        { 'data-testid': 'cold-probe', 'data-loading': String(loading) },
+        String(events.length),
+      );
+    }
+
+    const { rerender } = render(h(Probe, { active: false }));
+
+    // Wait out the inactive 80ms stagger so the cold-IDB branch runs.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByTestId('cold-probe').getAttribute('data-loading')).toBe('false');
+    expect(sendTimelineHistoryRequest).not.toHaveBeenCalled();
+    expect(fetchHistorySpy).not.toHaveBeenCalled();
+
+    rerender(h(Probe, { active: true }));
+    await act(async () => {
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(300);
+      await flushMicrotasks();
+    });
+
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+    expect(fetchHistorySpy).toHaveBeenCalled();
+  });
+
+  it('falls back to raw sessionId IDB key when the scoped read is empty (cacheKey scope drift)', async () => {
+    // Regression for the scope-drift bug — PR-4 in
+    // .imc/discussions/e9dbc48c-dda.md. When the app mounts before
+    // `selectedServerId` resolves, WS events get persisted under the
+    // bare sessionId. Once serverId resolves, useTimeline reads with
+    // the scoped key (`${serverId}:${sessionId}`) and the bare-key
+    // events become orphans — invisible to every later read. The
+    // fallback re-reads under the raw sessionId and stamps the events
+    // back under the scoped key so the user sees their history.
+    const sessionName = `deck_scope_drift_${Date.now()}`;
+    const serverId = `srv-drift-${Date.now()}`;
+    const stored: TimelineEvent[] = [{
+      eventId: `${sessionName}-raw-1`,
+      sessionId: sessionName, // ← bare sessionId, NOT scoped
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'orphaned history from bare-key write' },
+    }];
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    // Scoped key: nothing. Raw key: has the orphaned events.
+    const getLastSeqAndEpochSpy = vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch')
+      .mockImplementation(async (key: string) => {
+        if (key === sessionName) return { seq: 1, epoch: 1 };
+        return null;
+      });
+    const getRecentEventsSpy = vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
+      .mockImplementation(async (key: string) => {
+        if (key === sessionName) return stored;
+        return [];
+      });
+    const migrateSpy = vi.spyOn(TimelineDB.prototype, 'migrateRawToScoped').mockResolvedValue();
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, null, serverId);
+      return h(
+        'div',
+        { 'data-testid': 'probe-drift' },
+        events.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-drift').textContent).toBe('orphaned history from bare-key write');
+    });
+
+    // Both reads (scoped first, then raw fallback) and migration must
+    // have been invoked exactly as designed.
+    expect(getLastSeqAndEpochSpy).toHaveBeenCalledWith(`${serverId}:${sessionName}`);
+    expect(getLastSeqAndEpochSpy).toHaveBeenCalledWith(sessionName);
+    expect(getRecentEventsSpy).toHaveBeenCalledWith(`${serverId}:${sessionName}`, { limit: 300 });
+    expect(getRecentEventsSpy).toHaveBeenCalledWith(sessionName, { limit: 300 });
+    expect(migrateSpy).toHaveBeenCalledWith(sessionName, `${serverId}:${sessionName}`, stored);
+  });
+
+  it('falls back to raw localStorage snapshot when scoped key is empty', () => {
+    // Sibling regression. Snapshot was written under bare sessionId
+    // because `selectedServerId` was null at the time. The synchronous
+    // useState seed must surface that data using the fallback variant.
+    const sessionName = `deck_ls_drift_${Date.now()}`;
+    const serverId = `srv-ls-drift-${Date.now()}`;
+    const events = makeEvents(sessionName, 3);
+    // Write under the BARE sessionId (the "before serverId resolved" shape).
+    localStorage.setItem(
+      `rcc_timeline_snapshot:${sessionName}`,
+      JSON.stringify(events),
+    );
+    // Scoped key has nothing.
+    localStorage.removeItem(`rcc_timeline_snapshot:${serverId}:${sessionName}`);
+
+    function Probe() {
+      const { events: seen } = useTimeline(sessionName, null, serverId);
+      return h('div', { 'data-testid': 'ls-drift-probe' }, String(seen.length));
+    }
+
+    render(h(Probe));
+
+    expect(screen.getByTestId('ls-drift-probe').textContent).toBe('3');
+    // The fallback also migrates the snapshot to the scoped key.
+    expect(localStorage.getItem(`rcc_timeline_snapshot:${serverId}:${sessionName}`)).toBeTruthy();
+    expect(localStorage.getItem(`rcc_timeline_snapshot:${sessionName}`)).toBeNull();
   });
 
   it('stays idle for shell/script sessions with history disabled', async () => {
@@ -390,6 +739,175 @@ describe('useTimeline global cache bounds', () => {
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('snapshot history');
       expect(screen.getByTestId('probe').getAttribute('data-loading')).toBe('false');
+    });
+  });
+
+  it('debounces localStorage snapshot writes during rapid cache updates', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_debounce_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const snapshotKey = `rcc_timeline_snapshot:${serverId}:${sessionName}`;
+
+    for (let i = 0; i < 6; i += 1) {
+      ingestTimelineEventForCache({
+        eventId: `${sessionName}-${i}`,
+        sessionId: sessionName,
+        ts: i,
+        epoch: 1,
+        seq: i,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: `chunk ${i}` },
+      }, serverId);
+    }
+
+    expect(localStorage.getItem(snapshotKey)).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(749);
+    });
+    expect(localStorage.getItem(snapshotKey)).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+
+    const snapshot = JSON.parse(localStorage.getItem(snapshotKey) ?? '[]') as TimelineEvent[];
+    expect(snapshot.map((event) => event.eventId)).toEqual([
+      `${sessionName}-0`,
+      `${sessionName}-1`,
+      `${sessionName}-2`,
+      `${sessionName}-3`,
+      `${sessionName}-4`,
+      `${sessionName}-5`,
+    ]);
+  });
+
+  it('does not rewrite the local snapshot for streaming-only replacements', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_streaming_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const snapshotKey = `rcc_timeline_snapshot:${serverId}:${sessionName}`;
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-stable`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'stable history' },
+    }, serverId);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(750);
+    });
+    const initialSnapshot = localStorage.getItem(snapshotKey);
+    expect(initialSnapshot).toBeTruthy();
+
+    for (let i = 0; i < 30; i += 1) {
+      ingestTimelineEventForCache({
+        eventId: `${sessionName}-streaming`,
+        sessionId: sessionName,
+        ts: 2,
+        epoch: 1,
+        seq: 2,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: `streaming ${i}`, streaming: true },
+      }, serverId);
+    }
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    expect(localStorage.getItem(snapshotKey)).toBe(initialSnapshot);
+    const snapshot = JSON.parse(localStorage.getItem(snapshotKey) ?? '[]') as TimelineEvent[];
+    expect(snapshot.map((event) => event.eventId)).toEqual([`${sessionName}-stable`]);
+  });
+
+  it('does not persist streaming-only global ingests to IndexedDB', async () => {
+    const sessionName = `deck_streaming_idb_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const putEventsSpy = vi.spyOn(TimelineDB.prototype, 'putEvents').mockResolvedValue();
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-streaming`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'partial', streaming: true },
+    }, serverId);
+
+    expect(putEventsSpy).not.toHaveBeenCalled();
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-final`,
+      sessionId: sessionName,
+      ts: 2,
+      epoch: 1,
+      seq: 2,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'final', streaming: false },
+    }, serverId);
+
+    expect(putEventsSpy).toHaveBeenCalledTimes(1);
+    expect(putEventsSpy.mock.calls[0]?.[0]).toEqual([
+      expect.objectContaining({
+        eventId: `${sessionName}-final`,
+        sessionId: `${serverId}:${sessionName}`,
+      }),
+    ]);
+  });
+
+  it('flushes pending localStorage snapshots before a hidden tab is frozen', () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_hidden_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const snapshotKey = `rcc_timeline_snapshot:${serverId}:${sessionName}`;
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-1`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'flush before freeze' },
+    }, serverId);
+
+    expect(localStorage.getItem(snapshotKey)).toBeNull();
+
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      value: 'hidden',
+    });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    const flushedSnapshot = localStorage.getItem(snapshotKey);
+    expect(flushedSnapshot).toContain('flush before freeze');
+
+    act(() => {
+      vi.advanceTimersByTime(750);
+    });
+    expect(localStorage.getItem(snapshotKey)).toBe(flushedSnapshot);
+
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      value: 'visible',
     });
   });
 

@@ -6,6 +6,7 @@
  * handleTransportListModels dispatch delegates correctly.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { readFile } from 'node:fs/promises';
 import type { ProviderModelList } from '../../../src/agent/transport-provider.js';
 import { MEMORY_MCP_STATUS } from '../../../shared/memory-ws.js';
 
@@ -181,6 +182,80 @@ describe('GeminiSdkProvider.listModels', () => {
   });
 });
 
+// ── KimiSdkProvider ──────────────────────────────────────────────────────────
+
+describe('KimiSdkProvider.listModels', () => {
+  it('uses the supported `kimi acp` entrypoint, not deprecated `kimi --acp`', async () => {
+    const source = await readFile('src/agent/providers/kimi-sdk.ts', 'utf8');
+    expect(source).toContain("const args = [...resolved.prependArgs, 'acp'];");
+    expect(source).not.toContain("resolved.prependArgs, '--acp'");
+  });
+
+  it('reports managed MCP ready after the ACP connection is live', async () => {
+    const { KimiSdkProvider } = await import('../../../src/agent/providers/kimi-sdk.js');
+    const provider = new KimiSdkProvider();
+
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      providerId: 'kimi-sdk',
+      status: MEMORY_MCP_STATUS.UNKNOWN,
+      connected: false,
+    });
+
+    (provider as any).config = {};
+    (provider as any).connection = {};
+
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      providerId: 'kimi-sdk',
+      status: MEMORY_MCP_STATUS.READY,
+      connected: true,
+      degradedReasons: [],
+    });
+  });
+
+  it('probes for models via newSession if not cached', async () => {
+    const { KimiSdkProvider } = await import('../../../src/agent/providers/kimi-sdk.js');
+    const provider = new KimiSdkProvider();
+    const mockConnection = {
+      newSession: vi.fn().mockResolvedValue({
+        sessionId: 'kimi-session',
+        models: {
+          availableModels: [{ modelId: 'moonshot-v1-auto,thinking', name: 'moonshot-v1-auto (thinking)' }],
+          currentModelId: 'moonshot-v1-auto,thinking',
+        },
+      }),
+      closeSession: vi.fn().mockResolvedValue({}),
+    };
+    (provider as any).connection = mockConnection;
+    (provider as any).initPromise = Promise.resolve();
+
+    const result = await provider.listModels();
+    expect(mockConnection.newSession).toHaveBeenCalled();
+    expect(result.models[0]).toMatchObject({
+      id: 'moonshot-v1-auto,thinking',
+      name: 'moonshot-v1-auto (thinking)',
+    });
+    expect(result.defaultModel).toBe('moonshot-v1-auto,thinking');
+    expect(result.isAuthenticated).toBe(true);
+  });
+
+  it('auto-selects Kimi ACP allow-for-session permission options', async () => {
+    const { KimiSdkProvider } = await import('../../../src/agent/providers/kimi-sdk.js');
+    const provider = new KimiSdkProvider();
+    const client = (provider as any).createClientImpl();
+
+    const result = await client.requestPermission({
+      sessionId: 'kimi-session',
+      toolCall: { toolCallId: 'tool-1', title: 'Edit file' },
+      options: [
+        { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
+        { optionId: 'approve_for_session', name: 'Approve for this session', kind: 'allow_always' },
+      ],
+    });
+
+    expect(result).toEqual({ outcome: { outcome: 'selected', optionId: 'approve_for_session' } });
+  });
+});
+
 // ── ProviderModelList contract ────────────────────────────────────────────────
 
 describe('ProviderModelList contract', () => {
@@ -190,8 +265,9 @@ describe('ProviderModelList contract', () => {
     const { CopilotSdkProvider } = await import('../../../src/agent/providers/copilot-sdk.js');
     const { CursorHeadlessProvider } = await import('../../../src/agent/providers/cursor-headless.js');
     const { GeminiSdkProvider } = await import('../../../src/agent/providers/gemini-sdk.js');
+    const { KimiSdkProvider } = await import('../../../src/agent/providers/kimi-sdk.js');
 
-    for (const Cls of [ClaudeCodeSdkProvider, CodexSdkProvider, CopilotSdkProvider, CursorHeadlessProvider, GeminiSdkProvider]) {
+    for (const Cls of [ClaudeCodeSdkProvider, CodexSdkProvider, CopilotSdkProvider, CursorHeadlessProvider, GeminiSdkProvider, KimiSdkProvider]) {
       const p = new Cls();
       expect(typeof (p as unknown as { listModels?: unknown }).listModels, `${Cls.name} must implement listModels()`).toBe('function');
     }

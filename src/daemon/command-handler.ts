@@ -106,6 +106,7 @@ import {
   type MemoryMcpProviderStatusView,
   type MemoryMcpToolFamilyGateView,
 } from '../../shared/memory-ws.js';
+import { buildMemoryProjectionFallbackSource } from '../../shared/memory-projection-source-fallback.js';
 import { FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { P2P_PRESET_DEFAULT_SUMMARY_PROMPT, P2P_WORKFLOW_SCHEMA_VERSION } from '../../shared/p2p-workflow-constants.js';
@@ -610,13 +611,14 @@ function supportsEffort(agentType: string | undefined): agentType is 'claude-cod
     || agentType === 'qwen';
 }
 
-function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' {
+function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' | 'kimi-sdk' {
   return agentType === 'claude-code-sdk'
     || agentType === 'codex-sdk'
     || agentType === 'copilot-sdk'
     || agentType === 'cursor-headless'
     || agentType === 'openclaw'
-    || agentType === 'qwen';
+    || agentType === 'qwen'
+    || agentType === 'kimi-sdk';
 }
 
 // `/compact` is provider-dispatched, not daemon-synthesized. Provider adapters
@@ -636,7 +638,7 @@ async function relaunchFreshTransportConversation(record: SessionRecord): Promis
     name: record.name,
     projectName: record.projectName,
     role: record.role,
-    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen',
+    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' | 'kimi-sdk',
     projectDir: record.projectDir,
     label: record.label,
     description: record.description,
@@ -671,7 +673,7 @@ async function resumeTransportRuntimeAfterLoss(record: SessionRecord): Promise<v
     name: record.name,
     projectName: record.projectName,
     role: record.role,
-    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen',
+    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' | 'kimi-sdk',
     projectDir: record.projectDir,
     label: record.label,
     description: record.description,
@@ -682,7 +684,7 @@ async function resumeTransportRuntimeAfterLoss(record: SessionRecord): Promise<v
     // Thread resume ids back so the provider reuses the same conversation.
     ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
     ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
-    ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk') && record.providerResumeId
+    ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk' || record.agentType === 'kimi-sdk') && record.providerResumeId
       ? { providerResumeId: record.providerResumeId } : {}),
     ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
     ...(record.agentType === 'qwen' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
@@ -776,6 +778,7 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
 import { handleRepoCommand } from './repo-handler.js';
 import {
   handleFileUpload,
+  handleFileUploadFetch,
   handleFileDownload,
   tryCreateProjectFileHandle,
   lookupAttachment,
@@ -1480,6 +1483,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case MEMORY_WS.DELETE:
       void handleMemoryDelete(cmd, serverLink);
       break;
+    case MEMORY_WS.GET_SOURCES_REQUEST:
+      void handleMemoryGetSourcesRequest(cmd, serverLink);
+      break;
     case 'fs.ls':
       void traceCommandAsync(cmd, 'web_command.fs_ls', () => handleFsList(cmd, serverLink));
       break;
@@ -1577,6 +1583,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case 'file.upload':
       void handleFileUpload(cmd, serverLink);
+      break;
+    case 'file.upload_fetch':
+      void handleFileUploadFetch(cmd, serverLink);
       break;
     case 'file.download':
       void handleFileDownload(cmd, serverLink);
@@ -1740,7 +1749,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
       return;
     }
-    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'gemini-sdk') {
+    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
       removeSession(`deck_${project}_brain`);
     }
@@ -1750,7 +1759,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       label,
-      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'gemini-sdk',
+      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk',
       extraEnv,
       ccPreset: ccPresetName,
       effort,
@@ -1797,16 +1806,16 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         label,
         effort,
       });
-    } else if (agentType === 'gemini-sdk') {
-      // Gemini SDK shares the codex-sdk shape: fresh launch, optional requested
-      // model, no ccPreset, no resume id (ACP issues a fresh sessionId on the
-      // first turn and persists it via ~/.gemini/tmp/<project>/chats/).
-      logger.info({ project }, 'SDK fresh session.start launching new Gemini SDK main session');
+    } else if (agentType === 'gemini-sdk' || agentType === 'kimi-sdk') {
+      // ACP SDK providers share the codex-sdk shape: fresh launch, optional
+      // requested model, no ccPreset. The provider emits a durable resume id
+      // after the first real ACP session is created.
+      logger.info({ project, agentType }, 'SDK fresh session.start launching ACP SDK main session');
       await launchTransportSession({
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',
-        agentType: 'gemini-sdk',
+        agentType: agentType as 'gemini-sdk' | 'kimi-sdk',
         projectDir: dir,
         fresh: true,
         ...(requestedModel ? { requestedModel } : {}),
@@ -1970,11 +1979,12 @@ function resolveSessionCommandName(cmd: Record<string, unknown>): string | undef
 }
 
 function markTransportCancelIdle(sessionName: string, error?: string): void {
+  const runtime = getTransportRuntime(sessionName);
   timelineEmitter.emit(sessionName, 'session.state', {
     state: 'idle',
-    pendingCount: 0,
-    pendingMessages: [],
-    pendingMessageEntries: [],
+    pendingCount: runtime?.pendingCount ?? 0,
+    pendingMessages: runtime?.pendingMessages ?? [],
+    pendingMessageEntries: runtime?.pendingEntries ?? [],
     ...(error ? { error } : {}),
   }, { source: 'daemon', confidence: 'high' });
 }
@@ -2007,6 +2017,14 @@ function cancelTransportTurnNow(
 
   if (!stopRuntime) return true;
 
+  // STOP IS THE PRIORITY LANE.
+  // Do not acquire getMutex(sessionName), do not call transportRuntime.send('/stop'),
+  // and do not wait for provider/model/context work here. This path must cut
+  // in front of queued sends and long pre-send work (startup memory, semantic
+  // recall, authored context, provider send-start). Regressions are locked by:
+  // - test/daemon/command-handler-transport-queue.test.ts
+  // - test/daemon/transport-session-runtime.test.ts
+  // - web/test/components/SessionControls.test.tsx
   void (async () => {
     try {
       supervisionAutomation.cancelSession(sessionName);
@@ -3364,7 +3382,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
-      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'gemini-sdk') && modelMatch) {
+      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk') && modelMatch) {
         const nextModel = modelMatch[1];
         transportRuntime.setAgentId(nextModel);
         const nextRecord = {
@@ -4827,7 +4845,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         bindExistingKey,
         ...(ccPreset ? { ccPreset } : {}),
         ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
-        ...(type === 'codex-sdk' ? { fresh: true } : {}),
+        ...(type === 'codex-sdk' || type === 'kimi-sdk' ? { fresh: true } : {}),
         ...(effort ? { effort } : {}),
         userCreated: true,
         parentSession: parentSession || undefined,
@@ -6181,7 +6199,7 @@ log "[step 2] installing ${pkgSpec}"
 # --ignore-scripts again for the same reason.
 #
 # ── Retry on publish propagation / transient network failures ──────────
-# Real-world failure mode caught on 116.62.239.78: server publishes a
+# Real-world failure mode caught on a production daemon: server publishes a
 # new dev release to npm and broadcasts \`daemon.upgrade { targetVersion }\`
 # almost immediately. npm origin has the version but the regional CDN
 # edge serving this daemon hasn't replicated yet — so the packument
@@ -6349,7 +6367,7 @@ log "[step 3] version comparator: installed > current → restart"
 #     prefix (homebrew vs nvm vs system) leaves the symlink dangling.
 #   * any reorg of node versions where the bin sits at a new absolute path.
 #
-# Real-world hit: 116.62.239.78 daemon stuck on dev.1922 because the
+# Real-world hit: a production daemon stuck on an older dev build because the
 # unit's ExecStart pointed at /home/k/.nvm/versions/node/v22.22.2/bin/imcodes
 # from a prior install — \`systemctl restart imcodes\` succeeds in the
 # upgrade script's eyes but the spawned process crashes "Cannot find
@@ -8323,7 +8341,7 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
   let provider = getProvider(agentType);
 
   // Auto-connect local providers if missing, so we can probe for models
-  if (!provider && (agentType === 'gemini-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
+  if (!provider && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
     try {
       provider = await ensureProviderConnected(agentType, {});
     } catch (err) {
@@ -9097,6 +9115,7 @@ function buildMemoryMcpProviderStatuses(): MemoryMcpProviderStatusView[] {
 function memoryMcpToolFamilyGate(): MemoryMcpToolFamilyGateView {
   const tools = [
     MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
+    MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
     MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
     MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
     MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
@@ -10175,7 +10194,14 @@ async function handleMemoryCreate(cmd: Record<string, unknown>, serverLink: Serv
     serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_IDENTITY) });
     return;
   }
-  if (!ctx.boundProjects?.some((project) => project.canonicalRepoId === canonicalRepoId)) {
+  const projectDir = commandString(cmd, 'projectDir');
+  if (projectDir) {
+    const projectBinding = await validateProjectScopedManagementBinding(cmd, ctx);
+    if ('errorCode' in projectBinding) {
+      serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(projectBinding.errorCode) });
+      return;
+    }
+  } else if (!ctx.boundProjects?.some((project) => project.canonicalRepoId === canonicalRepoId)) {
     serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN) });
     return;
   }
@@ -10299,6 +10325,119 @@ async function handleMemoryPin(cmd: Record<string, unknown>, serverLink: ServerL
   } catch (error) {
     logger.warn({ error }, 'manual memory pin failed');
     serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+  }
+}
+
+
+/**
+ * Cross-server projection source resolution.
+ *
+ * Triggered by the server's pod-sticky `GET /api/memory/sources?serverId=...
+ * &projectionId=...` route. The server has already authenticated the caller
+ * and verified they own *this* daemon's serverId before forwarding the
+ * request — so by the time the handler runs, the WS payload is trustworthy
+ * for THIS daemon's own data. We resolve sources directly from the daemon's
+ * local SQLite (the same call `memoryGetSources` makes after its owner
+ * check) and reply with the standard `MemoryGetSourcesResult` shape plus
+ * `originServerId` equal to this daemon's own serverId.
+ *
+ * Cross-namespace access stays fail-closed because every event's
+ * `target.namespace` is matched against the projection's namespace before
+ * its content is returned — same isolation `memoryGetSources` provides.
+ */
+async function handleMemoryGetSourcesRequest(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const projectionId = typeof cmd.projectionId === 'string' ? cmd.projectionId.trim() : '';
+  const expectedProjectId = typeof cmd.expectedProjectId === 'string' && cmd.expectedProjectId.trim()
+    ? cmd.expectedProjectId.trim()
+    : undefined;
+  // The daemon's own bound serverId. Tagged on every reply so the server
+  // route can fill `originServerId` even before the orchestrator knows which
+  // daemon answered — useful for cache repopulation on the caller side.
+  const originServerId = typeof cmd.expectedServerId === 'string' && cmd.expectedServerId.trim()
+    ? cmd.expectedServerId.trim()
+    : undefined;
+
+  if (!projectionId) {
+    serverLink.send({
+      type: MEMORY_WS.GET_SOURCES_RESPONSE,
+      requestId,
+      status: 'error',
+      reason: 'validation_failed',
+      message: 'projectionId is required',
+      originServerId,
+    });
+    return;
+  }
+
+  try {
+    const { getProcessedProjectionById, listProjectionSources } = await import('../store/context-store.js');
+    const projection = getProcessedProjectionById(projectionId);
+    if (!projection || !expectedProjectId || projection.namespace.projectId !== expectedProjectId) {
+      // Isomorphic with missing/cross-project rows. The cloud route already
+      // authenticates the caller, but the daemon still enforces project scope
+      // before expanding local raw events.
+      serverLink.send({
+        type: MEMORY_WS.GET_SOURCES_RESPONSE,
+        requestId,
+        status: 'ok',
+        projectionId,
+        sourceEventCount: 0,
+        sources: [],
+        originServerId,
+      });
+      return;
+    }
+
+    const projectionNamespaceKey = serializeContextNamespace(projection.namespace);
+    const sources = listProjectionSources(projectionId).map((source) => {
+      // Same defense memoryGetSources applies: only surface event content
+      // when the underlying event's namespace matches the projection's.
+      // The daemon's SQLite is single-user, but a corrupt row from a past
+      // bug could conceivably mis-link namespaces, and silence is safer.
+      const event = source.event;
+      const eventInScope = !!event && serializeContextNamespace(event.target.namespace) === projectionNamespaceKey;
+      return {
+        eventId: source.eventId,
+        status: source.status,
+        content: eventInScope ? (event!.content ?? null) : null,
+        eventType: eventInScope ? event!.eventType : undefined,
+        createdAt: eventInScope ? event!.createdAt : undefined,
+      };
+    });
+    const projectionSource = buildMemoryProjectionFallbackSource(projection);
+    const shouldFallback = sources.length === 0
+      || sources.every((source) => source.content === null && source.status === 'missing');
+    const resolvedSources = shouldFallback && projectionSource
+      ? [projectionSource]
+      : sources;
+
+    const partial = !(resolvedSources.length === 1 && resolvedSources[0]?.status === 'projection') && (
+      sources.length !== projection.sourceEventIds.length
+      || sources.some((source) => source.content === null)
+    );
+
+    serverLink.send({
+      type: MEMORY_WS.GET_SOURCES_RESPONSE,
+      requestId,
+      status: 'ok',
+      projectionId,
+      sourceEventCount: Math.max(projection.sourceEventIds.length, resolvedSources.length),
+      sources: resolvedSources,
+      ...(projectionSource ? { projectionSource } : {}),
+      partial,
+      originServerId,
+    });
+  } catch (error) {
+    logger.warn({ error, projectionId }, 'memory.get_sources_request failed');
+    serverLink.send({
+      type: MEMORY_WS.GET_SOURCES_RESPONSE,
+      requestId,
+      status: 'error',
+      reason: FS_GENERIC_ERROR_CODES.INTERNAL_ERROR,
+      message: 'failed to resolve sources',
+      originServerId,
+    });
   }
 }
 

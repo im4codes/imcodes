@@ -370,6 +370,93 @@ describe('OpenClawProvider', () => {
       await sendPromise;
     });
 
+    it('routes split stable context to extraSystemPrompt and turn context to the message', async () => {
+      await connectProvider(provider);
+
+      const sendPromise = provider.send('sess-1', {
+        userMessage: 'Hello',
+        assembledMessage: 'Shared summary\n\nHello',
+        sessionSystemText: 'Stable runtime rules',
+        turnSystemText: 'Required shared context:\n- Active file rule',
+        systemText: 'Stable runtime rules\n\nRequired shared context:\n- Active file rule',
+        messagePreamble: 'Shared summary',
+        attachments: undefined,
+        context: {
+          sessionSystemText: 'Stable runtime rules',
+          turnSystemText: 'Required shared context:\n- Active file rule',
+          systemText: 'Stable runtime rules\n\nRequired shared context:\n- Active file rule',
+          messagePreamble: 'Shared summary',
+          requiredAuthoredContext: ['Active file rule'],
+          advisoryAuthoredContext: [],
+          appliedDocumentVersionIds: ['doc-v1'],
+          diagnostics: [],
+        },
+        authority: {
+          namespace: { scope: 'project_shared', projectId: 'repo' },
+          authoritySource: 'processed_remote',
+          freshness: 'fresh',
+          fallbackAllowed: false,
+          retryScheduled: false,
+          providerPolicyOutcome: 'allowed',
+          diagnostics: [],
+        },
+        supportClass: 'full-normalized-context-injection',
+        diagnostics: [],
+      });
+
+      const ws = lastWs();
+      const rpcFrame = JSON.parse(ws.sent[ws.sent.length - 1]);
+      expect(rpcFrame.params.extraSystemPrompt).toBe('Stable runtime rules');
+      expect(rpcFrame.params.message).toBe(
+        'Context instructions:\nRequired shared context:\n- Active file rule\n\nShared summary\n\nHello',
+      );
+      expect(rpcFrame.params.message).not.toContain('Stable runtime rules');
+
+      replyToLastRpc();
+      await sendPromise;
+    });
+
+    it('keeps split stable-only context out of the OpenClaw message body', async () => {
+      await connectProvider(provider);
+
+      const sendPromise = provider.send('sess-1', {
+        userMessage: 'Hello',
+        assembledMessage: 'Shared summary\n\nHello',
+        sessionSystemText: 'Stable runtime rules',
+        systemText: 'Stable runtime rules',
+        messagePreamble: 'Shared summary',
+        attachments: undefined,
+        context: {
+          sessionSystemText: 'Stable runtime rules',
+          systemText: 'Stable runtime rules',
+          messagePreamble: 'Shared summary',
+          requiredAuthoredContext: [],
+          advisoryAuthoredContext: [],
+          appliedDocumentVersionIds: [],
+          diagnostics: [],
+        },
+        authority: {
+          namespace: { scope: 'project_shared', projectId: 'repo' },
+          authoritySource: 'processed_remote',
+          freshness: 'fresh',
+          fallbackAllowed: false,
+          retryScheduled: false,
+          providerPolicyOutcome: 'allowed',
+          diagnostics: [],
+        },
+        supportClass: 'full-normalized-context-injection',
+        diagnostics: [],
+      });
+
+      const ws = lastWs();
+      const rpcFrame = JSON.parse(ws.sent[ws.sent.length - 1]);
+      expect(rpcFrame.params.extraSystemPrompt).toBe('Stable runtime rules');
+      expect(rpcFrame.params.message).toBe('Shared summary\n\nHello');
+
+      replyToLastRpc();
+      await sendPromise;
+    });
+
     it('rejects normalized payloads combined with legacy extraSystemPrompt', async () => {
       await connectProvider(provider);
 

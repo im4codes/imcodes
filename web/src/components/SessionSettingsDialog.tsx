@@ -783,6 +783,7 @@ export function SessionSettingsDialog({
       case 'openclaw': return t('session.agentType.openclaw');
       case 'copilot-sdk': return t('session.agentType.copilot_sdk');
       case 'cursor-headless': return t('session.agentType.cursor_headless');
+      case 'kimi-sdk': return t('session.agentType.kimi_sdk');
       default: return value;
     }
   };

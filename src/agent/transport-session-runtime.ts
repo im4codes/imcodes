@@ -4,9 +4,12 @@ import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate } from './transport-provider.js';
+import { PROVIDER_ERROR_CODES } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import {
+  SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+  SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
   isSessionCompactCommandText,
   shouldResetTransportPreferenceContextForSessionControl,
@@ -25,7 +28,7 @@ import type {
   TransportMemoryRecallArtifact,
   TransportMemoryRecallItem,
 } from '../../shared/context-types.js';
-import type { MemoryContextTimelinePayload } from '../shared/timeline/types.js';
+import type { MemoryContextTimelinePayload, MemoryContextTimelinePreferenceItem } from '../shared/timeline/types.js';
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from '../daemon/memory-context-timeline.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import { searchLocalMemorySemantic, type MemorySearchResultItem } from '../context/memory-search.js';
@@ -38,6 +41,7 @@ import {
 } from '../context/recent-injection-history.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
+import { clampUserSessionText } from '../../shared/user-session-text-caps.js';
 import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
 import { buildTransportStartupMemory, type TransportContextBootstrap } from './runtime-context-bootstrap.js';
 import { recordMemoryHits } from '../store/context-store.js';
@@ -129,6 +133,14 @@ function isTransportSlashControl(message: string | undefined): boolean {
   return message?.trim().startsWith('/') === true;
 }
 
+function makeCancelledProviderError(): ProviderError {
+  return {
+    code: PROVIDER_ERROR_CODES.CANCELLED,
+    message: 'Transport turn cancelled',
+    recoverable: true,
+  };
+}
+
 /**
  * Transport session runtime — manages a single conversation with a remote provider.
  *
@@ -155,6 +167,14 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _sending = false;
   private _description: string | undefined;
   private _systemPrompt: string | undefined;
+  /**
+   * Session-stable IM.codes identity (exact session name + display label).
+   * Injected at assembly-time into `sessionSystemText`, peer-level with
+   * `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE`, so it lives OUTSIDE the
+   * `USER_SESSION_TEXT_MAX_CHARS` cap that bounds user-authored
+   * `_description` / `_systemPrompt`. See p2p audit 37bfbb85-430 N-A.
+   */
+  private _sessionIdentity: { sessionName: string; label: string | null } | undefined;
   private _agentId: string | undefined;
   private _effort: TransportEffortLevel | undefined;
   private _contextNamespace: ContextNamespace | undefined;
@@ -189,6 +209,13 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _pendingMessages: PendingTransportMessage[] = [];
   /** Original message entries for the currently in-flight dispatch. */
   private _activeDispatchEntries: PendingTransportMessage[] = [];
+  /** True after a user stop request until the active provider turn settles. */
+  private _activeDispatchCancelled = false;
+  /** True once the active dispatch has crossed into provider.send(). */
+  private _activeDispatchProviderStarted = false;
+  private _activeDispatchId: number | null = null;
+  private _nextDispatchId = 0;
+  private readonly _locallyCancelledDispatchIds = new Set<number>();
 
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void;
@@ -206,10 +233,27 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._unsubscribes.push(
       this.provider.onDelta((sid: string, _delta: MessageDelta) => {
         if (sid !== this._providerSessionId) return;
+        if (this._activeDispatchCancelled) return;
         this.setStatus('streaming');
       }),
       this.provider.onComplete((sid: string, message: AgentMessage) => {
         if (sid !== this._providerSessionId) return;
+        if (this._activeDispatchCancelled) {
+          this._sending = false;
+          this._activeTurn?.reject(makeCancelledProviderError());
+          this._activeTurn = null;
+          this._activeDispatchEntries = [];
+          this._activeDispatchCancelled = false;
+          this._activeDispatchProviderStarted = false;
+          if (this._activeDispatchId !== null) {
+            this._locallyCancelledDispatchIds.delete(this._activeDispatchId);
+          }
+          this._activeDispatchId = null;
+          if (!this._drainPending()) {
+            this.setStatus('idle');
+          }
+          return;
+        }
         if (isTransportCompactionCompletion(message)) {
           this._lastInjectedPreferenceContextSignature = null;
         }
@@ -218,6 +262,8 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._activeTurn?.resolve();
         this._activeTurn = null;
         this._activeDispatchEntries = [];
+        this._activeDispatchProviderStarted = false;
+        this._activeDispatchId = null;
         // Drain pending messages before transitioning to idle.
         // If there are queued messages, merge and send — status stays running.
         if (!this._drainPending()) {
@@ -229,9 +275,15 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._sending = false;
         this._activeTurn?.reject(error);
         this._activeTurn = null;
+        this._activeDispatchProviderStarted = false;
+        if (this._activeDispatchId !== null) {
+          this._locallyCancelledDispatchIds.delete(this._activeDispatchId);
+        }
+        this._activeDispatchId = null;
         // Only drain pending on recoverable/cancel errors — unrecoverable errors
         // (auth failure, provider down) would just fail again and consume queued messages.
         const canDrain = error.code === 'CANCELLED' || error.recoverable;
+        this._activeDispatchCancelled = false;
         if (canDrain) {
           this._activeDispatchEntries = [];
           if (this._drainPending()) return;
@@ -243,6 +295,19 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._onSessionInfoChange?.(info);
       })] : []),
     );
+    const unsubscribeToolCall = this.provider.onToolCall?.((sid: string) => {
+      if (sid !== this._providerSessionId) return;
+      if (this._activeDispatchId === null || !this._activeTurn) return;
+      // Provider-visible tool events mean the SDK has already accepted work,
+      // even if the shared-context dispatcher has not crossed its provider.send
+      // callback boundary yet. STOP must then delegate to provider.cancel so
+      // SDKs can abort/rotate poisoned sessions instead of taking the purely
+      // local pre-send skip path.
+      this._activeDispatchProviderStarted = true;
+    }) as unknown;
+    if (typeof unsubscribeToolCall === 'function') {
+      this._unsubscribes.push(unsubscribeToolCall as () => void);
+    }
     if (this.provider.onApprovalRequest) {
       this.provider.onApprovalRequest((sid: string, req: ApprovalRequest) => {
         if (sid !== this._providerSessionId) return;
@@ -266,8 +331,18 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   /** Set providerSessionId directly (restore from store without initialize). */
   setProviderSessionId(id: string): void { this._providerSessionId = id; }
-  setDescription(desc: string): void { this._description = desc; }
-  setSystemPrompt(prompt: string): void { this._systemPrompt = prompt; }
+  setDescription(desc: string): void { this._description = clampUserSessionText(desc); }
+  setSystemPrompt(prompt: string): void { this._systemPrompt = clampUserSessionText(prompt); }
+  /**
+   * Update the session-stable IM.codes identity injected into every
+   * transport turn's `sessionSystemText`. Daemon-injected and NOT subject
+   * to `USER_SESSION_TEXT_MAX_CHARS` — see p2p audit 37bfbb85-430 N-A.
+   */
+  setSessionIdentity(sessionName: string, label: string | null | undefined): void {
+    const exact = sessionName.trim();
+    if (!exact) return;
+    this._sessionIdentity = { sessionName: exact, label: label?.trim() || null };
+  }
   setAgentId(agentId: string): void {
     this._agentId = agentId;
     if (this._providerSessionId) {
@@ -312,8 +387,16 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
 
     this._providerSessionId = await this.provider.createSession(config);
-    this._description = config.description;
-    this._systemPrompt = config.systemPrompt;
+    // Cap user-authored text so a single oversized paste can't bloat every
+    // subsequent turn — these get re-injected into the system prompt on
+    // every model call. See `shared/user-session-text-caps.ts`.
+    this._description = clampUserSessionText(config.description);
+    this._systemPrompt = clampUserSessionText(config.systemPrompt);
+    // Capture identity for assembly-time injection. Daemon-injected and
+    // NOT subject to the user-authored cap — see p2p audit 37bfbb85-430 N-A.
+    if (config.sessionName) {
+      this.setSessionIdentity(config.sessionName, config.label);
+    }
     this._projectDir = config.cwd;
     this._agentId = config.agentId;
     this._effort = config.effort;
@@ -425,7 +508,27 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
-    if (!this.provider.cancel) return;
+    // STOP/CANCEL is a cut-in-line operation, not a queued transport turn.
+    // It must be effective while the active turn is still in the async
+    // pre-provider phase (context bootstrap, memory recall, authored context
+    // assembly) as well as after provider.send() has started. If provider.send()
+    // has not started yet, cancel locally and skip that send entirely; if it
+    // has started, delegate to the provider-specific interrupt/abort path.
+    // Keep queued user messages intact so they may drain after the cancelled
+    // turn settles; only the currently active turn is being interrupted.
+    const dispatchId = this._activeDispatchId;
+    if (dispatchId !== null) {
+      this._locallyCancelledDispatchIds.add(dispatchId);
+      this._activeDispatchCancelled = true;
+    }
+    if (this._activeTurn && !this._activeDispatchProviderStarted) {
+      this.cancelActiveDispatchLocally(dispatchId);
+      return;
+    }
+    if (!this.provider.cancel) {
+      this.cancelActiveDispatchLocally(dispatchId);
+      return;
+    }
     await this.provider.cancel(this._providerSessionId);
   }
 
@@ -446,6 +549,10 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._sending = false;
     this._activeTurn = null;
     this._activeDispatchEntries = [];
+    this._activeDispatchCancelled = false;
+    this._activeDispatchProviderStarted = false;
+    this._activeDispatchId = null;
+    this._locallyCancelledDispatchIds.clear();
     this._pendingMessages = [];
     // Per-session memory injection history is daemon-scoped to this session;
     // a kill ends that scope. clear() is called on session.clear separately.
@@ -485,6 +592,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     attachments?: TransportAttachment[],
     dispatchedEntries?: PendingTransportMessage[],
   ): void {
+    const dispatchId = ++this._nextDispatchId;
     this._history.push({
       id: randomUUID(),
       sessionId: this._providerSessionId!,
@@ -497,6 +605,9 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     this.setStatus('thinking');
     this._sending = true;
+    this._activeDispatchCancelled = false;
+    this._activeDispatchProviderStarted = false;
+    this._activeDispatchId = dispatchId;
     this._activeDispatchEntries = (dispatchedEntries ?? [{
       clientMessageId: clientMessageId ?? randomUUID(),
       text: message,
@@ -516,8 +627,19 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._lastInjectedPreferenceContextSignature = null;
     }
 
+    if (isSessionCompactCommandText(message)) {
+      timelineEmitter.emit(this.sessionKey, 'session.state', {
+        state: SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
+        reason: SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
+      }, { source: 'daemon', confidence: 'high' });
+    }
+
     void (async () => {
       await this.refreshContextBootstrap({ phase: 'dispatch' });
+      if (this.isDispatchLocallyCancelled(dispatchId)) {
+        this.cancelActiveDispatchLocally(dispatchId);
+        return;
+      }
       const isSlashControl = isTransportSlashControl(message);
       const authority = resolveTransportDispatchAuthority(this.provider, {
         namespace: this._contextNamespace,
@@ -542,11 +664,29 @@ export class TransportSessionRuntime implements SessionRuntime {
           }
         : await this.buildTransportMessageRecallResultWithinBudget(message, authority.authoritySource);
       const memoryRecall = memoryRecallResult.artifact;
+      const messagePreamble = isSlashControl ? undefined : this.mergeMessagePreambles(dispatchedEntries, message);
+      if (this.isDispatchLocallyCancelled(dispatchId)) {
+        this.cancelActiveDispatchLocally(dispatchId);
+        return;
+      }
+      // Daemon-injected identity is stable session metadata — same on
+      // every turn, NOT user-authored — so we always pass it through.
+      // Slash control commands still get it: it is cheap, reinforces the
+      // model's identity for control replies, and skipping it on `/foo`
+      // would leak the exact session name out of the model's awareness
+      // on follow-up turns when the cached system text is rebuilt from
+      // a slash-only tail. The 300-char user-authored cap stays in
+      // force on `description` / `systemPrompt`; identity is peer-level.
+      // Generated Image Reporting is now appended in Codex SDK's own
+      // `baseInstructions` tail (Codex-only, once per thread/start) —
+      // it does NOT ride the per-turn payload at all.
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: message,
-        messagePreamble: isSlashControl ? undefined : this.mergeMessagePreambles(dispatchedEntries, message),
+        messagePreamble,
         description: isSlashControl ? undefined : this._description,
         systemPrompt: isSlashControl ? undefined : this._systemPrompt,
+        suppressMcpMemorySearchGuidance: isSlashControl,
+        suppressAgentProgressGuidance: isSlashControl,
         attachments,
         namespace: this._contextNamespace,
         namespaceDiagnostics: this._contextNamespaceDiagnostics,
@@ -557,6 +697,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         authoredContextRepository: isSlashControl ? undefined : this.resolveAuthoredContextRepository(),
         authoredContextLanguage: isSlashControl ? undefined : this._contextAuthoredContextLanguage,
         authoredContextFilePath: isSlashControl ? undefined : this._contextAuthoredContextFilePath,
+        ...(this._sessionIdentity ? { sessionIdentity: this._sessionIdentity } : {}),
         ...(startupMemory ? { startupMemory } : {}),
         ...(memoryRecall ? { memoryRecall } : {}),
       }, {
@@ -569,7 +710,21 @@ export class TransportSessionRuntime implements SessionRuntime {
           });
         },
         sendTimeoutMs: getTransportProviderSendTimeoutMs(),
+        onBeforeProviderSend: () => {
+          if (this.isDispatchLocallyCancelled(dispatchId)) {
+            throw makeCancelledProviderError();
+          }
+          if (this._activeDispatchId === dispatchId) {
+            this._activeDispatchProviderStarted = true;
+          }
+        },
       });
+      if (this.isDispatchLocallyCancelled(dispatchId)) {
+        await this.provider.cancel?.(this._providerSessionId!).catch((err: unknown) => {
+          logger.warn({ err, providerSessionId: this._providerSessionId }, 'runtime dispatch noticed late cancel after provider send accepted');
+        });
+        return;
+      }
       if (dispatchResult.payload?.memoryRecall) {
         const hitIds = dispatchResult.payload.memoryRecall.items.map((item) => item.id);
         if (hitIds.length > 0) {
@@ -587,7 +742,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         // (instead of eagerly in `initialize`) guarantees restart-before-
         // first-message never leaks an unbacked card — the card appears
         // exactly once, for the turn that actually carried the preamble.
-        this.emitStartupMemoryContext(this._startupMemory);
+        this.emitStartupMemoryContext(
+          dispatchResult.payload.startupMemory,
+          extractPreferenceContextTimelineItems(dispatchResult.payload.messagePreamble),
+        );
         this._startupMemory = null;
         // Notify session-manager so the flag is persisted to SessionRecord.
         // Invoked synchronously — the callback just schedules an upsert and
@@ -605,7 +763,10 @@ export class TransportSessionRuntime implements SessionRuntime {
           this._lastInjectedPreferenceContextSignature = this._preferenceContextInjectionAttempt.previous;
           this._preferenceContextInjectionAttempt = null;
         }
-        if (!this._sending || !this._activeTurn) return;
+        if (this._activeDispatchId !== dispatchId || !this._sending || !this._activeTurn) {
+          this._locallyCancelledDispatchIds.delete(dispatchId);
+          return;
+        }
         this.setStatus('error');
         this._sending = false;
         this._activeTurn.reject(
@@ -616,6 +777,12 @@ export class TransportSessionRuntime implements SessionRuntime {
                 : { code: 'PROVIDER_ERROR', message: String(err), recoverable: false }),
         );
         this._activeTurn = null;
+        this._activeDispatchProviderStarted = false;
+        this._activeDispatchCancelled = false;
+        if (this._activeDispatchId === dispatchId) {
+          this._activeDispatchId = null;
+        }
+        this._locallyCancelledDispatchIds.delete(dispatchId);
         // Preserve the in-flight payload so session-manager can replay it
         // after automatically rebuilding the transport runtime.
         // Don't drain on async send failure — the provider is likely broken.
@@ -679,6 +846,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._sending = false;
       this._activeTurn = null;
       this._activeDispatchEntries = [];
+      this._activeDispatchProviderStarted = false;
+      this._activeDispatchCancelled = false;
+      this._activeDispatchId = null;
       // Last-resort status update; `setStatus` itself is isolated post-C1b
       // but wrap defensively in case future code regresses that contract.
       try { this.setStatus('error'); } catch { /* swallow */ }
@@ -687,6 +857,34 @@ export class TransportSessionRuntime implements SessionRuntime {
       // The user must resend; the error status notifies them.
     }
     return true;
+  }
+
+  private isDispatchLocallyCancelled(dispatchId: number): boolean {
+    return this._locallyCancelledDispatchIds.has(dispatchId);
+  }
+
+  private cancelActiveDispatchLocally(dispatchId: number | null = this._activeDispatchId): void {
+    if (dispatchId !== null && this._activeDispatchId !== dispatchId) {
+      this._locallyCancelledDispatchIds.delete(dispatchId);
+      return;
+    }
+    if (!this._activeTurn && !this._sending) {
+      if (dispatchId !== null) this._locallyCancelledDispatchIds.delete(dispatchId);
+      this._activeDispatchCancelled = false;
+      this._activeDispatchProviderStarted = false;
+      this._activeDispatchId = null;
+      return;
+    }
+    this._sending = false;
+    this._activeTurn?.reject(makeCancelledProviderError());
+    this._activeTurn = null;
+    this._activeDispatchEntries = [];
+    this._activeDispatchCancelled = false;
+    this._activeDispatchProviderStarted = false;
+    this._activeDispatchId = null;
+    if (!this._drainPending()) {
+      this.setStatus('idle');
+    }
   }
 
   private mergeMessagePreambles(entries: PendingTransportMessage[] | undefined, userMessage?: string): string | undefined {
@@ -992,7 +1190,10 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
   }
 
-  private emitStartupMemoryContext(startupMemory: TransportMemoryRecallArtifact | null): void {
+  private emitStartupMemoryContext(
+    startupMemory: TransportMemoryRecallArtifact | null,
+    preferenceItems: MemoryContextTimelinePreferenceItem[] = [],
+  ): void {
     if (this._startupMemoryTimelineEmitted || !startupMemory || startupMemory.items.length === 0) return;
     const payload = buildMemoryContextTimelinePayload(undefined, startupMemory.items, 'startup', {
       runtimeFamily: 'transport',
@@ -1000,6 +1201,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       injectedText: startupMemory.injectedText,
       authoritySource: startupMemory.authoritySource,
       sourceKind: startupMemory.sourceKind,
+      preferenceItems,
     });
     if (!payload) return;
     timelineEmitter.emit(this.sessionKey, 'memory.context', payload, { source: 'daemon', confidence: 'high' });
@@ -1099,6 +1301,28 @@ function extractPreferenceContextBlocks(text: string): { blocks: string[]; witho
     blocks,
     withoutBlocks: retained.join('').replace(/\n{3,}/g, '\n\n').trim(),
   };
+}
+
+function extractPreferenceContextTimelineItems(text: string | undefined): MemoryContextTimelinePreferenceItem[] {
+  const blocks = extractPreferenceContextBlocks(text ?? '').blocks;
+  const items: MemoryContextTimelinePreferenceItem[] = [];
+  const seen = new Set<string>();
+  for (const block of blocks) {
+    const body = block
+      .replace(PREFERENCE_CONTEXT_START, '')
+      .replace(PREFERENCE_CONTEXT_END, '')
+      .trim();
+    for (const line of body.split(/\r?\n/)) {
+      const match = line.trim().match(/^-\s+(.+)$/);
+      if (!match) continue;
+      const text = match[1].trim();
+      const key = text.replace(/\s+/g, ' ').toLowerCase();
+      if (!text || seen.has(key)) continue;
+      seen.add(key);
+      items.push({ id: `preference-${items.length + 1}`, text });
+    }
+  }
+  return items;
 }
 
 function normalizePreferenceContextSignature(blocks: readonly string[]): string {

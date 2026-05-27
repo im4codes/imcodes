@@ -6,6 +6,7 @@ import { PREFERENCE_MAX_BYTES } from './preference-ingest.js';
 
 export const MEMORY_MCP_TOOL_NAMES = {
   SEARCH_MEMORY: 'search_memory',
+  LIST_MEMORY_SUMMARIES: 'list_memory_summaries',
   GET_MEMORY_SOURCES: 'get_memory_sources',
   SAVE_OBSERVATION: 'save_observation',
   SAVE_PREFERENCE: 'save_preference',
@@ -21,6 +22,7 @@ export type MemoryMcpToolName = (typeof MEMORY_MCP_TOOL_NAMES)[keyof typeof MEMO
 
 export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
+  MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
   MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
   MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
   MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
@@ -33,8 +35,10 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
 ] as const satisfies readonly MemoryMcpToolName[];
 
 export const MEMORY_MCP_CAPS = {
-  SEARCH_MEMORY_DEFAULT_LIMIT: 10,
+  SEARCH_MEMORY_DEFAULT_LIMIT: 20,
   SEARCH_MEMORY_MAX_LIMIT: 100,
+  LIST_MEMORY_SUMMARIES_DEFAULT_LIMIT: 20,
+  LIST_MEMORY_SUMMARIES_MAX_LIMIT: 100,
   OBSERVATION_CONTENT_MAX_BYTES: 16 * 1024,
   OBSERVATION_TAGS_MAX_COUNT: 8,
   OBSERVATION_TAG_MAX_CHARS: 64,
@@ -140,25 +144,44 @@ const statusSchema = objectSchema({
 export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, MemoryMcpToolContract>> = {
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: {
     name: MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
-    description: 'Search the caller-bound memory namespace with a text query. Use it before answering when prior project or user context may matter; returns compact hits with projection ids and summaries for optional source lookup. The query is text only; embeddings and vectors are computed internally when available.',
+    description: 'Search the caller-bound memory namespace with a text query. Use it before answering when prior project or user context may matter; returns compact hits with ids, summaries, match kind, and a typed sourceLookup object that shows exactly how to fetch details. If a relevant summary may affect the answer but is not enough, call get_memory_sources with the returned sourceLookup fields. The query is text only; embeddings and vectors are computed internally when available.',
     inputSchema: objectSchema({
       query: stringSchema('Required text query to search for. Do not send embeddings, vectors, identity, or namespace fields.'),
       limit: numberSchema(`Optional maximum hit count; defaults to ${MEMORY_MCP_CAPS.SEARCH_MEMORY_DEFAULT_LIMIT} and is clamped to ${MEMORY_MCP_CAPS.SEARCH_MEMORY_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.SEARCH_MEMORY_MAX_LIMIT }),
     }, ['query']),
     outputSchema: objectSchema({
       status: stringSchema('ok, disabled, or error.'),
-      items: { type: 'array', description: 'Compact same-namespace memory hits.', items: { type: 'object', additionalProperties: true } },
+      reason: stringSchema('Optional machine-readable reason when an empty result is caused by project scoping, policy, or feature availability.'),
+      items: { type: 'array', description: 'Compact same-namespace memory hits. Each item includes ref plus sourceLookup: { tool: "get_memory_sources", kind, projectionId | observationId } for exact source expansion.', items: { type: 'object', additionalProperties: true } },
+    }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]: {
+    name: MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
+    description: 'List recent processed memory summaries for the caller-bound project without requiring a text query. Use it when the user asks for recent task summaries, recent project context, or a compact memory digest; each returned item includes a compact ref plus sourceLookup so details can be fetched with get_memory_sources only when needed.',
+    inputSchema: objectSchema({
+      projectionClass: { type: 'string', enum: ['recent_summary', 'durable_memory_candidate'], description: 'Optional processed memory class to list. Defaults to recent_summary for the newest task summaries; durable_memory_candidate lists promoted durable facts.' },
+      limit: numberSchema(`Optional maximum summary count; defaults to ${MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_DEFAULT_LIMIT} and is clamped to ${MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_MAX_LIMIT }),
+    }),
+    outputSchema: objectSchema({
+      status: stringSchema('ok, disabled, or error.'),
+      reason: stringSchema('Optional machine-readable reason when an empty result is caused by project scoping, policy, or feature availability.'),
+      items: { type: 'array', description: 'Newest compact processed memory summaries. Each item includes ref plus sourceLookup: { tool: "get_memory_sources", kind: "projection", projectionId } for exact source expansion.', items: { type: 'object', additionalProperties: true } },
     }),
   },
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: {
     name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
-    description: 'Fetch source event snippets for a projection id returned by memory search. Use it only when a hit needs provenance; missing or cross-namespace ids return an empty source list without revealing which case occurred.',
+    description: 'Fetch source snippets for a projection id, observation id, or compact ref returned by memory search/startup memory. Use it after search_memory or when startup context gives a ref for exact prior instructions, decisions, preferences, bug details, commit/deployment facts, or provenance-sensitive answers; missing or cross-namespace ids return an empty source list without revealing which case occurred.',
     inputSchema: objectSchema({
-      projectionId: stringSchema('Required projection id from search_memory. Caller identity and namespace are runtime-bound.'),
-    }, ['projectionId']),
+      projectionId: stringSchema('Projection id from search_memory.sourceLookup for projection hits. Caller identity and namespace are runtime-bound.'),
+      observationId: stringSchema('Observation id from search_memory.sourceLookup for observation hits. Caller identity and namespace are runtime-bound.'),
+      ref: stringSchema('Compact ref shown in search_memory results or startup memory, such as obs:abc123 or proj:abc123. It resolves after the ref was observed by this daemon and is cached locally across daemon restarts.'),
+      kind: { type: 'string', enum: ['projection', 'observation'], description: 'Optional lookup kind copied from sourceLookup; provide exactly one matching id.' },
+    }),
     outputSchema: objectSchema({
-      projectionId: stringSchema('Requested projection id.'),
+      projectionId: stringSchema('Requested projection id when expanding a projection hit.'),
+      observationId: stringSchema('Requested observation id when expanding an observation hit.'),
       sources: { type: 'array', description: 'Source snippets visible to the caller namespace.', items: { type: 'object', additionalProperties: true } },
+      projectionSource: { type: 'object', description: 'Processed projection summary snippet, included when available so callers can cite compacted memories even when raw source events are unavailable or less informative.', additionalProperties: true },
     }),
   },
   [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: {

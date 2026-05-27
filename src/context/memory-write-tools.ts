@@ -78,6 +78,9 @@ export function saveObservation(input: unknown, caller: MemoryToolCaller, deps: 
   ) {
     return buildMcpErrorResult(MCP_ERROR_REASONS.WRITE_QUOTA_EXCEEDED, 'observation exceeds MCP write caps');
   }
+  if (!caller.namespace.projectId?.trim()) {
+    return buildMcpErrorResult(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'project scope is required to save observations');
+  }
 
   const namespace = observationNamespaceFor(caller);
   const scopeKey = serializeContextNamespace(namespace);

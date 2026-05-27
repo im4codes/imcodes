@@ -313,6 +313,34 @@ describe('WsBridge memory management routing', () => {
     expect(ctx?.boundProjects).toEqual([]);
   });
 
+  it('binds canonical memory requests to local visible project directories for daemon-side identity verification', async () => {
+    const db = makeDb(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash' };
+      if (sql.includes('shared_project_enrollments')) return null;
+      if (sql.includes('FROM sessions') && params?.[1] === '/work/repo') {
+        return { name: 'deck_repo_brain' };
+      }
+      return null;
+    });
+    const { daemon, browserA } = await setup(db);
+    browserA.emit('message', JSON.stringify({
+      type: MEMORY_WS.CREATE,
+      requestId: 'local-project-create',
+      canonicalRepoId: 'github.com/acme/repo',
+      projectDir: '/work/repo',
+      text: 'Remember the local project decision.',
+    }));
+    await flush();
+
+    const forwarded = daemon.sentJson().find((msg) => msg.type === MEMORY_WS.CREATE) as Record<string, unknown> | undefined;
+    const ctx = forwarded?.[MEMORY_MANAGEMENT_CONTEXT_FIELD] as Record<string, unknown> | undefined;
+    expect(ctx?.role).toBe('user');
+    expect(ctx?.boundProjects).toEqual([{
+      canonicalRepoId: 'github.com/acme/repo',
+      projectDir: '/work/repo',
+    }]);
+  });
+
   it('forwards active enrolled canonical projects with server-derived workspace/org bindings', async () => {
     const db = makeDb(async (sql: string, params?: unknown[]) => {
       if (sql.includes('token_hash')) return { token_hash: 'valid-hash' };

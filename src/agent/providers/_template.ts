@@ -71,7 +71,11 @@ export class YourProvider implements TransportProvider {
     //   'unsupported'                           — provider cannot carry context at all
     // The runtime calls normalizeProviderPayload() in send() to convert plain strings
     // into ProviderContextPayload. Use payload.assembledMessage for the user message
-    // (includes messagePreamble) and payload.systemText for system-level context.
+    // (includes messagePreamble). For system-level context, prefer the helpers in
+    // provider-context-routing.ts (getProviderSystemTextParts / composeProviderSystemText)
+    // so stable session instructions can be cached or injected once while turn-scoped
+    // authored context still reaches the model. payload.systemText is a legacy
+    // combined compatibility view and should not be used directly by new providers.
     contextSupport: 'full-normalized-context-injection',
   };
 
@@ -128,7 +132,7 @@ export class YourProvider implements TransportProvider {
    *   import { normalizeProviderPayload } from '../transport-provider.js';
    *   const payload = normalizeProviderPayload(message);
    *   // payload.assembledMessage — user message with preamble
-   *   // payload.systemText       — compiled system context (may be undefined)
+   *   // Use provider-context-routing helpers for payload session/turn system text.
    *
    * @param sessionId   - The session ID returned by createSession().
    * @param message     - Plain string or ProviderContextPayload.

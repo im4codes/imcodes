@@ -1264,7 +1264,7 @@ describe('sdk transport flow e2e', () => {
         runtimeFamily: 'transport',
         authoritySource: 'processed_local',
         sourceKind: 'local_processed',
-        injectionSurface: expect.stringMatching(/^(system-text|normalized-payload|degraded-message-side)$/),
+        injectionSurface: expect.stringMatching(/^(message-preamble|normalized-payload|degraded-message-side)$/),
         injectedText: expect.stringContaining('# Recent project memory'),
         items: expect.arrayContaining([
           expect.objectContaining({
@@ -1360,6 +1360,7 @@ describe('sdk transport flow e2e', () => {
       commandId: 'cmd-cxsdk-e2e',
     }, serverLink);
     await flushAsync();
+    await waitForCondition(() => mocks.store.get(SESSION_CX)?.codexSessionId === 'thread-codex-e2e');
 
     const record = mocks.store.get(SESSION_CX);
     expect(record?.runtimeType).toBe('transport');

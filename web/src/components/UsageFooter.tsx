@@ -2,7 +2,7 @@
  * UsageFooter — shared context bar + usage stats + cost display.
  * Used by both main session (app.tsx) and SubSessionWindow.
  */
-import { useEffect, useMemo, useState, useCallback } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
@@ -33,6 +33,10 @@ interface Props {
   activeToolCall?: boolean;
   /** Current timestamp for thinking timer (updated every second). */
   now?: number;
+  /** Sends recent memory summaries into the current agent as sync-only context. */
+  onSyncMemorySummaries?: () => void;
+  syncMemorySummariesBusy?: boolean;
+  syncMemorySummariesDisabled?: boolean;
 }
 
 const fmt = (n: number) =>
@@ -40,7 +44,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled }: Props) {
   const { t } = useTranslation();
   const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
   // Wrench pill: tri-state toggle for "show developer details in chat timeline".
@@ -75,6 +79,8 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const hasActiveLiveWork = !isAgentless && (!!activeToolCall || !!activeThinkingTs);
   const showLiveStatus = !isAgentless;
   const [quotaNow, setQuotaNow] = useState(() => Date.now());
+  const [ctxBurning, setCtxBurning] = useState(false);
+  const previousCtxSignatureRef = useRef<string | null>(null);
 
   const displayModel = modelOverride ?? usage.model;
   useEffect(() => {
@@ -107,7 +113,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     return planLabel;
   }, [planLabel, t]);
 
-  const { ctx, total, cachePct, newPct, pctStr, tip } = useMemo(() => {
+  const { ctx, total, totalPct, cachePct, newPct, pctStr, tip } = useMemo(() => {
     const ctx = resolveContextWindow(
       usage.contextWindow,
       displayModel,
@@ -130,9 +136,6 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     return { ctx, total, totalPct, cachePct, newPct, pctStr, tip };
   }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, usage.contextWindowSource, displayModel, displayPlanLabel, displayQuotaLabel, quotaUsageLabel, t]);
 
-  const sessionCost = showCost ? getSessionCost(sessionName) : 0;
-  const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
-  const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(displayModel);
   // Keep the ctx meter visible even before the first non-zero usage event when
   // the session/model is known. A zero-token session still has useful context
@@ -140,6 +143,26 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   // SDK sessions look like ctx tracking had disappeared after stale cumulative
   // usage snapshots were filtered out.
   const hasContextInfo = total > 0 || (usage.contextWindow ?? 0) > 0 || !!modelLabel;
+
+  useEffect(() => {
+    if (!hasContextInfo) {
+      previousCtxSignatureRef.current = null;
+      setCtxBurning(false);
+      return;
+    }
+    const signature = `${total}:${cachePct.toFixed(3)}:${newPct.toFixed(3)}:${ctx}`;
+    const previousSignature = previousCtxSignatureRef.current;
+    previousCtxSignatureRef.current = signature;
+    if (!previousSignature || previousSignature === signature) return;
+
+    setCtxBurning(true);
+    const timeoutId = window.setTimeout(() => setCtxBurning(false), 780);
+    return () => window.clearTimeout(timeoutId);
+  }, [cachePct, ctx, hasContextInfo, newPct, total]);
+
+  const sessionCost = showCost ? getSessionCost(sessionName) : 0;
+  const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
+  const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const inlineQuotaText = displayQuotaLabel;
   const liveStatusMode = isAgentless
     ? null
@@ -167,9 +190,10 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   return (
     <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
       {hasContextInfo && (
-        <div class="session-ctx-bar">
+        <div class={`session-ctx-bar${ctxBurning ? ' is-burning' : ''}`}>
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
+          {ctxBurning && <span class="session-ctx-burn" style={{ width: `${totalPct}%` }} aria-hidden="true" />}
         </div>
       )}
       {codexQuotaLines.length > 0 && (
@@ -193,6 +217,18 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           </span>
         )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          {onSyncMemorySummaries && (
+            <button
+              type="button"
+              class={`shortcut-btn shortcut-btn-icon shortcut-btn-memory-sync${syncMemorySummariesBusy ? ' is-busy' : ''}`}
+              title={syncMemorySummariesBusy ? t('chat.memory_summary_sync_busy') : t('chat.memory_summary_sync')}
+              aria-label={syncMemorySummariesBusy ? t('chat.memory_summary_sync_busy') : t('chat.memory_summary_sync')}
+              disabled={syncMemorySummariesDisabled}
+              onClick={onSyncMemorySummaries}
+            >
+              ↻
+            </button>
+          )}
           <span class="shortcut-btn-tools-wrapper">
             {/* Undecided-state bubble. Points the user at the wrench so the
              *  first-run choice surface is obvious even before they scroll

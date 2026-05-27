@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 
 const childProcessMock = vi.hoisted(() => {
@@ -17,6 +20,29 @@ const childProcessMock = vi.hoisted(() => {
   };
 
   const children: ChildRecord[] = [];
+  const heldThreadStarts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
+  const heldTurnStarts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
+  const heldTurnInterrupts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
+  let holdThreadStart = false;
+  let holdTurnStart = false;
+  let holdTurnInterrupt = false;
+
+  const emitThreadStartResult = (childRecord: ChildRecord, msg: Request) => {
+    childRecord.emits({
+      id: msg.id,
+      result: { thread: { id: 'thread-1' } },
+    });
+    childRecord.emits({ method: 'thread/started', params: { thread: { id: 'thread-1' } } });
+  };
+  const emitTurnStartResult = (childRecord: ChildRecord, msg: Request) => {
+    childRecord.emits({
+      id: msg.id,
+      result: { turn: { id: 'turn-1', status: 'inProgress', items: [], error: null } },
+    });
+  };
+  const emitTurnInterruptResult = (childRecord: ChildRecord, msg: Request) => {
+    childRecord.emits({ id: msg.id, result: {} });
+  };
 
   const spawn = vi.fn(() => {
     const stdout = new PassThrough();
@@ -32,11 +58,11 @@ const childProcessMock = vi.hoisted(() => {
             childRecord.emits({ id: msg.id, result: { userAgent: 'test' } });
           }
           if (msg.method === 'thread/start' && typeof msg.id === 'number') {
-            childRecord.emits({
-              id: msg.id,
-              result: { thread: { id: 'thread-1' } },
-            });
-            childRecord.emits({ method: 'thread/started', params: { thread: { id: 'thread-1' } } });
+            if (holdThreadStart) {
+              heldThreadStarts.push({ childRecord, msg });
+            } else {
+              emitThreadStartResult(childRecord, msg);
+            }
           }
           if (msg.method === 'thread/resume' && typeof msg.id === 'number') {
             if (msg.params?.threadId === 'thread-corrupt') {
@@ -54,16 +80,21 @@ const childProcessMock = vi.hoisted(() => {
             }
           }
           if (msg.method === 'turn/start' && typeof msg.id === 'number') {
-            childRecord.emits({
-              id: msg.id,
-              result: { turn: { id: 'turn-1', status: 'inProgress', items: [], error: null } },
-            });
+            if (holdTurnStart) {
+              heldTurnStarts.push({ childRecord, msg });
+            } else {
+              emitTurnStartResult(childRecord, msg);
+            }
           }
           if (msg.method === 'thread/compact/start' && typeof msg.id === 'number') {
             childRecord.emits({ id: msg.id, result: {} });
           }
           if (msg.method === 'turn/interrupt' && typeof msg.id === 'number') {
-            childRecord.emits({ id: msg.id, result: {} });
+            if (holdTurnInterrupt) {
+              heldTurnInterrupts.push({ childRecord, msg });
+            } else {
+              emitTurnInterruptResult(childRecord, msg);
+            }
           }
           if (msg.method === 'thread/unsubscribe' && typeof msg.id === 'number') {
             childRecord.emits({ id: msg.id, result: { status: 'unsubscribed' } });
@@ -105,7 +136,32 @@ const childProcessMock = vi.hoisted(() => {
     return {} as never;
   });
 
-  return { spawn, execFile, children };
+  return {
+    spawn,
+    execFile,
+    children,
+    setHoldThreadStart(value: boolean) {
+      holdThreadStart = value;
+    },
+    setHoldTurnStart(value: boolean) {
+      holdTurnStart = value;
+    },
+    setHoldTurnInterrupt(value: boolean) {
+      holdTurnInterrupt = value;
+    },
+    releaseHeldTurnStarts() {
+      const held = heldTurnStarts.splice(0);
+      for (const entry of held) emitTurnStartResult(entry.childRecord, entry.msg);
+    },
+    releaseHeldThreadStarts() {
+      const held = heldThreadStarts.splice(0);
+      for (const entry of held) emitThreadStartResult(entry.childRecord, entry.msg);
+    },
+    releaseHeldTurnInterrupts() {
+      const held = heldTurnInterrupts.splice(0);
+      for (const entry of held) emitTurnInterruptResult(entry.childRecord, entry.msg);
+    },
+  };
 });
 
 vi.mock('node:child_process', () => ({
@@ -151,6 +207,7 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
 }));
 
 import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
+import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import {
@@ -166,12 +223,38 @@ import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+async function waitForCondition(
+  check: () => boolean,
+  timeoutMs = 3000,
+  intervalMs = 10,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error('Timed out waiting for condition');
+}
+
+async function writeCodexAuthFile(codexHome: string, version: number): Promise<void> {
+  await writeFile(
+    join(codexHome, 'auth.json'),
+    JSON.stringify({ version, pad: 'x'.repeat(version) }),
+  );
+}
+
 describe('CodexSdkProvider', () => {
   beforeEach(() => {
     vi.useRealTimers();
     childProcessMock.spawn.mockClear();
     childProcessMock.execFile.mockClear();
     childProcessMock.children.length = 0;
+    childProcessMock.setHoldThreadStart(false);
+    childProcessMock.setHoldTurnStart(false);
+    childProcessMock.setHoldTurnInterrupt(false);
+    childProcessMock.releaseHeldThreadStarts();
+    childProcessMock.releaseHeldTurnStarts();
+    childProcessMock.releaseHeldTurnInterrupts();
   });
 
   afterEach(() => {
@@ -195,6 +278,94 @@ describe('CodexSdkProvider', () => {
       connected: true,
       degradedReasons: [],
     });
+  });
+
+  it('restarts the app-server before creating a session when Codex auth changes', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-auth-'));
+    const provider = new CodexSdkProvider();
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      await writeCodexAuthFile(codexHome, 1);
+
+      await provider.connect({ binaryPath: 'codex' });
+      expect(childProcessMock.children).toHaveLength(1);
+
+      await writeCodexAuthFile(codexHome, 2);
+      await provider.createSession({ sessionKey: 'route-1', cwd: '/tmp/project' });
+
+      expect(childProcessMock.children).toHaveLength(2);
+      expect(childProcessMock.children[0]!.child.killed).toBe(true);
+      expect(childProcessMock.children[1]!.requests.some((req) => req.method === 'initialize')).toBe(true);
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves Codex thread ids across auth-change app-server restarts', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-auth-'));
+    const provider = new CodexSdkProvider();
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      await writeCodexAuthFile(codexHome, 1);
+
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-1', cwd: '/tmp/project', resumeId: 'thread-keep' });
+      await provider.send('route-1', 'first');
+      const firstChild = childProcessMock.children[0]!;
+      expect(firstChild.requests.some((req) => req.method === 'thread/resume' && req.params?.threadId === 'thread-keep')).toBe(true);
+      firstChild.emits({ method: 'turn/completed', params: { threadId: 'thread-keep', turn: { id: 'turn-1', status: 'completed', error: null } } });
+      await flush();
+
+      await writeCodexAuthFile(codexHome, 3);
+      await provider.send('route-1', 'second');
+
+      expect(childProcessMock.children).toHaveLength(2);
+      const secondChild = childProcessMock.children[1]!;
+      expect(secondChild.requests.some((req) => req.method === 'thread/resume' && req.params?.threadId === 'thread-keep')).toBe(true);
+      expect(secondChild.requests.some((req) => req.method === 'turn/start')).toBe(true);
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('restarts the app-server when Codex reports a bearer auth failure', async () => {
+    const provider = new CodexSdkProvider();
+    const errors: Array<{ code: string; recoverable: boolean; message: string }> = [];
+    provider.onError((_sid, error) => errors.push({
+      code: error.code,
+      recoverable: error.recoverable,
+      message: error.message,
+    }));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-1', cwd: '/tmp/project' });
+    await provider.send('route-1', 'hello');
+    const firstChild = childProcessMock.children[0]!;
+
+    firstChild.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: {
+          id: 'turn-1',
+          status: 'failed',
+          error: {
+            message: 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header',
+          },
+        },
+      },
+    });
+    await waitForCondition(() => errors.length === 1 && childProcessMock.children.length === 2);
+
+    expect(errors).toMatchObject([{
+      code: PROVIDER_ERROR_CODES.AUTH_FAILED,
+      recoverable: false,
+    }]);
+    expect(childProcessMock.children).toHaveLength(2);
+    expect(firstChild.child.killed).toBe(true);
+    await provider.disconnect();
   });
 
   it('starts a thread, captures resume id, emits tool calls, streams message deltas, and completes', async () => {
@@ -252,7 +423,14 @@ describe('CodexSdkProvider', () => {
       params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'OK' } },
     });
     child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
-    await flush();
+    await waitForCondition(
+      () =>
+        tools.length === 2 &&
+        deltas.length === 2 &&
+        usageUpdates.length === 1 &&
+        completed.length === 1 &&
+        sessionInfo.some((info) => info.resumeId === 'thread-1'),
+    );
 
     expect(tools).toEqual([
       {
@@ -377,7 +555,13 @@ describe('CodexSdkProvider', () => {
     expect(threadStartReq?.params?.model).toBe('gpt-5.4');
     // Catalog hit → mock returns sentinel `[catalog-prompt:gpt-5.4]`. In
     // production this would be the real 14 KB codex base_instructions.
-    expect(threadStartReq?.params?.baseInstructions).toBe('[catalog-prompt:gpt-5.4]');
+    // baseInstructions also has the IM.codes runtime tail (Generated
+    // Image Reporting block) appended for every Codex thread, so use
+    // toContain instead of toBe.
+    const tStart = threadStartReq?.params?.baseInstructions as string;
+    expect(tStart).toContain('[catalog-prompt:gpt-5.4]');
+    expect(tStart).toContain('# IM.codes runtime instructions');
+    expect(tStart).toContain('Generated images:');
     codexRuntimeConfigMock.reset();
   });
 
@@ -432,7 +616,11 @@ describe('CodexSdkProvider', () => {
     await provider.send('route-resume-cat', 'hello');
     const child = childProcessMock.children[0];
     const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
-    expect(resumeReq?.params?.baseInstructions).toBe('[catalog-prompt:gpt-5.4]');
+    // Resume also gets the IM.codes runtime tail (image-reporting block).
+    const tResume = resumeReq?.params?.baseInstructions as string;
+    expect(tResume).toContain('[catalog-prompt:gpt-5.4]');
+    expect(tResume).toContain('# IM.codes runtime instructions');
+    expect(tResume).toContain('Generated images:');
     codexRuntimeConfigMock.reset();
   });
 
@@ -441,11 +629,16 @@ describe('CodexSdkProvider', () => {
     await provider.connect({ binaryPath: 'codex' });
 
     const resultPromise = provider.readModelList();
-    const child = childProcessMock.children[0];
-    const firstRequest = child.requests.find((req) => req.method === 'model/list');
+    const modelListRequests = () => childProcessMock.children.flatMap((child) =>
+      child.requests
+        .filter((req) => req.method === 'model/list')
+        .map((req) => ({ child, req })),
+    );
+    await waitForCondition(() => modelListRequests().length >= 1);
+    const { child: firstChild, req: firstRequest } = modelListRequests()[0]!;
     expect(firstRequest?.params).toMatchObject({ includeHidden: false, limit: 100 });
 
-    child.emits({
+    firstChild.emits({
       id: firstRequest?.id,
       result: {
         data: [
@@ -460,11 +653,11 @@ describe('CodexSdkProvider', () => {
         nextCursor: 'cursor-2',
       },
     });
-    await flush();
+    await waitForCondition(() => modelListRequests().length >= 2);
 
-    const secondRequest = child.requests.filter((req) => req.method === 'model/list')[1];
+    const { child: secondChild, req: secondRequest } = modelListRequests()[1]!;
     expect(secondRequest?.params).toMatchObject({ cursor: 'cursor-2', includeHidden: false, limit: 100 });
-    child.emits({
+    secondChild.emits({
       id: secondRequest?.id,
       result: {
         data: [
@@ -523,6 +716,327 @@ describe('CodexSdkProvider', () => {
     expect(turnStartReq?.params?.input?.[0]?.text).toBe(
       'Context instructions:\nNormalized system text\n\nRelevant context\n\nship it',
     );
+  });
+
+  it('moves split stable IM.codes context into codex baseInstructions and keeps only turn context in turn/start', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-split-context', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+
+    const payload: ProviderContextPayload = {
+      userMessage: 'ship it',
+      assembledMessage: 'Relevant context\n\nship it',
+      sessionSystemText: 'Stable IM.codes runtime rules',
+      turnSystemText: 'Required shared context:\n- Current file rule',
+      systemText: 'Stable IM.codes runtime rules\n\nRequired shared context:\n- Current file rule',
+      messagePreamble: 'Relevant context',
+      attachments: [],
+      context: {
+        sessionSystemText: 'Stable IM.codes runtime rules',
+        turnSystemText: 'Required shared context:\n- Current file rule',
+        systemText: 'Stable IM.codes runtime rules\n\nRequired shared context:\n- Current file rule',
+        messagePreamble: 'Relevant context',
+        requiredAuthoredContext: ['Current file rule'],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: ['doc-v1'],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-split-context' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+
+    await provider.send('route-split-context', payload);
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    const turnStartReq = child.requests.find((req) => req.method === 'turn/start');
+
+    expect(threadStartReq?.params?.baseInstructions).toContain('[catalog-prompt:gpt-5.4]');
+    expect(threadStartReq?.params?.baseInstructions).toContain('# IM.codes runtime instructions');
+    expect(threadStartReq?.params?.baseInstructions).toContain('Stable IM.codes runtime rules');
+    expect(threadStartReq?.params?.baseInstructions).not.toContain('Current file rule');
+    expect(turnStartReq?.params?.input?.[0]?.text).toBe(
+      'Context instructions:\nRequired shared context:\n- Current file rule\n\nRelevant context\n\nship it',
+    );
+  });
+
+  it('appends Generated Image Reporting protocol into codex baseInstructions tail (Codex is the only image-capable transport agent)', async () => {
+    // p2p audit 37bfbb85-430 N-A follow-up: image-reporting belongs in
+    // Codex's baseInstructions tail because (a) Codex is the only
+    // transport agent with native image generation today, (b) sending it
+    // once per thread/start beats sending it every turn, (c) it joins
+    // Codex's prefix cache, (d) zero token cost for non-Codex providers.
+    codexRuntimeConfigMock.set(['gpt-5.4']);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-image', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+
+    const payload: ProviderContextPayload = {
+      userMessage: 'draw something',
+      assembledMessage: 'draw something',
+      sessionSystemText: 'Stable IM.codes runtime rules',
+      systemText: 'Stable IM.codes runtime rules',
+      attachments: [],
+      context: {
+        sessionSystemText: 'Stable IM.codes runtime rules',
+        systemText: 'Stable IM.codes runtime rules',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-image' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+
+    await provider.send('route-image', payload);
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    const base = threadStartReq?.params?.baseInstructions as string;
+    expect(typeof base).toBe('string');
+    // Codex's own per-model prompt is preserved at the head.
+    expect(base).toContain('[catalog-prompt:gpt-5.4]');
+    // IM.codes marker sits between codex's prompt and the daemon tail.
+    expect(base).toContain('# IM.codes runtime instructions');
+    // sessionSystemText still flows through.
+    expect(base).toContain('Stable IM.codes runtime rules');
+    // Compressed Generated Image Reporting block lives here now — every
+    // semantic point present.
+    expect(base).toContain('Generated images:');
+    expect(base).toContain('file path of every image you create/edit/save');
+    expect(base).toContain('repo-relative inside workspace, else absolute');
+    expect(base).toContain('If no path returned, say so');
+    expect(base).toContain('app/site/docs');
+    codexRuntimeConfigMock.reset();
+  });
+
+  it('still appends image-reporting when sessionSystemText is absent (image-reporting is Codex-static, not gated on identity)', async () => {
+    codexRuntimeConfigMock.set(['gpt-5.4']);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-image-only', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+
+    const payload: ProviderContextPayload = {
+      userMessage: 'draw something',
+      assembledMessage: 'draw something',
+      attachments: [],
+      context: {
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-image-only' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+
+    await provider.send('route-image-only', payload);
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    const base = threadStartReq?.params?.baseInstructions as string;
+    expect(base).toContain('[catalog-prompt:gpt-5.4]');
+    expect(base).toContain('# IM.codes runtime instructions');
+    expect(base).toContain('Generated images:');
+    codexRuntimeConfigMock.reset();
+  });
+
+  it('appends exact Codex generated image file paths to the completed assistant message', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-images-'));
+    const provider = new CodexSdkProvider();
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-image-path', cwd: '/tmp/project' });
+
+      const completed: string[] = [];
+      provider.onComplete((_sid, msg) => completed.push(msg.content));
+      const imageDir = join(codexHome, 'generated_images', 'thread-1');
+      await mkdir(imageDir, { recursive: true });
+      const staleImagePath = join(imageDir, 'ig_previous.png');
+      await writeFile(staleImagePath, 'old-png');
+
+      await provider.send('route-image-path', 'draw a cat');
+      const child = childProcessMock.children[0]!;
+      const imagePath = join(imageDir, 'ig_07d4759a673646ae016a1650951d848198b675e585a0b7b1e4.png');
+      await writeFile(imagePath, 'fake-png');
+
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            id: 'msg-1',
+            type: 'agentMessage',
+            text: '生成好了，但工具没有返回本地文件路径。',
+          },
+        },
+      });
+      child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+
+      await waitForCondition(() => completed.length === 1);
+      expect(completed[0]).toContain('生成好了，但工具没有返回本地文件路径。');
+      expect(completed[0]).toContain('Generated image path detected by IM.codes:');
+      expect(completed[0]).toContain(imagePath);
+      expect(completed[0]).not.toContain(staleImagePath);
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('delivers changed split stable IM.codes context once after a Codex thread is loaded', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-stable-change', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+
+    const makePayload = (stable: string, turn: string): ProviderContextPayload => ({
+      userMessage: 'ship it',
+      assembledMessage: 'Relevant context\n\nship it',
+      sessionSystemText: stable,
+      turnSystemText: turn,
+      systemText: `${stable}\n\n${turn}`,
+      messagePreamble: 'Relevant context',
+      attachments: [],
+      context: {
+        sessionSystemText: stable,
+        turnSystemText: turn,
+        systemText: `${stable}\n\n${turn}`,
+        messagePreamble: 'Relevant context',
+        requiredAuthoredContext: [turn],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: ['doc-v1'],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-stable-change' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    await provider.send('route-stable-change', makePayload('Stable runtime v1', 'Required shared context:\n- First rule'));
+    const child = childProcessMock.children[0];
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    await provider.send('route-stable-change', makePayload('Stable runtime v2', 'Required shared context:\n- Second rule'));
+    const secondTurnStart = child.requests.filter((req) => req.method === 'turn/start').at(-1);
+    expect(secondTurnStart?.params?.input?.[0]?.text).toContain('# IM.codes runtime instructions updated:\nStable runtime v2');
+    expect(secondTurnStart?.params?.input?.[0]?.text).toContain('Required shared context:\n- Second rule');
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    await provider.send('route-stable-change', makePayload('Stable runtime v2', 'Required shared context:\n- Third rule'));
+    const thirdTurnStart = child.requests.filter((req) => req.method === 'turn/start').at(-1);
+    expect(thirdTurnStart?.params?.input?.[0]?.text).not.toContain('# IM.codes runtime instructions updated');
+    expect(thirdTurnStart?.params?.input?.[0]?.text).not.toContain('Stable runtime v2');
+    expect(thirdTurnStart?.params?.input?.[0]?.text).toContain('Required shared context:\n- Third rule');
+  });
+
+  it('re-sends a changed split stable context when the Codex update turn fails before completion', async () => {
+    const provider = new CodexSdkProvider();
+    const errors: string[] = [];
+    provider.onError((_sid, error) => errors.push(error.message));
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-stable-failed-update', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+
+    const makePayload = (stable: string, turn: string): ProviderContextPayload => ({
+      userMessage: 'ship it',
+      assembledMessage: 'Relevant context\n\nship it',
+      sessionSystemText: stable,
+      turnSystemText: turn,
+      systemText: `${stable}\n\n${turn}`,
+      messagePreamble: 'Relevant context',
+      attachments: [],
+      context: {
+        sessionSystemText: stable,
+        turnSystemText: turn,
+        systemText: `${stable}\n\n${turn}`,
+        messagePreamble: 'Relevant context',
+        requiredAuthoredContext: [turn],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: ['doc-v1'],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-stable-failed-update' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    await provider.send('route-stable-failed-update', makePayload('Stable runtime v1', 'Required shared context:\n- First rule'));
+    const child = childProcessMock.children[0];
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    await provider.send('route-stable-failed-update', makePayload('Stable runtime v2', 'Required shared context:\n- Second rule'));
+    const failedTurnStart = child.requests.filter((req) => req.method === 'turn/start').at(-1);
+    expect(failedTurnStart?.params?.input?.[0]?.text).toContain('# IM.codes runtime instructions updated:\nStable runtime v2');
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: {
+          id: 'turn-1',
+          status: 'failed',
+          error: { message: 'synthetic failure' },
+        },
+      },
+    });
+    await flush();
+    expect(errors).toContain('synthetic failure');
+
+    await provider.send('route-stable-failed-update', makePayload('Stable runtime v2', 'Required shared context:\n- Retry rule'));
+    const retryTurnStart = child.requests.filter((req) => req.method === 'turn/start').at(-1);
+    expect(retryTurnStart?.params?.input?.[0]?.text).toContain('# IM.codes runtime instructions updated:\nStable runtime v2');
+    expect(retryTurnStart?.params?.input?.[0]?.text).toContain('Required shared context:\n- Retry rule');
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    await provider.send('route-stable-failed-update', makePayload('Stable runtime v2', 'Required shared context:\n- Later rule'));
+    const finalTurnStart = child.requests.filter((req) => req.method === 'turn/start').at(-1);
+    expect(finalTurnStart?.params?.input?.[0]?.text).not.toContain('# IM.codes runtime instructions updated');
+    expect(finalTurnStart?.params?.input?.[0]?.text).toContain('Required shared context:\n- Later rule');
   });
 
   it('caps Codex SDK injected context while preserving the user turn text', async () => {
@@ -886,6 +1400,97 @@ describe('CodexSdkProvider', () => {
     const child = childProcessMock.children[0];
     await provider.cancel('route-cancel');
     expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(true);
+  });
+
+  it('interrupts a Codex turn when cancel arrives before turn/start returns a turn id', async () => {
+    childProcessMock.setHoldTurnStart(true);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cancel-pending-start', cwd: '/tmp/project' });
+
+    const sendPromise = provider.send('route-cancel-pending-start', 'hello');
+    const child = childProcessMock.children[0];
+    await waitForCondition(() => child.requests.some((req) => req.method === 'turn/start'));
+
+    await provider.cancel('route-cancel-pending-start');
+    expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
+
+    childProcessMock.releaseHeldTurnStarts();
+    await sendPromise;
+    await waitForCondition(() => child.requests.some((req) => req.method === 'turn/interrupt'));
+
+    const interrupt = child.requests.find((req) => req.method === 'turn/interrupt');
+    expect(interrupt?.params).toMatchObject({ threadId: 'thread-1', turnId: 'turn-1' });
+  });
+
+  it('remembers Codex cancel when it arrives before thread/start returns a thread id', async () => {
+    childProcessMock.setHoldThreadStart(true);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cancel-pending-thread', cwd: '/tmp/project' });
+
+    const sendPromise = provider.send('route-cancel-pending-thread', 'hello');
+    const child = childProcessMock.children[0];
+    await waitForCondition(() => child.requests.some((req) => req.method === 'thread/start'));
+
+    await provider.cancel('route-cancel-pending-thread');
+    expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
+
+    childProcessMock.releaseHeldThreadStarts();
+    await sendPromise;
+    await waitForCondition(() => child.requests.some((req) => req.method === 'turn/interrupt'));
+
+    const interrupt = child.requests.find((req) => req.method === 'turn/interrupt');
+    expect(interrupt?.params).toMatchObject({ threadId: 'thread-1', turnId: 'turn-1' });
+  });
+
+  it('ignores late Codex deltas and completed output after cancel', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cancel-late-output', cwd: '/tmp/project' });
+
+    const deltas: string[] = [];
+    const completes: string[] = [];
+    const errors: string[] = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+    provider.onComplete((_sid, message) => completes.push(message.content));
+    provider.onError((_sid, err) => errors.push(err.code));
+
+    await provider.send('route-cancel-late-output', 'hello');
+    const child = childProcessMock.children[0];
+    await provider.cancel('route-cancel-late-output');
+    child.emits({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', itemId: 'msg-late', delta: 'late text' },
+    });
+    child.emits({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } },
+    });
+    await flush();
+
+    expect(deltas).toEqual([]);
+    expect(completes).toEqual([]);
+    expect(errors).toContain(PROVIDER_ERROR_CODES.CANCELLED);
+  });
+
+  it('starts the Codex cancel watchdog even when turn/interrupt never acknowledges', async () => {
+    vi.useFakeTimers();
+    childProcessMock.setHoldTurnInterrupt(true);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cancel-interrupt-hangs', cwd: '/tmp/project' });
+
+    const errors: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.code));
+
+    await provider.send('route-cancel-interrupt-hangs', 'hello');
+    const child = childProcessMock.children[0];
+    await provider.cancel('route-cancel-interrupt-hangs');
+
+    expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_600);
+    expect(errors).toContain(PROVIDER_ERROR_CODES.CANCELLED);
   });
 
   it('recovers the session when turn/interrupt never produces an interrupted completion', async () => {

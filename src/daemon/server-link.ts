@@ -18,6 +18,7 @@ import {
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
 import { TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
+import { FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../shared/transport/file-transfer.js';
 import {
   classifyServerSendPlane,
   recordServerLinkDataPlaneBackpressure,
@@ -131,6 +132,7 @@ const PONG_TIMEOUT_MS = 10_000;       // if no pong within 10s, connection is de
 const DAEMON_STATIC_CAPABILITIES = [
   SESSION_GROUP_CLONE_CAPABILITY_V1,
   TIMELINE_PROTOCOL_CAPABILITY,
+  FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 ] as const;
 
 export interface ServerLinkOpts {
@@ -141,6 +143,16 @@ export interface ServerLinkOpts {
 
 export type MessageHandler = (msg: unknown) => void;
 export type BinaryMessageHandler = (data: Buffer) => void;
+
+async function toWebSocketBinaryBuffer(data: unknown): Promise<Buffer> {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  if (data && typeof (data as Blob).arrayBuffer === 'function') {
+    return Buffer.from(await (data as Blob).arrayBuffer());
+  }
+  return Buffer.from(data as ArrayBuffer);
+}
 
 function messageTypeOf(msg: unknown): string | undefined {
   return typeof (msg as { type?: unknown })?.type === 'string'
@@ -348,18 +360,27 @@ export class ServerLink {
       if (this.ws !== ws) return; // stale socket
       this.lastPong = Date.now();
       if (typeof event.data !== 'string') {
-        const buffer = Buffer.isBuffer(event.data) ? event.data : Buffer.from(event.data as ArrayBuffer);
-        for (const h of this.binaryHandlers) h(buffer);
+        void (async () => {
+          const buffer = await toWebSocketBinaryBuffer(event.data);
+          if (this.ws !== ws) return; // stale socket after async Blob read
+          for (const h of this.binaryHandlers) h(buffer);
+        })().catch((err) => {
+          logger.warn({ err }, 'ServerLink: binary message decode failed');
+        });
         return;
       }
       try {
         const msg = JSON.parse(event.data);
         if (msg?.type === 'heartbeat_ack') {
+          // Heartbeat acks are the CLI/status proof-of-life source. They must
+          // not be throttled behind a just-written heartbeat-sent record, or
+          // the runtime file can report a false stale link while acks are
+          // arriving normally.
           this.recordRuntimeLinkStatus({
             state: 'connected',
             lastHeartbeatAckAt: this.lastPong,
             clearError: true,
-          }, 10_000);
+          });
         }
         for (const h of this.handlers) h(msg);
       } catch {

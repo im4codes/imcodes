@@ -18,8 +18,11 @@ function Probe({ resource, label = 'value' }: { resource: SharedResource<string>
   return <div data-testid={label}>{JSON.stringify(snapshot)}</div>;
 }
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  });
   __resetSharedResourcesForTests();
 });
 

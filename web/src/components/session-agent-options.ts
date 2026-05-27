@@ -59,6 +59,14 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     surfaces: ['new-session', 'sub-session'],
   },
   {
+    id: 'kimi-sdk',
+    icon: '月',
+    fallbackLabel: 'Kimi Code',
+    labelKey: 'session.agentType.kimi_sdk',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
     id: 'qwen',
     icon: '千',
     fallbackLabel: 'Qwen Code',

@@ -21,6 +21,18 @@ vi.mock('../../src/components/FileBrowser.js', () => ({
   FileBrowser: () => null,
 }));
 
+vi.mock('../../src/components/file-browser-lazy.js', () => ({
+  FileBrowser: (props: {
+    onConfirm?: (paths: string[]) => void;
+    onDirectoryCreated?: (path: string) => void;
+  }) => (
+    <div data-testid="mock-file-browser">
+      <button onClick={() => props.onConfirm?.(['/home/user/selected'])}>mock-select-dir</button>
+      <button onClick={() => props.onDirectoryCreated?.('/home/user/new-project')}>mock-create-folder</button>
+    </div>
+  ),
+}));
+
 import { NewSessionDialog } from '../../src/components/NewSessionDialog.js';
 
 const makeWs = () => {
@@ -60,6 +72,18 @@ describe('NewSessionDialog', () => {
     expect(screen.getByPlaceholderText('~/projects/my-project')).toBeDefined();
   });
 
+  it('uses a newly created folder from the directory picker as the working directory', async () => {
+    render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.click(screen.getByTitle('browse'));
+    fireEvent.click(screen.getByText('mock-create-folder'));
+
+    await waitFor(() => {
+      expect((screen.getByPlaceholderText('~/projects/my-project') as HTMLInputElement).value).toBe('/home/user/new-project');
+    });
+    expect(screen.queryByTestId('mock-file-browser')).toBeNull();
+  });
+
   it('renders agent type selector', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
@@ -72,16 +96,17 @@ describe('NewSessionDialog', () => {
     const optgroups = Array.from(select.querySelectorAll('optgroup'));
     expect(optgroups.map((group) => group.label)).toEqual(['SDK', 'CLI']);
     const options = Array.from(select.options).map((o) => o.value);
-    expect(options.slice(0, 7)).toEqual([
+    expect(options.slice(0, 8)).toEqual([
       'claude-code-sdk',
       'codex-sdk',
       'copilot-sdk',
       'cursor-headless',
       'gemini-sdk',
+      'kimi-sdk',
       'qwen',
       'openclaw',
     ]);
-    expect(options.slice(7)).toEqual([
+    expect(options.slice(8)).toEqual([
       'claude-code',
       'codex',
       'opencode',
@@ -368,7 +393,7 @@ describe('NewSessionDialog', () => {
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     agentTypeSelect.value = 'qwen';
     fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
-    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
     expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined();
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
@@ -385,6 +410,47 @@ describe('NewSessionDialog', () => {
       ccPreset: 'MiniMax',
       requestedModel: 'MiniMax-M2.7',
       thinking: 'high',
+    }));
+  });
+
+  it('custom provider SDK locks the main-session agent to qwen and uses a preset', async () => {
+    const ws = makeWs();
+    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
+      handler({
+        type: 'cc.presets.list_response',
+        presets: [
+          {
+            name: 'MiniMax',
+            env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+            defaultModel: 'MiniMax-M2.7',
+            availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-Text-01' }],
+          },
+        ],
+      });
+      return () => {};
+    });
+
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
+
+    await waitFor(() => expect(agentTypeSelect.value).toBe('qwen'));
+    expect(agentTypeSelect.disabled).toBe(true);
+    expect(screen.getByText('custom_provider_preset')).toBeDefined();
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'qwen',
+      ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M2.7',
+      thinking: 'high',
+    }));
+    expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'custom-provider-sdk',
     }));
   });
 
@@ -423,7 +489,7 @@ describe('NewSessionDialog', () => {
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     agentTypeSelect.value = 'qwen';
     fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
-    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
 
     fireEvent.click(screen.getByText('api_provider_add_edit'));
     fireEvent.click(screen.getByRole('button', { name: 'api_provider_export_json' }));
@@ -442,7 +508,7 @@ describe('NewSessionDialog', () => {
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     agentTypeSelect.value = 'qwen';
     fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
-    await waitFor(() => expect(screen.getByText('Compatible API (via Qwen)')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
 
     fireEvent.click(screen.getByText('api_provider_add_edit'));
     fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'MiniMax' } });
@@ -603,6 +669,45 @@ describe('NewSessionDialog', () => {
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'gemini-sdk',
       requestedModel: 'auto',
+    }));
+  });
+
+  it('uses dynamically discovered kimi-sdk models when starting a session', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    agentTypeSelect.value = 'kimi-sdk';
+    fireEvent.input(agentTypeSelect, { target: { value: 'kimi-sdk' } });
+
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((call) => (
+        call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'kimi-sdk'
+      ))).toBe(true);
+    });
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'kimi-sdk'
+    ))?.[0];
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'kimi-sdk',
+      requestId: request?.requestId,
+      models: [
+        { id: 'moonshot-v1-auto', name: 'Moonshot Auto' },
+        { id: 'moonshot-v1-auto,thinking', name: 'Moonshot Auto Thinking' },
+      ],
+    }));
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'moonshot-v1-auto,thinking' })).toBeDefined());
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[1], { target: { value: 'moonshot-v1-auto,thinking' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'kimi-sdk',
+      requestedModel: 'moonshot-v1-auto,thinking',
     }));
   });
 });

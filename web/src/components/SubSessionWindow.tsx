@@ -39,6 +39,7 @@ import {
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
+import { buildMemorySummarySyncMessage } from '../memory-summary-sync.js';
 
 type GetMaximizeBounds = () => WorkspaceBounds | null;
 
@@ -88,6 +89,7 @@ interface Props {
   serverId?: string;
   pendingPrefillText?: string | null;
   onPendingPrefillApplied?: () => void;
+  onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
   detectedModelHint?: string;
   /** Whether this sub-session is participating in an active P2P discussion. */
   inP2p?: boolean;
@@ -179,7 +181,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onViewRepo, onTransportConfigSaved, onPreviewFile, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onViewRepo, onTransportConfigSaved, onPreviewFile, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -240,6 +242,7 @@ export function SubSessionWindow({
   }, [showFileBrowser, isMobile, onDesktopFileBrowserOpen, onDesktopFileBrowserClose]);
 
   const [quotes, setQuotes] = useState<string[]>([]);
+  const [syncingMemorySummaries, setSyncingMemorySummaries] = useState(false);
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
 
@@ -292,6 +295,7 @@ export function SubSessionWindow({
   // confirmClose removed — × now minimizes instead of terminating
 
   const inputRef = useRef<HTMLDivElement>(null);
+  const fileDropTargetRef = useRef<HTMLDivElement>(null);
   const termFitFnRef = useRef<(() => void) | null>(null);
   const geomRef = useRef(geom);
   geomRef.current = geom;
@@ -394,6 +398,32 @@ export function SubSessionWindow({
       else termScrollRef.current?.();
     }, 50);
   }, []);
+  const memorySummaryProjectId = useMemo(() => {
+    const parent = sub.parentSession
+      ? sessions?.find((session) => session.name === sub.parentSession)
+      : undefined;
+    return sub.contextNamespace?.projectId
+      ?? parent?.contextNamespace?.projectId
+      ?? null;
+  }, [sessions, sub.contextNamespace?.projectId, sub.parentSession]);
+
+  const handleSyncMemorySummaries = useCallback(async () => {
+    if (!ws || !connected || syncingMemorySummaries) return;
+    setSyncingMemorySummaries(true);
+    try {
+      const text = await buildMemorySummarySyncMessage(t, memorySummaryProjectId);
+      if (!text) return;
+      const commandId = globalThis.crypto?.randomUUID?.()
+        ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, commandId });
+      addOptimisticUserMessage(text, commandId);
+      scrollToBottom();
+    } catch {
+      // Non-blocking context sync: leave normal chat/send controls untouched.
+    } finally {
+      setSyncingMemorySummaries(false);
+    }
+  }, [addOptimisticUserMessage, connected, memorySummaryProjectId, scrollToBottom, sub.sessionName, syncingMemorySummaries, t, ws]);
 
   // ── Dragging ──────────────────────────────────────────────────────────────
   const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
@@ -632,6 +662,7 @@ export function SubSessionWindow({
         </div>
       </div>
 
+      <div ref={fileDropTargetRef} class="subsession-session-surface">
       {/* Content */}
       <div class="subsession-content">
         <div style={{ display: viewMode === 'terminal' ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}>
@@ -684,6 +715,9 @@ export function SubSessionWindow({
           statusText={statusText}
           activeToolCall={activeToolCall}
           now={thinkingNow}
+          onSyncMemorySummaries={handleSyncMemorySummaries}
+          syncMemorySummariesBusy={syncingMemorySummaries}
+          syncMemorySummariesDisabled={!connected || !ws || syncingMemorySummaries}
         />
       )}
 
@@ -732,12 +766,15 @@ export function SubSessionWindow({
         sessions={sessions}
         subSessions={subSessions}
         serverId={serverId}
+        fileDropTargetRef={fileDropTargetRef}
         detectedModel={effectiveDetectedModel ?? lastUsage?.model}
         quotes={quotes}
         onRemoveQuote={removeQuote}
         pendingPrefillText={pendingPrefillText}
         onPendingPrefillApplied={onPendingPrefillApplied}
+        onVersionSensitiveAction={onVersionSensitiveAction}
       />
+      </div>
 
       {/* Per-sub-session file browser. Mobile: full-screen overlay.
           Desktop: floating panel layered via the shared desktop window stack

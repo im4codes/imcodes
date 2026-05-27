@@ -6,10 +6,20 @@ import type { Env } from '../env.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
-import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js';
-import type { AttachmentRef, FileUploadRequest, FileDownloadRequest } from '../../../shared/transport/file-transfer.js';
+import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../../shared/transport/file-transfer.js';
+import type {
+  AttachmentRef,
+  FileDownloadRequest,
+  FileUploadFetchRequest,
+  FileUploadRequest,
+} from '../../../shared/transport/file-transfer.js';
 import logger from '../util/logger.js';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import * as path from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
 export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -19,6 +29,10 @@ export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId:
 // URL more than once, so tokens are resource-bound and short-lived with a small
 // use budget instead of being consumed on the first GET.
 const DOWNLOAD_TOKEN_MAX_USES = 5;
+const MULTIPART_UPLOAD_OVERHEAD_BYTES = 1024 * 1024;
+const STAGED_UPLOAD_PREFIX = 'imcodes-staged-upload-';
+const STAGED_UPLOAD_FETCH_CLEANUP_GRACE_MS = 30_000;
+const UPLOAD_PROGRESS_STREAM_MIME = 'application/x-ndjson';
 const downloadTokens = new Map<string, {
   serverId: string;
   attachmentId: string;
@@ -26,6 +40,62 @@ const downloadTokens = new Map<string, {
   expiresAt: number;
   remainingUses: number;
 }>();
+const stagedUploads = new Map<string, {
+  serverId: string;
+  token: string;
+  dir: string;
+  filePath: string;
+  size: number;
+  mime?: string;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout>;
+  deleteAfterFetchTimer?: ReturnType<typeof setTimeout>;
+}>();
+
+function deleteStagedUpload(uploadId: string): void {
+  const entry = stagedUploads.get(uploadId);
+  if (!entry) return;
+  stagedUploads.delete(uploadId);
+  clearTimeout(entry.timer);
+  if (entry.deleteAfterFetchTimer) clearTimeout(entry.deleteAfterFetchTimer);
+  void rm(entry.dir, { recursive: true, force: true }).catch((err) => {
+    logger.warn({ uploadId, err }, 'Failed to clean staged upload');
+  });
+}
+
+function scheduleStagedUploadFetchCleanup(uploadId: string): void {
+  const entry = stagedUploads.get(uploadId);
+  if (!entry || entry.deleteAfterFetchTimer) return;
+  entry.deleteAfterFetchTimer = setTimeout(
+    () => deleteStagedUpload(uploadId),
+    STAGED_UPLOAD_FETCH_CLEANUP_GRACE_MS,
+  );
+  entry.deleteAfterFetchTimer.unref?.();
+}
+
+async function persistStagedUpload(file: File, filePath: string): Promise<number> {
+  await pipeline(
+    Readable.fromWeb(file.stream() as never),
+    createWriteStream(filePath),
+  );
+  const fileStat = await stat(filePath);
+  return fileStat.size;
+}
+
+function buildStagedUploadUrl(requestUrl: string, serverId: string, uploadId: string, token: string): string {
+  const url = new URL(requestUrl);
+  url.pathname = `/api/server/${encodeURIComponent(serverId)}/upload-staged/${encodeURIComponent(uploadId)}`;
+  url.search = `token=${encodeURIComponent(token)}`;
+  return url.toString();
+}
+
+function wantsUploadProgressStream(accept: string | undefined): boolean {
+  return (accept ?? '').split(',').some((part) => part.trim().toLowerCase().startsWith(UPLOAD_PROGRESS_STREAM_MIME));
+}
+
+function jsonLine(payload: unknown): string {
+  return `${JSON.stringify(payload)}\n`;
+}
 
 // Token-auth middleware for download endpoint only — scoped to upload/download paths
 // to avoid shadowing other sub-apps mounted at the same /api/server prefix.
@@ -58,6 +128,39 @@ fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) =>
   return (authMiddleware as any)(c, next);
 });
 
+// ── GET /api/server/:id/upload-staged/:uploadId ─────────────────────────────
+// Token-authenticated, relay-local temporary object fetch for daemon uploads.
+// The token stays reusable for a short grace window after a successful read so
+// daemon-side HTTP retries do not fail, then the staged object is removed.
+
+fileTransferRoutes.get('/:id/upload-staged/:uploadId', async (c) => {
+  const serverId = c.req.param('id')!;
+  const uploadId = c.req.param('uploadId')!;
+  const token = c.req.query('token') ?? '';
+  const entry = stagedUploads.get(uploadId);
+  if (!entry || entry.serverId !== serverId) return c.json({ error: 'not_found' }, 404);
+  if (Date.now() > entry.expiresAt) {
+    deleteStagedUpload(uploadId);
+    return c.json({ error: 'expired' }, 410);
+  }
+  if (!token || token !== entry.token) return c.json({ error: 'forbidden' }, 403);
+
+  const fileStream = createReadStream(entry.filePath);
+  fileStream.once('end', () => scheduleStagedUploadFetchCleanup(uploadId));
+  fileStream.once('error', (err) => {
+    logger.warn({ uploadId, err }, 'Staged upload stream failed');
+  });
+
+  return new Response(Readable.toWeb(fileStream) as ReadableStream, {
+    status: 200,
+    headers: {
+      'Content-Type': entry.mime || 'application/octet-stream',
+      'Content-Length': String(entry.size),
+      'Cache-Control': 'no-store',
+    },
+  });
+});
+
 // ── POST /api/server/:id/upload ─────────────────────────────────────────────
 
 fileTransferRoutes.post('/:id/upload', async (c) => {
@@ -67,6 +170,18 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   // Permission check
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+
+  const contentLengthHeader = c.req.header('content-length');
+  const contentLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : Number.NaN;
+  if (
+    Number.isFinite(contentLength)
+    && contentLength > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE + MULTIPART_UPLOAD_OVERHEAD_BYTES
+  ) {
+    return c.json({
+      error: 'file_too_large',
+      maxBytes: FILE_TRANSFER_LIMITS.MAX_FILE_SIZE,
+    }, 413);
+  }
 
   // Parse multipart
   const formData = await c.req.formData().catch(() => null);
@@ -93,49 +208,168 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   const uploadId = randomHex(16);
   const ext = path.extname(file.name || '').replace(/[^a-zA-Z0-9.]/g, '').slice(0, 20);
   const filename = `${randomHex(16)}${ext}`;
-
-  // Read file as base64
-  const arrayBuffer = await file.arrayBuffer();
-  const content = Buffer.from(arrayBuffer).toString('base64');
-
-  const uploadMsg: FileUploadRequest = {
-    type: 'file.upload',
-    uploadId,
-    filename,
-    originalName: file.name || undefined,
-    mime: file.type || undefined,
-    size: file.size,
-    content,
+  const stagedDir = await mkdtemp(path.join(tmpdir(), STAGED_UPLOAD_PREFIX));
+  const stagedPath = path.join(stagedDir, filename);
+  const stagedSize = await persistStagedUpload(file, stagedPath).catch(async (err) => {
+    await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
+    throw err;
+  });
+  if (stagedSize !== file.size) {
+    await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
+    return c.json({ error: 'upload_failed', message: 'size_mismatch' }, 400);
+  }
+  const supportsRelayFetch = bridge.hasDaemonCapability(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
+  let relayStaged = false;
+  let legacyStageDeleted = false;
+  const cleanupUploadStage = () => {
+    if (relayStaged) {
+      deleteStagedUpload(uploadId);
+      return;
+    }
+    if (legacyStageDeleted) return;
+    legacyStageDeleted = true;
+    void rm(stagedDir, { recursive: true, force: true }).catch((err) => {
+      logger.warn({ uploadId, err }, 'Failed to clean legacy staged upload');
+    });
   };
 
-  try {
-    const result = await bridge.sendFileTransferRequest(
+  let uploadMsg: FileUploadFetchRequest | FileUploadRequest;
+  if (supportsRelayFetch) {
+    const token = randomHex(32);
+    const expiresAt = Date.now() + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS;
+    const timer = setTimeout(() => deleteStagedUpload(uploadId), FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS);
+    timer.unref?.();
+    stagedUploads.set(uploadId, {
+      serverId,
+      token,
+      dir: stagedDir,
+      filePath: stagedPath,
+      size: stagedSize,
+      mime: file.type || undefined,
+      expiresAt,
+      timer,
+    });
+    relayStaged = true;
+
+    uploadMsg = {
+      type: 'file.upload_fetch',
       uploadId,
-      uploadMsg as unknown as Record<string, unknown>,
-      FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS,
-    );
-
-    if (result.type === 'file.upload_error') {
-      logger.warn({ serverId, uploadId, error: result.message }, 'Daemon upload error');
-      return c.json({ error: 'upload_failed', message: result.message }, 500);
-    }
-
-    const attachment = result.attachment as AttachmentRef;
-    // Server fills serverId (daemon doesn't know it)
-    attachment.serverId = serverId;
-    return c.json({ ok: true, attachment });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg === 'daemon_offline' || msg === 'daemon_disconnected' || msg === 'daemon_error') {
-      return c.json({ error: 'daemon_offline' }, 503);
-    }
-    if (msg === 'timeout') {
-      logger.warn({ serverId, uploadId }, 'Upload timeout');
-      return c.json({ error: 'upload_timeout' }, 504);
-    }
-    logger.error({ serverId, uploadId, err }, 'Upload relay failed');
-    return c.json({ error: 'upload_failed' }, 500);
+      filename,
+      originalName: file.name || undefined,
+      mime: file.type || undefined,
+      size: file.size,
+      downloadUrl: buildStagedUploadUrl(c.req.url, serverId, uploadId, token),
+    };
+  } else {
+    uploadMsg = {
+      type: 'file.upload',
+      uploadId,
+      filename,
+      originalName: file.name || undefined,
+      mime: file.type || undefined,
+      size: file.size,
+      content: (await readFile(stagedPath)).toString('base64'),
+    };
   }
+
+  const runDaemonFetch = async (onProgress?: (msg: Record<string, unknown>) => void): Promise<Response> => {
+    try {
+      const result = await bridge.sendFileTransferRequest(
+        uploadId,
+        uploadMsg as unknown as Record<string, unknown>,
+        FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS,
+        onProgress,
+      );
+
+      if (result.type === 'file.upload_error') {
+        logger.warn({ serverId, uploadId, error: result.message }, 'Daemon upload error');
+        return c.json({ error: 'upload_failed', message: result.message }, 500);
+      }
+
+      const attachment = result.attachment as AttachmentRef;
+      // Server fills serverId (daemon doesn't know it)
+      attachment.serverId = serverId;
+      return c.json({ ok: true, attachment });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg === 'daemon_offline' || msg === 'daemon_disconnected' || msg === 'daemon_error') {
+        return c.json({ error: 'daemon_offline' }, 503);
+      }
+      if (msg === 'timeout') {
+        logger.warn({ serverId, uploadId }, 'Upload timeout');
+        return c.json({ error: 'upload_timeout' }, 504);
+      }
+      logger.error({ serverId, uploadId, err }, 'Upload relay failed');
+      return c.json({ error: 'upload_failed' }, 500);
+    } finally {
+      cleanupUploadStage();
+    }
+  };
+
+  if (!wantsUploadProgressStream(c.req.header('accept'))) {
+    return runDaemonFetch();
+  }
+
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let closed = false;
+      const write = (payload: unknown) => {
+        if (closed) return;
+        controller.enqueue(encoder.encode(jsonLine(payload)));
+      };
+      try {
+        write({
+          type: 'file.upload_progress',
+          uploadId,
+          loaded: 0,
+          total: file.size,
+        });
+        const result = await bridge.sendFileTransferRequest(
+          uploadId,
+          uploadMsg as unknown as Record<string, unknown>,
+          FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS,
+          (msg) => write(msg),
+        );
+
+        if (result.type === 'file.upload_error') {
+          logger.warn({ serverId, uploadId, error: result.message }, 'Daemon upload error');
+          write({ type: 'file.upload_error', uploadId, error: 'upload_failed', message: result.message });
+          return;
+        }
+
+        const attachment = result.attachment as AttachmentRef;
+        attachment.serverId = serverId;
+        write({ type: 'file.upload_done', uploadId, ok: true, attachment });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg === 'timeout') {
+          logger.warn({ serverId, uploadId }, 'Upload timeout');
+          write({ type: 'file.upload_error', uploadId, error: 'upload_timeout' });
+        } else if (msg === 'daemon_offline' || msg === 'daemon_disconnected' || msg === 'daemon_error') {
+          write({ type: 'file.upload_error', uploadId, error: 'daemon_offline' });
+        } else {
+          logger.error({ serverId, uploadId, err }, 'Upload relay failed');
+          write({ type: 'file.upload_error', uploadId, error: 'upload_failed' });
+        }
+      } finally {
+        cleanupUploadStage();
+        closed = true;
+        controller.close();
+      }
+    },
+    cancel() {
+      cleanupUploadStage();
+    }
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'Content-Type': `${UPLOAD_PROGRESS_STREAM_MIME}; charset=utf-8`,
+      'Cache-Control': 'no-store',
+    },
+  });
 });
 
 // ── POST /api/server/:id/uploads/:attachmentId/download-token ────────────────

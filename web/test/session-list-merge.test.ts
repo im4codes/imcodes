@@ -22,7 +22,14 @@ import {
   SUPERVISION_TRANSPORT_CONFIG_KEY,
   type SessionSupervisionSnapshot,
 } from '@shared/supervision-config.js';
-import { mergeSessionListEntry, type IncomingSessionListEntry } from '../src/session-list-merge.js';
+import {
+  isNavigableMainSession,
+  isSubSessionName,
+  isWorkerSessionName,
+  mergeSessionListEntry,
+  parseMainSessionName,
+  type IncomingSessionListEntry,
+} from '../src/session-list-merge.js';
 import type { SessionInfo } from '../src/types.js';
 
 const BASE_INCOMING: IncomingSessionListEntry = {
@@ -181,11 +188,29 @@ describe('mergeSessionListEntry — general field behavior', () => {
       label: 'Main Brain',
       modelDisplay: 'gpt-5.4',
       effort: 'high',
+      contextNamespace: { scope: 'personal', projectId: 'repo-existing' },
+      contextNamespaceDiagnostics: ['namespace:existing'],
     }));
 
     expect(merged.label).toBe('Main Brain');
     expect(merged.modelDisplay).toBe('gpt-5.4');
     expect(merged.effort).toBe('high');
+    expect(merged.contextNamespace).toEqual({ scope: 'personal', projectId: 'repo-existing' });
+    expect(merged.contextNamespaceDiagnostics).toEqual(['namespace:existing']);
+  });
+
+  it('copies incoming context namespace for project-scoped memory tools', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      contextNamespace: { scope: 'personal', projectId: 'repo-current' },
+      contextNamespaceDiagnostics: ['namespace:explicit'],
+    }, makeExisting({
+      contextNamespace: { scope: 'personal', projectId: 'repo-old' },
+      contextNamespaceDiagnostics: ['namespace:old'],
+    }));
+
+    expect(merged.contextNamespace).toEqual({ scope: 'personal', projectId: 'repo-current' });
+    expect(merged.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
   });
 
   it('preserves codex quota display when a transient broadcast omits or nulls it', () => {
@@ -318,5 +343,32 @@ describe('mergeSessionListEntry — general field behavior', () => {
 
     expect(merged.transportPendingMessages).toEqual([]);
     expect(merged.transportPendingMessageEntries).toEqual([]);
+  });
+});
+
+describe('session navigation visibility', () => {
+  it('parses main brain and worker session names without losing underscored project slugs', () => {
+    expect(parseMainSessionName('deck_my_proj_brain')).toEqual({
+      project: 'my_proj',
+      role: 'brain',
+    });
+    expect(parseMainSessionName('deck_my_proj_w12')).toEqual({
+      project: 'my_proj',
+      role: 'w12',
+    });
+  });
+
+  it('identifies sub-sessions and worker main sessions as hidden from top-level navigation', () => {
+    expect(isSubSessionName('deck_sub_abc123')).toBe(true);
+    expect(isWorkerSessionName('deck_proj_w1')).toBe(true);
+    expect(isNavigableMainSession({ name: 'deck_sub_abc123', role: 'brain' })).toBe(false);
+    expect(isNavigableMainSession({ name: 'deck_proj_w1', role: 'w1' })).toBe(false);
+    expect(isNavigableMainSession({ name: 'deck_proj_w1', role: 'brain' })).toBe(false);
+  });
+
+  it('keeps only brain sessions visible as independent top-level windows', () => {
+    expect(isNavigableMainSession({ name: 'deck_proj_brain', role: 'brain' })).toBe(true);
+    expect(isNavigableMainSession({ name: 'deck_proj_brain', role: 'w1' })).toBe(false);
+    expect(isNavigableMainSession({ name: 'custom_session', role: 'brain' })).toBe(true);
   });
 });

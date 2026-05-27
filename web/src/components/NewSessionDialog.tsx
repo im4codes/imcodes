@@ -47,6 +47,18 @@ const CURSOR_HEADLESS_MODEL_FALLBACK = ["auto", "composer-2-fast", "gpt-5.2"] as
 const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5.4", "gpt-5.4-mini"] as const;
 const CODEX_SDK_MODEL_FALLBACK = [...CODEX_MODEL_IDS] as const;
 const GEMINI_SDK_MODEL_FALLBACK = [...GEMINI_MODEL_IDS];
+const responsiveDialogStyle = {
+  // Hard-cap against the visual viewport instead of relying on flex padding.
+  // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
+  // which clips the custom-provider help text into one-character columns.
+  width: "calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)",
+  maxWidth: 380,
+  minWidth: 0,
+  boxSizing: "border-box",
+  // Long help/preset labels (e.g. Qwen provider URLs) must wrap inside the
+  // narrow viewport instead of forcing the dialog to grow past max-width.
+  overflowWrap: "anywhere",
+} as const;
 
 interface Props {
   ws: WsClient | null;
@@ -66,6 +78,7 @@ type AgentType =
   | "opencode"
   | "gemini"
   | "gemini-sdk"
+  | "kimi-sdk"
   | "openclaw"
   | "qwen";
 type OpenClawMode = "new" | "bind";
@@ -91,6 +104,8 @@ export function NewSessionDialog({
   const [project, setProject] = useState("");
   const [dir, setDir] = useState("~/");
   const [agentType, setAgentType] = useState<AgentType>("claude-code-sdk");
+  const [lastUnlockedAgentType, setLastUnlockedAgentType] = useState<AgentType>("claude-code-sdk");
+  const [customProviderSdk, setCustomProviderSdk] = useState(false);
   const [requestedModel, setRequestedModel] = useState("");
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
@@ -159,6 +174,22 @@ export function NewSessionDialog({
       ws?.send({ type: CC_PRESET_MSG.SAVE, requestId: `cc-preset-save-${Date.now()}`, presets: updated });
     } catch {}
     return preset;
+  };
+  const selectAgentType = (nextAgentType: AgentType) => {
+    setAgentType(nextAgentType);
+    if (!customProviderSdk) setLastUnlockedAgentType(nextAgentType);
+    setError("");
+  };
+  const toggleCustomProviderSdk = (enabled: boolean) => {
+    setCustomProviderSdk(enabled);
+    setError("");
+    setPresetError("");
+    if (enabled) {
+      if (agentType !== "qwen") setLastUnlockedAgentType(agentType);
+      setAgentType("qwen");
+      return;
+    }
+    setAgentType(lastUnlockedAgentType);
   };
   const selectedCcPreset = useMemo(
     () => ccPresets.find((preset) => preset.name === ccPreset),
@@ -347,6 +378,12 @@ export function NewSessionDialog({
     return () => clearTimeout(timeout);
   }, [starting, ws]);
 
+  useEffect(() => {
+    if (!customProviderSdk) return;
+    if (agentType !== "qwen") setAgentType("qwen");
+    if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
+  }, [agentType, ccPreset, ccPresets, customProviderSdk]);
+
   const handleStart = () => {
     if (!project.trim()) {
       setError(t("new_session.project_required"));
@@ -362,6 +399,11 @@ export function NewSessionDialog({
     }
     if (!ws.connected) {
       setError(t("new_session.daemon_offline"));
+      return;
+    }
+    if (customProviderSdk && !ccPreset) {
+      setError(t("new_session.custom_provider_preset_required"));
+      setShowPresetEditor(true);
       return;
     }
 
@@ -403,6 +445,7 @@ export function NewSessionDialog({
           || agentType === "copilot-sdk"
           || agentType === "cursor-headless"
           || agentType === "gemini-sdk"
+          || agentType === "kimi-sdk"
           || agentType === "qwen") &&
         requestedModel.trim()
       ) {
@@ -426,10 +469,11 @@ export function NewSessionDialog({
   const agentFlavor =
     agentType === "claude-code" || agentType === "codex"
       ? "cli"
-      : agentType === "claude-code-sdk" || agentType === "codex-sdk"
+      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "kimi-sdk"
         ? "sdk"
         : null;
-  const thinkingLevels =
+  const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
+  const thinkingLevels: readonly TransportEffortLevel[] =
     agentType === "claude-code-sdk"
       ? CLAUDE_SDK_EFFORT_LEVELS
       : agentType === "codex-sdk"
@@ -437,17 +481,23 @@ export function NewSessionDialog({
         : agentType === "copilot-sdk"
           ? COPILOT_SDK_EFFORT_LEVELS
           : agentType === "qwen"
-            ? QWEN_EFFORT_LEVELS
+            ? (qwenCompatibleApiPresetSelected ? ["high"] : QWEN_EFFORT_LEVELS)
             : agentType === "openclaw"
               ? OPENCLAW_THINKING_LEVELS
               : [];
   const supportsCcPreset = agentType === "claude-code" || agentType === "qwen";
+  const providerPresetLabel = customProviderSdk
+    ? t("new_session.custom_provider_preset")
+    : agentType === "qwen"
+      ? t("new_session.compatible_api_via_qwen")
+      : t("new_session.api_provider");
   const supportsModelSelection =
     agentType === "claude-code-sdk"
     || agentType === "codex-sdk"
     || agentType === "copilot-sdk"
     || agentType === "cursor-headless"
     || agentType === "gemini-sdk"
+    || agentType === "kimi-sdk"
     || (agentType === "qwen" && !!selectedCcPreset);
   const dynamicModelsAgentType = supportsDynamicTransportModels(agentType)
     ? agentType
@@ -485,7 +535,7 @@ export function NewSessionDialog({
 
   useEffect(() => {
     setThinking("high");
-  }, [agentType]);
+  }, [agentType, qwenCompatibleApiPresetSelected]);
 
   useEffect(() => {
     if (agentType !== "qwen") return;
@@ -514,32 +564,20 @@ export function NewSessionDialog({
   };
 
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "#00000080",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        zIndex: 9999,
-      }}
-      onKeyDown={handleKey}
-      role="dialog"
-    >
-      <div
-        style={{
-          background: "#1e293b",
-          border: "1px solid #334155",
-          borderRadius: 8,
-          padding: 24,
-          width: 400,
-        }}
-      >
-        <h2 style={{ margin: "0 0 20px", fontSize: 16, color: "#f1f5f9" }}>
-          {t("new_session.title")}
-        </h2>
+    <div class="dialog-overlay" onKeyDown={handleKey} role="dialog">
+      <div class="dialog" style={responsiveDialogStyle}>
+        <div class="dialog-header">
+          <h2>{t("new_session.title")}</h2>
+          <button
+            class="dialog-close"
+            onClick={onClose}
+            disabled={starting}
+          >
+            ×
+          </button>
+        </div>
 
+        <div class="dialog-body">
         <div class="form-group">
           <label>{t("new_session.project_name")}</label>
           <input
@@ -601,6 +639,11 @@ export function NewSessionDialog({
               setDir(paths[0] ?? "");
               setShowDirBrowser(false);
             }}
+            onDirectoryCreated={(path) => {
+              setDir(path);
+              setShowDirBrowser(false);
+              setError("");
+            }}
             onClose={() => setShowDirBrowser(false)}
           />
         )}
@@ -609,9 +652,9 @@ export function NewSessionDialog({
           <label>{t("new_session.agent_type")}</label>
           <select
             value={agentType}
-            disabled={starting}
+            disabled={starting || customProviderSdk}
             onInput={(e) =>
-              setAgentType((e.target as HTMLSelectElement).value as AgentType)
+              selectAgentType((e.target as HTMLSelectElement).value as AgentType)
             }
             style={{
               width: "100%",
@@ -633,6 +676,72 @@ export function NewSessionDialog({
               </optgroup>
             ))}
           </select>
+          {/*
+           * R-3-cycle-N — drop the nested flex layout for the help text.
+           * The previous `<label display:flex>` + inner `<span flex:1
+           * min-width:0 display:flex column>` consistently rendered the
+           * help text as a one-character-per-line vertical strip on
+           * narrow phones, despite multiple flex-shorthand tweaks.
+           * Reverting to plain block flow with margin-left indent
+           * eliminates the flex constraint entirely — text wraps based
+           * on parent .form-group width (which is correctly responsive
+           * via `.dialog`'s width:100%; max-width:calc(100vw - ...)`).
+           */}
+          <div style={{ marginTop: 10 }}>
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                cursor: starting ? "not-allowed" : "pointer",
+              }}
+            >
+              {/*
+               * width:auto is REQUIRED to override the global
+               * `.form-group input { width: 100% }` rule. Without it the
+               * checkbox stretches to the full label width (≈340 px),
+               * pushing the span past the dialog's right edge. The span
+               * then inherits `overflow-wrap: anywhere` from the dialog
+               * root and wraps the "Custom provider SDK" label as a
+               * one-character-per-line vertical strip on the screen edge.
+               * Setting margin:0 is paired defense in case form-group ever
+               * grows side margins on inputs.
+               */}
+              <input
+                type="checkbox"
+                checked={customProviderSdk}
+                disabled={starting}
+                onChange={(e) =>
+                  toggleCustomProviderSdk((e.target as HTMLInputElement).checked)
+                }
+                style={{ flex: "0 0 auto", width: "auto", margin: 0 }}
+              />
+              <span
+                style={{
+                  color: "#e2e8f0",
+                  fontSize: 13,
+                  // Match the help text: break at word boundaries, not
+                  // characters, in case the label ever grows to overflow.
+                  overflowWrap: "break-word",
+                  minWidth: 0,
+                  flex: "1 1 auto",
+                }}
+              >
+                {t("new_session.custom_provider_sdk")}
+              </span>
+            </label>
+            <div
+              style={{
+                marginLeft: 24,
+                marginTop: 4,
+                color: "#94a3b8",
+                fontSize: 12,
+                lineHeight: 1.35,
+              }}
+            >
+              {t("new_session.custom_provider_sdk_help")}
+            </div>
+          </div>
           {agentFlavor && (
             <div
               style={{
@@ -749,7 +858,7 @@ export function NewSessionDialog({
                   alignItems: "center",
                 }}
               >
-                <span>{agentType === "qwen" ? "Compatible API (via Qwen)" : t("new_session.api_provider")}</span>
+                <span>{providerPresetLabel}</span>
                 <button
                   type="button"
                   style={{
@@ -1519,7 +1628,19 @@ export function NewSessionDialog({
           </p>
         )}
 
-        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+        </div>
+
+        <div
+          class="dialog-footer"
+          style={{
+            display: "flex",
+            gap: 8,
+            justifyContent: "flex-end",
+            padding: "12px 20px 16px",
+            borderTop: "1px solid #334155",
+            flexShrink: 0,
+          }}
+        >
           <button
             class="btn btn-secondary"
             onClick={onClose}

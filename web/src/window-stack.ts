@@ -27,7 +27,11 @@
  * `31f2a56e` (reverted) and the `7c4e43b3` revert.
  */
 
-export const DESKTOP_WINDOW_STACK_BASE_Z = 5000;
+// Keep managed desktop windows above legacy fallback layers such as
+// SubSessionWindow's 6000 default and mobile file preview's 6500 fallback.
+// Otherwise a temporarily unregistered/restored sub-session can cover a
+// stack-managed window that was just raised.
+export const DESKTOP_WINDOW_STACK_BASE_Z = 7000;
 export const DESKTOP_WINDOW_STACK_STRIDE = 10;
 
 /**
@@ -53,6 +57,7 @@ export const DESKTOP_WINDOW_IDS = {
   localWebPreview: (serverId: string) => `local-web-preview-${serverId}`,
   subSession: (subId: string) => `sub:${subId}`,
   subsessionFileBrowser: (subId: string) => `subsession-filebrowser:${subId}`,
+  subsessionRepo: (subId: string) => `subsession-repo:${subId}`,
 } as const;
 
 export const DESKTOP_WINDOW_KINDS = {
@@ -66,6 +71,7 @@ export const DESKTOP_WINDOW_KINDS = {
   sharedContextDiagnostics: 'shared-context-diagnostics',
   subSession: 'sub-session',
   subsessionFileBrowser: 'subsession-filebrowser',
+  subsessionRepo: 'subsession-repo',
 } as const;
 
 export type DesktopWindowKind = typeof DESKTOP_WINDOW_KINDS[keyof typeof DESKTOP_WINDOW_KINDS] | string;
@@ -134,8 +140,8 @@ export class MutableDesktopWindowStack {
    * already frontmost returns false — this is the critical render-stability
    * guard for rapid pointer events.
    *
-   * For child entries, raising the child raises the OWNING ROOT's order;
-   * banded ordering keeps the child above its owner automatically.
+   * For child entries, raising the child raises the OWNING ROOT's order and
+   * the child's sibling order; banded ordering keeps the child above its owner.
    */
   bringToFront(id: string): boolean {
     const entry = this.entries.get(id);
@@ -143,13 +149,27 @@ export class MutableDesktopWindowStack {
     const rootId = this.getRootId(entry);
     const root = this.entries.get(rootId);
     if (!root) return false;
+    let changed = false;
+
+    if (entry.childOrder !== 0) {
+      let maxChildOrder = entry.childOrder;
+      for (const e of this.entries.values()) {
+        if (e.childOrder !== 0 && e.meta.parentId === rootId && e.childOrder > maxChildOrder) {
+          maxChildOrder = e.childOrder;
+        }
+      }
+      if (entry.childOrder < maxChildOrder) {
+        entry.childOrder = ++this.nextChildOrder;
+        changed = true;
+      }
+    }
 
     // Find the highest current root order.
     let maxOrder = root.order;
     for (const e of this.entries.values()) {
       if (e.childOrder === 0 && e.order > maxOrder) maxOrder = e.order;
     }
-    if (root.order === maxOrder) return false; // already frontmost
+    if (root.order === maxOrder) return changed; // already frontmost
 
     root.order = ++this.nextRootOrder;
     return true;

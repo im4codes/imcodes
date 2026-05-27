@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { fireEvent, render } from '@testing-library/preact';
+import { fireEvent, render, waitFor } from '@testing-library/preact';
 
 // ChatMarkdown's CodeBlock uses react-i18next for the per-block copy button's
 // tooltip. The runtime build aliases react → preact/compat via @preact/preset-vite,
@@ -69,6 +69,28 @@ describe('ChatMarkdown', () => {
     expect(button).not.toBeNull();
     fireEvent.click(button!);
     expect(onDownload).toHaveBeenCalledWith('./README.md');
+  });
+
+  it('shows download progress and failure state for async path downloads', async () => {
+    const onDownload = vi.fn().mockRejectedValue(new Error('missing download handle'));
+    const { container } = render(
+      <ChatMarkdown
+        text="Open ./missing.pdf"
+        onPathClick={() => {}}
+        onDownload={onDownload}
+      />
+    );
+
+    const button = container.querySelector('.chat-dl-btn') as HTMLButtonElement | null;
+    expect(button).not.toBeNull();
+    fireEvent.click(button!);
+
+    expect(button!.disabled).toBe(true);
+    expect(button!.textContent).toBe('…');
+    await waitFor(() => expect(button!.disabled).toBe(false));
+    expect(button!.classList.contains('is-error')).toBe(true);
+    expect(button!.textContent).toBe('!');
+    expect(button!.title).toBe('missing download handle');
   });
 
   it('renders a download button for backtick file paths and calls onDownload', () => {
@@ -164,6 +186,100 @@ describe('ChatMarkdown', () => {
     expect(button).not.toBeNull();
     fireEvent.click(button!);
     expect(onDownload).toHaveBeenCalledWith('./dist/report.pdf');
+  });
+
+  it.each([
+    ['plain text path', 'Open ./dist/index.html', './dist/index.html'],
+    ['markdown link', '[preview](./dist/INDEX.HTML)', './dist/INDEX.HTML'],
+    ['code span', 'Open `./dist/index.htm`', './dist/index.htm'],
+    ['fenced code block', '```bash\n./dist/index.html\n```', './dist/index.html'],
+  ])('renders download then HTML preview actions for %s', (_name, text, expectedPath) => {
+    const onDownload = vi.fn();
+    const onHtmlPreview = vi.fn();
+    const { container } = render(
+      <ChatMarkdown
+        text={text}
+        onPathClick={() => {}}
+        onDownload={onDownload}
+        onHtmlPreview={onHtmlPreview}
+      />,
+    );
+
+    const action = container.querySelector('.chat-path-actions') as HTMLElement | null;
+    expect(action).not.toBeNull();
+    const children = Array.from(action!.children);
+    expect(children[0].classList.contains('chat-path-link')).toBe(true);
+    expect(children[1].classList.contains('chat-dl-btn')).toBe(true);
+    expect(children[2].classList.contains('chat-html-preview-btn')).toBe(true);
+
+    fireEvent.click(children[1] as HTMLButtonElement);
+    expect(onDownload).toHaveBeenCalledWith(expectedPath);
+    fireEvent.click(children[2] as HTMLButtonElement);
+    expect(onHtmlPreview).toHaveBeenCalledWith(expectedPath);
+  });
+
+  it('does not render HTML preview for non-HTML paths or without a preview callback', () => {
+    const withNonHtml = render(
+      <ChatMarkdown
+        text="Open ./dist/readme.md"
+        onPathClick={() => {}}
+        onHtmlPreview={() => {}}
+      />,
+    );
+    expect(withNonHtml.container.querySelector('.chat-html-preview-btn')).toBeNull();
+
+    const withoutCallback = render(
+      <ChatMarkdown
+        text="Open ./dist/index.html"
+        onPathClick={() => {}}
+        onDownload={() => {}}
+      />,
+    );
+    expect(withoutCallback.container.querySelector('.chat-html-preview-btn')).toBeNull();
+  });
+
+  it('renders local image paths inline and reuses the shared lightbox zoom', async () => {
+    const onImagePreview = vi.fn().mockResolvedValue({
+      dataUrl: 'data:image/png;base64,aW1n',
+      alt: 'result.png',
+    });
+    const { container } = render(
+      <ChatMarkdown
+        text="Open ./screenshots/result.png"
+        onPathClick={() => {}}
+        onImagePreview={onImagePreview}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('.chat-local-image-preview-img')).not.toBeNull();
+    });
+    expect(onImagePreview).toHaveBeenCalledWith('./screenshots/result.png');
+
+    const image = container.querySelector('.chat-local-image-preview-img') as HTMLImageElement;
+    expect(image.src).toBe('data:image/png;base64,aW1n');
+
+    fireEvent.click(image);
+    expect(container.querySelector('.fb-lightbox')).not.toBeNull();
+    fireEvent.click(container.querySelector('.fb-lightbox-close') as HTMLButtonElement);
+    expect(container.querySelector('.fb-lightbox')).toBeNull();
+  });
+
+  it('renders local markdown image links through the same inline preview path', async () => {
+    const onImagePreview = vi.fn().mockResolvedValue('data:image/webp;base64,d2VicA==');
+    const { container } = render(
+      <ChatMarkdown
+        text="![rendered preview](./out/page.webp)"
+        onPathClick={() => {}}
+        onImagePreview={onImagePreview}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('.chat-local-image-preview-img')).not.toBeNull();
+    });
+    expect(container.querySelector('.chat-path-link')?.textContent).toBe('rendered preview');
+    expect(onImagePreview).toHaveBeenCalledWith('./out/page.webp');
   });
 
   it('does not detect paths inside URLs', () => {

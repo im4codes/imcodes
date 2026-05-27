@@ -2691,16 +2691,27 @@ export function listContextObservations(filters: {
   namespaceId?: string;
   scope?: MemoryScope;
   class?: ObservationClass;
+  state?: ObservationState | readonly ObservationState[];
   projectionId?: string;
 } = {}): ContextObservationRow[] {
   const database = ensureDb();
   const rows = database.prepare('SELECT * FROM context_observations ORDER BY updated_at DESC, id ASC').all() as Array<Record<string, unknown>>;
+  const states = Array.isArray(filters.state) ? new Set(filters.state) : undefined;
+  const state = typeof filters.state === 'string' ? filters.state : undefined;
   return rows
     .map(observationRowFromDb)
     .filter((row) => !filters.namespaceId || row.namespaceId === filters.namespaceId)
     .filter((row) => !filters.scope || row.scope === filters.scope)
     .filter((row) => !filters.class || row.class === filters.class)
+    .filter((row) => !filters.state || (states ? states.has(row.state) : row.state === state))
     .filter((row) => !filters.projectionId || row.projectionId === filters.projectionId);
+}
+
+export function getContextObservationById(id: string): ContextObservationRow | null {
+  const database = ensureDb();
+  const row = database.prepare('SELECT * FROM context_observations WHERE id = ?')
+    .get(id) as Record<string, unknown> | undefined;
+  return row ? observationRowFromDb(row) : null;
 }
 
 export function updateContextObservationText(input: {

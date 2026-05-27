@@ -357,7 +357,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
             <div style={{ display: 'flex', gap: '12px', fontSize: '12px', color: '#94a3b8', marginBottom: '8px', flexWrap: 'wrap' }}>
               <span style={{ fontFamily: 'monospace', color: '#cbd5e1' }}>{job.cron_expr}</span>
               <span>→ {displayTarget(job)}</span>
-              {action?.type === 'p2p' && <span style={{ opacity: 0.6 }}>P2P {action.mode}</span>}
+              {action?.type === 'p2p' && <span style={{ opacity: 0.6 }}>Team {action.mode}</span>}
               {action?.type === 'command' && <span style={{ opacity: 0.6, maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
               {action?.type === 'send' && <span style={{ opacity: 0.6, maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('common.send')} → {action.target}</span>}
             </div>
@@ -468,7 +468,7 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
               <span>{fmtTime(exec.created_at)}</span>
               {showAllServers && <span>{serverNameMap.get(exec.server_id) ?? exec.server_id.slice(0, 6)} / {exec.project_name}</span>}
               <span>→ {exec.target_role}</span>
-              {action?.type === 'p2p' && <span>P2P {action.mode}</span>}
+              {action?.type === 'p2p' && <span>Team {action.mode}</span>}
               {action?.type === 'command' && <span style={{ maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
               {action?.type === 'send' && <span style={{ maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('common.send')} → {action.target}</span>}
               {hasP2p && onViewDiscussion && (
@@ -546,7 +546,7 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
           <div style={{ marginTop: '2px' }}><strong style={{ color: '#cbd5e1' }}>{t('cron.action_command')}:</strong> <code style={{ color: '#e2e8f0' }}>{action.command}</code></div>
         )}
         {action?.type === 'p2p' && (
-          <div style={{ marginTop: '2px' }}><strong style={{ color: '#cbd5e1' }}>P2P:</strong> {action.mode} · {action.rounds ?? 1} {t('cron.p2p_rounds').toLowerCase()}</div>
+          <div style={{ marginTop: '2px' }}><strong style={{ color: '#cbd5e1' }}>Team:</strong> {action.mode} · {action.rounds ?? 1} {t('cron.p2p_rounds').toLowerCase()}</div>
         )}
         {action?.type === 'send' && (
           <div style={{ marginTop: '2px' }}><strong style={{ color: '#cbd5e1' }}>{t('common.send')}:</strong> {action.target}</div>

@@ -23,6 +23,7 @@ import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.j
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
+import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import {
   normalizeTransportCwd,
   resolveBinaryWithWindowsFallbacks,
@@ -74,6 +75,8 @@ interface CursorSessionState {
   completed: boolean;
   emittedToolSignatures: Map<string, string>;
   lastStatusSignature: string | null;
+  /** Stable IM.codes context already injected into this Cursor chat history. */
+  sessionSystemTextInjected?: string;
 }
 
 function isTruthyString(value: unknown): value is string {
@@ -276,6 +279,7 @@ export class CursorHeadlessProvider implements TransportProvider {
             ? routeId
             : await this.createRemoteChat(config, model);
 
+    const carryExistingHistory = !!existingEntry && !config.fresh;
     const state: CursorSessionState = {
       routeId,
       resumeId,
@@ -291,6 +295,7 @@ export class CursorHeadlessProvider implements TransportProvider {
       completed: false,
       emittedToolSignatures: new Map(),
       lastStatusSignature: null,
+      sessionSystemTextInjected: carryExistingHistory ? existingEntry?.[1].sessionSystemTextInjected : undefined,
     };
     this.sessions.set(routeId, state);
     this.emitSessionInfo(routeId, {
@@ -385,7 +390,9 @@ export class CursorHeadlessProvider implements TransportProvider {
     state.lastStatusSignature = null;
 
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
-    const prompt = this.composePrompt(payload);
+    const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
+    const includeSessionSystemText = !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
+    const prompt = this.composePrompt(payload, includeSessionSystemText);
     const resolved = resolveExecutableForSpawn(this.resolveBinaryPath(this.config));
     const resumeId = await this.ensureResumeId(state, resolved);
     const args = [
@@ -534,6 +541,7 @@ export class CursorHeadlessProvider implements TransportProvider {
         completed = true;
         state.completed = true;
         state.child = null;
+        if (includeSessionSystemText) state.sessionSystemTextInjected = sessionSystemText;
         state.currentMessageId ??= randomUUID();
         const message: AgentMessage = {
           id: state.currentMessageId,
@@ -682,9 +690,8 @@ export class CursorHeadlessProvider implements TransportProvider {
     return this.config?.force !== false;
   }
 
-  private composePrompt(payload: ProviderContextPayload): string {
-    const parts = [payload.systemText?.trim(), payload.assembledMessage?.trim()].filter((part): part is string => !!part && part.length > 0);
-    return parts.join('\n\n');
+  private composePrompt(payload: ProviderContextPayload, includeSessionSystemText: boolean): string {
+    return composeMessageSideProviderPrompt(payload, { includeSessionSystemText, labelContextInstructions: false });
   }
 
   private async createRemoteChat(config: SessionConfig, model?: string): Promise<string> {

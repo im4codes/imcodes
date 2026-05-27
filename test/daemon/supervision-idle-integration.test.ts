@@ -101,6 +101,7 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
 vi.mock('../../src/daemon/repo-handler.js', () => ({ handleRepoCommand: vi.fn() }));
 vi.mock('../../src/daemon/file-transfer-handler.js', () => ({
   handleFileUpload: vi.fn(),
+  handleFileUploadFetch: vi.fn(),
   handleFileDownload: vi.fn(),
   createProjectFileHandle: vi.fn(),
   createProjectFileHandleFromValidatedPath: vi.fn(),

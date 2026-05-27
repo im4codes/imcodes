@@ -155,7 +155,7 @@ describe('supervision config helpers', () => {
     expect(transportConfig[SUPERVISION_TRANSPORT_CONFIG_KEY]).toBeDefined();
   });
 
-  it('exposes the audit-mode allowlist from built-in combos', () => {
+  it('exposes the supervision audit-mode allowlist independently from default Team combos', () => {
     expect(getSupportedSupervisionAuditModes()).toEqual(SUPERVISION_AUDIT_MODES);
     expect(isSupportedSupervisionAuditMode('audit')).toBe(true);
     expect(isSupportedSupervisionAuditMode('audit>plan')).toBe(true);

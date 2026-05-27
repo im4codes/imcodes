@@ -58,9 +58,35 @@ export interface IncomingSessionListEntry {
   quotaUsageLabel?: string | null;
   quotaMeta?: SessionInfo['quotaMeta'];
   effort?: SessionInfo['effort'];
+  contextNamespace?: SessionInfo['contextNamespace'];
+  contextNamespaceDiagnostics?: string[];
   transportConfig?: Record<string, unknown> | null;
   transportPendingMessages?: unknown;
   transportPendingMessageEntries?: unknown;
+}
+
+export function isSubSessionName(sessionName: string): boolean {
+  return sessionName.startsWith('deck_sub_');
+}
+
+export function parseMainSessionName(sessionName: string): { project: string; role: SessionInfo['role'] } | null {
+  const match = /^deck_(.+)_(brain|w\d+)$/.exec(sessionName);
+  if (!match) return null;
+  return {
+    project: match[1],
+    role: match[2] as SessionInfo['role'],
+  };
+}
+
+export function isWorkerSessionName(sessionName: string): boolean {
+  const parsed = parseMainSessionName(sessionName);
+  return Boolean(parsed && parsed.role !== 'brain');
+}
+
+export function isNavigableMainSession(session: { name: string; role?: string | null }): boolean {
+  return !isSubSessionName(session.name)
+    && !isWorkerSessionName(session.name)
+    && session.role === 'brain';
 }
 
 export function mergeSessionListEntry(
@@ -122,6 +148,8 @@ export function mergeSessionListEntry(
     quotaUsageLabel: incoming.quotaUsageLabel ?? (isCodexFamily ? existing?.quotaUsageLabel : undefined),
     quotaMeta: incoming.quotaMeta ?? (isCodexFamily ? existing?.quotaMeta : undefined),
     effort: incoming.effort ?? existing?.effort,
+    contextNamespace: incoming.contextNamespace ?? existing?.contextNamespace,
+    contextNamespaceDiagnostics: incoming.contextNamespaceDiagnostics ?? existing?.contextNamespaceDiagnostics,
     transportConfig: mergeTransportConfigPreservingSupervision(
       incoming.transportConfig,
       existing?.transportConfig,

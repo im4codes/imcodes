@@ -151,12 +151,22 @@ export function resolveExecutableForSpawn(name: string): ResolvedExecutable {
 }
 
 export function terminateChildProcess(child: ChildProcess, escalationMs = 1_500): void {
-  if (child.killed) return;
+  if (child.exitCode != null || child.signalCode != null) return;
+  let closed = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const markClosed = () => {
+    closed = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  child.once('close', markClosed);
   child.kill('SIGTERM');
-  const timer = setTimeout(() => {
-    if (!child.killed) child.kill('SIGKILL');
+  timer = setTimeout(() => {
+    if (!closed) child.kill('SIGKILL');
   }, escalationMs);
-  child.once('close', () => clearTimeout(timer));
+  timer.unref?.();
 }
 
 /** Parse an npm-generated `.cmd` shim and return the absolute path of the

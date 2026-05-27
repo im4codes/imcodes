@@ -3,7 +3,7 @@ import type { ContextNamespace, ContextTargetRef } from '../../shared/context-ty
 import { searchLocalMemory, searchLocalMemoryAuthorized, formatSearchResults } from '../../src/context/memory-search.js';
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
 import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
-import { writeProcessedProjection } from '../../src/store/context-store.js';
+import { ensureContextNamespace, writeContextObservation, writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
 describe('memory-search', () => {
@@ -80,6 +80,39 @@ describe('memory-search', () => {
     expect(sharedResult.items[0]?.summary).toContain('Shared');
   });
 
+  it('includes same-owner user_private processed summaries when searching the project personal namespace', () => {
+    writeProcessedProjection({
+      namespace: { scope: 'user_private', projectId: 'github.com/acme/repo', userId: 'user-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-user-private-bridge'],
+      summary: 'User-private summary should remain visible through project MCP scope',
+      content: {},
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'user_private', projectId: 'github.com/acme/repo', userId: 'user-2' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-other-user-private'],
+      summary: 'Other private summary must stay hidden',
+      content: {},
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'user_private', projectId: 'github.com/other/repo', userId: 'user-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-other-project-private'],
+      summary: 'Other project private summary must stay hidden',
+      content: {},
+    });
+
+    const result = searchLocalMemory({
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' },
+      projectionClass: 'recent_summary',
+    });
+
+    expect(result.items.map((item) => item.summary)).toEqual([
+      'User-private summary should remain visible through project MCP scope',
+    ]);
+  });
+
   it('filters by scope, owner, and repo without requiring an exact namespace object', () => {
     writeProcessedProjection({
       namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' },
@@ -122,6 +155,57 @@ describe('memory-search', () => {
 
     expect(result.items.map((item) => item.summary)).toEqual(['User one personal memory']);
     expect(result.stats.matchedRecords).toBe(1);
+  });
+
+  it('searches first-class observations with exact matches and keeps rejected observations out', () => {
+    const namespaceRow = ensureContextNamespace({ scope: 'user_private', projectId: 'github.com/acme/repo', userId: 'user-1' }, 100);
+    writeContextObservation({
+      namespaceId: namespaceRow.id,
+      scope: 'user_private',
+      class: 'note',
+      origin: 'agent_learned',
+      fingerprint: 'obs-fp-alpha',
+      content: { text: 'mock server alpha lives at alpha.test.im.codes for local e2e checks' },
+      text: 'mock server alpha lives at alpha.test.im.codes for local e2e checks',
+      sourceEventIds: ['turn-alpha'],
+      state: 'candidate',
+      now: 200,
+    });
+    writeContextObservation({
+      namespaceId: namespaceRow.id,
+      scope: 'user_private',
+      class: 'note',
+      origin: 'agent_learned',
+      fingerprint: 'obs-fp-rejected',
+      content: { text: 'alpha.test.im.codes rejected stale detail' },
+      text: 'alpha.test.im.codes rejected stale detail',
+      sourceEventIds: ['turn-rejected'],
+      state: 'rejected',
+      now: 300,
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'user_private', projectId: 'github.com/acme/repo', userId: 'user-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-recent'],
+      summary: 'Recent summary also mentions alpha.test.im.codes',
+      content: {},
+      updatedAt: 400,
+    });
+
+    const result = searchLocalMemory({
+      namespace: { scope: 'user_private', projectId: 'github.com/acme/repo', userId: 'user-1' },
+      query: 'alpha.test.im.codes',
+      limit: 10,
+    });
+
+    expect(result.items[0]).toMatchObject({
+      type: 'observation',
+      observationClass: 'note',
+      observationState: 'candidate',
+      matchKind: 'exact',
+      summary: expect.stringContaining('alpha.test.im.codes'),
+    });
+    expect(result.items.map((item) => item.summary).join('\n')).not.toContain('rejected stale detail');
   });
 
 

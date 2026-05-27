@@ -19,7 +19,7 @@ import {
   P2P_CAPABILITY_FRESHNESS_TTL_MS,
   P2P_WORKFLOW_CAPABILITY_V1,
 } from '@shared/p2p-workflow-constants.js';
-import { useP2pCustomCombos } from './p2p-combos.js';
+import { isRecommendedCombo, useP2pCustomCombos } from './p2p-combos.js';
 import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
@@ -44,7 +44,7 @@ import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { migrateLegacyWorkflowDraft, normalizeWorkflowLibrary } from '@shared/p2p-workflow-library.js';
 import type { P2pWorkflowDraft } from '@shared/p2p-workflow-types.js';
-import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
+import { getQwenAuthTier, QWEN_AUTH_TIERS, QWEN_AUTH_TYPES } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
@@ -118,6 +118,8 @@ interface Props {
   subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
   /** Server ID — required for file upload. */
   serverId?: string;
+  /** Optional larger drop target that should behave like the composer upload area. */
+  fileDropTargetRef?: RefObject<HTMLElement>;
   /** Quoted text segments from chat messages. */
   quotes?: string[];
   /** Called to remove a quote by index. */
@@ -134,10 +136,13 @@ interface Props {
   onOverlayOpenChange?: (open: boolean) => void;
   /** Optional local optimistic update when transport config changes through quick controls. */
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
+  /** Gate version-sensitive panels when the loaded frontend is stale. */
+  onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
 }
 
 const MAX_UPLOAD_SIZE_MB = Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024));
 export const OPENSPEC_LIST_REQUEST_TIMEOUT_MS = 12_000;
+const OPENSPEC_NON_CHANGE_DIR_NAMES = new Set(['archive']);
 const TRANSPORT_QUEUE_HIDDEN_KEY_PREFIX = 'imcodes:transport-queue-hidden:';
 type LocalQueuedTransportEntry = {
   clientMessageId: string;
@@ -205,6 +210,16 @@ function buildPastedTextFileName(now = new Date()): string {
   return `pasted-text-${compact}.txt`;
 }
 
+function dataTransferHasFiles(dataTransfer: DataTransfer | null | undefined): boolean {
+  if (!dataTransfer) return false;
+  if (dataTransfer.files && dataTransfer.files.length > 0) return true;
+  try {
+    return Array.from(dataTransfer.types ?? []).includes('Files');
+  } catch {
+    return false;
+  }
+}
+
 function normalizeQueuedText(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
@@ -237,6 +252,63 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
     return [];
   }
 }
+
+function appendStoredComposerAttachment(storageKey: string, attachment: ComposerAttachment): ComposerAttachment[] {
+  const current = parseStoredComposerAttachments(window.sessionStorage.getItem(storageKey));
+  const next = renumberAttachments([...current, attachment]);
+  window.sessionStorage.setItem(storageKey, JSON.stringify(next));
+  return next;
+}
+
+type ComposerUploadSnapshot = {
+  uploading: boolean;
+  progress: number;
+  error: string | null;
+};
+
+type ComposerUploadEntry = {
+  snapshot: ComposerUploadSnapshot;
+  listeners: Set<(snapshot: ComposerUploadSnapshot) => void>;
+};
+
+const DEFAULT_COMPOSER_UPLOAD_STATE: ComposerUploadSnapshot = {
+  uploading: false,
+  progress: 0,
+  error: null,
+};
+const composerUploadStore = new Map<string, ComposerUploadEntry>();
+
+function getComposerUploadEntry(key: string): ComposerUploadEntry {
+  let entry = composerUploadStore.get(key);
+  if (!entry) {
+    entry = { snapshot: { ...DEFAULT_COMPOSER_UPLOAD_STATE }, listeners: new Set() };
+    composerUploadStore.set(key, entry);
+  }
+  return entry;
+}
+
+function getComposerUploadSnapshot(key: string): ComposerUploadSnapshot {
+  return { ...getComposerUploadEntry(key).snapshot };
+}
+
+function updateComposerUploadSnapshot(key: string, patch: Partial<ComposerUploadSnapshot>): void {
+  const entry = getComposerUploadEntry(key);
+  entry.snapshot = { ...entry.snapshot, ...patch };
+  const next = { ...entry.snapshot };
+  for (const listener of entry.listeners) listener(next);
+}
+
+function subscribeComposerUploadSnapshot(key: string, listener: (snapshot: ComposerUploadSnapshot) => void): () => void {
+  const entry = getComposerUploadEntry(key);
+  entry.listeners.add(listener);
+  listener({ ...entry.snapshot });
+  return () => {
+    entry.listeners.delete(listener);
+    if (entry.listeners.size === 0 && !entry.snapshot.uploading && !entry.snapshot.error) {
+      composerUploadStore.delete(key);
+    }
+  };
+}
 type CodexModelChoice = string;
 type QwenModelChoice = string;
 type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainstorm>discuss>plan' | typeof P2P_CONFIG_MODE
@@ -253,7 +325,7 @@ const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p
 const P2P_SINGLE_COLORS: Record<string, string> = { solo: '#dbe7f5', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
 
 function getP2pSoloDisplayLabel(): string {
-  return 'P2P';
+  return 'Team';
 }
 
 function getP2pModeColor(mode: string): string {
@@ -535,7 +607,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -565,6 +637,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [openSpecAuditMenu, setOpenSpecAuditMenu] = useState<string | null>(null);
   const [openSpecProposeMenuOpen, setOpenSpecProposeMenuOpen] = useState(false);
   const [openSpecExpandedChange, setOpenSpecExpandedChange] = useState<string | null>(null);
+  const [openSpecFolderPath, setOpenSpecFolderPath] = useState<string | null>(null);
   const [openSpecLayoutTick, setOpenSpecLayoutTick] = useState(0);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModelPreference);
@@ -592,11 +665,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [pendingComboSendConfirm, setPendingComboSendConfirm] = useState<PendingComboSendConfirmation | null>(null);
   const [rememberComboSendChoice, setRememberComboSendChoice] = useState(false);
   const [pendingTransportApproval, setPendingTransportApproval] = useState<PendingTransportApproval | null>(null);
+  const [fileDragActive, setFileDragActive] = useState(false);
+  const controlsWrapperRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
   const autoRef = useRef<HTMLDivElement>(null);
   const thinkingRef = useRef<HTMLDivElement>(null);
   const p2pRef = useRef<HTMLDivElement>(null);
+  const p2pDropdownRef = useRef<HTMLDivElement | null>(null);
   const openSpecRef = useRef<HTMLDivElement>(null);
   const openSpecDropdownRef = useRef<HTMLDivElement | null>(null);
   const openSpecSubmenuRef = useRef<HTMLDivElement | null>(null);
@@ -666,11 +742,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const draftRef = useRef('');      // saved unsent text while navigating
   const imeComposingRef = useRef(false);
   const attachmentDraftRef = useRef<ComposerAttachment[]>([]);
+  const composerDraftScope = buildComposerDraftScope(activeSession, subSessionId);
+  const draftKey = composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
+  const attachmentDraftKey = composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
+  const attachmentDraftKeyRef = useRef<string | null>(attachmentDraftKey);
+  attachmentDraftKeyRef.current = attachmentDraftKey;
+  const mountedRef = useRef(true);
+  const composerUploadKey = composerDraftScope ? `composer:${composerDraftScope}` : 'composer:global';
   // File upload state
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [uploading, setUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
-  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadSnapshot, setUploadSnapshot] = useState(() => getComposerUploadSnapshot(composerUploadKey));
+  const uploading = uploadSnapshot.uploading;
+  const uploadProgress = uploadSnapshot.progress;
+  const uploadError = uploadSnapshot.error;
   const [sendWarning, setSendWarning] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -691,6 +775,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return () => {
       el.removeEventListener('compositionstart', handleCompositionStart);
       el.removeEventListener('compositionend', handleCompositionEnd);
+    };
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
     };
   }, []);
 
@@ -729,9 +820,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, []);
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
-  const composerDraftScope = buildComposerDraftScope(activeSession, subSessionId);
-  const draftKey = composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
-  const attachmentDraftKey = composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
   const [hydratedAttachmentDraftKey, setHydratedAttachmentDraftKey] = useState<string | null>(null);
   useEffect(() => {
     if (!draftKey || !divRef.current) return;
@@ -769,6 +857,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       /* ignore */
     }
   }, [attachmentDraftKey, attachments, hydratedAttachmentDraftKey]);
+
+  useEffect(() => subscribeComposerUploadSnapshot(composerUploadKey, setUploadSnapshot), [composerUploadKey]);
 
   useEffect(() => () => {
     if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);
@@ -866,7 +956,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isCopilot = activeSession?.agentType === 'copilot-sdk';
   const isCursorHeadless = activeSession?.agentType === 'cursor-headless';
   const isGeminiSdk = activeSession?.agentType === 'gemini-sdk';
-  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isGeminiSdk;
+  const isKimiSdk = activeSession?.agentType === 'kimi-sdk';
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isGeminiSdk || isKimiSdk;
   // Source-of-truth priority for the model picker:
   //   1. `useTransportModels` — live daemon probe via `transport.list_models`
   //      WS round-trip. Works uniformly for main sessions AND sub-sessions
@@ -900,12 +991,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (isGeminiSdk) {
       return GEMINI_SDK_MODEL_SUGGESTIONS;
     }
+    if (isKimiSdk) {
+      return dynamicTransportModels.models.map((m) => m.id);
+    }
     return [];
   }, [
     dynamicTransportModels.models,
     isCopilot,
     isCursorHeadless,
     isGeminiSdk,
+    isKimiSdk,
     activeSession?.copilotAvailableModels,
     activeSession?.cursorAvailableModels,
   ]);
@@ -926,19 +1021,21 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const displayedCodexModel = activeSession?.agentType === 'codex-sdk'
     ? genericTransportModel
     : (genericTransportModel ?? codexModel);
+  const qwenCompatibleApiSession = activeSession?.agentType === 'qwen'
+    && (!!activeSession?.ccPreset || activeSession?.qwenAuthType === QWEN_AUTH_TYPES.API_KEY);
   const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
     activeSession?.agentType === 'claude-code-sdk'
       ? CLAUDE_SDK_EFFORT_LEVELS
       : activeSession?.agentType === 'codex-sdk'
         ? CODEX_SDK_EFFORT_LEVELS
         : activeSession?.agentType === 'qwen'
-          ? QWEN_EFFORT_LEVELS
+          ? (qwenCompatibleApiSession ? ['high'] : QWEN_EFFORT_LEVELS)
           : activeSession?.agentType === 'copilot-sdk'
             ? COPILOT_SDK_EFFORT_LEVELS
           : activeSession?.agentType === 'openclaw'
             ? OPENCLAW_THINKING_LEVELS
             : []
-  ), [activeSession?.agentType]);
+  ), [activeSession?.agentType, qwenCompatibleApiSession]);
   const supportsThinking = thinkingLevels.length > 0;
   // Default the pill to a sensible value whenever the agent supports thinking
   // but the session doesn't yet have an `effort` persisted. Prefer 'high' if
@@ -949,8 +1046,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         ? 'high'
         : thinkingLevels[thinkingLevels.length - 1])
     : undefined;
-  const currentThinking = (activeSession?.effort as TransportEffortLevel | undefined)
-    ?? defaultThinkingForAgent;
+  const persistedThinking = activeSession?.effort as TransportEffortLevel | undefined;
+  const currentThinking = persistedThinking && thinkingLevels.includes(persistedThinking)
+    ? persistedThinking
+    : defaultThinkingForAgent;
   const qwenTier = getQwenAuthTier(activeSession?.qwenAuthType);
   const qwenTierLabel = qwenTier === QWEN_AUTH_TIERS.FREE
     ? t('session.qwen_tier_free')
@@ -1025,6 +1124,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     || cloneDialogOpen
     || openSpecAuditMenu !== null
     || openSpecProposeMenuOpen
+    || !!openSpecFolderPath
     || voiceOpen
     || !!mobileFileBrowserOpen;
 
@@ -1172,45 +1272,66 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecError(null);
     setOpenSpecLoading(false);
     setOpenSpecAuditMenu(null);
+    setOpenSpecProposeMenuOpen(false);
     setOpenSpecExpandedChange(null);
+    setOpenSpecFolderPath(null);
     openSpecRequestIdRef.current = null;
   }, [activeSession?.projectDir, clearOpenSpecRequestTimer]);
 
-  // Close menus when clicking outside
+  // Close menus as soon as the pointer starts outside. On Android Chrome, waiting
+  // for the synthesized click can leave a model dropdown in front of the next
+  // sub-session tap after the viewport/layout shifts.
   useEffect(() => {
     if (!menuOpen && !modelOpen && !autoOpen && !p2pOpen && !thinkingOpen && !openSpecOpen) return;
-    const handleClick = (e: MouseEvent) => {
-      if (menuOpen && menuRef.current && !menuRef.current.contains(e.target as Node)) {
+    const handleOutsidePointer = (target: EventTarget | null) => {
+      if (!(target instanceof Node)) return;
+      if (menuOpen && menuRef.current && !menuRef.current.contains(target)) {
         setMenuOpen(false);
         setConfirm(null);
         setConfirmLevel(0);
       }
-      if (modelOpen && modelRef.current && !modelRef.current.contains(e.target as Node)) {
+      if (modelOpen && modelRef.current && !modelRef.current.contains(target)) {
         setModelOpen(false);
       }
-      if (autoOpen && autoRef.current && !autoRef.current.contains(e.target as Node)) {
+      if (autoOpen && autoRef.current && !autoRef.current.contains(target)) {
         setAutoOpen(false);
       }
-      if (thinkingOpen && thinkingRef.current && !thinkingRef.current.contains(e.target as Node)) {
+      if (thinkingOpen && thinkingRef.current && !thinkingRef.current.contains(target)) {
         setThinkingOpen(false);
       }
-      if (p2pOpen && p2pRef.current && !p2pRef.current.contains(e.target as Node)) {
+      if (
+        p2pOpen
+        && p2pRef.current
+        && !p2pRef.current.contains(target)
+        && !p2pDropdownRef.current?.contains(target)
+      ) {
         setP2pOpen(false);
       }
       if (
         openSpecOpen
         && openSpecRef.current
-        && !openSpecRef.current.contains(e.target as Node)
-        && !openSpecDropdownRef.current?.contains(e.target as Node)
-        && !openSpecSubmenuRef.current?.contains(e.target as Node)
+        && !openSpecRef.current.contains(target)
+        && !openSpecDropdownRef.current?.contains(target)
+        && !openSpecSubmenuRef.current?.contains(target)
       ) {
         setOpenSpecOpen(false);
         setOpenSpecAuditMenu(null);
         setOpenSpecProposeMenuOpen(false);
       }
     };
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
+    const handlePointerDown = (e: PointerEvent) => handleOutsidePointer(e.target);
+    const handleTouchStart = (e: TouchEvent) => handleOutsidePointer(e.target);
+    const handleMouseDown = (e: MouseEvent) => handleOutsidePointer(e.target);
+    const pointerOptions = { capture: true } as AddEventListenerOptions;
+    const touchOptions = { capture: true, passive: true } as AddEventListenerOptions;
+    document.addEventListener('pointerdown', handlePointerDown, pointerOptions);
+    document.addEventListener('touchstart', handleTouchStart, touchOptions);
+    document.addEventListener('mousedown', handleMouseDown, pointerOptions);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, pointerOptions);
+      document.removeEventListener('touchstart', handleTouchStart, touchOptions);
+      document.removeEventListener('mousedown', handleMouseDown, pointerOptions);
+    };
   }, [autoOpen, menuOpen, modelOpen, openSpecOpen, p2pOpen, thinkingOpen]);
 
   const quickAutoColor = quickSupervisionMode === SUPERVISION_MODE.SUPERVISED
@@ -1397,10 +1518,22 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return `${cwd.replace(/[\\/]+$/, '')}/openspec/changes`;
   }, [activeSession?.projectDir]);
 
+  const openOpenSpecChangeFolder = useCallback((changeName: string) => {
+    if (!openSpecChangesPath) return;
+    setOpenSpecFolderPath(`${openSpecChangesPath}/${changeName}`);
+    setOpenSpecAuditMenu(null);
+    setOpenSpecProposeMenuOpen(false);
+    setOpenSpecOpen(false);
+  }, [openSpecChangesPath]);
+
   const openP2pConfigPanel = useCallback((tab: P2pConfigTab = 'participants') => {
-    setP2pConfigInitialTab(tab);
-    setP2pConfigOpen(true);
-  }, []);
+    const open = () => {
+      setP2pConfigInitialTab(tab);
+      setP2pConfigOpen(true);
+    };
+    if (onVersionSensitiveAction) onVersionSensitiveAction(t('p2p.settings_title', 'Team settings'), open);
+    else open();
+  }, [onVersionSensitiveAction, t]);
 
   const refreshOpenSpecChanges = useCallback(() => {
     clearOpenSpecRequestTimer();
@@ -1508,9 +1641,22 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     );
   }, [getOpenSpecSubmenuStyle, isOpenSpecMobile]);
 
+  const renderP2pDropdown = useCallback((content: ComponentChildren) => {
+    const dropdown = (
+      <div class="menu-dropdown menu-dropdown-p2p" ref={p2pDropdownRef} data-testid="p2p-dropdown">
+        {content}
+      </div>
+    );
+    if (isOpenSpecMobile && typeof document !== 'undefined') {
+      return createPortal(dropdown, document.body);
+    }
+    return dropdown;
+  }, [isOpenSpecMobile]);
+
   const renderOpenSpecDropdown = useCallback((content: ComponentChildren) => {
     if (isOpenSpecMobile) {
-      return (
+      if (typeof document === 'undefined') return null;
+      return createPortal(
         <div
           class="menu-dropdown menu-dropdown-openspec menu-dropdown-openspec-inline"
           ref={openSpecDropdownRef}
@@ -1532,7 +1678,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
           </div>
           {content}
-        </div>
+        </div>,
+        document.body,
       );
     }
     if (typeof document === 'undefined') return null;
@@ -1702,7 +1849,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         return;
       }
       const changeNames = (msg.entries ?? [])
-        .filter((entry) => entry.isDir)
+        .filter((entry) => entry.isDir && !OPENSPEC_NON_CHANGE_DIR_NAMES.has(entry.name))
         .map((entry) => entry.name)
         .sort((a, b) => a.localeCompare(b));
       setOpenSpecChanges(changeNames);
@@ -2308,43 +2455,98 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const uploadAttachmentFiles = useCallback(async (files: readonly File[]): Promise<boolean> => {
     if (files.length === 0 || !serverId) return false;
-    setUploading(true);
-    setUploadProgress(0);
-    setUploadError(null);
+    const uploadKey = composerUploadKey;
+    const uploadAttachmentDraftKey = attachmentDraftKey;
+    updateComposerUploadSnapshot(uploadKey, { uploading: true, progress: 0, error: null });
     let uploadedAny = false;
     for (const file of files) {
       try {
-        const result = await uploadFile(serverId, file, (pct) => setUploadProgress(pct));
+        const result = await uploadFile(serverId, file, (pct) => updateComposerUploadSnapshot(uploadKey, { progress: pct }));
         if (result.attachment?.daemonPath) {
           uploadedAny = true;
-          // R3 v2 PR-ρ — Assign the next sequential `seq` so the badge
-          // and the text-prepend reference (#N) match the upload order.
-          setAttachments((prev) => [
-            ...prev,
-            { path: result.attachment!.daemonPath, name: file.name, seq: prev.length + 1 },
-          ]);
+          const attachment = { path: result.attachment.daemonPath, name: file.name, seq: 0 };
+          if (uploadAttachmentDraftKey) {
+            const next = appendStoredComposerAttachment(uploadAttachmentDraftKey, attachment);
+            if (mountedRef.current && attachmentDraftKeyRef.current === uploadAttachmentDraftKey) {
+              setAttachments(next);
+            }
+          } else {
+            setAttachments((prev) => renumberAttachments([...prev, attachment]));
+          }
         }
       } catch (err) {
         console.error('[upload] failed:', err);
         const body = err instanceof Error ? err.message : String(err);
+        let errorMessage: string;
         if (body.includes('daemon_offline')) {
-          setUploadError(t('upload.daemon_offline'));
+          errorMessage = t('upload.daemon_offline');
         } else if (body.includes('file_too_large')) {
-          setUploadError(t('upload.file_too_large', { max: MAX_UPLOAD_SIZE_MB }));
+          errorMessage = t('upload.file_too_large', { max: MAX_UPLOAD_SIZE_MB });
         } else {
-          setUploadError(t('upload.upload_failed'));
+          errorMessage = t('upload.upload_failed');
         }
-        setTimeout(() => setUploadError(null), 5000);
+        updateComposerUploadSnapshot(uploadKey, { error: errorMessage });
+        setTimeout(() => updateComposerUploadSnapshot(uploadKey, { error: null }), 5000);
       }
     }
-    setUploading(false);
+    updateComposerUploadSnapshot(uploadKey, { uploading: false, progress: uploadedAny ? 100 : 0 });
     return uploadedAny;
-  }, [serverId, t]);
+  }, [attachmentDraftKey, composerUploadKey, serverId, t]);
 
   const handleFileUpload = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     await uploadAttachmentFiles(Array.from(files));
   }, [uploadAttachmentFiles]);
+
+  const handleFileDragEnter = useCallback((e: DragEvent) => {
+    if (inputDisabled || !dataTransferHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = serverId ? 'copy' : 'none';
+    setFileDragActive(true);
+  }, [inputDisabled, serverId]);
+
+  const handleFileDragOver = useCallback((e: DragEvent) => {
+    if (inputDisabled || !dataTransferHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = serverId ? 'copy' : 'none';
+    setFileDragActive(true);
+  }, [inputDisabled, serverId]);
+
+  const handleFileDragLeave = useCallback((e: DragEvent) => {
+    if (!dataTransferHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const current = e.currentTarget as Node | null;
+    const related = e.relatedTarget as Node | null;
+    if (current && related && current.contains(related)) return;
+    setFileDragActive(false);
+  }, []);
+
+  const handleFileDrop = useCallback((e: DragEvent) => {
+    if (!dataTransferHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setFileDragActive(false);
+    if (inputDisabled) return;
+    void handleFileUpload(e.dataTransfer?.files ?? null);
+  }, [handleFileUpload, inputDisabled]);
+
+  useEffect(() => {
+    const target = fileDropTargetRef?.current;
+    if (!target) return;
+    target.addEventListener('dragenter', handleFileDragEnter, true);
+    target.addEventListener('dragover', handleFileDragOver, true);
+    target.addEventListener('dragleave', handleFileDragLeave, true);
+    target.addEventListener('drop', handleFileDrop, true);
+    return () => {
+      target.removeEventListener('dragenter', handleFileDragEnter, true);
+      target.removeEventListener('dragover', handleFileDragOver, true);
+      target.removeEventListener('dragleave', handleFileDragLeave, true);
+      target.removeEventListener('drop', handleFileDrop, true);
+    };
+  }, [fileDropTargetRef, handleFileDragEnter, handleFileDragLeave, handleFileDragOver, handleFileDrop]);
 
   // Paste: upload files from clipboard, or insert plain text
   const handlePaste = (e: Event) => {
@@ -2498,6 +2700,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       ? basePlaceholder
       : t('session.send_placeholder_desktop_upload', { placeholder: basePlaceholder });
 
+  const dropOverlayStyle = (() => {
+    if (!fileDragActive) return null;
+    const target = fileDropTargetRef?.current ?? controlsWrapperRef.current;
+    const rect = target?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return { inset: '0px' };
+    return {
+      left: `${Math.max(0, rect.left)}px`,
+      top: `${Math.max(0, rect.top)}px`,
+      width: `${Math.min(window.innerWidth - Math.max(0, rect.left), rect.width)}px`,
+      height: `${Math.min(window.innerHeight - Math.max(0, rect.top), rect.height)}px`,
+    };
+  })();
+
   useEffect(() => {
     if (!isMobileLayout) {
       setMobileComposerExpanded(false);
@@ -2535,10 +2750,45 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         />
       </div>
     )}
-    <div class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}${mobileComposerExpanded ? ' controls-wrapper-mobile-expanded' : ''}`}>
+    {openSpecFolderPath && ws && activeSession && (
+      <div class="fb-overlay openspec-folder-overlay" onClick={() => setOpenSpecFolderPath(null)}>
+        <div class="fb-modal openspec-folder-modal" onClick={(event) => event.stopPropagation()}>
+          <div class="fb-header openspec-folder-header">
+            <span class="fb-breadcrumb-path">{toComposerReference(openSpecFolderPath)}</span>
+            <button class="fb-close" onClick={() => setOpenSpecFolderPath(null)}>✕</button>
+          </div>
+          <FileBrowser
+            key={`${serverId ?? 'local'}:${openSpecFolderPath}`}
+            ws={ws}
+            serverId={serverId}
+            mode="file-multi"
+            layout="panel"
+            initialPath={openSpecFolderPath}
+            defaultTab="files"
+            hideFooter={false}
+            onConfirm={(paths) => {
+              appendToInput(paths.map((path) => toComposerReference(path)));
+              setOpenSpecFolderPath(null);
+            }}
+            onClose={() => setOpenSpecFolderPath(null)}
+          />
+        </div>
+      </div>
+    )}
+    <div ref={controlsWrapperRef} class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}${mobileComposerExpanded ? ' controls-wrapper-mobile-expanded' : ''}`}>
+      {dropOverlayStyle && createPortal(
+        <div class="session-file-drop-overlay" style={dropOverlayStyle}>
+          <div class="session-file-drop-card">
+            <div class="session-file-drop-icon">📎</div>
+            <div class="session-file-drop-title">{t('upload.drop_overlay_title')}</div>
+            <div class="session-file-drop-hint">{t('upload.drop_overlay_hint')}</div>
+          </div>
+        </div>,
+        document.body,
+      )}
       {/* Header control row — compact mode keeps meta controls but still hides terminal shortcuts */}
       {!hideShortcuts && (!compact || showCompactMetaControls) && <div class="shortcuts-row">
-        {!compact && <div class="shortcuts">
+        {!compact && <div class={`shortcuts${isTransport ? ' shortcuts-transport' : ''}`}>
           {/* Quick input trigger — shown here (before Esc) when shell terminal hides input row */}
           {isShellLike && (
             <button
@@ -2687,7 +2937,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                           setOpenSpecOpen(false);
                         }}
                       >
-                        {changeName}
+                        <span class="openspec-change-ref-prefix" aria-hidden="true">@</span>
+                        <span class="openspec-change-name-text">{changeName}</span>
+                      </button>
+                      <button
+                        type="button"
+                        class="openspec-change-folder-btn"
+                        title={t('sidebar.pinned_repo')}
+                        aria-label={t('sidebar.pinned_repo')}
+                        onClick={() => openOpenSpecChangeFolder(changeName)}
+                      >
+                        <span class="fb-create-icon fb-create-icon-folder" aria-hidden="true" />
                       </button>
                       {isOpenSpecMobile && (
                         <button
@@ -2973,10 +3233,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             data-onboarding="p2p-mode"
             onClick={() => setP2pOpen((o) => !o)}
             disabled={disabled}
-            title={p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `P2P: ${getP2pModeLabel(p2pMode, t)}`}
+            title={p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `${t('p2p.team_button', 'Team')}: ${getP2pModeLabel(p2pMode, t)}`}
             style={{ color: getP2pModeColor(p2pMode), fontSize: 10, fontWeight: p2pMode === 'solo' ? 600 : 700 }}
           >
-            {p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `P2P:${getP2pModeLabel(p2pMode, t)}`}
+            {p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `${t('p2p.team_button', 'Team')}:${getP2pModeLabel(p2pMode, t)}`}
           </button>
           <button
             class="shortcut-btn p2p-settings-btn"
@@ -2988,8 +3248,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             <span class="p2p-settings-icon" aria-hidden="true">⚙</span>
             <span class="p2p-settings-label">{t('p2p.settings_button')}</span>
           </button>
-          {p2pOpen && (
-            <div class="menu-dropdown menu-dropdown-p2p" data-testid="p2p-dropdown">
+          {p2pOpen && renderP2pDropdown(
+            <>
               <div
                 class="p2p-dropdown-rounds"
                 data-testid="p2p-dropdown-rounds"
@@ -3022,6 +3282,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   })}
                 </div>
               </div>
+              <div
+                class="p2p-dropdown-intro"
+                title={t('p2p.dropdown.team_intro_tooltip', 'Discussion → summary → implementation → review. More rounds repeat the loop on the previous result.')}
+              >
+                <div class="p2p-dropdown-intro-title">{t('p2p.dropdown.team_intro_title', 'Team discussion')}</div>
+                <div class="p2p-dropdown-intro-body">
+                  {t('p2p.dropdown.team_intro_body', 'Agents discuss, summarize, implement, then review the result. Extra rounds repeat the loop to harden the outcome.')}
+                </div>
+              </div>
               <div class="menu-divider" />
               <button
                 class={`menu-item ${p2pMode === 'solo' ? 'menu-item-active' : ''}`}
@@ -3043,7 +3312,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                */}
               <div
                 class="p2p-dropdown-tabs"
-                style={{ display: 'flex', gap: 4, padding: '4px 8px' }}
                 data-testid="p2p-dropdown-tabs"
               >
                 <button
@@ -3052,12 +3320,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   data-testid="p2p-dropdown-tab-combos"
                   data-active={dropdownActiveTab === 'combos' ? 'true' : 'false'}
                   onClick={() => setDropdownActiveTab('combos')}
-                  style={{
-                    flex: 1, fontSize: 11, padding: '4px 8px', borderRadius: 4,
-                    background: dropdownActiveTab === 'combos' ? '#1d4ed840' : 'transparent',
-                    color: dropdownActiveTab === 'combos' ? '#bfdbfe' : '#94a3b8',
-                    fontWeight: dropdownActiveTab === 'combos' ? 600 : 500,
-                  }}
                 >
                   {t('p2p.dropdown.tab_combos', t('p2p.combo_label', 'Combos'))}
                 </button>
@@ -3067,14 +3329,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   data-testid="p2p-dropdown-tab-workflows"
                   data-active={dropdownActiveTab === 'workflows' ? 'true' : 'false'}
                   onClick={() => setDropdownActiveTab('workflows')}
-                  style={{
-                    flex: 1, fontSize: 11, padding: '4px 8px', borderRadius: 4,
-                    background: dropdownActiveTab === 'workflows' ? '#1d4ed840' : 'transparent',
-                    color: dropdownActiveTab === 'workflows' ? '#bfdbfe' : '#94a3b8',
-                    fontWeight: dropdownActiveTab === 'workflows' ? 600 : 500,
-                  }}
                 >
-                  {t('p2p.dropdown.tab_workflows', 'Workflows')}
+                  <span>{t('p2p.dropdown.tab_workflows', 'Workflows')}</span>
+                  <span class="p2p-alpha-badge" title={t('p2p.alpha_hint', 'Experimental capability; not formally validated yet.')}>
+                    {t('p2p.alpha_badge', 'Alpha')}
+                  </span>
                 </button>
               </div>
               {dropdownActiveTab === 'combos' ? (
@@ -3087,16 +3346,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   {comboMenuItems.map((key) => (
                     <button
                       key={key}
-                      class="menu-item"
+                      class={`menu-item p2p-dropdown-combo-item ${isRecommendedCombo(key) ? 'p2p-dropdown-combo-recommended' : ''}`}
                       onClick={() => {
                         if (!hasConfiguredP2pParticipants) return;
                         handleDirectComboSelect(key);
                       }}
                       disabled={!hasConfiguredP2pParticipants}
-                      title={!hasConfiguredP2pParticipants ? t('p2p.combo_requires_participants_hint') : undefined}
+                      title={!hasConfiguredP2pParticipants
+                        ? t('p2p.combo_requires_participants_hint')
+                        : isRecommendedCombo(key)
+                          ? t('p2p.combo_recommended_hint', 'Recommended for most audit tasks.')
+                          : undefined}
                       style={{ color: getP2pModeColor(key), fontSize: 12, opacity: hasConfiguredP2pParticipants ? 1 : 0.45, cursor: hasConfiguredP2pParticipants ? 'pointer' : 'not-allowed' }}
                     >
-                      ○ {getP2pModeLabel(key, t)}
+                      <span class="p2p-dropdown-combo-name">○ {getP2pModeLabel(key, t)}</span>
+                      {isRecommendedCombo(key) && (
+                        <span class="p2p-recommended-icon" aria-hidden="true">★</span>
+                      )}
                     </button>
                   ))}
                   <div class="menu-divider" />
@@ -3179,7 +3445,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   </button>
                 </>
               )}
-            </div>
+            </>
           )}
         </div>}
       </div>}
@@ -3478,7 +3744,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
           <div
             ref={divRef}
-            class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}`}
+            class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}${fileDragActive ? ' controls-input-file-drag-over' : ''}`}
             data-onboarding="chat-input"
             contenteditable={inputDisabled ? 'false' : 'true'}
             role="textbox"
@@ -3540,6 +3806,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
+            onDragEnter={handleFileDragEnter}
+            onDragOver={handleFileDragOver}
+            onDragLeave={handleFileDragLeave}
+            onDrop={handleFileDrop}
           />
           {showEmbeddedVoiceButton && (
             <button
@@ -3598,11 +3868,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         {/* Config mode: show gear to open settings panel inline with send row */}
         {p2pMode === P2P_CONFIG_MODE && (
           <button
-            class="btn btn-secondary"
+            class="btn btn-secondary controls-icon-btn"
             onClick={() => openP2pConfigPanel('participants')}
             disabled={disabled}
             title={t('p2p.settings_title')}
-            style={{ padding: '6px 10px' }}
           >
             ⚙
           </button>
@@ -3611,11 +3880,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         {/* Menu button — hidden in compact mode */}
         {!compact && <div class="menu-wrap" ref={menuRef}>
           <button
-            class="btn btn-secondary"
+            class="btn btn-secondary controls-icon-btn"
             onClick={() => { setMenuOpen((o) => !o); resetConfirm(); }}
             disabled={disabled}
             title={t('session.actions')}
-            style={{ padding: '6px 10px' }}
           >
             ⋯
           </button>
