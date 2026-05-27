@@ -1221,19 +1221,12 @@ export class CodexSdkProvider implements TransportProvider {
     }, 'Codex SDK prepared generated image path tracking');
   }
 
-  private async refreshGeneratedImageTracking(sessionId: string, state: CodexSdkSessionState): Promise<string[]> {
+  private async detectNewGeneratedImagePaths(
+    state: CodexSdkSessionState,
+    knownPaths: ReadonlySet<string>,
+  ): Promise<string[]> {
     const paths = await this.listGeneratedImagePaths(state);
-    const nextPaths = paths.filter((path) => !state.generatedImageKnownPaths.has(path));
-    if (nextPaths.length === 0) return state.generatedImagePaths;
-    for (const path of nextPaths) state.generatedImageKnownPaths.add(path);
-    state.generatedImagePaths = [...state.generatedImagePaths, ...nextPaths];
-    logger.info({
-      provider: this.id,
-      sessionId,
-      threadId: state.threadId,
-      generatedImagePaths: nextPaths,
-    }, 'Codex SDK detected generated image output paths');
-    return state.generatedImagePaths;
+    return paths.filter((path) => !knownPaths.has(path));
   }
 
   private handleLine(line: string): void {
@@ -1467,10 +1460,30 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearCancelTimer(state);
       this.clearStatus(sessionId, state);
       this.commitPendingSessionSystemTextUpdate(state, typeof turn.id === 'string' ? turn.id : undefined);
-      const generatedImagePaths = await this.refreshGeneratedImageTracking(sessionId, state);
-      const content = appendDetectedGeneratedImagePaths(state.currentText, generatedImagePaths);
-      state.pendingComplete = {
-        id: state.currentMessageId ?? `${sessionId}:agent-message`,
+      const messageId = state.currentMessageId ?? `${sessionId}:agent-message`;
+      const currentText = state.currentText;
+      const usage = state.lastUsage;
+      const model = state.model;
+      const resumeId = state.threadId;
+      const knownGeneratedImagePaths = new Set(state.generatedImageKnownPaths);
+      const alreadyDetectedImagePaths = [...state.generatedImagePaths];
+      state.runningTurnId = undefined;
+      const newlyDetectedImagePaths = await this.detectNewGeneratedImagePaths(state, knownGeneratedImagePaths);
+      const generatedImagePaths = [
+        ...alreadyDetectedImagePaths,
+        ...newlyDetectedImagePaths.filter((path) => !alreadyDetectedImagePaths.includes(path)),
+      ];
+      if (newlyDetectedImagePaths.length > 0) {
+        logger.info({
+          provider: this.id,
+          sessionId,
+          threadId: resumeId,
+          generatedImagePaths: newlyDetectedImagePaths,
+        }, 'Codex SDK detected generated image output paths');
+      }
+      const content = appendDetectedGeneratedImagePaths(currentText, generatedImagePaths);
+      const completed: AgentMessage = {
+        id: messageId,
         sessionId,
         kind: 'text',
         role: 'assistant',
@@ -1478,17 +1491,14 @@ export class CodexSdkProvider implements TransportProvider {
         timestamp: Date.now(),
         status: 'complete',
         metadata: {
-          ...(state.lastUsage ? { usage: state.lastUsage } : {}),
-          ...(state.model ? { model: state.model } : {}),
-          ...(state.threadId ? { resumeId: state.threadId } : {}),
+          ...(usage ? { usage } : {}),
+          ...(model ? { model } : {}),
+          ...(resumeId ? { resumeId } : {}),
         },
       };
-      state.runningTurnId = undefined;
-      const completed = state.pendingComplete;
+      state.pendingComplete = completed;
       state.pendingComplete = undefined;
-      if (completed) {
-        for (const cb of this.completeCallbacks) cb(sessionId, completed);
-      }
+      for (const cb of this.completeCallbacks) cb(sessionId, completed);
       return;
     }
   }
