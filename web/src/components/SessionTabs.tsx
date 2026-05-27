@@ -48,7 +48,6 @@ interface LongPressState {
 }
 
 interface MousePressState {
-  pointerId: number;
   sessionName: string;
   startX: number;
   startY: number;
@@ -218,15 +217,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
 
   const onTabPointerDown = useCallback((e: PointerEvent, session: SessionInfo) => {
     if (typeof e.button === 'number' && e.button !== 0) return;
-    if (e.pointerType === 'mouse') {
-      mousePressRef.current = {
-        pointerId: e.pointerId,
-        sessionName: session.name,
-        startX: e.clientX,
-        startY: e.clientY,
-      };
-      return;
-    }
+    if (e.pointerType === 'mouse') return;
     clearLongPress();
 
     const target = e.currentTarget as HTMLElement;
@@ -255,29 +246,43 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
       const dy = e.clientY - state.startY;
       if (Math.hypot(dx, dy) > TAB_LONG_PRESS_MOVE_CANCEL_PX) clearLongPress();
     }
-
-    const mouseState = mousePressRef.current;
-    if (!mouseState || mouseState.pointerId !== e.pointerId) return;
-    const dx = e.clientX - mouseState.startX;
-    const dy = e.clientY - mouseState.startY;
-    if (Math.hypot(dx, dy) > TAB_MOUSE_CLICK_MOVE_CANCEL_PX) {
-      mousePressRef.current = null;
-    }
   }, [clearLongPress]);
 
   const onTabPointerEnd = useCallback((e: PointerEvent) => {
     const state = longPressRef.current;
     if (state && state.pointerId === e.pointerId) clearLongPress();
+  }, [clearLongPress]);
 
+  const onTabMouseDown = useCallback((e: MouseEvent, session: SessionInfo) => {
+    if (e.button !== 0) return;
+    mousePressRef.current = {
+      sessionName: session.name,
+      startX: e.clientX,
+      startY: e.clientY,
+    };
+  }, []);
+
+  const onTabMouseMove = useCallback((e: MouseEvent) => {
     const mouseState = mousePressRef.current;
-    if (!mouseState || mouseState.pointerId !== e.pointerId) return;
+    if (!mouseState) return;
+    const dx = e.clientX - mouseState.startX;
+    const dy = e.clientY - mouseState.startY;
+    if (Math.hypot(dx, dy) > TAB_MOUSE_CLICK_MOVE_CANCEL_PX) {
+      mousePressRef.current = null;
+    }
+  }, []);
+
+  const onTabMouseEnd = useCallback((e: MouseEvent) => {
+    const mouseState = mousePressRef.current;
+    if (!mouseState) return;
     mousePressRef.current = null;
+    if (suppressNextClickRef.current) return;
     const dx = e.clientX - mouseState.startX;
     const dy = e.clientY - mouseState.startY;
     if (Math.hypot(dx, dy) > TAB_MOUSE_CLICK_MOVE_CANCEL_PX) return;
     suppressNextSyntheticClick(180);
     selectTab(mouseState.sessionName);
-  }, [clearLongPress, selectTab, suppressNextSyntheticClick]);
+  }, [selectTab, suppressNextSyntheticClick]);
 
   const startRename = (s: SessionInfo) => {
     setCtx(null);
@@ -420,6 +425,10 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                 onPointerUp={(e) => onTabPointerEnd(e as PointerEvent)}
                 onPointerCancel={(e) => onTabPointerEnd(e as PointerEvent)}
                 onPointerLeave={(e) => onTabPointerEnd(e as PointerEvent)}
+                onMouseDown={(e) => onTabMouseDown(e as MouseEvent, s)}
+                onMouseMove={(e) => onTabMouseMove(e as MouseEvent)}
+                onMouseUp={(e) => onTabMouseEnd(e as MouseEvent)}
+                onMouseLeave={(e) => onTabMouseEnd(e as MouseEvent)}
                 title={`${s.agentType}${s.agentVersion ? ` ${s.agentVersion}` : ''} — ${s.state}${isPinned ? ' (pinned)' : ''}`}
               >
                 {isPinned && <span class="tab-pin">📌</span>}

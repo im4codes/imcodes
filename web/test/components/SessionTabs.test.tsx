@@ -159,16 +159,12 @@ describe('SessionTabs', () => {
     );
 
     const pinnedTab = screen.getAllByRole('tab')[0];
-    fireEvent.pointerDown(pinnedTab, {
-      pointerId: 11,
-      pointerType: 'mouse',
+    fireEvent.mouseDown(pinnedTab, {
       button: 0,
       clientX: 24,
       clientY: 12,
     });
-    fireEvent.pointerUp(pinnedTab, {
-      pointerId: 11,
-      pointerType: 'mouse',
+    fireEvent.mouseUp(pinnedTab, {
       button: 0,
       clientX: 25,
       clientY: 13,
@@ -186,16 +182,12 @@ describe('SessionTabs', () => {
     );
 
     const tab = screen.getByRole('tab');
-    fireEvent.pointerDown(tab, {
-      pointerId: 12,
-      pointerType: 'mouse',
+    fireEvent.mouseDown(tab, {
       button: 0,
       clientX: 24,
       clientY: 12,
     });
-    fireEvent.pointerUp(tab, {
-      pointerId: 12,
-      pointerType: 'mouse',
+    fireEvent.mouseUp(tab, {
       button: 0,
       clientX: 24,
       clientY: 12,
@@ -214,23 +206,17 @@ describe('SessionTabs', () => {
     );
 
     const tab = screen.getByRole('tab');
-    fireEvent.pointerDown(tab, {
-      pointerId: 13,
-      pointerType: 'mouse',
+    fireEvent.mouseDown(tab, {
       button: 0,
       clientX: 24,
       clientY: 12,
     });
-    fireEvent.pointerMove(tab, {
-      pointerId: 13,
-      pointerType: 'mouse',
+    fireEvent.mouseMove(tab, {
       button: 0,
       clientX: 40,
       clientY: 12,
     });
-    fireEvent.pointerUp(tab, {
-      pointerId: 13,
-      pointerType: 'mouse',
+    fireEvent.mouseUp(tab, {
       button: 0,
       clientX: 40,
       clientY: 12,
