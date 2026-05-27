@@ -69,6 +69,7 @@ function makeDb(overrides: Partial<Database> = {}): Database {
 function makeProjectionRow(input: {
   id: string;
   serverId: string;
+  projectId?: string;
   summary?: string | null;
   contentJson?: Record<string, unknown>;
   sourceEventIds?: string[];
@@ -76,6 +77,7 @@ function makeProjectionRow(input: {
   return {
     id: input.id,
     server_id: input.serverId,
+    project_id: input.projectId ?? 'repo-1',
     source_event_ids_json: input.sourceEventIds ?? [`evt-${input.id}`],
     summary: input.summary === undefined ? `authorized projection ${input.id}` : input.summary,
     content_json: input.contentJson ?? {},
@@ -88,7 +90,9 @@ function makeDbWithProjection(row: Record<string, unknown>): Database {
   return makeDb({
     queryOne: async <T>(sql: string, params: unknown[] = []) => {
       if (sql.toLowerCase().includes('from shared_context_projections')) {
-        return params[0] === row.id && (!params[2] || params[2] === row.server_id)
+        const serverOk = !sql.includes('server_id = $') || params.includes(row.server_id);
+        const projectOk = !sql.includes('project_id = $') || params.includes(row.project_id);
+        return params[0] === row.id && serverOk && projectOk
           ? row as T
           : null as T;
       }
@@ -158,12 +162,23 @@ describe('GET /api/memory/projection-owner', () => {
     expect(body.error).toBe('projection_id_required');
   });
 
-  it('returns originServerId for a projection owned by the caller', async () => {
+  it('404s when projectId is missing', async () => {
     const db = makeDb({
       queryOne: async <T>() => ({ server_id: 'srv-owner' }) as T,
     });
     const app = await buildTestApp(db);
     const res = await app.request('/api/memory/projection-owner?projectionId=proj-1');
+    expect(res.status).toBe(404);
+  });
+
+  it('returns originServerId for a projection owned by the caller project', async () => {
+    const db = makeDb({
+      queryOne: async <T>(_sql: string, params: unknown[] = []) => (
+        params.includes('repo-1') ? { server_id: 'srv-owner' } as T : null as T
+      ),
+    });
+    const app = await buildTestApp(db);
+    const res = await app.request('/api/memory/projection-owner?projectionId=proj-1&projectId=repo-1');
     expect(res.status).toBe(200);
     const body = await res.json() as { originServerId: string };
     expect(body.originServerId).toBe('srv-owner');
@@ -174,7 +189,7 @@ describe('GET /api/memory/projection-owner', () => {
       queryOne: async () => null, // simulated cross-user / missing row
     });
     const app = await buildTestApp(db);
-    const res = await app.request('/api/memory/projection-owner?projectionId=proj-1');
+    const res = await app.request('/api/memory/projection-owner?projectionId=proj-1&projectId=repo-1');
     expect(res.status).toBe(404);
     const body = await res.json() as { error: string };
     expect(body.error).toBe('not_found');
@@ -212,7 +227,7 @@ describe('GET /api/memory/sources', () => {
   it('403s when the caller does not own the serverId', async () => {
     mockResolveServerRole.mockResolvedValue('none');
     const app = await buildTestApp(makeDb());
-    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-1`);
+    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-1&projectId=repo-1`);
     expect(res.status).toBe(403);
   });
 
@@ -226,7 +241,7 @@ describe('GET /api/memory/sources', () => {
       contentJson: {},
       sourceEventIds: [],
     })));
-    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-1`);
+    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-1&projectId=repo-1`);
     expect(res.status).toBe(409);
     const body = await res.json() as { error: string };
     expect(body.error).toBe('daemon_offline');
@@ -238,7 +253,7 @@ describe('GET /api/memory/sources', () => {
     await authDaemon(bridge, daemon, makeDb());
     const app = await buildTestApp(makeDb());
 
-    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=foreign-proj`);
+    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=foreign-proj&projectId=repo-1`);
     expect(res.status).toBe(404);
     const body = await res.json() as { error: string };
     expect(body.error).toBe('not_found');
@@ -258,7 +273,7 @@ describe('GET /api/memory/sources', () => {
     });
     const app = await buildTestApp(db);
 
-    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=foreign-personal-proj`);
+    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=foreign-personal-proj&projectId=repo-1`);
     expect(res.status).toBe(404);
     expect(projectionSql).toContain("OR (scope <> 'personal' AND EXISTS");
   });
@@ -274,11 +289,11 @@ describe('GET /api/memory/sources', () => {
     // Snoop the daemon-side message so we can synthesize a reply with the
     // matching requestId. The route assigns a random requestId; we read it
     // off the wire.
-    const requestArrived = new Promise<{ requestId: string; projectionId: string }>((resolve) => {
+    const requestArrived = new Promise<{ requestId: string; projectionId: string; expectedProjectId?: string }>((resolve) => {
       const tick = () => {
         const sent = daemon.sent.find((s) => s.includes(MEMORY_WS.GET_SOURCES_REQUEST));
         if (sent) {
-          const parsed = JSON.parse(sent) as { requestId: string; projectionId: string };
+          const parsed = JSON.parse(sent) as { requestId: string; projectionId: string; expectedProjectId?: string };
           resolve(parsed);
         } else {
           setImmediate(tick);
@@ -287,9 +302,10 @@ describe('GET /api/memory/sources', () => {
       tick();
     });
 
-    const responsePromise = app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-42`);
-    const { requestId, projectionId } = await requestArrived;
+    const responsePromise = app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-42&projectId=repo-1`);
+    const { requestId, projectionId, expectedProjectId } = await requestArrived;
     expect(projectionId).toBe('proj-42');
+    expect(expectedProjectId).toBe('repo-1');
 
     // Simulate the daemon's reply.
     daemon.emit('message', Buffer.from(JSON.stringify({
@@ -329,7 +345,7 @@ describe('GET /api/memory/sources', () => {
       };
       tick();
     });
-    const resPromise = app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-1`);
+    const resPromise = app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-1&projectId=repo-1`);
     const { requestId } = await requestArrived;
     daemon.emit('message', Buffer.from(JSON.stringify({
       type: MEMORY_WS.GET_SOURCES_RESPONSE,
@@ -378,7 +394,7 @@ describe('GET /api/memory/sources', () => {
       };
       tick();
     });
-    const resPromise = app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-cloud-fallback`);
+    const resPromise = app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-cloud-fallback&projectId=repo-1`);
     const { requestId } = await requestArrived;
     daemon.emit('message', Buffer.from(JSON.stringify({
       type: MEMORY_WS.GET_SOURCES_RESPONSE,
@@ -437,7 +453,7 @@ describe('GET /api/memory/sources', () => {
     });
     const app = await buildTestApp(db);
 
-    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-offline-fallback`);
+    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-offline-fallback&projectId=repo-1`);
     expect(res.status).toBe(200);
     const body = await res.json() as { sources: Array<{ eventId: string; content: string }>; originServerId: string };
     expect(body.originServerId).toBe(serverId);

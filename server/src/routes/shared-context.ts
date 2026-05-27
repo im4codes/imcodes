@@ -1551,7 +1551,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
       : runtimeConfigRow?.shared_context_runtime_config,
   );
 
-  let body: { query: string; projectId?: string; limit?: number; mode?: 'recall' | 'search' };
+  let body: { query: string; projectId?: string; limit?: number; mode?: 'recall' | 'search'; sessionKind?: string; hasProjectBinding?: boolean };
   try {
     body = await c.req.json() as typeof body;
   } catch {
@@ -1577,7 +1577,12 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
     return c.json({ results: [], vectorSearch: false, skipped: 'imperative_command' });
   }
   const searchMode = body.mode === 'search';
+  const recallMode = body.mode !== 'search';
+  const shellOrScratchRecall = recallMode && !projectId && (body.sessionKind === 'shell' || body.sessionKind === 'scratch');
   if (searchMode && !projectId) {
+    return c.json({ results: [], vectorSearch: false, skipped: 'project_required' });
+  }
+  if (recallMode && !projectId && !shellOrScratchRecall) {
     return c.json({ results: [], vectorSearch: false, skipped: 'project_required' });
   }
   const limitCap = searchMode ? 100 : 20;
@@ -1633,7 +1638,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
        FROM shared_context_projections p
       WHERE p.scope = 'personal' AND p.user_id = $1
         AND COALESCE(p.status, 'active') = 'active'
-        ${projectId ? 'AND p.project_id = $2' : ''}
+        ${projectId ? 'AND p.project_id = $2' : 'AND p.project_id IS NULL'}
         AND EXISTS (
           SELECT 1 FROM unnest($${projectId ? 3 : 2}::text[]) AS pat(pattern)
           WHERE LOWER(p.summary) LIKE pat.pattern ESCAPE '\\'
@@ -1652,7 +1657,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
        JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $1
        JOIN unnest($2::text[]) AS allowed_scope(scope) ON allowed_scope.scope = p.scope
       WHERE COALESCE(p.status, 'active') = 'active'
-        ${projectId ? 'AND p.project_id = $3' : ''}
+        ${projectId ? 'AND p.project_id = $3' : 'AND FALSE'}
         AND EXISTS (
           SELECT 1 FROM unnest($${projectId ? 4 : 3}::text[]) AS pat(pattern)
           WHERE LOWER(p.summary) LIKE pat.pattern ESCAPE '\\'
@@ -1676,7 +1681,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
        JOIN shared_context_embeddings e ON e.source_id = p.id AND e.source_kind = 'projection'
        WHERE p.scope = 'personal' AND p.user_id = $2
          AND COALESCE(p.status, 'active') = 'active'
-         ${projectId ? 'AND p.project_id = $3' : ''}
+         ${projectId ? 'AND p.project_id = $3' : 'AND p.project_id IS NULL'}
        ORDER BY e.embedding <=> $1::vector
        LIMIT $${projectId ? 4 : 3}`,
       [vecSql, userId, ...(projectId ? [projectId] : []), candidateLimit],
@@ -1690,7 +1695,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
        JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $2
        JOIN unnest($3::text[]) AS allowed_scope(scope) ON allowed_scope.scope = p.scope
        WHERE COALESCE(p.status, 'active') = 'active'
-         ${projectId ? 'AND p.project_id = $4' : ''}
+         ${projectId ? 'AND p.project_id = $4' : 'AND FALSE'}
        ORDER BY e.embedding <=> $1::vector
        LIMIT $${projectId ? 5 : 4}`,
       [vecSql, userId, [...REPLICABLE_SHARED_PROJECTION_SCOPES], ...(projectId ? [projectId] : []), candidateLimit],
@@ -1712,7 +1717,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
        FROM shared_context_projections
        WHERE scope = 'personal' AND user_id = $2
          AND COALESCE(status, 'active') = 'active'
-         ${projectId ? 'AND project_id = $3' : ''}
+         ${projectId ? 'AND project_id = $3' : 'AND project_id IS NULL'}
          AND summary % $1
        ORDER BY score DESC
        LIMIT $${projectId ? 4 : 3}`,
@@ -1726,7 +1731,7 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
        JOIN team_members tm ON tm.team_id = p.enterprise_id AND tm.user_id = $2
        JOIN unnest($3::text[]) AS allowed_scope(scope) ON allowed_scope.scope = p.scope
        WHERE COALESCE(p.status, 'active') = 'active'
-         ${projectId ? 'AND p.project_id = $4' : ''}
+         ${projectId ? 'AND p.project_id = $4' : 'AND FALSE'}
          AND p.summary % $1
        ORDER BY score DESC
        LIMIT $${projectId ? 5 : 4}`,

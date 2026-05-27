@@ -4830,7 +4830,7 @@ export class WsBridge {
    * correlated reply. Rejects with 'daemon_offline' when the WS is not
    * authenticated, 'timeout' on slow daemons.
    */
-  sendMemorySourcesRequest(requestId: string, projectionId: string, timeoutMs: number): Promise<Record<string, unknown>> {
+  sendMemorySourcesRequest(requestId: string, projectionId: string, expectedProjectId: string, timeoutMs: number): Promise<Record<string, unknown>> {
     if (!this.isDaemonConnected()) {
       return Promise.reject(new Error('daemon_offline'));
     }
@@ -4847,6 +4847,7 @@ export class WsBridge {
           type: MEMORY_WS.GET_SOURCES_REQUEST,
           requestId,
           projectionId,
+          expectedProjectId,
           // The daemon stamps its own bound serverId on the reply, but we
           // also tell it our expected serverId so its log can flag mis-
           // routing when present.

@@ -20,6 +20,7 @@ import {
   type MemoryMcpToolName,
 } from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
+import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { resolveRuntimeScope } from '../../shared/session-scope.js';
 import {
@@ -339,7 +340,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       try {
         const scopedCaller = memoryCaller();
         const projectId = callerProjectId(scopedCaller);
-        if (!projectId) return { status: 'ok', items: [] };
+        if (!projectId) return { status: 'ok', reason: MEMORY_PROJECT_SCOPE_REASON.UNAVAILABLE, items: [] };
         const result = await searchMemory({
           query,
           namespace: scopedCaller.namespace,
@@ -364,7 +365,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const scopedCaller = memoryCaller();
       try {
         const projectId = callerProjectId(scopedCaller);
-        if (!projectId) return { status: 'ok', items: [] };
+        if (!projectId) return { status: 'ok', reason: MEMORY_PROJECT_SCOPE_REASON.UNAVAILABLE, items: [] };
         const result = await listMemorySummaries({
           namespace: scopedCaller.namespace,
           currentEnterpriseId: scopedCaller.namespace.enterpriseId,
@@ -404,6 +405,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const projectId = callerProjectId(scopedCaller);
       const emptySources = () => ({
         status: 'ok',
+        reason: MEMORY_PROJECT_SCOPE_REASON.UNAVAILABLE,
         ...(ref ? { ref } : {}),
         ...(projectionId ? { projectionId } : {}),
         ...(observationId ? { observationId } : {}),

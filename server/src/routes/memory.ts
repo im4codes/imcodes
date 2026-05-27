@@ -23,6 +23,7 @@ import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import { buildMemoryProjectionFallbackSource } from '../../../shared/memory-projection-source-fallback.js';
+import { cleanMemoryProjectId } from '../../../shared/memory-project-scope.js';
 import logger from '../util/logger.js';
 
 export const memoryRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -51,7 +52,7 @@ interface SharedProjectionSourceFallbackRow {
 
 async function loadAuthorizedProjectionSourceRow(
   db: Env['DB'],
-  input: { projectionId: string; userId: string; originServerId?: string; projectId?: string },
+  input: { projectionId: string; userId: string; originServerId?: string; projectId: string },
 ): Promise<SharedProjectionSourceFallbackRow | undefined> {
   const params: unknown[] = [input.projectionId, input.userId];
   let serverClause = '';
@@ -59,11 +60,8 @@ async function loadAuthorizedProjectionSourceRow(
     params.push(input.originServerId);
     serverClause = `AND server_id = $${params.length}`;
   }
-  let projectClause = '';
-  if (input.projectId) {
-    params.push(input.projectId);
-    projectClause = `AND project_id = $${params.length}`;
-  }
+  params.push(input.projectId);
+  const projectClause = `AND project_id = $${params.length}`;
   const row = await db.queryOne<SharedProjectionSourceFallbackRow>(
     `SELECT id, server_id, source_event_ids_json, summary, content_json, origin, created_at
        FROM shared_context_projections
@@ -170,16 +168,16 @@ async function withProjectionFallback(
 memoryRoutes.get('/memory/projection-owner', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const projectionId = c.req.query('projectionId')?.trim();
-  const projectId = c.req.query('projectId')?.trim();
+  const projectId = cleanMemoryProjectId(c.req.query('projectId'));
   if (!projectionId) {
     return c.json({ error: 'projection_id_required' }, 400);
   }
-  const params: unknown[] = [projectionId, userId];
-  let projectClause = '';
-  if (projectId) {
-    params.push(projectId);
-    projectClause = `AND project_id = $${params.length}`;
+  if (!projectId) {
+    return c.json({ error: 'not_found' }, 404);
   }
+  const params: unknown[] = [projectionId, userId];
+  params.push(projectId);
+  const projectClause = `AND project_id = $${params.length}`;
 
   // Single row lookup gated on user ownership. 404 vs 200-with-empty is
   // intentional — see the spec scenario "caller cannot probe foreign
@@ -217,10 +215,11 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.query('serverId')?.trim();
   const projectionId = c.req.query('projectionId')?.trim();
-  const projectId = c.req.query('projectId')?.trim();
+  const projectId = cleanMemoryProjectId(c.req.query('projectId'));
 
   if (!serverId) return c.json({ error: 'server_id_required' }, 400);
   if (!projectionId) return c.json({ error: 'projection_id_required' }, 400);
+  if (!projectId) return c.json({ error: 'not_found' }, 404);
 
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
@@ -229,7 +228,7 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
     projectionId,
     userId,
     originServerId: serverId,
-    ...(projectId ? { projectId } : {}),
+    projectId,
   });
   if (!projectionRow) return c.json({ error: 'not_found' }, 404);
 
@@ -245,7 +244,7 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
 
   const requestId = `mem-src-${randomUUID()}`;
   try {
-    const reply = await bridge.sendMemorySourcesRequest(requestId, projectionId, SOURCES_REQUEST_TIMEOUT_MS);
+    const reply = await bridge.sendMemorySourcesRequest(requestId, projectionId, projectId, SOURCES_REQUEST_TIMEOUT_MS);
     // Strip our internal correlation field before returning. The reply
     // already carries `status` / `projectionId` / `sourceEventCount` /
     // `sources` / `partial` / `originServerId` from the daemon handler.

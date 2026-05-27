@@ -205,6 +205,7 @@ describe('memory MCP tool schema firewall', () => {
 
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]({ query: 'recent task', limit: 5 })).resolves.toEqual({
       status: 'ok',
+      reason: 'project_scope_unavailable',
       items: [],
     });
     expect(searchMemory).not.toHaveBeenCalled();
@@ -225,6 +226,7 @@ describe('memory MCP tool schema firewall', () => {
 
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]({ limit: 5 })).resolves.toEqual({
       status: 'ok',
+      reason: 'project_scope_unavailable',
       items: [],
     });
     expect(listMemorySummaries).not.toHaveBeenCalled();
@@ -589,6 +591,7 @@ describe('memory MCP tool schema firewall', () => {
 
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({ projectionId: 'proj-1' })).resolves.toEqual({
       status: 'ok',
+      reason: 'project_scope_unavailable',
       projectionId: 'proj-1',
       sourceEventCount: 0,
       sources: [],

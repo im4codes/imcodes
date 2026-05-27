@@ -290,7 +290,8 @@ function canUseObservationForStartup(row: ContextNamespaceRow, namespace: Contex
   return row.scope === 'user_private'
     && !!row.userId
     && userMatches
-    && (!namespace.projectId || row.projectId === namespace.projectId);
+    && !!namespace.projectId
+    && row.projectId === namespace.projectId;
 }
 
 function observationText(observation: ContextObservationRow): string {

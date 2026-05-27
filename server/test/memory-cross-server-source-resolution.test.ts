@@ -109,12 +109,14 @@ function makeEnv(db: Database): Env {
 function makeProjectionRow(input: {
   id: string;
   serverId: string;
+  projectId?: string;
   summary?: string | null;
   sourceEventIds?: string[];
 }): Record<string, unknown> {
   return {
     id: input.id,
     server_id: input.serverId,
+    project_id: input.projectId ?? 'repo-1',
     source_event_ids_json: input.sourceEventIds ?? [`evt-${input.id}`],
     summary: input.summary === undefined ? `authorized projection ${input.id}` : input.summary,
     content_json: {},
@@ -127,7 +129,9 @@ function makeDb(projectionRow?: Record<string, unknown>): Database {
   return {
     queryOne: async <T>(sql: string, params: unknown[] = []) => {
       if (sql.toLowerCase().includes('from shared_context_projections')) {
-        return projectionRow && params[0] === projectionRow.id && (!params[2] || params[2] === projectionRow.server_id)
+        const serverOk = !sql.includes('server_id = $') || params.includes(projectionRow?.server_id);
+        const projectOk = !sql.includes('project_id = $') || params.includes(projectionRow?.project_id);
+        return projectionRow && params[0] === projectionRow.id && serverOk && projectOk
           ? projectionRow as T
           : null as T;
       }
@@ -179,7 +183,7 @@ describe('end-to-end cross-server source resolution', () => {
     await authDaemon(bridge, daemon, makeDb());
 
     const app = await buildApp(makeDb(makeProjectionRow({ id: 'proj-e2e', serverId })));
-    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-e2e`);
+    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-e2e&projectId=repo-1`);
     expect(res.status).toBe(200);
     const body = await res.json() as {
       status: string;
@@ -201,6 +205,7 @@ describe('end-to-end cross-server source resolution', () => {
       .filter((m): m is Record<string, unknown> => m?.type === MEMORY_WS.GET_SOURCES_REQUEST);
     expect(requests).toHaveLength(1);
     expect(requests[0].projectionId).toBe('proj-e2e');
+    expect(requests[0].expectedProjectId).toBe('repo-1');
     // requestId must be present (route generates it)
     expect(typeof requests[0].requestId).toBe('string');
   });
@@ -212,7 +217,7 @@ describe('end-to-end cross-server source resolution', () => {
     await authDaemon(bridge, daemon, makeDb());
 
     const app = await buildApp(makeDb(makeProjectionRow({ id: 'proj-partial', serverId })));
-    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-partial`);
+    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-partial&projectId=repo-1`);
     expect(res.status).toBe(200);
     const body = await res.json() as { partial: boolean };
     expect(body.partial).toBe(true);
@@ -232,7 +237,7 @@ describe('end-to-end cross-server source resolution', () => {
         summary: null,
         sourceEventIds: [],
       })));
-      const requestPromise = app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-stuck`);
+      const requestPromise = app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-stuck&projectId=repo-1`);
       // Advance past the route's 8s timeout.
       await vi.advanceTimersByTimeAsync(9000);
       const res = await requestPromise;

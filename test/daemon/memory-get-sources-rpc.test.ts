@@ -61,6 +61,7 @@ describe('daemon WS handler: memory.get_sources_request', () => {
       type: MEMORY_WS.GET_SOURCES_REQUEST,
       requestId: 'req-1',
       expectedServerId: 'srv-self',
+      expectedProjectId: 'repo-1',
     }, link);
     // Handler is async (uses dynamic import). Allow the microtask queue to drain.
     for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
@@ -82,6 +83,7 @@ describe('daemon WS handler: memory.get_sources_request', () => {
       requestId: 'req-2',
       projectionId: 'does-not-exist',
       expectedServerId: 'srv-self',
+      expectedProjectId: 'repo-1',
     }, link);
     for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
 
@@ -135,6 +137,7 @@ describe('daemon WS handler: memory.get_sources_request', () => {
       requestId: 'req-3',
       projectionId: projection.id,
       expectedServerId: 'srv-self',
+      expectedProjectId: 'repo-1',
     }, link);
     for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
 
@@ -175,6 +178,7 @@ describe('daemon WS handler: memory.get_sources_request', () => {
       requestId: 'req-manual',
       projectionId: projection.id,
       expectedServerId: 'srv-self',
+      expectedProjectId: 'repo-1',
     }, link);
     for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
 
@@ -212,6 +216,7 @@ describe('daemon WS handler: memory.get_sources_request', () => {
       requestId: 'req-summary-fallback',
       projectionId: projection.id,
       expectedServerId: 'srv-self',
+      expectedProjectId: 'repo-1',
     }, link);
     for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
 
@@ -260,6 +265,7 @@ describe('daemon WS handler: memory.get_sources_request', () => {
       requestId: 'req-4',
       projectionId: projection.id,
       expectedServerId: 'srv-self',
+      expectedProjectId: 'repo-1',
     }, link);
     for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
 
@@ -307,6 +313,7 @@ describe('daemon WS handler: memory.get_sources_request', () => {
       requestId: 'req-5',
       projectionId: projection.id,
       expectedServerId: 'srv-self',
+      expectedProjectId: 'repo-1',
     }, link);
     for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
 

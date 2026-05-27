@@ -10348,6 +10348,9 @@ async function handleMemoryPin(cmd: Record<string, unknown>, serverLink: ServerL
 async function handleMemoryGetSourcesRequest(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   const projectionId = typeof cmd.projectionId === 'string' ? cmd.projectionId.trim() : '';
+  const expectedProjectId = typeof cmd.expectedProjectId === 'string' && cmd.expectedProjectId.trim()
+    ? cmd.expectedProjectId.trim()
+    : undefined;
   // The daemon's own bound serverId. Tagged on every reply so the server
   // route can fill `originServerId` even before the orchestrator knows which
   // daemon answered — useful for cache repopulation on the caller side.
@@ -10370,9 +10373,10 @@ async function handleMemoryGetSourcesRequest(cmd: Record<string, unknown>, serve
   try {
     const { getProcessedProjectionById, listProjectionSources } = await import('../store/context-store.js');
     const projection = getProcessedProjectionById(projectionId);
-    if (!projection) {
-      // Isomorphic with cross-namespace: the server already gated this
-      // request on user ownership, so a missing row really is missing.
+    if (!projection || !expectedProjectId || projection.namespace.projectId !== expectedProjectId) {
+      // Isomorphic with missing/cross-project rows. The cloud route already
+      // authenticates the caller, but the daemon still enforces project scope
+      // before expanding local raw events.
       serverLink.send({
         type: MEMORY_WS.GET_SOURCES_RESPONSE,
         requestId,

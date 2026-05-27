@@ -142,7 +142,7 @@ async function buildTestApp(db: Database) {
 
 async function postRecall(
   app: Hono<{ Bindings: Env }>,
-  body: { query: string; projectId?: string; limit?: number; mode?: 'recall' | 'search' },
+  body: { query: string; projectId?: string; limit?: number; mode?: 'recall' | 'search'; sessionKind?: string },
 ) {
   return app.request('/api/shared-context/srv-1/shared-context/memory/recall', {
     method: 'POST',
@@ -409,7 +409,7 @@ describe('memory recall endpoint — I.5', () => {
     expect(ids).toContain('extra-1');
   });
 
-  it('drops rows that fail the configured composite floor even for a normal query', async () => {
+  it('does not run prompt recall without a project id for project-bound sessions', async () => {
     // Ancient timestamps + no project match → composite scores collapse
     // below floor regardless of raw similarity.
     const { db } = makeMockDb({
@@ -420,10 +420,10 @@ describe('memory recall endpoint — I.5', () => {
     });
     const app = await buildTestApp(db);
 
-    // No matching projectId → projectBoost = 0.1, old updated_at → recency ≈ 0
     const res = await postRecall(app, { query: 'test' });
-    const json = await res.json() as { results: unknown[] };
+    const json = await res.json() as { results: unknown[]; skipped?: string };
     expect(json.results).toEqual([]);
+    expect(json.skipped).toBe('project_required');
   });
 
   it('uses the saved memory recall threshold from server runtime config', async () => {
@@ -449,7 +449,7 @@ describe('memory recall endpoint — I.5', () => {
     });
     const app = await buildTestApp(db);
 
-    const res = await postRecall(app, { query: '相关历史 recall threshold test' });
+    const res = await postRecall(app, { query: '相关历史 recall threshold test', projectId: 'proj-1' });
     expect(res.status).toBe(200);
     const json = await res.json() as { results: Array<{ id: string }> };
     expect(json.results.map((row) => row.id)).toEqual(['p-threshold']);
