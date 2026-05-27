@@ -60,6 +60,12 @@ describe('memory summary sync message', () => {
     expect(message).toBeNull();
   });
 
+  it('does not fetch summaries without a canonical project id', async () => {
+    await expect(buildMemorySummarySyncMessage(t, null, 3)).resolves.toBeNull();
+    await expect(buildMemorySummarySyncMessage(t, '   ', 3)).resolves.toBeNull();
+    expect(getPersonalCloudMemory).not.toHaveBeenCalled();
+  });
+
   it('defaults to a small bounded sync and truncates oversized summaries', async () => {
     const hugeSummary = `${'A'.repeat(2_000)}\nSHOULD_NOT_APPEAR`;
     getPersonalCloudMemory.mockResolvedValueOnce({

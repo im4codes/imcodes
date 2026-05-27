@@ -165,6 +165,7 @@ export function resolveMemoryShortRef(ref: string, namespace?: ContextNamespace)
   if (!bucket || bucket.length === 0) return undefined;
   const exact = namespace ? newestEntry(bucket.filter((entry) => sameNamespace(entry.namespace, namespace))) : undefined;
   if (exact) return exact;
+  if (namespace) return undefined;
   return bucket.length === 1 ? bucket[0] : undefined;
 }
 

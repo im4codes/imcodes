@@ -154,7 +154,8 @@ function canAccessNamespace(namespace: ContextNamespace, caller: AnyCaller): boo
     && caller.namespace.scope !== 'user_private'
     && caller.namespace.userId === caller.userId
     && namespace.userId === caller.userId
-    && (!caller.namespace.projectId || namespace.projectId === caller.namespace.projectId)
+    && !!caller.namespace.projectId
+    && namespace.projectId === caller.namespace.projectId
   ) {
     return true;
   }
@@ -224,7 +225,8 @@ function canAccessObservationNamespace(namespace: ContextNamespace | undefined, 
   return namespace.scope === 'user_private'
     && caller.namespace.userId === caller.userId
     && namespace.userId === caller.userId
-    && (!caller.namespace.projectId || namespace.projectId === caller.namespace.projectId);
+    && !!caller.namespace.projectId
+    && namespace.projectId === caller.namespace.projectId;
 }
 
 function observationText(content: Record<string, unknown>): string {

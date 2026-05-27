@@ -28,6 +28,8 @@ export async function fetchBackendStartupMemoryItems(
   fetchImpl: typeof fetch = fetch,
 ): Promise<MemorySearchResultItem[]> {
   if (!credentials.workerUrl || !credentials.serverId || !credentials.token) return [];
+  const projectId = namespace.projectId?.trim();
+  if (!projectId) return [];
   const response = await fetchImpl(`${cleanBaseUrl(credentials.workerUrl)}/api/shared-context/memory/search`, {
     method: 'POST',
     headers: {
@@ -38,7 +40,7 @@ export async function fetchBackendStartupMemoryItems(
     body: JSON.stringify({
       query: '',
       scope: namespace.scope,
-      projectId: namespace.projectId,
+      projectId,
       limit,
     }),
   });
@@ -53,14 +55,14 @@ export async function fetchBackendStartupMemoryItems(
       && item.preview.trim().length > 0
       && isStartupProjectionClass(item.class)
     ))
-    .filter((item) => !namespace.projectId || item.projectId === namespace.projectId)
+    .filter((item) => item.projectId === projectId)
     .filter((item) => item.scope === namespace.scope)
     .map((item) => {
       const projectionClass = item.class as ProcessedContextClass;
       return {
         type: 'processed' as const,
         id: item.id,
-        projectId: item.projectId ?? namespace.projectId ?? namespace.userId ?? namespace.enterpriseId ?? 'memory',
+        projectId: item.projectId ?? projectId,
         scope: item.scope ?? namespace.scope,
         ...(namespace.enterpriseId ? { enterpriseId: namespace.enterpriseId } : {}),
         ...(namespace.workspaceId ? { workspaceId: namespace.workspaceId } : {}),

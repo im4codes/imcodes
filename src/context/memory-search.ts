@@ -575,7 +575,8 @@ function observationNamespacesForQuery(query: MemorySearchQuery): Map<string, Co
       && row.scope === 'user_private'
       && row.userId
       && row.userId === requested.userId
-      && (!requested.projectId || row.projectId === requested.projectId)
+      && !!requested.projectId
+      && row.projectId === requested.projectId
     ) {
       out.set(row.id, row);
     }
@@ -745,7 +746,8 @@ function matchesNamespace(
       && namespace.scope !== 'user_private'
       && namespace.userId
       && item.userId === namespace.userId
-      && (!namespace.projectId || item.projectId === namespace.projectId)
+      && !!namespace.projectId
+      && item.projectId === namespace.projectId
     ) {
       return true;
     }

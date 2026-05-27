@@ -1557,7 +1557,10 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
   } catch {
     return c.json({ error: 'invalid_json' }, 400);
   }
-  const { query, projectId, limit: rawLimit } = body;
+  const { query, limit: rawLimit } = body;
+  const projectId = typeof body.projectId === 'string' && body.projectId.trim()
+    ? body.projectId.trim()
+    : undefined;
   if (!query || typeof query !== 'string' || query.trim().length === 0) {
     return c.json({ error: 'query_required' }, 400);
   }
@@ -1574,6 +1577,9 @@ sharedContextRoutes.post('/:id/shared-context/memory/recall', async (c) => {
     return c.json({ results: [], vectorSearch: false, skipped: 'imperative_command' });
   }
   const searchMode = body.mode === 'search';
+  if (searchMode && !projectId) {
+    return c.json({ results: [], vectorSearch: false, skipped: 'project_required' });
+  }
   const limitCap = searchMode ? 100 : 20;
   const defaultLimit = searchMode ? 20 : 5;
   const limit = typeof rawLimit === 'number' && rawLimit > 0 ? Math.min(rawLimit, limitCap) : defaultLimit;

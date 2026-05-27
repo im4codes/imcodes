@@ -190,6 +190,46 @@ describe('memory MCP tool schema firewall', () => {
     });
   });
 
+  it('does not invoke memory search when runtime scope has no project id', async () => {
+    const searchMemory = vi.fn(async () => ({ items: [{ projectionId: 'p1', projectId: 'other', summary: 'hidden' }] }));
+    const handlers = createMemoryMcpToolHandlers(caller({
+      namespace: { scope: 'user_private', userId: 'user-1' },
+      sessionName: null,
+      projectName: null,
+      projectRoot: null,
+    }), {
+      searchMemory,
+      isMemoryFeatureEnabled: () => true,
+      sendDeps: { listSessions: () => [] },
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]({ query: 'recent task', limit: 5 })).resolves.toEqual({
+      status: 'ok',
+      items: [],
+    });
+    expect(searchMemory).not.toHaveBeenCalled();
+  });
+
+  it('does not invoke memory summary listing when runtime scope has no project id', async () => {
+    const listMemorySummaries = vi.fn(async () => ({ items: [{ projectionId: 'p1', projectId: 'other', summary: 'hidden' }] }));
+    const handlers = createMemoryMcpToolHandlers(caller({
+      namespace: { scope: 'user_private', userId: 'user-1' },
+      sessionName: null,
+      projectName: null,
+      projectRoot: null,
+    }), {
+      listMemorySummaries,
+      isMemoryFeatureEnabled: () => true,
+      sendDeps: { listSessions: () => [] },
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]({ limit: 5 })).resolves.toEqual({
+      status: 'ok',
+      items: [],
+    });
+    expect(listMemorySummaries).not.toHaveBeenCalled();
+  });
+
   it('returns compact hits from the same recall search used by message memory recall', async () => {
     const projectionId = '1111111111222222222233333333334444444444555555555566666666667777';
     const searchMemory = vi.fn(async () => ({
@@ -527,6 +567,33 @@ describe('memory MCP tool schema firewall', () => {
     expect(passedCaller.userId).toBe('user-1');
     // Caller is built from runtime, not args — verify no smuggled fields.
     expect((passedCaller as unknown as Record<string, unknown>).serverId).not.toBe('attacker-srv');
+  });
+
+  it('does not expand memory sources when runtime scope has no project id', async () => {
+    const orchestrator = vi.fn(async () => ({
+      status: 'ok' as const,
+      projectionId: 'proj-1',
+      sourceEventCount: 1,
+      sources: [{ eventId: 'evt-1', status: 'archived', content: 'hidden source' }],
+    }));
+    const handlers = createMemoryMcpToolHandlers(caller({
+      namespace: { scope: 'user_private', userId: 'user-1' },
+      sessionName: null,
+      projectName: null,
+      projectRoot: null,
+    }), {
+      getMemorySourcesOrchestrator: orchestrator,
+      isMemoryFeatureEnabled: () => true,
+      sendDeps: { listSessions: () => [] },
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({ projectionId: 'proj-1' })).resolves.toEqual({
+      status: 'ok',
+      projectionId: 'proj-1',
+      sourceEventCount: 0,
+      sources: [],
+    });
+    expect(orchestrator).not.toHaveBeenCalled();
   });
 
   it('keeps get_memory_sources available when quick search is disabled but the MCP memory surface is enabled', async () => {

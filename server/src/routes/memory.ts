@@ -51,13 +51,25 @@ interface SharedProjectionSourceFallbackRow {
 
 async function loadAuthorizedProjectionSourceRow(
   db: Env['DB'],
-  input: { projectionId: string; userId: string; originServerId?: string },
+  input: { projectionId: string; userId: string; originServerId?: string; projectId?: string },
 ): Promise<SharedProjectionSourceFallbackRow | undefined> {
+  const params: unknown[] = [input.projectionId, input.userId];
+  let serverClause = '';
+  if (input.originServerId) {
+    params.push(input.originServerId);
+    serverClause = `AND server_id = $${params.length}`;
+  }
+  let projectClause = '';
+  if (input.projectId) {
+    params.push(input.projectId);
+    projectClause = `AND project_id = $${params.length}`;
+  }
   const row = await db.queryOne<SharedProjectionSourceFallbackRow>(
     `SELECT id, server_id, source_event_ids_json, summary, content_json, origin, created_at
        FROM shared_context_projections
       WHERE id = $1
-        ${input.originServerId ? 'AND server_id = $3' : ''}
+        ${serverClause}
+        ${projectClause}
         AND ((scope = 'personal' AND user_id = $2)
              OR (scope <> 'personal' AND EXISTS (
                SELECT 1
@@ -66,7 +78,7 @@ async function loadAuthorizedProjectionSourceRow(
                   AND tm.user_id = $2
              )))
       LIMIT 1`,
-    [input.projectionId, input.userId, ...(input.originServerId ? [input.originServerId] : [])],
+    params,
   );
   return row?.id ? row : undefined;
 }
@@ -158,8 +170,15 @@ async function withProjectionFallback(
 memoryRoutes.get('/memory/projection-owner', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const projectionId = c.req.query('projectionId')?.trim();
+  const projectId = c.req.query('projectId')?.trim();
   if (!projectionId) {
     return c.json({ error: 'projection_id_required' }, 400);
+  }
+  const params: unknown[] = [projectionId, userId];
+  let projectClause = '';
+  if (projectId) {
+    params.push(projectId);
+    projectClause = `AND project_id = $${params.length}`;
   }
 
   // Single row lookup gated on user ownership. 404 vs 200-with-empty is
@@ -169,6 +188,7 @@ memoryRoutes.get('/memory/projection-owner', requireAuth(), async (c) => {
     `SELECT server_id
        FROM shared_context_projections
       WHERE id = $1
+        ${projectClause}
         AND ((scope = 'personal' AND user_id = $2)
              OR (scope <> 'personal' AND EXISTS (
                SELECT 1
@@ -177,7 +197,7 @@ memoryRoutes.get('/memory/projection-owner', requireAuth(), async (c) => {
                   AND tm.user_id = $2
              )))
       LIMIT 1`,
-    [projectionId, userId],
+    params,
   );
 
   if (!row?.server_id) {
@@ -197,6 +217,7 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.query('serverId')?.trim();
   const projectionId = c.req.query('projectionId')?.trim();
+  const projectId = c.req.query('projectId')?.trim();
 
   if (!serverId) return c.json({ error: 'server_id_required' }, 400);
   if (!projectionId) return c.json({ error: 'projection_id_required' }, 400);
@@ -208,6 +229,7 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
     projectionId,
     userId,
     originServerId: serverId,
+    ...(projectId ? { projectId } : {}),
   });
   if (!projectionRow) return c.json({ error: 'not_found' }, 404);
 

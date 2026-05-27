@@ -302,6 +302,11 @@ function cronOptionsForCaller(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps)
   };
 }
 
+function callerProjectId(caller: { namespace: Pick<ContextNamespace, 'projectId'> }): string | undefined {
+  const projectId = caller.namespace.projectId?.trim();
+  return projectId || undefined;
+}
+
 export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
   const searchMemory = deps.searchMemory ?? searchMcpMemoryRecall;
   const listMemorySummaries = deps.listMemorySummaries ?? listMcpMemorySummaries;
@@ -333,15 +338,19 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const limit = numberArg(args, 'limit');
       try {
         const scopedCaller = memoryCaller();
+        const projectId = callerProjectId(scopedCaller);
+        if (!projectId) return { status: 'ok', items: [] };
         const result = await searchMemory({
           query,
           namespace: scopedCaller.namespace,
           currentEnterpriseId: scopedCaller.namespace.enterpriseId,
-          repo: scopedCaller.namespace.projectId,
+          repo: projectId,
           includeLegacyPersonalOwner: true,
           limit,
         });
-        const items = result.items.map((item) => compactSearchHit(item, scopedCaller.namespace));
+        const items = result.items
+          .filter((item) => item.projectId === projectId)
+          .map((item) => compactSearchHit(item, scopedCaller.namespace));
         return { status: 'ok', items };
       } catch (err) {
         return sanitizeCaughtError(err);
@@ -354,16 +363,20 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const limit = numberArg(args, 'limit');
       const scopedCaller = memoryCaller();
       try {
+        const projectId = callerProjectId(scopedCaller);
+        if (!projectId) return { status: 'ok', items: [] };
         const result = await listMemorySummaries({
           namespace: scopedCaller.namespace,
           currentEnterpriseId: scopedCaller.namespace.enterpriseId,
-          repo: scopedCaller.namespace.projectId,
+          repo: projectId,
           userId: scopedCaller.userId,
           includeLegacyPersonalOwner: true,
           projectionClass: listProjectionClassArg(args),
           limit,
         });
-        const items = result.items.map((item) => compactSearchHit(item, scopedCaller.namespace));
+        const items = result.items
+          .filter((item) => item.projectId === projectId)
+          .map((item) => compactSearchHit(item, scopedCaller.namespace));
         return { status: 'ok', items };
       } catch (err) {
         return sanitizeCaughtError(err);
@@ -388,6 +401,19 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'ref cannot be combined with projectionId or observationId');
       }
       const scopedCaller = memoryCaller();
+      const projectId = callerProjectId(scopedCaller);
+      const emptySources = () => ({
+        status: 'ok',
+        ...(ref ? { ref } : {}),
+        ...(projectionId ? { projectionId } : {}),
+        ...(observationId ? { observationId } : {}),
+        sourceEventCount: 0,
+        sources: [],
+      });
+      if (!projectId && !ref && !projectionId && !observationId) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'projectionId, observationId, or ref is required');
+      }
+      if (!projectId) return emptySources();
       if (ref) {
         const resolved = resolveMemoryShortRef(ref, scopedCaller.namespace);
         if (!resolved) return { status: 'ok', ref, sourceEventCount: 0, sources: [] };

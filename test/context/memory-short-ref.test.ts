@@ -73,6 +73,19 @@ describe('memory short refs', () => {
     });
   });
 
+  it('does not use singleton fallback when the supplied namespace does not match', () => {
+    const ref = registerMemoryShortRef({
+      kind: 'projection',
+      id: 'dddddddddd-1111-2222-3333-444444444444',
+      namespace: { scope: 'user_private', userId: 'user-1', projectId: 'repo-a' },
+    });
+
+    expect(resolveMemoryShortRef(ref, { scope: 'user_private', userId: 'user-1', projectId: 'repo-b' })).toBeUndefined();
+    expect(resolveMemoryShortRef(ref)).toMatchObject({
+      id: 'dddddddddd-1111-2222-3333-444444444444',
+    });
+  });
+
   it('resolves same-namespace short-ref conflicts to the newest seen entry', () => {
     const namespace = { scope: 'user_private' as const, userId: 'user-1', projectId: 'repo-1' };
     const ref = registerMemoryShortRef({

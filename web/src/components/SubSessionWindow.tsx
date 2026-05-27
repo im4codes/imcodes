@@ -404,10 +404,8 @@ export function SubSessionWindow({
       : undefined;
     return sub.contextNamespace?.projectId
       ?? parent?.contextNamespace?.projectId
-      ?? parent?.project
-      ?? sub.cwd
       ?? null;
-  }, [sessions, sub.contextNamespace?.projectId, sub.cwd, sub.parentSession]);
+  }, [sessions, sub.contextNamespace?.projectId, sub.parentSession]);
 
   const handleSyncMemorySummaries = useCallback(async () => {
     if (!ws || !connected || syncingMemorySummaries) return;

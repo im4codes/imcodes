@@ -84,11 +84,14 @@ async function defaultLoadCredentials(): Promise<OrchestratorCredentials | null>
 
 async function resolveOwnerFromCloud(
   projectionId: string,
+  projectId: string | undefined,
   credentials: OrchestratorCredentials,
   fetchImpl: typeof fetch,
   signal: AbortSignal,
 ): Promise<string | null> {
-  const url = `${cleanBaseUrl(credentials.workerUrl)}/api/memory/projection-owner?projectionId=${encodeURIComponent(projectionId)}`;
+  const params = new URLSearchParams({ projectionId });
+  if (projectId) params.set('projectId', projectId);
+  const url = `${cleanBaseUrl(credentials.workerUrl)}/api/memory/projection-owner?${params.toString()}`;
   try {
     const response = await fetchImpl(url, {
       method: 'GET',
@@ -126,12 +129,15 @@ interface RemoteSourcesEnvelope {
 
 async function fetchRemoteSources(
   projectionId: string,
+  projectId: string | undefined,
   ownerServerId: string,
   credentials: OrchestratorCredentials,
   fetchImpl: typeof fetch,
   signal: AbortSignal,
 ): Promise<GetSourcesOrchestratorResult> {
-  const url = `${cleanBaseUrl(credentials.workerUrl)}/api/memory/sources?serverId=${encodeURIComponent(ownerServerId)}&projectionId=${encodeURIComponent(projectionId)}`;
+  const params = new URLSearchParams({ serverId: ownerServerId, projectionId });
+  if (projectId) params.set('projectId', projectId);
+  const url = `${cleanBaseUrl(credentials.workerUrl)}/api/memory/sources?${params.toString()}`;
   let response: Response;
   try {
     response = await fetchImpl(url, {
@@ -207,6 +213,15 @@ export async function getMemorySourcesOrchestrated(
   const cache = deps.cache ?? projectionOwnerCache;
   const fetchImpl = deps.fetchImpl ?? fetch;
   const localGetSources = deps.localGetSources ?? memoryGetSources;
+  const projectId = caller.namespace.projectId?.trim();
+  if (!projectId) {
+    return {
+      status: 'ok',
+      projectionId: trimmed,
+      sourceEventCount: 0,
+      sources: [],
+    };
+  }
 
   const credentials = await (deps.loadCredentials ?? defaultLoadCredentials)();
   const localServerId = credentials?.serverId ?? null;
@@ -218,7 +233,7 @@ export async function getMemorySourcesOrchestrated(
     const timer = setTimeout(() => controller.abort(), deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     timer.unref?.();
     try {
-      owner = await resolveOwnerFromCloud(trimmed, credentials, fetchImpl, controller.signal);
+      owner = await resolveOwnerFromCloud(trimmed, projectId, credentials, fetchImpl, controller.signal);
     } finally {
       clearTimeout(timer);
     }
@@ -250,7 +265,7 @@ export async function getMemorySourcesOrchestrated(
   const timer = setTimeout(() => controller.abort(), deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   timer.unref?.();
   try {
-    return await fetchRemoteSources(trimmed, owner!, credentials!, fetchImpl, controller.signal);
+    return await fetchRemoteSources(trimmed, projectId, owner!, credentials!, fetchImpl, controller.signal);
   } finally {
     clearTimeout(timer);
   }

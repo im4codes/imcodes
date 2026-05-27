@@ -681,6 +681,29 @@ describe('memory recall endpoint — I.5', () => {
     expect(json.results).toHaveLength(12);
   });
 
+  it('does not run explicit MCP search without a project id', async () => {
+    const { db, executeLog } = makeMockDb({
+      personalRows: [
+        {
+          id: 'other-project-memory',
+          project_id: 'other-project',
+          projection_class: 'recent_summary',
+          summary: 'Other project memory must not leak into unscoped search',
+          updated_at: Date.now(),
+          score: 1,
+        },
+      ],
+    });
+    const app = await buildTestApp(db);
+
+    const res = await postRecall(app, { query: 'other project memory', mode: 'search' });
+    expect(res.status).toBe(200);
+    const json = await res.json() as { results: unknown[]; skipped?: string };
+    expect(json.results).toEqual([]);
+    expect(json.skipped).toBe('project_required');
+    expect(executeLog.find((entry) => entry.sql.toLowerCase().includes('hit_count'))).toBeUndefined();
+  });
+
   it('prioritizes exact matches before semantic rows for explicit MCP search', async () => {
     generateEmbeddingMock.mockResolvedValueOnce(new Float32Array([0.4, 0.2, 0.1]));
     embeddingToSqlMock.mockReturnValue('[0.4,0.2,0.1]');

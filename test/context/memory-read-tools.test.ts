@@ -181,6 +181,32 @@ describe('memory read tools', () => {
     expectForbidden(() => memoryGetSources(projection.id, caller('alice', aliceRepo)));
   });
 
+  it('does not bridge user_private projection sources when caller has no project id', () => {
+    const privateRepo: ContextNamespace = { scope: 'user_private', projectId: 'repo', userId: 'bob' };
+    const target = { namespace: privateRepo, kind: 'session' as const, sessionName: 'deck_repo_brain' };
+    const event = recordContextEvent({
+      id: 'evt-user-private-unscoped',
+      target,
+      eventType: 'assistant.text',
+      content: 'private projection source content',
+      createdAt: 1,
+    });
+    archiveEventsForMaterialization([event], 2);
+    const projection = writeProcessedProjection({
+      namespace: privateRepo,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-user-private-unscoped'],
+      summary: 'private projection summary',
+      content: {},
+    });
+
+    expect(memoryGetSources(projection.id, caller('bob', { scope: 'personal', userId: 'bob' }))).toEqual({
+      projectionId: projection.id,
+      sourceEventCount: 0,
+      sources: [],
+    });
+  });
+
   it('returns manual memory projection text when no raw source event exists', () => {
     const manualMemoryText = [
       'mock infra server alpha: ssh user@alpha.test.im.codes',
@@ -280,6 +306,27 @@ describe('memory read tools', () => {
     });
 
     expect(memoryGetSources({ observationId: observation.id, kind: 'observation' }, caller('bob', bobOtherRepo))).toEqual({
+      observationId: observation.id,
+      sourceEventCount: 0,
+      sources: [],
+    });
+  });
+
+  it('does not bridge user_private observations when caller has no project id', () => {
+    const namespace = ensureContextNamespace({ scope: 'user_private', projectId: 'repo', userId: 'bob' }, 10);
+    const observation = writeContextObservation({
+      namespaceId: namespace.id,
+      scope: 'user_private',
+      class: 'note',
+      origin: 'agent_learned',
+      fingerprint: 'obs-unscoped-hidden-fp',
+      content: { text: 'hidden observation text' },
+      text: 'hidden observation text',
+      state: 'candidate',
+      now: 20,
+    });
+
+    expect(memoryGetSources({ observationId: observation.id, kind: 'observation' }, caller('bob', { scope: 'personal', userId: 'bob' }))).toEqual({
       observationId: observation.id,
       sourceEventCount: 0,
       sources: [],

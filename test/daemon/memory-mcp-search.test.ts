@@ -139,6 +139,50 @@ describe('memory MCP recall search', () => {
     }
   });
 
+  it('does not search global memory when the caller has no project id', async () => {
+    const tempDir = await createIsolatedSharedContextDb('memory-mcp-search-no-project');
+    try {
+      writeProcessedProjection({
+        namespace: { scope: 'user_private', userId: 'daemon-local' },
+        class: 'recent_summary',
+        sourceEventIds: ['evt-global-local'],
+        summary: 'Unscoped local search memory must not leak',
+        content: {},
+        updatedAt: 100,
+      });
+      const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+        results: [
+          {
+            id: 'cloud-global',
+            projectId: 'repo-elsewhere',
+            class: 'recent_summary',
+            summary: 'Unscoped cloud search memory must not leak',
+            updatedAt: 300,
+          },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as unknown as typeof fetch;
+
+      const result = await searchMcpMemoryRecall({
+        query: 'search memory',
+        namespace: { scope: 'user_private', userId: 'daemon-local' },
+        includeLegacyPersonalOwner: true,
+        limit: 5,
+      }, {
+        fetchImpl,
+        credentials: {
+          workerUrl: 'https://example.im.codes/',
+          serverId: 'srv-1',
+          token: 'server-token',
+        },
+      });
+
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(result.items).toEqual([]);
+    } finally {
+      await cleanupIsolatedSharedContextDb(tempDir);
+    }
+  });
+
   it('queries cloud memory recall with daemon server credentials and merges local recall fallback', async () => {
     const tempDir = await createIsolatedSharedContextDb('memory-mcp-search');
     try {

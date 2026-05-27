@@ -279,7 +279,7 @@ export function SessionPane({
     try {
       const text = await buildMemorySummarySyncMessage(
         t,
-        session.contextNamespace?.projectId ?? session.project ?? session.projectDir ?? null,
+        session.contextNamespace?.projectId ?? null,
       );
       if (!text) return;
       const commandId = globalThis.crypto?.randomUUID?.()
@@ -295,7 +295,7 @@ export function SessionPane({
     } finally {
       setSyncingMemorySummaries(false);
     }
-  }, [addOptimisticUserMessage, connected, hasChatTimeline, scrollToBottom, session.contextNamespace?.projectId, session.project, session.projectDir, sessionName, syncingMemorySummaries, t, ws]);
+  }, [addOptimisticUserMessage, connected, hasChatTimeline, scrollToBottom, session.contextNamespace?.projectId, sessionName, syncingMemorySummaries, t, ws]);
 
   const terminalVisible = isActive && effectiveViewMode === 'terminal';
   const chatVisible = isActive && effectiveViewMode === 'chat';
