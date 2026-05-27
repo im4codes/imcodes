@@ -3,6 +3,16 @@ export interface TransportPendingMessageEntry {
   text: string;
 }
 
+export interface TransportPendingQueueSnapshot {
+  messages: string[];
+  entries: TransportPendingMessageEntry[];
+  changed: boolean;
+}
+
+function normalizeTransportPendingText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
 export function isLegacyTransportPendingMessageId(clientMessageId: string, scopeKey: string): boolean {
   return typeof clientMessageId === 'string'
     && clientMessageId.startsWith(`${scopeKey}:legacy:`);
@@ -60,6 +70,35 @@ export function normalizeTransportPendingEntries(
       text,
     };
   });
+}
+
+export function removeTransportPendingEntryForUserMessage(
+  existingEntries: unknown,
+  existingMessages: unknown,
+  payload: { clientMessageId?: unknown; commandId?: unknown; text?: unknown },
+  scopeKey: string,
+): TransportPendingQueueSnapshot {
+  const messages = extractTransportPendingMessages(existingMessages);
+  const entries = normalizeTransportPendingEntries(existingEntries, messages, scopeKey);
+  const candidateIds = [
+    payload.clientMessageId,
+    payload.commandId,
+  ].flatMap((value) => (typeof value === 'string' && value.trim() ? [value.trim()] : []));
+  const candidateIdSet = new Set(candidateIds);
+  const normalizedText = typeof payload.text === 'string'
+    ? normalizeTransportPendingText(payload.text)
+    : '';
+  const matchIndex = entries.findIndex((entry) => {
+    if (candidateIdSet.has(entry.clientMessageId)) return true;
+    return !!normalizedText && normalizeTransportPendingText(entry.text) === normalizedText;
+  });
+  if (matchIndex < 0) return { messages, entries, changed: false };
+  const nextEntries = entries.filter((_, index) => index !== matchIndex);
+  return {
+    messages: nextEntries.map((entry) => entry.text),
+    entries: nextEntries,
+    changed: true,
+  };
 }
 
 export function mergeTransportPendingMessagesForRunningState(

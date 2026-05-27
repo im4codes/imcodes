@@ -128,6 +128,7 @@ import {
   mergeTransportPendingMessagesForIdleState,
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
+  removeTransportPendingEntryForUserMessage,
 } from './transport-queue.js';
 import { ingestTimelineEventForCache, requestActiveTimelineRefresh } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
@@ -2220,6 +2221,28 @@ export function App() {
             toolUseId: String(event.payload.toolUseId ?? ''),
             questions: (event.payload.questions as PendingQuestion['questions']) ?? [],
           });
+        }
+        if (event.type === 'user.message' && !event.sessionId.startsWith('deck_sub_')) {
+          setSessions((prev) => prev.map((s) => {
+            if (s.name !== event.sessionId) return s;
+            const nextQueue = removeTransportPendingEntryForUserMessage(
+              s.transportPendingMessageEntries,
+              s.transportPendingMessages,
+              {
+                clientMessageId: event.payload.clientMessageId,
+                commandId: event.payload.commandId,
+                text: event.payload.text,
+              },
+              event.sessionId,
+            );
+            if (!nextQueue.changed) return s;
+            return {
+              ...s,
+              state: s.state === 'queued' && nextQueue.messages.length === 0 ? 'running' as SessionInfo['state'] : s.state,
+              transportPendingMessages: nextQueue.messages,
+              transportPendingMessageEntries: nextQueue.entries,
+            };
+          }));
         }
         // Sync session state from live timeline events (running/idle)
         if (event.type === 'session.state' && !event.sessionId.startsWith('deck_sub_')) {

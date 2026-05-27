@@ -19,6 +19,7 @@ import {
   mergeTransportPendingMessagesForIdleState,
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
+  removeTransportPendingEntryForUserMessage,
 } from '../transport-queue.js';
 import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
 import { getAutoSessionLabelPrefix } from '../agent-display.js';
@@ -300,6 +301,34 @@ export function useSubSessions(
 
       if (msg.type === 'timeline.event') {
         const ev = msg.event;
+        if (ev.type === 'user.message') {
+          const subSessionName = ev.sessionId;
+          if (!subSessionName || !subSessionName.startsWith('deck_sub_')) return;
+          setSubSessions((prev) => {
+            const idx = prev.findIndex((s) => s.sessionName === subSessionName);
+            if (idx === -1) return prev;
+            const nextQueue = removeTransportPendingEntryForUserMessage(
+              prev[idx].transportPendingMessageEntries,
+              prev[idx].transportPendingMessages,
+              {
+                clientMessageId: ev.payload.clientMessageId,
+                commandId: ev.payload.commandId,
+                text: ev.payload.text,
+              },
+              subSessionName,
+            );
+            if (!nextQueue.changed) return prev;
+            const next = [...prev];
+            next[idx] = {
+              ...next[idx],
+              state: next[idx].state === 'queued' && nextQueue.messages.length === 0 ? 'running' : next[idx].state,
+              transportPendingMessages: nextQueue.messages,
+              transportPendingMessageEntries: nextQueue.entries,
+            };
+            return next;
+          });
+          return;
+        }
         if (ev.type === 'session.state') {
           state = String(ev.payload.state ?? '');
           sessionName = ev.sessionId;
