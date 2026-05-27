@@ -387,9 +387,15 @@ footer {
 
 <section>
   <h2 data-i18n="h_install">install</h2>
-  <div class="install-block" onclick="copy(this)">
-    <code><span>$</span> npm install -g imcodes</code>
-    <div class="copy-hint" data-i18n="copy_hint">click to copy</div>
+  <div style="display:flex;gap:12px;flex-wrap:wrap;">
+    <div class="install-block" onclick="copy(this)">
+      <code><span>$</span> curl -fsSL https://im.codes/install.sh | bash</code>
+      <div class="copy-hint" data-i18n="copy_hint">click to copy</div>
+    </div>
+    <div class="install-block" onclick="copy(this)">
+      <code><span>&gt;</span> irm https://im.codes/install.ps1 | iex</code>
+      <div class="copy-hint" data-i18n="copy_hint">click to copy</div>
+    </div>
   </div>
 </section>
 
@@ -456,7 +462,7 @@ docker compose up -d</div>
   <h2 data-i18n="h_reqs">requirements</h2>
   <ul class="reqs">
     <li data-i18n="req_os">macOS, Linux, or Windows (native experimental; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> fully supported)</li>
-    <li>Node.js &ge; 20</li>
+    <li>Node.js &ge; 22</li>
     <li data-i18n="req_mux">tmux (Linux/macOS/WSL). Windows native uses ConPTY (built-in). Multiple agents also support SDK-backed sessions.</li>
   </ul>
 </section>
@@ -1085,7 +1091,9 @@ function applyLang() {
 }
 
 function copy(el) {
-  navigator.clipboard.writeText('npm install -g imcodes');
+  const code = el.querySelector('code');
+  const text = code ? code.textContent.replace(/\u00a0/g, ' ').trim() : '';
+  navigator.clipboard.writeText(text);
   const hint = el.querySelector('.copy-hint');
   const orig = hint.textContent;
   hint.textContent = { 'zh-CN': '已复制！', 'zh-TW': '已複製！', ja: 'コピーしました！', ko: '복사됨!', es: '¡copiado!', ru: 'скопировано!' }[currentLang] || 'copied!';

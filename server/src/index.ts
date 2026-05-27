@@ -249,10 +249,18 @@ export function buildApp(env: Env) {
           html: 'text/html', js: 'application/javascript', css: 'text/css',
           png: 'image/png', jpg: 'image/jpeg', svg: 'image/svg+xml',
           ico: 'image/x-icon',
+          // Install scripts served raw so `irm`/`curl` pipe clean UTF-8 text.
+          ps1: 'text/plain; charset=utf-8', sh: 'text/plain; charset=utf-8',
+          txt: 'text/plain; charset=utf-8',
         };
+        const isInstallScript = ext === 'sh' || ext === 'ps1' || ext === 'txt';
         const content = await readFile(filePath);
         return new Response(content, {
-          headers: { 'Content-Type': mime[ext] ?? 'application/octet-stream', ...SECURITY_HEADERS },
+          headers: {
+            'Content-Type': mime[ext] ?? 'application/octet-stream',
+            ...SECURITY_HEADERS,
+            ...(isInstallScript ? { 'Cache-Control': 'no-cache' } : {}),
+          },
         });
       }
     } catch { /* fall through to landing index */ }
