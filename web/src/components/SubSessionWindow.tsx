@@ -2,7 +2,7 @@
  * SubSessionWindow — floating, draggable/resizable window for a sub-session.
  * Uses the full SessionControls for input (same as the main session).
  */
-import { useState, useRef, useCallback, useEffect, useMemo } from 'preact/hooks';
+import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
@@ -152,6 +152,17 @@ export function measureMobileSubSessionBarHeight(
   }
 
   return Math.ceil(elements.reduce((total, el) => total + Math.max(0, el.offsetHeight), 0));
+}
+
+function isMobileSubSessionBarSuppressed(doc: Document = document): boolean {
+  const root = doc.documentElement;
+  return root.classList.contains('kb-open') || root.classList.contains('input-focused');
+}
+
+function getInitialMobileSubSessionBarHeight(isMobile: boolean): number {
+  if (!isMobile || typeof document === 'undefined') return 0;
+  if (isMobileSubSessionBarSuppressed()) return 0;
+  return measureMobileSubSessionBarHeight();
 }
 
 function currentDesktopBounds(): WorkspaceBounds {
@@ -638,8 +649,8 @@ export function SubSessionWindow({
     return () => vv.removeEventListener('resize', update);
   }, [isMobile]);
 
-  const [subSessionBarHeight, setSubSessionBarHeight] = useState(0);
-  useEffect(() => {
+  const [subSessionBarHeight, setSubSessionBarHeight] = useState(() => getInitialMobileSubSessionBarHeight(isMobile));
+  useLayoutEffect(() => {
     if (!isMobile) return;
     let raf = 0;
     let ro: ResizeObserver | null = null;
@@ -647,7 +658,12 @@ export function SubSessionWindow({
 
     const update = () => {
       const measured = measureMobileSubSessionBarHeight();
-      if (measured <= 0) return;
+      if (measured <= 0) {
+        if (isMobileSubSessionBarSuppressed()) {
+          setSubSessionBarHeight((prev) => (prev === 0 ? prev : 0));
+        }
+        return;
+      }
       setSubSessionBarHeight((prev) => (prev === measured ? prev : measured));
     };
     const scheduleUpdate = () => {
@@ -681,7 +697,13 @@ export function SubSessionWindow({
       attributes: true,
       attributeFilter: ['class', 'style', 'hidden'],
     });
+    mo?.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['class'],
+    });
     window.addEventListener('resize', scheduleUpdate);
+    document.addEventListener('focusin', scheduleUpdate, true);
+    document.addEventListener('focusout', scheduleUpdate, true);
     vv?.addEventListener('resize', scheduleUpdate);
     vv?.addEventListener('scroll', scheduleUpdate);
     return () => {
@@ -689,6 +711,8 @@ export function SubSessionWindow({
       ro?.disconnect();
       mo?.disconnect();
       window.removeEventListener('resize', scheduleUpdate);
+      document.removeEventListener('focusin', scheduleUpdate, true);
+      document.removeEventListener('focusout', scheduleUpdate, true);
       vv?.removeEventListener('resize', scheduleUpdate);
       vv?.removeEventListener('scroll', scheduleUpdate);
     };
