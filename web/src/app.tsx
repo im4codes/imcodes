@@ -1400,6 +1400,28 @@ export function App() {
     setSubSessionMaximized(id, false);
   }, [setSubSessionMaximized]);
 
+  const isSubSessionPinnedPanel = useCallback((id: string): boolean => {
+    const sub = subSessionsRef.current.find((candidate) => candidate.id === id);
+    if (!sub) return false;
+    return pinnedPanels.some((panel) => (
+      panel.type === 'subsession' && panel.props?.sessionName === sub.sessionName
+    ));
+  }, [pinnedPanels]);
+
+  const unpinSubSessionPanel = useCallback((id: string): boolean => {
+    const sub = subSessionsRef.current.find((candidate) => candidate.id === id);
+    if (!sub) return false;
+    let removed = false;
+    setPinnedPanels((prev) => {
+      const next = prev.filter((panel) => !(
+        panel.type === 'subsession' && panel.props?.sessionName === sub.sessionName
+      ));
+      removed = next.length !== prev.length;
+      return removed ? next : prev;
+    });
+    return removed;
+  }, [setPinnedPanels]);
+
   const minimizeSubSessionWindow = useCallback((id: string) => {
     clearSubSessionMaximized(id);
     setOpenSubIds((prev) => {
@@ -1416,20 +1438,22 @@ export function App() {
       setOpenSubIds((prev) => (prev.has(id) ? new Set() : new Set([id])));
       return;
     }
+    unpinSubSessionPanel(id);
     setSubSessionMaximized(id, true);
     setOpenSubIds((prev) => {
       if (prev.has(id)) return prev;
       return new Set([...prev, id]);
     });
     bringSubToFront(id);
-  }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized]);
+  }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized, unpinSubSessionPanel]);
 
   const maximizeOpenSubSession = useCallback((id: string) => {
     if (isMobileRef.current) return;
+    unpinSubSessionPanel(id);
     setSubSessionMaximized(id, true);
     setOpenSubIds((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
     bringSubToFront(id);
-  }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized]);
+  }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized, unpinSubSessionPanel]);
 
   const restoreSubSession = useCallback((id: string) => {
     clearSubSessionMaximized(id);
@@ -1444,32 +1468,51 @@ export function App() {
       return;
     }
 
+    unpinSubSessionPanel(id);
     setOpenSubIds((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
     bringSubToFront(id);
-  }, [bringSubToFront, clearSubSessionMaximized, setOpenSubIds]);
+  }, [bringSubToFront, clearSubSessionMaximized, setOpenSubIds, unpinSubSessionPanel]);
 
   const toggleSubSession = useCallback((id: string) => {
     const mobile = isMobileRef.current;
-    const wasOpen = openSubIdsRef.current.has(id);
-    clearSubSessionMaximized(id);
+    const wasPinned = !mobile && isSubSessionPinnedPanel(id);
+    let willOpen = false;
 
-    if (mobile) {
-      setOpenSubIds(wasOpen ? new Set() : new Set([id]));
-      return;
-    }
+    setOpenSubIds((prev) => {
+      clearSubSessionMaximized(id);
 
-    if (wasOpen) {
-      const next = new Set(openSubIdsRef.current);
-      next.delete(id);
-      setOpenSubIds(next);
-      removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
-    } else {
-      const next = new Set(openSubIdsRef.current);
-      next.add(id);
-      setOpenSubIds(next);
+      if (mobile) {
+        if (prev.has(id)) return new Set();
+        willOpen = true;
+        return new Set([id]);
+      }
+
+      const next = new Set(prev);
+      if (next.has(id) && !wasPinned) {
+        next.delete(id);
+      } else {
+        next.add(id);
+        willOpen = true;
+      }
+      return next;
+    });
+
+    if (mobile) return;
+
+    if (willOpen) {
+      if (wasPinned) unpinSubSessionPanel(id);
       bringSubToFront(id);
+    } else {
+      removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
     }
-  }, [bringSubToFront, clearSubSessionMaximized, removeDesktopWindow, setOpenSubIds]);
+  }, [
+    bringSubToFront,
+    clearSubSessionMaximized,
+    isSubSessionPinnedPanel,
+    removeDesktopWindow,
+    setOpenSubIds,
+    unpinSubSessionPanel,
+  ]);
 
   const activeSessionRef = useRef(activeSession);
   activeSessionRef.current = activeSession;

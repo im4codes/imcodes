@@ -180,9 +180,12 @@ vi.mock('../src/hooks/usePref.js', () => ({
   usePref: () => ({ loaded: true, value: '/bin/bash' }),
 }));
 
-vi.mock('../src/hooks/useSyncedPreference.js', () => ({
-  useSyncedPreference: (_key: string, initial: unknown) => [initial, vi.fn()],
-}));
+vi.mock('../src/hooks/useSyncedPreference.js', async () => {
+  const { useState } = await vi.importActual<typeof import('preact/hooks')>('preact/hooks');
+  return {
+    useSyncedPreference: (_key: string, initial: unknown) => useState(initial),
+  };
+});
 
 vi.mock('../src/git-status-store.js', () => ({
   requestSharedChanges: vi.fn(),
@@ -277,6 +280,7 @@ vi.mock('../src/components/Sidebar.js', () => ({
     <div>
       sidebar
       <button onClick={() => onDropPanel?.('subsession', 'sub-1')}>sidebar-drop</button>
+      <button onClick={() => onDropPanel?.('subsession', 'sub-2')}>sidebar-drop-sub-2</button>
       {children}
     </div>
   ),
@@ -666,6 +670,56 @@ describe('App shell', () => {
       const openedZ = Number((opened as HTMLElement).style.zIndex);
       expect(restoredZ).toBeGreaterThan(0);
       expect(openedZ).toBeGreaterThan(restoredZ);
+    });
+  }, 20_000);
+
+  it('opens a pinned sub-session as a floating window without closing other desktop sub-session windows', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+      {
+        id: 'sub-2',
+        sessionName: 'deck_sub_alpha_reviewer',
+        parentSession: 'deck_alpha_brain',
+        label: 'Reviewer',
+        description: 'Reviewer session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    fireEvent.click(screen.getByText('subbar-open-sub-1'));
+    expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('sidebar-drop-sub-2'));
+
+    fireEvent.click(screen.getByText('subbar-open-sub-2'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeTruthy();
+      expect(screen.queryByTestId('sub-session-window-sub-2')).toBeTruthy();
     });
   }, 20_000);
 
