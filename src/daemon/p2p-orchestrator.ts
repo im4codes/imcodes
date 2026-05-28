@@ -337,7 +337,9 @@ export function buildPostSummaryExecutionPrompt(
   const basePrompt = template
     .replaceAll('{{discussionFile}}', run.contextFilePath)
     .replaceAll('{{request}}', run.userText);
-  if (!markerSpec) return basePrompt;
+  const langLine = buildP2pLanguageInstruction(run.locale);
+  const appendLanguageInstruction = (prompt: string) => langLine ? `${prompt}\n\n${langLine}` : prompt;
+  if (!markerSpec) return appendLanguageInstruction(basePrompt);
 
   const successMarker = stringifyP2pExecutionMarker(buildP2pExecutionMarker(markerSpec, 'completed')).trimEnd();
   const failureMarker = stringifyP2pExecutionMarker({
@@ -351,7 +353,7 @@ export function buildPostSummaryExecutionPrompt(
     ? `\nThis is retry attempt ${options.attempt}; the required marker has not been observed yet.`
     : '';
 
-  return `${basePrompt}
+  return appendLanguageInstruction(`${basePrompt}
 
 Execution proof required before the P2P workflow can continue:
 - After you have directly executed the original request, write this exact JSON marker to: ${markerSpec.markerPath}
@@ -367,55 +369,21 @@ ${successMarker}
 Failed marker:
 \`\`\`json
 ${failureMarker}
-\`\`\``;
+\`\`\``);
 }
 
-/*
- * R3 v2 PR-ν — Concise i18n discussion-language instruction.
- *
- * Replaces the previous verbose English-only line:
- *   "Use the user's selected i18n language (Chinese (Simplified)) for the discussion."
- * with the locale's own native one-liner from the JSON dictionary, e.g.:
- *   en    → "Reply in English."
- *   zh-CN → "请用中文回复。"
- *   ja    → "日本語で回答してください。"
- *
- * The native-name table uses each locale's autonym so the agent reads the
- * instruction in the SAME language it is being asked to reply in — far less
- * ambiguous than the bilingual mix the old line produced.
- */
-const P2P_DISCUSSION_LANGUAGE_TEMPLATES: Record<string, string> = {
-  en: enLocale.p2p.discussion_language_instruction,
-  'zh-CN': zhCNLocale.p2p.discussion_language_instruction,
-  'zh-TW': zhTWLocale.p2p.discussion_language_instruction,
-  ja: jaLocale.p2p.discussion_language_instruction,
-  ko: koLocale.p2p.discussion_language_instruction,
-  es: esLocale.p2p.discussion_language_instruction,
-  ru: ruLocale.p2p.discussion_language_instruction,
-};
-
-const P2P_LANGUAGE_AUTONYMS: Record<string, string> = {
-  en: 'English',
-  'zh-CN': '中文',
-  'zh-TW': '繁體中文',
-  ja: '日本語',
-  ko: '한국어',
-  es: 'Español',
-  ru: 'Русский',
-};
+const P2P_SUPPORTED_I18N_LOCALES = new Set(['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']);
 
 /**
- * Build the per-run discussion-language reminder. Returns an empty string
- * when no locale is set OR the locale is unknown — callers should treat
- * an empty string as "skip this line" so unknown locales don't pollute
- * prompts with a missing-language hint.
+ * Build the per-run discussion-language reminder. It intentionally uses the
+ * selected i18n locale code and is appended at the END of P2P prompts, so it
+ * is not buried in the middle of the task body or localized into an easily
+ * missed side instruction.
  */
 export function buildP2pLanguageInstruction(locale: string | undefined): string {
   if (!locale) return '';
-  const template = P2P_DISCUSSION_LANGUAGE_TEMPLATES[locale];
-  const autonym = P2P_LANGUAGE_AUTONYMS[locale];
-  if (!template || !autonym) return '';
-  return template.replaceAll('{{language}}', autonym);
+  if (!P2P_SUPPORTED_I18N_LOCALES.has(locale)) return '';
+  return `You shall use ${locale} to reply and use ${locale} to discuss.`;
 }
 
 export function getP2pRun(id: string): P2pRun | undefined { return activeRuns.get(id); }
@@ -1999,12 +1967,6 @@ function buildAdvancedPromptCommon(
   parts.push(buildAdvancedRoundPrefix(run, round));
   parts.push('');
   parts.push(P2P_BASELINE_PROMPT);
-  // R3 v2 PR-ν — concise locale-native language reminder, surfaced
-  // immediately after the baseline prompt so it's visible to the agent
-  // before any task-specific instructions. Empty string when locale is
-  // missing/unknown, so callers append nothing extra in that case.
-  const langLine = buildP2pLanguageInstruction(run.locale);
-  if (langLine) parts.push(langLine);
   if (round.presetPrompt) parts.push(round.presetPrompt);
   parts.push('');
   parts.push(`[P2P Advanced Task — run ${run.id}]`);
@@ -2033,6 +1995,11 @@ function buildAdvancedPromptCommon(
   if (run.extraPrompt) {
     parts.push('');
     parts.push(`Additional instructions: ${run.extraPrompt}`);
+  }
+  const langLine = buildP2pLanguageInstruction(run.locale);
+  if (langLine) {
+    parts.push('');
+    parts.push(langLine);
   }
   return parts.join('\n');
 }
@@ -3501,13 +3468,6 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
   // Shared discussion-quality prompt
   parts.push(P2P_BASELINE_PROMPT);
 
-  // R3 v2 PR-ν — concise locale-native discussion-language reminder
-  // (e.g. "请用中文回复。"). Surfaced right after the baseline so the
-  // language requirement reaches the agent BEFORE any task-specific
-  // instructions. Empty string when locale is missing/unknown.
-  const langLine = buildP2pLanguageInstruction(run.locale);
-  if (langLine) parts.push(langLine);
-
   // Mode role prompt
   if (mode?.prompt) {
     parts.push(mode.prompt);
@@ -3563,6 +3523,12 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
   if (run.extraPrompt) {
     parts.push('');
     parts.push(`Additional instructions: ${run.extraPrompt}`);
+  }
+
+  const langLine = buildP2pLanguageInstruction(run.locale);
+  if (langLine) {
+    parts.push('');
+    parts.push(langLine);
   }
 
   return parts.join('\n');

@@ -545,12 +545,12 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
 
 const DEFAULT_PREVIOUS_SUMMARY_MAX_TOKENS = 1000;
 const DEFAULT_MAX_EVENT_CHARS = 2000;
-export const RECENT_SUMMARY_MAX_CHARS = 900;
+export const RECENT_SUMMARY_MAX_CHARS = 1400;
 const RECENT_SUMMARY_SECTION_MAX_CHARS = {
-  Problem: 180,
-  Done: 320,
-  Decisions: 180,
-  'Next/Risks': 140,
+  Problem: 240,
+  Done: 560,
+  Decisions: 280,
+  'Next/Risks': 220,
 } as const;
 
 export function computeTargetTokens(inputTokens: number, mode: CompressionMode = 'auto'): number {
@@ -867,10 +867,10 @@ export function buildCompressionPrompt(
 [One sentence naming the user's immediate ask or bug.]
 
 ## Done
-[1-4 bullets max. Only concrete changes, commits, files, commands, or outcomes from NEW EVENTS.]
+[2-6 bullets max when useful. Include concrete changes, commits, important files, commands, test results, or outcomes from NEW EVENTS.]
 
 ## Decisions
-[Only durable decisions/preferences/constraints. Omit if none.]
+[Only durable decisions/preferences/constraints, with enough context to act on them later. Omit if none.]
 
 ## User-Pinned Notes
 ${pinnedNoteBlock || '[Copy user-pinned notes verbatim here only when present. Omit filler.]'}
@@ -883,7 +883,8 @@ ${pinnedNoteBlock || '[Copy user-pinned notes verbatim here only when present. O
       'Do not include long handoff sections such as Active State, Active Task, Learned Facts, State Snapshot, Critical Context, User Problem, Resolution, or Key Decisions.',
       'This is a short delta summary for recent memory, not a master handoff. Capture only NEW EVENTS; do not preserve or restate prior summaries wholesale.',
       `Hard budget: keep the final answer under ${RECENT_SUMMARY_MAX_CHARS} characters unless User-Pinned Notes require exact verbatim content.`,
-      'Prefer compact bullets. Remove boilerplate, empty sections, repeated status snapshots, and duplicated deployment/test lists.',
+      'Prefer compact but information-dense bullets. Keep the specific file paths, commands, commit ids, errors, and user constraints needed for a future agent to continue without guessing.',
+      'Remove boilerplate, empty sections, repeated status snapshots, and duplicated deployment/test lists.',
     ].join(' ');
 
     return `${COMPRESSION_ANTI_INSTRUCTION_PREAMBLE}
@@ -901,7 +902,7 @@ CRITICAL — VERBATIM PRESERVATION RULE: If any user message in the events above
 
 ${invariant}
 
-Target ~${Math.min(targetTokens, 260)} tokens. Write only the summary.`;
+Target ~${Math.min(targetTokens, 420)} tokens. Write only the summary.`;
   }
 
   const template = `## User Problem

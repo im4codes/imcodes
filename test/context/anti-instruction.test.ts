@@ -89,6 +89,35 @@ describe('compression anti-instruction prompt', () => {
     expect(compact).not.toContain('## Key Decisions');
   });
 
+  it('keeps enough concrete detail in recent summaries for continuation', () => {
+    const detailed = [
+      '## User Problem',
+      'The user asked to make memory compression less aggressive because recent summaries were too short to be useful.',
+      '',
+      '## Done',
+      '- Updated src/context/summary-compressor.ts to raise the recent summary character budget and per-section caps.',
+      '- Adjusted the auto-compression prompt so it asks for compact but information-dense bullets instead of an ultra-short delta.',
+      '- Preserved the compact five-heading recent-memory shape so sync messages stay smaller than manual handoffs.',
+      '- Ran npm run test:context -- anti-instruction and npm run build before committing.',
+      '- Committed abc12345 Balance recent memory compression detail.',
+      '',
+      '## Decisions',
+      '- Keep recent summaries delta-only, but retain file paths, test commands, commit ids, errors, and user constraints needed for a future agent.',
+      '',
+      '## Next/Risks',
+      '- Watch the next memory sync output to confirm it is more useful without becoming a full handoff.',
+    ].join('\n');
+
+    const compact = compactRecentSummaryForStorage(detailed);
+
+    expect(compact.length).toBeLessThanOrEqual(RECENT_SUMMARY_MAX_CHARS);
+    expect(compact).toContain('src/context/summary-compressor.ts');
+    expect(compact).toContain('npm run test:context -- anti-instruction');
+    expect(compact).toContain('abc12345');
+    expect(compact).toContain('delta-only');
+    expect(compact).toContain('future agent');
+  });
+
   it('preserves pinned notes while capping non-pinned compact summary text', () => {
     const pinned = '记住: exact API token-shaped fixture abcdef0123456789abcdef0123456789abcdef01';
     const compact = compactRecentSummaryForStorage([

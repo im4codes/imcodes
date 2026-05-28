@@ -114,7 +114,7 @@ describe('processed-context replication', () => {
     });
   });
 
-  it('skips personal replication unless personal cloud sync is enabled', async () => {
+  it('skips personal replication when personal cloud sync is explicitly disabled', async () => {
     const personalNamespace: ContextNamespace = { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' };
     const projection = writeProcessedProjection({
       namespace: personalNamespace,
@@ -128,6 +128,11 @@ describe('processed-context replication', () => {
     });
     setReplicationState(personalNamespace, {
       pendingProjectionIds: [projection.id],
+    });
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      enablePersonalMemorySync: false,
     });
 
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {

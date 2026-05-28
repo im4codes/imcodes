@@ -161,7 +161,8 @@ const runtimeConfigSchema = z.object({
 });
 
 const DEFAULT_REMOTE_PROCESSED_FRESH_MS = 6 * 60 * 60 * 1000;
-const PERSONAL_MEMORY_SYNC_PREF_KEY = 'shared_context.personal_memory_sync';
+const PERSONAL_MEMORY_SYNC_PREF_KEY = 'shared_context.personal_memory_sync.v2';
+const LEGACY_PERSONAL_MEMORY_SYNC_PREF_KEY = 'shared_context.personal_memory_sync';
 
 function getRemoteProcessedFreshMs(): number {
   const raw = process.env.IMCODES_REMOTE_PROCESSED_FRESH_MS?.trim();
@@ -171,7 +172,12 @@ function getRemoteProcessedFreshMs(): number {
 
 async function getPersonalMemorySyncEnabled(db: Env['DB'], userId: string): Promise<boolean> {
   const raw = await getUserPref(db, userId, PERSONAL_MEMORY_SYNC_PREF_KEY);
-  return raw === 'true';
+  if (raw === 'true' || raw === 'false') return raw === 'true';
+  const legacyRaw = await getUserPref(db, userId, LEGACY_PERSONAL_MEMORY_SYNC_PREF_KEY);
+  if (legacyRaw === 'true') return true;
+  // Legacy "false" was often written by the old default-off UI without an
+  // explicit opt-out, so only the v2 pref can disable sync now.
+  return true;
 }
 
 async function setPersonalMemorySyncEnabled(db: Env['DB'], userId: string, enabled: boolean): Promise<void> {

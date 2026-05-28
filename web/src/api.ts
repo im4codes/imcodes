@@ -786,7 +786,7 @@ export async function reorderSubSessions(serverId: string, ids: string[]): Promi
 export async function fetchTimelineHistoryHttp(
   serverId: string,
   sessionName: string,
-  opts: { afterTs?: number; beforeTs?: number; limit?: number } = {},
+  opts: { afterTs?: number; beforeTs?: number; limit?: number; timeoutMs?: number } = {},
 ): Promise<(
   Omit<TimelinePayloadMetadata, 'nextCursor' | 'detailRefs'>
   & {
@@ -803,7 +803,7 @@ export async function fetchTimelineHistoryHttp(
   if (typeof opts.afterTs === 'number' && Number.isFinite(opts.afterTs)) params.set('afterTs', String(opts.afterTs));
   if (typeof opts.beforeTs === 'number' && Number.isFinite(opts.beforeTs)) params.set('beforeTs', String(opts.beforeTs));
   if (typeof opts.limit === 'number' && Number.isFinite(opts.limit)) params.set('limit', String(opts.limit));
-  const timeout = createTimeoutSignal(2_500);
+  const timeout = createTimeoutSignal(opts.timeoutMs ?? 2_500);
   try {
     const result = await apiFetch<{
       sessionName: string;

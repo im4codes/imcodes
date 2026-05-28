@@ -25,7 +25,7 @@ import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
-import { buildMemorySummarySyncMessage } from '../memory-summary-sync.js';
+import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
 
 type ViewMode = 'terminal' | 'chat';
 
@@ -76,6 +76,9 @@ export interface SessionPaneProps {
   onStopProject?: (project: string) => void;
   onRenameSession?: () => void;
   onSettings?: () => void;
+  sessionPinned?: boolean;
+  stopBlockedByPinned?: boolean;
+  onToggleSessionPin?: (sessionName: string) => void;
   onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   /** Called after shortcut/action button clicks — use to restore xterm focus. */
@@ -115,6 +118,9 @@ export function SessionPane({
   onStopProject,
   onRenameSession,
   onSettings,
+  sessionPinned,
+  stopBlockedByPinned,
+  onToggleSessionPin,
   onViewRepo,
   onTransportConfigSaved,
   onAfterAction,
@@ -142,6 +148,7 @@ export function SessionPane({
     markOptimisticFailed,
     retryOptimisticMessage,
     loadOlderEvents,
+    forceRefresh: timelineForceRefresh,
   } = useTimeline(sessionName, ws, serverId, {
     isActiveSession: isActive,
     disableHistory: !hasChatTimeline,
@@ -280,6 +287,8 @@ export function SessionPane({
       const text = await buildMemorySummarySyncMessage(
         t,
         session.contextNamespace?.projectId ?? null,
+        undefined,
+        { sources: [localPersonalMemorySummarySource(ws)] },
       );
       if (!text) return;
       const commandId = globalThis.crypto?.randomUUID?.()
@@ -339,6 +348,7 @@ export function SessionPane({
           events={timelineEvents}
           loading={timelineLoading}
           refreshing={timelineRefreshing}
+          onForceSync={timelineForceRefresh}
           historyStatus={historyStatus}
           loadingOlder={timelineLoadingOlder}
           hasOlderHistory={timelineHasOlderHistory}
@@ -421,6 +431,9 @@ export function SessionPane({
           onStopProject={onStopProject}
           onRenameSession={onRenameSession}
           onSettings={onSettings}
+          sessionPinned={sessionPinned}
+          stopBlockedByPinned={stopBlockedByPinned}
+          onToggleSessionPin={onToggleSessionPin}
           onTransportConfigSaved={onTransportConfigSaved}
           sessionDisplayName={session.label ? formatLabel(session.label) : (session.project ?? null)}
           quickData={quickData}

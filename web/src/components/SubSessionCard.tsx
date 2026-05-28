@@ -137,11 +137,16 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, retryOptimisticMessage: undefined }
     : useTimeline(timelineHydrated ? sub.sessionName : null, ws, serverId, {
       isActiveSession: !!isFocused,
+      // Open card = visible; participate in resume broadcast (rate-limited by
+      // the 15s success-only cooldown). Hidden/unhydrated cards pass null
+      // sessionName above so the hook stays inert.
+      isVisible: true,
     });
   const { events, refreshing } = timeline;
   const addOptimisticUserMessage = 'addOptimisticUserMessage' in timeline ? timeline.addOptimisticUserMessage : undefined;
   const markOptimisticFailed = 'markOptimisticFailed' in timeline ? timeline.markOptimisticFailed : undefined;
   const retryOptimisticMessage = 'retryOptimisticMessage' in timeline ? timeline.retryOptimisticMessage : undefined;
+  const forceRefresh = 'forceRefresh' in timeline ? timeline.forceRefresh : undefined;
   const termScrollRef = useRef<(() => void) | null>(null);
   const chatScrollRef = useRef<(() => void) | null>(null);
   const cardInputRef = useRef<HTMLInputElement>(null);
@@ -401,6 +406,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
               loading={false}
               refreshing={refreshing}
               sessionId={sub.sessionName}
+              onForceSync={forceRefresh}
               onScrollBottomFn={(fn) => { chatScrollRef.current = fn; }}
               preview
               agentType={sub.type}

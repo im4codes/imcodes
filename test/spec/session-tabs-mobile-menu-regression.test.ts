@@ -19,7 +19,8 @@ describe('SessionTabs mobile context menu regression', () => {
     expect(source).toContain('onTabPointerDown');
     expect(source).toContain('onPointerDown={(e) => onTabPointerDown(e as PointerEvent, s)}');
     expect(source).toContain('onPointerMove={(e) => onTabPointerMove(e as PointerEvent)}');
-    expect(source).toContain('onPointerCancel={(e) => onTabPointerEnd(e as PointerEvent)}');
+    expect(source).toContain('onPointerCancel={(e) => onTabPointerCancel(e as PointerEvent)}');
+    expect(source).toContain('onPointerLeave={(e) => onTabPointerCancel(e as PointerEvent)}');
     expect(source).toContain('onContextMenu={(e) => openCtx(e, s)}');
     expect(source).toContain('togglePin(ctx.session.name)');
   });

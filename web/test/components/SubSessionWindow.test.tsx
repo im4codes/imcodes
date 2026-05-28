@@ -188,6 +188,61 @@ describe('SubSessionWindow metadata wiring', () => {
     expect(root.style.getPropertyValue('--subsession-accent-color')).toBe('#34d399');
   });
 
+  it('focuses an inactive desktop window before allowing hide/minimize actions', () => {
+    const onFocus = vi.fn();
+    const onMinimize = vi.fn();
+    const view = render(
+      <SubSessionWindow
+        sub={makeSubSession()}
+        ws={ws}
+        connected={true}
+        active={false}
+        desktopLayoutCapable={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={onMinimize}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={onFocus}
+      />,
+    );
+
+    const root = view.container.querySelector('.subsession-window') as HTMLElement;
+    expect(root.className).not.toContain('subsession-window-active');
+
+    fireEvent.mouseDown(view.container.querySelector('button[aria-label="window.hide"]') as HTMLButtonElement);
+
+    expect(onFocus).toHaveBeenCalledOnce();
+    expect(onMinimize).not.toHaveBeenCalled();
+
+    view.rerender(
+      <SubSessionWindow
+        sub={makeSubSession()}
+        ws={ws}
+        connected={true}
+        active={true}
+        desktopLayoutCapable={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={onMinimize}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={onFocus}
+      />,
+    );
+
+    expect((view.container.querySelector('.subsession-window') as HTMLElement).className).toContain('subsession-window-active');
+    fireEvent.click(view.container.querySelector('button[aria-label="window.hide"]') as HTMLButtonElement);
+    expect(onMinimize).not.toHaveBeenCalled();
+
+    fireEvent.click(view.container.querySelector('button[aria-label="window.hide"]') as HTMLButtonElement);
+    expect(onMinimize).toHaveBeenCalledOnce();
+  });
+
   it('passes model, level, and quota metadata through for transport sub-sessions', async () => {
     const sub = makeSubSession({
       type: 'codex-sdk',

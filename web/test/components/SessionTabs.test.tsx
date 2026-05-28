@@ -7,7 +7,12 @@ import { act, render, screen, fireEvent, cleanup } from '@testing-library/preact
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string, fallback?: string) => fallback ?? key.split('.').pop() ?? key,
+    t: (key: string, fallback?: string | Record<string, unknown>, opts?: Record<string, unknown>) => {
+      if (key === 'session.unpin_to_stop') return 'Unpin tab first to stop';
+      const template = typeof fallback === 'string' ? fallback : key.split('.').pop() ?? key;
+      const values = typeof fallback === 'string' ? opts : fallback;
+      return template.replace(/\{\{(\w+)\}\}/g, (_match, name) => String(values?.[name] ?? `{{${name}}}`));
+    },
   }),
 }));
 
@@ -40,6 +45,35 @@ const defaultProps = {
   pinned: new Set<string>(),
   setPinnedArr: vi.fn(),
 };
+
+function firePointer(
+  target: Element,
+  type: 'pointerdown' | 'pointermove' | 'pointerup',
+  init: MouseEventInit & { pointerId: number; pointerType: string },
+) {
+  const win = target.ownerDocument.defaultView ?? window;
+  const eventNames = [
+    type,
+    type === 'pointerdown' ? 'PointerDown' : type === 'pointermove' ? 'PointerMove' : 'PointerUp',
+  ];
+  for (const eventName of eventNames) {
+    const event = new win.MouseEvent(eventName, {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      button: init.button ?? 0,
+      clientX: init.clientX,
+      clientY: init.clientY,
+    });
+    Object.defineProperties(event, {
+      pointerId: { value: init.pointerId, configurable: true },
+      pointerType: { value: init.pointerType, configurable: true },
+    });
+    act(() => {
+      target.dispatchEvent(event);
+    });
+  }
+}
 
 describe('SessionTabs', () => {
   beforeEach(() => {
@@ -174,6 +208,101 @@ describe('SessionTabs', () => {
     expect(onSelect).toHaveBeenCalledWith('session_w2');
   });
 
+  it('selects a pinned tab on touch pointer-up even if Android suppresses the click', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }, { name: 'session_w2' }, { name: 'session_w3' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={onSelect}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set(['session_w2'])}
+      />,
+    );
+
+    const pinnedTab = screen.getAllByRole('tab')[0];
+    firePointer(pinnedTab, 'pointerdown', {
+      pointerId: 11,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    firePointer(pinnedTab, 'pointerup', {
+      pointerId: 11,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 25,
+      clientY: 13,
+    });
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(onSelect).toHaveBeenCalledWith('session_w2');
+  });
+
+  it('does not double-select when a touch click follows pointer-up activation', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    firePointer(tab, 'pointerdown', {
+      pointerId: 12,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    firePointer(tab, 'pointerup', {
+      pointerId: 12,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.click(tab);
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(onSelect).toHaveBeenCalledWith('session_w1');
+  });
+
+  it('does not activate the touch pointer-up fallback after a scroll-sized move', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    firePointer(tab, 'pointerdown', {
+      pointerId: 13,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    firePointer(tab, 'pointermove', {
+      pointerId: 13,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 46,
+      clientY: 12,
+    });
+    firePointer(tab, 'pointerup', {
+      pointerId: 13,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 46,
+      clientY: 12,
+    });
+
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
   it('does not double-select when the normal mouse click follows pointer-up activation', () => {
     const onSelect = vi.fn();
     const sessions = makeSessions([{ name: 'session_w1' }]);
@@ -234,7 +363,7 @@ describe('SessionTabs', () => {
     );
 
     const tab = screen.getByRole('tab');
-    fireEvent.pointerDown(tab, {
+    firePointer(tab, 'pointerdown', {
       pointerId: 7,
       pointerType: 'touch',
       button: 0,
@@ -245,8 +374,15 @@ describe('SessionTabs', () => {
       vi.advanceTimersByTime(520);
     });
 
-    expect(screen.getByText('📌 Pin')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Pin' })).toBeDefined();
 
+    firePointer(tab, 'pointerup', {
+      pointerId: 7,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
     fireEvent.click(tab);
     expect(onSelect).not.toHaveBeenCalled();
   });
@@ -317,7 +453,7 @@ describe('SessionTabs', () => {
 
     const tab = screen.getByRole('tab');
     fireEvent.contextMenu(tab);
-    fireEvent.click(screen.getByText('✕ Stop'));
+    fireEvent.click(screen.getByRole('button', { name: /^Stop$/ }));
 
     const stopBtn = () => screen.getByRole('button', { name: /stop session|confirm stop|really stop/i });
 
@@ -332,6 +468,117 @@ describe('SessionTabs', () => {
     fireEvent.click(stopBtn());
     expect(onStopProject).toHaveBeenCalledOnce();
     expect(onStopProject).toHaveBeenCalledWith('proj-1');
+  });
+
+  it('uses typed icons and plain labels in the tab context menu', () => {
+    const sessions = makeSessions([
+      { name: 'deck_proj_brain', project: 'proj-1', role: 'brain', agentType: 'codex-sdk', userCreated: true },
+    ]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        onOpenSessionSettings={vi.fn()}
+        onCloneSession={vi.fn()}
+        {...defaultProps}
+      />,
+    );
+
+    fireEvent.contextMenu(screen.getByRole('tab'));
+    const menu = document.querySelector('.tab-context-menu') as HTMLElement;
+    expect(menu).toBeTruthy();
+
+    const expected: Array<[string, string]> = [
+      ['Pin', 'session-action-menu-icon-pin'],
+      ['Restart', 'session-action-menu-icon-restart'],
+      ['Start fresh', 'session-action-menu-icon-new'],
+      ['Rename', 'session-action-menu-icon-rename'],
+      ['Settings', 'session-action-menu-icon-settings'],
+      ['Copy session', 'session-action-menu-icon-clone'],
+      ['Stop', 'session-action-menu-icon-stop'],
+    ];
+
+    for (const [label, iconClass] of expected) {
+      const button = screen.getByRole('button', { name: label });
+      expect(button.closest('.tab-context-menu')).toBe(menu);
+      expect(button.querySelector(`.${iconClass}`)).toBeTruthy();
+    }
+  });
+
+  it('shows the same unpin-first stop guard in the tab context menu', () => {
+    const onStopProject = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1', project: 'proj-1' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set(['session_w1'])}
+        onStopProject={onStopProject}
+      />,
+    );
+
+    fireEvent.contextMenu(screen.getByRole('tab'));
+    const stopButton = screen.getByRole('button', { name: /unpin tab first to stop/i });
+    expect((stopButton as HTMLButtonElement).disabled).toBe(true);
+    expect(stopButton.querySelector('.session-action-menu-icon-unpin')).toBeTruthy();
+    fireEvent.click(stopButton);
+    expect(onStopProject).not.toHaveBeenCalled();
+  });
+
+  it('opens session settings from the tab context menu', () => {
+    const onOpenSessionSettings = vi.fn();
+    const sessions = makeSessions([{ name: 'deck_proj_brain', project: 'proj-1', role: 'brain', agentType: 'codex-sdk' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        onOpenSessionSettings={onOpenSessionSettings}
+        {...defaultProps}
+      />,
+    );
+
+    fireEvent.contextMenu(screen.getByRole('tab'));
+    fireEvent.click(screen.getByRole('button', { name: /settings/i }));
+
+    expect(onOpenSessionSettings).toHaveBeenCalledOnce();
+    expect(onOpenSessionSettings).toHaveBeenCalledWith(sessions[0]);
+  });
+
+  it('opens clone session action from the tab context menu for main brain sessions only', () => {
+    const onCloneSession = vi.fn();
+    const sessions = makeSessions([
+      { name: 'deck_proj_brain', project: 'proj-1', role: 'brain', agentType: 'codex-sdk', userCreated: true },
+      { name: 'deck_proj_w1', project: 'proj-1', role: 'w1', agentType: 'codex-sdk', userCreated: true },
+    ]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        onCloneSession={onCloneSession}
+        {...defaultProps}
+      />,
+    );
+
+    const [brainTab, workerTab] = screen.getAllByRole('tab');
+
+    fireEvent.contextMenu(workerTab);
+    expect(screen.queryByRole('button', { name: /copy session/i })).toBeNull();
+    fireEvent.mouseDown(document.body);
+
+    fireEvent.contextMenu(brainTab);
+    fireEvent.click(screen.getByRole('button', { name: /copy session/i }));
+
+    expect(onCloneSession).toHaveBeenCalledOnce();
+    expect(onCloneSession).toHaveBeenCalledWith(sessions[0]);
   });
 
   it('uses the current label as the rename input value and commits a label update', () => {

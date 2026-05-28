@@ -57,6 +57,7 @@ interface CollapsedSubSessionButtonProps {
   sub: SubSession;
   accentColor: string;
   isOpen: boolean;
+  isFocused: boolean;
   idleFlashToken: number;
   usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
   detectedModel?: string;
@@ -79,8 +80,10 @@ interface Props {
   desktopLayoutCapable?: boolean;
   idleFlashTokens?: Map<string, number>;
   onOpen: (id: string) => void;
+  onFocus?: (id: string) => void;
   onClose: (id: string) => void;
   onCloseAllOpen?: () => void;
+  onRestoreQuickClosed?: (ids: string[]) => void;
   onOpenMaximized?: (id: string) => void;
   onMaximize?: (id: string) => void;
   onRestore?: (id: string) => void;
@@ -134,6 +137,8 @@ interface CardSize { w: number; h: number }
 
 const DEFAULT_SIZE: CardSize = { w: 350, h: 250 };
 export const SUBSESSION_BAR_COLLAPSED_STORAGE_KEY = 'rcc_subcard_collapsed';
+const P2P_MOBILE_COMPACT_STORAGE_KEY = 'rcc_subcard_p2p_hidden';
+const P2P_DESKTOP_COMPACT_STORAGE_KEY = 'rcc_subcard_p2p_desktop_compact';
 const EXPANDED_PREVIEW_INITIAL_COUNT = 2;
 const EXPANDED_PREVIEW_BATCH_SIZE = 4;
 const EXPANDED_PREVIEW_BATCH_DELAY_MS = 32;
@@ -191,7 +196,7 @@ function renderTechClock(text: string): JSX.Element {
   );
 }
 
-function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, usage, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel }: CollapsedSubSessionButtonProps) {
+function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -214,7 +219,7 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, u
     <button
       key={sub.id}
       data-sub-id={sub.id}
-      class={`subsession-card${isOpen ? ' open' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
+      class={`subsession-card${isOpen ? ' open' : ''}${isFocused ? ' focused' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
       draggable={draggable}
       onPointerDown={(event) => onEntryPointerDown(sub.id, event)}
       onTouchStart={() => onEntryTouchStart(sub.id)}
@@ -266,13 +271,14 @@ function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, inP2p, t }:
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onClose, onCloseAllOpen, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [internalCollapsed, setInternalCollapsed] = useState(() => load(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, !desktopLayoutCapable));
   const collapsed = controlledCollapsed ?? internalCollapsed;
-  const [p2pHidden, setP2pHidden] = useState(() => load('rcc_subcard_p2p_hidden', false));
+  const [p2pHidden, setP2pHidden] = useState(() => load(P2P_MOBILE_COMPACT_STORAGE_KEY, false));
+  const [p2pDesktopCompact, setP2pDesktopCompact] = useState(() => load(P2P_DESKTOP_COMPACT_STORAGE_KEY, false));
   const [showSizePanel, setShowSizePanel] = useState(false);
   const [cardSize, setCardSize] = useState<CardSize>(() => load('rcc_subcard_size', DEFAULT_SIZE));
   const [draftW, setDraftW] = useState(String(cardSize.w));
@@ -280,6 +286,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const [stats, setStats] = useState<DaemonStats | null>(null);
   const localClockNow = useNowTicker(desktopLayoutCapable && !!stats);
   const localClockText = useMemo(() => formatLocalDateTime(localClockNow), [localClockNow]);
+  const [quickClosedIds, setQuickClosedIds] = useState<string[]>([]);
   // DB sort_order is the authority — subSessions arrive pre-sorted from server.
   // Local dragOrder only tracks in-session drag reorder (synced back to DB via reorderSubSessions).
   const [dragOrder, setDragOrder] = useState<string[] | null>(null);
@@ -308,8 +315,11 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   maximizedIdsRef.current = maximizedIds;
   const desktopLayoutCapableRef = useRef(desktopLayoutCapable);
   desktopLayoutCapableRef.current = desktopLayoutCapable;
+  const focusedSubIdRef = useRef(focusedSubId);
+  focusedSubIdRef.current = focusedSubId;
   const gestureCallbacksRef = useRef({
     onOpen,
+    onFocus,
     onOpenMaximized,
     onMaximize,
     onRestore,
@@ -317,6 +327,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   });
   gestureCallbacksRef.current = {
     onOpen,
+    onFocus,
     onOpenMaximized,
     onMaximize,
     onRestore,
@@ -342,9 +353,11 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       getState: () => ({
         isOpen: openIdsRef.current.has(id),
         isMaximized: maximizedIdsRef.current?.has(id) ?? false,
+        isFocused: !desktopLayoutCapableRef.current || focusedSubIdRef.current == null || focusedSubIdRef.current === id,
       }),
       actions: {
         openNormal: () => gestureCallbacksRef.current.onOpen(id),
+        focus: () => gestureCallbacksRef.current.onFocus?.(id),
         closeNormal: () => gestureCallbacksRef.current.onOpen(id),
         restoreThenClose: () => {
           const callbacks = gestureCallbacksRef.current;
@@ -384,12 +397,6 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const handleEntryDoubleClick = useCallback((id: string, event: JSX.TargetedMouseEvent<HTMLElement>) => {
     getEntryGestureController(id).handleDoubleClick(event, event.currentTarget as Element);
   }, [getEntryGestureController]);
-
-  const handleCloseAllOpenSubWindows = useCallback((event: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
-    event.preventDefault();
-    event.stopPropagation();
-    onCloseAllOpen?.();
-  }, [onCloseAllOpen]);
 
   const handleExpandedEntryTouchStart = useCallback((id: string, event: JSX.TargetedTouchEvent<HTMLElement>) => {
     handleEntryTouchStart(id);
@@ -473,7 +480,43 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     () => orderedSessions.filter((sub) => openIds.has(sub.id)).length,
     [openIds, orderedSessions],
   );
-  const showCloseAllOpenSubs = desktopLayoutCapable && openSubWindowCount > 1 && !!onCloseAllOpen;
+  const restorableQuickClosedIds = useMemo(() => {
+    if (quickClosedIds.length === 0) return [];
+    const knownIds = new Set(orderedSessionIds);
+    return quickClosedIds.filter((id) => knownIds.has(id) && !openIds.has(id));
+  }, [openIds, orderedSessionIds, quickClosedIds]);
+  const canQuickCloseSubWindows = desktopLayoutCapable && openSubWindowCount > 0 && !!onCloseAllOpen;
+  const canQuickRestoreSubWindows = desktopLayoutCapable
+    && openSubWindowCount === 0
+    && restorableQuickClosedIds.length > 0
+    && !!onRestoreQuickClosed;
+  const showQuickSubWindowControl = desktopLayoutCapable && !!onCloseAllOpen;
+  const quickSubWindowIsRestore = !canQuickCloseSubWindows && canQuickRestoreSubWindows;
+  const quickSubWindowDisabled = !canQuickCloseSubWindows && !canQuickRestoreSubWindows;
+  const quickSubWindowLabel = canQuickCloseSubWindows
+    ? t('subsessionBar.quick_close_open')
+    : canQuickRestoreSubWindows
+      ? t('subsessionBar.restore_quick_closed')
+      : t('subsessionBar.quick_close_unavailable');
+
+  const handleQuickSubWindowControl = useCallback((event: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const openIdsSnapshot = openIdsRef.current;
+    const closingIds = orderedSessionsRef.current
+      .filter((sub) => openIdsSnapshot.has(sub.id))
+      .map((sub) => sub.id);
+    if (closingIds.length > 0 && onCloseAllOpen) {
+      setQuickClosedIds(closingIds);
+      onCloseAllOpen();
+      return;
+    }
+    if (restorableQuickClosedIds.length > 0 && onRestoreQuickClosed) {
+      const restoreIds = restorableQuickClosedIds;
+      setQuickClosedIds([]);
+      onRestoreQuickClosed(restoreIds);
+    }
+  }, [onCloseAllOpen, onRestoreQuickClosed, restorableQuickClosedIds]);
 
   const moveSubSessionInDragOrder = useCallback((draggedId: string, overId: string) => {
     if (draggedId === overId) return;
@@ -567,8 +610,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   }, [collapsed, controlledCollapsed, onCollapsedChange]);
 
   useEffect(() => {
-    save('rcc_subcard_p2p_hidden', p2pHidden);
+    save(P2P_MOBILE_COMPACT_STORAGE_KEY, p2pHidden);
   }, [p2pHidden]);
+
+  useEffect(() => {
+    save(P2P_DESKTOP_COMPACT_STORAGE_KEY, p2pDesktopCompact);
+  }, [p2pDesktopCompact]);
 
   // Touch-based reorder for collapsed bar — desktop collapsed buttons use HTML5 drag events below.
   // The touch path must use addEventListener({ passive: false }) so touchmove can preventDefault.
@@ -792,6 +839,17 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             Team {p2pHidden ? '▾' : '▴'}
           </button>
         )}
+        {!isMobile && discussions.length > 0 && (
+          <button
+            class={`subcard-toolbar-btn${p2pDesktopCompact ? ' subcard-toolbar-btn-active' : ''}`}
+            data-testid="p2p-desktop-compact-toggle"
+            onClick={() => setP2pDesktopCompact((compact) => !compact)}
+            title={p2pDesktopCompact ? t('subsessionBar.p2p_compact_expand') : t('subsessionBar.p2p_compact_hide')}
+            aria-label={p2pDesktopCompact ? t('subsessionBar.p2p_compact_expand') : t('subsessionBar.p2p_compact_hide')}
+          >
+            Team {p2pDesktopCompact ? '▾' : '▴'}
+          </button>
+        )}
         {!collapsed && (
           <>
             <button class="subcard-toolbar-btn" onClick={toggleLayout} title={layout === 'single' ? t('subsessionBar.layout_double') : t('subsessionBar.layout_single')}>
@@ -1009,13 +1067,14 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
 
       {/* Discussions panel — above sub-session buttons */}
       {discussions.length > 0 && (
-        <div class={`discussion-panel${isMobile ? ' discussion-panel-mobile' : ''}`}>
+        <div class={`discussion-panel${isMobile ? ' discussion-panel-mobile' : ''}${!isMobile && p2pDesktopCompact ? ' discussion-panel-desktop-compact' : ''}`}>
           {discussions.map((d) => (
             <P2pProgressCard
               key={d.id}
               discussion={d}
-              compact={!isMobile}
+              compact={!isMobile && !p2pDesktopCompact}
               mobile={isMobile}
+              ultraCompact={!isMobile && p2pDesktopCompact}
               hidden={isMobile && p2pHidden}
               onToggleHide={isMobile ? () => setP2pHidden((v) => !v) : undefined}
               onStopDiscussion={onStopDiscussion}
@@ -1028,15 +1087,16 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       {/* Collapsed: compact buttons (all platforms) — drag on desktop, long-press on touch */}
       {collapsed && subSessions.length > 0 && (
         <div class="subsession-row-with-close">
-          {showCloseAllOpenSubs && (
+          {showQuickSubWindowControl && (
             <button
               type="button"
-              class="subsession-close-all-strip"
-              title={t('subsessionBar.close_all_open')}
-              aria-label={t('subsessionBar.close_all_open')}
-              onClick={handleCloseAllOpenSubWindows}
+              class={`subsession-close-all-strip${quickSubWindowIsRestore ? ' subsession-close-all-strip-restore' : ''}`}
+              title={quickSubWindowLabel}
+              aria-label={quickSubWindowLabel}
+              disabled={quickSubWindowDisabled}
+              onClick={handleQuickSubWindowControl}
             >
-              <span class="subsession-close-all-arrow" aria-hidden="true">↓</span>
+              <span class="subsession-close-all-arrow" aria-hidden="true">{quickSubWindowIsRestore ? '↑' : '↓'}</span>
             </button>
           )}
           <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}>
@@ -1046,6 +1106,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 sub={sub}
                 accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
                 isOpen={openIds.has(sub.id)}
+                isFocused={focusedSubId === sub.id}
                 idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
                 usage={subUsages?.get(`deck_sub_${sub.id}`)}
                 detectedModel={detectedModels?.get(sub.sessionName)}
@@ -1068,15 +1129,16 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       {/* Expanded: preview cards (all platforms) */}
       {!collapsed && orderedSessions.length > 0 && (
         <div class="subsession-row-with-close">
-          {showCloseAllOpenSubs && (
+          {showQuickSubWindowControl && (
             <button
               type="button"
-              class="subsession-close-all-strip"
-              title={t('subsessionBar.close_all_open')}
-              aria-label={t('subsessionBar.close_all_open')}
-              onClick={handleCloseAllOpenSubWindows}
+              class={`subsession-close-all-strip${quickSubWindowIsRestore ? ' subsession-close-all-strip-restore' : ''}`}
+              title={quickSubWindowLabel}
+              aria-label={quickSubWindowLabel}
+              disabled={quickSubWindowDisabled}
+              onClick={handleQuickSubWindowControl}
             >
-              <span class="subsession-close-all-arrow" aria-hidden="true">↓</span>
+              <span class="subsession-close-all-arrow" aria-hidden="true">{quickSubWindowIsRestore ? '↑' : '↓'}</span>
             </button>
           )}
           <div

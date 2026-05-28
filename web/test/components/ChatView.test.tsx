@@ -65,7 +65,19 @@ function selectText(node: Text, start: number, end: number) {
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string) => key,
+    t: (key: string) => {
+      const translations: Record<string, string> = {
+        'session.state_idle': 'Agent idle — waiting for input',
+        'session.state_running': 'Agent working...',
+        'session.state_started': 'Session started',
+        'session.state_starting': 'Session starting...',
+        'session.state_stopped': 'Session stopped',
+        'session.state_stop_requested': 'Stop requested',
+        'session.state_stopping': 'Stopping...',
+        'session.state_compacting': 'Compacting context...',
+      };
+      return translations[key] ?? key;
+    },
   }),
 }));
 
@@ -394,6 +406,76 @@ describe('ChatView', () => {
       />,
     );
     expect(container.querySelector('.chat-html-preview-btn')).toBeNull();
+  });
+
+  it('opens the fullscreen HTML preview in a new window and closes the overlay', () => {
+    vi.useFakeTimers();
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, 'createObjectURL');
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, 'revokeObjectURL');
+    const createObjectURL = vi.fn(() => 'blob:html-preview');
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL });
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL });
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+
+    try {
+      const wsListeners = new Set<(msg: any) => void>();
+      const ws = {
+        fsReadFile: vi.fn(() => 'read-html-preview'),
+        onMessage: vi.fn((handler: (msg: any) => void) => {
+          wsListeners.add(handler);
+          return () => wsListeners.delete(handler);
+        }),
+      };
+      const events = [{
+        eventId: 'user-html-path',
+        type: 'user.message',
+        ts: Date.now(),
+        payload: { text: 'Open ./dist/index.html' },
+      }];
+
+      const { container } = render(
+        <ChatView
+          events={events as any}
+          loading={false}
+          sessionId="deck_main_brain"
+          ws={ws as any}
+          workdir="/repo"
+        />,
+      );
+
+      fireEvent.click(container.querySelector('.chat-html-preview-btn') as HTMLButtonElement);
+      act(() => {
+        for (const listener of wsListeners) {
+          listener({
+            type: 'fs.read_response',
+            requestId: 'read-html-preview',
+            path: '/repo/./dist/index.html',
+            status: 'ok',
+            content: '<!doctype html><title>Preview</title><main>Hello</main>',
+          });
+        }
+      });
+
+      const openButton = document.body.querySelector('.html-fullscreen-preview-open-window') as HTMLButtonElement | null;
+      expect(openButton).not.toBeNull();
+      expect(openButton?.disabled).toBe(false);
+      fireEvent.click(openButton!);
+
+      expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
+      expect(openSpy).toHaveBeenCalledWith('blob:html-preview', '_blank', 'noopener,noreferrer');
+      expect(document.body.querySelector('.html-fullscreen-preview')).toBeNull();
+
+      vi.runOnlyPendingTimers();
+      expect(revokeObjectURL).toHaveBeenCalledWith('blob:html-preview');
+    } finally {
+      openSpy.mockRestore();
+      if (createDescriptor) Object.defineProperty(URL, 'createObjectURL', createDescriptor);
+      else Reflect.deleteProperty(URL, 'createObjectURL');
+      if (revokeDescriptor) Object.defineProperty(URL, 'revokeObjectURL', revokeDescriptor);
+      else Reflect.deleteProperty(URL, 'revokeObjectURL');
+      vi.useRealTimers();
+    }
   });
 
   it('loads inline local image previews from resolved chat file paths', async () => {
@@ -1524,7 +1606,7 @@ describe('ChatView', () => {
       />,
     );
 
-    expect(container.textContent).toContain('session.state_stop_requested');
+    expect(container.textContent).toContain('Stop requested');
   });
 
   it('renders transport Compact feedback as a visible system block', () => {
@@ -1546,7 +1628,7 @@ describe('ChatView', () => {
       />,
     );
 
-    expect(container.textContent).toContain('session.state_compacting');
+    expect(container.textContent).toContain('Compacting context...');
   });
 
   it('opens external URLs in the themed confirmation dialog', () => {

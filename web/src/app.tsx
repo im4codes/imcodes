@@ -43,6 +43,7 @@ import {
   type FilePreviewCache,
 } from './file-preview-state.js';
 import { StartSubSessionDialog } from './components/StartSubSessionDialog.js';
+import { CloneSessionGroupDialog } from './components/CloneSessionGroupDialog.js';
 import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
@@ -56,6 +57,7 @@ import { CronManager } from './pages/CronManager.js';
 import { SharedContextManagementPanel } from './components/SharedContextManagementPanel.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
+import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
 import { isPlausibleUsagePayload } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
@@ -97,7 +99,15 @@ import {
 import { resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
 import { useSubSessions, type SubSession } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
-import { DEFAULT_NEW_USER_GUIDE_PREF, shouldMarkNewUserGuidePending, shouldShowNewUserGuidePrompt, type NewUserGuidePref } from './onboarding.js';
+import {
+  DEFAULT_NEW_USER_GUIDE_PREF,
+  DEFAULT_TEAM_DISCUSSION_GUIDE_PREF,
+  shouldMarkNewUserGuidePending,
+  shouldShowNewUserGuidePrompt,
+  shouldShowTeamDiscussionGuide,
+  type NewUserGuidePref,
+  type TeamDiscussionGuidePref,
+} from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient } from './ws-client.js';
 import { configure as configureApi, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns } from './api.js';
@@ -128,8 +138,9 @@ import {
   mergeTransportPendingMessagesForIdleState,
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
+  removeTransportPendingEntryForUserMessage,
 } from './transport-queue.js';
-import { ingestTimelineEventForCache, requestActiveTimelineRefresh } from './hooks/useTimeline.js';
+import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
@@ -1086,7 +1097,16 @@ export function App() {
     0,
   );
   const pinnedTabs = useMemo(() => new Set(pinnedTabsArr), [pinnedTabsArr]);
+  const togglePinnedTab = useCallback((name: string) => {
+    setPinnedTabsArr((prev) => {
+      const set = new Set(prev);
+      if (set.has(name)) set.delete(name);
+      else set.add(name);
+      return [...set];
+    });
+  }, [setPinnedTabsArr]);
   const [newUserGuidePref, setNewUserGuidePref] = useSyncedPreference<NewUserGuidePref>('new_user_guide', DEFAULT_NEW_USER_GUIDE_PREF, 0);
+  const [teamDiscussionGuidePref, setTeamDiscussionGuidePref] = useSyncedPreference<TeamDiscussionGuidePref>('team_discussion_guide', DEFAULT_TEAM_DISCUSSION_GUIDE_PREF, 0);
   const [showNewUserGuidePrompt, setShowNewUserGuidePrompt] = useState(false);
   const [showNewUserGuide, setShowNewUserGuide] = useState(false);
   const [guidePromptSnoozed, setGuidePromptSnoozed] = useState(false);
@@ -1152,6 +1172,7 @@ export function App() {
 
   const [showSubDialog, setShowSubDialog] = useState(false);
   const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null } | null>(null);
+  const [cloneSessionTarget, setCloneSessionTarget] = useState<SessionInfo | null>(null);
 
   // Derive focused (topmost) sub-session from the shared stack + open set.
   // Dep list intentionally lists `stackVersion` (number) and `openSubIdsKey`
@@ -1389,6 +1410,28 @@ export function App() {
     setSubSessionMaximized(id, false);
   }, [setSubSessionMaximized]);
 
+  const isSubSessionPinnedPanel = useCallback((id: string): boolean => {
+    const sub = subSessionsRef.current.find((candidate) => candidate.id === id);
+    if (!sub) return false;
+    return pinnedPanels.some((panel) => (
+      panel.type === 'subsession' && panel.props?.sessionName === sub.sessionName
+    ));
+  }, [pinnedPanels]);
+
+  const unpinSubSessionPanel = useCallback((id: string): boolean => {
+    const sub = subSessionsRef.current.find((candidate) => candidate.id === id);
+    if (!sub) return false;
+    let removed = false;
+    setPinnedPanels((prev) => {
+      const next = prev.filter((panel) => !(
+        panel.type === 'subsession' && panel.props?.sessionName === sub.sessionName
+      ));
+      removed = next.length !== prev.length;
+      return removed ? next : prev;
+    });
+    return removed;
+  }, [setPinnedPanels]);
+
   const minimizeSubSessionWindow = useCallback((id: string) => {
     clearSubSessionMaximized(id);
     setOpenSubIds((prev) => {
@@ -1405,20 +1448,22 @@ export function App() {
       setOpenSubIds((prev) => (prev.has(id) ? new Set() : new Set([id])));
       return;
     }
+    unpinSubSessionPanel(id);
     setSubSessionMaximized(id, true);
     setOpenSubIds((prev) => {
       if (prev.has(id)) return prev;
       return new Set([...prev, id]);
     });
     bringSubToFront(id);
-  }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized]);
+  }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized, unpinSubSessionPanel]);
 
   const maximizeOpenSubSession = useCallback((id: string) => {
     if (isMobileRef.current) return;
+    unpinSubSessionPanel(id);
     setSubSessionMaximized(id, true);
     setOpenSubIds((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
     bringSubToFront(id);
-  }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized]);
+  }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized, unpinSubSessionPanel]);
 
   const restoreSubSession = useCallback((id: string) => {
     clearSubSessionMaximized(id);
@@ -1433,32 +1478,49 @@ export function App() {
       return;
     }
 
+    unpinSubSessionPanel(id);
     setOpenSubIds((prev) => (prev.has(id) ? prev : new Set([...prev, id])));
     bringSubToFront(id);
-  }, [bringSubToFront, clearSubSessionMaximized, setOpenSubIds]);
+  }, [bringSubToFront, clearSubSessionMaximized, setOpenSubIds, unpinSubSessionPanel]);
 
   const toggleSubSession = useCallback((id: string) => {
     const mobile = isMobileRef.current;
-    const wasOpen = openSubIdsRef.current.has(id);
-    clearSubSessionMaximized(id);
 
     if (mobile) {
-      setOpenSubIds(wasOpen ? new Set() : new Set([id]));
+      clearSubSessionMaximized(id);
+      const next = openSubIdsRef.current.has(id) ? new Set<string>() : new Set([id]);
+      setOpenSubIds(next);
       return;
     }
 
-    if (wasOpen) {
-      const next = new Set(openSubIdsRef.current);
+    const wasPinned = isSubSessionPinnedPanel(id);
+    const next = new Set(openSubIdsRef.current);
+    if (next.has(id) && !wasPinned && focusedSubIdRef.current !== id) {
+      bringSubToFront(id);
+      return;
+    }
+
+    clearSubSessionMaximized(id);
+    const willOpen = !next.has(id) || wasPinned;
+
+    if (willOpen) {
+      next.add(id);
+      setOpenSubIds(next);
+      if (wasPinned) unpinSubSessionPanel(id);
+      bringSubToFront(id);
+    } else {
       next.delete(id);
       setOpenSubIds(next);
       removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
-    } else {
-      const next = new Set(openSubIdsRef.current);
-      next.add(id);
-      setOpenSubIds(next);
-      bringSubToFront(id);
     }
-  }, [bringSubToFront, clearSubSessionMaximized, removeDesktopWindow, setOpenSubIds]);
+  }, [
+    bringSubToFront,
+    clearSubSessionMaximized,
+    isSubSessionPinnedPanel,
+    removeDesktopWindow,
+    setOpenSubIds,
+    unpinSubSessionPanel,
+  ]);
 
   const activeSessionRef = useRef(activeSession);
   activeSessionRef.current = activeSession;
@@ -1477,6 +1539,48 @@ export function App() {
     }
     if (changed) bumpStack();
   }, [bumpStack, setOpenSubIds]);
+
+  const restoreQuickClosedSubSessionWindows = useCallback((ids: string[]) => {
+    if (isMobileRef.current || ids.length === 0) return;
+    const availableIds: string[] = [];
+    const seen = new Set<string>();
+    for (const id of ids) {
+      if (seen.has(id)) continue;
+      if (!subSessionsRef.current.some((sub) => sub.id === id)) continue;
+      seen.add(id);
+      availableIds.push(id);
+    }
+    if (availableIds.length === 0) return;
+
+    setMaximizedSubIds((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const id of availableIds) {
+        if (next.delete(id)) changed = true;
+      }
+      return changed ? next : prev;
+    });
+    setOpenSubIds((prev) => {
+      const next = new Set(prev);
+      for (const id of availableIds) next.add(id);
+      return next.size === prev.size ? prev : next;
+    });
+
+    for (const id of availableIds) {
+      unpinSubSessionPanel(id);
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id), getSubSessionDesktopWindowMeta(id));
+    }
+    const frontId = availableIds[availableIds.length - 1];
+    if (frontId) {
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(frontId), getSubSessionDesktopWindowMeta(frontId), { bringToFront: true });
+    }
+  }, [
+    ensureDesktopWindow,
+    getSubSessionDesktopWindowMeta,
+    setMaximizedSubIds,
+    setOpenSubIds,
+    unpinSubSessionPanel,
+  ]);
 
   // ── Desktop window stack ↔ visibility-boolean sync ──────────────────────────
   // For each managed singleton floating window, mirror its show-boolean into
@@ -2045,7 +2149,14 @@ export function App() {
           setConnected(true);
           setConnecting(false);
           void checkForAppUpdate();
-          if (msg.reason === 'probe_recovered') return;
+          // `probe_recovered` only proves the socket is alive; control-plane
+          // state (session list, P2P discussions/status) may still be stale
+          // because we silently missed live events during the half-open window.
+          // Run the light refresh below, but skip the heavy timeline
+          // `requestActiveTimelineRefresh({resetCooldowns:true})` reset — the
+          // active-refresh listener in `useTimeline` already bare-dispatches on
+          // probe_recovered (governed by the 15s success-only cooldown).
+          const isProbeRecovered = msg.reason === 'probe_recovered';
           ws.requestSessionList();
           // Migrate to scoped p2p list. The active session is captured via the
           // ref to survive useEffect closure; the daemon will fail-closed and
@@ -2060,7 +2171,7 @@ export function App() {
             ws.p2pListDiscussions(initialScope);
             ws.p2pStatus(initialScope);
           }
-          requestActiveTimelineRefresh({ resetCooldowns: true });
+          if (!isProbeRecovered) requestActiveTimelineRefresh({ resetCooldowns: true });
           // Timeout: if session_list never arrives, stop blocking the UI
           if (sessionListRetryRef.current) clearTimeout(sessionListRetryRef.current);
           sessionListRetryRef.current = setTimeout(() => {
@@ -2220,6 +2331,28 @@ export function App() {
             toolUseId: String(event.payload.toolUseId ?? ''),
             questions: (event.payload.questions as PendingQuestion['questions']) ?? [],
           });
+        }
+        if (event.type === 'user.message' && !event.sessionId.startsWith('deck_sub_')) {
+          setSessions((prev) => prev.map((s) => {
+            if (s.name !== event.sessionId) return s;
+            const nextQueue = removeTransportPendingEntryForUserMessage(
+              s.transportPendingMessageEntries,
+              s.transportPendingMessages,
+              {
+                clientMessageId: event.payload.clientMessageId,
+                commandId: event.payload.commandId,
+                text: event.payload.text,
+              },
+              event.sessionId,
+            );
+            if (!nextQueue.changed) return s;
+            return {
+              ...s,
+              state: s.state === 'queued' && nextQueue.messages.length === 0 ? 'running' as SessionInfo['state'] : s.state,
+              transportPendingMessages: nextQueue.messages,
+              transportPendingMessageEntries: nextQueue.entries,
+            };
+          }));
         }
         // Sync session state from live timeline events (running/idle)
         if (event.type === 'session.state' && !event.sessionId.startsWith('deck_sub_')) {
@@ -2749,14 +2882,37 @@ export function App() {
       const wasLongHidden = hiddenSinceAt > 0 && Date.now() - hiddenSinceAt > 60_000;
       hiddenSinceAt = 0;
       handleResume(wasLongHidden, wasLongHidden);
+      // Short-hide (alt-tab etc.) still needs a timeline catch-up — the bare
+      // dispatch passes through the 15s success-only backfill cooldown, so
+      // alt-tab churn is absorbed but a real gap > 15s gets one HTTP backfill.
+      if (!wasLongHidden) dispatchActiveTimelineRefresh();
     };
     document.addEventListener('visibilitychange', onVisibility);
-    const onFocus = () => handleResume(false);
+    // Desktop "messages stuck before leaving" P0 fix: a foreground tab whose
+    // screen got locked/slept never fires `visibilitychange`, only `focus`.
+    // Previously `onFocus` only probed the WS and did NOT refresh the
+    // timeline, so events that arrived during the frozen window were never
+    // backfilled. Bare dispatch here goes through `dispatchActiveTimelineRefresh`
+    // → the timeline hook listener applies the existing 15s success-only
+    // cooldown, so >15s real gaps fire a backfill while alt-tab churn is
+    // absorbed automatically (no need to reset cooldowns).
+    const onFocus = () => {
+      handleResume(false);
+      dispatchActiveTimelineRefresh();
+    };
     window.addEventListener('focus', onFocus);
     const onPageShow = (ev: PageTransitionEvent) => {
       if (ev.persisted) handleResume(false, true);
     };
     window.addEventListener('pageshow', onPageShow);
+    // Network coming back online — treat like focus (bare dispatch, no force
+    // reset): `online` is unreliable behind proxies/captive portals, so we
+    // never want it to clear cooldowns, only to nudge a catch-up attempt.
+    const onOnline = () => {
+      handleResume(false);
+      dispatchActiveTimelineRefresh();
+    };
+    window.addEventListener('online', onOnline);
 
     let removeAppStateListener: (() => void) | null = null;
     if (isNative()) {
@@ -2772,6 +2928,7 @@ export function App() {
       document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('focus', onFocus);
       window.removeEventListener('pageshow', onPageShow);
+      window.removeEventListener('online', onOnline);
       removeAppStateListener?.();
       unsub();
       unsubStats();
@@ -3433,6 +3590,22 @@ export function App() {
       ],
     },
   ], []);
+  const showTeamDiscussionGuide = shouldShowTeamDiscussionGuide(
+    teamDiscussionGuidePref,
+    sessionsLoaded,
+    sessions.length,
+    showNewUserGuidePrompt
+      || showNewUserGuide
+      || showNewSession
+      || showSubDialog
+      || showRepoPage
+      || showSettingsPage
+      || showCronManager
+      || showAdminPage
+      || showDiscussionsPage
+      || showDiscussionDialog
+      || !activeSession,
+  );
 
   function scheduleResubscribe(items: Array<{ name: string; mode?: ViewMode }>) {
     const ws = wsRef.current;
@@ -3936,6 +4109,16 @@ export function App() {
               onNewSession={() => setShowNewSession(true)}
               onStopProject={handleStopProject}
               onRestartProject={handleRestartProject}
+              onOpenSessionSettings={(session) => setSettingsTarget({
+                sessionName: session.name,
+                label: session.label || '',
+                description: session.description || '',
+                cwd: session.projectDir || '',
+                type: session.agentType || '',
+                parentSession: null,
+                transportConfig: session.transportConfig ?? null,
+              })}
+              onCloneSession={(session) => setCloneSessionTarget(session)}
               renameRequest={renameRequest}
               onRenameHandled={() => setRenameRequest(null)}
               onRenameSession={handleRenameSession}
@@ -4025,6 +4208,9 @@ export function App() {
                 onStopProject={handleStopProject}
                 onRenameSession={() => setRenameRequest(s.name)}
                 onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null })}
+                sessionPinned={pinnedTabs.has(s.name)}
+                stopBlockedByPinned={sessions.some((session) => session.project === s.project && pinnedTabs.has(session.name))}
+                onToggleSessionPin={togglePinnedTab}
                 onViewRepo={() => {
                   setActiveSession(s.name);
                   openRepoPage({ sessionId: s.name, projectDir: s.projectDir, initialTab: 'branches' });
@@ -4157,8 +4343,10 @@ export function App() {
                 onVisualOrderChange={handleSubSessionVisualOrderChange}
                 idleFlashTokens={idleFlashTokens}
                 onOpen={toggleSubSession}
+                onFocus={bringSubToFront}
                 onClose={closeSubSessionAndClearMaximized}
                 onCloseAllOpen={closeAllSubSessionWindows}
+                onRestoreQuickClosed={restoreQuickClosedSubSessionWindows}
                 onOpenMaximized={openSubSessionMaximized}
                 onMaximize={maximizeOpenSubSession}
                 onRestore={restoreSubSession}
@@ -4686,6 +4874,11 @@ export function App() {
         }}
       />
 
+      <TeamDiscussionGuide
+        open={showTeamDiscussionGuide}
+        onDismiss={() => setTeamDiscussionGuidePref((prev) => ({ ...prev, dismissed: true }))}
+      />
+
       {showNewSession && (
         <NewSessionDialog
           ws={wsRef.current}
@@ -4706,7 +4899,7 @@ export function App() {
               sub={sub}
               ws={wsRef.current}
               connected={connected}
-              active
+              active={isMobile || focusedSubId === sub.id}
               idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}
               onHistory={registerHistoryApplyer}
@@ -4878,6 +5071,17 @@ export function App() {
               }));
             }
           }}
+        />
+      )}
+
+      {cloneSessionTarget && selectedServerId && (
+        <CloneSessionGroupDialog
+          ws={wsRef.current}
+          serverId={selectedServerId}
+          sourceSession={sessions.find((session) => session.name === cloneSessionTarget.name) ?? cloneSessionTarget}
+          sessions={sessions}
+          subSessions={subSessions}
+          onClose={() => setCloneSessionTarget(null)}
         />
       )}
 

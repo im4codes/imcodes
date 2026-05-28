@@ -9,6 +9,7 @@ import {
   mergeTransportPendingMessagesForIdleState,
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
+  removeTransportPendingEntryForUserMessage,
   synthesizeTransportPendingMessageEntries,
 } from '../src/transport-queue.js';
 
@@ -105,6 +106,50 @@ describe('normalizeTransportPendingMessageEntries', () => {
       { clientMessageId: 'deck_test:legacy:0:queued one', text: 'queued one' },
       { clientMessageId: 'deck_test:legacy:1:queued two', text: 'queued two' },
     ]);
+  });
+});
+
+describe('removeTransportPendingEntryForUserMessage', () => {
+  it('removes the echoed queued entry by clientMessageId', () => {
+    expect(removeTransportPendingEntryForUserMessage(
+      [
+        { clientMessageId: 'msg-1', text: 'queued one' },
+        { clientMessageId: 'msg-2', text: 'queued two' },
+      ],
+      ['queued one', 'queued two'],
+      { clientMessageId: 'msg-1', text: 'queued one' },
+      'deck_test',
+    )).toEqual({
+      messages: ['queued two'],
+      entries: [{ clientMessageId: 'msg-2', text: 'queued two' }],
+      changed: true,
+    });
+  });
+
+  it('falls back to normalized text when the echoed user message has no id', () => {
+    expect(removeTransportPendingEntryForUserMessage(
+      [],
+      ['queued   one', 'queued two'],
+      { text: 'queued one' },
+      'deck_test',
+    )).toEqual({
+      messages: ['queued two'],
+      entries: [{ clientMessageId: 'deck_test:legacy:1:queued two', text: 'queued two' }],
+      changed: true,
+    });
+  });
+
+  it('leaves the queue untouched when no echoed entry matches', () => {
+    expect(removeTransportPendingEntryForUserMessage(
+      [{ clientMessageId: 'msg-1', text: 'queued one' }],
+      ['queued one'],
+      { clientMessageId: 'msg-2', text: 'other' },
+      'deck_test',
+    )).toEqual({
+      messages: ['queued one'],
+      entries: [{ clientMessageId: 'msg-1', text: 'queued one' }],
+      changed: false,
+    });
   });
 });
 

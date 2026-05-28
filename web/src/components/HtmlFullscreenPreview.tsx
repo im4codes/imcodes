@@ -2,6 +2,7 @@ import { createPortal } from 'preact/compat';
 import { useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { HtmlSafePreview } from './HtmlSafePreview.js';
+import { createSafeHtmlPreviewDocument } from '../util/html-safe-preview.js';
 
 export type HtmlFullscreenPreviewState =
   | { status: 'loading'; path: string }
@@ -11,6 +12,23 @@ export type HtmlFullscreenPreviewState =
 interface HtmlFullscreenPreviewProps {
   preview: HtmlFullscreenPreviewState | null;
   onClose: () => void;
+}
+
+function openPreviewInNewWindow(preview: HtmlFullscreenPreviewState): boolean {
+  if (preview.status !== 'ok' || typeof preview.content !== 'string') return false;
+  if (typeof URL.createObjectURL !== 'function') return false;
+  const result = createSafeHtmlPreviewDocument(preview.content);
+  if (result.status !== 'ok') return false;
+
+  const url = URL.createObjectURL(new Blob([result.srcDoc], { type: 'text/html;charset=utf-8' }));
+  try {
+    window.open(url, '_blank', 'noopener,noreferrer');
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    return true;
+  } catch {
+    URL.revokeObjectURL(url);
+    return false;
+  }
 }
 
 export function HtmlFullscreenPreview({ preview, onClose }: HtmlFullscreenPreviewProps) {
@@ -26,6 +44,7 @@ export function HtmlFullscreenPreview({ preview, onClose }: HtmlFullscreenPrevie
   }, [onClose, preview]);
 
   if (!preview) return null;
+  const canOpenInNewWindow = preview.status === 'ok' && typeof preview.content === 'string';
 
   return createPortal((
     <div
@@ -34,6 +53,18 @@ export function HtmlFullscreenPreview({ preview, onClose }: HtmlFullscreenPrevie
       aria-modal="true"
       aria-label={t('chat.html_preview_title')}
     >
+      <button
+        type="button"
+        class="html-fullscreen-preview-open-window"
+        onClick={() => {
+          if (openPreviewInNewWindow(preview)) onClose();
+        }}
+        disabled={!canOpenInNewWindow}
+        title={t('chat.html_preview_open_new_window')}
+        aria-label={t('chat.html_preview_open_new_window')}
+      >
+        ↗
+      </button>
       <button
         type="button"
         class="html-fullscreen-preview-close"

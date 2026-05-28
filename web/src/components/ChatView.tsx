@@ -50,6 +50,11 @@ interface Props {
   loading: boolean;
   /** True while gap-filling new events after a cache hit */
   refreshing?: boolean;
+  /** Per-session force-sync for the chat ↻ button — a visible HTTP backfill of
+   *  THIS session's timeline. Provided by the parent that owns the useTimeline
+   *  hook (main pane, sub-session window/card). The button only renders when
+   *  this is provided. */
+  onForceSync?: () => void;
   /** Visible history-fetch progress shown as a non-layout overlay. */
   historyStatus?: TimelineHistoryStatus | null;
   /** True while loading older events via backward pagination */
@@ -939,8 +944,18 @@ function findScrollParent(start: HTMLElement): HTMLElement {
   return start;
 }
 
-export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
+export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
   const { t } = useTranslation();
+  const [syncDisabled, setSyncDisabled] = useState(false);
+  const handleForceSync = useCallback(() => {
+    if (syncDisabled || !onForceSync) return;
+    // Per-session visible backfill: sets `refreshing` → the refreshing overlay
+    // (full views) / button spin (compact cards) is the feedback, so no toast
+    // is needed. 10s cooldown prevents spam.
+    onForceSync();
+    setSyncDisabled(true);
+    setTimeout(() => setSyncDisabled(false), 10000);
+  }, [syncDisabled, onForceSync]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const [selMenu, setSelMenu] = useState<SelectionMenu | null>(null);
@@ -1941,14 +1956,29 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
   return (
     <div class={`chat-view-wrap${canShowFilePanel && showFilePanel ? ' chat-split' : ''}`}>
-      {canShowFilePanel && (
-        <button
-          class={`chat-panel-toggle${showFilePanel ? ' active' : ''}`}
-          onClick={toggleFilePanel}
-          title={showFilePanel ? t('chat.hide_file_panel') : t('chat.show_file_panel')}
-        >
-          ⊞
-        </button>
+      {(onForceSync || canShowFilePanel) && (
+        <div class="chat-top-actions">
+          {onForceSync && (
+            <button
+              class={`chat-panel-toggle chat-sync-btn${refreshing ? ' spinning' : ''}`}
+              onClick={handleForceSync}
+              disabled={syncDisabled}
+              title={t('chat.sync_history')}
+              aria-label={t('chat.sync_history')}
+            >
+              ↻
+            </button>
+          )}
+          {canShowFilePanel && (
+            <button
+              class={`chat-panel-toggle${showFilePanel ? ' active' : ''}`}
+              onClick={toggleFilePanel}
+              title={showFilePanel ? t('chat.hide_file_panel') : t('chat.show_file_panel')}
+            >
+              ⊞
+            </button>
+          )}
+        </div>
       )}
       <div class="chat-main">
         {!preview && (
@@ -2672,13 +2702,13 @@ const ChatEvent = memo(function ChatEvent({
       const isUserCancelFeedback = event.payload.reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL;
       const isUserCompactFeedback = event.payload.reason === SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT;
       const stateLabel: Record<string, string> = {
-        idle: 'Agent idle — waiting for input',
-        running: 'Agent working...',
-        started: 'Session started',
-        starting: 'Session starting...',
+        idle: t('session.state_idle'),
+        running: t('session.state_running'),
+        started: t('session.state_started'),
+        starting: t('session.state_starting'),
         compacting: t('session.state_compacting'),
         stopping: t('session.state_stopping'),
-        stopped: 'Session stopped',
+        stopped: t('session.state_stopped'),
       };
       const label = isUserCancelFeedback
         ? t('session.state_stop_requested')

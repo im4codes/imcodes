@@ -23,10 +23,12 @@ export type SubSessionEntryGestureKind = 'single' | 'double';
 export interface SubSessionEntryState {
   isOpen: boolean;
   isMaximized: boolean;
+  isFocused?: boolean;
 }
 
 export type SubSessionEntryAction =
   | 'open-normal'
+  | 'focus'
   | 'close-normal'
   | 'restore-then-close'
   | 'open-maximized'
@@ -35,6 +37,7 @@ export type SubSessionEntryAction =
 
 export interface SubSessionEntryGestureCallbacks {
   openNormal: () => void;
+  focus: () => void;
   closeNormal: () => void;
   restoreThenClose: () => void;
   openMaximized: () => void;
@@ -64,6 +67,8 @@ export function getSubSessionEntryAction(
   state: SubSessionEntryState,
   gesture: SubSessionEntryGestureKind,
 ): SubSessionEntryAction {
+  if (state.isOpen && state.isFocused === false) return 'focus';
+
   if (gesture === 'single') {
     if (!state.isOpen) return 'open-normal';
     return state.isMaximized ? 'restore-then-close' : 'close-normal';
@@ -80,6 +85,9 @@ export function runSubSessionEntryAction(
   switch (action) {
     case 'open-normal':
       callbacks.openNormal();
+      return;
+    case 'focus':
+      callbacks.focus();
       return;
     case 'close-normal':
       callbacks.closeNormal();

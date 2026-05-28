@@ -574,6 +574,51 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     second.unmount();
   });
 
+  it('foreground watchdog fires a silent catch-up when the active session goes stale', async () => {
+    // A session the user is staring at can silently miss a live event with no
+    // error / reconnect / focus signal to re-trigger a catch-up. The watchdog
+    // detects the quiet stream and fires ONE catch-up after WATCHDOG_STALE_MS
+    // (45s), throttled so an idle session does not poll on every 30s tick.
+    const sessionName = `deck_http_backfill_watchdog_${Date.now()}`;
+    const serverId = `srv-watchdog-${Date.now()}`;
+
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay-wd'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history-wd'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      useTimeline(sessionName, ws, serverId, { isActiveSession: true });
+      return h('div', { 'data-testid': 'probe' }, 'mounted');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const view = render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('mounted');
+    });
+    // Mount bootstrap backfill fires (~200ms) and stamps the verified baseline.
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    fetchSpy.mockClear();
+
+    // One interval tick (~30s) before the 45s stale threshold: still fresh →
+    // the watchdog must NOT fire (idle self-throttle).
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Past the stale threshold with no live event and the socket connected →
+    // exactly one silent catch-up.
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    view.unmount();
+  });
+
   it('app activation clears the mount cooldown and forces a fresh backfill for the active session', async () => {
     const sessionName = `deck_http_backfill_resume_${Date.now()}`;
     const serverId = `srv-resume-${Date.now()}`;

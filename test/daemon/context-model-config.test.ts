@@ -28,7 +28,7 @@ describe('context-model-config', () => {
         frequency: 0.15,
         project: 0.2,
       },
-      enablePersonalMemorySync: false,
+      enablePersonalMemorySync: true,
     });
   });
 
@@ -62,7 +62,7 @@ describe('context-model-config', () => {
         frequency: 0.15,
         project: 0.2,
       },
-      enablePersonalMemorySync: false,
+      enablePersonalMemorySync: true,
     });
   });
 

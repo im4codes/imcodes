@@ -180,9 +180,12 @@ vi.mock('../src/hooks/usePref.js', () => ({
   usePref: () => ({ loaded: true, value: '/bin/bash' }),
 }));
 
-vi.mock('../src/hooks/useSyncedPreference.js', () => ({
-  useSyncedPreference: (_key: string, initial: unknown) => [initial, vi.fn()],
-}));
+vi.mock('../src/hooks/useSyncedPreference.js', async () => {
+  const { useState } = await vi.importActual<typeof import('preact/hooks')>('preact/hooks');
+  return {
+    useSyncedPreference: (_key: string, initial: unknown) => useState(initial),
+  };
+});
 
 vi.mock('../src/git-status-store.js', () => ({
   requestSharedChanges: vi.fn(),
@@ -277,6 +280,7 @@ vi.mock('../src/components/Sidebar.js', () => ({
     <div>
       sidebar
       <button onClick={() => onDropPanel?.('subsession', 'sub-1')}>sidebar-drop</button>
+      <button onClick={() => onDropPanel?.('subsession', 'sub-2')}>sidebar-drop-sub-2</button>
       {children}
     </div>
   ),
@@ -295,7 +299,7 @@ vi.mock('../src/components/SessionTree.js', () => ({
   ),
 }));
 vi.mock('../src/components/SessionTabs.js', () => ({
-  SessionTabs: ({ sessions, onSelect, onAlertDismiss, onNewSession, onStopProject, onRestartProject, onRenameHandled, onRenameSession }: any) => (
+  SessionTabs: ({ sessions, onSelect, onAlertDismiss, onNewSession, onStopProject, onRestartProject, onOpenSessionSettings, onCloneSession, onRenameHandled, onRenameSession }: any) => (
     <div>
       session-tabs
       <button onClick={() => onSelect?.(sessions?.[0]?.name)}>tabs-select</button>
@@ -303,6 +307,8 @@ vi.mock('../src/components/SessionTabs.js', () => ({
       <button onClick={onNewSession}>tabs-new-session</button>
       <button onClick={() => onStopProject?.()}>tabs-stop</button>
       <button onClick={() => onRestartProject?.()}>tabs-restart</button>
+      <button onClick={() => onOpenSessionSettings?.(sessions?.[0])}>tabs-settings</button>
+      <button onClick={() => onCloneSession?.(sessions?.[0])}>tabs-clone</button>
       <button onClick={onRenameHandled}>tabs-rename-handled</button>
       <button onClick={() => onRenameSession?.(sessions?.[0]?.name, 'Renamed')}>tabs-rename</button>
     </div>
@@ -406,6 +412,14 @@ vi.mock('../src/components/SessionSettingsDialog.js', () => ({
       session-settings-dialog
       <button onClick={() => onSaved?.({ label: 'Saved', type: 'codex-sdk', cwd: '/work/saved', transportConfig: {} })}>settings-save</button>
       <button onClick={onClose}>settings-close</button>
+    </div>
+  ),
+}));
+vi.mock('../src/components/CloneSessionGroupDialog.js', () => ({
+  CloneSessionGroupDialog: ({ onClose }: any) => (
+    <div>
+      clone-session-group-dialog
+      <button onClick={onClose}>clone-close</button>
     </div>
   ),
 }));
@@ -669,6 +683,107 @@ describe('App shell', () => {
     });
   }, 20_000);
 
+  it('keeps multiple desktop sub-session windows open and fronts the latest click', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+      {
+        id: 'sub-2',
+        sessionName: 'deck_sub_alpha_reviewer',
+        parentSession: 'deck_alpha_brain',
+        label: 'Reviewer',
+        description: 'Reviewer session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    fireEvent.click(screen.getByText('subbar-open-sub-1'));
+    const first = await screen.findByTestId('sub-session-window-sub-1');
+
+    fireEvent.click(screen.getByText('subbar-open-sub-2'));
+    const second = await screen.findByTestId('sub-session-window-sub-2');
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeTruthy();
+      expect(screen.queryByTestId('sub-session-window-sub-2')).toBeTruthy();
+      expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBe(JSON.stringify(['sub-1', 'sub-2']));
+      expect(Number((second as HTMLElement).style.zIndex)).toBeGreaterThan(Number((first as HTMLElement).style.zIndex));
+    });
+  }, 20_000);
+
+  it('opens a pinned sub-session as a floating window without closing other desktop sub-session windows', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+      {
+        id: 'sub-2',
+        sessionName: 'deck_sub_alpha_reviewer',
+        parentSession: 'deck_alpha_brain',
+        label: 'Reviewer',
+        description: 'Reviewer session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    fireEvent.click(screen.getByText('subbar-open-sub-1'));
+    expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('sidebar-drop-sub-2'));
+
+    fireEvent.click(screen.getByText('subbar-open-sub-2'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeTruthy();
+      expect(screen.queryByTestId('sub-session-window-sub-2')).toBeTruthy();
+    });
+  }, 20_000);
+
   it('brings an already-open repository panel above a sub-session when the sub-session branch action opens it', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
@@ -834,7 +949,7 @@ describe('App shell', () => {
     const first = await screen.findByTestId('sub-session-window-sub-1');
     const second = await screen.findByTestId('sub-session-window-sub-2');
     await waitFor(() => {
-      expect(first.getAttribute('data-active')).toBe('true');
+      expect(first.getAttribute('data-active')).toBe('false');
       expect(second.getAttribute('data-active')).toBe('true');
     });
 
@@ -1055,6 +1170,14 @@ describe('App shell', () => {
     expect(await screen.findByText('session-settings-dialog')).toBeTruthy();
     fireEvent.click(screen.getByText('settings-save'));
     fireEvent.click(screen.getByText('settings-close'));
+
+    fireEvent.click(screen.getByText('tabs-settings'));
+    expect(await screen.findByText('session-settings-dialog')).toBeTruthy();
+    fireEvent.click(screen.getByText('settings-close'));
+
+    fireEvent.click(screen.getByText('tabs-clone'));
+    expect(await screen.findByText('clone-session-group-dialog')).toBeTruthy();
+    fireEvent.click(screen.getByText('clone-close'));
 
     fireEvent.click(screen.getByText('server-menu'));
     expect(await screen.findByText('server-context-menu')).toBeTruthy();

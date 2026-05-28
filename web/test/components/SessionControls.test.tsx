@@ -72,6 +72,14 @@ vi.mock('react-i18next', () => ({
         return 'Paste is too large for inline input here. Upload it as a file instead.';
       }
       if (key === 'session.stop_plain') return 'Stop';
+      if (key === 'session.restart_plain') return 'Restart';
+      if (key === 'session.start_fresh') return 'Start fresh';
+      if (key === 'session.pin_plain') return 'Pin';
+      if (key === 'session.unpin_plain') return 'Unpin';
+      if (key === 'session.rename_plain') return 'Rename';
+      if (key === 'session.unpin_to_stop') return 'Unpin tab first to stop';
+      if (key === 'session.tab_pin') return 'Pin';
+      if (key === 'session.tab_unpin') return 'Unpin';
       if (key === 'session.clone.menu') return 'Copy session group';
       if (key === 'session.supervision.quickLabel') return 'Auto';
       if (key === 'session.supervision.quickTitle') return 'Auto mode';
@@ -491,6 +499,120 @@ afterEach(() => {
 
     expect(screen.queryByTitle('actions')).toBeNull();
     expect(screen.queryByText('Copy session group')).toBeNull();
+  });
+
+  it('pins and unpins the active session from the session actions menu', () => {
+    const onToggleSessionPin = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        onToggleSessionPin={onToggleSessionPin}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    fireEvent.click(screen.getByText('Pin'));
+    expect(onToggleSessionPin).toHaveBeenCalledWith('deck_my-project_brain');
+    expect(screen.queryByText('Pin')).toBeNull();
+
+    cleanup();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        sessionPinned
+        onToggleSessionPin={onToggleSessionPin}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    fireEvent.click(screen.getByText('Unpin'));
+    expect(onToggleSessionPin).toHaveBeenLastCalledWith('deck_my-project_brain');
+  });
+
+  it('shows typed colored icons for every session action menu option', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        serverId="server-1"
+        sessions={[mainSession]}
+        quickData={makeQuickData() as any}
+        onSettings={vi.fn()}
+        onToggleSessionPin={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    const menu = document.querySelector('.session-actions-menu') as HTMLElement;
+    expect(menu).toBeTruthy();
+
+    const expected: Array<[string, string]> = [
+      ['Pin', 'session-action-menu-icon-pin'],
+      ['Restart', 'session-action-menu-icon-restart'],
+      ['Start fresh', 'session-action-menu-icon-new'],
+      ['Rename', 'session-action-menu-icon-rename'],
+      ['settings', 'session-action-menu-icon-settings'],
+      ['Copy session group', 'session-action-menu-icon-clone'],
+      ['Stop', 'session-action-menu-icon-stop'],
+    ];
+
+    for (const [label, iconClass] of expected) {
+      const button = within(menu).getByRole('button', { name: label });
+      expect(button.querySelector(`.${iconClass}`)).toBeTruthy();
+    }
+  });
+
+  it('uses the same unpin-first stop guard in the session action menu', () => {
+    const onStopProject = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        onStopProject={onStopProject}
+        stopBlockedByPinned
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    const stopButton = screen.getByRole('button', { name: /unpin tab first to stop/i });
+    expect((stopButton as HTMLButtonElement).disabled).toBe(true);
+    expect(stopButton.querySelector('.session-action-menu-icon-unpin')).toBeTruthy();
+    expect(onStopProject).not.toHaveBeenCalled();
+  });
+
+  it('hides the pin action from sub-session and compact action menus', () => {
+    const onToggleSessionPin = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        subSessionId="abc"
+        quickData={makeQuickData() as any}
+        onToggleSessionPin={onToggleSessionPin}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    expect(screen.queryByText('Pin')).toBeNull();
+
+    cleanup();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        compact
+        onToggleSessionPin={onToggleSessionPin}
+      />,
+    );
+
+    expect(screen.queryByTitle('actions')).toBeNull();
+    expect(screen.queryByText('Pin')).toBeNull();
   });
 
   it('keeps openspec through p2p settings controls visible in compact card mode', () => {

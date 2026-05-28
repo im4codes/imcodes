@@ -49,6 +49,7 @@ vi.mock('../../src/components/EmbeddingStatusIcon.js', () => ({
 function makeActions(log: string[]): SubSessionEntryGestureCallbacks {
   return {
     openNormal: () => log.push('openNormal'),
+    focus: () => log.push('focus'),
     closeNormal: () => log.push('closeNormal'),
     restoreThenClose: () => log.push('restoreThenClose'),
     openMaximized: () => log.push('openMaximized'),
@@ -122,9 +123,11 @@ describe('sub-session entry gesture helper', () => {
     expect(getSubSessionEntryAction({ isOpen: false, isMaximized: false }, 'single')).toBe('open-normal');
     expect(getSubSessionEntryAction({ isOpen: true, isMaximized: false }, 'single')).toBe('close-normal');
     expect(getSubSessionEntryAction({ isOpen: true, isMaximized: true }, 'single')).toBe('restore-then-close');
+    expect(getSubSessionEntryAction({ isOpen: true, isMaximized: false, isFocused: false }, 'single')).toBe('focus');
     expect(getSubSessionEntryAction({ isOpen: false, isMaximized: false }, 'double')).toBe('open-maximized');
     expect(getSubSessionEntryAction({ isOpen: true, isMaximized: false }, 'double')).toBe('maximize');
     expect(getSubSessionEntryAction({ isOpen: true, isMaximized: true }, 'double')).toBe('restore');
+    expect(getSubSessionEntryAction({ isOpen: true, isMaximized: true, isFocused: false }, 'double')).toBe('focus');
   });
 
   it('ignores interactive descendants and drag/reorder handles', () => {
@@ -289,6 +292,7 @@ function renderBar(props: Partial<Parameters<typeof SubSessionBar>[0]> = {}) {
       collapsed={props.collapsed}
       idleFlashTokens={new Map()}
       onOpen={props.onOpen ?? vi.fn()}
+      onFocus={props.onFocus}
       onClose={props.onClose ?? vi.fn()}
       onOpenMaximized={props.onOpenMaximized}
       onMaximize={props.onMaximize}
@@ -301,6 +305,7 @@ function renderBar(props: Partial<Parameters<typeof SubSessionBar>[0]> = {}) {
       onDiff={vi.fn()}
       onHistory={vi.fn()}
       desktopLayoutCapable={props.desktopLayoutCapable}
+      focusedSubId={props.focusedSubId}
     />,
   );
 }
@@ -365,6 +370,50 @@ describe('SubSessionBar component entry gestures', () => {
     vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS);
 
     expect(onRestoreThenClose).toHaveBeenCalledWith('sub-1');
+  });
+
+  it('focuses an open desktop entry before allowing close or maximize actions', () => {
+    const onOpen = vi.fn();
+    const onFocus = vi.fn();
+    const onMaximize = vi.fn();
+    renderBar({
+      openIds: new Set(['sub-1']),
+      focusedSubId: 'sub-2',
+      onOpen,
+      onFocus,
+      onMaximize,
+    });
+
+    const entry = screen.getByRole('button', { name: /worker/ });
+    firePointerDown(entry, 'mouse');
+    fireEvent.click(entry);
+    vi.advanceTimersByTime(SUBSESSION_ENTRY_DOUBLE_CLICK_DELAY_MS);
+
+    expect(onFocus).toHaveBeenCalledWith('sub-1');
+    expect(onOpen).not.toHaveBeenCalled();
+
+    fireEvent.dblClick(entry);
+    expect(onMaximize).not.toHaveBeenCalled();
+    expect(onFocus).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps non-desktop entry behavior unchanged even when focusedSubId differs', () => {
+    const onOpen = vi.fn();
+    const onFocus = vi.fn();
+    renderBar({
+      desktopLayoutCapable: false,
+      openIds: new Set(['sub-1']),
+      focusedSubId: 'sub-2',
+      onOpen,
+      onFocus,
+    });
+
+    const entry = screen.getByRole('button', { name: /worker/ });
+    firePointerDown(entry, 'mouse');
+    fireEvent.click(entry);
+
+    expect(onOpen).toHaveBeenCalledWith('sub-1');
+    expect(onFocus).not.toHaveBeenCalled();
   });
 
   it('does not run desktop double-click maximize when desktop layout capability is disabled', () => {

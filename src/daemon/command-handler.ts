@@ -43,6 +43,7 @@ import logger from '../util/logger.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
+import { hashSessionName } from '../../shared/session-hash.js';
 import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
 import {
   TIMELINE_CURSOR_DIRECTIONS,
@@ -2811,20 +2812,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
       const record = getSession(sessionName);
       const projectDir = record?.projectDir ?? '';
-      // R3 v2 PR-ν — Removed the legacy verbose language-instruction
-      // injection that mutated `p2pExtraPrompt` with a 79-char bilingual
-      // English line. The language hint is now a first-class structured
-      // field: `run.locale` flows through to `buildHopPrompt` /
-      // `buildAdvancedPromptCommon`, which call
-      // `buildP2pLanguageInstruction(locale)` to emit the concise
-      // locale-native one-liner from the i18n dictionary
-      // (`p2p.discussion_language_instruction`). The new line sits right
-      // after `P2P_BASELINE_PROMPT` — a more prominent slot than the
-      // tail-of-prompt extraPrompt position the old line ended up in —
-      // and the autonym (中文 / 日本語 / etc.) ensures the agent reads
-      // the instruction in the same language it's being asked to reply in.
-      // The extraPrompt field is left untouched for user-supplied custom
-      // hints; nothing the daemon writes leaks into it now.
+      // The selected UI locale is a structured field. Prompt builders append
+      // the final language line at the very end, leaving user extraPrompt
+      // untouched and avoiding mid-prompt "reply in ..." hints that get missed.
       const advancedLaunchRequested = hasOldAdvancedLaunchFields(cmd)
         || isPlainRecord((cmd as Record<string, unknown>).p2pWorkflowLaunchEnvelope)
         || isPlainRecord((cmd as Record<string, unknown>).workflowLaunchEnvelope);
@@ -4610,7 +4600,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
           trimmed = synthesizedTrimmed;
         }
       } catch (err) {
-        logger.debug({ err, sessionName: params.sessionName, opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
+        logger.debug({ err, sessionHash: hashSessionName(params.sessionName), opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
       }
       synthesizeMs = Date.now() - tSyn0;
     }
@@ -4731,7 +4721,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
     const totalMs = Date.now() - tStart;
     const requestedBudgetBytes = optionalFiniteNumber(cmd.budgetBytes);
     logger.info({
-      sessionName,
+      sessionHash: hashSessionName(sessionName),
       requestId,
       requestType: typeof cmd.type === 'string' ? cmd.type : undefined,
       responseType: sent.type,
@@ -4755,7 +4745,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
     }, 'timeline.history served');
     return;
   } catch (err) {
-    logger.error({ err, sessionName, requestId }, 'timeline.history_request unexpectedly failed');
+    logger.error({ err, sessionHash: hashSessionName(sessionName), requestId }, 'timeline.history_request unexpectedly failed');
     try {
       sendTimelineMessage(serverLink, {
         type: timelineHistoryResponseTypeForRequest(cmd),

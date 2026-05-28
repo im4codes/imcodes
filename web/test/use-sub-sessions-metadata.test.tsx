@@ -1334,6 +1334,39 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
     expectQueueCleared();
   });
 
+  it('removes queued entries as authoritative user messages enter the timeline', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'user.message',
+        sessionId: 'deck_sub_eq1',
+        payload: { clientMessageId: 'q1', text: 'fix the bug' },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['then add tests']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'q2', text: 'then add tests' },
+    ]);
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'user.message',
+        sessionId: 'deck_sub_eq1',
+        payload: { text: 'then   add tests' },
+      },
+    }));
+
+    expectQueueCleared();
+    expect(captured[0].state).toBe('running');
+  });
+
   it('full lifecycle: queue → running → idle clears', async () => {
     const { ws, send } = createMockWs();
     await setupSession(ws, send);

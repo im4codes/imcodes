@@ -39,7 +39,7 @@ import {
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
-import { buildMemorySummarySyncMessage } from '../memory-summary-sync.js';
+import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
 
 type GetMaximizeBounds = () => WorkspaceBounds | null;
 
@@ -206,8 +206,12 @@ export function SubSessionWindow({
     addOptimisticUserMessage,
     markOptimisticFailed,
     retryOptimisticMessage,
+    forceRefresh: timelineForceRefresh,
   } = useTimeline(sub.sessionName, ws, serverId, {
     isActiveSession: active,
+    // Window mounted = visible; participate in resume broadcast even when
+    // minimized/inactive so timeline stays fresh on focus / online / probe.
+    isVisible: true,
   });
   const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
   const quickData = useQuickData();
@@ -411,7 +415,9 @@ export function SubSessionWindow({
     if (!ws || !connected || syncingMemorySummaries) return;
     setSyncingMemorySummaries(true);
     try {
-      const text = await buildMemorySummarySyncMessage(t, memorySummaryProjectId);
+      const text = await buildMemorySummarySyncMessage(t, memorySummaryProjectId, undefined, {
+        sources: [localPersonalMemorySummarySource(ws)],
+      });
       if (!text) return;
       const commandId = globalThis.crypto?.randomUUID?.()
         ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -520,15 +526,38 @@ export function SubSessionWindow({
     if (maximized) onRestoreBeforeClose?.();
   }, [maximized, onRestoreBeforeClose]);
 
+  const focusOnlyWindowCommandRef = useRef(false);
+  const focusInactiveDesktopWindow = useCallback((
+    event?: Pick<Event, 'preventDefault' | 'stopPropagation'>,
+    options?: { suppressFollowingClick?: boolean },
+  ) => {
+    if (!desktopLayoutCapable || isMobile || active) return false;
+    if (options?.suppressFollowingClick) focusOnlyWindowCommandRef.current = true;
+    event?.preventDefault();
+    event?.stopPropagation();
+    onFocus();
+    return true;
+  }, [active, desktopLayoutCapable, isMobile, onFocus]);
+
+  const consumeFocusOnlyWindowCommandClick = useCallback((event: Pick<Event, 'preventDefault' | 'stopPropagation'>) => {
+    if (!focusOnlyWindowCommandRef.current) return false;
+    focusOnlyWindowCommandRef.current = false;
+    event.preventDefault();
+    event.stopPropagation();
+    return true;
+  }, []);
+
   const handleMinimize = useCallback(() => {
+    if (focusInactiveDesktopWindow()) return;
     restoreBeforeClosing();
     onMinimize();
-  }, [onMinimize, restoreBeforeClosing]);
+  }, [focusInactiveDesktopWindow, onMinimize, restoreBeforeClosing]);
 
   const handleClose = useCallback(() => {
+    if (focusInactiveDesktopWindow()) return;
     restoreBeforeClosing();
     onClose();
-  }, [onClose, restoreBeforeClosing]);
+  }, [focusInactiveDesktopWindow, onClose, restoreBeforeClosing]);
 
   // Usage tracking
   const lastUsage = useMemo(() => extractLatestUsage(events), [events]);
@@ -607,11 +636,16 @@ export function SubSessionWindow({
         zIndex,
       }
     : { '--subsession-accent-color': accentColor, position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h, zIndex };
+  const rootClass = [
+    'subsession-window',
+    isDesktopMaximized ? 'subsession-window-maximized' : '',
+    desktopLayoutCapable && !isMobile && active ? 'subsession-window-active' : '',
+  ].filter(Boolean).join(' ');
 
   return (
     <div
       ref={swipeBackRef}
-      class={`subsession-window${isDesktopMaximized ? ' subsession-window-maximized' : ''}`}
+      class={rootClass}
       style={style}
       onMouseDown={onFocus}
     >
@@ -654,11 +688,26 @@ export function SubSessionWindow({
           {desktopLayoutCapable && onToggleMaximized && (
             <DesktopWindowMaximizeButton
               maximized={isDesktopMaximized}
-              onClick={handleToggleMaximized}
+              onClick={(event) => {
+                if (focusInactiveDesktopWindow(event)) return;
+                handleToggleMaximized();
+              }}
             />
           )}
-          <button class="subsession-minimize-btn" onClick={handleMinimize} title={t('window.minimize')} aria-label={t('window.minimize')}>▾</button>
-          <button class="subsession-close-btn" onClick={handleMinimize} title={t('window.hide')} aria-label={t('window.hide')}>×</button>
+          <button
+            class="subsession-minimize-btn"
+            onMouseDown={(event) => { focusInactiveDesktopWindow(event, { suppressFollowingClick: true }); }}
+            onClick={(event) => { if (!consumeFocusOnlyWindowCommandClick(event) && !focusInactiveDesktopWindow(event)) handleMinimize(); }}
+            title={t('window.minimize')}
+            aria-label={t('window.minimize')}
+          >▾</button>
+          <button
+            class="subsession-close-btn"
+            onMouseDown={(event) => { focusInactiveDesktopWindow(event, { suppressFollowingClick: true }); }}
+            onClick={(event) => { if (!consumeFocusOnlyWindowCommandClick(event) && !focusInactiveDesktopWindow(event)) handleMinimize(); }}
+            title={t('window.hide')}
+            aria-label={t('window.hide')}
+          >×</button>
         </div>
       </div>
 
@@ -685,6 +734,7 @@ export function SubSessionWindow({
             refreshing={refreshing}
             historyStatus={historyStatus}
             sessionId={sub.sessionName}
+            onForceSync={timelineForceRefresh}
             onScrollBottomFn={onChatScrollBottomFn}
             ws={ws}
             workdir={sub.cwd ?? null}

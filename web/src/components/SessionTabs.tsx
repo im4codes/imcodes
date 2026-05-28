@@ -4,6 +4,7 @@ import type { SessionInfo } from '../types.js';
 import { useSyncedPreference } from '../hooks/useSyncedPreference.js';
 import { formatLabel } from '../format-label.js';
 import { getAgentBadgeConfig } from '../agent-display.js';
+import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 
 interface Props {
   sessions: SessionInfo[];
@@ -19,6 +20,8 @@ interface Props {
   onNewSession: () => void;
   onStopProject: (project: string) => void;
   onRestartProject: (project: string, fresh?: boolean) => void;
+  onCloneSession?: (session: SessionInfo) => void;
+  onOpenSessionSettings?: (session: SessionInfo) => void;
   /** When set to a session name, triggers inline rename */
   renameRequest?: string | null;
   onRenameHandled?: () => void;
@@ -47,6 +50,15 @@ interface LongPressState {
   startY: number;
 }
 
+interface TouchPressState {
+  sessionName: string;
+  pointerId: number;
+  startX: number;
+  startY: number;
+  moved: boolean;
+  longPressTriggered: boolean;
+}
+
 interface MousePressState {
   sessionName: string;
   startX: number;
@@ -57,7 +69,7 @@ function readLegacyOrder(): string[] {
   try { return JSON.parse(localStorage.getItem(LEGACY_LS_ORDER) ?? '[]'); } catch { return []; }
 }
 
-export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
+export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, onCloneSession, onOpenSessionSettings, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
   const { t } = useTranslation();
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
   const [stopConfirmProject, setStopConfirmProject] = useState<string | null>(null);
@@ -68,6 +80,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   const renameRef = useRef<HTMLInputElement>(null);
   const tabBarRef = useRef<HTMLDivElement>(null);
   const longPressRef = useRef<LongPressState | null>(null);
+  const touchPressRef = useRef<TouchPressState | null>(null);
   const mousePressRef = useRef<MousePressState | null>(null);
   const suppressNextClickRef = useRef(false);
   const suppressNextClickResetRef = useRef<number | null>(null);
@@ -149,6 +162,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
 
   useEffect(() => () => {
     clearLongPress();
+    touchPressRef.current = null;
     mousePressRef.current = null;
     if (suppressNextClickResetRef.current !== null) {
       window.clearTimeout(suppressNextClickResetRef.current);
@@ -226,11 +240,22 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     const startY = e.clientY;
     try { target.setPointerCapture?.(pointerId); } catch { /* best-effort on older WebViews */ }
 
+    touchPressRef.current = {
+      sessionName: session.name,
+      pointerId,
+      startX,
+      startY,
+      moved: false,
+      longPressTriggered: false,
+    };
     longPressRef.current = {
       pointerId,
       startX,
       startY,
       timer: window.setTimeout(() => {
+        if (touchPressRef.current?.pointerId === pointerId) {
+          touchPressRef.current.longPressTriggered = true;
+        }
         longPressRef.current = null;
         suppressNextSyntheticClick();
         try { target.releasePointerCapture?.(pointerId); } catch { /* best-effort on older WebViews */ }
@@ -240,6 +265,12 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   }, [clearLongPress, openCtxAt, suppressNextSyntheticClick]);
 
   const onTabPointerMove = useCallback((e: PointerEvent) => {
+    const touchState = touchPressRef.current;
+    if (touchState && touchState.pointerId === e.pointerId) {
+      const dx = e.clientX - touchState.startX;
+      const dy = e.clientY - touchState.startY;
+      if (Math.hypot(dx, dy) > TAB_LONG_PRESS_MOVE_CANCEL_PX) touchState.moved = true;
+    }
     const state = longPressRef.current;
     if (state && state.pointerId === e.pointerId) {
       const dx = e.clientX - state.startX;
@@ -248,9 +279,29 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     }
   }, [clearLongPress]);
 
-  const onTabPointerEnd = useCallback((e: PointerEvent) => {
+  const onTabPointerUp = useCallback((e: PointerEvent) => {
     const state = longPressRef.current;
     if (state && state.pointerId === e.pointerId) clearLongPress();
+    const touchState = touchPressRef.current;
+    if (!touchState || touchState.pointerId !== e.pointerId) return;
+    touchPressRef.current = null;
+    try { (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId); } catch { /* best-effort on older WebViews */ }
+
+    const dx = e.clientX - touchState.startX;
+    const dy = e.clientY - touchState.startY;
+    const movedOnRelease = Math.hypot(dx, dy) > TAB_LONG_PRESS_MOVE_CANCEL_PX;
+    if (touchState.moved || movedOnRelease || touchState.longPressTriggered) return;
+
+    suppressNextSyntheticClick(180);
+    selectTab(touchState.sessionName);
+  }, [clearLongPress, selectTab, suppressNextSyntheticClick]);
+
+  const onTabPointerCancel = useCallback((e: PointerEvent) => {
+    const state = longPressRef.current;
+    if (state && state.pointerId === e.pointerId) clearLongPress();
+    const touchState = touchPressRef.current;
+    if (touchState?.pointerId === e.pointerId) touchPressRef.current = null;
+    try { (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId); } catch { /* best-effort on older WebViews */ }
   }, [clearLongPress]);
 
   const onTabMouseDown = useCallback((e: MouseEvent, session: SessionInfo) => {
@@ -357,7 +408,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   }, [orderedSessions, pinned, setTabOrder]);
 
   const menuX = ctx ? Math.min(ctx.x, window.innerWidth - 160) : 0;
-  const menuY = ctx ? Math.min(ctx.y, window.innerHeight - 200) : 0;
+  const menuY = ctx ? Math.min(ctx.y, window.innerHeight - 260) : 0;
 
   return (
     <div ref={tabBarRef} class="tab-bar" role="tablist">
@@ -422,9 +473,9 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                 onContextMenu={(e) => openCtx(e, s)}
                 onPointerDown={(e) => onTabPointerDown(e as PointerEvent, s)}
                 onPointerMove={(e) => onTabPointerMove(e as PointerEvent)}
-                onPointerUp={(e) => onTabPointerEnd(e as PointerEvent)}
-                onPointerCancel={(e) => onTabPointerEnd(e as PointerEvent)}
-                onPointerLeave={(e) => onTabPointerEnd(e as PointerEvent)}
+                onPointerUp={(e) => onTabPointerUp(e as PointerEvent)}
+                onPointerCancel={(e) => onTabPointerCancel(e as PointerEvent)}
+                onPointerLeave={(e) => onTabPointerCancel(e as PointerEvent)}
                 onMouseDown={(e) => onTabMouseDown(e as MouseEvent, s)}
                 onMouseMove={(e) => onTabMouseMove(e as MouseEvent)}
                 onMouseUp={(e) => onTabMouseEnd(e as MouseEvent)}
@@ -447,25 +498,50 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         );
       })}
 
-      <button class="tab-add-btn" onClick={onNewSession} title="New session">＋</button>
+      <button class="tab-add-btn" onClick={onNewSession} title={t('session.new_btn', 'New session')}>＋</button>
 
       {ctx && (() => {
         // Pinned tabs can't be stopped — user must unpin first. Check both the
         // right-clicked session and any sibling sessions of the same project,
         // since `Stop` terminates the whole project (all its tmux processes).
         const projectHasPinned = sessions.some((s) => s.project === ctx.session.project && pinned.has(s.name));
+        const canCloneSession = ctx.session.role === 'brain'
+          && !ctx.session.name.startsWith('deck_sub_')
+          && ctx.session.userCreated !== false;
         return (
         <div ref={menuRef} class="tab-context-menu" style={{ left: menuX, top: menuY }}>
-          <button class="menu-item" onClick={() => togglePin(ctx.session.name)}>
-            {pinned.has(ctx.session.name) ? '📌 Unpin' : '📌 Pin'}
+          <button class="menu-item session-action-menu-item" onClick={() => togglePin(ctx.session.name)}>
+            <SessionActionMenuIcon kind={pinned.has(ctx.session.name) ? 'unpin' : 'pin'} />
+            <span class="session-action-menu-label">{pinned.has(ctx.session.name) ? t('session.unpin_plain', 'Unpin') : t('session.pin_plain', 'Pin')}</span>
           </button>
           <div class="menu-divider" />
-          <button class="menu-item" onClick={() => { onRestartProject(ctx.session.project); setCtx(null); }}>↺ Restart</button>
-          <button class="menu-item" onClick={() => { onRestartProject(ctx.session.project, true); setCtx(null); }}>＋ New</button>
-          <button class="menu-item" onClick={() => startRename(ctx.session)}>✎ Rename</button>
+          <button class="menu-item session-action-menu-item" onClick={() => { onRestartProject(ctx.session.project); setCtx(null); }}>
+            <SessionActionMenuIcon kind="restart" />
+            <span class="session-action-menu-label">{t('session.restart_plain', 'Restart')}</span>
+          </button>
+          <button class="menu-item session-action-menu-item" onClick={() => { onRestartProject(ctx.session.project, true); setCtx(null); }}>
+            <SessionActionMenuIcon kind="new" />
+            <span class="session-action-menu-label">{t('session.start_fresh', 'Start fresh')}</span>
+          </button>
+          <button class="menu-item session-action-menu-item" onClick={() => startRename(ctx.session)}>
+            <SessionActionMenuIcon kind="rename" />
+            <span class="session-action-menu-label">{t('session.rename_plain', 'Rename')}</span>
+          </button>
+          {onOpenSessionSettings && (
+            <button class="menu-item session-action-menu-item" onClick={() => { onOpenSessionSettings(ctx.session); setCtx(null); }}>
+              <SessionActionMenuIcon kind="settings" />
+              <span class="session-action-menu-label">{t('session.settings', 'Settings')}</span>
+            </button>
+          )}
+          {onCloneSession && canCloneSession && (
+            <button class="menu-item session-action-menu-item" onClick={() => { onCloneSession(ctx.session); setCtx(null); }}>
+              <SessionActionMenuIcon kind="clone" />
+              <span class="session-action-menu-label">{t('session.clone.menu', 'Copy session')}</span>
+            </button>
+          )}
           <div class="menu-divider" />
           <button
-            class="menu-item menu-item-danger"
+            class="menu-item session-action-menu-item menu-item-danger"
             disabled={projectHasPinned}
             title={projectHasPinned ? t('session.unpin_to_stop') : undefined}
             onClick={() => {
@@ -475,7 +551,8 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
               setCtx(null);
             }}
           >
-            {projectHasPinned ? `📌 ${t('session.unpin_to_stop')}` : '✕ Stop'}
+            <SessionActionMenuIcon kind={projectHasPinned ? 'unpin' : 'stop'} />
+            <span class="session-action-menu-label">{projectHasPinned ? t('session.unpin_to_stop') : t('session.stop_plain', 'Stop')}</span>
           </button>
         </div>
         );
@@ -484,12 +561,16 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         <div class="ask-dialog-overlay" onClick={() => { setStopConfirmProject(null); setStopConfirmLevel(0); }}>
           <div class="ask-dialog stop-session-dialog" onClick={(e) => e.stopPropagation()}>
             <div class="stop-session-dialog-icon">⚠</div>
-            <div class="stop-session-dialog-title">Stop main session?</div>
+            <div class="stop-session-dialog-title">{t('session.stop_main_title', 'Stop main session?')}</div>
             <div class="stop-session-dialog-body">
-              <strong>{stopConfirmProject}</strong> is a main session. Stopping it will terminate all its tmux processes. This cannot be undone.
+              {t(
+                'session.stop_main_body',
+                '{{project}} is a main session. Stopping it will terminate all its tmux processes. This cannot be undone.',
+                { project: stopConfirmProject },
+              )}
             </div>
             <div class="ask-actions">
-              <button class="ask-btn-cancel" onClick={() => { setStopConfirmProject(null); setStopConfirmLevel(0); }}>Cancel</button>
+              <button class="ask-btn-cancel" onClick={() => { setStopConfirmProject(null); setStopConfirmLevel(0); }}>{t('common.cancel', 'Cancel')}</button>
               <button
                 class={`ask-btn-submit stop-session-confirm-btn${stopConfirmLevel >= 1 ? ' menu-item-danger' : ''}`}
                 onClick={() => {
@@ -502,9 +583,9 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                   setStopConfirmLevel(0);
                 }}
               >
-                {stopConfirmLevel >= 2 ? `⚠ REALLY stop ${stopConfirmProject}?`
-                  : stopConfirmLevel === 1 ? 'Confirm stop?'
-                  : 'Stop session'}
+                {stopConfirmLevel >= 2 ? t('session.really_stop_project', '⚠ REALLY stop {{project}}?', { project: stopConfirmProject })
+                  : stopConfirmLevel === 1 ? t('session.confirm_stop', 'Confirm stop?')
+                  : t('session.stop_session', 'Stop session')}
               </button>
             </div>
           </div>

@@ -120,6 +120,24 @@ describe('SettingsPage', () => {
     expect(screen.getByText('alice')).toBeDefined();
   });
 
+  it('shows a persistent Team discussion explainer for later review', () => {
+    render(
+      <SettingsPage
+        displayName="Alice"
+        username="alice"
+        hasPassword
+        serverUrl="https://app.im.codes"
+        onBack={vi.fn()}
+        onDisplayNameChanged={vi.fn()}
+        onUserAuthUpdated={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('settings.team_discussion_title')).toBeDefined();
+    expect(screen.getByText('settings.team_discussion_body')).toBeDefined();
+    expect(screen.getByText('settings.team_discussion_point_3')).toBeDefined();
+  });
+
   it('maps structured API error codes for password setup', async () => {
     passkeyVerifyBeginMock.mockResolvedValue({ challengeId: 'cid-1', foo: 'bar' });
     startAuthenticationMock.mockResolvedValue({ id: 'cred-1' });

@@ -7,6 +7,10 @@ describe('startup splash screen contract', () => {
   const appSource = readFileSync(resolve(__dirname, '../src/app.tsx'), 'utf8');
 
   it('keeps the logo centered while the codes text reveals', () => {
+    expect(indexHtml).toContain('--splash-avatar-size');
+    expect(indexHtml).toContain('--splash-avatar-size: clamp(96px, 18vw, 156px)');
+    expect(indexHtml).toContain('class="splash-avatar" src="/imcodes-robot-avatar.png"');
+    expect(indexHtml).toMatch(/\.splash-avatar\s*\{[^}]*width:\s*var\(--splash-avatar-size\)/);
     expect(indexHtml).toContain('--splash-logo-width');
     expect(indexHtml).toMatch(/\.splash-logo\s*\{[^}]*width:\s*var\(--splash-logo-width\)/);
     expect(indexHtml).toMatch(/\.splash-top\s*\{[^}]*justify-content:\s*center/);
@@ -17,6 +21,7 @@ describe('startup splash screen contract', () => {
   });
 
   it('runs the splash animation quickly enough for app startup', () => {
+    expect(indexHtml).toMatch(/animation:\s*avatarBoot 0\.34s/);
     expect(indexHtml).toMatch(/animation:\s*glitchIn 0\.45s/);
     expect(indexHtml).toMatch(/animation:\s*revealCodes 0\.32s/);
     expect(indexHtml).toMatch(/animation:\s*fadeUp 0\.34s/);
