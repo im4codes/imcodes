@@ -4209,6 +4209,7 @@ export function App() {
                 onRenameSession={() => setRenameRequest(s.name)}
                 onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null })}
                 sessionPinned={pinnedTabs.has(s.name)}
+                stopBlockedByPinned={sessions.some((session) => session.project === s.project && pinnedTabs.has(session.name))}
                 onToggleSessionPin={togglePinnedTab}
                 onViewRepo={() => {
                   setActiveSession(s.name);

@@ -77,6 +77,7 @@ export interface SessionPaneProps {
   onRenameSession?: () => void;
   onSettings?: () => void;
   sessionPinned?: boolean;
+  stopBlockedByPinned?: boolean;
   onToggleSessionPin?: (sessionName: string) => void;
   onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
@@ -118,6 +119,7 @@ export function SessionPane({
   onRenameSession,
   onSettings,
   sessionPinned,
+  stopBlockedByPinned,
   onToggleSessionPin,
   onViewRepo,
   onTransportConfigSaved,
@@ -430,6 +432,7 @@ export function SessionPane({
           onRenameSession={onRenameSession}
           onSettings={onSettings}
           sessionPinned={sessionPinned}
+          stopBlockedByPinned={stopBlockedByPinned}
           onToggleSessionPin={onToggleSessionPin}
           onTransportConfigSaved={onTransportConfigSaved}
           sessionDisplayName={session.label ? formatLabel(session.label) : (session.project ?? null)}

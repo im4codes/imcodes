@@ -8,6 +8,7 @@ import { act, render, screen, fireEvent, cleanup } from '@testing-library/preact
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, fallback?: string | Record<string, unknown>, opts?: Record<string, unknown>) => {
+      if (key === 'session.unpin_to_stop') return 'Unpin tab first to stop';
       const template = typeof fallback === 'string' ? fallback : key.split('.').pop() ?? key;
       const values = typeof fallback === 'string' ? opts : fallback;
       return template.replace(/\{\{(\w+)\}\}/g, (_match, name) => String(values?.[name] ?? `{{${name}}}`));
@@ -373,7 +374,7 @@ describe('SessionTabs', () => {
       vi.advanceTimersByTime(520);
     });
 
-    expect(screen.getByText('📌 Pin')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Pin' })).toBeDefined();
 
     firePointer(tab, 'pointerup', {
       pointerId: 7,
@@ -452,7 +453,7 @@ describe('SessionTabs', () => {
 
     const tab = screen.getByRole('tab');
     fireEvent.contextMenu(tab);
-    fireEvent.click(screen.getByText('✕ Stop'));
+    fireEvent.click(screen.getByRole('button', { name: /^Stop$/ }));
 
     const stopBtn = () => screen.getByRole('button', { name: /stop session|confirm stop|really stop/i });
 
@@ -467,6 +468,66 @@ describe('SessionTabs', () => {
     fireEvent.click(stopBtn());
     expect(onStopProject).toHaveBeenCalledOnce();
     expect(onStopProject).toHaveBeenCalledWith('proj-1');
+  });
+
+  it('uses typed icons and plain labels in the tab context menu', () => {
+    const sessions = makeSessions([
+      { name: 'deck_proj_brain', project: 'proj-1', role: 'brain', agentType: 'codex-sdk', userCreated: true },
+    ]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        onOpenSessionSettings={vi.fn()}
+        onCloneSession={vi.fn()}
+        {...defaultProps}
+      />,
+    );
+
+    fireEvent.contextMenu(screen.getByRole('tab'));
+    const menu = document.querySelector('.tab-context-menu') as HTMLElement;
+    expect(menu).toBeTruthy();
+
+    const expected: Array<[string, string]> = [
+      ['Pin', 'session-action-menu-icon-pin'],
+      ['Restart', 'session-action-menu-icon-restart'],
+      ['Start fresh', 'session-action-menu-icon-new'],
+      ['Rename', 'session-action-menu-icon-rename'],
+      ['Settings', 'session-action-menu-icon-settings'],
+      ['Copy session', 'session-action-menu-icon-clone'],
+      ['Stop', 'session-action-menu-icon-stop'],
+    ];
+
+    for (const [label, iconClass] of expected) {
+      const button = screen.getByRole('button', { name: label });
+      expect(button.closest('.tab-context-menu')).toBe(menu);
+      expect(button.querySelector(`.${iconClass}`)).toBeTruthy();
+    }
+  });
+
+  it('shows the same unpin-first stop guard in the tab context menu', () => {
+    const onStopProject = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1', project: 'proj-1' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set(['session_w1'])}
+        onStopProject={onStopProject}
+      />,
+    );
+
+    fireEvent.contextMenu(screen.getByRole('tab'));
+    const stopButton = screen.getByRole('button', { name: /unpin tab first to stop/i });
+    expect((stopButton as HTMLButtonElement).disabled).toBe(true);
+    expect(stopButton.querySelector('.session-action-menu-icon-unpin')).toBeTruthy();
+    fireEvent.click(stopButton);
+    expect(onStopProject).not.toHaveBeenCalled();
   });
 
   it('opens session settings from the tab context menu', () => {

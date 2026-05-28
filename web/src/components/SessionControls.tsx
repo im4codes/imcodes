@@ -10,6 +10,7 @@ import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { CloneSessionGroupDialog } from './CloneSessionGroupDialog.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
+import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
@@ -78,6 +79,8 @@ interface Props {
   onSettings?: () => void;
   /** Whether the active session tab is pinned. */
   sessionPinned?: boolean;
+  /** Whether stopping the active project is blocked because one of its tabs is pinned. */
+  stopBlockedByPinned?: boolean;
   /** Called when the active session should be pinned/unpinned from the menu. */
   onToggleSessionPin?: (sessionName: string) => void;
   /** Sub-session id when the active control surface belongs to a sub-session. */
@@ -360,81 +363,6 @@ function getP2pMenuItemColor(mode: string, active: boolean): string {
   return getP2pModeColor(mode);
 }
 
-type SessionActionIconKind = 'pin' | 'unpin' | 'restart' | 'new' | 'rename' | 'settings' | 'clone' | 'stop';
-
-function SessionActionMenuIcon({ kind }: { kind: SessionActionIconKind }) {
-  const common = {
-    width: '16',
-    height: '16',
-    viewBox: '0 0 24 24',
-    fill: 'none',
-    stroke: 'currentColor',
-    strokeWidth: '2',
-    strokeLinecap: 'round',
-    strokeLinejoin: 'round',
-    'aria-hidden': 'true',
-    focusable: 'false',
-  } as const;
-
-  return (
-    <span class={`session-action-menu-icon session-action-menu-icon-${kind}`} aria-hidden="true">
-      {kind === 'pin' && (
-        <svg {...common}>
-          <path d="M12 17v5" />
-          <path d="M5 17h14" />
-          <path d="m16 3 5 5" />
-          <path d="M8 3h8l-2 7 3 3v4H7v-4l3-3L8 3Z" />
-        </svg>
-      )}
-      {kind === 'unpin' && (
-        <svg {...common}>
-          <path d="m3 3 18 18" />
-          <path d="M12 17v5" />
-          <path d="M5 17h12" />
-          <path d="M8 3h8l-1.2 4.3" />
-          <path d="M10 10 7 13v4h7" />
-          <path d="m16 3 5 5" />
-        </svg>
-      )}
-      {kind === 'restart' && (
-        <svg {...common}>
-          <path d="M21 12a9 9 0 1 1-2.64-6.36" />
-          <path d="M21 3v6h-6" />
-        </svg>
-      )}
-      {kind === 'new' && (
-        <svg {...common}>
-          <path d="M12 5v14" />
-          <path d="M5 12h14" />
-        </svg>
-      )}
-      {kind === 'rename' && (
-        <svg {...common}>
-          <path d="M12 20h9" />
-          <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
-        </svg>
-      )}
-      {kind === 'settings' && (
-        <svg {...common}>
-          <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
-          <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6l-.09.09a2 2 0 1 1-3.82 0L10 20a1.7 1.7 0 0 0-1-.6 1.7 1.7 0 0 0-1.88.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1l-.09-.09a2 2 0 1 1 0-3.82L4 10a1.7 1.7 0 0 0 .6-1 1.7 1.7 0 0 0-.34-1.88l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6l.09-.09a2 2 0 1 1 3.82 0L14 4a1.7 1.7 0 0 0 1 .6 1.7 1.7 0 0 0 1.88-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9c.25.32.46.66.6 1l.09.09a2 2 0 1 1 0 3.82L20 14a1.7 1.7 0 0 0-.6 1Z" />
-        </svg>
-      )}
-      {kind === 'clone' && (
-        <svg {...common}>
-          <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
-          <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
-        </svg>
-      )}
-      {kind === 'stop' && (
-        <svg {...common}>
-          <rect width="14" height="14" x="5" y="5" rx="2" />
-        </svg>
-      )}
-    </span>
-  );
-}
-
 function getAnchoredOverlayStyle(
   trigger: DOMRect,
   minWidth: number,
@@ -665,7 +593,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -2682,6 +2610,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
     // Main session
     if (isStop) {
+      if (stopBlockedByPinned) {
+        try { window.alert(t('session.unpin_to_stop')); } catch { /* ignore */ }
+        setMenuOpen(false); resetConfirm(); onAfterAction?.();
+        return;
+      }
       // Main session stop: 3-level (warn → danger → dialog)
       if (confirm !== action) { startConfirm(action, 1); return; }
       if (confirmLevel < 2) { startConfirm(action, 2); return; }
@@ -3963,7 +3896,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     }}
                   >
                     <SessionActionMenuIcon kind={sessionPinned ? 'unpin' : 'pin'} />
-                    <span class="session-action-menu-label">{sessionPinned ? t('session.tab_unpin') : t('session.tab_pin')}</span>
+                    <span class="session-action-menu-label">{sessionPinned ? t('session.unpin_plain') : t('session.pin_plain')}</span>
                   </button>
                   <div class="menu-divider" />
                 </>
@@ -3976,7 +3909,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 <span class="session-action-menu-label">
                   {confirm === 'restart'
                     ? (confirmLevel >= 2 ? t('session.confirm_sub_restart_2', { label: activeSession?.label || activeSession?.name }) : t('session.confirm_restart'))
-                    : t('session.restart')}
+                    : t('session.restart_plain')}
                 </span>
               </button>
               <button
@@ -3987,7 +3920,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 <span class="session-action-menu-label">
                   {confirm === 'new'
                     ? (confirmLevel >= 2 ? t('session.confirm_sub_new_2', { label: activeSession?.label || activeSession?.name }) : t('session.confirm_new'))
-                    : t('session.new')}
+                    : t('session.start_fresh')}
                 </span>
               </button>
               <button
@@ -3995,7 +3928,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 onClick={() => { onRenameSession?.(); setMenuOpen(false); }}
               >
                 <SessionActionMenuIcon kind="rename" />
-                <span class="session-action-menu-label">{t('session.rename')}</span>
+                <span class="session-action-menu-label">{t('session.rename_plain')}</span>
               </button>
               {onSettings && (
                 <button
@@ -4021,14 +3954,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               )}
               <div class="menu-divider" />
               <button
-                class={`menu-item session-action-menu-item ${confirm === 'stop' ? 'menu-item-danger' : ''}`}
+                class={`menu-item session-action-menu-item ${stopBlockedByPinned || confirm === 'stop' ? 'menu-item-danger' : ''}`}
+                disabled={stopBlockedByPinned}
+                title={stopBlockedByPinned ? t('session.unpin_to_stop') : undefined}
                 onClick={() => handleMenuAction('stop')}
               >
-                <SessionActionMenuIcon kind="stop" />
+                <SessionActionMenuIcon kind={stopBlockedByPinned ? 'unpin' : 'stop'} />
                 <span class="session-action-menu-label">
-                  {confirm === 'stop'
-                    ? (confirmLevel >= 2 ? t('session.confirm_sub_stop_2', { label: activeSession?.label || activeSession?.name }) : t('session.confirm_stop'))
-                    : t('session.stop')}
+                  {stopBlockedByPinned
+                    ? t('session.unpin_to_stop')
+                    : confirm === 'stop'
+                      ? (confirmLevel >= 2 ? t('session.confirm_sub_stop_2', { label: activeSession?.label || activeSession?.name }) : t('session.confirm_stop'))
+                      : t('session.stop_plain')}
                 </span>
               </button>
             </div>

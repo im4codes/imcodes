@@ -72,6 +72,12 @@ vi.mock('react-i18next', () => ({
         return 'Paste is too large for inline input here. Upload it as a file instead.';
       }
       if (key === 'session.stop_plain') return 'Stop';
+      if (key === 'session.restart_plain') return 'Restart';
+      if (key === 'session.start_fresh') return 'Start fresh';
+      if (key === 'session.pin_plain') return 'Pin';
+      if (key === 'session.unpin_plain') return 'Unpin';
+      if (key === 'session.rename_plain') return 'Rename';
+      if (key === 'session.unpin_to_stop') return 'Unpin tab first to stop';
       if (key === 'session.tab_pin') return 'Pin';
       if (key === 'session.tab_unpin') return 'Unpin';
       if (key === 'session.clone.menu') return 'Copy session group';
@@ -546,18 +552,37 @@ afterEach(() => {
 
     const expected: Array<[string, string]> = [
       ['Pin', 'session-action-menu-icon-pin'],
-      ['restart', 'session-action-menu-icon-restart'],
-      ['new', 'session-action-menu-icon-new'],
-      ['rename', 'session-action-menu-icon-rename'],
+      ['Restart', 'session-action-menu-icon-restart'],
+      ['Start fresh', 'session-action-menu-icon-new'],
+      ['Rename', 'session-action-menu-icon-rename'],
       ['settings', 'session-action-menu-icon-settings'],
       ['Copy session group', 'session-action-menu-icon-clone'],
-      ['stop', 'session-action-menu-icon-stop'],
+      ['Stop', 'session-action-menu-icon-stop'],
     ];
 
     for (const [label, iconClass] of expected) {
       const button = within(menu).getByRole('button', { name: label });
       expect(button.querySelector(`.${iconClass}`)).toBeTruthy();
     }
+  });
+
+  it('uses the same unpin-first stop guard in the session action menu', () => {
+    const onStopProject = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        onStopProject={onStopProject}
+        stopBlockedByPinned
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    const stopButton = screen.getByRole('button', { name: /unpin tab first to stop/i });
+    expect((stopButton as HTMLButtonElement).disabled).toBe(true);
+    expect(stopButton.querySelector('.session-action-menu-icon-unpin')).toBeTruthy();
+    expect(onStopProject).not.toHaveBeenCalled();
   });
 
   it('hides the pin action from sub-session and compact action menus', () => {

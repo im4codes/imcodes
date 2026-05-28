@@ -4,6 +4,7 @@ import type { SessionInfo } from '../types.js';
 import { useSyncedPreference } from '../hooks/useSyncedPreference.js';
 import { formatLabel } from '../format-label.js';
 import { getAgentBadgeConfig } from '../agent-display.js';
+import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 
 interface Props {
   sessions: SessionInfo[];
@@ -509,22 +510,38 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
           && ctx.session.userCreated !== false;
         return (
         <div ref={menuRef} class="tab-context-menu" style={{ left: menuX, top: menuY }}>
-          <button class="menu-item" onClick={() => togglePin(ctx.session.name)}>
-            {pinned.has(ctx.session.name) ? t('session.tab_unpin', '📌 Unpin') : t('session.tab_pin', '📌 Pin')}
+          <button class="menu-item session-action-menu-item" onClick={() => togglePin(ctx.session.name)}>
+            <SessionActionMenuIcon kind={pinned.has(ctx.session.name) ? 'unpin' : 'pin'} />
+            <span class="session-action-menu-label">{pinned.has(ctx.session.name) ? t('session.unpin_plain', 'Unpin') : t('session.pin_plain', 'Pin')}</span>
           </button>
           <div class="menu-divider" />
-          <button class="menu-item" onClick={() => { onRestartProject(ctx.session.project); setCtx(null); }}>{t('session.restart', '↺ Restart')}</button>
-          <button class="menu-item" onClick={() => { onRestartProject(ctx.session.project, true); setCtx(null); }}>{t('session.new', '+ New')}</button>
-          <button class="menu-item" onClick={() => startRename(ctx.session)}>{t('session.rename', '✎ Rename')}</button>
+          <button class="menu-item session-action-menu-item" onClick={() => { onRestartProject(ctx.session.project); setCtx(null); }}>
+            <SessionActionMenuIcon kind="restart" />
+            <span class="session-action-menu-label">{t('session.restart_plain', 'Restart')}</span>
+          </button>
+          <button class="menu-item session-action-menu-item" onClick={() => { onRestartProject(ctx.session.project, true); setCtx(null); }}>
+            <SessionActionMenuIcon kind="new" />
+            <span class="session-action-menu-label">{t('session.start_fresh', 'Start fresh')}</span>
+          </button>
+          <button class="menu-item session-action-menu-item" onClick={() => startRename(ctx.session)}>
+            <SessionActionMenuIcon kind="rename" />
+            <span class="session-action-menu-label">{t('session.rename_plain', 'Rename')}</span>
+          </button>
           {onOpenSessionSettings && (
-            <button class="menu-item" onClick={() => { onOpenSessionSettings(ctx.session); setCtx(null); }}>⚙ {t('session.settings', 'Settings')}</button>
+            <button class="menu-item session-action-menu-item" onClick={() => { onOpenSessionSettings(ctx.session); setCtx(null); }}>
+              <SessionActionMenuIcon kind="settings" />
+              <span class="session-action-menu-label">{t('session.settings', 'Settings')}</span>
+            </button>
           )}
           {onCloneSession && canCloneSession && (
-            <button class="menu-item" onClick={() => { onCloneSession(ctx.session); setCtx(null); }}>⧉ {t('session.clone.menu', 'Copy session')}</button>
+            <button class="menu-item session-action-menu-item" onClick={() => { onCloneSession(ctx.session); setCtx(null); }}>
+              <SessionActionMenuIcon kind="clone" />
+              <span class="session-action-menu-label">{t('session.clone.menu', 'Copy session')}</span>
+            </button>
           )}
           <div class="menu-divider" />
           <button
-            class="menu-item menu-item-danger"
+            class="menu-item session-action-menu-item menu-item-danger"
             disabled={projectHasPinned}
             title={projectHasPinned ? t('session.unpin_to_stop') : undefined}
             onClick={() => {
@@ -534,7 +551,8 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
               setCtx(null);
             }}
           >
-            {projectHasPinned ? `📌 ${t('session.unpin_to_stop')}` : t('session.stop', '✕ Stop')}
+            <SessionActionMenuIcon kind={projectHasPinned ? 'unpin' : 'stop'} />
+            <span class="session-action-menu-label">{projectHasPinned ? t('session.unpin_to_stop') : t('session.stop_plain', 'Stop')}</span>
           </button>
         </div>
         );
