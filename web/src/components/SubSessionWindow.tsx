@@ -115,6 +115,44 @@ const DEFAULT_H = 620;
 const MIN_W = 600;
 const MIN_H = 400;
 const DESKTOP_VISIBLE_MARGIN = 32;
+const MOBILE_BOTTOM_CHROME_SELECTORS = [
+  '.subcard-bar',
+  '.session-usage-footer',
+  '.controls-wrapper',
+  '.subsession-bar',
+] as const;
+
+function getExternalMobileBottomChromeElements(doc: Document = document): HTMLElement[] {
+  const seen = new Set<HTMLElement>();
+  const candidates: HTMLElement[] = [];
+  for (const selector of MOBILE_BOTTOM_CHROME_SELECTORS) {
+    for (const el of Array.from(doc.querySelectorAll<HTMLElement>(selector))) {
+      if (seen.has(el)) continue;
+      if (el.closest('.subsession-window')) continue;
+      seen.add(el);
+      candidates.push(el);
+    }
+  }
+  return candidates.filter((el) => !candidates.some((other) => other !== el && other.contains(el)));
+}
+
+export function measureMobileBottomChromeHeight(
+  doc: Document = document,
+  viewportHeight = window.visualViewport?.height ?? window.innerHeight,
+): number {
+  const elements = getExternalMobileBottomChromeElements(doc);
+  if (elements.length === 0) return 0;
+
+  const visibleTops = elements
+    .map((el) => el.getBoundingClientRect())
+    .filter((rect) => rect.height > 0 && rect.bottom > 0 && rect.top < viewportHeight)
+    .map((rect) => Math.max(0, rect.top));
+  if (visibleTops.length > 0) {
+    return Math.ceil(Math.max(0, viewportHeight - Math.min(...visibleTops)));
+  }
+
+  return Math.ceil(elements.reduce((total, el) => total + Math.max(0, el.offsetHeight), 0));
+}
 
 function currentDesktopBounds(): WorkspaceBounds {
   return reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
@@ -600,21 +638,60 @@ export function SubSessionWindow({
     return () => vv.removeEventListener('resize', update);
   }, [isMobile]);
 
-  const [controlsHeight, setControlsHeight] = useState(0);
+  const [bottomChromeHeight, setBottomChromeHeight] = useState(0);
   useEffect(() => {
     if (!isMobile) return;
-    const controls = Array.from(document.querySelectorAll('.controls-wrapper'))
-      .find((el) => !(el as HTMLElement).closest('.subsession-window')) as HTMLElement | undefined;
-    const subBar = Array.from(document.querySelectorAll('.subsession-bar'))
-      .find((el) => !(el as HTMLElement).closest('.subsession-window')) as HTMLElement | undefined;
-    if (!controls && !subBar) return;
-    const update = () => setControlsHeight(subBar?.offsetHeight ?? controls?.offsetHeight ?? 0);
+    let raf = 0;
+    let ro: ResizeObserver | null = null;
+    const vv = window.visualViewport;
+
+    const update = () => {
+      const measured = measureMobileBottomChromeHeight();
+      if (measured <= 0) return;
+      setBottomChromeHeight((prev) => (prev === measured ? prev : measured));
+    };
+    const scheduleUpdate = () => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        update();
+      });
+    };
+    const observeTargets = () => {
+      if (typeof ResizeObserver === 'undefined') return;
+      ro?.disconnect();
+      ro = new ResizeObserver(scheduleUpdate);
+      for (const el of getExternalMobileBottomChromeElements()) {
+        ro.observe(el);
+      }
+    };
+
+    observeTargets();
     update();
-    if (typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(update);
-    if (controls) ro.observe(controls);
-    if (subBar) ro.observe(subBar);
-    return () => ro.disconnect();
+
+    const mo = typeof MutationObserver === 'undefined'
+      ? null
+      : new MutationObserver(() => {
+        observeTargets();
+        scheduleUpdate();
+      });
+    mo?.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['class', 'style', 'hidden'],
+    });
+    window.addEventListener('resize', scheduleUpdate);
+    vv?.addEventListener('resize', scheduleUpdate);
+    vv?.addEventListener('scroll', scheduleUpdate);
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      ro?.disconnect();
+      mo?.disconnect();
+      window.removeEventListener('resize', scheduleUpdate);
+      vv?.removeEventListener('resize', scheduleUpdate);
+      vv?.removeEventListener('scroll', scheduleUpdate);
+    };
   }, [isMobile]);
 
   const displayGeom = useMemo(() => {
@@ -624,6 +701,9 @@ export function SubSessionWindow({
     return clampMaximizedGeom(bounds);
   }, [geom, getMaximizeBounds, isMobile, isDesktopMaximized, maximizeBoundsVersion]);
 
+  const mobileBottomChromeHeight = Math.max(0, Math.min(bottomChromeHeight, Math.max(0, vvh - 120)));
+  const mobileWindowHeight = `calc(${vvh}px - var(--sat, 0px) - ${mobileBottomChromeHeight}px)`;
+
   const style: Record<string, string | number> = isMobile
     ? {
         '--subsession-accent-color': accentColor,
@@ -631,8 +711,10 @@ export function SubSessionWindow({
         top: 'var(--sat, 0px)',
         left: 0,
         right: 0,
-        bottom: `${controlsHeight}px`,
-        height: `calc(${vvh}px - var(--sat, 0px) - ${controlsHeight}px)`,
+        bottom: `${mobileBottomChromeHeight}px`,
+        height: mobileWindowHeight,
+        maxHeight: mobileWindowHeight,
+        minHeight: 0,
         zIndex,
       }
     : { '--subsession-accent-color': accentColor, position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h, zIndex };

@@ -149,6 +149,24 @@ function rectWithBottom(bottom: number): DOMRect {
   };
 }
 
+function rectAt(top: number, height: number): DOMRect {
+  return {
+    x: 0,
+    y: top,
+    width: 320,
+    height,
+    top,
+    right: 320,
+    bottom: top + height,
+    left: 0,
+    toJSON: () => ({}),
+  };
+}
+
+function setElementRect(el: HTMLElement, top: number, height: number): void {
+  el.getBoundingClientRect = () => rectAt(top, height);
+}
+
 
 describe('SubSessionWindow metadata wiring', () => {
   const ws = {
@@ -564,12 +582,15 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
   it('on mobile leaves the main controls area visible below the sub-session window', async () => {
     const originalUserAgent = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const viewportHeight = window.innerHeight;
     const controls = document.createElement('div');
     controls.className = 'controls-wrapper';
     Object.defineProperty(controls, 'offsetHeight', { configurable: true, value: 132 });
     const subBar = document.createElement('div');
     subBar.className = 'subsession-bar';
     Object.defineProperty(subBar, 'offsetHeight', { configurable: true, value: 48 });
+    setElementRect(subBar, viewportHeight - 180, 48);
+    setElementRect(controls, viewportHeight - 132, 132);
     document.body.appendChild(controls);
     document.body.appendChild(subBar);
 
@@ -594,8 +615,8 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     await waitFor(() => {
       const panel = container.querySelector('.subsession-window') as HTMLElement | null;
       expect(panel).toBeTruthy();
-      expect(panel?.style.bottom).toBe('48px');
-      expect(panel?.style.height).toContain('48px');
+      expect(panel?.style.bottom).toBe('180px');
+      expect(panel?.style.height).toContain('180px');
       expect(panel?.style.zIndex).toBe('6000');
     });
 
@@ -608,6 +629,7 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
   it('on mobile ignores the sub-window composer controls and reserves space for the main controls', async () => {
     const originalUserAgent = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const viewportHeight = window.innerHeight;
 
     const mainControls = document.createElement('div');
     mainControls.className = 'controls-wrapper';
@@ -615,6 +637,8 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     const subBar = document.createElement('div');
     subBar.className = 'subsession-bar';
     Object.defineProperty(subBar, 'offsetHeight', { configurable: true, value: 44 });
+    setElementRect(subBar, viewportHeight - 192, 44);
+    setElementRect(mainControls, viewportHeight - 148, 148);
     document.body.appendChild(mainControls);
     document.body.appendChild(subBar);
 
@@ -640,8 +664,8 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       const internalControls = container.querySelector('.subsession-window .controls-wrapper') as HTMLElement | null;
       const panel = container.querySelector('.subsession-window') as HTMLElement | null;
       expect(internalControls).toBeTruthy();
-      expect(panel?.style.bottom).toBe('44px');
-      expect(panel?.style.height).toContain('44px');
+      expect(panel?.style.bottom).toBe('192px');
+      expect(panel?.style.height).toContain('192px');
     });
 
     unmount();
@@ -653,9 +677,11 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
   it('on mobile falls back to the main controls height when no external sub-session bar exists', async () => {
     const originalUserAgent = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const viewportHeight = window.innerHeight;
     const controls = document.createElement('div');
     controls.className = 'controls-wrapper';
     Object.defineProperty(controls, 'offsetHeight', { configurable: true, value: 132 });
+    setElementRect(controls, viewportHeight - 132, 132);
     document.body.appendChild(controls);
 
     const sub = makeSubSession();
