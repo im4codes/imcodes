@@ -760,6 +760,16 @@ export interface UseTimelineOptions {
    */
   isActiveSession?: boolean;
   /**
+   * Resume-broadcast eligibility: when `true`, the hook participates in the
+   * `ACTIVE_TIMELINE_REFRESH_EVENT` broadcast even if it isn't the active
+   * session. Used by visible-but-not-focused sub-session cards / windows so
+   * that a desktop with multiple open cards catches up on focus/visibility
+   * resume (gated by the same 15s success-only `ACTIVE_REFRESH_COOLDOWN_MS`,
+   * so multi-card resume is still rate-limited per session). Defaults to
+   * `isActiveSession` for back-compat.
+   */
+  isVisible?: boolean;
+  /**
    * Shell/script process sessions have no chat timeline. When disabled, the
    * hook stays idle and skips daemon/HTTP/text-tail history work entirely.
    */
@@ -1090,6 +1100,7 @@ export function useTimeline(
   // when different servers share the same session name (e.g. deck_cd_brain).
   const cacheKey = sessionId ? scopeCacheKey(serverId, sessionId) : sessionId;
   const isActiveSession = options?.isActiveSession ?? true;
+  const isVisible = options?.isVisible ?? isActiveSession;
   const disableHistory = options?.disableHistory ?? false;
   const wsConnected = !!ws?.connected;
   const cacheKeyRef = useRef(cacheKey);
@@ -2174,6 +2185,8 @@ export function useTimeline(
   // today, but the dependency direction should be safe by construction).
   const isActiveSessionRef = useRef(isActiveSession);
   isActiveSessionRef.current = isActiveSession;
+  const isVisibleRef = useRef(isVisible);
+  isVisibleRef.current = isVisible;
 
   // Retry schedule for transient HTTP backfill failures (daemon briefly
   // offline at activation, pod miss during deploy, network blip on resume).
@@ -2325,8 +2338,12 @@ export function useTimeline(
   useEffect(() => {
     if (disableHistory) return;
     const handler = (): void => {
-      if (!isActiveSessionRef.current) {
-        backfillDebug('activation event: gated by !isActiveSession', { sessionId });
+      // Resume broadcast: refresh if either the hook is the active session
+      // OR it is a visible-but-not-focused mount (open sub-session card / window).
+      // The downstream 15s success-only cooldown still rate-limits each session
+      // so multiple visible cards on desktop don't herd the daemon.
+      if (!isActiveSessionRef.current && !isVisibleRef.current) {
+        backfillDebug('activation event: gated by !isActiveSession && !isVisible', { sessionId });
         return;
       }
       const now = Date.now();
@@ -2732,7 +2749,16 @@ export function useTimeline(
       // window. If we have no local events (first connect / fresh tab) we omit
       // afterTs and get the standard recent window.
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {
-        if ((msg as { reason?: string }).reason === 'probe_recovered') return;
+        if ((msg as { reason?: string }).reason === 'probe_recovered') {
+          // Probe recovery alone doesn't prove the timeline is in sync — events
+          // may have been missed while the socket was half-open. Bare dispatch
+          // goes through the active-refresh listener's 15s success-only cooldown
+          // (`ACTIVE_REFRESH_COOLDOWN_MS`), so repeated probe events are absorbed
+          // but a real >15s gap gets one HTTP backfill. We skip the heavier
+          // replay+forward-history path to avoid daemon herd on probe churn.
+          dispatchActiveTimelineRefresh();
+          return;
+        }
         // Same gate as the DAEMON_MSG.RECONNECTED path — restrict the
         // browser-WS reconnect refresh to the active card's hook so we
         // don't herd the daemon with N timeline.history_request +

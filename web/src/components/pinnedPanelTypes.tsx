@@ -38,6 +38,9 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const { t } = useTranslation();
   const { events, refreshing, historyStatus } = useTimeline(sessionName, ctx.ws, ctx.serverId, {
     isActiveSession: ctx.activeSession === sessionName,
+    // Pinned panel is always visible to the user while mounted; participate
+    // in resume broadcast so it catches up even when not the active session.
+    isVisible: true,
   });
   const liveSub = ctx.subSessions.find(s => s.sessionName === sessionName);
 

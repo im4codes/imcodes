@@ -139,7 +139,7 @@ import {
   normalizeTransportPendingEntries,
   removeTransportPendingEntryForUserMessage,
 } from './transport-queue.js';
-import { ingestTimelineEventForCache, requestActiveTimelineRefresh } from './hooks/useTimeline.js';
+import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
@@ -2056,7 +2056,14 @@ export function App() {
           setConnected(true);
           setConnecting(false);
           void checkForAppUpdate();
-          if (msg.reason === 'probe_recovered') return;
+          // `probe_recovered` only proves the socket is alive; control-plane
+          // state (session list, P2P discussions/status) may still be stale
+          // because we silently missed live events during the half-open window.
+          // Run the light refresh below, but skip the heavy timeline
+          // `requestActiveTimelineRefresh({resetCooldowns:true})` reset — the
+          // active-refresh listener in `useTimeline` already bare-dispatches on
+          // probe_recovered (governed by the 15s success-only cooldown).
+          const isProbeRecovered = msg.reason === 'probe_recovered';
           ws.requestSessionList();
           // Migrate to scoped p2p list. The active session is captured via the
           // ref to survive useEffect closure; the daemon will fail-closed and
@@ -2071,7 +2078,7 @@ export function App() {
             ws.p2pListDiscussions(initialScope);
             ws.p2pStatus(initialScope);
           }
-          requestActiveTimelineRefresh({ resetCooldowns: true });
+          if (!isProbeRecovered) requestActiveTimelineRefresh({ resetCooldowns: true });
           // Timeout: if session_list never arrives, stop blocking the UI
           if (sessionListRetryRef.current) clearTimeout(sessionListRetryRef.current);
           sessionListRetryRef.current = setTimeout(() => {
@@ -2782,14 +2789,37 @@ export function App() {
       const wasLongHidden = hiddenSinceAt > 0 && Date.now() - hiddenSinceAt > 60_000;
       hiddenSinceAt = 0;
       handleResume(wasLongHidden, wasLongHidden);
+      // Short-hide (alt-tab etc.) still needs a timeline catch-up — the bare
+      // dispatch passes through the 15s success-only backfill cooldown, so
+      // alt-tab churn is absorbed but a real gap > 15s gets one HTTP backfill.
+      if (!wasLongHidden) dispatchActiveTimelineRefresh();
     };
     document.addEventListener('visibilitychange', onVisibility);
-    const onFocus = () => handleResume(false);
+    // Desktop "messages stuck before leaving" P0 fix: a foreground tab whose
+    // screen got locked/slept never fires `visibilitychange`, only `focus`.
+    // Previously `onFocus` only probed the WS and did NOT refresh the
+    // timeline, so events that arrived during the frozen window were never
+    // backfilled. Bare dispatch here goes through `dispatchActiveTimelineRefresh`
+    // → the timeline hook listener applies the existing 15s success-only
+    // cooldown, so >15s real gaps fire a backfill while alt-tab churn is
+    // absorbed automatically (no need to reset cooldowns).
+    const onFocus = () => {
+      handleResume(false);
+      dispatchActiveTimelineRefresh();
+    };
     window.addEventListener('focus', onFocus);
     const onPageShow = (ev: PageTransitionEvent) => {
       if (ev.persisted) handleResume(false, true);
     };
     window.addEventListener('pageshow', onPageShow);
+    // Network coming back online — treat like focus (bare dispatch, no force
+    // reset): `online` is unreliable behind proxies/captive portals, so we
+    // never want it to clear cooldowns, only to nudge a catch-up attempt.
+    const onOnline = () => {
+      handleResume(false);
+      dispatchActiveTimelineRefresh();
+    };
+    window.addEventListener('online', onOnline);
 
     let removeAppStateListener: (() => void) | null = null;
     if (isNative()) {
@@ -2805,6 +2835,7 @@ export function App() {
       document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('focus', onFocus);
       window.removeEventListener('pageshow', onPageShow);
+      window.removeEventListener('online', onOnline);
       removeAppStateListener?.();
       unsub();
       unsubStats();

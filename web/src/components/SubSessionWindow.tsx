@@ -208,6 +208,9 @@ export function SubSessionWindow({
     retryOptimisticMessage,
   } = useTimeline(sub.sessionName, ws, serverId, {
     isActiveSession: active,
+    // Window mounted = visible; participate in resume broadcast even when
+    // minimized/inactive so timeline stays fresh on focus / online / probe.
+    isVisible: true,
   });
   const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
   const quickData = useQuickData();
