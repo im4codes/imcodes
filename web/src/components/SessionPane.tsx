@@ -55,10 +55,6 @@ export interface SessionPaneProps {
   focused?: boolean;
   quickData: UseQuickDataResult;
   detectedModel?: string;
-  /** @deprecated Vestigial — the sync button now shows a visible refreshing
-   *  overlay/spinner instead of a toast. Kept only so the existing app.tsx call
-   *  site (`onToast={showSuccessToast}`) still type-checks; drop with it later. */
-  onToast?: (message: string) => void;
 
   // ── Ref-registration callbacks ─────────────────────────────────────────────
   /** Called with the terminal fit function so app.tsx can call it on resize/reconnect. */

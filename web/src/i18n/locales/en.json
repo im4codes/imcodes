@@ -90,7 +90,6 @@
     "show_file_panel": "Open file panel",
     "hide_file_panel": "Close file panel",
     "sync_history": "Sync chat history",
-    "sync_history_started": "Syncing chat history…",
     "html_preview": "Render HTML",
     "html_preview_title": "Render HTML preview",
     "html_preview_open_new_window": "Open preview in new window",

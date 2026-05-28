@@ -90,7 +90,6 @@
     "show_file_panel": "파일 패널 열기",
     "hide_file_panel": "파일 패널 닫기",
     "sync_history": "채팅 기록 동기화",
-    "sync_history_started": "채팅 기록 동기화 중…",
     "html_preview": "HTML 렌더링",
     "html_preview_title": "렌더링된 HTML 미리보기",
     "html_preview_open_new_window": "새 창에서 미리보기 열기",

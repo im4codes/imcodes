@@ -90,7 +90,6 @@
     "show_file_panel": "ファイルパネルを開く",
     "hide_file_panel": "ファイルパネルを閉じる",
     "sync_history": "チャット履歴を同期",
-    "sync_history_started": "チャット履歴を同期しています…",
     "html_preview": "HTML をレンダー",
     "html_preview_title": "レンダー済み HTML プレビュー",
     "html_preview_open_new_window": "プレビューを新しいウィンドウで開く",
