@@ -56,6 +56,7 @@ import {
   type TimelineDetailFieldPath,
 } from '../../../src/shared/timeline/merge.js';
 import { fetchTimelineHistoryHttp, sendSessionViaHttp } from '../api.js';
+import { runTailBackfill } from '../timeline/catchup/backfill-pager.js';
 import { normalizeTransportPendingEntries } from '../transport-queue.js';
 
 // Singleton DB shared across all useTimeline instances — opened once at module load.
@@ -2325,55 +2326,70 @@ export function useTimeline(
         updateHistoryStep('http', 'running', phase);
         setHttpRefreshing(true);
       }
-      void Promise.resolve(fetchTimelineHistoryHttp(serverId, backfillSessionId, {
-        afterTs,
-        limit: MAX_MEMORY_EVENTS,
-        timeoutMs: resolveBackfillTimeoutMs(opts),
-      })).then((result) => {
-        if (!result) {
-          // Transient failure (daemon offline / pod miss / network blip).
-          // Retry with backoff if budget remains; otherwise give up — the WS
-          // path or next activation will catch up.
-          if (retryAttempt < HTTP_BACKFILL_RETRY_DELAYS_MS.length) {
-            const delay = HTTP_BACKFILL_RETRY_DELAYS_MS[retryAttempt];
-            backfillDebug('fireHttpBackfill: null result → retry', { sessionId: backfillSessionId, retryAttempt: retryAttempt + 1, delayMs: delay });
-            setTimeout(() => {
-              fireHttpBackfillRef.current(0, { ...opts, _retryAttempt: retryAttempt + 1 });
-            }, delay);
-          } else {
-            backfillDebug('fireHttpBackfill: null result → give up', { sessionId: backfillSessionId, retryAttempt });
+      // Tail-backlog continuation (Tier-0 / symptom S1): consume `hasMore` and
+      // page forward (bounded) instead of fetching a single page, advancing the
+      // forward cursor by the max `ts` of each merged page. Only a fully
+      // caught-up round (hasMore=false, no truncation) advances the cooldown /
+      // watchdog baseline — `cap_hit`/`truncated` must NOT cool down so the next
+      // trigger continues rather than being suppressed by a false-completion.
+      // NOTE: this does NOT fix the "middle/ordering gap" (events older than the
+      // local tail base); that needs the deferred verified/forward cursor.
+      void (async () => {
+        try {
+          const outcome = await runTailBackfill(afterTs, {
+            fetchPage: (at) => Promise.resolve(fetchTimelineHistoryHttp(serverId, backfillSessionId, {
+              afterTs: at,
+              limit: MAX_MEMORY_EVENTS,
+              timeoutMs: resolveBackfillTimeoutMs(opts),
+            })),
+            mergePage: (events) => {
+              if (cacheKeyRef.current !== backfillCacheKey) return { newCount: 0, maxTs: null };
+              const recovered = events.filter(
+                (ev): ev is TimelineEvent => !!ev && typeof ev === 'object' && typeof (ev as TimelineEvent).eventId === 'string',
+              );
+              if (recovered.length === 0) return { newCount: 0, maxTs: null };
+              backfillDebug('fireHttpBackfill: merging page', { sessionId: backfillSessionId, count: recovered.length });
+              mergeEvents(recovered);
+              for (const recoveredEvent of recovered) {
+                settleOptimisticByCommandAckEvent(recoveredEvent);
+                settleOptimisticByTimelineProgress(recoveredEvent);
+              }
+              idbPutEvents(recovered);
+              let maxTs = -Infinity;
+              for (const recoveredEvent of recovered) {
+                if (recoveredEvent.ts > maxTs) maxTs = recoveredEvent.ts;
+              }
+              return { newCount: recovered.length, maxTs: Number.isFinite(maxTs) ? maxTs : null };
+            },
+          });
+          // Transient null on the FIRST page → preserve the legacy retry-with-backoff.
+          // A null on a later page means ≥1 page already merged; stop (next trigger
+          // continues) rather than restart the whole round.
+          if (outcome.terminal === 'transient_null' && outcome.pageCount === 0) {
+            if (retryAttempt < HTTP_BACKFILL_RETRY_DELAYS_MS.length) {
+              const delay = HTTP_BACKFILL_RETRY_DELAYS_MS[retryAttempt];
+              backfillDebug('fireHttpBackfill: null result → retry', { sessionId: backfillSessionId, retryAttempt: retryAttempt + 1, delayMs: delay });
+              setTimeout(() => {
+                fireHttpBackfillRef.current(0, { ...opts, _retryAttempt: retryAttempt + 1 });
+              }, delay);
+            } else {
+              backfillDebug('fireHttpBackfill: null result → give up', { sessionId: backfillSessionId, retryAttempt });
+            }
+            return;
           }
-          return;
-        }
-        const recovered = result.events.filter(
-          (ev): ev is TimelineEvent => !!ev && typeof ev === 'object' && typeof (ev as TimelineEvent).eventId === 'string',
-        );
-        // Record that an HTTP backfill RESPONDED (non-null). This is NOT proof
-        // the timeline is verified-contiguous (that needs the Layer B cursor) —
-        // it only feeds the activation/mount cooldown and the watchdog staleness
-        // baseline so an idle/responding session stops re-probing. Timeouts and
-        // nulls return earlier and never stamp, so a failing link keeps retrying.
-        if (backfillCacheKey) lastHttpBackfillResponseAt.set(backfillCacheKey, Date.now());
-        if (recovered.length === 0) {
-          backfillDebug('fireHttpBackfill: no new events', { sessionId: backfillSessionId });
-          return;
-        }
-        if (cacheKeyRef.current !== backfillCacheKey) return;
-        backfillDebug('fireHttpBackfill: merging', { sessionId: backfillSessionId, count: recovered.length });
-        mergeEvents(recovered);
-        for (const recoveredEvent of recovered) {
-          settleOptimisticByCommandAckEvent(recoveredEvent);
-          settleOptimisticByTimelineProgress(recoveredEvent);
-        }
-        idbPutEvents(recovered);
-      }).catch(() => { /* opportunistic — WS path is primary */ })
-        .finally(() => {
+          if (backfillCacheKey && outcome.terminal === 'caught_up') {
+            lastHttpBackfillResponseAt.set(backfillCacheKey, Date.now());
+          }
+          backfillDebug('fireHttpBackfill: tail backfill settled', { sessionId: backfillSessionId, terminal: outcome.terminal, pages: outcome.pageCount, totalNew: outcome.totalNew });
+        } catch { /* opportunistic — WS path is primary */ }
+        finally {
           if (visible) {
             httpBackfillInFlightRef.current = Math.max(0, httpBackfillInFlightRef.current - 1);
             updateHistoryStep('http', 'done', phase);
             if (httpBackfillInFlightRef.current === 0) setHttpRefreshing(false);
           }
-        });
+        }
+      })();
     }, delayMs);
   }, [clearHttpBackfillTimer, disableHistory, isActiveSession, serverId, sessionId, cacheKey, mergeEvents, idbPutEvents, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
 

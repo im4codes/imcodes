@@ -18,6 +18,17 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-
 import { TIMELINE_RESPONSE_STATUS } from '../../../shared/timeline-protocol.js';
 import { getPodIdentity } from '../util/pod-identity.js';
 import logger from '../util/logger.js';
+import { createHash } from 'node:crypto';
+
+/**
+ * Hash a sessionName for logs/metrics. Raw session identifiers can encode
+ * project/role context, so they MUST NOT land in centralized logs (the logger
+ * only redacts `_token`/`_key`/`_secret` suffixes). Response bodies keep
+ * `sessionName` for client compatibility; only logs use this hash.
+ */
+export function hashSessionName(sessionName: string): string {
+  return `s_${createHash('sha256').update(sessionName).digest('hex').slice(0, 12)}`;
+}
 
 export const watchRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 const TEXT_TAIL_HISTORY_PAGE_LIMIT = 500;
@@ -304,7 +315,7 @@ async function verifyWatchSessionOwnership(db: Env['DB'], serverId: string, sess
     );
     return !!subRow;
   } catch (err) {
-    logger.warn({ serverId, sessionName, err }, 'watch timeline session ownership check failed');
+    logger.warn({ serverId, sessionHash: hashSessionName(sessionName), err }, 'watch timeline session ownership check failed');
     return false;
   }
 }
@@ -591,7 +602,7 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
 
     const totalMs = Date.now() - tStart;
     logger.info({
-      serverId, sessionName, limit, afterTs, beforeTs,
+      serverId, sessionHash: hashSessionName(sessionName), limit, afterTs, beforeTs,
       eventsReturned: events.length,
       payloadBytes: typeof response.payloadBytes === 'number' ? response.payloadBytes : undefined,
       payloadTruncated: typeof response.payloadTruncated === 'boolean' ? response.payloadTruncated : undefined,
@@ -612,7 +623,7 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
   } catch (err) {
     const bridgeMs = Date.now() - tStart;
     const message = err instanceof Error ? err.message : String(err);
-    logger.warn({ serverId, sessionName, bridgeMs, err: message }, 'timeline.history/full failed');
+    logger.warn({ serverId, sessionHash: hashSessionName(sessionName), bridgeMs, err: message }, 'timeline.history/full failed');
     if (message === 'daemon_offline') return c.json({ error: 'daemon_offline' }, 503);
     if (message === 'timeout') return c.json({ error: 'timeline_timeout' }, 504);
     return c.json({ error: 'relay_failed' }, 502);
@@ -643,7 +654,7 @@ watchRoutes.get('/server/:id/timeline/text-tail', requireAuth(), async (c) => {
     } catch (err) {
       logger.info({
         serverId,
-        sessionName,
+        sessionHash: hashSessionName(sessionName),
         err: err instanceof Error ? err.message : String(err),
       }, 'timeline.text-tail backfill skipped');
     }
@@ -652,7 +663,7 @@ watchRoutes.get('/server/:id/timeline/text-tail', requireAuth(), async (c) => {
   } catch (err) {
     logger.warn({
       serverId,
-      sessionName,
+      sessionHash: hashSessionName(sessionName),
       err: err instanceof Error ? err.message : String(err),
     }, 'timeline.text-tail failed');
     return c.json({ error: 'cache_read_failed' }, 500);
