@@ -56,6 +56,7 @@ import { CronManager } from './pages/CronManager.js';
 import { SharedContextManagementPanel } from './components/SharedContextManagementPanel.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
+import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
 import { isPlausibleUsagePayload } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
@@ -97,7 +98,15 @@ import {
 import { resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
 import { useSubSessions, type SubSession } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
-import { DEFAULT_NEW_USER_GUIDE_PREF, shouldMarkNewUserGuidePending, shouldShowNewUserGuidePrompt, type NewUserGuidePref } from './onboarding.js';
+import {
+  DEFAULT_NEW_USER_GUIDE_PREF,
+  DEFAULT_TEAM_DISCUSSION_GUIDE_PREF,
+  shouldMarkNewUserGuidePending,
+  shouldShowNewUserGuidePrompt,
+  shouldShowTeamDiscussionGuide,
+  type NewUserGuidePref,
+  type TeamDiscussionGuidePref,
+} from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient } from './ws-client.js';
 import { configure as configureApi, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns } from './api.js';
@@ -1088,6 +1097,7 @@ export function App() {
   );
   const pinnedTabs = useMemo(() => new Set(pinnedTabsArr), [pinnedTabsArr]);
   const [newUserGuidePref, setNewUserGuidePref] = useSyncedPreference<NewUserGuidePref>('new_user_guide', DEFAULT_NEW_USER_GUIDE_PREF, 0);
+  const [teamDiscussionGuidePref, setTeamDiscussionGuidePref] = useSyncedPreference<TeamDiscussionGuidePref>('team_discussion_guide', DEFAULT_TEAM_DISCUSSION_GUIDE_PREF, 0);
   const [showNewUserGuidePrompt, setShowNewUserGuidePrompt] = useState(false);
   const [showNewUserGuide, setShowNewUserGuide] = useState(false);
   const [guidePromptSnoozed, setGuidePromptSnoozed] = useState(false);
@@ -3456,6 +3466,22 @@ export function App() {
       ],
     },
   ], []);
+  const showTeamDiscussionGuide = shouldShowTeamDiscussionGuide(
+    teamDiscussionGuidePref,
+    sessionsLoaded,
+    sessions.length,
+    showNewUserGuidePrompt
+      || showNewUserGuide
+      || showNewSession
+      || showSubDialog
+      || showRepoPage
+      || showSettingsPage
+      || showCronManager
+      || showAdminPage
+      || showDiscussionsPage
+      || showDiscussionDialog
+      || !activeSession,
+  );
 
   function scheduleResubscribe(items: Array<{ name: string; mode?: ViewMode }>) {
     const ws = wsRef.current;
@@ -4707,6 +4733,11 @@ export function App() {
           setGuidePromptSnoozed(true);
           setNewUserGuidePref((prev) => ({ ...prev, pending: false, completed: true }));
         }}
+      />
+
+      <TeamDiscussionGuide
+        open={showTeamDiscussionGuide}
+        onDismiss={() => setTeamDiscussionGuidePref((prev) => ({ ...prev, dismissed: true }))}
       />
 
       {showNewSession && (

@@ -1308,6 +1308,13 @@
       "expert": "I'm experienced, don't show again",
       "later": "Close, remind me next time"
     },
+    "team_discussion_guide": {
+      "title": "Team discussion mode lives here",
+      "body_1": "Use discussion mode for complex problems, OpenSpec audits, code reviews, and architecture decisions.",
+      "body_2": "Different models challenge and complement each other, often exposing blind spots a single model misses.",
+      "body_3": "Enter what you want discussed, choose a discussion mode, then start. For hard problems, add rounds to harden the conclusion.",
+      "dismiss": "Got it"
+    },
     "step_counter": "Step {{current}} / {{total}}",
     "prev": "Back",
     "next": "Next",

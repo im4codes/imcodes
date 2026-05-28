@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_NEW_USER_GUIDE_PREF,
+  DEFAULT_TEAM_DISCUSSION_GUIDE_PREF,
   shouldMarkNewUserGuidePending,
   shouldShowNewUserGuidePrompt,
+  shouldShowTeamDiscussionGuide,
   type NewUserGuidePref,
 } from '../src/onboarding.js';
 
@@ -88,5 +90,13 @@ describe('new user onboarding gating', () => {
         1,
       ),
     ).toBe(false);
+  });
+
+  it('shows the Team discussion guide once a main session exists unless dismissed or blocked', () => {
+    expect(shouldShowTeamDiscussionGuide(DEFAULT_TEAM_DISCUSSION_GUIDE_PREF, true, 1, false)).toBe(true);
+    expect(shouldShowTeamDiscussionGuide({ dismissed: true }, true, 1, false)).toBe(false);
+    expect(shouldShowTeamDiscussionGuide(DEFAULT_TEAM_DISCUSSION_GUIDE_PREF, false, 1, false)).toBe(false);
+    expect(shouldShowTeamDiscussionGuide(DEFAULT_TEAM_DISCUSSION_GUIDE_PREF, true, 0, false)).toBe(false);
+    expect(shouldShowTeamDiscussionGuide(DEFAULT_TEAM_DISCUSSION_GUIDE_PREF, true, 1, true)).toBe(false);
   });
 });
