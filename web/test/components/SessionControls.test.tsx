@@ -527,6 +527,39 @@ afterEach(() => {
     expect(onToggleSessionPin).toHaveBeenLastCalledWith('deck_my-project_brain');
   });
 
+  it('shows typed colored icons for every session action menu option', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        serverId="server-1"
+        sessions={[mainSession]}
+        quickData={makeQuickData() as any}
+        onSettings={vi.fn()}
+        onToggleSessionPin={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    const menu = document.querySelector('.session-actions-menu') as HTMLElement;
+    expect(menu).toBeTruthy();
+
+    const expected: Array<[string, string]> = [
+      ['Pin', 'session-action-menu-icon-pin'],
+      ['restart', 'session-action-menu-icon-restart'],
+      ['new', 'session-action-menu-icon-new'],
+      ['rename', 'session-action-menu-icon-rename'],
+      ['settings', 'session-action-menu-icon-settings'],
+      ['Copy session group', 'session-action-menu-icon-clone'],
+      ['stop', 'session-action-menu-icon-stop'],
+    ];
+
+    for (const [label, iconClass] of expected) {
+      const button = within(menu).getByRole('button', { name: label });
+      expect(button.querySelector(`.${iconClass}`)).toBeTruthy();
+    }
+  });
+
   it('hides the pin action from sub-session and compact action menus', () => {
     const onToggleSessionPin = vi.fn();
     render(
