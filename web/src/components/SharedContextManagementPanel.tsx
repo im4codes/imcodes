@@ -4170,6 +4170,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 onClick={() => {
                   if (processingSaving || !processingSnapshot) return;
                   const next = !processingPersonalSyncEnabled;
+                  if (!next && !window.confirm(t('sharedContext.management.personalSyncDisableConfirm'))) return;
                   setProcessingPersonalSyncEnabled(next);
                   void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
                     setProcessingSaving(true);

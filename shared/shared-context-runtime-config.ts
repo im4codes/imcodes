@@ -54,7 +54,7 @@ export function defaultSharedContextRuntimeConfig(): ContextModelConfig {
     backupContextPreset: undefined,
     memoryRecallMinScore: DEFAULT_MEMORY_RECALL_MIN_SCORE,
     memoryScoringWeights: { ...DEFAULT_MEMORY_SCORING_WEIGHTS },
-    enablePersonalMemorySync: false,
+    enablePersonalMemorySync: true,
   };
 }
 
@@ -164,7 +164,7 @@ export function normalizeSharedContextRuntimeConfig(
     materializationMinIntervalMs,
     memoryRecallMinScore,
     memoryScoringWeights,
-    enablePersonalMemorySync: input?.enablePersonalMemorySync === true,
+    enablePersonalMemorySync: input?.enablePersonalMemorySync !== false,
   };
 }
 

@@ -39,7 +39,7 @@ import {
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
-import { buildMemorySummarySyncMessage } from '../memory-summary-sync.js';
+import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
 
 type GetMaximizeBounds = () => WorkspaceBounds | null;
 
@@ -415,7 +415,9 @@ export function SubSessionWindow({
     if (!ws || !connected || syncingMemorySummaries) return;
     setSyncingMemorySummaries(true);
     try {
-      const text = await buildMemorySummarySyncMessage(t, memorySummaryProjectId);
+      const text = await buildMemorySummarySyncMessage(t, memorySummaryProjectId, undefined, {
+        sources: [localPersonalMemorySummarySource(ws)],
+      });
       if (!text) return;
       const commandId = globalThis.crypto?.randomUUID?.()
         ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;

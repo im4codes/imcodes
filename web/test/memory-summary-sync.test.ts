@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { MEMORY_WS } from '@shared/memory-ws.js';
 
 const getPersonalCloudMemory = vi.hoisted(() => vi.fn());
 
@@ -6,7 +7,7 @@ vi.mock('../src/api.js', () => ({
   getPersonalCloudMemory,
 }));
 
-import { buildMemorySummarySyncMessage } from '../src/memory-summary-sync.js';
+import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../src/memory-summary-sync.js';
 
 const t = (key: string, options?: Record<string, unknown>) => ({
   'chat.memory_summary_sync_instruction': 'SYNC ONLY',
@@ -58,6 +59,118 @@ describe('memory summary sync message', () => {
       limit: 3,
     });
     expect(message).toBeNull();
+  });
+
+  it('merges cloud and local summaries while keeping cloud records first for duplicates', async () => {
+    const localSource = vi.fn().mockResolvedValue({
+      records: [
+        { id: 'duplicate-summary', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Local duplicate summary', updatedAt: 700 },
+        { id: 'local-summary', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Local only summary', updatedAt: 600 },
+      ],
+    });
+    getPersonalCloudMemory.mockResolvedValueOnce({
+      records: [
+        { id: 'duplicate-summary', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Cloud duplicate summary', updatedAt: 500 },
+        { id: 'cloud-summary', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Cloud only summary', updatedAt: 400 },
+      ],
+    });
+
+    const message = await buildMemorySummarySyncMessage(t, 'repo-1', 3, {
+      sources: [localSource],
+    });
+
+    expect(localSource).toHaveBeenCalledWith({
+      projectId: 'repo-1',
+      projectionClass: 'recent_summary',
+      limit: 3,
+    });
+    expect(getPersonalCloudMemory).toHaveBeenCalledWith({
+      projectId: 'repo-1',
+      projectionClass: 'recent_summary',
+      limit: 3,
+    });
+    expect(message).toContain('Local only summary');
+    expect(message).toContain('Cloud duplicate summary');
+    expect(message).toContain('Cloud only summary');
+    expect(message).not.toContain('Local duplicate summary');
+  });
+
+  it('uses local summaries when cloud memory has no project summaries', async () => {
+    const localSource = vi.fn().mockResolvedValue({
+      records: [
+        { id: 'local-summary', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Local summary', updatedAt: 600 },
+      ],
+    });
+    getPersonalCloudMemory.mockResolvedValueOnce({ records: [] });
+
+    const message = await buildMemorySummarySyncMessage(t, 'repo-1', 3, {
+      sources: [localSource],
+    });
+
+    expect(localSource).toHaveBeenCalledTimes(1);
+    expect(getPersonalCloudMemory).toHaveBeenCalledWith({
+      projectId: 'repo-1',
+      projectionClass: 'recent_summary',
+      limit: 3,
+    });
+    expect(message).toContain('Local summary');
+  });
+
+  it('continues to local summaries when cloud memory cannot be queried', async () => {
+    const localSource = vi.fn().mockResolvedValue({
+      records: [
+        { id: 'local-summary', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Local summary', updatedAt: 600 },
+      ],
+    });
+    getPersonalCloudMemory.mockRejectedValueOnce(new Error('cloud unavailable'));
+
+    const message = await buildMemorySummarySyncMessage(t, 'repo-1', 3, {
+      sources: [localSource],
+    });
+
+    expect(getPersonalCloudMemory).toHaveBeenCalledTimes(1);
+    expect(localSource).toHaveBeenCalledTimes(1);
+    expect(message).toContain('Local summary');
+  });
+
+  it('queries daemon local personal memory over ws', async () => {
+    const handlers = new Set<(message: any) => void>();
+    const ws = {
+      send: vi.fn((message: any) => {
+        queueMicrotask(() => {
+          for (const handler of handlers) {
+            handler({
+              type: MEMORY_WS.PERSONAL_RESPONSE,
+              requestId: message.requestId,
+              stats: {},
+              records: [
+                { id: 'local-ws-summary', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Local ws summary', updatedAt: 700 },
+              ],
+            });
+          }
+        });
+      }),
+      onMessage: vi.fn((handler: (message: any) => void) => {
+        handlers.add(handler);
+        return () => handlers.delete(handler);
+      }),
+    };
+
+    const view = await localPersonalMemorySummarySource(ws as any, 1000)({
+      projectId: 'repo-1',
+      projectionClass: 'recent_summary',
+      limit: 4,
+    });
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.PERSONAL_QUERY,
+      canonicalRepoId: 'repo-1',
+      projectId: 'repo-1',
+      projectionClass: 'recent_summary',
+      limit: 4,
+    }));
+    expect(view?.records[0].summary).toBe('Local ws summary');
+    expect(handlers.size).toBe(0);
   });
 
   it('does not fetch summaries without a canonical project id', async () => {

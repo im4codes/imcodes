@@ -19,7 +19,7 @@ describe('shared-context-runtime-config', () => {
     expect(result.backupContextModel).toBeUndefined();
     expect(result.memoryRecallMinScore).toBe(DEFAULT_MEMORY_RECALL_MIN_SCORE);
     expect(result.memoryScoringWeights).toEqual(DEFAULT_MEMORY_SCORING_WEIGHTS);
-    expect(result.enablePersonalMemorySync).toBe(false);
+    expect(result.enablePersonalMemorySync).toBe(true);
   });
 
   it('replaces incompatible saved models with the backend default', () => {
@@ -126,6 +126,14 @@ describe('shared-context-runtime-config', () => {
     expect(result.enablePersonalMemorySync).toBe(true);
   });
 
+  it('preserves enablePersonalMemorySync when explicitly false', () => {
+    const result = normalizeSharedContextRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      enablePersonalMemorySync: false,
+    });
+    expect(result.enablePersonalMemorySync).toBe(false);
+  });
+
   it('preserves a configured memory recall threshold when valid', () => {
     const result = normalizeSharedContextRuntimeConfig({
       primaryContextBackend: 'claude-code-sdk',
@@ -169,10 +177,10 @@ describe('shared-context-runtime-config', () => {
     expect(normalizeMemoryScoringWeights({ similarity: -1, recency: -1, frequency: -1, project: -1 })).toEqual(DEFAULT_MEMORY_SCORING_WEIGHTS);
   });
 
-  it('defaults enablePersonalMemorySync to false when undefined', () => {
+  it('defaults enablePersonalMemorySync to true when undefined', () => {
     const result = normalizeSharedContextRuntimeConfig({
       primaryContextBackend: 'claude-code-sdk',
     });
-    expect(result.enablePersonalMemorySync).toBe(false);
+    expect(result.enablePersonalMemorySync).toBe(true);
   });
 });

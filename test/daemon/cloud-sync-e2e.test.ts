@@ -82,11 +82,12 @@ describe('personal memory cloud sync e2e', () => {
 
   // ── Config toggle gate ────────────────────────────────────────────────
 
-  it('blocks personal replication when enablePersonalMemorySync is false (default)', async () => {
+  it('blocks personal replication when enablePersonalMemorySync is explicitly false', async () => {
     const ns = personalNs();
     const p = writeSummary(ns);
     setReplicationState(ns, { pendingProjectionIds: [p.id] });
 
+    setContextModelRuntimeConfig({ enablePersonalMemorySync: false });
     const { fetchFn } = mockFetchWithAck();
 
     const result = await replicatePendingProcessedContext(CREDS);
@@ -122,7 +123,7 @@ describe('personal memory cloud sync e2e', () => {
     const p = writeSummary(ns);
     setReplicationState(ns, { pendingProjectionIds: [p.id] });
 
-    // enablePersonalMemorySync is false (default)
+    setContextModelRuntimeConfig({ enablePersonalMemorySync: false });
     const { fetchFn } = mockFetchWithAck();
 
     const result = await replicatePendingProcessedContext(CREDS);
@@ -146,13 +147,13 @@ describe('personal memory cloud sync e2e', () => {
     expect(config.enablePersonalMemorySync).toBe(true);
   });
 
-  it('normalizeSharedContextRuntimeConfig defaults enablePersonalMemorySync to false', () => {
+  it('normalizeSharedContextRuntimeConfig defaults enablePersonalMemorySync to true', () => {
     const normalized = normalizeSharedContextRuntimeConfig({
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5',
       // enablePersonalMemorySync omitted
     });
-    expect(normalized.enablePersonalMemorySync).toBe(false);
+    expect(normalized.enablePersonalMemorySync).toBe(true);
   });
 
   // ── ACK verification ──────────────────────────────────────────────────

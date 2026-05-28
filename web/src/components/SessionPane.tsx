@@ -25,7 +25,7 @@ import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
-import { buildMemorySummarySyncMessage } from '../memory-summary-sync.js';
+import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
 
 type ViewMode = 'terminal' | 'chat';
 
@@ -281,6 +281,8 @@ export function SessionPane({
       const text = await buildMemorySummarySyncMessage(
         t,
         session.contextNamespace?.projectId ?? null,
+        undefined,
+        { sources: [localPersonalMemorySummarySource(ws)] },
       );
       if (!text) return;
       const commandId = globalThis.crypto?.randomUUID?.()

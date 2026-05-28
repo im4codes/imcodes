@@ -374,7 +374,7 @@ export async function getServerSharedContextRuntimeConfig(
         project: typeof rawMemoryScoringWeights.project === 'number' ? rawMemoryScoringWeights.project : undefined,
       }
     : undefined;
-  const enablePersonalMemorySync = raw.enablePersonalMemorySync === true;
+  const enablePersonalMemorySync = raw.enablePersonalMemorySync !== false;
   if (!primaryContextModel) return null;
   return {
     primaryContextBackend,

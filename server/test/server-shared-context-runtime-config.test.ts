@@ -69,7 +69,7 @@ describe('server shared-context runtime config routes', () => {
       },
     });
     updateServerSharedContextRuntimeConfigMock.mockResolvedValue(true);
-    getUserPrefMock.mockResolvedValue('false');
+    getUserPrefMock.mockResolvedValue(undefined);
     setUserPrefMock.mockResolvedValue(undefined);
     queryOneMock.mockResolvedValue({ id: 'srv-1', user_id: 'user-1' });
   });
@@ -101,7 +101,7 @@ describe('server shared-context runtime config routes', () => {
             frequency: 0.15,
             project: 0.2,
           },
-          enablePersonalMemorySync: false,
+          enablePersonalMemorySync: true,
         },
         effective: {
           primaryContextBackend: 'claude-code-sdk',
@@ -113,10 +113,36 @@ describe('server shared-context runtime config routes', () => {
             frequency: 0.15,
             project: 0.2,
           },
-          enablePersonalMemorySync: false,
+          enablePersonalMemorySync: true,
         },
       },
     });
+  });
+
+  it('treats legacy false personal sync prefs as default-enabled until explicitly disabled in v2', async () => {
+    getUserPrefMock.mockImplementation(async (_db, _userId, key) => (
+      key === 'shared_context.personal_memory_sync' ? 'false' : undefined
+    ));
+
+    const app = await buildApp();
+    const response = await app.request('/api/server/srv-1/shared-context/runtime-config');
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.snapshot.persisted.enablePersonalMemorySync).toBe(true);
+    expect(body.snapshot.effective.enablePersonalMemorySync).toBe(true);
+  });
+
+  it('respects an explicit v2 personal sync opt-out', async () => {
+    getUserPrefMock.mockImplementation(async (_db, _userId, key) => (
+      key === 'shared_context.personal_memory_sync.v2' ? 'false' : 'true'
+    ));
+
+    const app = await buildApp();
+    const response = await app.request('/api/server/srv-1/shared-context/runtime-config');
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.snapshot.persisted.enablePersonalMemorySync).toBe(false);
+    expect(body.snapshot.effective.enablePersonalMemorySync).toBe(false);
   });
 
   it('updates the cloud config and relays apply to the daemon', async () => {
@@ -166,7 +192,7 @@ describe('server shared-context runtime config routes', () => {
     expect(setUserPrefMock).toHaveBeenCalledWith(
       expect.anything(),
       'user-1',
-      'shared_context.personal_memory_sync',
+      'shared_context.personal_memory_sync.v2',
       'true',
     );
     expect(sendToDaemonMock).toHaveBeenCalledWith(JSON.stringify({
@@ -212,7 +238,7 @@ describe('server shared-context runtime config routes', () => {
           frequency: 0.15,
           project: 0.2,
         },
-        enablePersonalMemorySync: false,
+        enablePersonalMemorySync: true,
       },
     });
     expect(queryOneMock).toHaveBeenCalled();
