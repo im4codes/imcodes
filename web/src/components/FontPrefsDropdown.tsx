@@ -13,6 +13,7 @@
  * via localStorage under `imcodes_fontPrefs:<scope>`.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import type { JSX } from 'preact';
 
 export interface FontPrefs {
   family: string;
@@ -257,6 +258,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const [open, setOpen] = useState(false);
   const [localFonts, setLocalFonts] = useState<LocalFontsState>({ kind: 'idle' });
   const wrapRef = useRef<HTMLDivElement>(null);
+  const suppressNextSizeClickRef = useRef(false);
 
   // Filter the curated preset list down to families actually installed on
   // this machine. Generic stacks (no detectFamily) are always shown.
@@ -399,10 +401,32 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     color: '#cbd5e1',
   } as const;
 
-  const setSize = (delta: number) => {
+  const setSize = useCallback((delta: number) => {
     const next = clampSize(prefs.size + delta);
     if (next !== prefs.size) onChange({ ...prefs, size: next });
-  };
+  }, [onChange, prefs]);
+
+  const handleSizePointerDown = useCallback((delta: number) => (e: JSX.TargetedPointerEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    suppressNextSizeClickRef.current = true;
+    setSize(delta);
+    window.setTimeout(() => { suppressNextSizeClickRef.current = false; }, 0);
+  }, [setSize]);
+
+  const handleSizeClick = useCallback((delta: number) => (e: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (suppressNextSizeClickRef.current) return;
+    setSize(delta);
+  }, [setSize]);
+
+  const handleSizeKeyDown = useCallback((delta: number) => (e: JSX.TargetedKeyboardEvent<HTMLButtonElement>) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    e.stopPropagation();
+    setSize(delta);
+  }, [setSize]);
 
   const pickFamily = (cssValue: string) => {
     if (cssValue !== prefs.family) onChange({ ...prefs, family: cssValue });
@@ -474,7 +498,9 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
           <div style={sizeRowStyle}>
             <button
               type="button"
-              onClick={() => setSize(-1)}
+              onPointerDown={handleSizePointerDown(-1)}
+              onClick={handleSizeClick(-1)}
+              onKeyDown={handleSizeKeyDown(-1)}
               disabled={prefs.size <= MIN_SIZE}
               aria-label="−"
               style={sizeBtnStyle(prefs.size <= MIN_SIZE)}
@@ -484,7 +510,9 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
             <div style={sizeReadoutStyle}>{prefs.size}</div>
             <button
               type="button"
-              onClick={() => setSize(1)}
+              onPointerDown={handleSizePointerDown(1)}
+              onClick={handleSizeClick(1)}
+              onKeyDown={handleSizeKeyDown(1)}
               disabled={prefs.size >= MAX_SIZE}
               aria-label="+"
               style={sizeBtnStyle(prefs.size >= MAX_SIZE)}

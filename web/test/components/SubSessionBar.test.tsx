@@ -298,7 +298,7 @@ describe('SubSessionBar', () => {
     expect(buttons[15].style.getPropertyValue('--subsession-accent-color')).toBe(SUBSESSION_ACCENT_COLORS[0]);
   });
 
-  it('shows a desktop close-all strip for multiple open sub-session windows and reuses the shared close-all handler', () => {
+  it('shows a desktop quick window strip for one or more open sub-session windows and reuses the shared close handler', () => {
     const onCloseAllOpen = vi.fn();
     const subSessions = [
       makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
@@ -326,14 +326,124 @@ describe('SubSessionBar', () => {
 
     const strip = view.container.querySelector('.subsession-close-all-strip') as HTMLButtonElement;
     expect(strip).not.toBeNull();
-    expect(strip.getAttribute('aria-label')).toBe('subsessionBar.close_all_open');
+    expect(strip.getAttribute('aria-label')).toBe('subsessionBar.quick_close_open');
+    expect(strip.textContent).toBe('↓');
 
     fireEvent.click(strip);
 
     expect(onCloseAllOpen).toHaveBeenCalledTimes(1);
+
+    view.rerender(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set(['sub-a'])}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onCloseAllOpen={onCloseAllOpen}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(view.container.querySelector('.subsession-close-all-strip')).not.toBeNull();
   });
 
-  it('hides the close-all strip on mobile, with one open sub-session, or without the shared handler', () => {
+  it('restores the windows closed by the desktop quick window strip', () => {
+    const onCloseAllOpen = vi.fn();
+    const onRestoreQuickClosed = vi.fn();
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+    ];
+
+    const view = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set(['sub-a', 'sub-b'])}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onCloseAllOpen={onCloseAllOpen}
+        onRestoreQuickClosed={onRestoreQuickClosed}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(view.container.querySelector('.subsession-close-all-strip') as HTMLButtonElement);
+
+    view.rerender(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onCloseAllOpen={onCloseAllOpen}
+        onRestoreQuickClosed={onRestoreQuickClosed}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const restoreStrip = view.container.querySelector('.subsession-close-all-strip') as HTMLButtonElement;
+    expect(restoreStrip.disabled).toBe(false);
+    expect(restoreStrip.getAttribute('aria-label')).toBe('subsessionBar.restore_quick_closed');
+    expect(restoreStrip.textContent).toBe('↑');
+
+    fireEvent.click(restoreStrip);
+
+    expect(onRestoreQuickClosed).toHaveBeenCalledWith(['sub-a', 'sub-b']);
+  });
+
+  it('keeps the desktop quick window strip disabled until a window can be closed or restored', () => {
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+    ];
+
+    const view = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onCloseAllOpen={vi.fn()}
+        onRestoreQuickClosed={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const strip = view.container.querySelector('.subsession-close-all-strip') as HTMLButtonElement;
+    expect(strip).not.toBeNull();
+    expect(strip.disabled).toBe(true);
+    expect(strip.getAttribute('aria-label')).toBe('subsessionBar.quick_close_unavailable');
+    expect(strip.textContent).toBe('↓');
+  });
+
+  it('hides the quick window strip on mobile or without the shared handler', () => {
     const subSessions = [
       makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
       makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
@@ -355,10 +465,6 @@ describe('SubSessionBar', () => {
         onHistory={vi.fn()}
       />,
     );
-
-    const oneOpen = renderBar({ openIds: new Set(['sub-a']), onCloseAllOpen: vi.fn() });
-    expect(oneOpen.container.querySelector('.subsession-close-all-strip')).toBeNull();
-    oneOpen.unmount();
 
     const mobile = renderBar({ openIds: new Set(['sub-a', 'sub-b']), desktopLayoutCapable: false, onCloseAllOpen: vi.fn() });
     expect(mobile.container.querySelector('.subsession-close-all-strip')).toBeNull();

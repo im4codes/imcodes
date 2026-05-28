@@ -81,6 +81,7 @@ interface Props {
   onOpen: (id: string) => void;
   onClose: (id: string) => void;
   onCloseAllOpen?: () => void;
+  onRestoreQuickClosed?: (ids: string[]) => void;
   onOpenMaximized?: (id: string) => void;
   onMaximize?: (id: string) => void;
   onRestore?: (id: string) => void;
@@ -266,7 +267,7 @@ function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, inP2p, t }:
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onClose, onCloseAllOpen, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
@@ -280,6 +281,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const [stats, setStats] = useState<DaemonStats | null>(null);
   const localClockNow = useNowTicker(desktopLayoutCapable && !!stats);
   const localClockText = useMemo(() => formatLocalDateTime(localClockNow), [localClockNow]);
+  const [quickClosedIds, setQuickClosedIds] = useState<string[]>([]);
   // DB sort_order is the authority — subSessions arrive pre-sorted from server.
   // Local dragOrder only tracks in-session drag reorder (synced back to DB via reorderSubSessions).
   const [dragOrder, setDragOrder] = useState<string[] | null>(null);
@@ -385,12 +387,6 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     getEntryGestureController(id).handleDoubleClick(event, event.currentTarget as Element);
   }, [getEntryGestureController]);
 
-  const handleCloseAllOpenSubWindows = useCallback((event: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
-    event.preventDefault();
-    event.stopPropagation();
-    onCloseAllOpen?.();
-  }, [onCloseAllOpen]);
-
   const handleExpandedEntryTouchStart = useCallback((id: string, event: JSX.TargetedTouchEvent<HTMLElement>) => {
     handleEntryTouchStart(id);
     const touch = event.touches[0];
@@ -473,7 +469,43 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     () => orderedSessions.filter((sub) => openIds.has(sub.id)).length,
     [openIds, orderedSessions],
   );
-  const showCloseAllOpenSubs = desktopLayoutCapable && openSubWindowCount > 1 && !!onCloseAllOpen;
+  const restorableQuickClosedIds = useMemo(() => {
+    if (quickClosedIds.length === 0) return [];
+    const knownIds = new Set(orderedSessionIds);
+    return quickClosedIds.filter((id) => knownIds.has(id) && !openIds.has(id));
+  }, [openIds, orderedSessionIds, quickClosedIds]);
+  const canQuickCloseSubWindows = desktopLayoutCapable && openSubWindowCount > 0 && !!onCloseAllOpen;
+  const canQuickRestoreSubWindows = desktopLayoutCapable
+    && openSubWindowCount === 0
+    && restorableQuickClosedIds.length > 0
+    && !!onRestoreQuickClosed;
+  const showQuickSubWindowControl = desktopLayoutCapable && !!onCloseAllOpen;
+  const quickSubWindowIsRestore = !canQuickCloseSubWindows && canQuickRestoreSubWindows;
+  const quickSubWindowDisabled = !canQuickCloseSubWindows && !canQuickRestoreSubWindows;
+  const quickSubWindowLabel = canQuickCloseSubWindows
+    ? t('subsessionBar.quick_close_open')
+    : canQuickRestoreSubWindows
+      ? t('subsessionBar.restore_quick_closed')
+      : t('subsessionBar.quick_close_unavailable');
+
+  const handleQuickSubWindowControl = useCallback((event: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const openIdsSnapshot = openIdsRef.current;
+    const closingIds = orderedSessionsRef.current
+      .filter((sub) => openIdsSnapshot.has(sub.id))
+      .map((sub) => sub.id);
+    if (closingIds.length > 0 && onCloseAllOpen) {
+      setQuickClosedIds(closingIds);
+      onCloseAllOpen();
+      return;
+    }
+    if (restorableQuickClosedIds.length > 0 && onRestoreQuickClosed) {
+      const restoreIds = restorableQuickClosedIds;
+      setQuickClosedIds([]);
+      onRestoreQuickClosed(restoreIds);
+    }
+  }, [onCloseAllOpen, onRestoreQuickClosed, restorableQuickClosedIds]);
 
   const moveSubSessionInDragOrder = useCallback((draggedId: string, overId: string) => {
     if (draggedId === overId) return;
@@ -1028,15 +1060,16 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       {/* Collapsed: compact buttons (all platforms) — drag on desktop, long-press on touch */}
       {collapsed && subSessions.length > 0 && (
         <div class="subsession-row-with-close">
-          {showCloseAllOpenSubs && (
+          {showQuickSubWindowControl && (
             <button
               type="button"
-              class="subsession-close-all-strip"
-              title={t('subsessionBar.close_all_open')}
-              aria-label={t('subsessionBar.close_all_open')}
-              onClick={handleCloseAllOpenSubWindows}
+              class={`subsession-close-all-strip${quickSubWindowIsRestore ? ' subsession-close-all-strip-restore' : ''}`}
+              title={quickSubWindowLabel}
+              aria-label={quickSubWindowLabel}
+              disabled={quickSubWindowDisabled}
+              onClick={handleQuickSubWindowControl}
             >
-              <span class="subsession-close-all-arrow" aria-hidden="true">↓</span>
+              <span class="subsession-close-all-arrow" aria-hidden="true">{quickSubWindowIsRestore ? '↑' : '↓'}</span>
             </button>
           )}
           <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}>
@@ -1068,15 +1101,16 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       {/* Expanded: preview cards (all platforms) */}
       {!collapsed && orderedSessions.length > 0 && (
         <div class="subsession-row-with-close">
-          {showCloseAllOpenSubs && (
+          {showQuickSubWindowControl && (
             <button
               type="button"
-              class="subsession-close-all-strip"
-              title={t('subsessionBar.close_all_open')}
-              aria-label={t('subsessionBar.close_all_open')}
-              onClick={handleCloseAllOpenSubWindows}
+              class={`subsession-close-all-strip${quickSubWindowIsRestore ? ' subsession-close-all-strip-restore' : ''}`}
+              title={quickSubWindowLabel}
+              aria-label={quickSubWindowLabel}
+              disabled={quickSubWindowDisabled}
+              onClick={handleQuickSubWindowControl}
             >
-              <span class="subsession-close-all-arrow" aria-hidden="true">↓</span>
+              <span class="subsession-close-all-arrow" aria-hidden="true">{quickSubWindowIsRestore ? '↑' : '↓'}</span>
             </button>
           )}
           <div

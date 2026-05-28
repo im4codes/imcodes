@@ -1538,6 +1538,9 @@ body {
 .subsession-close-all-strip { flex: 0 0 18px; width: 18px; min-height: 34px; margin: 7px 0 8px 8px; padding: 0; border: 1px solid rgba(34,211,238,0.28); border-radius: 8px; background: linear-gradient(180deg, rgba(15,23,42,0.82), rgba(8,47,73,0.34)); color: #67e8f9; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 0 14px rgba(34,211,238,0.10); transition: color 0.14s, border-color 0.14s, background 0.14s, box-shadow 0.14s, transform 0.14s; }
 .subsession-close-all-strip:hover { color: #a7f3d0; border-color: rgba(52,211,153,0.62); background: linear-gradient(180deg, rgba(8,145,178,0.28), rgba(20,83,45,0.32)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.07), 0 0 18px rgba(52,211,153,0.18); transform: translateY(-1px); }
 .subsession-close-all-strip:active { transform: translateY(0); }
+.subsession-close-all-strip-restore { border-color: rgba(52,211,153,0.48); color: #a7f3d0; background: linear-gradient(180deg, rgba(6,95,70,0.28), rgba(8,47,73,0.34)); }
+.subsession-close-all-strip:disabled { cursor: not-allowed; color: #475569; border-color: rgba(71,85,105,0.34); background: rgba(15,23,42,0.38); box-shadow: inset 0 1px 0 rgba(255,255,255,0.025); transform: none; opacity: 0.72; }
+.subsession-close-all-strip:disabled:hover { color: #475569; border-color: rgba(71,85,105,0.34); background: rgba(15,23,42,0.38); box-shadow: inset 0 1px 0 rgba(255,255,255,0.025); transform: none; }
 .subsession-close-all-arrow { display: inline-block; font-size: 15px; line-height: 1; text-shadow: 0 0 10px rgba(34,211,238,0.5); }
 .subcard-scroll { padding: 7px 10px 8px; gap: 10px; overflow-x: auto; scrollbar-width: thin; scrollbar-color: #334155 transparent; overscroll-behavior-x: contain; overscroll-behavior-y: auto; -webkit-overflow-scrolling: touch; touch-action: pan-x; position: relative; z-index: 1; }
 .subcard-scroll::-webkit-scrollbar { height: 4px; }

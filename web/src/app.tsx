@@ -1524,6 +1524,48 @@ export function App() {
     if (changed) bumpStack();
   }, [bumpStack, setOpenSubIds]);
 
+  const restoreQuickClosedSubSessionWindows = useCallback((ids: string[]) => {
+    if (isMobileRef.current || ids.length === 0) return;
+    const availableIds: string[] = [];
+    const seen = new Set<string>();
+    for (const id of ids) {
+      if (seen.has(id)) continue;
+      if (!subSessionsRef.current.some((sub) => sub.id === id)) continue;
+      seen.add(id);
+      availableIds.push(id);
+    }
+    if (availableIds.length === 0) return;
+
+    setMaximizedSubIds((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const id of availableIds) {
+        if (next.delete(id)) changed = true;
+      }
+      return changed ? next : prev;
+    });
+    setOpenSubIds((prev) => {
+      const next = new Set(prev);
+      for (const id of availableIds) next.add(id);
+      return next.size === prev.size ? prev : next;
+    });
+
+    for (const id of availableIds) {
+      unpinSubSessionPanel(id);
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id), getSubSessionDesktopWindowMeta(id));
+    }
+    const frontId = availableIds[availableIds.length - 1];
+    if (frontId) {
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(frontId), getSubSessionDesktopWindowMeta(frontId), { bringToFront: true });
+    }
+  }, [
+    ensureDesktopWindow,
+    getSubSessionDesktopWindowMeta,
+    setMaximizedSubIds,
+    setOpenSubIds,
+    unpinSubSessionPanel,
+  ]);
+
   // ── Desktop window stack ↔ visibility-boolean sync ──────────────────────────
   // For each managed singleton floating window, mirror its show-boolean into
   // the stack. Opening = ensure + bring-to-front. Closing = remove. The
@@ -4274,6 +4316,7 @@ export function App() {
                 onOpen={toggleSubSession}
                 onClose={closeSubSessionAndClearMaximized}
                 onCloseAllOpen={closeAllSubSessionWindows}
+                onRestoreQuickClosed={restoreQuickClosedSubSessionWindows}
                 onOpenMaximized={openSubSessionMaximized}
                 onMaximize={maximizeOpenSubSession}
                 onRestore={restoreSubSession}
