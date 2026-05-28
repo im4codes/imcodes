@@ -55,6 +55,8 @@ export interface SessionPaneProps {
   focused?: boolean;
   quickData: UseQuickDataResult;
   detectedModel?: string;
+  /** Show a transient toast (forwarded to ChatView's manual-sync button). */
+  onToast?: (message: string) => void;
 
   // ── Ref-registration callbacks ─────────────────────────────────────────────
   /** Called with the terminal fit function so app.tsx can call it on resize/reconnect. */
@@ -124,6 +126,7 @@ export function SessionPane({
   pendingPrefillText,
   onPendingPrefillApplied,
   onVersionSensitiveAction,
+  onToast,
 }: SessionPaneProps) {
   const { t } = useTranslation();
   const sessionName = session.name;
@@ -339,6 +342,7 @@ export function SessionPane({
           events={timelineEvents}
           loading={timelineLoading}
           refreshing={timelineRefreshing}
+          onToast={onToast}
           historyStatus={historyStatus}
           loadingOlder={timelineLoadingOlder}
           hasOlderHistory={timelineHasOlderHistory}

@@ -90,6 +90,7 @@
     "show_file_panel": "Abrir panel de archivos",
     "hide_file_panel": "Cerrar panel de archivos",
     "sync_history": "Sincronizar historial de chat",
+    "sync_history_started": "Sincronizando historial de chat…",
     "html_preview": "Renderizar HTML",
     "html_preview_title": "Vista previa HTML renderizada",
     "html_preview_open_new_window": "Abrir vista previa en una nueva ventana",

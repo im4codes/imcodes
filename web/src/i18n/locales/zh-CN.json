@@ -90,6 +90,7 @@
     "show_file_panel": "打开文件面板",
     "hide_file_panel": "关闭文件面板",
     "sync_history": "强制同步聊天记录",
+    "sync_history_started": "正在同步聊天记录…",
     "html_preview": "渲染 HTML",
     "html_preview_title": "渲染 HTML 预览",
     "html_preview_open_new_window": "在新窗口中预览",

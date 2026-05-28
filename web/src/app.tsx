@@ -4064,6 +4064,7 @@ export function App() {
                 viewMode={(viewModes[s.name] ?? defaultViewMode) as ViewMode}
                 quickData={quickData}
                 detectedModel={detectedModels.get(s.name)}
+                onToast={showSuccessToast}
                 onFitFn={(fn) => { termFitFnsRef.current.set(s.name, fn); }}
                 onScrollBottomFn={(fn) => { termScrollFnsRef.current.set(s.name, fn); }}
                 onFocusFn={(fn) => { termFocusFnsRef.current.set(s.name, fn); }}

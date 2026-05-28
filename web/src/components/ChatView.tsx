@@ -51,6 +51,8 @@ interface Props {
   loading: boolean;
   /** True while gap-filling new events after a cache hit */
   refreshing?: boolean;
+  /** Show a transient toast (e.g. when the user triggers a manual history sync). */
+  onToast?: (message: string) => void;
   /** Visible history-fetch progress shown as a non-layout overlay. */
   historyStatus?: TimelineHistoryStatus | null;
   /** True while loading older events via backward pagination */
@@ -940,8 +942,16 @@ function findScrollParent(start: HTMLElement): HTMLElement {
   return start;
 }
 
-export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed }: Props) {
+export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onToast }: Props) {
   const { t } = useTranslation();
+  const [syncDisabled, setSyncDisabled] = useState(false);
+  const handleForceSync = useCallback(() => {
+    if (syncDisabled) return;
+    requestActiveTimelineRefresh({ resetCooldowns: true });
+    onToast?.(t('chat.sync_history_started'));
+    setSyncDisabled(true);
+    setTimeout(() => setSyncDisabled(false), 10000);
+  }, [syncDisabled, onToast, t]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const [selMenu, setSelMenu] = useState<SelectionMenu | null>(null);
@@ -1946,8 +1956,8 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
         <div class="chat-top-actions">
           <button
             class={`chat-panel-toggle chat-sync-btn${refreshing ? ' spinning' : ''}`}
-            onClick={() => requestActiveTimelineRefresh({ resetCooldowns: true })}
-            disabled={refreshing}
+            onClick={handleForceSync}
+            disabled={syncDisabled}
             title={t('chat.sync_history')}
             aria-label={t('chat.sync_history')}
           >
