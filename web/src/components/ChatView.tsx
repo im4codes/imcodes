@@ -50,8 +50,6 @@ interface Props {
   loading: boolean;
   /** True while gap-filling new events after a cache hit */
   refreshing?: boolean;
-  /** Show a transient toast (main pane only; e.g. on manual history sync). */
-  onToast?: (message: string) => void;
   /** Per-session force-sync for the chat ↻ button — a visible HTTP backfill of
    *  THIS session's timeline. Provided by the parent that owns the useTimeline
    *  hook (main pane, sub-session window/card). The button only renders when
@@ -946,20 +944,18 @@ function findScrollParent(start: HTMLElement): HTMLElement {
   return start;
 }
 
-export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onToast, onForceSync }: Props) {
+export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
   const { t } = useTranslation();
   const [syncDisabled, setSyncDisabled] = useState(false);
   const handleForceSync = useCallback(() => {
     if (syncDisabled || !onForceSync) return;
-    // Per-session visible backfill (sets `refreshing` → overlay/spinner on this
-    // exact session); 10s cooldown prevents spam. The optional onToast (main
-    // pane only) is best-effort extra feedback; sub-sessions rely on the
-    // visible refreshing overlay/spinner.
+    // Per-session visible backfill: sets `refreshing` → the refreshing overlay
+    // (full views) / button spin (compact cards) is the feedback, so no toast
+    // is needed. 10s cooldown prevents spam.
     onForceSync();
-    onToast?.(t('chat.sync_history_started'));
     setSyncDisabled(true);
     setTimeout(() => setSyncDisabled(false), 10000);
-  }, [syncDisabled, onForceSync, onToast, t]);
+  }, [syncDisabled, onForceSync]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const [selMenu, setSelMenu] = useState<SelectionMenu | null>(null);

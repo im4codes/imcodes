@@ -55,7 +55,9 @@ export interface SessionPaneProps {
   focused?: boolean;
   quickData: UseQuickDataResult;
   detectedModel?: string;
-  /** Show a transient toast (forwarded to ChatView's manual-sync button). */
+  /** @deprecated Vestigial — the sync button now shows a visible refreshing
+   *  overlay/spinner instead of a toast. Kept only so the existing app.tsx call
+   *  site (`onToast={showSuccessToast}`) still type-checks; drop with it later. */
   onToast?: (message: string) => void;
 
   // ── Ref-registration callbacks ─────────────────────────────────────────────
@@ -126,7 +128,6 @@ export function SessionPane({
   pendingPrefillText,
   onPendingPrefillApplied,
   onVersionSensitiveAction,
-  onToast,
 }: SessionPaneProps) {
   const { t } = useTranslation();
   const sessionName = session.name;
@@ -343,7 +344,6 @@ export function SessionPane({
           events={timelineEvents}
           loading={timelineLoading}
           refreshing={timelineRefreshing}
-          onToast={onToast}
           onForceSync={timelineForceRefresh}
           historyStatus={historyStatus}
           loadingOlder={timelineLoadingOlder}
