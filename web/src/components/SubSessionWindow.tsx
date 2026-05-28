@@ -115,17 +115,17 @@ const DEFAULT_H = 620;
 const MIN_W = 600;
 const MIN_H = 400;
 const DESKTOP_VISIBLE_MARGIN = 32;
-const MOBILE_BOTTOM_CHROME_SELECTORS = [
+// Mobile sub-session windows should only clear the bottom sub-session
+// launcher/card area. Parent usage footers and composers can sit behind
+// the overlay; counting them pushes the window too high.
+const MOBILE_SUBSESSION_BAR_SELECTORS = [
   '.subcard-bar',
-  '.session-usage-footer',
-  '.controls-wrapper',
-  '.subsession-bar',
 ] as const;
 
-function getExternalMobileBottomChromeElements(doc: Document = document): HTMLElement[] {
+function getExternalMobileSubSessionBarElements(doc: Document = document): HTMLElement[] {
   const seen = new Set<HTMLElement>();
   const candidates: HTMLElement[] = [];
-  for (const selector of MOBILE_BOTTOM_CHROME_SELECTORS) {
+  for (const selector of MOBILE_SUBSESSION_BAR_SELECTORS) {
     for (const el of Array.from(doc.querySelectorAll<HTMLElement>(selector))) {
       if (seen.has(el)) continue;
       if (el.closest('.subsession-window')) continue;
@@ -136,11 +136,11 @@ function getExternalMobileBottomChromeElements(doc: Document = document): HTMLEl
   return candidates.filter((el) => !candidates.some((other) => other !== el && other.contains(el)));
 }
 
-export function measureMobileBottomChromeHeight(
+export function measureMobileSubSessionBarHeight(
   doc: Document = document,
   viewportHeight = window.visualViewport?.height ?? window.innerHeight,
 ): number {
-  const elements = getExternalMobileBottomChromeElements(doc);
+  const elements = getExternalMobileSubSessionBarElements(doc);
   if (elements.length === 0) return 0;
 
   const visibleTops = elements
@@ -638,7 +638,7 @@ export function SubSessionWindow({
     return () => vv.removeEventListener('resize', update);
   }, [isMobile]);
 
-  const [bottomChromeHeight, setBottomChromeHeight] = useState(0);
+  const [subSessionBarHeight, setSubSessionBarHeight] = useState(0);
   useEffect(() => {
     if (!isMobile) return;
     let raf = 0;
@@ -646,9 +646,9 @@ export function SubSessionWindow({
     const vv = window.visualViewport;
 
     const update = () => {
-      const measured = measureMobileBottomChromeHeight();
+      const measured = measureMobileSubSessionBarHeight();
       if (measured <= 0) return;
-      setBottomChromeHeight((prev) => (prev === measured ? prev : measured));
+      setSubSessionBarHeight((prev) => (prev === measured ? prev : measured));
     };
     const scheduleUpdate = () => {
       if (raf) cancelAnimationFrame(raf);
@@ -661,7 +661,7 @@ export function SubSessionWindow({
       if (typeof ResizeObserver === 'undefined') return;
       ro?.disconnect();
       ro = new ResizeObserver(scheduleUpdate);
-      for (const el of getExternalMobileBottomChromeElements()) {
+      for (const el of getExternalMobileSubSessionBarElements()) {
         ro.observe(el);
       }
     };
@@ -701,8 +701,8 @@ export function SubSessionWindow({
     return clampMaximizedGeom(bounds);
   }, [geom, getMaximizeBounds, isMobile, isDesktopMaximized, maximizeBoundsVersion]);
 
-  const mobileBottomChromeHeight = Math.max(0, Math.min(bottomChromeHeight, Math.max(0, vvh - 120)));
-  const mobileWindowHeight = `calc(${vvh}px - var(--sat, 0px) - ${mobileBottomChromeHeight}px)`;
+  const mobileSubSessionBarHeight = Math.max(0, Math.min(subSessionBarHeight, Math.max(0, vvh - 120)));
+  const mobileWindowHeight = `calc(${vvh}px - var(--sat, 0px) - ${mobileSubSessionBarHeight}px)`;
 
   const style: Record<string, string | number> = isMobile
     ? {
@@ -711,7 +711,7 @@ export function SubSessionWindow({
         top: 'var(--sat, 0px)',
         left: 0,
         right: 0,
-        bottom: `${mobileBottomChromeHeight}px`,
+        bottom: `${mobileSubSessionBarHeight}px`,
         height: mobileWindowHeight,
         maxHeight: mobileWindowHeight,
         minHeight: 0,
