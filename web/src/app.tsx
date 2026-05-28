@@ -206,6 +206,28 @@ type AppUpdateNotice = {
   dismissed?: boolean;
 };
 
+const FAST_SERVER_SWITCH_SPLASH_KEY = 'imcodes:fast-server-switch-splash';
+
+function markFastServerSwitchSplash(): void {
+  try {
+    sessionStorage.setItem(FAST_SERVER_SWITCH_SPLASH_KEY, '1');
+  } catch {
+    // Ignore storage failures; switching servers should still reload normally.
+  }
+}
+
+function takeFastServerSwitchSplashFlag(): boolean {
+  try {
+    const flagged = sessionStorage.getItem(FAST_SERVER_SWITCH_SPLASH_KEY) === '1';
+    if (flagged) {
+      sessionStorage.removeItem(FAST_SERVER_SWITCH_SPLASH_KEY);
+    }
+    return flagged;
+  } catch {
+    return false;
+  }
+}
+
 export function isTextEntryElement(el: HTMLElement | null): boolean {
   if (!el) return false;
   const tag = el.tagName;
@@ -639,17 +661,26 @@ export function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // The HTML splash masks JS/native startup work. Once startup is ready, leave
-  // immediately; the animation must never become an extra artificial wait.
+  // The HTML splash masks JS/native startup work. Normal page opens keep a short
+  // minimum animation; explicit server-switch reloads take the fast path.
   useEffect(() => {
     const splash = document.getElementById('splash');
     if (!splash) { setSplashDone(true); return; }
     if (!nativeReady && !nativeCallback) return;
     if (nativeCallback) { splash.remove(); setSplashDone(true); return; }
+    const fastServerSwitch = takeFastServerSwitchSplashFlag();
+    const minMs = fastServerSwitch ? 0 : 1100;
     const exitMs = 120;
-    splash.classList.add('splash-exit');
-    const t = setTimeout(() => { splash.remove(); setSplashDone(true); }, exitMs);
-    return () => clearTimeout(t);
+    let exitTimer: ReturnType<typeof setTimeout> | undefined;
+    const startExit = () => {
+      splash.classList.add('splash-exit');
+      exitTimer = setTimeout(() => { splash.remove(); setSplashDone(true); }, exitMs);
+    };
+    const timer = setTimeout(startExit, minMs);
+    return () => {
+      clearTimeout(timer);
+      if (exitTimer) clearTimeout(exitTimer);
+    };
   }, [nativeReady]);
 
   // Native: init push notifications after login
@@ -3267,6 +3298,7 @@ export function App() {
 
     // Full page reload — guarantees all components, WS connections, and pinned
     // panels start fresh with the new server. Avoids stale WS/state bugs.
+    markFastServerSwitchSplash();
     window.location.reload();
   }, []);
 
