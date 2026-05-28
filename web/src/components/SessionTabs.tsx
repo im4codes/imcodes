@@ -284,7 +284,10 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     touchPressRef.current = null;
     try { (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId); } catch { /* best-effort on older WebViews */ }
 
-    if (touchState.moved || touchState.longPressTriggered) return;
+    const dx = e.clientX - touchState.startX;
+    const dy = e.clientY - touchState.startY;
+    const movedOnRelease = Math.hypot(dx, dy) > TAB_LONG_PRESS_MOVE_CANCEL_PX;
+    if (touchState.moved || movedOnRelease || touchState.longPressTriggered) return;
 
     suppressNextSyntheticClick(180);
     selectTab(touchState.sessionName);

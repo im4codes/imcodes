@@ -1475,9 +1475,9 @@ export function App() {
 
   const toggleSubSession = useCallback((id: string) => {
     const mobile = isMobileRef.current;
-    clearSubSessionMaximized(id);
 
     if (mobile) {
+      clearSubSessionMaximized(id);
       const next = openSubIdsRef.current.has(id) ? new Set<string>() : new Set([id]);
       setOpenSubIds(next);
       return;
@@ -1485,6 +1485,12 @@ export function App() {
 
     const wasPinned = isSubSessionPinnedPanel(id);
     const next = new Set(openSubIdsRef.current);
+    if (next.has(id) && !wasPinned && focusedSubIdRef.current !== id) {
+      bringSubToFront(id);
+      return;
+    }
+
+    clearSubSessionMaximized(id);
     const willOpen = !next.has(id) || wasPinned;
 
     if (willOpen) {
@@ -4314,6 +4320,7 @@ export function App() {
                 onVisualOrderChange={handleSubSessionVisualOrderChange}
                 idleFlashTokens={idleFlashTokens}
                 onOpen={toggleSubSession}
+                onFocus={bringSubToFront}
                 onClose={closeSubSessionAndClearMaximized}
                 onCloseAllOpen={closeAllSubSessionWindows}
                 onRestoreQuickClosed={restoreQuickClosedSubSessionWindows}
@@ -4869,7 +4876,7 @@ export function App() {
               sub={sub}
               ws={wsRef.current}
               connected={connected}
-              active
+              active={isMobile || focusedSubId === sub.id}
               idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}
               onHistory={registerHistoryApplyer}

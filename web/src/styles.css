@@ -1642,11 +1642,13 @@ body {
 .subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 54px; min-height: 54px; padding: 6px 10px; background: linear-gradient(180deg, rgba(17,27,45,0.92), rgba(10,16,27,0.92)); border: 1px solid rgba(125,211,252,0.16); border-top: 3px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: transform 0.15s, border-color 0.15s, background 0.15s, color 0.15s, box-shadow 0.15s; flex-shrink: 0; position: relative; isolation: isolate; overflow: hidden; box-shadow: inset 0 1px 0 rgba(255,255,255,0.035); }
 .subsession-card::before { content: ''; position: absolute; inset: 0; background: linear-gradient(135deg, rgba(34,211,238,0.12), transparent 38%, rgba(52,211,153,0.08)); opacity: 0; transition: opacity 0.15s; pointer-events: none; }
 .subsession-card:hover, .subsession-card.open { border-color: rgba(34,211,238,0.44); background: linear-gradient(180deg, rgba(15,40,62,0.92), rgba(10,20,34,0.94)); color: #dbeafe; }
-.subsession-card:hover::before, .subsession-card.open::before { opacity: 1; }
+.subsession-card:hover::before, .subsession-card.open::before, .subsession-card.focused::before { opacity: 1; }
 .subsession-card.open { transform: scale(1.08); z-index: 1; box-shadow: 0 0 0 1px rgba(34,211,238,0.16), 0 0 16px rgba(34,211,238,0.24); }
+.subsession-card.focused { border-color: rgba(96,165,250,0.78); box-shadow: 0 0 0 1px rgba(96,165,250,0.28), 0 0 18px rgba(59,130,246,0.34); }
 .subsession-card,
 .subsession-card:hover,
 .subsession-card.open,
+.subsession-card.focused,
 .subsession-card.subcard-running-pulse { border-top-color: var(--subsession-accent-color, #38bdf8) !important; border-top-width: 3px; }
 .subsession-card-icon { font-size: 13px; font-weight: 700; letter-spacing: 0; line-height: 1; position: relative; z-index: 1; }
 .subsession-card-label { font-size: 10px; color: #7b8797; position: relative; z-index: 1; }
@@ -1659,6 +1661,9 @@ body {
 
 /* ── Sub-session window ───────────────────────────────────────────────────── */
 .subsession-window { display: flex; flex-direction: column; background: linear-gradient(180deg, #0f1724, #090d15); border: 1px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; box-shadow: 0 12px 38px rgba(0,0,0,0.62), 0 0 0 1px rgba(255,255,255,0.025), 0 0 24px rgba(34,211,238,0.12); overflow: hidden; min-width: 300px; min-height: 200px; isolation: isolate; }
+.subsession-window::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--subsession-accent-color, #38bdf8); opacity: 0.45; box-shadow: 0 0 10px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 45%, transparent); pointer-events: none; z-index: 3; transition: height 0.15s, opacity 0.15s, box-shadow 0.15s; }
+.subsession-window-active { box-shadow: 0 14px 42px rgba(0,0,0,0.68), 0 0 0 1px rgba(96,165,250,0.22), 0 0 28px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 28%, transparent); }
+.subsession-window-active::before { height: 5px; opacity: 1; box-shadow: 0 0 14px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 72%, transparent); }
 .subsession-window-maximized { border: 2px solid var(--subsession-accent-color, #38bdf8); box-shadow: 0 0 0 1px rgba(15,23,42,0.75), 0 8px 32px rgba(0,0,0,0.6), 0 0 24px rgba(34,211,238,0.12); box-sizing: border-box; }
 .subsession-header { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: linear-gradient(180deg, rgba(17,27,45,0.98), rgba(10,16,27,0.98)); border-bottom: 1px solid rgba(125,211,252,0.16); cursor: move; user-select: none; flex-shrink: 0; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
 .subsession-drag-icon { color: rgba(34,211,238,0.48); font-size: 16px; cursor: grab; text-shadow: 0 0 8px rgba(34,211,238,0.16); }

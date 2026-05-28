@@ -41,6 +41,29 @@ const defaultProps = {
   setPinnedArr: vi.fn(),
 };
 
+function firePointer(
+  target: Element,
+  type: 'pointerdown' | 'pointermove' | 'pointerup',
+  init: MouseEventInit & { pointerId: number; pointerType: string },
+) {
+  const eventName =
+    type === 'pointerdown' ? 'PointerDown' : type === 'pointermove' ? 'PointerMove' : 'PointerUp';
+  const win = target.ownerDocument.defaultView ?? window;
+  const event = new win.MouseEvent(eventName, {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    button: init.button ?? 0,
+    clientX: init.clientX,
+    clientY: init.clientY,
+  });
+  Object.defineProperties(event, {
+    pointerId: { value: init.pointerId },
+    pointerType: { value: init.pointerType },
+  });
+  fireEvent(target, event);
+}
+
 describe('SessionTabs', () => {
   beforeEach(() => {
     getUserPrefMock.mockResolvedValue(null);
@@ -189,14 +212,14 @@ describe('SessionTabs', () => {
     );
 
     const pinnedTab = screen.getAllByRole('tab')[0];
-    fireEvent.pointerDown(pinnedTab, {
+    firePointer(pinnedTab, 'pointerdown', {
       pointerId: 11,
       pointerType: 'touch',
       button: 0,
       clientX: 24,
       clientY: 12,
     });
-    fireEvent.pointerUp(pinnedTab, {
+    firePointer(pinnedTab, 'pointerup', {
       pointerId: 11,
       pointerType: 'touch',
       button: 0,
@@ -216,14 +239,14 @@ describe('SessionTabs', () => {
     );
 
     const tab = screen.getByRole('tab');
-    fireEvent.pointerDown(tab, {
+    firePointer(tab, 'pointerdown', {
       pointerId: 12,
       pointerType: 'touch',
       button: 0,
       clientX: 24,
       clientY: 12,
     });
-    fireEvent.pointerUp(tab, {
+    firePointer(tab, 'pointerup', {
       pointerId: 12,
       pointerType: 'touch',
       button: 0,
@@ -244,21 +267,21 @@ describe('SessionTabs', () => {
     );
 
     const tab = screen.getByRole('tab');
-    fireEvent.pointerDown(tab, {
+    firePointer(tab, 'pointerdown', {
       pointerId: 13,
       pointerType: 'touch',
       button: 0,
       clientX: 24,
       clientY: 12,
     });
-    fireEvent.pointerMove(tab, {
+    firePointer(tab, 'pointermove', {
       pointerId: 13,
       pointerType: 'touch',
       button: 0,
       clientX: 46,
       clientY: 12,
     });
-    fireEvent.pointerUp(tab, {
+    firePointer(tab, 'pointerup', {
       pointerId: 13,
       pointerType: 'touch',
       button: 0,
@@ -329,7 +352,7 @@ describe('SessionTabs', () => {
     );
 
     const tab = screen.getByRole('tab');
-    fireEvent.pointerDown(tab, {
+    firePointer(tab, 'pointerdown', {
       pointerId: 7,
       pointerType: 'touch',
       button: 0,
@@ -342,7 +365,7 @@ describe('SessionTabs', () => {
 
     expect(screen.getByText('📌 Pin')).toBeDefined();
 
-    fireEvent.pointerUp(tab, {
+    firePointer(tab, 'pointerup', {
       pointerId: 7,
       pointerType: 'touch',
       button: 0,

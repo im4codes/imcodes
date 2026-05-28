@@ -57,6 +57,7 @@ interface CollapsedSubSessionButtonProps {
   sub: SubSession;
   accentColor: string;
   isOpen: boolean;
+  isFocused: boolean;
   idleFlashToken: number;
   usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
   detectedModel?: string;
@@ -79,6 +80,7 @@ interface Props {
   desktopLayoutCapable?: boolean;
   idleFlashTokens?: Map<string, number>;
   onOpen: (id: string) => void;
+  onFocus?: (id: string) => void;
   onClose: (id: string) => void;
   onCloseAllOpen?: () => void;
   onRestoreQuickClosed?: (ids: string[]) => void;
@@ -194,7 +196,7 @@ function renderTechClock(text: string): JSX.Element {
   );
 }
 
-function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, usage, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel }: CollapsedSubSessionButtonProps) {
+function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -217,7 +219,7 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, idleFlashToken, u
     <button
       key={sub.id}
       data-sub-id={sub.id}
-      class={`subsession-card${isOpen ? ' open' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
+      class={`subsession-card${isOpen ? ' open' : ''}${isFocused ? ' focused' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
       draggable={draggable}
       onPointerDown={(event) => onEntryPointerDown(sub.id, event)}
       onTouchStart={() => onEntryTouchStart(sub.id)}
@@ -269,7 +271,7 @@ function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, inP2p, t }:
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
@@ -313,8 +315,11 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   maximizedIdsRef.current = maximizedIds;
   const desktopLayoutCapableRef = useRef(desktopLayoutCapable);
   desktopLayoutCapableRef.current = desktopLayoutCapable;
+  const focusedSubIdRef = useRef(focusedSubId);
+  focusedSubIdRef.current = focusedSubId;
   const gestureCallbacksRef = useRef({
     onOpen,
+    onFocus,
     onOpenMaximized,
     onMaximize,
     onRestore,
@@ -322,6 +327,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   });
   gestureCallbacksRef.current = {
     onOpen,
+    onFocus,
     onOpenMaximized,
     onMaximize,
     onRestore,
@@ -347,9 +353,11 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       getState: () => ({
         isOpen: openIdsRef.current.has(id),
         isMaximized: maximizedIdsRef.current?.has(id) ?? false,
+        isFocused: !desktopLayoutCapableRef.current || focusedSubIdRef.current == null || focusedSubIdRef.current === id,
       }),
       actions: {
         openNormal: () => gestureCallbacksRef.current.onOpen(id),
+        focus: () => gestureCallbacksRef.current.onFocus?.(id),
         closeNormal: () => gestureCallbacksRef.current.onOpen(id),
         restoreThenClose: () => {
           const callbacks = gestureCallbacksRef.current;
@@ -1098,6 +1106,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 sub={sub}
                 accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
                 isOpen={openIds.has(sub.id)}
+                isFocused={focusedSubId === sub.id}
                 idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
                 usage={subUsages?.get(`deck_sub_${sub.id}`)}
                 detectedModel={detectedModels?.get(sub.sessionName)}
