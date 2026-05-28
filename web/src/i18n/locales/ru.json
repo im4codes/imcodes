@@ -89,6 +89,7 @@
     "thinking_done": "Думал {{sec}}s",
     "show_file_panel": "Открыть панель файлов",
     "hide_file_panel": "Закрыть панель файлов",
+    "sync_history": "Синхронизировать историю чата",
     "html_preview": "Отрисовать HTML",
     "html_preview_title": "Отрисованный предпросмотр HTML",
     "html_preview_open_new_window": "Открыть предпросмотр в новом окне",

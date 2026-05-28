@@ -32,6 +32,7 @@ import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
+import { requestActiveTimelineRefresh } from '../hooks/useTimeline.js';
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
 import { splitTextByHttpUrls } from '../link-detection.js';
 import {
@@ -1941,14 +1942,27 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
   return (
     <div class={`chat-view-wrap${canShowFilePanel && showFilePanel ? ' chat-split' : ''}`}>
-      {canShowFilePanel && (
-        <button
-          class={`chat-panel-toggle${showFilePanel ? ' active' : ''}`}
-          onClick={toggleFilePanel}
-          title={showFilePanel ? t('chat.hide_file_panel') : t('chat.show_file_panel')}
-        >
-          ⊞
-        </button>
+      {!preview && (
+        <div class="chat-top-actions">
+          <button
+            class={`chat-panel-toggle chat-sync-btn${refreshing ? ' spinning' : ''}`}
+            onClick={() => requestActiveTimelineRefresh({ resetCooldowns: true })}
+            disabled={refreshing}
+            title={t('chat.sync_history')}
+            aria-label={t('chat.sync_history')}
+          >
+            ↻
+          </button>
+          {canShowFilePanel && (
+            <button
+              class={`chat-panel-toggle${showFilePanel ? ' active' : ''}`}
+              onClick={toggleFilePanel}
+              title={showFilePanel ? t('chat.hide_file_panel') : t('chat.show_file_panel')}
+            >
+              ⊞
+            </button>
+          )}
+        </div>
       )}
       <div class="chat-main">
         {!preview && (

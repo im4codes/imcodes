@@ -1257,8 +1257,11 @@ body {
 .chat-view::-webkit-scrollbar-track { background: #1e293b; border-radius: 3px; }
 .chat-view::-webkit-scrollbar-thumb { background: linear-gradient(180deg, #3b82f6, #6366f1, #3b82f6); border-radius: 3px; box-shadow: 0 0 8px #6366f1cc; }
 .chat-view::-webkit-scrollbar-thumb:hover { background: linear-gradient(180deg, #60a5fa, #818cf8, #60a5fa); box-shadow: 0 0 12px #818cf8ee; }
-/* File panel toggle button */
-.chat-panel-toggle { position: absolute; top: 6px; right: 8px; z-index: 10; background: rgba(15,23,42,.85); border: 1px solid #334155; border-radius: 5px; color: #64748b; cursor: pointer; padding: 3px 7px; font-size: 14px; line-height: 1; transition: color .15s, border-color .15s; }
+/* Top-right control cluster: force-sync (↻) + file-panel toggle (⊞). */
+.chat-top-actions { position: absolute; top: 6px; right: 8px; z-index: 10; display: flex; gap: 6px; align-items: center; }
+.chat-panel-toggle { background: rgba(15,23,42,.85); border: 1px solid #334155; border-radius: 5px; color: #64748b; cursor: pointer; padding: 3px 7px; font-size: 14px; line-height: 1; transition: color .15s, border-color .15s; }
+.chat-sync-btn[disabled] { opacity: .55; cursor: default; }
+.chat-sync-btn.spinning { animation: chat-spinner-rotate 0.8s linear infinite; }
 .chat-panel-toggle:hover, .chat-panel-toggle.active { color: #818cf8; border-color: #6366f1; }
 /* Drag handle between chat and file panel */
 .chat-panel-drag { width: 4px; flex-shrink: 0; cursor: col-resize; background: #1e293b; transition: background .15s; }
