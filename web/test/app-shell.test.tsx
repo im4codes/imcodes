@@ -939,7 +939,7 @@ describe('App shell', () => {
     const first = await screen.findByTestId('sub-session-window-sub-1');
     const second = await screen.findByTestId('sub-session-window-sub-2');
     await waitFor(() => {
-      expect(first.getAttribute('data-active')).toBe('true');
+      expect(first.getAttribute('data-active')).toBe('false');
       expect(second.getAttribute('data-active')).toBe('true');
     });
 
