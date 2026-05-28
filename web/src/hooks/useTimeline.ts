@@ -704,19 +704,21 @@ function getSharedTimelineBase(
  * `session_epoch_seq`), so a null cursor must never be treated as "no history".
  * The cursor is best-effort (index lookup, else derived from the read events).
  *
- * NOTE (cycle-2 follow-up): a session whose history is SPLIT across both keys
- * (some bare, some scoped) currently surfaces only the scoped segment here. The
- * always-dual-read merge that heals a live split is deferred to avoid reworking
- * the single-read test harness in this cycle.
+ * Phase 1 of local restore. Returns `rawAlreadyRead` so the caller knows
+ * whether the bare key was already consumed here (the scoped-empty fallback);
+ * a non-empty-scoped session still triggers a phase-2 raw merge that heals a
+ * SPLIT across both keys (see `readRawSegment` / `mergeRawSegmentLater`).
  */
 async function readLocalTimelineMerged(
   db: TimelineDB,
   cacheKey: string,
   rawSessionId: string | undefined,
   limit: number,
-): Promise<{ stored: TimelineEvent[]; cursor: { epoch: number; seq: number } | null }> {
+): Promise<{ stored: TimelineEvent[]; cursor: { epoch: number; seq: number } | null; rawAlreadyRead: boolean }> {
   let stored = await db.getRecentEvents(cacheKey, { limit });
+  let rawAlreadyRead = false;
   if (stored.length === 0 && rawSessionId) {
+    rawAlreadyRead = true;
     const rawStored = await db.getRecentEvents(rawSessionId, { limit });
     if (rawStored.length > 0) {
       stored = rawStored.map((event) => (
@@ -730,16 +732,50 @@ async function readLocalTimelineMerged(
   // Cursor: prefer the explicit index lookup; else derive from the read events.
   let cursor: { epoch: number; seq: number } | null = await db.getLastSeqAndEpoch(cacheKey);
   if (!cursor && rawSessionId) cursor = await db.getLastSeqAndEpoch(rawSessionId);
-  if (!cursor && stored.length > 0) {
-    let epoch = 0;
-    let seq = 0;
-    for (const event of stored) {
-      if (event.epoch > epoch) epoch = event.epoch;
-      if (event.seq > seq) seq = event.seq;
-    }
-    cursor = { epoch, seq };
+  if (!cursor) cursor = deriveLocalCursor(stored);
+  return { stored, cursor, rawAlreadyRead };
+}
+
+/** Best-effort cursor (max epoch/seq) derived from a set of events. */
+function deriveLocalCursor(events: TimelineEvent[]): { epoch: number; seq: number } | null {
+  if (events.length === 0) return null;
+  let epoch = 0;
+  let seq = 0;
+  for (const event of events) {
+    if (event.epoch > epoch) epoch = event.epoch;
+    if (event.seq > seq) seq = event.seq;
   }
-  return { stored, cursor };
+  return { epoch, seq };
+}
+
+/** Pick the higher of two cursors (epoch, then seq); either may be null. */
+function maxLocalCursor(
+  a: { epoch: number; seq: number } | null,
+  b: { epoch: number; seq: number } | null,
+): { epoch: number; seq: number } | null {
+  if (!a) return b;
+  if (!b) return a;
+  return (b.epoch > a.epoch || (b.epoch === a.epoch && b.seq > a.seq)) ? b : a;
+}
+
+/**
+ * Phase 2 of local restore (split-key heal): read the bare-sessionId key,
+ * restamp to the scoped key, and report events + cursor so the caller can
+ * idempotently merge them. Used only when phase 1's scoped read was non-empty
+ * (a session whose history is split across both keys). Read on its own so the
+ * caller can run it fire-and-forget — it must never block the scoped first paint.
+ */
+async function readRawSegment(
+  db: TimelineDB,
+  rawSessionId: string,
+  cacheKey: string,
+  limit: number,
+): Promise<{ rawStored: TimelineEvent[]; rawRestamped: TimelineEvent[]; cursor: { epoch: number; seq: number } | null }> {
+  const rawStored = await db.getRecentEvents(rawSessionId, { limit });
+  const rawRestamped = rawStored.map((event) => (
+    event.sessionId === cacheKey ? event : { ...event, sessionId: cacheKey }
+  ));
+  return { rawStored, rawRestamped, cursor: deriveLocalCursor(rawRestamped) };
 }
 
 export function __getSharedTimelineBaseForTests(
@@ -1505,10 +1541,17 @@ export function useTimeline(
     // Use the fallback variant so cacheKey-scope shifts (early-mount
     // serverId resolution) still surface the prior snapshot.
     const rawSessionIdForFallback = sessionId && sessionId !== cacheKey ? sessionId : undefined;
-    const localSnapshot = loadPersistedTimelineSnapshotWithFallback(cacheKey!, rawSessionIdForFallback);
+    // Filter streaming on read too (the sync useState seed already filters, so
+    // keep path1.5 consistent — otherwise an old streaming snapshot re-flashes
+    // half-typed text after the first paint). Do NOT write this snapshot to the
+    // GLOBAL eventsCache: a tail snapshot is low-completeness, and writing it
+    // would let path1's `memCached.length>0` short-circuit skip the fuller IDB
+    // read on a later effect re-run (run 016f9b5b-c8f M3/B3). It is only this
+    // hook's first-paint seed; the global cache is written by IDB/daemon/HTTP.
+    const localSnapshot = loadPersistedTimelineSnapshotWithFallback(cacheKey!, rawSessionIdForFallback)
+      .filter(shouldPersistTimelineEvent);
     if (localSnapshot.length > 0) {
       updateHistoryStep('cache', 'done', 'bootstrap');
-      setCachedEvents(cacheKey!, localSnapshot);
       setEvents((prev) => (prev === localSnapshot ? prev : localSnapshot));
       setLoading(false);
       requestDaemonHistory(false, MAX_MEMORY_EVENTS, localSnapshot);
@@ -1564,7 +1607,7 @@ export function useTimeline(
       // never mistaken for "no history". `ensureOpen` is awaited inside the
       // read methods. See run 016f9b5b-c8f (split-key + fail-safe).
       const rawSessionIdForFallback = sessionId && sessionId !== cacheKey ? sessionId : undefined;
-      const { stored, cursor } = await readLocalTimelineMerged(
+      const { stored, cursor, rawAlreadyRead } = await readLocalTimelineMerged(
         db, cacheKey!, rawSessionIdForFallback, MAX_MEMORY_EVENTS,
       );
       if (cancelled) return;
@@ -1588,6 +1631,12 @@ export function useTimeline(
         // WS event; reopening after a mid-chat close may leave a gap.
         if (isActiveSession) {
           fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+        }
+        // Phase 2 (split-key heal): scoped had data, but the bare key may ALSO
+        // hold a segment (serverId resolved mid-session). Merge it in the
+        // background — fire-and-forget so it never blocks the scoped first paint.
+        if (rawSessionIdForFallback && !rawAlreadyRead) {
+          mergeRawSegmentLaterRef.current(db, rawSessionIdForFallback, cacheKey!);
         }
       } else {
         // Empty local read — a genuine cold start OR a transient IDB read
@@ -2193,6 +2242,25 @@ export function useTimeline(
     });
   }, []);
 
+  // Phase-2 split-key heal: read the bare-sessionId segment in the background
+  // and idempotently merge it (raw → restamped → mergeEvents). Fire-and-forget
+  // so it NEVER blocks the scoped first paint (this is also why the dual read
+  // survives single-promise test mocks). Only invoked when phase 1's scoped read
+  // was non-empty (a session split across both keys). Bumps the cursor to the
+  // higher of the two segments and consolidates the bare rows into scoped.
+  const mergeRawSegmentLater = useCallback((db: TimelineDB, rawSessionId: string, key: string) => {
+    void readRawSegment(db, rawSessionId, key, MAX_MEMORY_EVENTS).then((raw) => {
+      if (cacheKeyRef.current !== key || raw.rawStored.length === 0) return;
+      mergeEvents(raw.rawRestamped);
+      const bumped = maxLocalCursor({ epoch: epochRef.current, seq: seqRef.current }, raw.cursor);
+      if (bumped) { epochRef.current = bumped.epoch; seqRef.current = bumped.seq; }
+      setLoading(false);
+      db.migrateRawToScoped(rawSessionId, key, raw.rawStored).catch(() => { /* best-effort */ });
+    }).catch(() => { /* best-effort */ });
+  }, [mergeEvents]);
+  const mergeRawSegmentLaterRef = useRef(mergeRawSegmentLater);
+  mergeRawSegmentLaterRef.current = mergeRawSegmentLater;
+
   const replaceEvents = useCallback((incoming: TimelineEvent[], maxEvents = MAX_MEMORY_EVENTS) => {
     setEvents(() => {
       const result = incoming.length > maxEvents
@@ -2468,11 +2536,15 @@ export function useTimeline(
   const reloadLocalTimeline = useCallback(async () => {
     const key = cacheKeyRef.current;
     if (!key) return;
-    try {
-      await sharedDb.resetAndReopen();
-    } catch { /* ignore — the read below still falls back to memory */ }
+    // Only force a reopen when the DB is actually degraded — resetAndReopen()
+    // closes the SHARED singleton connection, which would disrupt every OTHER
+    // session's in-flight reads/writes. A healthy connection just re-reads
+    // (run 016f9b5b-c8f M2 — the cycle-1 unconditional reset was a regression).
+    if (sharedDb.memoryOnly) {
+      try { await sharedDb.resetAndReopen(); } catch { /* ignore — read below falls back to memory */ }
+    }
     const rawSessionId = sessionId && sessionId !== key ? sessionId : undefined;
-    const { stored, cursor } = await readLocalTimelineMerged(sharedDb, key, rawSessionId, MAX_MEMORY_EVENTS);
+    const { stored, cursor, rawAlreadyRead } = await readLocalTimelineMerged(sharedDb, key, rawSessionId, MAX_MEMORY_EVENTS);
     if (cacheKeyRef.current !== key) return;
     if (cursor) {
       epochRef.current = cursor.epoch;
@@ -2484,8 +2556,10 @@ export function useTimeline(
       setCachedEvents(key, restored);
       setEvents((prev) => (prev === restored ? prev : restored));
       historyLoadedRef.current = key;
+      // Phase 2 split-key heal (same as bootstrap) — merge the bare segment.
+      if (rawSessionId && !rawAlreadyRead) mergeRawSegmentLater(sharedDb, rawSessionId, key);
     }
-  }, [sessionId]);
+  }, [sessionId, mergeRawSegmentLater]);
 
   const forceRefresh = useCallback(() => {
     // Re-read LOCAL IDB first (the user's history is local — this recovers a

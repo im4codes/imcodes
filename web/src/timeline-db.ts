@@ -45,6 +45,10 @@ export class TimelineDB {
   private memoryFallback = new Map<string, TimelineEvent[]>();
   private _memoryOnly = false;
   private lastOpenFailureAt = 0;
+  // Incremented on every resetAndReopen() so a superseded in-flight open chain's
+  // .then/.catch side effects (set db / _memoryOnly / openPromise) are discarded
+  // instead of clobbering the fresh open (run 016f9b5b-c8f NB1).
+  private openGen = 0;
 
   get memoryOnly(): boolean {
     return this._memoryOnly;
@@ -66,6 +70,7 @@ export class TimelineDB {
    * prior open failure never permanently blocks reading on-disk history.
    */
   async resetAndReopen(): Promise<IDBDatabase | null> {
+    this.openGen += 1; // invalidate any in-flight open chain's side effects
     try { this.db?.close(); } catch { /* ignore */ }
     this.db = null;
     this.openPromise = null;
@@ -94,8 +99,15 @@ export class TimelineDB {
       this._memoryOnly = false;
     }
     if (!this.openPromise) {
+      const gen = this.openGen;
       this.openPromise = this.openInternal()
         .then(async (db) => {
+          if (gen !== this.openGen) {
+            // A resetAndReopen() superseded this attempt — discard its side
+            // effects and close the now-orphaned connection (don't leak it).
+            if (db) { try { db.close(); } catch { /* ignore */ } }
+            return null;
+          }
           if (db) {
             this.db = db;
             await this.flushMemoryFallbackToDb(db);
@@ -103,6 +115,8 @@ export class TimelineDB {
           return db;
         })
         .catch(() => {
+          // Superseded by a reset → don't clobber the fresh open's state.
+          if (gen !== this.openGen) return null;
           this._memoryOnly = true;
           this.lastOpenFailureAt = Date.now();
           // Drop the cached rejected promise so a later call can retry a fresh
@@ -135,6 +149,29 @@ export class TimelineDB {
         }
       };
 
+      // Single settle point so a late onsuccess after a blocked-timeout reject
+      // closes the orphan connection instead of leaking it (run 016f9b5b-c8f
+      // #2/B5), and the blocked timer is always cleared on success/error.
+      let settled = false;
+      let blockedTimer: ReturnType<typeof setTimeout> | null = null;
+      const finishSuccess = (db: IDBDatabase): void => {
+        if (settled) {
+          // Holder released after we already timed out → close the orphan so it
+          // doesn't linger and block future version upgrades.
+          try { db.close(); } catch { /* ignore */ }
+          return;
+        }
+        settled = true;
+        if (blockedTimer) { clearTimeout(blockedTimer); blockedTimer = null; }
+        resolve(db);
+      };
+      const finishError = (err: unknown): void => {
+        if (settled) return;
+        settled = true;
+        if (blockedTimer) { clearTimeout(blockedTimer); blockedTimer = null; }
+        reject(err);
+      };
+
       req.onsuccess = () => {
         const db = req.result;
         // If another tab upgrades the schema later we want to drop our
@@ -145,16 +182,15 @@ export class TimelineDB {
           try { db.close(); } catch { /* ignore */ }
           this.db = null;
         };
-        resolve(db);
+        finishSuccess(db);
       };
-      req.onerror = () => reject(req.error);
+      req.onerror = () => finishError(req.error);
       req.onblocked = () => {
         // Another tab still holds a connection to the old version. Don't hang
         // forever — if the holder doesn't release within the timeout, reject so
         // the caller falls back to memory + a backoff retry instead of a
-        // permanently-pending promise (which would freeze local load). If
-        // `onsuccess` fires first (holder closed), this reject is ignored.
-        setTimeout(() => reject(new Error('idb_open_blocked')), OPEN_BLOCKED_TIMEOUT_MS);
+        // permanently-pending promise. A late `onsuccess` closes the orphan.
+        blockedTimer = setTimeout(() => finishError(new Error('idb_open_blocked')), OPEN_BLOCKED_TIMEOUT_MS);
       };
     });
   }

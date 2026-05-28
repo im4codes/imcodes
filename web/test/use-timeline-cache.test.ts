@@ -425,6 +425,51 @@ describe('useTimeline global cache bounds', () => {
     expect(migrateSpy).toHaveBeenCalledWith(sessionName, `${serverId}:${sessionName}`, stored);
   });
 
+  it('heals a SPLIT-key session: shows scoped + bare segments together (dual-read phase 2)', async () => {
+    // run 016f9b5b-c8f M1/V3: when serverId resolves mid-session, some events
+    // land under the scoped key and some under the bare sessionId. The cycle-1
+    // "raw only if scoped empty" read showed only the scoped segment ("不全").
+    // The phase-2 raw merge must surface BOTH and consolidate the bare rows.
+    const sessionName = `deck_split_${Date.now()}`;
+    const serverId = `srv-split-${Date.now()}`;
+    const scopedKey = `${serverId}:${sessionName}`;
+    const scopedEvent: TimelineEvent = {
+      eventId: `${sessionName}-scoped`, sessionId: scopedKey, ts: 2, epoch: 1, seq: 2,
+      source: 'daemon', confidence: 'high', type: 'assistant.text', payload: { text: 'scoped segment' },
+    };
+    const bareEvent: TimelineEvent = {
+      eventId: `${sessionName}-bare`, sessionId: sessionName, ts: 1, epoch: 1, seq: 1,
+      source: 'daemon', confidence: 'high', type: 'assistant.text', payload: { text: 'bare segment' },
+    };
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 2, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(async (key: string) => {
+      if (key === scopedKey) return [scopedEvent]; // scoped is NON-empty (the cycle-1 gap)
+      if (key === sessionName) return [bareEvent];
+      return [];
+    });
+    const migrateSpy = vi.spyOn(TimelineDB.prototype, 'migrateRawToScoped').mockResolvedValue();
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, null, serverId);
+      return h(
+        'div',
+        { 'data-testid': 'probe-split' },
+        events.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    render(h(Probe));
+
+    // ts-sorted: bare(ts1) then scoped(ts2). The phase-2 merge is async.
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-split').textContent).toBe('bare segment|scoped segment');
+    });
+    // The bare segment must be consolidated into the scoped key (no delete).
+    expect(migrateSpy).toHaveBeenCalledWith(sessionName, scopedKey, [bareEvent]);
+  });
+
   it('falls back to raw localStorage snapshot when scoped key is empty', () => {
     // Sibling regression. Snapshot was written under bare sessionId
     // because `selectedServerId` was null at the time. The synchronous
