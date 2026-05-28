@@ -1,36 +1,64 @@
 /**
- * Tail-backlog continuation pager for HTTP timeline backfill (Tier-0).
+ * Newest-first WINDOW pager for HTTP timeline backfill (Tier-0).
  *
- * Fixes symptom S1 ("tail gap"): when the local timeline tail is old and the
- * server has MORE than one page of newer events, the previous `fireHttpBackfill`
- * fetched only the FIRST page (it never read `result.hasMore`), leaving the rest
- * missing until the next trigger. This pager consumes `hasMore` and continues
- * paging forward — bounded by `CATCHUP_TAIL_MAX_PAGES` — deriving the next
- * `afterTs` from the max `ts` of the page just merged (the server's
- * `nextCursor` is OLDER-oriented, so it cannot drive forward continuation).
+ * Fixes the real tail-gap symptom against the ACTUAL backend. The daemon serves
+ * timeline history as `... WHERE ts > afterTs [AND ts < beforeTs] ORDER BY ts
+ * DESC LIMIT n` — i.e. it returns the NEWEST `limit` events of the requested
+ * window, not a forward page. So a single request with `{ afterTs = localTail }`
+ * already syncs the timeline to the LATEST message, but if more than one page of
+ * events accumulated above the local tail it returns only the newest `limit` and
+ * leaves the rest of `(localTail, newest]` unfetched.
+ *
+ * To recover that backlog we hold the window's LOWER bound fixed at the round's
+ * `afterTs` (the local tail) and walk the UPPER bound DOWN: each subsequent page
+ * sets `beforeTs = minTs + 1` of the page just merged, so the next request
+ * returns the next-newest `limit` events still inside `(afterTs, minTs]`. We
+ * stop as soon as a page comes back shorter than `limit` (the window is
+ * exhausted down to the local tail), and merge every page by `eventId`
+ * (idempotent — the `+1` overlap re-includes the boundary millisecond's events
+ * on purpose so a same-`ts` cluster split across the page boundary is never
+ * dropped; the merge dedups the overlap).
+ *
+ * Wire-semantics note (do NOT confuse the two "more" signals):
+ *  - WINDOW continuation is driven by COUNT truncation: `events.length >= limit`
+ *    means the window held at least `limit` events and we got the newest slice,
+ *    so there may be more below. `events.length < limit` proves the window is
+ *    exhausted. (The server body `hasMore` is wired to the daemon's
+ *    `droppedEvents > 0`, i.e. PAYLOAD truncation — it is an INCOMPLETE-page
+ *    signal, not a count signal, and MUST NOT drive continuation.)
+ *  - PAYLOAD truncation (`payloadTruncated` / `droppedEvents` / `truncatedEvents`
+ *    / `cursorReset` / `recoverable`) means the page itself is incomplete; the
+ *    round ends `truncated` and MUST NOT cool down.
  *
  * It ALSO separates "responded" from "caught up": only a `caught_up` terminal
- * (server `hasMore=false` with no truncation/drop/reset) should advance the
- * backfill cooldown / mark the step done. A `cap_hit` / `truncated` terminal
- * must NOT write the cooldown, so the next trigger continues instead of being
- * suppressed by a false-completion.
+ * (window exhausted with no truncation/drop/reset) should advance the backfill
+ * cooldown / mark the step done. A `cap_hit` / `truncated` / `transient_null`
+ * terminal must NOT write the cooldown, so the next trigger continues instead of
+ * being suppressed by a false-completion.
  *
- * SCOPE (honest): this does NOT fix symptom S2 ("middle/ordering gap" — an
- * event missed that is older than `localMax - OVERLAP`). The request base is
- * still derived from the local tail, so events earlier than the first page's
- * base are never returned. S2 requires a verified/contiguous base cursor +
- * forward `(ts,seq)` cursor (deferred Tier-1+ work in the OpenSpec change).
+ * SCOPE (honest): this recovers the tail window `(localTail, newest]`. It does
+ * NOT recover a "middle/ordering gap" — an event OLDER than `localTail`
+ * (`localMax − OVERLAP`) that was missed while a later event arrived — because
+ * the window's lower bound is the local tail. That, and same-millisecond
+ * exactness when a single `ts` holds more than `limit` events (which terminates
+ * `cap_hit`), are deferred Tier-1+ work in the OpenSpec change and are an
+ * accepted product trade-off (occasional middle gaps, especially tool calls).
  *
  * Pure / framework-free and dependency-injected (fetch + merge) so it is
  * unit-testable with no React, no real network, and no real timers.
  */
 
-/** Bounded number of forward pages a single tail-backfill round may fetch. */
+/** Bounded number of window pages a single catch-up round may fetch. */
 export const CATCHUP_TAIL_MAX_PAGES = 5;
 
 /** Subset of the HTTP backfill response the pager needs. */
 export interface BackfillPage {
   events: unknown[];
+  /**
+   * PAYLOAD-truncation signal (server body `hasMore` ← daemon `droppedEvents>0`).
+   * Indicates the page is incomplete, NOT that more older events exist — do not
+   * use it to drive window continuation (that is `events.length >= limit`).
+   */
   hasMore: boolean;
   payloadTruncated?: boolean;
   droppedEvents?: number;
@@ -41,35 +69,47 @@ export interface BackfillPage {
 
 /**
  * How a round ended:
- * - `caught_up`   — server reported `hasMore=false` with no truncation; the
- *                   timeline is verified up-to-date as of this round (the ONLY
- *                   terminal that may advance the cooldown / mark done).
- * - `cap_hit`     — page cap reached (or no forward progress possible) while
- *                   the server still reports more; do NOT cool down — let the
- *                   next trigger continue.
+ * - `caught_up`   — a page returned fewer than `limit` events with no
+ *                   truncation; the window `(afterTs, beforeTs]` is exhausted and
+ *                   the timeline is verified up-to-date as of this round (the
+ *                   ONLY terminal that may advance the cooldown / mark done).
+ * - `cap_hit`     — the page cap was reached while pages were still full, or no
+ *                   downward progress was possible (a same-`ts` cluster larger
+ *                   than `limit`); do NOT cool down — let the next trigger
+ *                   continue.
  * - `truncated`   — a page was payload-truncated / dropped / reset / recoverable;
  *                   incomplete, do NOT cool down.
  * - `transient_null` — a fetch returned null (daemon offline / timeout / blip).
  */
 export type BackfillTerminal = 'caught_up' | 'cap_hit' | 'truncated' | 'transient_null';
 
-export interface TailBackfillDeps {
+export interface NewestWindowBackfillDeps {
   /**
-   * Fetch one page starting strictly after `afterTs` (undefined = no cursor /
-   * from the start). Returns null on transient failure.
+   * Fetch one window page. `afterTs` is the round's FIXED lower bound (undefined
+   * = from the start); `beforeTs` is the moving upper bound (undefined on the
+   * first page). The fetch MUST request `limit` events so the pager's
+   * count-truncation check (`events.length >= limit`) is meaningful. Returns
+   * null on transient failure.
    */
-  fetchPage: (afterTs: number | undefined) => Promise<BackfillPage | null>;
+  fetchPage: (args: { afterTs: number | undefined; beforeTs?: number }) => Promise<BackfillPage | null>;
   /**
-   * Merge a page's events into the timeline. Returns the number of NEW events
-   * merged and the max `ts` seen (used to advance the forward cursor). Returning
-   * `newCount: 0` / `maxTs: null` signals "no forward progress possible".
+   * Merge a page's events into the timeline. Returns how many well-formed events
+   * were merged (`candidateCount`, idempotent — re-merged overlap is fine) and
+   * the min/max `ts` across them (`minTs` drives the next window's upper bound).
+   * `minTs: null` signals "no usable cursor" (empty / all-malformed page).
    */
-  mergePage: (events: unknown[]) => { newCount: number; maxTs: number | null };
-  /** Max forward pages (default `CATCHUP_TAIL_MAX_PAGES`). */
+  mergePage: (events: unknown[]) => { candidateCount: number; minTs: number | null; maxTs: number | null };
+  /**
+   * The page size requested per fetch. A page with `events.length >= limit` is a
+   * full window slice (there may be more below → continue); `< limit` proves the
+   * window is exhausted (→ `caught_up`).
+   */
+  limit: number;
+  /** Max window pages (default `CATCHUP_TAIL_MAX_PAGES`). */
   maxPages?: number;
 }
 
-export interface TailBackfillOutcome {
+export interface NewestWindowBackfillOutcome {
   terminal: BackfillTerminal;
   pageCount: number;
   totalNew: number;
@@ -84,43 +124,49 @@ function pageIsIncomplete(page: BackfillPage): boolean {
 }
 
 /**
- * Run a bounded forward tail-backfill starting at `initialAfterTs`.
- * Merges each page via `deps.mergePage` and stops at the first terminal
- * condition. Never loops unboundedly: it stops on cap, on transient null, on
- * truncation, or as soon as it cannot make forward progress.
+ * Run a bounded newest-first window backfill over `(lowerAfterTs, newest]`.
+ * Holds the lower bound fixed and walks the upper bound (`beforeTs`) down by
+ * each merged page's `minTs`, merging via `deps.mergePage`. Stops at the first
+ * terminal condition; never loops unboundedly (it stops on cap, on a short page,
+ * on a transient null, on truncation, or as soon as the upper bound cannot
+ * descend).
  */
-export async function runTailBackfill(
-  initialAfterTs: number | undefined,
-  deps: TailBackfillDeps,
-): Promise<TailBackfillOutcome> {
+export async function runNewestWindowBackfill(
+  lowerAfterTs: number | undefined,
+  deps: NewestWindowBackfillDeps,
+): Promise<NewestWindowBackfillOutcome> {
   const maxPages = deps.maxPages ?? CATCHUP_TAIL_MAX_PAGES;
-  let afterTs: number | undefined = initialAfterTs;
+  const afterTs = lowerAfterTs; // fixed lower bound for the whole round
+  let beforeTs: number | undefined; // moving upper bound (undefined = newest)
+  let prevMinTs = Number.POSITIVE_INFINITY;
   let pageCount = 0;
   let totalNew = 0;
 
   while (pageCount < maxPages) {
-    const page = await deps.fetchPage(afterTs);
+    const page = await deps.fetchPage({ afterTs, beforeTs });
     if (page === null) {
       return { terminal: 'transient_null', pageCount, totalNew };
     }
-    const { newCount, maxTs } = deps.mergePage(page.events);
+    const { candidateCount, minTs } = deps.mergePage(page.events);
     pageCount += 1;
-    totalNew += newCount;
+    totalNew += candidateCount;
 
     if (pageIsIncomplete(page)) {
-      // Incomplete page — NOT caught up; let a later trigger retry.
+      // Payload-incomplete page — NOT caught up; let a later trigger retry.
       return { terminal: 'truncated', pageCount, totalNew };
     }
-    if (!page.hasMore) {
-      // The only path that proves the tail is fully caught up.
+    if (page.events.length < deps.limit) {
+      // Short page ⇒ the window is exhausted down to the local tail: caught up.
       return { terminal: 'caught_up', pageCount, totalNew };
     }
-    // Server says there is more, but if we made no progress / cannot advance the
-    // forward cursor, stop bounded (do NOT cool down — avoids a same-afterTs loop).
-    if (newCount === 0 || maxTs === null || (afterTs !== undefined && maxTs <= afterTs)) {
+    // Full page ⇒ there may be more below. Descend the upper bound, but stop
+    // bounded if we cannot derive a lower cursor or it fails to descend (a
+    // single `ts` holding ≥ limit events — same-ms exactness is out of scope).
+    if (minTs === null || minTs >= prevMinTs) {
       return { terminal: 'cap_hit', pageCount, totalNew };
     }
-    afterTs = maxTs;
+    prevMinTs = minTs;
+    beforeTs = minTs + 1; // +1 re-includes the boundary ms; merge dedups it.
   }
   return { terminal: 'cap_hit', pageCount, totalNew };
 }

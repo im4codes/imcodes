@@ -43,6 +43,7 @@ import logger from '../util/logger.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
+import { hashSessionName } from '../../shared/session-hash.js';
 import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
 import {
   TIMELINE_CURSOR_DIRECTIONS,
@@ -4610,7 +4611,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
           trimmed = synthesizedTrimmed;
         }
       } catch (err) {
-        logger.debug({ err, sessionName: params.sessionName, opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
+        logger.debug({ err, sessionHash: hashSessionName(params.sessionName), opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
       }
       synthesizeMs = Date.now() - tSyn0;
     }
@@ -4731,7 +4732,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
     const totalMs = Date.now() - tStart;
     const requestedBudgetBytes = optionalFiniteNumber(cmd.budgetBytes);
     logger.info({
-      sessionName,
+      sessionHash: hashSessionName(sessionName),
       requestId,
       requestType: typeof cmd.type === 'string' ? cmd.type : undefined,
       responseType: sent.type,
@@ -4755,7 +4756,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
     }, 'timeline.history served');
     return;
   } catch (err) {
-    logger.error({ err, sessionName, requestId }, 'timeline.history_request unexpectedly failed');
+    logger.error({ err, sessionHash: hashSessionName(sessionName), requestId }, 'timeline.history_request unexpectedly failed');
     try {
       sendTimelineMessage(serverLink, {
         type: timelineHistoryResponseTypeForRequest(cmd),

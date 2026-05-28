@@ -18,17 +18,11 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-
 import { TIMELINE_RESPONSE_STATUS } from '../../../shared/timeline-protocol.js';
 import { getPodIdentity } from '../util/pod-identity.js';
 import logger from '../util/logger.js';
-import { createHash } from 'node:crypto';
-
-/**
- * Hash a sessionName for logs/metrics. Raw session identifiers can encode
- * project/role context, so they MUST NOT land in centralized logs (the logger
- * only redacts `_token`/`_key`/`_secret` suffixes). Response bodies keep
- * `sessionName` for client compatibility; only logs use this hash.
- */
-export function hashSessionName(sessionName: string): string {
-  return `s_${createHash('sha256').update(sessionName).digest('hex').slice(0, 12)}`;
-}
+// Shared so the daemon (command-handler.ts) and server emit the SAME log
+// identifier for a session (see shared/session-hash.ts). Re-exported so existing
+// importers (and watch-session-hash.test.ts) keep importing `hashSessionName`.
+import { hashSessionName } from '../../../shared/session-hash.js';
+export { hashSessionName };
 
 export const watchRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 const TEXT_TAIL_HISTORY_PAGE_LIMIT = 500;

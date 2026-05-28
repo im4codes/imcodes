@@ -56,7 +56,7 @@ import {
   type TimelineDetailFieldPath,
 } from '../../../src/shared/timeline/merge.js';
 import { fetchTimelineHistoryHttp, sendSessionViaHttp } from '../api.js';
-import { runTailBackfill } from '../timeline/catchup/backfill-pager.js';
+import { runNewestWindowBackfill } from '../timeline/catchup/backfill-pager.js';
 import { normalizeTransportPendingEntries } from '../transport-queue.js';
 
 // Singleton DB shared across all useTimeline instances — opened once at module load.
@@ -2326,28 +2326,39 @@ export function useTimeline(
         updateHistoryStep('http', 'running', phase);
         setHttpRefreshing(true);
       }
-      // Tail-backlog continuation (Tier-0 / symptom S1): consume `hasMore` and
-      // page forward (bounded) instead of fetching a single page, advancing the
-      // forward cursor by the max `ts` of each merged page. Only a fully
-      // caught-up round (hasMore=false, no truncation) advances the cooldown /
-      // watchdog baseline — `cap_hit`/`truncated` must NOT cool down so the next
-      // trigger continues rather than being suppressed by a false-completion.
+      // Newest-first WINDOW catch-up (Tier-0): the daemon serves history as the
+      // NEWEST `limit` of `(afterTs, beforeTs]` (ORDER BY ts DESC), so page 1
+      // already syncs to the latest message; to recover a tail backlog larger
+      // than one page we hold the lower bound (`afterTs`, the local tail) fixed
+      // and walk `beforeTs` DOWN by each page's min `ts` (bounded). Continuation
+      // is driven by COUNT truncation (`events.length >= limit`), NOT the wire
+      // `hasMore` (which is payload-drop). Only a fully caught-up round (a short
+      // page, no truncation) advances the cooldown / watchdog baseline —
+      // `cap_hit`/`truncated` must NOT cool down so the next trigger continues
+      // rather than being suppressed by a false-completion.
       // NOTE: this does NOT fix the "middle/ordering gap" (events older than the
       // local tail base); that needs the deferred verified/forward cursor.
       void (async () => {
         try {
-          const outcome = await runTailBackfill(afterTs, {
-            fetchPage: (at) => Promise.resolve(fetchTimelineHistoryHttp(serverId, backfillSessionId, {
+          const outcome = await runNewestWindowBackfill(afterTs, {
+            limit: MAX_MEMORY_EVENTS,
+            fetchPage: ({ afterTs: at, beforeTs: bt }) => Promise.resolve(fetchTimelineHistoryHttp(serverId, backfillSessionId, {
               afterTs: at,
+              ...(bt !== undefined ? { beforeTs: bt } : {}),
               limit: MAX_MEMORY_EVENTS,
               timeoutMs: resolveBackfillTimeoutMs(opts),
             })),
             mergePage: (events) => {
-              if (cacheKeyRef.current !== backfillCacheKey) return { newCount: 0, maxTs: null };
+              if (cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
               const recovered = events.filter(
-                (ev): ev is TimelineEvent => !!ev && typeof ev === 'object' && typeof (ev as TimelineEvent).eventId === 'string',
+                (ev): ev is TimelineEvent => !!ev && typeof ev === 'object'
+                  && typeof (ev as TimelineEvent).eventId === 'string'
+                  && typeof (ev as TimelineEvent).sessionId === 'string'
+                  && typeof (ev as TimelineEvent).type === 'string'
+                  && typeof (ev as TimelineEvent).ts === 'number'
+                  && Number.isFinite((ev as TimelineEvent).ts),
               );
-              if (recovered.length === 0) return { newCount: 0, maxTs: null };
+              if (recovered.length === 0) return { candidateCount: 0, minTs: null, maxTs: null };
               backfillDebug('fireHttpBackfill: merging page', { sessionId: backfillSessionId, count: recovered.length });
               mergeEvents(recovered);
               for (const recoveredEvent of recovered) {
@@ -2355,11 +2366,17 @@ export function useTimeline(
                 settleOptimisticByTimelineProgress(recoveredEvent);
               }
               idbPutEvents(recovered);
+              let minTs = Infinity;
               let maxTs = -Infinity;
               for (const recoveredEvent of recovered) {
+                if (recoveredEvent.ts < minTs) minTs = recoveredEvent.ts;
                 if (recoveredEvent.ts > maxTs) maxTs = recoveredEvent.ts;
               }
-              return { newCount: recovered.length, maxTs: Number.isFinite(maxTs) ? maxTs : null };
+              return {
+                candidateCount: recovered.length,
+                minTs: Number.isFinite(minTs) ? minTs : null,
+                maxTs: Number.isFinite(maxTs) ? maxTs : null,
+              };
             },
           });
           // Transient null on the FIRST page → preserve the legacy retry-with-backoff.
