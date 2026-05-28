@@ -673,6 +673,57 @@ describe('App shell', () => {
     });
   }, 20_000);
 
+  it('keeps multiple desktop sub-session windows open and fronts the latest click', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+      {
+        id: 'sub-2',
+        sessionName: 'deck_sub_alpha_reviewer',
+        parentSession: 'deck_alpha_brain',
+        label: 'Reviewer',
+        description: 'Reviewer session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    fireEvent.click(screen.getByText('subbar-open-sub-1'));
+    const first = await screen.findByTestId('sub-session-window-sub-1');
+
+    fireEvent.click(screen.getByText('subbar-open-sub-2'));
+    const second = await screen.findByTestId('sub-session-window-sub-2');
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeTruthy();
+      expect(screen.queryByTestId('sub-session-window-sub-2')).toBeTruthy();
+      expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBe(JSON.stringify(['sub-1', 'sub-2']));
+      expect(Number((second as HTMLElement).style.zIndex)).toBeGreaterThan(Number((first as HTMLElement).style.zIndex));
+    });
+  }, 20_000);
+
   it('opens a pinned sub-session as a floating window without closing other desktop sub-session windows', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
