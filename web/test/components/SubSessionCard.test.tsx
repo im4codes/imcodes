@@ -124,6 +124,7 @@ describe('SubSessionCard', () => {
 
     expect(useTimelineSpy).toHaveBeenLastCalledWith(null, null, undefined, {
       isActiveSession: false,
+      isVisible: true,
     });
 
     await act(async () => {
@@ -132,6 +133,7 @@ describe('SubSessionCard', () => {
 
     expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: false,
+      isVisible: true,
     });
   });
 
