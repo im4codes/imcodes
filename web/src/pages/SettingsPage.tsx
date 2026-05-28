@@ -228,6 +228,15 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
     marginBottom: '6px',
   };
 
+  const teamPointStyle: Record<string, string> = {
+    display: 'flex',
+    gap: '8px',
+    alignItems: 'flex-start',
+    color: '#cbd5e1',
+    fontSize: '13px',
+    lineHeight: '1.55',
+  };
+
   const messageColor = (type: 'ok' | 'err'): string => (type === 'ok' ? '#4ade80' : '#f87171');
 
   return (
@@ -237,6 +246,36 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
           {t('settings.back')}
         </button>
         <h1 style={{ fontSize: '24px', fontWeight: '700', marginBottom: '24px' }}>{t('settings.title')}</h1>
+
+        <div
+          style={{
+            ...cardStyle,
+            background: 'linear-gradient(135deg, #102033 0%, #182235 58%, #111827 100%)',
+            border: '1px solid rgba(96, 165, 250, 0.28)',
+          }}
+        >
+          <div style={inlineLabelStyle}>{t('settings.team_discussion_label')}</div>
+          <h2 style={{ fontSize: '17px', fontWeight: '700', margin: '0 0 10px', color: '#e5edf7' }}>
+            {t('settings.team_discussion_title')}
+          </h2>
+          <p style={{ color: '#b6c2d2', fontSize: '14px', lineHeight: 1.6, margin: '0 0 12px' }}>
+            {t('settings.team_discussion_body')}
+          </p>
+          <div style={{ display: 'grid', gap: '8px' }}>
+            <div style={teamPointStyle}>
+              <span aria-hidden="true" style={{ color: '#60a5fa', fontWeight: '700' }}>01</span>
+              <span>{t('settings.team_discussion_point_1')}</span>
+            </div>
+            <div style={teamPointStyle}>
+              <span aria-hidden="true" style={{ color: '#60a5fa', fontWeight: '700' }}>02</span>
+              <span>{t('settings.team_discussion_point_2')}</span>
+            </div>
+            <div style={teamPointStyle}>
+              <span aria-hidden="true" style={{ color: '#60a5fa', fontWeight: '700' }}>03</span>
+              <span>{t('settings.team_discussion_point_3')}</span>
+            </div>
+          </div>
+        </div>
 
         <div style={cardStyle}>
           <h2 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '12px', color: '#94a3b8' }}>

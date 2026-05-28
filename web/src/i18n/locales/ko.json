@@ -995,6 +995,12 @@
   "settings": {
     "title": "설정",
     "back": "← 뒤로",
+    "team_discussion_label": "Team 토론 모드",
+    "team_discussion_title": "복잡한 작업은 여러 Agent로 토론할 수 있습니다",
+    "team_discussion_body": "Team 토론은 코드에만 쓰는 기능이 아닙니다. 복잡한 문서, 제안서, 감사, 의사결정에도 잘 맞습니다. 서로 다른 모델이 보완하고 반박하면서 더 우수하고 엄밀한 결과를 만들 수 있습니다.",
+    "team_discussion_point_1": "먼저 입력창에 토론할 내용을 쓰고 토론 모드를 선택해 시작하세요.",
+    "team_discussion_point_2": "어려운 작업은 라운드를 늘려 이전 결론을 다시 검토하고 더 단단하게 만들 수 있습니다.",
+    "team_discussion_point_3": "OpenSpec 감사, 복잡한 제안, 코드 리뷰, 아키텍처 결정은 단일 모델의 사각지대를 찾기에 좋은 용도입니다.",
     "display_name": "표시 이름",
     "no_name": "설정되지 않음",
     "edit": "편집",

@@ -995,6 +995,12 @@
   "settings": {
     "title": "設定",
     "back": "← 戻る",
+    "team_discussion_label": "Team ディスカッション",
+    "team_discussion_title": "複雑な作業は複数 Agent で議論できます",
+    "team_discussion_body": "Team ディスカッションはコードだけでなく、複雑な文書、提案、監査、意思決定にも向いています。異なるモデルが互いに補完し、反論することで、より質が高く厳密な結果を出しやすくなります。",
+    "team_discussion_point_1": "まず入力欄に議論したい内容を書き、ディスカッションモードを選んで開始します。",
+    "team_discussion_point_2": "難しい作業ではラウンドを増やし、前回の結論をさらにレビューして強化できます。",
+    "team_discussion_point_3": "OpenSpec 監査、複雑な提案、コードレビュー、アーキテクチャ判断は単一モデルの盲点を見つけやすい用途です。",
     "display_name": "表示名",
     "no_name": "未設定",
     "edit": "編集",

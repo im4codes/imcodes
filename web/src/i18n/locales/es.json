@@ -995,6 +995,12 @@
   "settings": {
     "title": "Configuración",
     "back": "← Volver",
+    "team_discussion_label": "Modo de discusión Team",
+    "team_discussion_title": "Usa varios agentes para trabajo complejo",
+    "team_discussion_body": "La discusión Team no es solo para código. También sirve para documentos complejos, propuestas, auditorías y decisiones. Modelos distintos se cuestionan y se complementan para producir resultados más rigurosos.",
+    "team_discussion_point_1": "Escribe primero el tema en el cuadro de entrada y luego elige un modo de discusión para iniciar.",
+    "team_discussion_point_2": "Para trabajos difíciles, añade rondas para revisar y reforzar la conclusión anterior.",
+    "team_discussion_point_3": "Auditorías OpenSpec, propuestas complejas, revisiones de código y decisiones de arquitectura son buenos casos para detectar puntos ciegos de un solo modelo.",
     "display_name": "Nombre visible",
     "no_name": "No establecido",
     "edit": "Editar",

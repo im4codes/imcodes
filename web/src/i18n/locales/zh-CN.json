@@ -996,6 +996,12 @@
   "settings": {
     "title": "设置",
     "back": "← 返回",
+    "team_discussion_label": "Team 讨论模式",
+    "team_discussion_title": "复杂问题可以交给多 Agent 讨论",
+    "team_discussion_body": "Team 讨论不只用于写代码，也适合复杂文书、方案、审计和决策。多个不同模型会互相补充与挑战，帮助产出更优质、更严谨的结果。",
+    "team_discussion_point_1": "先在输入框写清楚要讨论的内容，再选择讨论模式启动。",
+    "team_discussion_point_2": "困难问题可以增加轮次，让上一轮结论继续被复核和加固。",
+    "team_discussion_point_3": "OpenSpec 审计、复杂方案、代码审查和架构决策都很适合用它来发现单模型盲区。",
     "display_name": "显示名称",
     "no_name": "未设置",
     "edit": "编辑",

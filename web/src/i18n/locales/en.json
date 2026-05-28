@@ -996,6 +996,12 @@
   "settings": {
     "title": "Settings",
     "back": "← Back",
+    "team_discussion_label": "Team discussion mode",
+    "team_discussion_title": "Use multiple agents for complex work",
+    "team_discussion_body": "Team discussion is not just for code. It also works well for complex documents, proposals, audits, and decisions. Different models challenge and complement each other, producing more rigorous results.",
+    "team_discussion_point_1": "Write the topic in the input box first, then choose a discussion mode to start.",
+    "team_discussion_point_2": "For difficult work, add rounds so the previous conclusion is reviewed and hardened.",
+    "team_discussion_point_3": "OpenSpec audits, complex proposals, code reviews, and architecture decisions are good fits for finding single-model blind spots.",
     "display_name": "Display Name",
     "no_name": "Not set",
     "edit": "Edit",
