@@ -2216,22 +2216,19 @@ describe('p2p-workflow reverse-regression', () => {
 
   /*
    * Reverse-regression #77 (R3 v2 PR-ν — User feedback: "i18n 的讨论
-   * 语言要加进去, 尽量精简相关 prompt"). The legacy 79-char bilingual
-   * line ("Use the user's selected i18n language (Chinese (Simplified))
-   * for the discussion.") was injected into `p2pExtraPrompt` and only
-   * appeared at the END of the prompt — buried where models often skim.
-   * The replacement is a concise locale-native one-liner pulled from the
-   * i18n dictionary (`p2p.discussion_language_instruction`), surfaced
-   * right after the baseline prompt in BOTH the legacy combo and
-   * advanced workflow prompt builders.
+   * 语言要加进去" + later correction: the language instruction belongs at
+   * the END of the generated prompt). The daemon must not inject localized
+   * "用中文回复" / "Reply in English" snippets in the middle of the task body:
+   * those are easy to miss. It appends one standard line instead:
+   * "You shall use <locale> to reply and use <locale> to discuss."
    *
    * Locked invariants:
-   *   1. The i18n key `p2p.discussion_language_instruction` exists in
-   *      ALL 7 supported locales with the `{{language}}` placeholder.
-   *   2. `buildP2pLanguageInstruction` is exported from the orchestrator.
+   *   1. `buildP2pLanguageInstruction` is exported from the orchestrator.
+   *   2. The helper uses supported i18n locale codes directly, not autonyms
+   *      or locale JSON prompt snippets.
    *   3. Both `buildHopPrompt` (legacy combo) and
-   *      `buildAdvancedPromptCommon` (workflow) call the helper and
-   *      inject the result right after `P2P_BASELINE_PROMPT`.
+   *      `buildAdvancedPromptCommon` (workflow) append the helper output
+   *      immediately before `return parts.join('\n')`.
    *   4. The legacy verbose extraPrompt-mutation regex is GONE from
    *      `command-handler.ts` so the daemon no longer pollutes
    *      user-supplied `extraPrompt` with a language hint.
@@ -2627,51 +2624,44 @@ describe('p2p-workflow reverse-regression', () => {
     ).toBe(true);
   });
 
-  it('#77 concise i18n discussion-language reminder MUST be injected via shared helper (R3 v2 PR-ν)', () => {
-    // (1) The i18n key exists in all 7 locales with the placeholder.
-    for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ja', 'ko', 'ru']) {
-      const file = read(`web/src/i18n/locales/${locale}.json`);
-      const json = JSON.parse(file.text) as { p2p?: { discussion_language_instruction?: string } };
-      const value = json.p2p?.discussion_language_instruction;
-      expect(typeof value, `${locale}: p2p.discussion_language_instruction must be a string`).toBe('string');
-      expect(value!.includes('{{language}}'), `${locale}: must contain the {{language}} placeholder`).toBe(true);
-      // Concise: under 40 chars (the new line is much shorter than the
-      // 79-char English legacy injection it replaced).
-      expect(value!.length, `${locale}: instruction must stay concise (<= 40 chars)`).toBeLessThanOrEqual(40);
-    }
-
-    // (2) Helper is exported from the orchestrator.
+  it('#77 i18n discussion-language reminder MUST be appended at prompt end via shared helper (R3 v2 PR-ν)', () => {
+    // (1) Helper is exported from the orchestrator.
     const orchestrator = read('src/daemon/p2p-orchestrator.ts');
     expect(
       /export\s+function\s+buildP2pLanguageInstruction/.test(orchestrator.text),
       'buildP2pLanguageInstruction must be exported from p2p-orchestrator.ts',
     ).toBe(true);
-    // The helper must read both autonyms AND the i18n template.
+    // The helper must use supported i18n locale codes directly.
+    expect(
+      orchestrator.text.includes('P2P_SUPPORTED_I18N_LOCALES')
+        && orchestrator.text.includes('You shall use ${locale} to reply and use ${locale} to discuss.'),
+      'helper must emit the standard final language line from the selected locale code',
+    ).toBe(true);
     expect(
       orchestrator.text.includes('P2P_DISCUSSION_LANGUAGE_TEMPLATES')
-        && orchestrator.text.includes('P2P_LANGUAGE_AUTONYMS'),
-      'helper must combine the per-locale template + autonym tables',
-    ).toBe(true);
+        || orchestrator.text.includes('P2P_LANGUAGE_AUTONYMS'),
+      'helper must not use old locale-template/autonym tables',
+    ).toBe(false);
 
-    // (3) Both prompt builders call the helper AND inject the line right
-    // after P2P_BASELINE_PROMPT.
+    // (2) Both prompt builders call the helper near the end and append it
+    // before returning.
     const advancedAnchor = orchestrator.text.indexOf('function buildAdvancedPromptCommon');
     expect(advancedAnchor, 'buildAdvancedPromptCommon must exist').toBeGreaterThan(0);
-    const advancedWindow = orchestrator.text.slice(advancedAnchor, advancedAnchor + 2000);
+    const advancedWindow = orchestrator.text.slice(advancedAnchor, advancedAnchor + 2600);
     expect(
-      /P2P_BASELINE_PROMPT[\s\S]{0,400}buildP2pLanguageInstruction/.test(advancedWindow),
-      'buildAdvancedPromptCommon must call buildP2pLanguageInstruction after P2P_BASELINE_PROMPT',
+      /buildP2pLanguageInstruction\(run\.locale\)[\s\S]{0,250}parts\.push\(langLine\)[\s\S]{0,120}return parts\.join\('\\n'\)/.test(advancedWindow),
+      'buildAdvancedPromptCommon must append buildP2pLanguageInstruction(run.locale) at the end',
     ).toBe(true);
 
     const legacyAnchor = orchestrator.text.indexOf('export function buildHopPrompt');
     expect(legacyAnchor, 'buildHopPrompt must exist').toBeGreaterThan(0);
-    const legacyWindow = orchestrator.text.slice(legacyAnchor, legacyAnchor + 1500);
+    const legacyWindow = orchestrator.text.slice(legacyAnchor, legacyAnchor + 7000);
     expect(
-      /P2P_BASELINE_PROMPT[\s\S]{0,400}buildP2pLanguageInstruction/.test(legacyWindow),
-      'buildHopPrompt must call buildP2pLanguageInstruction after P2P_BASELINE_PROMPT',
+      /buildP2pLanguageInstruction\(run\.locale\)[\s\S]{0,250}parts\.push\(langLine\)[\s\S]{0,120}return parts\.join\('\\n'\)/.test(legacyWindow),
+      'buildHopPrompt must append buildP2pLanguageInstruction(run.locale) at the end',
     ).toBe(true);
 
-    // (4) The legacy verbose injection in command-handler is GONE.
+    // (3) The legacy verbose injection in command-handler is GONE.
     const cmd = read('src/daemon/command-handler.ts');
     expect(
       cmd.text.includes("Use the user's selected i18n language"),

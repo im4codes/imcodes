@@ -249,35 +249,35 @@ describe('P2P_MAX_ROUNDS clamping — production constant', () => {
   });
 });
 
-// ── R3 v2 PR-ν — Concise i18n discussion-language reminder ────────────────
+// ── R3 v2 PR-ν — End-of-prompt i18n discussion-language reminder ─────────
 
-describe('buildP2pLanguageInstruction — concise locale-native reminder', () => {
-  it('returns the English autonym for en', () => {
-    expect(buildP2pLanguageInstruction('en')).toBe('Reply in English.');
+describe('buildP2pLanguageInstruction — final locale-code reminder', () => {
+  it('returns the standard final reminder for en', () => {
+    expect(buildP2pLanguageInstruction('en')).toBe('You shall use en to reply and use en to discuss.');
   });
 
-  it('returns the simplified-Chinese autonym + native template for zh-CN', () => {
-    expect(buildP2pLanguageInstruction('zh-CN')).toBe('请用中文回复。');
+  it('returns the standard final reminder for zh-CN', () => {
+    expect(buildP2pLanguageInstruction('zh-CN')).toBe('You shall use zh-CN to reply and use zh-CN to discuss.');
   });
 
-  it('returns the traditional-Chinese autonym + native template for zh-TW', () => {
-    expect(buildP2pLanguageInstruction('zh-TW')).toBe('請用繁體中文回覆。');
+  it('returns the standard final reminder for zh-TW', () => {
+    expect(buildP2pLanguageInstruction('zh-TW')).toBe('You shall use zh-TW to reply and use zh-TW to discuss.');
   });
 
-  it('returns the Japanese autonym + native template for ja', () => {
-    expect(buildP2pLanguageInstruction('ja')).toBe('日本語で回答してください。');
+  it('returns the standard final reminder for ja', () => {
+    expect(buildP2pLanguageInstruction('ja')).toBe('You shall use ja to reply and use ja to discuss.');
   });
 
-  it('returns the Korean autonym + native template for ko', () => {
-    expect(buildP2pLanguageInstruction('ko')).toBe('한국어로 답변하세요.');
+  it('returns the standard final reminder for ko', () => {
+    expect(buildP2pLanguageInstruction('ko')).toBe('You shall use ko to reply and use ko to discuss.');
   });
 
-  it('returns the Spanish autonym + native template for es', () => {
-    expect(buildP2pLanguageInstruction('es')).toBe('Responde en Español.');
+  it('returns the standard final reminder for es', () => {
+    expect(buildP2pLanguageInstruction('es')).toBe('You shall use es to reply and use es to discuss.');
   });
 
-  it('returns the Russian autonym + native template for ru', () => {
-    expect(buildP2pLanguageInstruction('ru')).toBe('Отвечай на Русский.');
+  it('returns the standard final reminder for ru', () => {
+    expect(buildP2pLanguageInstruction('ru')).toBe('You shall use ru to reply and use ru to discuss.');
   });
 
   it('returns empty string for missing locale (caller skips line)', () => {
@@ -290,27 +290,25 @@ describe('buildP2pLanguageInstruction — concise locale-native reminder', () =>
 });
 
 describe('buildHopPrompt — language reminder injection', () => {
-  it('injects the locale-native language line right after the baseline prompt', () => {
+  it('appends the standard locale reminder at the very end of the prompt', () => {
     const run = makeRun({ locale: 'zh-CN' });
     const mode = getP2pMode('audit');
     const prompt = buildHopPrompt(run, mode, defaultOpts);
-    expect(prompt).toContain('请用中文回复。');
-    // The reminder must appear BEFORE the mode-specific prompt so the agent
-    // reads the language requirement before any task-specific instructions.
-    const langIdx = prompt.indexOf('请用中文回复。');
+    const line = 'You shall use zh-CN to reply and use zh-CN to discuss.';
+    expect(prompt).toContain(line);
+    const langIdx = prompt.indexOf(line);
     const modeIdx = prompt.indexOf(mode!.prompt);
     expect(langIdx).toBeGreaterThan(-1);
     expect(modeIdx).toBeGreaterThan(-1);
-    expect(langIdx).toBeLessThan(modeIdx);
+    expect(langIdx).toBeGreaterThan(modeIdx);
+    expect(prompt.trimEnd().endsWith(line)).toBe(true);
   });
 
   it('omits the language line entirely when locale is undefined', () => {
     const run = makeRun({ locale: undefined });
     const mode = getP2pMode('audit');
     const prompt = buildHopPrompt(run, mode, defaultOpts);
-    expect(prompt).not.toContain('Reply in');
-    expect(prompt).not.toContain('请用');
-    expect(prompt).not.toContain('日本語で');
+    expect(prompt).not.toContain('You shall use');
   });
 
   it('does NOT pollute extraPrompt with the language hint (it is now structured)', () => {
@@ -321,7 +319,10 @@ describe('buildHopPrompt — language reminder injection', () => {
     // appears in the "Additional instructions:" trailer.
     expect(prompt).toContain('Additional instructions: focus on security');
     expect(prompt).not.toContain("Use the user's selected i18n language");
-    // The concise language line still appears at the top.
-    expect(prompt).toContain('Reply in English.');
+    // The standard language line is last, after user-supplied extras.
+    const line = 'You shall use en to reply and use en to discuss.';
+    expect(prompt).toContain(line);
+    expect(prompt.indexOf(line)).toBeGreaterThan(prompt.indexOf('Additional instructions: focus on security'));
+    expect(prompt.trimEnd().endsWith(line)).toBe(true);
   });
 });

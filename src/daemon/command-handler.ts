@@ -2812,20 +2812,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
       const record = getSession(sessionName);
       const projectDir = record?.projectDir ?? '';
-      // R3 v2 PR-ν — Removed the legacy verbose language-instruction
-      // injection that mutated `p2pExtraPrompt` with a 79-char bilingual
-      // English line. The language hint is now a first-class structured
-      // field: `run.locale` flows through to `buildHopPrompt` /
-      // `buildAdvancedPromptCommon`, which call
-      // `buildP2pLanguageInstruction(locale)` to emit the concise
-      // locale-native one-liner from the i18n dictionary
-      // (`p2p.discussion_language_instruction`). The new line sits right
-      // after `P2P_BASELINE_PROMPT` — a more prominent slot than the
-      // tail-of-prompt extraPrompt position the old line ended up in —
-      // and the autonym (中文 / 日本語 / etc.) ensures the agent reads
-      // the instruction in the same language it's being asked to reply in.
-      // The extraPrompt field is left untouched for user-supplied custom
-      // hints; nothing the daemon writes leaks into it now.
+      // The selected UI locale is a structured field. Prompt builders append
+      // the final language line at the very end, leaving user extraPrompt
+      // untouched and avoiding mid-prompt "reply in ..." hints that get missed.
       const advancedLaunchRequested = hasOldAdvancedLaunchFields(cmd)
         || isPlainRecord((cmd as Record<string, unknown>).p2pWorkflowLaunchEnvelope)
         || isPlainRecord((cmd as Record<string, unknown>).workflowLaunchEnvelope);
