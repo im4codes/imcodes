@@ -7,7 +7,11 @@ import { act, render, screen, fireEvent, cleanup } from '@testing-library/preact
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string, fallback?: string) => fallback ?? key.split('.').pop() ?? key,
+    t: (key: string, fallback?: string | Record<string, unknown>, opts?: Record<string, unknown>) => {
+      const template = typeof fallback === 'string' ? fallback : key.split('.').pop() ?? key;
+      const values = typeof fallback === 'string' ? opts : fallback;
+      return template.replace(/\{\{(\w+)\}\}/g, (_match, name) => String(values?.[name] ?? `{{${name}}}`));
+    },
   }),
 }));
 
@@ -47,19 +51,27 @@ function firePointer(
   init: MouseEventInit & { pointerId: number; pointerType: string },
 ) {
   const win = target.ownerDocument.defaultView ?? window;
-  const event = new win.MouseEvent(type, {
-    bubbles: true,
-    cancelable: true,
-    composed: true,
-    button: init.button ?? 0,
-    clientX: init.clientX,
-    clientY: init.clientY,
-  });
-  Object.defineProperties(event, {
-    pointerId: { value: init.pointerId },
-    pointerType: { value: init.pointerType },
-  });
-  fireEvent(target, event);
+  const eventNames = [
+    type,
+    type === 'pointerdown' ? 'PointerDown' : type === 'pointermove' ? 'PointerMove' : 'PointerUp',
+  ];
+  for (const eventName of eventNames) {
+    const event = new win.MouseEvent(eventName, {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      button: init.button ?? 0,
+      clientX: init.clientX,
+      clientY: init.clientY,
+    });
+    Object.defineProperties(event, {
+      pointerId: { value: init.pointerId, configurable: true },
+      pointerType: { value: init.pointerType, configurable: true },
+    });
+    act(() => {
+      target.dispatchEvent(event);
+    });
+  }
 }
 
 describe('SessionTabs', () => {

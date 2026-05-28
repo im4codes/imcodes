@@ -497,7 +497,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         );
       })}
 
-      <button class="tab-add-btn" onClick={onNewSession} title="New session">＋</button>
+      <button class="tab-add-btn" onClick={onNewSession} title={t('session.new_btn', 'New session')}>＋</button>
 
       {ctx && (() => {
         // Pinned tabs can't be stopped — user must unpin first. Check both the
@@ -510,12 +510,12 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         return (
         <div ref={menuRef} class="tab-context-menu" style={{ left: menuX, top: menuY }}>
           <button class="menu-item" onClick={() => togglePin(ctx.session.name)}>
-            {pinned.has(ctx.session.name) ? '📌 Unpin' : '📌 Pin'}
+            {pinned.has(ctx.session.name) ? t('session.tab_unpin', '📌 Unpin') : t('session.tab_pin', '📌 Pin')}
           </button>
           <div class="menu-divider" />
-          <button class="menu-item" onClick={() => { onRestartProject(ctx.session.project); setCtx(null); }}>↺ Restart</button>
-          <button class="menu-item" onClick={() => { onRestartProject(ctx.session.project, true); setCtx(null); }}>＋ New</button>
-          <button class="menu-item" onClick={() => startRename(ctx.session)}>✎ Rename</button>
+          <button class="menu-item" onClick={() => { onRestartProject(ctx.session.project); setCtx(null); }}>{t('session.restart', '↺ Restart')}</button>
+          <button class="menu-item" onClick={() => { onRestartProject(ctx.session.project, true); setCtx(null); }}>{t('session.new', '+ New')}</button>
+          <button class="menu-item" onClick={() => startRename(ctx.session)}>{t('session.rename', '✎ Rename')}</button>
           {onOpenSessionSettings && (
             <button class="menu-item" onClick={() => { onOpenSessionSettings(ctx.session); setCtx(null); }}>⚙ {t('session.settings', 'Settings')}</button>
           )}
@@ -534,7 +534,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
               setCtx(null);
             }}
           >
-            {projectHasPinned ? `📌 ${t('session.unpin_to_stop')}` : '✕ Stop'}
+            {projectHasPinned ? `📌 ${t('session.unpin_to_stop')}` : t('session.stop', '✕ Stop')}
           </button>
         </div>
         );
@@ -543,12 +543,16 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         <div class="ask-dialog-overlay" onClick={() => { setStopConfirmProject(null); setStopConfirmLevel(0); }}>
           <div class="ask-dialog stop-session-dialog" onClick={(e) => e.stopPropagation()}>
             <div class="stop-session-dialog-icon">⚠</div>
-            <div class="stop-session-dialog-title">Stop main session?</div>
+            <div class="stop-session-dialog-title">{t('session.stop_main_title', 'Stop main session?')}</div>
             <div class="stop-session-dialog-body">
-              <strong>{stopConfirmProject}</strong> is a main session. Stopping it will terminate all its tmux processes. This cannot be undone.
+              {t(
+                'session.stop_main_body',
+                '{{project}} is a main session. Stopping it will terminate all its tmux processes. This cannot be undone.',
+                { project: stopConfirmProject },
+              )}
             </div>
             <div class="ask-actions">
-              <button class="ask-btn-cancel" onClick={() => { setStopConfirmProject(null); setStopConfirmLevel(0); }}>Cancel</button>
+              <button class="ask-btn-cancel" onClick={() => { setStopConfirmProject(null); setStopConfirmLevel(0); }}>{t('common.cancel', 'Cancel')}</button>
               <button
                 class={`ask-btn-submit stop-session-confirm-btn${stopConfirmLevel >= 1 ? ' menu-item-danger' : ''}`}
                 onClick={() => {
@@ -561,9 +565,9 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                   setStopConfirmLevel(0);
                 }}
               >
-                {stopConfirmLevel >= 2 ? `⚠ REALLY stop ${stopConfirmProject}?`
-                  : stopConfirmLevel === 1 ? 'Confirm stop?'
-                  : 'Stop session'}
+                {stopConfirmLevel >= 2 ? t('session.really_stop_project', '⚠ REALLY stop {{project}}?', { project: stopConfirmProject })
+                  : stopConfirmLevel === 1 ? t('session.confirm_stop', 'Confirm stop?')
+                  : t('session.stop_session', 'Stop session')}
               </button>
             </div>
           </div>
