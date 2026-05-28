@@ -216,7 +216,7 @@ describe('MaterializationCoordinator', () => {
       backupContextModel: 'qwen3-coder-plus',
       backupContextPreset: undefined,
       backupContextSdk: undefined,
-      enablePersonalMemorySync: false,
+      enablePersonalMemorySync: true,
       materializationMinIntervalMs: undefined,
       memoryRecallMinScore: 0.4,
       memoryScoringWeights: {
