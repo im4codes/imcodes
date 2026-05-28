@@ -72,6 +72,8 @@ vi.mock('react-i18next', () => ({
         return 'Paste is too large for inline input here. Upload it as a file instead.';
       }
       if (key === 'session.stop_plain') return 'Stop';
+      if (key === 'session.tab_pin') return 'Pin';
+      if (key === 'session.tab_unpin') return 'Unpin';
       if (key === 'session.clone.menu') return 'Copy session group';
       if (key === 'session.supervision.quickLabel') return 'Auto';
       if (key === 'session.supervision.quickTitle') return 'Auto mode';
@@ -491,6 +493,68 @@ afterEach(() => {
 
     expect(screen.queryByTitle('actions')).toBeNull();
     expect(screen.queryByText('Copy session group')).toBeNull();
+  });
+
+  it('pins and unpins the active session from the session actions menu', () => {
+    const onToggleSessionPin = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        onToggleSessionPin={onToggleSessionPin}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    fireEvent.click(screen.getByText('Pin'));
+    expect(onToggleSessionPin).toHaveBeenCalledWith('deck_my-project_brain');
+    expect(screen.queryByText('Pin')).toBeNull();
+
+    cleanup();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        sessionPinned
+        onToggleSessionPin={onToggleSessionPin}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    fireEvent.click(screen.getByText('Unpin'));
+    expect(onToggleSessionPin).toHaveBeenLastCalledWith('deck_my-project_brain');
+  });
+
+  it('hides the pin action from sub-session and compact action menus', () => {
+    const onToggleSessionPin = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        subSessionId="abc"
+        quickData={makeQuickData() as any}
+        onToggleSessionPin={onToggleSessionPin}
+      />,
+    );
+
+    fireEvent.click(screen.getByTitle('actions'));
+    expect(screen.queryByText('Pin')).toBeNull();
+
+    cleanup();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        compact
+        onToggleSessionPin={onToggleSessionPin}
+      />,
+    );
+
+    expect(screen.queryByTitle('actions')).toBeNull();
+    expect(screen.queryByText('Pin')).toBeNull();
   });
 
   it('keeps openspec through p2p settings controls visible in compact card mode', () => {

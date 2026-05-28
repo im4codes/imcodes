@@ -1097,6 +1097,14 @@ export function App() {
     0,
   );
   const pinnedTabs = useMemo(() => new Set(pinnedTabsArr), [pinnedTabsArr]);
+  const togglePinnedTab = useCallback((name: string) => {
+    setPinnedTabsArr((prev) => {
+      const set = new Set(prev);
+      if (set.has(name)) set.delete(name);
+      else set.add(name);
+      return [...set];
+    });
+  }, [setPinnedTabsArr]);
   const [newUserGuidePref, setNewUserGuidePref] = useSyncedPreference<NewUserGuidePref>('new_user_guide', DEFAULT_NEW_USER_GUIDE_PREF, 0);
   const [teamDiscussionGuidePref, setTeamDiscussionGuidePref] = useSyncedPreference<TeamDiscussionGuidePref>('team_discussion_guide', DEFAULT_TEAM_DISCUSSION_GUIDE_PREF, 0);
   const [showNewUserGuidePrompt, setShowNewUserGuidePrompt] = useState(false);
@@ -4200,6 +4208,8 @@ export function App() {
                 onStopProject={handleStopProject}
                 onRenameSession={() => setRenameRequest(s.name)}
                 onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null })}
+                sessionPinned={pinnedTabs.has(s.name)}
+                onToggleSessionPin={togglePinnedTab}
                 onViewRepo={() => {
                   setActiveSession(s.name);
                   openRepoPage({ sessionId: s.name, projectDir: s.projectDir, initialTab: 'branches' });

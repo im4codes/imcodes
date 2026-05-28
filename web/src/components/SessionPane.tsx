@@ -76,6 +76,8 @@ export interface SessionPaneProps {
   onStopProject?: (project: string) => void;
   onRenameSession?: () => void;
   onSettings?: () => void;
+  sessionPinned?: boolean;
+  onToggleSessionPin?: (sessionName: string) => void;
   onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   /** Called after shortcut/action button clicks — use to restore xterm focus. */
@@ -115,6 +117,8 @@ export function SessionPane({
   onStopProject,
   onRenameSession,
   onSettings,
+  sessionPinned,
+  onToggleSessionPin,
   onViewRepo,
   onTransportConfigSaved,
   onAfterAction,
@@ -425,6 +429,8 @@ export function SessionPane({
           onStopProject={onStopProject}
           onRenameSession={onRenameSession}
           onSettings={onSettings}
+          sessionPinned={sessionPinned}
+          onToggleSessionPin={onToggleSessionPin}
           onTransportConfigSaved={onTransportConfigSaved}
           sessionDisplayName={session.label ? formatLabel(session.label) : (session.project ?? null)}
           quickData={quickData}

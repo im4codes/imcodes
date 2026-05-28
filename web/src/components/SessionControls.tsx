@@ -76,6 +76,10 @@ interface Props {
   onRenameSession?: () => void;
   /** Called when Settings is selected in the menu. */
   onSettings?: () => void;
+  /** Whether the active session tab is pinned. */
+  sessionPinned?: boolean;
+  /** Called when the active session should be pinned/unpinned from the menu. */
+  onToggleSessionPin?: (sessionName: string) => void;
   /** Sub-session id when the active control surface belongs to a sub-session. */
   subSessionId?: string;
   /** Display name (rename label) for the active session — shown in placeholder. */
@@ -607,7 +611,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -933,6 +937,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     && activeSession.role === 'brain'
     && !activeSession.name.startsWith('deck_sub_')
     && activeSession.userCreated !== false;
+  const canShowPinAction = !!activeSession
+    && !subSessionId
+    && !compact
+    && !!onToggleSessionPin;
   // Input only disabled when there's no session at all (can type while disconnected)
   const inputDisabled = !hasSession;
   // Send/action buttons disabled when disconnected or no session
@@ -3889,6 +3897,22 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           </button>
           {menuOpen && (
             <div class="menu-dropdown">
+              {canShowPinAction && (
+                <>
+                  <button
+                    class="menu-item"
+                    onClick={() => {
+                      if (!activeSession) return;
+                      onToggleSessionPin?.(activeSession.name);
+                      setMenuOpen(false);
+                      resetConfirm();
+                    }}
+                  >
+                    {sessionPinned ? t('session.tab_unpin') : t('session.tab_pin')}
+                  </button>
+                  <div class="menu-divider" />
+                </>
+              )}
               <button
                 class={`menu-item ${confirm === 'restart' ? (confirmLevel >= 2 ? 'menu-item-danger' : 'menu-item-warn') : ''}`}
                 onClick={() => handleMenuAction('restart')}
