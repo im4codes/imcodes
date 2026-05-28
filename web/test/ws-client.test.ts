@@ -294,6 +294,30 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
+  it('jitters the reconnect backoff so weak-network drops do not reconnect in lockstep', async () => {
+    vi.useFakeTimers();
+    // First attempt: ceiling = min(1000 * 2^0, 30000) = 1000ms. Equal jitter
+    // picks a delay in [ceiling/2, ceiling]; Math.random()=0 → the 500ms floor.
+    // The un-jittered backoff fired at a fixed 1000ms, so a reconnect that fires
+    // at 500ms (and not before) proves the jitter is applied.
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const internal = client as unknown as { scheduleReconnect: () => void };
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+
+    internal.scheduleReconnect();
+
+    await vi.advanceTimersByTimeAsync(499);
+    expect(fetchMock).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    randomSpy.mockRestore();
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
   it('reconnectNow(false) closes a stale CONNECTING socket before opening another one', async () => {
     vi.useFakeTimers();
     const client = new WsClient('http://localhost:8787', 'srv-1');

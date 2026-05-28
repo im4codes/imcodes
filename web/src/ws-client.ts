@@ -1702,7 +1702,12 @@ export class WsClient {
   private scheduleReconnect(): void {
     if (this._destroyed) return;
     if (this.reconnectTimer) return;
-    const delay = Math.min(RECONNECT_BASE_MS * 2 ** this.reconnectAttempt, RECONNECT_MAX_MS);
+    const ceiling = Math.min(RECONNECT_BASE_MS * 2 ** this.reconnectAttempt, RECONNECT_MAX_MS);
+    // Equal jitter: pick a delay in [ceiling/2, ceiling]. Without jitter, many
+    // tabs/devices dropped on the same weak-network blip reconnect in lockstep
+    // and herd the server, worsening the very congestion that caused the drop.
+    // Decorrelating the retries spreads the resubscribe load over the window.
+    const delay = ceiling / 2 + Math.random() * (ceiling / 2);
     this.reconnectAttempt++;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;

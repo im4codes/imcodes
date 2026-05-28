@@ -70,8 +70,55 @@ sharedDb.open().catch(() => {});
 const eventsCache = new Map<string, TimelineEvent[]>();
 const eventsCacheAccess = new Map<string, number>();
 const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
-const lastHttpBackfillOkAt = new Map<string, number>();
+// Per-cacheKey wall-clock of the last *successful* HTTP backfill (response
+// received, not a timeout/null). Two consumers:
+//   1. The activation/mount cooldown — coalesces the focus/visibility/tap burst
+//      so the same session isn't re-fetched on every tick (timeouts/nulls don't
+//      write here, so a failed read never suppresses the next retry).
+//   2. The foreground watchdog — treats any fresh response (even a no-gap empty
+//      one) as "recently responded, stop re-probing for now". This is NOT a
+//      verified-contiguous signal (that is cycle-2 Layer B); it only damps the
+//      idle/responding poll rate.
+const lastHttpBackfillResponseAt = new Map<string, number>();
 const MOUNT_BACKFILL_COOLDOWN_MS = 60_000;
+/** Scenario-based HTTP timeout for catch-up backfills. The keystone weak-network
+ *  fix was lifting the 2.5s default (which aborted before a slow daemon could
+ *  answer on a weak link). But a flat 10s also wastes the everyday silent path's
+ *  failure-detection budget (round-4 audit N2), so the budget now scales with how
+ *  user-visible the recovery is. All values stay below the server relay budget
+ *  (`server/src/ws/bridge.ts` HTTP_TIMELINE_TIMEOUT_MS = 15s). */
+const SILENT_BACKFILL_TIMEOUT_MS = 6_000;     // activation / watchdog background probes
+const MOUNT_BACKFILL_TIMEOUT_MS = 8_000;      // first-open bootstrap
+const RECOVERY_BACKFILL_TIMEOUT_MS = 10_000;  // visible resume / reconnect recovery
+const FORCE_BACKFILL_TIMEOUT_MS = 12_000;     // manual ↻ — user is waiting; cap < 15s
+/** Pick the HTTP timeout from the fire reason encoded in the existing opts:
+ *  force (manual) > bootstrap (mount) > visible recovery > silent background. */
+function resolveBackfillTimeoutMs(opts?: { phase?: 'bootstrap' | 'refresh'; visible?: boolean; force?: boolean }): number {
+  if (opts?.force) return FORCE_BACKFILL_TIMEOUT_MS;
+  if (opts?.phase === 'bootstrap') return MOUNT_BACKFILL_TIMEOUT_MS;
+  if (opts?.visible) return RECOVERY_BACKFILL_TIMEOUT_MS;
+  return SILENT_BACKFILL_TIMEOUT_MS;
+}
+/** Foreground staleness watchdog. A session the user is looking at can silently
+ *  miss a CONTENT `timeline.event` while the pipe still looks alive (no error,
+ *  no reconnect, no focus tick) — the "前台停留弱网不自动同步" complaint. When no
+ *  content event AND no HTTP response has landed within WATCHDOG_STALE_MS, the
+ *  watchdog fires one silent catch-up. NOTE: `lastHttpBackfillResponseAt` only
+ *  means "an HTTP backfill returned (non-null)", NOT "the timeline is verified
+ *  caught up" — a verified/contiguous cursor is cycle-2 Layer B, not yet here. */
+const WATCHDOG_INTERVAL_MS = 30_000;
+const WATCHDOG_STALE_MS = 45_000;
+/** When the watchdog keeps finding the session stale (link down / persistent
+ *  failure so `lastHttpBackfillResponseAt` never advances), space successive
+ *  probes out exponentially instead of firing every WATCHDOG_INTERVAL_MS. */
+const WATCHDOG_BACKOFF_BASE_MS = 30_000;
+const WATCHDOG_BACKOFF_MAX_MS = 120_000;
+const WATCHDOG_JITTER_MS = 8_000;
+/** Per-cacheKey watchdog scheduling state. `nextAllowedAt` gates BOTH the
+ *  exponential backoff AND dedup across multiple hook mounts of the same session
+ *  (they share the cacheKey entry, so only one probe fires per window — round-4
+ *  audit R1/A3). Reset when the session goes fresh again. */
+const watchdogStateByCacheKey = new Map<string, { nextAllowedAt: number; streak: number }>();
 const RESUME_RESET_COOLDOWN_AFTER_MS = 60_000;
 /**
  * Cooldown for "user signaled they want fresh data" refreshes (activation
@@ -88,7 +135,7 @@ const RESUME_RESET_COOLDOWN_AFTER_MS = 60_000;
  *
  * `requestActiveTimelineRefresh({ resetCooldowns: true })` (called on
  * confirmed app-resume from background) explicitly clears
- * `lastHttpBackfillOkAt`, so a real foreground transition still bypasses
+ * `lastHttpBackfillResponseAt`, so a real foreground transition still bypasses
  * this gate.
  */
 const ACTIVE_REFRESH_COOLDOWN_MS = 15_000;
@@ -96,7 +143,9 @@ const RECONNECT_REFRESH_COOLDOWN_MS = 15_000;
 const FORWARD_HISTORY_TIMEOUT_MS = 8_000;
 
 function resetBackfillCooldowns(): void {
-  lastHttpBackfillOkAt.clear();
+  lastHttpBackfillResponseAt.clear();
+  // A genuine resume should let the watchdog probe immediately again.
+  watchdogStateByCacheKey.clear();
 }
 
 /** Diagnostic logging for the backfill chain. Off by default; flip
@@ -651,7 +700,8 @@ export function __resetTimelineCacheForTests(): void {
   eventsCache.clear();
   eventsCacheAccess.clear();
   cacheListeners.clear();
-  lastHttpBackfillOkAt.clear();
+  lastHttpBackfillResponseAt.clear();
+  watchdogStateByCacheKey.clear();
 }
 
 export function __resetBackfillCooldownsForTests(): void {
@@ -2193,6 +2243,11 @@ export function useTimeline(
   isActiveSessionRef.current = isActiveSession;
   const isVisibleRef = useRef(isVisible);
   isVisibleRef.current = isVisible;
+  // Wall-clock of the last inbound live `timeline.event` for THIS session.
+  // The foreground watchdog uses it (together with the last verified backfill)
+  // to detect a silently-stalled stream — a live event the WS never delivered
+  // with no error/reconnect/focus signal to re-trigger a catch-up.
+  const lastTimelineEventAtRef = useRef(0);
 
   // Retry schedule for transient HTTP backfill failures (daemon briefly
   // offline at activation, pod miss during deploy, network blip on resume).
@@ -2217,8 +2272,8 @@ export function useTimeline(
     // their history through HTTP backfill. Without this, the WS-side
     // request (also force-through'd) is the only data source, and if WS
     // is mid-reconnect the user sees a permanently empty pane.
-    if (disableHistory || !serverId || !sessionId || (!isActiveSessionRef.current && !opts?.force)) {
-      backfillDebug('fireHttpBackfill: gated', { disableHistory, isActiveSession: isActiveSessionRef.current, hasServerId: !!serverId, hasSessionId: !!sessionId, sessionId, force: opts?.force });
+    if (disableHistory || !serverId || !sessionId || (!isActiveSessionRef.current && !isVisibleRef.current && !opts?.force)) {
+      backfillDebug('fireHttpBackfill: gated', { disableHistory, isActiveSession: isActiveSessionRef.current, isVisible: isVisibleRef.current, hasServerId: !!serverId, hasSessionId: !!sessionId, sessionId, force: opts?.force });
       return;
     }
     const cooldownMs = opts?.cooldownMs ?? 0;
@@ -2253,7 +2308,7 @@ export function useTimeline(
       httpBackfillTimerDueAtRef.current = 0;
       if (cacheKeyRef.current !== backfillCacheKey) return;
       if (backfillCacheKey && cooldownMs > 0) {
-        const lastOk = lastHttpBackfillOkAt.get(backfillCacheKey);
+        const lastOk = lastHttpBackfillResponseAt.get(backfillCacheKey);
         if (lastOk !== undefined && Date.now() - lastOk < cooldownMs) {
           backfillDebug('fireHttpBackfill: cooldown skip', { sessionId: backfillSessionId, lastOk, cooldownMs });
           if (visible) updateHistoryStep('http', 'done', phase);
@@ -2273,6 +2328,7 @@ export function useTimeline(
       void Promise.resolve(fetchTimelineHistoryHttp(serverId, backfillSessionId, {
         afterTs,
         limit: MAX_MEMORY_EVENTS,
+        timeoutMs: resolveBackfillTimeoutMs(opts),
       })).then((result) => {
         if (!result) {
           // Transient failure (daemon offline / pod miss / network blip).
@@ -2289,16 +2345,20 @@ export function useTimeline(
           }
           return;
         }
-        if (backfillCacheKey) lastHttpBackfillOkAt.set(backfillCacheKey, Date.now());
-        if (result.events.length === 0) {
+        const recovered = result.events.filter(
+          (ev): ev is TimelineEvent => !!ev && typeof ev === 'object' && typeof (ev as TimelineEvent).eventId === 'string',
+        );
+        // Record that an HTTP backfill RESPONDED (non-null). This is NOT proof
+        // the timeline is verified-contiguous (that needs the Layer B cursor) —
+        // it only feeds the activation/mount cooldown and the watchdog staleness
+        // baseline so an idle/responding session stops re-probing. Timeouts and
+        // nulls return earlier and never stamp, so a failing link keeps retrying.
+        if (backfillCacheKey) lastHttpBackfillResponseAt.set(backfillCacheKey, Date.now());
+        if (recovered.length === 0) {
           backfillDebug('fireHttpBackfill: no new events', { sessionId: backfillSessionId });
           return;
         }
         if (cacheKeyRef.current !== backfillCacheKey) return;
-        const recovered = result.events.filter(
-          (ev): ev is TimelineEvent => !!ev && typeof ev === 'object' && typeof (ev as TimelineEvent).eventId === 'string',
-        );
-        if (recovered.length === 0) return;
         backfillDebug('fireHttpBackfill: merging', { sessionId: backfillSessionId, count: recovered.length });
         mergeEvents(recovered);
         for (const recoveredEvent of recovered) {
@@ -2410,6 +2470,59 @@ export function useTimeline(
     }
   }, [isActiveSession, disableHistory, sessionId]);
 
+  // ── Foreground staleness watchdog ───────────────────────────────────────
+  // A session the user is actively looking at can silently miss a live
+  // `timeline.event`: the WS delivered nothing, threw no error, never
+  // reconnected, and no focus/visibility tick fired — so none of the existing
+  // catch-up triggers run and the chat just sits there stale. This is the core
+  // "弱网前台停留不自动同步" complaint. Periodically, while foreground and
+  // active/visible, check whether the stream has gone quiet beyond
+  // WATCHDOG_STALE_MS (no content event AND no HTTP response) and, if so, fire
+  // ONE silent catch-up. Any non-null HTTP response advances the staleness
+  // baseline via `lastHttpBackfillResponseAt` (NOT a verified-contiguous signal),
+  // so a genuinely idle/responding session self-throttles instead of probing
+  // every tick; per-cacheKey backoff bounds the retry rate while the link is down.
+  useEffect(() => {
+    if (disableHistory || typeof window === 'undefined') return;
+    const tick = (): void => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      if (!isActiveSessionRef.current && !isVisibleRef.current) return;
+      if (!serverId || !sessionId) return;
+      // HTTP backfill is independent of the socket, but if the WS is down the
+      // reconnect path already owns recovery; the watchdog targets the
+      // "connected but silently stalled" case.
+      if (!ws?.connected) return;
+      const key = cacheKeyRef.current;
+      if (!key) return;
+      const okAt = lastHttpBackfillResponseAt.get(key) ?? 0;
+      const lastSignal = Math.max(lastTimelineEventAtRef.current, okAt);
+      const now = Date.now();
+      if (lastSignal > 0 && now - lastSignal < WATCHDOG_STALE_MS) {
+        // Fresh again → drop any backoff so the next stale episode probes promptly.
+        watchdogStateByCacheKey.delete(key);
+        return;
+      }
+      // Stale. The per-cacheKey gate (a) dedups multiple mounts of the same
+      // session so only ONE probe fires per window (round-4 R1/A3), and (b) backs
+      // the retry off exponentially while the link stays down so we don't probe
+      // every WATCHDOG_INTERVAL_MS (round-4 N4/A4).
+      const prev = watchdogStateByCacheKey.get(key);
+      if (prev && now < prev.nextAllowedAt) return;
+      const streak = prev ? prev.streak : 0;
+      const spacing = Math.min(WATCHDOG_BACKOFF_BASE_MS * 2 ** streak, WATCHDOG_BACKOFF_MAX_MS)
+        + Math.random() * WATCHDOG_JITTER_MS;
+      watchdogStateByCacheKey.set(key, { nextAllowedAt: now + spacing, streak: Math.min(streak + 1, 2) });
+      backfillDebug('watchdog: stale → silent catch-up', { sessionId, lastSignal, streak });
+      // Silent (visible:false), cooldownMs:0 so the activation/mount cooldown
+      // can't suppress this recovery. A silent fire's scenario timeout is ~6s and
+      // the gate above keeps the next probe ≥30s away, so each probe's retry
+      // chain (~21s) finishes well before another is allowed (no overlap).
+      fireHttpBackfillRef.current(0, { phase: 'refresh', cooldownMs: 0 });
+    };
+    const id = window.setInterval(tick, WATCHDOG_INTERVAL_MS);
+    return () => window.clearInterval(id);
+  }, [disableHistory, serverId, sessionId, ws]);
+
   // Listen for WS messages
   useEffect(() => {
     if (disableHistory || !ws || !sessionId) return;
@@ -2419,6 +2532,16 @@ export function useTimeline(
       if (msg.type === TIMELINE_MESSAGES.EVENT) {
         const event = msg.event;
         if (event.sessionId !== sessionId) return;
+        // Watchdog liveness = CONTENT freshness, not pipe-alive. `session.state`
+        // heartbeats from a running agent must NOT reset liveness, or a dropped
+        // `assistant.text`/`tool.*` event stays invisible to the watchdog while
+        // state pings keep the window "fresh" (round-4 audit S1 / 新框定#1). A
+        // content-quiet session probing every stale-window is benign (returns
+        // empty + backs off). The true fix for ordered-gap detection ("missed
+        // A/B, then received C") is the Layer B verified cursor.
+        if (event.type !== 'session.state') {
+          lastTimelineEventAtRef.current = Date.now();
+        }
         if (event.type === 'session.state' && event.payload?.state === 'queued') {
           reconcileQueuedOptimisticMessages(event.payload.pendingMessageEntries, event.payload.pendingMessages);
         }
