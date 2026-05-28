@@ -1309,8 +1309,8 @@
     },
     "team_discussion_guide": {
       "title": "Aquí está el modo de discusión Team",
-      "body_1": "Usa el modo de discusión para problemas complejos, auditorías OpenSpec, revisiones de código y decisiones de arquitectura.",
-      "body_2": "Modelos distintos se complementan y se cuestionan entre sí, y suelen revelar puntos ciegos que un solo modelo no ve.",
+      "body_1": "El modo de discusión no es solo para código: sirve para documentos complejos, propuestas, auditorías OpenSpec, revisiones de código y decisiones de arquitectura.",
+      "body_2": "Modelos distintos se complementan y se cuestionan entre sí, y suelen producir resultados más rigurosos que un solo modelo.",
       "body_3": "Escribe primero lo que quieres discutir, elige un modo de discusión y empieza. Para problemas difíciles, añade rondas para reforzar la conclusión.",
       "dismiss": "Entendido"
     },
