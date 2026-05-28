@@ -255,6 +255,12 @@ type PendingRequest = {
   reject: (error: Error) => void;
 };
 
+type GeneratedImageTrackingSnapshot = {
+  dir: string;
+  knownPaths: Set<string>;
+  startedAtMs: number;
+};
+
 export interface CodexDiscoveredModel {
   id: string;
   name?: string;
@@ -307,7 +313,8 @@ interface CodexSdkSessionState {
   lastStatusSignature: string | null;
   pendingSessionSystemTextUpdate?: string;
   pendingSessionSystemTextUpdateTurnId?: string;
-  generatedImageKnownPaths: Set<string>;
+  completedCompactTurnIds: Set<string>;
+  generatedImageTracking: GeneratedImageTrackingSnapshot | null;
   generatedImagePaths: string[];
 }
 
@@ -664,7 +671,8 @@ export class CodexSdkProvider implements TransportProvider {
       lastStatusSignature: null,
       pendingSessionSystemTextUpdate: undefined,
       pendingSessionSystemTextUpdateTurnId: undefined,
-      generatedImageKnownPaths: new Set(),
+      completedCompactTurnIds: existing?.completedCompactTurnIds ?? new Set(),
+      generatedImageTracking: null,
       generatedImagePaths: [],
     });
     if (config.resumeId || config.effort) this.emitSessionInfo(routeId, { ...(config.resumeId ? { resumeId: config.resumeId } : {}), ...(config.effort ? { effort: config.effort } : {}) });
@@ -771,7 +779,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearCancelTimer(state);
     state.lastUsage = undefined;
     state.lastStatusSignature = null;
-    state.generatedImageKnownPaths = new Set();
+    state.generatedImageTracking = null;
     state.generatedImagePaths = [];
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
     if (this.isCompactCommand(payload)) {
@@ -1195,9 +1203,7 @@ export class CodexSdkProvider implements TransportProvider {
     return resolve(getCodexHome(this.codexGeneratedImageEnv(state)), 'generated_images', state.threadId);
   }
 
-  private async listGeneratedImagePaths(state: CodexSdkSessionState): Promise<string[]> {
-    const dir = this.codexGeneratedImageDir(state);
-    if (!dir) return [];
+  private async listGeneratedImagePathsInDir(dir: string): Promise<string[]> {
     try {
       const entries = await readdir(dir, { withFileTypes: true });
       return entries
@@ -1210,23 +1216,43 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async prepareGeneratedImageTracking(sessionId: string, state: CodexSdkSessionState): Promise<void> {
-    const existingPaths = await this.listGeneratedImagePaths(state);
-    state.generatedImageKnownPaths = new Set(existingPaths);
+    const dir = this.codexGeneratedImageDir(state);
+    if (!dir) {
+      state.generatedImageTracking = null;
+      state.generatedImagePaths = [];
+      return;
+    }
+    const startedAtMs = Date.now();
+    const existingPaths = await this.listGeneratedImagePathsInDir(dir);
+    state.generatedImageTracking = {
+      dir,
+      knownPaths: new Set(existingPaths),
+      startedAtMs,
+    };
     state.generatedImagePaths = [];
     logger.debug({
       provider: this.id,
       sessionId,
       threadId: state.threadId,
+      generatedImageDir: dir,
       knownGeneratedImages: existingPaths.length,
     }, 'Codex SDK prepared generated image path tracking');
   }
 
   private async detectNewGeneratedImagePaths(
-    state: CodexSdkSessionState,
-    knownPaths: ReadonlySet<string>,
+    snapshot: GeneratedImageTrackingSnapshot | null,
   ): Promise<string[]> {
-    const paths = await this.listGeneratedImagePaths(state);
-    return paths.filter((path) => !knownPaths.has(path));
+    if (!snapshot) return [];
+    const paths = await this.listGeneratedImagePathsInDir(snapshot.dir);
+    const freshPaths: string[] = [];
+    for (const path of paths) {
+      if (snapshot.knownPaths.has(path)) continue;
+      const fileStat = await stat(path).catch(() => null);
+      if (!fileStat) continue;
+      if (fileStat.mtimeMs < snapshot.startedAtMs) continue;
+      freshPaths.push(path);
+    }
+    return freshPaths;
   }
 
   private handleLine(line: string): void {
@@ -1404,6 +1430,11 @@ export class CodexSdkProvider implements TransportProvider {
       if (!sessionId || !state) return;
       const turn = params.turn ?? {};
       const status = turn.status;
+      const turnId = readParamTurnId(params);
+
+      if (turnId && state.completedCompactTurnIds.has(turnId)) {
+        return;
+      }
 
       if (status === 'failed') {
         this.clearCancelTimer(state);
@@ -1459,16 +1490,17 @@ export class CodexSdkProvider implements TransportProvider {
 
       this.clearCancelTimer(state);
       this.clearStatus(sessionId, state);
-      this.commitPendingSessionSystemTextUpdate(state, typeof turn.id === 'string' ? turn.id : undefined);
+      this.commitPendingSessionSystemTextUpdate(state, turnId);
       const messageId = state.currentMessageId ?? `${sessionId}:agent-message`;
       const currentText = state.currentText;
       const usage = state.lastUsage;
       const model = state.model;
       const resumeId = state.threadId;
-      const knownGeneratedImagePaths = new Set(state.generatedImageKnownPaths);
+      const generatedImageTracking = state.generatedImageTracking;
       const alreadyDetectedImagePaths = [...state.generatedImagePaths];
       state.runningTurnId = undefined;
-      const newlyDetectedImagePaths = await this.detectNewGeneratedImagePaths(state, knownGeneratedImagePaths);
+      state.generatedImageTracking = null;
+      const newlyDetectedImagePaths = await this.detectNewGeneratedImagePaths(generatedImageTracking);
       const generatedImagePaths = [
         ...alreadyDetectedImagePaths,
         ...newlyDetectedImagePaths.filter((path) => !alreadyDetectedImagePaths.includes(path)),
@@ -1539,6 +1571,8 @@ export class CodexSdkProvider implements TransportProvider {
     state.runningCompact = false;
     state.runningTurnId = undefined;
     state.compactObserved = false;
+    state.generatedImageTracking = null;
+    this.rememberCompletedCompactTurn(state, turnId);
     this.clearPendingSessionSystemTextUpdate(state);
     state.currentMessageId = null;
     state.currentText = '';
@@ -1559,6 +1593,14 @@ export class CodexSdkProvider implements TransportProvider {
       },
     };
     for (const cb of this.completeCallbacks) cb(sessionId, completed);
+  }
+
+  private rememberCompletedCompactTurn(state: CodexSdkSessionState, turnId?: string): void {
+    if (!turnId) return;
+    state.completedCompactTurnIds.add(turnId);
+    if (state.completedCompactTurnIds.size <= 20) return;
+    const oldest = state.completedCompactTurnIds.values().next().value;
+    if (oldest) state.completedCompactTurnIds.delete(oldest);
   }
 
   /**
