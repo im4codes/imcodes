@@ -1475,34 +1475,26 @@ export function App() {
 
   const toggleSubSession = useCallback((id: string) => {
     const mobile = isMobileRef.current;
-    const wasPinned = !mobile && isSubSessionPinnedPanel(id);
-    let willOpen = false;
+    clearSubSessionMaximized(id);
 
-    setOpenSubIds((prev) => {
-      clearSubSessionMaximized(id);
+    if (mobile) {
+      const next = openSubIdsRef.current.has(id) ? new Set<string>() : new Set([id]);
+      setOpenSubIds(next);
+      return;
+    }
 
-      if (mobile) {
-        if (prev.has(id)) return new Set();
-        willOpen = true;
-        return new Set([id]);
-      }
-
-      const next = new Set(prev);
-      if (next.has(id) && !wasPinned) {
-        next.delete(id);
-      } else {
-        next.add(id);
-        willOpen = true;
-      }
-      return next;
-    });
-
-    if (mobile) return;
+    const wasPinned = isSubSessionPinnedPanel(id);
+    const next = new Set(openSubIdsRef.current);
+    const willOpen = !next.has(id) || wasPinned;
 
     if (willOpen) {
+      next.add(id);
+      setOpenSubIds(next);
       if (wasPinned) unpinSubSessionPanel(id);
       bringSubToFront(id);
     } else {
+      next.delete(id);
+      setOpenSubIds(next);
       removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
     }
   }, [
