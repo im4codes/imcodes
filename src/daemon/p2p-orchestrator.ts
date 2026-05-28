@@ -337,7 +337,9 @@ export function buildPostSummaryExecutionPrompt(
   const basePrompt = template
     .replaceAll('{{discussionFile}}', run.contextFilePath)
     .replaceAll('{{request}}', run.userText);
-  if (!markerSpec) return basePrompt;
+  const langLine = buildP2pLanguageInstruction(run.locale);
+  const appendLanguageInstruction = (prompt: string) => langLine ? `${prompt}\n\n${langLine}` : prompt;
+  if (!markerSpec) return appendLanguageInstruction(basePrompt);
 
   const successMarker = stringifyP2pExecutionMarker(buildP2pExecutionMarker(markerSpec, 'completed')).trimEnd();
   const failureMarker = stringifyP2pExecutionMarker({
@@ -351,7 +353,7 @@ export function buildPostSummaryExecutionPrompt(
     ? `\nThis is retry attempt ${options.attempt}; the required marker has not been observed yet.`
     : '';
 
-  return `${basePrompt}
+  return appendLanguageInstruction(`${basePrompt}
 
 Execution proof required before the P2P workflow can continue:
 - After you have directly executed the original request, write this exact JSON marker to: ${markerSpec.markerPath}
@@ -367,7 +369,7 @@ ${successMarker}
 Failed marker:
 \`\`\`json
 ${failureMarker}
-\`\`\``;
+\`\`\``);
 }
 
 const P2P_SUPPORTED_I18N_LOCALES = new Set(['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']);

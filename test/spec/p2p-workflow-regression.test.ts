@@ -2661,6 +2661,15 @@ describe('p2p-workflow reverse-regression', () => {
       'buildHopPrompt must append buildP2pLanguageInstruction(run.locale) at the end',
     ).toBe(true);
 
+    const postSummaryAnchor = orchestrator.text.indexOf('export function buildPostSummaryExecutionPrompt');
+    expect(postSummaryAnchor, 'buildPostSummaryExecutionPrompt must exist').toBeGreaterThan(0);
+    const postSummaryWindow = orchestrator.text.slice(postSummaryAnchor, postSummaryAnchor + 2500);
+    expect(
+      /buildP2pLanguageInstruction\(run\.locale\)[\s\S]{0,250}appendLanguageInstruction/.test(postSummaryWindow)
+        && /return\s+appendLanguageInstruction\(`\$\{basePrompt\}/.test(postSummaryWindow),
+      'buildPostSummaryExecutionPrompt must append buildP2pLanguageInstruction(run.locale) at the final prompt end',
+    ).toBe(true);
+
     // (3) The legacy verbose injection in command-handler is GONE.
     const cmd = read('src/daemon/command-handler.ts');
     expect(

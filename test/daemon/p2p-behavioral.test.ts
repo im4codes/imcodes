@@ -198,11 +198,13 @@ describe('buildHopPrompt — production function', () => {
     expect(prompt).toContain('/tmp/test-discussion.md');
     expect(prompt).toContain('根据讨论结果真正完成这个需求');
     expect(prompt).toContain('不要再次停留在讨论总结');
+    expect(prompt.trimEnd().endsWith('You shall use zh-CN to reply and use zh-CN to discuss.')).toBe(true);
   });
 
   it('adds marker-file execution proof instructions when a marker spec is supplied', () => {
     const prompt = buildPostSummaryExecutionPrompt(makeRun({
       contextFilePath: '/tmp/test-discussion.md',
+      locale: 'en',
       userText: 'implement the requested feature',
     }), {
       runId: 'run_marker',
@@ -223,6 +225,7 @@ describe('buildHopPrompt — production function', () => {
     expect(prompt).toContain('"nonce": "nonce_marker"');
     expect(prompt).toContain('idling without the marker does not count as success');
     expect(prompt).toContain('retry attempt 2');
+    expect(prompt.trimEnd().endsWith('You shall use en to reply and use en to discuss.')).toBe(true);
   });
 });
 
