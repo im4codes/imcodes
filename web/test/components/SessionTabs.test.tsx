@@ -174,6 +174,101 @@ describe('SessionTabs', () => {
     expect(onSelect).toHaveBeenCalledWith('session_w2');
   });
 
+  it('selects a pinned tab on touch pointer-up even if Android suppresses the click', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }, { name: 'session_w2' }, { name: 'session_w3' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={onSelect}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set(['session_w2'])}
+      />,
+    );
+
+    const pinnedTab = screen.getAllByRole('tab')[0];
+    fireEvent.pointerDown(pinnedTab, {
+      pointerId: 11,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.pointerUp(pinnedTab, {
+      pointerId: 11,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 25,
+      clientY: 13,
+    });
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(onSelect).toHaveBeenCalledWith('session_w2');
+  });
+
+  it('does not double-select when a touch click follows pointer-up activation', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    fireEvent.pointerDown(tab, {
+      pointerId: 12,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.pointerUp(tab, {
+      pointerId: 12,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.click(tab);
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(onSelect).toHaveBeenCalledWith('session_w1');
+  });
+
+  it('does not activate the touch pointer-up fallback after a scroll-sized move', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    fireEvent.pointerDown(tab, {
+      pointerId: 13,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.pointerMove(tab, {
+      pointerId: 13,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 46,
+      clientY: 12,
+    });
+    fireEvent.pointerUp(tab, {
+      pointerId: 13,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 46,
+      clientY: 12,
+    });
+
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
   it('does not double-select when the normal mouse click follows pointer-up activation', () => {
     const onSelect = vi.fn();
     const sessions = makeSessions([{ name: 'session_w1' }]);
@@ -247,6 +342,13 @@ describe('SessionTabs', () => {
 
     expect(screen.getByText('📌 Pin')).toBeDefined();
 
+    fireEvent.pointerUp(tab, {
+      pointerId: 7,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
     fireEvent.click(tab);
     expect(onSelect).not.toHaveBeenCalled();
   });

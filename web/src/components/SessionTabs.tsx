@@ -47,6 +47,15 @@ interface LongPressState {
   startY: number;
 }
 
+interface TouchPressState {
+  sessionName: string;
+  pointerId: number;
+  startX: number;
+  startY: number;
+  moved: boolean;
+  longPressTriggered: boolean;
+}
+
 interface MousePressState {
   sessionName: string;
   startX: number;
@@ -68,6 +77,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   const renameRef = useRef<HTMLInputElement>(null);
   const tabBarRef = useRef<HTMLDivElement>(null);
   const longPressRef = useRef<LongPressState | null>(null);
+  const touchPressRef = useRef<TouchPressState | null>(null);
   const mousePressRef = useRef<MousePressState | null>(null);
   const suppressNextClickRef = useRef(false);
   const suppressNextClickResetRef = useRef<number | null>(null);
@@ -149,6 +159,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
 
   useEffect(() => () => {
     clearLongPress();
+    touchPressRef.current = null;
     mousePressRef.current = null;
     if (suppressNextClickResetRef.current !== null) {
       window.clearTimeout(suppressNextClickResetRef.current);
@@ -226,11 +237,22 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     const startY = e.clientY;
     try { target.setPointerCapture?.(pointerId); } catch { /* best-effort on older WebViews */ }
 
+    touchPressRef.current = {
+      sessionName: session.name,
+      pointerId,
+      startX,
+      startY,
+      moved: false,
+      longPressTriggered: false,
+    };
     longPressRef.current = {
       pointerId,
       startX,
       startY,
       timer: window.setTimeout(() => {
+        if (touchPressRef.current?.pointerId === pointerId) {
+          touchPressRef.current.longPressTriggered = true;
+        }
         longPressRef.current = null;
         suppressNextSyntheticClick();
         try { target.releasePointerCapture?.(pointerId); } catch { /* best-effort on older WebViews */ }
@@ -240,6 +262,12 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   }, [clearLongPress, openCtxAt, suppressNextSyntheticClick]);
 
   const onTabPointerMove = useCallback((e: PointerEvent) => {
+    const touchState = touchPressRef.current;
+    if (touchState && touchState.pointerId === e.pointerId) {
+      const dx = e.clientX - touchState.startX;
+      const dy = e.clientY - touchState.startY;
+      if (Math.hypot(dx, dy) > TAB_LONG_PRESS_MOVE_CANCEL_PX) touchState.moved = true;
+    }
     const state = longPressRef.current;
     if (state && state.pointerId === e.pointerId) {
       const dx = e.clientX - state.startX;
@@ -248,9 +276,26 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     }
   }, [clearLongPress]);
 
-  const onTabPointerEnd = useCallback((e: PointerEvent) => {
+  const onTabPointerUp = useCallback((e: PointerEvent) => {
     const state = longPressRef.current;
     if (state && state.pointerId === e.pointerId) clearLongPress();
+    const touchState = touchPressRef.current;
+    if (!touchState || touchState.pointerId !== e.pointerId) return;
+    touchPressRef.current = null;
+    try { (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId); } catch { /* best-effort on older WebViews */ }
+
+    if (touchState.moved || touchState.longPressTriggered) return;
+
+    suppressNextSyntheticClick(180);
+    selectTab(touchState.sessionName);
+  }, [clearLongPress, selectTab, suppressNextSyntheticClick]);
+
+  const onTabPointerCancel = useCallback((e: PointerEvent) => {
+    const state = longPressRef.current;
+    if (state && state.pointerId === e.pointerId) clearLongPress();
+    const touchState = touchPressRef.current;
+    if (touchState?.pointerId === e.pointerId) touchPressRef.current = null;
+    try { (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId); } catch { /* best-effort on older WebViews */ }
   }, [clearLongPress]);
 
   const onTabMouseDown = useCallback((e: MouseEvent, session: SessionInfo) => {
@@ -422,9 +467,9 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                 onContextMenu={(e) => openCtx(e, s)}
                 onPointerDown={(e) => onTabPointerDown(e as PointerEvent, s)}
                 onPointerMove={(e) => onTabPointerMove(e as PointerEvent)}
-                onPointerUp={(e) => onTabPointerEnd(e as PointerEvent)}
-                onPointerCancel={(e) => onTabPointerEnd(e as PointerEvent)}
-                onPointerLeave={(e) => onTabPointerEnd(e as PointerEvent)}
+                onPointerUp={(e) => onTabPointerUp(e as PointerEvent)}
+                onPointerCancel={(e) => onTabPointerCancel(e as PointerEvent)}
+                onPointerLeave={(e) => onTabPointerCancel(e as PointerEvent)}
                 onMouseDown={(e) => onTabMouseDown(e as MouseEvent, s)}
                 onMouseMove={(e) => onTabMouseMove(e as MouseEvent)}
                 onMouseUp={(e) => onTabMouseEnd(e as MouseEvent)}
