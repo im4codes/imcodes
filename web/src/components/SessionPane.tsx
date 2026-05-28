@@ -145,6 +145,7 @@ export function SessionPane({
     markOptimisticFailed,
     retryOptimisticMessage,
     loadOlderEvents,
+    forceRefresh: timelineForceRefresh,
   } = useTimeline(sessionName, ws, serverId, {
     isActiveSession: isActive,
     disableHistory: !hasChatTimeline,
@@ -343,6 +344,7 @@ export function SessionPane({
           loading={timelineLoading}
           refreshing={timelineRefreshing}
           onToast={onToast}
+          onForceSync={timelineForceRefresh}
           historyStatus={historyStatus}
           loadingOlder={timelineLoadingOlder}
           hasOlderHistory={timelineHasOlderHistory}

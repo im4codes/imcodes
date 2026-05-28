@@ -36,7 +36,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const sessionName = panel.props?.sessionName as string;
   const pinnedViewMode = panel.props?.viewMode as 'terminal' | 'chat' | undefined;
   const { t } = useTranslation();
-  const { events, refreshing, historyStatus } = useTimeline(sessionName, ctx.ws, ctx.serverId, {
+  const { events, refreshing, historyStatus, forceRefresh } = useTimeline(sessionName, ctx.ws, ctx.serverId, {
     isActiveSession: ctx.activeSession === sessionName,
     // Pinned panel is always visible to the user while mounted; participate
     // in resume broadcast so it catches up even when not the active session.
@@ -78,6 +78,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           historyStatus={historyStatus}
           sessionId={sessionName}
           sessionState={liveSessionState ?? undefined}
+          onForceSync={forceRefresh}
           ws={ctx.ws}
           workdir={liveSub.cwd ?? null}
           serverId={ctx.serverId}

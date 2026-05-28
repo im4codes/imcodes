@@ -750,6 +750,12 @@ export interface UseTimelineResult {
   ) => void;
   /** Load older events before the earliest currently loaded event. */
   loadOlderEvents: () => void;
+  /** Explicit user-triggered sync for THIS session (the chat ↻ button):
+   *  visible (shows the refreshing overlay), force (works even when this hook
+   *  isn't the active session, e.g. a visible sub-session card/window), and
+   *  no cooldown. Unlike the global `requestActiveTimelineRefresh`, this is
+   *  per-session and surfaces visible feedback. */
+  forceRefresh: () => void;
 }
 
 export interface UseTimelineOptions {
@@ -2317,6 +2323,13 @@ export function useTimeline(
   // mount effect to re-run on every render.
   const fireHttpBackfillRef = useRef(fireHttpBackfill);
   fireHttpBackfillRef.current = fireHttpBackfill;
+  // Explicit user-triggered sync (chat ↻ button). visible:true lights the
+  // refreshing overlay so the user sees the catch-up; force:true bypasses the
+  // active-session gate so it works on a visible-but-not-focused sub-session;
+  // no cooldownMs so the click always fires regardless of the 15s throttle.
+  const forceRefresh = useCallback(() => {
+    fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true, force: true });
+  }, []);
   const lastActiveRefreshAtRef = useRef(0);
 
   // (`isActiveSessionRef` declared above so the fire-gate can read it.)
@@ -2920,5 +2933,6 @@ export function useTimeline(
     removeOptimisticMessage,
     retryOptimisticMessage,
     loadOlderEvents,
+    forceRefresh,
   };
 }

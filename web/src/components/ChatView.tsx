@@ -32,7 +32,6 @@ import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
-import { requestActiveTimelineRefresh } from '../hooks/useTimeline.js';
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
 import { splitTextByHttpUrls } from '../link-detection.js';
 import {
@@ -51,8 +50,13 @@ interface Props {
   loading: boolean;
   /** True while gap-filling new events after a cache hit */
   refreshing?: boolean;
-  /** Show a transient toast (e.g. when the user triggers a manual history sync). */
+  /** Show a transient toast (main pane only; e.g. on manual history sync). */
   onToast?: (message: string) => void;
+  /** Per-session force-sync for the chat ↻ button — a visible HTTP backfill of
+   *  THIS session's timeline. Provided by the parent that owns the useTimeline
+   *  hook (main pane, sub-session window/card). The button only renders when
+   *  this is provided. */
+  onForceSync?: () => void;
   /** Visible history-fetch progress shown as a non-layout overlay. */
   historyStatus?: TimelineHistoryStatus | null;
   /** True while loading older events via backward pagination */
@@ -942,16 +946,20 @@ function findScrollParent(start: HTMLElement): HTMLElement {
   return start;
 }
 
-export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onToast }: Props) {
+export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onToast, onForceSync }: Props) {
   const { t } = useTranslation();
   const [syncDisabled, setSyncDisabled] = useState(false);
   const handleForceSync = useCallback(() => {
-    if (syncDisabled) return;
-    requestActiveTimelineRefresh({ resetCooldowns: true });
+    if (syncDisabled || !onForceSync) return;
+    // Per-session visible backfill (sets `refreshing` → overlay/spinner on this
+    // exact session); 10s cooldown prevents spam. The optional onToast (main
+    // pane only) is best-effort extra feedback; sub-sessions rely on the
+    // visible refreshing overlay/spinner.
+    onForceSync();
     onToast?.(t('chat.sync_history_started'));
     setSyncDisabled(true);
     setTimeout(() => setSyncDisabled(false), 10000);
-  }, [syncDisabled, onToast, t]);
+  }, [syncDisabled, onForceSync, onToast, t]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const [selMenu, setSelMenu] = useState<SelectionMenu | null>(null);
@@ -1952,17 +1960,19 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
   return (
     <div class={`chat-view-wrap${canShowFilePanel && showFilePanel ? ' chat-split' : ''}`}>
-      {!preview && (
+      {(onForceSync || canShowFilePanel) && (
         <div class="chat-top-actions">
-          <button
-            class={`chat-panel-toggle chat-sync-btn${refreshing ? ' spinning' : ''}`}
-            onClick={handleForceSync}
-            disabled={syncDisabled}
-            title={t('chat.sync_history')}
-            aria-label={t('chat.sync_history')}
-          >
-            ↻
-          </button>
+          {onForceSync && (
+            <button
+              class={`chat-panel-toggle chat-sync-btn${refreshing ? ' spinning' : ''}`}
+              onClick={handleForceSync}
+              disabled={syncDisabled}
+              title={t('chat.sync_history')}
+              aria-label={t('chat.sync_history')}
+            >
+              ↻
+            </button>
+          )}
           {canShowFilePanel && (
             <button
               class={`chat-panel-toggle${showFilePanel ? ' active' : ''}`}
