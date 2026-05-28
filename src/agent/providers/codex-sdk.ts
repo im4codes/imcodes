@@ -258,7 +258,6 @@ type PendingRequest = {
 type GeneratedImageTrackingSnapshot = {
   dir: string;
   knownPaths: Set<string>;
-  startedAtMs: number;
 };
 
 export interface CodexDiscoveredModel {
@@ -1222,12 +1221,10 @@ export class CodexSdkProvider implements TransportProvider {
       state.generatedImagePaths = [];
       return;
     }
-    const startedAtMs = Date.now();
     const existingPaths = await this.listGeneratedImagePathsInDir(dir);
     state.generatedImageTracking = {
       dir,
       knownPaths: new Set(existingPaths),
-      startedAtMs,
     };
     state.generatedImagePaths = [];
     logger.debug({
@@ -1247,9 +1244,6 @@ export class CodexSdkProvider implements TransportProvider {
     const freshPaths: string[] = [];
     for (const path of paths) {
       if (snapshot.knownPaths.has(path)) continue;
-      const fileStat = await stat(path).catch(() => null);
-      if (!fileStat) continue;
-      if (fileStat.mtimeMs < snapshot.startedAtMs) continue;
       freshPaths.push(path);
     }
     return freshPaths;
