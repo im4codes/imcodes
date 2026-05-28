@@ -299,7 +299,7 @@ vi.mock('../src/components/SessionTree.js', () => ({
   ),
 }));
 vi.mock('../src/components/SessionTabs.js', () => ({
-  SessionTabs: ({ sessions, onSelect, onAlertDismiss, onNewSession, onStopProject, onRestartProject, onRenameHandled, onRenameSession }: any) => (
+  SessionTabs: ({ sessions, onSelect, onAlertDismiss, onNewSession, onStopProject, onRestartProject, onOpenSessionSettings, onCloneSession, onRenameHandled, onRenameSession }: any) => (
     <div>
       session-tabs
       <button onClick={() => onSelect?.(sessions?.[0]?.name)}>tabs-select</button>
@@ -307,6 +307,8 @@ vi.mock('../src/components/SessionTabs.js', () => ({
       <button onClick={onNewSession}>tabs-new-session</button>
       <button onClick={() => onStopProject?.()}>tabs-stop</button>
       <button onClick={() => onRestartProject?.()}>tabs-restart</button>
+      <button onClick={() => onOpenSessionSettings?.(sessions?.[0])}>tabs-settings</button>
+      <button onClick={() => onCloneSession?.(sessions?.[0])}>tabs-clone</button>
       <button onClick={onRenameHandled}>tabs-rename-handled</button>
       <button onClick={() => onRenameSession?.(sessions?.[0]?.name, 'Renamed')}>tabs-rename</button>
     </div>
@@ -410,6 +412,14 @@ vi.mock('../src/components/SessionSettingsDialog.js', () => ({
       session-settings-dialog
       <button onClick={() => onSaved?.({ label: 'Saved', type: 'codex-sdk', cwd: '/work/saved', transportConfig: {} })}>settings-save</button>
       <button onClick={onClose}>settings-close</button>
+    </div>
+  ),
+}));
+vi.mock('../src/components/CloneSessionGroupDialog.js', () => ({
+  CloneSessionGroupDialog: ({ onClose }: any) => (
+    <div>
+      clone-session-group-dialog
+      <button onClick={onClose}>clone-close</button>
     </div>
   ),
 }));
@@ -1160,6 +1170,14 @@ describe('App shell', () => {
     expect(await screen.findByText('session-settings-dialog')).toBeTruthy();
     fireEvent.click(screen.getByText('settings-save'));
     fireEvent.click(screen.getByText('settings-close'));
+
+    fireEvent.click(screen.getByText('tabs-settings'));
+    expect(await screen.findByText('session-settings-dialog')).toBeTruthy();
+    fireEvent.click(screen.getByText('settings-close'));
+
+    fireEvent.click(screen.getByText('tabs-clone'));
+    expect(await screen.findByText('clone-session-group-dialog')).toBeTruthy();
+    fireEvent.click(screen.getByText('clone-close'));
 
     fireEvent.click(screen.getByText('server-menu'));
     expect(await screen.findByText('server-context-menu')).toBeTruthy();

@@ -46,10 +46,8 @@ function firePointer(
   type: 'pointerdown' | 'pointermove' | 'pointerup',
   init: MouseEventInit & { pointerId: number; pointerType: string },
 ) {
-  const eventName =
-    type === 'pointerdown' ? 'PointerDown' : type === 'pointermove' ? 'PointerMove' : 'PointerUp';
   const win = target.ownerDocument.defaultView ?? window;
-  const event = new win.MouseEvent(eventName, {
+  const event = new win.MouseEvent(type, {
     bubbles: true,
     cancelable: true,
     composed: true,
@@ -457,6 +455,57 @@ describe('SessionTabs', () => {
     fireEvent.click(stopBtn());
     expect(onStopProject).toHaveBeenCalledOnce();
     expect(onStopProject).toHaveBeenCalledWith('proj-1');
+  });
+
+  it('opens session settings from the tab context menu', () => {
+    const onOpenSessionSettings = vi.fn();
+    const sessions = makeSessions([{ name: 'deck_proj_brain', project: 'proj-1', role: 'brain', agentType: 'codex-sdk' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        onOpenSessionSettings={onOpenSessionSettings}
+        {...defaultProps}
+      />,
+    );
+
+    fireEvent.contextMenu(screen.getByRole('tab'));
+    fireEvent.click(screen.getByRole('button', { name: /settings/i }));
+
+    expect(onOpenSessionSettings).toHaveBeenCalledOnce();
+    expect(onOpenSessionSettings).toHaveBeenCalledWith(sessions[0]);
+  });
+
+  it('opens clone session action from the tab context menu for main brain sessions only', () => {
+    const onCloneSession = vi.fn();
+    const sessions = makeSessions([
+      { name: 'deck_proj_brain', project: 'proj-1', role: 'brain', agentType: 'codex-sdk', userCreated: true },
+      { name: 'deck_proj_w1', project: 'proj-1', role: 'w1', agentType: 'codex-sdk', userCreated: true },
+    ]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        onCloneSession={onCloneSession}
+        {...defaultProps}
+      />,
+    );
+
+    const [brainTab, workerTab] = screen.getAllByRole('tab');
+
+    fireEvent.contextMenu(workerTab);
+    expect(screen.queryByRole('button', { name: /copy session/i })).toBeNull();
+    fireEvent.mouseDown(document.body);
+
+    fireEvent.contextMenu(brainTab);
+    fireEvent.click(screen.getByRole('button', { name: /copy session/i }));
+
+    expect(onCloneSession).toHaveBeenCalledOnce();
+    expect(onCloneSession).toHaveBeenCalledWith(sessions[0]);
   });
 
   it('uses the current label as the rename input value and commits a label update', () => {

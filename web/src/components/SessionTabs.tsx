@@ -19,6 +19,8 @@ interface Props {
   onNewSession: () => void;
   onStopProject: (project: string) => void;
   onRestartProject: (project: string, fresh?: boolean) => void;
+  onCloneSession?: (session: SessionInfo) => void;
+  onOpenSessionSettings?: (session: SessionInfo) => void;
   /** When set to a session name, triggers inline rename */
   renameRequest?: string | null;
   onRenameHandled?: () => void;
@@ -66,7 +68,7 @@ function readLegacyOrder(): string[] {
   try { return JSON.parse(localStorage.getItem(LEGACY_LS_ORDER) ?? '[]'); } catch { return []; }
 }
 
-export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
+export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, onCloneSession, onOpenSessionSettings, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
   const { t } = useTranslation();
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
   const [stopConfirmProject, setStopConfirmProject] = useState<string | null>(null);
@@ -405,7 +407,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   }, [orderedSessions, pinned, setTabOrder]);
 
   const menuX = ctx ? Math.min(ctx.x, window.innerWidth - 160) : 0;
-  const menuY = ctx ? Math.min(ctx.y, window.innerHeight - 200) : 0;
+  const menuY = ctx ? Math.min(ctx.y, window.innerHeight - 260) : 0;
 
   return (
     <div ref={tabBarRef} class="tab-bar" role="tablist">
@@ -502,6 +504,9 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         // right-clicked session and any sibling sessions of the same project,
         // since `Stop` terminates the whole project (all its tmux processes).
         const projectHasPinned = sessions.some((s) => s.project === ctx.session.project && pinned.has(s.name));
+        const canCloneSession = ctx.session.role === 'brain'
+          && !ctx.session.name.startsWith('deck_sub_')
+          && ctx.session.userCreated !== false;
         return (
         <div ref={menuRef} class="tab-context-menu" style={{ left: menuX, top: menuY }}>
           <button class="menu-item" onClick={() => togglePin(ctx.session.name)}>
@@ -511,6 +516,12 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
           <button class="menu-item" onClick={() => { onRestartProject(ctx.session.project); setCtx(null); }}>↺ Restart</button>
           <button class="menu-item" onClick={() => { onRestartProject(ctx.session.project, true); setCtx(null); }}>＋ New</button>
           <button class="menu-item" onClick={() => startRename(ctx.session)}>✎ Rename</button>
+          {onOpenSessionSettings && (
+            <button class="menu-item" onClick={() => { onOpenSessionSettings(ctx.session); setCtx(null); }}>⚙ {t('session.settings', 'Settings')}</button>
+          )}
+          {onCloneSession && canCloneSession && (
+            <button class="menu-item" onClick={() => { onCloneSession(ctx.session); setCtx(null); }}>⧉ {t('session.clone.menu', 'Copy session')}</button>
+          )}
           <div class="menu-divider" />
           <button
             class="menu-item menu-item-danger"

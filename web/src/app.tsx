@@ -43,6 +43,7 @@ import {
   type FilePreviewCache,
 } from './file-preview-state.js';
 import { StartSubSessionDialog } from './components/StartSubSessionDialog.js';
+import { CloneSessionGroupDialog } from './components/CloneSessionGroupDialog.js';
 import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
@@ -1163,6 +1164,7 @@ export function App() {
 
   const [showSubDialog, setShowSubDialog] = useState(false);
   const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null } | null>(null);
+  const [cloneSessionTarget, setCloneSessionTarget] = useState<SessionInfo | null>(null);
 
   // Derive focused (topmost) sub-session from the shared stack + open set.
   // Dep list intentionally lists `stackVersion` (number) and `openSubIdsKey`
@@ -4099,6 +4101,16 @@ export function App() {
               onNewSession={() => setShowNewSession(true)}
               onStopProject={handleStopProject}
               onRestartProject={handleRestartProject}
+              onOpenSessionSettings={(session) => setSettingsTarget({
+                sessionName: session.name,
+                label: session.label || '',
+                description: session.description || '',
+                cwd: session.projectDir || '',
+                type: session.agentType || '',
+                parentSession: null,
+                transportConfig: session.transportConfig ?? null,
+              })}
+              onCloneSession={(session) => setCloneSessionTarget(session)}
               renameRequest={renameRequest}
               onRenameHandled={() => setRenameRequest(null)}
               onRenameSession={handleRenameSession}
@@ -5048,6 +5060,17 @@ export function App() {
               }));
             }
           }}
+        />
+      )}
+
+      {cloneSessionTarget && selectedServerId && (
+        <CloneSessionGroupDialog
+          ws={wsRef.current}
+          serverId={selectedServerId}
+          sourceSession={sessions.find((session) => session.name === cloneSessionTarget.name) ?? cloneSessionTarget}
+          sessions={sessions}
+          subSessions={subSessions}
+          onClose={() => setCloneSessionTarget(null)}
         />
       )}
 
