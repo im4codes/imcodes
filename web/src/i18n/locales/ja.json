@@ -1191,6 +1191,7 @@
     "p2p_discussions": "Team ディスカッション",
     "p2p_compact_show": "コンパクトな Team バーを表示",
     "p2p_compact_hide": "Team バーをコンパクト化",
+    "p2p_compact_expand": "詳細な Team バーを表示",
     "p2p_discussions_with_running_one": "{{count}} 件の進行中のディスカッション — すべて表示",
     "p2p_discussions_with_running_other": "{{count}} 件の進行中のディスカッション — すべて表示",
     "p2p_discussions_with_running": "{{count}} 件の進行中のディスカッション — すべて表示",

@@ -1192,6 +1192,7 @@
     "p2p_discussions": "Team discussions",
     "p2p_compact_show": "Show compact Team bar",
     "p2p_compact_hide": "Compact Team bar",
+    "p2p_compact_expand": "Show detailed Team bar",
     "p2p_discussions_with_running_one": "{{count}} running discussion — view all",
     "p2p_discussions_with_running_other": "{{count}} running discussions — view all",
     "p2p_discussions_with_running": "{{count}} running discussions — view all",

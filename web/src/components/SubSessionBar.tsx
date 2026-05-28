@@ -135,6 +135,8 @@ interface CardSize { w: number; h: number }
 
 const DEFAULT_SIZE: CardSize = { w: 350, h: 250 };
 export const SUBSESSION_BAR_COLLAPSED_STORAGE_KEY = 'rcc_subcard_collapsed';
+const P2P_MOBILE_COMPACT_STORAGE_KEY = 'rcc_subcard_p2p_hidden';
+const P2P_DESKTOP_COMPACT_STORAGE_KEY = 'rcc_subcard_p2p_desktop_compact';
 const EXPANDED_PREVIEW_INITIAL_COUNT = 2;
 const EXPANDED_PREVIEW_BATCH_SIZE = 4;
 const EXPANDED_PREVIEW_BATCH_DELAY_MS = 32;
@@ -273,7 +275,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [internalCollapsed, setInternalCollapsed] = useState(() => load(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, !desktopLayoutCapable));
   const collapsed = controlledCollapsed ?? internalCollapsed;
-  const [p2pHidden, setP2pHidden] = useState(() => load('rcc_subcard_p2p_hidden', false));
+  const [p2pHidden, setP2pHidden] = useState(() => load(P2P_MOBILE_COMPACT_STORAGE_KEY, false));
+  const [p2pDesktopCompact, setP2pDesktopCompact] = useState(() => load(P2P_DESKTOP_COMPACT_STORAGE_KEY, false));
   const [showSizePanel, setShowSizePanel] = useState(false);
   const [cardSize, setCardSize] = useState<CardSize>(() => load('rcc_subcard_size', DEFAULT_SIZE));
   const [draftW, setDraftW] = useState(String(cardSize.w));
@@ -599,8 +602,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   }, [collapsed, controlledCollapsed, onCollapsedChange]);
 
   useEffect(() => {
-    save('rcc_subcard_p2p_hidden', p2pHidden);
+    save(P2P_MOBILE_COMPACT_STORAGE_KEY, p2pHidden);
   }, [p2pHidden]);
+
+  useEffect(() => {
+    save(P2P_DESKTOP_COMPACT_STORAGE_KEY, p2pDesktopCompact);
+  }, [p2pDesktopCompact]);
 
   // Touch-based reorder for collapsed bar — desktop collapsed buttons use HTML5 drag events below.
   // The touch path must use addEventListener({ passive: false }) so touchmove can preventDefault.
@@ -824,6 +831,17 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             Team {p2pHidden ? '▾' : '▴'}
           </button>
         )}
+        {!isMobile && discussions.length > 0 && (
+          <button
+            class={`subcard-toolbar-btn${p2pDesktopCompact ? ' subcard-toolbar-btn-active' : ''}`}
+            data-testid="p2p-desktop-compact-toggle"
+            onClick={() => setP2pDesktopCompact((compact) => !compact)}
+            title={p2pDesktopCompact ? t('subsessionBar.p2p_compact_expand') : t('subsessionBar.p2p_compact_hide')}
+            aria-label={p2pDesktopCompact ? t('subsessionBar.p2p_compact_expand') : t('subsessionBar.p2p_compact_hide')}
+          >
+            Team {p2pDesktopCompact ? '▾' : '▴'}
+          </button>
+        )}
         {!collapsed && (
           <>
             <button class="subcard-toolbar-btn" onClick={toggleLayout} title={layout === 'single' ? t('subsessionBar.layout_double') : t('subsessionBar.layout_single')}>
@@ -1041,13 +1059,14 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
 
       {/* Discussions panel — above sub-session buttons */}
       {discussions.length > 0 && (
-        <div class={`discussion-panel${isMobile ? ' discussion-panel-mobile' : ''}`}>
+        <div class={`discussion-panel${isMobile ? ' discussion-panel-mobile' : ''}${!isMobile && p2pDesktopCompact ? ' discussion-panel-desktop-compact' : ''}`}>
           {discussions.map((d) => (
             <P2pProgressCard
               key={d.id}
               discussion={d}
-              compact={!isMobile}
+              compact={!isMobile && !p2pDesktopCompact}
               mobile={isMobile}
+              ultraCompact={!isMobile && p2pDesktopCompact}
               hidden={isMobile && p2pHidden}
               onToggleHide={isMobile ? () => setP2pHidden((v) => !v) : undefined}
               onStopDiscussion={onStopDiscussion}

@@ -1191,6 +1191,7 @@
     "p2p_discussions": "Team 토론",
     "p2p_compact_show": "컴팩트 Team 바 표시",
     "p2p_compact_hide": "Team 바 컴팩트로 접기",
+    "p2p_compact_expand": "자세한 Team 바 표시",
     "p2p_discussions_with_running_one": "{{count}}개의 진행 중 토론 — 모두 보기",
     "p2p_discussions_with_running_other": "{{count}}개의 진행 중 토론 — 모두 보기",
     "p2p_discussions_with_running": "{{count}}개의 진행 중 토론 — 모두 보기",

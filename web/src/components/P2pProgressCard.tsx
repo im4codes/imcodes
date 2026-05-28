@@ -59,7 +59,8 @@ export interface P2pProgressDiscussion {
 interface Props {
   discussion: P2pProgressDiscussion;
   compact?: boolean;
-  /** Ultra-compact mobile mode: single line with active node only + hide button */
+  /** Ultra-compact mode: single line with active node only + hide button */
+  ultraCompact?: boolean;
   mobile?: boolean;
   hidden?: boolean;
   onToggleHide?: () => void;
@@ -220,6 +221,7 @@ const HopElapsedTimer = memo(function HopElapsedTimer({
 export const P2pProgressCard = memo(function P2pProgressCard({
   discussion,
   compact = false,
+  ultraCompact = false,
   mobile = false,
   hidden = false,
   onToggleHide,
@@ -314,9 +316,10 @@ export const P2pProgressCard = memo(function P2pProgressCard({
 
   const hopKey = isRunning ? `${discussion.currentRound}:${discussion.activeHop}:${discussion.activePhase}` : null;
   const runKey = isRunning ? discussion.id : null;
+  const renderUltraCompact = mobile || ultraCompact;
 
-  // ── Mobile ultra-compact: single-line summary ──────────────────────────
-  if (mobile) {
+  // ── Ultra-compact: single-line summary ─────────────────────────────────
+  if (renderUltraCompact) {
     const activeNode = nodes.find((n) => n.status === 'active');
     return (
       <div

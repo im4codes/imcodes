@@ -1971,6 +1971,9 @@ body {
   padding: 4px 7px;
   font-size: 10px;
 }
+.discussion-panel-desktop-compact { padding: 5px 8px; gap: 5px; }
+.discussion-panel-desktop-compact .discussions-progress-card-mobile { padding: 4px 8px !important; }
+.discussion-panel-desktop-compact .discussions-progress-mobile-title { margin-top: 1px; }
 /* Mobile ultra-compact P2P card */
 .discussion-panel-mobile { padding: 4px 6px; gap: 4px; }
 .discussions-progress-card-mobile {

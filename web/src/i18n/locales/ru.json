@@ -1191,6 +1191,7 @@
     "p2p_discussions": "Team-обсуждения",
     "p2p_compact_show": "Показать компактную Team-панель",
     "p2p_compact_hide": "Свернуть Team-панель",
+    "p2p_compact_expand": "Показать подробную Team-панель",
     "p2p_discussions_with_running_one": "{{count}} активное обсуждение — показать все",
     "p2p_discussions_with_running_other": "{{count}} активных обсуждений — показать все",
     "p2p_discussions_with_running": "{{count}} активных обсуждений — показать все",

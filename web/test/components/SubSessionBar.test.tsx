@@ -28,8 +28,13 @@ vi.mock('../../src/components/SubSessionCard.js', () => ({
 }));
 
 vi.mock('../../src/components/P2pProgressCard.js', () => ({
-  P2pProgressCard: ({ hidden, onToggleHide }: { hidden?: boolean; onToggleHide?: () => void }) => (
-    <div>
+  P2pProgressCard: ({ hidden, onToggleHide, compact, mobile, ultraCompact }: { hidden?: boolean; onToggleHide?: () => void; compact?: boolean; mobile?: boolean; ultraCompact?: boolean }) => (
+    <div
+      data-testid="p2p-progress-card"
+      data-compact={compact ? 'true' : 'false'}
+      data-mobile={mobile ? 'true' : 'false'}
+      data-ultra-compact={ultraCompact ? 'true' : 'false'}
+    >
       <span data-testid="p2p-hidden-state">{hidden ? 'hidden' : 'visible'}</span>
       {onToggleHide && <button onClick={onToggleHide}>toggle-p2p-hide</button>}
     </div>
@@ -570,6 +575,52 @@ describe('SubSessionBar', () => {
     expect(view.getByTestId('p2p-hidden-state').textContent).toBe('hidden');
     fireEvent.click(view.getByTestId('p2p-compact-toggle'));
     expect(view.getByTestId('p2p-hidden-state').textContent).toBe('visible');
+  });
+
+  it('toggles and persists the desktop P2P compact bar mode', () => {
+    const discussion = {
+      id: 'p2p_run_1',
+      topic: 'Team audit',
+      state: 'running',
+      currentRound: 1,
+      maxRounds: 1,
+      completedHops: 0,
+      totalHops: 1,
+    };
+    const renderBar = () => render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        desktopLayoutCapable={true}
+        discussions={[discussion]}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const view = renderBar();
+    const card = () => view.getByTestId('p2p-progress-card');
+
+    expect(card().getAttribute('data-compact')).toBe('true');
+    expect(card().getAttribute('data-mobile')).toBe('false');
+    expect(card().getAttribute('data-ultra-compact')).toBe('false');
+
+    fireEvent.click(view.getByTestId('p2p-desktop-compact-toggle'));
+
+    expect(card().getAttribute('data-compact')).toBe('false');
+    expect(card().getAttribute('data-mobile')).toBe('false');
+    expect(card().getAttribute('data-ultra-compact')).toBe('true');
+    expect(localStorage.getItem('rcc_subcard_p2p_desktop_compact')).toBe('true');
+
+    view.unmount();
+    const restored = renderBar();
+    expect(restored.getByTestId('p2p-progress-card').getAttribute('data-ultra-compact')).toBe('true');
   });
 
   it('recalculates accent colors and reports visual order after drag reorder', async () => {
