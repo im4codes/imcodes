@@ -27,7 +27,14 @@ describe('startup splash screen contract', () => {
     expect(indexHtml).toMatch(/animation:\s*fadeUp 0\.34s/);
     expect(indexHtml).toMatch(/animation:\s*beamSweep 0\.9s/);
     expect(indexHtml).toMatch(/animation:\s*scanDown 1\.7s/);
-    expect(appSource).toContain('const minMs = 1100');
-    expect(appSource).toContain('}, 320);');
+    expect(indexHtml).toMatch(/transition:\s*opacity 0\.12s ease,\s*visibility 0\.12s ease/);
+    expect(appSource).toContain('const exitMs = 120');
+    expect(appSource).not.toContain('const minMs = 1100');
+  });
+
+  it('does not hold the app behind a fixed splash duration once startup is ready', () => {
+    expect(appSource).toContain('The HTML splash masks JS/native startup work');
+    expect(appSource).toMatch(/if \(!nativeReady && !nativeCallback\) return/);
+    expect(appSource).toMatch(/splash\.classList\.add\('splash-exit'\);\s*const t = setTimeout\(\(\) => \{ splash\.remove\(\); setSplashDone\(true\); \}, exitMs\)/);
   });
 });

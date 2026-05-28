@@ -639,19 +639,18 @@ export function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Dismiss splash after minimum display time (let animation play)
-  // Skip splash entirely for native auth callback — needs to render immediately
+  // The HTML splash masks JS/native startup work. Once startup is ready, leave
+  // immediately; the animation must never become an extra artificial wait.
   useEffect(() => {
     const splash = document.getElementById('splash');
     if (!splash) { setSplashDone(true); return; }
+    if (!nativeReady && !nativeCallback) return;
     if (nativeCallback) { splash.remove(); setSplashDone(true); return; }
-    const minMs = 1100; // keep the startup splash lively without holding the app back
-    const t = setTimeout(() => {
-      splash.classList.add('splash-exit');
-      setTimeout(() => { splash.remove(); setSplashDone(true); }, 320);
-    }, minMs);
+    const exitMs = 120;
+    splash.classList.add('splash-exit');
+    const t = setTimeout(() => { splash.remove(); setSplashDone(true); }, exitMs);
     return () => clearTimeout(t);
-  }, []);
+  }, [nativeReady]);
 
   // Native: init push notifications after login
   useEffect(() => {
@@ -3418,7 +3417,7 @@ export function App() {
   }
 
   if (!nativeReady || !splashDone) {
-    return null; // Wait for splash animation + native init
+    return null; // Wait for startup readiness while the HTML splash remains visible
   }
 
   if (isNative() && !nativeServerUrl) {
