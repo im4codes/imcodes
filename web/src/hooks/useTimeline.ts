@@ -599,8 +599,12 @@ function convertTransportHistoryRecordToTimelineEvent(
 }
 
 function scopeEventsForDb(cacheKey: string, events: TimelineEvent[]): TimelineEvent[] {
-  if (cacheKey === events[0]?.sessionId) return events;
-  return events.map((event) => ({ ...event, sessionId: cacheKey }));
+  // Per-event scope — do NOT trust events[0] as a batch invariant. After
+  // snapshot/raw-fallback merges a batch can be a mix of raw + scoped events,
+  // and keying off the first item would write the rest under the wrong key
+  // (re-creating split-key orphans). Skip the clone only when ALL are scoped.
+  if (events.every((event) => event.sessionId === cacheKey)) return events;
+  return events.map((event) => (event.sessionId === cacheKey ? event : { ...event, sessionId: cacheKey }));
 }
 
 function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void {
@@ -685,6 +689,57 @@ function getSharedTimelineBase(
   if (shared.length === 0) return localEvents;
   if (localEvents.length === 0) return shared;
   return mergeTimelineEvents(shared, localEvents, maxEvents);
+}
+
+/**
+ * Read a session's recent local history, falling back to the bare-sessionId key
+ * when the serverId-scoped key is empty (scope drift / PR-4), and consolidating
+ * the orphaned bare-key rows into the scoped key via `migrateRawToScoped`
+ * (idempotent, NO delete — the prior impl deleted what it migrated). Shared by
+ * the bootstrap load and the ↻ local reload so the read logic lives in one
+ * place.
+ *
+ * Existence is determined by the actual events read (`getRecentEvents`), NOT by
+ * `getLastSeqAndEpoch` — the two use different indexes (`session_ts` vs
+ * `session_epoch_seq`), so a null cursor must never be treated as "no history".
+ * The cursor is best-effort (index lookup, else derived from the read events).
+ *
+ * NOTE (cycle-2 follow-up): a session whose history is SPLIT across both keys
+ * (some bare, some scoped) currently surfaces only the scoped segment here. The
+ * always-dual-read merge that heals a live split is deferred to avoid reworking
+ * the single-read test harness in this cycle.
+ */
+async function readLocalTimelineMerged(
+  db: TimelineDB,
+  cacheKey: string,
+  rawSessionId: string | undefined,
+  limit: number,
+): Promise<{ stored: TimelineEvent[]; cursor: { epoch: number; seq: number } | null }> {
+  let stored = await db.getRecentEvents(cacheKey, { limit });
+  if (stored.length === 0 && rawSessionId) {
+    const rawStored = await db.getRecentEvents(rawSessionId, { limit });
+    if (rawStored.length > 0) {
+      stored = rawStored.map((event) => (
+        event.sessionId === cacheKey ? event : { ...event, sessionId: cacheKey }
+      ));
+      // Consolidate the orphaned bare-key rows into the scoped key. Idempotent,
+      // no delete (see migrateRawToScoped — the old delete destroyed history).
+      db.migrateRawToScoped(rawSessionId, cacheKey, rawStored).catch(() => { /* best-effort */ });
+    }
+  }
+  // Cursor: prefer the explicit index lookup; else derive from the read events.
+  let cursor: { epoch: number; seq: number } | null = await db.getLastSeqAndEpoch(cacheKey);
+  if (!cursor && rawSessionId) cursor = await db.getLastSeqAndEpoch(rawSessionId);
+  if (!cursor && stored.length > 0) {
+    let epoch = 0;
+    let seq = 0;
+    for (const event of stored) {
+      if (event.epoch > epoch) epoch = event.epoch;
+      if (event.seq > seq) seq = event.seq;
+    }
+    cursor = { epoch, seq };
+  }
+  return { stored, cursor };
 }
 
 export function __getSharedTimelineBaseForTests(
@@ -1504,62 +1559,47 @@ export function useTimeline(
     const load = async () => {
       const db = sharedDb;
       if (!db) return;
-      await db.open();
-      if (cancelled) return;
-      // Read the scoped key first; fall back to the bare sessionId for
-      // rows that were persisted before `serverId` resolved on this page
-      // session. Migrate-on-hit so future reads take the fast path.
-      // See PR-4 in .imc/discussions/e9dbc48c-dda.md.
+      // Dual-read scoped + bare keys and merge (history can be split across keys
+      // when serverId resolved mid-session), status-aware so a read FAILURE is
+      // never mistaken for "no history". `ensureOpen` is awaited inside the
+      // read methods. See run 016f9b5b-c8f (split-key + fail-safe).
       const rawSessionIdForFallback = sessionId && sessionId !== cacheKey ? sessionId : undefined;
-      let last = await db.getLastSeqAndEpoch(cacheKey!);
-      if (!last && rawSessionIdForFallback) {
-        last = await db.getLastSeqAndEpoch(rawSessionIdForFallback);
-      }
+      const { stored, cursor } = await readLocalTimelineMerged(
+        db, cacheKey!, rawSessionIdForFallback, MAX_MEMORY_EVENTS,
+      );
       if (cancelled) return;
-      if (last) {
-        epochRef.current = last.epoch;
-        seqRef.current = last.seq;
-        let stored = await db.getRecentEvents(cacheKey!, { limit: MAX_MEMORY_EVENTS });
-        if (stored.length === 0 && rawSessionIdForFallback) {
-          const rawStored = await db.getRecentEvents(rawSessionIdForFallback, { limit: MAX_MEMORY_EVENTS });
-          if (rawStored.length > 0) {
-            // Re-stamp sessionId on the in-memory copy so consumers treat
-            // these as scoped events. Migration to IDB runs async so the
-            // next mount finds them under the scoped key directly.
-            stored = rawStored.map((event) => (
-              event.sessionId === cacheKey ? event : { ...event, sessionId: cacheKey! }
-            ));
-            db.migrateRawToScoped(rawSessionIdForFallback, cacheKey!, rawStored).catch(() => { /* ignore */ });
-          }
-        }
-        if (cancelled) return;
+      if (cursor) {
+        epochRef.current = cursor.epoch;
+        seqRef.current = cursor.seq;
+      } else {
+        epochRef.current = 0;
+        seqRef.current = 0;
+      }
+      updateHistoryStep('cache', 'done', 'bootstrap');
+      if (stored.length > 0) {
         const existing = getSharedTimelineBase(cacheKey!, eventsRef.current, MAX_MEMORY_EVENTS);
         const restored = mergeTimelineEvents(existing, stored, MAX_MEMORY_EVENTS);
-        updateHistoryStep('cache', 'done', 'bootstrap');
         setCachedEvents(cacheKey!, restored);
         setEvents((prev) => (prev === restored ? prev : restored));
         setLoading(false);
         historyLoadedRef.current = cacheKeyRef.current;
         requestDaemonHistory(false, MAX_MEMORY_EVENTS, restored);
-        // Background HTTP backfill — IDB is authoritative only up to the
-        // last time a WS event landed; if the user closed the tab mid-chat
-        // and reopened later there may be a gap between IDB and daemon.
+        // Background HTTP backfill — IDB is authoritative only up to the last
+        // WS event; reopening after a mid-chat close may leave a gap.
         if (isActiveSession) {
           fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
         }
       } else {
-        epochRef.current = 0;
-        seqRef.current = 0;
-        if (cancelled) return;
-        updateHistoryStep('cache', 'done', 'bootstrap');
-        // Preserve any optimistic user messages added by the user before the
-        // cold IDB load completed. Without this guard, a fast send right
-        // after mount (before async load() finishes) gets wiped out — and
-        // when `command.failed` arrives, the auto-retry path can't find the
-        // optimistic event to settle it. Authoritative timeline events from
-        // the daemon will arrive shortly after via WS / HTTP backfill and
-        // reconcile (matched by commandId).
-        setEvents((prev) => prev.filter(isLocalOptimisticUserMessage));
+        // Empty local read — a genuine cold start OR a transient IDB read
+        // failure (both surface as empty here). FAIL-SAFE: do NOT wipe an
+        // already-shown seed. The previous code did
+        // `setEvents(prev => prev.filter(isLocalOptimisticUserMessage))` here,
+        // which is exactly what turned a seeded/snapshot-painted pane blank when
+        // the scoped read missed (split-key) or the open transiently failed.
+        // We keep the seed, ask the daemon (visible if active) + HTTP to fill
+        // in (authoritative history reconciles by eventId), and leave
+        // `historyLoadedRef` unset so a dep-churn re-run / ↻ / the IDB-open
+        // backoff retry can re-read the local store if data appears.
         if (isActiveSession && wsConnected) {
           requestDaemonHistory(true);
         } else {
@@ -2420,9 +2460,41 @@ export function useTimeline(
   // refreshing overlay so the user sees the catch-up; force:true bypasses the
   // active-session gate so it works on a visible-but-not-focused sub-session;
   // no cooldownMs so the click always fires regardless of the 15s throttle.
+  // Re-read local IDB history on demand — independent of the network. Clears
+  // any transient memory-only degradation (`resetAndReopen`) so a prior IDB
+  // open failure is retried instead of stranding on-disk history until a full
+  // page reload. This is what makes the ↻ button actually recover a blank pane
+  // even when serverId is unresolved / the daemon is offline (HTTP no-op).
+  const reloadLocalTimeline = useCallback(async () => {
+    const key = cacheKeyRef.current;
+    if (!key) return;
+    try {
+      await sharedDb.resetAndReopen();
+    } catch { /* ignore — the read below still falls back to memory */ }
+    const rawSessionId = sessionId && sessionId !== key ? sessionId : undefined;
+    const { stored, cursor } = await readLocalTimelineMerged(sharedDb, key, rawSessionId, MAX_MEMORY_EVENTS);
+    if (cacheKeyRef.current !== key) return;
+    if (cursor) {
+      epochRef.current = cursor.epoch;
+      seqRef.current = cursor.seq;
+    }
+    if (stored.length > 0) {
+      const existing = getSharedTimelineBase(key, eventsRef.current, MAX_MEMORY_EVENTS);
+      const restored = mergeTimelineEvents(existing, stored, MAX_MEMORY_EVENTS);
+      setCachedEvents(key, restored);
+      setEvents((prev) => (prev === restored ? prev : restored));
+      historyLoadedRef.current = key;
+    }
+  }, [sessionId]);
+
   const forceRefresh = useCallback(() => {
+    // Re-read LOCAL IDB first (the user's history is local — this recovers a
+    // blank pane even when serverId is unresolved or the daemon is offline,
+    // i.e. when the HTTP path is a no-op), then opportunistically catch up
+    // over HTTP.
+    void reloadLocalTimeline();
     fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true, force: true });
-  }, []);
+  }, [reloadLocalTimeline]);
   const lastActiveRefreshAtRef = useRef(0);
 
   // (`isActiveSessionRef` declared above so the fire-gate can read it.)

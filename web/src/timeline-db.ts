@@ -29,11 +29,22 @@ const DB_NAME = 'imcodes-timeline';
 const DB_VERSION = 1;
 const STORE_NAME = 'events';
 
+/**
+ * How long to stay in transient memory-only mode after an open failure before
+ * the next `ensureOpen()` retries the real IndexedDB open. Local data has no
+ * network excuse to fail — a failed open MUST be retryable without a full page
+ * reload (run 016f9b5b-c8f).
+ */
+const OPEN_RETRY_BACKOFF_MS = 3_000;
+/** Reject a permanently-`blocked` open after this long so callers can retry. */
+const OPEN_BLOCKED_TIMEOUT_MS = 1_500;
+
 export class TimelineDB {
   private db: IDBDatabase | null = null;
   private openPromise: Promise<IDBDatabase | null> | null = null;
   private memoryFallback = new Map<string, TimelineEvent[]>();
   private _memoryOnly = false;
+  private lastOpenFailureAt = 0;
 
   get memoryOnly(): boolean {
     return this._memoryOnly;
@@ -50,14 +61,38 @@ export class TimelineDB {
   }
 
   /**
+   * Force a fresh open attempt, clearing any transient memory-only degradation.
+   * Used by explicit user recovery (the chat ↻ button → local reload) so a
+   * prior open failure never permanently blocks reading on-disk history.
+   */
+  async resetAndReopen(): Promise<IDBDatabase | null> {
+    try { this.db?.close(); } catch { /* ignore */ }
+    this.db = null;
+    this.openPromise = null;
+    this._memoryOnly = false;
+    this.lastOpenFailureAt = 0;
+    return this.ensureOpen();
+  }
+
+  /**
    * Single-flight open. Resolves with the live `IDBDatabase` on success or
-   * `null` when open() itself rejected (quota / private mode / corruption).
+   * `null` when open() rejected (quota / private mode / corruption / blocked).
    * On the first successful open we also drain `memoryFallback` into IDB so
    * cold-start writes are durable.
+   *
+   * Failure is TRANSIENT, not a permanent latch: after an open failure we stay
+   * memory-only only for `OPEN_RETRY_BACKOFF_MS`, then the next call retries the
+   * real open. This satisfies "local load must be retryable" — a transient
+   * quota/lock/private-mode blip must not strand on-disk history until a full
+   * page reload.
    */
   private async ensureOpen(): Promise<IDBDatabase | null> {
     if (this.db) return this.db;
-    if (this._memoryOnly) return null;
+    if (this._memoryOnly) {
+      if (Date.now() - this.lastOpenFailureAt < OPEN_RETRY_BACKOFF_MS) return null;
+      // Backoff elapsed → drop the transient degradation and retry below.
+      this._memoryOnly = false;
+    }
     if (!this.openPromise) {
       this.openPromise = this.openInternal()
         .then(async (db) => {
@@ -69,6 +104,10 @@ export class TimelineDB {
         })
         .catch(() => {
           this._memoryOnly = true;
+          this.lastOpenFailureAt = Date.now();
+          // Drop the cached rejected promise so a later call can retry a fresh
+          // open once the backoff window elapses (no permanent latch).
+          this.openPromise = null;
           return null;
         });
     }
@@ -110,10 +149,12 @@ export class TimelineDB {
       };
       req.onerror = () => reject(req.error);
       req.onblocked = () => {
-        // Another tab still holds a connection to the old version. We
-        // don't reject here — when the holder closes we'll get
-        // `onsuccess` eventually. Leaving the promise pending is
-        // preferable to flipping to memory-only on a slow tab.
+        // Another tab still holds a connection to the old version. Don't hang
+        // forever — if the holder doesn't release within the timeout, reject so
+        // the caller falls back to memory + a backoff retry instead of a
+        // permanently-pending promise (which would freeze local load). If
+        // `onsuccess` fires first (holder closed), this reject is ignored.
+        setTimeout(() => reject(new Error('idb_open_blocked')), OPEN_BLOCKED_TIMEOUT_MS);
       };
     });
   }
@@ -206,49 +247,60 @@ export class TimelineDB {
     if (!db) {
       return this.memGetByTime(sessionId, opts);
     }
-
     try {
-      const limit = opts?.limit ?? Infinity;
-
-      return await new Promise<TimelineEvent[]>((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readonly');
-        const store = tx.objectStore(STORE_NAME);
-        const index = store.index('session_ts');
-
-        const lower = [sessionId, 0];
-        const upper = [sessionId, Infinity];
-        const range = IDBKeyRange.bound(lower, upper);
-
-        // getAll is a single IDB round-trip — much faster than cursor iteration
-        const req = index.getAll(range);
-        req.onsuccess = () => {
-          const all = req.result as TimelineEvent[];
-          resolve(limit < all.length ? all.slice(-limit) : all);
-        };
-        req.onerror = () => reject(req.error);
-      });
+      return await this.getRecentEventsTx(db, sessionId, opts);
     } catch {
       return this.memGetByTime(sessionId, opts);
     }
   }
 
+  private getRecentEventsTx(
+    db: IDBDatabase,
+    sessionId: string,
+    opts?: { limit?: number },
+  ): Promise<TimelineEvent[]> {
+    const limit = opts?.limit ?? Infinity;
+    return new Promise<TimelineEvent[]>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const index = store.index('session_ts');
+
+      const lower = [sessionId, 0];
+      const upper = [sessionId, Infinity];
+      const range = IDBKeyRange.bound(lower, upper);
+
+      // getAll is a single IDB round-trip — much faster than cursor iteration
+      const req = index.getAll(range);
+      req.onsuccess = () => {
+        const all = req.result as TimelineEvent[];
+        resolve(limit < all.length ? all.slice(-limit) : all);
+      };
+      req.onerror = () => reject(req.error);
+    });
+  }
+
   /**
-   * Async migration helper used by `useTimeline`'s scope-fallback path.
-   * Re-writes `events` under `scopedKey` and deletes the raw-key rows.
-   * Best-effort; failures leave both copies alive so the fallback path
-   * keeps working on the next read.
+   * Rewrite the given events' storage scope from a bare/raw `sessionId` key to
+   * the serverId-scoped key, in a single readwrite transaction. No delete.
+   *
+   * CRITICAL: the object store's primary key is `eventId` ALONE (not composite
+   * with sessionId), so a raw row and a scoped row CANNOT coexist for the same
+   * `eventId` — they are the same physical row. The previous implementation
+   * ("put(restamped) then delete(eventId)") therefore DELETED the row it had
+   * just rewritten, destroying local history (run 016f9b5b-c8f A1/RV1). This is
+   * a pure in-place `sessionId` rewrite: for each event we `get` the current
+   * row, pick the more-complete payload, and `put` it back with
+   * `sessionId=scopedKey` (forced explicitly — NOT relying on a merge
+   * tie-break, so scoping can't silently revert).
    *
    * Why this exists: `useTimeline` scopes the IDB key by serverId
    * (`${serverId}:${sessionId}`). When the app first paints with
-   * `selectedServerId === null` (state loading from localStorage), WS
-   * events arriving in that window get persisted under the bare
-   * `sessionId`. Once selectedServerId resolves, subsequent reads use
-   * the scoped key and the bare-key rows become "orphans" — invisible
-   * to every later read. The data IS there in IDB, just under the
-   * previous (raw) key shape — so the chat pane reads empty despite a
-   * real local cache.
+   * `selectedServerId === null`, WS events persist under the bare `sessionId`;
+   * once serverId resolves, scoped reads miss those bare rows. This consolidates
+   * them under the scoped key. Best-effort; on failure the rows remain readable
+   * under the raw key (the read path dual-reads both).
    *
-   * See `.imc/discussions/e9dbc48c-dda.md` PR-4 for the full audit.
+   * See `.imc/discussions/e9dbc48c-dda.md` PR-4 and `016f9b5b-c8f` for the audit.
    */
   async migrateRawToScoped(
     rawSessionId: string,
@@ -256,20 +308,24 @@ export class TimelineDB {
     rawEvents: TimelineEvent[],
   ): Promise<void> {
     if (rawSessionId === scopedKey || rawEvents.length === 0) return;
-    // 1. Re-stamp + put under scoped key. putEvents internally awaits
-    //    ensureOpen so we don't need to re-check.
-    const restamped = rawEvents.map((event) => ({ ...event, sessionId: scopedKey }));
-    await this.putEvents(restamped);
-    // 2. Delete the raw rows by eventId. Each event's eventId is the
-    //    primary key, so a single readwrite transaction can drop them.
     const db = await this.ensureOpen();
-    if (!db) return;
+    if (!db) {
+      // Memory-only: re-stamp the in-memory copies under the scoped key.
+      for (const event of rawEvents) this.memPut({ ...event, sessionId: scopedKey });
+      return;
+    }
     await new Promise<void>((resolve, reject) => {
       try {
         const tx = db.transaction(STORE_NAME, 'readwrite');
         const store = tx.objectStore(STORE_NAME);
         for (const event of rawEvents) {
-          try { store.delete(event.eventId); } catch { /* ignore */ }
+          const getReq = store.get(event.eventId);
+          getReq.onsuccess = () => {
+            const existing = getReq.result as TimelineEvent | undefined;
+            const preferred = existing ? preferTimelineEvent(existing, event) : event;
+            store.put({ ...preferred, sessionId: scopedKey });
+          };
+          getReq.onerror = () => reject(getReq.error);
         }
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
