@@ -16,12 +16,12 @@ describe('shortModelLabel', () => {
   });
 
   it('shows the Claude family with its version, preserves Gemini shorthand', () => {
-    expect(shortModelLabel('claude-opus-4-1')).toBe('opus 4.1');
-    expect(shortModelLabel('claude-opus-4-8')).toBe('opus 4.8');
-    expect(shortModelLabel('claude-opus-4-8-20260514')).toBe('opus 4.8');
-    expect(shortModelLabel('claude-sonnet-4-5')).toBe('sonnet 4.5');
-    expect(shortModelLabel('claude-3-5-sonnet-20241022')).toBe('sonnet 3.5');
-    expect(shortModelLabel('claude-3-opus')).toBe('opus 3');
+    expect(shortModelLabel('claude-opus-4-1')).toBe('opus-4.1');
+    expect(shortModelLabel('claude-opus-4-8')).toBe('opus-4.8');
+    expect(shortModelLabel('claude-opus-4-8-20260514')).toBe('opus-4.8');
+    expect(shortModelLabel('claude-sonnet-4-5')).toBe('sonnet-4.5');
+    expect(shortModelLabel('claude-3-5-sonnet-20241022')).toBe('sonnet-3.5');
+    expect(shortModelLabel('claude-3-opus')).toBe('opus-3');
     expect(shortModelLabel('opus')).toBe('opus');
     expect(shortModelLabel('gemini-3-flash-preview')).toBe('flash');
   });

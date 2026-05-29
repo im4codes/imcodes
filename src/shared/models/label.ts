@@ -16,7 +16,7 @@ export function shortModelLabel(model?: string | null): string | null {
     const before = lower.match(new RegExp(`(\\d+(?:[-.]\\d+)?)[-_]${claudeFamily}`));
     const after = lower.match(new RegExp(`${claudeFamily}[-_]?(\\d+(?:[-.]\\d+)?)`));
     const ver = before?.[1] ?? after?.[1] ?? null;
-    return ver ? `${claudeFamily} ${ver.replace(/[-_]/g, '.')}` : claudeFamily;
+    return ver ? `${claudeFamily}-${ver.replace(/[-_]/g, '.')}` : claudeFamily;
   }
   if (lower.includes('flash')) return 'flash';
 
