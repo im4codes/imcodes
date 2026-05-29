@@ -12,6 +12,13 @@ describe('normalizeClaudeCodeModelId', () => {
     expect(normalizeClaudeCodeModelId('haiku')).toBe('haiku');
   });
 
+  it('maps version-bearing / full Claude ids to their canonical option by family', () => {
+    expect(normalizeClaudeCodeModelId('claude-opus-4-8[1m]')).toBe('opus[1M]');
+    expect(normalizeClaudeCodeModelId('claude-opus-4-8')).toBe('opus[1M]');
+    expect(normalizeClaudeCodeModelId('claude-3-5-sonnet-20241022')).toBe('sonnet');
+    expect(normalizeClaudeCodeModelId('claude-haiku-4')).toBe('haiku');
+  });
+
   it('rejects unknown values', () => {
     expect(normalizeClaudeCodeModelId('')).toBeUndefined();
     expect(normalizeClaudeCodeModelId('foo')).toBeUndefined();

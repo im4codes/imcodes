@@ -2456,11 +2456,16 @@ export function App() {
         if (event.type === 'usage.update') {
           // Model detection
           if (event.payload.model) {
-            const modelStr = String(event.payload.model).toLowerCase();
+            const rawModel = String(event.payload.model);
+            const modelStr = rawModel.toLowerCase();
+            // Preserve the full Claude id (e.g. "claude-opus-4-8") so the ctx-bar
+            // label can surface the version ("opus-4.8"). The model picker still
+            // normalizes this to its canonical option via
+            // normalizeClaudeCodeModelId, so selection is unaffected.
             const claudeM: string | null =
-              modelStr.includes('opus') ? 'opus[1M]' :
-              modelStr.includes('sonnet') ? 'sonnet' :
-              modelStr.includes('haiku') ? 'haiku' : null;
+              (modelStr.includes('opus') || modelStr.includes('sonnet') || modelStr.includes('haiku'))
+                ? rawModel
+                : null;
             const gptM = modelStr.match(/\b(gpt-5(?:\.\d+)?(?:-\w+)?)\b/);
             const gemM = modelStr.match(/\b(gemini[- ]\d[\w.-]*)\b/);
             const det = claudeM ?? (gptM ? gptM[1] : null) ?? (gemM ? gemM[1] : null);
