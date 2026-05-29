@@ -58,6 +58,7 @@ const GENERIC_FONT_FAMILIES = new Set(['monospace', 'sans-serif', 'serif', 'curs
 const CJK_FONT_FAMILIES = new Set([
   'pingfang sc',
   'pingfang tc',
+  'pingfang hk',
   'microsoft yahei',
   'microsoft jhenghei',
   'hiragino sans gb',
@@ -70,25 +71,44 @@ const CJK_FONT_FAMILIES = new Set([
   'sarasa mono sc',
   'lxgw wenkai',
   'songti sc',
+  'kaiti sc',
+  'stheiti',
+  'stsong',
+  'stkaiti',
+  'stfangsong',
   'simsun',
+  'nsimsun',
+  'dengxian',
+  'kaiti',
+  'fangsong',
 ]);
+
+type CJKPlatform = 'apple' | 'windows';
 
 interface CJKFamilyOption {
   id: string;
   name: string;
   cssValue: string;
+  platform?: CJKPlatform;
+  alwaysShow?: boolean;
 }
 
 const CJK_OPTIONS: readonly CJKFamilyOption[] = [
-  { id: 'system-cjk', name: 'System CJK', cssValue: DEFAULT_CJK_FAMILY },
-  { id: 'pingfang-sc', name: 'PingFang SC', cssValue: cjkStack('PingFang SC') },
-  { id: 'microsoft-yahei', name: 'Microsoft YaHei', cssValue: cjkStack('Microsoft YaHei') },
-  { id: 'noto-sans-cjk-sc', name: 'Noto Sans CJK SC', cssValue: cjkStack('Noto Sans CJK SC') },
-  { id: 'source-han-sans-sc', name: 'Source Han Sans SC', cssValue: cjkStack('Source Han Sans SC') },
-  { id: 'sarasa-mono-sc', name: 'Sarasa Mono SC', cssValue: cjkStack('Sarasa Mono SC') },
-  { id: 'lxgw-wenkai', name: 'LXGW WenKai', cssValue: cjkStack('LXGW WenKai') },
-  { id: 'songti-sc', name: 'Songti SC', cssValue: cjkStack('Songti SC') },
-  { id: 'simsun', name: 'SimSun', cssValue: cjkStack('SimSun') },
+  { id: 'system-cjk', name: 'System CJK', cssValue: DEFAULT_CJK_FAMILY, alwaysShow: true },
+  { id: 'pingfang-sc', name: 'PingFang SC', cssValue: cjkStack('PingFang SC'), platform: 'apple' },
+  { id: 'songti-sc', name: 'Songti SC', cssValue: cjkStack('Songti SC'), platform: 'apple' },
+  { id: 'kaiti-sc', name: 'Kaiti SC', cssValue: cjkStack('Kaiti SC'), platform: 'apple' },
+  { id: 'stheiti', name: 'STHeiti', cssValue: cjkStack('STHeiti'), platform: 'apple' },
+  { id: 'stsong', name: 'STSong', cssValue: cjkStack('STSong'), platform: 'apple' },
+  { id: 'stkaiti', name: 'STKaiti', cssValue: cjkStack('STKaiti'), platform: 'apple' },
+  { id: 'stfangsong', name: 'STFangsong', cssValue: cjkStack('STFangsong'), platform: 'apple' },
+  { id: 'microsoft-yahei', name: 'Microsoft YaHei', cssValue: cjkStack('Microsoft YaHei'), platform: 'windows' },
+  { id: 'simsun', name: 'SimSun', cssValue: cjkStack('SimSun'), platform: 'windows' },
+  { id: 'nsimsun', name: 'NSimSun', cssValue: cjkStack('NSimSun'), platform: 'windows' },
+  { id: 'dengxian', name: 'DengXian', cssValue: cjkStack('DengXian'), platform: 'windows' },
+  { id: 'kaiti', name: 'KaiTi', cssValue: cjkStack('KaiTi'), platform: 'windows' },
+  { id: 'fangsong', name: 'FangSong', cssValue: cjkStack('FangSong'), platform: 'windows' },
+  { id: 'microsoft-jhenghei', name: 'Microsoft JhengHei', cssValue: cjkStack('Microsoft JhengHei'), platform: 'windows' },
 ];
 
 /**
@@ -329,6 +349,20 @@ function isFontInstalled(family: string): boolean {
   }
 }
 
+function currentCJKPlatform(): CJKPlatform | undefined {
+  try {
+    const nav = typeof navigator !== 'undefined' ? navigator : undefined;
+    const haystack = [
+      nav?.platform,
+      nav?.userAgent,
+      (nav as Navigator & { userAgentData?: { platform?: string } } | undefined)?.userAgentData?.platform,
+    ].filter(Boolean).join(' ').toLowerCase();
+    if (/(mac|iphone|ipad|ipod)/.test(haystack)) return 'apple';
+    if (/win/.test(haystack)) return 'windows';
+  } catch { /* ignore unavailable navigator fields */ }
+  return undefined;
+}
+
 /**
  * Build a CSS font-family value for an arbitrary local family name. The
  * picked font sits at the front; CJK fallback keeps Chinese / Japanese /
@@ -370,6 +404,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const [open, setOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<FontTab>('code');
   const [localFonts, setLocalFonts] = useState<LocalFontsState>({ kind: 'idle' });
+  const [showAllSystemCJK, setShowAllSystemCJK] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
   const suppressNextSizeClickRef = useRef(false);
   const lastSelectEventRef = useRef('');
@@ -381,6 +416,12 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     // Re-evaluate when the popover opens so newly-loaded webfonts are picked up.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
+
+  const cjkPlatform = useMemo(() => currentCJKPlatform(), [open]);
+  const visibleCJKOptions = useMemo(() => {
+    if (showAllSystemCJK || !cjkPlatform) return CJK_OPTIONS;
+    return CJK_OPTIONS.filter((opt) => opt.alwaysShow || opt.platform === cjkPlatform);
+  }, [cjkPlatform, showAllSystemCJK]);
 
   const localFontsSupported = useMemo(() => typeof window !== 'undefined' && 'queryLocalFonts' in window, []);
 
@@ -470,6 +511,19 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     padding: 0,
     lineHeight: 1,
   } as const);
+
+  const utilityButtonStyle = {
+    width: '100%',
+    height: 26,
+    border: '1px solid #334155',
+    borderRadius: 6,
+    background: 'rgba(15, 23, 42, 0.72)',
+    color: '#93c5fd',
+    fontSize: 11,
+    fontWeight: 700,
+    fontFamily: 'system-ui',
+    cursor: 'pointer',
+  } as const;
 
   const selectWrapStyle = {
     position: 'relative' as const,
@@ -633,8 +687,8 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
 
   const cjkSelectValue = prefs.cjkFamily ?? DEFAULT_CJK_FAMILY;
   const cjkIsOrphan = useMemo(() => {
-    return !CJK_OPTIONS.some((o) => o.cssValue === cjkSelectValue);
-  }, [cjkSelectValue]);
+    return !visibleCJKOptions.some((o) => o.cssValue === cjkSelectValue);
+  }, [cjkSelectValue, visibleCJKOptions]);
 
   const handleSelectChange = (e: Event) => {
     const v = (e.target as HTMLSelectElement).value;
@@ -777,7 +831,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
               </>
             ) : (
               <>
-                {CJK_OPTIONS.map((opt) => (
+                {visibleCJKOptions.map((opt) => (
                   <option key={opt.id} value={opt.cssValue} style={{ fontFamily: `${opt.cssValue}, system-ui, sans-serif` }}>
                     {opt.name}
                   </option>
@@ -795,6 +849,15 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
               on mobile and the dropdown on desktop. */}
           <span style={chevronStyle} aria-hidden="true">▾</span>
           </div>
+          {activeTab === 'cjk' && cjkPlatform && !showAllSystemCJK && (
+            <button
+              type="button"
+              style={utilityButtonStyle}
+              onClick={() => setShowAllSystemCJK(true)}
+            >
+              All built-in CJK fonts
+            </button>
+          )}
           <div style={previewStyle}>Aa 123 const text = "你好世界";</div>
         </div>
       )}

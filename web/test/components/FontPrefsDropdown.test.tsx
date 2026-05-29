@@ -72,6 +72,44 @@ describe('FontPrefsDropdown', () => {
     expect(onChange.mock.calls[0][0].family).toContain('"Microsoft YaHei"');
   });
 
+  it('keeps non-system CJK fonts out of the built-in selector', () => {
+    const onChange = vi.fn();
+    const prefs = { ...DEFAULT_CHAT_FONT, size: 14 };
+
+    render(<FontPrefsDropdown prefs={prefs} onChange={onChange} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Aa' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'CJK' }));
+
+    expect(screen.queryByRole('option', { name: 'LXGW WenKai' })).toBeNull();
+    expect(screen.queryByRole('option', { name: 'Sarasa Mono SC' })).toBeNull();
+    expect(screen.queryByRole('option', { name: 'Noto Sans CJK SC' })).toBeNull();
+  });
+
+  it('can expand from platform CJK fonts to all Mac and Windows built-ins', () => {
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(window.navigator, 'platform', { value: 'MacIntel', configurable: true });
+    const onChange = vi.fn();
+    const prefs = { ...DEFAULT_CHAT_FONT, size: 14 };
+
+    try {
+      render(<FontPrefsDropdown prefs={prefs} onChange={onChange} />);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Aa' }));
+      fireEvent.click(screen.getByRole('tab', { name: 'CJK' }));
+
+      expect(screen.getByRole('option', { name: 'PingFang SC' })).toBeTruthy();
+      expect(screen.queryByRole('option', { name: 'Microsoft YaHei' })).toBeNull();
+
+      fireEvent.click(screen.getByRole('button', { name: 'All built-in CJK fonts' }));
+
+      expect(screen.getByRole('option', { name: 'Microsoft YaHei' })).toBeTruthy();
+      expect(screen.getByRole('option', { name: 'FangSong' })).toBeTruthy();
+    } finally {
+      Object.defineProperty(window.navigator, 'platform', { value: originalPlatform, configurable: true });
+    }
+  });
+
   it('persists the selected CJK fallback when using stored font prefs', () => {
     const scope = 'font-test';
     function Harness() {
