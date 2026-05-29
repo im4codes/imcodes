@@ -3,9 +3,21 @@ export function shortModelLabel(model?: string | null): string | null {
   if (!m) return null;
   const lower = m.toLowerCase();
 
-  if (lower.includes('opus')) return 'opus';
-  if (lower.includes('sonnet')) return 'sonnet';
-  if (lower.includes('haiku')) return 'haiku';
+  const claudeFamily =
+    lower.includes('opus') ? 'opus'
+    : lower.includes('sonnet') ? 'sonnet'
+    : lower.includes('haiku') ? 'haiku'
+    : null;
+  if (claudeFamily) {
+    // Surface the version: new-style `claude-opus-4-8` (digits AFTER the
+    // family) or old-style `claude-3-5-sonnet` (digits BEFORE the family).
+    // Capture at most major[-minor] so trailing date suffixes like
+    // `-20260514` are not swallowed. `-`/`_` separators render as `.`.
+    const before = lower.match(new RegExp(`(\\d+(?:[-.]\\d+)?)[-_]${claudeFamily}`));
+    const after = lower.match(new RegExp(`${claudeFamily}[-_]?(\\d+(?:[-.]\\d+)?)`));
+    const ver = before?.[1] ?? after?.[1] ?? null;
+    return ver ? `${claudeFamily} ${ver.replace(/[-_]/g, '.')}` : claudeFamily;
+  }
   if (lower.includes('flash')) return 'flash';
 
   if (/^gpt-5\.4(?:$|[-_.])/.test(lower)) {
