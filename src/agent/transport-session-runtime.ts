@@ -165,6 +165,14 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _history: AgentMessage[] = [];
   private _providerSessionId: string | null = null;
   private _sending = false;
+  /** Epoch ms of the last sign of life for the active turn — any provider
+   *  event (delta / completion / error / tool call / session info) or a turn
+   *  dispatch we initiated. Frozen if the provider wedges mid-turn (e.g. a
+   *  lost `onComplete` leaves `_status='streaming'` / `_sending=true`
+   *  forever). The daemon-upgrade gate reads its age to detect a phantom
+   *  in-progress turn and stop blocking upgrades indefinitely — one stuck SDK
+   *  session must never pin the daemon on an old version. */
+  private _lastActivityAt = Date.now();
   private _description: string | undefined;
   private _systemPrompt: string | undefined;
   /**
@@ -245,11 +253,13 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._unsubscribes.push(
       this.provider.onDelta((sid: string, _delta: MessageDelta) => {
         if (sid !== this._providerSessionId) return;
+        this._lastActivityAt = Date.now();
         if (this._activeDispatchCancelled) return;
         this.setStatus('streaming');
       }),
       this.provider.onComplete((sid: string, message: AgentMessage) => {
         if (sid !== this._providerSessionId) return;
+        this._lastActivityAt = Date.now();
         if (this._activeDispatchCancelled) {
           this._sending = false;
           this._activeTurn?.reject(makeCancelledProviderError());
@@ -284,6 +294,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       }),
       this.provider.onError((sid: string, error: ProviderError) => {
         if (sid !== this._providerSessionId) return;
+        this._lastActivityAt = Date.now();
         this._sending = false;
         this._activeTurn?.reject(error);
         this._activeTurn = null;
@@ -304,11 +315,13 @@ export class TransportSessionRuntime implements SessionRuntime {
       }),
       ...(this.provider.onSessionInfo ? [this.provider.onSessionInfo((sid: string, info: SessionInfoUpdate) => {
         if (sid !== this._providerSessionId) return;
+        this._lastActivityAt = Date.now();
         this._onSessionInfoChange?.(info);
       })] : []),
     );
     const unsubscribeToolCall = this.provider.onToolCall?.((sid: string) => {
       if (sid !== this._providerSessionId) return;
+      this._lastActivityAt = Date.now();
       if (this._activeDispatchId === null || !this._activeTurn) return;
       // Provider-visible tool events mean the SDK has already accepted work,
       // even if the shared-context dispatcher has not crossed its provider.send
@@ -551,6 +564,11 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   getStatus(): AgentStatus { return this._status; }
 
+  /** Epoch ms of the last provider event or turn dispatch. The daemon-upgrade
+   *  gate uses `Date.now() - lastActivityAt` to detect a phantom in-progress
+   *  turn (wedged provider) and avoid blocking upgrades forever. */
+  get lastActivityAt(): number { return this._lastActivityAt; }
+
   async kill(): Promise<void> {
     for (const unsub of this._unsubscribes) unsub();
     this._unsubscribes = [];
@@ -621,6 +639,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       status: 'complete',
     });
 
+    this._lastActivityAt = Date.now();
     this.setStatus('thinking');
     this._sending = true;
     this._activeDispatchCancelled = false;

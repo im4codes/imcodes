@@ -5648,6 +5648,52 @@ export function evaluateAutoUpgradeCooldown(
   return { onCooldown: true, remainingMs: cooldownMs - ageMs, lastAt };
 }
 
+/** How long the *session-busy* gate may keep deferring an upgrade before the
+ *  daemon forces it through. The per-turn staleness guard
+ *  (`TRANSPORT_STALE_TURN_MS`) catches wedged transport turns; this is the
+ *  final backstop for everything else (a process-agent CLI stuck in
+ *  'running'/'queued', a transport turn the staleness guard hasn't yet aged
+ *  out, an unforeseen state) so ONE stuck session can never pin the daemon on
+ *  an old version forever. Override for tests via IMCODES_MAX_UPGRADE_DEFER_MS. */
+const MAX_UPGRADE_DEFER_MS = (() => {
+  const raw = parseInt(process.env.IMCODES_MAX_UPGRADE_DEFER_MS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60 * 1000;
+})();
+
+/** Epoch ms when the session-busy gate FIRST blocked the current run of
+ *  upgrade attempts, or null when the last attempt was not session-blocked.
+ *  Persists across `handleDaemonUpgrade` calls (each server upgrade broadcast)
+ *  so the backstop measures *continuous* deferral, not a single attempt. */
+let upgradeSessionBusyDeferredSince: number | null = null;
+
+/** Pure decision for the session-busy deferral backstop. Given whether the
+ *  session gate is currently blocking and how long it has been blocking,
+ *  decide whether to proceed anyway (forced) and what the next "blocked since"
+ *  marker should be. Extracted for deterministic unit testing. */
+export function evaluateUpgradeDeferralBackstop(args: {
+  blocked: boolean;
+  deferredSince: number | null;
+  now: number;
+  maxDeferMs: number;
+}): { proceed: boolean; forced: boolean; nextDeferredSince: number | null; deferredMs: number } {
+  const { blocked, deferredSince, now, maxDeferMs } = args;
+  if (!blocked) {
+    return { proceed: true, forced: false, nextDeferredSince: null, deferredMs: 0 };
+  }
+  const since = deferredSince ?? now;
+  const deferredMs = Math.max(0, now - since);
+  if (Number.isFinite(maxDeferMs) && maxDeferMs > 0 && deferredMs >= maxDeferMs) {
+    // Deferred long enough — force the upgrade through and reset the tracker.
+    return { proceed: true, forced: true, nextDeferredSince: null, deferredMs };
+  }
+  return { proceed: false, forced: false, nextDeferredSince: since, deferredMs };
+}
+
+/** Test-only: reset the module-level session-busy deferral tracker. */
+export function __resetUpgradeDeferralStateForTests(): void {
+  upgradeSessionBusyDeferredSince = null;
+}
+
 /**
  * Resolve which npm registry the daemon's own auto-upgrade should use, so the
  * pre-flight "is latest newer?" probe and the actual `npm install -g` agree on
@@ -5785,10 +5831,19 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
   // mid-turn would silently get killed by self-upgrade restart, throwing
   // away the in-flight generation.
   const activeSessions = getActiveSessionsBlockingDaemonUpgrade();
-  if (activeSessions.length > 0) {
+  const deferralBackstop = evaluateUpgradeDeferralBackstop({
+    blocked: activeSessions.length > 0,
+    deferredSince: upgradeSessionBusyDeferredSince,
+    now: Date.now(),
+    maxDeferMs: MAX_UPGRADE_DEFER_MS,
+  });
+  upgradeSessionBusyDeferredSince = deferralBackstop.nextDeferredSince;
+  if (activeSessions.length > 0 && !deferralBackstop.proceed) {
     logger.warn({
       targetVersion,
       blockedSessions: activeSessions,
+      deferredMs: deferralBackstop.deferredMs,
+      maxDeferMs: MAX_UPGRADE_DEFER_MS,
     }, 'daemon.upgrade: blocked because sessions have active turns');
     try {
       serverLink?.send({
@@ -5799,6 +5854,18 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
       });
     } catch { /* ignore */ }
     return;
+  }
+  if (activeSessions.length > 0 && deferralBackstop.forced) {
+    // Deferred past MAX_UPGRADE_DEFER_MS — the blocking session(s) are almost
+    // certainly wedged. Proceed anyway rather than stay pinned on an old
+    // version forever; a transport SDK session resumes after restart and a
+    // wedged process turn was already lost.
+    logger.warn({
+      targetVersion,
+      blockedSessions: activeSessions,
+      deferredMs: deferralBackstop.deferredMs,
+      maxDeferMs: MAX_UPGRADE_DEFER_MS,
+    }, 'daemon.upgrade: forcing upgrade despite active sessions after prolonged deferral (sessions likely wedged)');
   }
 
   const { spawn } = await import('child_process');
@@ -6756,6 +6823,23 @@ export function getActiveP2pRunsBlockingDaemonUpgrade(runs = listP2pRuns()) {
  *  restart` (which is exactly what the upgrade wants to do anyway). */
 const TRANSPORT_IN_PROGRESS_STATUSES: ReadonlySet<string> = new Set(['thinking', 'streaming']);
 
+/** A transport turn that reports in-progress (thinking/streaming) or
+ *  sending/pending but has produced NO provider activity (no delta /
+ *  completion / error / tool call / session-info / dispatch) for this long is
+ *  treated as a PHANTOM — the provider wedged mid-turn (classic symptom: a
+ *  lost `onComplete` leaves `_status='streaming'` and `_sending=true`
+ *  forever) — and must NOT block daemon upgrades. Observed in production: a
+ *  codex-sdk sub-session stuck in 'streaming' for 8+ hours blocked every
+ *  auto-upgrade, pinning the daemon on a stale version. A live turn refreshes
+ *  its activity timestamp on every delta, so a real generation never trips
+ *  this (the absolute deferral backstop in `handleDaemonUpgrade` is the final
+ *  safety net for everything this doesn't catch, e.g. wedged process agents).
+ *  Override for tests via IMCODES_TRANSPORT_STALE_TURN_MS. */
+const TRANSPORT_STALE_TURN_MS = (() => {
+  const raw = parseInt(process.env.IMCODES_TRANSPORT_STALE_TURN_MS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15 * 60 * 1000;
+})();
+
 /** Snapshot of why a transport session is currently blocking daemon upgrade.
  *  Embedded in the upgrade-blocked log so future "why didn't it upgrade"
  *  investigations can see the actual failing condition instead of guessing
@@ -6767,23 +6851,43 @@ export interface TransportUpgradeBlockReason {
   blockReason: 'status_thinking' | 'status_streaming' | 'sending' | 'pending';
 }
 
-export function getTransportSessionUpgradeBlockReason(sessionName: string): TransportUpgradeBlockReason | null {
+export function getTransportSessionUpgradeBlockReason(
+  sessionName: string,
+  opts?: { now?: number; staleTurnMs?: number },
+): TransportUpgradeBlockReason | null {
   const runtime = getTransportRuntime(sessionName);
   if (!runtime) return null;
   const status = runtime.getStatus();
   const sending = !!runtime.sending;
   const pendingCount = runtime.pendingCount ?? 0;
+  let blockReason: TransportUpgradeBlockReason['blockReason'] | null = null;
   if (TRANSPORT_IN_PROGRESS_STATUSES.has(status)) {
-    return {
-      status,
-      sending,
-      pendingCount,
-      blockReason: status === 'streaming' ? 'status_streaming' : 'status_thinking',
-    };
+    blockReason = status === 'streaming' ? 'status_streaming' : 'status_thinking';
+  } else if (sending) {
+    blockReason = 'sending';
+  } else if (pendingCount > 0) {
+    blockReason = 'pending';
   }
-  if (sending) return { status, sending, pendingCount, blockReason: 'sending' };
-  if (pendingCount > 0) return { status, sending, pendingCount, blockReason: 'pending' };
-  return null;
+  if (!blockReason) return null;
+
+  // Phantom-turn staleness guard. A runtime that reports in-progress but has
+  // gone silent past the threshold is wedged — do NOT let it block the
+  // upgrade indefinitely. `lastActivityAt` is absent on legacy/mock runtimes;
+  // when so, fall back to the original always-block behaviour (safe default).
+  const lastActivityAt = (runtime as { lastActivityAt?: number }).lastActivityAt;
+  if (typeof lastActivityAt === 'number' && Number.isFinite(lastActivityAt)) {
+    const now = opts?.now ?? Date.now();
+    const staleMs = opts?.staleTurnMs ?? TRANSPORT_STALE_TURN_MS;
+    const ageMs = now - lastActivityAt;
+    if (ageMs >= staleMs) {
+      logger.warn(
+        { sessionName, status, sending, pendingCount, blockReason, ageMs, staleMs },
+        'daemon.upgrade: transport turn is stale (no provider activity past threshold) — treating as phantom, NOT blocking upgrade',
+      );
+      return null;
+    }
+  }
+  return { status, sending, pendingCount, blockReason };
 }
 
 /** Process-agent session.state values that represent a genuine in-flight turn.
@@ -6813,11 +6917,14 @@ export interface SessionUpgradeBlockReason {
   transport: TransportUpgradeBlockReason | null;
 }
 
-export function getActiveSessionsBlockingDaemonUpgrade(sessions = listSessions()): SessionUpgradeBlockReason[] {
+export function getActiveSessionsBlockingDaemonUpgrade(
+  sessions = listSessions(),
+  opts?: { now?: number; staleTurnMs?: number },
+): SessionUpgradeBlockReason[] {
   const reasons: SessionUpgradeBlockReason[] = [];
   for (const session of sessions) {
     if (session.runtimeType === 'transport') {
-      const transport = getTransportSessionUpgradeBlockReason(session.name);
+      const transport = getTransportSessionUpgradeBlockReason(session.name, opts);
       if (transport) {
         reasons.push({
           name: session.name,
