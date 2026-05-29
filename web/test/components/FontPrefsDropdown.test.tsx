@@ -37,4 +37,16 @@ describe('FontPrefsDropdown', () => {
     expect(onChange).toHaveBeenCalledTimes(1);
     expect(onChange).toHaveBeenCalledWith({ ...prefs, size: 13 });
   });
+
+  it('always exposes bundled Cascadia Mono in the font picker', () => {
+    const onChange = vi.fn();
+    const prefs = { ...DEFAULT_CHAT_FONT, size: 14 };
+
+    render(<FontPrefsDropdown prefs={prefs} onChange={onChange} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Aa' }));
+    const cascadiaOption = screen.getByRole('option', { name: 'Cascadia Mono' }) as HTMLOptionElement;
+    expect(cascadiaOption).toBeTruthy();
+    expect(cascadiaOption.value).toContain('"Cascadia Mono"');
+  });
 });

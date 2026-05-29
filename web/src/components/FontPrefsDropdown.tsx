@@ -174,13 +174,15 @@ interface FontFamilyOption {
  * stack ends with a sensible generic family.
  *
  * Programmer mono families chosen for ubiquity:
- *   JetBrains Mono, Fira Code, Cascadia Code, Source Code Pro,
+ *   JetBrains Mono, Cascadia Mono, Fira Code, Cascadia Code, Source Code Pro,
  *   IBM Plex Mono, Hack, Iosevka, Inconsolata, Roboto Mono, Ubuntu Mono,
  *   Menlo (mac default), Consolas (Windows default), SF Mono.
  */
 const FAMILY_OPTIONS: readonly FontFamilyOption[] = [
   // JetBrains Mono — bundled webfont, default. Always shown.
   { id: 'jetbrains-mono', name: 'JetBrains Mono', cssValue: `"JetBrains Mono", "JetBrains Mono NL", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace` },
+  // Cascadia Mono — bundled webfont. Always shown.
+  { id: 'cascadia-mono', name: 'Cascadia Mono', cssValue: `"Cascadia Mono", "Cascadia Code", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace` },
   // Generic categories — always available
   { id: 'system', name: 'System', cssValue: 'system-ui' },
   { id: 'sans', name: 'Sans', cssValue: `-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, ${CJK_FALLBACK}, "Helvetica Neue", Arial, sans-serif` },
