@@ -10,6 +10,7 @@ import path from 'node:path';
 import logger from '../util/logger.js';
 import { ensureImcDir } from '../util/imc-dir.js';
 import type { AgentType } from '../agent/detect.js';
+import { DISCUSSION_RECONCILE_HIDDEN_MS } from '../../shared/discussion-ui.js';
 
 const IDLE_TIMEOUT = 300_000;      // max total wall time per response
 const ACTIVE_TIMEOUT = 120_000;    // timeout only when agent is idle with no file growth
@@ -60,6 +61,8 @@ interface DiscussionParticipant {
 interface Discussion {
   id: string;
   serverId: string;
+  /** Correlation id echoed from the originating discussion.start (web requestId). */
+  requestId?: string;
   topic: string;
   cwd: string;
   state: DiscussionState;
@@ -105,7 +108,7 @@ function scheduleDiscussionCleanup(id: string): void {
   setTimeout(() => {
     discussions.delete(id);
     discussionCleanupScheduled.delete(id);
-  }, 60_000);
+  }, DISCUSSION_RECONCILE_HIDDEN_MS);
 }
 
 /** Test-only: clear the cleanup-scheduled set (vitest fake-timer flushing). */
@@ -391,6 +394,17 @@ async function runDiscussion(
     filePath: d.filePath, startedAt: d.startedAt,
   });
 
+  // Relayed to browsers (discussion.save is DB-only at the bridge): moves the
+  // optimistic / setup card out of "starting" the moment the run actually
+  // begins, instead of leaving it frozen until the first round update. Carries
+  // requestId so the web reconciler can match a still-pending optimistic entry.
+  onUpdate({
+    type: 'discussion.update',
+    discussionId: d.id, requestId: d.requestId,
+    state: d.state, currentRound: 0, maxRounds: d.maxRounds,
+    currentSpeaker: null, filePath: d.filePath,
+  });
+
   const isStopped = () => (d.state as string) === 'failed';
   const { stat } = await import('node:fs/promises');
 
@@ -529,6 +543,7 @@ export async function startDiscussion(
   opts: {
     id: string;
     serverId: string;
+    requestId?: string;
     topic: string;
     cwd: string;
     participants: Array<{
@@ -581,6 +596,7 @@ export async function startDiscussion(
   const discussion: Discussion = {
     id: opts.id,
     serverId: opts.serverId,
+    requestId: opts.requestId,
     topic: opts.topic,
     cwd: opts.cwd,
     state: 'setup',
@@ -600,7 +616,7 @@ export async function startDiscussion(
     discussion.state = 'failed';
     discussion.error = e instanceof Error ? e.message : String(e);
     scheduleDiscussionCleanup(discussion.id);
-    onUpdate({ type: 'discussion.error', discussionId: discussion.id, error: discussion.error });
+    onUpdate({ type: 'discussion.error', discussionId: discussion.id, requestId: discussion.requestId, error: discussion.error });
     onUpdate({
       type: 'discussion.save',
       id: discussion.id, topic: discussion.topic, state: 'failed', maxRounds: discussion.maxRounds,
@@ -626,6 +642,7 @@ export function getDiscussion(id: string): Discussion | undefined {
 
 export function listDiscussions(): Array<{
   id: string;
+  requestId?: string;
   topic: string;
   state: string;
   currentRound: number;
@@ -636,6 +653,7 @@ export function listDiscussions(): Array<{
 }> {
   return [...discussions.values()].map((d) => ({
     id: d.id,
+    requestId: d.requestId,
     topic: d.topic,
     state: d.state,
     currentRound: d.currentRound,
