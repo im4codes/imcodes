@@ -1233,7 +1233,9 @@
     "empty": "로컬 포트와 경로를 입력한 다음 미리보기를 여세요.",
     "noServer": "먼저 서버를 선택하세요.",
     "previewing": "미리보기 중：",
-    "initialPathNote": "이 경로는 처음 여는 페이지만 지정합니다. 로드 후 탐색 범위는 이 경로가 아니라 포트 기준입니다."
+    "initialPathNote": "이 경로는 처음 여는 페이지만 지정합니다. 로드 후 탐색 범위는 이 경로가 아니라 포트 기준입니다.",
+    "portHistoryLabel": "최근 포트",
+    "pathHistoryLabel": "최근 경로"
   },
   "cron": {
     "title": "예약 작업",

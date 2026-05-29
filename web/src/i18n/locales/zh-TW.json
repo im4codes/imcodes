@@ -1234,7 +1234,9 @@
     "empty": "輸入本機連接埠與路徑後即可開啟預覽。",
     "noServer": "請先選擇伺服器。",
     "previewing": "預覽中：",
-    "initialPathNote": "這個路徑只決定初始開啟頁面；載入後，後續導覽是依埠範圍處理，而不是依這個路徑限制。"
+    "initialPathNote": "這個路徑只決定初始開啟頁面；載入後，後續導覽是依埠範圍處理，而不是依這個路徑限制。",
+    "portHistoryLabel": "最近使用的埠",
+    "pathHistoryLabel": "最近使用的路徑"
   },
   "cron": {
     "title": "排程任務",

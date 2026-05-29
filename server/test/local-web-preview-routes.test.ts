@@ -1,10 +1,56 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { buildApp } from '../src/index.js';
+import { WsBridge } from '../src/ws/bridge.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 import { sha256Hex, signJwt } from '../src/security/crypto.js';
 import { COOKIE_CSRF, COOKIE_PREVIEW_ACCESS, COOKIE_SESSION, HEADER_CSRF } from '../../shared/cookie-names.js';
-import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '../../shared/preview-types.js';
+import {
+  PREVIEW_ACCESS_TOKEN_QUERY_PARAM,
+  PREVIEW_MSG,
+  PREVIEW_BINARY_FRAME,
+  packPreviewBinaryFrame,
+} from '../../shared/preview-types.js';
+
+/**
+ * Minimal mock daemon WS for driving the preview proxy end-to-end in-process.
+ * Auto-answers each `preview.request` with a fast 200 + body + response_end so
+ * the HTTP relay resolves (used to prove first-paint bursts are NOT rejected).
+ */
+class MockDaemonWs extends EventEmitter {
+  sent: Array<string | Buffer> = [];
+  closed = false;
+  readyState = 1; // OPEN
+  autoRespond = true;
+
+  send(data: string | Buffer, optsOrCb?: unknown, callback?: (err?: Error) => void): void {
+    const cb = typeof optsOrCb === 'function' ? (optsOrCb as (e?: Error) => void) : callback;
+    if (this.closed) { cb?.(new Error('closed')); return; }
+    this.sent.push(data);
+    cb?.();
+    if (this.autoRespond && typeof data === 'string') {
+      let msg: Record<string, unknown> | null = null;
+      try { msg = JSON.parse(data) as Record<string, unknown>; } catch { msg = null; }
+      if (msg?.type === PREVIEW_MSG.REQUEST_END && typeof msg.requestId === 'string') {
+        const requestId = msg.requestId;
+        // Reply asynchronously, as the real daemon would.
+        queueMicrotask(() => {
+          this.emit('message', Buffer.from(JSON.stringify({
+            type: PREVIEW_MSG.RESPONSE_START,
+            requestId,
+            status: 200,
+            headers: { 'content-type': 'text/plain' },
+          })), false);
+          this.emit('message', packPreviewBinaryFrame(PREVIEW_BINARY_FRAME.RESPONSE_BODY, requestId, Buffer.from('ok')), true);
+          this.emit('message', Buffer.from(JSON.stringify({ type: PREVIEW_MSG.RESPONSE_END, requestId })), false);
+        });
+      }
+    }
+  }
+
+  close() { this.closed = true; this.readyState = 3; this.emit('close', 1000, Buffer.from('')); }
+}
 
 type ServerRow = { id: string; user_id: string; team_id: string | null; token_hash: string };
 type ApiKeyRow = { id: string; user_id: string; key_hash: string; revoked_at: number | null; grace_expires_at: number | null };
@@ -26,6 +72,10 @@ function makeMemDb() {
     },
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
       const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+      if (s.includes('select token_hash, user_id from servers where id = $1')) {
+        const row = servers.get(params[0] as string);
+        return (row ? { token_hash: row.token_hash, user_id: row.user_id } : null) as T | null;
+      }
       if (s.includes('select team_id, user_id from servers where id = $1')) {
         const row = servers.get(params[0] as string);
         return (row ? { team_id: row.team_id, user_id: row.user_id } : null) as T | null;
@@ -83,6 +133,10 @@ describe('local web preview routes', () => {
     db.seedServer({ id: serverId, user_id: userId, team_id: null, token_hash: sha256Hex('daemon-token') });
     db.seedApiKey({ id: 'key1', user_id: userId, key_hash: sha256Hex('deck_test_key'), revoked_at: null, grace_expires_at: null });
     app = buildApp(makeEnv(db));
+  });
+
+  afterEach(() => {
+    WsBridge.getAll().clear();
   });
 
   function sessionCookie(csrf = 'csrf-token') {
@@ -177,29 +231,36 @@ describe('local web preview routes', () => {
     expect(proxyRes.headers.get('set-cookie')).toContain(`${COOKIE_PREVIEW_ACCESS}=${created.preview.accessToken}`);
   });
 
-  it('rate limits preview proxy requests per user/server', async () => {
+  // ── V-conc-首屏 (run 8a975732-23a P0.5.1 / P0.6) ────────────────────────────
+  // Replaces the removed "121st request → 429" per-request count-limit assertion.
+  // A real SPA first paint fires dozens–hundreds of fast sub-resource requests;
+  // with the count limiter gone and only an in-flight concurrency floor remaining,
+  // a high-but-fast-completing burst MUST NOT be rejected with 429 OR 503.
+  it('V-conc-首屏: a fast >120/min burst is never rejected with 429 or 503', async () => {
+    // Wire a mock daemon that auto-answers each request fast, so the relay
+    // resolves (proving requests are forwarded, not daemon-offline-503).
+    const daemon = new MockDaemonWs();
+    WsBridge.get(serverId).handleDaemonConnection(daemon as never, db as never, makeEnv(db) as never);
+    daemon.emit('message', Buffer.from(JSON.stringify({ type: 'auth', serverId, token: 'daemon-token' })), false);
+    await new Promise((r) => setTimeout(r, 5));
+
     const createRes = await app.request(`/api/server/${serverId}/local-web-preview`, {
       method: 'POST',
-      headers: {
-        Authorization: 'Bearer deck_test_key',
-        'Content-Type': 'application/json',
-      },
+      headers: { Authorization: 'Bearer deck_test_key', 'Content-Type': 'application/json' },
       body: JSON.stringify({ port: 3000, path: '/' }),
     });
-    const created = await createRes.json() as { preview: { id: string } };
+    const created = await createRes.json() as { preview: { id: string; accessToken: string } };
 
-    for (let i = 0; i < 120; i++) {
-      const res = await app.request(`/api/server/${serverId}/local-web/${created.preview.id}/`, {
-        method: 'GET',
-        headers: { Authorization: 'Bearer deck_test_key' },
-      });
-      expect([503, 502]).toContain(res.status);
+    // 130 sequential (fast-completing) requests — each settles before the next,
+    // so in-flight is always 1 and far below the floor.
+    for (let i = 0; i < 130; i++) {
+      const res = await app.request(
+        `/api/server/${serverId}/local-web/${created.preview.id}/?${PREVIEW_ACCESS_TOKEN_QUERY_PARAM}=${created.preview.accessToken}`,
+        { method: 'GET' },
+      );
+      expect(res.status).not.toBe(429);
+      expect(res.status).not.toBe(503);
+      expect(res.status).toBe(200);
     }
-
-    const limited = await app.request(`/api/server/${serverId}/local-web/${created.preview.id}/`, {
-      method: 'GET',
-      headers: { Authorization: 'Bearer deck_test_key' },
-    });
-    expect(limited.status).toBe(429);
   });
 });

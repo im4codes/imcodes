@@ -1234,7 +1234,9 @@
     "empty": "输入本机端口和路径后即可打开预览。",
     "noServer": "请先选择一个服务器。",
     "previewing": "预览中：",
-    "initialPathNote": "这个路径只决定初始打开页面；加载后，后续导航按端口范围处理，而不是按这个路径限制。"
+    "initialPathNote": "这个路径只决定初始打开页面；加载后，后续导航按端口范围处理，而不是按这个路径限制。",
+    "portHistoryLabel": "最近使用的端口",
+    "pathHistoryLabel": "最近使用的路径"
   },
   "cron": {
     "title": "定时任务",

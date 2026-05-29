@@ -1234,7 +1234,9 @@
     "empty": "Enter a localhost port and path, then open the preview.",
     "noServer": "Select a server first.",
     "previewing": "Previewing:",
-    "initialPathNote": "Path sets only the initial page. After load, navigation is scoped by port, not by this path."
+    "initialPathNote": "Path sets only the initial page. After load, navigation is scoped by port, not by this path.",
+    "portHistoryLabel": "Recent ports",
+    "pathHistoryLabel": "Recent paths"
   },
   "cron": {
     "title": "Scheduled Tasks",

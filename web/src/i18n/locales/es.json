@@ -1233,7 +1233,9 @@
     "empty": "Introduce un puerto local y una ruta, luego abre la vista previa.",
     "noServer": "Selecciona primero un servidor.",
     "previewing": "Vista previa:",
-    "initialPathNote": "La ruta solo establece la página inicial. Después de cargar, la navegación queda limitada por el puerto, no por esta ruta."
+    "initialPathNote": "La ruta solo establece la página inicial. Después de cargar, la navegación queda limitada por el puerto, no por esta ruta.",
+    "portHistoryLabel": "Puertos recientes",
+    "pathHistoryLabel": "Rutas recientes"
   },
   "cron": {
     "title": "Tareas programadas",

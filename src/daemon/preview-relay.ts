@@ -18,12 +18,23 @@ import {
   type PreviewWsCloseMessage,
 } from '../../shared/preview-types.js';
 import { normalizePreviewUpstreamPath } from '../../shared/preview-policy.js';
+import { isStreamingResponse } from '../../shared/preview-stream-policy.js';
 
 type PendingPreviewRequest = {
   abortController: AbortController;
   bodyStream: PassThrough | null;
   requestBytes: number;
   responseBytes: number;
+  /**
+   * Decided ONCE at RESPONSE_START via the shared `isStreamingResponse` predicate
+   * (run 8a975732-23a A3/A5). A streaming response (SSE / ndjson / chunked non-JSON)
+   * is EXEMPT from the cumulative MAX_RESPONSE_BYTES cap — it is instead bounded by
+   * the stream-idle timeout (here) and the server-side unconsumed-buffer high-watermark.
+   * Non-streaming responses keep the cumulative byte-cap protection. The server WS
+   * bridge feeds the SAME RESPONSE_START headers into the SAME shared predicate, so
+   * the two sides can never disagree (no copy across daemon/server — CLAUDE.md).
+   */
+  streaming: boolean;
   timedOut: boolean;
   timer: ReturnType<typeof setTimeout>;
   timerMode: 'start' | 'idle';
@@ -164,12 +175,16 @@ async function runPreviewFetch(serverLink: ServerLink, msg: PreviewRequestMessag
       signal: pending.abortController.signal,
     } as RequestInit & { duplex?: 'half' });
 
+    const responseHeaders = responseHeadersToRecord(response.headers);
+    // Classify ONCE at RESPONSE_START (shared predicate). Streaming responses are
+    // exempt from the cumulative MAX_RESPONSE_BYTES cap; non-streaming keep it.
+    pending.streaming = isStreamingResponse(responseHeaders);
     serverLink.send({
       type: PREVIEW_MSG.RESPONSE_START,
       requestId: msg.requestId,
       status: response.status,
       statusText: response.statusText,
-      headers: responseHeadersToRecord(response.headers),
+      headers: responseHeaders,
     });
     resetPreviewTimeout(msg.requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
 
@@ -177,7 +192,9 @@ async function runPreviewFetch(serverLink: ServerLink, msg: PreviewRequestMessag
       for await (const chunk of response.body) {
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         pending.responseBytes += buffer.length;
-        if (pending.responseBytes > PREVIEW_LIMITS.MAX_RESPONSE_BYTES) {
+        // Streaming responses (SSE / ndjson / chunked non-JSON) are NOT bounded by
+        // the cumulative byte cap — they rely on stream-idle + server buffer cap.
+        if (!pending.streaming && pending.responseBytes > PREVIEW_LIMITS.MAX_RESPONSE_BYTES) {
           pending.abortController.abort();
           failPreviewRequest(serverLink, msg.requestId, PREVIEW_ERROR.LIMIT_EXCEEDED, 'preview response exceeded byte limit', PREVIEW_TERMINAL_OUTCOME.LIMIT_EXCEEDED);
           cleanupPreviewRequest(msg.requestId);
@@ -226,6 +243,7 @@ export function handlePreviewCommand(cmd: Record<string, unknown>, serverLink: S
       bodyStream,
       requestBytes: 0,
       responseBytes: 0,
+      streaming: false,
       timedOut: false,
       timer: setTimeout(() => {
         const active = pendingPreviewRequests.get(msg.requestId);
