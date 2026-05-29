@@ -1986,6 +1986,7 @@ function markTransportCancelIdle(sessionName: string, error?: string): void {
     pendingCount: runtime?.pendingCount ?? 0,
     pendingMessages: runtime?.pendingMessages ?? [],
     pendingMessageEntries: runtime?.pendingEntries ?? [],
+    pendingMessageVersion: runtime?.pendingVersion ?? 0,
     ...(error ? { error } : {}),
   }, { source: 'daemon', confidence: 'high' });
 }
@@ -3476,6 +3477,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           pendingCount: transportRuntime.pendingCount,
           pendingMessages: transportRuntime.pendingMessages,
           pendingMessageEntries: transportRuntime.pendingEntries,
+          pendingMessageVersion: transportRuntime.pendingVersion,
         }, { source: 'daemon', confidence: 'high' });
       }
       // Clear fresh-start flag — the new conversation is now active
@@ -3762,6 +3764,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
       pendingMessageEntries: runtime.pendingEntries,
+      pendingMessageVersion: runtime.pendingVersion,
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
@@ -3798,6 +3801,7 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
       pendingMessageEntries: runtime.pendingEntries,
+      pendingMessageVersion: runtime.pendingVersion,
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });

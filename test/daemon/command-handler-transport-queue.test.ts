@@ -889,6 +889,7 @@ describe('handleWebCommand transport queue behavior', () => {
         pendingCount: 3,
         pendingMessages: ['a', 'b', 'c'],
         pendingMessageEntries: [],
+        pendingMessageVersion: 0,
       },
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );

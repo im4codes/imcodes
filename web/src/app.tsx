@@ -133,12 +133,15 @@ import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timel
 import { isP2pDiscussionVisibleInSubSessionBar } from './p2p-discussion-scope.js';
 import {
   extractTransportPendingMessages,
+  extractTransportPendingVersion,
   mergeTransportPendingEntriesForIdleState,
   mergeTransportPendingEntriesForRunningState,
   mergeTransportPendingMessagesForIdleState,
   mergeTransportPendingMessagesForRunningState,
+  nextTransportQueueVersion,
   normalizeTransportPendingEntries,
   removeTransportPendingEntryForUserMessage,
+  shouldApplyTransportQueueSnapshot,
 } from './transport-queue.js';
 import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
@@ -2363,6 +2366,11 @@ export function App() {
           });
         }
         if (event.type === 'user.message' && !event.sessionId.startsWith('deck_sub_')) {
+          // A drained message enters the timeline as user.message carrying the
+          // post-drain queue version. Advancing the baseline here (even when no
+          // entry needs removal) guarantees a later stale snapshot can't
+          // resurrect it, regardless of which drain event arrives first.
+          const incomingVersion = extractTransportPendingVersion(event.payload.pendingMessageVersion);
           setSessions((prev) => prev.map((s) => {
             if (s.name !== event.sessionId) return s;
             const nextQueue = removeTransportPendingEntryForUserMessage(
@@ -2375,12 +2383,18 @@ export function App() {
               },
               event.sessionId,
             );
-            if (!nextQueue.changed) return s;
+            const advancedVersion = nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion);
+            if (!nextQueue.changed) {
+              return advancedVersion === s.transportPendingMessageVersion
+                ? s
+                : { ...s, transportPendingMessageVersion: advancedVersion };
+            }
             return {
               ...s,
               state: s.state === 'queued' && nextQueue.messages.length === 0 ? 'running' as SessionInfo['state'] : s.state,
               transportPendingMessages: nextQueue.messages,
               transportPendingMessageEntries: nextQueue.entries,
+              transportPendingMessageVersion: advancedVersion,
             };
           }));
         }
@@ -2388,6 +2402,7 @@ export function App() {
         if (event.type === 'session.state' && !event.sessionId.startsWith('deck_sub_')) {
           const liveState = String(event.payload.state ?? '');
           const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessages');
+          const incomingVersion = extractTransportPendingVersion(event.payload.pendingMessageVersion);
           if (liveState === 'queued') {
             const pendingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
             const pendingEntries = normalizeTransportPendingEntries(
@@ -2395,58 +2410,76 @@ export function App() {
               pendingMessages,
               event.sessionId,
             );
-            setSessions((prev) => prev.map((s) =>
-              s.name === event.sessionId
-                ? {
-                    ...s,
-                    state: 'queued' as SessionInfo['state'],
-                    transportPendingMessages: pendingMessages,
-                    transportPendingMessageEntries: pendingEntries,
-                  }
-                : s,
-            ));
+            setSessions((prev) => prev.map((s) => {
+              if (s.name !== event.sessionId) return s;
+              // Drop a stale `queued` snapshot wholesale: it would otherwise
+              // both resurrect drained entries AND wrongly downgrade a session
+              // that has since moved past queued.
+              if (!shouldApplyTransportQueueSnapshot(s.transportPendingMessageVersion, incomingVersion)) return s;
+              return {
+                ...s,
+                state: 'queued' as SessionInfo['state'],
+                transportPendingMessages: pendingMessages,
+                transportPendingMessageEntries: pendingEntries,
+                transportPendingMessageVersion: nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion),
+              };
+            }));
           } else if (liveState === 'running') {
-            setSessions((prev) => prev.map((s) =>
-              s.name === event.sessionId
-                ? {
-                    ...s,
-                    state: 'running' as SessionInfo['state'],
-                    transportPendingMessages: mergeTransportPendingMessagesForRunningState(
+            setSessions((prev) => prev.map((s) => {
+              if (s.name !== event.sessionId) return s;
+              const applyPending = shouldApplyTransportQueueSnapshot(s.transportPendingMessageVersion, incomingVersion);
+              return {
+                ...s,
+                state: 'running' as SessionInfo['state'],
+                transportPendingMessages: applyPending
+                  ? mergeTransportPendingMessagesForRunningState(
                       s.transportPendingMessages,
                       event.payload.pendingMessages,
                       hasPendingMessagesField,
-                    ),
-                    transportPendingMessageEntries: mergeTransportPendingEntriesForRunningState(
+                    )
+                  : (s.transportPendingMessages ?? []),
+                transportPendingMessageEntries: applyPending
+                  ? mergeTransportPendingEntriesForRunningState(
                       s.transportPendingMessageEntries,
                       event.payload.pendingMessageEntries,
                       event.payload.pendingMessages,
                       hasPendingMessagesField,
                       event.sessionId,
-                    ),
-                  }
-                : s,
-            ));
+                    )
+                  : (s.transportPendingMessageEntries ?? []),
+                transportPendingMessageVersion: applyPending
+                  ? nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion)
+                  : s.transportPendingMessageVersion,
+              };
+            }));
           } else if (liveState === 'idle') {
-            setSessions((prev) => prev.map((s) =>
-              s.name === event.sessionId
-                ? {
-                    ...s,
-                    state: liveState as SessionInfo['state'],
-                    transportPendingMessages: mergeTransportPendingMessagesForIdleState(
+            setSessions((prev) => prev.map((s) => {
+              if (s.name !== event.sessionId) return s;
+              const applyPending = shouldApplyTransportQueueSnapshot(s.transportPendingMessageVersion, incomingVersion);
+              return {
+                ...s,
+                state: liveState as SessionInfo['state'],
+                transportPendingMessages: applyPending
+                  ? mergeTransportPendingMessagesForIdleState(
                       s.transportPendingMessages,
                       event.payload.pendingMessages,
                       hasPendingMessagesField,
-                    ),
-                    transportPendingMessageEntries: mergeTransportPendingEntriesForIdleState(
+                    )
+                  : (s.transportPendingMessages ?? []),
+                transportPendingMessageEntries: applyPending
+                  ? mergeTransportPendingEntriesForIdleState(
                       s.transportPendingMessageEntries,
                       event.payload.pendingMessageEntries,
                       event.payload.pendingMessages,
                       hasPendingMessagesField,
                       event.sessionId,
-                    ),
-                  }
-                : s,
-            ));
+                    )
+                  : (s.transportPendingMessageEntries ?? []),
+                transportPendingMessageVersion: applyPending
+                  ? nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion)
+                  : s.transportPendingMessageVersion,
+              };
+            }));
           }
         }
         if (event.type === 'session.state') {

@@ -46,6 +46,9 @@ export interface SessionListItem extends SessionContextBootstrapState {
   transportConfig?: Record<string, unknown>;
   transportPendingMessages?: string[];
   transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }>;
+  /** Monotonic version of the pending-queue snapshot. Lets the UI ignore
+   *  stale snapshots delivered out of order. See TransportSessionRuntime. */
+  transportPendingMessageVersion?: number;
 }
 
 function resolveTransportSessionListState(
@@ -103,6 +106,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     transportConfig: s.transportConfig,
     transportPendingMessages: runtime?.pendingMessages ?? [],
     transportPendingMessageEntries: runtime?.pendingEntries ?? [],
+    transportPendingMessageVersion: runtime?.pendingVersion ?? 0,
   };
 }
 

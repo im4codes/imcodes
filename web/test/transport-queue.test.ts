@@ -3,13 +3,16 @@ import { describe, expect, it } from 'vitest';
 import {
   extractTransportPendingMessageEntries,
   extractTransportPendingMessages,
+  extractTransportPendingVersion,
   isLegacyTransportPendingMessageId,
   mergeTransportPendingEntriesForIdleState,
   mergeTransportPendingEntriesForRunningState,
   mergeTransportPendingMessagesForIdleState,
   mergeTransportPendingMessagesForRunningState,
+  nextTransportQueueVersion,
   normalizeTransportPendingEntries,
   removeTransportPendingEntryForUserMessage,
+  shouldApplyTransportQueueSnapshot,
   synthesizeTransportPendingMessageEntries,
 } from '../src/transport-queue.js';
 
@@ -264,5 +267,55 @@ describe('mergeTransportPendingEntriesForIdleState', () => {
     ], ['queued two'], true, 'deck_test')).toEqual([
       { clientMessageId: 'msg-2', text: 'queued two' },
     ]);
+  });
+});
+
+describe('extractTransportPendingVersion', () => {
+  it('returns finite numbers and undefined otherwise', () => {
+    expect(extractTransportPendingVersion(0)).toBe(0);
+    expect(extractTransportPendingVersion(7)).toBe(7);
+    expect(extractTransportPendingVersion(undefined)).toBeUndefined();
+    expect(extractTransportPendingVersion(null)).toBeUndefined();
+    expect(extractTransportPendingVersion('3')).toBeUndefined();
+    expect(extractTransportPendingVersion(Number.NaN)).toBeUndefined();
+    expect(extractTransportPendingVersion(Infinity)).toBeUndefined();
+  });
+});
+
+describe('shouldApplyTransportQueueSnapshot', () => {
+  it('applies unversioned snapshots (legacy / resend path)', () => {
+    expect(shouldApplyTransportQueueSnapshot(5, undefined)).toBe(true);
+    expect(shouldApplyTransportQueueSnapshot(undefined, undefined)).toBe(true);
+  });
+  it('applies when there is no baseline yet', () => {
+    expect(shouldApplyTransportQueueSnapshot(undefined, 3)).toBe(true);
+  });
+  it('drops strictly-older snapshots (the stale-snapshot resurrection guard)', () => {
+    expect(shouldApplyTransportQueueSnapshot(3, 2)).toBe(false);
+    expect(shouldApplyTransportQueueSnapshot(10, 1)).toBe(false);
+  });
+  it('applies equal or newer versions (idempotent + forward progress)', () => {
+    expect(shouldApplyTransportQueueSnapshot(3, 3)).toBe(true);
+    expect(shouldApplyTransportQueueSnapshot(3, 4)).toBe(true);
+  });
+  it('always applies version 0 — a fresh runtime restarts the sequence', () => {
+    expect(shouldApplyTransportQueueSnapshot(9, 0)).toBe(true);
+  });
+});
+
+describe('nextTransportQueueVersion', () => {
+  it('keeps baseline when snapshot is unversioned', () => {
+    expect(nextTransportQueueVersion(5, undefined)).toBe(5);
+    expect(nextTransportQueueVersion(undefined, undefined)).toBeUndefined();
+  });
+  it('resets to 0 on a fresh-runtime snapshot', () => {
+    expect(nextTransportQueueVersion(9, 0)).toBe(0);
+  });
+  it('advances monotonically', () => {
+    expect(nextTransportQueueVersion(undefined, 2)).toBe(2);
+    expect(nextTransportQueueVersion(2, 5)).toBe(5);
+    expect(nextTransportQueueVersion(5, 5)).toBe(5);
+    // Never moves backward even if a caller passes a stale value.
+    expect(nextTransportQueueVersion(5, 3)).toBe(5);
   });
 });

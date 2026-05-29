@@ -169,6 +169,41 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
   });
 
+  it('bumps pendingVersion monotonically on every queue mutation (desync guard)', async () => {
+    // The UI uses this monotonic version to drop stale out-of-order snapshots.
+    // Every mutation MUST advance it so a late pre-mutation snapshot is rejected.
+    expect(runtime.pendingVersion).toBe(0);
+
+    runtime.send('first'); // dispatched immediately (idle) — not a queue mutation
+    await flushDispatch();
+    expect(runtime.pendingVersion).toBe(0);
+
+    // enqueue while busy → bump
+    runtime.send('second', 'q2');
+    runtime.send('third', 'q3');
+    expect(runtime.pendingVersion).toBe(2);
+    expect(runtime.pendingCount).toBe(2);
+
+    // edit → bump
+    expect(runtime.editPendingMessage('q2', 'second edited')).toBe(true);
+    expect(runtime.pendingVersion).toBe(3);
+
+    // remove → bump
+    expect(runtime.removePendingMessage('q3')).not.toBeNull();
+    expect(runtime.pendingVersion).toBe(4);
+
+    // no-op edit/remove (unknown id) → NO bump
+    expect(runtime.editPendingMessage('nope', 'x')).toBe(false);
+    expect(runtime.removePendingMessage('nope')).toBeNull();
+    expect(runtime.pendingVersion).toBe(4);
+
+    // drain on turn completion → bump (queue empties, one entry 'q2' left)
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.pendingVersion).toBe(5);
+  });
+
   it('injects stable preference context only once per provider conversation', async () => {
     const preferencePreamble = `${PREFERENCE_CONTEXT_START}\n- Use pnpm\n${PREFERENCE_CONTEXT_END}`;
 

@@ -372,3 +372,87 @@ describe('session navigation visibility', () => {
     expect(isNavigableMainSession({ name: 'custom_session', role: 'brain' })).toBe(true);
   });
 });
+
+describe('mergeSessionListEntry — pending-queue version guard', () => {
+  // Regression: UI/daemon queue desync. A `session_list` heartbeat can be
+  // built before a drain but delivered after it. Without the version guard it
+  // would replace the (correctly cleared) queue with its stale pre-drain
+  // snapshot, resurrecting already-drained entries in the UI.
+  const existing: SessionInfo = {
+    name: 'deck_proj_brain',
+    project: 'proj',
+    role: 'brain',
+    agentType: 'codex-sdk',
+    state: 'running',
+    runtimeType: 'transport',
+    transportPendingMessages: [],
+    transportPendingMessageEntries: [],
+    transportPendingMessageVersion: 7,
+  };
+
+  it('ignores a stale snapshot (older version) and keeps the existing cleared queue', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'running',
+      transportPendingMessages: ['stale one', 'stale two'],
+      transportPendingMessageEntries: [
+        { clientMessageId: 'm1', text: 'stale one' },
+        { clientMessageId: 'm2', text: 'stale two' },
+      ],
+      transportPendingMessageVersion: 5, // older than existing (7)
+    }, existing);
+    expect(merged.transportPendingMessages).toEqual([]);
+    expect(merged.transportPendingMessageEntries).toEqual([]);
+    expect(merged.transportPendingMessageVersion).toBe(7);
+  });
+
+  it('applies a newer snapshot and advances the baseline', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'queued',
+      transportPendingMessages: ['fresh one'],
+      transportPendingMessageEntries: [{ clientMessageId: 'm9', text: 'fresh one' }],
+      transportPendingMessageVersion: 9,
+    }, existing);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'm9', text: 'fresh one' }]);
+    expect(merged.transportPendingMessageVersion).toBe(9);
+  });
+
+  it('accepts an equal-version snapshot (idempotent redelivery)', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'queued',
+      transportPendingMessages: ['v7 entry'],
+      transportPendingMessageEntries: [{ clientMessageId: 'm7', text: 'v7 entry' }],
+      transportPendingMessageVersion: 7,
+    }, existing);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'm7', text: 'v7 entry' }]);
+    expect(merged.transportPendingMessageVersion).toBe(7);
+  });
+
+  it('accepts a fresh-runtime snapshot (version 0) even when the baseline is higher', () => {
+    // After a provider restart the runtime version resets to 0; that snapshot
+    // must win so the queue does not get stuck behind a stale-high baseline.
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'idle',
+      transportPendingMessages: [],
+      transportPendingMessageEntries: [],
+      transportPendingMessageVersion: 0,
+    }, existing);
+    expect(merged.transportPendingMessageVersion).toBe(0);
+  });
+
+  it('applies snapshots from a legacy daemon that omits the version (backward compatible)', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'queued',
+      transportPendingMessages: ['legacy one'],
+      transportPendingMessageEntries: [{ clientMessageId: 'mL', text: 'legacy one' }],
+      // no transportPendingMessageVersion
+    }, existing);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'mL', text: 'legacy one' }]);
+    // Baseline unchanged when the snapshot is unversioned.
+    expect(merged.transportPendingMessageVersion).toBe(7);
+  });
+});

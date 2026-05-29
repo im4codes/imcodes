@@ -1141,6 +1141,7 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       payload.pendingCount = runtime.pendingCount;
       payload.pendingMessages = runtime.pendingMessages;
       payload.pendingMessageEntries = runtime.pendingEntries;
+      payload.pendingMessageVersion = runtime.pendingVersion;
     }
     timelineEmitter.emit(sessionName, 'session.state', payload, { source: 'daemon', confidence: 'high' });
     if (status === 'error') {
@@ -1148,16 +1149,21 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     }
   };
   runtime.onDrain = (messages, merged, count) => {
+    // The post-drain queue version. Stamped on the per-entry user.message
+    // events AND the cleared session.state below so the UI advances its
+    // baseline even if one of those events is lost on a weak network — a
+    // stale pre-drain snapshot can then never resurrect these entries.
+    const drainedVersion = runtime.pendingVersion;
     for (const entry of messages) {
       timelineEmitter.emit(
         sessionName,
         'user.message',
-        { text: entry.text, clientMessageId: entry.clientMessageId, allowDuplicate: true },
+        { text: entry.text, clientMessageId: entry.clientMessageId, allowDuplicate: true, pendingMessageVersion: drainedVersion },
         { source: 'daemon', confidence: 'high', eventId: transportUserEventId(entry.clientMessageId) },
       );
     }
     if (messages.length === 0) {
-      timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count, allowDuplicate: true });
+      timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count, allowDuplicate: true, pendingMessageVersion: drainedVersion });
     }
     // Include authoritative pending state after drain. The drained messages have
     // been moved into the timeline via user.message emissions above, so they must
@@ -1168,6 +1174,7 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
       pendingMessageEntries: runtime.pendingEntries,
+      pendingMessageVersion: runtime.pendingVersion,
     }, { source: 'daemon', confidence: 'high' });
   };
   runtime.onStartupMemoryInjected = () => {
@@ -1545,6 +1552,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         pendingCount: runtime.pendingCount,
         pendingMessages: runtime.pendingMessages,
         pendingMessageEntries: runtime.pendingEntries,
+        pendingMessageVersion: runtime.pendingVersion,
       }, { source: 'daemon', confidence: 'high' });
       logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId, freshAfterCancel }, 'Restored transport session runtime');
 

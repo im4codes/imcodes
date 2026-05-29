@@ -14,12 +14,15 @@ import { isRunningTimelineEvent } from '../timeline-running.js';
 import { mergeTransportConfigPreservingSupervision } from '@shared/supervision-config.js';
 import {
   extractTransportPendingMessages,
+  extractTransportPendingVersion,
   mergeTransportPendingEntriesForIdleState,
   mergeTransportPendingEntriesForRunningState,
   mergeTransportPendingMessagesForIdleState,
   mergeTransportPendingMessagesForRunningState,
+  nextTransportQueueVersion,
   normalizeTransportPendingEntries,
   removeTransportPendingEntryForUserMessage,
+  shouldApplyTransportQueueSnapshot,
 } from '../transport-queue.js';
 import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
 import { getAutoSessionLabelPrefix } from '../agent-display.js';
@@ -30,6 +33,8 @@ export interface SubSession extends SubSessionData {
   state: 'queued' | 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'starting' | 'unknown';
   transportPendingMessages?: string[] | null;
   transportPendingMessageEntries?: import('../transport-queue.js').TransportPendingMessageEntry[] | null;
+  /** Newest pending-queue version applied. Drops stale snapshots. */
+  transportPendingMessageVersion?: number | null;
 }
 
 function isCodexFamily(agentType: string | null | undefined): boolean {
@@ -196,6 +201,10 @@ export function useSubSessions(
                     extractTransportPendingMessages(m.transportPendingMessages),
                     updated[existingIdx].sessionName,
                   ),
+                  transportPendingMessageVersion: nextTransportQueueVersion(
+                    updated[existingIdx].transportPendingMessageVersion ?? undefined,
+                    extractTransportPendingVersion(m.transportPendingMessageVersion),
+                  ),
                 }),
                 ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
                 ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
@@ -241,6 +250,7 @@ export function useSubSessions(
                 extractTransportPendingMessages(m.transportPendingMessages),
                 toSessionName(m.id),
               ),
+              transportPendingMessageVersion: extractTransportPendingVersion(m.transportPendingMessageVersion),
             }];
           });
         }
@@ -292,6 +302,10 @@ export function useSubSessions(
                   extractTransportPendingMessages(m.transportPendingMessages),
                   s.sessionName,
                 ),
+                transportPendingMessageVersion: nextTransportQueueVersion(
+                  s.transportPendingMessageVersion ?? undefined,
+                  extractTransportPendingVersion(m.transportPendingMessageVersion),
+                ),
               } : {}),
             };
           }));
@@ -304,6 +318,7 @@ export function useSubSessions(
         if (ev.type === 'user.message') {
           const subSessionName = ev.sessionId;
           if (!subSessionName || !subSessionName.startsWith('deck_sub_')) return;
+          const incomingVersion = extractTransportPendingVersion(ev.payload.pendingMessageVersion);
           setSubSessions((prev) => {
             const idx = prev.findIndex((s) => s.sessionName === subSessionName);
             if (idx === -1) return prev;
@@ -317,13 +332,20 @@ export function useSubSessions(
               },
               subSessionName,
             );
-            if (!nextQueue.changed) return prev;
+            const advancedVersion = nextTransportQueueVersion(prev[idx].transportPendingMessageVersion ?? undefined, incomingVersion);
+            if (!nextQueue.changed) {
+              if (advancedVersion === (prev[idx].transportPendingMessageVersion ?? undefined)) return prev;
+              const nextSame = [...prev];
+              nextSame[idx] = { ...nextSame[idx], transportPendingMessageVersion: advancedVersion };
+              return nextSame;
+            }
             const next = [...prev];
             next[idx] = {
               ...next[idx],
               state: next[idx].state === 'queued' && nextQueue.messages.length === 0 ? 'running' : next[idx].state,
               transportPendingMessages: nextQueue.messages,
               transportPendingMessageEntries: nextQueue.entries,
+              transportPendingMessageVersion: advancedVersion,
             };
             return next;
           });
@@ -355,6 +377,9 @@ export function useSubSessions(
       const pendingMessagesPayload = msg.type === 'timeline.event' && msg.event.type === 'session.state'
         ? msg.event.payload.pendingMessages
         : undefined;
+      const incomingPendingVersion = msg.type === 'timeline.event' && msg.event.type === 'session.state'
+        ? extractTransportPendingVersion(msg.event.payload.pendingMessageVersion)
+        : undefined;
       if (state === 'queued') {
         const pendingMessages = msg.type === 'timeline.event' && msg.event.type === 'session.state'
           ? extractTransportPendingMessages(pendingMessagesPayload)
@@ -369,12 +394,15 @@ export function useSubSessions(
         setSubSessions((prev) => {
           const idx = prev.findIndex((s) => s.sessionName === sessionName);
           if (idx === -1) return prev;
+          // Drop a stale `queued` snapshot wholesale (mirror app.tsx).
+          if (!shouldApplyTransportQueueSnapshot(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion)) return prev;
           const next = [...prev];
           next[idx] = {
             ...next[idx],
             state: 'queued',
             transportPendingMessages: pendingMessages,
             transportPendingMessageEntries: pendingEntries,
+            transportPendingMessageVersion: nextTransportQueueVersion(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion),
           };
           return next;
         });
@@ -384,6 +412,13 @@ export function useSubSessions(
         setSubSessions((prev) => {
           const idx = prev.findIndex((s) => s.sessionName === sessionName);
           if (idx === -1) return prev;
+          const applyPending = shouldApplyTransportQueueSnapshot(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion);
+          if (!applyPending) {
+            if (prev[idx].state === 'running') return prev;
+            const sameNext = [...prev];
+            sameNext[idx] = { ...sameNext[idx], state: 'running' };
+            return sameNext;
+          }
           const next = [...prev];
           next[idx] = {
             ...next[idx],
@@ -400,6 +435,7 @@ export function useSubSessions(
               true,
               sessionName,
             ),
+            transportPendingMessageVersion: nextTransportQueueVersion(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion),
           };
           return next;
         });
@@ -409,14 +445,17 @@ export function useSubSessions(
       setSubSessions((prev) => {
         const idx = prev.findIndex((s) => s.sessionName === sessionName);
         if (idx === -1) return prev;
-        const nextPendingMessages = state === 'idle'
+        // For idle, only fold in the pending snapshot when it isn't stale.
+        const applyIdlePending = state === 'idle'
+          && shouldApplyTransportQueueSnapshot(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion);
+        const nextPendingMessages = applyIdlePending
           ? mergeTransportPendingMessagesForIdleState(
               prev[idx].transportPendingMessages,
               pendingMessagesPayload,
               hasPendingMessagesField,
             )
           : prev[idx].transportPendingMessages ?? [];
-        const nextPendingEntries = state === 'idle'
+        const nextPendingEntries = applyIdlePending
           ? mergeTransportPendingEntriesForIdleState(
               prev[idx].transportPendingMessageEntries,
               pendingEntriesPayload,
@@ -425,6 +464,9 @@ export function useSubSessions(
               sessionName,
             )
           : prev[idx].transportPendingMessageEntries ?? [];
+        const nextVersion = applyIdlePending
+          ? nextTransportQueueVersion(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion)
+          : (prev[idx].transportPendingMessageVersion ?? undefined);
         if (state === 'running') {
           if (prev[idx].state === 'running') return prev;
           const next = [...prev];
@@ -435,6 +477,7 @@ export function useSubSessions(
           prev[idx].state === state
           && (prev[idx].transportPendingMessages ?? []).join('\u0000') === nextPendingMessages.join('\u0000')
           && JSON.stringify(prev[idx].transportPendingMessageEntries ?? []) === JSON.stringify(nextPendingEntries)
+          && (prev[idx].transportPendingMessageVersion ?? undefined) === nextVersion
         ) return prev;
         const next = [...prev];
         next[idx] = {
@@ -442,6 +485,7 @@ export function useSubSessions(
           state: state as SubSession['state'],
           transportPendingMessages: nextPendingMessages,
           transportPendingMessageEntries: nextPendingEntries,
+          transportPendingMessageVersion: nextVersion,
         };
         return next;
       });

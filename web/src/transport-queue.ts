@@ -31,6 +31,60 @@ export function synthesizeTransportPendingMessageEntries(
   }));
 }
 
+/**
+ * Extract a pending-queue version from a daemon event/snapshot payload.
+ * Returns `undefined` when absent (legacy daemon, or the resend/relaunch
+ * paths that emit unversioned snapshots) — callers treat `undefined` as
+ * "always apply", preserving pre-versioning behavior.
+ */
+export function extractTransportPendingVersion(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Decide whether an incoming pending-queue snapshot should be applied,
+ * given the newest version already applied for that session.
+ *
+ * The daemon's TransportSessionRuntime stamps a monotonic version on every
+ * queue mutation and carries it on every snapshot. A snapshot whose version
+ * is strictly older than what we've already applied is stale (delivered out
+ * of order on a weak network) and MUST be ignored, otherwise it resurrects
+ * queue entries the daemon has already drained — the root cause of UI/daemon
+ * queue desync.
+ *
+ * Rules:
+ *   - `next === undefined`  → apply (unversioned legacy/resend snapshot)
+ *   - `prev === undefined`  → apply (no baseline yet)
+ *   - `next === 0`          → apply (a fresh runtime restarts the sequence at
+ *                             0; accept it and let callers reset the baseline)
+ *   - otherwise             → apply only if `next >= prev`
+ */
+export function shouldApplyTransportQueueSnapshot(
+  prev: number | undefined,
+  next: number | undefined,
+): boolean {
+  if (next === undefined) return true;
+  if (prev === undefined) return true;
+  if (next === 0) return true;
+  return next >= prev;
+}
+
+/**
+ * Fold an applied snapshot's version into the stored baseline. A fresh
+ * runtime (`next === 0`) resets the baseline; an unversioned snapshot
+ * (`next === undefined`) leaves the baseline untouched; otherwise the
+ * baseline advances monotonically.
+ */
+export function nextTransportQueueVersion(
+  prev: number | undefined,
+  next: number | undefined,
+): number | undefined {
+  if (next === undefined) return prev;
+  if (next === 0) return 0;
+  if (prev === undefined) return next;
+  return Math.max(prev, next);
+}
+
 export function extractTransportPendingMessages(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value
