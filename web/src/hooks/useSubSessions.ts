@@ -82,9 +82,30 @@ export function useSubSessions(
   const [loadedServerId, setLoadedServerId] = useState<string | null>(null);
   const rebuiltRef = useRef(false);
 
+  // A half-open WebSocket that gets healed by a ping/pong probe surfaces as a
+  // `connected` event with reason `probe_recovered` — WITHOUT the app's
+  // `connected` boolean ever flipping to false and back (only a real socket
+  // `close` dispatches `disconnected`). Main sessions resync regardless because
+  // app.tsx calls `requestSessionList()` directly on that event, but the
+  // sub-session reload/rebuild effects below are keyed on the `connected`
+  // boolean, so after a probe recovery they would never re-run — leaving each
+  // sub-session's `state` stuck at whatever it was before the frontend went
+  // away (e.g. a perpetual running pulse / sweep even though the agent has
+  // since gone idle). Bump a nonce on probe recovery so the reload — and its
+  // cascading rebuild → `subsession.sync` — re-fires and pulls fresh state.
+  const [reconnectTick, setReconnectTick] = useState(0);
+  useEffect(() => {
+    if (!ws) return;
+    return ws.onMessage((msg) => {
+      if (msg.type === 'session.event' && msg.event === 'connected' && msg.reason === 'probe_recovered') {
+        setReconnectTick((n) => n + 1);
+      }
+    });
+  }, [ws]);
+
   // Load from PG — retries indefinitely with backoff until successful.
-  // Re-triggers when serverId changes or WS connection state changes (which
-  // signals the API key / network may now be ready).
+  // Re-triggers when serverId changes, the WS (re)connects, or a probe
+  // recovery bumps `reconnectTick` (the API key / network may now be ready).
   const loadGenRef = useRef(0);
   const loadedGenRef = useRef(0);
   useEffect(() => {
@@ -123,7 +144,7 @@ export function useSubSessions(
     load();
 
     return () => { if (timer) clearTimeout(timer); };
-  }, [serverId, connected]);
+  }, [serverId, connected, reconnectTick]);
 
   // Rebuild all when daemon connects (once per connection)
   useEffect(() => {
