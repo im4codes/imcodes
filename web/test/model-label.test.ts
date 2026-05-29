@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { shortModelLabel } from '../src/model-label.js';
+import { shortModelLabel, bestModelLabel } from '../src/model-label.js';
 
 describe('shortModelLabel', () => {
   it('normalizes GPT-5.4 family labels', () => {
@@ -31,5 +31,24 @@ describe('shortModelLabel', () => {
     expect(shortModelLabel('qwen3-coder-next')).toBe('qwen3-coder-next');
     expect(shortModelLabel('glm-4.7')).toBe('glm-4.7');
     expect(shortModelLabel('kimi-k2.5')).toBe('kimi-k2.5');
+  });
+});
+
+describe('bestModelLabel', () => {
+  it('prefers a version-bearing label over a bare alias', () => {
+    // Configured alias has no version, usage event carries the resolved id.
+    expect(bestModelLabel('opus[1M]', 'claude-opus-4-8')).toBe('opus-4.8');
+    expect(bestModelLabel('opus[1M]', 'claude-opus-4-8[1m]')).toBe('opus-4.8');
+  });
+
+  it('keeps the first candidate when it already carries a version', () => {
+    expect(bestModelLabel('gpt-5.5', 'gpt-5.4')).toBe('gpt-5.5');
+    expect(bestModelLabel('claude-opus-4-8', 'opus[1M]')).toBe('opus-4.8');
+  });
+
+  it('falls back to the first non-empty label when none have a version', () => {
+    expect(bestModelLabel('opus[1M]', undefined)).toBe('opus');
+    expect(bestModelLabel(null, 'opus[1M]')).toBe('opus');
+    expect(bestModelLabel(null, undefined)).toBeNull();
   });
 });

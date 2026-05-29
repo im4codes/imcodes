@@ -14,7 +14,7 @@ import { reorderSubSessions } from '../api.js';
 import { formatLabel } from '../format-label.js';
 import { getAgentBadgeLabel } from '../agent-display.js';
 import { resolveContextWindow } from '../model-context.js';
-import { shortModelLabel } from '../model-label.js';
+import { bestModelLabel } from '../model-label.js';
 import { P2pProgressCard } from './P2pProgressCard.js';
 import type { P2pProgressDiscussion } from './P2pProgressCard.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
@@ -203,7 +203,7 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFl
   const abbr = getAgentBadgeLabel(sub.type);
   const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(sub, detectedModel, usage?.model);
   const effectiveModel = resolveEffectiveSessionModel(sub, detectedModel, usage?.model, legacyCodexModel);
-  const model = effectiveModel ? shortModelLabel(effectiveModel) : null;
+  const model = bestModelLabel(effectiveModel, usage?.model);
   let ctxPct = 0;
   if (usage) {
     const ctx = resolveContextWindow(

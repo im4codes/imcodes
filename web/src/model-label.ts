@@ -1,1 +1,1 @@
-export { shortModelLabel } from '../../src/shared/models/label.js';
+export { shortModelLabel, bestModelLabel } from '../../src/shared/models/label.js';

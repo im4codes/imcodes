@@ -52,3 +52,22 @@ export function shortModelLabel(model?: string | null): string | null {
   const parts = m.split('-');
   return parts[parts.length - 1] ?? m;
 }
+
+/**
+ * Pick the best display label across several candidate model strings,
+ * preferring the one that carries a version number.
+ *
+ * Sessions often store the configured model as a bare alias (e.g. `opus[1M]`),
+ * which collapses to `opus` with no version, while the authoritative usage
+ * event reports the resolved id (e.g. `claude-opus-4-8`) → `opus-4.8`. Callers
+ * pass candidates in priority order; a version-bearing label wins over a
+ * version-less one, otherwise the first non-empty label is used. This keeps the
+ * configured-model priority intact except when it would hide an available
+ * version.
+ */
+export function bestModelLabel(...models: Array<string | null | undefined>): string | null {
+  const labels = models.map((m) => shortModelLabel(m));
+  const versioned = labels.find((l): l is string => l != null && /\d/.test(l));
+  if (versioned) return versioned;
+  return labels.find((l): l is string => l != null) ?? null;
+}

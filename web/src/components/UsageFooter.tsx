@@ -5,7 +5,7 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { resolveContextWindow } from '../model-context.js';
-import { shortModelLabel } from '../model-label.js';
+import { bestModelLabel } from '../model-label.js';
 import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
 import type { UsageData } from '../usage-data.js';
 import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
@@ -136,7 +136,10 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     return { ctx, total, totalPct, cachePct, newPct, pctStr, tip };
   }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, usage.contextWindowSource, displayModel, displayPlanLabel, displayQuotaLabel, quotaUsageLabel, t]);
 
-  const modelLabel = shortModelLabel(displayModel);
+  // Prefer a version-bearing label: modelOverride is often a bare alias
+  // (`opus[1M]` → `opus`) while usage.model carries the resolved id
+  // (`claude-opus-4-8` → `opus-4.8`).
+  const modelLabel = bestModelLabel(modelOverride, usage.model);
   // Keep the ctx meter visible even before the first non-zero usage event when
   // the session/model is known. A zero-token session still has useful context
   // capacity information (e.g. "0 / 922k" for GPT-5.5); hiding it made Codex
