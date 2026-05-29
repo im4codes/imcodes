@@ -105,6 +105,19 @@ probe() {  # open-internet check: exactly HTTP 204 within 3s (curl). Any other
   fi
 }
 
+# node_shasum_for <shasums_text> <tarball_name>
+# Prints the SHA256 (column 1) for <tarball_name> from a SHASUMS256.txt body,
+# or nothing if absent. Pure (no I/O) so it can be unit-tested directly —
+# see test/install/install-sh.test.ts.
+node_shasum_for() {
+  printf '%s\n' "$1" | awk -v f="$2" '$2==f {print $1; exit}'
+}
+
+# Test hook: when sourced with IMCODES_INSTALL_LIB=1 (unit tests), stop here so
+# the pure helpers above are available without running the installer's
+# imperative flow. A normal `curl … | bash` or direct run never sets this var.
+if [ -n "${IMCODES_INSTALL_LIB:-}" ]; then return 0 2>/dev/null || exit 0; fi
+
 printf "\n  ${W}IM.codes daemon installer${N}\n  channel=%s  source=%s\n\n" "$CHANNEL" "$SOURCE"
 
 # ── Source selection ──────────────────────────────────────────────────────────
@@ -188,7 +201,7 @@ else
   shasums=$(fetch_stdout "$shasums_url") || { echo "failed to fetch SHASUMS256.txt from $shasums_url" >&2; rm -rf "$tmp"; exit 1; }
   # Match the artifact name as a whole field (column 2), not a regex suffix, so we
   # read the hash of OUR file and a literal '.' can't act as a wildcard.
-  expected_hash=$(printf '%s\n' "$shasums" | awk -v f="$pkg.tar.gz" '$2==f {print $1; exit}')
+  expected_hash=$(node_shasum_for "$shasums" "$pkg.tar.gz")
   [ -n "$expected_hash" ] || { echo "SHA256 entry not found for $pkg.tar.gz in SHASUMS256.txt" >&2; rm -rf "$tmp"; exit 1; }
   ok "verifying SHA256 of $pkg.tar.gz ..."
   verify_sha256 "$tmp/node.tar.gz" "$expected_hash" || { rm -rf "$tmp"; exit 1; }
