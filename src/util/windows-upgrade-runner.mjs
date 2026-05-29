@@ -42,6 +42,8 @@
  *   process.argv[4] = pkg spec (e.g. "imcodes@2026.5.2059-dev.2036")
  *   process.argv[5] = target version (e.g. "2026.5.2059-dev.2036" or "latest")
  *   process.argv[6] = absolute path to script_dir (for self-cleanup)
+ *   process.argv[7] = npm registry to pin (or "-" for npm's ambient default)
+ *   process.argv[8] = current daemon version (for the latest downgrade guard)
  *
  * Exit code:
  *   0 on success or expected abort (install fail, version mismatch).
@@ -67,6 +69,41 @@ const NPM_CMD = process.argv[3];
 const PKG_SPEC = process.argv[4];
 const TARGET_VER = process.argv[5];
 const SCRIPT_DIR = process.argv[6];
+// "-" sentinel means "use npm's ambient/default registry" (no --registry flag).
+const REGISTRY = process.argv[7] && process.argv[7] !== '-' ? process.argv[7] : null;
+const CURRENT_VER = process.argv[8] || null;
+
+/** Compare two daemon version strings (release + optional prerelease).
+ *  Returns <0 if a<b, 0 if equal, >0 if a>b. Mirrors the in-script
+ *  comparator the Linux/macOS upgrade script bakes in, so the Windows
+ *  downgrade guard uses identical semantics. */
+function compareDaemonVersionsLocal(a, b) {
+  const parse = (v) => {
+    const i = v.indexOf('-');
+    return {
+      rel: (i < 0 ? v : v.slice(0, i)).split('.').map((n) => parseInt(n, 10) || 0),
+      pre: i < 0 ? null : v.slice(i + 1).split('.'),
+    };
+  };
+  const A = parse(a), B = parse(b);
+  const len = Math.max(A.rel.length, B.rel.length);
+  for (let i = 0; i < len; i++) {
+    const da = A.rel[i] || 0, db = B.rel[i] || 0;
+    if (da !== db) return da < db ? -1 : 1;
+  }
+  if (A.pre === null && B.pre === null) return 0;
+  if (A.pre === null) return 1;   // a release outranks a prerelease
+  if (B.pre === null) return -1;
+  const plen = Math.max(A.pre.length, B.pre.length);
+  for (let i = 0; i < plen; i++) {
+    const pa = A.pre[i] || '', pb = B.pre[i] || '';
+    const na = /^\d+$/.test(pa) ? parseInt(pa, 10) : null;
+    const nb = /^\d+$/.test(pb) ? parseInt(pb, 10) : null;
+    if (na !== null && nb !== null) { if (na !== nb) return na < nb ? -1 : 1; }
+    else if (pa !== pb) return pa < pb ? -1 : 1;
+  }
+  return 0;
+}
 
 function log(msg) {
   // Best-effort logging.  fs failures here MUST NOT throw — losing a
@@ -393,12 +430,14 @@ async function main() {
   log(`installing ${PKG_SPEC}...`);
   trace(3, 'pre-npm-install');
   const installStartedAt = Date.now();
+  if (REGISTRY) log(`pinning npm registry: ${REGISTRY}`);
   const installResult = spawnNpm(
     NPM_CMD,
     // --ignore-scripts: sharp's install hook is unreliable on global
     // npm-prefix installs (see sharpRepair() doc).  Skip post-install,
     // we'll nest-install sharp ourselves below.
-    ['install', '-g', '--ignore-scripts', PKG_SPEC],
+    // --registry pins the same source the daemon's pre-flight probe used.
+    ['install', '-g', '--ignore-scripts', ...(REGISTRY ? ['--registry', REGISTRY] : []), PKG_SPEC],
     {
       env, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', windowsHide: true,
       timeout: NPM_INSTALL_TIMEOUT_MS,
@@ -440,6 +479,17 @@ async function main() {
   if (TARGET_VER !== 'latest' && installedVer && installedVer !== TARGET_VER) {
     log('version mismatch after install — aborting');
     return;
+  }
+  // Downgrade guard for `latest`: Linux/macOS refuse to restart when the
+  // freshly-installed version is older than the running daemon (a stale mirror
+  // `latest` can resolve below a local dev build). Windows had no such guard.
+  // The old daemon keeps running (its modules are already loaded in memory);
+  // we simply decline to kill + relaunch into the older on-disk version.
+  if (TARGET_VER === 'latest' && installedVer && CURRENT_VER) {
+    if (compareDaemonVersionsLocal(installedVer, CURRENT_VER) < 0) {
+      log(`installed ${installedVer} is OLDER than current ${CURRENT_VER} — refusing to downgrade`);
+      return;
+    }
   }
 
   // Step 5: Sharp repair (best effort).

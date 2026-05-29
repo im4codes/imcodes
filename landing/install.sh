@@ -20,8 +20,9 @@
 #      custom upgrade logic; the daemon's own auto-upgrade takes over from here.
 #      To keep that auto-upgrade working without sudo, we fall back to a
 #      user-writable npm prefix when the global one isn't writable; in a
-#      restricted-network region we also persist the mirror registry (user ~/.npmrc)
-#      so the daemon's plain `npm i -g` keeps resolving through the mirror.
+#      restricted-network region we record the mirror registry in
+#      ~/.imcodes/install.json (NOT the global ~/.npmrc) so the daemon passes it
+#      explicitly on its own `npm i -g` without affecting other npm projects.
 
 set -euo pipefail
 
@@ -49,6 +50,24 @@ CHANNEL="${CHANNEL:-latest}"
 SOURCE="${SOURCE:-auto}"
 case "$CHANNEL" in latest|dev) ;; *) echo "invalid --channel '$CHANNEL' (use: latest | dev)" >&2; exit 1 ;; esac
 case "$SOURCE"  in auto|mirror|direct) ;; *) echo "invalid --source '$SOURCE' (use: auto | mirror | direct)" >&2; exit 1 ;; esac
+
+# ── Re-validate NODE_MAJOR after flag parsing ─────────────────────────────────
+#    A --node-major flag may have overwritten the env-default validated above, so
+#    a non-numeric / empty value must be rejected here too (otherwise it surfaces
+#    later only as a confusing "could not resolve version" error).
+if [[ ! "$NODE_MAJOR" =~ ^[0-9]+$ ]]; then
+  echo "invalid --node-major '$NODE_MAJOR' (must be a number)" >&2; exit 1
+fi
+
+# ── Validate INSTALL_ROOT (must be a real, non-root path; no control chars) ───
+#    Guards against an empty/last-flag --install-root collapsing to "/node" and a
+#    later rm -rf, and against control characters that could corrupt rc writes.
+if [ -z "$INSTALL_ROOT" ] || [ "$INSTALL_ROOT" = "/" ]; then
+  echo "invalid --install-root '$INSTALL_ROOT' (must be a non-empty, non-root path)" >&2; exit 1
+fi
+if [[ "$INSTALL_ROOT" == *[[:cntrl:]]* ]]; then
+  echo "invalid --install-root (must not contain control characters)" >&2; exit 1
+fi
 
 # ── Output helpers ────────────────────────────────────────────────────────────
 if [ -t 1 ]; then C='\033[36m'; G='\033[32m'; Y='\033[33m'; W='\033[37m'; N='\033[0m'; else C=''; G=''; Y=''; W=''; N=''; fi
@@ -113,7 +132,7 @@ if [ "$use_mirror" = 1 ]; then
   NPM_REGISTRY="https://mirrors.cloud.tencent.com/npm/"
 else
   NODE_BASE="https://nodejs.org/dist"
-  NPM_REGISTRY=""   # keep npm default (registry.npmjs.org)
+  NPM_REGISTRY="https://registry.npmjs.org/"   # official npm registry (passed explicitly)
 fi
 
 # ── OS / arch ─────────────────────────────────────────────────────────────────
@@ -153,9 +172,12 @@ else
   fi
   pkg="node-${ver}-${NODE_OS}-${NODE_ARCH}"
   url="$NODE_BASE/$ver/$pkg.tar.gz"
-  # Cross-source integrity (N1): SHASUMS is a tiny text file fetched from the
-  # OFFICIAL nodejs.org even when the binary comes from a mirror — a poisoned
-  # mirror cannot forge a matching hash here. Fail-closed if unreachable.
+  # Cross-source integrity: the binary may come from the mirror, but its SHA256 is
+  # anchored to SHASUMS256.txt fetched over TLS directly from nodejs.org — an origin
+  # independent of the mirror. A mirror serving a tampered binary will not match this
+  # anchor (fail-closed). Residual trust reduces to the TLS connection to nodejs.org
+  # itself (the same model nvm/Volta/fnm rely on); the GPG .sig is intentionally not
+  # additionally verified. Fail-closed if unreachable.
   shasums_url="https://nodejs.org/dist/$ver/SHASUMS256.txt"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp" 2>/dev/null || true' EXIT
@@ -164,7 +186,9 @@ else
   ok "downloading SHASUMS (from nodejs.org for verification)"
   # Fetch SHASUMS from official source — independent of NODE_BASE mirror path
   shasums=$(fetch_stdout "$shasums_url") || { echo "failed to fetch SHASUMS256.txt from $shasums_url" >&2; rm -rf "$tmp"; exit 1; }
-  expected_hash=$(echo "$shasums" | grep "  $pkg.tar.gz$" | awk '{print $1}' || true)
+  # Match the artifact name as a whole field (column 2), not a regex suffix, so we
+  # read the hash of OUR file and a literal '.' can't act as a wildcard.
+  expected_hash=$(printf '%s\n' "$shasums" | awk -v f="$pkg.tar.gz" '$2==f {print $1; exit}')
   [ -n "$expected_hash" ] || { echo "SHA256 entry not found for $pkg.tar.gz in SHASUMS256.txt" >&2; rm -rf "$tmp"; exit 1; }
   ok "verifying SHA256 of $pkg.tar.gz ..."
   verify_sha256 "$tmp/node.tar.gz" "$expected_hash" || { rm -rf "$tmp"; exit 1; }
@@ -197,32 +221,66 @@ if [ "$NPM" = npm ]; then
   fi
 fi
 
-# ── Restricted region: persist mirror registry so daemon auto-upgrade works here ─
+# ── Record the registry for the daemon's own auto-upgrade WITHOUT mutating the
+#    user's global ~/.npmrc. The daemon reads ~/.imcodes/install.json and passes
+#    the recorded registry explicitly on its own `npm i -g`, so a mirror stays
+#    in effect for upgrades without polluting every other npm project. ─────────
+IMCODES_HOME="$HOME/.imcodes"
+INSTALL_CONFIG="$IMCODES_HOME/install.json"
+mkdir -p "$IMCODES_HOME"
 if [ "$use_mirror" = 1 ]; then
-  step "Setting npm registry to the mirror (keeps the daemon's auto-upgrade working here)..."
-  "$NPM" config set registry "$NPM_REGISTRY"
-  ok "npm registry -> $NPM_REGISTRY   (revert any time: npm config delete registry)"
+  step "Recording mirror registry for the daemon's auto-upgrade (no global ~/.npmrc changes)..."
+  printf '{\n  "npmRegistry": "%s"\n}\n' "$NPM_REGISTRY" > "$INSTALL_CONFIG"
+  ok "imcodes registry -> $NPM_REGISTRY   (config: $INSTALL_CONFIG)"
+else
+  # direct: clear any imcodes-managed mirror memory so --source direct really
+  # means direct for future daemon upgrades. We do NOT touch the user's global
+  # ~/.npmrc — that may be a deliberately-configured private/corporate source.
+  if [ -f "$INSTALL_CONFIG" ]; then
+    rm -f "$INSTALL_CONFIG"
+    ok "cleared imcodes mirror registry memory ($INSTALL_CONFIG)"
+  fi
+  cur_reg="$("$NPM" config get registry 2>/dev/null || true)"
+  case "$cur_reg" in
+    *registry.npmjs.org*|"") : ;;
+    *) note "note: your global npm registry is '$cur_reg' — --source direct forces THIS install to the official registry, but the daemon's future upgrades will follow your global npm config." ;;
+  esac
 fi
 
-# ── Install the daemon (plain dist-tag; no pin, no custom upgrade path) ────────
+# ── Install the daemon (plain dist-tag; explicit --registry, no global config) ─
 step "Installing imcodes@$CHANNEL ..."
-"$NPM" install -g "imcodes@$CHANNEL" --no-fund --no-audit
+"$NPM" install -g "imcodes@$CHANNEL" --no-fund --no-audit --registry "$NPM_REGISTRY"
 
 # ── Persist PATH to shell rc files (only when we added a dir) ──────────────────
+#    Written as a single managed block delimited by begin/end markers so a re-run
+#    (e.g. a Node major bump) REPLACES the old block instead of accumulating dead,
+#    version-specific PATH entries. The path is single-quoted so no shell
+#    metacharacter inside it can be interpreted when the rc file is later sourced.
 if [ -n "$PATH_DIR" ]; then
-  marker="# added by IM.codes installer"
-  line="export PATH=\"$PATH_DIR:\$PATH\""
-  for rc in "$HOME/.profile" "$HOME/.bashrc"; do
-    if [ -f "$rc" ] || [ "$rc" = "$HOME/.profile" ]; then
-      if ! grep -qF "$PATH_DIR" "$rc" 2>/dev/null; then
-        printf '\n%s\n%s\n' "$marker" "$line" >> "$rc"
+  begin="# >>> IM.codes installer >>>"
+  end="# <<< IM.codes installer <<<"
+  # Escape any single quote in the path using the '\'' idiom, then emit
+  #   export PATH='<path>':"$PATH"
+  esc_path=$(printf '%s' "$PATH_DIR" | sed "s/'/'\\\\''/g")
+  block=$(printf '%s\nexport PATH='\''%s'\'':"$PATH"\n%s' "$begin" "$esc_path" "$end")
+  for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.zprofile"; do
+    # Only update files that already exist, except .profile (the POSIX login
+    # default) which we may create. Avoids leaving empty rc files for shells the
+    # user doesn't use.
+    if [ -e "$rc" ] || [ "$rc" = "$HOME/.profile" ]; then
+      if [ -f "$rc" ] && grep -qF "$begin" "$rc" 2>/dev/null; then
+        tmp_rc="$(mktemp)"
+        awk -v b="$begin" -v e="$end" '
+          $0==b {skip=1}
+          skip==0 {print}
+          $0==e {skip=0}
+        ' "$rc" > "$tmp_rc"
+        printf '\n%s\n' "$block" >> "$tmp_rc"
+        cat "$tmp_rc" > "$rc"
+        rm -f "$tmp_rc"
+      else
+        printf '\n%s\n' "$block" >> "$rc"
       fi
-    fi
-  done
-  # For zsh: always touch .zshrc (login shell reads it) and .zprofile
-  for rc in "$HOME/.zshrc" "$HOME/.zprofile"; do
-    if ! grep -qF "$PATH_DIR" "$rc" 2>/dev/null; then
-      printf '\n%s\n%s\n' "$marker" "$line" >> "$rc"
     fi
   done
 fi

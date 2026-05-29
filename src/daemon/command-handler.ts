@@ -67,6 +67,13 @@ import { supervisionAutomation } from './supervision-automation.js';
 import { parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import type { P2pAdvancedRound, P2pContextReducerConfig, P2pRoundPreset } from '../../shared/p2p-advanced.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
+import {
+  INSTALLER_CONFIG_BASENAME,
+  INSTALLER_OFFICIAL_NPM_REGISTRY,
+  normalizeRegistryBase,
+  pickUpgradeRegistry,
+  type InstallerConfig,
+} from '../../shared/installer-contract.js';
 import { executeCronJob } from './cron-executor.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { copyFile } from 'node:fs/promises';
@@ -5448,6 +5455,7 @@ async function handleDiscussionStart(cmd: Record<string, unknown>, serverLink: S
       {
         id,
         serverId: '',
+        requestId,
         topic,
         cwd: cwd ?? '',
         participants,
@@ -5640,6 +5648,50 @@ export function evaluateAutoUpgradeCooldown(
   return { onCooldown: true, remainingMs: cooldownMs - ageMs, lastAt };
 }
 
+/**
+ * Resolve which npm registry the daemon's own auto-upgrade should use, so the
+ * pre-flight "is latest newer?" probe and the actual `npm install -g` agree on
+ * a single source. Previously the probe hard-coded registry.npmjs.org while the
+ * install obeyed whatever registry the user's ~/.npmrc named (a mirror, in
+ * restricted-network regions) — so in those regions the probe always failed,
+ * the anti-downgrade short-circuit never fired, and the probe/install could
+ * even resolve different versions.
+ *
+ * Priority: imcodes' own ~/.imcodes/install.json (written by the installer),
+ * then the ambient `npm config get registry` (covers users installed via the
+ * legacy script that persisted a mirror to ~/.npmrc), then the official
+ * registry. `explicit` is true when the result is NOT the official default —
+ * callers then pass `--registry` to npm so resolution is pinned, not ambient.
+ */
+async function resolveUpgradeRegistry(): Promise<{ base: string; explicit: boolean }> {
+  const { readFileSync } = await import('fs');
+  const { join } = await import('path');
+  const { homedir } = await import('os');
+  const { execFile } = await import('child_process');
+
+  let configRegistry: unknown;
+  try {
+    const raw = readFileSync(join(homedir(), '.imcodes', INSTALLER_CONFIG_BASENAME), 'utf8');
+    const parsed = JSON.parse(raw) as InstallerConfig;
+    configRegistry = parsed?.npmRegistry;
+  } catch { /* no install.json (or unreadable) — fall through to ambient */ }
+
+  let ambientRegistry: unknown;
+  if (!normalizeRegistryBase(configRegistry)) {
+    ambientRegistry = await new Promise<string | undefined>((resolve) => {
+      try {
+        const child = execFile('npm', ['config', 'get', 'registry'], { timeout: 5000 }, (err, stdout) => {
+          resolve(err ? undefined : String(stdout).trim());
+        });
+        child.on('error', () => resolve(undefined));
+      } catch { resolve(undefined); }
+    });
+  }
+
+  const base = pickUpgradeRegistry({ configRegistry, ambientRegistry });
+  return { base, explicit: base !== INSTALLER_OFFICIAL_NPM_REGISTRY };
+}
+
 async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLink): Promise<void> {
   const UPGRADE_MEMORY_FREEZE_TTL_MS = 15 * 60 * 1000;
 
@@ -5775,9 +5827,13 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
   // global install (npm install -g would replace the symlink/dir with the
   // older registry release even if we then refused to restart, so we have to
   // catch this BEFORE spawning the install).
+  // Resolve the registry ONCE here and reuse it for both the pre-flight probe
+  // and the install command baked into the upgrade script, so they never
+  // diverge (this is the fix for the prior hard-coded-official-registry probe).
+  const upgradeRegistry = await resolveUpgradeRegistry();
   if (!targetVersion || targetVersion === 'latest') {
     try {
-      const res = await fetch('https://registry.npmjs.org/imcodes/latest', {
+      const res = await fetch(`${upgradeRegistry.base}imcodes/latest`, {
         headers: { accept: 'application/json' },
         // 5 s — registry should be fast; if it's not we'd rather skip the
         // probe and fall through than block the daemon for long.
@@ -5916,10 +5972,15 @@ launchctl load -w "${plist}"`;
     // hidden + detached.  Bake all paths as args so the runner doesn't
     // depend on env-var expansion or working directory.
     const upgradeVbsPath = join(scriptDir, 'upgrade.vbs');
+    // Pass the resolved registry (sentinel '-' when official/default so we
+    // don't add a redundant --registry) and the current daemon version so the
+    // runner can apply a post-install downgrade guard for `latest` (Linux/macOS
+    // do this in-script; Windows had no such guard before).
+    const winRegistryArg = upgradeRegistry.explicit ? upgradeRegistry.base : '-';
     const upgradeVbs = buildWindowsUpgradeRunnerVbs({
       nodeExe: process.execPath,
       runnerPath: runnerCopy,
-      args: [logFile, npmCmd, pkgSpec, targetVer, scriptDir],
+      args: [logFile, npmCmd, pkgSpec, targetVer, scriptDir, winRegistryArg, DAEMON_VERSION],
     });
     writeFileSync(upgradeVbsPath, encodeVbsAsUtf16(upgradeVbs));
 
@@ -6001,6 +6062,11 @@ launchctl load -w "${plist}"`;
   // imcodes.service stays in the daemon's cgroup and pollutes systemctl status
   // until it exits.
   const CLEANUP_AFTER_SEC = 24 * 60 * 60;
+  // Pin the registry for both the visibility precheck and the install so they
+  // resolve from the same source as the pre-flight probe above. Empty when the
+  // resolved registry is the official default (preserves prior behavior exactly
+  // — no --registry flag, npm uses its ambient config).
+  const registryArg = upgradeRegistry.explicit ? `--registry ${upgradeRegistry.base}` : '';
   const script = `#!/bin/bash
 # imcodes daemon-upgrade script. Generated by daemon.upgrade.
 # Runs detached, outlives the parent daemon process.
@@ -6010,6 +6076,7 @@ launchctl load -w "${plist}"`;
 LOG="${logFile}"
 SCRIPT_DIR="${scriptDir}"
 CLEANUP_AFTER_SEC=${CLEANUP_AFTER_SEC}
+REGISTRY_ARG="${registryArg}"
 log() { echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] $*" >> "$LOG"; }
 
 schedule_self_cleanup() {
@@ -6041,6 +6108,7 @@ log "=== imcodes upgrade started ==="
 log "[step 0] daemon PID at gen time: ${oldDaemonPid}"
 log "[step 0] node bin: ${nodeBin}"
 log "[step 0] target: ${pkgSpec} (current daemon version: ${currentVer})"
+log "[step 0] registry: \${REGISTRY_ARG:-<npm default>}"
 
 # ── Single-flight guard ─────────────────────────────────────────────────
 #
@@ -6269,7 +6337,7 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
 
   if [ "${targetVer}" != "latest" ]; then
     log "[step 2] registry visibility precheck for ${pkgSpec}"
-    eval "$NPM_RUN view --prefer-online ${pkgSpec} version" >> "$INSTALL_OUT" 2>&1
+    eval "$NPM_RUN view --prefer-online \${REGISTRY_ARG} ${pkgSpec} version" >> "$INSTALL_OUT" 2>&1
     VIEW_RC=$?
     cat "$INSTALL_OUT" >> "$LOG"
     if [ "$VIEW_RC" -ne 0 ] && is_etarget_output "$INSTALL_OUT"; then
@@ -6294,7 +6362,7 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
   # rather than serve potentially-stale entries. Do NOT use \`npm cache
   # clean --force\` here: it wipes cached dependency tarballs too, which is
   # exactly what made upgrades on large SDK dependency sets feel glacial.
-  eval "$NPM_RUN install -g --ignore-scripts --prefer-online ${pkgSpec}" >> "$INSTALL_OUT" 2>&1
+  eval "$NPM_RUN install -g --ignore-scripts --prefer-online \${REGISTRY_ARG} ${pkgSpec}" >> "$INSTALL_OUT" 2>&1
   INSTALL_RC=$?
   # Always tee the attempt's output into the main log for forensics.
   cat "$INSTALL_OUT" >> "$LOG"
