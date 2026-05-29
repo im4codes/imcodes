@@ -61,7 +61,7 @@ describe('FontPrefsDropdown', () => {
     fireEvent.click(screen.getByRole('tab', { name: 'CJK' }));
 
     const yaheiOption = screen.getByRole('option', { name: 'Microsoft YaHei' }) as HTMLOptionElement;
-    fireEvent.input(screen.getByLabelText('CJK font'), { target: { value: yaheiOption.value } });
+    fireEvent.change(screen.getByLabelText('CJK font'), { target: { value: yaheiOption.value } });
 
     expect(onChange).toHaveBeenCalledTimes(1);
     expect(onChange.mock.calls[0][0]).toMatchObject({
@@ -84,11 +84,12 @@ describe('FontPrefsDropdown', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Aa' }));
     fireEvent.click(screen.getByRole('tab', { name: 'CJK' }));
     const yaheiOption = screen.getByRole('option', { name: 'Microsoft YaHei' }) as HTMLOptionElement;
-    fireEvent.input(screen.getByLabelText('CJK font'), { target: { value: yaheiOption.value } });
+    fireEvent.change(screen.getByLabelText('CJK font'), { target: { value: yaheiOption.value } });
 
     const stored = JSON.parse(localStorage.getItem(`imcodes_fontPrefs:${scope}`) ?? '{}') as { cjkFamily?: string; family?: string };
     expect(stored.cjkFamily).toContain('"Microsoft YaHei"');
     expect(stored.family).toContain('"Microsoft YaHei"');
+    expect(stored.family?.indexOf('"Microsoft YaHei"')).toBeLessThan(stored.family?.indexOf('"PingFang SC"') ?? Number.MAX_SAFE_INTEGER);
   });
 
   it('recovers CJK selection from previously saved family stacks without cjkFamily', () => {
@@ -99,7 +100,32 @@ describe('FontPrefsDropdown', () => {
 
     const prefs = readFontPrefs('legacy-cjk', DEFAULT_CHAT_FONT);
 
-    expect(prefs.cjkFamily).toContain('"Microsoft YaHei"');
+    expect(prefs.cjkFamily?.startsWith('"Microsoft YaHei"')).toBe(true);
     expect(prefs.family).toContain('"Microsoft YaHei"');
+  });
+
+  it('replaces an existing CJK fallback in stored family stacks', () => {
+    const scope = 'replace-cjk';
+    function Harness() {
+      const [prefs, update] = useFontPrefs(scope, DEFAULT_CHAT_FONT);
+      return <FontPrefsDropdown prefs={prefs} onChange={update} />;
+    }
+
+    localStorage.setItem(`imcodes_fontPrefs:${scope}`, JSON.stringify({
+      family: `"Custom Mono", "Microsoft YaHei", "PingFang SC", monospace`,
+      cjkFamily: `"Microsoft YaHei", "PingFang SC"`,
+      size: 14,
+    }));
+    render(<Harness />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Aa' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'CJK' }));
+    const simsunOption = screen.getByRole('option', { name: 'SimSun' }) as HTMLOptionElement;
+    fireEvent.change(screen.getByLabelText('CJK font'), { target: { value: simsunOption.value } });
+
+    const stored = JSON.parse(localStorage.getItem(`imcodes_fontPrefs:${scope}`) ?? '{}') as { cjkFamily?: string; family?: string };
+    expect(stored.cjkFamily?.startsWith('"SimSun"')).toBe(true);
+    expect(stored.family?.indexOf('"SimSun"')).toBeLessThan(stored.family?.indexOf('"PingFang SC"') ?? Number.MAX_SAFE_INTEGER);
+    expect(stored.family?.indexOf('"Microsoft YaHei"')).toBeGreaterThan(stored.family?.indexOf('"SimSun"') ?? Number.MAX_SAFE_INTEGER);
   });
 });

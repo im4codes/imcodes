@@ -54,6 +54,25 @@ function cjkStack(primary: string): string {
   return `"${primary}", ${CJK_FALLBACK}`;
 }
 
+const GENERIC_FONT_FAMILIES = new Set(['monospace', 'sans-serif', 'serif', 'cursive', 'fantasy', 'system-ui', 'ui-monospace']);
+const CJK_FONT_FAMILIES = new Set([
+  'pingfang sc',
+  'pingfang tc',
+  'microsoft yahei',
+  'microsoft jhenghei',
+  'hiragino sans gb',
+  'hiragino sans',
+  'yu gothic',
+  'apple sd gothic neo',
+  'malgun gothic',
+  'noto sans cjk sc',
+  'source han sans sc',
+  'sarasa mono sc',
+  'lxgw wenkai',
+  'songti sc',
+  'simsun',
+]);
+
 interface CJKFamilyOption {
   id: string;
   name: string;
@@ -92,6 +111,44 @@ function clampSize(n: number): number {
   return Math.max(MIN_SIZE, Math.min(MAX_SIZE, Math.round(n)));
 }
 
+function splitFontFamilyStack(family: string): string[] {
+  const parts: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  for (const ch of family) {
+    if ((ch === '"' || ch === "'") && !quote) {
+      quote = ch;
+      current += ch;
+      continue;
+    }
+    if (quote === ch) {
+      quote = null;
+      current += ch;
+      continue;
+    }
+    if (ch === ',' && !quote) {
+      const trimmed = current.trim();
+      if (trimmed) parts.push(trimmed);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  const trimmed = current.trim();
+  if (trimmed) parts.push(trimmed);
+  return parts;
+}
+
+function normalizeFontFamilyName(part: string): string {
+  return part.trim().replace(/^['"]|['"]$/g, '').toLowerCase();
+}
+
+function stripKnownCJKFamilies(family: string): string {
+  return splitFontFamilyStack(family)
+    .filter((part) => !CJK_FONT_FAMILIES.has(normalizeFontFamilyName(part)))
+    .join(', ');
+}
+
 /**
  * Forward-compat: the first version of this component shipped preset
  * stacks WITHOUT explicit CJK fallback, so users who picked a font in
@@ -102,24 +159,37 @@ function clampSize(n: number): number {
  * doesn't already contain a CJK marker, so an old save silently upgrades
  * on the next page load.
  *
- * Idempotent: stacks that already include "PingFang" (added by us in
- * every preset of the new build) are returned unchanged.
+ * Idempotent: any CJK fallback that we previously inserted is stripped
+ * first, then the currently selected CJK stack is inserted again. This
+ * keeps later CJK changes effective instead of leaving the first fallback
+ * stuck in front forever.
  */
 function buildFontFamily(baseFamily: string, cjkFamily = DEFAULT_CJK_FAMILY): string {
-  if (baseFamily.includes('PingFang')) return baseFamily;
-  const match = baseFamily.match(/^(.+?),\s*(monospace|sans-serif|serif|cursive|fantasy)\s*$/i);
-  if (match) return `${match[1]}, ${cjkFamily}, ${match[2]}`;
-  return `${baseFamily}, ${cjkFamily}`;
+  const parts = splitFontFamilyStack(stripKnownCJKFamilies(baseFamily));
+  if (parts.length === 0) return `${cjkFamily}, monospace`;
+  const last = parts[parts.length - 1];
+  if (parts.length === 1 && last && GENERIC_FONT_FAMILIES.has(normalizeFontFamilyName(last))) {
+    return `${last}, ${cjkFamily}`;
+  }
+  if (last && GENERIC_FONT_FAMILIES.has(normalizeFontFamilyName(last))) {
+    return [...parts.slice(0, -1), cjkFamily, last].join(', ');
+  }
+  return [...parts, cjkFamily].join(', ');
 }
 
 function ensureCJKFallback(family: string, cjkFamily = DEFAULT_CJK_FAMILY): string {
-  if (family.includes('PingFang')) return family; // already migrated
   return buildFontFamily(family, cjkFamily);
 }
 
 function inferCJKFamily(family: string): string | undefined {
-  const match = CJK_OPTIONS.find((opt) => opt.id !== 'system-cjk' && family.includes(`"${opt.name}"`));
-  return match?.cssValue;
+  let best: { index: number; cssValue: string } | undefined;
+  for (const opt of CJK_OPTIONS) {
+    if (opt.id === 'system-cjk') continue;
+    const index = family.indexOf(`"${opt.name}"`);
+    if (index < 0) continue;
+    if (!best || index < best.index) best = { index, cssValue: opt.cssValue };
+  }
+  return best?.cssValue;
 }
 
 export function readFontPrefs(scope: string, defaults: FontPrefs): FontPrefs {
@@ -302,6 +372,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const [localFonts, setLocalFonts] = useState<LocalFontsState>({ kind: 'idle' });
   const wrapRef = useRef<HTMLDivElement>(null);
   const suppressNextSizeClickRef = useRef(false);
+  const lastSelectEventRef = useRef('');
 
   // Filter the curated preset list down to families actually installed on
   // this machine. Generic stacks (no detectFamily) are always shown.
@@ -567,6 +638,12 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
 
   const handleSelectChange = (e: Event) => {
     const v = (e.target as HTMLSelectElement).value;
+    const eventKey = `${activeTab}:${v}`;
+    if (lastSelectEventRef.current === eventKey) return;
+    lastSelectEventRef.current = eventKey;
+    window.setTimeout(() => {
+      if (lastSelectEventRef.current === eventKey) lastSelectEventRef.current = '';
+    }, 0);
     if (activeTab === 'cjk') {
       pickCJKFamily(v);
       return;
@@ -650,6 +727,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
           <select
             value={activeTab === 'code' ? codeSelectValue : cjkSelectValue}
             onInput={handleSelectChange}
+            onChange={handleSelectChange}
             style={selectStyle}
             aria-label={activeTab === 'code' ? 'font family' : 'CJK font'}
           >
