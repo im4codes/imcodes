@@ -4,11 +4,12 @@
 import { h } from 'preact';
 import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_CHAT_FONT, FontPrefsDropdown } from '../../src/components/FontPrefsDropdown.js';
+import { DEFAULT_CHAT_FONT, FontPrefsDropdown, readFontPrefs, useFontPrefs } from '../../src/components/FontPrefsDropdown.js';
 
 describe('FontPrefsDropdown', () => {
   afterEach(() => {
     cleanup();
+    localStorage.clear();
     vi.useRealTimers();
   });
 
@@ -69,5 +70,36 @@ describe('FontPrefsDropdown', () => {
     });
     expect(onChange.mock.calls[0][0].family).toContain('"JetBrains Mono"');
     expect(onChange.mock.calls[0][0].family).toContain('"Microsoft YaHei"');
+  });
+
+  it('persists the selected CJK fallback when using stored font prefs', () => {
+    const scope = 'font-test';
+    function Harness() {
+      const [prefs, update] = useFontPrefs(scope, DEFAULT_CHAT_FONT);
+      return <FontPrefsDropdown prefs={prefs} onChange={update} />;
+    }
+
+    render(<Harness />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Aa' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'CJK' }));
+    const yaheiOption = screen.getByRole('option', { name: 'Microsoft YaHei' }) as HTMLOptionElement;
+    fireEvent.input(screen.getByLabelText('CJK font'), { target: { value: yaheiOption.value } });
+
+    const stored = JSON.parse(localStorage.getItem(`imcodes_fontPrefs:${scope}`) ?? '{}') as { cjkFamily?: string; family?: string };
+    expect(stored.cjkFamily).toContain('"Microsoft YaHei"');
+    expect(stored.family).toContain('"Microsoft YaHei"');
+  });
+
+  it('recovers CJK selection from previously saved family stacks without cjkFamily', () => {
+    localStorage.setItem('imcodes_fontPrefs:legacy-cjk', JSON.stringify({
+      family: `"JetBrains Mono", "JetBrains Mono NL", ui-monospace, Menlo, Consolas, "Microsoft YaHei", "PingFang SC", monospace`,
+      size: 14,
+    }));
+
+    const prefs = readFontPrefs('legacy-cjk', DEFAULT_CHAT_FONT);
+
+    expect(prefs.cjkFamily).toContain('"Microsoft YaHei"');
+    expect(prefs.family).toContain('"Microsoft YaHei"');
   });
 });

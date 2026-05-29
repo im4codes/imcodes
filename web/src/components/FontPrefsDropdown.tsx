@@ -54,6 +54,24 @@ function cjkStack(primary: string): string {
   return `"${primary}", ${CJK_FALLBACK}`;
 }
 
+interface CJKFamilyOption {
+  id: string;
+  name: string;
+  cssValue: string;
+}
+
+const CJK_OPTIONS: readonly CJKFamilyOption[] = [
+  { id: 'system-cjk', name: 'System CJK', cssValue: DEFAULT_CJK_FAMILY },
+  { id: 'pingfang-sc', name: 'PingFang SC', cssValue: cjkStack('PingFang SC') },
+  { id: 'microsoft-yahei', name: 'Microsoft YaHei', cssValue: cjkStack('Microsoft YaHei') },
+  { id: 'noto-sans-cjk-sc', name: 'Noto Sans CJK SC', cssValue: cjkStack('Noto Sans CJK SC') },
+  { id: 'source-han-sans-sc', name: 'Source Han Sans SC', cssValue: cjkStack('Source Han Sans SC') },
+  { id: 'sarasa-mono-sc', name: 'Sarasa Mono SC', cssValue: cjkStack('Sarasa Mono SC') },
+  { id: 'lxgw-wenkai', name: 'LXGW WenKai', cssValue: cjkStack('LXGW WenKai') },
+  { id: 'songti-sc', name: 'Songti SC', cssValue: cjkStack('Songti SC') },
+  { id: 'simsun', name: 'SimSun', cssValue: cjkStack('SimSun') },
+];
+
 /**
  * Default chat font. JetBrains Mono is bundled as a webfont (see
  * `web/src/main.tsx`) so it is always available regardless of the user's
@@ -99,6 +117,11 @@ function ensureCJKFallback(family: string, cjkFamily = DEFAULT_CJK_FAMILY): stri
   return buildFontFamily(family, cjkFamily);
 }
 
+function inferCJKFamily(family: string): string | undefined {
+  const match = CJK_OPTIONS.find((opt) => opt.id !== 'system-cjk' && family.includes(`"${opt.name}"`));
+  return match?.cssValue;
+}
+
 export function readFontPrefs(scope: string, defaults: FontPrefs): FontPrefs {
   try {
     const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(STORAGE_PREFIX + scope) : null;
@@ -107,7 +130,7 @@ export function readFontPrefs(scope: string, defaults: FontPrefs): FontPrefs {
     const rawFamily = typeof parsed.family === 'string' && parsed.family.length > 0 ? parsed.family : defaults.family;
     const cjkFamily = typeof parsed.cjkFamily === 'string' && parsed.cjkFamily.length > 0
       ? parsed.cjkFamily
-      : defaults.cjkFamily ?? DEFAULT_CJK_FAMILY;
+      : inferCJKFamily(rawFamily) ?? defaults.cjkFamily ?? DEFAULT_CJK_FAMILY;
     return {
       family: ensureCJKFallback(rawFamily, cjkFamily),
       cjkFamily,
@@ -150,7 +173,8 @@ export function useFontPrefs(scope: string, defaults: FontPrefs): [FontPrefs, (n
   }, [scope]);
 
   const update = useCallback((next: FontPrefs) => {
-    const safe: FontPrefs = { family: next.family, size: clampSize(next.size) };
+    const cjkFamily = next.cjkFamily ?? inferCJKFamily(next.family) ?? defaultsRef.current.cjkFamily ?? DEFAULT_CJK_FAMILY;
+    const safe: FontPrefs = { family: next.family, cjkFamily, size: clampSize(next.size) };
     setPrefs(safe);
     try {
       if (typeof localStorage !== 'undefined') {
@@ -216,24 +240,6 @@ const FAMILY_OPTIONS: readonly FontFamilyOption[] = [
   { id: 'menlo', name: 'Menlo', cssValue: `Menlo, ui-monospace, monospace`, detectFamily: 'Menlo' },
   { id: 'consolas', name: 'Consolas', cssValue: `Consolas, ui-monospace, monospace`, detectFamily: 'Consolas' },
   { id: 'sf-mono', name: 'SF Mono', cssValue: `"SF Mono", ui-monospace, monospace`, detectFamily: 'SF Mono' },
-];
-
-interface CJKFamilyOption {
-  id: string;
-  name: string;
-  cssValue: string;
-}
-
-const CJK_OPTIONS: readonly CJKFamilyOption[] = [
-  { id: 'system-cjk', name: 'System CJK', cssValue: DEFAULT_CJK_FAMILY },
-  { id: 'pingfang-sc', name: 'PingFang SC', cssValue: cjkStack('PingFang SC') },
-  { id: 'microsoft-yahei', name: 'Microsoft YaHei', cssValue: cjkStack('Microsoft YaHei') },
-  { id: 'noto-sans-cjk-sc', name: 'Noto Sans CJK SC', cssValue: cjkStack('Noto Sans CJK SC') },
-  { id: 'source-han-sans-sc', name: 'Source Han Sans SC', cssValue: cjkStack('Source Han Sans SC') },
-  { id: 'sarasa-mono-sc', name: 'Sarasa Mono SC', cssValue: cjkStack('Sarasa Mono SC') },
-  { id: 'lxgw-wenkai', name: 'LXGW WenKai', cssValue: cjkStack('LXGW WenKai') },
-  { id: 'songti-sc', name: 'Songti SC', cssValue: cjkStack('Songti SC') },
-  { id: 'simsun', name: 'SimSun', cssValue: cjkStack('SimSun') },
 ];
 
 /**
