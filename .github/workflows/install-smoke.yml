@@ -6,10 +6,18 @@
 #     Instead it packs the CURRENT repo (npm pack) and installs that tarball
 #     globally — "can it install at all", testing the actual artifact this
 #     branch produces, with no dependency on what's published.
-#   - It is NOT wired into ci.yml and has no push/pull_request trigger, so it
-#     never blocks merges. Run it on demand (workflow_dispatch) or weekly.
+#   - It is a separate workflow (not wired into ci.yml) and is NOT a required
+#     check, so it never blocks merges. It only runs when the install surface
+#     changes (paths filter below) — not on ordinary code pushes — so it stays
+#     out of the way of normal dev.
 #   - It adds NO new tooling dependency: only npm, `bash -n`, and the built-in
 #     PowerShell parser (preinstalled pwsh on the Ubuntu runner).
+#
+# Trigger note: GitHub fires `workflow_dispatch` and `schedule` only from the
+# repository's default branch. While this workflow lives on a non-default
+# working branch, those two triggers can't reach it — so the paths-scoped
+# `push` trigger below (install-surface files only) is what actually runs it
+# without waiting for it to land on the default branch.
 #
 # The installer scripts themselves (landing/install.sh|ps1) do a registry
 # install of imcodes@<channel>; that pulls "latest", which we deliberately do
@@ -20,7 +28,15 @@ name: Install Smoke
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 6 * * 1' # Mondays 06:00 UTC
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC (only fires once this reaches the default branch)
+  push:
+    branches: [dev, master]
+    paths:
+      - 'landing/install.sh'
+      - 'landing/install.ps1'
+      - 'gen-env.sh'
+      - 'package.json'
+      - '.github/workflows/install-smoke.yml'
 
 concurrency:
   group: install-smoke-${{ github.ref }}
