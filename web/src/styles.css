@@ -203,6 +203,21 @@ body {
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
 .shortcut-btn-icon { width: 28px; min-width: 28px; padding: 4px 0; display: inline-flex; align-items: center; justify-content: center; }
+/* Mobile arrow D-pad — replaces the separate up/down buttons on small screens.
+ * Drag toward a direction to send that arrow key. touch-action:none keeps the
+ * drag from scrolling the page; the four glyphs sit around a center. */
+.shortcut-dpad { position: relative; width: 36px; min-width: 36px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+.shortcut-dpad .dpad-arrow { position: absolute; font-size: 7px; line-height: 1; color: #5b6573; pointer-events: none; transition: color 0.1s, text-shadow 0.1s; }
+.shortcut-dpad .dpad-arrow-up { top: 3px; left: 50%; transform: translateX(-50%); }
+.shortcut-dpad .dpad-arrow-down { bottom: 3px; left: 50%; transform: translateX(-50%); }
+.shortcut-dpad .dpad-arrow-left { left: 4px; top: 50%; transform: translateY(-50%); }
+.shortcut-dpad .dpad-arrow-right { right: 4px; top: 50%; transform: translateY(-50%); }
+.shortcut-dpad.shortcut-dpad-active { border-color: rgba(34,211,238,0.5); background: rgba(8,145,178,0.16); box-shadow: 0 0 12px rgba(34,211,238,0.14), inset 0 1px 0 rgba(255,255,255,0.05); }
+.shortcut-dpad.dpad-dir-up .dpad-arrow-up,
+.shortcut-dpad.dpad-dir-down .dpad-arrow-down,
+.shortcut-dpad.dpad-dir-left .dpad-arrow-left,
+.shortcut-dpad.dpad-dir-right .dpad-arrow-right { color: #67e8f9; text-shadow: 0 0 6px rgba(34,211,238,0.7); }
+.shortcut-dpad[data-disabled="true"] { opacity: 0.4; pointer-events: none; }
 /* Tool-call toggle wrench (UsageFooter). Three visual states correspond to
  * the show_tool_calls preference:
  *   - off  → grey border, dim icon (default tool-row hidden state)

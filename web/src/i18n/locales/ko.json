@@ -46,6 +46,9 @@
     "retry": "다시 시도"
   },
   "chat": {
+    "dpad": {
+      "title": "방향키 — 드래그하여 이동"
+    },
     "sendFailedReason": {
       "daemonOffline": "연결이 끊어졌습니다",
       "ackTimeout": "에이전트 응답 없음",

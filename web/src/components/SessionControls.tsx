@@ -14,6 +14,7 @@ import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
+import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
 import { isFutureWorkflowSchema } from '@shared/p2p-workflow-validators.js';
 import {
@@ -2806,17 +2807,36 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             >
               <span aria-hidden="true">■</span>
             </button>
-          ) : SHORTCUTS.map((s) => (
-            <button
-              key={s.label}
-              class={`shortcut-btn${s.wide ? ' shortcut-btn-wide' : ''}`}
-              title={s.title}
-              disabled={disabled}
-              onClick={() => handleShortcut(s.data)}
-            >
-              {s.label}
-            </button>
-          ))}
+          ) : SHORTCUTS.map((s) => {
+            // Mobile: collapse the separate ↑/↓ buttons into one drag D-pad
+            // (rendered once at the ↑ slot; ↓ is folded in). It sends the
+            // same standard arrow sequences down the same handleShortcut path,
+            // so ncdu/vim/less TUI handling is inherited unchanged, and adds
+            // left/right. Desktop keeps the discrete buttons.
+            if (isMobileLayout && s.data === DPAD_ARROW_SEQUENCES.down) return null;
+            if (isMobileLayout && s.data === DPAD_ARROW_SEQUENCES.up) {
+              return (
+                <MobileDpad
+                  key="dpad"
+                  disabled={disabled}
+                  title={t('chat.dpad.title')}
+                  ariaLabel={t('chat.dpad.title')}
+                  onDirection={(seq) => handleShortcut(seq)}
+                />
+              );
+            }
+            return (
+              <button
+                key={s.label}
+                class={`shortcut-btn${s.wide ? ' shortcut-btn-wide' : ''}`}
+                title={s.title}
+                disabled={disabled}
+                onClick={() => handleShortcut(s.data)}
+              >
+                {s.label}
+              </button>
+            );
+          })}
         </div>}
 
         {canQuickControlSupervision && (

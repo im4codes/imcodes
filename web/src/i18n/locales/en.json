@@ -46,6 +46,9 @@
     "retry": "Retry"
   },
   "chat": {
+    "dpad": {
+      "title": "Arrow keys — drag to move"
+    },
     "sendFailedReason": {
       "daemonOffline": "Connection lost",
       "ackTimeout": "No response from agent",

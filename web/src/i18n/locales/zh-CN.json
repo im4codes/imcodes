@@ -46,6 +46,9 @@
     "retry": "重试"
   },
   "chat": {
+    "dpad": {
+      "title": "方向键 — 拖动发送方向键"
+    },
     "sendFailedReason": {
       "daemonOffline": "连接中断",
       "ackTimeout": "代理无响应",

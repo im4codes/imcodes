@@ -46,6 +46,9 @@
     "retry": "再試行"
   },
   "chat": {
+    "dpad": {
+      "title": "矢印キー — ドラッグで移動"
+    },
     "sendFailedReason": {
       "daemonOffline": "接続が切れました",
       "ackTimeout": "エージェントから応答がありません",

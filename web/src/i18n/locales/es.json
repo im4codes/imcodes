@@ -46,6 +46,9 @@
     "retry": "Reintentar"
   },
   "chat": {
+    "dpad": {
+      "title": "Teclas de flecha: arrastra para mover"
+    },
     "sendFailedReason": {
       "daemonOffline": "Conexión perdida",
       "ackTimeout": "Sin respuesta del agente",
