@@ -24,6 +24,7 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
+import { computeFollowThresholds } from './chat-follow-thresholds.js';
 import type { ChatLocalImagePreviewLoader, ChatLocalImagePreviewResult } from './ChatLocalImagePreview.js';
 import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { isLikelyDomainPath, renderChatPathActions, type ChatPathDownloadHandler } from '../chat-path-actions.js';
@@ -1648,8 +1649,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     // over-engagement (a flat 150 px swallows ~42 % of a 360 px landscape
     // viewport but only 14 % of a 1080 px desktop pane).
     const distance = scrollHeight - scrollTop - clientHeight;
-    const disengageThreshold = Math.max(180, Math.round(0.25 * clientHeight));
-    const reengageThreshold = Math.max(60, Math.round(0.10 * clientHeight));
+    // Adaptive thresholds, with a short-content guard so follow-mode is always
+    // escapable by scrolling up (see chat-follow-thresholds.ts). Fixes the
+    // "chat jitters back to bottom on a gentle scroll-up at certain heights".
+    const { disengageThreshold, reengageThreshold } = computeFollowThresholds(clientHeight, scrollHeight);
     if (wasAutoFollowing && distance > disengageThreshold) {
       autoScrollRef.current = false;
       // Reset count so it starts fresh from this pause
