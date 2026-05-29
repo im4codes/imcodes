@@ -5455,7 +5455,6 @@ async function handleDiscussionStart(cmd: Record<string, unknown>, serverLink: S
       {
         id,
         serverId: '',
-        requestId,
         topic,
         cwd: cwd ?? '',
         participants,
