@@ -242,7 +242,7 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
   };
 }
 
-function isTerminalDiscussionState(state: unknown): boolean {
+export function isTerminalDiscussionState(state: unknown): boolean {
   return state === 'done' || state === 'failed';
 }
 

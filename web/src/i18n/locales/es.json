@@ -576,7 +576,25 @@
     "role_innovator": "Innovador",
     "role_custom": "Personalizado...",
     "arbiter": "Árbitro",
-    "arbiter_active": "⚖️ Árbitro"
+    "arbiter_active": "⚖️ Árbitro",
+    "starting": "Iniciando…",
+    "start_failed_title": "No se pudo iniciar la discusión",
+    "start_failed_offline": "Estás sin conexión: vuelve a conectarte e inténtalo de nuevo.",
+    "dialog_title": "Iniciar discusión",
+    "start_button": "Iniciar discusión",
+    "field_topic": "Tema",
+    "topic_placeholder": "Describe lo que quieres que discutan los agentes…",
+    "field_cwd": "Directorio de trabajo",
+    "field_participants": "Participantes",
+    "add_participant": "+ Añadir",
+    "field_max_rounds": "Rondas máximas",
+    "team_label": "Equipo",
+    "complete_status": "Completado",
+    "failed_status": "Fallido",
+    "error": {
+      "missing_fields": "Faltan campos obligatorios (tema y al menos dos participantes).",
+      "generic": "No se pudo iniciar la discusión. Inténtalo de nuevo."
+    }
   },
   "new_session": {
     "project_required": "El nombre del proyecto es obligatorio",

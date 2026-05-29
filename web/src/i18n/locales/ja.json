@@ -576,7 +576,25 @@
     "role_innovator": "革新者",
     "role_custom": "カスタム...",
     "arbiter": "仲裁者",
-    "arbiter_active": "⚖️ 仲裁者"
+    "arbiter_active": "⚖️ 仲裁者",
+    "starting": "開始中…",
+    "start_failed_title": "ディスカッションを開始できませんでした",
+    "start_failed_offline": "オフラインです。再接続してからもう一度お試しください。",
+    "dialog_title": "ディスカッションを開始",
+    "start_button": "ディスカッションを開始",
+    "field_topic": "トピック",
+    "topic_placeholder": "エージェントに議論させたい内容を記述してください…",
+    "field_cwd": "作業ディレクトリ",
+    "field_participants": "参加者",
+    "add_participant": "+ 追加",
+    "field_max_rounds": "最大ラウンド数",
+    "team_label": "チーム",
+    "complete_status": "完了",
+    "failed_status": "失敗",
+    "error": {
+      "missing_fields": "必須項目が不足しています(トピックと参加者2名以上)。",
+      "generic": "ディスカッションを開始できませんでした。もう一度お試しください。"
+    }
   },
   "new_session": {
     "project_required": "プロジェクト名は必須です",

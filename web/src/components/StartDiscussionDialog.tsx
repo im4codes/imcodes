@@ -1,6 +1,5 @@
-import { useState } from 'preact/hooks';
+import { useState, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import type { WsClient } from '../ws-client.js';
 import { saveUserPref } from '../api.js';
 
 const AGENTS = [
@@ -31,14 +30,22 @@ export interface DiscussionPrefs {
 }
 
 interface Props {
-  ws: WsClient;
+  /** App-owned start handler: App mints the requestId, inserts the optimistic
+   *  bar entry, performs the send, and handles dispatch-time failure. */
+  onStartRequested: (payload: {
+    topic: string;
+    cwd: string;
+    participants: Array<{ agentType: string; model?: string; roleId: string; roleLabel?: string; rolePrompt?: string; sessionName?: string }>;
+    maxRounds: number;
+    verdictIdx: number;
+  }) => void;
   defaultCwd?: string;
   existingSessions: SubSessionOption[];
   savedPrefs?: DiscussionPrefs | null;
   onClose: () => void;
 }
 
-export function StartDiscussionDialog({ ws, defaultCwd, existingSessions, savedPrefs, onClose }: Props) {
+export function StartDiscussionDialog({ onStartRequested, defaultCwd, existingSessions, savedPrefs, onClose }: Props) {
   const { t } = useTranslation();
 
   const PRESET_ROLES = [
@@ -77,8 +84,12 @@ export function StartDiscussionDialog({ ws, defaultCwd, existingSessions, savedP
     setParticipants(participants.map((p, i) => (i === idx ? { ...p, ...updates } : p)));
   };
 
+  const submittingRef = useRef(false);
   const handleStart = () => {
-    if (!topic.trim()) return;
+    // Synchronous double-submit guard: a second click before the dialog
+    // unmounts cannot dispatch twice. Visible feedback is the bar card.
+    if (!topic.trim() || submittingRef.current) return;
+    submittingRef.current = true;
     void saveUserPref('discussion_prefs', {
       participants: participants.map((p) => ({
         roleId: p.roleId,
@@ -90,10 +101,10 @@ export function StartDiscussionDialog({ ws, defaultCwd, existingSessions, savedP
       verdictIdx,
       maxRounds,
     });
-    ws.discussionStart(
+    onStartRequested({
       topic,
       cwd,
-      participants.map((p) => ({
+      participants: participants.map((p) => ({
         agentType: p.agentType,
         model: p.model,
         roleId: p.roleId,
@@ -103,7 +114,7 @@ export function StartDiscussionDialog({ ws, defaultCwd, existingSessions, savedP
       })),
       maxRounds,
       verdictIdx,
-    );
+    });
     onClose();
   };
 
@@ -111,18 +122,18 @@ export function StartDiscussionDialog({ ws, defaultCwd, existingSessions, savedP
     <div class="dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="dialog" style={{ width: 520 }}>
         <div class="dialog-header">
-          <span>Start Discussion</span>
+          <span>{t('discussion.dialog_title')}</span>
           <button class="dialog-close" onClick={onClose}>✕</button>
         </div>
 
         <div class="dialog-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           {/* Topic */}
           <div>
-            <div class="field-label">Topic</div>
+            <div class="field-label">{t('discussion.field_topic')}</div>
             <textarea
               class="input"
               rows={3}
-              placeholder="Describe what you want the agents to discuss..."
+              placeholder={t('discussion.topic_placeholder')}
               value={topic}
               onInput={(e) => setTopic((e.target as HTMLTextAreaElement).value)}
               style={{ width: '100%', resize: 'vertical' }}
@@ -131,7 +142,7 @@ export function StartDiscussionDialog({ ws, defaultCwd, existingSessions, savedP
 
           {/* Working directory */}
           <div>
-            <div class="field-label">Working Directory</div>
+            <div class="field-label">{t('discussion.field_cwd')}</div>
             <input
               class="input"
               placeholder="~/projects/myapp"
@@ -144,9 +155,9 @@ export function StartDiscussionDialog({ ws, defaultCwd, existingSessions, savedP
           {/* Participants */}
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-              <div class="field-label" style={{ margin: 0 }}>Participants</div>
+              <div class="field-label" style={{ margin: 0 }}>{t('discussion.field_participants')}</div>
               {participants.length < 3 && (
-                <button class="btn btn-sm" onClick={addParticipant}>+ Add</button>
+                <button class="btn btn-sm" onClick={addParticipant}>{t('discussion.add_participant')}</button>
               )}
             </div>
 
@@ -265,7 +276,7 @@ export function StartDiscussionDialog({ ws, defaultCwd, existingSessions, savedP
 
           {/* Max Rounds */}
           <div>
-            <div class="field-label">Max Rounds</div>
+            <div class="field-label">{t('discussion.field_max_rounds')}</div>
             <select
               class="input"
               value={maxRounds}
@@ -280,9 +291,9 @@ export function StartDiscussionDialog({ ws, defaultCwd, existingSessions, savedP
         </div>
 
         <div class="dialog-footer">
-          <button class="btn btn-secondary" onClick={onClose}>Cancel</button>
+          <button class="btn btn-secondary" onClick={onClose}>{t('common.cancel')}</button>
           <button class="btn btn-primary" onClick={handleStart} disabled={!topic.trim()}>
-            Start Discussion
+            {t('discussion.start_button')}
           </button>
         </div>
       </div>

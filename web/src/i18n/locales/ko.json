@@ -576,7 +576,25 @@
     "role_innovator": "혁신가",
     "role_custom": "사용자 정의...",
     "arbiter": "중재자",
-    "arbiter_active": "⚖️ 중재자"
+    "arbiter_active": "⚖️ 중재자",
+    "starting": "시작 중…",
+    "start_failed_title": "토론을 시작하지 못했습니다",
+    "start_failed_offline": "오프라인 상태입니다. 다시 연결한 후 시도하세요.",
+    "dialog_title": "토론 시작",
+    "start_button": "토론 시작",
+    "field_topic": "주제",
+    "topic_placeholder": "에이전트가 논의할 내용을 설명하세요…",
+    "field_cwd": "작업 디렉터리",
+    "field_participants": "참여자",
+    "add_participant": "+ 추가",
+    "field_max_rounds": "최대 라운드",
+    "team_label": "팀",
+    "complete_status": "완료",
+    "failed_status": "실패",
+    "error": {
+      "missing_fields": "필수 항목이 누락되었습니다 (주제 및 참여자 2명 이상).",
+      "generic": "토론을 시작하지 못했습니다. 다시 시도하세요."
+    }
   },
   "new_session": {
     "project_required": "프로젝트 이름은 필수입니다",

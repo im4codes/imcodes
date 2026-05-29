@@ -23,6 +23,8 @@ import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
 import type { UsageContextWindowSource } from '@shared/usage-context-window.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate, mergeP2pStatusResponseDiscussions } from './p2p-run-mapping.js';
+import { matchDiscussionIndex, reconcileDiscussionEntry, reconcileClassicList, isBarActiveDiscussion } from './discussion-reconcile.js';
+import { PENDING_START_TIMEOUT_MS, DISCUSSION_RECONCILE_HIDDEN_MS } from '@shared/discussion-ui.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
@@ -1332,6 +1334,16 @@ export function App() {
     id: string;
     topic: string;
     state: string;
+    /** Web requestId for an optimistic launch (classic discussion startup feedback). */
+    requestId?: string;
+    /** True while the entry is an optimistic local placeholder (pre-`discussion.started`). */
+    pending?: boolean;
+    /** Raw failure string from the daemon — internal only, never rendered. */
+    error?: string;
+    /** i18n key for the user-facing failure reason (rendered in place of raw error). */
+    displayReasonKey?: string;
+    /** Internal copy of the raw failure for logs/detail (never rendered). */
+    rawError?: string;
     modeKey?: string;
     currentRound: number;
     maxRounds: number;
@@ -1841,6 +1853,83 @@ export function App() {
   }, [auth, manualDashboard, selectedServerId, servers, serversLoaded, setActiveSession]);
 
   const wsRef = useRef<WsClient | null>(null);
+
+  // ── Classic discussion startup feedback (optimistic launch + failure UX) ──
+  // Always read the latest translator inside stable callbacks.
+  const transRef = useRef(trans);
+  transRef.current = trans;
+  // requestIds this tab dispatched — gates initiator-only failure toasts.
+  const initiatedRequestIdsRef = useRef<Set<string>>(new Set());
+  // Backstop timers keyed by requestId (send OK but no started/error).
+  const pendingStartTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  const clearPendingStartTimer = useCallback((requestId?: string) => {
+    if (!requestId) return;
+    const timer = pendingStartTimersRef.current.get(requestId);
+    if (timer) { clearTimeout(timer); pendingStartTimersRef.current.delete(requestId); }
+  }, []);
+
+  // Mirror the P2P terminal cleanup cadence (~120s): keep the finished card
+  // briefly, then drop it from client state so terminal entries don't pile up.
+  const scheduleClassicDiscussionCleanup = useCallback((id: string) => {
+    setTimeout(() => {
+      setDiscussions((prev) => prev.filter((d) => d.id !== id));
+    }, DISCUSSION_RECONCILE_HIDDEN_MS * 2);
+  }, []);
+
+  const pushDiscussionFailureToast = useCallback((reasonKey: string) => {
+    const t = transRef.current;
+    const id = Date.now() + Math.random();
+    setToasts((prev) => [...prev, {
+      id, sessionName: '', project: '', kind: 'notification',
+      title: t('discussion.start_failed_title'),
+      message: t(reasonKey),
+    }]);
+    setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
+  }, []);
+
+  // App owns the optimistic launch state and mints the requestId so the
+  // pending card is inserted BEFORE the (synchronously-throwing) send.
+  const handleStartDiscussion = useCallback((payload: {
+    topic: string;
+    cwd: string;
+    participants: Array<{ agentType: string; model?: string; roleId: string; roleLabel?: string; rolePrompt?: string; sessionName?: string }>;
+    maxRounds?: number;
+    verdictIdx?: number;
+  }) => {
+    const ws = wsRef.current;
+    if (!ws) return;
+    const requestId = crypto.randomUUID();
+    const pendingId = `pending_${requestId}`;
+    setDiscussions((prev) => [...prev, {
+      id: pendingId, requestId, pending: true, state: 'setup', topic: payload.topic,
+      currentRound: 0, maxRounds: payload.maxRounds ?? 3, completedHops: 0, totalHops: 0, startedAt: Date.now(),
+    }]);
+    initiatedRequestIdsRef.current.add(requestId);
+    if (initiatedRequestIdsRef.current.size > 64) {
+      const oldest = initiatedRequestIdsRef.current.values().next().value;
+      if (oldest !== undefined) initiatedRequestIdsRef.current.delete(oldest);
+    }
+    try {
+      ws.discussionStart(payload.topic, payload.cwd, payload.participants, payload.maxRounds, payload.verdictIdx, requestId);
+      const timer = setTimeout(() => {
+        pendingStartTimersRef.current.delete(requestId);
+        initiatedRequestIdsRef.current.delete(requestId);
+        setDiscussions((prev) => prev.map((d) => (d.requestId === requestId && d.pending)
+          ? { ...d, pending: false, state: 'failed', displayReasonKey: 'discussion.error.generic' }
+          : d));
+        pushDiscussionFailureToast('discussion.error.generic');
+      }, PENDING_START_TIMEOUT_MS);
+      pendingStartTimersRef.current.set(requestId, timer);
+    } catch {
+      // Dispatch-time failure (WS not connected → synchronous throw): drop the
+      // optimistic entry in the same tick, show a localized offline toast.
+      setDiscussions((prev) => prev.filter((d) => d.requestId !== requestId));
+      initiatedRequestIdsRef.current.delete(requestId);
+      pushDiscussionFailureToast('discussion.start_failed_offline');
+    }
+    setShowDiscussionDialog(false);
+  }, [pushDiscussionFailureToast]);
   const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } | null>(null);
 
   useEffect(() => {
@@ -2208,6 +2297,9 @@ export function App() {
             const initialScope = initialActive ? { sessionName: initialActive } : undefined;
             ws.p2pListDiscussions(initialScope);
             ws.p2pStatus(initialScope);
+            // Re-sync classic discussions too (not just the P2P path) so a run
+            // that finished while backgrounded is reconciled out of the bar.
+            ws.discussionList();
           }
           if (!isProbeRecovered) requestActiveTimelineRefresh({ resetCooldowns: true });
           // Timeout: if session_list never arrives, stop blocking the UI
@@ -2622,42 +2714,101 @@ export function App() {
         watchProjectionStore.removeSubSession(msg.sessionName);
       }
       if (msg.type === 'discussion.started') {
-        setDiscussions((prev) => [
-          ...prev,
-          { id: msg.discussionId, topic: msg.topic, state: 'setup', currentRound: 0, maxRounds: msg.maxRounds, completedHops: 0, totalHops: msg.totalHops ?? 0, startedAt: Date.now() },
-        ]);
+        clearPendingStartTimer(msg.requestId);
+        setDiscussions((prev) => {
+          const idx = matchDiscussionIndex(prev, msg);
+          if (idx >= 0) {
+            const next = [...prev];
+            next[idx] = reconcileDiscussionEntry(prev[idx], {
+              id: msg.discussionId,
+              state: 'setup',
+              topic: msg.topic,
+              maxRounds: msg.maxRounds,
+              totalHops: msg.totalHops,
+              filePath: msg.filePath,
+            });
+            return next;
+          }
+          return [...prev, {
+            id: msg.discussionId, requestId: msg.requestId, topic: msg.topic, state: 'setup',
+            currentRound: 0, maxRounds: msg.maxRounds, completedHops: 0,
+            totalHops: msg.totalHops ?? 0, startedAt: Date.now(),
+          }];
+        });
       }
       if (msg.type === 'discussion.update') {
-        setDiscussions((prev) => prev.map((d) =>
-          d.id === msg.discussionId
-            ? { ...d, state: msg.state, currentRound: msg.currentRound, maxRounds: msg.maxRounds, completedHops: msg.completedHops ?? d.completedHops, totalHops: msg.totalHops ?? d.totalHops, currentSpeaker: msg.currentSpeaker }
-            : d,
-        ));
+        clearPendingStartTimer(msg.requestId);
+        setDiscussions((prev) => {
+          const idx = matchDiscussionIndex(prev, msg);
+          if (idx < 0) return prev;
+          const next = [...prev];
+          next[idx] = reconcileDiscussionEntry(prev[idx], {
+            id: msg.discussionId,
+            state: msg.state,
+            currentRound: msg.currentRound,
+            maxRounds: msg.maxRounds,
+            completedHops: msg.completedHops,
+            totalHops: msg.totalHops,
+            currentSpeaker: msg.currentSpeaker ?? undefined,
+            filePath: msg.filePath,
+          });
+          return next;
+        });
       }
       if (msg.type === 'discussion.done') {
-        setDiscussions((prev) => prev.map((d) =>
-          d.id === msg.discussionId
-            ? { ...d, state: 'done', conclusion: msg.conclusion, filePath: msg.filePath }
-            : d,
-        ));
+        setDiscussions((prev) => {
+          const idx = matchDiscussionIndex(prev, msg);
+          if (idx < 0) return prev;
+          const next = [...prev];
+          next[idx] = reconcileDiscussionEntry(prev[idx], { state: 'done', conclusion: msg.conclusion, filePath: msg.filePath });
+          return next;
+        });
+        if (typeof msg.discussionId === 'string') scheduleClassicDiscussionCleanup(msg.discussionId);
       }
       if (msg.type === 'discussion.error') {
-        if (msg.discussionId) {
-          setDiscussions((prev) => prev.map((d) =>
-            d.id === msg.discussionId ? { ...d, state: 'failed', error: msg.error ?? undefined } : d,
-          ));
+        clearPendingStartTimer(msg.requestId);
+        // Map the daemon's stable error token to a localized key; the raw error
+        // string is kept only as rawError (never rendered) — initiator-only toast.
+        const reasonKey = msg.error === 'missing_fields' ? 'discussion.error.missing_fields' : 'discussion.error.generic';
+        let matchedId: string | undefined;
+        setDiscussions((prev) => {
+          const idx = matchDiscussionIndex(prev, msg);
+          if (idx < 0) return prev;
+          matchedId = prev[idx].id;
+          const next = [...prev];
+          next[idx] = reconcileDiscussionEntry(prev[idx], {
+            state: 'failed',
+            displayReasonKey: reasonKey,
+            rawError: typeof msg.error === 'string' ? msg.error : undefined,
+          });
+          return next;
+        });
+        const reqId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
+        if (reqId && initiatedRequestIdsRef.current.has(reqId)) {
+          initiatedRequestIdsRef.current.delete(reqId);
+          pushDiscussionFailureToast(reasonKey);
         }
+        if (matchedId) scheduleClassicDiscussionCleanup(matchedId);
       }
       if (msg.type === 'discussion.list') {
-        // Merge live discussions from daemon with existing DB history
-        // Preserve active P2P entries (p2p_ prefix) — they come from p2p.run_update, not discussion.list
-        setDiscussions((prev) => {
-          const liveIds = new Set(msg.discussions.map((d: { id: string }) => d.id));
-          const dbHistory = prev.filter((d) => !liveIds.has(d.id) && (d.state === 'done' || d.state === 'failed'));
-          const activeP2p = prev.filter((d) => d.id.startsWith('p2p_') && d.state !== 'done' && d.state !== 'failed');
-          const mapped = msg.discussions.map((d) => ({ ...d, completedHops: d.completedHops ?? 0, totalHops: d.totalHops ?? 0 }));
-          return [...mapped, ...dbHistory, ...activeP2p];
-        });
+        // Single requestId-aware reconciler: preserve unresolved pending entries,
+        // merge present entries in place (no daemon-shaped replacement), keep
+        // terminal history + p2p_ entries, drop resolved active classic entries
+        // absent from the live set (finished daemon-side).
+        setDiscussions((prev) => reconcileClassicList(
+          prev,
+          (msg.discussions ?? []) as Array<Record<string, unknown> & { id: string; requestId?: string }>,
+          (item) => ({
+            ...(item as Record<string, unknown>),
+            id: item.id as string,
+            topic: (item.topic as string) ?? '',
+            state: (item.state as string) ?? 'setup',
+            currentRound: (item.currentRound as number) ?? 0,
+            maxRounds: (item.maxRounds as number) ?? 3,
+            completedHops: 0,
+            totalHops: 0,
+          }) as (typeof prev)[number],
+        ));
       }
       // ── P2P Quick Discussion progress → map to discussions state ──────────
       if (msg.type === P2P_WORKFLOW_MSG.CONFLICT) {
@@ -2939,12 +3090,19 @@ export function App() {
     let lastResumeCheckAt = 0;
     let lastResumeCheckWasForce = false;
     let hiddenSinceAt = 0;
+    let lastDiscussionResyncAt = 0;
     const handleResume = (forceIfStale = false, refreshTimeline = false) => {
       const now = Date.now();
       if (now - lastResumeCheckAt < 500 && (!forceIfStale || lastResumeCheckWasForce)) return;
       lastResumeCheckAt = now;
       lastResumeCheckWasForce = forceIfStale;
       ws.resumeConnection(forceIfStale);
+      // Cooldown-gated classic discussion re-sync so a run that ended while
+      // backgrounded disappears from the bar without a reload (absorbs alt-tab churn).
+      if (now - lastDiscussionResyncAt > DISCUSSION_RECONCILE_HIDDEN_MS) {
+        lastDiscussionResyncAt = now;
+        ws.discussionList();
+      }
       if (refreshTimeline) requestActiveTimelineRefresh({ resetCooldowns: true });
     };
     const onVisibility = () => {
@@ -2952,7 +3110,7 @@ export function App() {
         hiddenSinceAt = Date.now();
         return;
       }
-      const wasLongHidden = hiddenSinceAt > 0 && Date.now() - hiddenSinceAt > 60_000;
+      const wasLongHidden = hiddenSinceAt > 0 && Date.now() - hiddenSinceAt > DISCUSSION_RECONCILE_HIDDEN_MS;
       hiddenSinceAt = 0;
       handleResume(wasLongHidden, wasLongHidden);
       // Short-hide (alt-tab etc.) still needs a timeline catch-up — the bare
@@ -4439,9 +4597,13 @@ export function App() {
                 // a badge even when the user is viewing a session
                 // unrelated to the running discussions. Lets the user
                 // notice and click through without losing track.
-                totalRunningDiscussions={discussions.filter((d) => d.state !== 'done').length}
+                totalRunningDiscussions={discussions.filter(isBarActiveDiscussion).length}
                 onStopDiscussion={(id) => {
-                  if (id.startsWith('p2p_')) {
+                  if (id.startsWith('pending_')) {
+                    // Optimistic entry not yet acknowledged by the daemon — there is
+                    // no remote run to stop; drop it locally only.
+                    setDiscussions((prev) => prev.filter((d) => d.id !== id));
+                  } else if (id.startsWith('p2p_')) {
                     // P2P runs use p2p.cancel with the actual run ID (strip p2p_ prefix)
                     wsRef.current?.send({ type: P2P_WORKFLOW_MSG.CANCEL, runId: id.slice(4) });
                     // Remove from UI immediately
@@ -5041,7 +5203,7 @@ export function App() {
 
       {showDiscussionDialog && wsRef.current && (
         <StartDiscussionDialog
-          ws={wsRef.current}
+          onStartRequested={handleStartDiscussion}
           defaultCwd={activeSessionInfo?.projectDir}
           existingSessions={subSessions.map((s): SubSessionOption => ({
             sessionName: s.sessionName,

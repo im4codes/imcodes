@@ -577,7 +577,25 @@
     "role_innovator": "创新者",
     "role_custom": "自定义...",
     "arbiter": "裁决者",
-    "arbiter_active": "⚖️ 裁决者"
+    "arbiter_active": "⚖️ 裁决者",
+    "starting": "启动中…",
+    "start_failed_title": "讨论启动失败",
+    "start_failed_offline": "当前离线 —— 请重新连接后再试。",
+    "dialog_title": "发起讨论",
+    "start_button": "发起讨论",
+    "field_topic": "主题",
+    "topic_placeholder": "描述你想让各 Agent 讨论的内容…",
+    "field_cwd": "工作目录",
+    "field_participants": "参与者",
+    "add_participant": "+ 添加",
+    "field_max_rounds": "最大轮数",
+    "team_label": "Team",
+    "complete_status": "已完成",
+    "failed_status": "失败",
+    "error": {
+      "missing_fields": "缺少必填项(主题以及至少两名参与者)。",
+      "generic": "讨论启动失败,请重试。"
+    }
   },
   "new_session": {
     "project_required": "项目名称不能为空",

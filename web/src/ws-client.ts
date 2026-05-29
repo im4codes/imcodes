@@ -142,10 +142,10 @@ export type ServerMessage =
   | { type: 'subsession.shells'; shells: string[] }
   | { type: 'subsession.response'; sessionName: string; status: 'working' | 'idle'; response?: string }
   | { type: 'discussion.started'; requestId?: string; discussionId: string; topic: string; maxRounds: number; totalHops?: number; filePath: string; participants: Array<{ sessionName: string; roleLabel: string; agentType: string; model?: string }> }
-  | { type: 'discussion.update'; discussionId: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; lastResponse?: string }
+  | { type: 'discussion.update'; requestId?: string; discussionId: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string | null; filePath?: string; lastResponse?: string }
   | { type: 'discussion.done'; discussionId: string; filePath: string; conclusion: string }
   | { type: 'discussion.error'; discussionId?: string; requestId?: string; error: string }
-  | { type: 'discussion.list'; discussions: Array<{ id: string; topic: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
+  | { type: 'discussion.list'; discussions: Array<{ id: string; requestId?: string; topic: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
   | { type: 'daemon.stats'; daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number }
   | FsLsResponse
   | FsReadResponse
@@ -923,9 +923,14 @@ export class WsClient {
     }>,
     maxRounds?: number,
     verdictIdx?: number,
-  ): void {
-    const requestId = crypto.randomUUID();
-    this.send({ type: 'discussion.start', requestId, topic, cwd, participants, maxRounds, verdictIdx });
+    requestId?: string,
+  ): string {
+    // The caller (App) mints the requestId so it can insert the optimistic
+    // pending entry BEFORE this send (which throws synchronously when the
+    // socket is not open). Falls back to a generated id for legacy callers.
+    const id = requestId ?? crypto.randomUUID();
+    this.send({ type: 'discussion.start', requestId: id, topic, cwd, participants, maxRounds, verdictIdx });
+    return id;
   }
 
   discussionStatus(discussionId: string): void {
@@ -938,11 +943,11 @@ export class WsClient {
   }
 
   /**
-   * @deprecated Use {@link p2pListDiscussions} instead. The legacy
-   * `discussion.list` daemon command predates the project-scoped p2p workflow
-   * messages and is not enforced by the daemon's scope guards. All app
-   * call sites were migrated to `p2pListDiscussions(scope)`. Kept on the
-   * client only until the daemon-side `discussion.list` route is retired.
+   * Request the daemon's current in-memory classic discussions. Used to
+   * reconcile the discussion bar on connect / reconnect / foreground-resume so
+   * a run that finished while the app was backgrounded is removed without a
+   * full page reload. Travels over the daemon WS (inherently pod-sticky), so
+   * it carries no separate `serverId` routing.
    */
   discussionList(): void {
     this.send({ type: 'discussion.list' });

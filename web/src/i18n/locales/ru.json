@@ -576,7 +576,25 @@
     "role_innovator": "Новатор",
     "role_custom": "Пользовательская...",
     "arbiter": "Арбитр",
-    "arbiter_active": "⚖️ Арбитр"
+    "arbiter_active": "⚖️ Арбитр",
+    "starting": "Запуск…",
+    "start_failed_title": "Не удалось запустить обсуждение",
+    "start_failed_offline": "Нет подключения — переподключитесь и повторите попытку.",
+    "dialog_title": "Начать обсуждение",
+    "start_button": "Начать обсуждение",
+    "field_topic": "Тема",
+    "topic_placeholder": "Опишите, что должны обсудить агенты…",
+    "field_cwd": "Рабочий каталог",
+    "field_participants": "Участники",
+    "add_participant": "+ Добавить",
+    "field_max_rounds": "Макс. раундов",
+    "team_label": "Команда",
+    "complete_status": "Завершено",
+    "failed_status": "Ошибка",
+    "error": {
+      "missing_fields": "Отсутствуют обязательные поля (тема и не менее двух участников).",
+      "generic": "Не удалось запустить обсуждение. Повторите попытку."
+    }
   },
   "new_session": {
     "project_required": "Название проекта обязательно",

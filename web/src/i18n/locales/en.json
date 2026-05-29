@@ -577,7 +577,25 @@
     "role_innovator": "Innovator",
     "role_custom": "Custom...",
     "arbiter": "Arbiter",
-    "arbiter_active": "⚖️ Arbiter"
+    "arbiter_active": "⚖️ Arbiter",
+    "starting": "Starting…",
+    "start_failed_title": "Couldn't start discussion",
+    "start_failed_offline": "You're offline — reconnect and try again.",
+    "dialog_title": "Start Discussion",
+    "start_button": "Start Discussion",
+    "field_topic": "Topic",
+    "topic_placeholder": "Describe what you want the agents to discuss…",
+    "field_cwd": "Working Directory",
+    "field_participants": "Participants",
+    "add_participant": "+ Add",
+    "field_max_rounds": "Max Rounds",
+    "team_label": "Team",
+    "complete_status": "Complete",
+    "failed_status": "Failed",
+    "error": {
+      "missing_fields": "Missing required fields (topic and at least two participants).",
+      "generic": "Failed to start the discussion. Please try again."
+    }
   },
   "new_session": {
     "project_required": "Project name is required",
