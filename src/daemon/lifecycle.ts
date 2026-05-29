@@ -342,6 +342,8 @@ export async function startup(): Promise<DaemonContext> {
   }, 'Daemon starting');
   lockServer = await acquireInstanceLock();
   writePidFile();
+  // Captures an initial heap snapshot into the runtime status; subsequent
+  // refreshes ride the heartbeat write (no dedicated timer / extra I/O).
   recordDaemonStart({ version: DAEMON_VERSION });
 
   const config = await loadConfig();
