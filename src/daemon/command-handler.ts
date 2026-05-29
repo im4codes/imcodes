@@ -4196,14 +4196,18 @@ function timelineReplayInflightKey(params: TimelineReplayRequestParams): string 
   });
 }
 
-function buildTimelineReplay(params: TimelineReplayRequestParams): TimelineReplayBuildResult {
+async function buildTimelineReplay(params: TimelineReplayRequestParams): Promise<TimelineReplayBuildResult> {
   if (params.requestEpoch !== timelineEmitter.epoch) {
-    // Epoch mismatch — serve current epoch events from file store, fallback to all epochs.
+    // Epoch reset (client reconnected across a daemon restart) — serve the
+    // latest events from the SQLite projection, the sole chat-history read
+    // source. readPreferred returns the most recent N events (across epochs)
+    // ascending, which is exactly what a cursor-reset replay needs to re-sync.
+    // No JSONL `read()` fallback: on projection unavailability this throws
+    // TimelinePreferredReadError and handleTimelineReplay turns it into a
+    // replay error response rather than degrading to a synchronous JSONL scan
+    // (JSONL is now write/backup-only).
     const replayEpochResetLimit = 200;
-    let events = timelineStore.read(params.sessionName, { epoch: timelineEmitter.epoch, limit: replayEpochResetLimit });
-    if (events.length === 0) {
-      events = timelineStore.read(params.sessionName, { limit: replayEpochResetLimit });
-    }
+    const events = await timelineStore.readPreferred(params.sessionName, { limit: replayEpochResetLimit });
     const shaped = shapeTimelineEventsForTransport(events, {
       detailSink: getDefaultTimelineDetailStore(),
     });
@@ -4213,7 +4217,7 @@ function buildTimelineReplay(params: TimelineReplayRequestParams): TimelineRepla
       truncated: false,
       epoch: timelineEmitter.epoch,
       status: timelineStatusFromPayload(shaped.droppedEvents, shaped.truncatedEvents),
-      source: TIMELINE_RESPONSE_SOURCES.JSONL_TAIL,
+      source: TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE,
       payloadBytes: shaped.payloadBytes,
       payloadTruncated,
       hasMore: shaped.droppedEvents > 0,
@@ -4252,11 +4256,7 @@ function getTimelineReplayResult(params: TimelineReplayRequestParams): Promise<T
   if (existing) return existing;
   const promise = new Promise<TimelineReplayBuildResult>((resolve, reject) => {
     setImmediate(() => {
-      try {
-        resolve(buildTimelineReplay(params));
-      } catch (err) {
-        reject(err);
-      }
+      buildTimelineReplay(params).then(resolve, reject);
     });
   }).finally(() => {
     timelineReplayInflight.delete(key);
@@ -5199,16 +5199,30 @@ async function materializeP2pDiscussionHistoryEntry(
   };
 }
 
-async function handleP2pListDiscussions(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const requestId = cmd.requestId as string | undefined;
-  const scope = await resolveP2pDiscussionProjectScope(cmd);
+// Short-TTL result cache + in-flight coalescing for p2p.list_discussions.
+// Before this, EVERY poll re-scanned every project's discussions dir and
+// re-parsed every candidate file's preview (heavy fs + JSON allocation → a
+// top GC-pressure source under load). Web + mobile clients poll this list
+// frequently and in reconnect bursts; a 2s cache collapses sequential polls
+// and the in-flight map collapses simultaneous ones into a single scan.
+const P2P_DISCUSSION_LIST_CACHE_TTL_MS = 2_000;
+const P2P_DISCUSSION_LIST_GLOBAL_KEY = '__global__';
+interface P2pDiscussionListResult {
+  discussions: P2pDiscussionHistoryEntry[];
+  aggregated: boolean;
+}
+const p2pDiscussionListCache = new Map<string, { expiresAt: number; value: P2pDiscussionListResult }>();
+const p2pDiscussionListInflight = new Map<string, Promise<P2pDiscussionListResult>>();
+
+async function computeP2pDiscussionList(
+  scope: { projectDir: string; canonicalProjectDir: string } | null,
+): Promise<P2pDiscussionListResult> {
   // Audit fix (e940d73f-a8e / M7-B) — when the caller cannot supply scope
   // (mobile global view, multi-project daemon's "view discussions" entry
   // without an active session), aggregate discussions across **all** known
-  // projects instead of failing closed. The `error` field is still set so
-  // the UI can show a "scope optional" hint, but the list is no longer
-  // empty. Each entry carries `projectDir` so subsequent reads can route
-  // back. Single-project daemons still return the same one-project list.
+  // projects instead of failing closed. Each entry carries `projectDir` so
+  // subsequent reads can route back. Single-project daemons still return the
+  // same one-project list.
   const projectsToScan: Array<{ projectDir: string }> = [];
   if (scope) {
     projectsToScan.push({ projectDir: scope.projectDir });
@@ -5228,13 +5242,40 @@ async function handleP2pListDiscussions(cmd: Record<string, unknown>, serverLink
     P2P_DISCUSSION_PREVIEW_CONCURRENCY,
     materializeP2pDiscussionHistoryEntry,
   );
+  return { discussions, aggregated: !scope };
+}
+
+async function getP2pDiscussionList(
+  scope: { projectDir: string; canonicalProjectDir: string } | null,
+): Promise<P2pDiscussionListResult> {
+  const key = scope ? scope.canonicalProjectDir : P2P_DISCUSSION_LIST_GLOBAL_KEY;
+  const cached = p2pDiscussionListCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const inflight = p2pDiscussionListInflight.get(key);
+  if (inflight) return await inflight;
+  const promise = computeP2pDiscussionList(scope)
+    .then((value) => {
+      p2pDiscussionListCache.set(key, { value, expiresAt: Date.now() + P2P_DISCUSSION_LIST_CACHE_TTL_MS });
+      return value;
+    })
+    .finally(() => {
+      p2pDiscussionListInflight.delete(key);
+    });
+  p2pDiscussionListInflight.set(key, promise);
+  return await promise;
+}
+
+async function handleP2pListDiscussions(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = cmd.requestId as string | undefined;
+  const scope = await resolveP2pDiscussionProjectScope(cmd);
+  const { discussions, aggregated } = await getP2pDiscussionList(scope);
   serverLink.send({
     type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
     requestId,
     discussions,
     // Surface to the caller that the list was aggregated across projects.
     // Old clients ignore unknown fields.
-    ...(scope ? {} : { aggregated: true }),
+    ...(aggregated ? { aggregated: true } : {}),
   });
 }
 

@@ -186,6 +186,7 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
   timelineStore: {
     append: vi.fn(),
     read: vi.fn(() => []),
+    readPreferred: vi.fn(() => Promise.resolve([])),
     readByTypesPreferred: vi.fn(() => []),
     clear: vi.fn(),
   },
@@ -1631,9 +1632,11 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(Buffer.byteLength(JSON.stringify(response?.events), 'utf8')).toBeLessThanOrEqual(TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE);
   });
 
-  it('shapes epoch-mismatch replay fallback from JSONL tail under the default envelope budget', async () => {
-    vi.mocked(timelineStore.read).mockReturnValueOnce(Array.from({ length: 100 }, (_, index) => timelineEvent({
-      eventId: `jsonl-tail-${index}`,
+  it('shapes epoch-mismatch replay from the SQLite projection under the default envelope budget', async () => {
+    // Epoch-reset replay now reads the SQLite projection (sole chat-history
+    // source) instead of falling back to a synchronous JSONL tail scan.
+    vi.mocked(timelineStore.readPreferred).mockResolvedValueOnce(Array.from({ length: 100 }, (_, index) => timelineEvent({
+      eventId: `sqlite-tail-${index}`,
       ts: index,
       seq: index,
       payload: { output: 'j'.repeat(96 * 1024), detail: { output: 'j'.repeat(96 * 1024) } },
@@ -1654,7 +1657,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(response).toMatchObject({
       type: TIMELINE_MESSAGES.REPLAY,
       status: TIMELINE_RESPONSE_STATUS.PARTIAL,
-      source: TIMELINE_RESPONSE_SOURCES.JSONL_TAIL,
+      source: TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE,
       cursorReset: true,
       payloadTruncated: true,
     });

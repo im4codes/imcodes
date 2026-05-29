@@ -48,6 +48,14 @@ process.on('unhandledRejection', (reason) => {
 // Also catch warnings — node-pty sometimes emits MaxListenersExceededWarning
 // which we want to log but not crash on.
 process.on('warning', (warning) => {
+  // node:sqlite emits an ExperimentalWarning on first load in every thread
+  // (main + each SQLite worker); it's non-actionable noise (the bundled SQLite
+  // is already current) and is suppressed at `emitWarning` for the threads we
+  // control. Filter here too as defense-in-depth so it can never reach the
+  // daemon log even if some path loads node:sqlite before the shim installs.
+  if (warning.name === 'ExperimentalWarning' && /SQLite is an experimental feature/i.test(warning.message)) {
+    return;
+  }
   console.warn('[imcodes-daemon] warning:', warning.name, warning.message);
   // Don't forward warnings — too noisy.
 });

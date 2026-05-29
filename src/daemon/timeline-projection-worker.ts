@@ -43,6 +43,13 @@ function ensureDb(): DatabaseSyncInstance {
   instance.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
+    -- Without busy_timeout, any lock contention (e.g. a read worker holding a
+    -- shared lock while this writer checkpoints the 500MB+ WAL) surfaces as an
+    -- immediate SQLITE_BUSY throw. That throw bubbles up as projection_unavailable
+    -- and used to trigger the synchronous JSONL fallback. Block-and-retry inside
+    -- the worker thread instead (the worker thread is off the main event loop, so
+    -- waiting here never stalls command handling).
+    PRAGMA busy_timeout = 5000;
     CREATE TABLE IF NOT EXISTS timeline_projection_events (
       session_id TEXT NOT NULL,
       append_ordinal INTEGER NOT NULL,

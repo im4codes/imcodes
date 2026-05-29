@@ -94,6 +94,10 @@ function clampWorkersTarget(value: number | undefined): number {
 function createNodeWorker(): TimelineHistoryWorkerThreadLike {
   const worker = new Worker(getWorkerModuleUrl(), {
     workerData: { dbPath: getProjectionDbPath() },
+    // Suppress the node:sqlite ExperimentalWarning that fires on first load in
+    // every history worker thread (log noise; bundled SQLite is current).
+    // ExperimentalWarning is the only experimental warning this worker emits.
+    execArgv: [...process.execArgv, '--disable-warning=ExperimentalWarning'],
   });
   worker.unref();
   return worker as TimelineHistoryWorkerThreadLike;
