@@ -310,6 +310,30 @@ async function generateTitle(sessionName: string, topic: string, titleFile: stri
   return cleaned || topic.slice(0, 20).replace(/[\\/:*?"<>|\s]+/g, '-');
 }
 
+/**
+ * The relayed `discussion.update` emitted at the setup→running transition.
+ *
+ * Extracted as a pure builder so the requestId propagation (task 2.2/D3) is
+ * unit-testable without driving the full agent/file runtime. The bridge treats
+ * `discussion.save` as DB-only, so this relayed `discussion.update` — carrying
+ * `requestId` — is what moves a still-pending optimistic card out of "starting"
+ * the moment the run actually begins.
+ */
+export function buildRunningTransitionRelay(
+  d: Pick<Discussion, 'id' | 'requestId' | 'maxRounds' | 'filePath'>,
+): Record<string, unknown> {
+  return {
+    type: 'discussion.update',
+    discussionId: d.id,
+    requestId: d.requestId,
+    state: 'running',
+    currentRound: 0,
+    maxRounds: d.maxRounds,
+    currentSpeaker: null,
+    filePath: d.filePath,
+  };
+}
+
 // ── Discussion runner ──────────────────────────────────────────────────────
 
 async function runDiscussion(
@@ -398,12 +422,7 @@ async function runDiscussion(
   // optimistic / setup card out of "starting" the moment the run actually
   // begins, instead of leaving it frozen until the first round update. Carries
   // requestId so the web reconciler can match a still-pending optimistic entry.
-  onUpdate({
-    type: 'discussion.update',
-    discussionId: d.id, requestId: d.requestId,
-    state: d.state, currentRound: 0, maxRounds: d.maxRounds,
-    currentSpeaker: null, filePath: d.filePath,
-  });
+  onUpdate(buildRunningTransitionRelay(d));
 
   const isStopped = () => (d.state as string) === 'failed';
   const { stat } = await import('node:fs/promises');

@@ -23,7 +23,7 @@ import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
 import type { UsageContextWindowSource } from '@shared/usage-context-window.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate, mergeP2pStatusResponseDiscussions } from './p2p-run-mapping.js';
-import { matchDiscussionIndex, reconcileDiscussionEntry, reconcileClassicList, isBarActiveDiscussion } from './discussion-reconcile.js';
+import { matchDiscussionIndex, reconcileDiscussionEntry, reconcileClassicList, isBarActiveDiscussion, makeOptimisticDiscussionEntry, discussionErrorReasonKey, shouldToastDiscussionError, classifyDiscussionStop, removeDiscussionByRequestId } from './discussion-reconcile.js';
 import { PENDING_START_TIMEOUT_MS, DISCUSSION_RECONCILE_HIDDEN_MS } from '@shared/discussion-ui.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
@@ -1900,11 +1900,9 @@ export function App() {
     const ws = wsRef.current;
     if (!ws) return;
     const requestId = crypto.randomUUID();
-    const pendingId = `pending_${requestId}`;
-    setDiscussions((prev) => [...prev, {
-      id: pendingId, requestId, pending: true, state: 'setup', topic: payload.topic,
-      currentRound: 0, maxRounds: payload.maxRounds ?? 3, completedHops: 0, totalHops: 0, startedAt: Date.now(),
-    }]);
+    setDiscussions((prev) => [...prev, makeOptimisticDiscussionEntry(
+      requestId, { topic: payload.topic, maxRounds: payload.maxRounds }, Date.now(),
+    )]);
     initiatedRequestIdsRef.current.add(requestId);
     if (initiatedRequestIdsRef.current.size > 64) {
       const oldest = initiatedRequestIdsRef.current.values().next().value;
@@ -1924,7 +1922,7 @@ export function App() {
     } catch {
       // Dispatch-time failure (WS not connected → synchronous throw): drop the
       // optimistic entry in the same tick, show a localized offline toast.
-      setDiscussions((prev) => prev.filter((d) => d.requestId !== requestId));
+      setDiscussions((prev) => removeDiscussionByRequestId(prev, requestId));
       initiatedRequestIdsRef.current.delete(requestId);
       pushDiscussionFailureToast('discussion.start_failed_offline');
     }
@@ -2769,7 +2767,7 @@ export function App() {
         clearPendingStartTimer(msg.requestId);
         // Map the daemon's stable error token to a localized key; the raw error
         // string is kept only as rawError (never rendered) — initiator-only toast.
-        const reasonKey = msg.error === 'missing_fields' ? 'discussion.error.missing_fields' : 'discussion.error.generic';
+        const reasonKey = discussionErrorReasonKey(msg.error);
         let matchedId: string | undefined;
         setDiscussions((prev) => {
           const idx = matchDiscussionIndex(prev, msg);
@@ -2783,9 +2781,8 @@ export function App() {
           });
           return next;
         });
-        const reqId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
-        if (reqId && initiatedRequestIdsRef.current.has(reqId)) {
-          initiatedRequestIdsRef.current.delete(reqId);
+        if (shouldToastDiscussionError(msg.requestId, initiatedRequestIdsRef.current)) {
+          initiatedRequestIdsRef.current.delete(msg.requestId as string);
           pushDiscussionFailureToast(reasonKey);
         }
         if (matchedId) scheduleClassicDiscussionCleanup(matchedId);
@@ -4599,17 +4596,21 @@ export function App() {
                 // notice and click through without losing track.
                 totalRunningDiscussions={discussions.filter(isBarActiveDiscussion).length}
                 onStopDiscussion={(id) => {
-                  if (id.startsWith('pending_')) {
-                    // Optimistic entry not yet acknowledged by the daemon — there is
-                    // no remote run to stop; drop it locally only.
-                    setDiscussions((prev) => prev.filter((d) => d.id !== id));
-                  } else if (id.startsWith('p2p_')) {
-                    // P2P runs use p2p.cancel with the actual run ID (strip p2p_ prefix)
-                    wsRef.current?.send({ type: P2P_WORKFLOW_MSG.CANCEL, runId: id.slice(4) });
-                    // Remove from UI immediately
-                    setDiscussions((prev) => prev.filter((d) => d.id !== id));
-                  } else {
-                    wsRef.current?.discussionStop(id);
+                  switch (classifyDiscussionStop(id)) {
+                    case 'local':
+                      // Optimistic pending entry — no daemon run exists yet; drop it
+                      // locally only. Never discussionStop('pending_*') (the daemon
+                      // Map cannot resolve a pending id).
+                      setDiscussions((prev) => prev.filter((d) => d.id !== id));
+                      break;
+                    case 'p2p-cancel':
+                      // P2P runs use p2p.cancel with the actual run ID (strip p2p_ prefix)
+                      wsRef.current?.send({ type: P2P_WORKFLOW_MSG.CANCEL, runId: id.slice(4) });
+                      setDiscussions((prev) => prev.filter((d) => d.id !== id));
+                      break;
+                    case 'daemon-stop':
+                      wsRef.current?.discussionStop(id);
+                      break;
                   }
                 }}
                 ws={wsRef.current}

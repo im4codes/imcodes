@@ -5,6 +5,11 @@ import {
   reconcileClassicList,
   isBarActiveDiscussion,
   isTerminalDiscussionUiState,
+  makeOptimisticDiscussionEntry,
+  discussionErrorReasonKey,
+  shouldToastDiscussionError,
+  classifyDiscussionStop,
+  removeDiscussionByRequestId,
 } from '../src/discussion-reconcile.js';
 
 type Entry = {
@@ -140,5 +145,77 @@ describe('terminal / active helpers', () => {
     expect(isBarActiveDiscussion({ state: 'failed' })).toBe(false);
     expect(isBarActiveDiscussion({ state: 'setup' })).toBe(true);
     expect(isBarActiveDiscussion({ state: 'running' })).toBe(true);
+  });
+});
+
+describe('makeOptimisticDiscussionEntry (9.2 optimistic launch)', () => {
+  it('builds a pending setup entry keyed pending_<requestId>', () => {
+    expect(makeOptimisticDiscussionEntry('r1', { topic: 'T', maxRounds: 5 }, 1000)).toEqual({
+      id: 'pending_r1', requestId: 'r1', pending: true, state: 'setup',
+      topic: 'T', currentRound: 0, maxRounds: 5, completedHops: 0, totalHops: 0, startedAt: 1000,
+    });
+  });
+
+  it('defaults maxRounds to 3', () => {
+    expect(makeOptimisticDiscussionEntry('r2', { topic: 'X' }, 0).maxRounds).toBe(3);
+  });
+
+  it('produces an entry the started/list reconciler matches + collapses to one card', () => {
+    const entry = makeOptimisticDiscussionEntry('r3', { topic: 'T' }, 7);
+    // discussion.started arriving with only the real id still matches by requestId…
+    expect(matchDiscussionIndex([entry], { requestId: 'r3', discussionId: 'real-3' })).toBe(0);
+    // …and reconciles in place (no second card), clearing pending + swapping id.
+    const merged = reconcileDiscussionEntry(entry, { id: 'real-3', state: 'running' });
+    expect(merged.id).toBe('real-3');
+    expect(merged.pending).toBe(false);
+    expect(merged.startedAt).toBe(7); // local-only preserved
+  });
+});
+
+describe('discussionErrorReasonKey (9.3 — localized, never raw)', () => {
+  it('maps the known missing_fields token', () => {
+    expect(discussionErrorReasonKey('missing_fields')).toBe('discussion.error.missing_fields');
+  });
+
+  it('falls back to the generic key for unknown/non-string tokens and never leaks the raw value', () => {
+    expect(discussionErrorReasonKey('Error: boom\n at frame')).toBe('discussion.error.generic');
+    expect(discussionErrorReasonKey(undefined)).toBe('discussion.error.generic');
+    expect(discussionErrorReasonKey(42)).toBe('discussion.error.generic');
+    expect(discussionErrorReasonKey('boom')).not.toContain('boom');
+  });
+});
+
+describe('shouldToastDiscussionError (9.3 — initiator-only)', () => {
+  it('toasts only on the tab that initiated the requestId', () => {
+    const initiated = new Set(['r1']);
+    expect(shouldToastDiscussionError('r1', initiated)).toBe(true); // initiator
+    expect(shouldToastDiscussionError('r2', initiated)).toBe(false); // another tab's run
+    expect(shouldToastDiscussionError(undefined, initiated)).toBe(false);
+    expect(shouldToastDiscussionError(123, initiated)).toBe(false);
+    expect(shouldToastDiscussionError('r1', new Set<string>())).toBe(false);
+  });
+});
+
+describe('classifyDiscussionStop (9.6 — pending-stop safety)', () => {
+  it('routes pending_ to local removal (NEVER a daemon discussionStop)', () => {
+    expect(classifyDiscussionStop('pending_abc')).toBe('local');
+  });
+  it('routes p2p_ to p2p cancel', () => {
+    expect(classifyDiscussionStop('p2p_run-9')).toBe('p2p-cancel');
+  });
+  it('routes a real discussion id to a daemon stop', () => {
+    expect(classifyDiscussionStop('disc-1234')).toBe('daemon-stop');
+  });
+});
+
+describe('removeDiscussionByRequestId (9.3 — dispatch-throw, no orphan pending)', () => {
+  it('removes only the matching optimistic entry', () => {
+    const list = [
+      { id: 'pending_r1', requestId: 'r1' },
+      { id: 'pending_r2', requestId: 'r2' },
+      { id: 'real-3' },
+    ];
+    const next = removeDiscussionByRequestId(list, 'r1');
+    expect(next.map((d) => d.id)).toEqual(['pending_r2', 'real-3']);
   });
 });
