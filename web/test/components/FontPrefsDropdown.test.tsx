@@ -3,10 +3,42 @@
  */
 import { h } from 'preact';
 import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_CHAT_FONT, FontPrefsDropdown, readFontPrefs, useFontPrefs } from '../../src/components/FontPrefsDropdown.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  applyGlobalFontPrefs,
+  DEFAULT_CHAT_FONT,
+  FontPrefsDropdown,
+  GLOBAL_CJK_FONT_FAMILY_VAR,
+  GLOBAL_FONT_FAMILY_VAR,
+  readFontPrefs,
+  useFontPrefs,
+} from '../../src/components/FontPrefsDropdown.js';
+
+const i18nMock = vi.hoisted(() => ({
+  translations: {} as Record<string, string>,
+}));
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, options?: { defaultValue?: string }) => i18nMock.translations[key] ?? options?.defaultValue ?? key,
+  }),
+}));
+
+const DEFAULT_TRANSLATIONS: Record<string, string> = {
+  'chat.font.dialogLabel': 'font',
+  'chat.font.typeLabel': 'font type',
+  'chat.font.codeTab': 'Code',
+  'chat.font.cjkTab': 'CJK',
+  'chat.font.familyLabel': 'font family',
+  'chat.font.cjkFamilyLabel': 'CJK font',
+  'chat.font.allBuiltInCjk': 'All built-in CJK fonts',
+};
 
 describe('FontPrefsDropdown', () => {
+  beforeEach(() => {
+    i18nMock.translations = { ...DEFAULT_TRANSLATIONS };
+  });
+
   afterEach(() => {
     cleanup();
     localStorage.clear();
@@ -165,5 +197,40 @@ describe('FontPrefsDropdown', () => {
     expect(stored.cjkFamily?.startsWith('"SimSun"')).toBe(true);
     expect(stored.family?.indexOf('"SimSun"')).toBeLessThan(stored.family?.indexOf('"PingFang SC"') ?? Number.MAX_SAFE_INTEGER);
     expect(stored.family?.indexOf('"Microsoft YaHei"')).toBeGreaterThan(stored.family?.indexOf('"SimSun"') ?? Number.MAX_SAFE_INTEGER);
+  });
+
+  it('localizes the CJK tab, select label, and known Chinese font names without changing CSS values', () => {
+    i18nMock.translations = {
+      ...DEFAULT_TRANSLATIONS,
+      'chat.font.cjkTab': '中文',
+      'chat.font.cjkFamilyLabel': '中文字体',
+      'chat.font.allBuiltInCjk': '全部系统内置中文字体',
+      'chat.font.cjkFamilies.microsoft-yahei': '微软雅黑',
+    };
+    const onChange = vi.fn();
+    const prefs = { ...DEFAULT_CHAT_FONT, size: 14 };
+
+    render(<FontPrefsDropdown prefs={prefs} onChange={onChange} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Aa' }));
+    fireEvent.click(screen.getByRole('tab', { name: '中文' }));
+
+    const yaheiOption = screen.getByRole('option', { name: '微软雅黑' }) as HTMLOptionElement;
+    expect(yaheiOption.value).toContain('"Microsoft YaHei"');
+    fireEvent.change(screen.getByLabelText('中文字体'), { target: { value: yaheiOption.value } });
+    expect(onChange.mock.calls[0][0].family).toContain('"Microsoft YaHei"');
+  });
+
+  it('applies font preferences to global app CSS variables', () => {
+    const root = document.createElement('div');
+
+    applyGlobalFontPrefs({
+      family: '"Cascadia Mono", monospace',
+      cjkFamily: '"Microsoft YaHei", sans-serif',
+      size: 15,
+    }, root);
+
+    expect(root.style.getPropertyValue(GLOBAL_FONT_FAMILY_VAR)).toBe('"Cascadia Mono", monospace');
+    expect(root.style.getPropertyValue(GLOBAL_CJK_FONT_FAMILY_VAR)).toBe('"Microsoft YaHei", sans-serif');
   });
 });

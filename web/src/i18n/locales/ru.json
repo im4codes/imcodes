@@ -186,7 +186,33 @@
     "file_change_no_after": "(нет нового текста)",
     "file_change_derived_no_preview": "(предпросмотр недоступен)",
     "file_change_coarse_hint": "Доступен путь к файлу, но diff не предоставлен.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "font": {
+      "dialogLabel": "Шрифт",
+      "typeLabel": "Тип шрифта",
+      "codeTab": "Код",
+      "cjkTab": "CJK",
+      "familyLabel": "Шрифт кода",
+      "cjkFamilyLabel": "Шрифт CJK",
+      "allBuiltInCjk": "Показать все встроенные шрифты CJK",
+      "cjkFamilies": {
+        "system-cjk": "Системный CJK",
+        "pingfang-sc": "PingFang SC",
+        "songti-sc": "Songti SC",
+        "kaiti-sc": "Kaiti SC",
+        "stheiti": "STHeiti",
+        "stsong": "STSong",
+        "stkaiti": "STKaiti",
+        "stfangsong": "STFangsong",
+        "microsoft-yahei": "Microsoft YaHei",
+        "simsun": "SimSun",
+        "nsimsun": "NSimSun",
+        "dengxian": "DengXian",
+        "kaiti": "KaiTi",
+        "fangsong": "FangSong",
+        "microsoft-jhenghei": "Microsoft JhengHei"
+      }
+    }
   },
   "session": {
     "restart": "↺ Перезапустить",

@@ -14,6 +14,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
+import { useTranslation } from 'react-i18next';
 
 export interface FontPrefs {
   family: string;
@@ -24,6 +25,8 @@ export interface FontPrefs {
 const STORAGE_PREFIX = 'imcodes_fontPrefs:';
 /** Same-tab broadcast event name — `storage` event only fires cross-tab. */
 const FONT_PREFS_EVENT = 'imcodes:fontPrefsChanged';
+export const GLOBAL_FONT_FAMILY_VAR = '--imcodes-app-font-family';
+export const GLOBAL_CJK_FONT_FAMILY_VAR = '--imcodes-app-cjk-font-family';
 
 /**
  * CJK fallback stack appended to monospace presets. Latin-only programmer
@@ -279,6 +282,11 @@ export function useFontPrefs(scope: string, defaults: FontPrefs): [FontPrefs, (n
   return [prefs, update];
 }
 
+export function applyGlobalFontPrefs(prefs: FontPrefs, target: HTMLElement = document.documentElement): void {
+  target.style.setProperty(GLOBAL_FONT_FAMILY_VAR, prefs.family);
+  target.style.setProperty(GLOBAL_CJK_FONT_FAMILY_VAR, prefs.cjkFamily ?? DEFAULT_CJK_FAMILY);
+}
+
 interface FontFamilyOption {
   id: string;
   /** Display name shown in the dropdown — typography terms or brand names. */
@@ -401,6 +409,7 @@ function extractPrimaryFamily(css: string): string {
 }
 
 export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Props) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<FontTab>('code');
   const [localFonts, setLocalFonts] = useState<LocalFontsState>({ kind: 'idle' });
@@ -722,7 +731,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
         Aa
       </button>
       {open && (
-        <div style={popStyle} role="dialog" aria-label="font">
+        <div style={popStyle} role="dialog" aria-label={t('chat.font.dialogLabel', { defaultValue: 'Font' })}>
           {/* Row 1 — size adjuster (− current +). Always first so the most
               common adjustment is the closest to the trigger. */}
           <div style={sizeRowStyle}>
@@ -750,7 +759,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
               +
             </button>
           </div>
-          <div style={tabRowStyle} role="tablist" aria-label="font type">
+          <div style={tabRowStyle} role="tablist" aria-label={t('chat.font.typeLabel', { defaultValue: 'Font type' })}>
             <button
               type="button"
               role="tab"
@@ -758,7 +767,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
               onClick={() => setActiveTab('code')}
               style={tabButtonStyle(activeTab === 'code')}
             >
-              Code
+              {t('chat.font.codeTab', { defaultValue: 'Code' })}
             </button>
             <button
               type="button"
@@ -767,7 +776,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
               onClick={() => setActiveTab('cjk')}
               style={tabButtonStyle(activeTab === 'cjk')}
             >
-              CJK
+              {t('chat.font.cjkTab', { defaultValue: 'CJK' })}
             </button>
           </div>
           {/* Row 3 — native <select> showing font names. Native selects
@@ -783,7 +792,9 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
             onInput={handleSelectChange}
             onChange={handleSelectChange}
             style={selectStyle}
-            aria-label={activeTab === 'code' ? 'font family' : 'CJK font'}
+            aria-label={activeTab === 'code'
+              ? t('chat.font.familyLabel', { defaultValue: 'Font family' })
+              : t('chat.font.cjkFamilyLabel', { defaultValue: 'CJK font' })}
           >
             {activeTab === 'code' ? (
               <>
@@ -833,7 +844,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
               <>
                 {visibleCJKOptions.map((opt) => (
                   <option key={opt.id} value={opt.cssValue} style={{ fontFamily: `${opt.cssValue}, system-ui, sans-serif` }}>
-                    {opt.name}
+                    {t(`chat.font.cjkFamilies.${opt.id}`, { defaultValue: opt.name })}
                   </option>
                 ))}
                 {cjkIsOrphan && (
@@ -855,7 +866,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
               style={utilityButtonStyle}
               onClick={() => setShowAllSystemCJK(true)}
             >
-              All built-in CJK fonts
+              {t('chat.font.allBuiltInCjk', { defaultValue: 'All built-in CJK fonts' })}
             </button>
           )}
           <div style={previewStyle}>Aa 123 const text = "你好世界";</div>

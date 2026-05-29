@@ -128,6 +128,32 @@ const TIMELINE_STATUS_KEYS = [
   'pageMalformed',
   'error',
 ] as const;
+const CHAT_FONT_KEYS = [
+  'dialogLabel',
+  'typeLabel',
+  'codeTab',
+  'cjkTab',
+  'familyLabel',
+  'cjkFamilyLabel',
+  'allBuiltInCjk',
+] as const;
+const CHAT_FONT_CJK_FAMILY_KEYS = [
+  'system-cjk',
+  'pingfang-sc',
+  'songti-sc',
+  'kaiti-sc',
+  'stheiti',
+  'stsong',
+  'stkaiti',
+  'stfangsong',
+  'microsoft-yahei',
+  'simsun',
+  'nsimsun',
+  'dengxian',
+  'kaiti',
+  'fangsong',
+  'microsoft-jhenghei',
+] as const;
 
 describe('generic i18n coverage guard', () => {
   it('keeps memory post-1.1 translation keys present in every locale', () => {
@@ -185,6 +211,23 @@ describe('generic i18n coverage guard', () => {
       for (const key of TIMELINE_STATUS_KEYS) {
         expect(messages.chat?.timelineStatus?.[key], `${locale}: chat.timelineStatus.${key}`).toEqual(expect.any(String));
         expect(messages.chat?.timelineStatus?.[key]?.trim().length, `${locale}: chat.timelineStatus.${key}`).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('keeps chat font picker translation keys present in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as {
+        chat?: { font?: Record<string, unknown> & { cjkFamilies?: Record<string, string> } };
+      };
+      const font = messages.chat?.font;
+      for (const key of CHAT_FONT_KEYS) {
+        expect(font?.[key], `${locale}: chat.font.${key}`).toEqual(expect.any(String));
+        expect((font?.[key] as string | undefined)?.trim().length, `${locale}: chat.font.${key}`).toBeGreaterThan(0);
+      }
+      for (const key of CHAT_FONT_CJK_FAMILY_KEYS) {
+        expect(font?.cjkFamilies?.[key], `${locale}: chat.font.cjkFamilies.${key}`).toEqual(expect.any(String));
+        expect(font?.cjkFamilies?.[key]?.trim().length, `${locale}: chat.font.cjkFamilies.${key}`).toBeGreaterThan(0);
       }
     }
   });

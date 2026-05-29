@@ -30,6 +30,7 @@ import { LoginPage } from './pages/LoginPage.js';
 import { SessionTabs } from './components/SessionTabs.js';
 // TransportChatView removed — transport sessions use unified ChatView via timelineEmitter
 import { SessionPane } from './components/SessionPane.js';
+import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
 import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
@@ -345,6 +346,10 @@ function getRepoDesktopWindowId(parentSubId?: string | null): string {
 
 export function App() {
   const { t: trans } = useTranslation();
+  const [globalFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
+  useEffect(() => {
+    applyGlobalFontPrefs(globalFontPrefs);
+  }, [globalFontPrefs.family, globalFontPrefs.cjkFamily]);
   const [auth, setAuth] = useState<AuthState | null>(() => {
     try {
       const raw = localStorage.getItem('rcc_auth');

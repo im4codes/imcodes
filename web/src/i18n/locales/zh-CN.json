@@ -186,7 +186,33 @@
     "file_change_no_after": "（无新文本）",
     "file_change_derived_no_preview": "（无可用预览）",
     "file_change_coarse_hint": "仅有文件路径，未提供 diff 文本。",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "font": {
+      "dialogLabel": "字体",
+      "typeLabel": "字体类型",
+      "codeTab": "代码",
+      "cjkTab": "中文",
+      "familyLabel": "代码字体",
+      "cjkFamilyLabel": "中文字体",
+      "allBuiltInCjk": "全部系统内置中文字体",
+      "cjkFamilies": {
+        "system-cjk": "系统中文",
+        "pingfang-sc": "苹方简体",
+        "songti-sc": "宋体-简",
+        "kaiti-sc": "楷体-简",
+        "stheiti": "华文黑体",
+        "stsong": "华文宋体",
+        "stkaiti": "华文楷体",
+        "stfangsong": "华文仿宋",
+        "microsoft-yahei": "微软雅黑",
+        "simsun": "宋体",
+        "nsimsun": "新宋体",
+        "dengxian": "等线",
+        "kaiti": "楷体",
+        "fangsong": "仿宋",
+        "microsoft-jhenghei": "微软正黑体"
+      }
+    }
   },
   "session": {
     "restart": "↺ 重启",

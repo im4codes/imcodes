@@ -186,7 +186,33 @@
     "file_change_no_after": "(새 텍스트 없음)",
     "file_change_derived_no_preview": "(미리보기 없음)",
     "file_change_coarse_hint": "파일 경로는 있지만 diff 텍스트가 제공되지 않았습니다.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "font": {
+      "dialogLabel": "글꼴",
+      "typeLabel": "글꼴 유형",
+      "codeTab": "코드",
+      "cjkTab": "한국어",
+      "familyLabel": "코드 글꼴",
+      "cjkFamilyLabel": "한국어 글꼴",
+      "allBuiltInCjk": "내장 CJK 글꼴 모두 보기",
+      "cjkFamilies": {
+        "system-cjk": "시스템 CJK",
+        "pingfang-sc": "PingFang SC",
+        "songti-sc": "Songti SC",
+        "kaiti-sc": "Kaiti SC",
+        "stheiti": "STHeiti",
+        "stsong": "STSong",
+        "stkaiti": "STKaiti",
+        "stfangsong": "STFangsong",
+        "microsoft-yahei": "Microsoft YaHei",
+        "simsun": "SimSun",
+        "nsimsun": "NSimSun",
+        "dengxian": "DengXian",
+        "kaiti": "KaiTi",
+        "fangsong": "FangSong",
+        "microsoft-jhenghei": "Microsoft JhengHei"
+      }
+    }
   },
   "session": {
     "restart": "↺ 재시작",

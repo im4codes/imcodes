@@ -186,7 +186,33 @@
     "file_change_no_after": "（新しいテキストなし）",
     "file_change_derived_no_preview": "（プレビューなし）",
     "file_change_coarse_hint": "ファイルパスはありますが、diff テキストはありません。",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "font": {
+      "dialogLabel": "フォント",
+      "typeLabel": "フォント種別",
+      "codeTab": "コード",
+      "cjkTab": "日本語",
+      "familyLabel": "コードフォント",
+      "cjkFamilyLabel": "日本語フォント",
+      "allBuiltInCjk": "すべての内蔵 CJK フォント",
+      "cjkFamilies": {
+        "system-cjk": "システム CJK",
+        "pingfang-sc": "PingFang SC",
+        "songti-sc": "Songti SC",
+        "kaiti-sc": "Kaiti SC",
+        "stheiti": "STHeiti",
+        "stsong": "STSong",
+        "stkaiti": "STKaiti",
+        "stfangsong": "STFangsong",
+        "microsoft-yahei": "Microsoft YaHei",
+        "simsun": "SimSun",
+        "nsimsun": "NSimSun",
+        "dengxian": "DengXian",
+        "kaiti": "KaiTi",
+        "fangsong": "FangSong",
+        "microsoft-jhenghei": "Microsoft JhengHei"
+      }
+    }
   },
   "session": {
     "restart": "↺ 再起動",
