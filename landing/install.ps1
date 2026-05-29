@@ -146,7 +146,7 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
     Write-Ok "verifying SHA256 from official SHASUMS ..."
     try {
       $shasumsText = (Invoke-WebRequest $shasumsUrl -UseBasicParsing -TimeoutSec 15).Content
-    } catch { throw "Failed to fetch SHASUMS256.txt from $shasumsUrl: $_" }
+    } catch { throw "Failed to fetch SHASUMS256.txt from ${shasumsUrl}: $_" }
     # Parse line-by-line and match the artifact name as a WHOLE field (column 2),
     # not a regex suffix. The previous " $($pkg.zip)`$" evaluated $pkg.zip as a
     # (non-existent) .zip PROPERTY -> $null, collapsing the pattern to " $" which

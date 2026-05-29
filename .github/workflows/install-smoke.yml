@@ -65,6 +65,13 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
+      # The daemon detects its terminal backend at startup, so even
+      # `imcodes --version` needs a multiplexer present. ubuntu-latest ships
+      # tmux; Windows uses ConPTY; macOS runners have neither, so install tmux
+      # there — this mirrors a real macOS prerequisite (README requires tmux).
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux
       - name: Install dependencies
         run: npm ci
       - name: Build daemon (populate dist/)
