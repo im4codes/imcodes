@@ -2,13 +2,13 @@
  * FontPrefsDropdown — icon-only chat font customization control.
  *
  * Trigger: a small "Aa" button. Popover shows
- *   • a wrapping grid of font sample buttons (each rendered in its own family)
+ *   • a Code / CJK segmented switch for independent font selection
  *   • a "…" button that triggers the Local Font Access API for the full
  *     installed-font list when the browser supports it
  *   • a − / + size adjuster
  *
- * No text labels. Changes are real-time and broadcast across the page so
- * every <ChatView> instance updates simultaneously (custom-event bus +
+ * Changes are real-time and broadcast across the page so every <ChatView>
+ * instance updates simultaneously (custom-event bus +
  * `storage` event for cross-tab). Preferences are persisted per-machine
  * via localStorage under `imcodes_fontPrefs:<scope>`.
  */
@@ -17,6 +17,7 @@ import type { JSX } from 'preact';
 
 export interface FontPrefs {
   family: string;
+  cjkFamily?: string;
   size: number;
 }
 
@@ -47,6 +48,12 @@ const CJK_FALLBACK = [
   '"Source Han Sans SC"',   // Linux alternate
 ].join(', ');
 
+const DEFAULT_CJK_FAMILY = CJK_FALLBACK;
+
+function cjkStack(primary: string): string {
+  return `"${primary}", ${CJK_FALLBACK}`;
+}
+
 /**
  * Default chat font. JetBrains Mono is bundled as a webfont (see
  * `web/src/main.tsx`) so it is always available regardless of the user's
@@ -54,7 +61,8 @@ const CJK_FALLBACK = [
  * `CJK_FALLBACK` stack, then the last-resort `monospace`.
  */
 export const DEFAULT_CHAT_FONT: FontPrefs = {
-  family: `"JetBrains Mono", "JetBrains Mono NL", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`,
+  family: `"JetBrains Mono", "JetBrains Mono NL", ui-monospace, Menlo, Consolas, ${DEFAULT_CJK_FAMILY}, monospace`,
+  cjkFamily: DEFAULT_CJK_FAMILY,
   size: 14,
 };
 
@@ -79,14 +87,16 @@ function clampSize(n: number): number {
  * Idempotent: stacks that already include "PingFang" (added by us in
  * every preset of the new build) are returned unchanged.
  */
-function ensureCJKFallback(family: string): string {
-  if (family === 'system-ui') return family; // browser handles CJK natively
+function buildFontFamily(baseFamily: string, cjkFamily = DEFAULT_CJK_FAMILY): string {
+  if (baseFamily.includes('PingFang')) return baseFamily;
+  const match = baseFamily.match(/^(.+?),\s*(monospace|sans-serif|serif|cursive|fantasy)\s*$/i);
+  if (match) return `${match[1]}, ${cjkFamily}, ${match[2]}`;
+  return `${baseFamily}, ${cjkFamily}`;
+}
+
+function ensureCJKFallback(family: string, cjkFamily = DEFAULT_CJK_FAMILY): string {
   if (family.includes('PingFang')) return family; // already migrated
-  // Insert just before the trailing generic family (monospace / sans-serif /
-  // serif / cursive / fantasy) so the cascade order stays valid.
-  const match = family.match(/^(.+?),\s*(monospace|sans-serif|serif|cursive|fantasy)\s*$/i);
-  if (match) return `${match[1]}, ${CJK_FALLBACK}, ${match[2]}`;
-  return `${family}, ${CJK_FALLBACK}`;
+  return buildFontFamily(family, cjkFamily);
 }
 
 export function readFontPrefs(scope: string, defaults: FontPrefs): FontPrefs {
@@ -95,8 +105,12 @@ export function readFontPrefs(scope: string, defaults: FontPrefs): FontPrefs {
     if (!raw) return defaults;
     const parsed = JSON.parse(raw) as Partial<FontPrefs>;
     const rawFamily = typeof parsed.family === 'string' && parsed.family.length > 0 ? parsed.family : defaults.family;
+    const cjkFamily = typeof parsed.cjkFamily === 'string' && parsed.cjkFamily.length > 0
+      ? parsed.cjkFamily
+      : defaults.cjkFamily ?? DEFAULT_CJK_FAMILY;
     return {
-      family: ensureCJKFallback(rawFamily),
+      family: ensureCJKFallback(rawFamily, cjkFamily),
+      cjkFamily,
       size: typeof parsed.size === 'number' ? clampSize(parsed.size) : defaults.size,
     };
   } catch {
@@ -166,7 +180,7 @@ interface FontFamilyOption {
 }
 
 /**
- * Curated cross-platform font stacks — no bundled web fonts.
+ * Curated cross-platform code/Latin font stacks.
  *
  * Categories first (always shown), then well-known programmer-friendly
  * monospace families that we only show when actually installed on this
@@ -180,28 +194,46 @@ interface FontFamilyOption {
  */
 const FAMILY_OPTIONS: readonly FontFamilyOption[] = [
   // JetBrains Mono — bundled webfont, default. Always shown.
-  { id: 'jetbrains-mono', name: 'JetBrains Mono', cssValue: `"JetBrains Mono", "JetBrains Mono NL", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace` },
+  { id: 'jetbrains-mono', name: 'JetBrains Mono', cssValue: `"JetBrains Mono", "JetBrains Mono NL", ui-monospace, Menlo, Consolas, monospace` },
   // Cascadia Mono — bundled webfont. Always shown.
-  { id: 'cascadia-mono', name: 'Cascadia Mono', cssValue: `"Cascadia Mono", "Cascadia Code", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace` },
+  { id: 'cascadia-mono', name: 'Cascadia Mono', cssValue: `"Cascadia Mono", "Cascadia Code", ui-monospace, Menlo, Consolas, monospace` },
   // Generic categories — always available
   { id: 'system', name: 'System', cssValue: 'system-ui' },
-  { id: 'sans', name: 'Sans', cssValue: `-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, ${CJK_FALLBACK}, "Helvetica Neue", Arial, sans-serif` },
-  { id: 'serif', name: 'Serif', cssValue: `Georgia, "Times New Roman", "Songti SC", "STSong", "SimSun", ${CJK_FALLBACK}, serif` },
-  { id: 'mono', name: 'Mono', cssValue: `ui-monospace, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", ${CJK_FALLBACK}, monospace` },
-  { id: 'rounded', name: 'Rounded', cssValue: `"SF Pro Rounded", -apple-system, "Nunito", ${CJK_FALLBACK}, system-ui, sans-serif` },
+  { id: 'sans', name: 'Sans', cssValue: `-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif` },
+  { id: 'serif', name: 'Serif', cssValue: `Georgia, "Times New Roman", serif` },
+  { id: 'mono', name: 'Mono', cssValue: `ui-monospace, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace` },
+  { id: 'rounded', name: 'Rounded', cssValue: `"SF Pro Rounded", -apple-system, "Nunito", system-ui, sans-serif` },
   // Other programmer mono — only shown if detected on this machine
-  { id: 'fira-code', name: 'Fira Code', cssValue: `"Fira Code", "Fira Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Fira Code' },
-  { id: 'cascadia', name: 'Cascadia Code', cssValue: `"Cascadia Code", "Cascadia Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Cascadia Code' },
-  { id: 'source-code-pro', name: 'Source Code Pro', cssValue: `"Source Code Pro", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Source Code Pro' },
-  { id: 'ibm-plex-mono', name: 'IBM Plex Mono', cssValue: `"IBM Plex Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'IBM Plex Mono' },
-  { id: 'hack', name: 'Hack', cssValue: `Hack, ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Hack' },
-  { id: 'iosevka', name: 'Iosevka', cssValue: `Iosevka, ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Iosevka' },
-  { id: 'inconsolata', name: 'Inconsolata', cssValue: `Inconsolata, ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Inconsolata' },
-  { id: 'roboto-mono', name: 'Roboto Mono', cssValue: `"Roboto Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Roboto Mono' },
-  { id: 'ubuntu-mono', name: 'Ubuntu Mono', cssValue: `"Ubuntu Mono", ui-monospace, Menlo, Consolas, ${CJK_FALLBACK}, monospace`, detectFamily: 'Ubuntu Mono' },
-  { id: 'menlo', name: 'Menlo', cssValue: `Menlo, ui-monospace, ${CJK_FALLBACK}, monospace`, detectFamily: 'Menlo' },
-  { id: 'consolas', name: 'Consolas', cssValue: `Consolas, ui-monospace, ${CJK_FALLBACK}, monospace`, detectFamily: 'Consolas' },
-  { id: 'sf-mono', name: 'SF Mono', cssValue: `"SF Mono", ui-monospace, ${CJK_FALLBACK}, monospace`, detectFamily: 'SF Mono' },
+  { id: 'fira-code', name: 'Fira Code', cssValue: `"Fira Code", "Fira Mono", ui-monospace, Menlo, Consolas, monospace`, detectFamily: 'Fira Code' },
+  { id: 'cascadia', name: 'Cascadia Code', cssValue: `"Cascadia Code", "Cascadia Mono", ui-monospace, Menlo, Consolas, monospace`, detectFamily: 'Cascadia Code' },
+  { id: 'source-code-pro', name: 'Source Code Pro', cssValue: `"Source Code Pro", ui-monospace, Menlo, Consolas, monospace`, detectFamily: 'Source Code Pro' },
+  { id: 'ibm-plex-mono', name: 'IBM Plex Mono', cssValue: `"IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace`, detectFamily: 'IBM Plex Mono' },
+  { id: 'hack', name: 'Hack', cssValue: `Hack, ui-monospace, Menlo, Consolas, monospace`, detectFamily: 'Hack' },
+  { id: 'iosevka', name: 'Iosevka', cssValue: `Iosevka, ui-monospace, Menlo, Consolas, monospace`, detectFamily: 'Iosevka' },
+  { id: 'inconsolata', name: 'Inconsolata', cssValue: `Inconsolata, ui-monospace, Menlo, Consolas, monospace`, detectFamily: 'Inconsolata' },
+  { id: 'roboto-mono', name: 'Roboto Mono', cssValue: `"Roboto Mono", ui-monospace, Menlo, Consolas, monospace`, detectFamily: 'Roboto Mono' },
+  { id: 'ubuntu-mono', name: 'Ubuntu Mono', cssValue: `"Ubuntu Mono", ui-monospace, Menlo, Consolas, monospace`, detectFamily: 'Ubuntu Mono' },
+  { id: 'menlo', name: 'Menlo', cssValue: `Menlo, ui-monospace, monospace`, detectFamily: 'Menlo' },
+  { id: 'consolas', name: 'Consolas', cssValue: `Consolas, ui-monospace, monospace`, detectFamily: 'Consolas' },
+  { id: 'sf-mono', name: 'SF Mono', cssValue: `"SF Mono", ui-monospace, monospace`, detectFamily: 'SF Mono' },
+];
+
+interface CJKFamilyOption {
+  id: string;
+  name: string;
+  cssValue: string;
+}
+
+const CJK_OPTIONS: readonly CJKFamilyOption[] = [
+  { id: 'system-cjk', name: 'System CJK', cssValue: DEFAULT_CJK_FAMILY },
+  { id: 'pingfang-sc', name: 'PingFang SC', cssValue: cjkStack('PingFang SC') },
+  { id: 'microsoft-yahei', name: 'Microsoft YaHei', cssValue: cjkStack('Microsoft YaHei') },
+  { id: 'noto-sans-cjk-sc', name: 'Noto Sans CJK SC', cssValue: cjkStack('Noto Sans CJK SC') },
+  { id: 'source-han-sans-sc', name: 'Source Han Sans SC', cssValue: cjkStack('Source Han Sans SC') },
+  { id: 'sarasa-mono-sc', name: 'Sarasa Mono SC', cssValue: cjkStack('Sarasa Mono SC') },
+  { id: 'lxgw-wenkai', name: 'LXGW WenKai', cssValue: cjkStack('LXGW WenKai') },
+  { id: 'songti-sc', name: 'Songti SC', cssValue: cjkStack('Songti SC') },
+  { id: 'simsun', name: 'SimSun', cssValue: cjkStack('SimSun') },
 ];
 
 /**
@@ -227,7 +259,7 @@ function isFontInstalled(family: string): boolean {
  * Korean text readable when the user picks a Latin-only family.
  */
 function localFamilyToCssValue(family: string): string {
-  return `"${family}", ${CJK_FALLBACK}, system-ui`;
+  return `"${family}", system-ui`;
 }
 
 interface Props {
@@ -244,6 +276,8 @@ type LocalFontsState =
   | { kind: 'denied' }
   | { kind: 'ready'; families: string[] };
 
+type FontTab = 'code' | 'cjk';
+
 /** Sentinel value for the "load local fonts" entry inside the <select>. */
 const SENTINEL_LOAD_LOCAL = '__load_local__';
 
@@ -258,6 +292,7 @@ function extractPrimaryFamily(css: string): string {
 
 export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Props) {
   const [open, setOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<FontTab>('code');
   const [localFonts, setLocalFonts] = useState<LocalFontsState>({ kind: 'idle' });
   const wrapRef = useRef<HTMLDivElement>(null);
   const suppressNextSizeClickRef = useRef(false);
@@ -335,6 +370,30 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     gap: 4,
   } as const;
 
+  const tabRowStyle = {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1fr',
+    gap: 4,
+    background: '#0f172a',
+    border: '1px solid #334155',
+    borderRadius: 7,
+    padding: 3,
+  } as const;
+
+  const tabButtonStyle = (active: boolean) => ({
+    height: 24,
+    border: 'none',
+    borderRadius: 5,
+    background: active ? '#334155' : 'transparent',
+    color: active ? '#f8fafc' : '#94a3b8',
+    fontSize: 11,
+    fontWeight: 700,
+    fontFamily: 'system-ui',
+    cursor: 'pointer',
+    padding: 0,
+    lineHeight: 1,
+  } as const);
+
   const selectWrapStyle = {
     position: 'relative' as const,
     width: '100%',
@@ -355,7 +414,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     fontSize: 13,
     // Render the select itself in the currently-chosen font so the user
     // gets an immediate preview of their selection as the menu collapses.
-    fontFamily: prefs.family,
+    fontFamily: activeTab === 'code' ? prefs.family : `${prefs.cjkFamily ?? DEFAULT_CJK_FAMILY}, system-ui, sans-serif`,
     boxSizing: 'border-box' as const,
     cursor: 'pointer',
     appearance: 'none' as const,
@@ -403,6 +462,20 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     color: '#cbd5e1',
   } as const;
 
+  const previewStyle = {
+    padding: '5px 7px',
+    background: '#0f172a',
+    color: '#cbd5e1',
+    border: '1px solid #334155',
+    borderRadius: 6,
+    fontSize: 12,
+    lineHeight: 1.35,
+    fontFamily: prefs.family,
+    whiteSpace: 'nowrap' as const,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+  } as const;
+
   const setSize = useCallback((delta: number) => {
     const next = clampSize(prefs.size + delta);
     if (next !== prefs.size) onChange({ ...prefs, size: next });
@@ -430,8 +503,17 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     setSize(delta);
   }, [setSize]);
 
-  const pickFamily = (cssValue: string) => {
-    if (cssValue !== prefs.family) onChange({ ...prefs, family: cssValue });
+  const pickCodeFamily = (cssValue: string) => {
+    const cjkFamily = prefs.cjkFamily ?? DEFAULT_CJK_FAMILY;
+    const nextFamily = buildFontFamily(cssValue, cjkFamily);
+    if (nextFamily !== prefs.family) onChange({ ...prefs, family: nextFamily, cjkFamily });
+  };
+
+  const pickCJKFamily = (cssValue: string) => {
+    const nextFamily = buildFontFamily(codeSelectValue, cssValue);
+    if (nextFamily !== prefs.family || cssValue !== prefs.cjkFamily) {
+      onChange({ ...prefs, family: nextFamily, cjkFamily: cssValue });
+    }
   };
 
   const loadLocalFonts = async () => {
@@ -456,7 +538,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   // stored prefs.family differs slightly (e.g., older saves migrated by
   // ensureCJKFallback). Falls back to the stored value so the orphan
   // <option> can still hold the selection.
-  const selectValue = useMemo(() => {
+  const codeSelectValue = useMemo(() => {
     const primary = extractPrimaryFamily(prefs.family);
     const match = visibleOptions.find((o) => extractPrimaryFamily(o.cssValue) === primary);
     if (match) return match.cssValue;
@@ -467,18 +549,27 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
     return prefs.family;
   }, [prefs.family, visibleOptions, localFonts]);
 
-  const isOrphan = useMemo(() => {
-    return !visibleOptions.some((o) => o.cssValue === selectValue)
-      && !(localFonts.kind === 'ready' && localFonts.families.some((f) => localFamilyToCssValue(f) === selectValue));
-  }, [selectValue, visibleOptions, localFonts]);
+  const codeIsOrphan = useMemo(() => {
+    return !visibleOptions.some((o) => o.cssValue === codeSelectValue)
+      && !(localFonts.kind === 'ready' && localFonts.families.some((f) => localFamilyToCssValue(f) === codeSelectValue));
+  }, [codeSelectValue, visibleOptions, localFonts]);
+
+  const cjkSelectValue = prefs.cjkFamily ?? DEFAULT_CJK_FAMILY;
+  const cjkIsOrphan = useMemo(() => {
+    return !CJK_OPTIONS.some((o) => o.cssValue === cjkSelectValue);
+  }, [cjkSelectValue]);
 
   const handleSelectChange = (e: Event) => {
     const v = (e.target as HTMLSelectElement).value;
+    if (activeTab === 'cjk') {
+      pickCJKFamily(v);
+      return;
+    }
     if (v === SENTINEL_LOAD_LOCAL) {
       void loadLocalFonts();
       return;
     }
-    pickFamily(v);
+    pickCodeFamily(v);
   };
 
   return (
@@ -522,7 +613,27 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
               +
             </button>
           </div>
-          {/* Row 2 — native <select> showing font names. Native selects
+          <div style={tabRowStyle} role="tablist" aria-label="font type">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === 'code'}
+              onClick={() => setActiveTab('code')}
+              style={tabButtonStyle(activeTab === 'code')}
+            >
+              Code
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === 'cjk'}
+              onClick={() => setActiveTab('cjk')}
+              style={tabButtonStyle(activeTab === 'cjk')}
+            >
+              CJK
+            </button>
+          </div>
+          {/* Row 3 — native <select> showing font names. Native selects
               give us free scrolling, OS-native pickers on mobile (which
               are touch-optimized), and built-in keyboard navigation —
               far more usable than the previous wrap-grid of "Aa" tiles
@@ -531,51 +642,68 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
               an unmistakable dropdown affordance. */}
           <div style={selectWrapStyle}>
           <select
-            value={selectValue}
-            onChange={handleSelectChange}
+            value={activeTab === 'code' ? codeSelectValue : cjkSelectValue}
+            onInput={handleSelectChange}
             style={selectStyle}
-            aria-label="font family"
+            aria-label={activeTab === 'code' ? 'font family' : 'CJK font'}
           >
-            {visibleOptions.map((opt) => (
-              <option key={opt.id} value={opt.cssValue} style={{ fontFamily: opt.cssValue }}>
-                {opt.name}
-              </option>
-            ))}
-            {/* Stored value isn't a known preset or local family — surface
-                it explicitly so the select stays "controlled" and the
-                user can still see what they have selected. */}
-            {isOrphan && (
-              <option value={selectValue} style={{ fontFamily: selectValue }}>
-                {extractPrimaryFamily(selectValue)}
-              </option>
-            )}
-            {/* Local-font enumeration is opt-in: the user must pick the
-                "…" entry to trigger the browser permission prompt. We
-                avoid prompting on mount so casual users aren't surprised. */}
-            {localFontsSupported && localFonts.kind === 'idle' && (
-              // Picking this entry invokes queryLocalFonts (separate
-              // permission prompt). The label is intentionally just an
-              // ellipsis — language-neutral and consistent with the
-              // icon-only aesthetic of the rest of the control.
-              <option value={SENTINEL_LOAD_LOCAL}>…</option>
-            )}
-            {localFonts.kind === 'loading' && (
-              <option disabled>…</option>
-            )}
-            {(localFonts.kind === 'unsupported' || localFonts.kind === 'denied') && (
-              <option disabled>⚠</option>
-            )}
-            {localFonts.kind === 'ready' && localFonts.families.length > 0 && (
-              <optgroup label="…">
-                {localFonts.families.map((family) => {
-                  const cv = localFamilyToCssValue(family);
-                  return (
-                    <option key={family} value={cv} style={{ fontFamily: cv }}>
-                      {family}
-                    </option>
-                  );
-                })}
-              </optgroup>
+            {activeTab === 'code' ? (
+              <>
+                {visibleOptions.map((opt) => (
+                  <option key={opt.id} value={opt.cssValue} style={{ fontFamily: buildFontFamily(opt.cssValue, cjkSelectValue) }}>
+                    {opt.name}
+                  </option>
+                ))}
+                {/* Stored value isn't a known preset or local family — surface
+                    it explicitly so the select stays "controlled" and the
+                    user can still see what they have selected. */}
+                {codeIsOrphan && (
+                  <option value={codeSelectValue} style={{ fontFamily: buildFontFamily(codeSelectValue, cjkSelectValue) }}>
+                    {extractPrimaryFamily(codeSelectValue)}
+                  </option>
+                )}
+                {/* Local-font enumeration is opt-in: the user must pick the
+                    "…" entry to trigger the browser permission prompt. We
+                    avoid prompting on mount so casual users aren't surprised. */}
+                {localFontsSupported && localFonts.kind === 'idle' && (
+                  // Picking this entry invokes queryLocalFonts (separate
+                  // permission prompt). The label is intentionally just an
+                  // ellipsis — language-neutral and consistent with the
+                  // icon-only aesthetic of the rest of the control.
+                  <option value={SENTINEL_LOAD_LOCAL}>…</option>
+                )}
+                {localFonts.kind === 'loading' && (
+                  <option disabled>…</option>
+                )}
+                {(localFonts.kind === 'unsupported' || localFonts.kind === 'denied') && (
+                  <option disabled>⚠</option>
+                )}
+                {localFonts.kind === 'ready' && localFonts.families.length > 0 && (
+                  <optgroup label="…">
+                    {localFonts.families.map((family) => {
+                      const cv = localFamilyToCssValue(family);
+                      return (
+                        <option key={family} value={cv} style={{ fontFamily: buildFontFamily(cv, cjkSelectValue) }}>
+                          {family}
+                        </option>
+                      );
+                    })}
+                  </optgroup>
+                )}
+              </>
+            ) : (
+              <>
+                {CJK_OPTIONS.map((opt) => (
+                  <option key={opt.id} value={opt.cssValue} style={{ fontFamily: `${opt.cssValue}, system-ui, sans-serif` }}>
+                    {opt.name}
+                  </option>
+                ))}
+                {cjkIsOrphan && (
+                  <option value={cjkSelectValue} style={{ fontFamily: `${cjkSelectValue}, system-ui, sans-serif` }}>
+                    {extractPrimaryFamily(cjkSelectValue)}
+                  </option>
+                )}
+              </>
             )}
           </select>
           {/* Custom dropdown chevron — `pointer-events: none` so taps fall
@@ -583,6 +711,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
               on mobile and the dropdown on desktop. */}
           <span style={chevronStyle} aria-hidden="true">▾</span>
           </div>
+          <div style={previewStyle}>Aa 123 const text = "你好世界";</div>
         </div>
       )}
     </div>
