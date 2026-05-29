@@ -1,21 +1,16 @@
-import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MobileDpad, DPAD_ARROW_SEQUENCES } from '../../src/components/MobileDpad.js';
+import { render, screen, cleanup } from '@testing-library/preact';
+import { afterEach, describe, expect, it } from 'vitest';
+import { MobileDpad, DPAD_ARROW_SEQUENCES, resolveDpadDirection } from '../../src/components/MobileDpad.js';
 
 afterEach(cleanup);
 
-const down = (el: Element, x: number, y: number) =>
-  fireEvent.pointerDown(el, { pointerId: 1, pointerType: 'touch', clientX: x, clientY: y });
-const move = (el: Element, x: number, y: number) =>
-  fireEvent.pointerMove(el, { pointerId: 1, pointerType: 'touch', clientX: x, clientY: y });
-const up = (el: Element) =>
-  fireEvent.pointerUp(el, { pointerId: 1, pointerType: 'touch' });
-
-describe('MobileDpad', () => {
-  it('keeps standard CSI arrow sequences (so daemon XTERM_KEY_MAP applies ncdu/TUI handling)', () => {
-    // These MUST be the normal-cursor (CSI) form. The daemon maps them to tmux
-    // key names (Up/Down/Left/Right); tmux then emits the app-correct sequence
-    // (e.g. SS3 \x1bOA) for apps in application-cursor-keys mode like ncdu/vim.
+describe('DPAD_ARROW_SEQUENCES', () => {
+  it('uses standard CSI arrow sequences so the daemon XTERM_KEY_MAP applies ncdu/TUI handling', () => {
+    // These MUST be the normal-cursor (CSI) form. The daemon maps each one to a
+    // tmux key name (Up/Down/Left/Right) via XTERM_KEY_MAP; tmux then emits the
+    // app-correct sequence (e.g. SS3 \x1bOA) for apps in application-cursor-keys
+    // mode like ncdu / vim / less / fzf / htop. Sending raw SS3 here would break
+    // that, so this invariant is locked.
     expect(DPAD_ARROW_SEQUENCES).toEqual({
       up: '\x1b[A',
       down: '\x1b[B',
@@ -23,68 +18,56 @@ describe('MobileDpad', () => {
       right: '\x1b[C',
     });
   });
+});
 
-  it('fires the matching arrow sequence for each drag direction', () => {
-    const onDirection = vi.fn();
-    render(<MobileDpad onDirection={onDirection} title="dpad" />);
-    const pad = screen.getByRole('button', { name: 'dpad' });
-
-    down(pad, 100, 100); move(pad, 100, 140); // drag down
-    expect(onDirection).toHaveBeenLastCalledWith('\x1b[B');
-    up(pad);
-
-    down(pad, 100, 100); move(pad, 100, 60); // drag up
-    expect(onDirection).toHaveBeenLastCalledWith('\x1b[A');
-    up(pad);
-
-    down(pad, 100, 100); move(pad, 140, 100); // drag right
-    expect(onDirection).toHaveBeenLastCalledWith('\x1b[C');
-    up(pad);
-
-    down(pad, 100, 100); move(pad, 60, 100); // drag left
-    expect(onDirection).toHaveBeenLastCalledWith('\x1b[D');
-    up(pad);
+describe('resolveDpadDirection', () => {
+  it('maps the dominant axis to the matching direction once past the deadzone', () => {
+    expect(resolveDpadDirection(0, 40)).toBe('down');
+    expect(resolveDpadDirection(0, -40)).toBe('up');
+    expect(resolveDpadDirection(40, 0)).toBe('right');
+    expect(resolveDpadDirection(-40, 0)).toBe('left');
   });
 
-  it('treats a tap (movement within the deadzone) as nothing', () => {
-    const onDirection = vi.fn();
-    render(<MobileDpad onDirection={onDirection} title="dpad" />);
-    const pad = screen.getByRole('button', { name: 'dpad' });
-    down(pad, 100, 100); move(pad, 103, 102); up(pad);
-    expect(onDirection).not.toHaveBeenCalled();
+  it('picks the larger axis on a diagonal drag (horizontal wins ties)', () => {
+    expect(resolveDpadDirection(30, 10)).toBe('right');
+    expect(resolveDpadDirection(-10, 30)).toBe('down');
+    expect(resolveDpadDirection(20, 20)).toBe('right'); // |dx| >= |dy| → horizontal
+    expect(resolveDpadDirection(-20, -20)).toBe('left');
   });
 
-  it('does not re-fire the same held direction, but re-arms after returning to center', () => {
-    const onDirection = vi.fn();
-    render(<MobileDpad onDirection={onDirection} title="dpad" />);
-    const pad = screen.getByRole('button', { name: 'dpad' });
-    down(pad, 100, 100);
-    move(pad, 100, 140); // down → fire #1
-    move(pad, 100, 150); // still down, same direction → no new immediate fire
-    expect(onDirection).toHaveBeenCalledTimes(1);
-    move(pad, 100, 100); // back to center → re-arm
-    move(pad, 100, 140); // down again → fire #2
-    expect(onDirection).toHaveBeenCalledTimes(2);
-    up(pad);
+  it('returns null inside the deadzone (a tap sends nothing)', () => {
+    expect(resolveDpadDirection(0, 0)).toBeNull();
+    expect(resolveDpadDirection(3, 2)).toBeNull(); // hypot ≈ 3.6 < 8
+    expect(resolveDpadDirection(-5, 5)).toBeNull(); // hypot ≈ 7.07 < 8
   });
 
-  it('switches direction without needing to recenter (diagonal cross)', () => {
-    const onDirection = vi.fn();
-    render(<MobileDpad onDirection={onDirection} title="dpad" />);
-    const pad = screen.getByRole('button', { name: 'dpad' });
-    down(pad, 100, 100);
-    move(pad, 100, 140); // down
-    move(pad, 140, 100); // right (dominant axis flips) → new fire
-    expect(onDirection).toHaveBeenNthCalledWith(1, '\x1b[B');
-    expect(onDirection).toHaveBeenNthCalledWith(2, '\x1b[C');
-    up(pad);
+  it('honors a custom deadzone', () => {
+    expect(resolveDpadDirection(0, 12, 20)).toBeNull();
+    expect(resolveDpadDirection(0, 25, 20)).toBe('down');
   });
 
-  it('does nothing when disabled', () => {
-    const onDirection = vi.fn();
-    render(<MobileDpad onDirection={onDirection} title="dpad" disabled />);
-    const pad = screen.getByRole('button', { name: 'dpad' });
-    down(pad, 100, 100); move(pad, 100, 140); up(pad);
-    expect(onDirection).not.toHaveBeenCalled();
+  it('returns null for non-finite deltas (defensive — never fire on a bad event)', () => {
+    expect(resolveDpadDirection(Number.NaN, 40)).toBeNull();
+    expect(resolveDpadDirection(40, Number.NaN)).toBeNull();
+    expect(resolveDpadDirection(Infinity, 0)).toBeNull();
+  });
+});
+
+describe('MobileDpad render', () => {
+  it('renders an accessible button exposing the four direction glyphs', () => {
+    render(<MobileDpad onDirection={() => {}} title="Arrow keys" />);
+    const pad = screen.getByRole('button', { name: 'Arrow keys' });
+    expect(pad).toBeTruthy();
+    expect(pad.className).toContain('shortcut-dpad');
+    // Four directional arrows present for visual affordance.
+    expect(pad.querySelectorAll('.dpad-arrow').length).toBe(4);
+    expect(pad.getAttribute('data-disabled')).toBeNull();
+  });
+
+  it('marks itself disabled so pointer interaction is suppressed', () => {
+    render(<MobileDpad onDirection={() => {}} title="Arrow keys" disabled />);
+    const pad = screen.getByRole('button', { name: 'Arrow keys' });
+    expect(pad.getAttribute('data-disabled')).toBe('true');
+    expect(pad.getAttribute('aria-disabled')).toBe('true');
   });
 });

@@ -19,10 +19,25 @@ export const DPAD_ARROW_SEQUENCES = {
   right: '\x1b[C',
 } as const;
 
-type DpadDirection = keyof typeof DPAD_ARROW_SEQUENCES;
+export type DpadDirection = keyof typeof DPAD_ARROW_SEQUENCES;
 
 /** Drag distance (px) before a direction registers — avoids accidental taps firing a key. */
 const DEADZONE_PX = 8;
+
+/**
+ * Pure direction decision for a drag delta. Returns the dominant-axis
+ * direction once the drag clears the deadzone, or `null` while still inside
+ * it (a tap, or returned-to-center) or for non-finite input (defensive — real
+ * pointer events always carry finite coordinates). Exported for unit testing
+ * so the interaction logic is verified without synthetic-pointer harness quirks.
+ */
+export function resolveDpadDirection(dx: number, dy: number, deadzone: number = DEADZONE_PX): DpadDirection | null {
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return null;
+  if (Math.hypot(dx, dy) < deadzone) return null;
+  return Math.abs(dx) >= Math.abs(dy)
+    ? (dx > 0 ? 'right' : 'left')
+    : (dy > 0 ? 'down' : 'up');
+}
 /** Delay before auto-repeat starts while a direction is held (matches keyboard repeat feel). */
 const REPEAT_DELAY_MS = 400;
 /** Interval between auto-repeat fires while a direction is held. */
@@ -99,16 +114,13 @@ export function MobileDpad({ onDirection, disabled, title, ariaLabel }: MobileDp
     if (pointerRef.current !== e.pointerId) return;
     const origin = originRef.current;
     if (!origin) return;
-    const dx = e.clientX - origin.x;
-    const dy = e.clientY - origin.y;
-    if (Math.hypot(dx, dy) < DEADZONE_PX) {
-      // Returned to center — re-arm so dragging out again fires the next key.
+    const dir = resolveDpadDirection(e.clientX - origin.x, e.clientY - origin.y);
+    if (dir === null) {
+      // Inside the deadzone (tap / returned to center) — re-arm so dragging
+      // out again fires the next key.
       if (dirRef.current !== null) recenter();
       return;
     }
-    const dir: DpadDirection = Math.abs(dx) >= Math.abs(dy)
-      ? (dx > 0 ? 'right' : 'left')
-      : (dy > 0 ? 'down' : 'up');
     if (dir !== dirRef.current) fireDirection(dir);
     e.preventDefault();
   }, [fireDirection, recenter]);
