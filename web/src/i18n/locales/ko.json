@@ -571,7 +571,8 @@
   "toast": {
     "finished": "완료됨",
     "upgrade_blocked_title": "업그레이드 차단됨",
-    "upgrade_blocked_p2p_active": "Team가 아직 실행 중입니다. daemon을 업그레이드하기 전에 먼저 중지하세요."
+    "upgrade_blocked_p2p_active": "Team가 아직 실행 중입니다. daemon을 업그레이드하기 전에 먼저 중지하세요.",
+    "upgrade_blocked_toolchain_unavailable": "daemon 호스트에 Node가 없습니다(툴체인 제거됨). Node를 다시 설치하세요. 그 전까지 자동 업그레이드가 비활성화됩니다."
   },
   "discussion": {
     "role_critic": "비평가",

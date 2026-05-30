@@ -2906,9 +2906,11 @@ export function App() {
         }
       }
       if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
-        const message = msg.reason === 'transport_busy'
-          ? trans('toast.upgrade_blocked_transport_busy')
-          : trans('toast.upgrade_blocked_p2p_active');
+        const message = msg.reason === 'toolchain_unavailable'
+          ? trans('toast.upgrade_blocked_toolchain_unavailable')
+          : msg.reason === 'transport_busy'
+            ? trans('toast.upgrade_blocked_transport_busy')
+            : trans('toast.upgrade_blocked_p2p_active');
         const id = Date.now() + Math.random();
         setToasts((prev) => [...prev, {
           id,

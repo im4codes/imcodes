@@ -5706,6 +5706,65 @@ export function __resetUpgradeDeferralStateForTests(): void {
   upgradeSessionBusyDeferredSince = null;
 }
 
+export interface UpgradeToolchainStatus {
+  /** The node binary the upgrade script will use (process.execPath). */
+  nodeBin: string;
+  /** False when nodeBin no longer exists on disk — e.g. `apt autoremove`
+   *  deleted the system Node while the daemon kept running on the now-deleted
+   *  inode. Restarting in this state would `exec` a missing binary and kill the
+   *  daemon for good, and every `npm install` fails because npm went with it. */
+  nodeBinPresent: boolean;
+  /** Resolved npm-cli.js path, or null if not found at the standard locations
+   *  next to nodeBin. Advisory only (the upgrade script has more strategies,
+   *  e.g. `npm prefix -g`), so a null here downgrades to a warning, not abort. */
+  npmCli: string | null;
+}
+
+/**
+ * Pre-flight check for the Node/npm toolchain the auto-upgrade depends on.
+ * Pure (all IO injected) so it is unit-testable. Mirrors the npm-cli.js
+ * discovery the generated upgrade.sh performs, plus the critical "is the node
+ * binary still on disk" check the script cannot meaningfully recover from.
+ *
+ * The point: an upgrade spawned when the toolchain is broken fails silently in
+ * a detached script — the daemon only notices 15 min later via the memory-
+ * freeze watchdog, so a box can sit stuck on an old version for hours with no
+ * clear signal. Surfacing this up front turns it into an immediate, actionable
+ * alert ("reinstall Node").
+ */
+export function checkUpgradeToolchain(opts: {
+  nodeBin: string;
+  nodeDir: string;
+  join: (...parts: string[]) => string;
+  exists: (p: string) => boolean;
+  realpath: (p: string) => string | null;
+}): UpgradeToolchainStatus {
+  const { nodeBin, nodeDir, join, exists, realpath } = opts;
+  const nodeBinPresent = exists(nodeBin);
+
+  let npmCli: string | null = null;
+  // Strategy A: <nodeDir>/npm symlink → npm-cli.js (covers system / tarball /
+  // most managed installs, where npm sits right next to node).
+  const npmLink = join(nodeDir, 'npm');
+  if (exists(npmLink)) {
+    const resolved = realpath(npmLink);
+    if (resolved && resolved.endsWith('npm-cli.js') && exists(resolved)) npmCli = resolved;
+  }
+  // Strategy B: known relative-from-nodeDir layouts (nvm/fnm/volta/system/snap).
+  if (!npmCli) {
+    const candidates = [
+      join(nodeDir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+      join(nodeDir, '..', '..', '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+      join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    ];
+    for (const c of candidates) {
+      if (exists(c)) { npmCli = c; break; }
+    }
+  }
+
+  return { nodeBin, nodeBinPresent, npmCli };
+}
+
 /**
  * Resolve which npm registry the daemon's own auto-upgrade should use, so the
  * pre-flight "is latest newer?" probe and the actual `npm install -g` agree on
@@ -5931,6 +5990,50 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
       }
     } catch (e) {
       logger.warn({ err: e }, 'daemon.upgrade: registry probe failed, proceeding without pre-flight');
+    }
+  }
+
+  // ── Toolchain pre-flight (non-Windows; Windows has its own runner) ─────────
+  // Before spawning a detached upgrade script that would otherwise fail
+  // silently, verify the Node/npm toolchain is intact. The unambiguous, fatal
+  // case is a deleted node binary (e.g. `apt autoremove` pulled nodejs while
+  // the daemon ran on the now-deleted inode): restarting would `exec` a missing
+  // binary and kill the daemon permanently, and every `npm install` fails.
+  // Abort loudly and keep the current version running instead. A missing
+  // npm-cli.js alone is only a warning — the script has more discovery
+  // strategies (`npm prefix -g`, PATH) that this static check doesn't run.
+  if (process.platform !== 'win32') {
+    const { existsSync: _existsSync, realpathSync: _realpathSync } = await import('fs');
+    const { dirname: _dirname, join: _join } = await import('path');
+    const nodeBin = process.execPath;
+    const toolchain = checkUpgradeToolchain({
+      nodeBin,
+      nodeDir: _dirname(nodeBin),
+      join: _join,
+      exists: (p) => { try { return _existsSync(p); } catch { return false; } },
+      realpath: (p) => { try { return _realpathSync(p); } catch { return null; } },
+    });
+    if (!toolchain.nodeBinPresent) {
+      logger.error({
+        targetVersion,
+        nodeBin: toolchain.nodeBin,
+        npmCli: toolchain.npmCli,
+      }, 'daemon.upgrade: ABORTING — the Node binary no longer exists on disk (toolchain deleted, e.g. apt autoremove). Restarting would kill the daemon and npm is gone, so auto-upgrade is impossible until Node is reinstalled. Keeping the current version running.');
+      try {
+        serverLink?.send({
+          type: DAEMON_MSG.UPGRADE_BLOCKED,
+          reason: 'toolchain_unavailable',
+          nodeBinPresent: false,
+          npmAvailable: toolchain.npmCli !== null,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
+    if (toolchain.npmCli === null) {
+      logger.warn({
+        targetVersion,
+        nodeBin: toolchain.nodeBin,
+      }, 'daemon.upgrade: npm-cli.js not found next to the node binary; the upgrade script will fall back to `npm prefix -g` / PATH but the install may fail');
     }
   }
 

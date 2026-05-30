@@ -572,7 +572,8 @@
     "finished": "已完成",
     "upgrade_blocked_title": "升級已阻止",
     "upgrade_blocked_p2p_active": "團隊 仍在執行中。請先停止，再升級 daemon。",
-    "upgrade_blocked_transport_busy": "還有 transport session 正在 turn 中。等它回到 idle 再升級 daemon。"
+    "upgrade_blocked_transport_busy": "還有 transport session 正在 turn 中。等它回到 idle 再升級 daemon。",
+    "upgrade_blocked_toolchain_unavailable": "daemon 主機上的 Node 已遺失（工具鏈被移除）。請重新安裝 Node——在此之前自動升級已停用。"
   },
   "discussion": {
     "role_critic": "評論者",
