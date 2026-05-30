@@ -127,6 +127,21 @@ async function claudeCliHeaders(token: string): Promise<Record<string, string>> 
   };
 }
 
+// Opt-in gate (default OFF). The weekly quota reads the local Claude OAuth
+// token, so we touch NOTHING until the user explicitly authorizes it. The web
+// sets this (driven by the per-user `claude_weekly_quota` preference) on every
+// (re)connect and on toggle.
+let optedIn = false;
+
+export function setClaudeUsageQuotaOptIn(enabled: boolean): void {
+  if (optedIn === enabled) return;
+  optedIn = enabled;
+  // Re-evaluate under the new state on the next call rather than serving a
+  // stale (or stale-null) snapshot from before the toggle.
+  cache = null;
+  inflight = null;
+}
+
 let cache: { at: number; value: ClaudeUsageQuota | null } | null = null;
 let inflight: Promise<ClaudeUsageQuota | null> | null = null;
 
@@ -158,6 +173,8 @@ async function fetchUsageQuota(): Promise<ClaudeUsageQuota | null> {
  * 30-minute throttle (no retry storms).
  */
 export async function getClaudeUsageQuota(force = false): Promise<ClaudeUsageQuota | null> {
+  // Off by default — no token read, no network — until the user authorizes it.
+  if (!optedIn) return null;
   const now = Date.now();
   if (!force && cache && now - cache.at < CACHE_TTL_MS) return cache.value;
   if (inflight) return inflight;

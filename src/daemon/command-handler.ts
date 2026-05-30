@@ -63,6 +63,8 @@ const execAsync = promisify(execCb);
 const execFileAsync = promisify(execFileCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
 import { buildSessionList } from './session-list.js';
+import { setClaudeUsageQuotaOptIn } from '../agent/claude-usage-quota.js';
+import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import { parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import type { P2pAdvancedRound, P2pContextReducerConfig, P2pRoundPreset } from '../../shared/p2p-advanced.js';
@@ -1360,6 +1362,11 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case 'subsession.rebuild_all':
       void traceCommandAsync(cmd, 'web_command.subsession_rebuild_all', () => handleSubSessionRebuildAll(cmd, serverLink));
+      break;
+    case CLAUDE_QUOTA_MSG.SET_OPT_IN:
+      // User authorized (or revoked) reading the local Claude token for the
+      // weekly (7d) quota. Off by default; gates the /api/oauth/usage pull.
+      setClaudeUsageQuotaOptIn(cmd.enabled === true);
       break;
     case 'subsession.detect_shells':
       void handleSubSessionDetectShells(serverLink);

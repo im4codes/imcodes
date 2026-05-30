@@ -398,6 +398,8 @@
     "codex_limit_title": "{{label}} осталось {{percent}}% · сброс {{reset}}",
     "provider_plan_title": "План: {{value}}",
     "provider_quota_title": "Квота: {{value}}",
+    "weekly_quota_authorize": "Показать недельный лимит",
+    "weekly_quota_authorize_hint": "Разрешить чтение локального токена Claude для показа недельного (7-дневного) лимита",
     "provider_quota_usage_title": "Использование квоты: {{value}}",
     "history_loading_label": "История",
     "history_step_cache": "кэш",

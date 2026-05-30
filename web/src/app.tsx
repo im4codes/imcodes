@@ -91,7 +91,8 @@ import {
 } from './session-list-merge.js';
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
-import { parseString, usePref } from './hooks/usePref.js';
+import { parseString, parseBooleanish, usePref } from './hooks/usePref.js';
+import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 import { PREF_KEY_DEFAULT_SHELL, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from './constants/prefs.js';
 import {
   p2pSubSessionParentSignature,
@@ -1962,6 +1963,14 @@ export function App() {
   }, [clearSubSessionMaximized, closeSubSession, removeDesktopWindow]);
 
   const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
+  // Weekly (7d) quota opt-in (per-user pref → all servers). Tell the daemon
+  // whether the user authorized reading the local Claude token; re-sent on
+  // (re)connect and server switch so every server honors the single pref.
+  const weeklyQuotaOptIn = usePref<boolean>(CLAUDE_WEEKLY_QUOTA_PREF_KEY, { parse: parseBooleanish });
+  useEffect(() => {
+    if (!connected) return;
+    wsRef.current?.setClaudeWeeklyQuotaOptIn(weeklyQuotaOptIn.value === true);
+  }, [connected, weeklyQuotaOptIn.value, selectedServerId]);
   const subSessionParentSignature = useMemo(
     () => p2pSubSessionParentSignature(subSessions),
     [subSessions],

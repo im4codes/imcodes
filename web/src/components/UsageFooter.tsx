@@ -12,6 +12,7 @@ import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provid
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
+import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 
 interface Props {
   usage: UsageData;
@@ -189,6 +190,12 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     return t('session.state_idle');
   }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, isAgentless, now, sessionState, statusText, t]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result';
+  // The weekly (7d) line is opt-in: it needs the daemon to read the local
+  // Claude token. The 5h line needs no authorization (it comes from the SDK
+  // rate_limit_event). Show an authorize affordance for claude-code-sdk until
+  // the user opts in (per-user pref → applies to all their servers).
+  const weeklyQuotaPref = usePref<boolean>(CLAUDE_WEEKLY_QUOTA_PREF_KEY, { parse: parseBooleanish });
+  const showWeeklyAuthPrompt = agentType === 'claude-code-sdk' && weeklyQuotaPref.value !== true;
   // Providers that report structured quota windows (Codex + claude-code-sdk)
   // render the SAME prominent multi-line quota block as Codex — not the inline
   // bottom token span — so the limit display is consistent across providers.
@@ -204,11 +211,21 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           {ctxBurning && <span class="session-ctx-burn" style={{ width: `${totalPct}%` }} aria-hidden="true" />}
         </div>
       )}
-      {providerQuotaLines.length > 0 && (
+      {(providerQuotaLines.length > 0 || showWeeklyAuthPrompt) && (
         <div class="session-usage-codex-quota">
           {providerQuotaLines.map((line) => (
             <div class="session-usage-codex-line">{line}</div>
           ))}
+          {showWeeklyAuthPrompt && (
+            <button
+              type="button"
+              class="session-usage-codex-line session-usage-weekly-authorize"
+              title={t('session.weekly_quota_authorize_hint')}
+              onClick={() => { void weeklyQuotaPref.save(true); }}
+            >
+              {t('session.weekly_quota_authorize')}
+            </button>
+          )}
         </div>
       )}
       <div class="session-usage-stats">

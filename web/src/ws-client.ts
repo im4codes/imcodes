@@ -13,6 +13,7 @@ import { TRANSPORT_EVENT } from '@shared/transport-events.js';
 import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
+import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
 import {
   SESSION_GROUP_CLONE_MSG,
   type SessionGroupCloneCancelRequest,
@@ -849,6 +850,13 @@ export class WsClient {
   /** Request the current session list from the daemon. */
   requestSessionList(): void {
     this.send({ type: 'get_sessions' });
+  }
+
+  /** Authorize (or revoke) the daemon reading the local Claude token for the
+   *  weekly (7d) quota. Driven by the per-user `claude_weekly_quota` pref; sent
+   *  on every (re)connect and on toggle so each server the user visits honors it. */
+  setClaudeWeeklyQuotaOptIn(enabled: boolean): void {
+    this.send({ type: CLAUDE_QUOTA_MSG.SET_OPT_IN, enabled });
   }
 
   async cloneSessionGroup(payload: Omit<SessionGroupCloneRequest, 'type'>): Promise<void> {

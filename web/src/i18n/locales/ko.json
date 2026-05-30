@@ -398,6 +398,8 @@
     "codex_limit_title": "{{label}} {{percent}}% 남음 · {{reset}}에 재설정",
     "provider_plan_title": "플랜: {{value}}",
     "provider_quota_title": "한도: {{value}}",
+    "weekly_quota_authorize": "주간 한도 표시",
+    "weekly_quota_authorize_hint": "로컬 Claude 토큰 읽기를 허용하여 주간(7일) 한도를 표시합니다",
     "provider_quota_usage_title": "사용량: {{value}}",
     "history_loading_label": "기록",
     "history_step_cache": "캐시",

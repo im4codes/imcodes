@@ -398,6 +398,8 @@
     "codex_limit_title": "{{label}} 剩余 {{percent}}% · 重置于 {{reset}}",
     "provider_plan_title": "方案：{{value}}",
     "provider_quota_title": "额度：{{value}}",
+    "weekly_quota_authorize": "显示周限额",
+    "weekly_quota_authorize_hint": "授权读取本机 Claude token 以显示每周（7 天）限额",
     "provider_quota_usage_title": "额度进度：{{value}}",
     "history_loading_label": "历史",
     "history_step_cache": "本地缓存",

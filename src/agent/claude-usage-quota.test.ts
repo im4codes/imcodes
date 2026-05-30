@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { usageEndpointToQuotaMeta } from './claude-usage-quota.js';
+import { describe, it, expect, afterEach } from 'vitest';
+import { usageEndpointToQuotaMeta, getClaudeUsageQuota, setClaudeUsageQuotaOptIn, __resetClaudeUsageQuotaCache } from './claude-usage-quota.js';
 import { formatProviderQuotaLabel } from '../../shared/provider-quota.js';
 
 // The exact /api/oauth/usage payload captured from the live endpoint:
@@ -54,5 +54,16 @@ describe('usageEndpointToQuotaMeta', () => {
     expect(usageEndpointToQuotaMeta({})).toBeUndefined();
     expect(usageEndpointToQuotaMeta(null)).toBeUndefined();
     expect(usageEndpointToQuotaMeta({ seven_day_opus: null })).toBeUndefined();
+  });
+});
+
+describe('getClaudeUsageQuota opt-in gate', () => {
+  afterEach(() => { setClaudeUsageQuotaOptIn(false); __resetClaudeUsageQuotaCache(); });
+
+  it('returns null without reading the token / network when not opted in', async () => {
+    setClaudeUsageQuotaOptIn(false);
+    // force=true bypasses the cache; the gate must still short-circuit to null
+    // before any token read or fetch.
+    expect(await getClaudeUsageQuota(true)).toBeNull();
   });
 });

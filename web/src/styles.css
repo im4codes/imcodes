@@ -1739,6 +1739,8 @@ body {
 .session-usage-codex-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; align-items: center; }
 .session-usage-codex-quota { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; margin-bottom: 2px; }
 .session-usage-codex-line { color: #64748b; font-size: 9px; line-height: 1.2; text-align: right; }
+.session-usage-weekly-authorize { background: none; border: none; padding: 0; margin: 0; font: inherit; font-size: 9px; line-height: 1.2; text-align: right; color: var(--chrome-accent, #22d3ee); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.session-usage-weekly-authorize:hover { color: #67e8f9; }
 .session-ctx-input { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, var(--chrome-accent-2), var(--chrome-accent)); border-radius: 999px; box-shadow: 0 0 10px rgba(52,211,153,0.42); }
 .session-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, var(--chrome-accent-3), #818cf8); border-radius: 999px; box-shadow: 0 0 10px rgba(129,140,248,0.36); }
 

@@ -398,6 +398,8 @@
     "codex_limit_title": "{{label}} left {{percent}}% · resets {{reset}}",
     "provider_plan_title": "Plan: {{value}}",
     "provider_quota_title": "Quota: {{value}}",
+    "weekly_quota_authorize": "Show weekly limit",
+    "weekly_quota_authorize_hint": "Authorize reading your local Claude token to show the weekly (7-day) limit",
     "provider_quota_usage_title": "Quota usage: {{value}}",
     "history_loading_label": "History",
     "history_step_cache": "cache",
