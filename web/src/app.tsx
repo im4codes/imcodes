@@ -1968,9 +1968,12 @@ export function App() {
   // (re)connect and server switch so every server honors the single pref.
   const weeklyQuotaOptIn = usePref<boolean>(CLAUDE_WEEKLY_QUOTA_PREF_KEY, { parse: parseBooleanish });
   useEffect(() => {
-    if (!connected) return;
+    // Wait for the pref to load — sending `false` during the unloaded phase
+    // would make the daemon drop its cached/persisted quota on every page load
+    // (and re-fetch), which is a big part of the "quota flickers" symptom.
+    if (!connected || !weeklyQuotaOptIn.loaded) return;
     wsRef.current?.setClaudeWeeklyQuotaOptIn(weeklyQuotaOptIn.value === true);
-  }, [connected, weeklyQuotaOptIn.value, selectedServerId]);
+  }, [connected, weeklyQuotaOptIn.loaded, weeklyQuotaOptIn.value, selectedServerId]);
   const subSessionParentSignature = useMemo(
     () => p2pSubSessionParentSignature(subSessions),
     [subSessions],

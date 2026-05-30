@@ -247,6 +247,25 @@ describe('mergeSessionListEntry — general field behavior', () => {
     expect(nulled.quotaMeta?.primary?.usedPercent).toBe(22);
   });
 
+  it('preserves claude-code-sdk quota when a transient session_list omits it (no flicker)', () => {
+    const existing = makeExisting({
+      agentType: 'claude-code-sdk',
+      planLabel: 'Max',
+      quotaLabel: '5h 14% 4h27m 5/31 00:40 · 7d 45% 2d19h 6/2 16:00',
+      quotaMeta: {
+        primary: { usedPercent: 14, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+        secondary: { usedPercent: 45, windowDurationMins: 10080, resetsAt: 1_800_500_000 },
+      },
+    });
+    // A buildSessionList pass where the /api/oauth/usage poll was null (idle /
+    // 30-min throttle / transient): the daemon omits quota. The footer must keep
+    // the last value, not flicker blank.
+    const merged = mergeSessionListEntry({ ...BASE_INCOMING, agentType: 'claude-code-sdk' }, existing);
+    expect(merged.quotaLabel).toBe('5h 14% 4h27m 5/31 00:40 · 7d 45% 2d19h 6/2 16:00');
+    expect(merged.quotaMeta?.primary?.usedPercent).toBe(14);
+    expect(merged.quotaMeta?.secondary?.usedPercent).toBe(45);
+  });
+
   it('allows non-codex quota display to clear when daemon reports no quota', () => {
     const existing = makeExisting({
       agentType: 'qwen',

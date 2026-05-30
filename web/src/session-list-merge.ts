@@ -98,6 +98,11 @@ export function mergeSessionListEntry(
   existing: SessionInfo | undefined,
 ): SessionInfo {
   const isCodexFamily = incoming.agentType === 'codex' || incoming.agentType === 'codex-sdk';
+  // Codex AND claude-code-sdk surface provider quota that the daemon may omit on
+  // a given session_list pass (idle / 30-min throttle / a transient B failure);
+  // preserve the last known value so the footer doesn't flicker blank between
+  // updates instead of dropping it to undefined.
+  const preservesProviderQuota = isCodexFamily || incoming.agentType === 'claude-code-sdk';
   const shouldKeepPendingQueue = incoming.state === 'queued' || incoming.state === 'running';
   const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(incoming, 'transportPendingMessages');
   const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(incoming, 'transportPendingMessageEntries');
@@ -164,10 +169,10 @@ export function mergeSessionListEntry(
     qwenAvailableModels: incoming.qwenAvailableModels ?? existing?.qwenAvailableModels,
     codexAvailableModels: incoming.codexAvailableModels ?? existing?.codexAvailableModels,
     modelDisplay: incoming.modelDisplay ?? incoming.activeModel ?? existing?.modelDisplay,
-    planLabel: incoming.planLabel ?? (isCodexFamily ? existing?.planLabel : undefined),
-    quotaLabel: incoming.quotaLabel ?? (isCodexFamily ? existing?.quotaLabel : undefined),
-    quotaUsageLabel: incoming.quotaUsageLabel ?? (isCodexFamily ? existing?.quotaUsageLabel : undefined),
-    quotaMeta: incoming.quotaMeta ?? (isCodexFamily ? existing?.quotaMeta : undefined),
+    planLabel: incoming.planLabel ?? (preservesProviderQuota ? existing?.planLabel : undefined),
+    quotaLabel: incoming.quotaLabel ?? (preservesProviderQuota ? existing?.quotaLabel : undefined),
+    quotaUsageLabel: incoming.quotaUsageLabel ?? (preservesProviderQuota ? existing?.quotaUsageLabel : undefined),
+    quotaMeta: incoming.quotaMeta ?? (preservesProviderQuota ? existing?.quotaMeta : undefined),
     effort: incoming.effort ?? existing?.effort,
     contextNamespace: incoming.contextNamespace ?? existing?.contextNamespace,
     contextNamespaceDiagnostics: incoming.contextNamespaceDiagnostics ?? existing?.contextNamespaceDiagnostics,

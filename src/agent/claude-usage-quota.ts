@@ -244,9 +244,16 @@ export async function getClaudeUsageQuota(force = false): Promise<ClaudeUsageQuo
   if (inflight) return inflight;
   inflight = (async () => {
     const value = await fetchUsageQuota();
-    cache = { at: Date.now(), value };
-    persistCache(cache);
-    return value;
+    if (value) {
+      cache = { at: Date.now(), value };
+      persistCache(cache);
+    } else {
+      // Failed/empty fetch: keep the last good snapshot rather than blanking the
+      // footer — just advance the timestamp so the 30-min throttle still holds.
+      // A transient token / network / 429 blip must not make the quota flicker.
+      cache = { at: Date.now(), value: cache?.value ?? null };
+    }
+    return cache.value;
   })().finally(() => { inflight = null; });
   return inflight;
 }
