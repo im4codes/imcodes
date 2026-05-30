@@ -46,7 +46,6 @@ const fmt = (n: number) =>
 
 export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled }: Props) {
   const { t } = useTranslation();
-  const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
   // Wrench pill: tri-state toggle for "show developer details in chat timeline".
   // Sourced from usePref → SharedResource, so this UsageFooter and ChatView
   // share one GET / one listener / one cache entry per tab.
@@ -83,8 +82,11 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const previousCtxSignatureRef = useRef<string | null>(null);
 
   const displayModel = modelOverride ?? usage.model;
+  // Live-tick the quota label (so "resets in Xm" stays current) for ANY provider
+  // that reports structured quota windows — Codex and claude-code-sdk both feed
+  // `quotaMeta`; the gate is its presence, not the agent family.
   useEffect(() => {
-    if (!isCodexFamily || !quotaMeta) return;
+    if (!quotaMeta) return;
     let intervalId: number | undefined;
     const tick = () => setQuotaNow(Date.now());
     tick();
@@ -97,12 +99,12 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
       window.clearTimeout(timeoutId);
       if (intervalId !== undefined) window.clearInterval(intervalId);
     };
-  }, [isCodexFamily, quotaMeta]);
+  }, [quotaMeta]);
 
   const displayQuotaLabel = useMemo(() => {
-    if (!isCodexFamily || !quotaMeta) return quotaLabel;
+    if (!quotaMeta) return quotaLabel;
     return formatProviderQuotaLabel(quotaMeta, now ?? quotaNow) ?? quotaLabel;
-  }, [isCodexFamily, now, quotaLabel, quotaMeta, quotaNow]);
+  }, [now, quotaLabel, quotaMeta, quotaNow]);
 
   const displayPlanLabel = useMemo(() => {
     const normalized = planLabel?.trim().toLowerCase();
