@@ -797,9 +797,14 @@ program
 program
   .command('upgrade')
   .description('Upgrade imcodes and restart daemon (auto-detects dev vs stable channel)')
-  .option('--version <ver>', 'Install a specific version (overrides --channel)')
+  // Positional version, NOT a `--version` flag: commander reserves `--version`
+  // for the program-level `.version()` (top of file), so a subcommand
+  // `--version <ver>` is shadowed — `imcodes upgrade --version X` just prints
+  // the running version and exits without upgrading. A positional argument
+  // sidesteps that entirely. Accepts a full version or a dist-tag (latest|dev).
+  .argument('[version]', 'Version or dist-tag to install (e.g. 2026.5.2477-dev.2586, latest, dev); overrides --channel')
   .option('--channel <channel>', 'Release channel: latest (stable) | dev — defaults to the channel this build is on')
-  .action((opts: { version?: string; channel?: string }) => {
+  .action((versionArg: string | undefined, opts: { channel?: string }) => {
     const platform = process.platform;
 
     // ── Resolve target package spec + channel ──────────────────────────────
@@ -809,9 +814,9 @@ program
     // a stable box on stable unless explicitly told otherwise.
     let pkgTag: string;
     let channelLabel: string;
-    if (opts.version) {
-      pkgTag = opts.version;
-      channelLabel = `pinned ${opts.version}`;
+    if (versionArg) {
+      pkgTag = versionArg;
+      channelLabel = `pinned ${versionArg}`;
     } else {
       let channel = getReleaseChannel(version);
       if (opts.channel) {
