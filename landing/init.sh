@@ -6,9 +6,10 @@
 # and the agent CLIs (Claude Code, Codex, Qwen, Gemini), wired so the daemon's
 # auto-upgrade keeps working — including in restricted-network regions.
 #
-# Just give it the IP and username; it ships itself over SSH and provisions:
-#   ./init.sh ai@1.2.3.4
-#   ./init.sh ai@1.2.3.4 --source mirror --channel dev
+# Just give it the host; it ships itself over SSH and provisions. The target is
+# `[user@]host[:port]` — username defaults to `ai`, SSH port to `22`:
+#   ./init.sh 1.2.3.4                              # → ai@1.2.3.4:22
+#   ./init.sh ai@1.2.3.4:2222 --source mirror --channel dev
 # Or run it ON the target directly:
 #   curl -fsSL https://im.codes/init.sh | bash
 #
@@ -27,12 +28,20 @@
 # that is not nounset-clean. `-e` + explicit checks keep us honest.
 set -eo pipefail
 
-# ── Remote driver: given user@host, ship THIS script over SSH and run it there ──
-if [ "${1:-}" ] && printf '%s' "$1" | grep -q '@'; then
-  TARGET="$1"; shift
-  printf '\n==> provisioning %s (shipping init.sh over SSH)...\n\n' "$TARGET"
-  exec ssh -o ConnectTimeout=15 "$TARGET" "bash -s -- $*" < "$0"
-fi
+# ── Remote driver: if the first arg is a host (not a flag), ship THIS script ────
+# over SSH and run it on the target. Target is `[user@]host[:port]` — username
+# defaults to `ai`, port to `22`. No leading host (no args, or a leading -flag)
+# ⇒ we are already ON the target, so fall through to the bootstrap below.
+case "${1:-}" in
+  ''|-*) : ;;
+  *)
+    spec="$1"; shift
+    case "$spec" in *@*) tu="${spec%%@*}"; spec="${spec#*@}" ;; *) tu="ai" ;; esac
+    if [[ "$spec" =~ ^(.+):([0-9]+)$ ]]; then th="${BASH_REMATCH[1]}"; tp="${BASH_REMATCH[2]}"; else th="$spec"; tp=22; fi
+    printf '\n==> provisioning %s@%s:%s (shipping init.sh over SSH)...\n\n' "$tu" "$th" "$tp"
+    exec ssh -p "$tp" -o ConnectTimeout=15 "$tu@$th" "bash -s -- $*" < "$0"
+    ;;
+esac
 
 # ─────────────────────────── on-target bootstrap ───────────────────────────────
 CHANNEL="${IMCODES_CHANNEL:-dev}"
