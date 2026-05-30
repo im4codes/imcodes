@@ -23,6 +23,7 @@ import {
   type SessionRecord,
 } from '../store/session-store.js';
 import logger from '../util/logger.js';
+import { mapWithConcurrency } from '../util/concurrency.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import { emitSessionInlineError } from '../daemon/session-error.js';
 import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
@@ -988,6 +989,20 @@ export async function relaunchSessionWithSettings(
 /** In-memory map of active transport session runtimes */
 const transportRuntimes = new Map<string, TransportSessionRuntime>();
 const transportErrorRecoveryInFlight = new Map<string, Promise<boolean>>();
+
+/**
+ * How many transport sessions to restore concurrently on startup / reconnect.
+ * Each restore is ~1s of mostly-I/O wait (a 2.5s-timeout context bootstrap plus
+ * the provider's resume RPC), so a sequential restore of ~30 sessions takes
+ * ~30s of wall-clock before they are usable again. A handful in flight overlaps
+ * those waits and turns that into a few seconds. Kept modest so we don't fire a
+ * burst of git / provider RPCs at once. Override with
+ * IMCODES_TRANSPORT_RESTORE_CONCURRENCY.
+ */
+const TRANSPORT_RESTORE_CONCURRENCY = (() => {
+  const raw = Number(process.env.IMCODES_TRANSPORT_RESTORE_CONCURRENCY);
+  return Number.isFinite(raw) && raw >= 1 ? Math.trunc(raw) : 6;
+})();
 const transportErrorRecoveryTimestamps = new Map<string, number[]>();
 
 function buildTransportSessionEnv(
@@ -1383,14 +1398,27 @@ export function getTransportRuntime(name: string): TransportSessionRuntime | und
 export async function restoreTransportSessions(providerId: string): Promise<void> {
   const all = storeSessions();
   const qwenRuntime = providerId === 'qwen' ? await getQwenRuntimeConfig().catch(() => null) : null;
-  for (const s of all) {
-    if (s.runtimeType !== RUNTIME_TYPES.TRANSPORT) continue;
-    if (s.providerId !== providerId) continue;
-    if (!s.providerSessionId) continue;
-    if (transportRuntimes.has(s.name)) continue; // already rebuilt by oc-sync
+  // Restore with BOUNDED CONCURRENCY rather than one-at-a-time. Each session's
+  // restore is ~1s of mostly-I/O wait (context bootstrap has a 2.5s timeout +
+  // the provider's resume RPC), so a sequential loop over ~30 transport
+  // sessions takes ~30s of wall-clock before they are usable again after a
+  // daemon restart / reconnect. A few in flight overlaps those waits and cuts
+  // it to a few seconds. Safe to parallelize: runtime.initialize mutates only
+  // its own instance; the codex/cc app-server RPC layer is id-correlated
+  // (concurrent requests don't cross-talk) and createSession does not spawn a
+  // process; node:sqlite is synchronous so memory/context reads serialise on
+  // the main thread anyway; every store write is keyed by session name.
+  type Restorable = SessionRecord & { providerId: string; providerSessionId: string };
+  const pending = all.filter((s): s is Restorable =>
+    s.runtimeType === RUNTIME_TYPES.TRANSPORT
+    && s.providerId === providerId
+    && !!s.providerSessionId,
+  );
+  const restoreOne = async (s: Restorable): Promise<void> => {
+    if (transportRuntimes.has(s.name)) return; // already rebuilt by oc-sync
     try {
       const provider = getProvider(s.providerId);
-      if (!provider) continue;
+      if (!provider) return;
       let availableQwenModels = s.providerId === 'qwen'
         ? (s.qwenAvailableModels?.length ? s.qwenAvailableModels : (qwenRuntime?.availableModels ?? []))
         : [];
@@ -1636,7 +1664,10 @@ export async function restoreTransportSessions(providerId: string): Promise<void
     } catch (err) {
       logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
     }
-  }
+  };
+  // restoreOne swallows its own errors above, so mapWithConcurrency never
+  // rejects — one bad session can't abort the rest of the restore.
+  await mapWithConcurrency(pending, TRANSPORT_RESTORE_CONCURRENCY, restoreOne);
 }
 
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
