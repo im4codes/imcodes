@@ -400,6 +400,7 @@
     "provider_quota_title": "额度：{{value}}",
     "weekly_quota_authorize": "显示周限额",
     "weekly_quota_authorize_hint": "授权读取本机 Claude token 以显示每周（7 天）限额",
+    "weekly_quota_confirm": "这将读取本机的 Claude 登录令牌（token）以获取每周（7 天）限额。确认授权？",
     "provider_quota_usage_title": "额度进度：{{value}}",
     "history_loading_label": "历史",
     "history_step_cache": "本地缓存",

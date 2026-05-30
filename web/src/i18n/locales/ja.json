@@ -400,6 +400,7 @@
     "provider_quota_title": "上限: {{value}}",
     "weekly_quota_authorize": "週間上限を表示",
     "weekly_quota_authorize_hint": "ローカルの Claude トークンの読み取りを許可して週間（7日）の上限を表示します",
+    "weekly_quota_confirm": "週間（7日）の上限を取得するため、ローカルの Claude ログイントークンを読み取ります。許可しますか？",
     "provider_quota_usage_title": "利用状況: {{value}}",
     "history_loading_label": "履歴",
     "history_step_cache": "キャッシュ",

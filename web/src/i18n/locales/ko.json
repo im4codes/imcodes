@@ -400,6 +400,7 @@
     "provider_quota_title": "한도: {{value}}",
     "weekly_quota_authorize": "주간 한도 표시",
     "weekly_quota_authorize_hint": "로컬 Claude 토큰 읽기를 허용하여 주간(7일) 한도를 표시합니다",
+    "weekly_quota_confirm": "주간(7일) 한도를 가져오기 위해 로컬 Claude 로그인 토큰을 읽습니다. 인증하시겠습니까?",
     "provider_quota_usage_title": "사용량: {{value}}",
     "history_loading_label": "기록",
     "history_step_cache": "캐시",

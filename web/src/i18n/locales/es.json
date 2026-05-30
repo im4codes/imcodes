@@ -400,6 +400,7 @@
     "provider_quota_title": "Cuota: {{value}}",
     "weekly_quota_authorize": "Mostrar límite semanal",
     "weekly_quota_authorize_hint": "Autorizar la lectura de tu token local de Claude para mostrar el límite semanal (7 días)",
+    "weekly_quota_confirm": "Esto leerá tu token de inicio de sesión local de Claude para obtener el límite semanal (7 días). ¿Autorizar?",
     "provider_quota_usage_title": "Uso de cuota: {{value}}",
     "history_loading_label": "Historial",
     "history_step_cache": "caché",

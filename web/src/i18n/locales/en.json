@@ -400,6 +400,7 @@
     "provider_quota_title": "Quota: {{value}}",
     "weekly_quota_authorize": "Show weekly limit",
     "weekly_quota_authorize_hint": "Authorize reading your local Claude token to show the weekly (7-day) limit",
+    "weekly_quota_confirm": "This reads your local Claude login token to fetch the weekly (7-day) limit. Authorize?",
     "provider_quota_usage_title": "Quota usage: {{value}}",
     "history_loading_label": "History",
     "history_step_cache": "cache",
