@@ -342,6 +342,8 @@ export async function startup(): Promise<DaemonContext> {
   }, 'Daemon starting');
   lockServer = await acquireInstanceLock();
   writePidFile();
+  // Captures an initial heap snapshot into the runtime status; subsequent
+  // refreshes ride the heartbeat write (no dedicated timer / extra I/O).
   recordDaemonStart({ version: DAEMON_VERSION });
 
   const config = await loadConfig();
@@ -611,23 +613,18 @@ export async function startup(): Promise<DaemonContext> {
     let sessionsBackfilled = 0;
     for (const session of listSessions()) {
       sessionsSeen += 1;
-      // Per-session try/catch — commit 42dfabec changed `readPreferred` to
-      // throw `TimelinePreferredReadError` when the SQLite projection is
-      // unavailable instead of returning `[]`. An unhandled throw here would
-      // abort the whole startup backfill loop after the first bad session.
-      // Fall back to the JSONL `read()` path (same semantics, slower) so a
-      // single mid-init projection still lets every session bootstrap.
+      // SQLite projection is the sole chat-history read source — no JSONL
+      // `read()` fallback. That synchronous main-thread read was an event-loop
+      // saturation amplifier under load (and JSONL is now write/backup-only).
+      // Startup backfill is best-effort: if the projection is briefly
+      // unavailable for a session, skip it — live ingestion plus the
+      // self-healing projection worker will catch it up.
       let history: Awaited<ReturnType<typeof timelineStore.readPreferred>> = [];
       try {
         history = await timelineStore.readPreferred(session.name, { limit: 100 });
       } catch (err) {
-        logger.warn({ err, session: session.name }, 'Startup backfill: readPreferred failed, falling back to JSONL');
-        try {
-          history = timelineStore.read(session.name, { limit: 100 });
-        } catch (fallbackErr) {
-          logger.warn({ err: fallbackErr, session: session.name }, 'Startup backfill: JSONL fallback also failed; skipping session');
-          continue;
-        }
+        logger.warn({ err, session: session.name }, 'Startup backfill: projection read failed; skipping session (no JSONL fallback)');
+        continue;
       }
       if (history.length === 0) continue;
       sessionsBackfilled += 1;

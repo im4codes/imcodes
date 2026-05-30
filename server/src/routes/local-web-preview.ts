@@ -3,19 +3,22 @@ import { getCookie, setCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import { requireAuth, resolveAuth, resolveServerRole } from '../security/authorization.js';
 import { LocalWebPreviewRegistry, normalizeLocalPreviewPath } from '../preview/registry.js';
-import { MemoryRateLimiter } from '../ws/rate-limiter.js';
+import { commitAuthorizedAccess, resolveLocalPreviewAccess } from '../preview/access.js';
 import { rewritePreviewHtmlDocument, shouldRewritePreviewHtml } from '../preview/policy.js';
 import {
+  appendPreviewAccessTokenIfMissing,
   filterPreviewResponseHeaders,
   normalizePreviewUpstreamPath,
   redactPreviewHeaders,
   rewritePreviewRedirectLocation,
   rewriteSetCookieHeader,
   sanitizePreviewRequestHeaders,
+  stripPreviewAccessTokenFromUpstreamPath,
 } from '../../../shared/preview-policy.js';
 import {
   PREVIEW_ACCESS_TOKEN_QUERY_PARAM,
   PREVIEW_ERROR,
+  PREVIEW_INFLIGHT_REJECT_HTTP_STATUS,
   PREVIEW_LIMITS,
   PREVIEW_MSG,
   type CreatePreviewRequest,
@@ -33,12 +36,17 @@ const createSchema = z.object({
   path: z.string().max(1024).optional(),
 });
 
-const previewRateLimiter = new MemoryRateLimiter();
-
+/**
+ * Build the path?query forwarded to the local upstream. The preview access
+ * token is stripped via the shared `stripPreviewAccessTokenFromUpstreamPath`
+ * (run 8a975732-23a P0.3) — the same single entry point the WS upgrade uses —
+ * so the untrusted upstream never sees this replayable credential.
+ */
 function getUpstreamPath(url: URL, serverId: string, previewId: string): string {
   const prefix = `/api/server/${serverId}/local-web/${previewId}`;
   const pathname = url.pathname.startsWith(prefix) ? url.pathname.slice(prefix.length) || '/' : '/';
-  return normalizePreviewUpstreamPath(`${pathname}${url.search}`);
+  const stripped = stripPreviewAccessTokenFromUpstreamPath(`${pathname}${url.search}`);
+  return normalizePreviewUpstreamPath(stripped);
 }
 
 function getSetCookieValues(headers: Headers): string[] {
@@ -127,33 +135,31 @@ localWebPreviewRoutes.delete('/:id/local-web-preview/:previewId', requireAuth(),
 localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
   const serverId = c.req.param('id')!;
   const previewId = c.req.param('previewId')!;
-  const registry = LocalWebPreviewRegistry.get(serverId);
   const previewAccessToken = new URL(c.req.url).searchParams.get(PREVIEW_ACCESS_TOKEN_QUERY_PARAM) ?? getCookie(c, COOKIE_PREVIEW_ACCESS) ?? null;
   const auth = await resolveAuth(c);
 
-  let userId: string | null = auth?.userId ?? null;
-  let role = auth ? await resolveServerRole(c.env.DB, serverId, auth.userId) : 'none';
-
-  const previewFromToken = !auth && previewAccessToken
-    ? registry.authorizeWithAccessToken(previewId, previewAccessToken)
-    : null;
-
-  if (!auth && !previewFromToken) return c.json({ error: 'unauthorized' }, 401);
-  if (!auth && previewFromToken) {
-    userId = previewFromToken.userId;
-    role = await resolveServerRole(c.env.DB, serverId, previewFromToken.userId);
+  // Pure peek/verify — NO side effects (no touch / no Set-Cookie / no TTL
+  // renewal) until owner + current role + token/session ALL pass. HTTP and WS
+  // upgrade share this exact function (run 8a975732-23a P0.1).
+  const access = await resolveLocalPreviewAccess({
+    db: c.env.DB,
+    serverId,
+    previewId,
+    previewAccessToken,
+    session: auth ? { userId: auth.userId } : null,
+  });
+  if (!access.ok) {
+    return c.json({ error: access.error }, access.status);
   }
-  if (!userId) return c.json({ error: 'unauthorized' }, 401);
-  if (role === 'none') return c.json({ error: PREVIEW_ERROR.FORBIDDEN }, 403);
+  const { preview } = access;
 
-  const rateKey = `${serverId}:${userId}`;
-  if (!previewRateLimiter.check(rateKey, PREVIEW_LIMITS.MAX_REQUESTS_PER_WINDOW, PREVIEW_LIMITS.REQUEST_RATE_WINDOW_MS)) {
-    return c.json({ error: PREVIEW_ERROR.LIMIT_EXCEEDED }, 429);
-  }
-
-  const preview = registry.get(previewId);
-  if (!preview) return c.json({ error: PREVIEW_ERROR.PREVIEW_EXPIRED }, 404);
-  if (preview.userId !== userId) return c.json({ error: PREVIEW_ERROR.FORBIDDEN }, 403);
+  // Authorization passed (owner + current role + token/session) → commit the
+  // side effects: slide the TTL (commit, NOT peek) and — HTTP only — re-set the
+  // preview scoped cookie so post-initial-load same-origin requests carry it
+  // (SameSite=Strict default defense). Committed here, BEFORE the daemon /
+  // in-flight gates, so a transient daemon outage doesn't strip a legitimately
+  // authorized session's credential.
+  commitAuthorizedAccess(serverId, previewId);
   if (previewAccessToken) {
     setPreviewAccessCookie(c, serverId, previewId, previewAccessToken);
   }
@@ -163,12 +169,21 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
     return c.json({ error: PREVIEW_ERROR.DAEMON_OFFLINE }, 503);
   }
 
+  // In-flight HTTP concurrency floor (run 8a975732-23a P0.4) — replaces the
+  // removed per-request count rate limiter (which misfired on a real SPA first
+  // paint). The check happens HERE, at the point we decide to forward upstream.
+  // WS tunnels are NOT counted here (they have MAX_WS_PER_PREVIEW). Reject with
+  // 503 + PREVIEW_ERROR.INFLIGHT_LIMIT (non-bare).
+  if (!bridge.canAcceptPreviewInflight(previewId)) {
+    return c.json({ error: PREVIEW_ERROR.INFLIGHT_LIMIT }, PREVIEW_INFLIGHT_REJECT_HTTP_STATUS);
+  }
+
   const requestId = randomHex(16);
   const requestUrl = new URL(c.req.url);
   const upstreamPath = getUpstreamPath(requestUrl, serverId, previewId);
   const sanitizedHeaders = sanitizePreviewRequestHeaders(c.req.raw.headers, previewId);
   const hasBody = !['GET', 'HEAD'].includes(c.req.method) && c.req.raw.body !== null;
-  const relay = bridge.createPreviewRelay(requestId, PREVIEW_LIMITS.RESPONSE_START_TIMEOUT_MS);
+  const relay = bridge.createPreviewRelay(requestId, previewId, PREVIEW_LIMITS.RESPONSE_START_TIMEOUT_MS);
 
   c.req.raw.signal.addEventListener('abort', () => {
     relay.abort('browser_disconnect');
@@ -234,19 +249,18 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
         previewId,
         port: preview.port,
       });
-      // Only append access token for loopback redirects (rewritten to preview prefix)
+      // Only append the access token for loopback redirects (rewritten to the
+      // preview prefix). Presence is decided by URLSearchParams.has — NOT a
+      // `.includes` substring match (run 8a975732-23a A14): substring matching
+      // would mis-fire when the pathname or another param's value happens to
+      // contain the literal `preview_access_token`. The token appended here is
+      // the browser→proxy segment credential; the upstream segment is stripped
+      // separately by getUpstreamPath. Shared, unit-tested helper.
       const isLoopbackRedirect = rewritten !== location;
-      if (isLoopbackRedirect && previewAccessToken && !rewritten.includes(PREVIEW_ACCESS_TOKEN_QUERY_PARAM)) {
-        try {
-          const redirectUrl = new URL(rewritten, c.req.url);
-          redirectUrl.searchParams.set(PREVIEW_ACCESS_TOKEN_QUERY_PARAM, previewAccessToken);
-          upstreamHeaders.set('location', `${redirectUrl.pathname}${redirectUrl.search}${redirectUrl.hash}`);
-        } catch {
-          upstreamHeaders.set('location', rewritten);
-        }
-      } else {
-        upstreamHeaders.set('location', rewritten);
-      }
+      const nextLocation = isLoopbackRedirect
+        ? appendPreviewAccessTokenIfMissing(rewritten, c.req.url, previewAccessToken)
+        : rewritten;
+      upstreamHeaders.set('location', nextLocation);
     }
 
     const responseHeaders = filterPreviewResponseHeaders(upstreamHeaders);

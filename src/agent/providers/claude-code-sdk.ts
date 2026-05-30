@@ -30,6 +30,8 @@ import { CLAUDE_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../sh
 import { normalizeTransportCwd, resolveClaudeCodePathForSdk, resolveExecutableForSpawn } from '../transport-paths.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
+import { claudeRateLimitsToQuotaMeta, type ClaudeRateLimitInfo } from '../claude-rate-limit.js';
+import { formatProviderQuotaLabel } from '../../../shared/provider-quota.js';
 
 const CLAUDE_BIN = 'claude';
 const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
@@ -60,6 +62,10 @@ interface ClaudeSdkSessionState {
   cancelled: boolean;
   finalMetadata?: Record<string, unknown>;
   lastAssistantUsage?: ClaudeUsageSnapshot;
+  /** Cached per-type Claude rate-limit snapshots (five_hour / seven_day*). Each
+   *  `rate_limit_event` carries ONE window; accumulate across the session so the
+   *  weekly window — which only surfaces near a limit — is retained once seen. */
+  rateLimits?: Record<string, ClaudeRateLimitInfo>;
   pendingComplete?: AgentMessage;
   pendingError?: ProviderError;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
@@ -203,6 +209,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       cancelled: false,
       finalMetadata: existing?.finalMetadata,
       lastAssistantUsage: existing?.lastAssistantUsage,
+      rateLimits: existing?.rateLimits,
       pendingComplete: undefined,
       toolCalls: new Map(),
       emittedToolStates: new Map(),
@@ -461,6 +468,23 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
           status: msg.status,
           label: null,
         });
+      }
+      return;
+    }
+
+    if (msg.type === 'rate_limit_event') {
+      // claude.ai subscription rate-limit info (5h + weekly windows, with reset
+      // times). Each event carries one `rateLimitType`; cache per type and push
+      // a quotaMeta so the existing provider→record→session_list display
+      // surfaces it (resetsAt is epoch seconds — passed through unchanged).
+      const info = (msg as { rate_limit_info?: ClaudeRateLimitInfo }).rate_limit_info;
+      if (info?.rateLimitType) {
+        state.rateLimits = { ...(state.rateLimits ?? {}), [info.rateLimitType]: info };
+        const quotaMeta = claudeRateLimitsToQuotaMeta(state.rateLimits);
+        if (quotaMeta) {
+          const quotaLabel = formatProviderQuotaLabel(quotaMeta);
+          this.emitSessionInfo(sessionId, { ...(quotaLabel ? { quotaLabel } : {}), quotaMeta });
+        }
       }
       return;
     }

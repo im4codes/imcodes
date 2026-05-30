@@ -517,6 +517,33 @@ export async function isPaneAlive(name: string): Promise<boolean> {
   }
 }
 
+/**
+ * Check whether a concrete pane *target* (e.g. a tmux "%5" pane id) currently
+ * resolves to a live pane.
+ *
+ * Unlike `sessionExists`/`isPaneAlive` (which take a session NAME), this
+ * validates a specific paneId. It exists so we can reject a STALE paneId — a
+ * migrated `sessions.json` on a fresh box, or one left over after a tmux-server
+ * restart, points at a `%N` that no longer exists — BEFORE committing to a
+ * pipe-pane reader against a pane that is already gone. Returns false on any
+ * lookup error (a transient tmux failure is treated as "not streamable now",
+ * exactly as the subsequent `pipe-pane` would have failed anyway).
+ */
+export async function paneExists(paneTarget: string): Promise<boolean> {
+  if (!paneTarget) return false;
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    return c.conptyIsPaneAlive(paneTarget);
+  }
+  if (BACKEND === 'wezterm') return weztermIsPaneAlive(paneTarget);
+  try {
+    const raw = await tmuxRun('display-message', '-p', '-t', paneTarget, '#{pane_id}');
+    return raw.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Respawn a dead pane (remain-on-exit) with a new command. */
 export async function respawnPane(name: string, command: string, opts?: { env?: Record<string, string> }): Promise<void> {
   if (BACKEND === 'conpty') {
@@ -820,6 +847,23 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
 
   if (!SESSION_PATTERN.test(session)) {
     throw new Error(`Invalid session name for pipe-pane: ${session}`);
+  }
+
+  // ── Hard guard: the target pane MUST exist before we touch the FIFO ─────────
+  // Order matters. Below we mkfifo + spawn a `cat` reader and ONLY THEN run
+  // `tmux pipe-pane`. If the paneId is stale (a migrated sessions.json on a
+  // fresh box, or a cold start before the tmux session is recreated) the
+  // pipe-pane writer never attaches — but the reader is already spawned. A
+  // FIFO reader with no writer blocks in the kernel (D-state); it ignores
+  // SIGTERM/SIGKILL, counts against load, and — because the daemon's own
+  // systemd unit uses KillMode=process — survives a daemon restart and BRICKS
+  // it (observed on a migrated box: ~12 unkillable `cat` children stalled the
+  // restart). Verifying the pane up-front means a dead pane fails fast with
+  // NO FIFO and NO reader — the caller's normal rebind path takes over. This
+  // is the authoritative fix; callers may also pre-resolve a live pane, but
+  // this chokepoint guarantees no reader is ever orphaned.
+  if (!(await paneExists(paneId))) {
+    throw new Error(`pipe-pane target pane does not exist: ${paneId || '(empty)'} (session ${session})`);
   }
 
   // Stop any existing pipe for this session

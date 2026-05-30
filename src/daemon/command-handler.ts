@@ -63,10 +63,19 @@ const execAsync = promisify(execCb);
 const execFileAsync = promisify(execFileCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
 import { buildSessionList } from './session-list.js';
+import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
+import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import { parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import type { P2pAdvancedRound, P2pContextReducerConfig, P2pRoundPreset } from '../../shared/p2p-advanced.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
+import {
+  INSTALLER_CONFIG_BASENAME,
+  INSTALLER_OFFICIAL_NPM_REGISTRY,
+  normalizeRegistryBase,
+  pickUpgradeRegistry,
+  type InstallerConfig,
+} from '../../shared/installer-contract.js';
 import { executeCronJob } from './cron-executor.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { copyFile } from 'node:fs/promises';
@@ -1354,6 +1363,11 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case 'subsession.rebuild_all':
       void traceCommandAsync(cmd, 'web_command.subsession_rebuild_all', () => handleSubSessionRebuildAll(cmd, serverLink));
       break;
+    case CLAUDE_QUOTA_MSG.SET_OPT_IN:
+      // User authorized (or revoked) reading the local Claude token for the
+      // weekly (7d) quota. Off by default; gates the /api/oauth/usage pull.
+      setClaudeUsageQuotaOptIn(cmd.enabled === true);
+      break;
     case 'subsession.detect_shells':
       void handleSubSessionDetectShells(serverLink);
       break;
@@ -1986,6 +2000,7 @@ function markTransportCancelIdle(sessionName: string, error?: string): void {
     pendingCount: runtime?.pendingCount ?? 0,
     pendingMessages: runtime?.pendingMessages ?? [],
     pendingMessageEntries: runtime?.pendingEntries ?? [],
+    pendingMessageVersion: runtime?.pendingVersion ?? 0,
     ...(error ? { error } : {}),
   }, { source: 'daemon', confidence: 'high' });
 }
@@ -2508,6 +2523,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     logger.warn('session.send: missing sessionName or text');
     return;
   }
+
+  // Only a message to a claude-code-sdk session counts as activity that keeps the
+  // Claude usage-quota poll alive (the quota tracks the Claude subscription).
+  // Cheap sync Map lookup — does not touch the send hot-path ack latency.
+  if (getSession(sessionName)?.agentType === 'claude-code-sdk') recordClaudeQuotaActivity();
 
   // Fallback: legacy clients that don't send commandId get a server-generated one
   const isLegacy = !commandId;
@@ -3476,6 +3496,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           pendingCount: transportRuntime.pendingCount,
           pendingMessages: transportRuntime.pendingMessages,
           pendingMessageEntries: transportRuntime.pendingEntries,
+          pendingMessageVersion: transportRuntime.pendingVersion,
         }, { source: 'daemon', confidence: 'high' });
       }
       // Clear fresh-start flag — the new conversation is now active
@@ -3762,6 +3783,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
       pendingMessageEntries: runtime.pendingEntries,
+      pendingMessageVersion: runtime.pendingVersion,
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
@@ -3798,6 +3820,7 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
       pendingMessageEntries: runtime.pendingEntries,
+      pendingMessageVersion: runtime.pendingVersion,
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
@@ -4196,14 +4219,18 @@ function timelineReplayInflightKey(params: TimelineReplayRequestParams): string 
   });
 }
 
-function buildTimelineReplay(params: TimelineReplayRequestParams): TimelineReplayBuildResult {
+async function buildTimelineReplay(params: TimelineReplayRequestParams): Promise<TimelineReplayBuildResult> {
   if (params.requestEpoch !== timelineEmitter.epoch) {
-    // Epoch mismatch — serve current epoch events from file store, fallback to all epochs.
+    // Epoch reset (client reconnected across a daemon restart) — serve the
+    // latest events from the SQLite projection, the sole chat-history read
+    // source. readPreferred returns the most recent N events (across epochs)
+    // ascending, which is exactly what a cursor-reset replay needs to re-sync.
+    // No JSONL `read()` fallback: on projection unavailability this throws
+    // TimelinePreferredReadError and handleTimelineReplay turns it into a
+    // replay error response rather than degrading to a synchronous JSONL scan
+    // (JSONL is now write/backup-only).
     const replayEpochResetLimit = 200;
-    let events = timelineStore.read(params.sessionName, { epoch: timelineEmitter.epoch, limit: replayEpochResetLimit });
-    if (events.length === 0) {
-      events = timelineStore.read(params.sessionName, { limit: replayEpochResetLimit });
-    }
+    const events = await timelineStore.readPreferred(params.sessionName, { limit: replayEpochResetLimit });
     const shaped = shapeTimelineEventsForTransport(events, {
       detailSink: getDefaultTimelineDetailStore(),
     });
@@ -4213,7 +4240,7 @@ function buildTimelineReplay(params: TimelineReplayRequestParams): TimelineRepla
       truncated: false,
       epoch: timelineEmitter.epoch,
       status: timelineStatusFromPayload(shaped.droppedEvents, shaped.truncatedEvents),
-      source: TIMELINE_RESPONSE_SOURCES.JSONL_TAIL,
+      source: TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE,
       payloadBytes: shaped.payloadBytes,
       payloadTruncated,
       hasMore: shaped.droppedEvents > 0,
@@ -4252,11 +4279,7 @@ function getTimelineReplayResult(params: TimelineReplayRequestParams): Promise<T
   if (existing) return existing;
   const promise = new Promise<TimelineReplayBuildResult>((resolve, reject) => {
     setImmediate(() => {
-      try {
-        resolve(buildTimelineReplay(params));
-      } catch (err) {
-        reject(err);
-      }
+      buildTimelineReplay(params).then(resolve, reject);
     });
   }).finally(() => {
     timelineReplayInflight.delete(key);
@@ -5199,16 +5222,30 @@ async function materializeP2pDiscussionHistoryEntry(
   };
 }
 
-async function handleP2pListDiscussions(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const requestId = cmd.requestId as string | undefined;
-  const scope = await resolveP2pDiscussionProjectScope(cmd);
+// Short-TTL result cache + in-flight coalescing for p2p.list_discussions.
+// Before this, EVERY poll re-scanned every project's discussions dir and
+// re-parsed every candidate file's preview (heavy fs + JSON allocation → a
+// top GC-pressure source under load). Web + mobile clients poll this list
+// frequently and in reconnect bursts; a 2s cache collapses sequential polls
+// and the in-flight map collapses simultaneous ones into a single scan.
+const P2P_DISCUSSION_LIST_CACHE_TTL_MS = 2_000;
+const P2P_DISCUSSION_LIST_GLOBAL_KEY = '__global__';
+interface P2pDiscussionListResult {
+  discussions: P2pDiscussionHistoryEntry[];
+  aggregated: boolean;
+}
+const p2pDiscussionListCache = new Map<string, { expiresAt: number; value: P2pDiscussionListResult }>();
+const p2pDiscussionListInflight = new Map<string, Promise<P2pDiscussionListResult>>();
+
+async function computeP2pDiscussionList(
+  scope: { projectDir: string; canonicalProjectDir: string } | null,
+): Promise<P2pDiscussionListResult> {
   // Audit fix (e940d73f-a8e / M7-B) — when the caller cannot supply scope
   // (mobile global view, multi-project daemon's "view discussions" entry
   // without an active session), aggregate discussions across **all** known
-  // projects instead of failing closed. The `error` field is still set so
-  // the UI can show a "scope optional" hint, but the list is no longer
-  // empty. Each entry carries `projectDir` so subsequent reads can route
-  // back. Single-project daemons still return the same one-project list.
+  // projects instead of failing closed. Each entry carries `projectDir` so
+  // subsequent reads can route back. Single-project daemons still return the
+  // same one-project list.
   const projectsToScan: Array<{ projectDir: string }> = [];
   if (scope) {
     projectsToScan.push({ projectDir: scope.projectDir });
@@ -5228,13 +5265,40 @@ async function handleP2pListDiscussions(cmd: Record<string, unknown>, serverLink
     P2P_DISCUSSION_PREVIEW_CONCURRENCY,
     materializeP2pDiscussionHistoryEntry,
   );
+  return { discussions, aggregated: !scope };
+}
+
+async function getP2pDiscussionList(
+  scope: { projectDir: string; canonicalProjectDir: string } | null,
+): Promise<P2pDiscussionListResult> {
+  const key = scope ? scope.canonicalProjectDir : P2P_DISCUSSION_LIST_GLOBAL_KEY;
+  const cached = p2pDiscussionListCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const inflight = p2pDiscussionListInflight.get(key);
+  if (inflight) return await inflight;
+  const promise = computeP2pDiscussionList(scope)
+    .then((value) => {
+      p2pDiscussionListCache.set(key, { value, expiresAt: Date.now() + P2P_DISCUSSION_LIST_CACHE_TTL_MS });
+      return value;
+    })
+    .finally(() => {
+      p2pDiscussionListInflight.delete(key);
+    });
+  p2pDiscussionListInflight.set(key, promise);
+  return await promise;
+}
+
+async function handleP2pListDiscussions(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = cmd.requestId as string | undefined;
+  const scope = await resolveP2pDiscussionProjectScope(cmd);
+  const { discussions, aggregated } = await getP2pDiscussionList(scope);
   serverLink.send({
     type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
     requestId,
     discussions,
     // Surface to the caller that the list was aggregated across projects.
     // Old clients ignore unknown fields.
-    ...(scope ? {} : { aggregated: true }),
+    ...(aggregated ? { aggregated: true } : {}),
   });
 }
 
@@ -5403,6 +5467,7 @@ async function handleDiscussionStart(cmd: Record<string, unknown>, serverLink: S
       {
         id,
         serverId: '',
+        requestId,
         topic,
         cwd: cwd ?? '',
         participants,
@@ -5595,6 +5660,155 @@ export function evaluateAutoUpgradeCooldown(
   return { onCooldown: true, remainingMs: cooldownMs - ageMs, lastAt };
 }
 
+/** How long the *session-busy* gate may keep deferring an upgrade before the
+ *  daemon forces it through. The per-turn staleness guard
+ *  (`TRANSPORT_STALE_TURN_MS`) catches wedged transport turns; this is the
+ *  final backstop for everything else (a process-agent CLI stuck in
+ *  'running'/'queued', a transport turn the staleness guard hasn't yet aged
+ *  out, an unforeseen state) so ONE stuck session can never pin the daemon on
+ *  an old version forever. Override for tests via IMCODES_MAX_UPGRADE_DEFER_MS. */
+const MAX_UPGRADE_DEFER_MS = (() => {
+  const raw = parseInt(process.env.IMCODES_MAX_UPGRADE_DEFER_MS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60 * 1000;
+})();
+
+/** Epoch ms when the session-busy gate FIRST blocked the current run of
+ *  upgrade attempts, or null when the last attempt was not session-blocked.
+ *  Persists across `handleDaemonUpgrade` calls (each server upgrade broadcast)
+ *  so the backstop measures *continuous* deferral, not a single attempt. */
+let upgradeSessionBusyDeferredSince: number | null = null;
+
+/** Pure decision for the session-busy deferral backstop. Given whether the
+ *  session gate is currently blocking and how long it has been blocking,
+ *  decide whether to proceed anyway (forced) and what the next "blocked since"
+ *  marker should be. Extracted for deterministic unit testing. */
+export function evaluateUpgradeDeferralBackstop(args: {
+  blocked: boolean;
+  deferredSince: number | null;
+  now: number;
+  maxDeferMs: number;
+}): { proceed: boolean; forced: boolean; nextDeferredSince: number | null; deferredMs: number } {
+  const { blocked, deferredSince, now, maxDeferMs } = args;
+  if (!blocked) {
+    return { proceed: true, forced: false, nextDeferredSince: null, deferredMs: 0 };
+  }
+  const since = deferredSince ?? now;
+  const deferredMs = Math.max(0, now - since);
+  if (Number.isFinite(maxDeferMs) && maxDeferMs > 0 && deferredMs >= maxDeferMs) {
+    // Deferred long enough — force the upgrade through and reset the tracker.
+    return { proceed: true, forced: true, nextDeferredSince: null, deferredMs };
+  }
+  return { proceed: false, forced: false, nextDeferredSince: since, deferredMs };
+}
+
+/** Test-only: reset the module-level session-busy deferral tracker. */
+export function __resetUpgradeDeferralStateForTests(): void {
+  upgradeSessionBusyDeferredSince = null;
+}
+
+export interface UpgradeToolchainStatus {
+  /** The node binary the upgrade script will use (process.execPath). */
+  nodeBin: string;
+  /** False when nodeBin no longer exists on disk — e.g. `apt autoremove`
+   *  deleted the system Node while the daemon kept running on the now-deleted
+   *  inode. Restarting in this state would `exec` a missing binary and kill the
+   *  daemon for good, and every `npm install` fails because npm went with it. */
+  nodeBinPresent: boolean;
+  /** Resolved npm-cli.js path, or null if not found at the standard locations
+   *  next to nodeBin. Advisory only (the upgrade script has more strategies,
+   *  e.g. `npm prefix -g`), so a null here downgrades to a warning, not abort. */
+  npmCli: string | null;
+}
+
+/**
+ * Pre-flight check for the Node/npm toolchain the auto-upgrade depends on.
+ * Pure (all IO injected) so it is unit-testable. Mirrors the npm-cli.js
+ * discovery the generated upgrade.sh performs, plus the critical "is the node
+ * binary still on disk" check the script cannot meaningfully recover from.
+ *
+ * The point: an upgrade spawned when the toolchain is broken fails silently in
+ * a detached script — the daemon only notices 15 min later via the memory-
+ * freeze watchdog, so a box can sit stuck on an old version for hours with no
+ * clear signal. Surfacing this up front turns it into an immediate, actionable
+ * alert ("reinstall Node").
+ */
+export function checkUpgradeToolchain(opts: {
+  nodeBin: string;
+  nodeDir: string;
+  join: (...parts: string[]) => string;
+  exists: (p: string) => boolean;
+  realpath: (p: string) => string | null;
+}): UpgradeToolchainStatus {
+  const { nodeBin, nodeDir, join, exists, realpath } = opts;
+  const nodeBinPresent = exists(nodeBin);
+
+  let npmCli: string | null = null;
+  // Strategy A: <nodeDir>/npm symlink → npm-cli.js (covers system / tarball /
+  // most managed installs, where npm sits right next to node).
+  const npmLink = join(nodeDir, 'npm');
+  if (exists(npmLink)) {
+    const resolved = realpath(npmLink);
+    if (resolved && resolved.endsWith('npm-cli.js') && exists(resolved)) npmCli = resolved;
+  }
+  // Strategy B: known relative-from-nodeDir layouts (nvm/fnm/volta/system/snap).
+  if (!npmCli) {
+    const candidates = [
+      join(nodeDir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+      join(nodeDir, '..', '..', '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+      join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    ];
+    for (const c of candidates) {
+      if (exists(c)) { npmCli = c; break; }
+    }
+  }
+
+  return { nodeBin, nodeBinPresent, npmCli };
+}
+
+/**
+ * Resolve which npm registry the daemon's own auto-upgrade should use, so the
+ * pre-flight "is latest newer?" probe and the actual `npm install -g` agree on
+ * a single source. Previously the probe hard-coded registry.npmjs.org while the
+ * install obeyed whatever registry the user's ~/.npmrc named (a mirror, in
+ * restricted-network regions) — so in those regions the probe always failed,
+ * the anti-downgrade short-circuit never fired, and the probe/install could
+ * even resolve different versions.
+ *
+ * Priority: imcodes' own ~/.imcodes/install.json (written by the installer),
+ * then the ambient `npm config get registry` (covers users installed via the
+ * legacy script that persisted a mirror to ~/.npmrc), then the official
+ * registry. `explicit` is true when the result is NOT the official default —
+ * callers then pass `--registry` to npm so resolution is pinned, not ambient.
+ */
+async function resolveUpgradeRegistry(): Promise<{ base: string; explicit: boolean }> {
+  const { readFileSync } = await import('fs');
+  const { join } = await import('path');
+  const { homedir } = await import('os');
+  const { execFile } = await import('child_process');
+
+  let configRegistry: unknown;
+  try {
+    const raw = readFileSync(join(homedir(), '.imcodes', INSTALLER_CONFIG_BASENAME), 'utf8');
+    const parsed = JSON.parse(raw) as InstallerConfig;
+    configRegistry = parsed?.npmRegistry;
+  } catch { /* no install.json (or unreadable) — fall through to ambient */ }
+
+  let ambientRegistry: unknown;
+  if (!normalizeRegistryBase(configRegistry)) {
+    ambientRegistry = await new Promise<string | undefined>((resolve) => {
+      try {
+        const child = execFile('npm', ['config', 'get', 'registry'], { timeout: 5000 }, (err, stdout) => {
+          resolve(err ? undefined : String(stdout).trim());
+        });
+        child.on('error', () => resolve(undefined));
+      } catch { resolve(undefined); }
+    });
+  }
+
+  const base = pickUpgradeRegistry({ configRegistry, ambientRegistry });
+  return { base, explicit: base !== INSTALLER_OFFICIAL_NPM_REGISTRY };
+}
+
 async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLink): Promise<void> {
   const UPGRADE_MEMORY_FREEZE_TTL_MS = 15 * 60 * 1000;
 
@@ -5688,10 +5902,19 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
   // mid-turn would silently get killed by self-upgrade restart, throwing
   // away the in-flight generation.
   const activeSessions = getActiveSessionsBlockingDaemonUpgrade();
-  if (activeSessions.length > 0) {
+  const deferralBackstop = evaluateUpgradeDeferralBackstop({
+    blocked: activeSessions.length > 0,
+    deferredSince: upgradeSessionBusyDeferredSince,
+    now: Date.now(),
+    maxDeferMs: MAX_UPGRADE_DEFER_MS,
+  });
+  upgradeSessionBusyDeferredSince = deferralBackstop.nextDeferredSince;
+  if (activeSessions.length > 0 && !deferralBackstop.proceed) {
     logger.warn({
       targetVersion,
       blockedSessions: activeSessions,
+      deferredMs: deferralBackstop.deferredMs,
+      maxDeferMs: MAX_UPGRADE_DEFER_MS,
     }, 'daemon.upgrade: blocked because sessions have active turns');
     try {
       serverLink?.send({
@@ -5702,6 +5925,18 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
       });
     } catch { /* ignore */ }
     return;
+  }
+  if (activeSessions.length > 0 && deferralBackstop.forced) {
+    // Deferred past MAX_UPGRADE_DEFER_MS — the blocking session(s) are almost
+    // certainly wedged. Proceed anyway rather than stay pinned on an old
+    // version forever; a transport SDK session resumes after restart and a
+    // wedged process turn was already lost.
+    logger.warn({
+      targetVersion,
+      blockedSessions: activeSessions,
+      deferredMs: deferralBackstop.deferredMs,
+      maxDeferMs: MAX_UPGRADE_DEFER_MS,
+    }, 'daemon.upgrade: forcing upgrade despite active sessions after prolonged deferral (sessions likely wedged)');
   }
 
   const { spawn } = await import('child_process');
@@ -5730,9 +5965,13 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
   // global install (npm install -g would replace the symlink/dir with the
   // older registry release even if we then refused to restart, so we have to
   // catch this BEFORE spawning the install).
+  // Resolve the registry ONCE here and reuse it for both the pre-flight probe
+  // and the install command baked into the upgrade script, so they never
+  // diverge (this is the fix for the prior hard-coded-official-registry probe).
+  const upgradeRegistry = await resolveUpgradeRegistry();
   if (!targetVersion || targetVersion === 'latest') {
     try {
-      const res = await fetch('https://registry.npmjs.org/imcodes/latest', {
+      const res = await fetch(`${upgradeRegistry.base}imcodes/latest`, {
         headers: { accept: 'application/json' },
         // 5 s — registry should be fast; if it's not we'd rather skip the
         // probe and fall through than block the daemon for long.
@@ -5751,6 +5990,50 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
       }
     } catch (e) {
       logger.warn({ err: e }, 'daemon.upgrade: registry probe failed, proceeding without pre-flight');
+    }
+  }
+
+  // ── Toolchain pre-flight (non-Windows; Windows has its own runner) ─────────
+  // Before spawning a detached upgrade script that would otherwise fail
+  // silently, verify the Node/npm toolchain is intact. The unambiguous, fatal
+  // case is a deleted node binary (e.g. `apt autoremove` pulled nodejs while
+  // the daemon ran on the now-deleted inode): restarting would `exec` a missing
+  // binary and kill the daemon permanently, and every `npm install` fails.
+  // Abort loudly and keep the current version running instead. A missing
+  // npm-cli.js alone is only a warning — the script has more discovery
+  // strategies (`npm prefix -g`, PATH) that this static check doesn't run.
+  if (process.platform !== 'win32') {
+    const { existsSync: _existsSync, realpathSync: _realpathSync } = await import('fs');
+    const { dirname: _dirname, join: _join } = await import('path');
+    const nodeBin = process.execPath;
+    const toolchain = checkUpgradeToolchain({
+      nodeBin,
+      nodeDir: _dirname(nodeBin),
+      join: _join,
+      exists: (p) => { try { return _existsSync(p); } catch { return false; } },
+      realpath: (p) => { try { return _realpathSync(p); } catch { return null; } },
+    });
+    if (!toolchain.nodeBinPresent) {
+      logger.error({
+        targetVersion,
+        nodeBin: toolchain.nodeBin,
+        npmCli: toolchain.npmCli,
+      }, 'daemon.upgrade: ABORTING — the Node binary no longer exists on disk (toolchain deleted, e.g. apt autoremove). Restarting would kill the daemon and npm is gone, so auto-upgrade is impossible until Node is reinstalled. Keeping the current version running.');
+      try {
+        serverLink?.send({
+          type: DAEMON_MSG.UPGRADE_BLOCKED,
+          reason: 'toolchain_unavailable',
+          nodeBinPresent: false,
+          npmAvailable: toolchain.npmCli !== null,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
+    if (toolchain.npmCli === null) {
+      logger.warn({
+        targetVersion,
+        nodeBin: toolchain.nodeBin,
+      }, 'daemon.upgrade: npm-cli.js not found next to the node binary; the upgrade script will fall back to `npm prefix -g` / PATH but the install may fail');
     }
   }
 
@@ -5871,10 +6154,15 @@ launchctl load -w "${plist}"`;
     // hidden + detached.  Bake all paths as args so the runner doesn't
     // depend on env-var expansion or working directory.
     const upgradeVbsPath = join(scriptDir, 'upgrade.vbs');
+    // Pass the resolved registry (sentinel '-' when official/default so we
+    // don't add a redundant --registry) and the current daemon version so the
+    // runner can apply a post-install downgrade guard for `latest` (Linux/macOS
+    // do this in-script; Windows had no such guard before).
+    const winRegistryArg = upgradeRegistry.explicit ? upgradeRegistry.base : '-';
     const upgradeVbs = buildWindowsUpgradeRunnerVbs({
       nodeExe: process.execPath,
       runnerPath: runnerCopy,
-      args: [logFile, npmCmd, pkgSpec, targetVer, scriptDir],
+      args: [logFile, npmCmd, pkgSpec, targetVer, scriptDir, winRegistryArg, DAEMON_VERSION],
     });
     writeFileSync(upgradeVbsPath, encodeVbsAsUtf16(upgradeVbs));
 
@@ -5956,6 +6244,11 @@ launchctl load -w "${plist}"`;
   // imcodes.service stays in the daemon's cgroup and pollutes systemctl status
   // until it exits.
   const CLEANUP_AFTER_SEC = 24 * 60 * 60;
+  // Pin the registry for both the visibility precheck and the install so they
+  // resolve from the same source as the pre-flight probe above. Empty when the
+  // resolved registry is the official default (preserves prior behavior exactly
+  // — no --registry flag, npm uses its ambient config).
+  const registryArg = upgradeRegistry.explicit ? `--registry ${upgradeRegistry.base}` : '';
   const script = `#!/bin/bash
 # imcodes daemon-upgrade script. Generated by daemon.upgrade.
 # Runs detached, outlives the parent daemon process.
@@ -5965,6 +6258,7 @@ launchctl load -w "${plist}"`;
 LOG="${logFile}"
 SCRIPT_DIR="${scriptDir}"
 CLEANUP_AFTER_SEC=${CLEANUP_AFTER_SEC}
+REGISTRY_ARG="${registryArg}"
 log() { echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] $*" >> "$LOG"; }
 
 schedule_self_cleanup() {
@@ -5996,6 +6290,7 @@ log "=== imcodes upgrade started ==="
 log "[step 0] daemon PID at gen time: ${oldDaemonPid}"
 log "[step 0] node bin: ${nodeBin}"
 log "[step 0] target: ${pkgSpec} (current daemon version: ${currentVer})"
+log "[step 0] registry: \${REGISTRY_ARG:-<npm default>}"
 
 # ── Single-flight guard ─────────────────────────────────────────────────
 #
@@ -6224,7 +6519,7 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
 
   if [ "${targetVer}" != "latest" ]; then
     log "[step 2] registry visibility precheck for ${pkgSpec}"
-    eval "$NPM_RUN view --prefer-online ${pkgSpec} version" >> "$INSTALL_OUT" 2>&1
+    eval "$NPM_RUN view --prefer-online \${REGISTRY_ARG} ${pkgSpec} version" >> "$INSTALL_OUT" 2>&1
     VIEW_RC=$?
     cat "$INSTALL_OUT" >> "$LOG"
     if [ "$VIEW_RC" -ne 0 ] && is_etarget_output "$INSTALL_OUT"; then
@@ -6249,7 +6544,7 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
   # rather than serve potentially-stale entries. Do NOT use \`npm cache
   # clean --force\` here: it wipes cached dependency tarballs too, which is
   # exactly what made upgrades on large SDK dependency sets feel glacial.
-  eval "$NPM_RUN install -g --ignore-scripts --prefer-online ${pkgSpec}" >> "$INSTALL_OUT" 2>&1
+  eval "$NPM_RUN install -g --ignore-scripts --prefer-online \${REGISTRY_ARG} ${pkgSpec}" >> "$INSTALL_OUT" 2>&1
   INSTALL_RC=$?
   # Always tee the attempt's output into the main log for forensics.
   cat "$INSTALL_OUT" >> "$LOG"
@@ -6643,6 +6938,23 @@ export function getActiveP2pRunsBlockingDaemonUpgrade(runs = listP2pRuns()) {
  *  restart` (which is exactly what the upgrade wants to do anyway). */
 const TRANSPORT_IN_PROGRESS_STATUSES: ReadonlySet<string> = new Set(['thinking', 'streaming']);
 
+/** A transport turn that reports in-progress (thinking/streaming) or
+ *  sending/pending but has produced NO provider activity (no delta /
+ *  completion / error / tool call / session-info / dispatch) for this long is
+ *  treated as a PHANTOM — the provider wedged mid-turn (classic symptom: a
+ *  lost `onComplete` leaves `_status='streaming'` and `_sending=true`
+ *  forever) — and must NOT block daemon upgrades. Observed in production: a
+ *  codex-sdk sub-session stuck in 'streaming' for 8+ hours blocked every
+ *  auto-upgrade, pinning the daemon on a stale version. A live turn refreshes
+ *  its activity timestamp on every delta, so a real generation never trips
+ *  this (the absolute deferral backstop in `handleDaemonUpgrade` is the final
+ *  safety net for everything this doesn't catch, e.g. wedged process agents).
+ *  Override for tests via IMCODES_TRANSPORT_STALE_TURN_MS. */
+const TRANSPORT_STALE_TURN_MS = (() => {
+  const raw = parseInt(process.env.IMCODES_TRANSPORT_STALE_TURN_MS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15 * 60 * 1000;
+})();
+
 /** Snapshot of why a transport session is currently blocking daemon upgrade.
  *  Embedded in the upgrade-blocked log so future "why didn't it upgrade"
  *  investigations can see the actual failing condition instead of guessing
@@ -6654,23 +6966,43 @@ export interface TransportUpgradeBlockReason {
   blockReason: 'status_thinking' | 'status_streaming' | 'sending' | 'pending';
 }
 
-export function getTransportSessionUpgradeBlockReason(sessionName: string): TransportUpgradeBlockReason | null {
+export function getTransportSessionUpgradeBlockReason(
+  sessionName: string,
+  opts?: { now?: number; staleTurnMs?: number },
+): TransportUpgradeBlockReason | null {
   const runtime = getTransportRuntime(sessionName);
   if (!runtime) return null;
   const status = runtime.getStatus();
   const sending = !!runtime.sending;
   const pendingCount = runtime.pendingCount ?? 0;
+  let blockReason: TransportUpgradeBlockReason['blockReason'] | null = null;
   if (TRANSPORT_IN_PROGRESS_STATUSES.has(status)) {
-    return {
-      status,
-      sending,
-      pendingCount,
-      blockReason: status === 'streaming' ? 'status_streaming' : 'status_thinking',
-    };
+    blockReason = status === 'streaming' ? 'status_streaming' : 'status_thinking';
+  } else if (sending) {
+    blockReason = 'sending';
+  } else if (pendingCount > 0) {
+    blockReason = 'pending';
   }
-  if (sending) return { status, sending, pendingCount, blockReason: 'sending' };
-  if (pendingCount > 0) return { status, sending, pendingCount, blockReason: 'pending' };
-  return null;
+  if (!blockReason) return null;
+
+  // Phantom-turn staleness guard. A runtime that reports in-progress but has
+  // gone silent past the threshold is wedged — do NOT let it block the
+  // upgrade indefinitely. `lastActivityAt` is absent on legacy/mock runtimes;
+  // when so, fall back to the original always-block behaviour (safe default).
+  const lastActivityAt = (runtime as { lastActivityAt?: number }).lastActivityAt;
+  if (typeof lastActivityAt === 'number' && Number.isFinite(lastActivityAt)) {
+    const now = opts?.now ?? Date.now();
+    const staleMs = opts?.staleTurnMs ?? TRANSPORT_STALE_TURN_MS;
+    const ageMs = now - lastActivityAt;
+    if (ageMs >= staleMs) {
+      logger.warn(
+        { sessionName, status, sending, pendingCount, blockReason, ageMs, staleMs },
+        'daemon.upgrade: transport turn is stale (no provider activity past threshold) — treating as phantom, NOT blocking upgrade',
+      );
+      return null;
+    }
+  }
+  return { status, sending, pendingCount, blockReason };
 }
 
 /** Process-agent session.state values that represent a genuine in-flight turn.
@@ -6700,11 +7032,14 @@ export interface SessionUpgradeBlockReason {
   transport: TransportUpgradeBlockReason | null;
 }
 
-export function getActiveSessionsBlockingDaemonUpgrade(sessions = listSessions()): SessionUpgradeBlockReason[] {
+export function getActiveSessionsBlockingDaemonUpgrade(
+  sessions = listSessions(),
+  opts?: { now?: number; staleTurnMs?: number },
+): SessionUpgradeBlockReason[] {
   const reasons: SessionUpgradeBlockReason[] = [];
   for (const session of sessions) {
     if (session.runtimeType === 'transport') {
-      const transport = getTransportSessionUpgradeBlockReason(session.name);
+      const transport = getTransportSessionUpgradeBlockReason(session.name, opts);
       if (transport) {
         reasons.push({
           name: session.name,

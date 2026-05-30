@@ -46,6 +46,9 @@
     "retry": "Retry"
   },
   "chat": {
+    "dpad": {
+      "title": "Arrow keys — drag to move"
+    },
     "sendFailedReason": {
       "daemonOffline": "Connection lost",
       "ackTimeout": "No response from agent",
@@ -183,7 +186,33 @@
     "file_change_no_after": "(no new text)",
     "file_change_derived_no_preview": "(no preview available)",
     "file_change_coarse_hint": "File path available, but no diff text was provided.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "font": {
+      "dialogLabel": "Font",
+      "typeLabel": "Font type",
+      "codeTab": "Code",
+      "cjkTab": "CJK",
+      "familyLabel": "Font family",
+      "cjkFamilyLabel": "CJK font",
+      "allBuiltInCjk": "All built-in CJK fonts",
+      "cjkFamilies": {
+        "system-cjk": "System CJK",
+        "pingfang-sc": "PingFang SC",
+        "songti-sc": "Songti SC",
+        "kaiti-sc": "Kaiti SC",
+        "stheiti": "STHeiti",
+        "stsong": "STSong",
+        "stkaiti": "STKaiti",
+        "stfangsong": "STFangsong",
+        "microsoft-yahei": "Microsoft YaHei",
+        "simsun": "SimSun",
+        "nsimsun": "NSimSun",
+        "dengxian": "DengXian",
+        "kaiti": "KaiTi",
+        "fangsong": "FangSong",
+        "microsoft-jhenghei": "Microsoft JhengHei"
+      }
+    }
   },
   "session": {
     "restart": "↺ Restart",
@@ -369,6 +398,9 @@
     "codex_limit_title": "{{label}} left {{percent}}% · resets {{reset}}",
     "provider_plan_title": "Plan: {{value}}",
     "provider_quota_title": "Quota: {{value}}",
+    "weekly_quota_authorize": "Show weekly limit",
+    "weekly_quota_authorize_hint": "Authorize reading your local Claude token to show the weekly (7-day) limit",
+    "weekly_quota_confirm": "This reads your local Claude login token to fetch the weekly (7-day) limit. Authorize?",
     "provider_quota_usage_title": "Quota usage: {{value}}",
     "history_loading_label": "History",
     "history_step_cache": "cache",
@@ -540,7 +572,8 @@
     "finished": "finished",
     "upgrade_blocked_title": "Upgrade blocked",
     "upgrade_blocked_p2p_active": "Team is still running. Stop it before upgrading the daemon.",
-    "upgrade_blocked_transport_busy": "A transport session is still in a turn. Wait until it goes idle before upgrading the daemon."
+    "upgrade_blocked_transport_busy": "A transport session is still in a turn. Wait until it goes idle before upgrading the daemon.",
+    "upgrade_blocked_toolchain_unavailable": "Node is missing on the daemon host (toolchain removed). Reinstall Node — auto-upgrade is disabled until then."
   },
   "discussion": {
     "role_critic": "Critic",
@@ -548,7 +581,25 @@
     "role_innovator": "Innovator",
     "role_custom": "Custom...",
     "arbiter": "Arbiter",
-    "arbiter_active": "⚖️ Arbiter"
+    "arbiter_active": "⚖️ Arbiter",
+    "starting": "Starting…",
+    "start_failed_title": "Couldn't start discussion",
+    "start_failed_offline": "You're offline — reconnect and try again.",
+    "dialog_title": "Start Discussion",
+    "start_button": "Start Discussion",
+    "field_topic": "Topic",
+    "topic_placeholder": "Describe what you want the agents to discuss…",
+    "field_cwd": "Working Directory",
+    "field_participants": "Participants",
+    "add_participant": "+ Add",
+    "field_max_rounds": "Max Rounds",
+    "team_label": "Team",
+    "complete_status": "Complete",
+    "failed_status": "Failed",
+    "error": {
+      "missing_fields": "Missing required fields (topic and at least two participants).",
+      "generic": "Failed to start the discussion. Please try again."
+    }
   },
   "new_session": {
     "project_required": "Project name is required",
@@ -1234,7 +1285,9 @@
     "empty": "Enter a localhost port and path, then open the preview.",
     "noServer": "Select a server first.",
     "previewing": "Previewing:",
-    "initialPathNote": "Path sets only the initial page. After load, navigation is scoped by port, not by this path."
+    "initialPathNote": "Path sets only the initial page. After load, navigation is scoped by port, not by this path.",
+    "portHistoryLabel": "Recent ports",
+    "pathHistoryLabel": "Recent paths"
   },
   "cron": {
     "title": "Scheduled Tasks",

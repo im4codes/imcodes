@@ -13,6 +13,7 @@ import { TRANSPORT_EVENT } from '@shared/transport-events.js';
 import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
+import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
 import {
   SESSION_GROUP_CLONE_MSG,
   type SessionGroupCloneCancelRequest,
@@ -125,6 +126,7 @@ export type ServerMessage =
   | { type: typeof DAEMON_MSG.DISCONNECTED }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'p2p_active'; activeRunIds?: string[] }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'transport_busy'; activeSessionNames?: string[]; blockedSessions?: TransportUpgradeBlockedSession[] }
+  | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'toolchain_unavailable'; nodeBinPresent?: boolean; npmAvailable?: boolean }
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
   | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; userCreated?: boolean; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
@@ -142,10 +144,10 @@ export type ServerMessage =
   | { type: 'subsession.shells'; shells: string[] }
   | { type: 'subsession.response'; sessionName: string; status: 'working' | 'idle'; response?: string }
   | { type: 'discussion.started'; requestId?: string; discussionId: string; topic: string; maxRounds: number; totalHops?: number; filePath: string; participants: Array<{ sessionName: string; roleLabel: string; agentType: string; model?: string }> }
-  | { type: 'discussion.update'; discussionId: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; lastResponse?: string }
+  | { type: 'discussion.update'; requestId?: string; discussionId: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string | null; filePath?: string; lastResponse?: string }
   | { type: 'discussion.done'; discussionId: string; filePath: string; conclusion: string }
   | { type: 'discussion.error'; discussionId?: string; requestId?: string; error: string }
-  | { type: 'discussion.list'; discussions: Array<{ id: string; topic: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
+  | { type: 'discussion.list'; discussions: Array<{ id: string; requestId?: string; topic: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
   | { type: 'daemon.stats'; daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number }
   | FsLsResponse
   | FsReadResponse
@@ -851,6 +853,13 @@ export class WsClient {
     this.send({ type: 'get_sessions' });
   }
 
+  /** Authorize (or revoke) the daemon reading the local Claude token for the
+   *  weekly (7d) quota. Driven by the per-user `claude_weekly_quota` pref; sent
+   *  on every (re)connect and on toggle so each server the user visits honors it. */
+  setClaudeWeeklyQuotaOptIn(enabled: boolean): void {
+    this.send({ type: CLAUDE_QUOTA_MSG.SET_OPT_IN, enabled });
+  }
+
   async cloneSessionGroup(payload: Omit<SessionGroupCloneRequest, 'type'>): Promise<void> {
     if (payload.serverId && payload.sourceMainSessionName) {
       await apiFetch(`/api/server/${encodeURIComponent(payload.serverId)}/sessions/${encodeURIComponent(payload.sourceMainSessionName)}/group-clone`, {
@@ -923,9 +932,14 @@ export class WsClient {
     }>,
     maxRounds?: number,
     verdictIdx?: number,
-  ): void {
-    const requestId = crypto.randomUUID();
-    this.send({ type: 'discussion.start', requestId, topic, cwd, participants, maxRounds, verdictIdx });
+    requestId?: string,
+  ): string {
+    // The caller (App) mints the requestId so it can insert the optimistic
+    // pending entry BEFORE this send (which throws synchronously when the
+    // socket is not open). Falls back to a generated id for legacy callers.
+    const id = requestId ?? crypto.randomUUID();
+    this.send({ type: 'discussion.start', requestId: id, topic, cwd, participants, maxRounds, verdictIdx });
+    return id;
   }
 
   discussionStatus(discussionId: string): void {
@@ -938,11 +952,11 @@ export class WsClient {
   }
 
   /**
-   * @deprecated Use {@link p2pListDiscussions} instead. The legacy
-   * `discussion.list` daemon command predates the project-scoped p2p workflow
-   * messages and is not enforced by the daemon's scope guards. All app
-   * call sites were migrated to `p2pListDiscussions(scope)`. Kept on the
-   * client only until the daemon-side `discussion.list` route is retired.
+   * Request the daemon's current in-memory classic discussions. Used to
+   * reconcile the discussion bar on connect / reconnect / foreground-resume so
+   * a run that finished while the app was backgrounded is removed without a
+   * full page reload. Travels over the daemon WS (inherently pod-sticky), so
+   * it carries no separate `serverId` routing.
    */
   discussionList(): void {
     this.send({ type: 'discussion.list' });

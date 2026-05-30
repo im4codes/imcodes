@@ -6,18 +6,31 @@
  * Requires tmux (>= 2.6 for pipe-pane -O). Skip with SKIP_TMUX_TESTS=1.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import os from 'os';
+import { readdirSync } from 'fs';
 import {
   newSession,
   killSession,
   sendKeys,
   getPaneId,
   capturePaneVisible,
+  paneExists,
   startPipePaneStream,
   stopPipePaneStream,
   checkPipePaneCapability,
   sessionExists,
 } from '../../src/agent/tmux.js';
 import { RawStreamParser, resetParser } from '../../src/daemon/terminal-parser.js';
+
+/** Names of FIFO temp dirs this daemon process created (imcodes-pty-<pid>-*). */
+function ourFifoDirs(): string[] {
+  const prefix = `imcodes-pty-${process.pid}-`;
+  try {
+    return readdirSync(os.tmpdir()).filter((n) => n.startsWith(prefix));
+  } catch {
+    return [];
+  }
+}
 
 const SKIP = process.env.SKIP_TMUX_TESTS === '1';
 const RUN_ID = Math.random().toString(36).slice(2, 8);
@@ -117,6 +130,50 @@ describe.skipIf(SKIP)('pipe-pane stream e2e (task 8.5)', () => {
   it('tmux >= 2.6 supports pipe-pane -O', async () => {
     const capable = await checkPipePaneCapability();
     expect(capable).toBe(true);
+  });
+
+  // ── paneExists: validate a concrete paneId against live tmux ────────────────
+
+  it('paneExists reflects whether a concrete paneId is live', async () => {
+    const realPaneId = await getPaneId(SESSION_A);
+    expect(await paneExists(realPaneId)).toBe(true);
+    // A pane id that was never allocated, and the empty string, are both dead.
+    expect(await paneExists('%999999')).toBe(false);
+    expect(await paneExists('')).toBe(false);
+  });
+
+  // ── Hard guard: never spawn a reader for a pane that no longer exists ────────
+  //
+  // Reproduces the migrated-box brick: sessions.json carries a paneId that is
+  // valid on the OLD host but dead here. startPipePaneStream must reject FAST —
+  // before creating the FIFO + `cat` reader — so no reader is ever left blocked
+  // (D-state) to survive and brick the daemon's own restart.
+
+  it('rejects a stale/dead paneId without leaking a FIFO reader', async () => {
+    const before = new Set(ourFifoDirs());
+
+    await expect(startPipePaneStream(SESSION_A, '%999999')).rejects.toThrow(/does not exist/);
+
+    // No new imcodes-pty FIFO dir was left behind (no orphaned reader).
+    const leaked = ourFifoDirs().filter((d) => !before.has(d));
+    expect(leaked).toEqual([]);
+  });
+
+  it('rejects piping into a session whose pane was killed (no leak)', async () => {
+    // Capture a real pane, then kill the session so the pane is gone — exactly
+    // the cold-start/migration shape where the recorded paneId is now stale.
+    const deadPaneId = await getPaneId(SESSION_A);
+    await killAndWaitSession(SESSION_A);
+    const before = new Set(ourFifoDirs());
+
+    await expect(startPipePaneStream(SESSION_A, deadPaneId)).rejects.toThrow();
+
+    const leaked = ourFifoDirs().filter((d) => !before.has(d));
+    expect(leaked).toEqual([]);
+
+    // Recreate so afterEach teardown is consistent.
+    await retry(() => newSession(SESSION_A, 'bash', { cwd: '/tmp' }));
+    await new Promise((r) => setTimeout(r, 300));
   });
 
   // ── Task 8.5 check 1: terminal live output ──────────────────────────────────

@@ -85,7 +85,8 @@ import {
   type PreviewWsErrorMessage,
   type PreviewWsOpenedMessage,
 } from '../../../shared/preview-types.js';
-import { LocalWebPreviewRegistry } from '../preview/registry.js';
+import { isStreamingResponse } from '../../../shared/preview-stream-policy.js';
+import { LocalWebPreviewRegistry, setPreviewActiveRelayHook, setPreviewEvictedHook } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer } from '../db/queries.js';
 import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
@@ -294,11 +295,37 @@ interface DaemonP2pWorkflowCapabilities {
 }
 
 type PendingPreviewRequest = {
+  /**
+   * Owning preview. Added (run 8a975732-23a P0.4.4) so the in-flight HTTP
+   * concurrency floor can attribute per-preview counts and so cleanup×relay
+   * (P1.4) can map a request to its preview. A pending request IS an in-flight
+   * slot: it is created when the proxy decides to forward upstream and removed
+   * on any terminal (complete/fail/abort/rejectAllPending).
+   */
+  previewId: string;
   readable: ReadableStream<Uint8Array>;
   controller: ReadableStreamDefaultController<Uint8Array> | null;
   started: boolean;
   terminalOutcome: string | null;
   responseBytes: number;
+  /**
+   * Decided ONCE at RESPONSE_START via the shared `isStreamingResponse`
+   * predicate (run 8a975732-23a P1.1/P1.2). A streaming response is EXEMPT from
+   * the cumulative `MAX_RESPONSE_BYTES` cap and instead bounded by the
+   * unconsumed-buffer high-watermark below.
+   */
+  streaming: boolean;
+  /**
+   * Unconsumed (enqueued-but-not-yet-read) bytes sitting in the ReadableStream's
+   * internal queue, tracked explicitly in BYTES (run 8a975732-23a P1.2 — MUST
+   * NOT use `controller.desiredSize` as a byte measure). Incremented on enqueue,
+   * decremented in the stream's `pull` (one chunk per consumed read). When it
+   * exceeds `MAX_PREVIEW_STREAM_BUFFER_BYTES` the stream is deterministically
+   * closed.
+   */
+  unconsumedBytes: number;
+  /** FIFO of enqueued chunk byte-sizes, so `pull` can decrement `unconsumedBytes` exactly. */
+  chunkSizes: number[];
   timer: ReturnType<typeof setTimeout>;
   timerMode: 'start' | 'idle';
   resolveStart: (payload: PreviewStartPayload) => void;
@@ -992,6 +1019,22 @@ export class WsBridge {
   private previewWsTunnels = new Map<string, WsTunnelState>();
 
   /**
+   * Deferred preview WS upgrades awaiting the upstream subprotocol (run
+   * 8a975732-23a P1.5.1). The HTTP upgrade handshake is held open until the
+   * daemon reports the upstream-negotiated subprotocol via `WS_OPENED.protocol`,
+   * so the proxy can echo it in the `Sec-WebSocket-Protocol` handshake response
+   * and the browser's `WebSocket.protocol` reads the correct value end-to-end.
+   * On `WS_OPENED` we call `completeUpgrade(protocol)` to finish the handshake.
+   */
+  private pendingPreviewWsUpgrades = new Map<string, {
+    previewId: string;
+    /** Completes the held-open handshake selecting `protocol`; resolves the upgraded browser socket, null on failure. */
+    completeUpgrade: (protocol: string | undefined) => Promise<WebSocket | null>;
+    /** Open timeout guarding against a daemon that never replies WS_OPENED/WS_ERROR. */
+    openTimer: ReturnType<typeof setTimeout>;
+  }>();
+
+  /**
    * Per-session subscription reference counts derived from browser sockets.
    * totalRefs tracks active browser subscribers; rawRefs tracks raw-enabled subscribers.
    */
@@ -1033,6 +1076,18 @@ export class WsBridge {
       // Don't keep the process alive just for cleanup
       cleanupSweepHandle.unref?.();
     }
+    // Tell the registry which previews still have a live relay so its idle
+    // cleanup skips them (run 8a975732-23a P1.4). Installed once; routes to the
+    // owning bridge instance by serverId. Idempotent re-install is harmless.
+    setPreviewActiveRelayHook((serverId, previewId) =>
+      WsBridge.instances.get(serverId)?.hasActivePreviewRelay(previewId) ?? false,
+    );
+    // When the registry evicts a preview (idle or hard-lifetime), tear down any
+    // relay that survived the race — abort pending HTTP relays + close WS
+    // tunnels deterministically (P1.4.2). Routes to the owning bridge instance.
+    setPreviewEvictedHook((serverId, previewId) =>
+      WsBridge.instances.get(serverId)?.terminatePreviewRelaysForPreview(previewId),
+    );
   }
 
   static get(serverId: string): WsBridge {
@@ -4679,7 +4734,25 @@ export class WsBridge {
     return backfill;
   }
 
-  createPreviewRelay(requestId: string, timeoutMs = PREVIEW_LIMITS.RESPONSE_START_TIMEOUT_MS): {
+  /**
+   * Register an in-flight preview HTTP relay and forward the response back as a
+   * ReadableStream. The pending entry IS the in-flight slot (run 8a975732-23a
+   * P0.4): callers MUST check `tryReservePreviewInflight(previewId)` BEFORE
+   * calling this (the proxy "decides to forward upstream" only after passing the
+   * concurrency floor). The slot is released on any terminal
+   * (complete/fail/abort/rejectAllPending) — all of which delete the pending
+   * entry.
+   *
+   * The stream uses an explicit unconsumed-byte counter (NOT desiredSize) so a
+   * streaming response with a slow consumer is deterministically closed once the
+   * server-side unconsumed buffer exceeds `MAX_PREVIEW_STREAM_BUFFER_BYTES`
+   * (P1.2). `previewId` lets cleanup×relay (P1.4) treat live relays as non-idle.
+   */
+  createPreviewRelay(
+    requestId: string,
+    previewId: string,
+    timeoutMs = PREVIEW_LIMITS.RESPONSE_START_TIMEOUT_MS,
+  ): {
     start: Promise<PreviewStartPayload & { body: ReadableStream<Uint8Array> }>;
     abort: (reason?: string) => void;
   } {
@@ -4694,6 +4767,19 @@ export class WsBridge {
     const readable = new ReadableStream<Uint8Array>({
       start: (controller) => {
         controllerRef = controller;
+      },
+      pull: () => {
+        // A read drained one chunk from the internal queue — decrement the
+        // explicit unconsumed-byte counter by exactly that chunk's size (FIFO).
+        // Precise accounting: enqueue (pushPreviewResponseChunk) increments and
+        // pushes the size; pull consumes one. `pull` is invoked by the stream
+        // once per chunk pulled out as the consumer reads.
+        const active = this.pendingPreviewRequests.get(requestId);
+        if (!active) return;
+        const consumed = active.chunkSizes.shift();
+        if (consumed !== undefined) {
+          active.unconsumedBytes = Math.max(0, active.unconsumedBytes - consumed);
+        }
       },
       cancel: () => {
         this.abortPreviewRequest(requestId, PREVIEW_ERROR.ABORTED, true);
@@ -4717,11 +4803,15 @@ export class WsBridge {
     }, timeoutMs);
 
     this.pendingPreviewRequests.set(requestId, {
+      previewId,
       readable,
       controller: controllerRef,
       started: false,
       terminalOutcome: null,
       responseBytes: 0,
+      streaming: false,
+      unconsumedBytes: 0,
+      chunkSizes: [],
       timer,
       timerMode: 'start',
       resolveStart: (payload) => resolveStart({ ...payload, body: readable }),
@@ -4732,6 +4822,39 @@ export class WsBridge {
       start,
       abort: (reason) => this.abortPreviewRequest(requestId, reason ?? PREVIEW_ERROR.ABORTED, true),
     };
+  }
+
+  /**
+   * In-flight HTTP concurrency floor (run 8a975732-23a P0.4). Returns true if a
+   * new request for `previewId` is allowed to be forwarded upstream (both the
+   * per-preview and per-server in-flight ceilings have headroom). Pure read — it
+   * does NOT reserve; the reservation happens implicitly when `createPreviewRelay`
+   * adds the pending entry. Callers reject with
+   * `PREVIEW_INFLIGHT_REJECT_HTTP_STATUS` (503) + `PREVIEW_ERROR.INFLIGHT_LIMIT`
+   * when this returns false. WS tunnels are NOT counted here.
+   */
+  canAcceptPreviewInflight(previewId: string): boolean {
+    if (this.pendingPreviewRequests.size >= PREVIEW_LIMITS.MAX_INFLIGHT_PREVIEW_HTTP_PER_SERVER) return false;
+    let perPreview = 0;
+    for (const pending of this.pendingPreviewRequests.values()) {
+      if (pending.previewId === previewId) perPreview += 1;
+    }
+    return perPreview < PREVIEW_LIMITS.MAX_INFLIGHT_PREVIEW_HTTP_PER_PREVIEW;
+  }
+
+  /**
+   * Whether `previewId` currently has any live relay — an in-flight HTTP request
+   * OR an active/pending WS tunnel. Used by registry cleanup to skip live
+   * previews (run 8a975732-23a P1.4.1).
+   */
+  hasActivePreviewRelay(previewId: string): boolean {
+    for (const pending of this.pendingPreviewRequests.values()) {
+      if (pending.previewId === previewId && !pending.terminalOutcome) return true;
+    }
+    for (const tunnel of this.previewWsTunnels.values()) {
+      if (tunnel.previewId === previewId) return true;
+    }
+    return false;
   }
 
   sendPreviewControl(message: Record<string, unknown>): void {
@@ -4890,6 +5013,12 @@ export class WsBridge {
     if (!pending || pending.terminalOutcome) return;
     if (pending.started) return;
     pending.started = true;
+    // Classify ONCE at RESPONSE_START via the SAME shared predicate the daemon
+    // uses (run 8a975732-23a P1.1) so the two sides can never disagree (no
+    // one-side-exempt/one-side-abort half-truncation). Streaming → exempt from
+    // the cumulative MAX_RESPONSE_BYTES cap; bounded instead by stream-idle +
+    // the unconsumed-buffer high-watermark.
+    pending.streaming = isStreamingResponse(msg.headers);
     this.resetPreviewTimeout(msg.requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
     pending.resolveStart({
       status: msg.status,
@@ -4913,7 +5042,9 @@ export class WsBridge {
     }
 
     pending.responseBytes += chunk.length;
-    if (pending.responseBytes > PREVIEW_LIMITS.MAX_RESPONSE_BYTES) {
+    // Non-streaming responses keep the cumulative byte-cap protection. Streaming
+    // responses (SSE / ndjson / chunked non-JSON) are EXEMPT (P1.2.1).
+    if (!pending.streaming && pending.responseBytes > PREVIEW_LIMITS.MAX_RESPONSE_BYTES) {
       this.failPreviewRequest({
         type: PREVIEW_MSG.ERROR,
         requestId,
@@ -4925,7 +5056,29 @@ export class WsBridge {
       return;
     }
 
+    // Unconsumed-buffer high-watermark (P1.2.2). Measured in BYTES via an
+    // explicit counter — NOT controller.desiredSize. A slow consumer + fast
+    // stream that lets unconsumed bytes exceed MAX_PREVIEW_STREAM_BUFFER_BYTES
+    // is deterministically closed (emit terminal, not silent).
+    pending.unconsumedBytes += chunk.length;
+    pending.chunkSizes.push(chunk.length);
+    if (pending.unconsumedBytes > PREVIEW_LIMITS.MAX_PREVIEW_STREAM_BUFFER_BYTES) {
+      this.failPreviewRequest({
+        type: PREVIEW_MSG.ERROR,
+        requestId,
+        code: PREVIEW_ERROR.LIMIT_EXCEEDED,
+        message: 'preview stream unconsumed buffer exceeded high-watermark',
+        terminalOutcome: PREVIEW_TERMINAL_OUTCOME.LIMIT_EXCEEDED,
+      });
+      this.sendPreviewControl({ type: PREVIEW_MSG.ABORT, requestId, reason: PREVIEW_ERROR.LIMIT_EXCEEDED });
+      return;
+    }
+
     this.resetPreviewTimeout(requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
+    // Slide the preview TTL while a stream is actively delivering data, so a
+    // long-lived SSE (> preview_session_idle) is not idle-evicted (P1.3.2).
+    // touch() is clamped by the absolute lifetime hard ceiling.
+    LocalWebPreviewRegistry.get(this.serverId).touch(pending.previewId);
     pending.controller.enqueue(chunk);
   }
 
@@ -4996,7 +5149,71 @@ export class WsBridge {
     }
   }
 
+  /**
+   * Tear down every relay belonging to `previewId` (run 8a975732-23a P1.4.2).
+   * Called when the registry evicts the preview (idle/hard-lifetime) so the
+   * client always sees a deterministic terminal: pending HTTP relays are aborted
+   * (and the abort is propagated to the daemon so the upstream fetch stops), and
+   * all WS tunnels for the preview are closed (NON-silent). MUST NOT leave a
+   * half-dead SSE or silently 404 a freshly-requested sub-resource.
+   */
+  terminatePreviewRelaysForPreview(previewId: string): void {
+    for (const [requestId, pending] of [...this.pendingPreviewRequests]) {
+      if (pending.previewId !== previewId) continue;
+      this.abortPreviewRequest(requestId, PREVIEW_ERROR.PREVIEW_EXPIRED, true);
+    }
+    this.closeAllPreviewWsForPreview(previewId);
+  }
+
   // ── Preview WS Tunnel ──────────────────────────────────────────────────────
+
+  /**
+   * Begin a preview WS tunnel with a DEFERRED browser handshake (run
+   * 8a975732-23a P1.5.1). Sends `preview.ws.open` to the daemon and holds the
+   * browser HTTP upgrade open until the daemon reports the upstream-negotiated
+   * subprotocol via `WS_OPENED.protocol`. Only then do we complete the handshake
+   * (echoing that protocol) and promote to an active tunnel — so the browser's
+   * `WebSocket.protocol` matches the upstream end-to-end. On WS_ERROR / open
+   * timeout the handshake is failed without ever upgrading.
+   *
+   * `completeUpgrade(protocol)` MUST perform `wss.handleUpgrade(...)` selecting
+   * `protocol` and resolve the upgraded `WebSocket` (or null on failure).
+   */
+  beginPreviewWsTunnel(args: {
+    wsId: string;
+    previewId: string;
+    port: number;
+    path: string;
+    headers: Record<string, string>;
+    protocols: string[];
+    completeUpgrade: (protocol: string | undefined) => Promise<WebSocket | null>;
+  }): void {
+    const { wsId, previewId, port, path, headers, protocols, completeUpgrade } = args;
+    const openTimer = setTimeout(() => {
+      const pending = this.pendingPreviewWsUpgrades.get(wsId);
+      if (!pending) return;
+      this.pendingPreviewWsUpgrades.delete(wsId);
+      logger.warn({ serverId: this.serverId, wsId, previewId }, 'Preview WS tunnel open timeout (deferred upgrade)');
+      // Fail the handshake without upgrading. completeUpgrade(undefined) is the
+      // caller's signal to reject the socket (it returns null and destroys it).
+      void pending.completeUpgrade(undefined).catch(() => null);
+      this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1001, reason: 'open timeout' });
+      this.maybeCleanup();
+    }, PREVIEW_LIMITS.WS_OPEN_TIMEOUT_MS);
+    openTimer.unref?.();
+
+    this.pendingPreviewWsUpgrades.set(wsId, { previewId, completeUpgrade, openTimer });
+
+    this.sendPreviewControl({
+      type: PREVIEW_MSG.WS_OPEN,
+      wsId,
+      previewId,
+      port,
+      path,
+      headers,
+      protocols,
+    });
+  }
 
   /**
    * Create a new WS tunnel in pending state.
@@ -5057,10 +5274,70 @@ export class WsBridge {
   }
 
   /**
+   * Adopt an already-upgraded browser socket into an ACTIVE tunnel (run
+   * 8a975732-23a P1.5.1, deferred-upgrade path). The handshake has already been
+   * completed by the caller with the upstream-negotiated `protocol`, and the
+   * daemon's upstream WS is already open, so there is no pending state and no
+   * message queue to flush — we start the idle timer and relay immediately.
+   */
+  private adoptActivePreviewWsTunnel(
+    wsId: string,
+    previewId: string,
+    browserWs: WebSocket,
+    protocol: string | undefined,
+  ): void {
+    const tunnel: WsTunnelState = {
+      browserWs,
+      previewId,
+      idleTimer: null,
+      openTimer: null,
+      state: 'active',
+      messageQueue: [],
+      queueBytes: 0,
+      createdAt: Date.now(),
+    };
+    this.previewWsTunnels.set(wsId, tunnel);
+
+    browserWs.on('message', (data: Buffer | string, isBinary: boolean) => {
+      this.handleBrowserWsTunnelMessage(wsId, data, isBinary);
+    });
+    browserWs.on('close', (code: number, reason: Buffer) => {
+      this.handleBrowserWsTunnelClose(wsId, code, reason.toString());
+    });
+    browserWs.on('error', () => {
+      this.handleBrowserWsTunnelClose(wsId, 1011, 'error');
+    });
+
+    this.resetWsTunnelIdleTimer(wsId);
+    logger.info({ serverId: this.serverId, wsId, previewId, protocol }, 'Preview WS tunnel active (deferred upgrade)');
+  }
+
+  /**
    * Called when daemon sends preview.ws.opened.
    * Transitions tunnel to active state, flushes queued messages.
    */
   private resolvePreviewWsOpened(msg: PreviewWsOpenedMessage): void {
+    // Deferred-upgrade path (P1.5.1): complete the held-open browser handshake
+    // echoing the upstream-negotiated subprotocol, then promote to an active
+    // tunnel. The browser's WebSocket.protocol now matches the upstream.
+    const deferred = this.pendingPreviewWsUpgrades.get(msg.wsId);
+    if (deferred) {
+      this.pendingPreviewWsUpgrades.delete(msg.wsId);
+      clearTimeout(deferred.openTimer);
+      void deferred.completeUpgrade(msg.protocol).then((browserWs) => {
+        if (!browserWs) {
+          // Handshake failed after WS_OPENED — tell daemon to close upstream.
+          this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId: msg.wsId, code: 1011, reason: 'handshake failed' });
+          return;
+        }
+        this.adoptActivePreviewWsTunnel(msg.wsId, deferred.previewId, browserWs, msg.protocol);
+      }).catch((err) => {
+        logger.warn({ serverId: this.serverId, wsId: msg.wsId, err }, 'Preview WS deferred upgrade failed');
+        this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId: msg.wsId, code: 1011, reason: 'handshake failed' });
+      });
+      return;
+    }
+
     const tunnel = this.previewWsTunnels.get(msg.wsId);
     if (!tunnel) return;
 
@@ -5098,6 +5375,17 @@ export class WsBridge {
    * Closes browser WS with 1011 and cleans up.
    */
   private handlePreviewWsError(msg: PreviewWsErrorMessage): void {
+    // Deferred-upgrade path: daemon rejected the upstream upgrade before
+    // WS_OPENED. Fail the held-open browser handshake without upgrading.
+    const deferred = this.pendingPreviewWsUpgrades.get(msg.wsId);
+    if (deferred) {
+      this.pendingPreviewWsUpgrades.delete(msg.wsId);
+      clearTimeout(deferred.openTimer);
+      logger.warn({ serverId: this.serverId, wsId: msg.wsId, error: msg.error }, 'Preview WS upstream error before upgrade');
+      void deferred.completeUpgrade(undefined).catch(() => null);
+      this.maybeCleanup();
+      return;
+    }
     const tunnel = this.previewWsTunnels.get(msg.wsId);
     if (!tunnel) return;
     logger.warn({ serverId: this.serverId, wsId: msg.wsId, error: msg.error }, 'Preview WS tunnel error from daemon');
@@ -5110,6 +5398,15 @@ export class WsBridge {
    * Forwards close frame to browser WS and cleans up.
    */
   private handlePreviewWsClose(msg: PreviewWsCloseMessage): void {
+    // Deferred-upgrade path: daemon closed the upstream before WS_OPENED.
+    const deferred = this.pendingPreviewWsUpgrades.get(msg.wsId);
+    if (deferred) {
+      this.pendingPreviewWsUpgrades.delete(msg.wsId);
+      clearTimeout(deferred.openTimer);
+      void deferred.completeUpgrade(undefined).catch(() => null);
+      this.maybeCleanup();
+      return;
+    }
     const tunnel = this.previewWsTunnels.get(msg.wsId);
     if (!tunnel) return;
     try { tunnel.browserWs.close(msg.code, msg.reason); } catch { /* ignore */ }
@@ -5216,6 +5513,14 @@ export class WsBridge {
       this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1001, reason: 'preview closed' });
       this.cleanupTunnel(wsId);
     }
+    // Also fail any deferred upgrades still awaiting WS_OPENED for this preview.
+    for (const [wsId, pending] of [...this.pendingPreviewWsUpgrades]) {
+      if (pending.previewId !== previewId) continue;
+      this.pendingPreviewWsUpgrades.delete(wsId);
+      clearTimeout(pending.openTimer);
+      void pending.completeUpgrade(undefined).catch(() => null);
+      this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1001, reason: 'preview closed' });
+    }
   }
 
   /**
@@ -5225,6 +5530,12 @@ export class WsBridge {
     for (const [wsId, tunnel] of this.previewWsTunnels) {
       try { tunnel.browserWs.close(code, reason); } catch { /* ignore */ }
       this.cleanupTunnel(wsId);
+    }
+    // Fail any deferred upgrades — the daemon is gone, so the upstream can never open.
+    for (const [wsId, pending] of [...this.pendingPreviewWsUpgrades]) {
+      this.pendingPreviewWsUpgrades.delete(wsId);
+      clearTimeout(pending.openTimer);
+      void pending.completeUpgrade(undefined).catch(() => null);
     }
   }
 
@@ -5271,18 +5582,25 @@ export class WsBridge {
     }
   }
 
-  /** Count WS tunnels for a given previewId. Used by route to enforce per-preview limit. */
+  /**
+   * Count WS tunnels for a given previewId (active + deferred-upgrade pending).
+   * Used by the upgrade handler to enforce `MAX_WS_PER_PREVIEW`; pending upgrades
+   * are counted so a flood of simultaneous handshakes can't bypass the ceiling.
+   */
   getPreviewWsCount(previewId: string): number {
     let count = 0;
     for (const tunnel of this.previewWsTunnels.values()) {
       if (tunnel.previewId === previewId) count++;
     }
+    for (const pending of this.pendingPreviewWsUpgrades.values()) {
+      if (pending.previewId === previewId) count++;
+    }
     return count;
   }
 
-  /** Total WS tunnel count across all previews. Used by route to enforce per-server limit. */
+  /** Total WS tunnel count across all previews (active + deferred-upgrade pending). */
   getServerWsCount(): number {
-    return this.previewWsTunnels.size;
+    return this.previewWsTunnels.size + this.pendingPreviewWsUpgrades.size;
   }
 
   // ── Push notifications ──────────────────────────────────────────────────────
@@ -5449,7 +5767,12 @@ export class WsBridge {
   }
 
   private maybeCleanup(): void {
-    if (!this.daemonWs && this.browserSockets.size === 0 && this.previewWsTunnels.size === 0) {
+    if (
+      !this.daemonWs
+      && this.browserSockets.size === 0
+      && this.previewWsTunnels.size === 0
+      && this.pendingPreviewWsUpgrades.size === 0
+    ) {
       this.browserRateLimiter.stop();
       WsBridge.instances.delete(this.serverId);
     }

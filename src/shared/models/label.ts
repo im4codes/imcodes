@@ -3,9 +3,21 @@ export function shortModelLabel(model?: string | null): string | null {
   if (!m) return null;
   const lower = m.toLowerCase();
 
-  if (lower.includes('opus')) return 'opus';
-  if (lower.includes('sonnet')) return 'sonnet';
-  if (lower.includes('haiku')) return 'haiku';
+  const claudeFamily =
+    lower.includes('opus') ? 'opus'
+    : lower.includes('sonnet') ? 'sonnet'
+    : lower.includes('haiku') ? 'haiku'
+    : null;
+  if (claudeFamily) {
+    // Surface the version: new-style `claude-opus-4-8` (digits AFTER the
+    // family) or old-style `claude-3-5-sonnet` (digits BEFORE the family).
+    // Capture at most major[-minor] so trailing date suffixes like
+    // `-20260514` are not swallowed. `-`/`_` separators render as `.`.
+    const before = lower.match(new RegExp(`(\\d+(?:[-.]\\d+)?)[-_]${claudeFamily}`));
+    const after = lower.match(new RegExp(`${claudeFamily}[-_]?(\\d+(?:[-.]\\d+)?)`));
+    const ver = before?.[1] ?? after?.[1] ?? null;
+    return ver ? `${claudeFamily}-${ver.replace(/[-_]/g, '.')}` : claudeFamily;
+  }
   if (lower.includes('flash')) return 'flash';
 
   if (/^gpt-5\.4(?:$|[-_.])/.test(lower)) {
@@ -39,4 +51,23 @@ export function shortModelLabel(model?: string | null): string | null {
 
   const parts = m.split('-');
   return parts[parts.length - 1] ?? m;
+}
+
+/**
+ * Pick the best display label across several candidate model strings,
+ * preferring the one that carries a version number.
+ *
+ * Sessions often store the configured model as a bare alias (e.g. `opus[1M]`),
+ * which collapses to `opus` with no version, while the authoritative usage
+ * event reports the resolved id (e.g. `claude-opus-4-8`) → `opus-4.8`. Callers
+ * pass candidates in priority order; a version-bearing label wins over a
+ * version-less one, otherwise the first non-empty label is used. This keeps the
+ * configured-model priority intact except when it would hide an available
+ * version.
+ */
+export function bestModelLabel(...models: Array<string | null | undefined>): string | null {
+  const labels = models.map((m) => shortModelLabel(m));
+  const versioned = labels.find((l): l is string => l != null && /\d/.test(l));
+  if (versioned) return versioned;
+  return labels.find((l): l is string => l != null) ?? null;
 }

@@ -1,13 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import {
+  appendPreviewAccessTokenIfMissing,
   filterPreviewResponseHeaders,
   isWebSocketUpgrade,
   rewritePreviewRedirectLocation,
   rewriteSetCookieHeader,
   sanitizePreviewRequestHeaders,
+  stripPreviewAccessTokenFromUpstreamPath,
 } from '../../shared/preview-policy.js';
+import { isStreamingResponse } from '../../shared/preview-stream-policy.js';
 import { rewritePreviewHtmlDocument } from '../src/preview/policy.js';
 import { COOKIE_CSRF, COOKIE_SESSION } from '../../shared/cookie-names.js';
+import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '../../shared/preview-types.js';
 
 describe('local web preview policy', () => {
   it('rewrites upstream cookies into preview-scoped cookies', () => {
@@ -274,5 +278,116 @@ describe('sanitizePreviewRequestHeaders — non-WebSocket (existing behavior)', 
 
     expect(sanitized['sec-websocket-extensions']).toBeUndefined();
     expect(sanitized['x-custom']).toBe('value');
+  });
+});
+
+// ── V-strip (run 8a975732-23a P0.5.5) ──────────────────────────────────────────
+// The upstream path/query MUST NOT carry the preview access token. The same
+// shared function backs both the HTTP getUpstreamPath and the WS upstream path.
+describe('V-strip: stripPreviewAccessTokenFromUpstreamPath', () => {
+  const KEY = PREVIEW_ACCESS_TOKEN_QUERY_PARAM;
+
+  it('removes the token but keeps other query keys AND their order', () => {
+    expect(stripPreviewAccessTokenFromUpstreamPath(`/app?a=1&${KEY}=secret&b=2`)).toBe('/app?a=1&b=2');
+    // order preserved when token is first / middle / last
+    expect(stripPreviewAccessTokenFromUpstreamPath(`/x?${KEY}=s&a=1&b=2`)).toBe('/x?a=1&b=2');
+    expect(stripPreviewAccessTokenFromUpstreamPath(`/x?a=1&b=2&${KEY}=s`)).toBe('/x?a=1&b=2');
+  });
+
+  it('removes EVERY occurrence including repeated / empty-value / value-less forms', () => {
+    const out = stripPreviewAccessTokenFromUpstreamPath(`/p?${KEY}=x&${KEY}=&${KEY}&keep=1`);
+    expect(out).toBe('/p?keep=1');
+    expect(out).not.toContain(KEY);
+  });
+
+  it('drops the query separator entirely when only the token was present', () => {
+    expect(stripPreviewAccessTokenFromUpstreamPath(`/only?${KEY}=x`)).toBe('/only');
+    expect(stripPreviewAccessTokenFromUpstreamPath(`/only?${KEY}`)).toBe('/only');
+  });
+
+  it('leaves the pathname and a token-free query untouched', () => {
+    expect(stripPreviewAccessTokenFromUpstreamPath('/app/page?a=1&b=2')).toBe('/app/page?a=1&b=2');
+    expect(stripPreviewAccessTokenFromUpstreamPath('/app/page')).toBe('/app/page');
+  });
+
+  it('is case-SENSITIVE on the key (matches how auth reads it)', () => {
+    // An uppercase variant is NOT the auth key, so it is preserved.
+    expect(stripPreviewAccessTokenFromUpstreamPath('/p?Preview_Access_Token=x&a=1')).toBe('/p?Preview_Access_Token=x&a=1');
+  });
+});
+
+// ── V-redirect-append (run 8a975732-23a A14 / access spec "redirect token append") ─
+// The browser→proxy token is appended to a rewritten loopback redirect Location
+// ONLY when missing, decided via URLSearchParams.has — NOT a `.includes` substring
+// match. (The upstream segment is stripped separately — see V-strip above.)
+describe('V-redirect-append: appendPreviewAccessTokenIfMissing', () => {
+  const KEY = PREVIEW_ACCESS_TOKEN_QUERY_PARAM;
+  const BASE = 'https://imcodes.example/api/server/s1/local-web/p1/page';
+
+  it('does not duplicate the token when the Location already carries it', () => {
+    const out = appendPreviewAccessTokenIfMissing(`/api/server/s1/local-web/p1/next?${KEY}=existing`, BASE, 'NEWTOKEN');
+    expect(new URL(out, BASE).searchParams.get(KEY)).toBe('existing');
+    expect(out).not.toContain('NEWTOKEN');
+    expect(out.split(`${KEY}=`).length - 1).toBe(1); // exactly one occurrence
+  });
+
+  it('appends the token when only a same-named substring is in the PATHNAME (no query key)', () => {
+    const out = appendPreviewAccessTokenIfMissing(`/api/server/s1/local-web/p1/${KEY}_help`, BASE, 'TOK');
+    const url = new URL(out, BASE);
+    expect(url.pathname.endsWith(`/${KEY}_help`)).toBe(true);
+    expect(url.searchParams.get(KEY)).toBe('TOK'); // substring in path not misjudged as "present"
+  });
+
+  it('appends the token when a same-named substring is only in another param VALUE', () => {
+    const out = appendPreviewAccessTokenIfMissing(`/x?note=${KEY}`, BASE, 'TOK');
+    const params = new URL(out, BASE).searchParams;
+    expect(params.get('note')).toBe(KEY);
+    expect(params.get(KEY)).toBe('TOK'); // a `.includes` check would have WRONGLY skipped here
+  });
+
+  it('preserves other query params and the fragment when appending', () => {
+    const out = appendPreviewAccessTokenIfMissing('/x?a=1&b=2#frag', BASE, 'TOK');
+    const url = new URL(out, BASE);
+    expect(url.searchParams.get('a')).toBe('1');
+    expect(url.searchParams.get('b')).toBe('2');
+    expect(url.searchParams.get(KEY)).toBe('TOK');
+    expect(url.hash).toBe('#frag');
+  });
+
+  it('returns the Location unchanged when no token is configured', () => {
+    expect(appendPreviewAccessTokenIfMissing('/x?a=1', BASE, null)).toBe('/x?a=1');
+    expect(appendPreviewAccessTokenIfMissing('/x?a=1', BASE, undefined)).toBe('/x?a=1');
+    expect(appendPreviewAccessTokenIfMissing('/x?a=1', BASE, '')).toBe('/x?a=1');
+  });
+});
+
+// ── V-policy-parity (run 8a975732-23a P1.2.4) ──────────────────────────────────
+// daemon preview-relay and server WS bridge MUST feed the SAME RESPONSE_START
+// headers into the SAME shared `isStreamingResponse`. This asserts the predicate
+// itself classifies the documented matrix (so both importers agree by construction).
+describe('V-policy-parity: isStreamingResponse classification matrix', () => {
+  it('classifies SSE / ndjson MIME as streaming (independently sufficient)', () => {
+    expect(isStreamingResponse({ 'content-type': 'text/event-stream' })).toBe(true);
+    expect(isStreamingResponse({ 'content-type': 'text/event-stream; charset=utf-8' })).toBe(true);
+    expect(isStreamingResponse({ 'content-type': 'application/x-ndjson' })).toBe(true);
+  });
+
+  it('classifies chunked + non-JSON as streaming', () => {
+    expect(isStreamingResponse({ 'content-type': 'text/plain', 'transfer-encoding': 'chunked' })).toBe(true);
+  });
+
+  it('does NOT classify chunked JSON (json / *+json) as streaming', () => {
+    expect(isStreamingResponse({ 'content-type': 'application/json', 'transfer-encoding': 'chunked' })).toBe(false);
+    expect(isStreamingResponse({ 'content-type': 'application/foo+json', 'transfer-encoding': 'chunked' })).toBe(false);
+  });
+
+  it('does NOT treat a missing Content-Length alone as streaming', () => {
+    expect(isStreamingResponse({ 'content-type': 'application/json' })).toBe(false);
+    expect(isStreamingResponse({ 'content-type': 'text/plain' })).toBe(false);
+  });
+
+  it('never treats text/html (even chunked) as streaming', () => {
+    expect(isStreamingResponse({ 'content-type': 'text/html', 'transfer-encoding': 'chunked' })).toBe(false);
+    expect(isStreamingResponse({ 'content-type': 'application/xhtml+xml', 'transfer-encoding': 'chunked' })).toBe(false);
   });
 });

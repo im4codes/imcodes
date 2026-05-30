@@ -46,6 +46,9 @@
     "retry": "再試行"
   },
   "chat": {
+    "dpad": {
+      "title": "矢印キー — ドラッグで移動"
+    },
     "sendFailedReason": {
       "daemonOffline": "接続が切れました",
       "ackTimeout": "エージェントから応答がありません",
@@ -183,7 +186,33 @@
     "file_change_no_after": "（新しいテキストなし）",
     "file_change_derived_no_preview": "（プレビューなし）",
     "file_change_coarse_hint": "ファイルパスはありますが、diff テキストはありません。",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "font": {
+      "dialogLabel": "フォント",
+      "typeLabel": "フォント種別",
+      "codeTab": "コード",
+      "cjkTab": "日本語",
+      "familyLabel": "コードフォント",
+      "cjkFamilyLabel": "日本語フォント",
+      "allBuiltInCjk": "すべての内蔵 CJK フォント",
+      "cjkFamilies": {
+        "system-cjk": "システム CJK",
+        "pingfang-sc": "PingFang SC",
+        "songti-sc": "Songti SC",
+        "kaiti-sc": "Kaiti SC",
+        "stheiti": "STHeiti",
+        "stsong": "STSong",
+        "stkaiti": "STKaiti",
+        "stfangsong": "STFangsong",
+        "microsoft-yahei": "Microsoft YaHei",
+        "simsun": "SimSun",
+        "nsimsun": "NSimSun",
+        "dengxian": "DengXian",
+        "kaiti": "KaiTi",
+        "fangsong": "FangSong",
+        "microsoft-jhenghei": "Microsoft JhengHei"
+      }
+    }
   },
   "session": {
     "restart": "↺ 再起動",
@@ -369,6 +398,9 @@
     "codex_limit_title": "{{label}} 残り {{percent}}% · リセット {{reset}}",
     "provider_plan_title": "プラン: {{value}}",
     "provider_quota_title": "上限: {{value}}",
+    "weekly_quota_authorize": "週間上限を表示",
+    "weekly_quota_authorize_hint": "ローカルの Claude トークンの読み取りを許可して週間（7日）の上限を表示します",
+    "weekly_quota_confirm": "週間（7日）の上限を取得するため、ローカルの Claude ログイントークンを読み取ります。許可しますか？",
     "provider_quota_usage_title": "利用状況: {{value}}",
     "history_loading_label": "履歴",
     "history_step_cache": "キャッシュ",
@@ -539,7 +571,8 @@
   "toast": {
     "finished": "完了",
     "upgrade_blocked_title": "アップグレードはブロックされました",
-    "upgrade_blocked_p2p_active": "Team がまだ実行中です。daemon をアップグレードする前に停止してください。"
+    "upgrade_blocked_p2p_active": "Team がまだ実行中です。daemon をアップグレードする前に停止してください。",
+    "upgrade_blocked_toolchain_unavailable": "daemon ホストの Node が見つかりません（ツールチェーンが削除されました）。Node を再インストールしてください。それまで自動アップグレードは無効です。"
   },
   "discussion": {
     "role_critic": "批評家",
@@ -547,7 +580,25 @@
     "role_innovator": "革新者",
     "role_custom": "カスタム...",
     "arbiter": "仲裁者",
-    "arbiter_active": "⚖️ 仲裁者"
+    "arbiter_active": "⚖️ 仲裁者",
+    "starting": "開始中…",
+    "start_failed_title": "ディスカッションを開始できませんでした",
+    "start_failed_offline": "オフラインです。再接続してからもう一度お試しください。",
+    "dialog_title": "ディスカッションを開始",
+    "start_button": "ディスカッションを開始",
+    "field_topic": "トピック",
+    "topic_placeholder": "エージェントに議論させたい内容を記述してください…",
+    "field_cwd": "作業ディレクトリ",
+    "field_participants": "参加者",
+    "add_participant": "+ 追加",
+    "field_max_rounds": "最大ラウンド数",
+    "team_label": "チーム",
+    "complete_status": "完了",
+    "failed_status": "失敗",
+    "error": {
+      "missing_fields": "必須項目が不足しています(トピックと参加者2名以上)。",
+      "generic": "ディスカッションを開始できませんでした。もう一度お試しください。"
+    }
   },
   "new_session": {
     "project_required": "プロジェクト名は必須です",
@@ -1233,7 +1284,9 @@
     "empty": "ローカルポートとパスを入力してからプレビューを開いてください。",
     "noServer": "先にサーバーを選択してください。",
     "previewing": "プレビュー中：",
-    "initialPathNote": "このパスは最初に開くページだけを指定します。読み込み後の移動範囲はこのパスではなくポート単位です。"
+    "initialPathNote": "このパスは最初に開くページだけを指定します。読み込み後の移動範囲はこのパスではなくポート単位です。",
+    "portHistoryLabel": "最近のポート",
+    "pathHistoryLabel": "最近のパス"
   },
   "cron": {
     "title": "スケジュールタスク",

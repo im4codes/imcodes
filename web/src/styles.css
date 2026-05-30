@@ -15,6 +15,8 @@ html { position: fixed; }
   --chrome-accent-2: #34d399;
   --chrome-accent-3: #a78bfa;
   --chrome-warm: #f59e0b;
+  --imcodes-app-font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --imcodes-app-cjk-font-family: 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
 }
 /* Global: all fixed full-screen overlays respect iOS safe area (status bar/notch) */
 .dialog-overlay, .ask-dialog-overlay, .fb-overlay, .mobile-fb-overlay { padding-top: var(--sat); }
@@ -22,7 +24,7 @@ html { position: fixed; }
 body {
   background: var(--chrome-bg);
   color: #e2e8f0;
-  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-family: var(--imcodes-app-font-family);
   font-size: 14px;
   overflow: hidden;
 }
@@ -203,6 +205,21 @@ body {
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
 .shortcut-btn-icon { width: 28px; min-width: 28px; padding: 4px 0; display: inline-flex; align-items: center; justify-content: center; }
+/* Mobile arrow D-pad — replaces the separate up/down buttons on small screens.
+ * Drag toward a direction to send that arrow key. touch-action:none keeps the
+ * drag from scrolling the page; the four glyphs sit around a center. */
+.shortcut-dpad { position: relative; width: 36px; min-width: 36px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+.shortcut-dpad .dpad-arrow { position: absolute; font-size: 7px; line-height: 1; color: #5b6573; pointer-events: none; transition: color 0.1s, text-shadow 0.1s; }
+.shortcut-dpad .dpad-arrow-up { top: 3px; left: 50%; transform: translateX(-50%); }
+.shortcut-dpad .dpad-arrow-down { bottom: 3px; left: 50%; transform: translateX(-50%); }
+.shortcut-dpad .dpad-arrow-left { left: 4px; top: 50%; transform: translateY(-50%); }
+.shortcut-dpad .dpad-arrow-right { right: 4px; top: 50%; transform: translateY(-50%); }
+.shortcut-dpad.shortcut-dpad-active { border-color: rgba(34,211,238,0.5); background: rgba(8,145,178,0.16); box-shadow: 0 0 12px rgba(34,211,238,0.14), inset 0 1px 0 rgba(255,255,255,0.05); }
+.shortcut-dpad.dpad-dir-up .dpad-arrow-up,
+.shortcut-dpad.dpad-dir-down .dpad-arrow-down,
+.shortcut-dpad.dpad-dir-left .dpad-arrow-left,
+.shortcut-dpad.dpad-dir-right .dpad-arrow-right { color: #67e8f9; text-shadow: 0 0 6px rgba(34,211,238,0.7); }
+.shortcut-dpad[data-disabled="true"] { opacity: 0.4; pointer-events: none; }
 /* Tool-call toggle wrench (UsageFooter). Three visual states correspond to
  * the show_tool_calls preference:
  *   - off  → grey border, dim icon (default tool-row hidden state)
@@ -1674,7 +1691,7 @@ body {
 /* Quick input trigger in shortcuts row: hidden by default, shown when shell input is hidden */
 .shell-quick-trigger { display: none !important; }
 .kb-open .shell-terminal-pane .shell-quick-trigger { display: inline-flex !important; color: #fbbf24 !important; }
-.subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 54px; min-height: 54px; padding: 6px 10px; background: linear-gradient(180deg, rgba(17,27,45,0.92), rgba(10,16,27,0.92)); border: 1px solid rgba(125,211,252,0.16); border-top: 3px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: transform 0.15s, border-color 0.15s, background 0.15s, color 0.15s, box-shadow 0.15s; flex-shrink: 0; position: relative; isolation: isolate; overflow: hidden; box-shadow: inset 0 1px 0 rgba(255,255,255,0.035); }
+.subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 54px; min-height: 54px; padding: 6px 1px; background: linear-gradient(180deg, rgba(17,27,45,0.92), rgba(10,16,27,0.92)); border: 1px solid rgba(125,211,252,0.16); border-top: 3px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: transform 0.15s, border-color 0.15s, background 0.15s, color 0.15s, box-shadow 0.15s; flex-shrink: 0; position: relative; isolation: isolate; overflow: hidden; box-shadow: inset 0 1px 0 rgba(255,255,255,0.035); }
 .subsession-card::before { content: ''; position: absolute; inset: 0; background: linear-gradient(135deg, rgba(34,211,238,0.12), transparent 38%, rgba(52,211,153,0.08)); opacity: 0; transition: opacity 0.15s; pointer-events: none; }
 .subsession-card:hover, .subsession-card.open { border-color: rgba(34,211,238,0.44); background: linear-gradient(180deg, rgba(15,40,62,0.92), rgba(10,20,34,0.94)); color: #dbeafe; }
 .subsession-card:hover::before, .subsession-card.open::before, .subsession-card.focused::before { opacity: 1; }
@@ -1722,6 +1739,8 @@ body {
 .session-usage-codex-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; align-items: center; }
 .session-usage-codex-quota { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; margin-bottom: 2px; }
 .session-usage-codex-line { color: #64748b; font-size: 9px; line-height: 1.2; text-align: right; }
+.session-usage-weekly-authorize { background: none; border: none; padding: 0; margin: 0; font: inherit; font-size: 9px; line-height: 1.2; text-align: right; color: var(--chrome-accent, #22d3ee); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.session-usage-weekly-authorize:hover { color: #67e8f9; }
 .session-ctx-input { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, var(--chrome-accent-2), var(--chrome-accent)); border-radius: 999px; box-shadow: 0 0 10px rgba(52,211,153,0.42); }
 .session-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, var(--chrome-accent-3), #818cf8); border-radius: 999px; box-shadow: 0 0 10px rgba(129,140,248,0.36); }
 

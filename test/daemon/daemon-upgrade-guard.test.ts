@@ -4,6 +4,7 @@ import {
   getActiveP2pRunsBlockingDaemonUpgrade,
   getActiveSessionsBlockingDaemonUpgrade,
   getActiveTransportSessionsBlockingDaemonUpgrade,
+  getTransportSessionUpgradeBlockReason,
 } from '../../src/daemon/command-handler.js';
 import * as sessionManager from '../../src/agent/session-manager.js';
 
@@ -259,5 +260,93 @@ describe('getActiveSessionsBlockingDaemonUpgrade — process + transport coverag
       sessionState: 'queued',
       transport: null,
     });
+  });
+});
+
+// ── Phantom-turn staleness guard ──────────────────────────────────────────────
+//
+// Production incident: a codex-sdk sub-session got wedged in `status:'streaming'
+// sending:true` (lost `onComplete`) while `session.state` read `idle`. Every
+// auto-upgrade attempt for 8+ hours was blocked by that ONE phantom session, so
+// the daemon stayed pinned on a stale version. The fix: a transport turn that
+// reports in-progress but has produced no provider activity past a threshold is
+// treated as a phantom and does NOT block the upgrade. A live turn refreshes
+// `lastActivityAt` on every delta, so a real generation never trips this.
+
+describe('getTransportSessionUpgradeBlockReason — phantom-turn staleness', () => {
+  const NOW = 1_000_000_000;
+  const STALE_MS = 60_000;
+
+  function mockRuntime(over: { status: string; sending?: boolean; pendingCount?: number; lastActivityAt?: number }) {
+    vi.spyOn(sessionManager, 'getTransportRuntime').mockReturnValue({
+      getStatus: () => over.status,
+      sending: over.sending ?? false,
+      pendingCount: over.pendingCount ?? 0,
+      ...(over.lastActivityAt !== undefined ? { lastActivityAt: over.lastActivityAt } : {}),
+    } as any);
+  }
+
+  it('does NOT block a "streaming" turn whose activity is older than the stale threshold', () => {
+    mockRuntime({ status: 'streaming', sending: true, lastActivityAt: NOW - STALE_MS - 1 });
+    expect(
+      getTransportSessionUpgradeBlockReason('deck_phantom', { now: NOW, staleTurnMs: STALE_MS }),
+    ).toBeNull();
+  });
+
+  it('does NOT block exactly AT the stale threshold (age >= staleMs)', () => {
+    mockRuntime({ status: 'streaming', lastActivityAt: NOW - STALE_MS });
+    expect(
+      getTransportSessionUpgradeBlockReason('deck_edge', { now: NOW, staleTurnMs: STALE_MS }),
+    ).toBeNull();
+  });
+
+  it('STILL blocks a "streaming" turn with recent activity (live generation)', () => {
+    mockRuntime({ status: 'streaming', lastActivityAt: NOW - STALE_MS + 1 });
+    expect(
+      getTransportSessionUpgradeBlockReason('deck_live', { now: NOW, staleTurnMs: STALE_MS }),
+    ).toMatchObject({ blockReason: 'status_streaming' });
+  });
+
+  it('treats a stale "sending" (status idle) turn as phantom too', () => {
+    mockRuntime({ status: 'idle', sending: true, lastActivityAt: NOW - STALE_MS - 1 });
+    expect(
+      getTransportSessionUpgradeBlockReason('deck_stale_send', { now: NOW, staleTurnMs: STALE_MS }),
+    ).toBeNull();
+  });
+
+  it('treats stale pending (status idle) as phantom too', () => {
+    mockRuntime({ status: 'idle', pendingCount: 3, lastActivityAt: NOW - STALE_MS - 1 });
+    expect(
+      getTransportSessionUpgradeBlockReason('deck_stale_pending', { now: NOW, staleTurnMs: STALE_MS }),
+    ).toBeNull();
+  });
+
+  it('falls back to always-block when the runtime exposes no lastActivityAt (legacy/mock)', () => {
+    mockRuntime({ status: 'streaming' }); // no lastActivityAt
+    expect(
+      getTransportSessionUpgradeBlockReason('deck_legacy', { now: NOW, staleTurnMs: STALE_MS }),
+    ).toMatchObject({ blockReason: 'status_streaming' });
+  });
+
+  it('via the combined helper: a stale phantom session is dropped from the blocking set', () => {
+    vi.spyOn(sessionManager, 'getTransportRuntime').mockImplementation((name: string) => {
+      if (name === 'deck_phantom') {
+        return { getStatus: () => 'streaming', sending: true, pendingCount: 0, lastActivityAt: NOW - STALE_MS - 1 } as any;
+      }
+      if (name === 'deck_live') {
+        return { getStatus: () => 'streaming', sending: false, pendingCount: 0, lastActivityAt: NOW - 1 } as any;
+      }
+      return undefined;
+    });
+
+    const blocked = getActiveSessionsBlockingDaemonUpgrade(
+      [
+        { name: 'deck_phantom', runtimeType: 'transport', state: 'idle' },
+        { name: 'deck_live', runtimeType: 'transport', state: 'running' },
+      ] as any,
+      { now: NOW, staleTurnMs: STALE_MS },
+    );
+
+    expect(blocked.map((r) => r.name)).toEqual(['deck_live']);
   });
 });

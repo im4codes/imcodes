@@ -46,6 +46,10 @@ export interface P2pProgressDiscussion {
   activePhase?: 'queued' | 'initial' | 'hop' | 'summary' | 'execution';
   conclusion?: string;
   error?: string;
+  /** True while the entry is an optimistic local placeholder (classic startup). */
+  pending?: boolean;
+  /** i18n key for a localized failure reason; rendered instead of the raw error. */
+  displayReasonKey?: string;
   nodes?: P2pProgressNode[];
   hopStates?: P2pHopState[];
   /** Epoch ms when the P2P run started */
@@ -328,7 +332,7 @@ export const P2pProgressCard = memo(function P2pProgressCard({
         onClick={onClick}
       >
         <div class="discussions-progress-mobile-row">
-          <span class="discussions-progress-kicker">Team</span>
+          <span class="discussions-progress-kicker">{t('discussion.team_label')}</span>{discussion.pending ? <span class="discussions-progress-badge discussions-progress-badge-phase">{t('discussion.starting')}</span> : null}
           <span class="discussions-progress-badge">{roundText}</span>
           {stepText && <span class="discussions-progress-badge">{stepText}</span>}
           {hopText && <span class="discussions-progress-badge">{hopText}</span>}
@@ -528,15 +532,17 @@ export const P2pProgressCard = memo(function P2pProgressCard({
 
       {discussion.state === 'done' && discussion.conclusion && (
         <div class="discussion-card-body">
-          <div class="discussion-status done">✓ Complete</div>
+          <div class="discussion-status done">✓ {t('discussion.complete_status')}</div>
           <div class="discussion-conclusion">{discussion.conclusion}</div>
         </div>
       )}
 
-      {discussion.state === 'failed' && discussion.error && (
+      {discussion.state === 'failed' && (discussion.displayReasonKey || discussion.error) && (
         <div class="discussion-card-body">
-          <div class="discussion-status failed">✕ Failed</div>
-          <div class="discussion-conclusion" style={{ color: '#f87171' }}>{discussion.error}</div>
+          <div class="discussion-status failed">✕ {t('discussion.failed_status')}</div>
+          <div class="discussion-conclusion" style={{ color: '#f87171' }}>
+            {discussion.displayReasonKey ? t(discussion.displayReasonKey) : discussion.error}
+          </div>
         </div>
       )}
     </div>

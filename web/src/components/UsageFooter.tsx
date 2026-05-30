@@ -5,13 +5,14 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { resolveContextWindow } from '../model-context.js';
-import { shortModelLabel } from '../model-label.js';
+import { bestModelLabel } from '../model-label.js';
 import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
 import type { UsageData } from '../usage-data.js';
 import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
+import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 
 interface Props {
   usage: UsageData;
@@ -46,7 +47,6 @@ const fmt = (n: number) =>
 
 export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled }: Props) {
   const { t } = useTranslation();
-  const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
   // Wrench pill: tri-state toggle for "show developer details in chat timeline".
   // Sourced from usePref → SharedResource, so this UsageFooter and ChatView
   // share one GET / one listener / one cache entry per tab.
@@ -83,8 +83,11 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const previousCtxSignatureRef = useRef<string | null>(null);
 
   const displayModel = modelOverride ?? usage.model;
+  // Live-tick the quota label (so "resets in Xm" stays current) for ANY provider
+  // that reports structured quota windows — Codex and claude-code-sdk both feed
+  // `quotaMeta`; the gate is its presence, not the agent family.
   useEffect(() => {
-    if (!isCodexFamily || !quotaMeta) return;
+    if (!quotaMeta) return;
     let intervalId: number | undefined;
     const tick = () => setQuotaNow(Date.now());
     tick();
@@ -97,12 +100,12 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
       window.clearTimeout(timeoutId);
       if (intervalId !== undefined) window.clearInterval(intervalId);
     };
-  }, [isCodexFamily, quotaMeta]);
+  }, [quotaMeta]);
 
   const displayQuotaLabel = useMemo(() => {
-    if (!isCodexFamily || !quotaMeta) return quotaLabel;
+    if (!quotaMeta) return quotaLabel;
     return formatProviderQuotaLabel(quotaMeta, now ?? quotaNow) ?? quotaLabel;
-  }, [isCodexFamily, now, quotaLabel, quotaMeta, quotaNow]);
+  }, [now, quotaLabel, quotaMeta, quotaNow]);
 
   const displayPlanLabel = useMemo(() => {
     const normalized = planLabel?.trim().toLowerCase();
@@ -136,7 +139,10 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     return { ctx, total, totalPct, cachePct, newPct, pctStr, tip };
   }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, usage.contextWindowSource, displayModel, displayPlanLabel, displayQuotaLabel, quotaUsageLabel, t]);
 
-  const modelLabel = shortModelLabel(displayModel);
+  // Prefer a version-bearing label: modelOverride is often a bare alias
+  // (`opus[1M]` → `opus`) while usage.model carries the resolved id
+  // (`claude-opus-4-8` → `opus-4.8`).
+  const modelLabel = bestModelLabel(modelOverride, usage.model);
   // Keep the ctx meter visible even before the first non-zero usage event when
   // the session/model is known. A zero-token session still has useful context
   // capacity information (e.g. "0 / 922k" for GPT-5.5); hiding it made Codex
@@ -184,7 +190,16 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     return t('session.state_idle');
   }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, isAgentless, now, sessionState, statusText, t]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result';
-  const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
+  // The weekly (7d) line is opt-in: it needs the daemon to read the local
+  // Claude token. The 5h line needs no authorization (it comes from the SDK
+  // rate_limit_event). Show an authorize affordance for claude-code-sdk until
+  // the user opts in (per-user pref → applies to all their servers).
+  const weeklyQuotaPref = usePref<boolean>(CLAUDE_WEEKLY_QUOTA_PREF_KEY, { parse: parseBooleanish });
+  const showWeeklyAuthPrompt = agentType === 'claude-code-sdk' && weeklyQuotaPref.value !== true;
+  // Providers that report structured quota windows (Codex + claude-code-sdk)
+  // render the SAME prominent multi-line quota block as Codex — not the inline
+  // bottom token span — so the limit display is consistent across providers.
+  const providerQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk' || agentType === 'claude-code-sdk')
     ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)
     : [];
   return (
@@ -196,11 +211,27 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           {ctxBurning && <span class="session-ctx-burn" style={{ width: `${totalPct}%` }} aria-hidden="true" />}
         </div>
       )}
-      {codexQuotaLines.length > 0 && (
+      {(providerQuotaLines.length > 0 || showWeeklyAuthPrompt) && (
         <div class="session-usage-codex-quota">
-          {codexQuotaLines.map((line) => (
+          {providerQuotaLines.map((line) => (
             <div class="session-usage-codex-line">{line}</div>
           ))}
+          {showWeeklyAuthPrompt && (
+            <button
+              type="button"
+              class="session-usage-codex-line session-usage-weekly-authorize"
+              title={t('session.weekly_quota_authorize_hint')}
+              onClick={() => {
+                // Explicit consent before reading the local Claude token — not
+                // a one-click toggle.
+                if (typeof window !== 'undefined' && window.confirm(t('session.weekly_quota_confirm'))) {
+                  void weeklyQuotaPref.save(true);
+                }
+              }}
+            >
+              {t('session.weekly_quota_authorize')}
+            </button>
+          )}
         </div>
       )}
       <div class="session-usage-stats">
@@ -274,7 +305,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           </span>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
           {hasContextInfo && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
-          {inlineQuotaText && codexQuotaLines.length === 0 && <span class="session-usage-tokens">{inlineQuotaText}</span>}
+          {inlineQuotaText && providerQuotaLines.length === 0 && <span class="session-usage-tokens">{inlineQuotaText}</span>}
           {sessionCost > 0 && (
             <span class="session-usage-cost">
               {formatCost(sessionCost)} · wk {formatCost(weeklyCost)} · mo {formatCost(monthlyCost)}

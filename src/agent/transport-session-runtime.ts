@@ -165,6 +165,14 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _history: AgentMessage[] = [];
   private _providerSessionId: string | null = null;
   private _sending = false;
+  /** Epoch ms of the last sign of life for the active turn — any provider
+   *  event (delta / completion / error / tool call / session info) or a turn
+   *  dispatch we initiated. Frozen if the provider wedges mid-turn (e.g. a
+   *  lost `onComplete` leaves `_status='streaming'` / `_sending=true`
+   *  forever). The daemon-upgrade gate reads its age to detect a phantom
+   *  in-progress turn and stop blocking upgrades indefinitely — one stuck SDK
+   *  session must never pin the daemon on an old version. */
+  private _lastActivityAt = Date.now();
   private _description: string | undefined;
   private _systemPrompt: string | undefined;
   /**
@@ -207,6 +215,18 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   /** Messages queued while a turn is in flight. Drained and merged on turn completion. */
   private _pendingMessages: PendingTransportMessage[] = [];
+  /**
+   * Monotonic version of the pending-queue, bumped on EVERY mutation
+   * (enqueue / drain / edit / remove / kill). The runtime owns the queue,
+   * so it owns the authoritative ordering. Every daemon event that carries
+   * a pending snapshot also carries this version; the UI ignores any
+   * snapshot whose version is older than the newest it has already applied.
+   * This is what prevents a stale snapshot (e.g. a `session_list` heartbeat
+   * or `session.state:queued` built before a drain but delivered after it,
+   * common on weak networks) from resurrecting already-drained entries —
+   * the root cause of UI/daemon queue desync.
+   */
+  private _pendingVersion = 0;
   /** Original message entries for the currently in-flight dispatch. */
   private _activeDispatchEntries: PendingTransportMessage[] = [];
   /** True after a user stop request until the active provider turn settles. */
@@ -233,11 +253,13 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._unsubscribes.push(
       this.provider.onDelta((sid: string, _delta: MessageDelta) => {
         if (sid !== this._providerSessionId) return;
+        this._lastActivityAt = Date.now();
         if (this._activeDispatchCancelled) return;
         this.setStatus('streaming');
       }),
       this.provider.onComplete((sid: string, message: AgentMessage) => {
         if (sid !== this._providerSessionId) return;
+        this._lastActivityAt = Date.now();
         if (this._activeDispatchCancelled) {
           this._sending = false;
           this._activeTurn?.reject(makeCancelledProviderError());
@@ -272,6 +294,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       }),
       this.provider.onError((sid: string, error: ProviderError) => {
         if (sid !== this._providerSessionId) return;
+        this._lastActivityAt = Date.now();
         this._sending = false;
         this._activeTurn?.reject(error);
         this._activeTurn = null;
@@ -292,11 +315,13 @@ export class TransportSessionRuntime implements SessionRuntime {
       }),
       ...(this.provider.onSessionInfo ? [this.provider.onSessionInfo((sid: string, info: SessionInfoUpdate) => {
         if (sid !== this._providerSessionId) return;
+        this._lastActivityAt = Date.now();
         this._onSessionInfoChange?.(info);
       })] : []),
     );
     const unsubscribeToolCall = this.provider.onToolCall?.((sid: string) => {
       if (sid !== this._providerSessionId) return;
+      this._lastActivityAt = Date.now();
       if (this._activeDispatchId === null || !this._activeTurn) return;
       // Provider-visible tool events mean the SDK has already accepted work,
       // even if the shared-context dispatcher has not crossed its provider.send
@@ -360,6 +385,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   get sending(): boolean { return this._sending; }
   /** Number of messages waiting in the queue. */
   get pendingCount(): number { return this._pendingMessages.length; }
+  /** Monotonic version of the pending-queue. See `_pendingVersion`. */
+  get pendingVersion(): number { return this._pendingVersion; }
   /** Snapshot of queued messages waiting to be drained (legacy text-only view). */
   get pendingMessages(): string[] { return this._pendingMessages.map((entry) => entry.text); }
   /** Snapshot of queued messages waiting to be drained (stable entity ids for UI/edit/undo). */
@@ -458,6 +485,7 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     if (this._sending) {
       this._pendingMessages.push(entry);
+      this._pendingVersion++;
       return 'queued';
     }
 
@@ -493,6 +521,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!entry) return false;
     entry.text = nextText;
     entry.messagePreamble = undefined;
+    this._pendingVersion++;
     return true;
   }
 
@@ -501,6 +530,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const index = this._pendingMessages.findIndex((item) => item.clientMessageId === clientMessageId);
     if (index < 0) return null;
     const [removed] = this._pendingMessages.splice(index, 1);
+    this._pendingVersion++;
     return removed ?? null;
   }
 
@@ -534,6 +564,11 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   getStatus(): AgentStatus { return this._status; }
 
+  /** Epoch ms of the last provider event or turn dispatch. The daemon-upgrade
+   *  gate uses `Date.now() - lastActivityAt` to detect a phantom in-progress
+   *  turn (wedged provider) and avoid blocking upgrades forever. */
+  get lastActivityAt(): number { return this._lastActivityAt; }
+
   async kill(): Promise<void> {
     for (const unsub of this._unsubscribes) unsub();
     this._unsubscribes = [];
@@ -553,6 +588,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchProviderStarted = false;
     this._activeDispatchId = null;
     this._locallyCancelledDispatchIds.clear();
+    if (this._pendingMessages.length > 0) this._pendingVersion++;
     this._pendingMessages = [];
     // Per-session memory injection history is daemon-scoped to this session;
     // a kill ends that scope. clear() is called on session.clear separately.
@@ -603,6 +639,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       status: 'complete',
     });
 
+    this._lastActivityAt = Date.now();
     this.setStatus('thinking');
     this._sending = true;
     this._activeDispatchCancelled = false;
@@ -803,6 +840,12 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (this._pendingMessages.length === 0 || !this._providerSessionId) return false;
 
     const messages = this._pendingMessages.splice(0);
+    // Bump the queue version the moment the queue empties. The onDrain
+    // callback below emits this new version on both the per-entry
+    // `user.message` events and the cleared `session.state`, so a stale
+    // pre-drain snapshot (lower version) delivered later cannot resurrect
+    // these entries in the UI.
+    this._pendingVersion++;
     const merged = messages.map((entry) => entry.text).join('\n\n');
     const attachments = messages.flatMap((entry) => entry.attachments ?? []);
     // N1 defensive fix (audit f395d49c-78c) — set `_sending=true` BEFORE

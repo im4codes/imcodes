@@ -15,7 +15,9 @@ export function isP2pDiscussionVisibleInSubSessionBar(
   discussion: P2pScopedDiscussion,
   context: P2pScopeContext,
 ): boolean {
-  if (discussion.state === 'done') return false;
+  // Both terminal states leave the bar (aligned with DiscussionsPage.activeLive),
+  // so a failed classic discussion does not linger as a permanent red card.
+  if (discussion.state === 'done' || discussion.state === 'failed') return false;
 
   const visibleSubSessionNames = new Set(context.visibleSubSessionNames ?? []);
   const matchesCurrentView = (sessionName?: string | null) => {

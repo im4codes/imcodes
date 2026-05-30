@@ -24,6 +24,7 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
+import { computeFollowThresholds } from './chat-follow-thresholds.js';
 import type { ChatLocalImagePreviewLoader, ChatLocalImagePreviewResult } from './ChatLocalImagePreview.js';
 import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { isLikelyDomainPath, renderChatPathActions, type ChatPathDownloadHandler } from '../chat-path-actions.js';
@@ -981,6 +982,17 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const lastScrollTopRef = useRef(0);
+  // Y of the active touch's start, for detecting an explicit finger-down
+  // (content scrolls up) gesture that should pause follow-mode immediately.
+  const touchStartYRef = useRef(0);
+  // Epoch ms of the last "LAST SENT" pin-banner show/hide. The banner is a
+  // flow sibling of `.chat-view`, so toggling it resizes the scroll area by
+  // ~60px and fires the ResizeObserver — which must NOT re-pin to bottom (the
+  // banner only appears because the user scrolled UP). Used to suppress that
+  // observer's re-pin for a short window after a banner toggle, so the height
+  // oscillation can't snap the user back to the bottom (works for any input
+  // method, including scrollbar drag that emits no wheel/touch).
+  const bannerToggleAtRef = useRef(0);
   const suppressLoadOlderUntilRef = useRef(0);
   // ── Programmatic-scroll guard ────────────────────────────────────────────
   // `scrollToBottom` writes `el.scrollTop` directly, which fires a synthetic
@@ -1498,6 +1510,13 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     return () => observer.disconnect();
   }, [lastSentUserMessage?.eventId, preview]);
 
+  // Stamp when the pin banner toggles so the ResizeObserver can tell its own
+  // ~60px height shift apart from a genuine viewport resize (sub-session bar,
+  // keyboard) and skip re-pinning to bottom for the former. See bannerToggleAtRef.
+  useEffect(() => {
+    bannerToggleAtRef.current = Date.now();
+  }, [pinnedAboveViewport]);
+
   // Auto-scroll only on visible new events — agent.status / assistant.thinking / usage.update
   // events are filtered from the chat view but still part of `events`, so using the raw last ts
   // would trigger spurious scrolls while the agent is running without any new visible content.
@@ -1613,6 +1632,46 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // Scroll anchor preservation: save scrollHeight before prepend, restore after
   const scrollAnchorRef = useRef<{ scrollHeight: number } | null>(null);
 
+  // Pause "stick to bottom" follow mode. Shared by handleScroll's distance
+  // threshold and the explicit wheel/touch up-gesture handlers below.
+  const disengageFollow = () => {
+    if (!autoScrollRef.current) return;
+    autoScrollRef.current = false;
+    newSinceUnfollowRef.current = 0;
+    setNewSinceUnfollow(0);
+    countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
+    setShowScrollBtn(true);
+    lastScrollActivityRef.current = Date.now();
+  };
+
+  // An explicit upward wheel/touch gesture is unambiguous "stop following"
+  // intent. Honour it the instant it happens — BEFORE the next programmatic
+  // `scrollToBottom` (streaming, ResizeObserver, the "LAST SENT" pin banner
+  // toggling height) can re-pin the view. The distance-threshold path in
+  // handleScroll loses this race at certain heights in Safari, where only a
+  // large fast swipe escapes; this path makes a gentle scroll-up reliable.
+  // These events are never synthesised by scrollToBottom, so they can't
+  // false-trigger. Re-engagement stays distance-based (scroll back to bottom).
+  const handleUserScrollUpIntent = () => {
+    if (preview || !autoScrollRef.current) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    if (el.scrollHeight - el.clientHeight < 8) return; // nothing to scroll into
+    disengageFollow();
+  };
+  const handleWheel = (e: WheelEvent) => {
+    if (e.deltaY < 0) handleUserScrollUpIntent();
+  };
+  const handleTouchStart = (e: TouchEvent) => {
+    touchStartYRef.current = e.touches[0]?.clientY ?? 0;
+  };
+  const handleTouchMove = (e: TouchEvent) => {
+    const y = e.touches[0]?.clientY ?? 0;
+    // Finger moving DOWN (clientY increases) drags content UP toward older
+    // history. 6px deadzone avoids reacting to taps / micro-jitter.
+    if (y - touchStartYRef.current > 6) handleUserScrollUpIntent();
+  };
+
   const handleScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
@@ -1643,19 +1702,15 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       requestAnimationFrame(() => scrollToBottom(true));
       return;
     }
-    // Adaptive + hysteresis thresholds. Avoid flicker around the boundary
-    // (one threshold flapping during streaming layout) and avoid mobile
-    // over-engagement (a flat 150 px swallows ~42 % of a 360 px landscape
-    // viewport but only 14 % of a 1080 px desktop pane).
+    // Adaptive + hysteresis thresholds (avoid boundary flicker during streaming
+    // layout; avoid mobile over-engagement), with a short-content guard so
+    // follow-mode is always escapable by scrolling up even when the content
+    // barely overflows the viewport. See chat-follow-thresholds.ts. This is the
+    // secondary disengage path; the primary is the wheel/touch gesture handler.
     const distance = scrollHeight - scrollTop - clientHeight;
-    const disengageThreshold = Math.max(180, Math.round(0.25 * clientHeight));
-    const reengageThreshold = Math.max(60, Math.round(0.10 * clientHeight));
+    const { disengageThreshold, reengageThreshold } = computeFollowThresholds(clientHeight, scrollHeight);
     if (wasAutoFollowing && distance > disengageThreshold) {
-      autoScrollRef.current = false;
-      // Reset count so it starts fresh from this pause
-      newSinceUnfollowRef.current = 0;
-      setNewSinceUnfollow(0);
-      countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
+      disengageFollow();
     } else if (!wasAutoFollowing && distance < reengageThreshold) {
       autoScrollRef.current = true;
       newSinceUnfollowRef.current = 0;
@@ -1696,9 +1751,19 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       const nextClientHeight = el.clientHeight;
       if (nextClientHeight === prevClientHeight) return;
       prevClientHeight = nextClientHeight;
-      if (!preview && autoScrollRef.current) {
-        requestAnimationFrame(() => scrollToBottom());
-      }
+      if (preview) return;
+      // If this resize was the pin banner toggling its own ~60px height, do NOT
+      // re-pin — the banner only appears because the user scrolled UP, so
+      // re-pinning would snap them back and (since that re-hides the banner)
+      // start the height-oscillation jitter loop. A genuine viewport resize
+      // (sub-session bar, keyboard) has no recent banner toggle and still pins.
+      if (Date.now() - bannerToggleAtRef.current < 300) return;
+      // Re-check follow state INSIDE the rAF: a user scroll-up that disengages
+      // during the frame gap must still win, or we'd snap them back against
+      // their intent.
+      requestAnimationFrame(() => {
+        if (autoScrollRef.current) scrollToBottom();
+      });
     });
 
     ro.observe(el);
@@ -2068,6 +2133,9 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           </div>
         )}
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} style={chatFontStyle} onScroll={preview ? undefined : handleScroll}
+          onWheel={preview ? undefined : handleWheel}
+          onTouchStart={preview ? undefined : handleTouchStart}
+          onTouchMove={preview ? undefined : handleTouchMove}
           // Keyboard parity for the floating "↓" button: End force-engages
           // follow and jumps to bottom. tabIndex={-1} keeps it scriptable
           // without inserting it into the natural tab order.

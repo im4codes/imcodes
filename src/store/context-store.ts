@@ -54,8 +54,10 @@ import {
   type ObservationState,
 } from '../../shared/memory-observation.js';
 import { isMemoryOrigin, requireExplicitMemoryOrigin, type MemoryOrigin } from '../../shared/memory-origin.js';
+import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 
 const require = createRequire(import.meta.url);
+suppressSqliteExperimentalWarning();
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 export type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 

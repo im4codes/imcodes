@@ -7,6 +7,8 @@ import {
   createLocalWebPreview,
   normalizeLocalWebPreviewPath,
 } from '../api.js';
+import { stripPreviewAccessTokenFromUpstreamPath } from '@shared/preview-policy.js';
+import { useLocalPreviewInputHistory } from '../hooks/useLocalPreviewInputHistory.js';
 
 interface Props {
   serverId: string;
@@ -20,8 +22,13 @@ interface ActivePreview {
   previewUrl: string;
 }
 
+// Legacy single-value keys — migrated into their respective MRU history lists
+// (capability local-web-preview-input-history). Kept only as migration sources.
 const LOCAL_PORT_KEY = 'imcodes_local_preview_port';
 const LOCAL_PATH_KEY = 'imcodes_local_preview_path';
+// MRU history lists (port and path are independent).
+const LOCAL_PORT_HISTORY_KEY = 'imcodes_local_preview_port_history';
+const LOCAL_PATH_HISTORY_KEY = 'imcodes_local_preview_path_history';
 
 function parsePort(text: string): number | null {
   const trimmed = text.trim();
@@ -31,10 +38,159 @@ function parsePort(text: string): number | null {
   return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
 }
 
+/** History dedup/normalize key for a port: the parsePort output as a string. */
+function normalizePortForHistory(raw: string): string | null {
+  const port = parsePort(raw);
+  return port === null ? null : String(port);
+}
+
+/**
+ * History dedup/normalize key for a path: strip the access token first (so it
+ * never lands in localStorage), then run the same normalization the proxy uses.
+ */
+function normalizePathForHistory(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const stripped = stripPreviewAccessTokenFromUpstreamPath(normalizeLocalWebPreviewPath(trimmed));
+  return stripped || null;
+}
+
+interface InputWithHistoryProps {
+  value: string;
+  onValue: (value: string) => void;
+  history: string[];
+  /** i18n key for the field's history dropdown aria-label. */
+  historyLabelKey: string;
+  placeholder?: string;
+  inputMode?: 'numeric' | 'text';
+}
+
+/**
+ * A text input with a click/focus-triggered MRU history dropdown (capability
+ * local-web-preview-input-history). Mouse selection is the MVP; arrow-key /
+ * Enter / Esc navigation is provided as a SHOULD-level enhancement. All
+ * readable text (aria-label) goes through `t()`.
+ */
+function InputWithHistory({ value, onValue, history, historyLabelKey, placeholder, inputMode }: InputWithHistoryProps) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  const hasHistory = history.length > 0;
+
+  const close = useCallback(() => {
+    setOpen(false);
+    setActiveIndex(-1);
+  }, []);
+
+  const choose = useCallback((item: string) => {
+    onValue(item);
+    close();
+  }, [onValue, close]);
+
+  // Close when focus/click leaves the field+dropdown.
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: MouseEvent | TouchEvent) => {
+      if (!containerRef.current) return;
+      if (!containerRef.current.contains(e.target as Node)) close();
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('touchstart', onPointerDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('touchstart', onPointerDown);
+    };
+  }, [open, close]);
+
+  const onKeyDown = useCallback((e: KeyboardEvent) => {
+    if (!hasHistory) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setOpen(true);
+      setActiveIndex((i) => Math.min(i + 1, history.length - 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setOpen(true);
+      setActiveIndex((i) => Math.max(i - 1, 0));
+    } else if (e.key === 'Enter') {
+      if (open && activeIndex >= 0 && activeIndex < history.length) {
+        e.preventDefault();
+        choose(history[activeIndex]);
+      }
+    } else if (e.key === 'Escape') {
+      if (open) {
+        e.preventDefault();
+        close();
+      }
+    }
+  }, [hasHistory, history, open, activeIndex, choose, close]);
+
+  return (
+    <div ref={containerRef} style={{ position: 'relative', minWidth: 0 }}>
+      <input
+        class="input"
+        inputMode={inputMode}
+        placeholder={placeholder}
+        value={value}
+        role={hasHistory ? 'combobox' : undefined}
+        aria-expanded={hasHistory ? open : undefined}
+        aria-haspopup={hasHistory ? 'listbox' : undefined}
+        onInput={(e) => onValue((e.currentTarget as HTMLInputElement).value)}
+        onFocus={() => { if (hasHistory) setOpen(true); }}
+        onClick={() => { if (hasHistory) setOpen(true); }}
+        onKeyDown={onKeyDown}
+      />
+      {open && hasHistory && (
+        <ul
+          role="listbox"
+          aria-label={t(historyLabelKey)}
+          style={{
+            position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 20, margin: '2px 0 0', padding: 4,
+            listStyle: 'none', maxHeight: 180, overflowY: 'auto',
+            background: '#0f172a', border: '1px solid #334155', borderRadius: 6, boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+          }}
+        >
+          {history.map((item, index) => (
+            <li
+              key={item}
+              role="option"
+              aria-selected={index === activeIndex}
+              onMouseDown={(e) => { e.preventDefault(); choose(item); }}
+              onMouseEnter={() => setActiveIndex(index)}
+              style={{
+                padding: '4px 8px', borderRadius: 4, cursor: 'pointer', fontSize: 12,
+                color: '#e2e8f0', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                background: index === activeIndex ? '#1e293b' : 'transparent',
+              }}
+            >
+              {item}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Props) {
   const { t } = useTranslation();
-  const [portText, setPortText] = useState(() => String(port ?? localStorage.getItem(LOCAL_PORT_KEY) ?? ''));
-  const [pathText, setPathText] = useState(() => path ?? localStorage.getItem(LOCAL_PATH_KEY) ?? '/');
+
+  // Independent MRU histories for port and path (migrating any legacy single
+  // value into history[0]). Written only on successful preview creation.
+  const portHistory = useLocalPreviewInputHistory(LOCAL_PORT_HISTORY_KEY, normalizePortForHistory, LOCAL_PORT_KEY);
+  const pathHistory = useLocalPreviewInputHistory(LOCAL_PATH_HISTORY_KEY, normalizePathForHistory, LOCAL_PATH_KEY);
+  // `commit` is referentially stable across renders (keyed only on storageKey),
+  // so depending on these keeps `openPreview` stable.
+  const commitPort = portHistory.commit;
+  const commitPath = pathHistory.commit;
+
+  // Controlled props must NOT clobber local history with their empty initial
+  // values: seed from the prop when it is explicitly provided, otherwise from
+  // the most-recent history entry (history[0]).
+  const [portText, setPortText] = useState(() => (port !== undefined ? String(port) : (portHistory.mostRecent ?? '')));
+  const [pathText, setPathText] = useState(() => (path !== undefined ? path : (pathHistory.mostRecent ?? '/')));
   const [preview, setPreview] = useState<ActivePreview | null>(null);
   const [loading, setLoading] = useState(false);
   const [iframeLoaded, setIframeLoaded] = useState(false);
@@ -43,12 +199,14 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
   const currentPreviewRef = useRef<ActivePreview | null>(null);
   const autoOpenAttemptedRef = useRef(false);
 
+  // Only sync from a controlled prop when it is explicitly provided (!== undefined);
+  // never overwrite locally-restored input with an empty/default initial value.
   useEffect(() => {
-    setPortText(String(port ?? ''));
+    if (port !== undefined) setPortText(String(port));
   }, [port]);
 
   useEffect(() => {
-    setPathText(path ?? '/');
+    if (path !== undefined) setPathText(path);
   }, [path]);
 
   // Use ref to avoid infinite loop: onDraftChange is a new closure every render
@@ -57,10 +215,6 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
   onDraftChangeRef.current = onDraftChange;
   useEffect(() => {
     onDraftChangeRef.current?.({ port: portText, path: pathText });
-    try {
-      if (portText) localStorage.setItem(LOCAL_PORT_KEY, portText);
-      if (pathText && pathText !== '/') localStorage.setItem(LOCAL_PATH_KEY, pathText);
-    } catch { /* quota exceeded or private mode */ }
   }, [portText, pathText]);
 
   const normalizedPath = useMemo(() => normalizeLocalWebPreviewPath(pathText), [pathText]);
@@ -118,6 +272,11 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
       setPreview(nextPreview);
       setIframeLoaded(false);
 
+      // Record successful inputs into their MRU histories (normalized/stripped
+      // inside the validators). Write only on success, never on keystroke.
+      commitPort(portText);
+      commitPath(pathText);
+
       if (previous && previous.previewId !== response.previewId) {
         void closeLocalWebPreview(serverId, previous.previewId).catch(() => {});
       }
@@ -134,7 +293,7 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
         setLoading(false);
       }
     }
-  }, [normalizedPath, portText, serverId, t]);
+  }, [normalizedPath, pathText, portText, serverId, t, commitPort, commitPath]);
 
   const handleSubmit = useCallback((e: Event) => {
     e.preventDefault();
@@ -193,21 +352,23 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
           <form onSubmit={handleSubmit} style={{ display: 'grid', gridTemplateColumns: '88px 1fr auto', gap: 8, alignItems: 'end' }}>
             <label style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
               <span style={{ fontSize: 11, color: '#94a3b8' }}>{t('localWebPreview.port')}</span>
-              <input
-                class="input"
-                inputMode="numeric"
-                placeholder="3000"
+              <InputWithHistory
                 value={portText}
-                onInput={(e) => setPortText((e.currentTarget as HTMLInputElement).value)}
+                onValue={setPortText}
+                history={portHistory.history}
+                historyLabelKey="localWebPreview.portHistoryLabel"
+                placeholder="3000"
+                inputMode="numeric"
               />
             </label>
             <label style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
               <span style={{ fontSize: 11, color: '#94a3b8' }}>{t('localWebPreview.path')}</span>
-              <input
-                class="input"
-                placeholder="/"
+              <InputWithHistory
                 value={pathText}
-                onInput={(e) => setPathText((e.currentTarget as HTMLInputElement).value)}
+                onValue={setPathText}
+                history={pathHistory.history}
+                historyLabelKey="localWebPreview.pathHistoryLabel"
+                placeholder="/"
               />
             </label>
             <button class="btn btn-primary" type="submit" disabled={!isReady || loading}>

@@ -46,6 +46,9 @@
     "retry": "다시 시도"
   },
   "chat": {
+    "dpad": {
+      "title": "방향키 — 드래그하여 이동"
+    },
     "sendFailedReason": {
       "daemonOffline": "연결이 끊어졌습니다",
       "ackTimeout": "에이전트 응답 없음",
@@ -183,7 +186,33 @@
     "file_change_no_after": "(새 텍스트 없음)",
     "file_change_derived_no_preview": "(미리보기 없음)",
     "file_change_coarse_hint": "파일 경로는 있지만 diff 텍스트가 제공되지 않았습니다.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "font": {
+      "dialogLabel": "글꼴",
+      "typeLabel": "글꼴 유형",
+      "codeTab": "코드",
+      "cjkTab": "한국어",
+      "familyLabel": "코드 글꼴",
+      "cjkFamilyLabel": "한국어 글꼴",
+      "allBuiltInCjk": "내장 CJK 글꼴 모두 보기",
+      "cjkFamilies": {
+        "system-cjk": "시스템 CJK",
+        "pingfang-sc": "PingFang SC",
+        "songti-sc": "Songti SC",
+        "kaiti-sc": "Kaiti SC",
+        "stheiti": "STHeiti",
+        "stsong": "STSong",
+        "stkaiti": "STKaiti",
+        "stfangsong": "STFangsong",
+        "microsoft-yahei": "Microsoft YaHei",
+        "simsun": "SimSun",
+        "nsimsun": "NSimSun",
+        "dengxian": "DengXian",
+        "kaiti": "KaiTi",
+        "fangsong": "FangSong",
+        "microsoft-jhenghei": "Microsoft JhengHei"
+      }
+    }
   },
   "session": {
     "restart": "↺ 재시작",
@@ -369,6 +398,9 @@
     "codex_limit_title": "{{label}} {{percent}}% 남음 · {{reset}}에 재설정",
     "provider_plan_title": "플랜: {{value}}",
     "provider_quota_title": "한도: {{value}}",
+    "weekly_quota_authorize": "주간 한도 표시",
+    "weekly_quota_authorize_hint": "로컬 Claude 토큰 읽기를 허용하여 주간(7일) 한도를 표시합니다",
+    "weekly_quota_confirm": "주간(7일) 한도를 가져오기 위해 로컬 Claude 로그인 토큰을 읽습니다. 인증하시겠습니까?",
     "provider_quota_usage_title": "사용량: {{value}}",
     "history_loading_label": "기록",
     "history_step_cache": "캐시",
@@ -539,7 +571,8 @@
   "toast": {
     "finished": "완료됨",
     "upgrade_blocked_title": "업그레이드 차단됨",
-    "upgrade_blocked_p2p_active": "Team가 아직 실행 중입니다. daemon을 업그레이드하기 전에 먼저 중지하세요."
+    "upgrade_blocked_p2p_active": "Team가 아직 실행 중입니다. daemon을 업그레이드하기 전에 먼저 중지하세요.",
+    "upgrade_blocked_toolchain_unavailable": "daemon 호스트에 Node가 없습니다(툴체인 제거됨). Node를 다시 설치하세요. 그 전까지 자동 업그레이드가 비활성화됩니다."
   },
   "discussion": {
     "role_critic": "비평가",
@@ -547,7 +580,25 @@
     "role_innovator": "혁신가",
     "role_custom": "사용자 정의...",
     "arbiter": "중재자",
-    "arbiter_active": "⚖️ 중재자"
+    "arbiter_active": "⚖️ 중재자",
+    "starting": "시작 중…",
+    "start_failed_title": "토론을 시작하지 못했습니다",
+    "start_failed_offline": "오프라인 상태입니다. 다시 연결한 후 시도하세요.",
+    "dialog_title": "토론 시작",
+    "start_button": "토론 시작",
+    "field_topic": "주제",
+    "topic_placeholder": "에이전트가 논의할 내용을 설명하세요…",
+    "field_cwd": "작업 디렉터리",
+    "field_participants": "참여자",
+    "add_participant": "+ 추가",
+    "field_max_rounds": "최대 라운드",
+    "team_label": "팀",
+    "complete_status": "완료",
+    "failed_status": "실패",
+    "error": {
+      "missing_fields": "필수 항목이 누락되었습니다 (주제 및 참여자 2명 이상).",
+      "generic": "토론을 시작하지 못했습니다. 다시 시도하세요."
+    }
   },
   "new_session": {
     "project_required": "프로젝트 이름은 필수입니다",
@@ -1233,7 +1284,9 @@
     "empty": "로컬 포트와 경로를 입력한 다음 미리보기를 여세요.",
     "noServer": "먼저 서버를 선택하세요.",
     "previewing": "미리보기 중：",
-    "initialPathNote": "이 경로는 처음 여는 페이지만 지정합니다. 로드 후 탐색 범위는 이 경로가 아니라 포트 기준입니다."
+    "initialPathNote": "이 경로는 처음 여는 페이지만 지정합니다. 로드 후 탐색 범위는 이 경로가 아니라 포트 기준입니다.",
+    "portHistoryLabel": "최근 포트",
+    "pathHistoryLabel": "최근 경로"
   },
   "cron": {
     "title": "예약 작업",

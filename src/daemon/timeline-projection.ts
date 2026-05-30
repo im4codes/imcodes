@@ -22,8 +22,17 @@ export interface TimelineProjectionLatest {
 
 export type TimelineProjectionStatus = 'missing' | 'building' | 'ready' | 'stale' | 'corrupt';
 
-const DEFAULT_QUERY_TIMEOUT_MS = 500;
+// Read-query timeout for the SQLite projection worker. Bumped from 500ms:
+// under main-event-loop saturation the worker's *response* is processed late on
+// the main thread (not because SQLite itself is slow), so 500ms produced
+// spurious timeouts that used to degrade to the synchronous JSONL fallback. 2s
+// tolerates transient contention while still bounding a genuinely stuck worker.
+const DEFAULT_QUERY_TIMEOUT_MS = 2_000;
 const DEFAULT_WRITE_TIMEOUT_MS = 2_000;
+// Self-heal backoff for respawning a crashed projection worker (exponential,
+// capped). Replaces the old permanent-disable behaviour.
+const WORKER_RESPAWN_BASE_BACKOFF_MS = 1_000;
+const WORKER_RESPAWN_MAX_BACKOFF_MS = 30_000;
 
 export function getProjectionDbPath(): string {
   return process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH?.trim()
@@ -44,14 +53,31 @@ class TimelineProjectionClient {
     reject: (error: Error) => void;
     timer?: NodeJS.Timeout;
   }>();
-  private permanentlyDisabled = false;
+  // Self-heal instead of permanent disable. A worker crash / abnormal exit
+  // starts an exponential cooldown (cooldownUntil); the next request after it
+  // elapses lazily respawns the worker. Previously a single crash set a
+  // permanent `permanentlyDisabled` flag that stranded the SQLite fast path for
+  // the entire daemon lifetime, forcing every history read down the JSONL
+  // fallback — exactly the failure mode this subsystem must never enter now
+  // that JSONL is no longer a read fallback.
+  private consecutiveFailures = 0;
+  private cooldownUntil = 0;
 
   private ensureWorker(): Worker | null {
-    if (this.permanentlyDisabled) return null;
     if (this.worker) return this.worker;
+    // Still cooling down from a recent crash — fail fast without respawning so
+    // we don't hot-loop spawning workers against a persistent fault.
+    if (this.cooldownUntil > Date.now()) return null;
     try {
       const worker = new Worker(getWorkerModuleUrl(), {
         workerData: { dbPath: getProjectionDbPath() },
+        // Suppress the node:sqlite ExperimentalWarning at the worker boundary
+        // (it fires on first node:sqlite load in every worker thread and floods
+        // the log). Done via execArgv rather than a module-level emitWarning
+        // shim because adding an import to the worker entry destabilises its
+        // loading. ExperimentalWarning is the only experimental warning these
+        // SQLite workers can emit, so disabling the type here is safe.
+        execArgv: [...process.execArgv, '--disable-warning=ExperimentalWarning'],
       });
       worker.unref();
       worker.on('message', (message: ProjectionWorkerResponse) => this.handleWorkerMessage(message));
@@ -59,7 +85,7 @@ class TimelineProjectionClient {
         logger.warn({ err }, 'TimelineProjection: worker failed');
         this.failAllPending(err instanceof Error ? err : new Error(String(err)));
         this.worker = null;
-        this.permanentlyDisabled = true;
+        this.scheduleWorkerCooldown();
       });
       worker.on('exit', (code) => {
         if (code !== 0) {
@@ -67,18 +93,32 @@ class TimelineProjectionClient {
         }
         this.failAllPending(new Error(`timeline_projection_worker_exit:${code}`));
         this.worker = null;
-        if (code !== 0) this.permanentlyDisabled = true;
+        if (code !== 0) this.scheduleWorkerCooldown();
       });
       this.worker = worker;
       return worker;
     } catch (err) {
       logger.warn({ err }, 'TimelineProjection: failed to start worker');
-      this.permanentlyDisabled = true;
+      this.scheduleWorkerCooldown();
       return null;
     }
   }
 
+  /** Start (or extend) the respawn cooldown after a worker fault. */
+  private scheduleWorkerCooldown(): void {
+    this.consecutiveFailures += 1;
+    const backoff = Math.min(
+      WORKER_RESPAWN_MAX_BACKOFF_MS,
+      WORKER_RESPAWN_BASE_BACKOFF_MS * 2 ** (this.consecutiveFailures - 1),
+    );
+    this.cooldownUntil = Date.now() + backoff;
+  }
+
   private handleWorkerMessage(message: ProjectionWorkerResponse): void {
+    // A response of any kind proves the (possibly just-respawned) worker is
+    // alive again — clear the crash backoff so future faults start fresh.
+    this.consecutiveFailures = 0;
+    this.cooldownUntil = 0;
     const pending = this.pending.get(message.id);
     if (!pending) return;
     this.pending.delete(message.id);
@@ -230,7 +270,8 @@ class TimelineProjectionClient {
     } catch (err) {
       logger.debug({ err }, 'TimelineProjection: worker terminate failed');
     }
-    this.permanentlyDisabled = false;
+    this.consecutiveFailures = 0;
+    this.cooldownUntil = 0;
   }
 }
 

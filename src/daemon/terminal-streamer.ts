@@ -16,7 +16,7 @@
  */
 
 import type { Readable } from 'stream';
-import { BACKEND, capturePaneVisible, capturePaneHistory, getPaneId, getPaneSize, sessionExists, startPipePaneStream, stopPipePaneStream } from '../agent/tmux.js';
+import { BACKEND, capturePaneVisible, capturePaneHistory, getPaneId, getPaneSize, paneExists, sessionExists, startPipePaneStream, stopPipePaneStream } from '../agent/tmux.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { getSession, upsertSession } from '../store/session-store.js';
 import { processRawPtyData, resetParser } from './terminal-parser.js';
@@ -499,6 +499,26 @@ export class TerminalStreamer {
     if (BACKEND !== 'conpty') {
       const session = getSession(sessionName);
       paneId = session?.paneId;
+      // A STORED paneId can be stale: a migrated sessions.json on a fresh box,
+      // or one left over after a tmux-server restart, points at a `%N` that no
+      // longer exists. Piping into it would fail downstream and burn rebind
+      // attempts. If the stored pane is gone, try to swap in a freshly-resolved
+      // live pane (and persist it). We only DROP the stored id when a live one
+      // is actually resolvable — if we can't resolve one either (e.g. a
+      // transient tmux hiccup), keep the stored id and let startPipePaneStream's
+      // own hard guard + the normal rebind path decide. (paneExists never
+      // throws — it returns false on any lookup error.)
+      if (paneId && !(await paneExists(paneId))) {
+        const fetched = getPaneId(sessionName);
+        const fresh = fetched != null ? await fetched.catch(() => undefined) : undefined;
+        if (fresh && fresh !== paneId) {
+          logger.warn({ sessionName, stalePaneId: paneId, paneId: fresh }, 'startPipe: stored paneId is stale — re-resolved live pane');
+          paneId = fresh;
+          if (session) upsertSession({ ...session, paneId: fresh });
+        } else if (!fresh) {
+          logger.warn({ sessionName, paneId }, 'startPipe: stored paneId appears stale but no live pane resolved — proceeding (pipe guard will reject if truly gone)');
+        }
+      }
       if (!paneId) {
         // Fetch paneId from tmux. For transport sessions that were just created
         // and not yet registered in the session store, getPaneId will return

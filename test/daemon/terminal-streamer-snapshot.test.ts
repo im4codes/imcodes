@@ -7,6 +7,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
   capturePaneHistory: vi.fn(),
   getPaneId: vi.fn().mockResolvedValue('%1'),
   getPaneSize: vi.fn(),
+  paneExists: vi.fn().mockResolvedValue(true),
   sessionExists: vi.fn().mockResolvedValue(true),
   startPipePaneStream: vi.fn(),
   stopPipePaneStream: vi.fn().mockResolvedValue(undefined),

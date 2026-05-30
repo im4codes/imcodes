@@ -11,7 +11,7 @@
  * IMCODES_UPGRADE_COOLDOWN_MS (default 10 min).
  *
  * The cooldown MUST NOT block operator-driven pinned-version upgrades
- * (`imcodes upgrade --version X`) — those are explicit intent and
+ * (`imcodes upgrade <version>`) — those are explicit intent and
  * should always be honoured.
  *
  * Pure-function harness — file IO is injected via `readSentinel` so

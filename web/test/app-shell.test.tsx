@@ -21,6 +21,7 @@ const {
     connect: ReturnType<typeof vi.fn>;
     disconnect: ReturnType<typeof vi.fn>;
     requestSessionList: ReturnType<typeof vi.fn>;
+    setClaudeWeeklyQuotaOptIn: ReturnType<typeof vi.fn>;
     subscribeTerminal: ReturnType<typeof vi.fn>;
     unsubscribeTerminal: ReturnType<typeof vi.fn>;
     subscribeTransportSession: ReturnType<typeof vi.fn>;
@@ -112,6 +113,7 @@ vi.mock('../src/ws-client.js', () => ({
     connect = vi.fn(() => { this.connected = true; });
     disconnect = vi.fn(() => { this.connected = false; });
     requestSessionList = vi.fn();
+    setClaudeWeeklyQuotaOptIn = vi.fn();
     subscribeTerminal = vi.fn();
     unsubscribeTerminal = vi.fn();
     subscribeTransportSession = vi.fn();
@@ -177,6 +179,7 @@ vi.mock('../src/hooks/useUnreadCounts.js', () => ({
 
 vi.mock('../src/hooks/usePref.js', () => ({
   parseString: (value: unknown) => String(value),
+  parseBooleanish: (value: unknown) => value === true,
   usePref: () => ({ loaded: true, value: '/bin/bash' }),
 }));
 

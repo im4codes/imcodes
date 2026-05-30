@@ -46,6 +46,9 @@
     "retry": "重試"
   },
   "chat": {
+    "dpad": {
+      "title": "方向鍵 — 拖曳發送方向鍵"
+    },
     "sendFailedReason": {
       "daemonOffline": "連線中斷",
       "ackTimeout": "代理無回應",
@@ -183,7 +186,33 @@
     "file_change_no_after": "（沒有新文字）",
     "file_change_derived_no_preview": "（沒有可用預覽）",
     "file_change_coarse_hint": "只有檔案路徑，未提供 diff 文字。",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "font": {
+      "dialogLabel": "字型",
+      "typeLabel": "字型類型",
+      "codeTab": "程式碼",
+      "cjkTab": "中文",
+      "familyLabel": "程式碼字型",
+      "cjkFamilyLabel": "中文字型",
+      "allBuiltInCjk": "全部系統內建中文字型",
+      "cjkFamilies": {
+        "system-cjk": "系統中文",
+        "pingfang-sc": "蘋方簡體",
+        "songti-sc": "宋體-簡",
+        "kaiti-sc": "楷體-簡",
+        "stheiti": "華文黑體",
+        "stsong": "華文宋體",
+        "stkaiti": "華文楷體",
+        "stfangsong": "華文仿宋",
+        "microsoft-yahei": "微軟雅黑",
+        "simsun": "宋體",
+        "nsimsun": "新宋體",
+        "dengxian": "等線",
+        "kaiti": "楷體",
+        "fangsong": "仿宋",
+        "microsoft-jhenghei": "微軟正黑體"
+      }
+    }
   },
   "session": {
     "restart": "↺ 重新啟動",
@@ -369,6 +398,9 @@
     "codex_limit_title": "{{label}} 剩餘 {{percent}}% · 重設於 {{reset}}",
     "provider_plan_title": "方案：{{value}}",
     "provider_quota_title": "額度：{{value}}",
+    "weekly_quota_authorize": "顯示週限額",
+    "weekly_quota_authorize_hint": "授權讀取本機 Claude token 以顯示每週（7 天）額度",
+    "weekly_quota_confirm": "這將讀取本機的 Claude 登入權杖（token）以取得每週（7 天）額度。確認授權？",
     "provider_quota_usage_title": "額度進度：{{value}}",
     "history_loading_label": "歷史",
     "history_step_cache": "本地快取",
@@ -540,7 +572,8 @@
     "finished": "已完成",
     "upgrade_blocked_title": "升級已阻止",
     "upgrade_blocked_p2p_active": "團隊 仍在執行中。請先停止，再升級 daemon。",
-    "upgrade_blocked_transport_busy": "還有 transport session 正在 turn 中。等它回到 idle 再升級 daemon。"
+    "upgrade_blocked_transport_busy": "還有 transport session 正在 turn 中。等它回到 idle 再升級 daemon。",
+    "upgrade_blocked_toolchain_unavailable": "daemon 主機上的 Node 已遺失（工具鏈被移除）。請重新安裝 Node——在此之前自動升級已停用。"
   },
   "discussion": {
     "role_critic": "評論者",
@@ -548,7 +581,25 @@
     "role_innovator": "創新者",
     "role_custom": "自訂...",
     "arbiter": "仲裁者",
-    "arbiter_active": "⚖️ 仲裁者"
+    "arbiter_active": "⚖️ 仲裁者",
+    "starting": "啟動中…",
+    "start_failed_title": "討論啟動失敗",
+    "start_failed_offline": "目前離線 —— 請重新連線後再試。",
+    "dialog_title": "發起討論",
+    "start_button": "發起討論",
+    "field_topic": "主題",
+    "topic_placeholder": "描述你想讓各 Agent 討論的內容…",
+    "field_cwd": "工作目錄",
+    "field_participants": "參與者",
+    "add_participant": "+ 新增",
+    "field_max_rounds": "最大輪數",
+    "team_label": "Team",
+    "complete_status": "已完成",
+    "failed_status": "失敗",
+    "error": {
+      "missing_fields": "缺少必填項(主題以及至少兩名參與者)。",
+      "generic": "討論啟動失敗,請重試。"
+    }
   },
   "new_session": {
     "project_required": "專案名稱為必填",
@@ -1234,7 +1285,9 @@
     "empty": "輸入本機連接埠與路徑後即可開啟預覽。",
     "noServer": "請先選擇伺服器。",
     "previewing": "預覽中：",
-    "initialPathNote": "這個路徑只決定初始開啟頁面；載入後，後續導覽是依埠範圍處理，而不是依這個路徑限制。"
+    "initialPathNote": "這個路徑只決定初始開啟頁面；載入後，後續導覽是依埠範圍處理，而不是依這個路徑限制。",
+    "portHistoryLabel": "最近使用的埠",
+    "pathHistoryLabel": "最近使用的路徑"
   },
   "cron": {
     "title": "排程任務",

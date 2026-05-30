@@ -46,6 +46,9 @@
     "retry": "Повторить"
   },
   "chat": {
+    "dpad": {
+      "title": "Клавиши-стрелки — тяните, чтобы двигать"
+    },
     "sendFailedReason": {
       "daemonOffline": "Соединение потеряно",
       "ackTimeout": "Нет ответа от агента",
@@ -183,7 +186,33 @@
     "file_change_no_after": "(нет нового текста)",
     "file_change_derived_no_preview": "(предпросмотр недоступен)",
     "file_change_coarse_hint": "Доступен путь к файлу, но diff не предоставлен.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "font": {
+      "dialogLabel": "Шрифт",
+      "typeLabel": "Тип шрифта",
+      "codeTab": "Код",
+      "cjkTab": "CJK",
+      "familyLabel": "Шрифт кода",
+      "cjkFamilyLabel": "Шрифт CJK",
+      "allBuiltInCjk": "Показать все встроенные шрифты CJK",
+      "cjkFamilies": {
+        "system-cjk": "Системный CJK",
+        "pingfang-sc": "PingFang SC",
+        "songti-sc": "Songti SC",
+        "kaiti-sc": "Kaiti SC",
+        "stheiti": "STHeiti",
+        "stsong": "STSong",
+        "stkaiti": "STKaiti",
+        "stfangsong": "STFangsong",
+        "microsoft-yahei": "Microsoft YaHei",
+        "simsun": "SimSun",
+        "nsimsun": "NSimSun",
+        "dengxian": "DengXian",
+        "kaiti": "KaiTi",
+        "fangsong": "FangSong",
+        "microsoft-jhenghei": "Microsoft JhengHei"
+      }
+    }
   },
   "session": {
     "restart": "↺ Перезапустить",
@@ -369,6 +398,9 @@
     "codex_limit_title": "{{label}} осталось {{percent}}% · сброс {{reset}}",
     "provider_plan_title": "План: {{value}}",
     "provider_quota_title": "Квота: {{value}}",
+    "weekly_quota_authorize": "Показать недельный лимит",
+    "weekly_quota_authorize_hint": "Разрешить чтение локального токена Claude для показа недельного (7-дневного) лимита",
+    "weekly_quota_confirm": "Будет прочитан локальный токен входа Claude для получения недельного (7-дневного) лимита. Авторизовать?",
     "provider_quota_usage_title": "Использование квоты: {{value}}",
     "history_loading_label": "История",
     "history_step_cache": "кэш",
@@ -539,7 +571,8 @@
   "toast": {
     "finished": "завершено",
     "upgrade_blocked_title": "Обновление заблокировано",
-    "upgrade_blocked_p2p_active": "Team всё ещё выполняется. Остановите его перед обновлением daemon."
+    "upgrade_blocked_p2p_active": "Team всё ещё выполняется. Остановите его перед обновлением daemon.",
+    "upgrade_blocked_toolchain_unavailable": "На хосте daemon отсутствует Node (toolchain удалён). Переустановите Node — автообновление отключено до этого."
   },
   "discussion": {
     "role_critic": "Критик",
@@ -547,7 +580,25 @@
     "role_innovator": "Новатор",
     "role_custom": "Пользовательская...",
     "arbiter": "Арбитр",
-    "arbiter_active": "⚖️ Арбитр"
+    "arbiter_active": "⚖️ Арбитр",
+    "starting": "Запуск…",
+    "start_failed_title": "Не удалось запустить обсуждение",
+    "start_failed_offline": "Нет подключения — переподключитесь и повторите попытку.",
+    "dialog_title": "Начать обсуждение",
+    "start_button": "Начать обсуждение",
+    "field_topic": "Тема",
+    "topic_placeholder": "Опишите, что должны обсудить агенты…",
+    "field_cwd": "Рабочий каталог",
+    "field_participants": "Участники",
+    "add_participant": "+ Добавить",
+    "field_max_rounds": "Макс. раундов",
+    "team_label": "Команда",
+    "complete_status": "Завершено",
+    "failed_status": "Ошибка",
+    "error": {
+      "missing_fields": "Отсутствуют обязательные поля (тема и не менее двух участников).",
+      "generic": "Не удалось запустить обсуждение. Повторите попытку."
+    }
   },
   "new_session": {
     "project_required": "Название проекта обязательно",
@@ -1233,7 +1284,9 @@
     "empty": "Введите локальный порт и путь, затем откройте предпросмотр.",
     "noServer": "Сначала выберите сервер.",
     "previewing": "Предпросмотр:",
-    "initialPathNote": "Путь задаёт только начальную страницу. После загрузки навигация ограничивается портом, а не этим путём."
+    "initialPathNote": "Путь задаёт только начальную страницу. После загрузки навигация ограничивается портом, а не этим путём.",
+    "portHistoryLabel": "Недавние порты",
+    "pathHistoryLabel": "Недавние пути"
   },
   "cron": {
     "title": "Запланированные задачи",

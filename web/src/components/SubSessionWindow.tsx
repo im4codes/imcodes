@@ -2,7 +2,7 @@
  * SubSessionWindow — floating, draggable/resizable window for a sub-session.
  * Uses the full SessionControls for input (same as the main session).
  */
-import { useState, useRef, useCallback, useEffect, useMemo } from 'preact/hooks';
+import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
@@ -115,6 +115,55 @@ const DEFAULT_H = 620;
 const MIN_W = 600;
 const MIN_H = 400;
 const DESKTOP_VISIBLE_MARGIN = 32;
+// Mobile sub-session windows should only clear the bottom sub-session
+// launcher/card area. Parent usage footers and composers can sit behind
+// the overlay; counting them pushes the window too high.
+const MOBILE_SUBSESSION_BAR_SELECTORS = [
+  '.subcard-bar',
+] as const;
+
+function getExternalMobileSubSessionBarElements(doc: Document = document): HTMLElement[] {
+  const seen = new Set<HTMLElement>();
+  const candidates: HTMLElement[] = [];
+  for (const selector of MOBILE_SUBSESSION_BAR_SELECTORS) {
+    for (const el of Array.from(doc.querySelectorAll<HTMLElement>(selector))) {
+      if (seen.has(el)) continue;
+      if (el.closest('.subsession-window')) continue;
+      seen.add(el);
+      candidates.push(el);
+    }
+  }
+  return candidates.filter((el) => !candidates.some((other) => other !== el && other.contains(el)));
+}
+
+export function measureMobileSubSessionBarHeight(
+  doc: Document = document,
+  viewportHeight = window.visualViewport?.height ?? window.innerHeight,
+): number {
+  const elements = getExternalMobileSubSessionBarElements(doc);
+  if (elements.length === 0) return 0;
+
+  const visibleTops = elements
+    .map((el) => el.getBoundingClientRect())
+    .filter((rect) => rect.height > 0 && rect.bottom > 0 && rect.top < viewportHeight)
+    .map((rect) => Math.max(0, rect.top));
+  if (visibleTops.length > 0) {
+    return Math.ceil(Math.max(0, viewportHeight - Math.min(...visibleTops)));
+  }
+
+  return Math.ceil(elements.reduce((total, el) => total + Math.max(0, el.offsetHeight), 0));
+}
+
+function isMobileSubSessionBarSuppressed(doc: Document = document): boolean {
+  const root = doc.documentElement;
+  return root.classList.contains('kb-open') || root.classList.contains('input-focused');
+}
+
+function getInitialMobileSubSessionBarHeight(isMobile: boolean): number {
+  if (!isMobile || typeof document === 'undefined') return 0;
+  if (isMobileSubSessionBarSuppressed()) return 0;
+  return measureMobileSubSessionBarHeight();
+}
 
 function currentDesktopBounds(): WorkspaceBounds {
   return reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
@@ -600,21 +649,73 @@ export function SubSessionWindow({
     return () => vv.removeEventListener('resize', update);
   }, [isMobile]);
 
-  const [controlsHeight, setControlsHeight] = useState(0);
-  useEffect(() => {
+  const [subSessionBarHeight, setSubSessionBarHeight] = useState(() => getInitialMobileSubSessionBarHeight(isMobile));
+  useLayoutEffect(() => {
     if (!isMobile) return;
-    const controls = Array.from(document.querySelectorAll('.controls-wrapper'))
-      .find((el) => !(el as HTMLElement).closest('.subsession-window')) as HTMLElement | undefined;
-    const subBar = Array.from(document.querySelectorAll('.subsession-bar'))
-      .find((el) => !(el as HTMLElement).closest('.subsession-window')) as HTMLElement | undefined;
-    if (!controls && !subBar) return;
-    const update = () => setControlsHeight(subBar?.offsetHeight ?? controls?.offsetHeight ?? 0);
+    let raf = 0;
+    let ro: ResizeObserver | null = null;
+    const vv = window.visualViewport;
+
+    const update = () => {
+      const measured = measureMobileSubSessionBarHeight();
+      if (measured <= 0) {
+        if (isMobileSubSessionBarSuppressed()) {
+          setSubSessionBarHeight((prev) => (prev === 0 ? prev : 0));
+        }
+        return;
+      }
+      setSubSessionBarHeight((prev) => (prev === measured ? prev : measured));
+    };
+    const scheduleUpdate = () => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        update();
+      });
+    };
+    const observeTargets = () => {
+      if (typeof ResizeObserver === 'undefined') return;
+      ro?.disconnect();
+      ro = new ResizeObserver(scheduleUpdate);
+      for (const el of getExternalMobileSubSessionBarElements()) {
+        ro.observe(el);
+      }
+    };
+
+    observeTargets();
     update();
-    if (typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(update);
-    if (controls) ro.observe(controls);
-    if (subBar) ro.observe(subBar);
-    return () => ro.disconnect();
+
+    const mo = typeof MutationObserver === 'undefined'
+      ? null
+      : new MutationObserver(() => {
+        observeTargets();
+        scheduleUpdate();
+      });
+    mo?.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['class', 'style', 'hidden'],
+    });
+    mo?.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['class'],
+    });
+    window.addEventListener('resize', scheduleUpdate);
+    document.addEventListener('focusin', scheduleUpdate, true);
+    document.addEventListener('focusout', scheduleUpdate, true);
+    vv?.addEventListener('resize', scheduleUpdate);
+    vv?.addEventListener('scroll', scheduleUpdate);
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      ro?.disconnect();
+      mo?.disconnect();
+      window.removeEventListener('resize', scheduleUpdate);
+      document.removeEventListener('focusin', scheduleUpdate, true);
+      document.removeEventListener('focusout', scheduleUpdate, true);
+      vv?.removeEventListener('resize', scheduleUpdate);
+      vv?.removeEventListener('scroll', scheduleUpdate);
+    };
   }, [isMobile]);
 
   const displayGeom = useMemo(() => {
@@ -624,6 +725,9 @@ export function SubSessionWindow({
     return clampMaximizedGeom(bounds);
   }, [geom, getMaximizeBounds, isMobile, isDesktopMaximized, maximizeBoundsVersion]);
 
+  const mobileSubSessionBarHeight = Math.max(0, Math.min(subSessionBarHeight, Math.max(0, vvh - 120)));
+  const mobileWindowHeight = `calc(${vvh}px - var(--sat, 0px) - ${mobileSubSessionBarHeight}px)`;
+
   const style: Record<string, string | number> = isMobile
     ? {
         '--subsession-accent-color': accentColor,
@@ -631,8 +735,10 @@ export function SubSessionWindow({
         top: 'var(--sat, 0px)',
         left: 0,
         right: 0,
-        bottom: `${controlsHeight}px`,
-        height: `calc(${vvh}px - var(--sat, 0px) - ${controlsHeight}px)`,
+        bottom: `${mobileSubSessionBarHeight}px`,
+        height: mobileWindowHeight,
+        maxHeight: mobileWindowHeight,
+        minHeight: 0,
         zIndex,
       }
     : { '--subsession-accent-color': accentColor, position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h, zIndex };

@@ -20,6 +20,17 @@ export const DAEMON_SERVER_LINK_FRESH_MS = 30_000;
 export const DAEMON_STORAGE_CRITICAL_FREE_BYTES = 512 * 1024 * 1024;
 export const DAEMON_STORAGE_LOW_FREE_BYTES = 2 * 1024 * 1024 * 1024;
 
+export interface DaemonResourceSnapshot {
+  /** epoch ms when the snapshot was taken (for freshness display) */
+  capturedAt: number;
+  /** process.memoryUsage() fields, in bytes */
+  rssBytes: number;
+  heapTotalBytes: number;
+  heapUsedBytes: number;
+  externalBytes: number;
+  arrayBuffersBytes: number;
+}
+
 export interface DaemonRuntimeStatus {
   pid: number;
   startedAt: number;
@@ -27,6 +38,7 @@ export interface DaemonRuntimeStatus {
   restartCount: number;
   version?: string;
   serverLink?: DaemonServerLinkRuntimeStatus;
+  resources?: DaemonResourceSnapshot;
 }
 
 export type DaemonServerLinkRuntimeState = 'connecting' | 'connected' | 'disconnected';
@@ -261,6 +273,7 @@ export function readDaemonRuntimeStatus(baseDir: string = defaultDaemonRuntimeSt
     const restartCount = coerceNonNegativeSafeInteger(parsed.restartCount);
     if (pid === null || startedAt === null || updatedAt === null || restartCount === null) return null;
     const serverLink = parseDaemonServerLinkRuntimeStatus(parsed.serverLink);
+    const resources = parseDaemonResourceSnapshot(parsed.resources);
     return {
       pid,
       startedAt,
@@ -268,6 +281,7 @@ export function readDaemonRuntimeStatus(baseDir: string = defaultDaemonRuntimeSt
       restartCount,
       ...(typeof parsed.version === 'string' && parsed.version ? { version: parsed.version } : {}),
       ...(serverLink ? { serverLink } : {}),
+      ...(resources ? { resources } : {}),
     };
   } catch {
     return null;
@@ -295,6 +309,10 @@ export function recordDaemonStart(input: {
     updatedAt: nowMs,
     restartCount,
     ...(input.version ? { version: input.version } : {}),
+    // Heap can only be observed from inside the daemon process itself, so we
+    // ride it along on writes that already happen (start + heartbeat) — no
+    // dedicated polling timer / extra disk writes.
+    resources: captureDaemonResourceSnapshot(nowMs),
   };
 
   return writeDaemonRuntimeStatus(next, baseDir, nowMs);
@@ -330,9 +348,58 @@ export function recordDaemonServerLinkStatus(input: DaemonServerLinkRuntimeUpdat
     updatedAt: nowMs,
     restartCount: samePid && previous ? previous.restartCount : previous?.restartCount ?? 0,
     ...(input.version ?? previous?.version ? { version: input.version ?? previous?.version } : {}),
+    // Capture a fresh heap snapshot on this heartbeat-driven write — heap is
+    // only observable from inside the daemon, and this write happens anyway
+    // (throttled to ~10s), so there is no extra disk I/O for it.
+    resources: captureDaemonResourceSnapshot(nowMs),
     serverLink: nextLink,
   };
   return writeDaemonRuntimeStatus(next, baseDir, nowMs);
+}
+
+/** Capture a memory snapshot of the CURRENT process (the daemon). */
+function captureDaemonResourceSnapshot(nowMs: number): DaemonResourceSnapshot {
+  const m = process.memoryUsage();
+  return {
+    capturedAt: nowMs,
+    rssBytes: m.rss,
+    heapTotalBytes: m.heapTotal,
+    heapUsedBytes: m.heapUsed,
+    externalBytes: m.external,
+    arrayBuffersBytes: m.arrayBuffers ?? 0,
+  };
+}
+
+/**
+ * Read another process's resident set size (RSS) live, on demand — used by
+ * `imcodes status` so RSS is accurate at view time rather than as-of the last
+ * daemon write. (Heap is NOT obtainable this way: a process's V8 heap is only
+ * visible from inside that process, hence the self-reported snapshot above.)
+ */
+export function readProcessRssBytes(
+  pid: number,
+  runner: ExecFileSyncLike = execFileSync,
+  platform: NodeJS.Platform = process.platform,
+): number | null {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    if (platform === 'win32') {
+      const script = `$p = Get-Process -Id ${pid} -ErrorAction Stop; [int64]$p.WorkingSet64`;
+      const out = runner(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+        UTF8_STDIO_OPTIONS,
+      );
+      const bytes = Number(String(out).trim());
+      return Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : null;
+    }
+    // Unix `ps` reports RSS in kilobytes.
+    const out = runner('ps', ['-p', String(pid), '-o', 'rss='], UTF8_STDIO_OPTIONS);
+    const kb = Number(String(out).trim());
+    return Number.isSafeInteger(kb) && kb >= 0 ? kb * 1024 : null;
+  } catch {
+    return null;
+  }
 }
 
 export function getDaemonServerLinkFreshness(
@@ -433,6 +500,27 @@ function parseDaemonServerLinkRuntimeStatus(value: unknown): DaemonServerLinkRun
     ...definedNonNegativeInteger('lastHeartbeatSentAt', raw.lastHeartbeatSentAt),
     ...definedNonNegativeInteger('lastSendFailedAt', raw.lastSendFailedAt),
     ...definedString('lastError', raw.lastError),
+  };
+}
+
+function parseDaemonResourceSnapshot(value: unknown): DaemonResourceSnapshot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const capturedAt = coerceNonNegativeSafeInteger(raw.capturedAt);
+  const rssBytes = coerceNonNegativeSafeInteger(raw.rssBytes);
+  const heapTotalBytes = coerceNonNegativeSafeInteger(raw.heapTotalBytes);
+  const heapUsedBytes = coerceNonNegativeSafeInteger(raw.heapUsedBytes);
+  const externalBytes = coerceNonNegativeSafeInteger(raw.externalBytes);
+  if (capturedAt === null || rssBytes === null || heapTotalBytes === null || heapUsedBytes === null || externalBytes === null) {
+    return null;
+  }
+  return {
+    capturedAt,
+    rssBytes,
+    heapTotalBytes,
+    heapUsedBytes,
+    externalBytes,
+    arrayBuffersBytes: coerceNonNegativeSafeInteger(raw.arrayBuffersBytes) ?? 0,
   };
 }
 

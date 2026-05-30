@@ -112,20 +112,16 @@ async function pollTick(sessionName: string, state: WatcherState): Promise<void>
     let sessionId = record?.opencodeSessionId;
     if (!record?.projectDir || !sessionId) return;
 
-    // Tolerate `TimelinePreferredReadError` (projection unavailable mid-init)
-    // by falling back to the JSONL path; the outer try/catch would otherwise
-    // swallow it as debug and silently skip this tick's backfill diff, which
-    // is worse than running a slightly heavier read.
+    // SQLite projection is the sole chat-history read source — no JSONL
+    // `read()` fallback. On a transient projection miss we leave recentTimeline
+    // empty; this watcher re-evaluates next tick (cheaper than the old
+    // synchronous JSONL read that amplified event-loop saturation under load,
+    // and JSONL is now write/backup-only).
     let recentTimeline: Awaited<ReturnType<typeof timelineStore.readPreferred>> = [];
     try {
       recentTimeline = await timelineStore.readPreferred(sessionName, { limit: 200 });
     } catch (err) {
-      logger.warn({ err, sessionName }, 'opencode-watcher: readPreferred failed, falling back to JSONL');
-      try {
-        recentTimeline = timelineStore.read(sessionName, { limit: 200 });
-      } catch (fallbackErr) {
-        logger.warn({ err: fallbackErr, sessionName }, 'opencode-watcher: JSONL fallback also failed');
-      }
+      logger.warn({ err, sessionName }, 'opencode-watcher: projection read failed; skipping this tick (no JSONL fallback)');
     }
     const hasAssistantHistory = hasAssistantLikeTimeline(recentTimeline);
     if (!hasAssistantHistory) {

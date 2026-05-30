@@ -113,6 +113,37 @@ describe('p2p.list_discussions', () => {
     expect(response.discussions[0]?.path).toBe(join(discussionsDir, 'run-main.md'));
   });
 
+  it('serves rapid repeat polls for the same scope from the short-lived cache', async () => {
+    // Regression guard for the p2p_list_discussions cache+dedup: before it,
+    // every poll re-scanned project dirs and re-parsed every discussion file
+    // (a top GC-pressure source under load). Two back-to-back polls for the
+    // same scope must collapse to a single scan — proven here by adding a
+    // second discussion file between the polls and asserting the cached
+    // (pre-add) result is returned within the 2s TTL.
+    const discussionsDir = imcSubDir(projectDir, 'discussions');
+    await writeFile(join(discussionsDir, 'run-first.md'), '## User Request\nfirst\n', 'utf8');
+
+    handleWebCommand({
+      type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS,
+      requestId: 'p2p-cache-1',
+      scope: { sessionName: 'deck_proj_brain' },
+    }, serverLink as any);
+    await waitForSentCount(1);
+    expect((sent[0] as { discussions: Array<{ id: string }> }).discussions.map((d) => d.id)).toEqual(['run-first']);
+
+    // Add a second discussion, then poll again immediately. Within the TTL the
+    // cached result (just the first file) must come back — the new file is not
+    // re-scanned. This is the behaviour that collapses a poll burst.
+    await writeFile(join(discussionsDir, 'run-second.md'), '## User Request\nsecond\n', 'utf8');
+    handleWebCommand({
+      type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS,
+      requestId: 'p2p-cache-2',
+      scope: { sessionName: 'deck_proj_brain' },
+    }, serverLink as any);
+    await waitForSentCount(2);
+    expect((sent[1] as { discussions: Array<{ id: string }> }).discussions.map((d) => d.id)).toEqual(['run-first']);
+  });
+
   it('does not list or read discussions across project scope', async () => {
     await writeFile(join(imcSubDir(projectDir, 'discussions'), 'run-main.md'), '## User Request\nmain request\n', 'utf8');
     await writeFile(join(imcSubDir(otherProjectDir, 'discussions'), 'run-secret.md'), '## User Request\nsecret request\n', 'utf8');

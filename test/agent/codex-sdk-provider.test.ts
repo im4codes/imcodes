@@ -1213,6 +1213,51 @@ describe('CodexSdkProvider', () => {
     expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
   });
 
+  it('ignores duplicate compact turn completion without scanning stale generated images', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-compact-images-'));
+    const provider = new CodexSdkProvider();
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-compact-image-scan', cwd: '/tmp/project' });
+
+      const imageDir = join(codexHome, 'generated_images', 'thread-1');
+      await mkdir(imageDir, { recursive: true });
+      const staleImagePath = join(imageDir, 'ig_previous.png');
+      await writeFile(staleImagePath, 'old-png');
+
+      const completed: string[] = [];
+      provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+      await provider.send('route-compact-image-scan', '/compact');
+
+      const child = childProcessMock.children[0];
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'compact-turn-item',
+          item: { id: 'compact-item', type: 'contextCompaction' },
+        },
+      });
+      child.emits({
+        method: 'turn/completed',
+        params: {
+          threadId: 'thread-1',
+          turn: { id: 'compact-turn-item', status: 'completed', error: null },
+        },
+      });
+      await flush();
+
+      expect(completed).toEqual(['Codex context compacted.']);
+      expect(completed.join('\n')).not.toContain('Generated image path detected by IM.codes');
+      expect(completed.join('\n')).not.toContain(staleImagePath);
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
   it('settles accepted compact requests that emit no native completion signal', async () => {
     vi.useFakeTimers();
     const provider = new CodexSdkProvider();

@@ -118,6 +118,105 @@ describe('daemon preview relay', () => {
     }));
   });
 
+  it('exempts a streaming (SSE) response from the cumulative byte cap', async () => {
+    // Load the relay + shared limits with a tiny MAX_RESPONSE_BYTES so we can
+    // overshoot it cheaply. isStreamingResponse must classify text/event-stream
+    // as streaming and therefore skip the cumulative byte-cap abort.
+    const prev = process.env.PREVIEW_MAX_RESPONSE_BYTES;
+    process.env.PREVIEW_MAX_RESPONSE_BYTES = '8';
+    vi.resetModules();
+    try {
+      const relay = await import('../../src/daemon/preview-relay.js');
+      const types = await import('../../shared/preview-types.js');
+      const serverLink = createServerLink();
+      fetchMock.mockResolvedValue({
+        status: 200,
+        statusText: 'OK',
+        headers: new Headers({ 'content-type': 'text/event-stream' }),
+        body: Readable.from([
+          Buffer.from('data: one two three four\n\n'), // > 8 bytes
+          Buffer.from('data: five six seven eight\n\n'),
+        ]),
+      });
+
+      relay.handlePreviewCommand({
+        type: types.PREVIEW_MSG.REQUEST,
+        requestId: 'req-stream',
+        previewId: 'preview-stream',
+        port: 3000,
+        method: 'GET',
+        path: '/events',
+        headers: {},
+        hasBody: false,
+      }, serverLink as never);
+
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: types.PREVIEW_MSG.RESPONSE_END,
+        requestId: 'req-stream',
+      }));
+      expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+        type: types.PREVIEW_MSG.ERROR,
+        requestId: 'req-stream',
+        code: types.PREVIEW_ERROR.LIMIT_EXCEEDED,
+      }));
+      // All body chunks were forwarded despite exceeding the 8-byte cap.
+      expect(serverLink.sendBinary).toHaveBeenCalledTimes(2);
+    } finally {
+      if (prev === undefined) delete process.env.PREVIEW_MAX_RESPONSE_BYTES;
+      else process.env.PREVIEW_MAX_RESPONSE_BYTES = prev;
+      vi.resetModules();
+    }
+  });
+
+  it('still aborts a non-streaming response that exceeds the cumulative byte cap', async () => {
+    const prev = process.env.PREVIEW_MAX_RESPONSE_BYTES;
+    process.env.PREVIEW_MAX_RESPONSE_BYTES = '8';
+    vi.resetModules();
+    try {
+      const relay = await import('../../src/daemon/preview-relay.js');
+      const types = await import('../../shared/preview-types.js');
+      const serverLink = createServerLink();
+      fetchMock.mockResolvedValue({
+        status: 200,
+        statusText: 'OK',
+        // Plain text, no chunked / streaming MIME → NOT streaming → byte cap applies.
+        headers: new Headers({ 'content-type': 'text/plain', 'content-length': '100' }),
+        body: Readable.from([
+          Buffer.from('0123456789'), // 10 bytes > 8-byte cap
+        ]),
+      });
+
+      relay.handlePreviewCommand({
+        type: types.PREVIEW_MSG.REQUEST,
+        requestId: 'req-nonstream',
+        previewId: 'preview-nonstream',
+        port: 3000,
+        method: 'GET',
+        path: '/big',
+        headers: {},
+        hasBody: false,
+      }, serverLink as never);
+
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: types.PREVIEW_MSG.ERROR,
+        requestId: 'req-nonstream',
+        code: types.PREVIEW_ERROR.LIMIT_EXCEEDED,
+      }));
+      expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+        type: types.PREVIEW_MSG.RESPONSE_END,
+        requestId: 'req-nonstream',
+      }));
+    } finally {
+      if (prev === undefined) delete process.env.PREVIEW_MAX_RESPONSE_BYTES;
+      else process.env.PREVIEW_MAX_RESPONSE_BYTES = prev;
+      vi.resetModules();
+    }
+  });
+
   it('does not time out an sse-style upstream while chunks keep arriving before idle timeout', async () => {
     vi.useFakeTimers();
     const serverLink = createServerLink();

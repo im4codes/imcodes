@@ -46,6 +46,9 @@
     "retry": "Reintentar"
   },
   "chat": {
+    "dpad": {
+      "title": "Teclas de flecha: arrastra para mover"
+    },
     "sendFailedReason": {
       "daemonOffline": "Conexión perdida",
       "ackTimeout": "Sin respuesta del agente",
@@ -183,7 +186,33 @@
     "file_change_no_after": "(sin texto nuevo)",
     "file_change_derived_no_preview": "(sin vista previa)",
     "file_change_coarse_hint": "Hay ruta de archivo, pero no se proporcionó texto diff.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "font": {
+      "dialogLabel": "Fuente",
+      "typeLabel": "Tipo de fuente",
+      "codeTab": "Código",
+      "cjkTab": "CJK",
+      "familyLabel": "Fuente de código",
+      "cjkFamilyLabel": "Fuente CJK",
+      "allBuiltInCjk": "Ver todas las fuentes CJK integradas",
+      "cjkFamilies": {
+        "system-cjk": "CJK del sistema",
+        "pingfang-sc": "PingFang SC",
+        "songti-sc": "Songti SC",
+        "kaiti-sc": "Kaiti SC",
+        "stheiti": "STHeiti",
+        "stsong": "STSong",
+        "stkaiti": "STKaiti",
+        "stfangsong": "STFangsong",
+        "microsoft-yahei": "Microsoft YaHei",
+        "simsun": "SimSun",
+        "nsimsun": "NSimSun",
+        "dengxian": "DengXian",
+        "kaiti": "KaiTi",
+        "fangsong": "FangSong",
+        "microsoft-jhenghei": "Microsoft JhengHei"
+      }
+    }
   },
   "session": {
     "restart": "↺ Reiniciar",
@@ -369,6 +398,9 @@
     "codex_limit_title": "{{label}} restante {{percent}}% · se restablece {{reset}}",
     "provider_plan_title": "Plan: {{value}}",
     "provider_quota_title": "Cuota: {{value}}",
+    "weekly_quota_authorize": "Mostrar límite semanal",
+    "weekly_quota_authorize_hint": "Autorizar la lectura de tu token local de Claude para mostrar el límite semanal (7 días)",
+    "weekly_quota_confirm": "Esto leerá tu token de inicio de sesión local de Claude para obtener el límite semanal (7 días). ¿Autorizar?",
     "provider_quota_usage_title": "Uso de cuota: {{value}}",
     "history_loading_label": "Historial",
     "history_step_cache": "caché",
@@ -539,7 +571,8 @@
   "toast": {
     "finished": "terminó",
     "upgrade_blocked_title": "Actualización bloqueada",
-    "upgrade_blocked_p2p_active": "Team sigue en ejecución. Deténlo antes de actualizar el daemon."
+    "upgrade_blocked_p2p_active": "Team sigue en ejecución. Deténlo antes de actualizar el daemon.",
+    "upgrade_blocked_toolchain_unavailable": "Falta Node en el host del daemon (toolchain eliminado). Reinstala Node; la actualización automática está deshabilitada hasta entonces."
   },
   "discussion": {
     "role_critic": "Crítico",
@@ -547,7 +580,25 @@
     "role_innovator": "Innovador",
     "role_custom": "Personalizado...",
     "arbiter": "Árbitro",
-    "arbiter_active": "⚖️ Árbitro"
+    "arbiter_active": "⚖️ Árbitro",
+    "starting": "Iniciando…",
+    "start_failed_title": "No se pudo iniciar la discusión",
+    "start_failed_offline": "Estás sin conexión: vuelve a conectarte e inténtalo de nuevo.",
+    "dialog_title": "Iniciar discusión",
+    "start_button": "Iniciar discusión",
+    "field_topic": "Tema",
+    "topic_placeholder": "Describe lo que quieres que discutan los agentes…",
+    "field_cwd": "Directorio de trabajo",
+    "field_participants": "Participantes",
+    "add_participant": "+ Añadir",
+    "field_max_rounds": "Rondas máximas",
+    "team_label": "Equipo",
+    "complete_status": "Completado",
+    "failed_status": "Fallido",
+    "error": {
+      "missing_fields": "Faltan campos obligatorios (tema y al menos dos participantes).",
+      "generic": "No se pudo iniciar la discusión. Inténtalo de nuevo."
+    }
   },
   "new_session": {
     "project_required": "El nombre del proyecto es obligatorio",
@@ -1233,7 +1284,9 @@
     "empty": "Introduce un puerto local y una ruta, luego abre la vista previa.",
     "noServer": "Selecciona primero un servidor.",
     "previewing": "Vista previa:",
-    "initialPathNote": "La ruta solo establece la página inicial. Después de cargar, la navegación queda limitada por el puerto, no por esta ruta."
+    "initialPathNote": "La ruta solo establece la página inicial. Después de cargar, la navegación queda limitada por el puerto, no por esta ruta.",
+    "portHistoryLabel": "Puertos recientes",
+    "pathHistoryLabel": "Rutas recientes"
   },
   "cron": {
     "title": "Tareas programadas",

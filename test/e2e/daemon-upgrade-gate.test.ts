@@ -547,7 +547,7 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     expect(sh).toMatch(/MAX_ATTEMPTS=5/);
     expect(sh).toMatch(/RETRY_DELAYS=\(0 15 30 60 120\)/);
     expect(sh).toContain('registry visibility precheck for');
-    expect(sh).toMatch(/view --prefer-online imcodes@99\.99\.99-test version/);
+    expect(sh).toMatch(/view --prefer-online \$\{REGISTRY_ARG\} imcodes@99\.99\.99-test version/);
     expect(sh).toContain('target never became visible across $MAX_ATTEMPTS attempts');
     expect(sh).toMatch(/grep -qiE 'code ETARGET\|No matching version found'/);
     // Regression: `npm cache clean --force` made the next successful
