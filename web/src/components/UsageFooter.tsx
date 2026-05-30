@@ -189,7 +189,10 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     return t('session.state_idle');
   }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, isAgentless, now, sessionState, statusText, t]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result';
-  const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
+  // Providers that report structured quota windows (Codex + claude-code-sdk)
+  // render the SAME prominent multi-line quota block as Codex — not the inline
+  // bottom token span — so the limit display is consistent across providers.
+  const providerQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk' || agentType === 'claude-code-sdk')
     ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)
     : [];
   return (
@@ -201,9 +204,9 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           {ctxBurning && <span class="session-ctx-burn" style={{ width: `${totalPct}%` }} aria-hidden="true" />}
         </div>
       )}
-      {codexQuotaLines.length > 0 && (
+      {providerQuotaLines.length > 0 && (
         <div class="session-usage-codex-quota">
-          {codexQuotaLines.map((line) => (
+          {providerQuotaLines.map((line) => (
             <div class="session-usage-codex-line">{line}</div>
           ))}
         </div>
@@ -279,7 +282,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           </span>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
           {hasContextInfo && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
-          {inlineQuotaText && codexQuotaLines.length === 0 && <span class="session-usage-tokens">{inlineQuotaText}</span>}
+          {inlineQuotaText && providerQuotaLines.length === 0 && <span class="session-usage-tokens">{inlineQuotaText}</span>}
           {sessionCost > 0 && (
             <span class="session-usage-cost">
               {formatCost(sessionCost)} · wk {formatCost(weeklyCost)} · mo {formatCost(monthlyCost)}
