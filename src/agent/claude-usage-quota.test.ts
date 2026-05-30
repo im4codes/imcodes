@@ -1,6 +1,9 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { usageEndpointToQuotaMeta, getClaudeUsageQuota, setClaudeUsageQuotaOptIn, __resetClaudeUsageQuotaCache } from './claude-usage-quota.js';
 import { formatProviderQuotaLabel } from '../../shared/provider-quota.js';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // The exact /api/oauth/usage payload captured from the live endpoint:
 // utilization is 0–100 PERCENT, resets_at is an ISO-8601 string.
@@ -65,5 +68,40 @@ describe('getClaudeUsageQuota opt-in gate', () => {
     // force=true bypasses the cache; the gate must still short-circuit to null
     // before any token read or fetch.
     expect(await getClaudeUsageQuota(true)).toBeNull();
+  });
+});
+
+describe('quota persistence + idle gate', () => {
+  // IS_TEST_ENV routes the cache file under tmpdir, not the real ~/.imcodes.
+  const cachePath = join(tmpdir(), '.imcodes', 'claude-usage-quota.json');
+  afterEach(() => {
+    setClaudeUsageQuotaOptIn(false);
+    __resetClaudeUsageQuotaCache();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('serves a disk-persisted snapshot after a restart without hitting the network', async () => {
+    // A snapshot persisted by a previous daemon run, <30min old.
+    mkdirSync(join(tmpdir(), '.imcodes'), { recursive: true });
+    const value = { quotaMeta: usageEndpointToQuotaMeta(REAL)!, quotaLabel: 'persisted-label' };
+    writeFileSync(cachePath, JSON.stringify({ at: Date.now(), value }));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    setClaudeUsageQuotaOptIn(true); // opt in (also marks activity)
+    const q = await getClaudeUsageQuota();
+
+    expect(fetchSpy).not.toHaveBeenCalled();      // served from disk — no /api/oauth/usage
+    expect(q?.quotaLabel).toBe('persisted-label');
+  });
+
+  it('does NOT hit the network when idle >15min with no claude-code-sdk activity', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    setClaudeUsageQuotaOptIn(true);                // last activity = real now
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 16 * 60 * 1000); // 16min later, still idle (no send)
+    const q = await getClaudeUsageQuota();
+    expect(fetchSpy).not.toHaveBeenCalled();        // idle gate suppressed the fetch
+    expect(q).toBeNull();                           // nothing cached yet → null, but no network
   });
 });

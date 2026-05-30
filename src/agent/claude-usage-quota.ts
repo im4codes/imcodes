@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -18,6 +19,15 @@ const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 // Account-wide quota — throttle the call to AT MOST once per 30 minutes
 // regardless of how many sessions or how often buildSessionList runs.
 const CACHE_TTL_MS = 30 * 60 * 1000;
+// When no claude-code-sdk session has been used for this long, stop hitting the
+// network: serve the last cached snapshot (incl. the disk-persisted one) instead
+// of calling /api/oauth/usage. A send to a claude-code-sdk session resumes it.
+const IDLE_FETCH_SUPPRESS_MS = 15 * 60 * 1000;
+const IS_TEST_ENV = !!process.env.VITEST || process.env.NODE_ENV === 'test';
+// Persist the snapshot so a daemon restart (it auto-upgrades often) doesn't lose
+// the quota or trigger an immediate re-fetch. Mirrors src/agent/provider-quota.ts.
+const CACHE_DIR = join(IS_TEST_ENV ? tmpdir() : homedir(), '.imcodes');
+const CACHE_PATH = join(CACHE_DIR, 'claude-usage-quota.json');
 const FIVE_HOUR_MINS = 5 * 60;
 const SEVEN_DAY_MINS = 7 * 24 * 60;
 const KEYCHAIN_SERVICE = 'Claude Code-credentials';
@@ -133,6 +143,49 @@ async function claudeCliHeaders(token: string): Promise<Record<string, string>> 
 // (re)connect and on toggle.
 let optedIn = false;
 
+let cache: { at: number; value: ClaudeUsageQuota | null } | null = null;
+let inflight: Promise<ClaudeUsageQuota | null> | null = null;
+// Idle until the first claude-code-sdk session activity (a send to one). While
+// idle we never hit /api/oauth/usage — we serve the last cached/persisted snapshot.
+let lastActivityAt = 0;
+let diskLoaded = false;
+
+/**
+ * Mark that a claude-code-sdk session was just used (called from the daemon's
+ * session.send path, gated to claude-code-sdk only). Resumes proactive quota
+ * fetching after an idle window.
+ */
+export function recordClaudeQuotaActivity(now = Date.now()): void {
+  lastActivityAt = now;
+}
+
+/** Lazily seed the in-memory cache from the persisted snapshot (once). */
+function loadPersistedCacheOnce(): void {
+  if (diskLoaded) return;
+  diskLoaded = true;
+  if (cache) return;
+  try {
+    if (!existsSync(CACHE_PATH)) return;
+    const parsed = JSON.parse(readFileSync(CACHE_PATH, 'utf8')) as { at?: number; value?: ClaudeUsageQuota | null };
+    if (parsed && typeof parsed.at === 'number' && parsed.value && Date.now() - parsed.at < CACHE_TTL_MS) {
+      cache = { at: parsed.at, value: parsed.value };
+    }
+  } catch { /* missing / unreadable / bad json — treat as no cache */ }
+}
+
+/** Persist a SUCCESSFUL snapshot so it survives a daemon restart. */
+function persistCache(entry: { at: number; value: ClaudeUsageQuota | null }): void {
+  if (!entry.value) return; // never persist a null/failed snapshot
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    writeFileSync(CACHE_PATH, JSON.stringify(entry), 'utf8');
+  } catch (err) { logger.debug({ err }, 'claude usage quota cache persist failed'); }
+}
+
+function deletePersistedCache(): void {
+  try { rmSync(CACHE_PATH, { force: true }); } catch { /* ignore */ }
+}
+
 export function setClaudeUsageQuotaOptIn(enabled: boolean): void {
   if (optedIn === enabled) return;
   optedIn = enabled;
@@ -140,10 +193,16 @@ export function setClaudeUsageQuotaOptIn(enabled: boolean): void {
   // stale (or stale-null) snapshot from before the toggle.
   cache = null;
   inflight = null;
+  diskLoaded = false;
+  if (enabled) {
+    // The user just authorized it — treat as activity so the next call fetches
+    // immediately rather than being suppressed by the idle gate.
+    lastActivityAt = Date.now();
+  } else {
+    // Revoked — drop the persisted snapshot too (privacy: stop showing it).
+    deletePersistedCache();
+  }
 }
-
-let cache: { at: number; value: ClaudeUsageQuota | null } | null = null;
-let inflight: Promise<ClaudeUsageQuota | null> | null = null;
 
 async function fetchUsageQuota(): Promise<ClaudeUsageQuota | null> {
   const token = await readClaudeAccessToken();
@@ -175,12 +234,18 @@ async function fetchUsageQuota(): Promise<ClaudeUsageQuota | null> {
 export async function getClaudeUsageQuota(force = false): Promise<ClaudeUsageQuota | null> {
   // Off by default — no token read, no network — until the user authorizes it.
   if (!optedIn) return null;
+  loadPersistedCacheOnce();
   const now = Date.now();
+  // Fresh cache (incl. one seeded from disk after a restart) → serve, no network.
   if (!force && cache && now - cache.at < CACHE_TTL_MS) return cache.value;
+  // Idle gate: no claude-code-sdk session activity for a while → don't hit the
+  // endpoint; serve the last known snapshot (possibly stale). A send resumes it.
+  if (!force && now - lastActivityAt > IDLE_FETCH_SUPPRESS_MS) return cache?.value ?? null;
   if (inflight) return inflight;
   inflight = (async () => {
     const value = await fetchUsageQuota();
     cache = { at: Date.now(), value };
+    persistCache(cache);
     return value;
   })().finally(() => { inflight = null; });
   return inflight;
@@ -190,4 +255,7 @@ export async function getClaudeUsageQuota(force = false): Promise<ClaudeUsageQuo
 export function __resetClaudeUsageQuotaCache(): void {
   cache = null;
   inflight = null;
+  diskLoaded = false;
+  lastActivityAt = 0;
+  deletePersistedCache();
 }

@@ -63,7 +63,7 @@ const execAsync = promisify(execCb);
 const execFileAsync = promisify(execFileCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
 import { buildSessionList } from './session-list.js';
-import { setClaudeUsageQuotaOptIn } from '../agent/claude-usage-quota.js';
+import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import { parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
@@ -2523,6 +2523,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     logger.warn('session.send: missing sessionName or text');
     return;
   }
+
+  // Only a message to a claude-code-sdk session counts as activity that keeps the
+  // Claude usage-quota poll alive (the quota tracks the Claude subscription).
+  // Cheap sync Map lookup — does not touch the send hot-path ack latency.
+  if (getSession(sessionName)?.agentType === 'claude-code-sdk') recordClaudeQuotaActivity();
 
   // Fallback: legacy clients that don't send commandId get a server-generated one
   const isLegacy = !commandId;
