@@ -1182,6 +1182,34 @@ export function App() {
   const bumpStack = useCallback(() => setStackVersion((n) => n + 1), []);
   const isMobileRef = useRef(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent));
 
+  // Active (frontmost) sub-session. Managed EXPLICITLY rather than re-derived
+  // from the mutable window stack on every render: opening/focusing a window
+  // sets it directly (`activateSubId`), and it STAYS PUT while that sub remains
+  // open — so background stack churn (WS-driven re-ensures, z-index bumps, the
+  // stack-sync effect) can never silently reassign the active highlight to a
+  // different window. It is re-derived ONLY when the active sub is gone (closed
+  // or session switched), picking the next frontmost. This is what makes opening
+  // an Nth window reliable: the just-opened one is the active one, full stop —
+  // no count-dependent race that left it dashed/inactive and un-closable.
+  const [focusedSubId, setFocusedSubIdState] = useState<string | null>(null);
+  const focusedSubIdRef = useRef(focusedSubId);
+  focusedSubIdRef.current = focusedSubId;
+  const recomputeFocusedSubId = useCallback(() => {
+    setFocusedSubIdState((prev) => {
+      if (isMobileRef.current) return null;
+      // Sticky: keep the current active sub while it is still open.
+      if (prev && openSubIdsRef.current.has(prev)) return prev;
+      return getFrontmostSubSessionId(stackRef.current!, openSubIdsRef.current);
+    });
+  }, []);
+  const activateSubId = useCallback((id: string) => {
+    setFocusedSubIdState(isMobileRef.current ? null : id);
+  }, []);
+  // Backstop: re-derive on any stack change (sticky — never steals focus from a
+  // still-open active sub; only reassigns once it's gone). Also keeps the
+  // `stackVersion` counter live so z-index consumers re-render on stack changes.
+  useEffect(() => { recomputeFocusedSubId(); }, [stackVersion, recomputeFocusedSubId]);
+
   /** Idempotent register; raises if `bringToFront` is requested. Bumps version only on real change. */
   const ensureDesktopWindow = useCallback((id: string, meta: DesktopWindowMeta, opts?: { bringToFront?: boolean }) => {
     if (isMobileRef.current) return;
@@ -1201,8 +1229,11 @@ export function App() {
 
   /** Remove a window (and its children). Bumps only if anything was actually removed. */
   const removeDesktopWindow = useCallback((id: string) => {
-    if (stackRef.current!.removeWindow(id)) bumpStack();
-  }, []);
+    if (stackRef.current!.removeWindow(id)) {
+      bumpStack();
+      recomputeFocusedSubId();
+    }
+  }, [recomputeFocusedSubId]);
 
   /**
    * Read effective z-index. Cheap and called during render. Consumers must
@@ -1224,11 +1255,6 @@ export function App() {
   const openSubIdsKeyMemo = useMemo(() => openSubIdsKey(openSubIds), [openSubIds]);
   const maximizedSubIdsRef = useRef(maximizedSubIds);
   maximizedSubIdsRef.current = maximizedSubIds;
-  const focusedSubId = useMemo(
-    () => (isMobileRef.current ? null : getFrontmostSubSessionId(stackRef.current!, openSubIds)),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- deps are intentionally [stackVersion, key] to avoid invalidating on every Set re-creation
-    [stackVersion, openSubIdsKeyMemo],
-  );
   const flashIdleSession = useCallback((sessionName: string) => {
     setIdleFlashTokens((prev) => {
       const next = new Map(prev);
@@ -1236,8 +1262,6 @@ export function App() {
       return next;
     });
   }, []);
-  const focusedSubIdRef = useRef(focusedSubId);
-  focusedSubIdRef.current = focusedSubId;
 
   useEffect(() => {
     if (sessionsLoaded && sessions.length === 0) {
@@ -1446,7 +1470,11 @@ export function App() {
       ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(openId), getSubSessionDesktopWindowMeta(openId));
     }
     ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id), getSubSessionDesktopWindowMeta(id), { bringToFront: true });
-  }, [ensureDesktopWindow, getSubSessionDesktopWindowMeta]);
+    // `id` was just raised to the front — it IS the active sub now. Set it
+    // explicitly so the highlight/active-window state can't lag or be reassigned
+    // by the stack-sync churn that follows an open.
+    activateSubId(id);
+  }, [activateSubId, ensureDesktopWindow, getSubSessionDesktopWindowMeta]);
 
   const setSubSessionMaximized = useCallback((id: string, maximized: boolean) => {
     setMaximizedSubIds((prev) => {
@@ -1583,6 +1611,7 @@ export function App() {
   const closeAllSubSessionWindows = useCallback(() => {
     setMaximizedSubIds(new Set());
     setOpenSubIds(new Set());
+    recomputeFocusedSubId();
     if (isMobileRef.current) return;
     const stack = stackRef.current!;
     let changed = false;
@@ -1591,7 +1620,7 @@ export function App() {
       if (stack.removeWindow(entry.id)) changed = true;
     }
     if (changed) bumpStack();
-  }, [bumpStack, setOpenSubIds]);
+  }, [bumpStack, recomputeFocusedSubId, setOpenSubIds]);
 
   const restoreQuickClosedSubSessionWindows = useCallback((ids: string[]) => {
     if (isMobileRef.current || ids.length === 0) return;
@@ -2091,7 +2120,11 @@ export function App() {
     }
 
     if (changed) bumpStack();
-  }, [bumpStack, getSubSessionDesktopWindowMeta, openSubIdsKeyMemo, visibleSubSessionStackKey, visibleSubSessions]);
+    // Re-derive the active sub after stack churn. Sticky: a no-op while the
+    // active sub is still open; only reassigns when it's gone (e.g. on a
+    // main-session switch that cleared the old session's open set).
+    recomputeFocusedSubId();
+  }, [bumpStack, getSubSessionDesktopWindowMeta, openSubIdsKeyMemo, recomputeFocusedSubId, visibleSubSessionStackKey, visibleSubSessions]);
 
   useEffect(() => {
     const liveSessionNames = new Set<string>([

@@ -1010,6 +1010,52 @@ describe('App shell', () => {
     expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
   }, 20_000);
 
+  it('marks the most-recently opened sub-session window active, regardless of how many are open', async () => {
+    // Regression: opening a 3rd (or Nth) window left it inactive (dashed accent,
+    // un-closable) because the active sub was re-derived from the mutable window
+    // stack and lost a race with background churn. The active sub is now set
+    // explicitly on open, so the just-opened window is always the active one.
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = ['a', 'b', 'c'].map((suffix, i) => ({
+      id: `sub-${i + 1}`,
+      sessionName: `deck_sub_alpha_${suffix}`,
+      parentSession: 'deck_alpha_brain',
+      label: suffix.toUpperCase(),
+      description: '',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    }));
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('subbar-open-sub-1'));
+    fireEvent.click(screen.getByText('subbar-open-sub-2'));
+    fireEvent.click(screen.getByText('subbar-open-sub-3'));
+
+    // The just-opened sub-3 is active; the earlier two are open but inactive.
+    await waitFor(() => {
+      expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-active')).toBe('true');
+    });
+    expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-active')).toBe('false');
+    expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-active')).toBe('false');
+
+    // Re-activating an older window flips active over to it (and only it).
+    fireEvent.mouseDown(screen.getByTestId('sub-session-window-sub-1'));
+    await waitFor(() => {
+      expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-active')).toBe('true');
+    });
+    expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-active')).toBe('false');
+  }, 20_000);
+
   it('executes app-level shell callbacks and websocket message reducers', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
