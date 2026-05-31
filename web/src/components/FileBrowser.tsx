@@ -524,6 +524,8 @@ export function FileBrowser({
   const previewScrollSnapshotRef = useRef<PreviewScrollSnapshot | null>(null);
   const mountedRef = useRef(true);
   const dismissedAutoPreviewPathRef = useRef<string | null>(null);
+  const autoPreviewPathRef = useRef(autoPreviewPath);
+  useEffect(() => { autoPreviewPathRef.current = autoPreviewPath; }, [autoPreviewPath]);
   const previewTabOverridePathRef = useRef<string | null>(null);
   const nextPreviewCycleIdRef = useRef(1);
   const activePreviewCycleRef = useRef<PendingPreviewRequest | null>(null);
@@ -755,6 +757,13 @@ export function FileBrowser({
             // The target is a directory, not a file — this is NOT a failed
             // preview. Open the folder's listing in the left tree and clear the
             // preview pane instead of showing "preview failed".
+            // When the directory IS the auto-preview target (e.g. a folder path
+            // clicked in chat), mark it dismissed first so the auto-preview
+            // effect does not immediately re-trigger fetchPreview() for it —
+            // otherwise navigate→idle→re-fetch loops forever and the UI flickers.
+            if (filePath === autoPreviewPathRef.current) {
+              dismissedAutoPreviewPathRef.current = filePath;
+            }
             navigateToRef.current(filePath);
             setPreview({ status: 'idle' });
             return;

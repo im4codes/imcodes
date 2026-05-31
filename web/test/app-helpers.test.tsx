@@ -56,7 +56,8 @@ describe('app shell pure helpers', () => {
   });
 
   it('derives stable file preview initial paths', () => {
-    expect(helpers.getFilePreviewInitialPath({ path: '/repo/src/app.tsx', rootPath: '/repo' })).toBe('/repo');
+    expect(helpers.getFilePreviewInitialPath({ path: '/repo/src/app.tsx', rootPath: '/repo' })).toBe('/repo/src');
+    expect(helpers.getFilePreviewInitialPath({ path: 'README.md', rootPath: '/repo' })).toBe('/repo');
     expect(helpers.getFilePreviewInitialPath({ path: '/repo/src/app.tsx' })).toBe('/repo/src');
     expect(helpers.getFilePreviewInitialPath({ path: 'C:\\repo\\src\\app.tsx' })).toBe('C:\\repo\\src');
     expect(helpers.getFilePreviewInitialPath({ path: 'README.md' })).toBe('~');

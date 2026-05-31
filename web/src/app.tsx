@@ -293,13 +293,15 @@ function readLegacyPinnedSessionTabs(): string[] {
 }
 
 export function getFilePreviewInitialPath(request: FileBrowserPreviewRequest): string {
-  if (request.rootPath) return request.rootPath;
+  // Root the left file tree at the previewed file's OWN parent directory so the
+  // list shows its siblings. rootPath (the project/diff base) is only used as a
+  // fallback for a bare filename that has no directory component.
   const slash = request.path.lastIndexOf('/');
   const backslash = request.path.lastIndexOf('\\');
   const idx = Math.max(slash, backslash);
   if (idx > 0) return request.path.slice(0, idx);
   if (idx === 0) return request.path[0] ?? '~';
-  return '~';
+  return request.rootPath ?? '~';
 }
 
 export function updateServerDaemonVersion<T extends { id: string; daemonVersion?: string | null }>(
