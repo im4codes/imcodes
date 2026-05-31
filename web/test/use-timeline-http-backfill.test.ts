@@ -22,6 +22,7 @@ import { render, screen, cleanup, act, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import type { ServerMessage, TimelineEvent, WsClient } from '../src/ws-client.js';
 import {
+  __getTimelineHistoryAfterTsForTests,
   __resetBackfillCooldownsForTests,
   __resetTimelineCacheForTests,
   ingestTimelineEventForCache,
@@ -49,6 +50,128 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
   });
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it('manual force refresh pulls the daemon latest window without afterTs so a pushed latest event cannot hide middle history', async () => {
+    const sessionName = `deck_manual_middle_gap_${Date.now()}`;
+    const serverId = `srv-manual-middle-${Date.now()}`;
+
+    const oldEvent: TimelineEvent = {
+      eventId: `${sessionName}-old`,
+      sessionId: sessionName,
+      ts: 100,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'old-local' },
+    };
+    const latestPush: TimelineEvent = {
+      eventId: `${sessionName}-latest-push`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 3,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'latest-push' },
+    };
+    const middleRecovered: TimelineEvent = {
+      eventId: `${sessionName}-middle`,
+      sessionId: sessionName,
+      ts: 500,
+      epoch: 1,
+      seq: 2,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'middle-recovered' },
+    };
+
+    ingestTimelineEventForCache(oldEvent, serverId);
+    ingestTimelineEventForCache(latestPush, serverId);
+    fetchSpy.mockResolvedValue({ events: [middleRecovered], epoch: 1, hasMore: false, nextCursor: null });
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay-manual-middle'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history-manual-middle'),
+    } as unknown as WsClient;
+
+    let timeline: ReturnType<typeof useTimeline> | null = null;
+    function Probe() {
+      timeline = useTimeline(sessionName, ws, serverId);
+      return h(
+        'div',
+        { 'data-testid': 'probe' },
+        timeline.events.map((e) => String(e.payload.text ?? '')).join('|'),
+      );
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('latest-push');
+    });
+
+    await act(async () => {
+      timeline!.forceRefresh();
+      await vi.advanceTimersByTimeAsync(1);
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      serverId,
+      sessionName,
+      expect.not.objectContaining({ afterTs: expect.any(Number) }),
+    );
+    expect(fetchSpy).toHaveBeenCalledWith(
+      serverId,
+      sessionName,
+      expect.objectContaining({ limit: 300, timeoutMs: 12_000 }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('middle-recovered');
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses only history content events for tail afterTs so session.state cannot advance the cursor past missing content', () => {
+    const sessionName = `deck_tail_cursor_content_${Date.now()}`;
+    const afterTs = __getTimelineHistoryAfterTsForTests([
+      {
+        eventId: `${sessionName}-content`,
+        sessionId: sessionName,
+        ts: 100,
+        epoch: 1,
+        seq: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'content' },
+      },
+      {
+        eventId: `${sessionName}-state`,
+        sessionId: sessionName,
+        ts: 1000,
+        epoch: 1,
+        seq: 2,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'session.state',
+        payload: { state: 'idle' },
+      },
+    ]);
+
+    expect(afterTs).toBe(99);
   });
 
   it('fires HTTP backfill ~600ms after reconnect and merges recovered events', async () => {

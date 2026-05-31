@@ -55,6 +55,7 @@ import {
   preferTimelineEvent,
   type TimelineDetailFieldPath,
 } from '../../../src/shared/timeline/merge.js';
+import { TIMELINE_HISTORY_CONTENT_TYPES } from '../../../src/shared/timeline/types.js';
 import { fetchTimelineHistoryHttp, sendSessionViaHttp } from '../api.js';
 import { runNewestWindowBackfill } from '../timeline/catchup/backfill-pager.js';
 import { normalizeTransportPendingEntries } from '../transport-queue.js';
@@ -148,6 +149,33 @@ const RECONNECT_REFRESH_COOLDOWN_MS = 15_000;
 // cooled-down, or a no-op. A local IDB re-read is cheap and an idempotent merge.
 const ACTIVE_LOCAL_RELOAD_MAX_EVENTS = 10;
 const FORWARD_HISTORY_TIMEOUT_MS = 8_000;
+const TIMELINE_HISTORY_CONTENT_TYPE_SET = new Set<string>(TIMELINE_HISTORY_CONTENT_TYPES);
+const HTTP_BACKFILL_MODES = ['tail', 'manualLatestWindow'] as const;
+type HttpBackfillMode = typeof HTTP_BACKFILL_MODES[number];
+type HttpBackfillOpts = {
+  cooldownMs?: number;
+  phase?: 'bootstrap' | 'refresh';
+  visible?: boolean;
+  force?: boolean;
+  mode?: HttpBackfillMode;
+  _retryAttempt?: number;
+};
+
+function createHttpBackfillCountState(): Record<HttpBackfillMode, number> {
+  return { tail: 0, manualLatestWindow: 0 };
+}
+
+function createHttpBackfillTimerState(): Record<HttpBackfillMode, ReturnType<typeof setTimeout> | null> {
+  return { tail: null, manualLatestWindow: null };
+}
+
+function createHttpBackfillDueAtState(): Record<HttpBackfillMode, number> {
+  return { tail: 0, manualLatestWindow: 0 };
+}
+
+function totalHttpBackfillInFlight(counts: Record<HttpBackfillMode, number>): number {
+  return counts.tail + counts.manualLatestWindow;
+}
 
 function resetBackfillCooldowns(): void {
   lastHttpBackfillResponseAt.clear();
@@ -820,17 +848,27 @@ export function __clearPersistedTimelineSnapshotsForTests(): void {
   }
 }
 
+function isHistoryCursorEligibleEvent(ev: TimelineEvent): boolean {
+  if (!TIMELINE_HISTORY_CONTENT_TYPE_SET.has(ev.type)) return false;
+  // Pending optimistic bubbles carry `ts = Date.now()` from the client clock —
+  // exclude them so a skewed client clock can't accidentally filter out
+  // legitimately-missed server events.
+  if (ev.type === 'user.message' && (ev as { payload?: { pending?: boolean } }).payload?.pending) return false;
+  return true;
+}
+
 function getTimelineHistoryAfterTs(events: TimelineEvent[]): number | undefined {
   let maxTs: number | undefined;
   for (const ev of events) {
-    // Pending optimistic bubbles carry `ts = Date.now()` from the client
-    // clock — exclude them so a skewed client clock can't accidentally
-    // filter out legitimately-missed server events.
-    if (ev.type === 'user.message' && (ev as { payload?: { pending?: boolean } }).payload?.pending) continue;
+    if (!isHistoryCursorEligibleEvent(ev)) continue;
     if (typeof ev.ts === 'number' && (maxTs === undefined || ev.ts > maxTs)) maxTs = ev.ts;
   }
   if (maxTs === undefined) return undefined;
   return Math.max(0, maxTs - TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS);
+}
+
+export function __getTimelineHistoryAfterTsForTests(events: TimelineEvent[]): number | undefined {
+  return getTimelineHistoryAfterTs(events);
 }
 
 export function __getTimelineCacheKeysForTests(): string[] {
@@ -1311,9 +1349,9 @@ export function useTimeline(
       : createIdleHistoryStatus()
   ));
   const loadingOlderRef = useRef(false); // Synchronous guard against duplicate pagination requests
-  const httpBackfillInFlightRef = useRef(0);
-  const httpBackfillTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const httpBackfillTimerDueAtRef = useRef(0);
+  const httpBackfillInFlightRef = useRef<Record<HttpBackfillMode, number>>(createHttpBackfillCountState());
+  const httpBackfillTimerRef = useRef<Record<HttpBackfillMode, ReturnType<typeof setTimeout> | null>>(createHttpBackfillTimerState());
+  const httpBackfillTimerDueAtRef = useRef<Record<HttpBackfillMode, number>>(createHttpBackfillDueAtState());
   const epochRef = useRef<number>(0);
   const seqRef = useRef<number>(0);
   const replayRequestIdRef = useRef<string | null>(null);
@@ -1411,11 +1449,15 @@ export function useTimeline(
     return true;
   }, [sessionId]);
 
-  const clearHttpBackfillTimer = useCallback(() => {
-    if (!httpBackfillTimerRef.current) return;
-    clearTimeout(httpBackfillTimerRef.current);
-    httpBackfillTimerRef.current = null;
-    httpBackfillTimerDueAtRef.current = 0;
+  const clearHttpBackfillTimer = useCallback((mode?: HttpBackfillMode) => {
+    const modes = mode ? [mode] : HTTP_BACKFILL_MODES;
+    for (const currentMode of modes) {
+      const timer = httpBackfillTimerRef.current[currentMode];
+      if (!timer) continue;
+      clearTimeout(timer);
+      httpBackfillTimerRef.current[currentMode] = null;
+      httpBackfillTimerDueAtRef.current[currentMode] = 0;
+    }
   }, []);
 
   useEffect(() => {
@@ -1433,7 +1475,7 @@ export function useTimeline(
       setLoading(false);
       setHttpRefreshing(false);
       setHistoryStatus(createIdleHistoryStatus());
-      httpBackfillInFlightRef.current = 0;
+      httpBackfillInFlightRef.current = createHttpBackfillCountState();
       clearHttpBackfillTimer();
       clearForwardHistoryTimeout();
       historyRequestIdRef.current = null;
@@ -1448,7 +1490,7 @@ export function useTimeline(
       setRefreshing(false);
       setHttpRefreshing(false);
       setHistoryStatus(createIdleHistoryStatus());
-      httpBackfillInFlightRef.current = 0;
+      httpBackfillInFlightRef.current = createHttpBackfillCountState();
       clearHttpBackfillTimer();
       clearForwardHistoryTimeout();
       historyRequestIdRef.current = null;
@@ -1470,7 +1512,7 @@ export function useTimeline(
       canHttp: false,
       cacheSeeded: eventsRef.current.length > 0,
     }));
-    httpBackfillInFlightRef.current = 0;
+    httpBackfillInFlightRef.current = createHttpBackfillCountState();
     clearHttpBackfillTimer();
     clearForwardHistoryTimeout();
     historyRequestIdRef.current = null;
@@ -2371,7 +2413,7 @@ export function useTimeline(
   // fire a fresh backfill, and the WS path remains the primary.
   const HTTP_BACKFILL_RETRY_DELAYS_MS = [800, 2000] as const;
 
-  const fireHttpBackfill = useCallback((delayMs: number, opts?: { cooldownMs?: number; phase?: 'bootstrap' | 'refresh'; visible?: boolean; force?: boolean; _retryAttempt?: number }) => {
+  const fireHttpBackfill = useCallback((delayMs: number, opts?: HttpBackfillOpts) => {
     // Read `isActiveSession` via ref so this gate always reflects the latest
     // render's value, never a stale closure. The closure value only desynchs
     // briefly during same-tick `setState` → render → effect sequences (e.g.
@@ -2395,48 +2437,54 @@ export function useTimeline(
     const phase = opts?.phase ?? 'refresh';
     const visible = opts?.visible === true;
     const retryAttempt = opts?._retryAttempt ?? 0;
+    const mode = opts?.mode ?? 'tail';
     const backfillSessionId = sessionId;
     const backfillCacheKey = cacheKey;
     const dueAt = Date.now() + Math.max(0, delayMs);
-    if (httpBackfillTimerRef.current && httpBackfillTimerDueAtRef.current <= dueAt) {
+    if (mode === 'manualLatestWindow') clearHttpBackfillTimer('tail');
+    if (httpBackfillTimerRef.current[mode] && httpBackfillTimerDueAtRef.current[mode] <= dueAt) {
       backfillDebug('fireHttpBackfill: coalesced', {
         sessionId: backfillSessionId,
+        mode,
         hasTimer: true,
-        inFlight: httpBackfillInFlightRef.current,
+        inFlight: httpBackfillInFlightRef.current[mode],
       });
-      if (visible) updateHistoryStep('http', 'done', phase);
+      if (visible) updateHistoryStep('http', 'running', phase);
       return;
     }
-    if (httpBackfillTimerRef.current) clearHttpBackfillTimer();
-    if (httpBackfillInFlightRef.current > 0) {
+    if (httpBackfillTimerRef.current[mode]) clearHttpBackfillTimer(mode);
+    if (httpBackfillInFlightRef.current[mode] > 0) {
       backfillDebug('fireHttpBackfill: coalesced', {
         sessionId: backfillSessionId,
+        mode,
         hasTimer: false,
-        inFlight: httpBackfillInFlightRef.current,
+        inFlight: httpBackfillInFlightRef.current[mode],
       });
-      if (visible) updateHistoryStep('http', 'done', phase);
+      if (visible) updateHistoryStep('http', 'running', phase);
       return;
     }
-    httpBackfillTimerDueAtRef.current = dueAt;
-    httpBackfillTimerRef.current = setTimeout(() => {
-      httpBackfillTimerRef.current = null;
-      httpBackfillTimerDueAtRef.current = 0;
+    httpBackfillTimerDueAtRef.current[mode] = dueAt;
+    httpBackfillTimerRef.current[mode] = setTimeout(() => {
+      httpBackfillTimerRef.current[mode] = null;
+      httpBackfillTimerDueAtRef.current[mode] = 0;
       if (cacheKeyRef.current !== backfillCacheKey) return;
       if (backfillCacheKey && cooldownMs > 0) {
         const lastOk = lastHttpBackfillResponseAt.get(backfillCacheKey);
         if (lastOk !== undefined && Date.now() - lastOk < cooldownMs) {
-          backfillDebug('fireHttpBackfill: cooldown skip', { sessionId: backfillSessionId, lastOk, cooldownMs });
+          backfillDebug('fireHttpBackfill: cooldown skip', { sessionId: backfillSessionId, mode, lastOk, cooldownMs });
           if (visible) updateHistoryStep('http', 'done', phase);
           return;
         }
       }
-      // Recompute the cursor at fire time, not call time — the UI may have
-      // received fresh WS events during the delay window and we don't want
-      // to redownload them.
-      const afterTs = getTimelineHistoryAfterTs(eventsRef.current);
-      backfillDebug('fireHttpBackfill: requesting', { sessionId: backfillSessionId, phase, afterTs, retryAttempt });
+      // Tail catch-up recomputes the cursor at fire time so fresh WS events
+      // aren't re-downloaded. Manual ↻ is different: it intentionally asks for
+      // the daemon's latest 300-event window with no lower timestamp bound, so
+      // a newly-pushed event cannot mask the missing middle history below it.
+      const afterTs = mode === 'manualLatestWindow' ? undefined : getTimelineHistoryAfterTs(eventsRef.current);
+      const maxPages = mode === 'manualLatestWindow' ? 1 : undefined;
+      backfillDebug('fireHttpBackfill: requesting', { sessionId: backfillSessionId, phase, mode, afterTs, retryAttempt });
       if (visible) {
-        httpBackfillInFlightRef.current += 1;
+        httpBackfillInFlightRef.current[mode] += 1;
         updateHistoryStep('http', 'running', phase);
         setHttpRefreshing(true);
       }
@@ -2453,9 +2501,11 @@ export function useTimeline(
       // NOTE: this does NOT fix the "middle/ordering gap" (events older than the
       // local tail base); that needs the deferred verified/forward cursor.
       void (async () => {
+        let terminal: 'caught_up' | 'cap_hit' | 'truncated' | 'transient_null' | 'error' | null = null;
         try {
           const outcome = await runNewestWindowBackfill(afterTs, {
             limit: MAX_MEMORY_EVENTS,
+            maxPages,
             fetchPage: ({ afterTs: at, beforeTs: bt }) => Promise.resolve(fetchTimelineHistoryHttp(serverId, backfillSessionId, {
               afterTs: at,
               ...(bt !== undefined ? { beforeTs: bt } : {}),
@@ -2493,6 +2543,7 @@ export function useTimeline(
               };
             },
           });
+          terminal = outcome.terminal;
           // Transient null on the FIRST page → preserve the legacy retry-with-backoff.
           // A null on a later page means ≥1 page already merged; stop (next trigger
           // continues) rather than restart the whole round.
@@ -2511,13 +2562,16 @@ export function useTimeline(
           if (backfillCacheKey && outcome.terminal === 'caught_up') {
             lastHttpBackfillResponseAt.set(backfillCacheKey, Date.now());
           }
-          backfillDebug('fireHttpBackfill: tail backfill settled', { sessionId: backfillSessionId, terminal: outcome.terminal, pages: outcome.pageCount, totalNew: outcome.totalNew });
-        } catch { /* opportunistic — WS path is primary */ }
+          backfillDebug('fireHttpBackfill: backfill settled', { sessionId: backfillSessionId, mode, terminal: outcome.terminal, pages: outcome.pageCount, totalNew: outcome.totalNew });
+        } catch {
+          terminal = 'error';
+          /* opportunistic — WS path is primary */
+        }
         finally {
           if (visible) {
-            httpBackfillInFlightRef.current = Math.max(0, httpBackfillInFlightRef.current - 1);
-            updateHistoryStep('http', 'done', phase);
-            if (httpBackfillInFlightRef.current === 0) setHttpRefreshing(false);
+            httpBackfillInFlightRef.current[mode] = Math.max(0, httpBackfillInFlightRef.current[mode] - 1);
+            updateHistoryStep('http', terminal === 'caught_up' ? 'done' : 'pending', phase);
+            if (totalHttpBackfillInFlight(httpBackfillInFlightRef.current) === 0) setHttpRefreshing(false);
           }
         }
       })();
@@ -2579,7 +2633,7 @@ export function useTimeline(
     // i.e. when the HTTP path is a no-op), then opportunistically catch up
     // over HTTP.
     void reloadLocalTimeline();
-    fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true, force: true });
+    fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true, force: true, mode: 'manualLatestWindow' });
   }, [reloadLocalTimeline]);
 
   // Self-heal a blank pane. The mount path seeds `events` from local cache, but
@@ -3259,7 +3313,7 @@ export function useTimeline(
       clearForwardHistoryTimeout();
       clearHttpBackfillTimer();
       reconnectRefreshInFlightRef.current = false;
-      httpBackfillInFlightRef.current = 0;
+      httpBackfillInFlightRef.current = createHttpBackfillCountState();
     };
   }, [clearForwardHistoryTimeout, clearHttpBackfillTimer, sessionId]);
 
