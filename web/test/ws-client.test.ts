@@ -1496,4 +1496,82 @@ describe('WsClient', () => {
       client.disconnect();
     });
   });
+
+  describe('eager probe on interaction (zombie-socket recovery)', () => {
+    const PING = JSON.stringify({ type: 'ping' });
+
+    it('probes the socket when subscribing after the liveness window lapses', async () => {
+      const client = await connectClient();
+      const events: Array<{ event?: string }> = [];
+      client.onMessage((m) => events.push(m as { event?: string }));
+      // Saw a pong long ago, socket still reports OPEN → classic zombie.
+      (client as unknown as { _lastPongAt: number })._lastPongAt = Date.now() - 20_000;
+      lastWs!.send.mockClear();
+
+      client.subscribeTerminal('deck_sub_zombie', false);
+
+      // A verification ping fires immediately instead of stalling until the
+      // heartbeat watchdog (~36s) or a manual tab switch.
+      expect(lastWs!.send).toHaveBeenCalledWith(PING);
+      // And it's surfaced as a soft "probing", not a hard disconnect.
+      expect(events.some((e) => e?.event === 'probing')).toBe(true);
+
+      client.disconnect();
+    });
+
+    it('does NOT probe when a recent pong already proved the socket alive', async () => {
+      const client = await connectClient();
+      const events: Array<{ event?: string }> = [];
+      client.onMessage((m) => events.push(m as { event?: string }));
+      (client as unknown as { _lastPongAt: number })._lastPongAt = Date.now(); // fresh
+      lastWs!.send.mockClear();
+
+      client.subscribeTerminal('deck_sub_healthy', false);
+
+      expect(lastWs!.send).not.toHaveBeenCalledWith(PING);
+      expect(events.some((e) => e?.event === 'probing')).toBe(false);
+
+      client.disconnect();
+    });
+
+    it('does NOT probe immediately after connect (no pong observed yet)', async () => {
+      const client = await connectClient(); // _lastPongAt is still 0
+      lastWs!.send.mockClear();
+
+      client.subscribeTerminal('deck_sub_fresh', false);
+
+      expect(lastWs!.send).not.toHaveBeenCalledWith(PING);
+
+      client.disconnect();
+    });
+
+    it('holdTerminalRaw also recovers a stalled socket', async () => {
+      const client = await connectClient();
+      (client as unknown as { _lastPongAt: number })._lastPongAt = Date.now() - 20_000;
+      lastWs!.send.mockClear();
+
+      const release = client.holdTerminalRaw('deck_sub_shell');
+      expect(lastWs!.send).toHaveBeenCalledWith(PING);
+      release();
+
+      client.disconnect();
+    });
+
+    it('sendTimelineHistoryRequest also recovers a stalled socket', async () => {
+      const client = await connectClient();
+      (client as unknown as { _lastPongAt: number })._lastPongAt = Date.now() - 20_000;
+      lastWs!.send.mockClear();
+
+      client.sendTimelineHistoryRequest('deck_sub_chat');
+      expect(lastWs!.send).toHaveBeenCalledWith(PING);
+
+      client.disconnect();
+    });
+
+    it('is a safe no-op when never connected', async () => {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      expect(() => client.subscribeTerminal('s', false)).not.toThrow();
+      expect(lastWs).toBeNull();
+    });
+  });
 });

@@ -280,6 +280,17 @@ const P2P_WORKFLOW_REQUEST_TIMEOUT_MS = 30_000;
  *  liveness during normal use; foreground probes only need to fire after a
  *  genuine sleep/background gap. */
 const PROBE_FRESHNESS_MS = 5_000;
+/** When a user interaction requests fresh data (opening a sub-session,
+ *  subscribing to a terminal, asking for timeline history) and the socket has
+ *  NOT proven liveness for at least one full heartbeat+pong window, eagerly
+ *  verify the socket instead of letting the interaction stall on a zombie
+ *  (readyState=OPEN but path dead). Without this, recovery waited for either the
+ *  heartbeat watchdog (~2 missed cycles ≈ 36s) or a manual tab switch — the
+ *  reported "click a sub-session, nothing happens until I refresh / switch tab".
+ *  Set to one heartbeat + one pong timeout so a healthy socket (which pongs
+ *  every ~10s) is never probed by ordinary interaction — only a genuinely
+ *  stalled one is. */
+const INTERACTION_PROBE_STALE_MS = HEARTBEAT_MS + PONG_TIMEOUT_MS;
 
 function createP2pWorkflowRequestId(): string {
   const requestId = globalThis.crypto?.randomUUID?.()
@@ -598,6 +609,26 @@ export class WsClient {
   }
 
   /**
+   * Eagerly verify the socket when a user interaction needs fresh data, so a
+   * zombie socket (readyState=OPEN but path dead) is recovered by the
+   * interaction itself rather than only by the slow heartbeat watchdog or a
+   * manual tab switch. No-op unless we previously saw a pong and it has since
+   * gone stale beyond a full heartbeat+pong window — healthy sockets (pong
+   * ~every 10s) and freshly-connected sockets are never probed here, so this
+   * adds no "probing" UI churn during normal use. probeConnection() itself is
+   * idempotent (skips when a probe is already in flight or a recent pong proved
+   * liveness), making this safe to call on every interaction.
+   */
+  private maybeProbeForInteraction(): void {
+    if (this._destroyed) return;
+    if (!this._connected) return;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (this._lastPongAt === 0) return; // just connected — heartbeat will prove liveness shortly
+    if (Date.now() - this._lastPongAt < INTERACTION_PROBE_STALE_MS) return;
+    this.probeConnection();
+  }
+
+  /**
    * Foreground/native-app resume entrypoint. Normal tab focus uses the cheap
    * probe path, but native resume or a long background gap can request a
    * stronger stale check. This keeps healthy sockets stable while bounding
@@ -628,6 +659,7 @@ export class WsClient {
   }
 
   subscribeTerminal(sessionName: string, raw: boolean): void {
+    this.maybeProbeForInteraction();
     this.setP2pWorkflowRequestScope({ sessionName });
     this.terminalBaseSubscriptions.set(sessionName, raw);
     this.syncTerminalSubscription(sessionName);
@@ -644,6 +676,7 @@ export class WsClient {
   }
 
   holdTerminalRaw(sessionName: string): () => void {
+    this.maybeProbeForInteraction();
     this.terminalRawHolds.set(sessionName, (this.terminalRawHolds.get(sessionName) ?? 0) + 1);
     this.syncTerminalSubscription(sessionName);
     let released = false;
@@ -1313,6 +1346,11 @@ export class WsClient {
       ...(afterTs !== undefined ? { afterTs } : {}),
       ...(beforeTs !== undefined ? { beforeTs } : {}),
     });
+    // Probe AFTER sending (not before): the send must run while the socket is
+    // still logically connected. If the socket turned out to be a zombie, the
+    // send is silently lost, but this kicks recovery so the window's foreground
+    // auto-sync refetch lands on a healthy socket instead of waiting ~36s.
+    this.maybeProbeForInteraction();
     return requestId;
   }
 
