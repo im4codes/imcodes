@@ -2569,6 +2569,31 @@ export function useTimeline(
     void reloadLocalTimeline();
     fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true, force: true });
   }, [reloadLocalTimeline]);
+
+  // Self-heal a blank pane. The mount path seeds `events` from local cache, but
+  // it can still settle EMPTY even when local history exists — e.g. serverId
+  // resolved AFTER the first read so the scoped cacheKey changed, a cold/slow
+  // IndexedDB read, or a daemon history response that came back empty. The user
+  // shouldn't have to hit ↻ to get their own local history back. When the
+  // timeline has SETTLED blank (not loading) but local cache may hold history,
+  // re-read it automatically — this is the LOCAL-ONLY half of forceRefresh (no
+  // HTTP). Gated once per cacheKey-blank episode via `blankSelfHealRef` so a
+  // genuinely-empty session never loops; the guard resets as soon as events
+  // appear (or the session switches), allowing a future blank to self-heal too.
+  const blankSelfHealRef = useRef<string | null>(null);
+  useEffect(() => {
+    const key = cacheKey;
+    if (!key || disableHistory) return;
+    if (events.length > 0) {
+      if (blankSelfHealRef.current === key) blankSelfHealRef.current = null;
+      return;
+    }
+    if (loading) return;                           // mount path is still reading
+    if (blankSelfHealRef.current === key) return;  // already self-healed this key
+    blankSelfHealRef.current = key;
+    void reloadLocalTimeline();
+  }, [cacheKey, events.length, loading, disableHistory, reloadLocalTimeline]);
+
   const lastActiveRefreshAtRef = useRef(0);
 
   // (`isActiveSessionRef` declared above so the fire-gate can read it.)
