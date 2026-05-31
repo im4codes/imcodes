@@ -141,6 +141,12 @@ const RESUME_RESET_COOLDOWN_AFTER_MS = 60_000;
  */
 const ACTIVE_REFRESH_COOLDOWN_MS = 15_000;
 const RECONNECT_REFRESH_COOLDOWN_MS = 15_000;
+// On activation (app foreground / session focus) re-read LOCAL history when the
+// on-screen timeline is shorter than this — NOT only when the pane is fully
+// empty (that path is the blankSelfHealRef effect). Covers reopens that restored
+// a truncated / half-loaded timeline where the HTTP backfill is gated,
+// cooled-down, or a no-op. A local IDB re-read is cheap and an idempotent merge.
+const ACTIVE_LOCAL_RELOAD_MAX_EVENTS = 10;
 const FORWARD_HISTORY_TIMEOUT_MS = 8_000;
 
 function resetBackfillCooldowns(): void {
@@ -2561,6 +2567,12 @@ export function useTimeline(
     }
   }, [sessionId, mergeRawSegmentLater]);
 
+  // Ref mirror so the activation listeners (whose deps are intentionally pinned
+  // to `[disableHistory, sessionId]` to avoid re-attach races) can invoke the
+  // latest reloadLocalTimeline without listing it as a dep.
+  const reloadLocalTimelineRef = useRef(reloadLocalTimeline);
+  reloadLocalTimelineRef.current = reloadLocalTimeline;
+
   const forceRefresh = useCallback(() => {
     // Re-read LOCAL IDB first (the user's history is local — this recovers a
     // blank pane even when serverId is unresolved or the daemon is offline,
@@ -2630,6 +2642,16 @@ export function useTimeline(
       }
       lastActiveRefreshAtRef.current = now;
       backfillDebug('activation event: firing backfill', { sessionId });
+      // Re-read LOCAL history too when the on-screen timeline is short — not only
+      // when it's empty. The HTTP backfill below is gated/cooled-down and can be a
+      // no-op (serverId unresolved, daemon offline, 15s cooldown), so a window
+      // that reopened with a truncated/half-restored timeline would otherwise stay
+      // short and the user "loses" messages. A local IDB re-read is cheap and an
+      // idempotent merge (never drops newer live events), so it safely restores
+      // the user's own history on activation. See ACTIVE_LOCAL_RELOAD_MAX_EVENTS.
+      if (eventsRef.current.length < ACTIVE_LOCAL_RELOAD_MAX_EVENTS) {
+        void reloadLocalTimelineRef.current();
+      }
       // SILENT (visible: false) — activation events fire on every focus /
       // visibility / pageshow / appStateChange tick. Even with the 15s
       // cooldown coalescing the burst, when a fetch DOES go through, the
@@ -2664,6 +2686,13 @@ export function useTimeline(
     prevIsActiveRef.current = isActiveSession;
     if (!prev && isActiveSession) {
       backfillDebug('isActiveSession false→true: firing backfill', { sessionId });
+      // Short on-screen timeline → also re-read local history (idempotent merge).
+      // Same rationale as the activation-event handler above
+      // (ACTIVE_LOCAL_RELOAD_MAX_EVENTS): recover a truncated reopen without
+      // waiting on the gated/cooled-down HTTP backfill.
+      if (eventsRef.current.length < ACTIVE_LOCAL_RELOAD_MAX_EVENTS) {
+        void reloadLocalTimelineRef.current();
+      }
       // SILENT (visible: false). Same reasoning as the activation-event
       // handler above — the false→true transition fires whenever the user
       // taps a session card; coupling that with a refreshing-state flip
