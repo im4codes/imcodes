@@ -32,10 +32,12 @@ const {
     send: ReturnType<typeof vi.fn>;
     p2pListDiscussions: ReturnType<typeof vi.fn>;
     p2pStatus: ReturnType<typeof vi.fn>;
+    discussionList: ReturnType<typeof vi.fn>;
     discussionStop: ReturnType<typeof vi.fn>;
     askAnswer: ReturnType<typeof vi.fn>;
     repoDetect: ReturnType<typeof vi.fn>;
     resumeConnection: ReturnType<typeof vi.fn>;
+    reconnectNow: ReturnType<typeof vi.fn>;
     onMessage(handler: (message: any) => void): () => void;
     onLatency(handler: ((ms: number) => void) | null): void;
     emit(message: any): void;
@@ -124,10 +126,12 @@ vi.mock('../src/ws-client.js', () => ({
     send = vi.fn();
     p2pListDiscussions = vi.fn();
     p2pStatus = vi.fn();
+    discussionList = vi.fn();
     discussionStop = vi.fn();
     askAnswer = vi.fn();
     repoDetect = vi.fn();
     resumeConnection = vi.fn();
+    reconnectNow = vi.fn();
 
     constructor() {
       wsInstances.push(this);
@@ -632,6 +636,46 @@ describe('App shell', () => {
     expect(view.container.textContent).toContain('session-pane:deck_alpha_brain');
     expect(view.container.textContent).toContain('session-tree');
     expect(ws.connect).toHaveBeenCalled();
+  }, 20_000);
+
+  it('nudges browser WebSocket recovery when daemon heartbeat is fresh but the tab is disconnected', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date('2026-05-31T12:00:00Z'));
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      expect(await screen.findByText('session-tabs')).toBeTruthy();
+      const ws = wsInstances[wsInstances.length - 1];
+      expect(ws.reconnectNow).not.toHaveBeenCalled();
+
+      await act(async () => {
+        await vi.runOnlyPendingTimersAsync();
+      });
+
+      expect(wsInstances.some((instance) => instance.reconnectNow.mock.calls.some((call) => call[0] === true))).toBe(true);
+
+      const activeWs = wsInstances.find((instance) => instance.reconnectNow.mock.calls.length > 0) ?? ws;
+      act(() => {
+        activeWs.emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+      });
+
+      const callsAfterConnect = activeWs.reconnectNow.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+
+      expect(activeWs.reconnectNow).toHaveBeenCalledTimes(callsAfterConnect);
+    } finally {
+      vi.useRealTimers();
+    }
   }, 20_000);
 
   it('brings a newly opened sub-session window above restored open sub-session windows', async () => {

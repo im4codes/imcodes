@@ -214,6 +214,8 @@ type AppUpdateNotice = {
 };
 
 const FAST_SERVER_SWITCH_SPLASH_KEY = 'imcodes:fast-server-switch-splash';
+const DAEMON_ONLINE_WS_RECOVERY_INITIAL_MS = 5_000;
+const DAEMON_ONLINE_WS_RECOVERY_INTERVAL_MS = 5_000;
 
 function markFastServerSwitchSplash(): void {
   try {
@@ -4048,6 +4050,34 @@ export function App() {
     : null;
   const daemonVersionForDisplay = daemonStats?.daemonVersion ?? selectedServerInfo?.daemonVersion ?? null;
   const daemonBadgeState = getDaemonBadgeState(connected, connecting, daemonOnline, selectedServerInfo);
+
+  useEffect(() => {
+    if (!auth || !selectedServerId || connected || !isServerOnline(selectedServerInfo)) return;
+    let stopped = false;
+    const shouldPulse = () => {
+      if (stopped) return false;
+      if (!isServerOnline(selectedServerInfo)) return false;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return false;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return false;
+      return true;
+    };
+    const pulse = () => {
+      if (!shouldPulse()) return;
+      wsRef.current?.reconnectNow(true);
+    };
+    const initial = setTimeout(pulse, DAEMON_ONLINE_WS_RECOVERY_INITIAL_MS);
+    const interval = setInterval(pulse, DAEMON_ONLINE_WS_RECOVERY_INTERVAL_MS);
+    return () => {
+      stopped = true;
+      clearTimeout(initial);
+      clearInterval(interval);
+    };
+  }, [
+    auth,
+    selectedServerId,
+    selectedServerInfo,
+    connected,
+  ]);
 
   useEffect(() => {
     if (showInitialConnectingGate) {
