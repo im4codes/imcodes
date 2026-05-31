@@ -846,6 +846,144 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(tool?.detail?.raw).toBeUndefined();
   });
 
+  it('emits SDK subagent snapshots for Claude runtime subagent notifications', async () => {
+    const sessionName = 'deck_project_claude_runtime';
+    const agentPath = '019e7f1c-cc';
+    const { tools } = await collectToolsForMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-route-subagent-runtime', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'subagent_notification',
+        session_id: 'session-route-subagent-runtime',
+        agent_path: agentPath,
+        status: 'running',
+        name: 'Hooke',
+      },
+      {
+        type: 'system',
+        subtype: 'subagent_status',
+        session_id: 'session-route-subagent-runtime',
+        subagent: {
+          agentPath: agentPath,
+          status: 'shutdown',
+          nickname: 'Hooke',
+        },
+      },
+      { type: 'result', session_id: 'session-route-subagent-runtime', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ], 'route-subagent-runtime', sessionName);
+
+    const subagents = sdkSubagentTools(tools);
+    const canonicalKey = makeClaudeSubagentCanonicalKey(sessionName, `runtime:${agentPath}`);
+    expect(subagents).toHaveLength(2);
+    expect(subagents[0]).toMatchObject({
+      id: canonicalKey,
+      name: 'Agent',
+      status: 'running',
+      detail: {
+        kind: SDK_SUBAGENT_DETAIL_KIND,
+        summary: 'Claude sub-agent Hooke',
+        meta: {
+          provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT,
+          canonicalKey,
+          agentPath,
+          agentName: 'Hooke',
+          rawStatus: 'running',
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          active: true,
+          terminal: false,
+        },
+      },
+    });
+    expect(subagents[1]).toMatchObject({
+      id: canonicalKey,
+      name: 'Agent',
+      status: 'complete',
+      output: 'shutdown',
+      detail: {
+        meta: {
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT,
+          canonicalKey,
+          rawStatus: 'shutdown',
+          normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+          active: false,
+          terminal: true,
+        },
+      },
+    });
+  });
+
+  it('emits SDK subagent snapshots for raw Claude runtime subagent notification tags', async () => {
+    const sessionName = 'deck_project_claude_runtime_tag';
+    const agentPath = '019e7f1c-cc-raw';
+    const { tools } = await collectToolsForMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-route-subagent-runtime-tag', model: 'claude-sonnet-4-6' },
+      {
+        type: 'assistant',
+        session_id: 'session-route-subagent-runtime-tag',
+        message: {
+          content: [{
+            type: 'text',
+            text: `<subagent_notification>{"agent_path":"${agentPath}","status":"running"}</subagent_notification>`,
+          }],
+        },
+      },
+      { type: 'result', session_id: 'session-route-subagent-runtime-tag', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ], 'route-subagent-runtime-tag', sessionName);
+
+    const [tool] = sdkSubagentTools(tools);
+    const canonicalKey = makeClaudeSubagentCanonicalKey(sessionName, `runtime:${agentPath}`);
+    expect(tool).toMatchObject({
+      id: canonicalKey,
+      name: 'Agent',
+      status: 'running',
+      detail: {
+        kind: SDK_SUBAGENT_DETAIL_KIND,
+        summary: `Claude sub-agent ${agentPath}`,
+        meta: {
+          provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT,
+          canonicalKey,
+          agentPath,
+          rawStatus: 'running',
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          active: true,
+          terminal: false,
+        },
+      },
+    });
+  });
+
+  it('diagnoses Claude runtime subagent notifications without an agent id', async () => {
+    const sessionName = 'deck_project_claude_runtime_missing_id';
+    const { tools } = await collectToolsForMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-route-subagent-runtime-missing-id', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'subagent_notification',
+        session_id: 'session-route-subagent-runtime-missing-id',
+        status: 'running',
+      },
+      { type: 'result', session_id: 'session-route-subagent-runtime-missing-id', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ], 'route-subagent-runtime-missing-id', sessionName);
+
+    const [tool] = sdkSubagentTools(tools);
+    expect(tool).toMatchObject({
+      id: makeClaudeSubagentCanonicalKey(sessionName, 'runtime:subagent_notification'),
+      name: 'Agent',
+      status: 'error',
+      detail: {
+        meta: {
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT,
+          normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+          active: false,
+          terminal: true,
+          diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID,
+        },
+      },
+    });
+  });
+
   it('emits detail-only Claude task_progress updates instead of generic tool dedup dropping them', async () => {
     const sessionName = 'deck_project_claude_progress';
     const { tools } = await collectToolsForMessages([

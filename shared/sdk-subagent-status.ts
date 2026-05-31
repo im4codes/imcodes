@@ -11,6 +11,7 @@ export const SDK_SUBAGENT_PROVIDERS = {
 
 export const SDK_SUBAGENT_PROVIDER_KINDS = {
   CLAUDE_TASK: 'claudeTask',
+  CLAUDE_RUNTIME_AGENT: 'claudeRuntimeAgent',
   CODEX_COLLAB_AGENT: 'codexCollabAgent',
   CODEX_RUNTIME_AGENT: 'codexRuntimeAgent',
 } as const;

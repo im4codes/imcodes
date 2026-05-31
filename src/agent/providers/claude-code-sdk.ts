@@ -58,6 +58,15 @@ const CLAUDE_TASK_SYSTEM_SUBTYPES = new Set([
   'task_updated',
   'task_notification',
 ]);
+const CLAUDE_RUNTIME_SUBAGENT_SYSTEM_SUBTYPES = new Set([
+  'subagent_notification',
+  'subagent_status',
+  'subagent/status',
+  'agent_subagent_notification',
+  'agent_subagent_status',
+  'runtime_subagent_notification',
+  'runtime_subagent_status',
+]);
 
 interface ClaudeSdkSessionState {
   routeId: string;
@@ -155,6 +164,22 @@ function collectAssistantText(message: SDKMessage): string {
 
 function makeMessageId(state: ClaudeSdkSessionState): string {
   return state.currentMessageId ?? `${state.resumeId}:${randomUUID()}`;
+}
+
+function normalizeStatusName(status: string | undefined): string {
+  return (status ?? '').replace(/[_\s-]+/g, '').toLowerCase();
+}
+
+function parseRuntimeSubagentTag(line: string): Record<string, unknown> | null {
+  const match = /^<subagent_notification>([\s\S]+)<\/subagent_notification>$/.exec(line.trim());
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[1]!);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    return { type: 'subagent_notification', ...(parsed as Record<string, unknown>) };
+  } catch {
+    return null;
+  }
 }
 
 export class ClaudeCodeSdkProvider implements TransportProvider {
@@ -514,6 +539,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       return;
     }
 
+    if (this.isClaudeRuntimeSubagentMessage(msg)) {
+      this.emitClaudeRuntimeSubagentSnapshot(sessionId, state, msg);
+      return;
+    }
+
     if (msg.type === 'system' && msg.subtype === 'compact_boundary') {
       this.emitStatus(sessionId, state, {
         status: 'compacting',
@@ -567,6 +597,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
         return;
       }
       if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && typeof event.delta.text === 'string') {
+        const runtimeSubagentPayload = parseRuntimeSubagentTag(event.delta.text);
+        if (runtimeSubagentPayload) {
+          this.emitClaudeRuntimeSubagentSnapshot(sessionId, state, runtimeSubagentPayload);
+          return;
+        }
         state.currentText += event.delta.text;
         const messageId = makeMessageId(state);
         state.currentMessageId = messageId;
@@ -622,6 +657,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
         };
       }
       const text = collectAssistantText(msg);
+      const runtimeSubagentPayload = parseRuntimeSubagentTag(text);
+      if (runtimeSubagentPayload) {
+        this.emitClaudeRuntimeSubagentSnapshot(sessionId, state, runtimeSubagentPayload);
+        return;
+      }
       if (Array.isArray(msg.message.content)) {
         for (const block of msg.message.content) {
           if (this.isToolBlock(block)) {
@@ -796,6 +836,201 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     }
 
     this.emitClaudeSubagentSnapshot(sessionId, state, task);
+  }
+
+  private emitClaudeRuntimeSubagentSnapshot(
+    sessionId: string,
+    state: ClaudeSdkSessionState,
+    payload: Record<string, unknown>,
+  ): void {
+    const record = this.readNestedRuntimeSubagentRecord(payload) ?? payload;
+    const rawAgentPath = this.readRuntimeSubagentId(record);
+    const fallbackId = this.pickString(payload.subtype) ?? this.pickString(payload.type) ?? 'notification-missing-id';
+    const agentPath = rawAgentPath ?? fallbackId;
+    const rawStatus = this.readRuntimeSubagentStatus(record) ?? 'unknown';
+    const missingIdDiagnostic = rawAgentPath ? undefined : SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID;
+    const statusMapping = this.normalizeClaudeRuntimeSubagentStatus(rawStatus, missingIdDiagnostic);
+    const canonicalKey = makeClaudeSubagentCanonicalKey(this.subagentSessionKey(sessionId, state), `runtime:${agentPath}`);
+    const agentName = this.readRuntimeSubagentName(record);
+    const summary = agentName ? `Claude sub-agent ${agentName}` : rawAgentPath ? `Claude sub-agent ${rawAgentPath}` : 'Claude sub-agent';
+    const detail = buildSdkSubagentSafeDetail({
+      kind: SDK_SUBAGENT_DETAIL_KIND,
+      summary,
+      ...(statusMapping.terminal ? { output: rawStatus } : {}),
+      meta: {
+        isSdkSubagent: true,
+        schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+        provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT,
+        canonicalKey,
+        normalizedStatus: statusMapping.normalizedStatus,
+        rawStatus,
+        active: statusMapping.active,
+        terminal: statusMapping.terminal,
+        parentSessionId: state.resumeId,
+        parentItemId: canonicalKey,
+        ...(rawAgentPath ? { agentPath: rawAgentPath } : {}),
+        ...(agentName ? { agentName } : {}),
+        diagnosticCode: statusMapping.diagnosticCode,
+      },
+    } satisfies SdkSubagentDetail, { allowRaw: false });
+    this.emitSubagentToolCall(sessionId, state, {
+      id: canonicalKey,
+      name: 'Agent',
+      status: statusMapping.toolStatus,
+      ...(detail.input ? { input: detail.input } : {}),
+      ...(detail.output ? { output: detail.output } : {}),
+      detail,
+    });
+  }
+
+  private readNestedRuntimeSubagentRecord(value: unknown): Record<string, unknown> | undefined {
+    const record = this.asRecord(value);
+    if (!record) return undefined;
+    for (const key of ['subagent', 'subAgent', 'agent', 'notification', 'data', 'event']) {
+      const nested = this.readNestedRuntimeSubagentRecord(record[key]);
+      if (nested) return nested;
+    }
+    const subtype = this.pickString(record.subtype);
+    const hasRuntimeShape = Boolean(
+      this.pickString(record.agent_path)
+      ?? this.pickString(record.agentPath)
+      ?? this.pickString(record.agent_id)
+      ?? this.pickString(record.agentId)
+      ?? this.pickString(record.path)
+      ?? this.pickString(record.status)
+      ?? this.pickString(record.state)
+      ?? (subtype && CLAUDE_RUNTIME_SUBAGENT_SYSTEM_SUBTYPES.has(subtype)),
+    );
+    if (hasRuntimeShape) return record;
+    return undefined;
+  }
+
+  private readRuntimeSubagentId(record: Record<string, unknown>): string | undefined {
+    return this.pickString(record.agent_path)
+      ?? this.pickString(record.agentPath)
+      ?? this.pickString(record.agent_id)
+      ?? this.pickString(record.agentId)
+      ?? this.pickString(record.path)
+      ?? this.pickString(record.id);
+  }
+
+  private readRuntimeSubagentName(record: Record<string, unknown>): string | undefined {
+    return this.pickShortString(record.name)
+      ?? this.pickShortString(record.nickname)
+      ?? this.pickShortString(record.displayName)
+      ?? this.pickShortString(record.display_name)
+      ?? this.pickShortString(record.label);
+  }
+
+  private readRuntimeSubagentStatus(record: Record<string, unknown>): string | undefined {
+    return this.pickString(record.status)
+      ?? this.pickString(record.state)
+      ?? this.pickString(record.lifecycleStatus)
+      ?? this.pickString(record.lifecycle_status);
+  }
+
+  private normalizeClaudeRuntimeSubagentStatus(
+    rawStatus: string,
+    diagnosticCode: SdkSubagentDiagnosticCode | undefined,
+  ): {
+    toolStatus: ToolCallEvent['status'];
+    normalizedStatus: SdkSubagentNormalizedStatus;
+    active: boolean;
+    terminal: boolean;
+    diagnosticCode?: SdkSubagentDiagnosticCode;
+  } {
+    if (diagnosticCode) {
+      return {
+        toolStatus: 'error',
+        normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+        active: false,
+        terminal: true,
+        diagnosticCode,
+      };
+    }
+
+    const normalized = normalizeStatusName(rawStatus);
+    if (
+      normalized === 'pending'
+      || normalized === 'queued'
+      || normalized === 'starting'
+      || normalized === 'created'
+      || normalized === 'spawned'
+    ) {
+      return {
+        toolStatus: 'running',
+        normalizedStatus: SDK_SUBAGENT_STATUS.PENDING,
+        active: true,
+        terminal: false,
+      };
+    }
+    if (
+      normalized === 'running'
+      || normalized === 'active'
+      || normalized === 'started'
+      || normalized === 'working'
+      || normalized === 'inprogress'
+    ) {
+      return {
+        toolStatus: 'running',
+        normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+        active: true,
+        terminal: false,
+      };
+    }
+    if (
+      normalized === 'shutdown'
+      || normalized === 'complete'
+      || normalized === 'completed'
+      || normalized === 'done'
+      || normalized === 'success'
+      || normalized === 'succeeded'
+      || normalized === 'finished'
+    ) {
+      return {
+        toolStatus: 'complete',
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+      };
+    }
+    if (
+      normalized === 'failed'
+      || normalized === 'failure'
+      || normalized === 'error'
+      || normalized === 'errored'
+      || normalized === 'crashed'
+    ) {
+      return {
+        toolStatus: 'error',
+        normalizedStatus: SDK_SUBAGENT_STATUS.ERROR,
+        active: false,
+        terminal: true,
+      };
+    }
+    if (
+      normalized === 'interrupted'
+      || normalized === 'cancelled'
+      || normalized === 'canceled'
+      || normalized === 'stopped'
+      || normalized === 'killed'
+    ) {
+      return {
+        toolStatus: 'error',
+        normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED,
+        active: false,
+        terminal: true,
+      };
+    }
+
+    return {
+      toolStatus: 'error',
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
+    };
   }
 
   private createClaudeTaskState(sessionId: string, state: ClaudeSdkSessionState, taskId: string): ClaudeTaskState {
@@ -995,6 +1230,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     if (msg.type !== 'system') return false;
     const subtype = (msg as { subtype?: unknown }).subtype;
     return typeof subtype === 'string' && CLAUDE_TASK_SYSTEM_SUBTYPES.has(subtype);
+  }
+
+  private isClaudeRuntimeSubagentMessage(msg: SDKMessage): msg is ClaudeTaskLifecycleMessage {
+    if (msg.type !== 'system') return false;
+    const subtype = (msg as { subtype?: unknown }).subtype;
+    return typeof subtype === 'string' && CLAUDE_RUNTIME_SUBAGENT_SYSTEM_SUBTYPES.has(subtype);
   }
 
   private isToolBlock(block: unknown): block is ClaudeToolBlock {
