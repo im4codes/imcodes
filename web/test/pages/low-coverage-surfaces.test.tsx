@@ -41,11 +41,17 @@ const {
   voiceApi: {
     audioLevelHandler: null as ((level: number) => void) | null,
     partialHandler: null as ((partial: string) => void) | null,
+    listeningHandler: null as ((listening: boolean) => void) | null,
     onAudioLevel: vi.fn((handler: ((level: number) => void) | null) => {
       voiceApi.audioLevelHandler = handler;
     }),
-    startListening: vi.fn(async (handler: (partial: string) => void) => {
+    startListening: vi.fn(async (
+      handler: (partial: string) => void,
+      onListeningChange?: (listening: boolean) => void,
+    ) => {
       voiceApi.partialHandler = handler;
+      voiceApi.listeningHandler = onListeningChange ?? null;
+      voiceApi.listeningHandler?.(true);
       return true;
     }),
     stopListening: vi.fn(async () => undefined),
@@ -142,6 +148,7 @@ beforeEach(() => {
   translate.mockClear();
   voiceApi.audioLevelHandler = null;
   voiceApi.partialHandler = null;
+  voiceApi.listeningHandler = null;
   voiceApi.onAudioLevel.mockClear();
   voiceApi.startListening.mockClear();
   voiceApi.stopListening.mockClear();
@@ -317,6 +324,22 @@ describe('low-coverage page and component surfaces', () => {
 
     expect(onSend).toHaveBeenCalledWith('hello world');
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it('VoiceOverlay restarts on the first tap after native listening stops itself', async () => {
+    vi.useFakeTimers();
+    render(<VoiceOverlay open initialText="" onSend={vi.fn()} onClose={vi.fn()} />);
+
+    await vi.advanceTimersByTimeAsync(150);
+    await waitFor(() => expect(voiceApi.startListening).toHaveBeenCalledTimes(1));
+    voiceApi.listeningHandler?.(false);
+    await waitFor(() => expect(screen.getByText('voice.paused')).toBeTruthy());
+
+    const micButton = document.querySelector('.voice-overlay-mic') as HTMLButtonElement;
+    fireEvent.click(micButton);
+
+    await waitFor(() => expect(voiceApi.startListening).toHaveBeenCalledTimes(2));
+    expect(voiceApi.stopListening).not.toHaveBeenCalled();
   });
 
   it('OfficePreview renders unsupported and spreadsheet previews', async () => {
