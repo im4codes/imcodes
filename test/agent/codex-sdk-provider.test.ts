@@ -207,7 +207,7 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
 }));
 
 import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
-import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
+import { PROVIDER_ERROR_CODES, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import {
@@ -220,6 +220,16 @@ import {
 } from '../../shared/memory-mcp-env.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_STATUS,
+  isSdkSubagentDetail,
+  makeCodexSubagentCanonicalKey,
+  type SdkSubagentDetail,
+} from '../../shared/sdk-subagent-status.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -241,6 +251,37 @@ async function writeCodexAuthFile(codexHome: string, version: number): Promise<v
     join(codexHome, 'auth.json'),
     JSON.stringify({ version, pad: 'x'.repeat(version) }),
   );
+}
+
+function emitCodexItem(
+  child: { emits: (msg: Record<string, any>) => void },
+  method: 'item/started' | 'item/completed',
+  item: Record<string, any>,
+): void {
+  child.emits({
+    method,
+    params: { threadId: 'thread-1', turnId: 'turn-1', item },
+  });
+}
+
+function collabItem(overrides: Record<string, any> = {}): Record<string, any> {
+  return {
+    id: 'collab-1',
+    type: 'collabAgentToolCall',
+    status: 'inProgress',
+    receiverThreadIds: ['agent-a'],
+    agentsStates: { 'agent-a': { status: 'running' } },
+    ...overrides,
+  };
+}
+
+function expectCodexSubagentDetail(tool: ToolCallEvent): SdkSubagentDetail {
+  expect(isSdkSubagentDetail(tool.detail)).toBe(true);
+  const detail = tool.detail as SdkSubagentDetail;
+  expect(detail.kind).toBe(SDK_SUBAGENT_DETAIL_KIND);
+  expect(detail.meta.provider).toBe(SDK_SUBAGENT_PROVIDERS.CODEX_SDK);
+  expect(detail.meta.providerKind).toBe(SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT);
+  return detail;
 }
 
 describe('CodexSdkProvider', () => {
@@ -366,6 +407,311 @@ describe('CodexSdkProvider', () => {
     expect(childProcessMock.children).toHaveLength(2);
     expect(firstChild.child.killed).toBe(true);
     await provider.disconnect();
+  });
+
+  it('emits SDK sub-agent snapshots for Codex collaboration start, completion, and failure', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab', 'coordinate work');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/started', collabItem({
+      receiverThreadIds: ['agent-a', 'agent-b'],
+      agentsStates: {
+        'agent-a': { status: 'pendingInit' },
+        'agent-b': { status: 'running' },
+      },
+    }));
+    emitCodexItem(child, 'item/completed', collabItem({
+      status: 'completed',
+      receiverThreadIds: ['agent-a', 'agent-b'],
+      agentsStates: {
+        'agent-a': { status: 'completed' },
+        'agent-b': { status: 'completed' },
+      },
+    }));
+    emitCodexItem(child, 'item/completed', collabItem({
+      id: 'collab-failed',
+      status: 'failed',
+      receiverThreadIds: ['agent-c'],
+      agentsStates: { 'agent-c': { status: 'errored' } },
+    }));
+    await flush();
+
+    expect(tools).toHaveLength(3);
+    expect(tools[0]).toMatchObject({
+      id: 'collab-1',
+      name: 'Codex Collaboration',
+      status: 'running',
+      input: {
+        action: 'codex-collaboration',
+        receiverCount: 2,
+      },
+    });
+    const startedDetail = expectCodexSubagentDetail(tools[0]!);
+    expect(startedDetail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-collab', 'collab-1'),
+      parentItemId: 'collab-1',
+      receiverCount: 2,
+      runningChildCount: 2,
+      childStatusSummary: 'pendingInit:1, running:1',
+      rawStatus: 'inProgress',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    });
+    expect(startedDetail.meta.diagnosticCode).toBeUndefined();
+
+    expect(tools[1]!.status).toBe('complete');
+    const completedDetail = expectCodexSubagentDetail(tools[1]!);
+    expect(completedDetail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-collab', 'collab-1'),
+      parentItemId: 'collab-1',
+      receiverCount: 2,
+      runningChildCount: 0,
+      childStatusSummary: 'completed:2',
+      rawStatus: 'completed',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    });
+    expect(completedDetail.meta.diagnosticCode).toBeUndefined();
+
+    expect(tools[2]!.status).toBe('error');
+    const failedDetail = expectCodexSubagentDetail(tools[2]!);
+    expect(failedDetail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-collab', 'collab-failed'),
+      parentItemId: 'collab-failed',
+      receiverCount: 1,
+      runningChildCount: 0,
+      childStatusSummary: 'errored:1',
+      rawStatus: 'failed',
+      normalizedStatus: SDK_SUBAGENT_STATUS.ERROR,
+      active: false,
+      terminal: true,
+    });
+  });
+
+  it('handles empty Codex collaboration receiver lists without inventing child work', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-empty', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-empty', 'coordinate work');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/started', collabItem({
+      id: 'collab-empty',
+      receiverThreadIds: [],
+      agentsStates: {},
+    }));
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]!.status).toBe('running');
+    const detail = expectCodexSubagentDetail(tools[0]!);
+    expect(detail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-collab-empty', 'collab-empty'),
+      parentItemId: 'collab-empty',
+      receiverCount: 0,
+      runningChildCount: 0,
+      childStatusSummary: 'receivers:0',
+      rawStatus: 'inProgress',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    });
+    expect(detail.meta.diagnosticCode).toBeUndefined();
+  });
+
+  it('diagnoses mismatched and extra Codex collaboration child state without counting it as running', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-mismatch', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-mismatch', 'coordinate work');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/started', collabItem({
+      id: 'collab-missing-state',
+      receiverThreadIds: ['agent-a', 'agent-b'],
+      agentsStates: { 'agent-a': { status: 'running' } },
+    }));
+    emitCodexItem(child, 'item/started', collabItem({
+      id: 'collab-extra-state',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: {
+        'agent-a': { status: 'running' },
+        'agent-extra': { status: 'running' },
+      },
+    }));
+    await flush();
+
+    expect(tools).toHaveLength(2);
+    const missingDetail = expectCodexSubagentDetail(tools[0]!);
+    expect(tools[0]!.status).toBe('error');
+    expect(missingDetail.meta).toMatchObject({
+      parentItemId: 'collab-missing-state',
+      receiverCount: 2,
+      runningChildCount: 0,
+      childStatusSummary: 'running:1, missing:1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.MALFORMED_PAYLOAD,
+    });
+
+    const extraDetail = expectCodexSubagentDetail(tools[1]!);
+    expect(tools[1]!.status).toBe('error');
+    expect(extraDetail.meta).toMatchObject({
+      parentItemId: 'collab-extra-state',
+      receiverCount: 1,
+      runningChildCount: 0,
+      childStatusSummary: 'running:1, extra:1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.MALFORMED_PAYLOAD,
+    });
+  });
+
+  it('diagnoses unknown Codex child states without counting them as running', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-unknown-child', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-unknown-child', 'coordinate work');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/started', collabItem({
+      id: 'collab-unknown-child',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: { 'agent-a': { status: 'paused' } },
+    }));
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]!.status).toBe('error');
+    const detail = expectCodexSubagentDetail(tools[0]!);
+    expect(detail.meta).toMatchObject({
+      parentItemId: 'collab-unknown-child',
+      runningChildCount: 0,
+      childStatusSummary: 'paused:1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
+    });
+  });
+
+  it('does not keep Codex completed lifecycle snapshots running when item status is stale inProgress', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-completed-stale-status', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-completed-stale-status', 'coordinate work');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/completed', collabItem({
+      id: 'collab-stale-status',
+      status: 'inProgress',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: { 'agent-a': { status: 'running' } },
+    }));
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]!.status).toBe('error');
+    const detail = expectCodexSubagentDetail(tools[0]!);
+    expect(detail.meta).toMatchObject({
+      parentItemId: 'collab-stale-status',
+      rawStatus: 'inProgress',
+      runningChildCount: 0,
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
+    });
+  });
+
+  it('diagnoses malformed Codex collaboration item ids without throwing or counting running work', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-malformed', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-malformed', 'coordinate work');
+    const child = childProcessMock.children[0];
+    expect(() => emitCodexItem(child, 'item/started', collabItem({ id: { bad: true } }))).not.toThrow();
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]!.status).toBe('error');
+    const detail = expectCodexSubagentDetail(tools[0]!);
+    expect(detail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-collab-malformed', 'malformed-started'),
+      parentItemId: 'malformed-started',
+      receiverCount: 1,
+      runningChildCount: 0,
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID,
+    });
+  });
+
+  it('keeps full Codex child prompts out of collaboration tool input and summaries', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-prompt-safe', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    const sensitivePrompt = 'SECRET CHILD PROMPT: clone the private repo and paste the token';
+    await provider.send('route-collab-prompt-safe', 'coordinate work');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/started', collabItem({
+      id: 'collab-prompt',
+      prompt: sensitivePrompt,
+      childPrompt: sensitivePrompt,
+      prompts: [sensitivePrompt],
+      agentsStates: {
+        'agent-a': {
+          status: 'running',
+          prompt: sensitivePrompt,
+        },
+      },
+    }));
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    const detail = expectCodexSubagentDetail(tools[0]!);
+    const visiblePayload = JSON.stringify({
+      input: tools[0]!.input,
+      summary: detail.summary,
+      detailInput: detail.input,
+      raw: detail.raw,
+    });
+    expect(visiblePayload).not.toContain(sensitivePrompt);
+    expect(tools[0]!.input).toMatchObject({
+      action: 'codex-collaboration',
+      receiverCount: 1,
+    });
   });
 
   it('starts a thread, captures resume id, emits tool calls, streams message deltas, and completes', async () => {

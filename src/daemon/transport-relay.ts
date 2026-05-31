@@ -20,6 +20,11 @@ import { normalizeCodexSdkFileChange, normalizeQwenFileChange } from './file-cha
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '../../shared/usage-context-window.js';
 import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
+import {
+  buildSdkSubagentTimelinePayload,
+  normalizeSdkSubagentKeyComponent,
+  parseSdkSubagentDetail,
+} from '../../shared/sdk-subagent-status.js';
 
 let sendToServer: ((msg: Record<string, unknown>) => void) | null = null;
 const inFlightMessages = new Map<string, { messageId: string; eventId: string; text: string }>();
@@ -297,6 +302,44 @@ export function wireProviderToRelay(provider: TransportProvider): void {
   provider.onToolCall?.((providerSid: string, tool: ToolCallEvent) => {
     const sessionName = resolveSessionName(providerSid);
     if (!sessionName) return;
+    const sdkDetail = parseSdkSubagentDetail(tool.detail);
+    if (sdkDetail.kind === 'malformed-sdk') {
+      logger.warn({ toolId: tool.id, reason: sdkDetail.reason }, 'transport-relay: dropping malformed sdk sub-agent detail');
+      return;
+    }
+    if (sdkDetail.kind === 'ok') {
+      const sdkPayload = buildSdkSubagentTimelinePayload({
+        ...tool,
+        detail: sdkDetail.detail,
+      }, {
+        allowRaw: Boolean(sdkDetail.detail.meta.diagnosticCode),
+      });
+      if (!sdkPayload) return;
+      const eventToolId = normalizeSdkSubagentKeyComponent(tool.id || sdkDetail.detail.meta.canonicalKey);
+      // Agents replay uses main timeline (via timelineEmitter), NOT transport JSONL.
+      // SDK tool.call/tool.result are hidden from transport history (transport-history only
+      // keeps user.message / assistant.text / tool.result for normal tools).  Do NOT
+      // appendTransportEvent here — it would write dead entries that shouldKeepTransportHistoryEvent
+      // would immediately discard, wasting memory and polluting the transport log.
+      if (tool.status === 'running') {
+        timelineEmitter.emit(sessionName, 'tool.call', sdkPayload.payload, {
+          source: 'daemon',
+          confidence: 'high',
+          eventId: `transport-tool:${sessionName}:${eventToolId}:call`,
+          hidden: true,
+        });
+        return;
+      }
+
+      timelineEmitter.emit(sessionName, 'tool.result', sdkPayload.payload, {
+        source: 'daemon',
+        confidence: 'high',
+        eventId: `transport-tool:${sessionName}:${eventToolId}:result`,
+        hidden: true,
+      });
+      return;
+    }
+
     const fileChangeKey = `${sessionName}:${tool.id}`;
 
     const initialToolKind = String(tool.detail?.kind ?? '').toLowerCase();

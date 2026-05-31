@@ -91,6 +91,10 @@ function rowToEvent(row: Record<string, unknown>): TimelineEvent {
   };
 }
 
+function compareTimelineEventsForReplay(a: TimelineEvent, b: TimelineEvent): number {
+  return a.ts - b.ts || a.seq - b.seq || a.eventId.localeCompare(b.eventId);
+}
+
 function buildRangeSql(base: string, afterTs?: number, beforeTs?: number): { sql: string; params: unknown[] } {
   const clauses = [base];
   const params: unknown[] = [];
@@ -130,13 +134,12 @@ export function collectSelectedDetailCandidates(
   selectedEvents: readonly TimelineEvent[],
 ): TimelineHistoryWorkerDetailCandidate[] {
   if (selectedEvents.length === 0) return [];
-  const selectedIds = new Set(selectedEvents.map((event) => event.eventId));
   const candidates: TimelineHistoryWorkerDetailCandidate[] = [];
   const seen = new Set<string>();
   let candidateBytes = 0;
 
-  for (const event of originalEvents) {
-    if (!selectedIds.has(event.eventId)) continue;
+  void originalEvents;
+  for (const event of selectedEvents) {
     for (const candidate of collectTimelineHistoryDetailCandidates(event)) {
       const key = `${candidate.eventId}:${candidate.fieldPath}`;
       if (seen.has(key)) continue;
@@ -181,14 +184,14 @@ export async function handleTimelineHistoryWorkerRequest(
       );
     }
 
-    const events = [...substantive, ...stateEvents].sort((a, b) => a.ts - b.ts);
+    const events = [...substantive, ...stateEvents].sort(compareTimelineEventsForReplay);
     const readMs = Date.now() - tRead;
     const trimmedSubstantive = substantive.length > limit ? substantive.slice(substantive.length - limit) : substantive;
     let trimmed: TimelineEvent[];
     if (trimmedSubstantive.length > 0 && stateEvents.length > 0) {
       const cutoffTs = trimmedSubstantive[0]!.ts;
       const relevantState = stateEvents.filter((event) => event.ts >= cutoffTs);
-      trimmed = [...trimmedSubstantive, ...relevantState].sort((a, b) => a.ts - b.ts);
+      trimmed = [...trimmedSubstantive, ...relevantState].sort(compareTimelineEventsForReplay);
     } else {
       trimmed = trimmedSubstantive;
     }

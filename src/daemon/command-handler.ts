@@ -4433,6 +4433,10 @@ export function countSubstantiveTimelineEvents(events: Array<{ type: string }>):
   )).length;
 }
 
+function compareTimelineEventsForReplay(a: TimelineEvent, b: TimelineEvent): number {
+  return a.ts - b.ts || a.seq - b.seq || a.eventId.localeCompare(b.eventId);
+}
+
 async function recoverOpenCodeSessionRecord(record: SessionRecord | undefined): Promise<SessionRecord | undefined> {
   if (!record || record.agentType !== 'opencode' || !record.projectDir) return record;
   try {
@@ -4583,7 +4587,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
       throw err;
     }
   }
-  const events = [...substantive, ...stateEvents].sort((a, b) => a.ts - b.ts);
+  const events = [...substantive, ...stateEvents].sort(compareTimelineEventsForReplay);
   readMs = Date.now() - tRead0;
 
   // Content-aware limit: session.state events don't count toward the budget.
@@ -4593,7 +4597,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
   if (trimmedSubstantive.length > 0 && stateEvents.length > 0) {
     const cutoffTs = trimmedSubstantive[0]!.ts;
     const relevantState = stateEvents.filter((event) => event.ts >= cutoffTs);
-    trimmed = [...trimmedSubstantive, ...relevantState].sort((a, b) => a.ts - b.ts);
+    trimmed = [...trimmedSubstantive, ...relevantState].sort(compareTimelineEventsForReplay);
   } else {
     trimmed = trimmedSubstantive;
   }

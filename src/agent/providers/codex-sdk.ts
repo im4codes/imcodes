@@ -41,6 +41,19 @@ import { getDefaultCodexMcpArgs } from './getDefaultCodexMcpArgs.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_SCHEMA_VERSION,
+  SDK_SUBAGENT_STATUS,
+  buildSdkSubagentSafeDetail,
+  makeCodexSubagentCanonicalKey,
+  type SdkSubagentDetail,
+  type SdkSubagentDiagnosticCode,
+  type SdkSubagentNormalizedStatus,
+} from '../../../shared/sdk-subagent-status.js';
 
 const CODEX_BIN = 'codex';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
@@ -52,6 +65,9 @@ const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
 const IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER = '# IM.codes runtime instructions';
 const GENERATED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
+const CODEX_COLLAB_MAX_RECEIVERS = 100;
+const CODEX_COLLAB_MAX_STATE_KEYS = 200;
+const CODEX_COLLAB_MAX_ID_CHARS = 160;
 
 
 function errorMessage(err: unknown): string {
@@ -433,13 +449,244 @@ function isThreadIdleStatus(status: string | undefined): boolean {
     || normalized === 'notloaded';
 }
 
-function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
-  const meaningfulString = (value: unknown): string | undefined => {
-    if (typeof value !== 'string') return undefined;
-    const trimmed = value.trim();
-    return trimmed ? trimmed : undefined;
+function meaningfulString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length <= CODEX_COLLAB_MAX_ID_CHARS ? trimmed : trimmed.slice(0, CODEX_COLLAB_MAX_ID_CHARS);
+}
+
+function meaningfulStringArray(value: unknown): { values: string[]; malformed: boolean } {
+  if (!Array.isArray(value)) {
+    return { values: [], malformed: value !== undefined };
+  }
+  if (value.length > CODEX_COLLAB_MAX_RECEIVERS) return { values: [], malformed: true };
+  const values: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string') return { values: [], malformed: true };
+    const trimmed = entry.trim();
+    if (!trimmed || trimmed.length > CODEX_COLLAB_MAX_ID_CHARS) return { values: [], malformed: true };
+    const stringValue = meaningfulString(trimmed);
+    if (!stringValue) return { values: [], malformed: true };
+    values.push(stringValue);
+  }
+  return { values, malformed: false };
+}
+
+function readCodexAgentStates(value: unknown): { states: Record<string, unknown>; malformed: boolean } {
+  if (value === undefined) return { states: {}, malformed: false };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { states: {}, malformed: true };
+  const keys = Object.keys(value as Record<string, unknown>);
+  if (keys.length > CODEX_COLLAB_MAX_STATE_KEYS || keys.some((key) => key.length > CODEX_COLLAB_MAX_ID_CHARS)) {
+    return { states: {}, malformed: true };
+  }
+  return { states: value as Record<string, unknown>, malformed: false };
+}
+
+function readCodexChildStatus(value: unknown): string | undefined {
+  if (typeof value === 'string') return meaningfulString(value);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  return meaningfulString(record.status)
+    ?? meaningfulString(record.state)
+    ?? meaningfulString(record.lifecycleStatus);
+}
+
+function isCodexRunningChildStatus(status: string | undefined): boolean {
+  const normalized = normalizeStatusName(status);
+  return normalized === 'pendinginit' || normalized === 'running';
+}
+
+function isKnownCodexChildStatus(status: string | undefined): boolean {
+  const normalized = normalizeStatusName(status);
+  return normalized === 'pendinginit'
+    || normalized === 'running'
+    || normalized === 'completed'
+    || normalized === 'errored'
+    || normalized === 'shutdown'
+    || normalized === 'notfound'
+    || normalized === 'interrupted'
+    || normalized === 'stale';
+}
+
+function childStatusSummary(counts: Map<string, number>): string {
+  if (counts.size === 0) return 'receivers:0';
+  const summary = [...counts.entries()].map(([status, count]) => `${status}:${count}`).join(', ');
+  return summary.length <= 160 ? summary : `${summary.slice(0, 157)}...`;
+}
+
+type CodexCollabChildSummary = {
+  receiverCount: number;
+  runningChildCount: number;
+  childStatusSummary: string;
+  diagnosticCode?: SdkSubagentDiagnosticCode;
+};
+
+function summarizeCodexCollabChildren(item: Record<string, any>, diagnosticOnly: boolean): CodexCollabChildSummary {
+  const receiverThreads = meaningfulStringArray(item.receiverThreadIds);
+  const agentStates = readCodexAgentStates(item.agentsStates);
+  const receiverIds = receiverThreads.values;
+  const receiverSet = new Set(receiverIds);
+  const stateKeys = Object.keys(agentStates.states).filter((key) => key.trim());
+  const extraKeys = stateKeys.filter((key) => !receiverSet.has(key));
+  const hasMissingState = receiverIds.some((receiverId) => !(receiverId in agentStates.states));
+  const counts = new Map<string, number>();
+  let hasUnknownChildState = false;
+
+  for (const receiverId of receiverIds) {
+    const status = readCodexChildStatus(agentStates.states[receiverId]);
+    const statusKey = status ?? 'missing';
+    counts.set(statusKey, (counts.get(statusKey) ?? 0) + 1);
+    if (!status || !isKnownCodexChildStatus(status)) hasUnknownChildState = true;
+  }
+  if (extraKeys.length > 0) counts.set('extra', extraKeys.length);
+
+  const malformed = item.receiverThreadIds === undefined
+    || receiverThreads.malformed
+    || agentStates.malformed
+    || hasMissingState
+    || extraKeys.length > 0;
+  const diagnosticCode = malformed
+    ? SDK_SUBAGENT_DIAGNOSTIC.MALFORMED_PAYLOAD
+    : hasUnknownChildState
+      ? SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE
+      : undefined;
+  const runningChildCount = diagnosticOnly || diagnosticCode
+    ? 0
+    : receiverIds.reduce((count, receiverId) => (
+        count + (isCodexRunningChildStatus(readCodexChildStatus(agentStates.states[receiverId])) ? 1 : 0)
+      ), 0);
+
+  return {
+    receiverCount: receiverIds.length,
+    runningChildCount,
+    childStatusSummary: childStatusSummary(counts),
+    diagnosticCode,
   };
+}
+
+function mapCodexCollabStatus(
+  rawStatus: string,
+  diagnosticCode: SdkSubagentDiagnosticCode | undefined,
+): {
+  toolStatus: ToolCallEvent['status'];
+  normalizedStatus: SdkSubagentNormalizedStatus;
+  active: boolean;
+  terminal: boolean;
+  diagnosticCode?: SdkSubagentDiagnosticCode;
+} {
+  if (diagnosticCode) {
+    return {
+      toolStatus: 'error',
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode,
+    };
+  }
+
+  const normalized = normalizeStatusName(rawStatus);
+  if (normalized === 'inprogress') {
+    return {
+      toolStatus: 'running',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    };
+  }
+  if (normalized === 'completed' || normalized === 'complete') {
+    return {
+      toolStatus: 'complete',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    };
+  }
+  if (normalized === 'failed' || normalized === 'error' || normalized === 'errored') {
+    return {
+      toolStatus: 'error',
+      normalizedStatus: SDK_SUBAGENT_STATUS.ERROR,
+      active: false,
+      terminal: true,
+    };
+  }
+
+  return {
+    toolStatus: 'error',
+    normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+    active: false,
+    terminal: true,
+    diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
+  };
+}
+
+function collabAgentToolFromItem(
+  sessionId: string,
+  item: Record<string, any>,
+  lifecycle: 'started' | 'completed',
+): ToolCallEvent {
+  const rawItemId = meaningfulString(item.id);
+  const parentItemId = rawItemId ?? `malformed-${lifecycle}`;
+  const missingIdDiagnostic = rawItemId ? undefined : SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID;
+  const fallbackRawStatus = lifecycle === 'started' ? 'inProgress' : 'completed';
+  const rawStatus = meaningfulString(item.status) ?? fallbackRawStatus;
+  const childSummary = summarizeCodexCollabChildren(item, Boolean(missingIdDiagnostic));
+  const lifecycleStatusMismatch = lifecycle === 'completed' && normalizeStatusName(rawStatus) === 'inprogress'
+    ? SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE
+    : undefined;
+  const statusMapping = mapCodexCollabStatus(rawStatus, missingIdDiagnostic ?? childSummary.diagnosticCode ?? lifecycleStatusMismatch);
+  const receiverCount = childSummary.receiverCount;
+  const receiverLabel = receiverCount === 1 ? '1 receiver' : `${receiverCount} receivers`;
+  const summary = statusMapping.diagnosticCode
+    ? `Codex collaboration diagnostic (${receiverLabel})`
+    : `Codex collaboration agent (${receiverLabel})`;
+  const output = statusMapping.toolStatus === 'complete'
+    ? 'completed'
+    : statusMapping.toolStatus === 'error'
+      ? (statusMapping.diagnosticCode ? 'diagnostic' : 'failed')
+      : undefined;
+  const detail = buildSdkSubagentSafeDetail({
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary,
+    input: {
+      action: 'codex-collaboration',
+      receiverCount,
+      description: summary,
+    },
+    ...(output ? { output } : {}),
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT,
+      canonicalKey: makeCodexSubagentCanonicalKey(sessionId, parentItemId),
+      normalizedStatus: statusMapping.normalizedStatus,
+      rawStatus,
+      active: statusMapping.active,
+      terminal: statusMapping.terminal,
+      parentSessionId: sessionId,
+      parentItemId,
+      receiverCount,
+      runningChildCount: statusMapping.diagnosticCode || statusMapping.terminal ? 0 : childSummary.runningChildCount,
+      childStatusSummary: childSummary.childStatusSummary,
+      diagnosticCode: statusMapping.diagnosticCode,
+    },
+  } satisfies SdkSubagentDetail, { allowRaw: false });
+
+  return {
+    id: rawItemId ?? `codex-collab-${sessionId}-${lifecycle}-malformed`,
+    name: 'Codex Collaboration',
+    status: statusMapping.toolStatus,
+    ...(detail.input ? { input: detail.input } : {}),
+    ...(detail.output ? { output: detail.output } : {}),
+    detail,
+  };
+}
+
+function toolFromItem(sessionId: string, item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
   switch (item.type) {
+    case 'collabAgentToolCall':
+      return collabAgentToolFromItem(sessionId, item, lifecycle);
     case 'commandExecution':
       return {
         id: item.id,
@@ -1393,7 +1640,7 @@ export class CodexSdkProvider implements TransportProvider {
 
       this.clearStatus(sessionId, state);
 
-      const tool = toolFromItem(item, method === 'item/started' ? 'started' : 'completed');
+      const tool = toolFromItem(sessionId, item, method === 'item/started' ? 'started' : 'completed');
       if (tool) {
         for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
       }

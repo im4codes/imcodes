@@ -20,6 +20,12 @@ import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
 } from '@shared/session-control-commands.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_STATUS,
+} from '@shared/sdk-subagent-status.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
@@ -45,6 +51,11 @@ import {
 import { domNodeToPlainText, selectionToPlainText } from '../util/dom-to-text.js';
 import { selectionSignature } from '../util/selection-signature.js';
 import { ZoomedTextDialog } from './ZoomedTextDialog.js';
+import {
+  deriveSdkSubagentStatusRows,
+  type SdkSubagentDiagnostic,
+  type SdkSubagentStatusRow,
+} from '../timeline/sdk-subagent-aggregator.js';
 
 interface Props {
   events: TimelineEvent[];
@@ -899,12 +910,16 @@ function useTouchChatGestures(): boolean {
 const LONG_PRESS_MS = 400;
 const panelWidthKey = (id: string | null | undefined) => `chatFilePanelWidth:${id ?? '_'}`;
 const panelOpenKey  = (id: string | null | undefined) => `chatFilePanelOpen:${id ?? '_'}`;
+const agentsPanelOpenKey = (id: string | null | undefined) => `chatSdkAgentsPanelOpen:${id ?? '_'}`;
 
 function readPanelWidth(id: string | null | undefined): number {
   try { return parseInt(localStorage.getItem(panelWidthKey(id)) ?? String(FILE_PANEL_DEFAULT), 10); } catch { return FILE_PANEL_DEFAULT; }
 }
 function readPanelOpen(id: string | null | undefined): boolean {
   try { return localStorage.getItem(panelOpenKey(id)) === '1'; } catch { return false; }
+}
+function readAgentsPanelOpen(id: string | null | undefined): boolean {
+  try { return localStorage.getItem(agentsPanelOpenKey(id)) === '1'; } catch { return false; }
 }
 
 /** Find a chat event element by its eventId without relying on CSS.escape —
@@ -943,6 +958,202 @@ function findScrollParent(start: HTMLElement): HTMLElement {
     node = node.parentElement;
   }
   return start;
+}
+
+type ChatTranslate = (key: string, options?: Record<string, unknown>) => string;
+
+function sdkAgentsProviderLabel(t: ChatTranslate, row: Pick<SdkSubagentStatusRow | SdkSubagentDiagnostic, 'provider'>): string {
+  switch (row.provider) {
+    case SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK:
+      return t('chat.sdk_agents_provider_claude');
+    case SDK_SUBAGENT_PROVIDERS.CODEX_SDK:
+      return t('chat.sdk_agents_provider_codex');
+    default:
+      return t('chat.sdk_agents_provider_unknown');
+  }
+}
+
+function sdkAgentsStatusLabel(t: ChatTranslate, status: SdkSubagentStatusRow['normalizedStatus'] | SdkSubagentDiagnostic['normalizedStatus']): string {
+  switch (status) {
+    case SDK_SUBAGENT_STATUS.PENDING:
+      return t('chat.sdk_agents_status_pending');
+    case SDK_SUBAGENT_STATUS.RUNNING:
+      return t('chat.sdk_agents_status_running');
+    case SDK_SUBAGENT_STATUS.COMPLETE:
+      return t('chat.sdk_agents_status_complete');
+    case SDK_SUBAGENT_STATUS.ERROR:
+      return t('chat.sdk_agents_status_error');
+    case SDK_SUBAGENT_STATUS.INTERRUPTED:
+      return t('chat.sdk_agents_status_interrupted');
+    case SDK_SUBAGENT_STATUS.STALE:
+      return t('chat.sdk_agents_status_stale');
+    case SDK_SUBAGENT_STATUS.UNKNOWN:
+    default:
+      return t('chat.sdk_agents_status_unknown');
+  }
+}
+
+function sdkAgentsDiagnosticLabel(t: ChatTranslate, diagnostic: SdkSubagentDiagnostic): string {
+  switch (diagnostic.diagnosticCode) {
+    case SDK_SUBAGENT_DIAGNOSTIC.UNSUPPORTED_RUNTIME:
+      return t('chat.sdk_agents_diagnostic_unsupported_runtime');
+    case SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_RUNTIME_SUPPORT:
+      return t('chat.sdk_agents_diagnostic_unknown_runtime_support');
+    case SDK_SUBAGENT_DIAGNOSTIC.MALFORMED_PAYLOAD:
+      return t('chat.sdk_agents_diagnostic_malformed_payload');
+    case SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID:
+      return t('chat.sdk_agents_diagnostic_missing_id');
+    case SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE:
+      return t('chat.sdk_agents_diagnostic_unknown_state');
+    case SDK_SUBAGENT_DIAGNOSTIC.STALE_WITHOUT_TERMINAL:
+      return t('chat.sdk_agents_diagnostic_stale_without_terminal');
+    case SDK_SUBAGENT_DIAGNOSTIC.SNAPSHOT_ONLY:
+      return t('chat.sdk_agents_diagnostic_snapshot_only');
+    default:
+      return t('chat.sdk_agents_diagnostic_generic');
+  }
+}
+
+function sdkAgentsRowSummary(row: SdkSubagentStatusRow): string {
+  return row.summary
+    || row.childStatusSummary
+    || row.rawStatus
+    || row.receiverThreadId
+    || row.taskId
+    || row.parentItemId
+    || row.canonicalKey;
+}
+
+function sdkAgentsDiagnosticSummary(diagnostic: SdkSubagentDiagnostic): string | null {
+  return diagnostic.summary || diagnostic.childStatusSummary || diagnostic.rawStatus || diagnostic.canonicalKey || null;
+}
+
+function sdkAgentsStatusClass(status: SdkSubagentStatusRow['normalizedStatus'] | SdkSubagentDiagnostic['normalizedStatus']): string {
+  switch (status) {
+    case SDK_SUBAGENT_STATUS.PENDING:
+      return 'pending';
+    case SDK_SUBAGENT_STATUS.RUNNING:
+      return 'running';
+    case SDK_SUBAGENT_STATUS.COMPLETE:
+      return 'complete';
+    case SDK_SUBAGENT_STATUS.ERROR:
+      return 'error';
+    case SDK_SUBAGENT_STATUS.INTERRUPTED:
+      return 'interrupted';
+    case SDK_SUBAGENT_STATUS.STALE:
+      return 'stale';
+    default:
+      return 'unknown';
+  }
+}
+
+function hasSdkSubagentTimelineEvent(events: readonly TimelineEvent[]): boolean {
+  return events.some((event) => {
+    if (event.type !== 'tool.call' && event.type !== 'tool.result') return false;
+    const detail = event.payload?.detail;
+    return Boolean(detail && typeof detail === 'object' && !Array.isArray(detail)
+      && (detail as { kind?: unknown }).kind === SDK_SUBAGENT_DETAIL_KIND);
+  });
+}
+
+function SdkAgentsPanel({
+  rows,
+  diagnostics,
+  runningCount,
+  onClose,
+}: {
+  rows: SdkSubagentStatusRow[];
+  diagnostics: SdkSubagentDiagnostic[];
+  runningCount: number;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const activeRows = rows.filter((row) => row.active);
+  const terminalRows = rows.filter((row) => !row.active);
+  return (
+    <div class="chat-sdk-agents-panel" role="region" aria-label={t('chat.sdk_agents_panel_title')}>
+      <div class="chat-sdk-agents-header">
+        <div class="chat-sdk-agents-heading">
+          <span class="chat-sdk-agents-title">{t('chat.sdk_agents_panel_title')}</span>
+          <span class="chat-sdk-agents-subtitle">{t('chat.sdk_agents_running_count', { count: runningCount })}</span>
+        </div>
+        <button
+          type="button"
+          class="chat-sdk-agents-close"
+          onClick={onClose}
+          aria-label={t('chat.sdk_agents_close')}
+          title={t('chat.sdk_agents_close')}
+        >
+          ×
+        </button>
+      </div>
+      <div class="chat-sdk-agents-body">
+        {activeRows.length > 0 && (
+          <section class="chat-sdk-agents-section" aria-label={t('chat.sdk_agents_active_section')}>
+            <div class="chat-sdk-agents-section-title">{t('chat.sdk_agents_active_section')}</div>
+            {activeRows.map((row) => (
+              <SdkAgentsRow key={row.canonicalKey} row={row} />
+            ))}
+          </section>
+        )}
+        {terminalRows.length > 0 && (
+          <section class="chat-sdk-agents-section" aria-label={t('chat.sdk_agents_recent_section')}>
+            <div class="chat-sdk-agents-section-title">{t('chat.sdk_agents_recent_section')}</div>
+            {terminalRows.map((row) => (
+              <SdkAgentsRow key={row.canonicalKey} row={row} />
+            ))}
+          </section>
+        )}
+        {diagnostics.length > 0 && (
+          <section class="chat-sdk-agents-section" aria-label={t('chat.sdk_agents_diagnostics_section')}>
+            <div class="chat-sdk-agents-section-title">{t('chat.sdk_agents_diagnostics_section')}</div>
+            {diagnostics.map((diagnostic) => (
+              <SdkAgentsDiagnosticRow key={diagnostic.id} diagnostic={diagnostic} />
+            ))}
+          </section>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SdkAgentsRow({ row }: { row: SdkSubagentStatusRow }) {
+  const { t } = useTranslation();
+  const statusClass = sdkAgentsStatusClass(row.normalizedStatus);
+  const statusLabel = sdkAgentsStatusLabel(t, row.normalizedStatus);
+  const summary = sdkAgentsRowSummary(row);
+  return (
+    <div class={`chat-sdk-agent-row ${row.active ? 'active' : 'terminal'} status-${statusClass}`}>
+      <div class="chat-sdk-agent-row-top">
+        <span class="chat-sdk-agent-provider">{sdkAgentsProviderLabel(t, row)}</span>
+        <span class="chat-sdk-agent-status">{statusLabel}</span>
+      </div>
+      <div class="chat-sdk-agent-summary">{summary}</div>
+      <div class="chat-sdk-agent-meta">
+        {row.active && typeof row.runningChildCount === 'number' && (
+          <span>{t('chat.sdk_agents_running_children', { count: row.runningChildCount })}</span>
+        )}
+        {typeof row.receiverCount === 'number' && (
+          <span>{t('chat.sdk_agents_receiver_count', { count: row.receiverCount })}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnostic }) {
+  const { t } = useTranslation();
+  const statusClass = sdkAgentsStatusClass(diagnostic.normalizedStatus);
+  const summary = sdkAgentsDiagnosticSummary(diagnostic);
+  return (
+    <div class={`chat-sdk-agent-row diagnostic status-${statusClass}`}>
+      <div class="chat-sdk-agent-row-top">
+        <span class="chat-sdk-agent-provider">{sdkAgentsProviderLabel(t, diagnostic)}</span>
+        <span class="chat-sdk-agent-status">{sdkAgentsDiagnosticLabel(t, diagnostic)}</span>
+      </div>
+      {summary && <div class="chat-sdk-agent-summary">{summary}</div>}
+    </div>
+  );
 }
 
 export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
@@ -1063,6 +1274,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // Split-screen file panel — width and open state are per-session
   const [showFilePanel, setShowFilePanel] = useState(() => readPanelOpen(sessionId));
   const [filePanelWidth, setFilePanelWidth] = useState(() => readPanelWidth(sessionId));
+  const [desiredAgentsOpen, setDesiredAgentsOpen] = useState(() => readAgentsPanelOpen(sessionId));
   const dragStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const filePanelWidthRef = useRef(filePanelWidth);
   filePanelWidthRef.current = filePanelWidth;
@@ -1074,6 +1286,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     prevSessionIdRef.current = sessionId;
     setShowFilePanel(readPanelOpen(sessionId));
     setFilePanelWidth(readPanelWidth(sessionId));
+    setDesiredAgentsOpen(readAgentsPanelOpen(sessionId));
   }, [sessionId]);
 
   const toggleFilePanel = useCallback(() => {
@@ -1083,6 +1296,15 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       return next;
     });
   }, [sessionId]);
+
+  const setDesiredAgentsPanelOpen = useCallback((next: boolean) => {
+    setDesiredAgentsOpen(next);
+    try { localStorage.setItem(agentsPanelOpenKey(sessionId), next ? '1' : '0'); } catch { /* ignore */ }
+  }, [sessionId]);
+
+  const toggleAgentsPanel = useCallback(() => {
+    setDesiredAgentsPanelOpen(!desiredAgentsOpen);
+  }, [desiredAgentsOpen, setDesiredAgentsPanelOpen]);
 
   const onDragStart = useCallback((e: MouseEvent) => {
     e.preventDefault();
@@ -1307,6 +1529,24 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const handleChooserPickSimple = useCallback(() => {
     void showToolCallsPref.save(false);
   }, [showToolCallsPref]);
+  const [sdkAgentsNow, setSdkAgentsNow] = useState(() => Date.now());
+  const hasSdkAgentEvents = useMemo(() => hasSdkSubagentTimelineEvent(events), [events]);
+  useEffect(() => {
+    if (!hasSdkAgentEvents) return;
+    setSdkAgentsNow(Date.now());
+  }, [hasSdkAgentEvents, events]);
+  const sdkAgentsStatus = useMemo(
+    () => deriveSdkSubagentStatusRows(events, sdkAgentsNow),
+    [events, sdkAgentsNow],
+  );
+  const hasAgentsStatusRows = sdkAgentsStatus.rows.length > 0 || sdkAgentsStatus.diagnostics.length > 0;
+  useEffect(() => {
+    if (preview || !hasAgentsStatusRows) return undefined;
+    const timer = window.setInterval(() => setSdkAgentsNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, [hasAgentsStatusRows, preview]);
+  const canShowAgentsControl = !preview;
+  const showAgentsPane = canShowAgentsControl && desiredAgentsOpen && hasAgentsStatusRows;
 
   // Preview cards (SubSessionCard) are small thumbnails; slice events to a
   // bounded tail BEFORE buildViewItems so it doesn't walk thousands of items
@@ -1989,6 +2229,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [isTouchDevice, preview, openCtxMenu]);
 
   const canShowFilePanel = !preview && !!ws;
+  const hasRightPanel = showAgentsPane || (canShowFilePanel && showFilePanel);
   // Per-machine chat-window font preference (family + size). Stored in
   // localStorage under `imcodes_fontPrefs:chat`; not synced across devices,
   // because each machine's display, OS font availability, and viewing
@@ -2020,9 +2261,26 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const showHistoryProgress = !preview && historySteps.some((step) => step.state === 'pending' || step.state === 'running');
   const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
   return (
-    <div class={`chat-view-wrap${canShowFilePanel && showFilePanel ? ' chat-split' : ''}`}>
-      {(onForceSync || canShowFilePanel) && (
+    <div class={`chat-view-wrap${hasRightPanel ? ' chat-split' : ''}`}>
+      {(canShowAgentsControl || onForceSync || canShowFilePanel) && (
         <div class="chat-top-actions">
+          {canShowAgentsControl && (
+            <button
+              type="button"
+              class={`chat-panel-toggle chat-sdk-agents-toggle${showAgentsPane ? ' active' : ''}`}
+              onClick={toggleAgentsPanel}
+              title={t('chat.sdk_agents_toggle')}
+              aria-label={t('chat.sdk_agents_toggle_aria', { count: sdkAgentsStatus.runningCount })}
+              aria-expanded={showAgentsPane}
+            >
+              <span class="chat-sdk-agents-toggle-label">{t('chat.sdk_agents_toggle')}</span>
+              {sdkAgentsStatus.runningCount > 0 && (
+                <span class="chat-sdk-agents-badge" aria-label={t('chat.sdk_agents_badge_aria', { count: sdkAgentsStatus.runningCount })}>
+                  {sdkAgentsStatus.runningCount}
+                </span>
+              )}
+            </button>
+          )}
           {onForceSync && (
             <button
               class={`chat-panel-toggle chat-sync-btn${refreshing ? ' spinning' : ''}`}
@@ -2375,6 +2633,14 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           </div>
         )}
       </div>
+      {showAgentsPane && (
+        <SdkAgentsPanel
+          rows={sdkAgentsStatus.rows}
+          diagnostics={sdkAgentsStatus.diagnostics}
+          runningCount={sdkAgentsStatus.runningCount}
+          onClose={() => setDesiredAgentsPanelOpen(false)}
+        />
+      )}
       {canShowFilePanel && showFilePanel && ws && (
         <>
           <div class="chat-panel-drag" onMouseDown={onDragStart} />
