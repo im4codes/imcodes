@@ -9,6 +9,9 @@ export {
 export const FS_READ_ERROR_CODES = {
   ...FS_GENERIC_ERROR_CODES,
   BINARY_FILE: 'binary_file',
+  /** The target path is a directory, not a file — the client should list it
+   *  (open the folder) instead of treating it as a failed file preview. */
+  IS_DIRECTORY: 'is_directory',
   PREVIEW_WORKER_QUEUE_FULL: 'preview_worker_queue_full',
   PREVIEW_WORKER_TIMEOUT: 'preview_worker_timeout',
   PREVIEW_WORKER_UNAVAILABLE: 'preview_worker_unavailable',
@@ -21,6 +24,7 @@ export type FsReadErrorCode = (typeof FS_READ_ERROR_CODES)[keyof typeof FS_READ_
 
 export const FS_READ_ERROR_CODE_VALUES = [
   FS_READ_ERROR_CODES.BINARY_FILE,
+  FS_READ_ERROR_CODES.IS_DIRECTORY,
   FS_READ_ERROR_CODES.FORBIDDEN_PATH,
   FS_READ_ERROR_CODES.FILE_TOO_LARGE,
   FS_READ_ERROR_CODES.FS_LIST_TIMEOUT,
