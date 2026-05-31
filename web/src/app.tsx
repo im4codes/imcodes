@@ -2072,9 +2072,20 @@ export function App() {
       }
     }
 
+    // Remove a sub-session window ONLY when its sub is no longer OPEN — NOT when
+    // it is merely absent from `currentlyOpen` (i.e. missing from this render's
+    // `visibleSubSessions`). `visibleSubSessions` gets a fresh array on every
+    // inbound sub-session WS tick, so while opening a 3rd window a background
+    // update can momentarily exclude the just-opened sub and evict its freshly
+    // created stack entry — leaving its card dashed/inactive and un-closable
+    // (close on an inactive window is a focus-only no-op) until another card was
+    // clicked (which re-ensured the window). `openSubIds` is the source of truth
+    // for "should this window exist"; it is scoped per main session (reset on
+    // session switch), so windows are still torn down on close and on switching
+    // the active session.
     for (const entry of stack.getOrderForTests()) {
       if (entry.meta.kind !== DESKTOP_WINDOW_KINDS.subSession) continue;
-      if (!entry.meta.subId || !currentlyOpen.has(entry.meta.subId)) {
+      if (!entry.meta.subId || !openSubIdsRef.current.has(entry.meta.subId)) {
         if (stack.removeWindow(entry.id)) changed = true;
       }
     }
