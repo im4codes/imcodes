@@ -2637,16 +2637,26 @@ export function useTimeline(
   }, [reloadLocalTimeline]);
 
   // Self-heal a blank pane. The mount path seeds `events` from local cache, but
-  // it can still settle EMPTY even when local history exists — e.g. serverId
-  // resolved AFTER the first read so the scoped cacheKey changed, a cold/slow
-  // IndexedDB read, or a daemon history response that came back empty. The user
-  // shouldn't have to hit ↻ to get their own local history back. When the
-  // timeline has SETTLED blank (not loading) but local cache may hold history,
-  // re-read it automatically — this is the LOCAL-ONLY half of forceRefresh (no
-  // HTTP). Gated once per cacheKey-blank episode via `blankSelfHealRef` so a
-  // genuinely-empty session never loops; the guard resets as soon as events
-  // appear (or the session switches), allowing a future blank to self-heal too.
+  // it can still settle EMPTY even when history exists — e.g. serverId resolved
+  // AFTER the first read so the scoped cacheKey changed, a cold/slow IndexedDB
+  // read, or a daemon history response that came back empty. The user shouldn't
+  // have to hit ↻ to get the same recovery path. When the timeline has SETTLED
+  // blank, re-read local IDB and run the same latest-window HTTP catch-up used
+  // by forceRefresh. `manualLatestWindow` also clears any pending tail backfill,
+  // so this does not double-fetch after the mount bootstrap timer.
   const blankSelfHealRef = useRef<string | null>(null);
+  const fireBlankPaneRecovery = useCallback((visible: boolean) => {
+    const key = cacheKeyRef.current;
+    if (!key) return;
+    blankSelfHealRef.current = key;
+    void reloadLocalTimelineRef.current();
+    fireHttpBackfillRef.current(0, {
+      phase: 'refresh',
+      visible,
+      force: true,
+      mode: 'manualLatestWindow',
+    });
+  }, []);
   useEffect(() => {
     const key = cacheKey;
     if (!key || disableHistory) return;
@@ -2654,11 +2664,19 @@ export function useTimeline(
       if (blankSelfHealRef.current === key) blankSelfHealRef.current = null;
       return;
     }
-    if (loading) return;                           // mount path is still reading
+    if (loading || refreshing || httpRefreshing) return; // another recovery path is still running
+    if (!isActiveSessionRef.current && !isVisibleRef.current) return;
     if (blankSelfHealRef.current === key) return;  // already self-healed this key
-    blankSelfHealRef.current = key;
-    void reloadLocalTimeline();
-  }, [cacheKey, events.length, loading, disableHistory, reloadLocalTimeline]);
+    fireBlankPaneRecovery(isActiveSessionRef.current);
+  }, [
+    cacheKey,
+    events.length,
+    loading,
+    refreshing,
+    httpRefreshing,
+    disableHistory,
+    fireBlankPaneRecovery,
+  ]);
 
   const lastActiveRefreshAtRef = useRef(0);
 
@@ -2746,6 +2764,14 @@ export function useTimeline(
       // waiting on the gated/cooled-down HTTP backfill.
       if (eventsRef.current.length < ACTIVE_LOCAL_RELOAD_MAX_EVENTS) {
         void reloadLocalTimelineRef.current();
+      }
+      if (eventsRef.current.length === 0) {
+        // A rarely-opened sub-session can activate with no local/daemon events
+        // rendered yet. The manual ↻ path is known to recover this state, so use
+        // that same latest-window, force-through recovery instead of the normal
+        // silent tail refresh that may be suppressed by the activation cooldown.
+        fireBlankPaneRecovery(true);
+        return;
       }
       // SILENT (visible: false). Same reasoning as the activation-event
       // handler above — the false→true transition fires whenever the user

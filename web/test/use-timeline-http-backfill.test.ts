@@ -21,6 +21,7 @@ vi.mock('../src/api.js', () => ({
 import { render, screen, cleanup, act, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import type { ServerMessage, TimelineEvent, WsClient } from '../src/ws-client.js';
+import { TimelineDB } from '../src/timeline-db.js';
 import {
   __getTimelineHistoryAfterTsForTests,
   __resetBackfillCooldownsForTests,
@@ -50,6 +51,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
   });
   afterEach(() => {
     vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it('manual force refresh pulls the daemon latest window without afterTs so a pushed latest event cannot hide middle history', async () => {
@@ -136,6 +138,89 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toContain('middle-recovered');
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('self-heals a settled blank pane through the force-refresh latest-window path', async () => {
+    const sessionName = `deck_blank_self_heal_${Date.now()}`;
+    const serverId = `srv-blank-self-heal-${Date.now()}`;
+    const recovered: TimelineEvent = {
+      eventId: `${sessionName}-recovered`,
+      sessionId: sessionName,
+      ts: 5000,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'blank recovered without clicking sync' },
+    };
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    fetchSpy.mockResolvedValue({ events: [recovered], epoch: 1, hasMore: false, nextCursor: null });
+
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineReplayRequest: vi.fn(() => 'replay-blank-self-heal'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history-blank-self-heal'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events, loading } = useTimeline(sessionName, ws, serverId, { isActiveSession: true });
+      return h(
+        'div',
+        {
+          'data-testid': 'probe',
+          'data-loading': String(loading),
+        },
+        events.map((e) => String(e.payload.text ?? '')).join('|'),
+      );
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => {
+      expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+    });
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.history',
+        sessionName,
+        requestId: 'history-blank-self-heal',
+        epoch: 1,
+        events: [],
+      } as ServerMessage);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-loading')).toBe('false');
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+
+    await waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+    const [, fetchedSession, options] = fetchSpy.mock.calls[0]!;
+    expect(fetchedSession).toBe(sessionName);
+    expect(options).toEqual(expect.objectContaining({ limit: 300, timeoutMs: 12_000 }));
+    expect((options as { afterTs?: number }).afterTs).toBeUndefined();
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('blank recovered without clicking sync');
     });
 
     await act(async () => {
