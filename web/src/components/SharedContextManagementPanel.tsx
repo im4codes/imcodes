@@ -1592,7 +1592,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryProjectId, setMemoryProjectId] = useState('');
   const [selectedMemoryProjectId, setSelectedMemoryProjectId] = useState('');
-  const [memoryBrowseProjectId, setMemoryBrowseProjectId] = useState('');
   const [memoryProjectSearch, setMemoryProjectSearch] = useState('');
   const [memoryIndexedProjects, setMemoryIndexedProjects] = useState<Record<string, MemoryProjectOption>>({});
   const [resolvedMemoryProjects, setResolvedMemoryProjects] = useState<Record<string, MemoryProjectOption>>({});
@@ -2097,15 +2096,14 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     () => memoryProjectOptions.find((option) => option.id === selectedMemoryProjectId) ?? null,
     [memoryProjectOptions, selectedMemoryProjectId],
   );
-  const selectedBrowseMemoryProject = useMemo(
-    () => memoryProjectOptions.find((option) => option.id === memoryBrowseProjectId) ?? null,
-    [memoryProjectOptions, memoryBrowseProjectId],
-  );
   const selectedMemoryProjectCapabilities = useMemo(
     () => deriveMemoryProjectCapabilities(selectedMemoryProject),
     [selectedMemoryProject],
   );
-  const browseCanonicalRepoId = selectedBrowseMemoryProject?.canonicalRepoId?.trim() || undefined;
+  // Unified project control: the single selected project ALSO scopes the memory
+  // list (no separate "browse" dropdown). It is auto-selected from
+  // activeProjectDir below, so opening the panel filters to that project.
+  const browseCanonicalRepoId = selectedMemoryProject?.canonicalRepoId?.trim() || undefined;
   const selectedCanonicalRepoId = selectedMemoryProject?.canonicalRepoId?.trim() || memoryProjectId.trim() || undefined;
   const selectedProjectDir = selectedMemoryProject?.projectDir?.trim() || memoryAdminProjectDir.trim() || undefined;
   const manualMemoryCanonicalRepoId = selectedCanonicalRepoId || browseCanonicalRepoId;
@@ -2171,12 +2169,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       ?? memoryProjectOptions[0];
     if (preferred) setSelectedMemoryProjectId(preferred.id);
   }, [activeProjectDir, memoryProjectOptions, selectedMemoryProjectId]);
-
-  useEffect(() => {
-    if (!memoryBrowseProjectId) return;
-    if (memoryProjectOptions.some((option) => option.id === memoryBrowseProjectId && option.canonicalRepoId?.trim())) return;
-    setMemoryBrowseProjectId('');
-  }, [memoryBrowseProjectId, memoryProjectOptions]);
 
   const memoryProjectStatusLabel = useCallback((status: MemoryProjectResolutionStatus): string => (
     t(`sharedContext.management.memoryProjectStatus.${status}`)
@@ -3116,48 +3108,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         <label style={fieldLabelStyle}>
           <span>{t('sharedContext.management.memoryBrowseProjectFilter')}</span>
           <select
-            value={memoryBrowseProjectId}
-            onInput={(e) => {
-              const next = (e.currentTarget as HTMLSelectElement).value;
-              setMemoryBrowseProjectId(next);
-            }}
-            aria-label={t('sharedContext.management.memoryBrowseProjectFilter')}
-            // `inputStyle` carries `flex: '1 1 180px'` which is correct in
-            // row-flex parents (180px = WIDTH basis). Here the parent is a
-            // column-flex `<label>`, so the same shorthand resolves on the
-            // VERTICAL axis and the select inflates to ~180+ px tall.
-            // Override flex back to intrinsic height; cross-axis stretch
-            // (default for column-flex children) keeps width filling the
-            // label.
-            style={{ ...inputStyle, flex: '0 0 auto' }}
-          >
-            <option value="">{t('sharedContext.management.memoryBrowseAllProjects')}</option>
-            {memoryProjectOptions.map((option) => (
-              <option key={`browse:${option.id}`} value={option.id} disabled={!option.canonicalRepoId?.trim()}>
-                {memoryProjectOptionLabel(
-                  option,
-                  t('sharedContext.management.memoryProjectNoCanonicalId'),
-                  t('sharedContext.management.memoryProjectNoDirectory'),
-                )}
-              </option>
-            ))}
-          </select>
-        </label>
-        <span style={pillStyle}>
-          {memoryBrowseProjectId && selectedBrowseMemoryProject
-            ? t('sharedContext.management.memoryActiveProjectFilter', { project: selectedBrowseMemoryProject.displayName })
-            : t('sharedContext.management.memoryAllProjectsActive')}
-        </span>
-        {memoryBrowseProjectId ? (
-          <button type="button" style={subtleButtonStyle} onClick={() => setMemoryBrowseProjectId('')}>
-            {t('sharedContext.management.memoryClearProjectFilter')}
-          </button>
-        ) : null}
-      </div>
-      <div style={adminFormRowStyle}>
-        <label style={fieldLabelStyle}>
-          <span>{t('sharedContext.management.memoryToolProjectSelector')}</span>
-          <select
             value={selectedMemoryProjectId}
             onInput={(e) => {
               const next = (e.currentTarget as HTMLSelectElement).value;
@@ -3197,7 +3147,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           </span>
         ) : null}
       </div>
-      <div style={helperTextStyle}>{t('sharedContext.management.memoryProjectPickerSplitHelp')}</div>
       <details style={{ color: DT.text.secondary }}>
         <summary style={{ cursor: 'pointer' }}>{t('sharedContext.management.memoryProjectKnownProjects')}</summary>
         <div style={{ ...adminFormRowStyle, marginTop: DT.space.sm }}>
@@ -5103,13 +5052,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     />
                   </div>
                 ) : null}
-                {memoryBrowseProjectId && selectedBrowseMemoryProject ? (
+                {selectedMemoryProject ? (
                   <div style={memoryProcessedNoteStyle}>
-                    {t('sharedContext.management.memoryFilteredByProject', { project: selectedBrowseMemoryProject.displayName })}
-                    {' '}
-                    <button type="button" style={archiveRestoreButtonStyle} onClick={() => setMemoryBrowseProjectId('')}>
-                      {t('sharedContext.management.memoryClearProjectFilter')}
-                    </button>
+                    {t('sharedContext.management.memoryFilteredByProject', { project: selectedMemoryProject.displayName })}
                   </div>
                 ) : null}
                 <div style={{ ...memoryFormPanelStyle, gap: DT.space.sm }}>
