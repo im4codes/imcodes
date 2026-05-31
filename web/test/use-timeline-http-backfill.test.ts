@@ -22,6 +22,7 @@ import { render, screen, cleanup, act, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import type { ServerMessage, TimelineEvent, WsClient } from '../src/ws-client.js';
 import { TimelineDB } from '../src/timeline-db.js';
+import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
 import {
   __getTimelineHistoryAfterTsForTests,
   __resetBackfillCooldownsForTests,
@@ -197,7 +198,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
 
     await act(async () => {
       handler?.({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName,
         requestId: 'history-blank-self-heal',
         epoch: 1,
