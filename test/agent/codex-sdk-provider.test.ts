@@ -275,12 +275,15 @@ function collabItem(overrides: Record<string, any> = {}): Record<string, any> {
   };
 }
 
-function expectCodexSubagentDetail(tool: ToolCallEvent): SdkSubagentDetail {
+function expectCodexSubagentDetail(
+  tool: ToolCallEvent,
+  providerKind = SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT,
+): SdkSubagentDetail {
   expect(isSdkSubagentDetail(tool.detail)).toBe(true);
   const detail = tool.detail as SdkSubagentDetail;
   expect(detail.kind).toBe(SDK_SUBAGENT_DETAIL_KIND);
   expect(detail.meta.provider).toBe(SDK_SUBAGENT_PROVIDERS.CODEX_SDK);
-  expect(detail.meta.providerKind).toBe(SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT);
+  expect(detail.meta.providerKind).toBe(providerKind);
   return detail;
 }
 
@@ -711,6 +714,145 @@ describe('CodexSdkProvider', () => {
     expect(tools[0]!.input).toMatchObject({
       action: 'codex-collaboration',
       receiverCount: 1,
+    });
+  });
+
+  it('emits SDK sub-agent snapshots for Codex runtime subagent notifications', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-runtime-subagent', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-runtime-subagent', 'spawn a helper');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'subagent_notification',
+      params: {
+        threadId: 'thread-1',
+        agent_path: '019e7f1c-4e8c-7180-ae0d-577b994c9473',
+        status: 'running',
+        name: 'Jason',
+      },
+    });
+    child.emits({
+      method: 'subagent/status',
+      params: {
+        threadId: 'thread-1',
+        subagent: {
+          agentPath: '019e7f1c-4e8c-7180-ae0d-577b994c9473',
+          status: 'shutdown',
+          nickname: 'Jason',
+        },
+      },
+    });
+    await flush();
+
+    const expectedKey = makeCodexSubagentCanonicalKey(
+      'route-runtime-subagent',
+      'runtime:019e7f1c-4e8c-7180-ae0d-577b994c9473',
+    );
+
+    expect(tools).toHaveLength(2);
+    expect(tools[0]).toMatchObject({
+      id: expectedKey,
+      name: 'Codex Sub-agent',
+      status: 'running',
+      input: { action: 'codex-runtime-subagent' },
+    });
+    const runningDetail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(runningDetail.summary).toBe('Codex sub-agent Jason');
+    expect(runningDetail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      parentItemId: expectedKey,
+      agentPath: '019e7f1c-4e8c-7180-ae0d-577b994c9473',
+      agentName: 'Jason',
+      rawStatus: 'running',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    });
+    expect(runningDetail.meta.diagnosticCode).toBeUndefined();
+
+    expect(tools[1]).toMatchObject({
+      id: expectedKey,
+      name: 'Codex Sub-agent',
+      status: 'complete',
+      output: 'shutdown',
+    });
+    const shutdownDetail = expectCodexSubagentDetail(tools[1]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(shutdownDetail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      rawStatus: 'shutdown',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    });
+  });
+
+  it('emits SDK sub-agent snapshots for raw Codex runtime subagent notification tags', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-runtime-subagent-tag', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-runtime-subagent-tag', 'spawn a helper');
+    const child = childProcessMock.children[0];
+    child.child.stdout.write(
+      '<subagent_notification>{"agent_path":"019e7f1c-raw","status":"running"}</subagent_notification>\n',
+    );
+    await flush();
+
+    const expectedKey = makeCodexSubagentCanonicalKey('route-runtime-subagent-tag', 'runtime:019e7f1c-raw');
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: expectedKey,
+      name: 'Codex Sub-agent',
+      status: 'running',
+    });
+    const detail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(detail.summary).toBe('Codex sub-agent 019e7f1c-raw');
+    expect(detail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      agentPath: '019e7f1c-raw',
+      rawStatus: 'running',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    });
+  });
+
+  it('diagnoses Codex runtime subagent notifications without an agent id', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-runtime-subagent-missing-id', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-runtime-subagent-missing-id', 'spawn a helper');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'subagent_notification',
+      params: {
+        threadId: 'thread-1',
+        status: 'running',
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]!.status).toBe('error');
+    const detail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(detail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-runtime-subagent-missing-id', 'runtime:notification-missing-id'),
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID,
     });
   });
 

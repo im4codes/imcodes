@@ -12,6 +12,7 @@ export const SDK_SUBAGENT_PROVIDERS = {
 export const SDK_SUBAGENT_PROVIDER_KINDS = {
   CLAUDE_TASK: 'claudeTask',
   CODEX_COLLAB_AGENT: 'codexCollabAgent',
+  CODEX_RUNTIME_AGENT: 'codexRuntimeAgent',
 } as const;
 
 export const SDK_SUBAGENT_STATUS = {
@@ -66,6 +67,8 @@ export interface SdkSubagentDetailMeta {
   parentSessionId?: string;
   parentToolUseId?: string;
   parentItemId?: string;
+  agentPath?: string;
+  agentName?: string;
   taskId?: string;
   receiverThreadId?: string;
   receiverIndex?: number;
@@ -108,6 +111,8 @@ const SAFE_META_STRING_KEYS = new Set([
   'parentSessionId',
   'parentToolUseId',
   'parentItemId',
+  'agentPath',
+  'agentName',
   'taskId',
   'receiverThreadId',
   'childStatusSummary',

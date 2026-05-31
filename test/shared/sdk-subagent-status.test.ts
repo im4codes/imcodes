@@ -62,6 +62,8 @@ describe('sdk-subagent-status shared contract', () => {
         ...makeDetail().meta,
         description: 'SECRET prompt',
         error: 'token leaked',
+        agentPath: '019e7f1c-4e8c-7180-ae0d-577b994c9473',
+        agentName: 'Jason',
         childStatusSummary: 'running:1',
       },
     });
@@ -72,6 +74,8 @@ describe('sdk-subagent-status shared contract', () => {
     expect(JSON.stringify(safe)).not.toContain('SECRET');
     expect(JSON.stringify(safe)).not.toContain('token leaked');
     expect(safe.input).toEqual({ action: 'diagnostic' });
+    expect(safe.meta.agentPath).toBe('019e7f1c-4e8c-7180-ae0d-577b994c9473');
+    expect(safe.meta.agentName).toBe('Jason');
     expect(safe.meta.childStatusSummary).toBe('running:1');
   });
 

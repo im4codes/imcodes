@@ -68,6 +68,21 @@ const GENERATED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
 const CODEX_COLLAB_MAX_RECEIVERS = 100;
 const CODEX_COLLAB_MAX_STATE_KEYS = 200;
 const CODEX_COLLAB_MAX_ID_CHARS = 160;
+const CODEX_RUNTIME_SUBAGENT_METHODS = new Set([
+  'subagent_notification',
+  'subagent/notification',
+  'subagent/status',
+  'agent/subagent_notification',
+  'agent/subagent/status',
+  'runtime/subagent_notification',
+  'runtime/subagent/status',
+]);
+const CODEX_RUNTIME_SUBAGENT_ITEM_TYPES = new Set([
+  'subagentnotification',
+  'subagentstatus',
+  'runtimesubagent',
+  'runtimesubagentnotification',
+]);
 
 
 function errorMessage(err: unknown): string {
@@ -620,6 +635,231 @@ function mapCodexCollabStatus(
   };
 }
 
+function isRecord(value: unknown): value is Record<string, any> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function readNestedRuntimeSubagentRecord(value: unknown): Record<string, any> | undefined {
+  if (!isRecord(value)) return undefined;
+  const record = value;
+  const type = meaningfulString(record.type);
+  const hasRuntimeShape = Boolean(
+    meaningfulString(record.agent_path)
+    ?? meaningfulString(record.agentPath)
+    ?? meaningfulString(record.agent_id)
+    ?? meaningfulString(record.agentId)
+    ?? meaningfulString(record.path)
+    ?? meaningfulString(record.status)
+    ?? meaningfulString(record.state)
+    ?? (type && CODEX_RUNTIME_SUBAGENT_ITEM_TYPES.has(normalizeStatusName(type))),
+  );
+  if (hasRuntimeShape) return record;
+  for (const key of ['subagent', 'subAgent', 'agent', 'notification', 'data', 'event']) {
+    const nested = readNestedRuntimeSubagentRecord(record[key]);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+function readRuntimeSubagentId(record: Record<string, any>): string | undefined {
+  return meaningfulString(record.agent_path)
+    ?? meaningfulString(record.agentPath)
+    ?? meaningfulString(record.agent_id)
+    ?? meaningfulString(record.agentId)
+    ?? meaningfulString(record.path)
+    ?? meaningfulString(record.id);
+}
+
+function readRuntimeSubagentName(record: Record<string, any>): string | undefined {
+  return meaningfulString(record.name)
+    ?? meaningfulString(record.nickname)
+    ?? meaningfulString(record.displayName)
+    ?? meaningfulString(record.display_name)
+    ?? meaningfulString(record.label);
+}
+
+function readRuntimeSubagentStatus(record: Record<string, any>): string | undefined {
+  return meaningfulString(record.status)
+    ?? meaningfulString(record.state)
+    ?? meaningfulString(record.lifecycleStatus)
+    ?? meaningfulString(record.lifecycle_status);
+}
+
+function mapCodexRuntimeSubagentStatus(
+  rawStatus: string,
+  diagnosticCode: SdkSubagentDiagnosticCode | undefined,
+): {
+  toolStatus: ToolCallEvent['status'];
+  normalizedStatus: SdkSubagentNormalizedStatus;
+  active: boolean;
+  terminal: boolean;
+  diagnosticCode?: SdkSubagentDiagnosticCode;
+} {
+  if (diagnosticCode) {
+    return {
+      toolStatus: 'error',
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode,
+    };
+  }
+
+  const normalized = normalizeStatusName(rawStatus);
+  if (
+    normalized === 'pending'
+    || normalized === 'queued'
+    || normalized === 'starting'
+    || normalized === 'created'
+    || normalized === 'spawned'
+  ) {
+    return {
+      toolStatus: 'running',
+      normalizedStatus: SDK_SUBAGENT_STATUS.PENDING,
+      active: true,
+      terminal: false,
+    };
+  }
+  if (
+    normalized === 'running'
+    || normalized === 'active'
+    || normalized === 'started'
+    || normalized === 'working'
+    || normalized === 'inprogress'
+  ) {
+    return {
+      toolStatus: 'running',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    };
+  }
+  if (
+    normalized === 'shutdown'
+    || normalized === 'complete'
+    || normalized === 'completed'
+    || normalized === 'done'
+    || normalized === 'success'
+    || normalized === 'succeeded'
+    || normalized === 'finished'
+  ) {
+    return {
+      toolStatus: 'complete',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    };
+  }
+  if (
+    normalized === 'failed'
+    || normalized === 'failure'
+    || normalized === 'error'
+    || normalized === 'errored'
+    || normalized === 'crashed'
+  ) {
+    return {
+      toolStatus: 'error',
+      normalizedStatus: SDK_SUBAGENT_STATUS.ERROR,
+      active: false,
+      terminal: true,
+    };
+  }
+  if (
+    normalized === 'interrupted'
+    || normalized === 'cancelled'
+    || normalized === 'canceled'
+    || normalized === 'stopped'
+    || normalized === 'killed'
+  ) {
+    return {
+      toolStatus: 'error',
+      normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED,
+      active: false,
+      terminal: true,
+    };
+  }
+
+  return {
+    toolStatus: 'error',
+    normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+    active: false,
+    terminal: true,
+    diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
+  };
+}
+
+function runtimeSubagentToolFromPayload(
+  sessionId: string,
+  payload: Record<string, any>,
+  lifecycle?: 'started' | 'completed',
+): ToolCallEvent | null {
+  const record = readNestedRuntimeSubagentRecord(payload) ?? payload;
+  const rawAgentPath = readRuntimeSubagentId(record);
+  const fallbackId = lifecycle ? `${lifecycle}-missing-id` : 'notification-missing-id';
+  const agentPath = rawAgentPath ?? fallbackId;
+  const rawStatus = readRuntimeSubagentStatus(record)
+    ?? (lifecycle === 'started' ? 'running' : lifecycle === 'completed' ? 'shutdown' : undefined);
+  const diagnosticCode = rawAgentPath
+    ? (rawStatus ? undefined : SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE)
+    : SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID;
+  const statusMapping = mapCodexRuntimeSubagentStatus(rawStatus ?? 'unknown', diagnosticCode);
+  const canonicalKey = makeCodexSubagentCanonicalKey(sessionId, `runtime:${agentPath}`);
+  const agentName = readRuntimeSubagentName(record);
+  const summary = agentName ? `Codex sub-agent ${agentName}` : rawAgentPath ? `Codex sub-agent ${rawAgentPath}` : 'Codex sub-agent';
+  const output = statusMapping.terminal ? (rawStatus ?? 'unknown') : undefined;
+  const detail = buildSdkSubagentSafeDetail({
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary,
+    input: {
+      action: 'codex-runtime-subagent',
+      description: summary,
+    },
+    ...(output ? { output } : {}),
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT,
+      canonicalKey,
+      normalizedStatus: statusMapping.normalizedStatus,
+      ...(rawStatus ? { rawStatus } : {}),
+      active: statusMapping.active,
+      terminal: statusMapping.terminal,
+      parentSessionId: sessionId,
+      parentItemId: canonicalKey,
+      ...(rawAgentPath ? { agentPath: rawAgentPath } : {}),
+      ...(agentName ? { agentName } : {}),
+      diagnosticCode: statusMapping.diagnosticCode,
+    },
+  } satisfies SdkSubagentDetail, { allowRaw: false });
+
+  return {
+    id: canonicalKey,
+    name: 'Codex Sub-agent',
+    status: statusMapping.toolStatus,
+    ...(detail.input ? { input: detail.input } : {}),
+    ...(detail.output ? { output: detail.output } : {}),
+    detail,
+  };
+}
+
+function isCodexRuntimeSubagentMethod(method: string, params: Record<string, any>): boolean {
+  if (CODEX_RUNTIME_SUBAGENT_METHODS.has(method)) return true;
+  const type = meaningfulString(params.type);
+  return Boolean(type && CODEX_RUNTIME_SUBAGENT_ITEM_TYPES.has(normalizeStatusName(type)));
+}
+
+function parseCodexRuntimeSubagentTag(line: string): Record<string, any> | null {
+  const match = /^<subagent_notification>([\s\S]+)<\/subagent_notification>$/.exec(line.trim());
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[1]!);
+    return isRecord(parsed) ? { type: 'subagent_notification', ...parsed } : null;
+  } catch {
+    return null;
+  }
+}
+
 function collabAgentToolFromItem(
   sessionId: string,
   item: Record<string, any>,
@@ -684,7 +924,17 @@ function collabAgentToolFromItem(
 }
 
 function toolFromItem(sessionId: string, item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
+  if (typeof item.type === 'string' && CODEX_RUNTIME_SUBAGENT_ITEM_TYPES.has(normalizeStatusName(item.type))) {
+    return runtimeSubagentToolFromPayload(sessionId, item, lifecycle);
+  }
   switch (item.type) {
+    case 'subagentNotification':
+    case 'subagent_notification':
+    case 'subagentStatus':
+    case 'subagent_status':
+    case 'runtimeSubagent':
+    case 'runtime_subagent':
+      return runtimeSubagentToolFromPayload(sessionId, item, lifecycle);
     case 'collabAgentToolCall':
       return collabAgentToolFromItem(sessionId, item, lifecycle);
     case 'commandExecution':
@@ -1503,6 +1753,11 @@ export class CodexSdkProvider implements TransportProvider {
     try {
       msg = JSON.parse(trimmed);
     } catch (err) {
+      const runtimeSubagentPayload = parseCodexRuntimeSubagentTag(trimmed);
+      if (runtimeSubagentPayload) {
+        this.emitRuntimeSubagentNotification(runtimeSubagentPayload);
+        return;
+      }
       logger.warn({ provider: this.id, line: trimmed, err }, 'Failed to parse Codex app-server line');
       return;
     }
@@ -1523,6 +1778,28 @@ export class CodexSdkProvider implements TransportProvider {
     void this.handleNotification(msg.method, msg.params ?? {}).catch((err) => {
       logger.warn({ provider: this.id, method: msg.method, err }, 'Codex app-server notification handler failed');
     });
+  }
+
+  private resolveRuntimeSubagentSession(params: Record<string, any>): string | undefined {
+    const threadId = readParamThreadId(params);
+    if (threadId) return this.threadToSession.get(threadId);
+    const activeSessions = [...this.sessions.entries()]
+      .filter(([, state]) => state.runningTurnId || state.runningCompact)
+      .map(([sessionId]) => sessionId);
+    if (activeSessions.length === 1) return activeSessions[0];
+    if (this.sessions.size === 1) return [...this.sessions.keys()][0];
+    return undefined;
+  }
+
+  private emitRuntimeSubagentNotification(params: Record<string, any>): void {
+    const sessionId = this.resolveRuntimeSubagentSession(params);
+    const state = sessionId ? this.sessions.get(sessionId) : null;
+    if (!sessionId || !state) return;
+    if (state.cancelled) return;
+    this.clearStatus(sessionId, state);
+    const tool = runtimeSubagentToolFromPayload(sessionId, params);
+    if (!tool) return;
+    for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
   }
 
   private async handleNotification(method: string, params: Record<string, any>): Promise<void> {
@@ -1581,6 +1858,11 @@ export class CodexSdkProvider implements TransportProvider {
       if (isThreadIdleStatus(status)) {
         this.completeCompact(sessionId, state, readParamTurnId(params));
       }
+      return;
+    }
+
+    if (isCodexRuntimeSubagentMethod(method, params)) {
+      this.emitRuntimeSubagentNotification(params);
       return;
     }
 
