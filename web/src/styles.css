@@ -1619,6 +1619,12 @@ body {
 .subcard-open,
 .subcard-focused,
 .subcard-running-pulse { border-top-color: var(--subsession-accent-color, #38bdf8) !important; border-top-width: 3px; }
+/* Active sub-session: mirror the top accent strip onto the BOTTOM edge as a
+   2px session-colour bar, so a focused card is bracketed top + bottom by its
+   own accent colour (not only the blue focus glow). Applies to both the dock
+   card (.subcard) and the collapsed bar button (.subsession-card). */
+.subcard-focused,
+.subsession-card.focused { border-bottom-color: var(--subsession-accent-color, #38bdf8) !important; border-bottom-width: 2px; }
 .subcard:not(.subcard-running-pulse):not(.subcard-focused) { transition: border-color 0.3s ease-out, box-shadow 0.3s ease-out; }
 
 @keyframes idle-flash-opacity { 0%, 100% { opacity: 0; } 50% { opacity: 1; } }
