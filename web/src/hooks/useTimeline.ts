@@ -456,8 +456,11 @@ function loadPersistedTimelineSnapshotWithFallback(
   return raw;
 }
 
-function getPersistableTimelineTail(events: TimelineEvent[]): TimelineEvent[] {
-  const persistable = events.filter(shouldPersistTimelineEvent);
+function getPersistableTimelineTail(
+  events: TimelineEvent[],
+  opts?: { includeStreaming?: boolean },
+): TimelineEvent[] {
+  const persistable = events.filter((event) => opts?.includeStreaming === true || shouldPersistTimelineEvent(event));
   return persistable.length > MAX_PERSISTED_SNAPSHOT_EVENTS
     ? persistable.slice(persistable.length - MAX_PERSISTED_SNAPSHOT_EVENTS)
     : persistable;
@@ -505,6 +508,13 @@ function flushPendingTimelineSnapshotWrites(): void {
   }
 }
 
+function persistTimelineSnapshotsBeforeFreeze(): void {
+  for (const [cacheKey, cachedEvents] of eventsCache.entries()) {
+    const tail = getPersistableTimelineTail(cachedEvents, { includeStreaming: true });
+    persistTimelineSnapshotTail(cacheKey, tail);
+  }
+}
+
 function clearPendingTimelineSnapshotWrites(): void {
   for (const timer of pendingTimelineSnapshotTimers.values()) clearTimeout(timer);
   pendingTimelineSnapshotTimers.clear();
@@ -528,6 +538,11 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
   const flushSnapshotsBeforeFreeze = (): void => {
     flushPendingTimelineCacheIngests();
     flushPendingTimelineSnapshotWrites();
+    // A full page refresh during an active transport turn otherwise loses the
+    // latest assistant.text streaming payload: streaming ticks are intentionally
+    // kept out of IDB, and the daemon history store only has the final event.
+    // localStorage is the lightweight browser-local crash mat for refresh/pagehide.
+    persistTimelineSnapshotsBeforeFreeze();
   };
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') flushSnapshotsBeforeFreeze();
@@ -1320,10 +1335,11 @@ export function useTimeline(
     const rawSessionIdForFallback = sessionId && sessionId !== cacheKey ? sessionId : undefined;
     const persisted = loadPersistedTimelineSnapshotWithFallback(cacheKey, rawSessionIdForFallback);
     if (persisted.length === 0) return [];
-    // Older snapshots written before we filtered streaming events on the
-    // write side may still contain typewriter intermediates. Filter on the
-    // read side too so the very first paint never flashes half-typed text.
-    return persisted.filter(shouldPersistTimelineEvent);
+    // Keep the localStorage snapshot exactly as written. During a manual page
+    // refresh this may include the latest streaming assistant.text; that partial
+    // local text is preferable to a blank/lost message and is replaced by the
+    // final non-streaming event as soon as history/live sync catches up.
+    return persisted;
   });
   const eventsRef = useRef(events);
   eventsRef.current = events;
@@ -1589,15 +1605,13 @@ export function useTimeline(
     // Use the fallback variant so cacheKey-scope shifts (early-mount
     // serverId resolution) still surface the prior snapshot.
     const rawSessionIdForFallback = sessionId && sessionId !== cacheKey ? sessionId : undefined;
-    // Filter streaming on read too (the sync useState seed already filters, so
-    // keep path1.5 consistent — otherwise an old streaming snapshot re-flashes
-    // half-typed text after the first paint). Do NOT write this snapshot to the
+    // Keep the snapshot exactly as written (including a latest streaming text
+    // saved during pagehide). Do NOT write this snapshot to the
     // GLOBAL eventsCache: a tail snapshot is low-completeness, and writing it
     // would let path1's `memCached.length>0` short-circuit skip the fuller IDB
     // read on a later effect re-run (run 016f9b5b-c8f M3/B3). It is only this
     // hook's first-paint seed; the global cache is written by IDB/daemon/HTTP.
-    const localSnapshot = loadPersistedTimelineSnapshotWithFallback(cacheKey!, rawSessionIdForFallback)
-      .filter(shouldPersistTimelineEvent);
+    const localSnapshot = loadPersistedTimelineSnapshotWithFallback(cacheKey!, rawSessionIdForFallback);
     if (localSnapshot.length > 0) {
       updateHistoryStep('cache', 'done', 'bootstrap');
       setEvents((prev) => (prev === localSnapshot ? prev : localSnapshot));
@@ -2604,6 +2618,18 @@ export function useTimeline(
       try { await sharedDb.resetAndReopen(); } catch { /* ignore — read below falls back to memory */ }
     }
     const rawSessionId = sessionId && sessionId !== key ? sessionId : undefined;
+    const localSnapshot = loadPersistedTimelineSnapshotWithFallback(key, rawSessionId);
+    if (localSnapshot.length > 0) {
+      const existing = getSharedTimelineBase(key, eventsRef.current, MAX_MEMORY_EVENTS);
+      const restored = mergeTimelineEvents(existing, localSnapshot, MAX_MEMORY_EVENTS);
+      setCachedEvents(key, restored);
+      setEvents((prev) => (prev === restored ? prev : restored));
+      const snapshotCursor = deriveLocalCursor(localSnapshot);
+      if (snapshotCursor) {
+        epochRef.current = Math.max(epochRef.current, snapshotCursor.epoch);
+        seqRef.current = Math.max(seqRef.current, snapshotCursor.seq);
+      }
+    }
     const { stored, cursor, rawAlreadyRead } = await readLocalTimelineMerged(sharedDb, key, rawSessionId, MAX_MEMORY_EVENTS);
     if (cacheKeyRef.current !== key) return;
     if (cursor) {

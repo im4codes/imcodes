@@ -170,6 +170,90 @@ describe('useTimeline global cache bounds', () => {
     expect(probe.getAttribute('data-loading')).toBe('false');
   });
 
+  it('restores in-flight streaming text from the localStorage tail snapshot on first paint', () => {
+    const sessionName = `deck_sub_streaming_refresh_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    localStorage.setItem(
+      `rcc_timeline_snapshot:${serverId}:${sessionName}`,
+      JSON.stringify([{
+        eventId: `${sessionName}-assistant`,
+        sessionId: sessionName,
+        ts: 1,
+        epoch: 1,
+        seq: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'partial answer before refresh', streaming: true },
+      } satisfies TimelineEvent]),
+    );
+
+    function Probe() {
+      const { events: seen, loading } = useTimeline(sessionName, null, serverId);
+      return h(
+        'div',
+        {
+          'data-testid': 'probe',
+          'data-loading': String(loading),
+        },
+        seen.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    render(h(Probe));
+
+    const probe = screen.getByTestId('probe');
+    expect(probe.textContent).toBe('partial answer before refresh');
+    expect(probe.getAttribute('data-loading')).toBe('false');
+  });
+
+  it('force refresh re-reads the localStorage tail snapshot when IndexedDB has no events', async () => {
+    const sessionName = `deck_force_snapshot_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, null, serverId);
+      return h(
+        'button',
+        {
+          type: 'button',
+          'data-testid': 'probe',
+          onClick: timeline.forceRefresh,
+        },
+        timeline.events.map((event) => String(event.payload.text ?? '')).join('|') || 'empty',
+      );
+    }
+
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('empty');
+    });
+
+    localStorage.setItem(
+      `rcc_timeline_snapshot:${serverId}:${sessionName}`,
+      JSON.stringify([{
+        eventId: `${sessionName}-recovered`,
+        sessionId: sessionName,
+        ts: 2,
+        epoch: 1,
+        seq: 2,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'local snapshot recovered by force sync', streaming: true },
+      } satisfies TimelineEvent]),
+    );
+
+    await act(async () => {
+      screen.getByTestId('probe').click();
+      await flushMicrotasks();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('local snapshot recovered by force sync');
+    });
+  });
+
   it('inactive sessions still load IDB history after a short stagger (not just visible ones)', async () => {
     // Regression: SubSessionCard previews and hidden tabs went empty
     // after commit 90cd30ec gated path-3 behind isActiveSession.
@@ -829,11 +913,12 @@ describe('useTimeline global cache bounds', () => {
     ]);
   });
 
-  it('does not rewrite the local snapshot for streaming-only replacements', async () => {
+  it('preserves latest streaming text in the local pagehide snapshot without writing it to IDB', async () => {
     vi.useFakeTimers();
     const sessionName = `deck_snapshot_streaming_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;
     const snapshotKey = `rcc_timeline_snapshot:${serverId}:${sessionName}`;
+    const putEventsSpy = vi.spyOn(TimelineDB.prototype, 'putEvents').mockResolvedValue();
 
     ingestTimelineEventForCache({
       eventId: `${sessionName}-stable`,
@@ -852,6 +937,7 @@ describe('useTimeline global cache bounds', () => {
     });
     const initialSnapshot = localStorage.getItem(snapshotKey);
     expect(initialSnapshot).toBeTruthy();
+    putEventsSpy.mockClear();
 
     for (let i = 0; i < 30; i += 1) {
       ingestTimelineEventForCache({
@@ -867,13 +953,18 @@ describe('useTimeline global cache bounds', () => {
       }, serverId);
     }
 
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(2_000);
-    });
-
+    expect(putEventsSpy).not.toHaveBeenCalled();
     expect(localStorage.getItem(snapshotKey)).toBe(initialSnapshot);
+
+    window.dispatchEvent(new Event('pagehide'));
+
     const snapshot = JSON.parse(localStorage.getItem(snapshotKey) ?? '[]') as TimelineEvent[];
-    expect(snapshot.map((event) => event.eventId)).toEqual([`${sessionName}-stable`]);
+    expect(snapshot.map((event) => event.eventId)).toEqual([
+      `${sessionName}-stable`,
+      `${sessionName}-streaming`,
+    ]);
+    expect(snapshot[1]?.payload).toMatchObject({ text: 'streaming 29', streaming: true });
+    expect(putEventsSpy).not.toHaveBeenCalled();
   });
 
   it('does not persist streaming-only global ingests to IndexedDB', async () => {
