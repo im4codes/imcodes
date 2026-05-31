@@ -6,7 +6,7 @@ const css = readFileSync(cssPath, 'utf8');
 
 function declarationBlock(selector: string): string {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const match = css.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`));
+  const match = css.match(new RegExp(`(?:^|\\n)${escaped}\\s*\\{([^}]*)\\}`));
   return match?.[1] ?? '';
 }
 
@@ -25,6 +25,26 @@ describe('discussions layout CSS', () => {
     expect(scroll).toContain('max-width: 100%');
     expect(nav).toContain('box-sizing: border-box');
     expect(nav).toContain('max-width: 100%');
+  });
+
+  it('constrains embedded discussion progress cards inside floating windows', () => {
+    const panel = declarationBlock('.discussion-panel');
+    const card = declarationBlock('.discussions-progress-card');
+    const lines = declarationBlock('.discussions-progress-lines');
+    const segments = declarationBlock('.discussions-progress-segments');
+    const nodes = declarationBlock('.discussions-progress-nodes');
+
+    expect(panel).toContain('min-width: 0');
+    expect(panel).toContain('max-width: 100%');
+    expect(panel).toContain('overflow: hidden');
+    expect(card).toContain('min-width: 0');
+    expect(card).toContain('max-width: 100%');
+    expect(card).toContain('box-sizing: border-box');
+    expect(lines).toContain('min-width: 0');
+    expect(segments).toContain('max-width: 100%');
+    expect(nodes).toContain('overflow-x: auto');
+    expect(nodes).toContain('min-width: 0');
+    expect(nodes).toContain('max-width: 100%');
   });
 
   it('wraps long discussion markdown, inline code, code blocks, and table cells', () => {

@@ -28,6 +28,7 @@ import { useNowTicker } from '../hooks/useNowTicker.js';
 import { resolveSubSessionRuntimeType } from '../runtime-type.js';
 import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
 import {
+  clampGeometryFullyIntoWorkspace,
   clampGeometryToWorkspace,
   normalizeWindowGeometry,
   reserveWorkspaceBottom,
@@ -114,7 +115,6 @@ const DEFAULT_W = 620;
 const DEFAULT_H = 620;
 const MIN_W = 600;
 const MIN_H = 400;
-const DESKTOP_VISIBLE_MARGIN = 32;
 // Mobile sub-session windows should only clear the bottom sub-session
 // launcher/card area. Parent usage footers and composers can sit behind
 // the overlay; counting them pushes the window too high.
@@ -176,15 +176,10 @@ function currentDesktopBounds(): WorkspaceBounds {
 
 function clampDesktopGeom(geom: WindowGeometry): WindowGeometry {
   const bounds = currentDesktopBounds();
-  const clamped = clampGeometryToWorkspace(geom, bounds, {
+  return clampGeometryFullyIntoWorkspace(geom, bounds, {
     minW: MIN_W,
     minH: MIN_H,
-    visibleMargin: DESKTOP_VISIBLE_MARGIN,
   });
-  return {
-    ...clamped,
-    y: Math.min(clamped.y, Math.max(bounds.y, bounds.y + bounds.h - clamped.h)),
-  };
 }
 
 function clampMaximizedGeom(bounds: WorkspaceBounds): WindowGeometry {

@@ -135,6 +135,27 @@ export function clampGeometryToWorkspace(
   };
 }
 
+export function clampGeometryFullyIntoWorkspace(
+  geometry: WindowGeometry,
+  bounds: WorkspaceBounds,
+  options: Omit<ClampGeometryOptions, 'visibleMargin'> = {},
+): WindowGeometry {
+  const workspace = geometryFromWorkspace(bounds);
+  const minW = Math.max(1, finiteOr(options.minW ?? DEFAULT_MIN_W, DEFAULT_MIN_W));
+  const minH = Math.max(1, finiteOr(options.minH ?? DEFAULT_MIN_H, DEFAULT_MIN_H));
+  const w = Math.min(Math.max(finiteOr(geometry.w, minW), minW), Math.max(minW, workspace.w));
+  const h = Math.min(Math.max(finiteOr(geometry.h, minH), minH), Math.max(minH, workspace.h));
+  const maxX = workspace.x + Math.max(0, workspace.w - w);
+  const maxY = workspace.y + Math.max(0, workspace.h - h);
+
+  return {
+    x: Math.min(Math.max(finiteOr(geometry.x, workspace.x), workspace.x), maxX),
+    y: Math.min(Math.max(finiteOr(geometry.y, workspace.y), workspace.y), maxY),
+    w,
+    h,
+  };
+}
+
 export function shouldPersistGeometry(isMaximized: boolean): boolean {
   return !isMaximized;
 }

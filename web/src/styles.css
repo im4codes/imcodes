@@ -2016,7 +2016,16 @@ body {
 /* ── Discussion dialog ────────────────────────────────────────────────────── */
 .discussion-participant-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px 8px; background: #0f172a; border: 1px solid #1e293b; border-radius: 6px; }
 .discussion-verdict-badge { font-size: 14px; margin-left: 2px; flex-shrink: 0; }
-.discussion-panel { display: flex; flex-direction: column; gap: 8px; padding: 8px; }
+.discussion-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  box-sizing: border-box;
+}
 .discussion-panel .discussions-progress-card {
   border-radius: 10px;
 }
@@ -2228,6 +2237,9 @@ body {
 .discussions-progress-card {
   position: relative;
   overflow: hidden;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
   background:
     linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(2, 6, 23, 0.96)),
     linear-gradient(135deg, rgba(59, 130, 246, 0.10), rgba(34, 197, 94, 0.06));
@@ -2332,17 +2344,22 @@ body {
   flex-direction: column;
   gap: 6px;
   margin-bottom: 8px;
+  min-width: 0;
+  max-width: 100%;
 }
 .discussions-progress-line {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-width: 0;
+  max-width: 100%;
 }
 .discussions-progress-line-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  min-width: 0;
 }
 .discussions-progress-line-label {
   font-size: 10px;
@@ -2394,6 +2411,8 @@ body {
   height: 16px;
   border-radius: 999px;
   overflow: hidden;
+  min-width: 0;
+  max-width: 100%;
 }
 .discussions-progress-segments-round { height: 18px; }
 .discussions-progress-segments-hop { height: 14px; }
@@ -2432,7 +2451,7 @@ body {
 .discussions-progress-segment.is-pending .discussions-progress-segment-index {
   color: rgba(148, 163, 184, 0.75);
 }
-.discussions-progress-nodes { display: flex; flex-wrap: nowrap; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+.discussions-progress-nodes { display: flex; flex-wrap: nowrap; gap: 6px; overflow-x: auto; min-width: 0; max-width: 100%; scrollbar-width: none; }
 .discussions-progress-nodes::-webkit-scrollbar { display: none; }
 .discussions-progress-node {
   display: inline-flex;

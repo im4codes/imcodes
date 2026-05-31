@@ -303,6 +303,18 @@ describe('SubSessionWindow maximize integration', () => {
     expect(parseFloat(panel.style.top) + parseFloat(panel.style.height)).toBeLessThanOrEqual(window.innerHeight - 100);
   });
 
+  it('restores offscreen normal window geometry fully inside the viewport', async () => {
+    localStorage.setItem('rcc_subsession_sub-1', JSON.stringify({
+      geom: { x: 99999, y: 122, w: 633, h: 444 },
+      viewMode: 'chat',
+    }));
+
+    const { container } = renderWindow({ onToggleMaximized: vi.fn() });
+    const panel = container.querySelector('.subsession-window') as HTMLElement;
+
+    expect(parseFloat(panel.style.left) + parseFloat(panel.style.width)).toBeLessThanOrEqual(window.innerWidth);
+  });
+
   it('does not persist maximized geometry over normal localStorage', async () => {
     renderWindow({
       maximized: true,
