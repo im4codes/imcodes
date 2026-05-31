@@ -1106,7 +1106,11 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 sub={sub}
                 accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
                 isOpen={openIds.has(sub.id)}
-                isFocused={focusedSubId === sub.id}
+                // Desktop: focusedSubId marks the single active card. Mobile only
+                // ever opens ONE sub-session, so that open card IS the active one
+                // (focusedSubId is null on mobile) — treat open as active there so
+                // it gets the SOLID bottom accent, not the dashed open-only one.
+                isFocused={isMobile ? openIds.has(sub.id) : focusedSubId === sub.id}
                 idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
                 usage={subUsages?.get(`deck_sub_${sub.id}`)}
                 detectedModel={detectedModels?.get(sub.sessionName)}
