@@ -497,6 +497,11 @@ export function FileBrowser({
   useEffect(() => { try { localStorage.setItem('rcc_fb_tree_width', String(treeWidth)); } catch {} }, [treeWidth]);
 
   const [panelView, setPanelViewRaw] = useState<'files' | 'changes'>(() => {
+    // A from-chat file preview (autoPreviewPath set) must open on the Files tab
+    // so the left directory listing of the file's folder shows immediately —
+    // ignore the shared `rcc_fb_tab` browse preference, which belongs to the
+    // sidebar file manager and would otherwise drop us on the Changes tab.
+    if (autoPreviewPath) return 'files';
     try {
       const saved = localStorage.getItem('rcc_fb_tab');
       if (saved === 'files' || saved === 'changes') return saved;
