@@ -103,7 +103,7 @@ vi.mock('../../src/agent/provider-registry.js', () => ({
 }));
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
-  timelineEmitter: { emit: timelineEmitMock, on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) },
+  timelineEmitter: { emit: timelineEmitMock, on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })), forgetSession: vi.fn() },
 }));
 
 vi.mock('../../src/agent/transport-session-runtime.js', () => ({

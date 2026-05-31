@@ -352,6 +352,15 @@ Environment=HOME=${homedir()}
 # large timeline batches) cannot OOM during the GC poll interval.
 # Both can be overridden via a drop-in.
 Environment="NODE_OPTIONS=--expose-gc --max-old-space-size=8192"
+# MALLOC_ARENA_MAX=2 caps glibc's per-thread malloc arenas. On multi-core
+# hosts glibc permits up to 8×cores arenas; native thread pools
+# (onnxruntime embedding inference, sharp/libvips image work) scatter
+# allocations across ~64 MB arenas that are never returned to the OS, so
+# RSS plateaus near ~1 GB while V8 heapUsed is only ~250 MB and forced GC
+# cannot move it (measured on 215, 24 cores, 2026-05-31). Caps the count
+# at 2. glibc-only (no-op on macOS) and unsettable from JS — glibc reads
+# it at process init — so it MUST live in the unit environment.
+Environment="MALLOC_ARENA_MAX=2"
 StandardOutput=append:${logPath}
 StandardError=append:${logPath}
 

@@ -986,21 +986,30 @@ export async function stopPipePaneStream(session: string): Promise<void> {
   await fsp.rmdir(info.dir).catch(() => {});
 }
 
+/** Liveness check: true if a process with `pid` exists (EPERM = alive but not ours). */
+function isPidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
+}
+
 /**
- * Clean up any FIFO temp dirs leftover from a previous daemon run with the same PID.
- * Only removes dirs scoped to the current process.pid.
+ * Clean up FIFO temp dirs (`imcodes-pty-<pid>-<rand>`) left behind by PREVIOUS
+ * daemon runs. This used to be scoped to the CURRENT process.pid, so dirs
+ * orphaned by an earlier run (especially after an unclean SIGKILL) accumulated
+ * in /tmp forever — 12+ per restart. Now we sweep every `imcodes-pty-*` dir
+ * whose owning pid is no longer alive; dirs owned by a running process (this
+ * daemon, or another live one on the box) are left untouched.
  */
 export async function cleanupOrphanFifos(): Promise<void> {
   if (BACKEND === 'conpty') return;
   const tmpDir = os.tmpdir();
-  const prefix = `imcodes-pty-${process.pid}-`;
   try {
     const entries = await fsp.readdir(tmpDir);
     for (const entry of entries) {
-      if (entry.startsWith(prefix)) {
-        const dirPath = path.join(tmpDir, entry);
-        await fsp.rm(dirPath, { recursive: true, force: true }).catch(() => {});
-      }
+      const match = /^imcodes-pty-(\d+)-/.exec(entry);
+      if (!match) continue;
+      if (isPidAlive(Number(match[1]))) continue; // owner still running — keep it
+      await fsp.rm(path.join(tmpDir, entry), { recursive: true, force: true }).catch(() => {});
     }
   } catch {
     // Best-effort cleanup

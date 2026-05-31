@@ -297,8 +297,10 @@ export async function stopProject(
           }
         }
         removeSession(record.name);
-        // Session is gone — drop any queued resend work so it can't replay into
-        // a same-named session that gets created later.
+        // Session is gone — free its in-memory timeline ring buffer + dedup maps
+        // (otherwise they leak for every session that ever ran), and drop any
+        // queued resend work so it can't replay into a same-named session later.
+        timelineEmitter.forgetSession(record.name);
         clearResend(record.name);
         emitSessionPersist(null, record.name);
         if (record.projectDir && !invalidatedDirs.has(record.projectDir)) {

@@ -359,3 +359,49 @@ describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression
     expect(received[1].pendingCount).toBe(0);
   });
 });
+
+describe('TimelineEmitter — forgetSession (frees per-session memory on teardown)', () => {
+  let emitter: TimelineEmitter;
+
+  beforeEach(() => {
+    emitter = new TimelineEmitter();
+    vi.mocked(timelineStore.read).mockReturnValue([]);
+  });
+
+  it('drops the ring buffer AND resets the seq counter for a forgotten session', () => {
+    emitter.emit('session-gone', 'assistant.text', { text: 'one' });
+    emitter.emit('session-gone', 'assistant.text', { text: 'two' });
+    // Served from the in-memory ring buffer while the session is alive.
+    expect(emitter.replay('session-gone', 0).events).toHaveLength(2);
+
+    emitter.forgetSession('session-gone');
+
+    // Buffer freed + on-disk store (mocked empty) → nothing to replay.
+    expect(emitter.replay('session-gone', 0).events).toHaveLength(0);
+    // seq restarts at 1 — proves seqMap (not just the buffer) was cleared,
+    // so a later same-named session can't inherit a stale high-water seq.
+    expect(emitter.emit('session-gone', 'assistant.text', { text: 'reborn' }).seq).toBe(1);
+  });
+
+  it('forgetting one session leaves other sessions untouched', () => {
+    emitter.emit('session-gone', 'assistant.text', { text: 'a' });
+    emitter.emit('session-keep', 'assistant.text', { text: 'b' });
+    emitter.emit('session-keep', 'assistant.text', { text: 'c' });
+
+    emitter.forgetSession('session-gone');
+
+    expect(emitter.replay('session-gone', 0).events).toHaveLength(0);
+    expect(emitter.replay('session-keep', 0).events).toHaveLength(2);
+    // The surviving session keeps counting from where it was.
+    expect(emitter.emit('session-keep', 'session.state', { state: 'idle' }).seq).toBe(3);
+  });
+
+  it('clears the duplicate-user-message dedup state for the forgotten session', () => {
+    emitter.emit('session-gone', 'user.message', { text: 'retry' }, { ts: 10 });
+    emitter.forgetSession('session-gone');
+    // Without forgetSession the recentUserMsg dedup would suppress this as a
+    // duplicate; after forgetting, it must be treated as a fresh message.
+    emitter.emit('session-gone', 'user.message', { text: 'retry' }, { ts: 20 });
+    expect(emitter.replay('session-gone', 0).events).toHaveLength(1);
+  });
+});

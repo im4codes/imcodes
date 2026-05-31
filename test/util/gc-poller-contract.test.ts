@@ -52,6 +52,18 @@ describe('GC poller wiring', () => {
       // working-set spikes (so we never OOM between GC poll firings).
       expect(src).toMatch(/--max-old-space-size=\d{4,}/);
     });
+
+    // The 1 GB-RSS / 247 MB-heapUsed split measured on 215 (2026-05-31) was
+    // off-heap glibc malloc-arena fragmentation, NOT a V8 leak — onnxruntime
+    // + sharp native thread pools scatter allocations across ~64 MB arenas
+    // glibc never returns to the OS. MALLOC_ARENA_MAX=2 caps that and is the
+    // global backstop; it MUST be in the unit env because glibc reads it at
+    // process init (unsettable from JS). Pairs with the onnxruntime
+    // intraOpNumThreads cap in src/context/embedding.ts.
+    it(`${rel} sets MALLOC_ARENA_MAX=2 in the systemd unit template`, () => {
+      const src = readFileSync(resolve(REPO_ROOT, rel), 'utf8');
+      expect(src).toMatch(/MALLOC_ARENA_MAX=2/);
+    });
   }
 
   it('bind-flow.ts plist includes NODE_OPTIONS in EnvironmentVariables (macOS path)', () => {

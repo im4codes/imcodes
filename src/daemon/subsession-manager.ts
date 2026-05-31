@@ -302,6 +302,7 @@ export async function stopSubSession(
         serverLink.send({ type: 'subsession.closed', id, sessionName });
       }
       removeSession(sessionName);
+      timelineEmitter.forgetSession(sessionName);
     },
     emitFailure: async (_record, failure) => {
       const message = buildSubSessionCloseFailureMessage(failure);
