@@ -68,7 +68,7 @@ body {
 .tab.active { color: #f8fafc; background: linear-gradient(180deg, rgba(34,211,238,0.16), rgba(15,23,42,0.92)); border-color: rgba(34,211,238,0.32); box-shadow: 0 0 0 1px rgba(34,211,238,0.10), 0 0 18px rgba(34,211,238,0.14), inset 0 1px 0 rgba(255,255,255,0.06); }
 .tab.active::before { background: linear-gradient(90deg, var(--chrome-accent), var(--chrome-accent-2)); box-shadow: 0 0 10px rgba(34,211,238,0.62); }
 .tab.brain { color: #c4b5fd; }
-.tab.brain.active { color: #ede9fe; background: linear-gradient(180deg, rgba(167,139,250,0.18), rgba(15,23,42,0.94)); border-color: rgba(167,139,250,0.34); border-top-color: transparent; border-bottom-color: #8b5cf6; border-bottom-width: 4px; box-shadow: 0 0 0 1px rgba(167,139,250,0.12), 0 0 18px rgba(167,139,250,0.16), inset 0 1px 0 rgba(255,255,255,0.06); }
+.tab.brain.active { color: #ede9fe; background: linear-gradient(180deg, rgba(167,139,250,0.18), rgba(15,23,42,0.94)); border-color: rgba(167,139,250,0.34); border-top-color: transparent; border-bottom-color: #8b5cf6; border-bottom-width: 2px; box-shadow: 0 0 0 1px rgba(167,139,250,0.12), 0 0 18px rgba(167,139,250,0.16), inset 0 1px 0 rgba(255,255,255,0.06); }
 .tab.brain.active::before { background: linear-gradient(90deg, var(--chrome-accent-3), var(--chrome-accent)); box-shadow: 0 0 10px rgba(167,139,250,0.62); }
 @media (pointer: coarse) { .tab { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; touch-action: pan-x; } }
 .tab.idle::after { content: '●'; margin-left: 6px; color: var(--chrome-accent-2); font-size: 7px; vertical-align: middle; text-shadow: 0 0 8px rgba(52,211,153,0.75); }
@@ -1721,7 +1721,12 @@ body {
 .subsession-window { display: flex; flex-direction: column; background: linear-gradient(180deg, #0f1724, #090d15); border: 1px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; box-shadow: 0 12px 38px rgba(0,0,0,0.62), 0 0 0 1px rgba(255,255,255,0.025), 0 0 24px rgba(34,211,238,0.12); overflow: hidden; min-width: 300px; min-height: 200px; isolation: isolate; }
 .subsession-window::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--subsession-accent-color, #38bdf8); opacity: 0.45; box-shadow: 0 0 10px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 45%, transparent); pointer-events: none; z-index: 3; transition: height 0.15s, opacity 0.15s, box-shadow 0.15s; }
 .subsession-window-active { box-shadow: 0 14px 42px rgba(0,0,0,0.68), 0 0 0 1px rgba(96,165,250,0.22), 0 0 28px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 28%, transparent); }
-.subsession-window-active::before { height: 5px; opacity: 1; box-shadow: 0 0 14px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 72%, transparent); }
+.subsession-window-active::before { height: 3px; opacity: 1; box-shadow: 0 0 14px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 72%, transparent); }
+/* Mirror the top accent strip onto the BOTTOM edge of an active sub-session
+   window so the focused window is bracketed top + bottom by its own colour,
+   matching the dock card (.subcard) / bar button (.subsession-card). 2px is
+   enough for the bottom — the top strip stays the dominant 5px indicator. */
+.subsession-window-active::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: var(--subsession-accent-color, #38bdf8); opacity: 1; box-shadow: 0 0 12px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 60%, transparent); pointer-events: none; z-index: 3; }
 .subsession-window-maximized { border: 2px solid var(--subsession-accent-color, #38bdf8); box-shadow: 0 0 0 1px rgba(15,23,42,0.75), 0 8px 32px rgba(0,0,0,0.6), 0 0 24px rgba(34,211,238,0.12); box-sizing: border-box; }
 .subsession-header { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: linear-gradient(180deg, rgba(17,27,45,0.98), rgba(10,16,27,0.98)); border-bottom: 1px solid rgba(125,211,252,0.16); cursor: move; user-select: none; flex-shrink: 0; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
 .subsession-drag-icon { color: rgba(34,211,238,0.48); font-size: 16px; cursor: grab; text-shadow: 0 0 8px rgba(34,211,238,0.16); }

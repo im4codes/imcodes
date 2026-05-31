@@ -59,12 +59,12 @@ describe('styles.css regression contracts', () => {
     expect(maximizedWindowRule![0]).toMatch(/border:\s*2px solid var\(--subsession-accent-color/);
   });
 
-  it('active brain session tab keeps a thicker purple bottom border', () => {
+  it('active brain session tab keeps a 2px purple bottom border (consistent with other active windows)', () => {
     const activeBrainRule = css.match(/\.tab\.brain\.active\s*\{[^}]*\}/);
     expect(activeBrainRule).not.toBeNull();
     expect(activeBrainRule![0]).toMatch(/border-top-color:\s*transparent/);
     expect(activeBrainRule![0]).toMatch(/border-bottom-color:\s*#8b5cf6/);
-    expect(activeBrainRule![0]).toMatch(/border-bottom-width:\s*4px/);
+    expect(activeBrainRule![0]).toMatch(/border-bottom-width:\s*2px/);
   });
 
   it('ctx live-status robot avatar stays legible without changing the compact footer layout', () => {
