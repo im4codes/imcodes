@@ -42,6 +42,7 @@ import { pruneLocalMemory } from '../context/memory-pruning.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { DAEMON_VERSION } from '../util/version.js';
+import { createWorkerSessionSyncRetrier, type WorkerSessionSyncRetrier, type WorkerSessionSyncRetryOutcome } from './worker-session-sync-retrier.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 export async function getLastAssistantText(sessionName: string): Promise<string | undefined> {
@@ -184,8 +185,17 @@ async function dropLocalSession(session: SessionRecord): Promise<void> {
   removeSession(session.name);
 }
 
-/** On startup: pull sessions from D1 and populate the local store so restoreFromStore can rebuild tmux. */
-async function syncSessionsFromWorker(workerUrl: string, serverId: string, token: string): Promise<void> {
+interface WorkerSessionSyncOutcome extends WorkerSessionSyncRetryOutcome {
+  remoteSessionCount?: number;
+  remoteSubSessionCount?: number;
+  prunedCount?: number;
+  syncedCount?: number;
+  skippedMainPrune?: boolean;
+  skippedSubSessionPrune?: boolean;
+}
+
+/** On startup/retry: pull sessions from D1 and populate the local store so restoreFromStore can rebuild runtimes. */
+export async function syncSessionsFromWorker(workerUrl: string, serverId: string, token: string): Promise<WorkerSessionSyncOutcome> {
   try {
     const headers = { Authorization: `Bearer ${token}`, 'X-Server-Id': serverId };
     const [sessionRes, subRes] = await Promise.all([
@@ -201,11 +211,11 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
 
     if (!sessionRes.ok) {
       logger.warn({ status: sessionRes.status }, 'syncSessionsFromWorker: non-ok response');
-      return;
+      return { ok: false, reason: `sessions_http_${sessionRes.status}` };
     }
     if (!subRes.ok) {
       logger.warn({ status: subRes.status }, 'syncSessionsFromWorker: sub-session fetch failed');
-      return;
+      return { ok: false, reason: `sub_sessions_http_${subRes.status}` };
     }
 
     const data = await sessionRes.json() as { sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; project_dir: string; state: string; label?: string | null; requested_model?: string | null; active_model?: string | null; effort?: SessionRecord['effort'] | null; transport_config?: Record<string, unknown> | string | null }> };
@@ -237,9 +247,25 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
     );
 
     const localSessions = listSessions();
+    const localMainSessions = localSessions.filter((session) => !session.name.startsWith('deck_sub_') && session.state !== 'stopped');
+    const localSubSessions = localSessions.filter((session) => session.name.startsWith('deck_sub_') && session.state !== 'stopped');
+    const shouldPruneMainSessions = remoteSessionNames.size > 0 || localMainSessions.length === 0;
+    const shouldPruneSubSessions = remoteSubSessionNames.size > 0 || localSubSessions.length === 0;
+    if (!shouldPruneMainSessions || !shouldPruneSubSessions) {
+      logger.warn({
+        remoteSessionCount: remoteSessionNames.size,
+        remoteSubSessionCount: remoteSubSessionNames.size,
+        localMainSessionCount: localMainSessions.length,
+        localSubSessionCount: localSubSessions.length,
+        skippedMainPrune: !shouldPruneMainSessions,
+        skippedSubSessionPrune: !shouldPruneSubSessions,
+      }, 'syncSessionsFromWorker: remote snapshot has an empty class; skipping destructive prune for that class');
+    }
     const staleLocal = localSessions.filter((session) => {
-      if (session.name.startsWith('deck_sub_')) return !remoteSubSessionNames.has(session.name);
-      return !remoteSessionNames.has(session.name);
+      if (session.name.startsWith('deck_sub_')) {
+        return shouldPruneSubSessions && !remoteSubSessionNames.has(session.name);
+      }
+      return shouldPruneMainSessions && !remoteSessionNames.has(session.name);
     });
 
     for (const session of staleLocal) {
@@ -258,10 +284,22 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
       count++;
     }
     logger.info({ count }, 'Sessions synced from D1');
+    return {
+      ok: true,
+      remoteSessionCount: remoteSessionNames.size,
+      remoteSubSessionCount: remoteSubSessionNames.size,
+      prunedCount: staleLocal.length,
+      syncedCount: count,
+      skippedMainPrune: !shouldPruneMainSessions,
+      skippedSubSessionPrune: !shouldPruneSubSessions,
+    };
   } catch (e) {
     logger.warn({ err: e }, 'syncSessionsFromWorker: fetch failed');
+    return { ok: false, reason: e instanceof Error ? e.message : 'fetch_failed' };
   }
 }
+
+let workerSessionSyncRetrier: WorkerSessionSyncRetrier | null = null;
 
 function scheduleDaemonStartupBackgroundTask(label: string, task: () => Promise<void>, delayMs = 0): void {
   const timer = setTimeout(() => {
@@ -420,9 +458,13 @@ export async function startup(): Promise<DaemonContext> {
     })();
   }
 
-  // Sync sessions from D1 before restoring tmux sessions
+  // Sync sessions from D1 before restoring tmux sessions. A transient
+  // DNS/server failure here must not be lifecycle-fatal, but it must also
+  // not be one-shot: the retry loop below will keep pulling until a healthy
+  // snapshot is applied and then reconcile runtimes.
+  let startupWorkerSessionSyncOutcome: WorkerSessionSyncOutcome | null = null;
   if (creds) {
-    await syncSessionsFromWorker(workerUrl!, serverId, token);
+    startupWorkerSessionSyncOutcome = await syncSessionsFromWorker(workerUrl!, serverId, token);
   }
 
   try {
@@ -883,12 +925,52 @@ export async function startup(): Promise<DaemonContext> {
   logger.info('Daemon started');
 
   void autoReconnectProviders();
+  if (creds && startupWorkerSessionSyncOutcome && !startupWorkerSessionSyncOutcome.ok) {
+    workerSessionSyncRetrier?.stop();
+    workerSessionSyncRetrier = createWorkerSessionSyncRetrier({
+      sync: () => syncSessionsFromWorker(workerUrl!, serverId, token),
+      onRecovered: (outcome) => reconcileRuntimesAfterWorkerSessionSync(serverLink, outcome),
+      logger,
+    });
+    workerSessionSyncRetrier.start(startupWorkerSessionSyncOutcome.reason ?? 'startup_sync_failed');
+  }
   scheduleDaemonStartupBackgroundTask('shared-context startup timeline backfill', backfillLiveContextFromTimeline, 2_000);
   if (pushLocalSessionsToWorkerOnStartup) {
     scheduleDaemonStartupBackgroundTask('startup local main session DB push', pushLocalSessionsToWorkerOnStartup, 4_000);
   }
 
   return ctx;
+}
+
+async function reconcileRuntimesAfterWorkerSessionSync(
+  serverLink: ServerLink | null,
+  outcome: WorkerSessionSyncOutcome,
+): Promise<void> {
+  logger.info({
+    remoteSessionCount: outcome.remoteSessionCount,
+    remoteSubSessionCount: outcome.remoteSubSessionCount,
+    syncedCount: outcome.syncedCount,
+    prunedCount: outcome.prunedCount,
+    skippedMainPrune: outcome.skippedMainPrune,
+    skippedSubSessionPrune: outcome.skippedSubSessionPrune,
+  }, 'Worker session sync retry succeeded; reconciling local runtimes');
+
+  rebuildProviderRoutes();
+  await restoreFromStore();
+  await autoReconnectProviders();
+
+  if (serverLink) {
+    try {
+      const sessions = await buildSessionList();
+      serverLink.send({
+        type: 'session_list',
+        daemonVersion: serverLink.daemonVersion,
+        sessions,
+      });
+    } catch (err) {
+      logger.warn({ err }, 'Worker session sync recovery session_list broadcast failed');
+    }
+  }
 }
 
 async function autoReconnectProviders(): Promise<void> {
@@ -1047,6 +1129,8 @@ export async function shutdown(exitCode = 0): Promise<void> {
     if (contextMaterializationTimer) clearInterval(contextMaterializationTimer);
     if (gcTimer) clearInterval(gcTimer);
     if (eventLoopDelayTimer) clearInterval(eventLoopDelayTimer);
+    workerSessionSyncRetrier?.stop();
+    workerSessionSyncRetrier = null;
     hookServer?.close();
     ctx?.serverLink?.disconnect();
     configureSharedContextRuntime(null);
