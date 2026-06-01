@@ -238,6 +238,7 @@ async function probeSessionStates(): Promise<void> {
   try {
     const { detectStatusAsync } = await import('../agent/detect.js');
     const { timelineEmitter } = await import('../daemon/timeline-emitter.js');
+    let mutated = false;
     for (const s of Object.values(store.sessions)) {
       if (s.state !== 'running') continue;
       if (s.runtimeType === 'transport') {
@@ -255,10 +256,11 @@ async function probeSessionStates(): Promise<void> {
       if (newState !== s.state) {
         s.state = newState;
         s.updatedAt = Date.now();
+        mutated = true;
         try { timelineEmitter.emit(s.name, 'session.state', { state: newState }); } catch { /* emitter may not be ready */ }
       }
     }
-    scheduleWrite();
+    if (mutated) scheduleWrite();
   } catch { /* probeSessionStates is best-effort — don't crash daemon */ }
 }
 
