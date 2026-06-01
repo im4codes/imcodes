@@ -187,12 +187,19 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
       store = { sessions: {} };
     }
   }
+  // Read-only consumers (probe:false — e.g. an MCP tool refreshing its send
+  // targets) return the freshly-read snapshot as-is: NO prune/reconcile/probe
+  // and NO scheduleWrite. Such a consumer does not own sessions.json, and
+  // letting it write back its (possibly stale) in-memory store would clobber
+  // the daemon's external writes — intermittently dropping a just-added session
+  // and failing send_message (flaky CI at the memory-mcp send-refresh path).
+  if (options.probe === false) return store;
   if (pruneNonPersistableSessions()) scheduleWrite();
   if (reconcilePersistedSessions()) scheduleWrite();
   // Probe actual state of each session via terminal detection.
   // Without this, stale "running" states from before daemon restart persist
   // and cause UI animations to trigger for idle agents.
-  if (options.probe !== false) void probeSessionStates();
+  void probeSessionStates();
   return store;
 }
 
