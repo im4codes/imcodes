@@ -80,6 +80,11 @@ const btnSecondary: Record<string, string> = { padding: '8px 16px', background: 
 const btnDanger: Record<string, string> = { ...btnSecondary, color: '#f87171' };
 const labelStyle = { display: 'block', color: '#94a3b8', fontSize: '13px', marginBottom: '4px', fontWeight: '500' as const };
 
+// Cron jobs created externally (MCP/agent, another device, or another browser
+// tab) aren't pushed to this view, so poll the list on a slow interval while
+// the page is visible (in addition to a focus/visibility refetch).
+const CRON_LIST_POLL_MS = 10_000;
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 function parseAction(raw: string): CronAction | null {
@@ -185,19 +190,42 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   };
 
   // ── Load jobs ──────────────────────────────────────────────────────────
-  const loadJobs = useCallback(async () => {
+  const loadJobs = useCallback(async (silent = false) => {
     try {
       const q = showAllServers ? '' : `serverId=${serverId}&projectName=${projectName}`;
       const res = await apiFetch<{ jobs: CronJob[] }>(`/api/cron?${q}`);
       setJobs(res.jobs);
+      setError(null);
     } catch (err) {
-      setError(String(err));
+      // A background poll/focus refetch must not flash an error banner; only the
+      // foreground (mount / explicit) load surfaces failures.
+      if (!silent) setError(String(err));
     } finally {
       setLoading(false);
     }
   }, [serverId, projectName, showAllServers]);
 
   useEffect(() => { loadJobs(); }, [loadJobs]);
+
+  // Keep the list fresh without a full page reload: external cron changes
+  // (MCP/agent, another device/tab) aren't pushed here. Refetch silently when
+  // the window regains focus/visibility, and poll slowly while the page is
+  // visible. The CronManager unmounts when its panel closes, so this stops too.
+  useEffect(() => {
+    const refresh = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      void loadJobs(true);
+    };
+    const onVisibility = () => { if (document.visibilityState === 'visible') void loadJobs(true); };
+    window.addEventListener('focus', refresh);
+    document.addEventListener('visibilitychange', onVisibility);
+    const timer = window.setInterval(refresh, CRON_LIST_POLL_MS);
+    return () => {
+      window.removeEventListener('focus', refresh);
+      document.removeEventListener('visibilitychange', onVisibility);
+      clearInterval(timer);
+    };
+  }, [loadJobs]);
 
   // ── Load cross-job executions ──────────────────────────────────────────
   const loadCrossExecs = useCallback(async () => {

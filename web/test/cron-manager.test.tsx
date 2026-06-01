@@ -510,4 +510,30 @@ describe('CronManager', () => {
     await waitFor(() => expect(apiFetch).toHaveBeenCalledWith('/api/cron?'));
     expect(localStorage.getItem('rcc_cron_show_all')).toBe('1');
   });
+
+  it('refetches the jobs list when the window regains focus (external/MCP cron)', async () => {
+    apiFetch
+      .mockResolvedValueOnce({ jobs: [cronJob({ id: 'job-1', name: 'First job' })] })
+      .mockResolvedValue({ jobs: [cronJob({ id: 'job-1', name: 'First job' }), cronJob({ id: 'job-2', name: 'MCP job' })] });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        onBack={vi.fn()}
+        servers={[{ id: 'srv-current', name: 'Current' }]}
+      />,
+    );
+
+    expect(await screen.findByText('First job')).toBeDefined();
+    expect(screen.queryByText('MCP job')).toBeNull();
+
+    // A cron created externally (e.g. via MCP) isn't pushed here; regaining
+    // window focus must silently refetch and surface it without a page reload.
+    window.dispatchEvent(new Event('focus'));
+
+    expect(await screen.findByText('MCP job')).toBeDefined();
+  });
 });
