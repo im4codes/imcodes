@@ -155,8 +155,21 @@ describe('ChatView SDK agents panel', () => {
       .toBeLessThan(Array.from(actions?.children ?? []).indexOf(agentsButton as Element));
   });
 
-  it('remembers desired-open state, auto-hides empty data, and manual close suppresses auto-show', () => {
+  it('remembers desired-open state, only mounts while agents are running, and manual close suppresses auto-show', () => {
     const runningEvent = makeSdkEvent('agent-running', makeMeta({ childStatusSummary: 'Checking files' }));
+    const terminalEvent = makeSdkEvent('agent-complete', makeMeta({
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+      childStatusSummary: 'Finished child work',
+    }));
+    const diagnosticEvent = makeSdkEvent('agent-diagnostic', makeMeta({
+      canonicalKey: 'claude:deck_agents:diagnostic',
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
+    }));
     const { container, rerender } = render(
       <ChatView events={[]} loading={false} sessionId="deck_agents" />,
     );
@@ -170,8 +183,14 @@ describe('ChatView SDK agents panel', () => {
     expect(screen.getByRole('region', { name: 'Agents' })).toBeTruthy();
     expect(screen.getByText('Checking files')).toBeTruthy();
 
-    rerender(<ChatView events={[]} loading={false} sessionId="deck_agents" />);
+    rerender(<ChatView events={[terminalEvent]} loading={false} sessionId="deck_agents" />);
     expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
+    expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(false);
+    expect(localStorage.getItem('chatSdkAgentsPanelOpen:deck_agents')).toBe('1');
+
+    rerender(<ChatView events={[diagnosticEvent]} loading={false} sessionId="deck_agents" />);
+    expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
+    expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(false);
     expect(localStorage.getItem('chatSdkAgentsPanelOpen:deck_agents')).toBe('1');
 
     rerender(<ChatView events={[runningEvent]} loading={false} sessionId="deck_agents" />);
@@ -242,16 +261,22 @@ describe('ChatView SDK agents panel', () => {
       },
     );
     terminal.ts = start.getTime() + 120_000;
-    render(<ChatView events={[running, terminal]} loading={false} sessionId="deck_agents" />);
+    const activePeer = makeSdkEvent(
+      'agent-peer-running',
+      makeMeta({
+        canonicalKey: 'claude:deck_agents:runtime:peer',
+        taskId: 'task-peer',
+        childStatusSummary: 'Peer still running',
+      }),
+      { summary: 'Peer' },
+    );
+    render(<ChatView events={[running, terminal, activePeer]} loading={false} sessionId="deck_agents" />);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 1 running' }));
 
-    expect(screen.getByText('ID')).toBeTruthy();
     expect(screen.getByText('019e80d8-44f2-7412-b703-b4ddde653d7f')).toBeTruthy();
     expect(screen.getByText('Model')).toBeTruthy();
     expect(screen.getByText('haiku')).toBeTruthy();
-    expect(screen.getByText('Started')).toBeTruthy();
-    expect(screen.getByText('Duration')).toBeTruthy();
     expect(screen.getByText('2m 0s')).toBeTruthy();
     expect(screen.getByText('Prompt')).toBeTruthy();
     expect(screen.getByText('Check sync status and report back')).toBeTruthy();
@@ -272,15 +297,23 @@ describe('ChatView SDK agents panel', () => {
       }),
       { summary: 'Safe provider summary' },
     );
-    render(<ChatView events={[terminal]} loading={false} sessionId="deck_agents" />);
+    const activePeer = makeSdkEvent(
+      'agent-peer-running',
+      makeMeta({
+        canonicalKey: 'claude:deck_agents:task-running',
+        taskId: 'task-running',
+        childStatusSummary: 'Peer still running',
+      }),
+    );
+    render(<ChatView events={[terminal, activePeer]} loading={false} sessionId="deck_agents" />);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 1 running' }));
 
     expect(screen.getByText('Safe provider summary')).toBeTruthy();
     expect(document.body.textContent).not.toContain('2 child running');
   });
 
-  it('renders diagnostics without incrementing the badge', () => {
+  it('shows diagnostics only while active agents keep the panel mounted and does not increment the badge', () => {
     const diagnostic = makeSdkEvent('agent-diagnostic', makeMeta({
       canonicalKey: 'claude:deck_agents:diagnostic',
       normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
@@ -289,9 +322,17 @@ describe('ChatView SDK agents panel', () => {
       diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
       rawStatus: 'mystery',
     }));
-    render(<ChatView events={[diagnostic]} loading={false} sessionId="deck_agents" />);
+    const activePeer = makeSdkEvent(
+      'agent-peer-running',
+      makeMeta({
+        canonicalKey: 'claude:deck_agents:task-running',
+        taskId: 'task-running',
+        childStatusSummary: 'Peer still running',
+      }),
+    );
+    render(<ChatView events={[diagnostic, activePeer]} loading={false} sessionId="deck_agents" />);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 1 running' }));
 
     expect(screen.getByText('Diagnostics')).toBeTruthy();
     expect(screen.getByText('Unknown provider state')).toBeTruthy();
@@ -310,18 +351,25 @@ describe('ChatView SDK agents panel', () => {
       childStatusSummary: 'Finished child work',
     }));
     terminalEvent.ts = now.getTime() - 299_000;
+    const runningEvent = makeSdkEvent('agent-running', makeMeta({
+      canonicalKey: 'claude:deck_agents:task-running',
+      taskId: 'task-running',
+      childStatusSummary: 'Still running',
+    }));
+    runningEvent.ts = now.getTime();
     const { container } = render(
-      <ChatView events={[terminalEvent]} loading={false} sessionId="deck_agents" />,
+      <ChatView events={[terminalEvent, runningEvent]} loading={false} sessionId="deck_agents" />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 1 running' }));
     expect(screen.getByText('Finished child work')).toBeTruthy();
 
     act(() => {
       vi.advanceTimersByTime(30_000);
     });
 
-    expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
+    expect(container.querySelector('.chat-sdk-agents-panel')).toBeTruthy();
+    expect(screen.queryByText('Finished child work')).toBeNull();
     expect(localStorage.getItem('chatSdkAgentsPanelOpen:deck_agents')).toBe('1');
   });
 });

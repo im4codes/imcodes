@@ -1629,7 +1629,8 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     return () => window.clearInterval(timer);
   }, [hasAgentsStatusRows, preview]);
   const canShowAgentsControl = !preview;
-  const showAgentsPane = canShowAgentsControl && desiredAgentsOpen && hasAgentsStatusRows;
+  const hasRunningSdkAgents = sdkAgentsStatus.runningCount > 0;
+  const showAgentsPane = canShowAgentsControl && desiredAgentsOpen && hasRunningSdkAgents;
 
   // Preview cards (SubSessionCard) are small thumbnails; slice events to a
   // bounded tail BEFORE buildViewItems so it doesn't walk thousands of items
