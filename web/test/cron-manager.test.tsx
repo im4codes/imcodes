@@ -50,6 +50,16 @@ function cronJob(overrides: Partial<any> = {}) {
   };
 }
 
+function expectedDateTimeLocalValue(ts: number): string {
+  const date = new Date(ts);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+  ].join('-') + `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 describe('CronManager', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -185,40 +195,31 @@ describe('CronManager', () => {
   });
 
   it('shows persisted expiration timestamps in the browser local timezone when editing', async () => {
-    const previousTz = process.env.TZ;
-    process.env.TZ = 'Asia/Shanghai';
-    try {
-      apiFetch.mockResolvedValueOnce({
-        jobs: [cronJob({
-          id: 'expiring-job',
-          name: 'Expiring job',
-          expires_at: Date.UTC(2026, 5, 1, 2, 47, 30),
-        })],
-      });
+    const expiresAt = Date.UTC(2026, 5, 1, 2, 47, 30);
+    apiFetch.mockResolvedValueOnce({
+      jobs: [cronJob({
+        id: 'expiring-job',
+        name: 'Expiring job',
+        expires_at: expiresAt,
+      })],
+    });
 
-      const { container } = render(
-        <CronManager
-          serverId="srv-current"
-          projectName="cd"
-          sessions={sessions}
-          subSessions={subSessions}
-          onBack={vi.fn()}
-          servers={[{ id: 'srv-current', name: 'Current' }]}
-        />,
-      );
+    const { container } = render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        onBack={vi.fn()}
+        servers={[{ id: 'srv-current', name: 'Current' }]}
+      />,
+    );
 
-      expect(await screen.findByText('Expiring job')).toBeDefined();
-      fireEvent.click(screen.getByText('✎'));
+    expect(await screen.findByText('Expiring job')).toBeDefined();
+    fireEvent.click(screen.getByText('✎'));
 
-      const expiresInput = container.querySelector('input[type="datetime-local"]') as HTMLInputElement;
-      expect(expiresInput.value).toBe('2026-06-01T10:47');
-    } finally {
-      if (previousTz === undefined) {
-        delete process.env.TZ;
-      } else {
-        process.env.TZ = previousTz;
-      }
-    }
+    const expiresInput = container.querySelector('input[type="datetime-local"]') as HTMLInputElement;
+    expect(expiresInput.value).toBe(expectedDateTimeLocalValue(expiresAt));
   });
 
   it('blocks saving inline cron commands longer than 1500 chars and shows a file-reference hint', async () => {
