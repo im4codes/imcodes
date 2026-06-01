@@ -130,6 +130,15 @@ export interface SessionStore {
   sessions: Record<string, SessionRecord>;
 }
 
+export interface LoadStoreOptions {
+  /**
+   * Probe terminal-backed sessions after loading. Disable for short-lived
+   * read-only consumers such as MCP tool calls that only need a fresh
+   * persisted snapshot.
+   */
+  probe?: boolean;
+}
+
 let writeTimer: ReturnType<typeof setTimeout> | null = null;
 let writeTimerPath: string | null = null;
 let writeQueue: Promise<void> = Promise.resolve();
@@ -160,7 +169,7 @@ function pruneNonPersistableSessions(): boolean {
   return Object.keys(store.sessions).length !== before;
 }
 
-export async function loadStore(): Promise<SessionStore> {
+export async function loadStore(options: LoadStoreOptions = {}): Promise<SessionStore> {
   await drainPendingWritesForRead();
   await mkdir(storeDir(), { recursive: true });
   try {
@@ -174,7 +183,7 @@ export async function loadStore(): Promise<SessionStore> {
   // Probe actual state of each session via terminal detection.
   // Without this, stale "running" states from before daemon restart persist
   // and cause UI animations to trigger for idle agents.
-  void probeSessionStates();
+  if (options.probe !== false) void probeSessionStates();
   return store;
 }
 

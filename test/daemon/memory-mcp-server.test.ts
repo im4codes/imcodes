@@ -12,7 +12,7 @@ import { createMemoryMcpServerFromEnv } from '../../src/daemon/memory-mcp-server
 
 const namespace = { scope: 'user_private', userId: 'user-1', projectId: 'repo-1' };
 
-async function writeSessionStore(home: string): Promise<void> {
+async function writeSessionStore(home: string, options: { includeLatePeer?: boolean } = {}): Promise<void> {
   const imcodesDir = join(home, '.imcodes');
   await mkdir(imcodesDir, { recursive: true });
   const now = Date.now();
@@ -61,6 +61,23 @@ async function writeSessionStore(home: string): Promise<void> {
         runtimeType: 'transport',
         label: 'Peer',
       },
+      ...(options.includeLatePeer ? {
+        deck_sub_late: {
+          name: 'deck_sub_late',
+          projectName: 'proj',
+          role: 'w1',
+          agentType: 'gemini-sdk',
+          projectDir: join(home, 'proj'),
+          state: 'idle',
+          restarts: 0,
+          restartTimestamps: [],
+          createdAt: now,
+          updatedAt: now,
+          parentSession: 'deck_proj_brain',
+          runtimeType: 'transport',
+          label: 'Late',
+        },
+      } : {}),
     },
   }), 'utf8');
 }
@@ -198,6 +215,13 @@ describe('memory MCP stdio server', () => {
         ],
       });
       expect(JSON.stringify(result.structuredContent)).not.toContain('deck_sub_worker');
+
+      await writeSessionStore(home, { includeLatePeer: true });
+      const refreshed = await client.callTool({ name: 'send_list_targets', arguments: { query: 'Late' } });
+      expect(refreshed.structuredContent).toMatchObject({
+        status: 'ok',
+        items: [expect.objectContaining({ target: 'deck_sub_late', label: 'Late' })],
+      });
     } finally {
       await client.close();
     }
@@ -217,9 +241,10 @@ describe('memory MCP stdio server', () => {
       req.setEncoding('utf8');
       req.on('data', (chunk) => { raw += chunk; });
       req.on('end', () => {
-        hookBodies.push(JSON.parse(raw) as Record<string, unknown>);
+        const body = JSON.parse(raw) as Record<string, unknown>;
+        hookBodies.push(body);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, delivered: true, target: 'deck_sub_peer' }));
+        res.end(JSON.stringify({ ok: true, delivered: true, target: body.to }));
       });
     });
 
@@ -257,6 +282,25 @@ describe('memory MCP stdio server', () => {
         message: 'hello from stdio mcp',
         depth: 0,
       }]);
+
+      await writeSessionStore(home, { includeLatePeer: true });
+      const refreshedSend = await client.callTool({
+        name: 'send_message',
+        arguments: {
+          target: 'deck_sub_late',
+          message: 'hello late peer',
+        },
+      });
+      expect(refreshedSend.structuredContent).toMatchObject({
+        status: 'accepted',
+        deliveries: [expect.objectContaining({ target: 'deck_sub_late', status: 'delivered' })],
+      });
+      expect(hookBodies.at(-1)).toMatchObject({
+        from: 'deck_sub_worker',
+        to: 'deck_sub_late',
+        message: 'hello late peer',
+        depth: 0,
+      });
     } finally {
       await client.close();
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));

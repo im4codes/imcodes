@@ -37,7 +37,7 @@ import { listMcpMemorySummaries, searchMcpMemoryRecall, type MemoryMcpListProjec
 import type { MemorySearchQuery } from '../context/memory-search.js';
 import { saveObservation, savePreference } from '../context/memory-write-tools.js';
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
-import { listSessions as listStoredSessions, type SessionRecord } from '../store/session-store.js';
+import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
 import { dispatchSendMessage, listSendTargets, type SendToolDeps } from './send-tool.js';
 import { cronMcpCreate, cronMcpDelete, cronMcpList, cronMcpUpdate, type CronMcpClientOptions } from './cron-mcp-client.js';
 import { registerMemoryShortRef, resolveMemoryShortRef } from '../context/memory-short-ref.js';
@@ -164,6 +164,11 @@ function parseExpiresAt(value: unknown): number | null | undefined {
 
 function sanitizeCaughtError(err: unknown): ToolResult {
   return error(MCP_ERROR_REASONS.INTERNAL_ERROR, sanitizeMcpErrorMessage(err));
+}
+
+async function refreshSendSessionStore(deps: MemoryMcpToolDeps): Promise<void> {
+  if (deps.sendDeps?.listSessions) return;
+  await loadStore({ probe: false });
 }
 
 function memoryGate(
@@ -461,7 +466,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (gate) return gate;
       return savePreferenceTool(pickAllowedMcpArgs(input, ['text', 'idempotencyKey']), memoryCaller()) as unknown as ToolResult;
     },
-    [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: (input) => {
+    [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: async (input) => {
+      await refreshSendSessionStore(deps);
       const args = pickAllowedMcpArgs(input, ['query', 'limit']);
       return listSendTargets(caller, {
         query: stringArg(args, 'query'),
@@ -472,6 +478,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }) as unknown as ToolResult;
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
+      await refreshSendSessionStore(deps);
       const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'broadcast', 'idempotencyKey']);
       return dispatchSendMessage(caller, {
         target: stringArg(args, 'target'),
