@@ -2103,6 +2103,8 @@
   },
   "todos": {
     "title": "Задачи",
-    "progress": "{{done}}/{{total}}"
+    "progress": "{{done}}/{{total}}",
+    "collapse": "Свернуть",
+    "expand": "Развернуть"
   }
 }

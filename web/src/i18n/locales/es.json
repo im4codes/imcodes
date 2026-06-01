@@ -2103,6 +2103,8 @@
   },
   "todos": {
     "title": "Tareas",
-    "progress": "{{done}}/{{total}}"
+    "progress": "{{done}}/{{total}}",
+    "collapse": "Contraer",
+    "expand": "Expandir"
   }
 }

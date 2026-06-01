@@ -2103,6 +2103,8 @@
   },
   "todos": {
     "title": "작업",
-    "progress": "{{done}}/{{total}}"
+    "progress": "{{done}}/{{total}}",
+    "collapse": "접기",
+    "expand": "펼치기"
   }
 }

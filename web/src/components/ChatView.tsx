@@ -2547,7 +2547,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             setCtxMenu(null);
           } : undefined}
         >
-          {!preview && <AgentTodoList events={events} />}
+          {!preview && <AgentTodoList events={events} sessionState={sessionState} />}
           {loading ? (
             <div class="chat-loading">{t('chat.loading')}</div>
           ) : viewItems.length === 0 ? (

@@ -2104,6 +2104,8 @@
   },
   "todos": {
     "title": "任務清單",
-    "progress": "{{done}}/{{total}}"
+    "progress": "{{done}}/{{total}}",
+    "collapse": "收合",
+    "expand": "展開"
   }
 }

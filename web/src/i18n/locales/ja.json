@@ -2103,6 +2103,8 @@
   },
   "todos": {
     "title": "タスク",
-    "progress": "{{done}}/{{total}}"
+    "progress": "{{done}}/{{total}}",
+    "collapse": "折りたたむ",
+    "expand": "展開"
   }
 }

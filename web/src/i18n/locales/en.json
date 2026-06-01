@@ -2104,6 +2104,8 @@
   },
   "todos": {
     "title": "Tasks",
-    "progress": "{{done}}/{{total}}"
+    "progress": "{{done}}/{{total}}",
+    "collapse": "Collapse",
+    "expand": "Expand"
   }
 }

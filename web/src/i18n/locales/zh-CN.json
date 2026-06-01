@@ -2104,6 +2104,8 @@
   },
   "todos": {
     "title": "任务清单",
-    "progress": "{{done}}/{{total}}"
+    "progress": "{{done}}/{{total}}",
+    "collapse": "折叠",
+    "expand": "展开"
   }
 }

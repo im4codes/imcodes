@@ -17,6 +17,13 @@
  */
 import type { TimelineEvent } from '../ws-client.js';
 
+/** Hide a checklist this long after its session goes idle (turn ended) — an
+ *  unfinished list shouldn't linger forever once the agent stops working. */
+export const TODO_LIST_IDLE_GRACE_MS = 3 * 60_000;
+/** Absolute cap: hide a checklist this long after its last update regardless of
+ *  session state, so a wedged/stuck "running" turn can't pin it indefinitely. */
+export const TODO_LIST_HARD_MAX_MS = 60 * 60_000;
+
 export type AgentTodoStatus = 'pending' | 'in_progress' | 'completed';
 
 export interface AgentTodoItem {
