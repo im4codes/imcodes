@@ -1158,9 +1158,10 @@ function SdkAgentsPanel({
         </button>
       </div>
       <div class="chat-sdk-agents-body">
+        {/* No "Active" title — running agents are the panel's default; the
+            header subtitle already shows the running count. Saves a row. */}
         {activeRows.length > 0 && (
           <section class="chat-sdk-agents-section" aria-label={t('chat.sdk_agents_active_section')}>
-            <div class="chat-sdk-agents-section-title">{t('chat.sdk_agents_active_section')}</div>
             {activeRows.map((row) => (
               <SdkAgentsRow key={row.canonicalKey} row={row} now={now} />
             ))}

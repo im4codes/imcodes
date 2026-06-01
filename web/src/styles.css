@@ -200,7 +200,11 @@ body {
 .session-ctx-bar::after { content: ''; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.22), transparent); opacity: 0.45; pointer-events: none; }
 .session-ctx-input { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, var(--chrome-accent-2), var(--chrome-accent)); border-radius: 999px; box-shadow: 0 0 10px rgba(52,211,153,0.42); }
 .session-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, var(--chrome-accent-3), #818cf8); border-radius: 999px; box-shadow: 0 0 10px rgba(129,140,248,0.36); }
-.shortcut-btn { flex-shrink: 0; padding: 4px 8px; background: rgba(15,23,42,0.58); border: 1px solid rgba(125,211,252,0.16); border-radius: 7px; color: #7b8797; font-size: 11px; font-family: inherit; cursor: pointer; transition: color 0.12s, border-color 0.12s, background 0.12s, box-shadow 0.12s; white-space: nowrap; box-shadow: inset 0 1px 0 rgba(255,255,255,0.03); }
+.shortcut-btn { flex-shrink: 0; padding: 4px 8px; background: rgba(15,23,42,0.58); border: 1px solid rgba(125,211,252,0.16); border-radius: 7px; color: #7b8797; font-size: 11px; font-family: inherit; cursor: pointer; transition: color 0.12s, border-color 0.12s, background 0.12s, box-shadow 0.12s; white-space: nowrap; box-shadow: inset 0 1px 0 rgba(255,255,255,0.03); touch-action: manipulation; }
+/* Instant optimistic feedback while a stop is in flight (before the session
+   state round-trip + provider interrupt land). */
+.shortcut-btn-stop-pending { animation: shortcut-btn-stop-pulse 0.7s ease-in-out infinite; border-color: rgba(248,113,113,0.6) !important; color: #f87171 !important; }
+@keyframes shortcut-btn-stop-pulse { 0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(248,113,113,0); } 50% { opacity: 0.55; box-shadow: 0 0 10px 1px rgba(248,113,113,0.35); } }
 .shortcut-btn:hover:not(:disabled) { background: rgba(8,145,178,0.14); border-color: rgba(34,211,238,0.42); color: #dbeafe; box-shadow: 0 0 12px rgba(34,211,238,0.12), inset 0 1px 0 rgba(255,255,255,0.05); }
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
@@ -1357,10 +1361,12 @@ body {
 /* Split file panel container */
 .chat-file-panel { display: flex; flex-direction: column; border-left: 1px solid #334155; background: #0f172a; overflow: hidden; min-width: 220px; }
 .chat-sdk-agents-panel { display: flex; flex-direction: column; width: clamp(260px, 28vw, 360px); min-width: 240px; flex-shrink: 0; border-left: 1px solid #334155; background: #0f172a; overflow: hidden; }
-.chat-sdk-agents-header { display: flex; align-items: center; gap: 8px; padding: 7px 9px; background: #1e293b; border-bottom: 1px solid #334155; min-height: 35px; box-sizing: border-box; }
-.chat-sdk-agents-heading { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.chat-sdk-agents-title { font-size: 12px; color: #dbeafe; font-weight: 800; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chat-sdk-agents-subtitle { font-size: 10px; color: #94a3b8; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-sdk-agents-header { display: flex; align-items: center; gap: 8px; padding: 6px 9px; background: #1e293b; border-bottom: 1px solid #334155; min-height: 30px; box-sizing: border-box; }
+/* Title + running-count subtitle share one row ("Agents · 2 running"). */
+.chat-sdk-agents-heading { flex: 1; min-width: 0; display: flex; flex-direction: row; align-items: baseline; gap: 6px; }
+.chat-sdk-agents-title { flex: 0 0 auto; font-size: 12px; color: #dbeafe; font-weight: 800; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-sdk-agents-subtitle { flex: 0 1 auto; min-width: 0; font-size: 10px; color: #94a3b8; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-sdk-agents-subtitle::before { content: '·'; margin-right: 5px; color: #475569; }
 .chat-sdk-agents-close { flex: 0 0 auto; background: none; border: none; color: #64748b; cursor: pointer; font-size: 14px; line-height: 1; padding: 3px 6px; border-radius: 4px; }
 .chat-sdk-agents-close:hover { color: #e2e8f0; background: rgba(148,163,184,0.12); }
 .chat-sdk-agents-body { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 9px; display: flex; flex-direction: column; gap: 10px; scrollbar-width: thin; scrollbar-color: #475569 #0f172a; }
