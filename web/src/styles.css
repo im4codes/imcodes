@@ -1360,6 +1360,9 @@ body {
   .chat-view-wrap.chat-split { flex-direction: column !important; }
   .chat-sdk-agents-panel,
   .chat-file-panel { width: 100% !important; min-width: 0; min-height: 150px; max-height: min(42dvh, 320px); border-left: 0; border-top: 1px solid #334155; }
+  /* Agents panel on phones: cap at ~one agent card tall — its body scrolls for
+     more — so a burst of sub-agents doesn't bury the chat. */
+  .chat-sdk-agents-panel { min-height: 0; max-height: 140px; }
   .chat-panel-drag { display: none; }
   .chat-top-actions { top: 5px; right: 6px; gap: 5px; }
   .chat-sdk-agents-toggle { max-width: 112px; }

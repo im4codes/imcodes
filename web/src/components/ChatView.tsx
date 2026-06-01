@@ -910,11 +910,22 @@ function useTouchChatGestures(): boolean {
 const LONG_PRESS_MS = 400;
 const panelWidthKey = (id: string | null | undefined) => `chatFilePanelWidth:${id ?? '_'}`;
 const panelOpenKey  = (id: string | null | undefined) => `chatFilePanelOpen:${id ?? '_'}`;
-// SDK agents panel toggle is a GLOBAL switch (one for every chat window), synced
-// live across all open ChatView instances + browser tabs. Default OPEN until the
-// user closes it — only an explicit '0' counts as closed.
+// SDK agents panel toggle. GLOBAL within a device class — one switch shared by
+// every chat window + tab, synced live — but SEPARATE for touch/phone vs desktop
+// (the key is suffixed by platform) so "手机开关手机, 电脑开关电脑". Default OPEN
+// until the user closes it; only an explicit '0' counts as closed.
 const SDK_AGENTS_OPEN_KEY = 'chatSdkAgentsPanelOpen';
 const SDK_AGENTS_OPEN_EVENT = 'deck:sdk-agents-panel-open-changed';
+function sdkAgentsOpenKey(): string {
+  let platform = 'desktop';
+  try {
+    if (typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+        && window.matchMedia(TOUCH_GESTURE_MEDIA_QUERY).matches) {
+      platform = 'mobile';
+    }
+  } catch { /* ignore — fall back to desktop */ }
+  return `${SDK_AGENTS_OPEN_KEY}:${platform}`;
+}
 
 function readPanelWidth(id: string | null | undefined): number {
   try { return parseInt(localStorage.getItem(panelWidthKey(id)) ?? String(FILE_PANEL_DEFAULT), 10); } catch { return FILE_PANEL_DEFAULT; }
@@ -924,10 +935,10 @@ function readPanelOpen(id: string | null | undefined): boolean {
 }
 function readSdkAgentsOpen(): boolean {
   // Default OPEN when never set; only an explicit '0' means the user closed it.
-  try { return localStorage.getItem(SDK_AGENTS_OPEN_KEY) !== '0'; } catch { return true; }
+  try { return localStorage.getItem(sdkAgentsOpenKey()) !== '0'; } catch { return true; }
 }
 function writeSdkAgentsOpen(next: boolean): void {
-  try { localStorage.setItem(SDK_AGENTS_OPEN_KEY, next ? '1' : '0'); } catch { /* ignore */ }
+  try { localStorage.setItem(sdkAgentsOpenKey(), next ? '1' : '0'); } catch { /* ignore */ }
   try { window.dispatchEvent(new CustomEvent(SDK_AGENTS_OPEN_EVENT)); } catch { /* ignore */ }
 }
 

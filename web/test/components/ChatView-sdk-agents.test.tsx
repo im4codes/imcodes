@@ -129,7 +129,7 @@ describe('ChatView SDK agents panel', () => {
     // Production now defaults the global agents toggle OPEN. Most tests below were
     // written for a closed-by-default toggle (they click to open), so seed an
     // explicit '0' here. The dedicated default-open test clears it.
-    localStorage.setItem('chatSdkAgentsPanelOpen', '0');
+    localStorage.setItem('chatSdkAgentsPanelOpen:desktop', '0');
   });
   afterEach(() => {
     cleanup();
@@ -177,13 +177,13 @@ describe('ChatView SDK agents panel', () => {
       diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
     }));
     // Start from an explicit CLOSED state — the toggle now defaults OPEN globally.
-    localStorage.setItem('chatSdkAgentsPanelOpen', '0');
+    localStorage.setItem('chatSdkAgentsPanelOpen:desktop', '0');
     const { container, rerender } = render(
       <ChatView events={[]} loading={false} sessionId="deck_agents" />,
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }));
-    expect(localStorage.getItem('chatSdkAgentsPanelOpen')).toBe('1');
+    expect(localStorage.getItem('chatSdkAgentsPanelOpen:desktop')).toBe('1');
     expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
     // `.active` now reflects the OPEN/closed toggle state, not whether agents are
     // running: toggled open with 0 agents is still active, and the badge shows 0.
@@ -200,19 +200,19 @@ describe('ChatView SDK agents panel', () => {
     rerender(<ChatView events={[terminalEvent]} loading={false} sessionId="deck_agents" />);
     expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
     expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(false);
-    expect(localStorage.getItem('chatSdkAgentsPanelOpen')).toBe('1');
+    expect(localStorage.getItem('chatSdkAgentsPanelOpen:desktop')).toBe('1');
     // Still toggled open (agents finished) → button stays active; badge shows 0.
     expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }).classList.contains('active')).toBe(true);
 
     rerender(<ChatView events={[diagnosticEvent]} loading={false} sessionId="deck_agents" />);
     expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
     expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(false);
-    expect(localStorage.getItem('chatSdkAgentsPanelOpen')).toBe('1');
+    expect(localStorage.getItem('chatSdkAgentsPanelOpen:desktop')).toBe('1');
 
     rerender(<ChatView events={[runningEvent]} loading={false} sessionId="deck_agents" />);
     expect(screen.getByRole('region', { name: 'Agents' })).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Close Agents panel' }));
-    expect(localStorage.getItem('chatSdkAgentsPanelOpen')).toBe('0');
+    expect(localStorage.getItem('chatSdkAgentsPanelOpen:desktop')).toBe('0');
     expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
 
     rerender(<ChatView events={[runningEvent]} loading={false} sessionId="deck_agents" />);
@@ -224,14 +224,14 @@ describe('ChatView SDK agents panel', () => {
 
   it('defaults the global SDK agents toggle to OPEN when the user has never set it', () => {
     // Clear the seeded '0' → never set → the global toggle defaults OPEN.
-    localStorage.removeItem('chatSdkAgentsPanelOpen');
+    localStorage.removeItem('chatSdkAgentsPanelOpen:desktop');
     const runningEvent = makeSdkEvent('agent-running', makeMeta({ childStatusSummary: 'Working' }));
     const { container, rerender } = render(
       <ChatView events={[]} loading={false} sessionId="deck_agents" />,
     );
 
     // No stored preference, yet the toggle reads as open (active) with 0 agents.
-    expect(localStorage.getItem('chatSdkAgentsPanelOpen')).toBeNull();
+    expect(localStorage.getItem('chatSdkAgentsPanelOpen:desktop')).toBeNull();
     expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }).classList.contains('active')).toBe(true);
 
     // A running agent auto-mounts the panel under the default-open toggle.
@@ -394,7 +394,7 @@ describe('ChatView SDK agents panel', () => {
     }));
     runningEvent.ts = now.getTime();
     // Toggle defaults OPEN, so the panel is already mounted with 1 running agent.
-    localStorage.setItem('chatSdkAgentsPanelOpen', '1');
+    localStorage.setItem('chatSdkAgentsPanelOpen:desktop', '1');
     const { container } = render(
       <ChatView events={[terminalEvent, runningEvent]} loading={false} sessionId="deck_agents" />,
     );
@@ -407,6 +407,6 @@ describe('ChatView SDK agents panel', () => {
 
     expect(container.querySelector('.chat-sdk-agents-panel')).toBeTruthy();
     expect(screen.queryByText('Finished child work')).toBeNull();
-    expect(localStorage.getItem('chatSdkAgentsPanelOpen')).toBe('1');
+    expect(localStorage.getItem('chatSdkAgentsPanelOpen:desktop')).toBe('1');
   });
 });
