@@ -231,8 +231,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
    * SAME turn. Returns false when nothing was pending (timed out / self-
    * continued) — the daemon then delivers the answer as a normal message.
    */
-  answerPendingQuestion(sessionId: string, answer: string): boolean {
-    return this.questions.resolve(sessionId, { behavior: 'deny', message: answer, interrupt: false });
+  answerPendingQuestion(sessionName: string, answer: string): boolean {
+    return this.questions.resolve(sessionName, { behavior: 'deny', message: answer, interrupt: false });
   }
 
   async connect(config: ProviderConfig): Promise<void> {
@@ -325,9 +325,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
   async endSession(sessionId: string): Promise<void> {
     // Release any paused AskUserQuestion so a torn-down session never leaks a
-    // pending timer / unresolved canUseTool promise.
-    this.questions.release(sessionId);
+    // pending timer / unresolved canUseTool promise. Keyed by sessionName.
     const state = this.sessions.get(sessionId);
+    this.questions.release(state?.sessionName ?? sessionId);
     if (state) {
       try { state.currentQuery?.close(); } catch {}
       this.terminateChild(state);
@@ -505,9 +505,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       if (toolName !== 'AskUserQuestion') {
         return Promise.resolve({ behavior: 'allow' as const, updatedInput: input });
       }
-      // Pause until answered (answerPendingQuestion) or the wait window elapses
-      // (fallback allow → the model self-continues / picks its own).
-      return this.questions.wait(sessionId, {
+      // Key by the daemon-facing sessionName (NOT the internal routeId
+      // `sessionId`) so handleAskAnswer — which answers by sessionName — resolves
+      // the right pending question. Pause until answered (answerPendingQuestion)
+      // or the wait window elapses (fallback allow → the model self-continues).
+      return this.questions.wait(state.sessionName ?? sessionId, {
         timeoutMs: ASK_QUESTION_WAIT_MS,
         fallback: { behavior: 'allow', updatedInput: input },
         signal: opts.signal,
