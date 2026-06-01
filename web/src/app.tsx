@@ -50,6 +50,7 @@ import { CloneSessionGroupDialog } from './components/CloneSessionGroupDialog.js
 import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
+import { shouldDismissPendingQuestion } from './ask-question-dismiss.js';
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
 import { RepoPage, type RepoPageTabKey } from './pages/RepoPage.js';
 import { ingestSessionRepoContext } from './session-repo-context-store.js';
@@ -1359,6 +1360,11 @@ export function App() {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [discussionPrefs, _setDiscussionPrefs] = useState<DiscussionPrefs | null>(null);
   const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
+  // Wall-clock when the current AskUserQuestion was shown. Used to auto-dismiss
+  // a stale card once the model self-continues (the SDK proceeds on its own if
+  // the question goes unanswered), while ignoring the question's own trailing
+  // message-completion flush that arrives in the same instant.
+  const pendingQuestionAtRef = useRef(0);
   const [discussions, setDiscussions] = useState<Array<{
     id: string;
     topic: string;
@@ -2514,11 +2520,26 @@ export function App() {
           }
         }
         if (event.type === 'ask.question') {
+          pendingQuestionAtRef.current = Date.now();
           setPendingQuestion({
             sessionName: event.sessionId,
             toolUseId: String(event.payload.toolUseId ?? ''),
             questions: (event.payload.questions as PendingQuestion['questions']) ?? [],
           });
+        }
+        // Auto-dismiss a stale question card: the SDK self-continues (picks an
+        // answer itself) if the question goes unanswered, so once the model
+        // produces new output for this session — more text or another tool call —
+        // the question is moot. The grace window ignores the question's own
+        // message-completion flush, which lands in the same instant as the ask.
+        if (event.type === 'assistant.text' || event.type === 'tool.call') {
+          setPendingQuestion((pq) => (
+            shouldDismissPendingQuestion(
+              pq ? { sessionName: pq.sessionName, askedAt: pendingQuestionAtRef.current } : null,
+              { type: event.type, sessionId: event.sessionId },
+              Date.now(),
+            ) ? null : pq
+          ));
         }
         if (event.type === 'user.message' && !event.sessionId.startsWith('deck_sub_')) {
           // A drained message enters the timeline as user.message carrying the
