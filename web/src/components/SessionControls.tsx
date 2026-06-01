@@ -2058,6 +2058,33 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return commandId;
   }, [activeSession, makeCommandId, serverId, ws]);
 
+  // Optimistic stop feedback. The cancel command is fire-and-forget on a
+  // priority lane (server/daemon never queue it), but the button only flips
+  // colour/state after the session.state round-trip + the provider actually
+  // interrupting the model (up to ~1.5s for the Claude SDK). Without local
+  // feedback the tap looks ignored. Fire on pointerdown (don't wait for the
+  // ~300ms synthetic click, which is also dispatched late when streaming
+  // jank keeps the main thread busy) and show a "stopping" pulse instantly.
+  const [stopRequested, setStopRequested] = useState(false);
+  const stopPressGuardRef = useRef(0);
+
+  const handleStopPress = useCallback(() => {
+    const now = Date.now();
+    if (now - stopPressGuardRef.current < 600) return; // dedupe pointerdown + click
+    stopPressGuardRef.current = now;
+    setStopRequested(true);
+    cancelActiveTransportTurn();
+  }, [cancelActiveTransportTurn]);
+
+  // Clear the optimistic state once the turn actually settles (session leaves
+  // the running state) or after a safety timeout so a stuck turn re-enables it.
+  useEffect(() => {
+    if (!stopRequested) return;
+    if (!isRunningSessionState(activeSession?.state)) { setStopRequested(false); return; }
+    const timer = setTimeout(() => setStopRequested(false), 4000);
+    return () => clearTimeout(timer);
+  }, [stopRequested, activeSession?.state]);
+
   const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}, commandId = makeCommandId()): string | null => {
     if (!activeSession) return null;
     if (effectiveRuntimeType === 'transport' && text.trim() === '/stop') {
@@ -2796,13 +2823,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           {/* Transport sessions: single Stop button instead of terminal shortcuts */}
           {isTransport ? (
             <button
-              class="shortcut-btn shortcut-btn-icon shortcut-btn-stop"
+              class={`shortcut-btn shortcut-btn-icon shortcut-btn-stop${stopRequested ? ' shortcut-btn-stop-pending' : ''}`}
               title={`${t('session.stop_plain')} (/stop)`}
               aria-label={t('session.stop_plain')}
               disabled={disabled || activeSession?.state === 'stopped'}
-              onClick={() => {
-                cancelActiveTransportTurn();
-              }}
+              onPointerDown={(e) => { e.preventDefault(); handleStopPress(); }}
+              onClick={handleStopPress}
               style={isRunningSessionState(activeSession?.state) ? { color: '#f87171' } : undefined}
             >
               <span aria-hidden="true">■</span>
