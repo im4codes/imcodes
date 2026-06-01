@@ -27,10 +27,12 @@ export function AgentTodoList({ events }: Props) {
 
   const total = list.items.length;
   const done = countCompleted(list.items);
-  const allDone = total > 0 && done === total;
+  // Once every item is completed the checklist has served its purpose — hide it
+  // so a finished list doesn't linger pinned at the top of the chat.
+  if (total > 0 && done === total) return null;
 
   return (
-    <div class={`agent-todos${allDone ? ' agent-todos-complete' : ''}`}>
+    <div class="agent-todos">
       <div class="agent-todos-header">
         <span class="agent-todos-title">{t('todos.title')}</span>
         <span class="agent-todos-count">{t('todos.progress', { done, total })}</span>
