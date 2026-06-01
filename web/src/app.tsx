@@ -2527,16 +2527,17 @@ export function App() {
             questions: (event.payload.questions as PendingQuestion['questions']) ?? [],
           });
         }
-        // Auto-dismiss a stale question card: the SDK self-continues (picks an
-        // answer itself) if the question goes unanswered, so once the model
-        // produces new output for this session — more text or another tool call —
-        // the question is moot. The grace window ignores the question's own
-        // message-completion flush, which lands in the same instant as the ask.
-        if (event.type === 'assistant.text' || event.type === 'tool.call') {
+        // Auto-dismiss a stale question card only once the model's turn is
+        // actually done (session idle). The SDK self-continues if the question
+        // goes unanswered, but answering is interrupt-based — so we KEEP the card
+        // up the whole time the model is working on its auto-choice, letting the
+        // user override it mid-run. The grace ignores an idle "blip" at the
+        // instant the question's tool call pauses the turn.
+        if (isIdleSessionStateTimelineEvent(event)) {
           setPendingQuestion((pq) => (
             shouldDismissPendingQuestion(
               pq ? { sessionName: pq.sessionName, askedAt: pendingQuestionAtRef.current } : null,
-              { type: event.type, sessionId: event.sessionId },
+              { sessionId: event.sessionId, sessionIdle: true },
               Date.now(),
             ) ? null : pq
           ));
