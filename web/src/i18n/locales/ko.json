@@ -873,6 +873,7 @@
     "dropdown": {
       "tab_combos": "콤보",
       "tab_workflows": "워크플로",
+      "solo_hint": "아래 흐름을 선택해 워크플로를 시작",
       "team_intro_title": "Team 토론",
       "team_intro_body": "에이전트가 토론하고 요약한 뒤 구현하고 결과를 검토합니다. 라운드를 늘리면 이 루프를 반복해 결과를 강화합니다.",
       "team_intro_tooltip": "토론 → 요약 → 구현 → 검토. 라운드를 늘리면 이전 결과를 바탕으로 루프를 반복합니다.",

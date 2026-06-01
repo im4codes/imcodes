@@ -874,6 +874,7 @@
     "dropdown": {
       "tab_combos": "组合流程",
       "tab_workflows": "高级工作流",
+      "solo_hint": "选择下面的流程启动工作流",
       "team_intro_title": "团队讨论",
       "team_intro_body": "多代理先讨论并总结，再实施用户请求；增加轮数会基于上一轮结果继续复核和加固。",
       "team_intro_tooltip": "讨论 → 总结 → 实施 → 复核；多轮会把上一轮结果带入下一轮。",

@@ -3316,7 +3316,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 }}
                 style={{ color: getP2pMenuItemColor('solo', p2pMode === 'solo'), fontWeight: p2pMode === 'solo' ? 700 : 600 }}
               >
-                {p2pMode === 'solo' ? '● ' : '○ '}{getP2pModeLabel('solo', t)}
+                {p2pMode === 'solo' ? '● ' : '○ '}{t('p2p.dropdown.solo_hint', 'Select a flow below to start a workflow')}
               </button>
               <div class="menu-divider" />
               {/*

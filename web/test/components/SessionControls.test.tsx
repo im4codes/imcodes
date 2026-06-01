@@ -1069,7 +1069,7 @@ afterEach(() => {
 
     const menu = screen.getByTestId('p2p-dropdown');
     const rounds = within(menu).getByTestId('p2p-dropdown-rounds');
-    const solo = within(menu).getByRole('button', { name: /Team$/i });
+    const solo = within(menu).getByRole('button', { name: /solo_hint$/i });
     expect(rounds.compareDocumentPosition(solo) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 
     fireEvent.click(within(rounds).getByTestId('p2p-dropdown-round-2'));

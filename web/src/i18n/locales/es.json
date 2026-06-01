@@ -873,6 +873,7 @@
     "dropdown": {
       "tab_combos": "Combos",
       "tab_workflows": "Flujos",
+      "solo_hint": "Elige un flujo abajo para iniciar un flujo de trabajo",
       "team_intro_title": "Discusión en equipo",
       "team_intro_body": "Los agentes discuten, resumen, implementan y luego revisan el resultado. Más rondas repiten el ciclo para reforzarlo.",
       "team_intro_tooltip": "Discusión → resumen → implementación → revisión. Más rondas repiten el ciclo sobre el resultado anterior.",
