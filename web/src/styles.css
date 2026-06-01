@@ -321,7 +321,7 @@ body {
   background: rgba(2, 6, 23, 0.72);
   z-index: 4090;
 }
-.controls-input-with-trailing { padding-right: 50px; }
+.controls-input-with-trailing { padding-right: 64px; }
 .btn-input-expand {
   width: 28px;
   height: 28px;
@@ -793,9 +793,14 @@ body {
     border-radius: 12px;
   }
   .btn-voice-embedded {
-    right: 6px;
-    width: 38px;
-    height: 38px;
+    right: 5px;
+    /* Fill the input's height (absolute-positioned, so it never pushes the
+       input taller) and make it comfortably wide for an easy tap target. */
+    top: 4px;
+    bottom: 4px;
+    transform: none;
+    width: 54px;
+    height: auto;
     padding: 0;
     /* Remove the 300ms tap delay / double-tap zoom on touch so the press
        registers immediately and is not mistaken for a gesture. */
@@ -803,7 +808,7 @@ body {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    border-radius: 999px;
+    border-radius: 10px;
     background: rgba(15,23,42,0.82);
     border: 1px solid rgba(125,211,252,0.18);
     color: #cbd5e1;
@@ -811,6 +816,9 @@ body {
   .controls-composer-mobile-expanded .btn-voice-embedded {
     top: 10px;
     right: 10px;
+    bottom: auto;
+    height: 34px;
+    width: 54px;
     transform: none;
   }
   .controls-wrapper-mobile-expanded .btn-input-expand-floating {
