@@ -1089,6 +1089,10 @@ function formatSdkAgentDuration(ms: number): string {
   return `${seconds}s`;
 }
 
+function formatSdkAgentTokenCount(tokens: number): string {
+  return new Intl.NumberFormat().format(Math.max(0, Math.floor(tokens)));
+}
+
 function SdkAgentsGlyph() {
   return (
     <svg
@@ -1224,6 +1228,12 @@ function SdkAgentsRow({ row, now }: { row: SdkSubagentStatusRow; now: number }) 
           <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_duration')}</span>
           <span class="chat-sdk-agent-detail-value">{formatSdkAgentDuration(durationMs)}</span>
         </div>
+        {typeof row.usageTotalTokens === 'number' && Number.isFinite(row.usageTotalTokens) && (
+          <div class="chat-sdk-agent-detail chat-sdk-agent-stat">
+            <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_tokens')}</span>
+            <span class="chat-sdk-agent-detail-value">{formatSdkAgentTokenCount(row.usageTotalTokens)}</span>
+          </div>
+        )}
       </div>
       {row.description && (
         <div class="chat-sdk-agent-detail">

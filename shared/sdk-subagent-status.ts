@@ -94,6 +94,10 @@ export interface SdkSubagentDetailMeta {
   receiverCount?: number;
   runningChildCount?: number;
   childStatusSummary?: string;
+  backgrounded?: boolean;
+  usageTotalTokens?: number;
+  usageToolUses?: number;
+  usageDurationMs?: number;
   diagnosticCode?: SdkSubagentDiagnosticCode;
 }
 

@@ -118,6 +118,7 @@
     "sdk_agents_model": "Модель",
     "sdk_agents_started_at": "Старт",
     "sdk_agents_duration": "Длительность",
+    "sdk_agents_tokens": "Токены",
     "sdk_agents_prompt": "Prompt",
     "sdk_agents_result": "Результат",
     "sdk_agents_running_children": "Дочерних agent выполняется: {{count}}",

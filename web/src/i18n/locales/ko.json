@@ -118,6 +118,7 @@
     "sdk_agents_model": "모델",
     "sdk_agents_started_at": "시작",
     "sdk_agents_duration": "실행 시간",
+    "sdk_agents_tokens": "토큰",
     "sdk_agents_prompt": "Prompt",
     "sdk_agents_result": "결과",
     "sdk_agents_running_children": "하위 agent {{count}}개 실행 중",

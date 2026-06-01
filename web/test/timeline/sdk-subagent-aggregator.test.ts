@@ -218,6 +218,34 @@ describe('deriveSdkSubagentStatusRows', () => {
     expect(expired.runningCount).toBe(0);
   });
 
+  it('keeps backgrounded Codex subagents active after the parent session idles', () => {
+    const running = makeEvent('backgrounded-codex-subagent', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT,
+      canonicalKey: 'codex:deck_main_brain:runtime:019e8422',
+      parentItemId: 'codex:deck_main_brain:runtime:019e8422',
+      agentPath: '019e8422',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+      backgrounded: true,
+      usageTotalTokens: 168,
+    }), { ts: NOW - 20_000 });
+    const idle = makeSessionStateEvent('parent-idle', 'idle', NOW - 1_000);
+
+    const result = deriveSdkSubagentStatusRows([running, idle], NOW);
+
+    expect(result.runningCount).toBe(1);
+    expect(result.rows).toMatchObject([{
+      canonicalKey: 'codex:deck_main_brain:runtime:019e8422',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+      backgrounded: true,
+      usageTotalTokens: 168,
+    }]);
+  });
+
   it('uses the first later session finish for stale retention', () => {
     const running = makeEvent('running-without-terminal', makeMeta({
       canonicalKey: 'claude:deck_main_brain:first-finish',

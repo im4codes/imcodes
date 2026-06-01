@@ -45,6 +45,10 @@ export interface SdkSubagentStatusRow {
   receiverCount?: number;
   runningChildCount?: number;
   childStatusSummary?: string;
+  backgrounded?: boolean;
+  usageTotalTokens?: number;
+  usageToolUses?: number;
+  usageDurationMs?: number;
 }
 
 export interface SdkSubagentDiagnostic {
@@ -198,6 +202,10 @@ function makeRow(event: TimelineEvent, detail: SdkSubagentDetail, order: number)
     receiverCount: meta.receiverCount,
     runningChildCount: meta.runningChildCount,
     childStatusSummary: meta.childStatusSummary,
+    backgrounded: meta.backgrounded === true,
+    usageTotalTokens: meta.usageTotalTokens,
+    usageToolUses: meta.usageToolUses,
+    usageDurationMs: meta.usageDurationMs,
     firstOrder: order,
     lastOrder: order,
   };
@@ -359,6 +367,7 @@ export function deriveSdkSubagentStatusRows(
 
   for (const [canonicalKey, row] of rowsByCanonicalKey.entries()) {
     if (!row.active || isTerminalish(row)) continue;
+    if (row.backgrounded) continue;
     const finish = findFinishAfter(row, sessionFinishes);
     if (!finish) continue;
     rowsByCanonicalKey.set(canonicalKey, staleRowAfterFinish(row, finish));

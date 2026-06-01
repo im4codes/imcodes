@@ -43,6 +43,7 @@ vi.mock('react-i18next', () => ({
         'chat.sdk_agents_model': 'Model',
         'chat.sdk_agents_started_at': 'Started',
         'chat.sdk_agents_duration': 'Duration',
+        'chat.sdk_agents_tokens': 'Tokens',
         'chat.sdk_agents_prompt': 'Prompt',
         'chat.sdk_agents_result': 'Result',
         'chat.sdk_agents_running_children': '{{count}} child running',
@@ -260,6 +261,24 @@ describe('ChatView SDK agents panel', () => {
     expect(document.body.textContent).not.toContain('OUTPUT_FILE');
   });
 
+  it('renders Claude SDK subagent token usage when provider meta includes usageTotalTokens', () => {
+    const event = makeSdkEvent(
+      'claude-agent-token-usage',
+      makeMeta({
+        canonicalKey: 'claude:deck_agents:task-token-usage',
+        taskId: 'task-token-usage',
+        usageTotalTokens: 4321,
+      }),
+      { summary: 'Claude child task' },
+    );
+    render(<ChatView events={[event]} loading={false} sessionId="deck_agents" />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 1 running' }));
+
+    expect(screen.getByText('Tokens')).toBeTruthy();
+    expect(screen.getByText('4,321')).toBeTruthy();
+  });
+
   it('renders agent id, model, start time, duration, prompt, and terminal result details', () => {
     const start = new Date('2026-05-31T12:00:00.000Z');
     vi.useFakeTimers();
@@ -273,6 +292,7 @@ describe('ChatView SDK agents panel', () => {
         terminal: false,
         agentPath: '019e80d8-44f2-7412-b703-b4ddde653d7f',
         model: 'haiku',
+        usageTotalTokens: 1234,
       }),
       {
         summary: 'Hume',
@@ -289,6 +309,7 @@ describe('ChatView SDK agents panel', () => {
         terminal: true,
         agentPath: '019e80d8-44f2-7412-b703-b4ddde653d7f',
         model: 'haiku',
+        usageTotalTokens: 5678,
       }),
       {
         summary: 'Hume',
@@ -314,6 +335,8 @@ describe('ChatView SDK agents panel', () => {
     expect(screen.getByText('Model')).toBeTruthy();
     expect(screen.getByText('haiku')).toBeTruthy();
     expect(screen.getByText('2m 0s')).toBeTruthy();
+    expect(screen.getByText('Tokens')).toBeTruthy();
+    expect(screen.getByText('5,678')).toBeTruthy();
     expect(screen.getByText('Prompt')).toBeTruthy();
     expect(screen.getByText('Check sync status and report back')).toBeTruthy();
     expect(screen.getByText('Result')).toBeTruthy();

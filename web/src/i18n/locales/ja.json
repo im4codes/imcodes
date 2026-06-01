@@ -118,6 +118,7 @@
     "sdk_agents_model": "モデル",
     "sdk_agents_started_at": "開始",
     "sdk_agents_duration": "実行時間",
+    "sdk_agents_tokens": "トークン",
     "sdk_agents_prompt": "Prompt",
     "sdk_agents_result": "結果",
     "sdk_agents_running_children": "{{count}} 件の子 agent が実行中",

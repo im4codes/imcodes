@@ -872,6 +872,217 @@ describe('CodexSdkProvider', () => {
     });
   });
 
+  it('emits backgrounded SDK sub-agent snapshots for raw spawn_agent response items', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-raw-spawn-agent', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-raw-spawn-agent', 'spawn a helper');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call',
+          name: 'spawn_agent',
+          call_id: 'call-spawn-1',
+          arguments: JSON.stringify({
+            agent_type: 'worker',
+            message: 'Wait for 100 seconds',
+            model: 'gpt-5.5',
+          }),
+        },
+      },
+    });
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call_output',
+          call_id: 'call-spawn-1',
+          output: JSON.stringify({
+            agent_id: '019e8422-0fed-7c12-ad2a-34da47e4e788',
+            nickname: 'Huygens',
+          }),
+        },
+      },
+    });
+    await flush();
+
+    const expectedKey = makeCodexSubagentCanonicalKey(
+      'route-raw-spawn-agent',
+      'runtime:019e8422-0fed-7c12-ad2a-34da47e4e788',
+    );
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: expectedKey,
+      name: 'Codex Sub-agent',
+      status: 'running',
+      input: { action: 'codex-runtime-subagent', description: 'Wait for 100 seconds' },
+    });
+    const runningDetail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(runningDetail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      agentPath: '019e8422-0fed-7c12-ad2a-34da47e4e788',
+      agentName: 'Huygens',
+      model: 'gpt-5.5',
+      rawStatus: 'running',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+      backgrounded: true,
+    });
+
+    child.emits({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId: '019e8422-0fed-7c12-ad2a-34da47e4e788',
+        turnId: 'turn-subagent-1',
+        tokenUsage: {
+          last: { inputTokens: 13, cachedInputTokens: 3, outputTokens: 5 },
+          total: { inputTokens: 123, cachedInputTokens: 20, outputTokens: 45, totalTokens: 168 },
+          modelContextWindow: 258400,
+        },
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(2);
+    expect(tools[1]).toMatchObject({
+      id: expectedKey,
+      name: 'Codex Sub-agent',
+      status: 'running',
+    });
+    const usageDetail = expectCodexSubagentDetail(tools[1]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(usageDetail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      usageTotalTokens: 168,
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+      backgrounded: true,
+    });
+
+    child.emits({
+      method: 'thread/status/changed',
+      params: {
+        threadId: '019e8422-0fed-7c12-ad2a-34da47e4e788',
+        status: 'idle',
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(3);
+    expect(tools[2]).toMatchObject({
+      id: expectedKey,
+      name: 'Codex Sub-agent',
+      status: 'complete',
+      output: 'idle',
+    });
+    const completeDetail = expectCodexSubagentDetail(tools[2]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(completeDetail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      usageTotalTokens: 168,
+      rawStatus: 'completed',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+      backgrounded: true,
+    });
+
+    child.emits({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId: '019e8422-0fed-7c12-ad2a-34da47e4e788',
+        turnId: 'turn-subagent-late',
+        tokenUsage: {
+          total: { inputTokens: 200, outputTokens: 100, totalTokens: 300 },
+        },
+      },
+    });
+    await flush();
+    expect(tools).toHaveLength(3);
+  });
+
+  it('marks raw spawn_agent sub-agent rows complete from child turn completion', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-raw-spawn-agent-turn-complete', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-raw-spawn-agent-turn-complete', 'spawn a helper');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call',
+          name: 'spawn_agent',
+          call_id: 'call-spawn-turn-complete',
+          arguments: JSON.stringify({ message: 'Do one quick task' }),
+        },
+      },
+    });
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call_output',
+          call_id: 'call-spawn-turn-complete',
+          output: JSON.stringify({ agent_id: '019e8422-turn-complete', nickname: 'Huygens' }),
+        },
+      },
+    });
+    await flush();
+
+    const expectedKey = makeCodexSubagentCanonicalKey(
+      'route-raw-spawn-agent-turn-complete',
+      'runtime:019e8422-turn-complete',
+    );
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: expectedKey,
+      status: 'running',
+    });
+
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: '019e8422-turn-complete',
+        turn: { id: 'turn-child', status: 'completed', error: null },
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(2);
+    expect(tools[1]).toMatchObject({
+      id: expectedKey,
+      status: 'complete',
+      output: 'completed',
+    });
+    const completeDetail = expectCodexSubagentDetail(tools[1]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(completeDetail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+      backgrounded: true,
+    });
+  });
+
   it('diagnoses Codex runtime subagent notifications without an agent id', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });

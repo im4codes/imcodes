@@ -118,6 +118,7 @@
     "sdk_agents_model": "模型",
     "sdk_agents_started_at": "启动",
     "sdk_agents_duration": "运行时长",
+    "sdk_agents_tokens": "Token",
     "sdk_agents_prompt": "Prompt",
     "sdk_agents_result": "结果",
     "sdk_agents_running_children": "{{count}} 个子 agent 运行中",

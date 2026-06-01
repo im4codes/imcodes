@@ -118,6 +118,7 @@
     "sdk_agents_model": "Modelo",
     "sdk_agents_started_at": "Inicio",
     "sdk_agents_duration": "Duración",
+    "sdk_agents_tokens": "Tokens",
     "sdk_agents_prompt": "Prompt",
     "sdk_agents_result": "Resultado",
     "sdk_agents_running_children": "{{count}} subagent en ejecución",
