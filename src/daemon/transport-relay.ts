@@ -302,6 +302,28 @@ export function wireProviderToRelay(provider: TransportProvider): void {
   provider.onToolCall?.((providerSid: string, tool: ToolCallEvent) => {
     const sessionName = resolveSessionName(providerSid);
     if (!sessionName) return;
+
+    // AskUserQuestion is an interactive tool: surface it as an `ask.question`
+    // event so the web renders the question/options dialog (same payload shape
+    // the process/JSONL path emits) instead of a raw `> AskUserQuestion {...}`
+    // tool-call line. The chosen answer comes back via `ask.answer` and is
+    // delivered to the provider as the next user turn (see handleAskAnswer).
+    if (tool.name === 'AskUserQuestion') {
+      if (tool.status === 'running') {
+        const askInput = (tool.input ?? {}) as Record<string, unknown>;
+        timelineEmitter.emit(sessionName, 'ask.question', {
+          toolUseId: tool.id,
+          questions: Array.isArray(askInput.questions) ? askInput.questions : [],
+        }, {
+          source: 'daemon',
+          confidence: 'high',
+          eventId: `transport-ask:${sessionName}:${tool.id}`,
+        });
+      }
+      // The tool's completion/result carries no extra UI value here.
+      return;
+    }
+
     const sdkDetail = parseSdkSubagentDetail(tool.detail);
     if (sdkDetail.kind === 'malformed-sdk') {
       logger.warn({ toolId: tool.id, reason: sdkDetail.reason }, 'transport-relay: dropping malformed sdk sub-agent detail');

@@ -1437,7 +1437,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     }
     case 'ask.answer':
-      void handleAskAnswer(cmd);
+      void handleAskAnswer(cmd, serverLink);
       break;
     case 'discussion.start':
       void handleDiscussionStart(cmd, serverLink);
@@ -5052,14 +5052,26 @@ async function handleSubSessionReadResponse(cmd: Record<string, unknown>, server
   } catch { /* not connected */ }
 }
 
-async function handleAskAnswer(cmd: Record<string, unknown>): Promise<void> {
+async function handleAskAnswer(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
   const answer = cmd.answer as string | undefined;
   if (!sessionName || answer === undefined) {
     logger.warn('ask.answer: missing sessionName or answer');
     return;
   }
-  // ESC to dismiss the TUI dialog, then send the answer text + Enter
+  // Transport (SDK) sessions have no TUI to type into. Deliver the chosen answer
+  // as an ordinary message via handleSend (which is transport-aware): the
+  // provider restarts the turn with it, resolving the AskUserQuestion by having
+  // the user's choice arrive as the next user turn. Process/tmux sessions keep
+  // the TUI behavior below.
+  const record = getSession(sessionName);
+  const isTransportSession = record?.runtimeType === 'transport'
+    || (typeof record?.agentType === 'string' && isTransportAgent(record.agentType));
+  if (isTransportSession) {
+    if (answer.trim()) await handleSend({ sessionName, text: answer }, serverLink);
+    return;
+  }
+  // Process/TUI path: ESC to dismiss the dialog, then send the answer text + Enter.
   await sendKey(sessionName, 'Escape');
   await new Promise<void>((r) => setTimeout(r, 150));
   await sendKeys(sessionName, answer);

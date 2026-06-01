@@ -1259,6 +1259,71 @@ describe('transport-relay (timeline-emitter based)', () => {
       }));
     });
   });
+
+  // ── wireProviderToRelay — onToolCall: AskUserQuestion ────────────────────
+  describe('onToolCall AskUserQuestion', () => {
+    const askInput = {
+      questions: [{
+        question: 'Pick an approach',
+        header: 'Approach',
+        multiSelect: false,
+        options: [
+          { label: 'A', description: 'first' },
+          { label: 'B', description: 'second' },
+        ],
+      }],
+    };
+
+    it('emits ask.question (not a raw tool.call) for a running AskUserQuestion', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-a', { id: 'tu-1', name: 'AskUserQuestion', status: 'running', input: askInput });
+
+      const askCalls = emitMock.mock.calls.filter((c) => c[1] === 'ask.question');
+      const toolCalls = emitMock.mock.calls.filter((c) => c[1] === 'tool.call');
+      expect(toolCalls).toHaveLength(0); // no raw "> AskUserQuestion {...}" line
+      expect(askCalls).toHaveLength(1);
+      const [sessionId, , payload, meta] = askCalls[0];
+      expect(sessionId).toBe('sess-a');
+      expect(payload.toolUseId).toBe('tu-1');
+      expect(payload.questions).toEqual(askInput.questions);
+      expect(meta.eventId).toBe('transport-ask:sess-a:tu-1');
+    });
+
+    it('defaults questions to [] when input has none', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-a', { id: 'tu-2', name: 'AskUserQuestion', status: 'running', input: {} });
+
+      const askCalls = emitMock.mock.calls.filter((c) => c[1] === 'ask.question');
+      expect(askCalls).toHaveLength(1);
+      expect(askCalls[0][2].questions).toEqual([]);
+    });
+
+    it('does not emit anything when the AskUserQuestion tool completes', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-a', { id: 'tu-3', name: 'AskUserQuestion', status: 'complete', input: askInput, output: 'A' });
+
+      expect(emitMock).not.toHaveBeenCalled();
+    });
+
+    it('still emits a normal tool.call for non-AskUserQuestion tools', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-a', { id: 'tu-4', name: 'Read', status: 'running', input: { file_path: '/x' } });
+
+      const askCalls = emitMock.mock.calls.filter((c) => c[1] === 'ask.question');
+      const toolCalls = emitMock.mock.calls.filter((c) => c[1] === 'tool.call');
+      expect(askCalls).toHaveLength(0);
+      expect(toolCalls).toHaveLength(1);
+      expect(toolCalls[0][2].tool).toBe('Read');
+    });
+  });
 });
 
 // ── useTimeline same-ID replacement (logic extracted for unit testing) ───────
