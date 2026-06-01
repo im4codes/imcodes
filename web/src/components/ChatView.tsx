@@ -1200,25 +1200,29 @@ function SdkAgentsRow({ row, now }: { row: SdkSubagentStatusRow; now: number }) 
         <span class="chat-sdk-agent-status">{statusLabel}</span>
       </div>
       <div class="chat-sdk-agent-summary">{summary}</div>
-      {(row.agentPath || row.taskId || row.parentItemId) && (
-        <div class="chat-sdk-agent-detail">
-          <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_id')}</span>
-          <span class="chat-sdk-agent-detail-value">{row.agentPath || row.taskId || row.parentItemId}</span>
+      {/* Short stats flow inline and wrap (use the width) instead of one tall
+          full-width row each. */}
+      <div class="chat-sdk-agent-stats">
+        {(row.agentPath || row.taskId || row.parentItemId) && (
+          <div class="chat-sdk-agent-detail chat-sdk-agent-stat">
+            <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_id')}</span>
+            <span class="chat-sdk-agent-detail-value">{row.agentPath || row.taskId || row.parentItemId}</span>
+          </div>
+        )}
+        {row.model && (
+          <div class="chat-sdk-agent-detail chat-sdk-agent-stat">
+            <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_model')}</span>
+            <span class="chat-sdk-agent-detail-value">{row.model}</span>
+          </div>
+        )}
+        <div class="chat-sdk-agent-detail chat-sdk-agent-stat">
+          <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_started_at')}</span>
+          <span class="chat-sdk-agent-detail-value">{formatSdkAgentClockTime(row.startTs)}</span>
         </div>
-      )}
-      {row.model && (
-        <div class="chat-sdk-agent-detail">
-          <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_model')}</span>
-          <span class="chat-sdk-agent-detail-value">{row.model}</span>
+        <div class="chat-sdk-agent-detail chat-sdk-agent-stat">
+          <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_duration')}</span>
+          <span class="chat-sdk-agent-detail-value">{formatSdkAgentDuration(durationMs)}</span>
         </div>
-      )}
-      <div class="chat-sdk-agent-detail">
-        <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_started_at')}</span>
-        <span class="chat-sdk-agent-detail-value">{formatSdkAgentClockTime(row.startTs)}</span>
-      </div>
-      <div class="chat-sdk-agent-detail">
-        <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_duration')}</span>
-        <span class="chat-sdk-agent-detail-value">{formatSdkAgentDuration(durationMs)}</span>
       </div>
       {row.description && (
         <div class="chat-sdk-agent-detail">
