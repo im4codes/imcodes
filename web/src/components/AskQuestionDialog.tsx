@@ -1,4 +1,5 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import { ASK_QUESTION_WAIT_MS, ASK_QUESTION_RETENTION_MS } from '@shared/ask-question-timing.js';
 
 export interface AskOption {
   label: string;
@@ -16,6 +17,8 @@ export interface PendingQuestion {
   sessionName: string;
   toolUseId: string;
   questions: AskQuestionItem[];
+  /** ms the model pauses for an answer before self-continuing (drives the countdown). */
+  waitMs?: number;
 }
 
 interface Props {
@@ -26,6 +29,32 @@ interface Props {
 
 export function AskQuestionDialog({ pending, onSubmit, onDismiss }: Props) {
   const { questions } = pending;
+
+  // ── Countdown / retention phases ──────────────────────────────────────────
+  // Phase 1 (≤ waitMs): the model is PAUSED waiting — answering steers it in the
+  // same turn. Phase 2 (next ASK_QUESTION_RETENTION_MS): the model self-continued
+  // but the card lingers so the user can force-interrupt with a different choice.
+  // After that, the card auto-dismisses.
+  const waitMs = typeof pending.waitMs === 'number' && pending.waitMs > 0 ? pending.waitMs : ASK_QUESTION_WAIT_MS;
+  const totalMs = waitMs + ASK_QUESTION_RETENTION_MS;
+  const startedAtRef = useRef(Date.now());
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    startedAtRef.current = Date.now();
+    setNow(Date.now());
+  }, [pending.toolUseId]);
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const elapsed = now - startedAtRef.current;
+  const expired = elapsed >= totalMs;
+  useEffect(() => {
+    if (expired) onDismiss();
+  }, [expired]); // eslint-disable-line react-hooks/exhaustive-deps
+  const inWaitPhase = elapsed < waitMs;
+  const waitRemainSec = Math.max(0, Math.ceil((waitMs - elapsed) / 1000));
+  const retentionRemainSec = Math.max(0, Math.ceil((totalMs - elapsed) / 1000));
 
   // State: for each question, either selected indices (multiSelect) or text value
   const [selections, setSelections] = useState<Array<Set<number>>>(() =>
@@ -58,6 +87,11 @@ export function AskQuestionDialog({ pending, onSubmit, onDismiss }: Props) {
   return (
     <div class="ask-dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onDismiss(); }}>
       <div class="ask-dialog">
+        <div class={`ask-status ${inWaitPhase ? 'ask-status-waiting' : 'ask-status-retained'}`}>
+          {inWaitPhase
+            ? `⏳ Waiting for your answer — the model continues on its own in ${waitRemainSec}s`
+            : `▶ The model already continued — you can still interrupt it (${retentionRemainSec}s)`}
+        </div>
         {questions.map((q, qi) => (
           <div key={qi} class="ask-question-block">
             {q.header && <div class="ask-header">{q.header}</div>}
@@ -101,8 +135,10 @@ export function AskQuestionDialog({ pending, onSubmit, onDismiss }: Props) {
           </div>
         ))}
         <div class="ask-actions">
-          <button class="ask-btn-cancel" onClick={onDismiss}>Cancel</button>
-          <button class="ask-btn-submit" onClick={() => onSubmit(buildAnswer())}>Send</button>
+          <button class="ask-btn-cancel" onClick={onDismiss}>Dismiss</button>
+          <button class="ask-btn-submit" onClick={() => onSubmit(buildAnswer())}>
+            {inWaitPhase ? 'Answer' : 'Interrupt with this'}
+          </button>
         </div>
       </div>
     </div>

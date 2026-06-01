@@ -1289,6 +1289,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(sessionId).toBe('sess-a');
       expect(payload.toolUseId).toBe('tu-1');
       expect(payload.questions).toEqual(askInput.questions);
+      expect(payload.waitMs).toBe(60_000); // ASK_QUESTION_WAIT_MS — drives the web countdown
       expect(meta.eventId).toBe('transport-ask:sess-a:tu-1');
     });
 

@@ -5068,7 +5068,17 @@ async function handleAskAnswer(cmd: Record<string, unknown>, serverLink: ServerL
   const isTransportSession = record?.runtimeType === 'transport'
     || (typeof record?.agentType === 'string' && isTransportAgent(record.agentType));
   if (isTransportSession) {
-    if (answer.trim()) await handleSend({ sessionName, text: answer }, serverLink);
+    if (!answer.trim()) return;
+    // If the model is PAUSED on this question (canUseTool wait window), resolve
+    // it in place so the model continues in the SAME turn with the user's
+    // choice. Otherwise (timed out / already self-continued) deliver the answer
+    // as an ordinary message — a force-interrupt that re-steers the model.
+    const provider = record?.agentType ? getProvider(record.agentType) : undefined;
+    const answerPending = (provider as { answerPendingQuestion?: (s: string, a: string) => boolean } | undefined)?.answerPendingQuestion;
+    const answeredInPlace = typeof answerPending === 'function' && answerPending.call(provider, sessionName, answer) === true;
+    if (!answeredInPlace) {
+      await handleSend({ sessionName, text: answer }, serverLink);
+    }
     return;
   }
   // Process/TUI path: ESC to dismiss the dialog, then send the answer text + Enter.

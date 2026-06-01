@@ -16,6 +16,7 @@ import { resolveContextWindow } from '../util/model-context.js';
 import { getSession } from '../store/session-store.js';
 import { getCachedPresetContextWindow } from './cc-presets.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
+import { ASK_QUESTION_WAIT_MS } from '../../shared/ask-question-timing.js';
 import { normalizeCodexSdkFileChange, normalizeQwenFileChange } from './file-change-normalizer.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '../../shared/usage-context-window.js';
 import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
@@ -322,6 +323,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
           timelineEmitter.emit(sessionName, 'ask.question', {
             toolUseId: tool.id,
             questions,
+            waitMs: ASK_QUESTION_WAIT_MS,
           }, {
             source: 'daemon',
             confidence: 'high',

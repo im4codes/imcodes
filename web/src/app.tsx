@@ -2080,6 +2080,24 @@ export function App() {
   // subSessionsRef itself is declared earlier (forward-declared before
   // bringSubToFront so the callback can close over it). Just sync each render.
   subSessionsRef.current = subSessions;
+
+  // Auto-navigate to the session that raised an AskUserQuestion so the operator
+  // sees its context (the card itself is a global overlay, but the underlying
+  // view should follow). Runs once per question (tracked by toolUseId).
+  const navigatedQuestionRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!pendingQuestion) { navigatedQuestionRef.current = null; return; }
+    if (navigatedQuestionRef.current === pendingQuestion.toolUseId) return;
+    navigatedQuestionRef.current = pendingQuestion.toolUseId;
+    const sid = pendingQuestion.sessionName;
+    if (isSubSessionName(sid)) {
+      const sub = subSessionsRef.current.find((s) => s.sessionName === sid);
+      if (sub) openSubSessionWindow(sub.id);
+    } else {
+      setActiveSession(sid);
+    }
+  }, [pendingQuestion, openSubSessionWindow, setActiveSession]);
+
   const visibleSubSessionStackKey = useMemo(
     () => visibleSubSessions
       .map((sub) => `${sub.id}:${sub.serverId ?? selectedServerId ?? ''}`)
@@ -2525,6 +2543,7 @@ export function App() {
             sessionName: event.sessionId,
             toolUseId: String(event.payload.toolUseId ?? ''),
             questions: (event.payload.questions as PendingQuestion['questions']) ?? [],
+            ...(typeof event.payload.waitMs === 'number' ? { waitMs: event.payload.waitMs } : {}),
           });
         }
         // Auto-dismiss a stale question card only once the model's turn is

@@ -24,6 +24,7 @@ import {
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
+import { ASK_QUESTION_WAIT_MS } from '../../../shared/ask-question-timing.js';
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import logger from '../../util/logger.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
@@ -184,6 +185,10 @@ function parseRuntimeSubagentTag(line: string): Record<string, unknown> | null {
   }
 }
 
+type SdkPermissionResult =
+  | { behavior: 'allow'; updatedInput?: Record<string, unknown> }
+  | { behavior: 'deny'; message: string; interrupt?: boolean };
+
 export class ClaudeCodeSdkProvider implements TransportProvider {
   readonly id = 'claude-code-sdk';
   readonly connectionMode = CONNECTION_MODES.LOCAL_SDK;
@@ -216,6 +221,31 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
+  // AskUserQuestion: per-session pending canUseTool resolver. Lets the model
+  // PAUSE on the question until the user answers (resolve with their choice as a
+  // deny-message the model reads) or the wait window elapses (resolve allow →
+  // the model self-continues / picks its own answer).
+  private pendingQuestions = new Map<string, { settle: (r: SdkPermissionResult) => void; timer: ReturnType<typeof setTimeout> }>();
+
+  /**
+   * Resolve a paused AskUserQuestion with the user's answer so the model
+   * continues in the SAME turn. Returns false when there is no pending question
+   * (already answered, timed out, or the model self-continued) — the caller then
+   * delivers the answer as an ordinary (force-interrupt) message instead.
+   */
+  answerPendingQuestion(sessionId: string, answer: string): boolean {
+    const pending = this.pendingQuestions.get(sessionId);
+    if (!pending) return false;
+    pending.settle({ behavior: 'deny', message: answer, interrupt: false });
+    return true;
+  }
+
+  private clearPendingQuestion(sessionId: string): void {
+    const pending = this.pendingQuestions.get(sessionId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingQuestions.delete(sessionId);
+  }
 
   async connect(config: ProviderConfig): Promise<void> {
     const binaryPath = this.getConfiguredBinaryPath(config);
@@ -305,6 +335,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   }
 
   async endSession(sessionId: string): Promise<void> {
+    // Release any paused AskUserQuestion so a torn-down session never leaks a
+    // pending timer / unresolved canUseTool promise.
+    this.pendingQuestions.get(sessionId)?.settle({ behavior: 'allow' });
     const state = this.sessions.get(sessionId);
     if (state) {
       try { state.currentQuery?.close(); } catch {}
@@ -471,6 +504,36 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
         logger.error({ provider: this.id, err }, 'Claude SDK spawn error (suppressed)');
       });
       return child;
+    };
+
+    // ── Interactive AskUserQuestion: PAUSE the turn until answered ────────────
+    // The SDK awaits canUseTool before running a tool. For AskUserQuestion we
+    // return a promise that resolves only when the user answers (delivered as a
+    // deny-message the model reads as their choice → same-turn continue) or the
+    // wait window elapses (allow → the model self-continues / picks its own).
+    // Every other tool is allowed unchanged.
+    options.canUseTool = (toolName: string, input: Record<string, unknown>, opts: { signal?: AbortSignal }) => {
+      if (toolName !== 'AskUserQuestion') {
+        return Promise.resolve({ behavior: 'allow' as const, updatedInput: input });
+      }
+      return new Promise<SdkPermissionResult>((resolve) => {
+        this.clearPendingQuestion(sessionId); // drop any stale pending for this session
+        let settled = false;
+        const settle = (result: SdkPermissionResult) => {
+          if (settled) return;
+          settled = true;
+          this.clearPendingQuestion(sessionId);
+          resolve(result);
+        };
+        const timer = setTimeout(() => {
+          logger.info({ provider: this.id, sessionName: state.sessionName },
+            'claude-sdk.AskUserQuestion: wait window elapsed — letting the model self-continue');
+          settle({ behavior: 'allow', updatedInput: input });
+        }, ASK_QUESTION_WAIT_MS);
+        timer.unref?.();
+        this.pendingQuestions.set(sessionId, { settle, timer });
+        opts.signal?.addEventListener('abort', () => settle({ behavior: 'allow', updatedInput: input }), { once: true });
+      });
     };
 
     const q = query({ prompt, options: options as any });

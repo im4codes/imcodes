@@ -2716,6 +2716,9 @@ body {
 .ask-dialog-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 9999; padding: calc(var(--sat, 0px) + 16px) 16px calc(env(safe-area-inset-bottom, 0px) + 16px); }
 .ask-dialog { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; width: 100%; max-width: 480px; max-height: 100%; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 16px; }
 .ask-question-block { display: flex; flex-direction: column; gap: 8px; }
+.ask-status { font-size: 12px; font-weight: 600; border-radius: 8px; padding: 8px 10px; line-height: 1.4; }
+.ask-status-waiting { color: #fbbf24; background: rgba(251,191,36,0.10); border: 1px solid rgba(251,191,36,0.28); }
+.ask-status-retained { color: #94a3b8; background: rgba(148,163,184,0.10); border: 1px solid rgba(148,163,184,0.24); }
 .ask-header { font-size: 11px; font-weight: 600; color: #818cf8; text-transform: uppercase; letter-spacing: 0.05em; }
 .ask-question { font-size: 14px; color: #e2e8f0; line-height: 1.5; }
 .ask-options { display: flex; flex-direction: column; gap: 6px; }
