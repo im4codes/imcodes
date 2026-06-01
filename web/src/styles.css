@@ -321,7 +321,7 @@ body {
   background: rgba(2, 6, 23, 0.72);
   z-index: 4090;
 }
-.controls-input-with-trailing { padding-right: 42px; }
+.controls-input-with-trailing { padding-right: 50px; }
 .btn-input-expand {
   width: 28px;
   height: 28px;
@@ -794,9 +794,12 @@ body {
   }
   .btn-voice-embedded {
     right: 6px;
-    width: 30px;
-    height: 30px;
+    width: 38px;
+    height: 38px;
     padding: 0;
+    /* Remove the 300ms tap delay / double-tap zoom on touch so the press
+       registers immediately and is not mistaken for a gesture. */
+    touch-action: manipulation;
     display: inline-flex;
     align-items: center;
     justify-content: center;

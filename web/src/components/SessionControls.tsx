@@ -3829,6 +3829,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           {showEmbeddedVoiceButton && (
             <button
               class="btn btn-voice btn-voice-embedded"
+              // Open on pointerdown (fires synchronously at touch-start) so the
+              // tap is never lost to the ~300ms click delay or to a re-render
+              // unmounting this conditionally-rendered button mid-gesture (the
+              // timeline re-renders constantly while an agent streams).
+              // preventDefault stops the tap from falling through to focus the
+              // input. onClick is kept as an idempotent fallback.
+              onPointerDown={(e) => { e.preventDefault(); setVoiceOpen(true); }}
               onClick={() => setVoiceOpen(true)}
               disabled={inputDisabled}
               title={t('voice.voice_input')}
