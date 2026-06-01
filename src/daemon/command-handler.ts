@@ -10,6 +10,7 @@ import { routeMessage, type InboundMessage, type RouterContext } from '../router
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { emitTransportUserMessage as emitTransportUserMessageEvent } from './transport-relay.js';
 import { TimelinePreferredReadError, timelineStore } from './timeline-store.js';
 import {
   recordFsWorkerMetric,
@@ -5100,7 +5101,15 @@ async function handleAskAnswer(cmd: Record<string, unknown>, serverLink: ServerL
     const provider = record?.agentType ? getProvider(record.agentType) : undefined;
     const answerPending = (provider as { answerPendingQuestion?: (s: string, a: string) => boolean } | undefined)?.answerPendingQuestion;
     const answeredInPlace = typeof answerPending === 'function' && answerPending.call(provider, sessionName, answer) === true;
-    if (!answeredInPlace) {
+    if (answeredInPlace) {
+      // Resolved in place: the model continues in the SAME turn without a new
+      // user send, so handleSend's echo never fires. Emit the chosen answer as a
+      // user.message ourselves so the chat visibly records what the user picked
+      // (confirming the answer was received) and persists it across a refresh.
+      emitTransportUserMessageEvent(sessionName, answer);
+    } else {
+      // Timed out / already self-continued: deliver as an ordinary message,
+      // which echoes the answer through handleSend.
       await handleSend({ sessionName, text: answer }, serverLink);
     }
     return;
