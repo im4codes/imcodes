@@ -1323,11 +1323,25 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(askCalls[0][2].questions).toEqual([flat]);
     });
 
+    it('suppresses the tool_result of an answered AskUserQuestion (no stray error line)', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      // Card emitted for the completed call…
+      fireTool('sess-z', { id: 'tu-ans', name: 'AskUserQuestion', status: 'complete', input: askInput });
+      emitMock.mockClear();
+      // …then the SDK re-emits its tool_result as a generic name:'tool' event,
+      // marked error because the answer came via canUseTool deny.
+      fireTool('sess-z', { id: 'tu-ans', name: 'tool', status: 'error', output: '[H] A', detail: { kind: 'tool_result' } });
+
+      expect(emitMock).not.toHaveBeenCalled(); // suppressed — no "< error:" line
+    });
+
     it('still emits a normal tool.call for non-AskUserQuestion tools', () => {
       const { provider, fireTool } = makeMockProvider();
       wireProviderToRelay(provider);
 
-      fireTool('sess-a', { id: 'tu-4', name: 'Read', status: 'running', input: { file_path: '/x' } });
+      fireTool('sess-a', { id: 'tu-read', name: 'Read', status: 'running', input: { file_path: '/x' } });
 
       const askCalls = emitMock.mock.calls.filter((c) => c[1] === 'ask.question');
       const toolCalls = emitMock.mock.calls.filter((c) => c[1] === 'tool.call');

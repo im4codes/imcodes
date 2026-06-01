@@ -39,6 +39,11 @@ const pendingStreamUpdates = new Map<string, {
 const STREAM_UPDATE_INTERVAL_MS = 40;
 const pendingFileLikeTools = new Map<string, ToolCallEvent>();
 const completedFileLikeTools = new Set<string>();
+// `${sessionName}:${toolUseId}` of AskUserQuestion calls surfaced as ask.question
+// cards. Their tool_result (which the SDK re-emits as a generic name:'tool' event,
+// marked is_error when the answer came back via canUseTool deny) is suppressed so
+// it doesn't render as a stray "< error: <answer>" line in the timeline.
+const askQuestionToolIds = new Set<string>();
 const MAX_TRACKED_FILE_TOOLS = 512;
 
 function isCompactControlCompletion(message: AgentMessage): boolean {
@@ -304,6 +309,17 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     const sessionName = resolveSessionName(providerSid);
     if (!sessionName) return;
 
+    // Suppress the tool_result of an AskUserQuestion we already surfaced as a
+    // card. The SDK re-emits it as a generic name:'tool' event (is_error when the
+    // answer was delivered via canUseTool deny) — rendering it would show a
+    // confusing "< error: <answer>" line. The card + the model's continuation
+    // already convey the outcome.
+    const askResultKey = `${sessionName}:${tool.id}`;
+    if (tool.name !== 'AskUserQuestion' && askQuestionToolIds.has(askResultKey)) {
+      if (tool.status !== 'running') askQuestionToolIds.delete(askResultKey);
+      return;
+    }
+
     // AskUserQuestion is an interactive tool: surface it as an `ask.question`
     // event so the web renders the question/options dialog (same payload shape
     // the process/JSONL path emits) instead of a raw `> AskUserQuestion {...}`
@@ -320,6 +336,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
           ? askInput.questions
           : (askInput.question || askInput.options ? [askInput] : []);
         if (questions.length > 0) {
+          askQuestionToolIds.add(`${sessionName}:${tool.id}`);
           timelineEmitter.emit(sessionName, 'ask.question', {
             toolUseId: tool.id,
             questions,
