@@ -274,10 +274,12 @@ export function buildSdkSubagentSafeDetail(
   const inputRecord = isRecord(detail.input) ? detail.input : undefined;
   const action = sanitizeSdkSubagentText(inputRecord?.action, 80);
   const receiverCount = safeFiniteNumber(inputRecord?.receiverCount, SDK_SUBAGENT_MAX_CHILD_COUNT);
-  const safeInput = action !== undefined || receiverCount !== undefined
+  const description = sanitizeSdkSubagentText(inputRecord?.description, SDK_SUBAGENT_SAFE_TEXT_MAX_LENGTH);
+  const safeInput = action !== undefined || receiverCount !== undefined || description !== undefined
     ? {
         ...(action !== undefined ? { action } : {}),
         ...(receiverCount !== undefined ? { receiverCount } : {}),
+        ...(description !== undefined ? { description } : {}),
       }
     : undefined;
   return {

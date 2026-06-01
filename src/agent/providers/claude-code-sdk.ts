@@ -99,6 +99,7 @@ interface ClaudeSdkSessionState {
   pendingComplete?: AgentMessage;
   pendingError?: ProviderError;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
+  runtimeAgentToolCalls: Map<string, { canonicalKey: string; agentPath: string; agentName?: string; prompt?: string }>;
   emittedToolStates: Map<string, string>;
   subagentTasks: Map<string, ClaudeTaskState>;
   emittedSubagentStates: Map<string, string>;
@@ -292,6 +293,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       rateLimits: existing?.rateLimits,
       pendingComplete: undefined,
       toolCalls: new Map(),
+      runtimeAgentToolCalls: new Map(),
       emittedToolStates: new Map(),
       subagentTasks: existing?.subagentTasks ?? new Map(),
       emittedSubagentStates: new Map(),
@@ -413,6 +415,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     state.pendingComplete = undefined;
     state.pendingError = undefined;
     state.toolCalls.clear();
+    state.runtimeAgentToolCalls.clear();
     state.emittedToolStates.clear();
     state.emittedSubagentStates.clear();
     state.lastStatusSignature = null;
@@ -594,6 +597,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
         const tool = this.normalizeToolCall(event.content_block);
         state.toolCalls.set(event.index, { ...tool, partialInputJson: undefined });
         this.emitToolCall(sessionId, state, tool);
+        this.emitClaudeRuntimeSubagentFromAgentTool(sessionId, state, tool, 'running');
         return;
       }
       if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && typeof event.delta.text === 'string') {
@@ -665,7 +669,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       if (Array.isArray(msg.message.content)) {
         for (const block of msg.message.content) {
           if (this.isToolBlock(block)) {
-            this.emitToolCall(sessionId, state, this.normalizeToolCall(block));
+            const tool = this.normalizeToolCall(block);
+            this.emitToolCall(sessionId, state, tool);
+            this.emitClaudeRuntimeSubagentFromAgentTool(sessionId, state, tool, 'running');
           }
         }
       }
@@ -707,6 +713,16 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
           : typeof block.content === 'string'
             ? block.content
             : undefined;
+        this.emitClaudeRuntimeSubagentFromAgentTool(
+          sessionId,
+          state,
+          {
+            id: block.tool_use_id,
+            name: 'Agent',
+            ...(output ? { output } : {}),
+          },
+          block.is_error ? 'error' : 'complete',
+        );
         this.emitToolCall(sessionId, state, {
           id: block.tool_use_id,
           name: 'tool',
@@ -847,16 +863,19 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     const rawAgentPath = this.readRuntimeSubagentId(record);
     const fallbackId = this.pickString(payload.subtype) ?? this.pickString(payload.type) ?? 'notification-missing-id';
     const agentPath = rawAgentPath ?? fallbackId;
-    const rawStatus = this.readRuntimeSubagentStatus(record) ?? 'unknown';
+    const statusInfo = this.readRuntimeSubagentStatusInfo(record);
+    const rawStatus = statusInfo.status ?? 'unknown';
     const missingIdDiagnostic = rawAgentPath ? undefined : SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID;
     const statusMapping = this.normalizeClaudeRuntimeSubagentStatus(rawStatus, missingIdDiagnostic);
     const canonicalKey = makeClaudeSubagentCanonicalKey(this.subagentSessionKey(sessionId, state), `runtime:${agentPath}`);
     const agentName = this.readRuntimeSubagentName(record);
+    const prompt = this.readRuntimeSubagentPrompt(record);
     const summary = agentName ? `Claude sub-agent ${agentName}` : rawAgentPath ? `Claude sub-agent ${rawAgentPath}` : 'Claude sub-agent';
     const detail = buildSdkSubagentSafeDetail({
       kind: SDK_SUBAGENT_DETAIL_KIND,
       summary,
-      ...(statusMapping.terminal ? { output: rawStatus } : {}),
+      ...(prompt ? { input: { action: 'claude-runtime-subagent', description: prompt } } : {}),
+      ...(statusMapping.terminal ? { output: statusInfo.message ?? rawStatus } : {}),
       meta: {
         isSdkSubagent: true,
         schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
@@ -928,6 +947,32 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       ?? this.pickString(record.state)
       ?? this.pickString(record.lifecycleStatus)
       ?? this.pickString(record.lifecycle_status);
+  }
+
+  private readRuntimeSubagentStatusInfo(record: Record<string, unknown>): { status?: string; message?: string } {
+    const direct = this.readRuntimeSubagentStatus(record);
+    if (direct) return { status: direct };
+    const statusRecord = this.asRecord(record.status) ?? this.asRecord(record.state);
+    if (!statusRecord) return {};
+    const nested = this.pickString(statusRecord.status)
+      ?? this.pickString(statusRecord.state)
+      ?? this.pickString(statusRecord.lifecycleStatus)
+      ?? this.pickString(statusRecord.lifecycle_status);
+    if (nested) return { status: nested };
+    for (const key of ['completed', 'complete', 'shutdown', 'running', 'pending', 'failed', 'error', 'interrupted', 'cancelled', 'canceled', 'stopped', 'killed']) {
+      if (key in statusRecord) {
+        return { status: key, message: this.pickShortString(statusRecord[key]) };
+      }
+    }
+    return {};
+  }
+
+  private readRuntimeSubagentPrompt(record: Record<string, unknown>): string | undefined {
+    return this.pickShortString(record.prompt)
+      ?? this.pickShortString(record.description)
+      ?? this.pickShortString(record.instruction)
+      ?? this.pickShortString(record.instructions)
+      ?? this.pickShortString(record.message);
   }
 
   private normalizeClaudeRuntimeSubagentStatus(
@@ -1045,6 +1090,72 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     };
   }
 
+  private emitClaudeRuntimeSubagentFromAgentTool(
+    sessionId: string,
+    state: ClaudeSdkSessionState,
+    tool: Pick<ToolCallEvent, 'id' | 'name' | 'input' | 'output'>,
+    status: 'running' | 'complete' | 'error',
+  ): void {
+    if (tool.name !== 'Agent' && tool.name !== 'Task') return;
+    const input = this.asRecord(tool.input);
+    const existing = state.runtimeAgentToolCalls.get(tool.id);
+    if (!existing && status !== 'running') return;
+    const agentPath = existing?.agentPath ?? tool.id;
+    const prompt = existing?.prompt ?? this.readRuntimeSubagentPrompt(input ?? {});
+    const agentName = existing?.agentName
+      ?? this.pickShortString(input?.subagent_type)
+      ?? this.pickShortString(input?.agent_type)
+      ?? this.pickShortString(input?.type)
+      ?? this.pickShortString(input?.name);
+    const canonicalKey = existing?.canonicalKey
+      ?? makeClaudeSubagentCanonicalKey(this.subagentSessionKey(sessionId, state), `runtime:${agentPath}`);
+    if (status === 'running' && !existing) {
+      state.runtimeAgentToolCalls.set(tool.id, {
+        canonicalKey,
+        agentPath,
+        ...(agentName ? { agentName } : {}),
+        ...(prompt ? { prompt } : {}),
+      });
+    }
+    const rawStatus = status === 'running' ? 'running' : status === 'complete' ? 'completed' : 'failed';
+    const output = status === 'running' ? undefined : sanitizeSdkSubagentText(tool.output) ?? rawStatus;
+    const detail = buildSdkSubagentSafeDetail({
+      kind: SDK_SUBAGENT_DETAIL_KIND,
+      summary: agentName ? `Claude sub-agent ${agentName}` : `Claude sub-agent ${agentPath}`,
+      ...(prompt ? { input: { action: 'claude-agent-tool', description: prompt } } : {}),
+      ...(output ? { output } : {}),
+      meta: {
+        isSdkSubagent: true,
+        schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+        provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT,
+        canonicalKey,
+        normalizedStatus: status === 'running'
+          ? SDK_SUBAGENT_STATUS.RUNNING
+          : status === 'complete'
+            ? SDK_SUBAGENT_STATUS.COMPLETE
+            : SDK_SUBAGENT_STATUS.ERROR,
+        rawStatus,
+        active: status === 'running',
+        terminal: status !== 'running',
+        parentSessionId: state.resumeId,
+        parentToolUseId: tool.id,
+        parentItemId: tool.id,
+        agentPath,
+        ...(agentName ? { agentName } : {}),
+      },
+    } satisfies SdkSubagentDetail, { allowRaw: false });
+    this.emitSubagentToolCall(sessionId, state, {
+      id: canonicalKey,
+      name: 'Agent',
+      status: status === 'running' ? 'running' : status === 'complete' ? 'complete' : 'error',
+      ...(detail.input ? { input: detail.input } : {}),
+      ...(detail.output ? { output: detail.output } : {}),
+      detail,
+    });
+    if (status !== 'running') state.runtimeAgentToolCalls.delete(tool.id);
+  }
+
   private applyClaudeTaskStatus(task: ClaudeTaskState, rawStatus: string | undefined): void {
     if (!rawStatus) return;
     const { normalizedStatus, terminal, diagnosticCode } = this.normalizeClaudeTaskStatus(rawStatus);
@@ -1117,6 +1228,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     const detail = buildSdkSubagentSafeDetail({
       kind: SDK_SUBAGENT_DETAIL_KIND,
       summary,
+      ...(task.description ? { input: { action: 'claude-task', description: task.description } } : {}),
       ...(task.terminal ? { output: task.error ?? task.summary } : {}),
       meta,
     }, { allowRaw: false });

@@ -677,7 +677,7 @@ describe('CodexSdkProvider', () => {
     });
   });
 
-  it('keeps full Codex child prompts out of collaboration tool input and summaries', async () => {
+  it('surfaces bounded Codex child prompts for collaboration rows without raw payloads', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-collab-prompt-safe', cwd: '/tmp/project' });
@@ -704,17 +704,19 @@ describe('CodexSdkProvider', () => {
 
     expect(tools).toHaveLength(1);
     const detail = expectCodexSubagentDetail(tools[0]!);
-    const visiblePayload = JSON.stringify({
-      input: tools[0]!.input,
-      summary: detail.summary,
-      detailInput: detail.input,
-      raw: detail.raw,
-    });
-    expect(visiblePayload).not.toContain(sensitivePrompt);
     expect(tools[0]!.input).toMatchObject({
       action: 'codex-collaboration',
       receiverCount: 1,
+      description: sensitivePrompt,
     });
+    expect(detail).toMatchObject({
+      input: {
+        action: 'codex-collaboration',
+        receiverCount: 1,
+        description: sensitivePrompt,
+      },
+    });
+    expect(detail.raw).toBeUndefined();
   });
 
   it('emits SDK sub-agent snapshots for Codex runtime subagent notifications', async () => {
@@ -734,6 +736,7 @@ describe('CodexSdkProvider', () => {
         agent_path: '019e7f1c-4e8c-7180-ae0d-577b994c9473',
         status: 'running',
         name: 'Jason',
+        prompt: 'Coordinate the worker handoff',
       },
     });
     child.emits({
@@ -742,7 +745,7 @@ describe('CodexSdkProvider', () => {
         threadId: 'thread-1',
         subagent: {
           agentPath: '019e7f1c-4e8c-7180-ae0d-577b994c9473',
-          status: 'shutdown',
+          status: { completed: 'Completed the worker handoff.' },
           nickname: 'Jason',
         },
       },
@@ -759,10 +762,14 @@ describe('CodexSdkProvider', () => {
       id: expectedKey,
       name: 'Codex Sub-agent',
       status: 'running',
-      input: { action: 'codex-runtime-subagent' },
+      input: { action: 'codex-runtime-subagent', description: 'Coordinate the worker handoff' },
     });
     const runningDetail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
     expect(runningDetail.summary).toBe('Codex sub-agent Jason');
+    expect(runningDetail.input).toMatchObject({
+      action: 'codex-runtime-subagent',
+      description: 'Coordinate the worker handoff',
+    });
     expect(runningDetail.meta).toMatchObject({
       canonicalKey: expectedKey,
       parentItemId: expectedKey,
@@ -779,12 +786,13 @@ describe('CodexSdkProvider', () => {
       id: expectedKey,
       name: 'Codex Sub-agent',
       status: 'complete',
-      output: 'shutdown',
+      output: 'Completed the worker handoff.',
     });
     const shutdownDetail = expectCodexSubagentDetail(tools[1]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(shutdownDetail.output).toBe('Completed the worker handoff.');
     expect(shutdownDetail.meta).toMatchObject({
       canonicalKey: expectedKey,
-      rawStatus: 'shutdown',
+      rawStatus: 'completed',
       normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
       active: false,
       terminal: true,

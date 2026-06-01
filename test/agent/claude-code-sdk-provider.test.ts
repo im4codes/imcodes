@@ -825,9 +825,17 @@ describe('ClaudeCodeSdkProvider', () => {
       id: canonicalKey,
       name: 'Agent',
       status: 'running',
+      input: {
+        action: 'claude-task',
+        description: 'Investigate the failing tests',
+      },
       detail: {
         kind: SDK_SUBAGENT_DETAIL_KIND,
         summary: 'Claude task',
+        input: {
+          action: 'claude-task',
+          description: 'Investigate the failing tests',
+        },
         meta: {
           provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
           providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
@@ -840,8 +848,6 @@ describe('ClaudeCodeSdkProvider', () => {
         },
       },
     });
-    expect(tool?.input).toBeUndefined();
-    expect(JSON.stringify(tool?.detail)).not.toContain('Investigate the failing tests');
     expect(JSON.stringify(tool?.input ?? null)).not.toContain(prompt);
     expect(tool?.detail?.raw).toBeUndefined();
   });
@@ -858,6 +864,7 @@ describe('ClaudeCodeSdkProvider', () => {
         agent_path: agentPath,
         status: 'running',
         name: 'Hooke',
+        prompt: 'Wait for the read-only sync worker',
       },
       {
         type: 'system',
@@ -865,7 +872,7 @@ describe('ClaudeCodeSdkProvider', () => {
         session_id: 'session-route-subagent-runtime',
         subagent: {
           agentPath: agentPath,
-          status: 'shutdown',
+          status: { completed: 'Completed the read-only sync wait. No files modified.' },
           nickname: 'Hooke',
         },
       },
@@ -879,9 +886,17 @@ describe('ClaudeCodeSdkProvider', () => {
       id: canonicalKey,
       name: 'Agent',
       status: 'running',
+      input: {
+        action: 'claude-runtime-subagent',
+        description: 'Wait for the read-only sync worker',
+      },
       detail: {
         kind: SDK_SUBAGENT_DETAIL_KIND,
         summary: 'Claude sub-agent Hooke',
+        input: {
+          action: 'claude-runtime-subagent',
+          description: 'Wait for the read-only sync worker',
+        },
         meta: {
           provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
           providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT,
@@ -899,12 +914,13 @@ describe('ClaudeCodeSdkProvider', () => {
       id: canonicalKey,
       name: 'Agent',
       status: 'complete',
-      output: 'shutdown',
+      output: 'Completed the read-only sync wait. No files modified.',
       detail: {
+        output: 'Completed the read-only sync wait. No files modified.',
         meta: {
           providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT,
           canonicalKey,
-          rawStatus: 'shutdown',
+          rawStatus: 'completed',
           normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
           active: false,
           terminal: true,
@@ -1085,12 +1101,18 @@ describe('ClaudeCodeSdkProvider', () => {
     ], 'route-subagent-update', sessionName);
 
     const subagents = sdkSubagentTools(tools);
-    expect(subagents).toHaveLength(1);
+    expect(subagents).toHaveLength(2);
     expect(new Set(subagents.map((tool) => tool.id))).toEqual(new Set([makeClaudeSubagentCanonicalKey(sessionName, 'task-update-1')]));
     expect(subagents[0]?.detail).toMatchObject({
       meta: { parentToolUseId: 'tool-use-update-original' },
     });
-    expect(JSON.stringify(subagents[0]?.detail)).not.toContain('Inspect implementation and tests');
+    expect(subagents.at(-1)?.detail).toMatchObject({
+      input: {
+        action: 'claude-task',
+        description: 'Inspect implementation and tests',
+      },
+      meta: { parentToolUseId: 'tool-use-update-original' },
+    });
   });
 
   it('emits a terminal complete SDK subagent snapshot for Claude task_notification completed', async () => {
@@ -1345,14 +1367,39 @@ describe('ClaudeCodeSdkProvider', () => {
     ], 'route-subagent-generic-agent', sessionName);
 
     const genericAgent = tools.find((tool) => tool.id === 'tool-agent-generic');
-    const [subagent] = sdkSubagentTools(tools);
+    const subagents = sdkSubagentTools(tools);
+    const runtimeAgent = subagents.find((tool) => tool.id === makeClaudeSubagentCanonicalKey(sessionName, 'runtime:tool-agent-generic'));
+    const structuredTask = subagents.find((tool) => tool.id === makeClaudeSubagentCanonicalKey(sessionName, 'task-generic-agent'));
     expect(genericAgent).toMatchObject({
       id: 'tool-agent-generic',
       name: 'Agent',
       status: 'running',
       detail: { kind: 'tool_use' },
     });
-    expect(subagent).toMatchObject({
+    expect(runtimeAgent).toMatchObject({
+      id: makeClaudeSubagentCanonicalKey(sessionName, 'runtime:tool-agent-generic'),
+      status: 'running',
+      input: {
+        action: 'claude-agent-tool',
+        description: 'Legacy Agent tool',
+      },
+      detail: {
+        kind: SDK_SUBAGENT_DETAIL_KIND,
+        input: {
+          action: 'claude-agent-tool',
+          description: 'Legacy Agent tool',
+        },
+        meta: {
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT,
+          agentPath: 'tool-agent-generic',
+          parentToolUseId: 'tool-agent-generic',
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          active: true,
+          terminal: false,
+        },
+      },
+    });
+    expect(structuredTask).toMatchObject({
       id: makeClaudeSubagentCanonicalKey(sessionName, 'task-generic-agent'),
       detail: {
         kind: SDK_SUBAGENT_DETAIL_KIND,

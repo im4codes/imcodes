@@ -685,6 +685,29 @@ function readRuntimeSubagentStatus(record: Record<string, any>): string | undefi
     ?? meaningfulString(record.lifecycle_status);
 }
 
+function readRuntimeSubagentStatusInfo(record: Record<string, any>): { status?: string; message?: string } {
+  const direct = readRuntimeSubagentStatus(record);
+  if (direct) return { status: direct };
+  const statusRecord = isRecord(record.status) ? record.status : isRecord(record.state) ? record.state : undefined;
+  if (!statusRecord) return {};
+  const nested = readRuntimeSubagentStatus(statusRecord);
+  if (nested) return { status: nested };
+  for (const key of ['completed', 'complete', 'shutdown', 'running', 'pending', 'failed', 'error', 'interrupted', 'cancelled', 'canceled', 'stopped', 'killed']) {
+    if (key in statusRecord) {
+      return { status: key, message: meaningfulString(statusRecord[key]) };
+    }
+  }
+  return {};
+}
+
+function readRuntimeSubagentPrompt(record: Record<string, any>): string | undefined {
+  return meaningfulString(record.prompt)
+    ?? meaningfulString(record.description)
+    ?? meaningfulString(record.instruction)
+    ?? meaningfulString(record.instructions)
+    ?? meaningfulString(record.message);
+}
+
 function mapCodexRuntimeSubagentStatus(
   rawStatus: string,
   diagnosticCode: SdkSubagentDiagnosticCode | undefined,
@@ -797,7 +820,8 @@ function runtimeSubagentToolFromPayload(
   const rawAgentPath = readRuntimeSubagentId(record);
   const fallbackId = lifecycle ? `${lifecycle}-missing-id` : 'notification-missing-id';
   const agentPath = rawAgentPath ?? fallbackId;
-  const rawStatus = readRuntimeSubagentStatus(record)
+  const statusInfo = readRuntimeSubagentStatusInfo(record);
+  const rawStatus = statusInfo.status
     ?? (lifecycle === 'started' ? 'running' : lifecycle === 'completed' ? 'shutdown' : undefined);
   const diagnosticCode = rawAgentPath
     ? (rawStatus ? undefined : SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE)
@@ -805,14 +829,15 @@ function runtimeSubagentToolFromPayload(
   const statusMapping = mapCodexRuntimeSubagentStatus(rawStatus ?? 'unknown', diagnosticCode);
   const canonicalKey = makeCodexSubagentCanonicalKey(sessionId, `runtime:${agentPath}`);
   const agentName = readRuntimeSubagentName(record);
+  const prompt = readRuntimeSubagentPrompt(record);
   const summary = agentName ? `Codex sub-agent ${agentName}` : rawAgentPath ? `Codex sub-agent ${rawAgentPath}` : 'Codex sub-agent';
-  const output = statusMapping.terminal ? (rawStatus ?? 'unknown') : undefined;
+  const output = statusMapping.terminal ? (statusInfo.message ?? rawStatus ?? 'unknown') : undefined;
   const detail = buildSdkSubagentSafeDetail({
     kind: SDK_SUBAGENT_DETAIL_KIND,
     summary,
     input: {
       action: 'codex-runtime-subagent',
-      description: summary,
+      description: prompt ?? summary,
     },
     ...(output ? { output } : {}),
     meta: {
@@ -880,6 +905,7 @@ function collabAgentToolFromItem(
   const summary = statusMapping.diagnosticCode
     ? `Codex collaboration diagnostic (${receiverLabel})`
     : `Codex collaboration agent (${receiverLabel})`;
+  const prompt = readRuntimeSubagentPrompt(item);
   const output = statusMapping.toolStatus === 'complete'
     ? 'completed'
     : statusMapping.toolStatus === 'error'
@@ -891,7 +917,7 @@ function collabAgentToolFromItem(
     input: {
       action: 'codex-collaboration',
       receiverCount,
-      description: summary,
+      description: prompt ?? summary,
     },
     ...(output ? { output } : {}),
     meta: {

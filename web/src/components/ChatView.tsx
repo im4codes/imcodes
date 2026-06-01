@@ -1016,8 +1016,10 @@ function sdkAgentsDiagnosticLabel(t: ChatTranslate, diagnostic: SdkSubagentDiagn
 
 function sdkAgentsRowSummary(row: SdkSubagentStatusRow): string {
   return row.summary
+    || row.agentName
     || row.childStatusSummary
     || row.rawStatus
+    || row.agentPath
     || row.receiverThreadId
     || row.taskId
     || row.parentItemId
@@ -1045,6 +1047,32 @@ function sdkAgentsStatusClass(status: SdkSubagentStatusRow['normalizedStatus'] |
     default:
       return 'unknown';
   }
+}
+
+function SdkAgentsGlyph() {
+  return (
+    <svg
+      class="chat-sdk-agents-glyph"
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M12 7.5v3.2" />
+      <path d="M7.7 14.2l2.8-2" />
+      <path d="M16.3 14.2l-2.8-2" />
+      <circle cx="12" cy="5.2" r="2.4" />
+      <circle cx="5.8" cy="16" r="2.4" />
+      <circle cx="18.2" cy="16" r="2.4" />
+      <path d="M9.1 20.4h5.8" />
+    </svg>
+  );
 }
 
 function hasSdkSubagentTimelineEvent(events: readonly TimelineEvent[]): boolean {
@@ -1129,6 +1157,24 @@ function SdkAgentsRow({ row }: { row: SdkSubagentStatusRow }) {
         <span class="chat-sdk-agent-status">{statusLabel}</span>
       </div>
       <div class="chat-sdk-agent-summary">{summary}</div>
+      {(row.agentPath || row.taskId || row.parentItemId) && (
+        <div class="chat-sdk-agent-detail">
+          <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_id')}</span>
+          <span class="chat-sdk-agent-detail-value">{row.agentPath || row.taskId || row.parentItemId}</span>
+        </div>
+      )}
+      {row.description && (
+        <div class="chat-sdk-agent-detail">
+          <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_prompt')}</span>
+          <span class="chat-sdk-agent-detail-value">{row.description}</span>
+        </div>
+      )}
+      {row.output && row.terminal && (
+        <div class="chat-sdk-agent-detail">
+          <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_result')}</span>
+          <span class="chat-sdk-agent-detail-value">{row.output}</span>
+        </div>
+      )}
       <div class="chat-sdk-agent-meta">
         {row.active && typeof row.runningChildCount === 'number' && (
           <span>{t('chat.sdk_agents_running_children', { count: row.runningChildCount })}</span>
@@ -2273,7 +2319,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               aria-label={t('chat.sdk_agents_toggle_aria', { count: sdkAgentsStatus.runningCount })}
               aria-expanded={showAgentsPane}
             >
-              <span class="chat-sdk-agents-toggle-label">{t('chat.sdk_agents_toggle')}</span>
+              <SdkAgentsGlyph />
               {sdkAgentsStatus.runningCount > 0 && (
                 <span class="chat-sdk-agents-badge" aria-label={t('chat.sdk_agents_badge_aria', { count: sdkAgentsStatus.runningCount })}>
                   {sdkAgentsStatus.runningCount}

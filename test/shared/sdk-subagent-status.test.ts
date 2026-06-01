@@ -49,7 +49,7 @@ describe('sdk-subagent-status shared contract', () => {
     expect(parseSdkSubagentDetail(detail)).toEqual({ kind: 'malformed-sdk', reason: 'provider' });
   });
 
-  it('sanitizes safe details by stripping prompt-like fields and normal raw payloads', () => {
+  it('sanitizes safe details by bounding prompt-like display fields and stripping normal raw payloads', () => {
     const detail = makeDetail({
       summary: 'Safe summary',
       input: { action: 'diagnostic', description: 'SECRET child prompt' },
@@ -71,9 +71,8 @@ describe('sdk-subagent-status shared contract', () => {
     const safe = buildSdkSubagentSafeDetail(detail);
 
     expect(safe.raw).toBeUndefined();
-    expect(JSON.stringify(safe)).not.toContain('SECRET');
     expect(JSON.stringify(safe)).not.toContain('token leaked');
-    expect(safe.input).toEqual({ action: 'diagnostic' });
+    expect(safe.input).toEqual({ action: 'diagnostic', description: 'SECRET child prompt' });
     expect(safe.meta.agentPath).toBe('019e7f1c-4e8c-7180-ae0d-577b994c9473');
     expect(safe.meta.agentName).toBe('Jason');
     expect(safe.meta.childStatusSummary).toBe('running:1');

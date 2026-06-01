@@ -39,6 +39,9 @@ vi.mock('react-i18next', () => ({
         'chat.sdk_agents_status_running': 'Running',
         'chat.sdk_agents_status_complete': 'Complete',
         'chat.sdk_agents_status_unknown': 'Unknown',
+        'chat.sdk_agents_id': 'ID',
+        'chat.sdk_agents_prompt': 'Prompt',
+        'chat.sdk_agents_result': 'Result',
         'chat.sdk_agents_running_children': '{{count}} child running',
         'chat.sdk_agents_receiver_count': '{{count}} receivers',
         'chat.sdk_agents_diagnostic_unknown_state': 'Unknown provider state',
@@ -141,7 +144,8 @@ describe('ChatView SDK agents panel', () => {
     expect(actions).toBeTruthy();
     const agentsButton = actions?.querySelector('.chat-sdk-agents-toggle');
     const refreshButton = actions?.querySelector('.chat-sync-btn');
-    expect(agentsButton?.textContent).toContain('Agents');
+    expect(agentsButton?.querySelector('.chat-sdk-agents-glyph')).toBeTruthy();
+    expect(agentsButton?.textContent).not.toContain('Agents');
     expect(agentsButton?.textContent).toContain('1');
     expect(refreshButton?.getAttribute('aria-label')).toBe('Sync chat history');
     expect(Array.from(actions?.children ?? []).indexOf(agentsButton as Element))
@@ -196,6 +200,34 @@ describe('ChatView SDK agents panel', () => {
     expect(document.body.textContent).not.toContain('SECRET_FULL_CHILD_PROMPT');
     expect(document.body.textContent).not.toContain('RAW_PROVIDER_PAYLOAD');
     expect(document.body.textContent).not.toContain('OUTPUT_FILE');
+  });
+
+  it('renders agent id, prompt, and terminal result details', () => {
+    const event = makeSdkEvent(
+      'agent-complete-details',
+      makeMeta({
+        canonicalKey: 'claude:deck_agents:runtime:019e80d8',
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+        agentPath: '019e80d8-44f2-7412-b703-b4ddde653d7f',
+      }),
+      {
+        summary: 'Hume',
+        input: { action: 'claude-runtime-subagent', description: 'Check sync status and report back' },
+        output: 'Completed the read-only sync wait.',
+      },
+    );
+    render(<ChatView events={[event]} loading={false} sessionId="deck_agents" />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }));
+
+    expect(screen.getByText('ID')).toBeTruthy();
+    expect(screen.getByText('019e80d8-44f2-7412-b703-b4ddde653d7f')).toBeTruthy();
+    expect(screen.getByText('Prompt')).toBeTruthy();
+    expect(screen.getByText('Check sync status and report back')).toBeTruthy();
+    expect(screen.getByText('Result')).toBeTruthy();
+    expect(screen.getByText('Completed the read-only sync wait.')).toBeTruthy();
   });
 
   it('prefers safe provider summaries and hides terminal running-child counts', () => {

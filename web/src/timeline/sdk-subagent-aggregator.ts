@@ -29,10 +29,14 @@ export interface SdkSubagentStatusRow {
   normalizedStatus: SdkSubagentNormalizedStatus;
   rawStatus?: string;
   summary?: string;
+  description?: string;
+  output?: string;
   active: boolean;
   terminal: boolean;
   parentItemId?: string;
   parentToolUseId?: string;
+  agentPath?: string;
+  agentName?: string;
   taskId?: string;
   receiverThreadId?: string;
   receiverIndex?: number;
@@ -52,6 +56,8 @@ export interface SdkSubagentDiagnostic {
   normalizedStatus?: SdkSubagentNormalizedStatus;
   rawStatus?: string;
   summary?: string;
+  description?: string;
+  output?: string;
   diagnosticCode: SdkSubagentDiagnosticCode;
   childStatusSummary?: string;
 }
@@ -146,6 +152,8 @@ function makeDiagnosticFromDetail(
     normalizedStatus: meta.normalizedStatus,
     rawStatus: meta.rawStatus,
     summary: detail.summary,
+    description: detail.input?.description,
+    output: detail.output,
     diagnosticCode: meta.diagnosticCode ?? fallbackCode,
     childStatusSummary: meta.childStatusSummary,
     firstOrder: order,
@@ -172,10 +180,14 @@ function makeRow(event: TimelineEvent, detail: SdkSubagentDetail, order: number)
     normalizedStatus: meta.normalizedStatus,
     rawStatus: meta.rawStatus,
     summary: detail.summary,
+    description: detail.input?.description,
+    output: detail.output,
     active,
     terminal,
     parentItemId: meta.parentItemId,
     parentToolUseId: meta.parentToolUseId,
+    agentPath: meta.agentPath,
+    agentName: meta.agentName,
     taskId: meta.taskId,
     receiverThreadId: meta.receiverThreadId,
     receiverIndex: meta.receiverIndex,
@@ -264,6 +276,20 @@ function getRunningContribution(row: SdkSubagentStatusRow): number {
   return 1;
 }
 
+function suppressClaudeRuntimeFallbackRows(rows: RowState[]): RowState[] {
+  const structuredToolUseIds = new Set(
+    rows
+      .filter((row) => row.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK && row.parentToolUseId)
+      .map((row) => row.parentToolUseId as string),
+  );
+  if (structuredToolUseIds.size === 0) return rows;
+  return rows.filter((row) => {
+    if (row.providerKind !== SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT) return true;
+    const toolUseId = row.parentToolUseId ?? row.parentItemId;
+    return !toolUseId || !structuredToolUseIds.has(toolUseId);
+  });
+}
+
 export function deriveSdkSubagentStatusRows(
   events: TimelineEvent[],
   now: number,
@@ -332,11 +358,13 @@ export function deriveSdkSubagentStatusRows(
     rowsByCanonicalKey.set(canonicalKey, staleRowAfterFinish(row, finish));
   }
 
-  const activeRows = Array.from(rowsByCanonicalKey.values())
+  const rowStates = suppressClaudeRuntimeFallbackRows(Array.from(rowsByCanonicalKey.values()));
+
+  const activeRows = rowStates
     .filter((row) => row.active && !isTerminalish(row))
     .sort(activeRowSort);
 
-  const terminalRows = Array.from(rowsByCanonicalKey.values())
+  const terminalRows = rowStates
     .filter((row) => !row.active || isTerminalish(row))
     .filter((row) => isRetained(row.ts, now, terminalTtlMs))
     .sort(terminalRowSort);

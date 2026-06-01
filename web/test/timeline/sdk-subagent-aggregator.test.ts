@@ -119,6 +119,37 @@ describe('deriveSdkSubagentStatusRows', () => {
     });
   });
 
+  it('suppresses Claude runtime Agent fallback rows when a structured task row shares the tool id', () => {
+    const runtimeFallback = makeEvent('runtime-agent', makeMeta({
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT,
+      canonicalKey: 'claude:deck_main_brain:runtime:tool-agent-1',
+      parentToolUseId: 'tool-agent-1',
+      agentPath: 'tool-agent-1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    }), { ts: NOW - 2_000 });
+    const structuredTask = makeEvent('structured-task', makeMeta({
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+      canonicalKey: 'claude:deck_main_brain:task-1',
+      parentToolUseId: 'tool-agent-1',
+      taskId: 'task-1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    }), { ts: NOW - 1_000 });
+
+    const result = deriveSdkSubagentStatusRows([runtimeFallback, structuredTask], NOW);
+
+    expect(result.runningCount).toBe(1);
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).toMatchObject({
+      canonicalKey: 'claude:deck_main_brain:task-1',
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+      parentToolUseId: 'tool-agent-1',
+    });
+  });
+
   it('retains only recent terminal stale rows and diagnostics, capped together', () => {
     const terminalEvents = Array.from({ length: 5 }, (_, index) => makeEvent(`terminal-${index}`, makeMeta({
       canonicalKey: `claude:deck_main_brain:task-${index}`,
