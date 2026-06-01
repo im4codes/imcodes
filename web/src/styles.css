@@ -1315,6 +1315,9 @@ body {
 .chat-sdk-agents-toggle { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-width: 28px; min-height: 24px; padding: 3px 6px; color: #8b9dc7; }
 .chat-sdk-agents-glyph { width: 16px; height: 16px; flex: 0 0 auto; }
 .chat-sdk-agents-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px; background: #16a34a; color: #ecfdf5; font-size: 10px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; box-shadow: 0 0 0 1px rgba(187,247,208,0.18); }
+/* No agents running: keep the count visible (0) but mute it so the green badge
+   isn't mistaken for "running". The toggle's own .active frame shows open/closed. */
+.chat-sdk-agents-badge-zero { background: #334155; color: #94a3b8; box-shadow: 0 0 0 1px rgba(148,163,184,0.16); }
 .chat-sync-btn[disabled] { opacity: .55; cursor: default; }
 .chat-sync-btn.spinning { animation: chat-spinner-rotate 0.8s linear infinite; }
 .chat-panel-toggle:hover, .chat-panel-toggle.active { color: #818cf8; border-color: #6366f1; }

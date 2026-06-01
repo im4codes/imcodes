@@ -910,7 +910,11 @@ function useTouchChatGestures(): boolean {
 const LONG_PRESS_MS = 400;
 const panelWidthKey = (id: string | null | undefined) => `chatFilePanelWidth:${id ?? '_'}`;
 const panelOpenKey  = (id: string | null | undefined) => `chatFilePanelOpen:${id ?? '_'}`;
-const agentsPanelOpenKey = (id: string | null | undefined) => `chatSdkAgentsPanelOpen:${id ?? '_'}`;
+// SDK agents panel toggle is a GLOBAL switch (one for every chat window), synced
+// live across all open ChatView instances + browser tabs. Default OPEN until the
+// user closes it — only an explicit '0' counts as closed.
+const SDK_AGENTS_OPEN_KEY = 'chatSdkAgentsPanelOpen';
+const SDK_AGENTS_OPEN_EVENT = 'deck:sdk-agents-panel-open-changed';
 
 function readPanelWidth(id: string | null | undefined): number {
   try { return parseInt(localStorage.getItem(panelWidthKey(id)) ?? String(FILE_PANEL_DEFAULT), 10); } catch { return FILE_PANEL_DEFAULT; }
@@ -918,8 +922,13 @@ function readPanelWidth(id: string | null | undefined): number {
 function readPanelOpen(id: string | null | undefined): boolean {
   try { return localStorage.getItem(panelOpenKey(id)) === '1'; } catch { return false; }
 }
-function readAgentsPanelOpen(id: string | null | undefined): boolean {
-  try { return localStorage.getItem(agentsPanelOpenKey(id)) === '1'; } catch { return false; }
+function readSdkAgentsOpen(): boolean {
+  // Default OPEN when never set; only an explicit '0' means the user closed it.
+  try { return localStorage.getItem(SDK_AGENTS_OPEN_KEY) !== '0'; } catch { return true; }
+}
+function writeSdkAgentsOpen(next: boolean): void {
+  try { localStorage.setItem(SDK_AGENTS_OPEN_KEY, next ? '1' : '0'); } catch { /* ignore */ }
+  try { window.dispatchEvent(new CustomEvent(SDK_AGENTS_OPEN_EVENT)); } catch { /* ignore */ }
 }
 
 /** Find a chat event element by its eventId without relying on CSS.escape —
@@ -1357,10 +1366,22 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // Split-screen file panel — width and open state are per-session
   const [showFilePanel, setShowFilePanel] = useState(() => readPanelOpen(sessionId));
   const [filePanelWidth, setFilePanelWidth] = useState(() => readPanelWidth(sessionId));
-  const [desiredAgentsOpen, setDesiredAgentsOpen] = useState(() => readAgentsPanelOpen(sessionId));
+  // GLOBAL toggle (not per-session): defaults open, synced across windows/tabs.
+  const [desiredAgentsOpen, setDesiredAgentsOpen] = useState(readSdkAgentsOpen);
   const dragStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const filePanelWidthRef = useRef(filePanelWidth);
   filePanelWidthRef.current = filePanelWidth;
+  // Keep this window's toggle in sync when the global switch flips elsewhere
+  // (another open chat window, or another browser tab).
+  useEffect(() => {
+    const onChange = () => setDesiredAgentsOpen(readSdkAgentsOpen());
+    window.addEventListener(SDK_AGENTS_OPEN_EVENT, onChange);
+    window.addEventListener('storage', onChange);
+    return () => {
+      window.removeEventListener(SDK_AGENTS_OPEN_EVENT, onChange);
+      window.removeEventListener('storage', onChange);
+    };
+  }, []);
 
   // Re-load per-session values when sessionId changes
   const prevSessionIdRef = useRef(sessionId);
@@ -1369,7 +1390,6 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     prevSessionIdRef.current = sessionId;
     setShowFilePanel(readPanelOpen(sessionId));
     setFilePanelWidth(readPanelWidth(sessionId));
-    setDesiredAgentsOpen(readAgentsPanelOpen(sessionId));
   }, [sessionId]);
 
   const toggleFilePanel = useCallback(() => {
@@ -1381,9 +1401,9 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [sessionId]);
 
   const setDesiredAgentsPanelOpen = useCallback((next: boolean) => {
-    setDesiredAgentsOpen(next);
-    try { localStorage.setItem(agentsPanelOpenKey(sessionId), next ? '1' : '0'); } catch { /* ignore */ }
-  }, [sessionId]);
+    // Persist + broadcast; every window's listener (incl. this one) updates state.
+    writeSdkAgentsOpen(next);
+  }, []);
 
   const toggleAgentsPanel = useCallback(() => {
     setDesiredAgentsPanelOpen(!desiredAgentsOpen);
@@ -2362,18 +2382,22 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           {canShowAgentsControl && (
             <button
               type="button"
-              class={`chat-panel-toggle chat-sdk-agents-toggle${showAgentsPane ? ' active' : ''}`}
+              class={`chat-panel-toggle chat-sdk-agents-toggle${desiredAgentsOpen ? ' active' : ''}`}
               onClick={toggleAgentsPanel}
               title={t('chat.sdk_agents_toggle')}
               aria-label={t('chat.sdk_agents_toggle_aria', { count: sdkAgentsStatus.runningCount })}
               aria-expanded={showAgentsPane}
             >
               <SdkAgentsGlyph />
-              {sdkAgentsStatus.runningCount > 0 && (
-                <span class="chat-sdk-agents-badge" aria-label={t('chat.sdk_agents_badge_aria', { count: sdkAgentsStatus.runningCount })}>
-                  {sdkAgentsStatus.runningCount}
-                </span>
-              )}
+              {/* Always show the count badge — including 0 — so the toggle reads
+                  as a status indicator (its green `.active` frame already shows
+                  open/closed). The 0 state is muted so it doesn't imply running. */}
+              <span
+                class={`chat-sdk-agents-badge${sdkAgentsStatus.runningCount === 0 ? ' chat-sdk-agents-badge-zero' : ''}`}
+                aria-label={t('chat.sdk_agents_badge_aria', { count: sdkAgentsStatus.runningCount })}
+              >
+                {sdkAgentsStatus.runningCount}
+              </span>
             </button>
           )}
           {canShowFilePanel && (
