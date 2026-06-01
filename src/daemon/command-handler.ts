@@ -69,6 +69,7 @@ import { supervisionAutomation } from './supervision-automation.js';
 import { parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import type { P2pAdvancedRound, P2pContextReducerConfig, P2pRoundPreset } from '../../shared/p2p-advanced.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
+import { getLoadedConfig } from '../config.js';
 import {
   INSTALLER_CONFIG_BASENAME,
   INSTALLER_OFFICIAL_NPM_REGISTRY,
@@ -5845,12 +5846,10 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
   // published npm release. The manual `imcodes upgrade` CLI is unaffected.
   const envDisabled = process.env.IMCODES_DISABLE_AUTO_UPGRADE === '1'
     || process.env.IMCODES_DISABLE_AUTO_UPGRADE === 'true';
-  let configDisabled = false;
-  try {
-    const { loadConfig } = await import('../config.js');
-    const cfg = await loadConfig();
-    configDisabled = cfg?.daemon?.autoUpgrade === false;
-  } catch { /* config unreadable — fall back to env only */ }
+  // Read the already-cached config synchronously — no await before the
+  // active-turn / cooldown checks below (an extra async hop would delay them
+  // past their awaiters). Null (config not yet loaded) is treated as enabled.
+  const configDisabled = getLoadedConfig()?.daemon?.autoUpgrade === false;
   if (envDisabled || configDisabled) {
     logger.info(
       { targetVersion, reason: envDisabled ? 'env' : 'config' },
