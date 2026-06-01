@@ -117,11 +117,11 @@ function isTodoToolCall(event: TimelineEvent): boolean {
 }
 
 /**
- * Derive the current checklist for a session from its ordered timeline events.
- * Scans newest-first and returns the most recent checklist tool.call. A most
- * recent call with an explicitly empty list clears the panel (returns null).
+ * Array-style checklist (CC TodoWrite, Qwen/Gemini todo_write, Codex/Gemini
+ * plan): scan newest-first and return the most recent checklist tool.call. A
+ * most recent call with an explicitly empty list clears the panel (null).
  */
-export function deriveLatestTodoList(events: readonly TimelineEvent[]): AgentTodoList | null {
+function deriveArrayTodoList(events: readonly TimelineEvent[]): AgentTodoList | null {
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i];
     if (!isTodoToolCall(event)) continue;
@@ -131,6 +131,74 @@ export function deriveLatestTodoList(events: readonly TimelineEvent[]): AgentTod
     return { items, eventId: event.eventId, ts: event.ts };
   }
   return null;
+}
+
+// Claude Code (this harness) has no TodoWrite array tool — it tracks tasks with
+// per-task TaskCreate + TaskUpdate calls (global ids, status in the result).
+// We reconstruct the list by replaying those events.
+const TASK_CREATE_RESULT_RE = /Task #(\d+) created successfully:\s*([\s\S]+?)\s*$/;
+
+interface TaskAgg { text: string; status: AgentTodoStatus; order: number; deleted: boolean; }
+
+/**
+ * Accumulation-style checklist (CC TaskCreate/TaskUpdate). TaskCreate's
+ * tool.result carries `Task #<id> created successfully: <subject>`; TaskUpdate's
+ * tool.call input carries { taskId, status, subject? } (status incl. deleted).
+ * Replay both into the current task list, in creation order.
+ */
+function deriveTaskToolList(events: readonly TimelineEvent[]): AgentTodoList | null {
+  const byId = new Map<string, TaskAgg>();
+  let order = 0;
+  let lastTs = 0;
+  let lastEventId = '';
+  let touched = false;
+
+  for (const event of events) {
+    if (event.type === 'tool.result') {
+      const output = (event.payload as { output?: unknown }).output;
+      if (typeof output !== 'string') continue;
+      const match = output.match(TASK_CREATE_RESULT_RE);
+      if (!match) continue;
+      const id = match[1];
+      const text = match[2].trim();
+      const existing = byId.get(id);
+      if (existing) { if (text) existing.text = text; existing.deleted = false; }
+      else byId.set(id, { text, status: 'pending', order: order++, deleted: false });
+      touched = true; lastTs = event.ts; lastEventId = event.eventId;
+    } else if (event.type === 'tool.call') {
+      const payload = event.payload as { tool?: unknown; input?: unknown };
+      if ((typeof payload.tool === 'string' ? payload.tool.toLowerCase() : '') !== 'taskupdate') continue;
+      const input = (payload.input ?? {}) as Record<string, unknown>;
+      const id = input.taskId != null ? String(input.taskId) : '';
+      if (!id) continue;
+      const subject = typeof input.subject === 'string' ? input.subject.trim() : '';
+      const task = byId.get(id) ?? { text: subject || `Task #${id}`, status: 'pending' as AgentTodoStatus, order: order++, deleted: false };
+      byId.set(id, task);
+      if (subject) task.text = subject;
+      if (input.status === 'deleted') task.deleted = true;
+      else if (typeof input.status === 'string') task.status = normalizeTodoStatus(input.status);
+      touched = true; lastTs = event.ts; lastEventId = event.eventId;
+    }
+  }
+
+  if (!touched) return null;
+  const items = [...byId.values()]
+    .filter((task) => !task.deleted && task.text)
+    .sort((a, b) => a.order - b.order)
+    .map((task) => ({ text: task.text, status: task.status }));
+  return items.length > 0 ? { items, eventId: lastEventId, ts: lastTs } : null;
+}
+
+/**
+ * Derive the current checklist for a session, supporting both the array-style
+ * tools and CC's TaskCreate/TaskUpdate model. When both are present (rare), the
+ * one with the more recent activity wins.
+ */
+export function deriveLatestTodoList(events: readonly TimelineEvent[]): AgentTodoList | null {
+  const arrayList = deriveArrayTodoList(events);
+  const taskList = deriveTaskToolList(events);
+  if (arrayList && taskList) return taskList.ts > arrayList.ts ? taskList : arrayList;
+  return arrayList ?? taskList;
 }
 
 export function countCompleted(items: readonly AgentTodoItem[]): number {

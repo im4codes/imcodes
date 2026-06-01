@@ -24,6 +24,22 @@ function toolCall(input: unknown, tool = 'TodoWrite', overrides: Partial<Timelin
   };
 }
 
+function toolResult(output: string, overrides: Partial<TimelineEvent> = {}): TimelineEvent {
+  seq += 1;
+  return {
+    eventId: `e${seq}`,
+    sessionId: 'deck_main_brain',
+    ts: 1000 + seq,
+    seq,
+    epoch: 1,
+    source: 'daemon',
+    confidence: 'high',
+    type: 'tool.result',
+    payload: { output },
+    ...overrides,
+  };
+}
+
 const TODOWRITE = [
   { content: 'Analyze requirements', status: 'completed', activeForm: 'Analyzing' },
   { content: 'Design schema', status: 'in_progress', activeForm: 'Designing' },
@@ -124,6 +140,44 @@ describe('deriveLatestTodoList', () => {
 
   it('returns null for an empty timeline', () => {
     expect(deriveLatestTodoList([])).toBeNull();
+  });
+});
+
+describe('deriveLatestTodoList — CC TaskCreate/TaskUpdate', () => {
+  it('aggregates TaskCreate results + TaskUpdate into a checklist (creation order)', () => {
+    const events = [
+      toolResult('Task #6 created successfully: Analyze requirements'),
+      toolResult('Task #7 created successfully: Design schema'),
+      toolResult('Task #8 created successfully: Build UI'),
+      toolCall({ taskId: '6', status: 'completed' }, 'TaskUpdate'),
+      toolCall({ taskId: '7', status: 'in_progress' }, 'TaskUpdate'),
+    ];
+    expect(deriveLatestTodoList(events)?.items).toEqual([
+      { text: 'Analyze requirements', status: 'completed' },
+      { text: 'Design schema', status: 'in_progress' },
+      { text: 'Build UI', status: 'pending' },
+    ]);
+  });
+
+  it('removes a task on TaskUpdate status=deleted', () => {
+    const events = [
+      toolResult('Task #1 created successfully: A'),
+      toolResult('Task #2 created successfully: B'),
+      toolCall({ taskId: '1', status: 'deleted' }, 'TaskUpdate'),
+    ];
+    expect(deriveLatestTodoList(events)?.items).toEqual([{ text: 'B', status: 'pending' }]);
+  });
+
+  it('applies a TaskUpdate subject rename', () => {
+    const events = [
+      toolResult('Task #3 created successfully: old name'),
+      toolCall({ taskId: '3', status: 'in_progress', subject: 'new name' }, 'TaskUpdate'),
+    ];
+    expect(deriveLatestTodoList(events)?.items).toEqual([{ text: 'new name', status: 'in_progress' }]);
+  });
+
+  it('ignores unrelated tool.result output', () => {
+    expect(deriveLatestTodoList([toolResult('ran 3 tests, all passed')])).toBeNull();
   });
 });
 
