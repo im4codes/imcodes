@@ -43,6 +43,12 @@ import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import { createWorkerSessionSyncRetrier, type WorkerSessionSyncRetrier, type WorkerSessionSyncRetryOutcome } from './worker-session-sync-retrier.js';
+import {
+  WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT,
+  WORKER_SESSION_SYNC_STATUS,
+  type WorkerSessionSyncStatus,
+} from '../../shared/worker-session-snapshot.js';
+import { buildWorkerSessionSyncPlan, type WorkerSessionSyncPlanInput } from './worker-session-sync-plan.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 export async function getLastAssistantText(sessionName: string): Promise<string | undefined> {
@@ -108,6 +114,9 @@ export interface DaemonContext {
 let ctx: DaemonContext | null = null;
 
 // ── Worker session sync helpers ────────────────────────────────────────────
+
+const WORKER_SESSION_SYNC_TIMEOUT_MS = 5_000;
+const STARTUP_WORKER_SESSION_SYNC_TIMEOUT_MS = 1_500;
 
 async function persistSessionToWorker(
   workerUrl: string,
@@ -186,116 +195,180 @@ async function dropLocalSession(session: SessionRecord): Promise<void> {
 }
 
 interface WorkerSessionSyncOutcome extends WorkerSessionSyncRetryOutcome {
+  status: WorkerSessionSyncStatus;
+  retryable: boolean;
+  snapshotComplete: boolean;
   remoteSessionCount?: number;
   remoteSubSessionCount?: number;
   prunedCount?: number;
   syncedCount?: number;
+  pendingMissingCount?: number;
+  remoteTestDeletedCount?: number;
   skippedMainPrune?: boolean;
   skippedSubSessionPrune?: boolean;
+  startupPushAllowedNames?: string[];
+  issues?: string[];
+}
+
+async function fetchLegacyWorkerSessionSnapshot(
+  workerUrl: string,
+  serverId: string,
+  headers: Record<string, string>,
+  timeoutMs: number,
+): Promise<WorkerSessionSyncPlanInput | WorkerSessionSyncOutcome> {
+  const [sessionRes, subRes] = await Promise.all([
+    fetch(`${workerUrl}/api/server/${serverId}/sessions`, {
+      headers,
+      signal: AbortSignal.timeout(timeoutMs),
+    }),
+    fetch(`${workerUrl}/api/server/${serverId}/sub-sessions`, {
+      headers,
+      signal: AbortSignal.timeout(timeoutMs),
+    }),
+  ]);
+
+  if (!sessionRes.ok) {
+    logger.warn({ status: sessionRes.status }, 'syncSessionsFromWorker: legacy sessions fetch failed');
+    return {
+      ok: false,
+      status: WORKER_SESSION_SYNC_STATUS.FAILED,
+      retryable: true,
+      snapshotComplete: false,
+      reason: `sessions_http_${sessionRes.status}`,
+    };
+  }
+  if (!subRes.ok) {
+    logger.warn({ status: subRes.status }, 'syncSessionsFromWorker: legacy sub-session fetch failed');
+    return {
+      ok: false,
+      status: WORKER_SESSION_SYNC_STATUS.FAILED,
+      retryable: true,
+      snapshotComplete: false,
+      reason: `sub_sessions_http_${subRes.status}`,
+    };
+  }
+
+  const data = await sessionRes.json() as { sessions?: unknown };
+  const subData = await subRes.json() as { subSessions?: unknown };
+  return {
+    source: 'legacy',
+    sessions: data.sessions,
+    subSessions: subData.subSessions,
+  };
+}
+
+interface WorkerSessionSyncOptions {
+  timeoutMs?: number;
 }
 
 /** On startup/retry: pull sessions from D1 and populate the local store so restoreFromStore can rebuild runtimes. */
-export async function syncSessionsFromWorker(workerUrl: string, serverId: string, token: string): Promise<WorkerSessionSyncOutcome> {
+export async function syncSessionsFromWorker(
+  workerUrl: string,
+  serverId: string,
+  token: string,
+  options: WorkerSessionSyncOptions = {},
+): Promise<WorkerSessionSyncOutcome> {
   try {
+    const timeoutMs = options.timeoutMs ?? WORKER_SESSION_SYNC_TIMEOUT_MS;
     const headers = { Authorization: `Bearer ${token}`, 'X-Server-Id': serverId };
-    const [sessionRes, subRes] = await Promise.all([
-      fetch(`${workerUrl}/api/server/${serverId}/sessions`, {
+    const snapshotRes = await fetch(`${workerUrl}/api/server/${serverId}/${WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT}`, {
         headers,
-        signal: AbortSignal.timeout(5_000),
-      }),
-      fetch(`${workerUrl}/api/server/${serverId}/sub-sessions`, {
-        headers,
-        signal: AbortSignal.timeout(5_000),
-      }),
-    ]);
-
-    if (!sessionRes.ok) {
-      logger.warn({ status: sessionRes.status }, 'syncSessionsFromWorker: non-ok response');
-      return { ok: false, reason: `sessions_http_${sessionRes.status}` };
-    }
-    if (!subRes.ok) {
-      logger.warn({ status: subRes.status }, 'syncSessionsFromWorker: sub-session fetch failed');
-      return { ok: false, reason: `sub_sessions_http_${subRes.status}` };
-    }
-
-    const data = await sessionRes.json() as { sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; project_dir: string; state: string; label?: string | null; requested_model?: string | null; active_model?: string | null; effort?: SessionRecord['effort'] | null; transport_config?: Record<string, unknown> | string | null }> };
-    const subData = await subRes.json() as { subSessions: Array<{ id: string; cwd?: string | null; parent_session?: string | null }> };
-    const remoteTestSessions = data.sessions.filter((session) => isKnownTestSessionLike({
-      name: session.name,
-      projectName: session.project_name,
-      projectDir: session.project_dir,
-    }));
-    const remoteTestSubSessions = subData.subSessions.filter((subSession) => isKnownTestSessionLike({
-      name: subSession.id ? `deck_sub_${subSession.id}` : undefined,
-      cwd: subSession.cwd,
-      parentSession: subSession.parent_session,
-    }));
-    await Promise.all([
-      ...remoteTestSessions.map((session) => deleteSessionFromWorker(workerUrl, serverId, token, session.name)),
-      ...remoteTestSubSessions.map((subSession) => deleteSubSessionFromWorker(workerUrl, serverId, token, subSession.id)),
-    ]);
-    const remoteSessionNames = new Set(
-      data.sessions
-        .filter((s) => !isKnownTestSessionLike({ name: s.name, projectName: s.project_name, projectDir: s.project_dir }))
-        .filter((s) => s.state !== 'stopped')
-        .map((s) => s.name),
-    );
-    const remoteSubSessionNames = new Set(
-      subData.subSessions
-        .filter((s) => !isKnownTestSessionLike({ name: s.id ? `deck_sub_${s.id}` : undefined, cwd: s.cwd, parentSession: s.parent_session }))
-        .map((s) => `deck_sub_${s.id}`),
-    );
-
-    const localSessions = listSessions();
-    const localMainSessions = localSessions.filter((session) => !session.name.startsWith('deck_sub_') && session.state !== 'stopped');
-    const localSubSessions = localSessions.filter((session) => session.name.startsWith('deck_sub_') && session.state !== 'stopped');
-    const shouldPruneMainSessions = remoteSessionNames.size > 0 || localMainSessions.length === 0;
-    const shouldPruneSubSessions = remoteSubSessionNames.size > 0 || localSubSessions.length === 0;
-    if (!shouldPruneMainSessions || !shouldPruneSubSessions) {
-      logger.warn({
-        remoteSessionCount: remoteSessionNames.size,
-        remoteSubSessionCount: remoteSubSessionNames.size,
-        localMainSessionCount: localMainSessions.length,
-        localSubSessionCount: localSubSessions.length,
-        skippedMainPrune: !shouldPruneMainSessions,
-        skippedSubSessionPrune: !shouldPruneSubSessions,
-      }, 'syncSessionsFromWorker: remote snapshot has an empty class; skipping destructive prune for that class');
-    }
-    const staleLocal = localSessions.filter((session) => {
-      if (session.name.startsWith('deck_sub_')) {
-        return shouldPruneSubSessions && !remoteSubSessionNames.has(session.name);
-      }
-      return shouldPruneMainSessions && !remoteSessionNames.has(session.name);
+        signal: AbortSignal.timeout(timeoutMs),
     });
 
-    for (const session of staleLocal) {
-      await dropLocalSession(session);
+    let planInput: WorkerSessionSyncPlanInput | WorkerSessionSyncOutcome;
+    if (snapshotRes.ok) {
+      planInput = { source: 'snapshot', response: await snapshotRes.json() as unknown };
+    } else if (snapshotRes.status === 404) {
+      logger.warn({ status: snapshotRes.status }, 'syncSessionsFromWorker: snapshot endpoint unavailable; falling back to degraded legacy list sync');
+      planInput = await fetchLegacyWorkerSessionSnapshot(workerUrl, serverId, headers, timeoutMs);
+    } else {
+      let response: unknown;
+      try {
+        response = await snapshotRes.json() as unknown;
+      } catch {
+        response = null;
+      }
+      if (response && typeof response === 'object' && 'complete' in response) {
+        planInput = { source: 'snapshot', response };
+      } else {
+        logger.warn({ status: snapshotRes.status }, 'syncSessionsFromWorker: snapshot fetch failed');
+        return {
+          ok: false,
+          status: WORKER_SESSION_SYNC_STATUS.FAILED,
+          retryable: true,
+          snapshotComplete: false,
+          reason: `session_snapshot_http_${snapshotRes.status}`,
+        };
+      }
     }
-    if (staleLocal.length > 0) {
-      logger.info({ count: staleLocal.length, sessions: staleLocal.map((s) => s.name) }, 'Pruned local sessions missing from server state');
+    if ('status' in planInput) {
+      return planInput;
+    }
+
+    const localSessions = listSessions();
+    const plan = buildWorkerSessionSyncPlan(planInput, serverId, localSessions);
+    if (plan.status !== WORKER_SESSION_SYNC_STATUS.APPLIED) {
+      logger.warn({
+        reason: plan.reason,
+        issues: plan.issues,
+        remoteSessionCount: plan.remoteSessionCount,
+        remoteSubSessionCount: plan.remoteSubSessionCount,
+      }, 'syncSessionsFromWorker: snapshot degraded; destructive sync and startup push disabled');
     }
 
     let count = 0;
-    for (const s of data.sessions) {
-      if (isKnownTestSessionLike({ name: s.name, projectName: s.project_name, projectDir: s.project_dir })) continue;
-      if (s.state === 'stopped') continue; // skip stopped sessions
+    for (const s of plan.mainUpserts) {
       const existing = getSession(s.name);
       upsertSession(mergeWorkerSessionSnapshot(existing, s));
       count++;
     }
-    logger.info({ count }, 'Sessions synced from D1');
+    let remoteTestDeletedCount = 0;
+    if (plan.status === WORKER_SESSION_SYNC_STATUS.APPLIED) {
+      await Promise.all([
+        ...plan.remoteTestSessions.map(async (session) => {
+          await deleteSessionFromWorker(workerUrl, serverId, token, session.name);
+          remoteTestDeletedCount++;
+        }),
+        ...plan.remoteTestSubSessions.map(async (subSession) => {
+          await deleteSubSessionFromWorker(workerUrl, serverId, token, subSession.id);
+          remoteTestDeletedCount++;
+        }),
+      ]);
+    }
+    logger.info({
+      count,
+      status: plan.status,
+      snapshotComplete: plan.snapshotComplete,
+      pendingMissingCount: plan.pendingMissingCount,
+      remoteTestDeletedCount,
+    }, 'Sessions synced from worker snapshot');
     return {
-      ok: true,
-      remoteSessionCount: remoteSessionNames.size,
-      remoteSubSessionCount: remoteSubSessionNames.size,
-      prunedCount: staleLocal.length,
+      ok: plan.status === WORKER_SESSION_SYNC_STATUS.APPLIED,
+      status: plan.status,
+      retryable: plan.retryable,
+      snapshotComplete: plan.snapshotComplete,
+      reason: plan.reason,
+      remoteSessionCount: plan.remoteSessionCount,
+      remoteSubSessionCount: plan.remoteSubSessionCount,
+      prunedCount: 0,
       syncedCount: count,
-      skippedMainPrune: !shouldPruneMainSessions,
-      skippedSubSessionPrune: !shouldPruneSubSessions,
+      pendingMissingCount: plan.pendingMissingCount,
+      remoteTestDeletedCount,
+      skippedMainPrune: plan.pendingMissingCount > 0 || plan.status !== WORKER_SESSION_SYNC_STATUS.APPLIED,
+      skippedSubSessionPrune: plan.pendingMissingCount > 0 || plan.status !== WORKER_SESSION_SYNC_STATUS.APPLIED,
+      startupPushAllowedNames: plan.startupPushAllowedNames,
+      issues: plan.issues,
     };
   } catch (e) {
     logger.warn({ err: e }, 'syncSessionsFromWorker: fetch failed');
-    return { ok: false, reason: e instanceof Error ? e.message : 'fetch_failed' };
+    return {
+      ok: false,
+      status: WORKER_SESSION_SYNC_STATUS.FAILED,
+      retryable: true,
+      snapshotComplete: false,
+      reason: e instanceof Error ? e.message : 'fetch_failed',
+    };
   }
 }
 
@@ -464,7 +537,9 @@ export async function startup(): Promise<DaemonContext> {
   // snapshot is applied and then reconcile runtimes.
   let startupWorkerSessionSyncOutcome: WorkerSessionSyncOutcome | null = null;
   if (creds) {
-    startupWorkerSessionSyncOutcome = await syncSessionsFromWorker(workerUrl!, serverId, token);
+    startupWorkerSessionSyncOutcome = await syncSessionsFromWorker(workerUrl!, serverId, token, {
+      timeoutMs: STARTUP_WORKER_SESSION_SYNC_TIMEOUT_MS,
+    });
   }
 
   try {
@@ -711,8 +786,22 @@ export async function startup(): Promise<DaemonContext> {
     pushLocalSessionsToWorkerOnStartup = async (): Promise<void> => {
       const localSessions = listSessions();
       const persistableSessions = localSessions.filter(shouldPersistMainSessionToWorkerOnStartup);
+      const syncOutcome = startupWorkerSessionSyncOutcome;
+      if (!syncOutcome || syncOutcome.status !== WORKER_SESSION_SYNC_STATUS.APPLIED) {
+        if (persistableSessions.length > 0) {
+          logger.warn({
+            count: persistableSessions.length,
+            syncStatus: syncOutcome?.status,
+            reason: syncOutcome?.reason,
+          }, 'startup: suppressing local main session DB push until worker snapshot is trusted');
+        }
+        return;
+      }
+      const allowedNames = new Set(syncOutcome.startupPushAllowedNames ?? []);
+      const pushableSessions = persistableSessions.filter((session) => allowedNames.has(session.name));
+      const suppressedCount = persistableSessions.length - pushableSessions.length;
       let pushFailures = 0;
-      for (const s of persistableSessions) {
+      for (const s of pushableSessions) {
         try {
           await persistSessionToWorker(workerUrl!, serverId, token, s.name, s);
         } catch (err) {
@@ -725,8 +814,13 @@ export async function startup(): Promise<DaemonContext> {
       }
       if (persistableSessions.length > 0) {
         logger.info(
-          { count: persistableSessions.length, skipped: localSessions.length - persistableSessions.length, failures: pushFailures },
-          'Pushed local main sessions to server DB on startup (background)',
+          {
+            count: pushableSessions.length,
+            skipped: localSessions.length - persistableSessions.length,
+            suppressed: suppressedCount,
+            failures: pushFailures,
+          },
+          'Pushed trusted local main sessions to server DB on startup (background)',
         );
       }
     };
@@ -925,11 +1019,14 @@ export async function startup(): Promise<DaemonContext> {
   logger.info('Daemon started');
 
   void autoReconnectProviders();
-  if (creds && startupWorkerSessionSyncOutcome && !startupWorkerSessionSyncOutcome.ok) {
+  if (creds && startupWorkerSessionSyncOutcome && startupWorkerSessionSyncOutcome.retryable) {
     workerSessionSyncRetrier?.stop();
     workerSessionSyncRetrier = createWorkerSessionSyncRetrier({
       sync: () => syncSessionsFromWorker(workerUrl!, serverId, token),
-      onRecovered: (outcome) => reconcileRuntimesAfterWorkerSessionSync(serverLink, outcome),
+      onRecovered: (outcome) => {
+        startupWorkerSessionSyncOutcome = outcome;
+        return reconcileRuntimesAfterWorkerSessionSync(serverLink, outcome);
+      },
       logger,
     });
     workerSessionSyncRetrier.start(startupWorkerSessionSyncOutcome.reason ?? 'startup_sync_failed');
@@ -947,10 +1044,15 @@ async function reconcileRuntimesAfterWorkerSessionSync(
   outcome: WorkerSessionSyncOutcome,
 ): Promise<void> {
   logger.info({
+    status: outcome.status,
+    snapshotComplete: outcome.snapshotComplete,
+    retryable: outcome.retryable,
     remoteSessionCount: outcome.remoteSessionCount,
     remoteSubSessionCount: outcome.remoteSubSessionCount,
     syncedCount: outcome.syncedCount,
     prunedCount: outcome.prunedCount,
+    pendingMissingCount: outcome.pendingMissingCount,
+    remoteTestDeletedCount: outcome.remoteTestDeletedCount,
     skippedMainPrune: outcome.skippedMainPrune,
     skippedSubSessionPrune: outcome.skippedSubSessionPrune,
   }, 'Worker session sync retry succeeded; reconciling local runtimes');

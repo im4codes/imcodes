@@ -1,5 +1,6 @@
 export interface WorkerSessionSyncRetryOutcome {
   ok: boolean;
+  retryable?: boolean;
   reason?: string;
 }
 
@@ -68,7 +69,7 @@ export function createWorkerSessionSyncRetrier<TOutcome extends WorkerSessionSyn
     inFlight = true;
     try {
       const outcome = await options.sync();
-      if (!outcome.ok) {
+      if (outcome.retryable ?? !outcome.ok) {
         const reason = outcome.reason ?? 'sync_failed';
         const delayForThisFailure = nextDelayMs;
         nextDelayMs = Math.min(nextDelayMs * 2, maxDelayMs);
