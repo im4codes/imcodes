@@ -175,8 +175,17 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
   try {
     const raw = await readFile(storePath(), 'utf8');
     store = JSON.parse(raw) as SessionStore;
-  } catch {
-    store = { sessions: {} };
+  } catch (err) {
+    // Reset to an empty store ONLY when the file genuinely doesn't exist. A
+    // transient read/parse failure (a concurrent writer truncating the file
+    // mid-read, an empty read while another process rewrites it, or an IO
+    // hiccup under load) must NOT wipe every session — keep the last good
+    // in-memory store. Otherwise a reload (e.g. send_message's refresh) can
+    // momentarily expose zero sessions, which surfaced as flaky CI:
+    // `send_message` intermittently returned status:'error' (target not found).
+    if ((err as { code?: string } | null)?.code === 'ENOENT') {
+      store = { sessions: {} };
+    }
   }
   if (pruneNonPersistableSessions()) scheduleWrite();
   if (reconcilePersistedSessions()) scheduleWrite();
