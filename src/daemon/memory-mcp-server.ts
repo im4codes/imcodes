@@ -1,9 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import http from 'http';
-import { readFileSync } from 'fs';
-import { homedir } from 'os';
-import { join } from 'path';
+import { resolveLiveHookPort } from './hook-port.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import {
   MemoryMcpCallerEnvError,
@@ -25,16 +23,6 @@ export function createMemoryMcpServer(caller: McpRuntimeCaller, toolDeps: Memory
   });
   registerMemoryMcpTools(server, caller, toolDeps);
   return server;
-}
-
-function readHookPort(): number | null {
-  try {
-    const raw = readFileSync(join(homedir(), '.imcodes', 'hook-port'), 'utf8').trim();
-    const port = Number.parseInt(raw, 10);
-    return Number.isFinite(port) && port > 1024 && port < 65536 ? port : null;
-  } catch {
-    return null;
-  }
 }
 
 async function postHookSend(port: number, body: Record<string, unknown>, hookPath = '/send'): Promise<Record<string, unknown>> {
@@ -79,7 +67,7 @@ function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryMcpToolD
     sendDeps: {
       ...toolDeps.sendDeps,
       dispatchMessage: async (target: SessionRecord, message: string) => {
-        const port = readHookPort();
+        const port = await resolveLiveHookPort();
         if (!port) throw new Error('daemon hook server is unavailable');
         if (!caller.sessionName) throw new Error('send_message requires a scoped caller');
         await postHookSend(port, {
@@ -90,7 +78,7 @@ function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryMcpToolD
         });
       },
       cancelSession: async (target: SessionRecord) => {
-        const port = readHookPort();
+        const port = await resolveLiveHookPort();
         if (!port) throw new Error('daemon hook server is unavailable');
         if (!caller.sessionName) throw new Error('send_stop requires a scoped caller');
         const res = await postHookSend(port, {

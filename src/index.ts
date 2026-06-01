@@ -73,6 +73,7 @@ import { resolve, join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
 import { printDirectSendResult, printSendResult } from './cli/send-output.js';
+import { resolveLiveHookPort } from './daemon/hook-port.js';
 import {
   formatDurationSeconds,
   getDaemonServerLinkFreshness,
@@ -529,7 +530,7 @@ program
     // ── --list mode: show available siblings ───────────────────────────────
     if (opts.list) {
       // Try hook server first, fall back to session store
-      const hookPort = readHookPort();
+      const hookPort = await resolveLiveHookPort();
       if (hookPort) {
         try {
           const res = await postToHookServer(hookPort, '/list', {
@@ -602,7 +603,7 @@ program
     const files = opts.files ? opts.files.split(',').map((f) => f.trim()).filter(Boolean) : undefined;
 
     // Try hook server IPC first (preferred — daemon handles target resolution, queuing, etc.)
-    const hookPort = readHookPort();
+    const hookPort = await resolveLiveHookPort();
     if (hookPort) {
       try {
         const detectedFrom = await detectSenderSession().catch(() => '');
@@ -675,17 +676,6 @@ program
     printDirectSendResult(name);
   });
 
-/** Read hook server port from ~/.imcodes/hook-port. Returns null if unavailable. */
-function readHookPort(): number | null {
-  try {
-    const portPath = join(homedir(), '.imcodes', 'hook-port');
-    const raw = readFileSync(portPath, 'utf8').trim();
-    const port = parseInt(raw, 10);
-    return Number.isFinite(port) && port > 1024 && port < 65536 ? port : null;
-  } catch {
-    return null;
-  }
-}
 
 /** POST JSON to the hook server and return parsed response. */
 async function postToHookServer(port: number, path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {

@@ -13,9 +13,6 @@
  * All hook scripts and plugins read this value at write time.
  */
 import http from 'http';
-import { promises as fs } from 'fs';
-import path from 'path';
-import os from 'os';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { getSession, upsertSession, listSessions } from '../store/session-store.js';
@@ -24,9 +21,10 @@ import { refreshSessionWatcher } from './watcher-controls.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { dispatchHookSend } from './send-tool.js';
 import { stopSessionNow } from './command-handler.js';
+import { DEFAULT_HOOK_PORT, readSavedHookPort, writeHookPort } from './hook-port.js';
 
-export const DEFAULT_HOOK_PORT = 51913;
-const PORT_FILE = path.join(os.homedir(), '.imcodes', 'hook-port');
+export { DEFAULT_HOOK_PORT };
+
 
 /** Max body size: 1 MB */
 const MAX_BODY_SIZE = 1024 * 1024;
@@ -73,19 +71,12 @@ const rateLimiter = new Map<string, number[]>();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-async function loadSavedPort(): Promise<number> {
-  try {
-    const raw = await fs.readFile(PORT_FILE, 'utf-8');
-    const p = parseInt(raw.trim(), 10);
-    return Number.isFinite(p) && p > 1024 && p < 65536 ? p : DEFAULT_HOOK_PORT;
-  } catch {
-    return DEFAULT_HOOK_PORT;
-  }
+function loadSavedPort(): number {
+  return readSavedHookPort() ?? DEFAULT_HOOK_PORT;
 }
 
-async function savePort(port: number): Promise<void> {
-  await fs.mkdir(path.dirname(PORT_FILE), { recursive: true });
-  await fs.writeFile(PORT_FILE, String(port));
+function savePort(port: number): void {
+  writeHookPort(port);
 }
 
 function tryBind(server: http.Server, port: number): Promise<void> {
@@ -446,7 +437,7 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 // ─── Server ──────────────────────────────────────────────────────────────────
 
 export async function startHookServer(onHook: HookCallback): Promise<{ server: http.Server; port: number }> {
-  const preferredPort = await loadSavedPort();
+  const preferredPort = loadSavedPort();
 
   const server = http.createServer(async (req, res) => {
     if (req.method !== 'POST') {
@@ -632,7 +623,7 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
     try {
       await tryBind(server, port);
       activeHookPort = port;
-      await savePort(port);
+      savePort(port);
       if (port !== preferredPort) {
         logger.info({ port, preferredPort }, 'Hook server: port conflict, using new port (saved)');
       } else {
