@@ -13,6 +13,8 @@
  * All hook scripts and plugins read this value at write time.
  */
 import http from 'http';
+import { promises as fs } from 'fs';
+import { dirname } from 'path';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { getSession, upsertSession, listSessions } from '../store/session-store.js';
@@ -20,8 +22,7 @@ import type { SessionRecord } from '../store/session-store.js';
 import { refreshSessionWatcher } from './watcher-controls.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { dispatchHookSend } from './send-tool.js';
-import { stopSessionNow } from './command-handler.js';
-import { DEFAULT_HOOK_PORT, readSavedHookPort, writeHookPort } from './hook-port.js';
+import { DEFAULT_HOOK_PORT, HOOK_PORT_FILE } from './hook-port.js';
 
 export { DEFAULT_HOOK_PORT };
 
@@ -71,12 +72,19 @@ const rateLimiter = new Map<string, number[]>();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function loadSavedPort(): number {
-  return readSavedHookPort() ?? DEFAULT_HOOK_PORT;
+async function loadSavedPort(): Promise<number> {
+  try {
+    const raw = await fs.readFile(HOOK_PORT_FILE, 'utf-8');
+    const p = parseInt(raw.trim(), 10);
+    return Number.isFinite(p) && p > 1024 && p < 65536 ? p : DEFAULT_HOOK_PORT;
+  } catch {
+    return DEFAULT_HOOK_PORT;
+  }
 }
 
-function savePort(port: number): void {
-  writeHookPort(port);
+async function savePort(port: number): Promise<void> {
+  await fs.mkdir(dirname(HOOK_PORT_FILE), { recursive: true });
+  await fs.writeFile(HOOK_PORT_FILE, String(port));
 }
 
 function tryBind(server: http.Server, port: number): Promise<void> {
@@ -370,7 +378,7 @@ interface StopRequest {
  * send_stop MCP tool so a busy session (which would otherwise just queue a
  * message) can be interrupted.
  */
-function handleStop(body: StopRequest): { status: number; body: Record<string, unknown> } {
+async function handleStop(body: StopRequest): Promise<{ status: number; body: Record<string, unknown> }> {
   const { from, to } = body;
   if (!from || !to) {
     return { status: 400, body: { ok: false, error: 'missing required fields: from, to' } };
@@ -385,6 +393,10 @@ function handleStop(body: StopRequest): { status: number; body: Record<string, u
   }
   recordSend(from);
 
+  // Lazy import: command-handler pulls in the whole daemon graph, so importing
+  // it eagerly here would create a heavy module cycle (and broke hook-server's
+  // own tests). Only loaded when /stop is actually called.
+  const { stopSessionNow } = await import('./command-handler.js');
   const stopped: string[] = [];
   const notStopped: string[] = [];
   for (const target of result.targets) {
@@ -437,7 +449,7 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 // ─── Server ──────────────────────────────────────────────────────────────────
 
 export async function startHookServer(onHook: HookCallback): Promise<{ server: http.Server; port: number }> {
-  const preferredPort = loadSavedPort();
+  const preferredPort = await loadSavedPort();
 
   const server = http.createServer(async (req, res) => {
     if (req.method !== 'POST') {
@@ -517,7 +529,7 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
       try {
         const body = await readBody(req);
         const parsed = JSON.parse(body) as StopRequest;
-        const result = handleStop(parsed);
+        const result = await handleStop(parsed);
         res.writeHead(result.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result.body));
       } catch (err) {
@@ -623,7 +635,7 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
     try {
       await tryBind(server, port);
       activeHookPort = port;
-      savePort(port);
+      await savePort(port);
       if (port !== preferredPort) {
         logger.info({ port, preferredPort }, 'Hook server: port conflict, using new port (saved)');
       } else {
