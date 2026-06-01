@@ -10,10 +10,13 @@ import {
   SDK_SUBAGENT_SAFE_RAW_MAX_TOTAL_BYTES,
   buildSdkSubagentSafeDetail,
   buildSdkSubagentMinimalReplayDetail,
+  isSdkRuntimeSubagentEventName,
   isSdkSubagentDetail,
   normalizeSdkSubagentCanonicalKey,
   parseSdkSubagentDetail,
+  parseSdkRuntimeSubagentTag,
   sdkSubagentDedupSignature,
+  startsWithSdkRuntimeSubagentTag,
   type SdkSubagentDetail,
 } from '../../shared/sdk-subagent-status.js';
 
@@ -186,5 +189,14 @@ describe('sdk-subagent-status shared contract', () => {
 
     expect(sdkSubagentDedupSignature({ name: 'Agent', status: 'running', detail: base }))
       .toBe(sdkSubagentDedupSignature({ name: 'Agent', status: 'running', detail: changedRaw }));
+  });
+
+  it('parses exact runtime subagent tags and rejects surrounding assistant text', () => {
+    expect(isSdkRuntimeSubagentEventName('runtime/subagent/status')).toBe(true);
+    expect(isSdkRuntimeSubagentEventName('ordinary_tool_call')).toBe(false);
+    expect(startsWithSdkRuntimeSubagentTag('<subagent_notification>{"status":"running"}</subagent_notification>')).toBe(true);
+    expect(parseSdkRuntimeSubagentTag('<subagent_notification>{"agent_path":"worker","status":"running"}</subagent_notification>'))
+      .toEqual({ agent_path: 'worker', status: 'running' });
+    expect(parseSdkRuntimeSubagentTag('before <subagent_notification>{"status":"running"}</subagent_notification> after')).toBeNull();
   });
 });

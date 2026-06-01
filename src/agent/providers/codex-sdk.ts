@@ -678,6 +678,14 @@ function readRuntimeSubagentName(record: Record<string, any>): string | undefine
     ?? meaningfulString(record.label);
 }
 
+function readRuntimeSubagentModel(record: Record<string, any>): string | undefined {
+  return meaningfulString(record.model)
+    ?? meaningfulString(record.agentModel)
+    ?? meaningfulString(record.agent_model)
+    ?? meaningfulString(record.modelId)
+    ?? meaningfulString(record.model_id);
+}
+
 function readRuntimeSubagentStatus(record: Record<string, any>): string | undefined {
   return meaningfulString(record.status)
     ?? meaningfulString(record.state)
@@ -829,6 +837,7 @@ function runtimeSubagentToolFromPayload(
   const statusMapping = mapCodexRuntimeSubagentStatus(rawStatus ?? 'unknown', diagnosticCode);
   const canonicalKey = makeCodexSubagentCanonicalKey(sessionId, `runtime:${agentPath}`);
   const agentName = readRuntimeSubagentName(record);
+  const model = readRuntimeSubagentModel(record);
   const prompt = readRuntimeSubagentPrompt(record);
   const summary = agentName ? `Codex sub-agent ${agentName}` : rawAgentPath ? `Codex sub-agent ${rawAgentPath}` : 'Codex sub-agent';
   const output = statusMapping.terminal ? (statusInfo.message ?? rawStatus ?? 'unknown') : undefined;
@@ -854,6 +863,7 @@ function runtimeSubagentToolFromPayload(
       parentItemId: canonicalKey,
       ...(rawAgentPath ? { agentPath: rawAgentPath } : {}),
       ...(agentName ? { agentName } : {}),
+      ...(model ? { model } : {}),
       diagnosticCode: statusMapping.diagnosticCode,
     },
   } satisfies SdkSubagentDetail, { allowRaw: false });
@@ -903,6 +913,7 @@ function collabAgentToolFromItem(
   const summary = statusMapping.diagnosticCode
     ? `Codex collaboration diagnostic (${receiverLabel})`
     : `Codex collaboration agent (${receiverLabel})`;
+  const model = readRuntimeSubagentModel(item);
   const prompt = readRuntimeSubagentPrompt(item);
   const output = statusMapping.toolStatus === 'complete'
     ? 'completed'
@@ -930,6 +941,7 @@ function collabAgentToolFromItem(
       terminal: statusMapping.terminal,
       parentSessionId: sessionId,
       parentItemId,
+      ...(model ? { model } : {}),
       receiverCount,
       runningChildCount: statusMapping.diagnosticCode || statusMapping.terminal ? 0 : childSummary.runningChildCount,
       childStatusSummary: childSummary.childStatusSummary,

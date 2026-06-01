@@ -7,6 +7,8 @@ export const SDK_SUBAGENT_SCHEMA_VERSION = 1 as const;
 export const SDK_SUBAGENT_PROVIDERS = {
   CLAUDE_CODE_SDK: 'claude-code-sdk',
   CODEX_SDK: 'codex-sdk',
+  QWEN: 'qwen',
+  GEMINI_SDK: 'gemini-sdk',
 } as const;
 
 export const SDK_SUBAGENT_PROVIDER_KINDS = {
@@ -14,6 +16,8 @@ export const SDK_SUBAGENT_PROVIDER_KINDS = {
   CLAUDE_RUNTIME_AGENT: 'claudeRuntimeAgent',
   CODEX_COLLAB_AGENT: 'codexCollabAgent',
   CODEX_RUNTIME_AGENT: 'codexRuntimeAgent',
+  QWEN_RUNTIME_AGENT: 'qwenRuntimeAgent',
+  GEMINI_RUNTIME_AGENT: 'geminiRuntimeAgent',
 } as const;
 
 export const SDK_SUBAGENT_STATUS = {
@@ -48,6 +52,19 @@ export const SDK_SUBAGENT_CANONICAL_KEY_MAX_LENGTH = 192;
 export const SDK_SUBAGENT_CANONICAL_COMPONENT_MAX_LENGTH = 48;
 export const SDK_SUBAGENT_MAX_CHILD_COUNT = 999;
 export const SDK_SUBAGENT_REDACTED_VALUE = '[REDACTED]';
+export const SDK_RUNTIME_SUBAGENT_EVENT_NAMES = [
+  'subagent_notification',
+  'subagent/notification',
+  'subagent/status',
+  'agent_subagent_notification',
+  'agent_subagent_status',
+  'agent/subagent_notification',
+  'agent/subagent/status',
+  'runtime_subagent_notification',
+  'runtime_subagent_status',
+  'runtime/subagent_notification',
+  'runtime/subagent/status',
+] as const;
 
 export type SdkSubagentProvider = typeof SDK_SUBAGENT_PROVIDERS[keyof typeof SDK_SUBAGENT_PROVIDERS];
 export type SdkSubagentProviderKind = typeof SDK_SUBAGENT_PROVIDER_KINDS[keyof typeof SDK_SUBAGENT_PROVIDER_KINDS];
@@ -70,6 +87,7 @@ export interface SdkSubagentDetailMeta {
   parentItemId?: string;
   agentPath?: string;
   agentName?: string;
+  model?: string;
   taskId?: string;
   receiverThreadId?: string;
   receiverIndex?: number;
@@ -105,6 +123,7 @@ const PROVIDER_VALUES = new Set<string>(Object.values(SDK_SUBAGENT_PROVIDERS));
 const PROVIDER_KIND_VALUES = new Set<string>(Object.values(SDK_SUBAGENT_PROVIDER_KINDS));
 const STATUS_VALUES = new Set<string>(Object.values(SDK_SUBAGENT_STATUS));
 const DIAGNOSTIC_VALUES = new Set<string>(Object.values(SDK_SUBAGENT_DIAGNOSTIC));
+const RUNTIME_SUBAGENT_EVENT_VALUES = new Set<string>(SDK_RUNTIME_SUBAGENT_EVENT_NAMES);
 const REDACT_KEY_RE = /(?:prompt|message|messages|content|secret|token|api[-_]?key|authorization|password|input)/i;
 const SENSITIVE_TEXT_RE = /\b(?:sk-[A-Za-z0-9_-]{12,}|[A-Za-z0-9._%+-]+:[A-Za-z0-9._%+-]+@|Bearer\s+[A-Za-z0-9._-]{8,})\b/g;
 const SAFE_META_STRING_KEYS = new Set([
@@ -114,6 +133,7 @@ const SAFE_META_STRING_KEYS = new Set([
   'parentItemId',
   'agentPath',
   'agentName',
+  'model',
   'taskId',
   'receiverThreadId',
   'childStatusSummary',
@@ -167,6 +187,36 @@ export function makeCodexSubagentCanonicalKey(sessionId: string, itemId: string,
   return normalizeSdkSubagentCanonicalKey(receiverThreadId
     ? `codex:${normalizeSdkSubagentKeyComponent(sessionId)}:${normalizeSdkSubagentKeyComponent(itemId)}:${normalizeSdkSubagentKeyComponent(receiverThreadId)}`
     : `codex:${normalizeSdkSubagentKeyComponent(sessionId)}:${normalizeSdkSubagentKeyComponent(itemId)}`);
+}
+
+export function makeQwenSubagentCanonicalKey(sessionId: string, itemId: string): string {
+  return normalizeSdkSubagentCanonicalKey(`qwen:${normalizeSdkSubagentKeyComponent(sessionId)}:${normalizeSdkSubagentKeyComponent(itemId)}`);
+}
+
+export function makeGeminiSubagentCanonicalKey(sessionId: string, itemId: string): string {
+  return normalizeSdkSubagentCanonicalKey(`gemini:${normalizeSdkSubagentKeyComponent(sessionId)}:${normalizeSdkSubagentKeyComponent(itemId)}`);
+}
+
+const SDK_RUNTIME_SUBAGENT_TAG_START = '<subagent_notification>';
+const SDK_RUNTIME_SUBAGENT_TAG_RE = /^<subagent_notification>([\s\S]+)<\/subagent_notification>$/;
+
+export function startsWithSdkRuntimeSubagentTag(value: string): boolean {
+  return value.trimStart().startsWith(SDK_RUNTIME_SUBAGENT_TAG_START);
+}
+
+export function parseSdkRuntimeSubagentTag(value: string): Record<string, unknown> | null {
+  const match = SDK_RUNTIME_SUBAGENT_TAG_RE.exec(value.trim());
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[1] ?? '');
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function isSdkRuntimeSubagentEventName(value: unknown): boolean {
+  return typeof value === 'string' && RUNTIME_SUBAGENT_EVENT_VALUES.has(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -423,6 +423,7 @@ describe('CodexSdkProvider', () => {
     await provider.send('route-collab', 'coordinate work');
     const child = childProcessMock.children[0];
     emitCodexItem(child, 'item/started', collabItem({
+      model: 'haiku',
       receiverThreadIds: ['agent-a', 'agent-b'],
       agentsStates: {
         'agent-a': { status: 'pendingInit' },
@@ -462,6 +463,7 @@ describe('CodexSdkProvider', () => {
       receiverCount: 2,
       runningChildCount: 2,
       childStatusSummary: 'pendingInit:1, running:1',
+      model: 'haiku',
       rawStatus: 'inProgress',
       normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
       active: true,

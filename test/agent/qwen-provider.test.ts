@@ -85,6 +85,12 @@ import type { AgentMessage } from '../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_STATUS,
+} from '../../shared/sdk-subagent-status.js';
+import {
   IMCODES_DAEMON_NAMESPACE_ENV,
   IMCODES_DAEMON_PROJECT_NAME_ENV,
   IMCODES_DAEMON_PROJECT_ROOT_ENV,
@@ -145,6 +151,58 @@ describe('QwenProvider', () => {
       status: MEMORY_MCP_STATUS.READY,
       connected: true,
       degradedReasons: [],
+    });
+  });
+
+  it('emits SDK subagent snapshots for Qwen runtime subagent notifications', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-runtime-subagent',
+      cwd: '/tmp/project',
+      agentId: 'qwen3-coder-plus',
+    });
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_sessionId, tool) => tools.push(tool));
+
+    await provider.send('sess-runtime-subagent', 'spawn a helper');
+    const spawned = lastSpawn();
+    spawned.child.stdout.write(`${JSON.stringify({
+      type: 'system',
+      subtype: 'subagent_notification',
+      subagent: {
+        agent_path: '019e-qwen-agent',
+        name: 'planner',
+        status: 'running',
+        prompt: 'Check the Qwen handoff',
+      },
+    })}\n`);
+    spawned.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'OK' })}\n`);
+    spawned.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: 'qwen:sess-runtime-subagent:runtime:019e-qwen-agent',
+      name: 'Agent',
+      status: 'running',
+      input: { action: 'qwen-runtime-subagent', description: 'Check the Qwen handoff' },
+      detail: {
+        kind: SDK_SUBAGENT_DETAIL_KIND,
+        summary: 'Qwen sub-agent planner',
+        meta: {
+          provider: SDK_SUBAGENT_PROVIDERS.QWEN,
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.QWEN_RUNTIME_AGENT,
+          canonicalKey: 'qwen:sess-runtime-subagent:runtime:019e-qwen-agent',
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          active: true,
+          terminal: false,
+          parentSessionId: 'sess-runtime-subagent',
+          agentPath: '019e-qwen-agent',
+          agentName: 'planner',
+          model: 'qwen3-coder-plus',
+        },
+      },
     });
   });
 

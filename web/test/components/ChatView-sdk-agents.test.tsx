@@ -40,6 +40,9 @@ vi.mock('react-i18next', () => ({
         'chat.sdk_agents_status_complete': 'Complete',
         'chat.sdk_agents_status_unknown': 'Unknown',
         'chat.sdk_agents_id': 'ID',
+        'chat.sdk_agents_model': 'Model',
+        'chat.sdk_agents_started_at': 'Started',
+        'chat.sdk_agents_duration': 'Duration',
         'chat.sdk_agents_prompt': 'Prompt',
         'chat.sdk_agents_result': 'Result',
         'chat.sdk_agents_running_children': '{{count}} child running',
@@ -148,8 +151,8 @@ describe('ChatView SDK agents panel', () => {
     expect(agentsButton?.textContent).not.toContain('Agents');
     expect(agentsButton?.textContent).toContain('1');
     expect(refreshButton?.getAttribute('aria-label')).toBe('Sync chat history');
-    expect(Array.from(actions?.children ?? []).indexOf(agentsButton as Element))
-      .toBeLessThan(Array.from(actions?.children ?? []).indexOf(refreshButton as Element));
+    expect(Array.from(actions?.children ?? []).indexOf(refreshButton as Element))
+      .toBeLessThan(Array.from(actions?.children ?? []).indexOf(agentsButton as Element));
   });
 
   it('remembers desired-open state, auto-hides empty data, and manual close suppresses auto-show', () => {
@@ -202,8 +205,27 @@ describe('ChatView SDK agents panel', () => {
     expect(document.body.textContent).not.toContain('OUTPUT_FILE');
   });
 
-  it('renders agent id, prompt, and terminal result details', () => {
-    const event = makeSdkEvent(
+  it('renders agent id, model, start time, duration, prompt, and terminal result details', () => {
+    const start = new Date('2026-05-31T12:00:00.000Z');
+    vi.useFakeTimers();
+    vi.setSystemTime(start.getTime() + 120_000);
+    const running = makeSdkEvent(
+      'agent-running-details',
+      makeMeta({
+        canonicalKey: 'claude:deck_agents:runtime:019e80d8',
+        normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+        active: true,
+        terminal: false,
+        agentPath: '019e80d8-44f2-7412-b703-b4ddde653d7f',
+        model: 'haiku',
+      }),
+      {
+        summary: 'Hume',
+        input: { action: 'claude-runtime-subagent', description: 'Check sync status and report back' },
+      },
+    );
+    running.ts = start.getTime();
+    const terminal = makeSdkEvent(
       'agent-complete-details',
       makeMeta({
         canonicalKey: 'claude:deck_agents:runtime:019e80d8',
@@ -211,6 +233,7 @@ describe('ChatView SDK agents panel', () => {
         active: false,
         terminal: true,
         agentPath: '019e80d8-44f2-7412-b703-b4ddde653d7f',
+        model: 'haiku',
       }),
       {
         summary: 'Hume',
@@ -218,12 +241,18 @@ describe('ChatView SDK agents panel', () => {
         output: 'Completed the read-only sync wait.',
       },
     );
-    render(<ChatView events={[event]} loading={false} sessionId="deck_agents" />);
+    terminal.ts = start.getTime() + 120_000;
+    render(<ChatView events={[running, terminal]} loading={false} sessionId="deck_agents" />);
 
     fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }));
 
     expect(screen.getByText('ID')).toBeTruthy();
     expect(screen.getByText('019e80d8-44f2-7412-b703-b4ddde653d7f')).toBeTruthy();
+    expect(screen.getByText('Model')).toBeTruthy();
+    expect(screen.getByText('haiku')).toBeTruthy();
+    expect(screen.getByText('Started')).toBeTruthy();
+    expect(screen.getByText('Duration')).toBeTruthy();
+    expect(screen.getByText('2m 0s')).toBeTruthy();
     expect(screen.getByText('Prompt')).toBeTruthy();
     expect(screen.getByText('Check sync status and report back')).toBeTruthy();
     expect(screen.getByText('Result')).toBeTruthy();

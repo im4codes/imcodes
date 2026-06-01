@@ -23,6 +23,7 @@ export interface SdkSubagentStatusRow {
   canonicalKey: string;
   sessionId: string;
   eventId: string;
+  startTs: number;
   ts: number;
   provider: SdkSubagentProvider;
   providerKind: SdkSubagentProviderKind;
@@ -37,6 +38,7 @@ export interface SdkSubagentStatusRow {
   parentToolUseId?: string;
   agentPath?: string;
   agentName?: string;
+  model?: string;
   taskId?: string;
   receiverThreadId?: string;
   receiverIndex?: number;
@@ -174,6 +176,7 @@ function makeRow(event: TimelineEvent, detail: SdkSubagentDetail, order: number)
     canonicalKey: meta.canonicalKey,
     sessionId: event.sessionId,
     eventId: event.eventId,
+    startTs: event.ts,
     ts: event.ts,
     provider: meta.provider,
     providerKind: meta.providerKind,
@@ -188,6 +191,7 @@ function makeRow(event: TimelineEvent, detail: SdkSubagentDetail, order: number)
     parentToolUseId: meta.parentToolUseId,
     agentPath: meta.agentPath,
     agentName: meta.agentName,
+    model: meta.model,
     taskId: meta.taskId,
     receiverThreadId: meta.receiverThreadId,
     receiverIndex: meta.receiverIndex,
@@ -322,6 +326,7 @@ export function deriveSdkSubagentStatusRows(
           rowsByCanonicalKey.set(next.canonicalKey, {
             ...next,
             firstOrder: previous?.firstOrder ?? next.firstOrder,
+            startTs: previous?.startTs ?? next.startTs,
           });
         }
       }
@@ -348,6 +353,7 @@ export function deriveSdkSubagentStatusRows(
     rowsByCanonicalKey.set(next.canonicalKey, {
       ...next,
       firstOrder: previous?.firstOrder ?? next.firstOrder,
+      startTs: previous?.startTs ?? next.startTs,
     });
   });
 

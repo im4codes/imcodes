@@ -968,6 +968,10 @@ function sdkAgentsProviderLabel(t: ChatTranslate, row: Pick<SdkSubagentStatusRow
       return t('chat.sdk_agents_provider_claude');
     case SDK_SUBAGENT_PROVIDERS.CODEX_SDK:
       return t('chat.sdk_agents_provider_codex');
+    case SDK_SUBAGENT_PROVIDERS.QWEN:
+      return t('chat.sdk_agents_provider_qwen');
+    case SDK_SUBAGENT_PROVIDERS.GEMINI_SDK:
+      return t('chat.sdk_agents_provider_gemini');
     default:
       return t('chat.sdk_agents_provider_unknown');
   }
@@ -1049,6 +1053,22 @@ function sdkAgentsStatusClass(status: SdkSubagentStatusRow['normalizedStatus'] |
   }
 }
 
+function formatSdkAgentClockTime(ts: number): string {
+  const date = new Date(ts);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function formatSdkAgentDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
 function SdkAgentsGlyph() {
   return (
     <svg
@@ -1088,11 +1108,13 @@ function SdkAgentsPanel({
   rows,
   diagnostics,
   runningCount,
+  now,
   onClose,
 }: {
   rows: SdkSubagentStatusRow[];
   diagnostics: SdkSubagentDiagnostic[];
   runningCount: number;
+  now: number;
   onClose: () => void;
 }) {
   const { t } = useTranslation();
@@ -1120,7 +1142,7 @@ function SdkAgentsPanel({
           <section class="chat-sdk-agents-section" aria-label={t('chat.sdk_agents_active_section')}>
             <div class="chat-sdk-agents-section-title">{t('chat.sdk_agents_active_section')}</div>
             {activeRows.map((row) => (
-              <SdkAgentsRow key={row.canonicalKey} row={row} />
+              <SdkAgentsRow key={row.canonicalKey} row={row} now={now} />
             ))}
           </section>
         )}
@@ -1128,7 +1150,7 @@ function SdkAgentsPanel({
           <section class="chat-sdk-agents-section" aria-label={t('chat.sdk_agents_recent_section')}>
             <div class="chat-sdk-agents-section-title">{t('chat.sdk_agents_recent_section')}</div>
             {terminalRows.map((row) => (
-              <SdkAgentsRow key={row.canonicalKey} row={row} />
+              <SdkAgentsRow key={row.canonicalKey} row={row} now={now} />
             ))}
           </section>
         )}
@@ -1145,11 +1167,12 @@ function SdkAgentsPanel({
   );
 }
 
-function SdkAgentsRow({ row }: { row: SdkSubagentStatusRow }) {
+function SdkAgentsRow({ row, now }: { row: SdkSubagentStatusRow; now: number }) {
   const { t } = useTranslation();
   const statusClass = sdkAgentsStatusClass(row.normalizedStatus);
   const statusLabel = sdkAgentsStatusLabel(t, row.normalizedStatus);
   const summary = sdkAgentsRowSummary(row);
+  const durationMs = row.active ? now - row.startTs : row.ts - row.startTs;
   return (
     <div class={`chat-sdk-agent-row ${row.active ? 'active' : 'terminal'} status-${statusClass}`}>
       <div class="chat-sdk-agent-row-top">
@@ -1163,6 +1186,20 @@ function SdkAgentsRow({ row }: { row: SdkSubagentStatusRow }) {
           <span class="chat-sdk-agent-detail-value">{row.agentPath || row.taskId || row.parentItemId}</span>
         </div>
       )}
+      {row.model && (
+        <div class="chat-sdk-agent-detail">
+          <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_model')}</span>
+          <span class="chat-sdk-agent-detail-value">{row.model}</span>
+        </div>
+      )}
+      <div class="chat-sdk-agent-detail">
+        <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_started_at')}</span>
+        <span class="chat-sdk-agent-detail-value">{formatSdkAgentClockTime(row.startTs)}</span>
+      </div>
+      <div class="chat-sdk-agent-detail">
+        <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_duration')}</span>
+        <span class="chat-sdk-agent-detail-value">{formatSdkAgentDuration(durationMs)}</span>
+      </div>
       {row.description && (
         <div class="chat-sdk-agent-detail">
           <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_prompt')}</span>
@@ -1588,7 +1625,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const hasAgentsStatusRows = sdkAgentsStatus.rows.length > 0 || sdkAgentsStatus.diagnostics.length > 0;
   useEffect(() => {
     if (preview || !hasAgentsStatusRows) return undefined;
-    const timer = window.setInterval(() => setSdkAgentsNow(Date.now()), 30_000);
+    const timer = window.setInterval(() => setSdkAgentsNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
   }, [hasAgentsStatusRows, preview]);
   const canShowAgentsControl = !preview;
@@ -2310,6 +2347,17 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     <div class={`chat-view-wrap${hasRightPanel ? ' chat-split' : ''}`}>
       {(canShowAgentsControl || onForceSync || canShowFilePanel) && (
         <div class="chat-top-actions">
+          {onForceSync && (
+            <button
+              class={`chat-panel-toggle chat-sync-btn${refreshing ? ' spinning' : ''}`}
+              onClick={handleForceSync}
+              disabled={syncDisabled}
+              title={t('chat.sync_history')}
+              aria-label={t('chat.sync_history')}
+            >
+              ↻
+            </button>
+          )}
           {canShowAgentsControl && (
             <button
               type="button"
@@ -2325,17 +2373,6 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                   {sdkAgentsStatus.runningCount}
                 </span>
               )}
-            </button>
-          )}
-          {onForceSync && (
-            <button
-              class={`chat-panel-toggle chat-sync-btn${refreshing ? ' spinning' : ''}`}
-              onClick={handleForceSync}
-              disabled={syncDisabled}
-              title={t('chat.sync_history')}
-              aria-label={t('chat.sync_history')}
-            >
-              ↻
             </button>
           )}
           {canShowFilePanel && (
@@ -2684,6 +2721,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           rows={sdkAgentsStatus.rows}
           diagnostics={sdkAgentsStatus.diagnostics}
           runningCount={sdkAgentsStatus.runningCount}
+          now={sdkAgentsNow}
           onClose={() => setDesiredAgentsPanelOpen(false)}
         />
       )}

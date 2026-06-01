@@ -99,7 +99,7 @@ interface ClaudeSdkSessionState {
   pendingComplete?: AgentMessage;
   pendingError?: ProviderError;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
-  runtimeAgentToolCalls: Map<string, { canonicalKey: string; agentPath: string; agentName?: string; prompt?: string }>;
+  runtimeAgentToolCalls: Map<string, { canonicalKey: string; agentPath: string; agentName?: string; model?: string; prompt?: string }>;
   emittedToolStates: Map<string, string>;
   subagentTasks: Map<string, ClaudeTaskState>;
   emittedSubagentStates: Map<string, string>;
@@ -124,6 +124,7 @@ interface ClaudeTaskState {
   canonicalKey: string;
   toolUseId?: string;
   description?: string;
+  model?: string;
   taskType?: string;
   workflowName?: string;
   rawStatus?: string;
@@ -829,11 +830,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
 
     if (msg.subtype === 'task_started') {
       task.description = this.pickShortString(msg.description) ?? task.description;
+      task.model = this.readRuntimeSubagentModel(msg) ?? task.model;
       task.taskType = this.pickShortString(msg.task_type) ?? task.taskType;
       task.workflowName = this.pickShortString(msg.workflow_name) ?? task.workflowName;
       this.applyClaudeTaskStatus(task, 'running');
     } else if (msg.subtype === 'task_progress') {
       task.description = this.pickShortString(msg.description) ?? task.description;
+      task.model = this.readRuntimeSubagentModel(msg) ?? task.model;
       task.summary = this.pickShortString(msg.summary) ?? task.summary;
       task.lastToolName = this.pickShortString(msg.last_tool_name) ?? task.lastToolName;
       task.usage = this.normalizeClaudeTaskUsage(msg.usage) ?? task.usage;
@@ -841,11 +844,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     } else if (msg.subtype === 'task_updated') {
       const patch = this.asRecord(msg.patch);
       task.description = this.pickShortString(patch?.description) ?? task.description;
+      task.model = this.readRuntimeSubagentModel(patch ?? {}) ?? task.model;
       task.error = this.pickShortString(patch?.error) ?? task.error;
       if (typeof patch?.is_backgrounded === 'boolean') task.backgrounded = patch.is_backgrounded;
       this.applyClaudeTaskStatus(task, this.pickString(patch?.status));
     } else if (msg.subtype === 'task_notification') {
       task.summary = this.pickShortString(msg.summary) ?? task.summary;
+      task.model = this.readRuntimeSubagentModel(msg) ?? task.model;
       task.outputFile = this.pickShortString(msg.output_file) ?? task.outputFile;
       task.usage = this.normalizeClaudeTaskUsage(msg.usage) ?? task.usage;
       this.applyClaudeTaskStatus(task, this.pickString(msg.status));
@@ -869,6 +874,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     const statusMapping = this.normalizeClaudeRuntimeSubagentStatus(rawStatus, missingIdDiagnostic);
     const canonicalKey = makeClaudeSubagentCanonicalKey(this.subagentSessionKey(sessionId, state), `runtime:${agentPath}`);
     const agentName = this.readRuntimeSubagentName(record);
+    const model = this.readRuntimeSubagentModel(record);
     const prompt = this.readRuntimeSubagentPrompt(record);
     const summary = agentName ? `Claude sub-agent ${agentName}` : rawAgentPath ? `Claude sub-agent ${rawAgentPath}` : 'Claude sub-agent';
     const detail = buildSdkSubagentSafeDetail({
@@ -890,6 +896,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
         parentItemId: canonicalKey,
         ...(rawAgentPath ? { agentPath: rawAgentPath } : {}),
         ...(agentName ? { agentName } : {}),
+        ...(model ? { model } : {}),
         diagnosticCode: statusMapping.diagnosticCode,
       },
     } satisfies SdkSubagentDetail, { allowRaw: false });
@@ -940,6 +947,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       ?? this.pickShortString(record.displayName)
       ?? this.pickShortString(record.display_name)
       ?? this.pickShortString(record.label);
+  }
+
+  private readRuntimeSubagentModel(record: Record<string, unknown>): string | undefined {
+    return this.pickShortString(record.model)
+      ?? this.pickShortString(record.agentModel)
+      ?? this.pickShortString(record.agent_model)
+      ?? this.pickShortString(record.modelId)
+      ?? this.pickShortString(record.model_id);
   }
 
   private readRuntimeSubagentStatus(record: Record<string, unknown>): string | undefined {
@@ -1107,6 +1122,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       ?? this.pickShortString(input?.agent_type)
       ?? this.pickShortString(input?.type)
       ?? this.pickShortString(input?.name);
+    const model = existing?.model ?? this.readRuntimeSubagentModel(input ?? {});
     const canonicalKey = existing?.canonicalKey
       ?? makeClaudeSubagentCanonicalKey(this.subagentSessionKey(sessionId, state), `runtime:${agentPath}`);
     if (status === 'running' && !existing) {
@@ -1114,6 +1130,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
         canonicalKey,
         agentPath,
         ...(agentName ? { agentName } : {}),
+        ...(model ? { model } : {}),
         ...(prompt ? { prompt } : {}),
       });
     }
@@ -1143,6 +1160,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
         parentItemId: tool.id,
         agentPath,
         ...(agentName ? { agentName } : {}),
+        ...(model ? { model } : {}),
       },
     } satisfies SdkSubagentDetail, { allowRaw: false });
     this.emitSubagentToolCall(sessionId, state, {
@@ -1311,6 +1329,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       ...(task.lastToolName ? { lastToolName: task.lastToolName } : {}),
       ...(task.taskType ? { taskType: task.taskType } : {}),
       ...(task.workflowName ? { workflowName: task.workflowName } : {}),
+      ...(task.model ? { model: task.model } : {}),
       ...(typeof task.backgrounded === 'boolean' ? { backgrounded: task.backgrounded } : {}),
       ...(task.usage?.total_tokens !== undefined ? { usageTotalTokens: task.usage.total_tokens } : {}),
       ...(task.usage?.tool_uses !== undefined ? { usageToolUses: task.usage.tool_uses } : {}),
