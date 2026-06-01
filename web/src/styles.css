@@ -191,7 +191,7 @@ body {
 }
 .shortcuts-row { display: flex; align-items: center; border-bottom: 1px solid rgba(125,211,252,0.14); background: linear-gradient(180deg, rgba(17,27,45,0.58), rgba(8,13,22,0.24)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.035); position: relative; z-index: 1; }
 .shortcuts { display: flex; gap: 4px; padding: 4px 8px; overflow-x: auto; scrollbar-width: none; flex: 1; min-width: 0; }
-.shortcuts-transport { flex: 1 1 auto; min-width: 0; margin-left: 0; }
+.shortcuts-transport { flex: 1 1 auto; min-width: 0; margin-left: 0; padding-left: 0; }
 .shortcuts::-webkit-scrollbar { display: none; }
 .shortcuts-model { padding: 4px 8px 4px 0; flex-shrink: 0; position: relative; }
 .session-ctx-wrap { display: flex; align-items: center; gap: 4px; padding: 4px 8px 4px 0; flex-shrink: 0; cursor: default; }
@@ -228,6 +228,7 @@ body {
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
 .shortcut-btn-icon { width: 28px; min-width: 28px; padding: 4px 0; display: inline-flex; align-items: center; justify-content: center; }
+.shortcut-btn-stop { width: 44px; min-width: 44px; }
 /* Mobile arrow D-pad — replaces the separate up/down buttons on small screens.
  * Drag toward a direction to send that arrow key. touch-action:none keeps the
  * drag from scrolling the page; the four glyphs sit around a center. */
@@ -779,7 +780,7 @@ body {
   .controls-composer { min-height: 32px; }
   .shortcuts-row { overflow: visible; }
   .shortcuts { gap: 3px; padding: 4px 4px 4px 6px; }
-  .shortcuts-transport { flex: 1 1 auto; min-width: 30px; max-width: none; overflow: visible; }
+  .shortcuts-transport { flex: 1 1 auto; min-width: 30px; max-width: none; overflow: visible; padding-left: 0; }
   /* Bigger stop tap-target on mobile. Extra height comes from padding that is
      cancelled by equal negative vertical margins, so the button's margin-box
      (which drives the toolbar row height) is unchanged — the toolbar does not
@@ -1773,7 +1774,7 @@ body {
 .subcard-input-area { flex-shrink: 0; border-top: 1px solid rgba(125,211,252,0.12); background: linear-gradient(180deg, #0a101b, #080d16); padding: 5px 6px; display: flex; flex-direction: column; gap: 3px; border-radius: 0 0 8px 8px; }
 .subcard-input-row { display: flex; align-items: stretch; gap: 6px; }
 .subcard-input-main { flex: 1; min-width: 0; }
-.subcard-stop-btn { flex: 0 0 auto; width: 30px; min-width: 30px; border-radius: 6px; border: 1px solid rgba(239,68,68,0.55); background: rgba(127,29,29,0.32); color: #f87171; cursor: pointer; font-size: 11px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; padding: 0; transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease; }
+.subcard-stop-btn { flex: 0 0 auto; width: 40px; min-width: 40px; margin-left: -6px; border-radius: 0 6px 6px 0; border: 1px solid rgba(239,68,68,0.55); background: rgba(127,29,29,0.32); color: #f87171; cursor: pointer; font-size: 11px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; padding: 0; transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease; }
 .subcard-stop-btn:hover:not(:disabled) { background: rgba(127,29,29,0.48); border-color: rgba(248,113,113,0.8); color: #fca5a5; }
 .subcard-stop-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .subcard-input-area .menu-dropdown { z-index: 10000; right: auto; left: 0; max-width: calc(100vw - 24px); }

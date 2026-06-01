@@ -135,6 +135,12 @@ describe('styles.css regression contracts', () => {
     expect(transportShortcutRule).not.toBeNull();
     expect(transportShortcutRule![0]).toMatch(/flex:\s*1\s+1\s+auto/);
     expect(transportShortcutRule![0]).toMatch(/margin-left:\s*0/);
+    expect(transportShortcutRule![0]).toMatch(/padding-left:\s*0/);
+
+    const stopButtonRule = css.match(/\.shortcut-btn-stop\s*\{[^}]*\}/);
+    expect(stopButtonRule).not.toBeNull();
+    expect(stopButtonRule![0]).toMatch(/width:\s*44px/);
+    expect(stopButtonRule![0]).toMatch(/min-width:\s*44px/);
 
     const mobileTransportShortcutRule = Array.from(css.matchAll(/\.shortcuts-transport\s*\{[^}]*\}/g))
       .map((match) => match[0])
@@ -142,6 +148,13 @@ describe('styles.css regression contracts', () => {
     expect(mobileTransportShortcutRule).not.toBeNull();
     expect(mobileTransportShortcutRule!).toMatch(/flex:\s*1\s+1\s+auto/);
     expect(mobileTransportShortcutRule!).toMatch(/max-width:\s*none/);
+    expect(mobileTransportShortcutRule!).toMatch(/padding-left:\s*0/);
+
+    const subcardStopRule = css.match(/\.subcard-stop-btn\s*\{[^}]*\}/);
+    expect(subcardStopRule).not.toBeNull();
+    expect(subcardStopRule![0]).toMatch(/width:\s*40px/);
+    expect(subcardStopRule![0]).toMatch(/margin-left:\s*-6px/);
+    expect(subcardStopRule![0]).toMatch(/border-radius:\s*0 6px 6px 0/);
   });
 
   it('daemon stats strip keeps the compact tech styling and animated clock digits', () => {
