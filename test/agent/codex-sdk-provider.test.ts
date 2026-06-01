@@ -617,7 +617,7 @@ describe('CodexSdkProvider', () => {
     });
   });
 
-  it('does not keep Codex completed lifecycle snapshots running when item status is stale inProgress', async () => {
+  it('keeps Codex completed lifecycle snapshots running when child state is still running', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-collab-completed-stale-status', cwd: '/tmp/project' });
@@ -636,17 +636,54 @@ describe('CodexSdkProvider', () => {
     await flush();
 
     expect(tools).toHaveLength(1);
-    expect(tools[0]!.status).toBe('error');
+    expect(tools[0]!.status).toBe('running');
     const detail = expectCodexSubagentDetail(tools[0]!);
     expect(detail.meta).toMatchObject({
       parentItemId: 'collab-stale-status',
       rawStatus: 'inProgress',
-      runningChildCount: 0,
-      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
-      active: false,
-      terminal: true,
-      diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
+      runningChildCount: 1,
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
     });
+    expect(detail.meta.diagnosticCode).toBeUndefined();
+  });
+
+  it('keeps Codex completed collaboration actions running while child agents are still running', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-completed-running-child', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-completed-running-child', 'coordinate work');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/completed', collabItem({
+      id: 'collab-running-after-dispatch',
+      tool: 'spawnAgent',
+      status: 'completed',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: { 'agent-a': { status: 'running' } },
+    }));
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]!.status).toBe('running');
+    expect(tools[0]!.output).toBeUndefined();
+    const detail = expectCodexSubagentDetail(tools[0]!);
+    expect(detail.meta).toMatchObject({
+      parentItemId: 'collab-running-after-dispatch',
+      receiverCount: 1,
+      runningChildCount: 1,
+      childStatusSummary: 'running:1',
+      rawStatus: 'inProgress',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    });
+    expect(detail.output).toBeUndefined();
+    expect(detail.meta.diagnosticCode).toBeUndefined();
   });
 
   it('diagnoses malformed Codex collaboration item ids without throwing or counting running work', async () => {

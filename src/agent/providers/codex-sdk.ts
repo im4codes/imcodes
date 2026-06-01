@@ -896,10 +896,8 @@ function collabAgentToolFromItem(
   const fallbackRawStatus = lifecycle === 'started' ? 'inProgress' : 'completed';
   const rawStatus = meaningfulString(item.status) ?? fallbackRawStatus;
   const childSummary = summarizeCodexCollabChildren(item, Boolean(missingIdDiagnostic));
-  const lifecycleStatusMismatch = lifecycle === 'completed' && normalizeStatusName(rawStatus) === 'inprogress'
-    ? SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE
-    : undefined;
-  const statusMapping = mapCodexCollabStatus(rawStatus, missingIdDiagnostic ?? childSummary.diagnosticCode ?? lifecycleStatusMismatch);
+  const effectiveRawStatus = childSummary.runningChildCount > 0 ? 'inProgress' : rawStatus;
+  const statusMapping = mapCodexCollabStatus(effectiveRawStatus, missingIdDiagnostic ?? childSummary.diagnosticCode);
   const receiverCount = childSummary.receiverCount;
   const receiverLabel = receiverCount === 1 ? '1 receiver' : `${receiverCount} receivers`;
   const summary = statusMapping.diagnosticCode
@@ -927,7 +925,7 @@ function collabAgentToolFromItem(
       providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT,
       canonicalKey: makeCodexSubagentCanonicalKey(sessionId, parentItemId),
       normalizedStatus: statusMapping.normalizedStatus,
-      rawStatus,
+      rawStatus: effectiveRawStatus,
       active: statusMapping.active,
       terminal: statusMapping.terminal,
       parentSessionId: sessionId,
