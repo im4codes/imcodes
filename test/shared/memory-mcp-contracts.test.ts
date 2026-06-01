@@ -21,7 +21,7 @@ function collectDescriptions(schema: { description?: string; properties?: Readon
 }
 
 describe('memory MCP shared contracts', () => {
-  it('exposes exactly the eleven MVP tool names', () => {
+  it('exposes exactly the twelve MVP tool names', () => {
     expect(MEMORY_MCP_TOOL_NAME_LIST).toEqual([
       'search_memory',
       'list_memory_summaries',
@@ -30,6 +30,7 @@ describe('memory MCP shared contracts', () => {
       'save_preference',
       'send_list_targets',
       'send_message',
+      'send_stop',
       'cron_create',
       'cron_list',
       'cron_update',
