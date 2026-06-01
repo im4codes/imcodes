@@ -386,7 +386,7 @@ describe('Hook server /send endpoint', () => {
       });
       listSessionsMock.mockReturnValue([brain, transport]);
 
-      const mockRuntime = { send: vi.fn().mockResolvedValue(undefined), getStatus: vi.fn().mockReturnValue('idle') };
+      const mockRuntime = { send: vi.fn().mockReturnValue('sent'), getStatus: vi.fn().mockReturnValue('idle') };
       getTransportRuntimeMock.mockReturnValue(mockRuntime);
 
       const res = await postSend(port, { from: 'deck_proj_brain', to: 'deck_proj_w1', message: 'hello transport' });
@@ -394,8 +394,68 @@ describe('Hook server /send endpoint', () => {
       expect(res.status).toBe(200);
       expect(res.body.ok).toBe(true);
       expect(res.body.delivered).toBe(true);
-      expect(mockRuntime.send).toHaveBeenCalledWith('hello transport');
+      const messageId = res.body.messageId;
+      expect(typeof messageId).toBe('string');
+      expect(mockRuntime.send).toHaveBeenCalledWith('hello transport', messageId);
       expect(typeof mockRuntime.send.mock.calls[0][0]).toBe('string');
+      expect(timelineEmitMock).toHaveBeenCalledWith(
+        'deck_proj_w1',
+        'user.message',
+        {
+          text: 'hello transport',
+          allowDuplicate: true,
+          commandId: messageId,
+          clientMessageId: messageId,
+        },
+        { source: 'daemon', confidence: 'high', eventId: `transport-user:${messageId}` },
+      );
+    });
+
+    it('records queued transport sends as queue state until runtime drain emits the user message', async () => {
+      const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
+      const transport = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'openclaw', runtimeType: 'transport' });
+
+      getSessionMock.mockImplementation((name: string) => {
+        if (name === 'deck_proj_brain') return brain;
+        if (name === 'deck_proj_w1') return transport;
+        return null;
+      });
+      listSessionsMock.mockReturnValue([brain, transport]);
+
+      const mockRuntime = {
+        send: vi.fn().mockReturnValue('queued'),
+        getStatus: vi.fn().mockReturnValue('running'),
+        pendingCount: 1,
+        pendingMessages: ['queued transport'],
+        pendingEntries: [{ clientMessageId: 'send_message_queued', text: 'queued transport' }],
+        pendingVersion: 7,
+      };
+      getTransportRuntimeMock.mockReturnValue(mockRuntime);
+
+      const res = await postSend(port, { from: 'deck_proj_brain', to: 'deck_proj_w1', message: 'queued transport' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.ok).toBe(true);
+      expect(res.body.queued).toBe(true);
+      expect(mockRuntime.send).toHaveBeenCalledWith('queued transport', res.body.messageId);
+      expect(timelineEmitMock).not.toHaveBeenCalledWith(
+        'deck_proj_w1',
+        'user.message',
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(timelineEmitMock).toHaveBeenCalledWith(
+        'deck_proj_w1',
+        'session.state',
+        {
+          state: 'queued',
+          pendingCount: 1,
+          pendingMessages: ['queued transport'],
+          pendingMessageEntries: [{ clientMessageId: 'send_message_queued', text: 'queued transport' }],
+          pendingMessageVersion: 7,
+        },
+        { source: 'daemon', confidence: 'high' },
+      );
     });
   });
 

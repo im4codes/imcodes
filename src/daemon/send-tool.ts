@@ -7,6 +7,7 @@ import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { isValidImcodesSessionName, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { getSession, listSessions } from '../store/session-store.js';
+import { timelineEmitter } from './timeline-emitter.js';
 
 export const SEND_MCP_DISPATCH_FEATURE_FLAG = IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG;
 export const SEND_TOOL_ERROR_REASONS = {
@@ -95,10 +96,17 @@ export interface SendToolDeps {
   now?: () => number;
   listSessions?: () => SessionRecord[];
   getSession?: (name: string) => SessionRecord | undefined;
-  dispatchMessage?: (target: SessionRecord, message: string) => Promise<void>;
+  dispatchMessage?: (target: SessionRecord, message: string, options: SendDispatchMessageOptions) => Promise<SendDispatchMessageResult>;
   isDispatchEnabled?: () => boolean;
   exactTargetOnly?: boolean;
 }
+
+export interface SendDispatchMessageOptions {
+  dispatchId: SendDispatchId;
+  messageId: SendMessageId;
+}
+
+export type SendDispatchMessageResult = 'sent' | 'queued' | void;
 
 export interface CronSendDispatchInput {
   fromSessionName: string;
@@ -228,7 +236,7 @@ export async function dispatchSendMessage(
   for (const target of targets.targets) {
     const messageId = createSendMessageId();
     try {
-      await d.dispatchMessage(target, message);
+      await d.dispatchMessage(target, message, { dispatchId, messageId });
       deliveries.push({ target: target.name, messageId, status: 'delivered' });
     } catch (err) {
       deliveries.push({ target: target.name, status: 'failed', error: sanitizeMcpErrorMessage(err) });
@@ -271,8 +279,9 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
   for (const target of input.targetRecords) {
     const messageId = createSendMessageId();
     try {
-      await d.dispatchMessage(target, message);
-      delivered.push(target.name);
+      const result = await d.dispatchMessage(target, message, { dispatchId, messageId });
+      if (result === 'queued') queued.push(target.name);
+      else delivered.push(target.name);
       messages.push({ target: target.name, messageId, status: 'delivered' });
     } catch (err) {
       errors.push(`${target.name}: ${(err as Error).message}`);
@@ -415,15 +424,44 @@ function buildSendMessage(message: string, options: { files: string[]; replyTo: 
   return result;
 }
 
-async function dispatchSessionMessage(target: SessionRecord, message: string): Promise<void> {
+async function dispatchSessionMessage(
+  target: SessionRecord,
+  message: string,
+  options: SendDispatchMessageOptions,
+): Promise<SendDispatchMessageResult> {
   if (target.runtimeType === 'transport') {
     const { getTransportRuntime } = await import('../agent/session-manager.js');
     const runtime = getTransportRuntime(target.name);
     if (!runtime) throw new Error(`no transport runtime for session ${target.name}`);
-    await runtime.send(message);
-    return;
+    const result = runtime.send(message, options.messageId);
+    if (result === 'sent') {
+      emitStructuredTransportUserMessage(target.name, message, options.messageId);
+    } else if (result === 'queued') {
+      timelineEmitter.emit(target.name, 'session.state', {
+        state: 'queued',
+        pendingCount: runtime.pendingCount,
+        pendingMessages: runtime.pendingMessages,
+        pendingMessageEntries: runtime.pendingEntries,
+        pendingMessageVersion: runtime.pendingVersion,
+      }, { source: 'daemon', confidence: 'high' });
+    }
+    return result;
   }
 
   const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
   await sendProcessSessionMessageForAutomation(target.name, message);
+}
+
+function emitStructuredTransportUserMessage(sessionName: string, message: string, messageId: SendMessageId): void {
+  timelineEmitter.emit(
+    sessionName,
+    'user.message',
+    {
+      text: message,
+      allowDuplicate: true,
+      commandId: messageId,
+      clientMessageId: messageId,
+    },
+    { source: 'daemon', confidence: 'high', eventId: `transport-user:${messageId}` },
+  );
 }
