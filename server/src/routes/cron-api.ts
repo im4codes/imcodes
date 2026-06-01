@@ -8,6 +8,7 @@ import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { CRON_STATUS } from '../../../shared/cron-types.js';
+import { MEMORY_MCP_CAPS } from '../../../shared/memory-mcp-contracts.js';
 import { MEMORY_MCP_SOURCE_FIELDS, stripMemoryMcpSourceProvenance } from '../../../shared/memory-mcp-provenance.js';
 import { P2P_MODE_KEYS } from '../../../shared/p2p-modes.js';
 import { dispatchJobNow } from '../cron/job-dispatch.js';
@@ -16,7 +17,7 @@ type CronRouteEnv = { Bindings: Env; Variables: { userId: string; role: string; 
 
 export const cronApiRoutes = new Hono<CronRouteEnv>();
 
-const MIN_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const MIN_INTERVAL_MS = MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES * 60 * 1000;
 
 const rolePattern = /^(brain|w\d+)$/;
 const sessionNamePattern = /^deck_sub_[a-zA-Z0-9_-]+$/;

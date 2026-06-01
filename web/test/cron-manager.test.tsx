@@ -184,6 +184,43 @@ describe('CronManager', () => {
     expect((screen.getByText('✎') as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it('shows persisted expiration timestamps in the browser local timezone when editing', async () => {
+    const previousTz = process.env.TZ;
+    process.env.TZ = 'Asia/Shanghai';
+    try {
+      apiFetch.mockResolvedValueOnce({
+        jobs: [cronJob({
+          id: 'expiring-job',
+          name: 'Expiring job',
+          expires_at: Date.UTC(2026, 5, 1, 2, 47, 30),
+        })],
+      });
+
+      const { container } = render(
+        <CronManager
+          serverId="srv-current"
+          projectName="cd"
+          sessions={sessions}
+          subSessions={subSessions}
+          onBack={vi.fn()}
+          servers={[{ id: 'srv-current', name: 'Current' }]}
+        />,
+      );
+
+      expect(await screen.findByText('Expiring job')).toBeDefined();
+      fireEvent.click(screen.getByText('✎'));
+
+      const expiresInput = container.querySelector('input[type="datetime-local"]') as HTMLInputElement;
+      expect(expiresInput.value).toBe('2026-06-01T10:47');
+    } finally {
+      if (previousTz === undefined) {
+        delete process.env.TZ;
+      } else {
+        process.env.TZ = previousTz;
+      }
+    }
+  });
+
   it('blocks saving inline cron commands longer than 1500 chars and shows a file-reference hint', async () => {
     apiFetch.mockResolvedValueOnce({ jobs: [] });
 

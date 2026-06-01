@@ -91,6 +91,18 @@ function fmtTime(ts: number | null): string {
   return new Date(ts).toLocaleString();
 }
 
+function formatDateTimeLocalInput(ts: number | null | undefined): string {
+  if (!ts) return '';
+  const date = new Date(ts);
+  if (!Number.isFinite(date.getTime())) return '';
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+  ].join('-') + `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 const statusColors: Record<string, string> = {
   [CRON_STATUS.ACTIVE]: '#4ade80',
   [CRON_STATUS.PAUSED]: '#94a3b8',
@@ -837,7 +849,7 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
     return [...new Set([...fromLegacy, ...fromEntries])];
   });
   const [p2pRounds, setP2pRounds] = useState(existingAction?.type === 'p2p' ? (existingAction.rounds ?? 1) : 1);
-  const [expiresAt, setExpiresAt] = useState(job?.expires_at ? new Date(job.expires_at).toISOString().slice(0, 16) : '');
+  const [expiresAt, setExpiresAt] = useState(formatDateTimeLocalInput(job?.expires_at));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const commandCharCount = Array.from(command).length;
