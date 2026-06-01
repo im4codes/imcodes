@@ -20,6 +20,9 @@ export interface Config {
     heartbeatInterval: number;
     reconnectBase: number;
     reconnectMax: number;
+    /** When false, the daemon refuses its own auto-upgrade (manual `imcodes
+     *  upgrade` still works). Default true. */
+    autoUpgrade: boolean;
   };
   agents: {
     defaultType: string;

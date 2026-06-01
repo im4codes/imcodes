@@ -8,6 +8,7 @@ daemon:
   heartbeatInterval: 30000 # ms WebSocket heartbeat
   reconnectBase: 1000      # ms initial reconnect backoff
   reconnectMax: 60000      # ms max reconnect backoff
+  autoUpgrade: true        # set false (here or in ~/.imcodes/config.yaml) to stop the daemon self-upgrading
 
 agents:
   defaultType: claude-code

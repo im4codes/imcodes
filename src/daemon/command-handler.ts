@@ -5828,6 +5828,27 @@ async function resolveUpgradeRegistry(): Promise<{ base: string; explicit: boole
 async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLink): Promise<void> {
   const UPGRADE_MEMORY_FREEZE_TTL_MS = 15 * 60 * 1000;
 
+  // ── Opt-out: forcibly disable the daemon's self-upgrade ───────────────────
+  // Set `daemon.autoUpgrade: false` in ~/.imcodes/config.yaml (or the env
+  // IMCODES_DISABLE_AUTO_UPGRADE=1) to stop the daemon from replacing itself —
+  // e.g. when running a local source build you don't want clobbered by the
+  // published npm release. The manual `imcodes upgrade` CLI is unaffected.
+  const envDisabled = process.env.IMCODES_DISABLE_AUTO_UPGRADE === '1'
+    || process.env.IMCODES_DISABLE_AUTO_UPGRADE === 'true';
+  let configDisabled = false;
+  try {
+    const { loadConfig } = await import('../config.js');
+    const cfg = await loadConfig();
+    configDisabled = cfg?.daemon?.autoUpgrade === false;
+  } catch { /* config unreadable — fall back to env only */ }
+  if (envDisabled || configDisabled) {
+    logger.info(
+      { targetVersion, reason: envDisabled ? 'env' : 'config' },
+      'daemon.upgrade: auto-upgrade disabled — skipping',
+    );
+    return;
+  }
+
   // ── Auto-upgrade cooldown ─────────────────────────────────────────────────
   // Server pushes `daemon.upgrade` whenever it sees a new dev tag on the
   // npm registry. With CI publishing every ~5 min during active dev work,
