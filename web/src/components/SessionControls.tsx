@@ -2796,7 +2796,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           {/* Transport sessions: single Stop button instead of terminal shortcuts */}
           {isTransport ? (
             <button
-              class="shortcut-btn shortcut-btn-icon"
+              class="shortcut-btn shortcut-btn-icon shortcut-btn-stop"
               title={`${t('session.stop_plain')} (/stop)`}
               aria-label={t('session.stop_plain')}
               disabled={disabled || activeSession?.state === 'stopped'}
