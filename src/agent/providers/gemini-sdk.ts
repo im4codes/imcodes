@@ -1041,6 +1041,12 @@ export class GeminiSdkProvider implements TransportProvider {
       case 'tool_call_update':
         this.handleToolCallUpdate(routeId, state, update);
         return;
+      case 'plan':
+        // Gemini's task checklist arrives as an ACP `plan` update (not a tool
+        // call). Surface it as a synthetic `plan` tool.call so the shared
+        // timeline + web checklist render it like CC/Codex/Qwen todos.
+        this.handlePlan(routeId, state, update);
+        return;
       case 'current_mode_update':
         // Just informational — the user may have switched mode through the
         // agent's own command vocabulary. Treat as metadata.
@@ -1073,7 +1079,6 @@ export class GeminiSdkProvider implements TransportProvider {
       }
       case 'available_commands_update':
       case 'user_message_chunk':
-      case 'plan':
       case 'config_option_update':
       case 'session_info_update':
         // Ignore for now. `user_message_chunk` arrives during history replay
@@ -1204,6 +1209,26 @@ export class GeminiSdkProvider implements TransportProvider {
     this.emitToolCallEvent(sessionId, state, evt);
   }
 
+  private handlePlan(
+    sessionId: string,
+    state: GeminiSdkSessionState,
+    update: SessionUpdate,
+  ): void {
+    const input = geminiPlanEntriesToInput((update as unknown as { entries?: unknown }).entries);
+    if (!input) return;
+    this.clearStatus(sessionId, state);
+    // Stable id so each plan revision overwrites the same timeline event in
+    // place. Name `plan` is deliberately NOT file-tool-shaped so transport-relay
+    // emits it as a plain tool.call; the web checklist keys off the input shape.
+    this.emitToolCallEvent(sessionId, state, {
+      id: `gemini-plan:${sessionId}`,
+      name: 'plan',
+      status: 'running',
+      input,
+      detail: { kind: 'plan', summary: 'Plan', input, meta: {}, raw: update as unknown as Record<string, unknown> },
+    });
+  }
+
   private emitRuntimeSubagentNotification(
     sessionId: string,
     state: GeminiSdkSessionState,
@@ -1313,6 +1338,28 @@ export class GeminiSdkProvider implements TransportProvider {
 /** Extract a text string from a ContentBlock if it's a textual variant.
  *  Gemini's agent_message_chunk and agent_thought_chunk carry TextContent;
  *  image/audio/resource variants are silently dropped. */
+/**
+ * Map ACP plan-update entries to the checklist `tool.call` input shape the web
+ * recognizes ({ plan: [{ content, status }] }). ACP PlanEntry has { content,
+ * priority, status }; some builds use `title`. Exported for unit testing.
+ */
+export function geminiPlanEntriesToInput(entries: unknown): { plan: Array<{ content: string; status: string }> } | null {
+  if (!Array.isArray(entries)) return null;
+  const plan: Array<{ content: string; status: string }> = [];
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') continue;
+    const record = entry as Record<string, unknown>;
+    const rawText = typeof record.content === 'string'
+      ? record.content
+      : typeof record.title === 'string' ? record.title : '';
+    const content = rawText.trim();
+    if (!content) continue;
+    const status = typeof record.status === 'string' ? record.status : 'pending';
+    plan.push({ content, status });
+  }
+  return plan.length > 0 ? { plan } : null;
+}
+
 function extractTextFromContent(block: ContentBlock): string {
   if (!block || typeof block !== 'object') return '';
   if (block.type === 'text' && typeof block.text === 'string') return block.text;
