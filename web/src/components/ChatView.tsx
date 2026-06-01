@@ -30,6 +30,7 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
+import { AgentTodoList } from './AgentTodoList.js';
 import { computeFollowThresholds } from './chat-follow-thresholds.js';
 import type { ChatLocalImagePreviewLoader, ChatLocalImagePreviewResult } from './ChatLocalImagePreview.js';
 import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
@@ -2546,6 +2547,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             setCtxMenu(null);
           } : undefined}
         >
+          {!preview && <AgentTodoList events={events} />}
           {loading ? (
             <div class="chat-loading">{t('chat.loading')}</div>
           ) : viewItems.length === 0 ? (

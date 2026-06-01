@@ -2101,5 +2101,9 @@
       "enforced": "Enforced",
       "additive": "Additive"
     }
+  },
+  "todos": {
+    "title": "Tasks",
+    "progress": "{{done}}/{{total}}"
   }
 }

@@ -2100,5 +2100,9 @@
       "enforced": "Obligatoria",
       "additive": "Aditiva"
     }
+  },
+  "todos": {
+    "title": "Tareas",
+    "progress": "{{done}}/{{total}}"
   }
 }

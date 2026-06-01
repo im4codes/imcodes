@@ -2100,5 +2100,9 @@
       "enforced": "Обязательный",
       "additive": "Добавочный"
     }
+  },
+  "todos": {
+    "title": "Задачи",
+    "progress": "{{done}}/{{total}}"
   }
 }

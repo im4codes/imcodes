@@ -2100,5 +2100,9 @@
       "enforced": "강제",
       "additive": "추가"
     }
+  },
+  "todos": {
+    "title": "작업",
+    "progress": "{{done}}/{{total}}"
   }
 }

@@ -2101,5 +2101,9 @@
       "enforced": "強制",
       "additive": "附加"
     }
+  },
+  "todos": {
+    "title": "任務清單",
+    "progress": "{{done}}/{{total}}"
   }
 }

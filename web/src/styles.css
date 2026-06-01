@@ -205,6 +205,22 @@ body {
    state round-trip + provider interrupt land). */
 .shortcut-btn-stop-pending { animation: shortcut-btn-stop-pulse 0.7s ease-in-out infinite; border-color: rgba(248,113,113,0.6) !important; color: #f87171 !important; }
 @keyframes shortcut-btn-stop-pulse { 0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(248,113,113,0); } 50% { opacity: 0.55; box-shadow: 0 0 10px 1px rgba(248,113,113,0.35); } }
+/* Agent task list (TodoWrite / todo_write / update_plan) — pinned checklist at
+   the top of the chat scroll viewport, auto-updating as the agent progresses. */
+.agent-todos { position: sticky; top: 0; z-index: 5; margin: 0 0 10px; padding: 8px 10px; background: linear-gradient(180deg, rgba(16,24,40,0.98), rgba(11,17,28,0.96)); border: 1px solid rgba(125,211,252,0.2); border-radius: 10px; box-shadow: 0 4px 14px rgba(0,0,0,0.32); backdrop-filter: blur(6px); }
+.agent-todos-complete { opacity: 0.72; }
+.agent-todos-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.agent-todos-title { font-size: 12px; font-weight: 700; color: #cbd5e1; letter-spacing: 0.02em; }
+.agent-todos-count { font-size: 11px; color: #93c5fd; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.agent-todos-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; max-height: 188px; overflow-y: auto; }
+.agent-todos-item { display: flex; align-items: flex-start; gap: 7px; font-size: 12.5px; line-height: 1.4; color: #cbd5e1; }
+.agent-todos-icon { flex-shrink: 0; width: 14px; text-align: center; line-height: 1.4; }
+.agent-todos-text { min-width: 0; word-break: break-word; }
+.agent-todos-item-pending .agent-todos-icon { color: #5f7087; }
+.agent-todos-item-in_progress .agent-todos-text { color: #f8fafc; font-weight: 600; }
+.agent-todos-item-in_progress .agent-todos-icon { color: #38bdf8; }
+.agent-todos-item-completed .agent-todos-icon { color: #34d399; }
+.agent-todos-item-completed .agent-todos-text { color: #6b7a8d; text-decoration: line-through; }
 .shortcut-btn:hover:not(:disabled) { background: rgba(8,145,178,0.14); border-color: rgba(34,211,238,0.42); color: #dbeafe; box-shadow: 0 0 12px rgba(34,211,238,0.12), inset 0 1px 0 rgba(255,255,255,0.05); }
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
