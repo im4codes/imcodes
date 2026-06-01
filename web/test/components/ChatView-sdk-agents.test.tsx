@@ -177,16 +177,19 @@ describe('ChatView SDK agents panel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }));
     expect(localStorage.getItem('chatSdkAgentsPanelOpen:deck_agents')).toBe('1');
     expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }).classList.contains('active')).toBe(false);
 
     rerender(<ChatView events={[runningEvent]} loading={false} sessionId="deck_agents" />);
     expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(true);
     expect(screen.getByRole('region', { name: 'Agents' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 1 running' }).classList.contains('active')).toBe(true);
     expect(screen.getByText('Checking files')).toBeTruthy();
 
     rerender(<ChatView events={[terminalEvent]} loading={false} sessionId="deck_agents" />);
     expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
     expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(false);
     expect(localStorage.getItem('chatSdkAgentsPanelOpen:deck_agents')).toBe('1');
+    expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }).classList.contains('active')).toBe(false);
 
     rerender(<ChatView events={[diagnosticEvent]} loading={false} sessionId="deck_agents" />);
     expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
@@ -201,7 +204,9 @@ describe('ChatView SDK agents panel', () => {
 
     rerender(<ChatView events={[runningEvent]} loading={false} sessionId="deck_agents" />);
     expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
-    expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 1 running' }).textContent).toContain('1');
+    const closedButton = screen.getByRole('button', { name: 'Toggle SDK agents status, 1 running' });
+    expect(closedButton.textContent).toContain('1');
+    expect(closedButton.classList.contains('active')).toBe(false);
   });
 
   it('uses hidden raw events even when tool transcript rows are disabled and avoids raw prompts', () => {
