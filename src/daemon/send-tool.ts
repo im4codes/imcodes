@@ -97,6 +97,9 @@ export interface SendToolDeps {
   listSessions?: () => SessionRecord[];
   getSession?: (name: string) => SessionRecord | undefined;
   dispatchMessage?: (target: SessionRecord, message: string, options: SendDispatchMessageOptions) => Promise<SendDispatchMessageResult>;
+  /** Force-stop a resolved target's active turn. Returns false when the target
+   *  could not be stopped (e.g. session not found). Used by send_stop. */
+  cancelSession?: (target: SessionRecord) => Promise<boolean>;
   isDispatchEnabled?: () => boolean;
   exactTargetOnly?: boolean;
 }
@@ -257,6 +260,92 @@ export async function dispatchSendMessage(
     status: 'accepted',
     dispatchId,
     ...(deliveries.length === 1 && delivered[0]?.messageId ? { messageId: delivered[0].messageId } : {}),
+    deliveries,
+    ...(failed > 0 ? { partial: true } : {}),
+  };
+  if (cacheKey && failed === 0) idempotencyCache.set(cacheKey, { expiresAt: now + SEND_IDEMPOTENCY_WINDOW_MS, result: accepted });
+  return accepted;
+}
+
+export interface SendStopInput {
+  target?: string;
+  broadcast?: boolean;
+  idempotencyKey?: string;
+}
+
+/**
+ * MCP-side `send_stop`: resolve scoped sibling target(s) exactly like
+ * send_message, then force-stop each via the injected `cancelSession` hook
+ * (production routes it to the daemon hook server's /stop endpoint, which runs
+ * stopSessionNow on the priority lane). Returns the same shape as send_message
+ * so callers get per-target status. Idempotent within the send window.
+ */
+export async function dispatchSendStop(
+  caller: SendRuntimeCaller,
+  input: SendStopInput,
+  deps?: SendToolDeps,
+): Promise<SendMessageResult> {
+  const d = depsWithDefaults(deps);
+  if (!d.isDispatchEnabled()) {
+    return { status: 'disabled', reason: MCP_ERROR_REASONS.FEATURE_DISABLED, disabledFlag: SEND_MCP_DISPATCH_FEATURE_FLAG };
+  }
+  if (!caller.sessionName) {
+    return { status: 'error', reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN, error: 'send_stop requires a scoped caller' };
+  }
+  const cancelSession = deps?.cancelSession;
+  if (!cancelSession) {
+    return { status: 'error', reason: MCP_ERROR_REASONS.INTERNAL_ERROR, error: 'stop dispatch is not configured' };
+  }
+  const allSessions = d.listSessions();
+  const callerProjectName = effectiveCallerProjectName(caller, allSessions);
+  if (!callerProjectName) {
+    return { status: 'error', reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN, error: 'send_stop requires a scoped caller' };
+  }
+  if (!input.target && !input.broadcast) {
+    return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: 'target is required unless broadcast is true' };
+  }
+
+  const idempotencyKey = typeof input.idempotencyKey === 'string' ? input.idempotencyKey.trim() : '';
+  const idempotencyTarget = input.broadcast ? '*' : input.target ?? '';
+  const cacheKey = idempotencyKey ? `${caller.userId}\0${caller.sessionName}\0stop\0${idempotencyTarget}\0${idempotencyKey}` : '';
+  const now = d.now();
+  if (cacheKey) {
+    const cached = idempotencyCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) return { ...cached.result, idempotentReplay: true };
+    if (cached) idempotencyCache.delete(cacheKey);
+  }
+
+  const targets = resolveScopedTargets({ ...caller, projectName: callerProjectName }, { target: input.target, broadcast: input.broadcast }, allSessions, d.exactTargetOnly);
+  if (!targets.ok) return { status: 'error', reason: targets.reason, error: targets.error };
+
+  const dispatchId = createSendDispatchId();
+  const deliveries: SendMessageDelivery[] = [];
+  for (const target of targets.targets) {
+    try {
+      const stopped = await cancelSession(target);
+      if (stopped === false) {
+        deliveries.push({ target: target.name, status: 'failed', error: 'session not found or not stoppable' });
+      } else {
+        deliveries.push({ target: target.name, status: 'delivered' });
+      }
+    } catch (err) {
+      deliveries.push({ target: target.name, status: 'failed', error: sanitizeMcpErrorMessage(err) });
+    }
+  }
+
+  const delivered = deliveries.filter((delivery) => delivery.status === 'delivered');
+  const failed = deliveries.length - delivered.length;
+  if (delivered.length === 0) {
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.INTERNAL_ERROR,
+      error: failed === 1 ? deliveries[0]?.error ?? 'stop dispatch failed' : 'stop dispatch failed for all targets',
+    };
+  }
+
+  const accepted: Extract<SendMessageResult, { status: 'accepted' }> = {
+    status: 'accepted',
+    dispatchId,
     deliveries,
     ...(failed > 0 ? { partial: true } : {}),
   };

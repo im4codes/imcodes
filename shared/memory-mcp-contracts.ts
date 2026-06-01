@@ -12,6 +12,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   SAVE_PREFERENCE: 'save_preference',
   SEND_LIST_TARGETS: 'send_list_targets',
   SEND_MESSAGE: 'send_message',
+  SEND_STOP: 'send_stop',
   CRON_CREATE: 'cron_create',
   CRON_LIST: 'cron_list',
   CRON_UPDATE: 'cron_update',
@@ -28,6 +29,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+  MEMORY_MCP_TOOL_NAMES.SEND_STOP,
   MEMORY_MCP_TOOL_NAMES.CRON_CREATE,
   MEMORY_MCP_TOOL_NAMES.CRON_LIST,
   MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
@@ -230,6 +232,16 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       broadcast: booleanSchema('Optional project-scoped broadcast request; unavailable for unscoped callers.'),
       idempotencyKey: stringSchema(`Optional retry key; duplicate sends within ${MEMORY_MCP_CAPS.SEND_MESSAGE_IDEMPOTENCY_WINDOW_MS} ms reuse the original ids.`),
     }, ['target', 'message']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: {
+    name: MEMORY_MCP_TOOL_NAMES.SEND_STOP,
+    description: 'Force-stop the active turn of a caller-project sibling session, using the exact target value returned by send_list_targets. Unlike send_message (which queues behind a busy session), this interrupts the session immediately: transport/SDK sessions cancel the in-flight turn on a priority lane, and terminal sessions receive an interrupt (ESC / Ctrl+C). Use it when a sibling is stuck or running the wrong work and a queued message will not reach it. The caller session is not a valid target. Queued user messages are preserved; only the currently active turn is interrupted.',
+    inputSchema: objectSchema({
+      target: stringSchema('Exact target value returned by send_list_targets.target. Required unless broadcast is true. Do not use label or agentType values.'),
+      broadcast: booleanSchema('Optional project-scoped request to stop every sendable sibling session; unavailable for unscoped callers.'),
+      idempotencyKey: stringSchema(`Optional retry key; duplicate stops within ${MEMORY_MCP_CAPS.SEND_MESSAGE_IDEMPOTENCY_WINDOW_MS} ms reuse the original ids.`),
+    }),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: {

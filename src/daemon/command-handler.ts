@@ -2080,6 +2080,29 @@ async function handleSessionCancel(cmd: Record<string, unknown>, serverLink: Ser
 }
 
 /**
+ * Force-stop a session's active turn, used by the `send_stop` MCP tool (and any
+ * other internal caller). Transport/SDK sessions cancel the in-flight turn on
+ * the priority lane; terminal sessions receive the same interrupt key as an ESC
+ * `session.input` (ESC for CC-style agents, remapped to Ctrl+C for Codex/Gemini
+ * and shell, which do not interrupt on ESC). Fire-and-forget for the terminal
+ * write. Returns true when a known session was handled, false when not found.
+ */
+export function stopSessionNow(sessionName: string): boolean {
+  if (cancelTransportTurnNow(sessionName, undefined, undefined)) return true;
+  const record = getSession(sessionName);
+  if (!record) return false;
+  const agentType = record.agentType;
+  // ESC interrupts CC/opencode; Codex, Gemini and shell only stop on Ctrl+C.
+  const interruptKey = (agentType === 'codex' || agentType === 'gemini' || agentType === 'shell')
+    ? '\x03' // Ctrl+C
+    : '\x1b'; // ESC
+  void sendRawInput(sessionName, interruptKey).catch((err) => {
+    logger.error({ sessionName, agentType, err }, 'stopSessionNow: terminal interrupt failed');
+  });
+  return true;
+}
+
+/**
  * Send a command to a session, handling `!`-prefixed shell commands:
  * - claude-code: send `!` first (with delayed-Enter), then send the rest of the command
  * - codex: strip `!` and send the shell command directly (Codex has no `!` prefix)

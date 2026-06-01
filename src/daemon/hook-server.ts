@@ -23,6 +23,7 @@ import type { SessionRecord } from '../store/session-store.js';
 import { refreshSessionWatcher } from './watcher-controls.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { dispatchHookSend } from './send-tool.js';
+import { stopSessionNow } from './command-handler.js';
 
 export const DEFAULT_HOOK_PORT = 51913;
 const PORT_FILE = path.join(os.homedir(), '.imcodes', 'hook-port');
@@ -364,6 +365,57 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
   };
 }
 
+// ─── /stop Handler ───────────────────────────────────────────────────────────
+
+interface StopRequest {
+  from: string;
+  to: string;
+}
+
+/**
+ * Force-stop the active turn of a resolved sibling target. Mirrors /send target
+ * resolution (label/name/type, sibling-scoped, broadcast via "*") but instead of
+ * delivering a message it runs stopSessionNow on the priority lane. Used by the
+ * send_stop MCP tool so a busy session (which would otherwise just queue a
+ * message) can be interrupted.
+ */
+function handleStop(body: StopRequest): { status: number; body: Record<string, unknown> } {
+  const { from, to } = body;
+  if (!from || !to) {
+    return { status: 400, body: { ok: false, error: 'missing required fields: from, to' } };
+  }
+  if (!checkRateLimit(from)) {
+    return { status: 429, body: { ok: false, error: 'rate limit exceeded' } };
+  }
+
+  const result = resolveTarget(from, to);
+  if (!result.ok) {
+    return { status: 404, body: { ok: false, error: result.error, available: result.available } };
+  }
+  recordSend(from);
+
+  const stopped: string[] = [];
+  const notStopped: string[] = [];
+  for (const target of result.targets) {
+    if (stopSessionNow(target.name)) stopped.push(target.name);
+    else notStopped.push(target.name);
+  }
+
+  if (result.targets.length === 1) {
+    const target = result.targets[0].name;
+    const ok = stopped.length === 1;
+    return {
+      status: 200,
+      body: { ok, stopped: ok, target, ...(ok ? {} : { error: 'session not found or not stoppable' }) },
+    };
+  }
+
+  return {
+    status: 200,
+    body: { ok: notStopped.length === 0, stopped, ...(notStopped.length > 0 ? { notStopped } : {}) },
+  };
+}
+
 // ─── Body Parser ─────────────────────────────────────────────────────────────
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -450,6 +502,31 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
         const body = await readBody(req);
         const parsed = JSON.parse(body) as SendRequest;
         const result = await handleSend(parsed);
+        res.writeHead(result.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result.body));
+      } catch (err) {
+        if ((err as Error).message === 'body too large') {
+          res.writeHead(413);
+          res.end(JSON.stringify({ ok: false, error: 'request body too large' }));
+        } else {
+          res.writeHead(400);
+          res.end(JSON.stringify({ ok: false, error: 'bad request' }));
+        }
+      }
+      return;
+    }
+
+    if (url === '/stop') {
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        res.writeHead(415);
+        res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+        return;
+      }
+      try {
+        const body = await readBody(req);
+        const parsed = JSON.parse(body) as StopRequest;
+        const result = handleStop(parsed);
         res.writeHead(result.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result.body));
       } catch (err) {

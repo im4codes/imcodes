@@ -37,13 +37,13 @@ function readHookPort(): number | null {
   }
 }
 
-async function postHookSend(port: number, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function postHookSend(port: number, body: Record<string, unknown>, hookPath = '/send'): Promise<Record<string, unknown>> {
   const data = JSON.stringify(body);
   return new Promise((resolve, reject) => {
     const req = http.request({
       hostname: '127.0.0.1',
       port,
-      path: '/send',
+      path: hookPath,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -88,6 +88,16 @@ function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryMcpToolD
           message,
           depth: 0,
         });
+      },
+      cancelSession: async (target: SessionRecord) => {
+        const port = readHookPort();
+        if (!port) throw new Error('daemon hook server is unavailable');
+        if (!caller.sessionName) throw new Error('send_stop requires a scoped caller');
+        const res = await postHookSend(port, {
+          from: caller.sessionName,
+          to: target.name,
+        }, '/stop');
+        return (res as { stopped?: boolean }).stopped !== false;
       },
     },
   };

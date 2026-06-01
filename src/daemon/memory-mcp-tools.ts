@@ -38,7 +38,7 @@ import type { MemorySearchQuery } from '../context/memory-search.js';
 import { saveObservation, savePreference } from '../context/memory-write-tools.js';
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
-import { dispatchSendMessage, listSendTargets, type SendToolDeps } from './send-tool.js';
+import { dispatchSendMessage, dispatchSendStop, listSendTargets, type SendToolDeps } from './send-tool.js';
 import { cronMcpCreate, cronMcpDelete, cronMcpList, cronMcpUpdate, type CronMcpClientOptions } from './cron-mcp-client.js';
 import { registerMemoryShortRef, resolveMemoryShortRef } from '../context/memory-short-ref.js';
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
@@ -493,6 +493,19 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         exactTargetOnly: true,
       }) as unknown as Promise<ToolResult>;
     },
+    [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: async (input) => {
+      await refreshSendSessionStore(deps);
+      const args = pickAllowedMcpArgs(input, ['target', 'broadcast', 'idempotencyKey']);
+      return dispatchSendStop(caller, {
+        target: stringArg(args, 'target'),
+        broadcast: boolArg(args, 'broadcast'),
+        idempotencyKey: stringArg(args, 'idempotencyKey'),
+      }, {
+        ...deps.sendDeps,
+        isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
+        exactTargetOnly: true,
+      }) as unknown as Promise<ToolResult>;
+    },
     [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['name', 'cronExpr', 'projectName', 'targetRole', 'targetSessionName', 'action', 'timezone', 'expiresAt']);
       const expiresAt = parseExpiresAt(args.expiresAt);
@@ -622,6 +635,11 @@ const schemas = {
     reply: z.boolean().optional().describe('Ask target to reply to the caller session.'),
     broadcast: z.boolean().optional().describe('Broadcast within the caller project.'),
     idempotencyKey: z.string().optional().describe('Retry key for accepted send replay.'),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: z.object({
+    target: z.string().optional().describe('Exact sibling target from send_list_targets to force-stop. Required unless broadcast is true. The caller session is not a valid target.'),
+    broadcast: z.boolean().optional().describe('Force-stop every sendable sibling session in the caller project.'),
+    idempotencyKey: z.string().optional().describe('Retry key for accepted stop replay.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: z.object({
     name: z.string().describe('Cron job name.'),
