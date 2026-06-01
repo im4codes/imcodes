@@ -284,6 +284,13 @@ const PROVISIONAL_TRANSPORT_HISTORY_PREFIX = 'transport-history:';
 const OPTIMISTIC_EVENT_ID_PREFIX = 'optimistic:';
 const TIMELINE_SNAPSHOT_STORAGE_PREFIX = 'rcc_timeline_snapshot:';
 const TIMELINE_SNAPSHOT_WRITE_DELAY_MS = 750;
+// Streaming assistant.text deltas are NOT written to IDB per-tick (too frequent —
+// see shouldPersistTimelineEvent). Instead, persist the LATEST streaming text to
+// IDB once the stream has been QUIET for this long: each delta resets the timer
+// ("一直更新不保存"), and after this idle gap we write once. This makes a turn
+// that only ever produced streaming events (no final non-streaming one) durable
+// in IDB, so a later page refresh restores it — not only the localStorage mat.
+const STREAMING_IDLE_PERSIST_MS = 2000;
 // Snapshot tail size matches MAX_MEMORY_EVENTS (300) so the synchronous
 // first-paint seed approaches the same coverage as the IDB-restored cache.
 // The previous 50-event cap meant 5/6 of a 300-event session disappeared
@@ -661,6 +668,13 @@ function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void 
   const persistable = events.filter(shouldPersistTimelineEvent);
   if (persistable.length === 0) return;
   sharedDb.putEvents(scopeEventsForDb(cacheKey, persistable)).catch(() => {});
+}
+
+// Persist events to IDB WITHOUT the streaming filter — used only by the
+// streaming idle-flush so the latest streaming assistant.text becomes durable.
+function persistTimelineEventsIncludingStreaming(cacheKey: string, events: TimelineEvent[]): void {
+  if (events.length === 0) return;
+  sharedDb.putEvents(scopeEventsForDb(cacheKey, events)).catch(() => {});
 }
 
 function shouldPersistTimelineEvent(event: TimelineEvent): boolean {
@@ -2360,24 +2374,73 @@ export function useTimeline(
     idbPutEvents(incoming);
   }, [idbPutEvents, mergeEvents]);
 
+  // ── Streaming idle-persist ──────────────────────────────────────────────
+  // Debounced IDB write for streaming assistant.text: each delta resets the
+  // timer; once the stream is idle for STREAMING_IDLE_PERSIST_MS we persist the
+  // LATEST text of every pending eventId. Reads from the per-key cache (not
+  // `eventsRef`) so a session switch mid-stream still writes the right session.
+  const streamingIdlePersistIdsRef = useRef(new Set<string>());
+  const streamingIdlePersistKeyRef = useRef<string | null>(null);
+  const streamingIdlePersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flushStreamingIdlePersist = useCallback(() => {
+    if (streamingIdlePersistTimerRef.current) {
+      clearTimeout(streamingIdlePersistTimerRef.current);
+      streamingIdlePersistTimerRef.current = null;
+    }
+    const key = streamingIdlePersistKeyRef.current;
+    const ids = streamingIdlePersistIdsRef.current;
+    streamingIdlePersistIdsRef.current = new Set();
+    streamingIdlePersistKeyRef.current = null;
+    if (!key || ids.size === 0) return;
+    const cached = getCachedEvents(key) ?? eventsRef.current;
+    const byId = new Map(cached.map((event) => [event.eventId, event]));
+    const toPersist: TimelineEvent[] = [];
+    for (const id of ids) {
+      const event = byId.get(id);
+      if (event) toPersist.push(event); // whatever the latest is (streaming or final)
+    }
+    if (toPersist.length > 0) persistTimelineEventsIncludingStreaming(key, toPersist);
+  }, []);
+  const scheduleStreamingIdlePersist = useCallback((eventId: string) => {
+    const key = cacheKeyRef.current;
+    if (!key) return;
+    // Session changed mid-stream → flush the previous session's pending first.
+    if (streamingIdlePersistKeyRef.current && streamingIdlePersistKeyRef.current !== key) {
+      flushStreamingIdlePersist();
+    }
+    streamingIdlePersistKeyRef.current = key;
+    streamingIdlePersistIdsRef.current.add(eventId);
+    if (streamingIdlePersistTimerRef.current) clearTimeout(streamingIdlePersistTimerRef.current);
+    streamingIdlePersistTimerRef.current = setTimeout(flushStreamingIdlePersist, STREAMING_IDLE_PERSIST_MS);
+  }, [flushStreamingIdlePersist]);
+
   const appendRealtimeEvent = useCallback((event: TimelineEvent) => {
     if (!shouldFrameCoalesceTimelineEvent(event)) {
       pendingRealtimeEventsRef.current.delete(event.eventId);
+      // A final (non-streaming) version arrived — idbPutEvents persists it below,
+      // so drop any pending idle-persist for this id.
+      streamingIdlePersistIdsRef.current.delete(event.eventId);
       appendEvent(event);
       idbPutEvents([event]);
       return;
+    }
+    // Streaming assistant.text isn't written per-tick; (re)arm the idle-persist
+    // debounce so the latest text lands in IDB once the stream goes quiet.
+    if (event.type === 'assistant.text' && event.payload?.streaming === true) {
+      scheduleStreamingIdlePersist(event.eventId);
     }
     const existing = pendingRealtimeEventsRef.current.get(event.eventId);
     pendingRealtimeEventsRef.current.set(event.eventId, existing ? preferTimelineEvent(existing, event) : event);
     if (pendingRealtimeFlushCancelRef.current) return;
     pendingRealtimeFlushCancelRef.current = scheduleBrowserFrame(flushPendingRealtimeEvents);
-  }, [appendEvent, flushPendingRealtimeEvents, idbPutEvents]);
+  }, [appendEvent, flushPendingRealtimeEvents, idbPutEvents, scheduleStreamingIdlePersist]);
 
   useEffect(() => () => {
     pendingRealtimeFlushCancelRef.current?.();
     pendingRealtimeFlushCancelRef.current = null;
     pendingRealtimeEventsRef.current.clear();
-  }, []);
+    flushStreamingIdlePersist();
+  }, [flushStreamingIdlePersist]);
 
   /**
    * Defense-in-depth: fire an HTTP "/timeline/history/full" read for this
