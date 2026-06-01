@@ -9,6 +9,9 @@ import type { SessionInfo } from '../types.js';
 import { formatLabel } from '../format-label.js';
 import { getAgentBadgeLabel } from '../agent-display.js';
 import { FloatingPanel } from '../components/FloatingPanel.js';
+import { useResourceEvent } from '../hooks/useResourceEvent.js';
+import { RESOURCE_TOPICS } from '@shared/resource-events.js';
+import type { WsClient } from '../ws-client.js';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -69,7 +72,11 @@ interface Props {
   onViewDiscussion?: (fileId: string) => void;
   onNavigateSession?: (sessionName: string, quote?: string) => void;
   servers?: ServerSlim[];
+  /** WS client used to subscribe to server-pushed cron `resource.changed` events. */
+  ws?: WsClient | null;
 }
+
+type CronSendActionView = Extract<CronAction, { type: 'send' }>;
 
 // ── Styles ───────────────────────────────────────────────────────────────
 
@@ -80,15 +87,36 @@ const btnSecondary: Record<string, string> = { padding: '8px 16px', background: 
 const btnDanger: Record<string, string> = { ...btnSecondary, color: '#f87171' };
 const labelStyle = { display: 'block', color: '#94a3b8', fontSize: '13px', marginBottom: '4px', fontWeight: '500' as const };
 
-// Cron jobs created externally (MCP/agent, another device, or another browser
-// tab) aren't pushed to this view, so poll the list on a slow interval while
-// the page is visible (in addition to a focus/visibility refetch).
-const CRON_LIST_POLL_MS = 10_000;
-
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 function parseAction(raw: string): CronAction | null {
   try { return JSON.parse(raw); } catch { return null; }
+}
+
+function compactMessage(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+function sendTargetText(action: CronSendActionView, t: (key: string) => string): string {
+  return action.broadcast ? t('cron.send_broadcast') : action.target;
+}
+
+function sendActionSummary(action: CronSendActionView, t: (key: string) => string): string {
+  const message = compactMessage(action.message);
+  const target = sendTargetText(action, t);
+  return message ? `${t('common.send')} → ${target}: ${message}` : `${t('common.send')} → ${target}`;
+}
+
+function SendActionDetails({ action, t }: { action: CronSendActionView; t: (key: string) => string }) {
+  return (
+    <div style={{ marginTop: '2px', display: 'grid', gap: '4px' }}>
+      <div>
+        <strong style={{ color: '#cbd5e1' }}>{t('common.send')}:</strong> {sendTargetText(action, t)}
+        {action.reply && <span style={{ color: '#94a3b8' }}> · {t('cron.send_reply')}</span>}
+      </div>
+      <pre style={{ margin: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', color: '#e2e8f0', fontFamily: 'inherit' }}>{action.message}</pre>
+    </div>
+  );
 }
 
 function fmtTime(ts: number | null): string {
@@ -158,7 +186,7 @@ function isCurrentContextJob(job: Pick<CronJob, 'server_id' | 'project_name'>, s
 
 // ── Component ────────────────────────────────────────────────────────────
 
-export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession: _activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [] }: Props) {
+export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession: _activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [], ws }: Props) {
   const { t } = useTranslation();
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);
@@ -207,10 +235,13 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
 
   useEffect(() => { loadJobs(); }, [loadJobs]);
 
-  // Keep the list fresh without a full page reload: external cron changes
-  // (MCP/agent, another device/tab) aren't pushed here. Refetch silently when
-  // the window regains focus/visibility, and poll slowly while the page is
-  // visible. The CronManager unmounts when its panel closes, so this stops too.
+  // Real-time refresh: the server pushes a `resource.changed` (topic: cron)
+  // whenever any cron is created/updated/deleted — including crons created
+  // externally via MCP/agent — so the list updates instantly, no page reload.
+  useResourceEvent(ws, RESOURCE_TOPICS.cron, () => { void loadJobs(true); });
+
+  // Cheap event-driven fallback for a WS message missed during a reconnect:
+  // refetch silently when the window regains focus/visibility. (Not polling.)
   useEffect(() => {
     const refresh = () => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
@@ -219,11 +250,9 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
     const onVisibility = () => { if (document.visibilityState === 'visible') void loadJobs(true); };
     window.addEventListener('focus', refresh);
     document.addEventListener('visibilitychange', onVisibility);
-    const timer = window.setInterval(refresh, CRON_LIST_POLL_MS);
     return () => {
       window.removeEventListener('focus', refresh);
       document.removeEventListener('visibilitychange', onVisibility);
-      clearInterval(timer);
     };
   }, [loadJobs]);
 
@@ -399,7 +428,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
               <span>→ {displayTarget(job)}</span>
               {action?.type === 'p2p' && <span style={{ opacity: 0.6 }}>Team {action.mode}</span>}
               {action?.type === 'command' && <span style={{ opacity: 0.6, maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
-              {action?.type === 'send' && <span style={{ opacity: 0.6, maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('common.send')} → {action.target}</span>}
+              {action?.type === 'send' && <span title={sendActionSummary(action, t)} style={{ opacity: 0.6, maxWidth: '260px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sendActionSummary(action, t)}</span>}
             </div>
 
             {isReadOnly && (
@@ -510,7 +539,7 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
               <span>→ {exec.target_role}</span>
               {action?.type === 'p2p' && <span>Team {action.mode}</span>}
               {action?.type === 'command' && <span style={{ maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
-              {action?.type === 'send' && <span style={{ maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('common.send')} → {action.target}</span>}
+              {action?.type === 'send' && <span title={sendActionSummary(action, t)} style={{ maxWidth: '220px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sendActionSummary(action, t)}</span>}
               {hasP2p && onViewDiscussion && (
                 <button type="button" onClick={(e) => { e.stopPropagation(); onViewDiscussion(exec.detail!.slice(4)); }}
                   style={{ color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline' }}>
@@ -588,9 +617,7 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
         {action?.type === 'p2p' && (
           <div style={{ marginTop: '2px' }}><strong style={{ color: '#cbd5e1' }}>Team:</strong> {action.mode} · {action.rounds ?? 1} {t('cron.p2p_rounds').toLowerCase()}</div>
         )}
-        {action?.type === 'send' && (
-          <div style={{ marginTop: '2px' }}><strong style={{ color: '#cbd5e1' }}>{t('common.send')}:</strong> {action.target}</div>
-        )}
+        {action?.type === 'send' && <SendActionDetails action={action} t={t} />}
         {job.next_run_at && <div style={{ marginTop: '4px', fontSize: '11px', color: '#64748b' }}>{t('cron.next_run')}: {fmtTime(job.next_run_at)}</div>}
       </div>
 
@@ -877,6 +904,10 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
     return [...new Set([...fromLegacy, ...fromEntries])];
   });
   const [p2pRounds, setP2pRounds] = useState(existingAction?.type === 'p2p' ? (existingAction.rounds ?? 1) : 1);
+  const [sendTarget, setSendTarget] = useState(existingAction?.type === 'send' ? existingAction.target : '');
+  const [sendMessage, setSendMessage] = useState(existingAction?.type === 'send' ? existingAction.message : '');
+  const [sendReply, setSendReply] = useState(existingAction?.type === 'send' ? existingAction.reply === true : false);
+  const [sendBroadcast, setSendBroadcast] = useState(existingAction?.type === 'send' ? existingAction.broadcast === true : false);
   const [expiresAt, setExpiresAt] = useState(formatDateTimeLocalInput(job?.expires_at));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -917,8 +948,18 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
 
     const action: CronAction = actionType === 'command'
       ? { type: 'command', command }
-      : actionType === 'send' && existingAction?.type === 'send'
-        ? existingAction
+      : actionType === 'send'
+        ? {
+          type: 'send',
+          target: sendTarget.trim(),
+          message: sendMessage,
+          ...(sendReply ? { reply: true } : {}),
+          ...(sendBroadcast ? { broadcast: true } : {}),
+          ...(existingAction?.type === 'send' && existingAction.idempotencyKey ? { idempotencyKey: existingAction.idempotencyKey } : {}),
+          ...(existingAction?.type === 'send' && existingAction.sourceSessionName ? { sourceSessionName: existingAction.sourceSessionName } : {}),
+          ...(existingAction?.type === 'send' && existingAction.sourceProjectName ? { sourceProjectName: existingAction.sourceProjectName } : {}),
+          ...(existingAction?.type === 'send' && existingAction.sourceServerId ? { sourceServerId: existingAction.sourceServerId } : {}),
+        }
         : {
           type: 'p2p', topic: p2pTopic, mode: p2pMode, rounds: p2pRounds,
           // When any session entries exist, use only participantEntries (avoids duplication).
@@ -962,6 +1003,10 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
   };
 
   const p2pModes = BUILT_IN_MODES.map(m => m.key);
+  const sendTargetOptions = useMemo(() => [
+    ...sessions.map(s => ({ value: s.name, label: `${sessionDisplayLabel(s)} (${agentBadge(s.agentType)})` })),
+    ...subSessions.map(s => ({ value: s.sessionName, label: `${s.label ? formatLabel(s.label) : s.type} (${agentBadge(s.type)})` })),
+  ], [sessions, subSessions]);
   // All sessions except the selected target — include both main sessions and sub-sessions
   const otherMainSessions = sessions.filter(s => targetSessionName ? true : s.role !== targetRole);
   const otherSubSessions = subSessions.filter(s => s.sessionName !== targetSessionName);
@@ -1005,12 +1050,10 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
             <input type="radio" name="actionType" checked={actionType === 'p2p'} onChange={() => setActionType('p2p')} style={{ marginRight: '6px' }} />
             {t('cron.action_p2p')}
           </label>
-          {actionType === 'send' && (
-            <label style={{ color: '#e2e8f0', fontSize: '14px' }}>
-              <input type="radio" name="actionType" checked readOnly style={{ marginRight: '6px' }} />
-              {t('common.send')}
-            </label>
-          )}
+          <label style={{ color: '#e2e8f0', fontSize: '14px', cursor: 'pointer' }}>
+            <input type="radio" name="actionType" checked={actionType === 'send'} onChange={() => setActionType('send')} style={{ marginRight: '6px' }} />
+            {t('common.send')}
+          </label>
         </div>
 
         {actionType === 'command' && (
@@ -1094,6 +1137,51 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
               ))}
               {otherMainSessions.length === 0 && otherSubSessions.length === 0 && <span style={{ color: '#64748b', fontSize: '13px' }}>{t('cron.no_participants')}</span>}
             </div>
+          </>
+        )}
+
+        {actionType === 'send' && (
+          <>
+            <label style={labelStyle}>{t('cron.send_target')}</label>
+            <input
+              style={{ ...inputStyle, opacity: sendBroadcast ? '0.55' : '1' }}
+              value={sendTarget}
+              onInput={e => setSendTarget((e.target as HTMLInputElement).value)}
+              placeholder={t('cron.send_target_placeholder')}
+              list="cron-send-target-options"
+              required={!sendBroadcast}
+              disabled={sendBroadcast}
+            />
+            <datalist id="cron-send-target-options">
+              {sendTargetOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </datalist>
+
+            <label style={{ color: '#e2e8f0', fontSize: '13px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', margin: '-2px 0 10px' }}>
+              <input
+                type="checkbox"
+                checked={sendBroadcast}
+                onChange={e => setSendBroadcast((e.target as HTMLInputElement).checked)}
+              />
+              {t('cron.send_broadcast')}
+            </label>
+
+            <label style={labelStyle}>{t('cron.send_message')}</label>
+            <textarea
+              style={{ ...inputStyle, minHeight: '90px', resize: 'vertical', fontFamily: 'inherit' }}
+              value={sendMessage}
+              onInput={e => setSendMessage((e.target as HTMLTextAreaElement).value)}
+              placeholder={t('cron.send_message_placeholder')}
+              required
+            />
+
+            <label style={{ color: '#e2e8f0', fontSize: '13px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', margin: '-2px 0 10px' }}>
+              <input
+                type="checkbox"
+                checked={sendReply}
+                onChange={e => setSendReply((e.target as HTMLInputElement).checked)}
+              />
+              {t('cron.send_reply')}
+            </label>
           </>
         )}
 

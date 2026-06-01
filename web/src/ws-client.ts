@@ -7,6 +7,7 @@ import { apiFetch, ApiError } from './api.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import type { ResourceChangedMessage } from '@shared/resource-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-messages.js';
 import { TRANSPORT_EVENT } from '@shared/transport-events.js';
@@ -111,6 +112,7 @@ export type SessionEventReason =
   | 'socket_closed';
 
 export type ServerMessage =
+  | ResourceChangedMessage
   | { type: 'terminal.diff'; diff: TerminalDiff }
   | { type: 'terminal.history'; sessionName: string; content: string }
   | { type: 'terminal.stream_reset'; session: string; reason: string }

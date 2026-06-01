@@ -5070,6 +5070,7 @@ export function App() {
               onBack={() => setShowCronManager(false)}
               onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); })}
               servers={servers.map(s => ({ id: s.id, name: s.name }))}
+              ws={wsRef.current}
             />
           </FloatingPanel>
         ) : null;

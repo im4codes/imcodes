@@ -20,6 +20,7 @@ import { MemoryRateLimiter } from './rate-limiter.js';
 import { sha256Hex } from '../security/crypto.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
+import { RESOURCE_EVENT_MSG, type ResourceTopic } from '../../../shared/resource-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
@@ -1101,6 +1102,20 @@ export class WsBridge {
 
   static getAll(): Map<string, WsBridge> {
     return WsBridge.instances;
+  }
+
+  /**
+   * Generic browser pub/sub: tell every browser viewing `serverId` that a
+   * server-scoped resource (identified by `topic`) changed, so open views can
+   * refetch over HTTP instead of polling. No-op when no bridge/browsers exist on
+   * this pod — pod-sticky routing guarantees the daemon's bridge (and thus its
+   * browser viewers) live on the pod that handled the serverId-scoped request,
+   * so the publisher and subscribers are always co-located.
+   */
+  static publishResourceChanged(serverId: string, topic: ResourceTopic, extra?: Record<string, unknown>): void {
+    const bridge = WsBridge.instances.get(serverId);
+    if (!bridge) return;
+    bridge.broadcastToBrowsers(JSON.stringify({ type: RESOURCE_EVENT_MSG.CHANGED, topic, serverId, ...extra }));
   }
 
   private pendingFsRouteMap(kind: FsPendingRouteKind): PendingFsRouteMap {
