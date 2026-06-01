@@ -309,18 +309,26 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     // tool-call line. The chosen answer comes back via `ask.answer` and is
     // delivered to the provider as the next user turn (see handleAskAnswer).
     if (tool.name === 'AskUserQuestion') {
-      if (tool.status === 'running') {
+      // The tool input (the questions) streams in incrementally, so it is only
+      // populated once the call is COMPLETE — emitting at 'running' would surface
+      // an empty card. The SDK self-continues without a tool_result, so the
+      // completed call is the right (and only) moment to show the question.
+      if (tool.status !== 'running') {
         const askInput = (tool.input ?? {}) as Record<string, unknown>;
-        timelineEmitter.emit(sessionName, 'ask.question', {
-          toolUseId: tool.id,
-          questions: Array.isArray(askInput.questions) ? askInput.questions : [],
-        }, {
-          source: 'daemon',
-          confidence: 'high',
-          eventId: `transport-ask:${sessionName}:${tool.id}`,
-        });
+        const questions = Array.isArray(askInput.questions)
+          ? askInput.questions
+          : (askInput.question || askInput.options ? [askInput] : []);
+        if (questions.length > 0) {
+          timelineEmitter.emit(sessionName, 'ask.question', {
+            toolUseId: tool.id,
+            questions,
+          }, {
+            source: 'daemon',
+            confidence: 'high',
+            eventId: `transport-ask:${sessionName}:${tool.id}`,
+          });
+        }
       }
-      // The tool's completion/result carries no extra UI value here.
       return;
     }
 

@@ -1274,11 +1274,12 @@ describe('transport-relay (timeline-emitter based)', () => {
       }],
     };
 
-    it('emits ask.question (not a raw tool.call) for a running AskUserQuestion', () => {
+    it('emits ask.question (not a raw tool.call) once the call completes with its input', () => {
       const { provider, fireTool } = makeMockProvider();
       wireProviderToRelay(provider);
 
-      fireTool('sess-a', { id: 'tu-1', name: 'AskUserQuestion', status: 'running', input: askInput });
+      // Input streams in incrementally — the completed call carries the questions.
+      fireTool('sess-a', { id: 'tu-1', name: 'AskUserQuestion', status: 'complete', input: askInput });
 
       const askCalls = emitMock.mock.calls.filter((c) => c[1] === 'ask.question');
       const toolCalls = emitMock.mock.calls.filter((c) => c[1] === 'tool.call');
@@ -1291,24 +1292,34 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(meta.eventId).toBe('transport-ask:sess-a:tu-1');
     });
 
-    it('defaults questions to [] when input has none', () => {
+    it('does NOT emit at running (input not streamed yet) — avoids an empty card', () => {
       const { provider, fireTool } = makeMockProvider();
       wireProviderToRelay(provider);
 
-      fireTool('sess-a', { id: 'tu-2', name: 'AskUserQuestion', status: 'running', input: {} });
+      fireTool('sess-a', { id: 'tu-2', name: 'AskUserQuestion', status: 'running', input: undefined });
+
+      expect(emitMock).not.toHaveBeenCalled();
+    });
+
+    it('does not emit when the completed call carries no questions', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-a', { id: 'tu-3', name: 'AskUserQuestion', status: 'complete', input: {} });
+
+      expect(emitMock).not.toHaveBeenCalled();
+    });
+
+    it('wraps a flat single-question input shape', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      const flat = { question: 'Pick', header: 'H', multiSelect: false, options: [{ label: 'A', description: 'a' }] };
+      fireTool('sess-a', { id: 'tu-4', name: 'AskUserQuestion', status: 'complete', input: flat });
 
       const askCalls = emitMock.mock.calls.filter((c) => c[1] === 'ask.question');
       expect(askCalls).toHaveLength(1);
-      expect(askCalls[0][2].questions).toEqual([]);
-    });
-
-    it('does not emit anything when the AskUserQuestion tool completes', () => {
-      const { provider, fireTool } = makeMockProvider();
-      wireProviderToRelay(provider);
-
-      fireTool('sess-a', { id: 'tu-3', name: 'AskUserQuestion', status: 'complete', input: askInput, output: 'A' });
-
-      expect(emitMock).not.toHaveBeenCalled();
+      expect(askCalls[0][2].questions).toEqual([flat]);
     });
 
     it('still emits a normal tool.call for non-AskUserQuestion tools', () => {
