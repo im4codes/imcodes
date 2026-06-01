@@ -25,6 +25,7 @@ import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.j
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import { ASK_QUESTION_WAIT_MS } from '../../../shared/ask-question-timing.js';
+import { PendingQuestionRegistry, type InteractiveQuestionAnswerer } from '../pending-question-registry.js';
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import logger from '../../util/logger.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
@@ -189,7 +190,7 @@ type SdkPermissionResult =
   | { behavior: 'allow'; updatedInput?: Record<string, unknown> }
   | { behavior: 'deny'; message: string; interrupt?: boolean };
 
-export class ClaudeCodeSdkProvider implements TransportProvider {
+export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQuestionAnswerer {
   readonly id = 'claude-code-sdk';
   readonly connectionMode = CONNECTION_MODES.LOCAL_SDK;
   readonly sessionOwnership = SESSION_OWNERSHIP.SHARED;
@@ -221,30 +222,17 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
-  // AskUserQuestion: per-session pending canUseTool resolver. Lets the model
-  // PAUSE on the question until the user answers (resolve with their choice as a
-  // deny-message the model reads) or the wait window elapses (resolve allow →
-  // the model self-continues / picks its own answer).
-  private pendingQuestions = new Map<string, { settle: (r: SdkPermissionResult) => void; timer: ReturnType<typeof setTimeout> }>();
+  // AskUserQuestion pause/answer lifecycle — generic, provider-agnostic.
+  private readonly questions = new PendingQuestionRegistry<SdkPermissionResult>();
 
   /**
-   * Resolve a paused AskUserQuestion with the user's answer so the model
-   * continues in the SAME turn. Returns false when there is no pending question
-   * (already answered, timed out, or the model self-continued) — the caller then
-   * delivers the answer as an ordinary (force-interrupt) message instead.
+   * {@link InteractiveQuestionAnswerer}. The user's choice is conveyed to the
+   * model as a `deny` message it reads as the answer, so it continues in the
+   * SAME turn. Returns false when nothing was pending (timed out / self-
+   * continued) — the daemon then delivers the answer as a normal message.
    */
   answerPendingQuestion(sessionId: string, answer: string): boolean {
-    const pending = this.pendingQuestions.get(sessionId);
-    if (!pending) return false;
-    pending.settle({ behavior: 'deny', message: answer, interrupt: false });
-    return true;
-  }
-
-  private clearPendingQuestion(sessionId: string): void {
-    const pending = this.pendingQuestions.get(sessionId);
-    if (!pending) return;
-    clearTimeout(pending.timer);
-    this.pendingQuestions.delete(sessionId);
+    return this.questions.resolve(sessionId, { behavior: 'deny', message: answer, interrupt: false });
   }
 
   async connect(config: ProviderConfig): Promise<void> {
@@ -285,6 +273,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
+    this.questions.releaseAll();
     for (const state of this.sessions.values()) {
       try { state.currentQuery?.close(); } catch {}
       this.terminateChild(state);
@@ -337,7 +326,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   async endSession(sessionId: string): Promise<void> {
     // Release any paused AskUserQuestion so a torn-down session never leaks a
     // pending timer / unresolved canUseTool promise.
-    this.pendingQuestions.get(sessionId)?.settle({ behavior: 'allow' });
+    this.questions.release(sessionId);
     const state = this.sessions.get(sessionId);
     if (state) {
       try { state.currentQuery?.close(); } catch {}
@@ -516,23 +505,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       if (toolName !== 'AskUserQuestion') {
         return Promise.resolve({ behavior: 'allow' as const, updatedInput: input });
       }
-      return new Promise<SdkPermissionResult>((resolve) => {
-        this.clearPendingQuestion(sessionId); // drop any stale pending for this session
-        let settled = false;
-        const settle = (result: SdkPermissionResult) => {
-          if (settled) return;
-          settled = true;
-          this.clearPendingQuestion(sessionId);
-          resolve(result);
-        };
-        const timer = setTimeout(() => {
-          logger.info({ provider: this.id, sessionName: state.sessionName },
-            'claude-sdk.AskUserQuestion: wait window elapsed — letting the model self-continue');
-          settle({ behavior: 'allow', updatedInput: input });
-        }, ASK_QUESTION_WAIT_MS);
-        timer.unref?.();
-        this.pendingQuestions.set(sessionId, { settle, timer });
-        opts.signal?.addEventListener('abort', () => settle({ behavior: 'allow', updatedInput: input }), { once: true });
+      // Pause until answered (answerPendingQuestion) or the wait window elapses
+      // (fallback allow → the model self-continues / picks its own).
+      return this.questions.wait(sessionId, {
+        timeoutMs: ASK_QUESTION_WAIT_MS,
+        fallback: { behavior: 'allow', updatedInput: input },
+        signal: opts.signal,
       });
     };
 

@@ -207,6 +207,25 @@ export class YourProvider implements TransportProvider {
   // restoreSession?(sessionId: string): Promise<boolean> { ... }
   // listSessions?(): Promise<RemoteSessionInfo[]> { ... }
 
+  // ── Interactive AskUserQuestion (optional) ─────────────────────────────────
+  // If your SDK exposes a hook that PAUSES the model to ask the user something
+  // (permission/elicitation/tool-approval), wire it through the shared
+  // PendingQuestionRegistry so the web question dialog + `ask.answer` flow work
+  // for free (the daemon duck-types `answerPendingQuestion`):
+  //
+  //   import { PendingQuestionRegistry, type InteractiveQuestionAnswerer }
+  //     from '../pending-question-registry.js';
+  //   // class implements TransportProvider, InteractiveQuestionAnswerer
+  //   private readonly questions = new PendingQuestionRegistry<MyResult>();
+  //   // inside your ask/permission hook (return the promise to pause the model):
+  //   return this.questions.wait(sessionId, { timeoutMs, fallback, signal });
+  //   answerPendingQuestion(sessionId, answer) {
+  //     return this.questions.resolve(sessionId, mapAnswerToResult(answer));
+  //   }
+  //   // on endSession: this.questions.release(sessionId);  on disconnect: releaseAll()
+  // Also emit an `ask.question` timeline event { toolUseId, questions, waitMs }
+  // when the question fires (see transport-relay's AskUserQuestion handling).
+
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {
