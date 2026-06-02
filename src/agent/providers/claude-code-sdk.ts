@@ -54,6 +54,13 @@ const CLAUDE_BIN = 'claude';
 const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
 const FORCE_KILL_TIMEOUT_MS = 500;
+
+// Claude Code ships native scheduling tools (RemoteTrigger creates a claude.ai
+// routine; the Cron* tools manage them) that bypass IM.codes entirely. We
+// provide our own scheduling via the imcodes-memory MCP cron_* tools, so disable
+// the native ones to force the agent through our cron (one source of truth,
+// pod-routed, visible in our cron UI).
+const DISALLOWED_NATIVE_TOOLS = ['RemoteTrigger', 'CronCreate', 'CronList', 'CronUpdate', 'CronDelete'];
 const CLAUDE_TASK_SYSTEM_SUBTYPES = new Set([
   'task_started',
   'task_progress',
@@ -456,6 +463,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       cwd: state.cwd,
       ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
       permissionMode: state.permissionMode,
+      disallowedTools: DISALLOWED_NATIVE_TOOLS,
       pathToClaudeCodeExecutable: resolvedBinary,
       includePartialMessages: true,
       agentProgressSummaries: false,

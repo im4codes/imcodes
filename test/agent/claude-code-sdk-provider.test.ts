@@ -171,6 +171,10 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(run.options.resume).toBeUndefined();
     expect(run.options.includePartialMessages).toBe(true);
     expect(run.options.permissionMode).toBe('bypassPermissions');
+    // Native scheduling tools are disabled so the agent uses our imcodes-memory
+    // MCP cron instead of creating claude.ai routines via RemoteTrigger.
+    expect(run.options.disallowedTools).toContain('RemoteTrigger');
+    expect(run.options.disallowedTools).toContain('CronCreate');
     expect(tools).toEqual([
       'Read:running:{"file_path":"a.ts"}',
       'Read:complete:{"file_path":"a.ts"}',
