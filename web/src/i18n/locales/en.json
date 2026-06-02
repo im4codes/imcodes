@@ -853,6 +853,8 @@
       "agents": "Agents",
       "search_project_files": "Search project files",
       "quick_discussion_with_agent": "Quick Discussion with an agent",
+      "team": "Team",
+      "team_desc": "Start a Team discussion",
       "select_mode": "Select Mode",
       "all_agents": "All Agents",
       "sessions": "sessions",

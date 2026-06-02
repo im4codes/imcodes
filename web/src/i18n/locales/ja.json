@@ -852,6 +852,8 @@
       "agents": "エージェント",
       "search_project_files": "プロジェクトファイルを検索",
       "quick_discussion_with_agent": "エージェントとクイックディスカッション",
+      "team": "Team",
+      "team_desc": "チーム討論を開始",
       "select_mode": "モードを選択",
       "all_agents": "全エージェント",
       "sessions": "セッション",

@@ -602,7 +602,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
-  const [atPickerStage, setAtPickerStage] = useState<'choose' | 'files' | 'agents' | 'mode'>('choose');
+  const [atPickerStage, setAtPickerStage] = useState<'choose' | 'files' | 'agents' | 'mode' | 'team'>('choose');
   const atJustClosedRef = useRef(false);
   const atSelectionLockRef = useRef(false);
   const atSelectionSnapshotRef = useRef('');
@@ -2333,13 +2333,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     requestSend(buildSendPayload(), { clearComposer: true });
   }, [buildSendPayload, requestSend]);
 
-  const handleDirectComboSelect = useCallback((mode: string) => {
+  const handleDirectComboSelect = useCallback((mode: string, roundsOverride?: number) => {
     setP2pOpen(false);
     if (isCurrentSessionP2pMember) {
       showSendWarning(t('p2p.member_cannot_initiate_discussion'));
       return;
     }
-    const selection = p2pSavedConfig ? buildP2pConfigSelection(p2pSavedConfig, mode) : null;
+    const selection = p2pSavedConfig
+      ? buildP2pConfigSelection(p2pSavedConfig, mode, roundsOverride ?? p2pSavedConfig.rounds ?? 1)
+      : null;
     const payloadOptions: BuildSendPayloadOptions = selection
       ? {
           modeOverride: mode,
@@ -3790,6 +3792,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 sel?.removeAllRanges();
                 sel?.addRange(range);
               } catch { /* jsdom lacks Selection API */ }
+            }}
+            onLaunchTeam={(modeKey, rounds) => {
+              // From the @ picker → TEAM stage: strip the @, close the picker,
+              // and launch the discussion directly (reuses the member-gated
+              // combo launcher with the chosen round count).
+              const text = divRef.current?.textContent ?? '';
+              const before = text.replace(/@[^\s@]*$/, '');
+              if (divRef.current) divRef.current.textContent = before;
+              setHasText(before.trim().length > 0);
+              setAtPickerOpen(false);
+              setAtPickerStage('choose');
+              atJustClosedRef.current = true;
+              setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
+              handleDirectComboSelect(modeKey, rounds);
             }}
             p2pConfig={p2pSavedConfig}
             onClose={() => { setAtPickerOpen(false); setAtPickerStage('choose'); }}

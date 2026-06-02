@@ -853,6 +853,8 @@
       "agents": "智能体",
       "search_project_files": "搜索项目文件",
       "quick_discussion_with_agent": "与智能体快速讨论",
+      "team": "团队",
+      "team_desc": "发起团队讨论",
       "select_mode": "选择模式",
       "all_agents": "全部 Agent",
       "sessions": "个会话",

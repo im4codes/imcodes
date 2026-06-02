@@ -852,6 +852,8 @@
       "agents": "Agentes",
       "search_project_files": "Buscar archivos del proyecto",
       "quick_discussion_with_agent": "Discusión rápida con un agente",
+      "team": "Team",
+      "team_desc": "Iniciar una discusión Team",
       "select_mode": "Seleccionar modo",
       "all_agents": "Todos los Agentes",
       "sessions": "sesiones",

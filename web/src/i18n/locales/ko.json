@@ -852,6 +852,8 @@
       "agents": "에이전트",
       "search_project_files": "프로젝트 파일 검색",
       "quick_discussion_with_agent": "에이전트와 빠른 토론",
+      "team": "Team",
+      "team_desc": "팀 토론 시작",
       "select_mode": "모드 선택",
       "all_agents": "모든 에이전트",
       "sessions": "세션",

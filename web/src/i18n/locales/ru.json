@@ -852,6 +852,8 @@
       "agents": "Агенты",
       "search_project_files": "Искать файлы проекта",
       "quick_discussion_with_agent": "Быстрое обсуждение с агентом",
+      "team": "Team",
+      "team_desc": "Начать обсуждение Team",
       "select_mode": "Выбрать режим",
       "all_agents": "Все агенты",
       "sessions": "сессий",
