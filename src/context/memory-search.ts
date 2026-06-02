@@ -15,6 +15,7 @@ import type { ObservationClass, ObservationState } from '../../shared/memory-obs
 import { projectionSemanticContent } from '../../shared/memory-content-hash.js';
 import { computeRelevanceScore, type ProjectionClass } from '../../shared/memory-scoring.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
+import { memoryTextMatchesQuery } from '../../shared/memory-search-text.js';
 import { getContextModelConfig } from './context-model-config.js';
 import { redactSensitiveText } from '../util/redact-secrets.js';
 import { resolveMemoryConfigForNamespace, type MemoryConfigResolver } from './memory-config-resolver.js';
@@ -702,10 +703,7 @@ function matchesQuery(item: MemorySearchResultItem, query: MemorySearchQuery): b
 }
 
 function itemMatchesText(item: MemorySearchResultItem, query: string | undefined): boolean {
-  if (!query?.trim()) return false;
-  const needle = query.toLowerCase();
-  const haystack = itemHaystack(item);
-  return haystack.includes(needle);
+  return memoryTextMatchesQuery(itemHaystack(item), query);
 }
 
 function itemHaystack(item: MemorySearchResultItem): string {

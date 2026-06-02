@@ -25,6 +25,7 @@ import { classifyTimestampFreshness } from '../../shared/context-freshness.js';
 import { serializeContextNamespace, serializeContextTarget } from '../context/context-keys.js';
 import { isMemoryNoiseSummary } from '../../shared/memory-noise-patterns.js';
 import { computeFingerprint, normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
+import { memoryTextMatchesQuery } from '../../shared/memory-search-text.js';
 import { countTokens } from '../context/tokenizer.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
@@ -3320,8 +3321,8 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
       if (filters.projectionClass && projection.class !== filters.projectionClass) return false;
       if (isMemoryNoiseSummary(projection.summary)) return false;
       if (normalizedQuery) {
-        const haystack = `${projection.summary}\n${JSON.stringify(projectionSemanticContent(projection.content))}`.toLowerCase();
-        if (!haystack.includes(normalizedQuery)) return false;
+        const haystack = `${projection.summary}\n${JSON.stringify(projectionSemanticContent(projection.content))}`;
+        if (!memoryTextMatchesQuery(haystack, normalizedQuery)) return false;
       }
       return true;
     });
