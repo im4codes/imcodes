@@ -136,7 +136,7 @@ function deriveArrayTodoList(events: readonly TimelineEvent[]): AgentTodoList | 
 // Claude Code (this harness) has no TodoWrite array tool — it tracks tasks with
 // per-task TaskCreate + TaskUpdate calls (global ids, status in the result).
 // We reconstruct the list by replaying those events.
-const TASK_CREATE_RESULT_RE = /Task #(\d+) created successfully:\s*([\s\S]+?)\s*$/;
+const TASK_CREATE_RESULT_LINE_RE = /^\s*Task #(\d+) created successfully:\s*(.+?)\s*$/;
 // TaskList result lines: "#6 [completed] subject text"
 const TASK_LIST_LINE_RE = /^\s*#(\d+)\s+\[([a-z_]+)\]\s+(.+?)\s*$/;
 
@@ -150,15 +150,24 @@ interface TaskAgg { text: string; status: AgentTodoStatus; order: number; delete
  */
 function parseTaskListSnapshot(output: string): Array<{ id: string; text: string; status: AgentTodoStatus }> | null {
   const tasks: Array<{ id: string; text: string; status: AgentTodoStatus }> = [];
-  let sawLine = false;
+  let sawTaskLine = false;
   for (const line of output.split('\n')) {
+    if (!line.trim()) continue;
     const match = line.match(TASK_LIST_LINE_RE);
-    if (!match) continue;
-    sawLine = true;
+    if (!match) return null;
+    sawTaskLine = true;
     if (match[2] === 'deleted') continue;
     tasks.push({ id: match[1], text: match[3].trim(), status: normalizeTodoStatus(match[2]) });
   }
-  return sawLine ? tasks : null;
+  return sawTaskLine ? tasks : null;
+}
+
+function parseTaskCreateResult(output: string): { id: string; text: string } | null {
+  const lines = output.split('\n').map((line) => line.trim()).filter(Boolean);
+  if (lines.length !== 1) return null;
+  const match = lines[0].match(TASK_CREATE_RESULT_LINE_RE);
+  if (!match) return null;
+  return { id: match[1], text: match[2].trim() };
 }
 
 /**
@@ -178,6 +187,8 @@ function parseTaskListSnapshot(output: string): Array<{ id: string; text: string
 function deriveTaskToolList(events: readonly TimelineEvent[]): AgentTodoList | null {
   const order: TaskAgg[] = [];                 // tasks in creation order
   const byRealId = new Map<string, TaskAgg>(); // real ids learned from results
+  const pendingCreates: TaskAgg[] = [];        // TaskCreate calls awaiting result ids
+  let awaitingResult: 'taskcreate' | 'tasklist' | null = null;
   let lastTs = 0;
   let lastEventId = '';
   let touched = false;
@@ -194,9 +205,15 @@ function deriveTaskToolList(events: readonly TimelineEvent[]): AgentTodoList | n
           .map((k) => (typeof input[k] === 'string' ? (input[k] as string).trim() : ''))
           .find(Boolean) ?? '';
         if (!subject) continue;
-        order.push({ text: subject, status: 'pending', order: order.length, deleted: false });
+        const task: TaskAgg = { text: subject, status: 'pending', order: order.length, deleted: false };
+        order.push(task);
+        pendingCreates.push(task);
+        awaitingResult = 'taskcreate';
         mark(event);
+      } else if (name === 'tasklist') {
+        awaitingResult = 'tasklist';
       } else if (name === 'taskupdate') {
+        awaitingResult = null;
         const id = input.taskId != null ? String(input.taskId) : '';
         if (!id) continue;
         const subject = typeof input.subject === 'string' ? input.subject.trim() : '';
@@ -214,14 +231,18 @@ function deriveTaskToolList(events: readonly TimelineEvent[]): AgentTodoList | n
         if (input.status === 'deleted') task.deleted = true;
         else if (typeof input.status === 'string') task.status = normalizeTodoStatus(input.status);
         mark(event);
+      } else {
+        awaitingResult = null;
       }
     } else if (event.type === 'tool.result') {
       const output = (event.payload as { output?: unknown }).output;
       if (typeof output !== 'string') continue;
       const snapshot = parseTaskListSnapshot(output);
-      if (snapshot) {
+      if (snapshot && (awaitingResult === 'tasklist' || order.length === 0)) {
         order.length = 0;
         byRealId.clear();
+        pendingCreates.length = 0;
+        awaitingResult = null;
         for (const task of snapshot) {
           const agg: TaskAgg = { text: task.text, status: task.status, order: order.length, deleted: false };
           order.push(agg);
@@ -230,22 +251,14 @@ function deriveTaskToolList(events: readonly TimelineEvent[]): AgentTodoList | n
         mark(event);
         continue;
       }
-      const match = output.match(TASK_CREATE_RESULT_RE);
-      if (!match) continue;
-      const id = match[1];
-      const text = match[2].trim();
+      const createResult = awaitingResult === 'taskcreate' ? parseTaskCreateResult(output) : null;
+      if (!createResult) continue;
+      const { id, text } = createResult;
       if (byRealId.has(id)) { mark(event); continue; }
-      // Attach the real id to the matching call-created task (by subject text)
-      // that isn't linked yet; create one if the call wasn't in the window.
-      const linked = new Set(byRealId.values());
-      const task = order.find((t) => !linked.has(t) && t.text === text);
-      if (task) {
-        byRealId.set(id, task);
-      } else {
-        const agg: TaskAgg = { text, status: 'pending', order: order.length, deleted: false };
-        order.push(agg);
-        byRealId.set(id, agg);
-      }
+      const task = pendingCreates.shift();
+      if (task && text) task.text = text;
+      if (task) byRealId.set(id, task);
+      awaitingResult = pendingCreates.length > 0 ? 'taskcreate' : null;
       mark(event);
     }
   }

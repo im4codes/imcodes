@@ -146,8 +146,11 @@ describe('deriveLatestTodoList', () => {
 describe('deriveLatestTodoList — CC TaskCreate/TaskUpdate', () => {
   it('aggregates TaskCreate results + TaskUpdate into a checklist (creation order)', () => {
     const events = [
+      toolCall({ subject: 'Analyze requirements' }, 'TaskCreate'),
       toolResult('Task #6 created successfully: Analyze requirements'),
+      toolCall({ subject: 'Design schema' }, 'TaskCreate'),
       toolResult('Task #7 created successfully: Design schema'),
+      toolCall({ subject: 'Build UI' }, 'TaskCreate'),
       toolResult('Task #8 created successfully: Build UI'),
       toolCall({ taskId: '6', status: 'completed' }, 'TaskUpdate'),
       toolCall({ taskId: '7', status: 'in_progress' }, 'TaskUpdate'),
@@ -161,7 +164,9 @@ describe('deriveLatestTodoList — CC TaskCreate/TaskUpdate', () => {
 
   it('removes a task on TaskUpdate status=deleted', () => {
     const events = [
+      toolCall({ subject: 'A' }, 'TaskCreate'),
       toolResult('Task #1 created successfully: A'),
+      toolCall({ subject: 'B' }, 'TaskCreate'),
       toolResult('Task #2 created successfully: B'),
       toolCall({ taskId: '1', status: 'deleted' }, 'TaskUpdate'),
     ];
@@ -170,6 +175,7 @@ describe('deriveLatestTodoList — CC TaskCreate/TaskUpdate', () => {
 
   it('applies a TaskUpdate subject rename', () => {
     const events = [
+      toolCall({ subject: 'old name' }, 'TaskCreate'),
       toolResult('Task #3 created successfully: old name'),
       toolCall({ taskId: '3', status: 'in_progress', subject: 'new name' }, 'TaskUpdate'),
     ];
@@ -178,6 +184,19 @@ describe('deriveLatestTodoList — CC TaskCreate/TaskUpdate', () => {
 
   it('ignores unrelated tool.result output', () => {
     expect(deriveLatestTodoList([toolResult('ran 3 tests, all passed')])).toBeNull();
+  });
+
+  it('does not parse TaskCreate/TaskList-looking strings from Bash output as a checklist', () => {
+    const bashOutput = [
+      "toolResult('Task #6 created successfully: Analyze requirements'),",
+      "toolResult('Task #7 created successfully: Design schema'),",
+      "expect(deriveLatestTodoList(events)?.items).toEqual([",
+      "toolResult('#1 [completed] 设计登录数据库表\\n#2 [pending] 实现登录 API'),",
+    ].join('\n');
+    expect(deriveLatestTodoList([
+      toolCall({ command: 'sed -n 130,220p web/test/timeline/agent-todos.test.ts' }, 'Bash'),
+      toolResult(bashOutput),
+    ])).toBeNull();
   });
 
   it('renders a TaskList snapshot result (authoritative; survives aged-out creates)', () => {
