@@ -200,6 +200,39 @@ describe('deriveLatestTodoList — CC TaskCreate/TaskUpdate', () => {
     ]);
   });
 
+  it('builds the list from tool.call only when tool.result never reaches the web', () => {
+    // The web reliably gets tool.call but not always tool.result, so TaskCreate
+    // subjects must come from the call input and TaskUpdate links by position.
+    const events = [
+      toolCall({ subject: '设计数据库' }, 'TaskCreate'),
+      toolCall({ subject: '后端 API' }, 'TaskCreate'),
+      toolCall({ subject: '前端页面' }, 'TaskCreate'),
+      toolCall({ subject: '测试' }, 'TaskCreate'),
+      toolCall({ taskId: '1', status: 'completed' }, 'TaskUpdate'),
+      toolCall({ taskId: '2', status: 'in_progress' }, 'TaskUpdate'),
+    ];
+    expect(deriveLatestTodoList(events)?.items).toEqual([
+      { text: '设计数据库', status: 'completed' },
+      { text: '后端 API', status: 'in_progress' },
+      { text: '前端页面', status: 'pending' },
+      { text: '测试', status: 'pending' },
+    ]);
+  });
+
+  it('does not duplicate a task when both the create call and its result are present', () => {
+    const events = [
+      toolCall({ subject: 'A' }, 'TaskCreate'),
+      toolCall({ subject: 'B' }, 'TaskCreate'),
+      toolResult('Task #1 created successfully: A'),
+      toolResult('Task #2 created successfully: B'),
+      toolCall({ taskId: '1', status: 'completed' }, 'TaskUpdate'),
+    ];
+    expect(deriveLatestTodoList(events)?.items).toEqual([
+      { text: 'A', status: 'completed' },
+      { text: 'B', status: 'pending' },
+    ]);
+  });
+
   it('applies a TaskUpdate after a TaskList snapshot', () => {
     const events = [
       toolResult('#1 [pending] A\n#2 [pending] B'),

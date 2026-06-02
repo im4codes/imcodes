@@ -162,59 +162,97 @@ function parseTaskListSnapshot(output: string): Array<{ id: string; text: string
 }
 
 /**
- * Accumulation-style checklist (CC TaskCreate/TaskUpdate). TaskCreate's
- * tool.result carries `Task #<id> created successfully: <subject>`; TaskUpdate's
- * tool.call input carries { taskId, status, subject? } (status incl. deleted).
- * Replay both into the current task list, in creation order.
+ * Accumulation-style checklist (CC TaskCreate/TaskUpdate). The web reliably has
+ * tool.CALL events but NOT always the tool.RESULT, so this reconstructs from
+ * calls and enriches with results when present:
+ *   - TaskCreate tool.call input { subject } → a task in creation order (the
+ *     subject; the real id arrives only in the result).
+ *   - TaskCreate tool.result "Task #<id> created successfully: <subject>" →
+ *     attaches the real id (and authoritative subject) to that create.
+ *   - TaskUpdate tool.call { taskId, status, subject? } → applied by real id
+ *     when known, else by creation position (taskId as 1-based index — true for
+ *     sessions whose tasks were created fresh), else a stub. status incl. deleted.
+ *   - TaskList tool.result snapshot ("#id [status] subject" lines) → an
+ *     authoritative rebuild when available.
  */
 function deriveTaskToolList(events: readonly TimelineEvent[]): AgentTodoList | null {
-  const byId = new Map<string, TaskAgg>();
-  let order = 0;
+  const order: TaskAgg[] = [];                 // tasks in creation order
+  const byRealId = new Map<string, TaskAgg>(); // real ids learned from results
   let lastTs = 0;
   let lastEventId = '';
   let touched = false;
 
+  const mark = (event: TimelineEvent): void => { touched = true; lastTs = event.ts; lastEventId = event.eventId; };
+
   for (const event of events) {
-    if (event.type === 'tool.result') {
+    if (event.type === 'tool.call') {
+      const payload = event.payload as { tool?: unknown; input?: unknown };
+      const name = typeof payload.tool === 'string' ? payload.tool.toLowerCase() : '';
+      const input = (payload.input ?? {}) as Record<string, unknown>;
+      if (name === 'taskcreate') {
+        const subject = ['subject', 'content', 'title', 'task', 'description']
+          .map((k) => (typeof input[k] === 'string' ? (input[k] as string).trim() : ''))
+          .find(Boolean) ?? '';
+        if (!subject) continue;
+        order.push({ text: subject, status: 'pending', order: order.length, deleted: false });
+        mark(event);
+      } else if (name === 'taskupdate') {
+        const id = input.taskId != null ? String(input.taskId) : '';
+        if (!id) continue;
+        const subject = typeof input.subject === 'string' ? input.subject.trim() : '';
+        let task = byRealId.get(id);
+        if (!task) {
+          const pos = parseInt(id, 10); // fallback: taskId as 1-based creation index
+          if (Number.isFinite(pos) && pos >= 1 && pos <= order.length) task = order[pos - 1];
+        }
+        if (!task) {
+          task = { text: subject || `Task #${id}`, status: 'pending', order: order.length, deleted: false };
+          order.push(task);
+          byRealId.set(id, task);
+        }
+        if (subject) task.text = subject;
+        if (input.status === 'deleted') task.deleted = true;
+        else if (typeof input.status === 'string') task.status = normalizeTodoStatus(input.status);
+        mark(event);
+      }
+    } else if (event.type === 'tool.result') {
       const output = (event.payload as { output?: unknown }).output;
       if (typeof output !== 'string') continue;
-      // TaskList: a full snapshot — rebuild the map from it (authoritative).
       const snapshot = parseTaskListSnapshot(output);
       if (snapshot) {
-        byId.clear();
-        order = 0;
-        for (const task of snapshot) byId.set(task.id, { text: task.text, status: task.status, order: order++, deleted: false });
-        touched = true; lastTs = event.ts; lastEventId = event.eventId;
+        order.length = 0;
+        byRealId.clear();
+        for (const task of snapshot) {
+          const agg: TaskAgg = { text: task.text, status: task.status, order: order.length, deleted: false };
+          order.push(agg);
+          byRealId.set(task.id, agg);
+        }
+        mark(event);
         continue;
       }
       const match = output.match(TASK_CREATE_RESULT_RE);
       if (!match) continue;
       const id = match[1];
       const text = match[2].trim();
-      const existing = byId.get(id);
-      if (existing) { if (text) existing.text = text; existing.deleted = false; }
-      else byId.set(id, { text, status: 'pending', order: order++, deleted: false });
-      touched = true; lastTs = event.ts; lastEventId = event.eventId;
-    } else if (event.type === 'tool.call') {
-      const payload = event.payload as { tool?: unknown; input?: unknown };
-      if ((typeof payload.tool === 'string' ? payload.tool.toLowerCase() : '') !== 'taskupdate') continue;
-      const input = (payload.input ?? {}) as Record<string, unknown>;
-      const id = input.taskId != null ? String(input.taskId) : '';
-      if (!id) continue;
-      const subject = typeof input.subject === 'string' ? input.subject.trim() : '';
-      const task = byId.get(id) ?? { text: subject || `Task #${id}`, status: 'pending' as AgentTodoStatus, order: order++, deleted: false };
-      byId.set(id, task);
-      if (subject) task.text = subject;
-      if (input.status === 'deleted') task.deleted = true;
-      else if (typeof input.status === 'string') task.status = normalizeTodoStatus(input.status);
-      touched = true; lastTs = event.ts; lastEventId = event.eventId;
+      if (byRealId.has(id)) { mark(event); continue; }
+      // Attach the real id to the matching call-created task (by subject text)
+      // that isn't linked yet; create one if the call wasn't in the window.
+      const linked = new Set(byRealId.values());
+      const task = order.find((t) => !linked.has(t) && t.text === text);
+      if (task) {
+        byRealId.set(id, task);
+      } else {
+        const agg: TaskAgg = { text, status: 'pending', order: order.length, deleted: false };
+        order.push(agg);
+        byRealId.set(id, agg);
+      }
+      mark(event);
     }
   }
 
   if (!touched) return null;
-  const items = [...byId.values()]
+  const items = order
     .filter((task) => !task.deleted && task.text)
-    .sort((a, b) => a.order - b.order)
     .map((task) => ({ text: task.text, status: task.status }));
   return items.length > 0 ? { items, eventId: lastEventId, ts: lastTs } : null;
 }
