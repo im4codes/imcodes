@@ -1,7 +1,7 @@
-import { access, copyFile, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { access, copyFile, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { homedir } from 'node:os';
-import { extname, resolve, sep } from 'node:path';
+import { extname, join, resolve, sep } from 'node:path';
 import { TextDecoder } from 'node:util';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import readline, { type Interface as ReadlineInterface } from 'node:readline';
@@ -84,6 +84,20 @@ const CODEX_RUNTIME_SUBAGENT_ITEM_TYPES = new Set([
   'runtimesubagentnotification',
 ]);
 const CODEX_RAW_SPAWN_AGENT_FUNCTION_NAMES = new Set(['spawn_agent', 'spawnAgent']);
+const CODEX_RAW_CHECKLIST_FUNCTION_NAMES = new Set([
+  'todowrite',
+  'todo_write',
+  'write_todos',
+  'update_plan',
+  'updateplan',
+  'update_todo_list',
+  'set_plan',
+  'setplan',
+]);
+const CODEX_RAW_CHECKLIST_HISTORY_TAIL_BYTES = 512 * 1024;
+const CODEX_RAW_CHECKLIST_HISTORY_CLOCK_SKEW_MS = 5_000;
+const CODEX_RAW_CHECKLIST_POLL_INTERVAL_MS = 2_000;
+const CODEX_RAW_CHECKLIST_POLL_WINDOW_MS = 20_000;
 
 interface CodexRawSpawnAgentCall {
   sessionId: string;
@@ -111,6 +125,49 @@ function getCodexHome(env: Record<string, string | undefined>): string {
   return typeof env.CODEX_HOME === 'string' && env.CODEX_HOME.trim()
     ? resolve(env.CODEX_HOME.trim())
     : resolve(homedir(), '.codex');
+}
+
+function codexSessionDir(codexHome: string, date: Date): string {
+  const yyyy = date.getUTCFullYear();
+  const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(date.getUTCDate()).padStart(2, '0');
+  return join(codexHome, 'sessions', String(yyyy), mm, dd);
+}
+
+function recentCodexSessionDirs(codexHome: string): string[] {
+  const dirs: string[] = [];
+  for (let i = 0; i < 30; i += 1) {
+    dirs.push(codexSessionDir(codexHome, new Date(Date.now() - i * 86_400_000)));
+  }
+  return dirs;
+}
+
+async function findCodexRolloutPathByUuid(env: Record<string, string | undefined>, uuid: string): Promise<string | null> {
+  const codexHome = getCodexHome(env);
+  let latestPath: string | null = null;
+  let latestMtime = -1;
+  for (const dir of recentCodexSessionDirs(codexHome)) {
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      if (!name.startsWith('rollout-') || !name.endsWith('.jsonl') || !name.includes(uuid)) continue;
+      const candidate = join(dir, name);
+      try {
+        const info = await stat(candidate);
+        if (info.mtimeMs > latestMtime) {
+          latestMtime = info.mtimeMs;
+          latestPath = candidate;
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+  return latestPath;
 }
 
 function isCodexAuthFailureMessage(message: string): boolean {
@@ -364,6 +421,13 @@ interface CodexSdkSessionState {
   completedCompactTurnIds: Set<string>;
   generatedImageTracking: GeneratedImageTrackingSnapshot | null;
   generatedImagePaths: string[];
+  rawChecklistStartedAt: number;
+  rawChecklistRolloutPath?: string;
+  rawChecklistRolloutOffset?: number;
+  rawChecklistSeenCallIds: Set<string>;
+  rawChecklistScanPromise?: Promise<void>;
+  rawChecklistPollTimer: ReturnType<typeof setTimeout> | null;
+  rawChecklistPollUntil: number;
 }
 
 function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
@@ -941,6 +1005,80 @@ function parseJsonRecord(value: unknown): Record<string, any> | undefined {
   }
 }
 
+function rawChecklistText(item: Record<string, unknown>): string | undefined {
+  for (const key of ['content', 'step', 'text', 'title', 'task', 'description', 'name']) {
+    const value = item[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function rawChecklistStatus(value: unknown): 'pending' | 'in_progress' | 'completed' {
+  const normalized = normalizeStatusName(typeof value === 'string' ? value : undefined);
+  if (normalized === 'completed' || normalized === 'complete' || normalized === 'done' || normalized === 'finished' || normalized === 'checked') {
+    return 'completed';
+  }
+  if (normalized === 'inprogress' || normalized === 'active' || normalized === 'doing' || normalized === 'running' || normalized === 'started') {
+    return 'in_progress';
+  }
+  return 'pending';
+}
+
+function rawChecklistInputFromArgs(args: Record<string, any>): { plan: Array<{ content: string; status: string }> } | null {
+  const rawItems = Array.isArray(args.plan)
+    ? args.plan
+    : Array.isArray(args.todos)
+      ? args.todos
+      : Array.isArray(args.tasks)
+        ? args.tasks
+        : Array.isArray(args.steps)
+          ? args.steps
+          : null;
+  if (!rawItems) return null;
+  const plan: Array<{ content: string; status: string }> = [];
+  for (const rawItem of rawItems) {
+    if (!isRecord(rawItem)) continue;
+    const content = rawChecklistText(rawItem);
+    if (!content) continue;
+    plan.push({ content, status: rawChecklistStatus(rawItem.status) });
+  }
+  return plan.length ? { plan } : null;
+}
+
+function rawChecklistToolFromFunctionCall(sessionId: string, item: Record<string, any>): ToolCallEvent | null {
+  const name = meaningfulString(item.name);
+  const normalizedName = name?.replace(/[\s-]+/g, '_').toLowerCase();
+  if (!name || !normalizedName || !CODEX_RAW_CHECKLIST_FUNCTION_NAMES.has(normalizedName)) return null;
+  const args = parseJsonRecord(item.arguments);
+  if (!args) return null;
+  const input = rawChecklistInputFromArgs(args);
+  if (!input) return null;
+  const id = meaningfulString(item.call_id) ?? meaningfulString(item.callId) ?? meaningfulString(item.id) ?? `codex-raw-checklist-${sessionId}`;
+  return {
+    id,
+    name,
+    status: 'complete',
+    input,
+    detail: { kind: 'plan', summary: 'Plan', input, meta: {}, raw: item },
+  };
+}
+
+function rawChecklistToolFromJsonlLine(sessionId: string, line: string, minTimestampMs: number): ToolCallEvent | null {
+  if (!line.trim()) return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!isRecord(raw) || raw.type !== 'response_item') return null;
+  const timestamp = typeof raw.timestamp === 'string' ? new Date(raw.timestamp).getTime() : NaN;
+  if (Number.isFinite(timestamp) && timestamp < minTimestampMs) return null;
+  const payload = isRecord(raw.payload) ? raw.payload : null;
+  if (!payload || payload.type !== 'function_call') return null;
+  return rawChecklistToolFromFunctionCall(sessionId, payload);
+}
+
 function readRawSpawnAgentId(record: Record<string, any>): string | undefined {
   return meaningfulString(record.agent_id)
     ?? meaningfulString(record.agentId)
@@ -1319,6 +1457,13 @@ export class CodexSdkProvider implements TransportProvider {
       completedCompactTurnIds: existing?.completedCompactTurnIds ?? new Set(),
       generatedImageTracking: null,
       generatedImagePaths: [],
+      rawChecklistStartedAt: Date.now(),
+      rawChecklistRolloutPath: existing?.rawChecklistRolloutPath,
+      rawChecklistRolloutOffset: existing?.rawChecklistRolloutOffset,
+      rawChecklistSeenCallIds: existing?.rawChecklistSeenCallIds ?? new Set(),
+      rawChecklistScanPromise: undefined,
+      rawChecklistPollTimer: null,
+      rawChecklistPollUntil: 0,
     });
     if (config.resumeId || config.effort) this.emitSessionInfo(routeId, { ...(config.resumeId ? { resumeId: config.resumeId } : {}), ...(config.effort ? { effort: config.effort } : {}) });
     return routeId;
@@ -1329,6 +1474,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state) return;
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
+    this.clearRawChecklistPollTimer(state);
     if (state.threadId && state.loaded) {
       await this.request('thread/unsubscribe', { threadId: state.threadId }).catch(() => {});
       this.threadToSession.delete(state.threadId);
@@ -1481,6 +1627,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearStatus(sessionId, state);
       state.runningTurnId = undefined;
       state.pendingComplete = undefined;
+      this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
       this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
     }, CANCEL_INTERRUPT_TIMEOUT_MS);
@@ -1498,6 +1645,7 @@ export class CodexSdkProvider implements TransportProvider {
     for (const [sessionId, state] of this.sessions) {
       this.clearCancelTimer(state);
       this.clearCompactTimers(state);
+      this.clearRawChecklistPollTimer(state);
       if (!options.clearSessions) {
         this.clearStatus(sessionId, state);
         state.loaded = false;
@@ -1660,8 +1808,10 @@ export class CodexSdkProvider implements TransportProvider {
       if (state.cancelled && state.runningTurnId) {
         await this.interruptRunningTurn(sessionId, state, state.runningTurnId);
       }
+      if (state.runningTurnId) this.armRawChecklistPolling(sessionId, state);
     } catch (err) {
       state.runningTurnId = undefined;
+      this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
       const error = this.normalizeError(err);
       if (this.isCodexAuthError(error)) {
@@ -1953,6 +2103,89 @@ export class CodexSdkProvider implements TransportProvider {
     for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
   }
 
+  private async readRawChecklistHistoryChunk(state: CodexSdkSessionState): Promise<string | null> {
+    if (!state.threadId) return null;
+    const env = { ...process.env, ...(state.env ?? {}) };
+    const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(env, state.threadId);
+    if (!rolloutPath) return null;
+    state.rawChecklistRolloutPath = rolloutPath;
+
+    let fh: Awaited<ReturnType<typeof open>> | null = null;
+    try {
+      fh = await open(rolloutPath, 'r');
+      const { size } = await fh.stat();
+      const priorOffset = state.rawChecklistRolloutOffset;
+      const start = priorOffset === undefined || priorOffset > size
+        ? Math.max(0, size - CODEX_RAW_CHECKLIST_HISTORY_TAIL_BYTES)
+        : priorOffset;
+      if (start >= size) {
+        state.rawChecklistRolloutOffset = size;
+        return null;
+      }
+      const buffer = Buffer.allocUnsafe(size - start);
+      const { bytesRead } = await fh.read(buffer, 0, buffer.length, start);
+      state.rawChecklistRolloutOffset = size;
+      let chunk = buffer.subarray(0, bytesRead).toString('utf8');
+      if (start > 0) {
+        const firstNewline = chunk.indexOf('\n');
+        chunk = firstNewline >= 0 ? chunk.slice(firstNewline + 1) : '';
+      }
+      return chunk;
+    } catch (err) {
+      logger.debug({ provider: this.id, threadId: state.threadId, rolloutPath, err }, 'Codex SDK raw checklist history scan failed');
+      return null;
+    } finally {
+      if (fh) await fh.close().catch(() => {});
+    }
+  }
+
+  private async scanRawChecklistHistory(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+    const chunk = await this.readRawChecklistHistoryChunk(state);
+    if (!chunk) return;
+    const minTimestamp = state.rawChecklistStartedAt - CODEX_RAW_CHECKLIST_HISTORY_CLOCK_SKEW_MS;
+    for (const line of chunk.split('\n')) {
+      const tool = rawChecklistToolFromJsonlLine(sessionId, line, minTimestamp);
+      if (!tool) continue;
+      if (state.rawChecklistSeenCallIds.has(tool.id)) continue;
+      state.rawChecklistSeenCallIds.add(tool.id);
+      for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+    }
+  }
+
+  private queueRawChecklistHistoryScan(sessionId: string, state: CodexSdkSessionState): void {
+    if (!state.threadId || state.rawChecklistScanPromise) return;
+    state.rawChecklistScanPromise = this.scanRawChecklistHistory(sessionId, state)
+      .catch((err) => logger.debug({ provider: this.id, sessionId, threadId: state.threadId, err }, 'Codex SDK raw checklist history scan failed'))
+      .finally(() => {
+        state.rawChecklistScanPromise = undefined;
+      });
+  }
+
+  private clearRawChecklistPollTimer(state: CodexSdkSessionState): void {
+    if (state.rawChecklistPollTimer) clearTimeout(state.rawChecklistPollTimer);
+    state.rawChecklistPollTimer = null;
+    state.rawChecklistPollUntil = 0;
+  }
+
+  private armRawChecklistPolling(sessionId: string, state: CodexSdkSessionState): void {
+    if (!state.threadId) return;
+    state.rawChecklistPollUntil = Date.now() + CODEX_RAW_CHECKLIST_POLL_WINDOW_MS;
+    if (state.rawChecklistPollTimer) return;
+    const tick = () => {
+      state.rawChecklistPollTimer = null;
+      if (!this.sessions.has(sessionId)) return;
+      if (!state.threadId || Date.now() > state.rawChecklistPollUntil) {
+        this.clearRawChecklistPollTimer(state);
+        return;
+      }
+      this.queueRawChecklistHistoryScan(sessionId, state);
+      state.rawChecklistPollTimer = setTimeout(tick, CODEX_RAW_CHECKLIST_POLL_INTERVAL_MS);
+      state.rawChecklistPollTimer.unref?.();
+    };
+    state.rawChecklistPollTimer = setTimeout(tick, CODEX_RAW_CHECKLIST_POLL_INTERVAL_MS);
+    state.rawChecklistPollTimer.unref?.();
+  }
+
   private handleRawResponseItem(params: Record<string, any>): boolean {
     const threadId = readParamThreadId(params);
     const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
@@ -1963,6 +2196,12 @@ export class CodexSdkProvider implements TransportProvider {
 
     if (item.type === 'function_call') {
       const name = meaningfulString(item.name);
+      const checklistTool = rawChecklistToolFromFunctionCall(sessionId, item);
+      if (checklistTool) {
+        state.rawChecklistSeenCallIds.add(checklistTool.id);
+        for (const cb of this.toolCallCallbacks) cb(sessionId, checklistTool);
+        return true;
+      }
       if (!name || !CODEX_RAW_SPAWN_AGENT_FUNCTION_NAMES.has(name)) return false;
       const callId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
       if (!callId) return true;
@@ -2112,6 +2351,7 @@ export class CodexSdkProvider implements TransportProvider {
         usage: normalizedUsage,
         ...(state.model ? { model: state.model } : {}),
       });
+      this.queueRawChecklistHistoryScan(sessionId, state);
       return;
     }
 
@@ -2253,6 +2493,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (status === 'failed') {
         this.clearCancelTimer(state);
         this.clearCompactTimers(state);
+        this.clearRawChecklistPollTimer(state);
         this.clearStatus(sessionId, state);
         state.runningCompact = false;
         state.compactObserved = false;
@@ -2270,6 +2511,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (status === 'interrupted') {
         this.clearCancelTimer(state);
         this.clearCompactTimers(state);
+        this.clearRawChecklistPollTimer(state);
         state.runningCompact = false;
         state.compactObserved = false;
         if (!state.runningTurnId && state.cancelled) {
@@ -2291,6 +2533,7 @@ export class CodexSdkProvider implements TransportProvider {
 
       if (state.cancelled) {
         this.clearCancelTimer(state);
+        this.clearRawChecklistPollTimer(state);
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         state.pendingComplete = undefined;
@@ -2304,6 +2547,8 @@ export class CodexSdkProvider implements TransportProvider {
 
       this.clearCancelTimer(state);
       this.clearStatus(sessionId, state);
+      this.queueRawChecklistHistoryScan(sessionId, state);
+      this.clearRawChecklistPollTimer(state);
       this.commitPendingSessionSystemTextUpdate(state, turnId);
       const messageId = state.currentMessageId ?? `${sessionId}:agent-message`;
       const currentText = state.currentText;
@@ -2381,6 +2626,7 @@ export class CodexSdkProvider implements TransportProvider {
   private completeCompact(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
+    this.clearRawChecklistPollTimer(state);
     this.clearStatus(sessionId, state);
     state.runningCompact = false;
     state.runningTurnId = undefined;
@@ -2553,6 +2799,7 @@ export class CodexSdkProvider implements TransportProvider {
   private cancelCompactLocally(sessionId: string, state: CodexSdkSessionState): void {
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
+    this.clearRawChecklistPollTimer(state);
     this.clearStatus(sessionId, state);
     state.runningCompact = false;
     state.runningTurnId = undefined;

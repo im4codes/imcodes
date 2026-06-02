@@ -253,6 +253,21 @@ async function writeCodexAuthFile(codexHome: string, version: number): Promise<v
   );
 }
 
+async function writeCodexRolloutFile(codexHome: string, threadId: string, lines: unknown[]): Promise<string> {
+  const now = new Date();
+  const dir = join(
+    codexHome,
+    'sessions',
+    String(now.getUTCFullYear()),
+    String(now.getUTCMonth() + 1).padStart(2, '0'),
+    String(now.getUTCDate()).padStart(2, '0'),
+  );
+  await mkdir(dir, { recursive: true });
+  const rolloutPath = join(dir, `rollout-test-${threadId}.jsonl`);
+  await writeFile(rolloutPath, `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`);
+  return rolloutPath;
+}
+
 function emitCodexItem(
   child: { emits: (msg: Record<string, any>) => void },
   method: 'item/started' | 'item/completed',
@@ -870,6 +885,179 @@ describe('CodexSdkProvider', () => {
       active: true,
       terminal: false,
     });
+  });
+
+  it('surfaces raw update_plan function calls as checklist tool events', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-raw-update-plan', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-raw-update-plan', 'make a checklist');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call',
+          name: 'update_plan',
+          call_id: 'call-plan-1',
+          arguments: JSON.stringify({
+            explanation: 'probe',
+            plan: [
+              { step: '梳理登录需求', status: 'completed' },
+              { step: '实现登录表单', status: 'in_progress' },
+              { step: '补充测试', status: 'pending' },
+            ],
+          }),
+        },
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: 'call-plan-1',
+      name: 'update_plan',
+      status: 'complete',
+      input: {
+        plan: [
+          { content: '梳理登录需求', status: 'completed' },
+          { content: '实现登录表单', status: 'in_progress' },
+          { content: '补充测试', status: 'pending' },
+        ],
+      },
+      detail: {
+        kind: 'plan',
+        summary: 'Plan',
+      },
+    });
+  });
+
+  it('surfaces raw update_plan calls from the Codex rollout when app-server omits the item', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-plan-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = new CodexSdkProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-rollout-update-plan', cwd: '/tmp/project' });
+
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall((_, tool) => tools.push(tool));
+
+      await provider.send('route-rollout-update-plan', 'make a checklist');
+      const child = childProcessMock.children[0];
+      const nowIso = new Date().toISOString();
+      const oldIso = new Date(Date.now() - 60_000).toISOString();
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: oldIso,
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'update_plan',
+            call_id: 'call-old-plan',
+            arguments: JSON.stringify({ plan: [{ step: 'old stale plan', status: 'in_progress' }] }),
+          },
+        },
+        {
+          timestamp: nowIso,
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'update_plan',
+            call_id: 'call-rollout-plan',
+            arguments: JSON.stringify({
+              plan: [
+                { step: '生成任务清单', status: 'completed' },
+                { step: '检查 timeline 落盘', status: 'in_progress' },
+                { step: '验证前端可渲染', status: 'pending' },
+              ],
+            }),
+          },
+        },
+      ]);
+
+      child.emits({
+        method: 'thread/tokenUsage/updated',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          tokenUsage: { last: { inputTokens: 10, cachedInputTokens: 2, outputTokens: 3 } },
+        },
+      });
+      await waitForCondition(() => tools.length === 1, 5000);
+
+      expect(tools).toHaveLength(1);
+      expect(tools[0]).toMatchObject({
+        id: 'call-rollout-plan',
+        name: 'update_plan',
+        status: 'complete',
+        input: {
+          plan: [
+            { content: '生成任务清单', status: 'completed' },
+            { content: '检查 timeline 落盘', status: 'in_progress' },
+            { content: '验证前端可渲染', status: 'pending' },
+          ],
+        },
+      });
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('polls the Codex rollout briefly for raw update_plan calls without waiting for token usage', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-plan-poll-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = new CodexSdkProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-rollout-update-plan-poll', cwd: '/tmp/project' });
+
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall((_, tool) => tools.push(tool));
+
+      await provider.send('route-rollout-update-plan-poll', 'make a checklist');
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'UpdatePlan',
+            call_id: 'call-rollout-plan-polled',
+            arguments: JSON.stringify({
+              plan: [
+                { step: '创建轮询测试清单', status: 'completed' },
+                { step: '等待 rollout 扫描', status: 'in_progress' },
+                { step: '确认前端可消费', status: 'pending' },
+              ],
+            }),
+          },
+        },
+      ]);
+
+      await waitForCondition(() => tools.length === 1);
+
+      expect(tools[0]).toMatchObject({
+        id: 'call-rollout-plan-polled',
+        name: 'UpdatePlan',
+        status: 'complete',
+        input: {
+          plan: [
+            { content: '创建轮询测试清单', status: 'completed' },
+            { content: '等待 rollout 扫描', status: 'in_progress' },
+            { content: '确认前端可消费', status: 'pending' },
+          ],
+        },
+      });
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
   });
 
   it('emits backgrounded SDK sub-agent snapshots for raw spawn_agent response items', async () => {

@@ -207,13 +207,15 @@ body {
 @keyframes shortcut-btn-stop-pulse { 0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(248,113,113,0); } 50% { opacity: 0.55; box-shadow: 0 0 10px 1px rgba(248,113,113,0.35); } }
 /* Agent task list (TodoWrite / todo_write / update_plan) — pinned checklist at
    the top of the chat scroll viewport, auto-updating as the agent progresses. */
-.agent-todos { position: sticky; top: 0; z-index: 5; margin: 0 0 10px; padding: 8px 10px; background: linear-gradient(180deg, rgba(16,24,40,0.98), rgba(11,17,28,0.96)); border: 1px solid rgba(125,211,252,0.2); border-radius: 10px; box-shadow: 0 4px 14px rgba(0,0,0,0.32); backdrop-filter: blur(6px); }
+.agent-todos { position: sticky; top: 0; z-index: 5; margin: 0 0 10px; padding: 9px 10px; background: linear-gradient(180deg, rgba(30,47,76,0.96), rgba(14,22,36,0.98)), rgba(15,23,42,0.98); border: 1px solid rgba(147,197,253,0.48); border-radius: 10px; box-shadow: 0 0 0 1px rgba(59,130,246,0.18) inset, 0 8px 22px rgba(0,0,0,0.42), 0 0 18px rgba(59,130,246,0.12); backdrop-filter: blur(6px); }
+.agent-todos::before { content: ''; display: block; height: 2px; margin: -9px -10px 8px; border-radius: 10px 10px 0 0; background: linear-gradient(90deg, rgba(96,165,250,0.82), rgba(52,211,153,0.58), rgba(168,85,247,0.72)); opacity: 0.85; }
 .agent-todos-complete { opacity: 0.72; }
 .agent-todos-header { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; width: 100%; padding: 0; background: none; border: none; cursor: pointer; font: inherit; text-align: left; color: inherit; }
 .agent-todos-collapsed .agent-todos-header { margin-bottom: 0; }
+.agent-todos-collapsed::before { margin-bottom: 7px; }
 .agent-todos-chevron { font-size: 10px; color: #93c5fd; flex-shrink: 0; line-height: 1; }
-.agent-todos-title { font-size: 12px; font-weight: 700; color: #cbd5e1; letter-spacing: 0.02em; }
-.agent-todos-count { font-size: 11px; color: #93c5fd; font-variant-numeric: tabular-nums; flex-shrink: 0; margin-left: auto; }
+.agent-todos-title { font-size: 12px; font-weight: 700; color: #e2e8f0; letter-spacing: 0.02em; }
+.agent-todos-count { font-size: 11px; color: #bfdbfe; font-variant-numeric: tabular-nums; flex-shrink: 0; margin-left: auto; }
 .agent-todos-header:hover .agent-todos-title { color: #f8fafc; }
 .agent-todos-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; max-height: 188px; overflow-y: auto; }
 .agent-todos-item { display: flex; align-items: flex-start; gap: 7px; font-size: 12.5px; line-height: 1.4; color: #cbd5e1; }
