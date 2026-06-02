@@ -3829,12 +3829,27 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               // Detect @/@@: use end of text (contentEditable anchorOffset is unreliable)
               const text = currentText;
 
-              // @@ → jump straight to agents picker
-              const doubleAt = text.match(/@@([^\s]*)$/);
+              // @@ → open the TEAM dropdown (combos / workflows). Selecting one
+              // launches a team discussion immediately with the current composer
+              // text as the topic. (Single-agent @@ selection was removed — it
+              // had little value vs. the combo/flow team discussion.) Strip the
+              // @@ trigger but keep the preceding text as the topic.
+              const doubleAt = text.match(/@@[\w-]*$/);
               if (doubleAt) {
-                setAtPickerOpen(true);
-                setAtPickerStage('agents');
-                setAtQuery(doubleAt[1]);
+                const before = text.replace(/@@[\w-]*$/, '');
+                if (divRef.current) divRef.current.textContent = before;
+                setHasText(!!before.trim());
+                setAtPickerOpen(false);
+                setAtPickerStage('choose');
+                setP2pOpen(true);
+                try {
+                  const sel = window.getSelection();
+                  const range = document.createRange();
+                  range.selectNodeContents(divRef.current!);
+                  range.collapse(false);
+                  sel?.removeAllRanges();
+                  sel?.addRange(range);
+                } catch { /* jsdom lacks Selection API */ }
               } else {
                 // Single @ → choose stage (files + agents menu)
                 const singleAt = text.match(/@([^\s@]*)$/);

@@ -3329,6 +3329,28 @@ afterEach(() => {
     getSelectionSpy.mockRestore();
   });
 
+  it('@@ opens the Team dropdown (combos/workflows) and strips the trigger, keeping the topic', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        sessions={[mainSession]}
+        subSessions={[
+          { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
+        ]}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'audit this module @@';
+    fireEvent.input(input);
+    // The @@ trigger is stripped; the preceding text is kept as the discussion topic.
+    expect(input.textContent).toBe('audit this module ');
+    // The Team dropdown (combos/workflows) opens — not the single-agent picker.
+    expect(screen.getByTestId('p2p-dropdown-tab-combos')).toBeDefined();
+  });
+
   it('sends p2pAtTargets in textbox order, not selection order', () => {
     const ws = makeWs();
     render(
