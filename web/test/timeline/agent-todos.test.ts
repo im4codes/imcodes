@@ -115,12 +115,26 @@ describe('deriveLatestTodoList', () => {
     expect(list?.eventId).toBe(events[2].eventId);
   });
 
-  it('detects update_plan by name and by input shape', () => {
+  it('detects update_plan by known checklist tool name', () => {
     const byName = deriveLatestTodoList([toolCall({ plan: [{ step: 'X', status: 'pending' }] }, 'update_plan')]);
     expect(byName?.items).toEqual([{ text: 'X', status: 'pending' }]);
-    // unknown tool name but checklist-shaped input still surfaces
-    const byShape = deriveLatestTodoList([toolCall({ todos: [{ content: 'Y', status: 'done' }] }, 'mystery_tool')]);
-    expect(byShape?.items).toEqual([{ text: 'Y', status: 'completed' }]);
+    const unknownTool = deriveLatestTodoList([toolCall({ todos: [{ content: 'Y', status: 'done' }] }, 'mystery_tool')]);
+    expect(unknownTool).toBeNull();
+  });
+
+  it('reads known checklist tool input from detail.input when top-level input is missing', () => {
+    const event = toolCall(undefined, 'todo_write', {
+      payload: {
+        tool: 'todo_write',
+        detail: {
+          summary: 'todo_write',
+          input: { todos: [{ content: 'Recovered from detail input', status: 'in_progress' }] },
+        },
+      },
+    });
+    expect(deriveLatestTodoList([event])?.items).toEqual([
+      { text: 'Recovered from detail input', status: 'in_progress' },
+    ]);
   });
 
   it('ignores unrelated tool.calls and non-tool events', () => {
@@ -199,9 +213,9 @@ describe('deriveLatestTodoList — CC TaskCreate/TaskUpdate', () => {
     ])).toBeNull();
   });
 
-  it('renders a TaskList snapshot result (authoritative; survives aged-out creates)', () => {
+  it('renders a TaskList snapshot result when it is paired with a TaskList call', () => {
     const events = [
-      toolResult('Task #1 created successfully: stale create that aged out'),
+      toolCall({}, 'TaskList'),
       toolResult('#1 [completed] 设计登录数据库表\n#2 [in_progress] 实现登录 API\n#3 [pending] 实现前端页面'),
     ];
     expect(deriveLatestTodoList(events)?.items).toEqual([
@@ -211,8 +225,49 @@ describe('deriveLatestTodoList — CC TaskCreate/TaskUpdate', () => {
     ]);
   });
 
+  it('renders a TaskList snapshot result when result metadata identifies TaskList', () => {
+    const output = '#1 [completed] 设计登录数据库表\n#2 [in_progress] 实现登录 API';
+    const event = toolResult(output, {
+      payload: { output, detail: { summary: 'TaskList' } },
+    });
+    expect(deriveLatestTodoList([event])?.items).toEqual([
+      { text: '设计登录数据库表', status: 'completed' },
+      { text: '实现登录 API', status: 'in_progress' },
+    ]);
+  });
+
+  it('does not parse bare TaskList-looking output without TaskList context', () => {
+    expect(deriveLatestTodoList([
+      toolResult('#1 [completed] 设计登录数据库表\n#2 [pending] 实现登录 API'),
+    ])).toBeNull();
+  });
+
+  it('does not let a stale TaskList expectation parse a later unrelated result', () => {
+    expect(deriveLatestTodoList([
+      toolCall({}, 'TaskList'),
+      toolResult('not a task list'),
+      toolResult('#1 [pending] Should not be parsed from a later Bash result'),
+    ])).toBeNull();
+  });
+
+  it('does not parse source-code snippets containing TaskCreate/TaskList examples', () => {
+    const sourceOutput = [
+      "      toolResult('Task #6 created successfully: Analyze requirements'),",
+      "      toolCall({ subject: 'Design schema' }, 'TaskCreate'),",
+      "      toolResult('Task #7 created successfully: Design schema'),",
+      "      toolResult('#1 [completed] 设计登录数据库表\\n#2 [pending] 实现登录 API'),",
+    ].join('\n');
+    expect(deriveLatestTodoList([
+      toolCall({ command: 'sed -n 1,260p web/test/timeline/agent-todos.test.ts' }, 'Bash'),
+      toolResult(sourceOutput),
+    ])).toBeNull();
+  });
+
   it('excludes deleted tasks from a TaskList snapshot', () => {
-    const events = [toolResult('#1 [completed] A\n#2 [deleted] B\n#3 [pending] C')];
+    const events = [
+      toolCall({}, 'TaskList'),
+      toolResult('#1 [completed] A\n#2 [deleted] B\n#3 [pending] C'),
+    ];
     expect(deriveLatestTodoList(events)?.items).toEqual([
       { text: 'A', status: 'completed' },
       { text: 'C', status: 'pending' },
@@ -254,6 +309,7 @@ describe('deriveLatestTodoList — CC TaskCreate/TaskUpdate', () => {
 
   it('applies a TaskUpdate after a TaskList snapshot', () => {
     const events = [
+      toolCall({}, 'TaskList'),
       toolResult('#1 [pending] A\n#2 [pending] B'),
       toolCall({ taskId: '2', status: 'completed' }, 'TaskUpdate'),
     ];

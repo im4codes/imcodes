@@ -5,7 +5,7 @@
  * all surface their progress checklist as a `tool.call` timeline event whose
  * `input` carries the list. Each update is a fresh tool.call with the full list,
  * so the LATEST matching event is the current state. This module detects those
- * events (by tool name OR input shape) and normalizes the differing schemas
+ * events by known checklist tool names and normalizes the differing schemas
  * into one shape the UI can render.
  *
  *   TodoWrite   { todos: [{ content, status, activeForm }] }
@@ -54,6 +54,27 @@ const LIST_KEYS = ['todos', 'plan', 'tasks', 'steps'] as const;
 /** Item fields that may hold the human-readable task text, in priority order. */
 const TEXT_KEYS = ['content', 'step', 'text', 'title', 'task', 'description', 'name'] as const;
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function eventToolName(event: TimelineEvent): string {
+  const payload = asRecord(event.payload);
+  const direct = payload && typeof payload.tool === 'string' ? payload.tool : '';
+  if (direct) return direct.toLowerCase();
+  const detail = asRecord(payload?.detail);
+  const summary = detail && typeof detail.summary === 'string' ? detail.summary : '';
+  return summary.toLowerCase();
+}
+
+function todoInputCandidates(event: TimelineEvent): unknown[] {
+  const payload = asRecord(event.payload);
+  const detail = asRecord(payload?.detail);
+  return [payload?.input, detail?.input].filter((value) => value !== undefined);
+}
+
 export function normalizeTodoStatus(raw: unknown): AgentTodoStatus {
   const value = String(raw ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_');
   if (value === 'in_progress' || value === 'inprogress' || value === 'active' || value === 'doing' || value === 'running' || value === 'started') {
@@ -66,8 +87,8 @@ export function normalizeTodoStatus(raw: unknown): AgentTodoStatus {
 }
 
 function extractRawItems(input: unknown): unknown[] | null {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
-  const obj = input as Record<string, unknown>;
+  const obj = asRecord(input);
+  if (!obj) return null;
   for (const key of LIST_KEYS) {
     if (Array.isArray(obj[key])) return obj[key] as unknown[];
   }
@@ -106,14 +127,14 @@ export function normalizeTodoInput(input: unknown): AgentTodoItem[] | null {
   return items;
 }
 
-function isTodoToolCall(event: TimelineEvent): boolean {
-  if (event.type !== 'tool.call') return false;
-  const payload = event.payload as { tool?: unknown; input?: unknown };
-  const name = typeof payload.tool === 'string' ? payload.tool.toLowerCase() : '';
-  if (TODO_TOOL_NAMES.has(name)) return true;
-  // Shape fallback: any tool.call whose input carries a known checklist array,
-  // so agent/tool-name variants still surface without a code change.
-  return extractRawItems(payload.input) !== null;
+function todoItemsFromToolCall(event: TimelineEvent): AgentTodoItem[] | null {
+  if (event.type !== 'tool.call') return null;
+  if (!TODO_TOOL_NAMES.has(eventToolName(event))) return null;
+  for (const input of todoInputCandidates(event)) {
+    const items = normalizeTodoInput(input);
+    if (items !== null) return items;
+  }
+  return null;
 }
 
 /**
@@ -124,8 +145,7 @@ function isTodoToolCall(event: TimelineEvent): boolean {
 function deriveArrayTodoList(events: readonly TimelineEvent[]): AgentTodoList | null {
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i];
-    if (!isTodoToolCall(event)) continue;
-    const items = normalizeTodoInput((event.payload as { input?: unknown }).input);
+    const items = todoItemsFromToolCall(event);
     if (items === null) continue;
     if (items.length === 0) return null; // cleared by the latest update
     return { items, eventId: event.eventId, ts: event.ts };
@@ -197,9 +217,9 @@ function deriveTaskToolList(events: readonly TimelineEvent[]): AgentTodoList | n
 
   for (const event of events) {
     if (event.type === 'tool.call') {
-      const payload = event.payload as { tool?: unknown; input?: unknown };
-      const name = typeof payload.tool === 'string' ? payload.tool.toLowerCase() : '';
-      const input = (payload.input ?? {}) as Record<string, unknown>;
+      const payload = asRecord(event.payload);
+      const name = eventToolName(event);
+      const input = asRecord(payload?.input) ?? {};
       if (name === 'taskcreate') {
         const subject = ['subject', 'content', 'title', 'task', 'description']
           .map((k) => (typeof input[k] === 'string' ? (input[k] as string).trim() : ''))
@@ -235,14 +255,17 @@ function deriveTaskToolList(events: readonly TimelineEvent[]): AgentTodoList | n
         awaitingResult = null;
       }
     } else if (event.type === 'tool.result') {
-      const output = (event.payload as { output?: unknown }).output;
+      const payload = asRecord(event.payload);
+      const output = payload?.output;
+      const resultName = eventToolName(event);
+      const expectedResult = awaitingResult;
+      awaitingResult = null;
       if (typeof output !== 'string') continue;
       const snapshot = parseTaskListSnapshot(output);
-      if (snapshot && (awaitingResult === 'tasklist' || order.length === 0)) {
+      if (snapshot && (expectedResult === 'tasklist' || resultName === 'tasklist')) {
         order.length = 0;
         byRealId.clear();
         pendingCreates.length = 0;
-        awaitingResult = null;
         for (const task of snapshot) {
           const agg: TaskAgg = { text: task.text, status: task.status, order: order.length, deleted: false };
           order.push(agg);
@@ -251,7 +274,9 @@ function deriveTaskToolList(events: readonly TimelineEvent[]): AgentTodoList | n
         mark(event);
         continue;
       }
-      const createResult = awaitingResult === 'taskcreate' ? parseTaskCreateResult(output) : null;
+      const createResult = expectedResult === 'taskcreate' || resultName === 'taskcreate'
+        ? parseTaskCreateResult(output)
+        : null;
       if (!createResult) continue;
       const { id, text } = createResult;
       if (byRealId.has(id)) { mark(event); continue; }
