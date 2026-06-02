@@ -5,9 +5,13 @@
 
 **給 AI agent 的 IM。共享記憶、託管 MCP 工具、受監督執行，以及跨模型審計。**
 
+> 三個臭皮匠，頂個諸葛亮。<br>
+> 三個諸葛亮，談笑定陰陽。<br>
+> — IM.codes
+
 IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層和託管 MCP 工具面。它會把已完成的工作沉澱成可重用上下文，再把合適的歷史注入或召回到後續 session，貫通 [Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、GitHub Copilot、Cursor、OpenCode、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent) 等，同時提供終端存取、檔案瀏覽、Git 視圖、localhost 預覽、通知、多 agent 工作流，以及 transport 型 agent 的原生串流輸出。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。內建團隊討論功能，讓多個模型互相審閱對方的方案和實作，能有效減少單模型的遺漏、盲點和偏差。
 
-> **說明：** 本文件是中文翻译版。**英文 README（`../README.md`）是規範版本。** 若内容存在差异，以英文版为准。
+> **說明：** 本文件是繁體中文翻譯版。**英文 README（`../README.md`）是規範版本。** 若內容有出入，以英文版為準。
 
 支援多個 agent 透過 CLI 和 SDK 兩種方式接入。
 
