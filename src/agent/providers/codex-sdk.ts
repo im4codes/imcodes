@@ -2115,7 +2115,8 @@ export class CodexSdkProvider implements TransportProvider {
       fh = await open(rolloutPath, 'r');
       const { size } = await fh.stat();
       const priorOffset = state.rawChecklistRolloutOffset;
-      const start = priorOffset === undefined || priorOffset > size
+      const shouldDiscardInitialPartial = priorOffset === undefined || priorOffset > size;
+      const start = shouldDiscardInitialPartial
         ? Math.max(0, size - CODEX_RAW_CHECKLIST_HISTORY_TAIL_BYTES)
         : priorOffset;
       if (start >= size) {
@@ -2124,12 +2125,28 @@ export class CodexSdkProvider implements TransportProvider {
       }
       const buffer = Buffer.allocUnsafe(size - start);
       const { bytesRead } = await fh.read(buffer, 0, buffer.length, start);
-      state.rawChecklistRolloutOffset = size;
-      let chunk = buffer.subarray(0, bytesRead).toString('utf8');
-      if (start > 0) {
-        const firstNewline = chunk.indexOf('\n');
-        chunk = firstNewline >= 0 ? chunk.slice(firstNewline + 1) : '';
+      if (bytesRead <= 0) return null;
+
+      let processStart = 0;
+      if (shouldDiscardInitialPartial && start > 0) {
+        const firstNewline = buffer.indexOf(10, 0);
+        if (firstNewline < 0 || firstNewline >= bytesRead) return null;
+        processStart = firstNewline + 1;
       }
+
+      let processEnd = bytesRead;
+      if (buffer[bytesRead - 1] !== 10) {
+        const lastNewline = buffer.lastIndexOf(10, bytesRead - 1);
+        if (lastNewline < processStart) {
+          state.rawChecklistRolloutOffset = start + processStart;
+          return null;
+        }
+        processEnd = lastNewline + 1;
+      }
+      if (processEnd <= processStart) return null;
+
+      state.rawChecklistRolloutOffset = start + processEnd;
+      const chunk = buffer.subarray(processStart, processEnd).toString('utf8');
       return chunk;
     } catch (err) {
       logger.debug({ provider: this.id, threadId: state.threadId, rolloutPath, err }, 'Codex SDK raw checklist history scan failed');

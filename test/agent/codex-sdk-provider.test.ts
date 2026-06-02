@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
@@ -1052,6 +1052,84 @@ describe('CodexSdkProvider', () => {
             { content: '创建轮询测试清单', status: 'completed' },
             { content: '等待 rollout 扫描', status: 'in_progress' },
             { content: '确认前端可消费', status: 'pending' },
+          ],
+        },
+      });
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('does not discard the first complete rollout line after advancing the scan offset', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-plan-offset-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = new CodexSdkProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-rollout-update-plan-offset', cwd: '/tmp/project' });
+
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall((_, tool) => tools.push(tool));
+
+      await provider.send('route-rollout-update-plan-offset', 'make a checklist');
+      const child = childProcessMock.children[0];
+      const rolloutPath = await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'not a checklist' }],
+          },
+        },
+      ]);
+
+      child.emits({
+        method: 'thread/tokenUsage/updated',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          tokenUsage: { last: { inputTokens: 10, cachedInputTokens: 2, outputTokens: 3 } },
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(tools).toHaveLength(0);
+
+      await appendFile(rolloutPath, `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'update_plan',
+          call_id: 'call-rollout-plan-after-offset',
+          arguments: JSON.stringify({
+            plan: [
+              { step: '启动清单创建', status: 'in_progress' },
+              { step: '更新清单推进', status: 'pending' },
+            ],
+          }),
+        },
+      })}\n`);
+
+      child.emits({
+        method: 'thread/tokenUsage/updated',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          tokenUsage: { last: { inputTokens: 11, cachedInputTokens: 2, outputTokens: 4 } },
+        },
+      });
+      await waitForCondition(() => tools.length === 1);
+
+      expect(tools[0]).toMatchObject({
+        id: 'call-rollout-plan-after-offset',
+        name: 'update_plan',
+        status: 'complete',
+        input: {
+          plan: [
+            { content: '启动清单创建', status: 'in_progress' },
+            { content: '更新清单推进', status: 'pending' },
           ],
         },
       });
