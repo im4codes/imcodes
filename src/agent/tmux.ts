@@ -213,20 +213,27 @@ async function ensureTmuxServer(): Promise<void> {
 
 /** Run a tmux command with array args (no shell — safe from injection). */
 async function tmuxRun(...args: string[]): Promise<string> {
-  await ensureTmuxServer();
-  try {
-    const { stdout } = await execFile('tmux', args);
-    return stdout.trim();
-  } catch (error) {
-    if (!isRecoverableTmuxServerError(error)) throw error;
-    // tmux exits when the last session dies. Under rapid create/kill loops,
-    // a cached "server exists" assumption can race with the server shutting
-    // down between commands. Re-prime once, then retry the original command.
-    tmuxServerChecked = false;
+  let lastError: unknown;
+  const attempts = 3;
+  for (let attempt = 0; attempt < attempts; attempt++) {
     await ensureTmuxServer();
-    const { stdout } = await execFile('tmux', args);
-    return stdout.trim();
+    try {
+      const { stdout } = await execFile('tmux', args);
+      return stdout.trim();
+    } catch (error) {
+      if (!isRecoverableTmuxServerError(error)) throw error;
+      lastError = error;
+      // tmux exits when the last session dies. Under rapid create/kill loops,
+      // a cached "server exists" assumption can race with the server shutting
+      // down between commands. Re-prime and retry the original command a few
+      // times so CI does not fail on a single tmux-server restart window.
+      tmuxServerChecked = false;
+      if (attempt < attempts - 1) {
+        await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+      }
+    }
   }
+  throw lastError;
 }
 
 // ── Raw send primitives (backend-dispatched) ────────────────────────────────────
@@ -486,7 +493,7 @@ export async function listSessions(): Promise<string[]> {
     return raw.split('\n').filter(Boolean);
   } catch (e: any) {
     const err = String(e.stderr || e.message || '');
-    if (err.includes('no sessions') || err.includes('no server running') || err.includes('No such file or directory') || err.includes('error connecting')) return [];
+    if (err.includes('no sessions') || isRecoverableTmuxServerError(e)) return [];
     throw e;
   }
 }

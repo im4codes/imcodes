@@ -187,6 +187,28 @@ describe('tmux shell-injection prevention', () => {
     expect(newSessionCalls.length).toBe(2);
   });
 
+  it('tolerates repeated recoverable tmux server exits during one command', async () => {
+    await tmux.capturePane('deck_test_brain'); // primes ensureTmuxServer cache
+    execFileCalls.length = 0;
+    let failures = 2;
+    failNextTmuxCall = (_cmd, args) => {
+      if (args[0] === 'new-session' && args[3] === 'deck_test_brain' && failures > 0) {
+        failures--;
+        return Object.assign(new Error('server exited unexpectedly'), {
+          stderr: 'server exited unexpectedly',
+        });
+      }
+      return null;
+    };
+
+    await tmux.newSession('deck_test_brain', 'bash');
+
+    const listSessionsCalls = execFileCalls.filter((c) => c.args[0] === 'list-sessions');
+    const newSessionCalls = execFileCalls.filter((c) => c.args[0] === 'new-session' && c.args[3] === 'deck_test_brain');
+    expect(listSessionsCalls.length).toBe(2);
+    expect(newSessionCalls.length).toBe(3);
+  });
+
   it('serializes tmux server priming so concurrent calls do not race on imcodes_init', async () => {
     vi.resetModules();
     const freshTmux = await import('../../src/agent/tmux.js');
