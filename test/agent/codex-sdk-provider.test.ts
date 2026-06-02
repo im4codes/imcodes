@@ -2516,6 +2516,51 @@ describe('CodexSdkProvider', () => {
     expect(detail.input).toEqual({ query: 'apple stock today', action: { type: 'search', query: 'apple stock today' } });
   });
 
+  it('surfaces Codex todo_list completed items as update_plan tool calls', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-todo-list', cwd: '/tmp/project' });
+
+    const tools: Array<{ name: string; status: string; input: unknown; detail?: unknown }> = [];
+    provider.onToolCall((_, tool) => tools.push({ name: tool.name, status: tool.status, input: tool.input, detail: tool.detail }));
+
+    await provider.send('route-todo-list', 'make a plan');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          id: 'todo-1',
+          type: 'todo_list',
+          items: [
+            { text: '梳理登录需求', completed: true },
+            { text: '实现登录表单', completed: false },
+          ],
+        },
+      },
+    });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      name: 'update_plan',
+      status: 'complete',
+      input: {
+        plan: [
+          { content: '梳理登录需求', status: 'completed' },
+          { content: '实现登录表单', status: 'pending' },
+        ],
+      },
+    });
+    expect(tools[0].detail).toMatchObject({
+      kind: 'plan',
+      summary: 'Plan',
+    });
+  });
+
   it('applies thinking level to subsequent Codex SDK turns', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });

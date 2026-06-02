@@ -39,6 +39,14 @@ const pendingStreamUpdates = new Map<string, {
 const STREAM_UPDATE_INTERVAL_MS = 40;
 const pendingFileLikeTools = new Map<string, ToolCallEvent>();
 const completedFileLikeTools = new Set<string>();
+const CHECKLIST_TOOL_NAMES = new Set([
+  'todowrite',
+  'todo_write',
+  'write_todos',
+  'update_plan',
+  'update_todo_list',
+  'set_plan',
+]);
 // `${sessionName}:${toolUseId}` of AskUserQuestion calls surfaced as ask.question
 // cards. Their tool_result (which the SDK re-emits as a generic name:'tool' event,
 // marked is_error when the answer came back via canUseTool deny) is suppressed so
@@ -69,6 +77,56 @@ function rememberPendingFileLikeTool(key: string, tool: ToolCallEvent): void {
   if (pendingFileLikeTools.size <= MAX_TRACKED_FILE_TOOLS) return;
   const oldestKey = pendingFileLikeTools.keys().next().value;
   if (oldestKey) pendingFileLikeTools.delete(oldestKey);
+}
+
+function isChecklistTool(tool: ToolCallEvent): boolean {
+  const name = tool.name.toLowerCase();
+  const detailKind = String(tool.detail?.kind ?? '').toLowerCase();
+  return CHECKLIST_TOOL_NAMES.has(name) || detailKind === 'plan';
+}
+
+function emitChecklistToolCall(sessionName: string, tool: ToolCallEvent): void {
+  timelineEmitter.emit(sessionName, 'tool.call', {
+    tool: tool.name,
+    ...(tool.input !== undefined ? { input: tool.input } : {}),
+    ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
+  }, {
+    source: 'daemon',
+    confidence: 'high',
+    eventId: `transport-tool:${sessionName}:${tool.id}:call`,
+  });
+  void appendTransportEvent(sessionName, {
+    type: 'tool.call',
+    sessionId: sessionName,
+    tool: tool.name,
+    ...(tool.input !== undefined ? { input: tool.input } : {}),
+    ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
+  });
+}
+
+function emitToolResult(sessionName: string, tool: ToolCallEvent): void {
+  timelineEmitter.emit(sessionName, 'tool.result', {
+    ...(tool.status === 'error'
+      ? { error: tool.output ?? 'error' }
+      : tool.output !== undefined
+        ? { output: tool.output }
+        : {}),
+    ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
+  }, {
+    source: 'daemon',
+    confidence: 'high',
+    eventId: `transport-tool:${sessionName}:${tool.id}:result`,
+  });
+  void appendTransportEvent(sessionName, {
+    type: 'tool.result',
+    sessionId: sessionName,
+    ...(tool.status === 'error'
+      ? { error: tool.output ?? 'error' }
+      : tool.output !== undefined
+        ? { output: tool.output }
+        : {}),
+    ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
+  });
 }
 
 function emitStreamingAssistantText(sessionName: string, eventId: string, text: string): void {
@@ -389,6 +447,17 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       return;
     }
 
+    if (isChecklistTool(tool)) {
+      // Plan/checklist snapshots are state, not file edits. In particular,
+      // Codex SDK can surface a `todo_list` item only at completion; if we let
+      // `update_plan` flow into the generic file-like deferral path (because
+      // its name contains "update"), the web receives only tool.result and the
+      // pinned checklist has no tool.call to render.
+      emitChecklistToolCall(sessionName, tool);
+      if (tool.status !== 'running') emitToolResult(sessionName, tool);
+      return;
+    }
+
     const fileChangeKey = `${sessionName}:${tool.id}`;
 
     const initialToolKind = String(tool.detail?.kind ?? '').toLowerCase();
@@ -525,28 +594,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       return;
     }
 
-    timelineEmitter.emit(sessionName, 'tool.result', {
-      ...(tool.status === 'error'
-        ? { error: tool.output ?? 'error' }
-        : tool.output !== undefined
-          ? { output: tool.output }
-          : {}),
-      ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
-    }, {
-      source: 'daemon',
-      confidence: 'high',
-      eventId: `transport-tool:${sessionName}:${tool.id}:result`,
-    });
-    void appendTransportEvent(sessionName, {
-      type: 'tool.result',
-      sessionId: sessionName,
-      ...(tool.status === 'error'
-        ? { error: tool.output ?? 'error' }
-        : tool.output !== undefined
-          ? { output: tool.output }
-          : {}),
-      ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
-    });
+    emitToolResult(sessionName, tool);
   });
 
   provider.onStatus?.((providerSid: string, status: ProviderStatusUpdate) => {

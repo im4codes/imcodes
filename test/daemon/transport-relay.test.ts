@@ -905,6 +905,58 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(call![3].hidden).not.toBe(true);
     });
 
+    it('emits a visible checklist tool.call for completed-only update_plan snapshots', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-plan', {
+        id: 'todo-1',
+        name: 'update_plan',
+        status: 'complete',
+        input: {
+          plan: [
+            { content: '梳理登录需求', status: 'completed' },
+            { content: '实现登录表单', status: 'pending' },
+          ],
+        },
+        detail: {
+          kind: 'plan',
+          summary: 'Plan',
+          input: {
+            plan: [
+              { content: '梳理登录需求', status: 'completed' },
+              { content: '实现登录表单', status: 'pending' },
+            ],
+          },
+        },
+      });
+
+      const call = emitMock.mock.calls.find((c) => c[1] === 'tool.call');
+      const result = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
+      expect(call).toBeDefined();
+      expect(call![0]).toBe('sess-plan');
+      expect(call![2]).toMatchObject({
+        tool: 'update_plan',
+        input: {
+          plan: [
+            { content: '梳理登录需求', status: 'completed' },
+            { content: '实现登录表单', status: 'pending' },
+          ],
+        },
+      });
+      expect(call![3]).toMatchObject({
+        eventId: 'transport-tool:sess-plan:todo-1:call',
+      });
+      expect(call![3].hidden).not.toBe(true);
+      expect(result?.[3]).toMatchObject({
+        eventId: 'transport-tool:sess-plan:todo-1:result',
+      });
+      expect(appendMock).toHaveBeenCalledWith('sess-plan', expect.objectContaining({
+        type: 'tool.call',
+        tool: 'update_plan',
+      }));
+    });
+
     it('emits hidden tool.call for running SDK sub-agent snapshots', async () => {
       const { provider, fireTool } = makeMockProvider();
       wireProviderToRelay(provider);
