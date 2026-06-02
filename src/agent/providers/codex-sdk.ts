@@ -1048,7 +1048,7 @@ function collabAgentToolFromItem(
   };
 }
 
-function toolFromItem(sessionId: string, item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
+export function toolFromItem(sessionId: string, item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
   if (typeof item.type === 'string' && CODEX_RUNTIME_SUBAGENT_ITEM_TYPES.has(normalizeStatusName(item.type))) {
     return runtimeSubagentToolFromPayload(sessionId, item, lifecycle);
   }
@@ -1190,6 +1190,28 @@ function toolFromItem(sessionId: string, item: Record<string, any>, lifecycle: '
           meta: { actionType },
           raw: item,
         },
+      };
+    }
+    case 'todo_list': {
+      // Codex's running plan/checklist (app-server TodoListItem: items of
+      // { text, completed }). Surface it as an update_plan tool.call so the
+      // shared timeline + web checklist render it like CC/Qwen/Gemini todos.
+      // `update_plan` is intentionally file-tool-shaped so transport-relay
+      // emits the completed call with its input (matching the web normalizer).
+      const todoItems = Array.isArray(item.items) ? item.items : [];
+      const plan = todoItems
+        .map((t: Record<string, unknown>) => ({
+          content: typeof t?.text === 'string' ? t.text.trim() : '',
+          status: t?.completed === true ? 'completed' : 'pending',
+        }))
+        .filter((t: { content: string }) => t.content);
+      const input = { plan };
+      return {
+        id: item.id ?? `codex-todo-${sessionId}`,
+        name: 'update_plan',
+        status: lifecycle === 'completed' ? 'complete' : 'running',
+        input,
+        detail: { kind: 'plan', summary: 'Plan', input, meta: {}, raw: item },
       };
     }
     default:
