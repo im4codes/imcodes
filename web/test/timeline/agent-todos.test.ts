@@ -179,6 +179,37 @@ describe('deriveLatestTodoList — CC TaskCreate/TaskUpdate', () => {
   it('ignores unrelated tool.result output', () => {
     expect(deriveLatestTodoList([toolResult('ran 3 tests, all passed')])).toBeNull();
   });
+
+  it('renders a TaskList snapshot result (authoritative; survives aged-out creates)', () => {
+    const events = [
+      toolResult('Task #1 created successfully: stale create that aged out'),
+      toolResult('#1 [completed] 设计登录数据库表\n#2 [in_progress] 实现登录 API\n#3 [pending] 实现前端页面'),
+    ];
+    expect(deriveLatestTodoList(events)?.items).toEqual([
+      { text: '设计登录数据库表', status: 'completed' },
+      { text: '实现登录 API', status: 'in_progress' },
+      { text: '实现前端页面', status: 'pending' },
+    ]);
+  });
+
+  it('excludes deleted tasks from a TaskList snapshot', () => {
+    const events = [toolResult('#1 [completed] A\n#2 [deleted] B\n#3 [pending] C')];
+    expect(deriveLatestTodoList(events)?.items).toEqual([
+      { text: 'A', status: 'completed' },
+      { text: 'C', status: 'pending' },
+    ]);
+  });
+
+  it('applies a TaskUpdate after a TaskList snapshot', () => {
+    const events = [
+      toolResult('#1 [pending] A\n#2 [pending] B'),
+      toolCall({ taskId: '2', status: 'completed' }, 'TaskUpdate'),
+    ];
+    expect(deriveLatestTodoList(events)?.items).toEqual([
+      { text: 'A', status: 'pending' },
+      { text: 'B', status: 'completed' },
+    ]);
+  });
 });
 
 describe('countCompleted', () => {

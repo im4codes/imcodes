@@ -137,8 +137,29 @@ function deriveArrayTodoList(events: readonly TimelineEvent[]): AgentTodoList | 
 // per-task TaskCreate + TaskUpdate calls (global ids, status in the result).
 // We reconstruct the list by replaying those events.
 const TASK_CREATE_RESULT_RE = /Task #(\d+) created successfully:\s*([\s\S]+?)\s*$/;
+// TaskList result lines: "#6 [completed] subject text"
+const TASK_LIST_LINE_RE = /^\s*#(\d+)\s+\[([a-z_]+)\]\s+(.+?)\s*$/;
 
 interface TaskAgg { text: string; status: AgentTodoStatus; order: number; deleted: boolean; }
+
+/**
+ * Parse a TaskList tool result (full snapshot, one "#id [status] subject" line
+ * per task) into ordered tasks, or null when the output isn't a task list.
+ * This is the authoritative recent snapshot — preferred over reconstructing
+ * from older TaskCreate/TaskUpdate events that may have aged out of the window.
+ */
+function parseTaskListSnapshot(output: string): Array<{ id: string; text: string; status: AgentTodoStatus }> | null {
+  const tasks: Array<{ id: string; text: string; status: AgentTodoStatus }> = [];
+  let sawLine = false;
+  for (const line of output.split('\n')) {
+    const match = line.match(TASK_LIST_LINE_RE);
+    if (!match) continue;
+    sawLine = true;
+    if (match[2] === 'deleted') continue;
+    tasks.push({ id: match[1], text: match[3].trim(), status: normalizeTodoStatus(match[2]) });
+  }
+  return sawLine ? tasks : null;
+}
 
 /**
  * Accumulation-style checklist (CC TaskCreate/TaskUpdate). TaskCreate's
@@ -157,6 +178,15 @@ function deriveTaskToolList(events: readonly TimelineEvent[]): AgentTodoList | n
     if (event.type === 'tool.result') {
       const output = (event.payload as { output?: unknown }).output;
       if (typeof output !== 'string') continue;
+      // TaskList: a full snapshot — rebuild the map from it (authoritative).
+      const snapshot = parseTaskListSnapshot(output);
+      if (snapshot) {
+        byId.clear();
+        order = 0;
+        for (const task of snapshot) byId.set(task.id, { text: task.text, status: task.status, order: order++, deleted: false });
+        touched = true; lastTs = event.ts; lastEventId = event.eventId;
+        continue;
+      }
       const match = output.match(TASK_CREATE_RESULT_RE);
       if (!match) continue;
       const id = match[1];
