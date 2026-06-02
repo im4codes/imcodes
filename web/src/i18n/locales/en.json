@@ -908,6 +908,7 @@
     "combo_send_confirm_skip": "Don't ask again, send directly next time",
     "combo_empty_message_warning": "Combo send requires a real message. Add some prompt text before sending.",
     "combo_requires_participants_hint": "Choose Team participants in Settings to enable combo modes.",
+    "member_cannot_initiate_discussion": "This session is a Team member, so it can't start a discussion. Start it from another session — a top-tier model is recommended.",
     "settings_enabled": "Participate",
     "settings_mode": "Mode",
     "settings_skip": "Skip",

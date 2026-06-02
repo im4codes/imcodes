@@ -907,6 +907,7 @@
     "combo_send_confirm_skip": "次回から確認せず直接送信する",
     "combo_empty_message_warning": "コンボ送信には本文が必要です。実際の依頼内容を入力してから送信してください。",
     "combo_requires_participants_hint": "コンボモードを有効にするには、先に Team 設定で参加者を選んでください。",
+    "member_cannot_initiate_discussion": "このセッションは Team のメンバーのため、ディスカッションを開始できません。別のセッションから開始してください（最上位モデルを推奨）。",
     "settings_enabled": "参加",
     "settings_mode": "モード",
     "settings_skip": "スキップ",

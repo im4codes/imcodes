@@ -908,6 +908,7 @@
     "combo_send_confirm_skip": "下次不再提示，直接发送",
     "combo_empty_message_warning": "组合流程发送必须带正文。先补充实际问题或指令再发送。",
     "combo_requires_participants_hint": "请先到 团队 设置里选择参与者，再启用组合流程。",
+    "member_cannot_initiate_discussion": "该会话已被设为团队成员，不能发起讨论。请改用其它 session 启动（建议使用最顶级模型）。",
     "settings_enabled": "参与",
     "settings_mode": "模式",
     "settings_skip": "跳过",

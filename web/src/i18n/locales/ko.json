@@ -907,6 +907,7 @@
     "combo_send_confirm_skip": "다음부터 묻지 않고 바로 전송",
     "combo_empty_message_warning": "콤보 전송에는 실제 메시지 본문이 필요합니다. 내용을 입력한 뒤 전송하세요.",
     "combo_requires_participants_hint": "콤보 모드를 쓰려면 먼저 Team 설정에서 참여자를 선택하세요.",
+    "member_cannot_initiate_discussion": "이 세션은 Team 멤버이므로 토론을 시작할 수 없습니다. 다른 세션에서 시작하세요(최상위 모델 권장).",
     "settings_enabled": "참여",
     "settings_mode": "모드",
     "settings_skip": "건너뛰기",

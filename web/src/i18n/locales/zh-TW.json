@@ -908,6 +908,7 @@
     "combo_send_confirm_skip": "下次不再提示，直接傳送",
     "combo_empty_message_warning": "組合流程傳送必須帶正文。請先補上實際問題或指令再傳送。",
     "combo_requires_participants_hint": "請先到 團隊 設定裡選擇參與者，再啟用組合流程。",
+    "member_cannot_initiate_discussion": "此工作階段已被設為團隊成員，無法發起討論。請改用其它 session 啟動（建議使用最頂級模型）。",
     "settings_enabled": "參與",
     "settings_mode": "模式",
     "settings_skip": "跳過",

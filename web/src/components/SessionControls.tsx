@@ -1707,6 +1707,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return Object.values(p2pSavedConfig.sessions).some((entry) => entry?.enabled && entry.mode !== 'skip');
   }, [p2pSavedConfig]);
 
+  // A session that is itself an enabled P2P participant ("member") must not
+  // start its own Team discussion from its Team dropdown — discussions spawn
+  // their own sub-sessions, so a member launching one would nest the team
+  // under a participant. The host/root session (the launcher) is never a
+  // member. When this is true we reject the combo/workflow launch and steer
+  // the user to start the discussion from another (non-member) session.
+  const isCurrentSessionP2pMember = useMemo(() => {
+    const name = activeSession?.name;
+    if (!name || name === rootSession) return false;
+    const entry = p2pSavedConfig?.sessions?.[name];
+    return !!entry?.enabled && entry.mode !== 'skip';
+  }, [activeSession?.name, rootSession, p2pSavedConfig]);
+
   // P2P config is per server + main-session (sub-sessions follow parent), stored on server for cross-device sync.
   const p2pConfigKey = rootSession ? p2pSessionConfigPrefKey(rootSession, serverId) : null;
   const p2pSavedConfigPref = usePref<P2pSavedConfig>(p2pConfigKey, {
@@ -2322,6 +2335,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const handleDirectComboSelect = useCallback((mode: string) => {
     setP2pOpen(false);
+    if (isCurrentSessionP2pMember) {
+      showSendWarning(t('p2p.member_cannot_initiate_discussion'));
+      return;
+    }
     const selection = p2pSavedConfig ? buildP2pConfigSelection(p2pSavedConfig, mode) : null;
     const payloadOptions: BuildSendPayloadOptions = selection
       ? {
@@ -2335,7 +2352,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         }
       : { modeOverride: mode };
     requestSend(buildSendPayload(payloadOptions), { clearComposer: true });
-  }, [buildSendPayload, p2pSavedConfig, requestSend]);
+  }, [buildSendPayload, isCurrentSessionP2pMember, p2pSavedConfig, requestSend, showSendWarning, t]);
 
   /*
    * R3 v2 PR-κ — Click-to-launch a saved workflow from the P2P dropdown.
@@ -2349,6 +2366,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
    */
   const handleDirectWorkflowSelect = useCallback((workflowId: string) => {
     setP2pOpen(false);
+    if (isCurrentSessionP2pMember) {
+      showSendWarning(t('p2p.member_cannot_initiate_discussion'));
+      return;
+    }
     if (!p2pSavedConfig || workflowLibraryItems.length === 0) return;
     const target = workflowLibraryItems.find((entry) => entry.id === workflowId);
     if (!target) return;
@@ -2365,7 +2386,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       syntheticConfigOverride: selection,
     };
     requestSend(buildSendPayload(payloadOptions), { clearComposer: true });
-  }, [buildSendPayload, p2pSavedConfig, requestSend, workflowLibraryItems]);
+  }, [buildSendPayload, isCurrentSessionP2pMember, p2pSavedConfig, requestSend, showSendWarning, t, workflowLibraryItems]);
 
   const handleComboSendCancel = useCallback(() => {
     maybePersistComboSendSkip();

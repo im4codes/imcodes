@@ -907,6 +907,7 @@
     "combo_send_confirm_skip": "No volver a preguntar, enviar directamente la próxima vez",
     "combo_empty_message_warning": "El envío combinado requiere un mensaje real. Agrega texto antes de enviarlo.",
     "combo_requires_participants_hint": "Elige participantes de Team en Configuración para habilitar los modos combinados.",
+    "member_cannot_initiate_discussion": "Esta sesión es miembro de Team, por lo que no puede iniciar una discusión. Iníciala desde otra sesión (se recomienda un modelo de primer nivel).",
     "settings_enabled": "Participar",
     "settings_mode": "Modo",
     "settings_skip": "Omitir",
