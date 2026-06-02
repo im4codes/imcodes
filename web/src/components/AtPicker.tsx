@@ -194,9 +194,10 @@ export function AtPicker({
   const [teamRoundsIdx, setTeamRoundsIdx] = useState(0);
   const CONFIG_ROUNDS_OPTIONS = [1, 2, 3, 5] as const;
   const { customCombos, saveCustomCombos, allCombos } = useP2pCustomCombos();
-  // Flat option list for the Team stage: single modes + preset combos + custom combos.
+  // Team stage lists combos only — preset combos + custom combos. Single modes
+  // are pointless for launching a Team discussion flow.
   const teamComboOptions = useMemo(
-    () => [...MODES, ...COMBO_PRESETS.map((c) => c.key), ...allCombos.custom],
+    () => [...COMBO_PRESETS.map((c) => c.key), ...allCombos.custom],
     [allCombos],
   );
   const teamOptionLabel = useCallback(
