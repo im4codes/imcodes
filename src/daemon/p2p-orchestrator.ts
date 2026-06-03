@@ -3173,6 +3173,17 @@ async function dispatchHop(
   const watchPath = localCopyPath ?? sourcePath;
   if (hop) hop.working_path = watchPath;
   const MAX_RETRIES = 1;
+  // Required hops (initiator initial-analysis + round summaries) cannot be
+  // skipped — a timeout here fails the ENTIRE run, unlike participant hops
+  // which are tolerant (Promise.allSettled + required:false → skipped). Give
+  // these non-skippable hops a doubled wait window per attempt so a host that
+  // is deliberating (large context, deep reasoning) isn't killed at the base
+  // deadline and take the whole discussion down with it. Combined with the
+  // existing MAX_RETRIES re-dispatch, a required hop gets a generous budget.
+  const REQUIRED_HOP_TIMEOUT_MULTIPLIER = 2;
+  const effectiveTimeoutMs = required
+    ? run.timeoutMs * REQUIRED_HOP_TIMEOUT_MULTIPLIER
+    : run.timeoutMs;
 
   const finishHop = async (status: P2pHopStatus, error: string | null = null) => {
     if (localCopyPath && status === 'completed') {
@@ -3236,12 +3247,12 @@ async function dispatchHop(
     }
 
     let idleEventReceived = false;
-    const idleWaiter = waitForIdleEvent(session, run.timeoutMs);
+    const idleWaiter = waitForIdleEvent(session, effectiveTimeoutMs);
     idleWaiter.promise.then((ok) => { idleEventReceived = ok; });
 
     const GRACE_PERIOD_MS = GRACE_PERIOD_DEFAULT_MS;
     const dispatchTime = Date.now();
-    const deadline = dispatchTime + run.timeoutMs;
+    const deadline = dispatchTime + effectiveTimeoutMs;
     const hardDeadline = deadline + 60_000;
     let fileGrew = false;
     let lastSize = sizeBefore;
@@ -3434,6 +3445,27 @@ async function dispatchHop(
       } catch {
         continue;
       }
+    }
+
+    // Resilience for non-skippable hops: if the host actually wrote content to
+    // the discussion file but never emitted a clean completion signal (e.g.
+    // growth stayed under the settle threshold, or it never went idle), do NOT
+    // nuke the entire run on the final deadline. The partial analysis/summary
+    // is already on disk and is far more useful than a hard failure. Accept it
+    // as completed and let the discussion continue.
+    if (required && fileGrew) {
+      try {
+        const finalSize = (await stat(watchPath)).size;
+        if (finalSize > sizeBefore) {
+          logger.warn(
+            { runId: run.id, session, grown: finalSize - sizeBefore },
+            'P2P: required hop hit deadline with partial content — accepting partial work instead of failing run',
+          );
+          await finishHop('completed');
+          pushState(run, serverLink);
+          return true;
+        }
+      } catch {}
     }
 
     logger.warn({ runId: run.id, session }, 'P2P: hop timed out');
