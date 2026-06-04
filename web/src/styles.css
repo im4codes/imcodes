@@ -788,7 +788,7 @@ body {
      (which drives the toolbar row height) is unchanged — the toolbar does not
      grow; the button just extends a few px above/below (overflow:visible
      above keeps it from being clipped). */
-  .shortcut-btn-stop {
+  .shortcut-btn-icon.shortcut-btn-stop {
     min-width: 64px;
     width: 64px;
     padding-top: 8px;
