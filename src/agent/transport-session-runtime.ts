@@ -559,6 +559,16 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.cancelActiveDispatchLocally(dispatchId);
       return;
     }
+    // The provider's CANCELLED callback (onComplete/onError) settles the turn
+    // and owns the queue drain, but it can arrive late or not at all. Until it
+    // does, getStatus() stays at streaming/thinking — which makes
+    // resolveTransportSessionListState() report 'running' on the next
+    // session_list pass and resurrect the "working" sweep/pulse after the user
+    // stopped (the UI animation never syncs to idle). Reflect idle now when
+    // nothing is queued — without draining here, since the callback owns the
+    // drain, so a session with queued work keeps running through to its next
+    // turn.
+    if (this.pendingCount === 0) this.setStatus('idle');
     await this.provider.cancel(this._providerSessionId);
   }
 

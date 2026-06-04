@@ -1244,6 +1244,22 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingCount).toBe(2);
   });
 
+  it('cancel() with no queued messages settles to idle immediately, before the provider CANCELLED callback', async () => {
+    runtime.send('only');
+    await flushDispatch();
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getStatus()).not.toBe('idle'); // turn is live
+
+    runtime.cancel();
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    // No queued work → reflect idle now, without waiting for the provider's
+    // (possibly late/absent) CANCELLED callback. Otherwise getStatus() stays
+    // streaming/thinking and resolveTransportSessionListState() reports
+    // 'running' on the next session_list pass — resurrecting the "working" UI
+    // animation after the user stopped.
+    expect(runtime.getStatus()).toBe('idle');
+  });
+
   it('cancel() stops a turn before provider.send starts when context bootstrap is still running', async () => {
     const resolveBootstraps: Array<() => void> = [];
     runtime.setContextBootstrapResolver(() => new Promise((resolve) => {
