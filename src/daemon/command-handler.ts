@@ -30,6 +30,7 @@ import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
 import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
 import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
+import { preserveTransportRuntimeQueuesToResend } from './transport-resend-preservation.js';
 import {
   startSubSession,
   stopSubSession,
@@ -680,6 +681,16 @@ async function relaunchFreshTransportConversation(record: SessionRecord): Promis
  * the caller enqueued right before invoking this helper is auto-delivered.
  */
 async function resumeTransportRuntimeAfterLoss(record: SessionRecord): Promise<void> {
+  const runtime = getTransportRuntime(record.name);
+  if (runtime) {
+    const preservation = preserveTransportRuntimeQueuesToResend(record.name, runtime);
+    if (preservation.preservedCount > 0) {
+      logger.info(
+        { sessionName: record.name, ...preservation },
+        'preserved transport runtime queues before provider-session loss resume',
+      );
+    }
+  }
   await stopTransportRuntimeSession(record.name).catch(() => {});
   await launchTransportSession({
     name: record.name,

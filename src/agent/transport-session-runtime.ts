@@ -588,7 +588,13 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchProviderStarted = false;
     this._activeDispatchId = null;
     this._locallyCancelledDispatchIds.clear();
-    if (this._pendingMessages.length > 0) this._pendingVersion++;
+    if (this._pendingMessages.length > 0) {
+      logger.warn(
+        { sessionKey: this.sessionKey, pendingCount: this._pendingMessages.length },
+        'transport runtime kill cleared pending messages',
+      );
+      this._pendingVersion++;
+    }
     this._pendingMessages = [];
     // Per-session memory injection history is daemon-scoped to this session;
     // a kill ends that scope. clear() is called on session.clear separately.

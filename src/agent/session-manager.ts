@@ -9,7 +9,7 @@ import type { AgentDriver } from './drivers/base.js';
 import type { AgentType } from './detect.js';
 import { isTransportAgent } from './detect.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
-import { TransportSessionRuntime, type PendingTransportMessage } from './transport-session-runtime.js';
+import { TransportSessionRuntime } from './transport-session-runtime.js';
 import { ensureProviderConnected, getProvider } from './provider-registry.js';
 import type { SessionInfoUpdate } from './transport-provider.js';
 import { setupCCStopHook } from './signal.js';
@@ -49,7 +49,8 @@ import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
 import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
 import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup.js';
-import { clearResend, drainResend, enqueueResend, getResendCount, getResendEntries } from '../daemon/transport-resend-queue.js';
+import { clearResend, drainResend, getResendCount, getResendEntries } from '../daemon/transport-resend-queue.js';
+import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
@@ -337,6 +338,13 @@ export async function teardownProject(projectName: string): Promise<void> {
     stopOpenCodeWatching(s.name);
     const transportRuntime = transportRuntimes.get(s.name);
     if (transportRuntime) {
+      const preservation = preserveTransportRuntimeQueuesToResend(s.name, transportRuntime);
+      if (preservation.preservedCount > 0) {
+        logger.info(
+          { sessionName: s.name, ...preservation },
+          'teardownProject preserved transport runtime queues before restart-oriented kill',
+        );
+      }
       if (transportRuntime.providerSessionId) unregisterProviderRoute(transportRuntime.providerSessionId);
       await transportRuntime.kill().catch(() => {});
       transportRuntimes.delete(s.name);
@@ -1037,23 +1045,6 @@ async function loadBoundServerIdForManagedMcp(): Promise<string | undefined> {
 // to the 300-char user-authored cap that bounds `description` /
 // `systemPrompt`. See p2p audit 37bfbb85-430 N-A.
 
-function queueTransportErrorResendEntries(sessionName: string, entries: PendingTransportMessage[]): number {
-  if (entries.length === 0) return getResendCount(sessionName);
-  const existingCommandIds = new Set(getResendEntries(sessionName).map((entry) => entry.commandId));
-  for (const entry of entries) {
-    if (existingCommandIds.has(entry.clientMessageId)) continue;
-    enqueueResend(sessionName, {
-      text: entry.text,
-      ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
-      commandId: entry.clientMessageId,
-      ...(entry.attachments?.length ? { attachments: entry.attachments } : {}),
-      queuedAt: Date.now(),
-    });
-    existingCommandIds.add(entry.clientMessageId);
-  }
-  return getResendCount(sessionName);
-}
-
 async function recoverTransportRuntimeAfterError(
   sessionName: string,
   runtime: TransportSessionRuntime,
@@ -1067,22 +1058,32 @@ async function recoverTransportRuntimeAfterError(
       return false;
     }
 
+    const preservation = preserveTransportRuntimeQueuesToResend(sessionName, runtime);
+    const pendingCount = preservation.afterCount;
+
     const now = Date.now();
     const windowStart = now - RESTART_WINDOW_MS;
     const recentRecoveries = (transportErrorRecoveryTimestamps.get(sessionName) ?? []).filter((ts) => ts > windowStart);
     if (recentRecoveries.length >= MAX_RESTARTS) {
-      logger.error({ sessionName }, 'Transport error recovery loop detected — refusing auto-restart');
+      logger.error({ sessionName, ...preservation }, 'Transport error recovery loop detected — refusing auto-restart');
       timelineEmitter.emit(sessionName, 'assistant.text', {
         text: `⚠️ Transport recovery stopped after ${MAX_RESTARTS} automatic restart attempts in 5 minutes.`,
         streaming: false,
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'high' });
+      if (pendingCount > 0) {
+        const queued = getResendEntries(sessionName);
+        timelineEmitter.emit(sessionName, 'session.state', {
+          state: 'queued',
+          pendingCount,
+          pendingMessages: queued.map((entry) => entry.text),
+          pendingMessageEntries: queued.map((entry) => ({ clientMessageId: entry.commandId, text: entry.text })),
+        }, { source: 'daemon', confidence: 'high' });
+      }
       return false;
     }
     transportErrorRecoveryTimestamps.set(sessionName, [...recentRecoveries, now]);
 
-    const failedEntries = runtime.activeDispatchEntries;
-    const pendingCount = queueTransportErrorResendEntries(sessionName, failedEntries);
     if (pendingCount > 0) {
       const queued = getResendEntries(sessionName);
       timelineEmitter.emit(sessionName, 'assistant.text', {
