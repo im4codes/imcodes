@@ -776,6 +776,27 @@ export function App() {
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, [auth]);
 
+  // Re-sync the session list — which carries the daemon-authoritative transport
+  // send queue (`transportPendingMessages`) — every time the app returns to the
+  // foreground. The WS reconnect path (socket_open / probe_recovered) and the
+  // native resume hook already request it, but a socket that quietly survived
+  // backgrounding never fires a reconnect, so a phone unlocked after the screen
+  // was off would keep showing a stale/empty queue ("熄屏发出的队列信息重开 app
+  // 不会同步"). This request is cheap + idempotent; the short cooldown dedupes the
+  // reconnect+foreground double-fire and rapid desktop tab switches.
+  useEffect(() => {
+    let lastSyncAt = 0;
+    const onVisibleSyncSessions = () => {
+      if (document.visibilityState !== 'visible') return;
+      const now = Date.now();
+      if (now - lastSyncAt < 1500) return;
+      lastSyncAt = now;
+      wsRef.current?.requestSessionList();
+    };
+    document.addEventListener('visibilitychange', onVisibleSyncSessions);
+    return () => document.removeEventListener('visibilitychange', onVisibleSyncSessions);
+  }, []);
+
   useEffect(() => {
     if (!auth) return;
     const verifyAuthStillValid = async (reason: string) => {
