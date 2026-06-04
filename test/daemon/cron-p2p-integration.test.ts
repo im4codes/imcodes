@@ -266,9 +266,12 @@ describe('Cron → P2P integration', () => {
     expect(completed).toBeDefined();
     expect(completed!.status).toBe('completed');
 
-    // The key assertion: deduplication means w1 + deck_sub_worker1 = 2 unique targets, NOT 3
+    // The key assertion: participant deduplication means w1 + deck_sub_worker1
+    // = 2 unique non-initiator targets, NOT 3. The initiator may also appear
+    // in completedHops for summary/execution turns and is not part of the
+    // participant de-dupe surface.
     const allDispatched = [...completed!.completedHops.map(h => h.session), ...completed!.skippedHops];
-    const uniqueTargets = new Set(allDispatched);
+    const uniqueTargets = new Set(allDispatched.filter((session) => session !== completed!.initiatorSession));
     expect(uniqueTargets.size).toBeLessThanOrEqual(2);
     expect(uniqueTargets.size).toBeGreaterThanOrEqual(1);
   });
