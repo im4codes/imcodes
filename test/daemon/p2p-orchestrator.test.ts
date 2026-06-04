@@ -160,14 +160,18 @@ beforeEach(async () => {
   detectStatusAsyncMock.mockResolvedValue('idle');
 
   sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (prompt.includes('[P2P Discussion Task')) {
+      const filePath = pathFromPrompt(prompt);
+      const heading = headingFromPrompt(prompt);
+      await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+      await writeExecutionMarkerFromPrompt(prompt);
+      setTimeout(() => notifySessionIdle(session), 30);
+      return;
+    }
     if (await writeExecutionMarkerFromPrompt(prompt)) {
       setTimeout(() => notifySessionIdle(session), 20);
       return;
     }
-    const filePath = pathFromPrompt(prompt);
-    const heading = headingFromPrompt(prompt);
-    await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
-    setTimeout(() => notifySessionIdle(session), 30);
   });
 });
 
@@ -267,23 +271,30 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(payload.flow_step_current).toBe(2);
     expect(payload.flow_step_total).toBe(2);
     const content = await readFile(done.contextFilePath, 'utf8');
-    expect(content.match(/Initial Analysis/g)?.length).toBe(2);
+    expect(content.match(/Initial Analysis/g)?.length).toBe(1);
   });
 
-  it('runs the post-summary execution prompt after each complete legacy combo cycle', async () => {
-    const executionPrompts: string[] = [];
+  it('inlines original-request execution into each complete legacy combo-cycle summary and follows up to confirm', async () => {
+    const confirmationPrompts: string[] = [];
+    const inlineExecutionPrompts: string[] = [];
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
       if (!prompt.includes('[P2P Discussion Task') && session === 'deck_proj_brain') {
-        executionPrompts.push(prompt);
+        confirmationPrompts.push(prompt);
+      }
+      if (prompt.includes('[P2P Discussion Task')) {
+        if (session === 'deck_proj_brain' && prompt.includes('Execution proof required')) {
+          inlineExecutionPrompts.push(prompt);
+        }
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+        await writeExecutionMarkerFromPrompt(prompt);
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
       }
       if (await writeExecutionMarkerFromPrompt(prompt)) {
         setTimeout(() => notifySessionIdle(session), 20);
         return;
-      }
-      if (prompt.includes('[P2P Discussion Task')) {
-        const filePath = pathFromPrompt(prompt);
-        const heading = headingFromPrompt(prompt);
-        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
       }
       setTimeout(() => notifySessionIdle(session), 20);
     });
@@ -300,32 +311,44 @@ describe('P2P orchestrator — parallel rounds', () => {
     );
 
     await waitForStatus(run.id, ['completed']);
-    expect(executionPrompts).toHaveLength(2);
-    expect(executionPrompts.every((prompt) => prompt.includes('implement after every full combo cycle'))).toBe(true);
+    expect(inlineExecutionPrompts).toHaveLength(2);
+    expect(inlineExecutionPrompts.every((prompt) => prompt.includes('implement after every full combo cycle'))).toBe(true);
+    expect(inlineExecutionPrompts.every((prompt) => !prompt.includes('Do NOT implement fixes'))).toBe(true);
+    expect(confirmationPrompts).toHaveLength(2);
+    expect(confirmationPrompts.every((prompt) => prompt.includes('Team execution follow-up verification'))).toBe(true);
+    expect(confirmationPrompts.every((prompt) => prompt.includes('Do not just say it is done'))).toBe(true);
   });
 
-  it('includes the previous cycle output as the next cycle initial audit scope', async () => {
+  it('includes the previous cycle output in the next cycle participant kickoff prompt', async () => {
     const initialPrompts: string[] = [];
+    const nextCycleHopPrompts: string[] = [];
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
       if (session === 'deck_proj_brain' && /Add a new heading "## [^"]+ — Initial Analysis/.test(prompt)) {
         initialPrompts.push(prompt);
       }
-      if (prompt.includes('Execution proof required')) {
-        const markerPath = prompt.match(/write this exact JSON marker to: ([^\n]+)/)?.[1]?.trim();
-        const markerBody = prompt.match(/Completed marker:\n```json\n([\s\S]*?)\n```/)?.[1];
-        if (!markerPath || !markerBody) throw new Error(`No execution marker contract found in prompt: ${prompt}`);
-        const marker = JSON.parse(markerBody) as Record<string, unknown>;
-        marker.summary = `Cycle ${marker.cycleIndex} execution result`;
-        marker.changedFiles = [`src/cycle-${marker.cycleIndex}.ts`];
-        marker.tests = [`vitest cycle ${marker.cycleIndex}`];
-        await writeFile(markerPath, `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
-        setTimeout(() => notifySessionIdle(session), 20);
-        return;
+      if (session === 'deck_proj_w1' && prompt.includes('Previous cycle audit scope')) {
+        nextCycleHopPrompts.push(prompt);
       }
       if (prompt.includes('[P2P Discussion Task')) {
         const filePath = pathFromPrompt(prompt);
         const heading = headingFromPrompt(prompt);
         await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session} for ${heading}.\n`, 'utf8');
+        if (prompt.includes('Execution proof required')) {
+          const markerPath = prompt.match(/write this exact JSON marker to: ([^\n]+)/)?.[1]?.trim();
+          const markerBody = prompt.match(/Completed marker:\n```json\n([\s\S]*?)\n```/)?.[1];
+          if (!markerPath || !markerBody) throw new Error(`No execution marker contract found in prompt: ${prompt}`);
+          const marker = JSON.parse(markerBody) as Record<string, unknown>;
+          marker.summary = `Cycle ${marker.cycleIndex} execution result`;
+          marker.changedFiles = [`src/cycle-${marker.cycleIndex}.ts`];
+          marker.tests = [`vitest cycle ${marker.cycleIndex}`];
+          await writeFile(markerPath, `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
+        }
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
       }
       setTimeout(() => notifySessionIdle(session), 20);
     });
@@ -343,14 +366,15 @@ describe('P2P orchestrator — parallel rounds', () => {
     );
 
     await waitForStatus(run.id, ['completed'], 5000);
-    expect(initialPrompts).toHaveLength(2);
+    expect(initialPrompts).toHaveLength(1);
     expect(initialPrompts[0]).not.toContain('Previous cycle audit scope');
-    expect(initialPrompts[1]).toContain('Previous cycle audit scope');
-    expect(initialPrompts[1]).toContain('Treat cycle 1/2 outputs as the primary audit scope');
-    expect(initialPrompts[1]).toContain('P2P Original Request Execution Confirmed (cycle 1/2)');
-    expect(initialPrompts[1]).toContain('Summary: Cycle 1 execution result');
-    expect(initialPrompts[1]).toContain('Changed files: src/cycle-1.ts');
-    expect(initialPrompts[1]).toContain('Tests: vitest cycle 1');
+    expect(nextCycleHopPrompts).toHaveLength(1);
+    expect(nextCycleHopPrompts[0]).toContain('Previous cycle audit scope');
+    expect(nextCycleHopPrompts[0]).toContain('Treat cycle 1/2 outputs as the primary audit scope');
+    expect(nextCycleHopPrompts[0]).toContain('P2P Original Request Execution Confirmed (cycle 1/2)');
+    expect(nextCycleHopPrompts[0]).toContain('Summary: Cycle 1 execution result');
+    expect(nextCycleHopPrompts[0]).toContain('Changed files: src/cycle-1.ts');
+    expect(nextCycleHopPrompts[0]).toContain('Tests: vitest cycle 1');
   });
 
   it('times out instead of hanging when the post-summary execution turn never returns idle', async () => {
@@ -426,9 +450,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
     const done = await waitForStatus(run.id, ['completed'], 5000);
     expect(executionAttempts).toBeGreaterThanOrEqual(2);
-    expect(done.executionAttempt).toBeGreaterThanOrEqual(2);
     const content = await readFile(done.contextFilePath, 'utf8');
     expect(content).toContain('P2P Original Request Execution Confirmed');
+    expect(content).toContain('Attempts: 3');
+    expect(content).toContain('P2P Original Request Execution Reconfirmed');
   });
 
   it('fails closed when the initiator writes a matching failed execution marker', async () => {
@@ -518,21 +543,24 @@ describe('P2P orchestrator — parallel rounds', () => {
     detectStatusAsyncMock.mockImplementation(async (session: string) => (idleSessions.has(session) ? 'idle' : 'running'));
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
-    if (await writeExecutionMarkerFromPrompt(prompt)) {
-      setTimeout(() => notifySessionIdle(session), 20);
-      return;
-    }
-      idleSessions.delete(session);
-      recordEvent(session, 'dispatch');
-      const filePath = pathFromPrompt(prompt);
-      const heading = headingFromPrompt(prompt);
-      const delay = session === 'deck_proj_w2' ? 140 : session === 'deck_proj_w1' ? 40 : 20;
-      setTimeout(async () => {
-        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
-        idleSessions.add(session);
-        recordEvent(session, 'idle');
-        notifySessionIdle(session);
-      }, delay);
+      if (prompt.includes('[P2P Discussion Task')) {
+        idleSessions.delete(session);
+        recordEvent(session, 'dispatch');
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        const delay = session === 'deck_proj_w2' ? 140 : session === 'deck_proj_w1' ? 40 : 20;
+        setTimeout(async () => {
+          await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+          await writeExecutionMarkerFromPrompt(prompt);
+          idleSessions.add(session);
+          recordEvent(session, 'idle');
+          notifySessionIdle(session);
+        }, delay);
+        return;
+      }
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 20);
+      }
     });
 
     const run = await startP2pRun(
@@ -562,19 +590,20 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect((summaryDispatch?.seq ?? 0)).toBeGreaterThan((w2Idle?.seq ?? 0));
   });
 
-  it('sends the original user request as a follow-up prompt after final summary completes', async () => {
+  it('inlines the original user request execution into the final summary prompt, then confirms it', async () => {
     const prompts: Array<{ session: string; prompt: string }> = [];
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
       prompts.push({ session, prompt });
-      if (await writeExecutionMarkerFromPrompt(prompt)) {
-        setTimeout(() => notifySessionIdle(session), 20);
-        return;
-      }
       if (prompt.includes('[P2P Discussion Task')) {
         const filePath = pathFromPrompt(prompt);
         const heading = headingFromPrompt(prompt);
         await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+        await writeExecutionMarkerFromPrompt(prompt);
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
         setTimeout(() => notifySessionIdle(session), 20);
       }
     });
@@ -589,20 +618,19 @@ describe('P2P orchestrator — parallel rounds', () => {
 
     await waitForStatus(run.id, ['completed']);
 
-    const followUp = prompts.at(-1);
-    expect(followUp?.session).toBe('deck_proj_brain');
-    expect(followUp?.prompt).toContain('implement the requested feature after the discussion');
-    expect(followUp?.prompt).toContain('Do not stop at another discussion summary');
-    expect(followUp?.prompt).toContain(run.contextFilePath);
-    expect(followUp?.prompt).not.toContain('[P2P Discussion Task');
+    const finalSummaryPrompt = prompts.find((entry) => entry.session === 'deck_proj_brain' && entry.prompt.includes('Final Summary'));
+    expect(finalSummaryPrompt?.prompt).toContain('implement the requested feature after the discussion');
+    expect(finalSummaryPrompt?.prompt).toContain('Do not stop at another discussion summary');
+    expect(finalSummaryPrompt?.prompt).toContain('Execution proof required');
+    expect(finalSummaryPrompt?.prompt).toContain(run.contextFilePath);
+    const confirmationPrompts = prompts.filter((entry) => entry.session === 'deck_proj_brain' && !entry.prompt.includes('[P2P Discussion Task'));
+    expect(confirmationPrompts).toHaveLength(1);
+    expect(confirmationPrompts[0].prompt).toContain('Team execution follow-up verification');
+    expect(confirmationPrompts[0].prompt).toContain('Do not just say it is done');
   });
 
   it('retains completed hop evidence with best-effort fallback when exact baseline slicing is not possible', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
-    if (await writeExecutionMarkerFromPrompt(prompt)) {
-      setTimeout(() => notifySessionIdle(session), 20);
-      return;
-    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       if (session === 'deck_proj_w1') {
@@ -610,6 +638,7 @@ describe('P2P orchestrator — parallel rounds', () => {
       } else {
         await appendFile(filePath, `\n## ${heading}\n\nSUMMARY:${session}\n`, 'utf8');
       }
+      await writeExecutionMarkerFromPrompt(prompt);
       setTimeout(() => notifySessionIdle(session), 20);
     });
 
@@ -629,10 +658,6 @@ describe('P2P orchestrator — parallel rounds', () => {
 
   it('collects completed hop evidence into the main file in hop order before summary', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
-    if (await writeExecutionMarkerFromPrompt(prompt)) {
-      setTimeout(() => notifySessionIdle(session), 20);
-      return;
-    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       const body = session === 'deck_proj_w1'
@@ -641,6 +666,7 @@ describe('P2P orchestrator — parallel rounds', () => {
           ? 'SECOND-HOP-FINDING'
           : `SUMMARY:${session}`;
       await appendFile(filePath, `\n## ${heading}\n\n${body}\n`, 'utf8');
+      await writeExecutionMarkerFromPrompt(prompt);
       setTimeout(() => notifySessionIdle(session), 20);
     });
 
@@ -1626,16 +1652,13 @@ describe('P2P orchestrator — parallel rounds', () => {
     });
 
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
-    if (await writeExecutionMarkerFromPrompt(prompt)) {
-      setTimeout(() => notifySessionIdle(session), 20);
-      return;
-    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       const body = heading.includes('Implementation Audit')
         ? 'Audit completed without verdict marker.'
         : `Output from ${session}.`;
       await appendFile(filePath, `\n## ${heading}\n\n${body}\n`, 'utf8');
+      await writeExecutionMarkerFromPrompt(prompt);
       setTimeout(() => notifySessionIdle(session), 20);
     });
 
@@ -1963,10 +1986,6 @@ describe('P2P orchestrator — parallel rounds', () => {
   it('times out if the whole-run deadline expires during final summary dispatch', async () => {
     let activeRunId = '';
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
-    if (await writeExecutionMarkerFromPrompt(prompt)) {
-      setTimeout(() => notifySessionIdle(session), 20);
-      return;
-    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
@@ -2257,10 +2276,6 @@ describe('P2P orchestrator — parallel rounds', () => {
     let auditCount = 0;
     let finalSummaryCount = 0;
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
-    if (await writeExecutionMarkerFromPrompt(prompt)) {
-      setTimeout(() => notifySessionIdle(session), 20);
-      return;
-    }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       let body = `Output from ${session}.`;
@@ -2272,6 +2287,7 @@ describe('P2P orchestrator — parallel rounds', () => {
       }
       if (heading.includes('Final Summary')) finalSummaryCount += 1;
       await appendFile(filePath, `\n## ${heading}\n\n${body}\n`, 'utf8');
+      await writeExecutionMarkerFromPrompt(prompt);
       setTimeout(() => notifySessionIdle(session), 20);
     });
 
