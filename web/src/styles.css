@@ -230,7 +230,7 @@ body {
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
 .shortcut-btn-icon { width: 28px; min-width: 28px; padding: 4px 0; display: inline-flex; align-items: center; justify-content: center; }
-.shortcut-btn-stop { width: 44px; min-width: 44px; }
+.shortcut-btn-stop { width: 44px; min-width: 44px; font-size: 18px; line-height: 1; }
 /* Mobile arrow D-pad — replaces the separate up/down buttons on small screens.
  * Drag toward a direction to send that arrow key. touch-action:none keeps the
  * drag from scrolling the page; the four glyphs sit around a center. */
@@ -795,7 +795,8 @@ body {
     padding-bottom: 8px;
     margin-top: -5px;
     margin-bottom: -5px;
-    font-size: 13px;
+    font-size: 22px;
+    line-height: 1;
     border-radius: 8px;
   }
   .shortcuts-model { padding: 4px 4px 4px 0; }
