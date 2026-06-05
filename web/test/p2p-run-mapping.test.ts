@@ -238,6 +238,24 @@ describe('mapP2pRunToDiscussion', () => {
     expect(discussion.nodes?.map((node) => node.label)).toEqual(['brain', 'w2']);
   });
 
+  it('normalizes server progress aliases so completed hops render as done', () => {
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_status_aliases',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 1,
+      total_hops: 3,
+      all_nodes: [
+        { label: 'w1', agentType: 'codex', status: 'completed', phase: 'hop' },
+        { label: 'w2', agentType: 'codex', status: 'running', phase: 'hop' },
+        { label: 'w3', agentType: 'codex', status: 'failed', phase: 'hop' },
+      ],
+    });
+
+    expect(discussion.nodes?.map((node) => node.status)).toEqual(['done', 'active', 'skipped']);
+  });
+
   it('preserves p2p discussion file id for homepage navigation', () => {
     const discussion = mapP2pRunToDiscussion({
       id: 'run_nav',
@@ -520,6 +538,80 @@ describe('mapP2pRunToDiscussion', () => {
     const merged = mergeP2pStatusResponseDiscussions(existing, []);
 
     expect(merged.map((d) => d.id)).toEqual(['p2p_run_alpha', 'p2p_run_beta']);
+  });
+
+  it('removes stale active P2P entries that are absent from a full status response', () => {
+    const existing = [
+      {
+        id: 'p2p_run_alpha',
+        topic: 'Team audit · alpha',
+        state: 'running',
+        currentRound: 1,
+        maxRounds: 2,
+        completedHops: 0,
+        totalHops: 2,
+      },
+      {
+        id: 'p2p_run_done',
+        topic: 'Team audit · done',
+        state: 'done',
+        currentRound: 2,
+        maxRounds: 2,
+        completedHops: 2,
+        totalHops: 2,
+      },
+      {
+        id: 'local_manual_discussion',
+        topic: 'Manual discussion',
+        state: 'running',
+        currentRound: 1,
+        maxRounds: 1,
+      },
+    ];
+
+    const merged = mergeP2pStatusResponseDiscussions(existing, [], { fullList: true });
+
+    expect(merged.map((d) => d.id)).toEqual(['p2p_run_done', 'local_manual_discussion']);
+  });
+
+  it('keeps active P2P entries present in a full status response and removes absent ones', () => {
+    const existing = [
+      {
+        id: 'p2p_run_alpha',
+        topic: 'Team audit · alpha',
+        state: 'running',
+        currentRound: 1,
+        maxRounds: 2,
+        completedHops: 0,
+        totalHops: 2,
+        startedAt: 100,
+      },
+      {
+        id: 'p2p_run_beta',
+        topic: 'Team review · beta',
+        state: 'running',
+        currentRound: 1,
+        maxRounds: 1,
+        completedHops: 0,
+        totalHops: 1,
+      },
+    ];
+    const incoming = [
+      {
+        id: 'p2p_run_beta',
+        topic: 'Team review · beta',
+        state: 'running',
+        currentRound: 1,
+        maxRounds: 1,
+        completedHops: 0,
+        totalHops: 1,
+        startedAt: undefined,
+      },
+    ];
+
+    const merged = mergeP2pStatusResponseDiscussions(existing, incoming, { fullList: true });
+
+    expect(merged.map((d) => d.id)).toEqual(['p2p_run_beta']);
   });
 
   it('removes only an explicitly missing status run', () => {

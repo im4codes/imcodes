@@ -49,11 +49,12 @@ import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
 import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
 import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup.js';
-import { clearResend, drainResend, getResendCount, getResendEntries } from '../daemon/transport-resend-queue.js';
+import { clearResend, drainResend, getResendCount, getResendEntries, listResendQueues } from '../daemon/transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
+import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
 
 const DEFAULT_CODEX_SDK_STARTUP_MODEL = 'gpt-5.5';
 
@@ -999,6 +1000,63 @@ export async function relaunchSessionWithSettings(
 /** In-memory map of active transport session runtimes */
 const transportRuntimes = new Map<string, TransportSessionRuntime>();
 const transportErrorRecoveryInFlight = new Map<string, Promise<boolean>>();
+
+function previewTransportQueueText(text: string): string {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  return normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized;
+}
+
+export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): DaemonTransportQueuesSnapshot {
+  const resendQueues = listResendQueues();
+  const resendBySession = new Map(resendQueues.map((queue) => [queue.sessionName, queue.entries]));
+  const sessionNames = new Set<string>([
+    ...transportRuntimes.keys(),
+    ...resendQueues.map((queue) => queue.sessionName),
+  ]);
+  for (const session of storeSessions()) {
+    if (session.runtimeType === RUNTIME_TYPES.TRANSPORT || isTransportAgent(session.agentType as AgentType)) {
+      sessionNames.add(session.name);
+    }
+  }
+
+  const sessions = [...sessionNames].sort().map((sessionName) => {
+    const runtime = transportRuntimes.get(sessionName);
+    const record = getSession(sessionName);
+    const runtimeSnapshot = runtime?.getDiagnosticSnapshot(nowMs);
+    const resendEntries = resendBySession.get(sessionName) ?? [];
+    return {
+      sessionName,
+      ...(record?.agentType ? { agentType: record.agentType } : {}),
+      ...(runtimeSnapshot?.status ? { status: runtimeSnapshot.status } : {}),
+      ...(typeof runtimeSnapshot?.sending === 'boolean' ? { sending: runtimeSnapshot.sending } : {}),
+      pendingCount: runtimeSnapshot?.pendingCount ?? 0,
+      ...(runtimeSnapshot ? { pendingVersion: runtimeSnapshot.pendingVersion } : {}),
+      ...(runtimeSnapshot ? { activeDispatchCount: runtimeSnapshot.activeDispatchCount } : {}),
+      ...(runtimeSnapshot ? { providerSessionBound: runtimeSnapshot.providerSessionBound } : {}),
+      ...(runtimeSnapshot ? { lastActivityAt: runtimeSnapshot.lastActivityAt } : {}),
+      ...(runtimeSnapshot ? { lastActivityAgeMs: runtimeSnapshot.lastActivityAgeMs } : {}),
+      resendCount: resendEntries.length,
+      ...(resendEntries.length
+        ? {
+            resendEntries: resendEntries.map((entry) => ({
+              commandId: entry.commandId,
+              queuedAt: entry.queuedAt,
+              ageMs: Math.max(0, nowMs - entry.queuedAt),
+              textPreview: previewTransportQueueText(entry.text),
+            })),
+          }
+        : {}),
+    };
+  });
+
+  return {
+    sessionCount: sessions.length,
+    totalPendingCount: sessions.reduce((sum, session) => sum + session.pendingCount, 0),
+    totalResendCount: sessions.reduce((sum, session) => sum + session.resendCount, 0),
+    totalActiveDispatchCount: sessions.reduce((sum, session) => sum + (session.activeDispatchCount ?? 0), 0),
+    sessions,
+  };
+}
 
 /**
  * How many transport sessions to restore concurrently on startup / reconnect.

@@ -14,6 +14,7 @@ import {
   readServiceRestartCount,
   recordDaemonStart,
   recordDaemonServerLinkStatus,
+  setDaemonRuntimeDiagnosticsProvider,
 } from '../../src/util/daemon-status.js';
 
 describe('daemon status helpers', () => {
@@ -186,6 +187,92 @@ describe('daemon status helpers', () => {
         lastError: 'closed:1006',
       });
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('records daemon runtime diagnostics on status writes', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-daemon-status-'));
+    try {
+      setDaemonRuntimeDiagnosticsProvider(() => ({
+        capturedAt: 11_000,
+        transportQueues: {
+          sessionCount: 1,
+          totalPendingCount: 1,
+          totalResendCount: 1,
+          totalActiveDispatchCount: 0,
+          sessions: [{
+            sessionName: 'deck_test_brain',
+            agentType: 'qwen',
+            status: 'idle',
+            sending: false,
+            pendingCount: 1,
+            pendingVersion: 3,
+            activeDispatchCount: 0,
+            providerSessionBound: true,
+            lastActivityAt: 10_500,
+            lastActivityAgeMs: 500,
+            resendCount: 1,
+            resendEntries: [{
+              commandId: 'cmd-1',
+              queuedAt: 10_000,
+              ageMs: 1_000,
+              textPreview: 'hello',
+            }],
+          }],
+        },
+        p2p: {
+          activeCount: 1,
+          discussionWriteQueueCount: 1,
+          discussionWritePendingBytes: 42,
+          runs: [{
+            id: 'run-1',
+            discussionId: 'disc-1',
+            status: 'running',
+            runPhase: 'round_execution',
+            activePhase: 'hop',
+            currentRound: 1,
+            totalRounds: 3,
+            currentTargetSession: 'deck_test_w1',
+            currentTargetLabel: 'deck_test_w1',
+            hopStartedAt: 10_000,
+            hopElapsedMs: 1_000,
+            executionAttempt: null,
+            executionCycleCurrent: null,
+            executionCycleTotal: null,
+            executionMarkerPath: null,
+            error: null,
+          }],
+        },
+      }));
+
+      recordDaemonStart({ pid: 500, nowMs: 11_000, baseDir: dir, version: 'diag' });
+      const status = readDaemonRuntimeStatus(dir);
+      expect(status?.diagnostics?.transportQueues?.totalPendingCount).toBe(1);
+      expect(status?.diagnostics?.transportQueues?.sessions[0]?.resendEntries?.[0]?.commandId).toBe('cmd-1');
+      expect(status?.diagnostics?.p2p?.runs[0]?.id).toBe('run-1');
+    } finally {
+      setDaemonRuntimeDiagnosticsProvider(null);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps daemon runtime status writable when diagnostics collection throws', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-daemon-status-'));
+    try {
+      setDaemonRuntimeDiagnosticsProvider(() => {
+        throw new Error('diagnostics unavailable');
+      });
+
+      expect(recordDaemonStart({ pid: 501, nowMs: 12_000, baseDir: dir, version: 'diag-fail' })).toMatchObject({
+        pid: 501,
+        version: 'diag-fail',
+      });
+      const status = readDaemonRuntimeStatus(dir);
+      expect(status?.pid).toBe(501);
+      expect(status?.diagnostics).toBeUndefined();
+    } finally {
+      setDaemonRuntimeDiagnosticsProvider(null);
       rmSync(dir, { recursive: true, force: true });
     }
   });

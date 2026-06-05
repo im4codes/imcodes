@@ -3,6 +3,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 
 const {
   apiFetchMock,
@@ -360,9 +361,23 @@ vi.mock('../src/components/SessionPane.js', () => ({
 }));
 vi.mock('../src/components/SubSessionBar.js', () => ({
   SUBSESSION_BAR_COLLAPSED_STORAGE_KEY: 'subsession_bar_collapsed',
-  SubSessionBar: ({ onCollapsedChange, onNew, onOpen, onOpenMaximized, onViewCron, onViewDiscussions, onViewDiscussion, onViewRepo, onStopDiscussion, subSessions }: any) => (
-    <div>
+  SubSessionBar: ({ onCollapsedChange, onNew, onOpen, onOpenMaximized, onViewCron, onViewDiscussions, onViewDiscussion, onViewRepo, onStopDiscussion, subSessions, discussions = [], totalRunningDiscussions = 0 }: any) => (
+    <div data-testid="app-shell-subsession-bar" data-running-discussions={String(totalRunningDiscussions)}>
       sub-session-bar
+      {discussions.map((discussion: any) => (
+        <div
+          key={discussion.id}
+          data-testid={`app-shell-p2p-discussion-${discussion.id}`}
+          data-state={discussion.state}
+        >
+          {discussion.topic}
+          {(discussion.nodes ?? []).map((node: any) => (
+            <span key={`${discussion.id}-${node.label}`} data-testid={`app-shell-p2p-node-${discussion.id}-${node.label}`}>
+              {node.label}:{node.status}
+            </span>
+          ))}
+        </div>
+      ))}
       <button onClick={() => onCollapsedChange?.(true)}>subbar-collapse</button>
       <button onClick={onNew}>subbar-new</button>
       <button onClick={() => onOpen?.(subSessions?.[0]?.id)}>subbar-open</button>
@@ -558,6 +573,13 @@ function sessionList() {
   };
 }
 
+async function getActiveWsClient() {
+  await waitFor(() => {
+    expect(wsInstances.some((instance) => instance.messageHandlers.length > 0)).toBe(true);
+  });
+  return wsInstances.findLast((instance) => instance.messageHandlers.length > 0) ?? wsInstances[wsInstances.length - 1];
+}
+
 beforeEach(() => {
   vi.resetModules();
   localStorage.clear();
@@ -636,6 +658,56 @@ describe('App shell', () => {
     expect(view.container.textContent).toContain('session-pane:deck_alpha_brain');
     expect(view.container.textContent).toContain('session-tree');
     expect(ws.connect).toHaveBeenCalled();
+  }, 20_000);
+
+  it('clears stale P2P progress from the session bar when a full status response has no active runs', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+
+    await act(async () => {
+      ws.emit({
+        type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+        run: {
+          id: 'run-status-bar',
+          status: 'running',
+          mode_key: 'discuss',
+          current_round: 1,
+          total_rounds: 1,
+          total_hops: 2,
+          active_phase: 'hop',
+          initiator_session: 'deck_alpha_brain',
+          all_nodes: [
+            { label: 'Cx1', agentType: 'codex-sdk', status: 'completed', phase: 'hop' },
+            { label: 'Cu1', agentType: 'cursor-headless', status: 'running', phase: 'hop' },
+          ],
+        },
+      });
+    });
+
+    const row = await screen.findByTestId('app-shell-p2p-discussion-p2p_run-status-bar');
+    expect(row.getAttribute('data-state')).toBe('running');
+    expect(screen.getByTestId('app-shell-p2p-node-p2p_run-status-bar-Cx1').textContent).toBe('Cx1:done');
+    expect(screen.getByTestId('app-shell-subsession-bar').getAttribute('data-running-discussions')).toBe('1');
+
+    await act(async () => {
+      ws.emit({
+        type: P2P_WORKFLOW_MSG.STATUS_RESPONSE,
+        requestId: 'p2p-status-empty',
+        runs: [],
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('app-shell-p2p-discussion-p2p_run-status-bar')).toBeNull();
+      expect(screen.getByTestId('app-shell-subsession-bar').getAttribute('data-running-discussions')).toBe('0');
+    });
   }, 20_000);
 
   it('nudges browser WebSocket recovery when daemon heartbeat is fresh but the tab is disconnected', async () => {

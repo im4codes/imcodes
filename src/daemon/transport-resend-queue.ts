@@ -67,6 +67,14 @@ export function getResendEntries(sessionName: string): ResendEntry[] {
   return [...(queues.get(sessionName) ?? [])];
 }
 
+/** Non-mutating snapshot of every resend queue for daemon status diagnostics. */
+export function listResendQueues(): Array<{ sessionName: string; entries: ResendEntry[] }> {
+  return [...queues.entries()].map(([sessionName, entries]) => ({
+    sessionName,
+    entries: [...entries],
+  }));
+}
+
 /** Number of entries currently queued for a session. */
 export function getResendCount(sessionName: string): number {
   return queues.get(sessionName)?.length ?? 0;

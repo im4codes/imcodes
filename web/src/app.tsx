@@ -2968,6 +2968,7 @@ export function App() {
         setDiscussions((prev) => mergeP2pStatusResponseDiscussions(prev, mapped, {
           runId: typeof msg.runId === 'string' ? msg.runId : undefined,
           runFound: !!msg.run,
+          fullList: Array.isArray(msg.runs),
         }));
       }
       if (msg.type === REPO_MSG.DETECTED || msg.type === REPO_MSG.DETECT_RESPONSE) {

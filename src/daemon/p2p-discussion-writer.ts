@@ -41,6 +41,22 @@ interface RunQueue {
 
 const queues = new Map<string, RunQueue>();
 
+export interface P2pDiscussionWriteQueueSnapshot {
+  filePath: string;
+  pendingSegments: number;
+  pendingBytes: number;
+  draining: boolean;
+}
+
+export function listP2pDiscussionWriteQueueSnapshots(): P2pDiscussionWriteQueueSnapshot[] {
+  return [...queues.entries()].map(([filePath, queue]) => ({
+    filePath,
+    pendingSegments: queue.pendingSegments.length,
+    pendingBytes: queue.pendingBytes,
+    draining: queue.draining,
+  }));
+}
+
 function makeDrainPromise(queue: RunQueue): void {
   let resolve!: () => void;
   queue.drainPromise = new Promise<void>((res) => { resolve = res; });

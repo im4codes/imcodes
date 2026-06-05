@@ -57,6 +57,17 @@ export interface PendingTransportMessage {
   attachments?: TransportAttachment[];
 }
 
+export interface TransportRuntimeDiagnosticSnapshot {
+  status: AgentStatus;
+  sending: boolean;
+  pendingCount: number;
+  pendingVersion: number;
+  activeDispatchCount: number;
+  providerSessionBound: boolean;
+  lastActivityAt: number;
+  lastActivityAgeMs: number;
+}
+
 const DEFAULT_TRANSPORT_CONTEXT_BUDGET_MS = 2_500;
 const DEFAULT_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 60_000;
 const MIN_TRANSPORT_CONTEXT_BUDGET_MS = 50;
@@ -394,6 +405,19 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Snapshot of the message entries currently being dispatched. */
   get activeDispatchEntries(): PendingTransportMessage[] { return this._activeDispatchEntries.map((entry) => ({ ...entry })); }
 
+  getDiagnosticSnapshot(nowMs: number = Date.now()): TransportRuntimeDiagnosticSnapshot {
+    return {
+      status: this._status,
+      sending: this._sending,
+      pendingCount: this._pendingMessages.length,
+      pendingVersion: this._pendingVersion,
+      activeDispatchCount: this._activeDispatchEntries.length,
+      providerSessionBound: !!this._providerSessionId,
+      lastActivityAt: this._lastActivityAt,
+      lastActivityAgeMs: Math.max(0, nowMs - this._lastActivityAt),
+    };
+  }
+
   setContextBootstrapResolver(
     resolver: (() => Promise<TransportContextBootstrap>) | undefined,
   ): void {
@@ -616,6 +640,17 @@ export class TransportSessionRuntime implements SessionRuntime {
   // ── Internal ────────────────────────────────────────────────────────────────
 
   private setStatus(status: AgentStatus): void {
+    if (status === 'idle' && this._pendingMessages.length > 0 && !this._sending && !this._activeTurn) {
+      logger.warn(
+        {
+          sessionKey: this.sessionKey,
+          pendingCount: this._pendingMessages.length,
+          pendingVersion: this._pendingVersion,
+        },
+        'transport runtime attempted to enter idle with pending messages; draining defensively',
+      );
+      if (this._drainPending()) return;
+    }
     if (this._status === status) return;
     this._status = status;
     if (!this._onStatusChange) return;

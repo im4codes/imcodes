@@ -169,6 +169,23 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
   });
 
+  it('diagnostic snapshot exposes active dispatch and pending queue state', async () => {
+    runtime.send('first', 'cmd-first');
+    await flushDispatch();
+    runtime.send('second', 'cmd-second');
+
+    const snapshot = runtime.getDiagnosticSnapshot(runtime.lastActivityAt + 250);
+    expect(snapshot).toMatchObject({
+      status: 'thinking',
+      sending: true,
+      pendingCount: 1,
+      activeDispatchCount: 1,
+      providerSessionBound: true,
+      lastActivityAgeMs: 250,
+    });
+    expect(snapshot.pendingVersion).toBeGreaterThanOrEqual(1);
+  });
+
   it('bumps pendingVersion monotonically on every queue mutation (desync guard)', async () => {
     // The UI uses this monotonic version to drop stale out-of-order snapshots.
     // Every mutation MUST advance it so a late pre-mutation snapshot is rejected.
@@ -1499,6 +1516,31 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toContain('cmd-reentrant');
     // provider.send called once more (the merged drain turn), NOT twice.
     expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(earlierProviderSendCalls + 1);
+  });
+
+  it('drains defensively instead of entering idle when pending messages remain without an active turn', async () => {
+    runtime.send('first', 'cmd-first');
+    await flushDispatch();
+    runtime.send('queued-after-invariant-break', 'cmd-queued');
+    expect(runtime.pendingCount).toBe(1);
+
+    const internal = runtime as unknown as {
+      _sending: boolean;
+      _activeTurn: unknown;
+      setStatus: (status: 'idle') => void;
+    };
+    internal._sending = false;
+    internal._activeTurn = null;
+
+    const before = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
+    internal.setStatus('idle');
+    await flushDispatch();
+
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.sending).toBe(true);
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before + 1);
+    const resentPayload = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(resentPayload.userMessage).toBe('queued-after-invariant-break');
   });
 
   it('truncates user-authored description and systemPrompt to USER_SESSION_TEXT_MAX_CHARS', async () => {

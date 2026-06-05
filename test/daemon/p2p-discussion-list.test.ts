@@ -366,6 +366,46 @@ describe('p2p.status', () => {
     expect(response.runs.map((r) => r.id)).toEqual(['run-in-scope']);
   });
 
+  it('handleP2pStatus emits an authoritative empty full-list response after active runs drain', async () => {
+    mockListP2pRuns.mockReturnValue([
+      {
+        id: 'run-draining',
+        status: 'running',
+        contextFilePath: join(imcSubDir(projectDir, 'discussions'), 'run-draining.md'),
+        initiatorSession: 'deck_proj_brain',
+      },
+    ]);
+
+    handleWebCommand({
+      type: P2P_WORKFLOW_MSG.STATUS,
+      requestId: 'p2p-status-before-drain',
+      scope: { sessionName: 'deck_proj_brain' },
+    }, serverLink as any);
+    await waitForSentCount(1);
+
+    expect(sent[0]).toMatchObject({
+      type: P2P_WORKFLOW_MSG.STATUS_RESPONSE,
+      requestId: 'p2p-status-before-drain',
+      runs: [{ id: 'run-draining' }],
+    });
+
+    sent.length = 0;
+    mockListP2pRuns.mockReturnValue([]);
+
+    handleWebCommand({
+      type: P2P_WORKFLOW_MSG.STATUS,
+      requestId: 'p2p-status-after-drain',
+      scope: { sessionName: 'deck_proj_brain' },
+    }, serverLink as any);
+    await waitForSentCount(1);
+
+    expect(sent[0]).toMatchObject({
+      type: P2P_WORKFLOW_MSG.STATUS_RESPONSE,
+      requestId: 'p2p-status-after-drain',
+      runs: [],
+    });
+  });
+
   it('handleP2pStatus with runId outside scope returns null run', async () => {
     const outOfScopeRun = {
       id: 'run-other',

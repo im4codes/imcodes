@@ -177,6 +177,40 @@ function formatSystemResources(s: SystemResourcesView): string {
   return `mem ${formatBytes(s.memUsedBytes)} / ${formatBytes(s.memTotalBytes)} ${memColor}(${s.memUsedPercent}%)${memReset}${load} · ${s.cpuCount} cpu`;
 }
 
+function formatTransportQueueStatus(runtimeStatus: DaemonRuntimeStatus | null): string {
+  const queues = runtimeStatus?.diagnostics?.transportQueues;
+  if (!queues) return '\x1b[33munknown\x1b[0m';
+  const color = queues.totalPendingCount > 0 || queues.totalResendCount > 0 ? '\x1b[33m' : '\x1b[32m';
+  const busy = queues.totalActiveDispatchCount > 0 ? ` · active ${queues.totalActiveDispatchCount}` : '';
+  const stuck = queues.sessions
+    .filter((session) => session.pendingCount > 0 || session.resendCount > 0)
+    .slice(0, 3)
+    .map((session) => {
+      const pending = session.pendingCount > 0 ? `pending=${session.pendingCount}` : '';
+      const resend = session.resendCount > 0 ? `resend=${session.resendCount}` : '';
+      return `${session.sessionName}(${[pending, resend].filter(Boolean).join(',')})`;
+    });
+  const suffix = stuck.length > 0 ? ` · ${stuck.join(' ')}` : '';
+  return `${color}pending ${queues.totalPendingCount}, resend ${queues.totalResendCount}\x1b[0m${busy}${suffix}`;
+}
+
+function formatP2pRuntimeStatus(runtimeStatus: DaemonRuntimeStatus | null): string {
+  const p2p = runtimeStatus?.diagnostics?.p2p;
+  if (!p2p) return '\x1b[33munknown\x1b[0m';
+  const color = p2p.activeCount > 0 || (p2p.discussionWritePendingBytes ?? 0) > 0 ? '\x1b[33m' : '\x1b[32m';
+  const write = p2p.discussionWritePendingBytes && p2p.discussionWritePendingBytes > 0
+    ? ` · write ${formatBytes(p2p.discussionWritePendingBytes)}`
+    : '';
+  const runs = p2p.runs.slice(0, 2).map((run) => {
+    const elapsed = run.hopElapsedMs !== null && run.hopElapsedMs !== undefined
+      ? ` ${formatDurationSeconds(Math.floor(run.hopElapsedMs / 1000))}`
+      : '';
+    return `${run.id}:${run.status}/${run.activePhase ?? 'n/a'}${elapsed}`;
+  });
+  const suffix = runs.length > 0 ? ` · ${runs.join(' ')}` : '';
+  return `${color}active ${p2p.activeCount}\x1b[0m${write}${suffix}`;
+}
+
 function formatStorageStatus(storage: DaemonFilesystemSpace | null): string {
   if (!storage) return '\x1b[33munknown\x1b[0m';
   const color = storage.status === 'critical' ? '\x1b[31m' : storage.status === 'low' ? '\x1b[33m' : '\x1b[32m';
@@ -455,6 +489,7 @@ program
             rssLive: daemonRssBytes !== null,
           },
           system: systemResources,
+          diagnostics: currentRuntimeStatus?.diagnostics ?? null,
           server: creds ? { url: creds.workerUrl, serverId: creds.serverId } : null,
         },
         sessions: sessions.map((s) => ({ ...s, tmuxAlive: liveSet.has(s.name) })),
@@ -476,6 +511,8 @@ program
     if (daemonRunning) {
       console.log(`  Memory:  ${formatDaemonMemory(daemonResources, daemonRssBytes)}`);
     }
+    console.log(`  Queues:  ${daemonRunning ? formatTransportQueueStatus(currentRuntimeStatus) : '\x1b[31mstopped\x1b[0m'}`);
+    console.log(`  P2P:     ${daemonRunning ? formatP2pRuntimeStatus(currentRuntimeStatus) : '\x1b[31mstopped\x1b[0m'}`);
     console.log(`  System:  ${formatSystemResources(systemResources)}`);
     if (creds) {
       console.log(`  Server:  ${creds.workerUrl}`);

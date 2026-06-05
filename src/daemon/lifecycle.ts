@@ -25,6 +25,7 @@ import { loadCredentials } from '../bind/bind-flow.js';
 import { sendKeys } from '../agent/tmux.js';
 import logger from '../util/logger.js';
 import { recordDaemonStart } from '../util/daemon-status.js';
+import { installDaemonRuntimeDiagnosticsProvider } from './runtime-diagnostics.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -453,6 +454,7 @@ export async function startup(): Promise<DaemonContext> {
   }, 'Daemon starting');
   lockServer = await acquireInstanceLock();
   writePidFile();
+  installDaemonRuntimeDiagnosticsProvider();
   // Captures an initial heap snapshot into the runtime status; subsequent
   // refreshes ride the heartbeat write (no dedicated timer / extra I/O).
   recordDaemonStart({ version: DAEMON_VERSION });
