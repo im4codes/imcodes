@@ -70,7 +70,14 @@ COPY server/scripts/preload-embedding-model.mjs ./scripts/preload-embedding-mode
 COPY shared/embedding-config.ts ./shared/embedding-config.ts
 
 ARG PRELOAD_EMBEDDING_MODEL=1
-RUN if [ "$PRELOAD_EMBEDDING_MODEL" = "1" ]; then node ./scripts/preload-embedding-model.mjs; fi
+ARG IMCODES_EMBEDDING_PRELOAD_ATTEMPTS=3
+ARG IMCODES_EMBEDDING_PRELOAD_RETRY_DELAY_MS=2000
+ARG IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=0
+ENV IMCODES_EMBEDDING_PRELOAD_ATTEMPTS=${IMCODES_EMBEDDING_PRELOAD_ATTEMPTS}
+ENV IMCODES_EMBEDDING_PRELOAD_RETRY_DELAY_MS=${IMCODES_EMBEDDING_PRELOAD_RETRY_DELAY_MS}
+ENV IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=${IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL}
+RUN mkdir -p /app/embedding-cache \
+ && if [ "$PRELOAD_EMBEDDING_MODEL" = "1" ]; then node ./scripts/preload-embedding-model.mjs; fi
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS runtime

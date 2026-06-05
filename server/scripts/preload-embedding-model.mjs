@@ -6,6 +6,31 @@ function readEnv(name) {
   return value ? value : null;
 }
 
+function readPositiveIntEnv(name, fallback) {
+  const value = readEnv(name);
+  if (!value) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function readBooleanEnv(name, fallback = false) {
+  const value = readEnv(name);
+  if (!value) return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function resolvePreloadRetryConfig() {
+  return {
+    attempts: readPositiveIntEnv('IMCODES_EMBEDDING_PRELOAD_ATTEMPTS', 3),
+    retryDelayMs: readPositiveIntEnv('IMCODES_EMBEDDING_PRELOAD_RETRY_DELAY_MS', 2_000),
+    softFail: readBooleanEnv('IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL', false),
+  };
+}
+
 export async function resolveEmbeddingConfig() {
   const modelFromEnv = readEnv('EMBEDDING_MODEL');
   const dtypeFromEnv = readEnv('EMBEDDING_DTYPE');
@@ -43,13 +68,44 @@ export async function resolveEmbeddingConfig() {
   };
 }
 
-async function main() {
+export async function preloadEmbeddingModel(opts = {}) {
   const { model, dtype } = await resolveEmbeddingConfig();
-  const { pipeline, env } = await import('@huggingface/transformers');
+  const {
+    attempts,
+    retryDelayMs,
+    softFail,
+  } = opts.retryConfig ?? resolvePreloadRetryConfig();
+  const logger = opts.logger ?? console;
+  const pause = opts.sleep ?? sleep;
+  const importTransformers = opts.importTransformers ?? (() => import('@huggingface/transformers'));
+  const { pipeline, env } = await importTransformers();
   env.cacheDir = readEnv('IMCODES_EMBEDDING_CACHE_DIR') || '/app/embedding-cache';
-  console.log(`[embedding] preloading ${model} (${dtype}) into ${env.cacheDir}`);
-  await pipeline('feature-extraction', model, { dtype });
-  console.log('[embedding] preload complete');
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const suffix = attempts > 1 ? ` (attempt ${attempt}/${attempts})` : '';
+      logger.log(`[embedding] preloading ${model} (${dtype}) into ${env.cacheDir}${suffix}`);
+      await pipeline('feature-extraction', model, { dtype });
+      logger.log('[embedding] preload complete');
+      return true;
+    } catch (err) {
+      lastError = err;
+      if (attempt >= attempts) break;
+      logger.warn(`[embedding] preload attempt ${attempt}/${attempts} failed; retrying in ${retryDelayMs}ms`, err);
+      if (retryDelayMs > 0) await pause(retryDelayMs);
+    }
+  }
+
+  if (softFail) {
+    logger.warn(`[embedding] preload failed after ${attempts} attempt(s); continuing without a warm embedding cache`, lastError);
+    return false;
+  }
+  throw lastError ?? new Error('embedding preload failed');
+}
+
+async function main() {
+  await preloadEmbeddingModel();
 }
 
 const isEntrypoint = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
