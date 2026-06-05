@@ -11,6 +11,7 @@ import {
   ingestTimelineEventForCache,
   useTimeline,
 } from '../src/hooks/useTimeline.js';
+import { TimelineDB } from '../src/timeline-db.js';
 
 function makeEvent(text: string, overrides: Partial<TimelineEvent> = {}): TimelineEvent {
   return {
@@ -154,5 +155,48 @@ describe('useTimeline streaming coalescing', () => {
 
     expect(__getTimelineCacheForTests('deck_perf_brain')?.[0]?.payload.text).toBe('hello');
     expect(getByTestId('events').textContent).toBe('hello');
+  });
+
+  it('persists the latest streaming assistant.text to IDB only after the stream goes idle', async () => {
+    const putSpy = vi.spyOn(TimelineDB.prototype, 'putEvents').mockResolvedValue(undefined);
+    const streamingPuts = (): TimelineEvent[] =>
+      putSpy.mock.calls
+        .flatMap(([evts]) => evts as TimelineEvent[])
+        .filter((event) => event.eventId === 'assistant-stream');
+
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const ws = {
+      connected: false,
+      onMessage: (fn: (msg: ServerMessage) => void) => { handler = fn; return () => { handler = null; }; },
+      sendTimelineHistoryRequest: vi.fn(() => 'history-req'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const result = useTimeline('deck_perf_brain', ws, null);
+      return <div data-testid="events">{result.events.map((event) => String(event.payload.text ?? '')).join('|')}</div>;
+    }
+
+    render(<Probe />);
+    await act(async () => {});
+    await act(async () => { vi.runOnlyPendingTimers(); await Promise.resolve(); });
+
+    // Stream a couple of deltas (all streaming:true).
+    act(() => {
+      handler?.({ type: 'timeline.event', event: makeEvent('h') } as ServerMessage);
+      handler?.({ type: 'timeline.event', event: makeEvent('hel', { seq: 2 }) } as ServerMessage);
+    });
+    // Flush the coalescing frame (rAF = setTimeout 0) so the cache is populated;
+    // the idle-persist timer is armed but not yet due.
+    await act(async () => { vi.advanceTimersByTime(1); await Promise.resolve(); await Promise.resolve(); });
+
+    // While the stream is live, streaming text is NOT written to IDB (too frequent).
+    expect(streamingPuts()).toHaveLength(0);
+
+    // Once it has been idle past the threshold, the LATEST text is persisted.
+    await act(async () => { vi.advanceTimersByTime(2100); await Promise.resolve(); });
+    const persisted = streamingPuts();
+    expect(persisted.length).toBeGreaterThan(0);
+    expect(persisted.at(-1)?.payload.text).toBe('hel');
+    expect(persisted.at(-1)?.payload.streaming).toBe(true);
   });
 });

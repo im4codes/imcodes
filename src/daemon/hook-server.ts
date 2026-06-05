@@ -14,8 +14,7 @@
  */
 import http from 'http';
 import { promises as fs } from 'fs';
-import path from 'path';
-import os from 'os';
+import { dirname } from 'path';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { getSession, upsertSession, listSessions } from '../store/session-store.js';
@@ -23,9 +22,10 @@ import type { SessionRecord } from '../store/session-store.js';
 import { refreshSessionWatcher } from './watcher-controls.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { dispatchHookSend } from './send-tool.js';
+import { DEFAULT_HOOK_PORT, HOOK_PORT_FILE } from './hook-port.js';
 
-export const DEFAULT_HOOK_PORT = 51913;
-const PORT_FILE = path.join(os.homedir(), '.imcodes', 'hook-port');
+export { DEFAULT_HOOK_PORT };
+
 
 /** Max body size: 1 MB */
 const MAX_BODY_SIZE = 1024 * 1024;
@@ -74,7 +74,7 @@ const rateLimiter = new Map<string, number[]>();
 
 async function loadSavedPort(): Promise<number> {
   try {
-    const raw = await fs.readFile(PORT_FILE, 'utf-8');
+    const raw = await fs.readFile(HOOK_PORT_FILE, 'utf-8');
     const p = parseInt(raw.trim(), 10);
     return Number.isFinite(p) && p > 1024 && p < 65536 ? p : DEFAULT_HOOK_PORT;
   } catch {
@@ -83,8 +83,8 @@ async function loadSavedPort(): Promise<number> {
 }
 
 async function savePort(port: number): Promise<void> {
-  await fs.mkdir(path.dirname(PORT_FILE), { recursive: true });
-  await fs.writeFile(PORT_FILE, String(port));
+  await fs.mkdir(dirname(HOOK_PORT_FILE), { recursive: true });
+  await fs.writeFile(HOOK_PORT_FILE, String(port));
 }
 
 function tryBind(server: http.Server, port: number): Promise<void> {
@@ -364,6 +364,61 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
   };
 }
 
+// ─── /stop Handler ───────────────────────────────────────────────────────────
+
+interface StopRequest {
+  from: string;
+  to: string;
+}
+
+/**
+ * Force-stop the active turn of a resolved sibling target. Mirrors /send target
+ * resolution (label/name/type, sibling-scoped, broadcast via "*") but instead of
+ * delivering a message it runs stopSessionNow on the priority lane. Used by the
+ * send_stop MCP tool so a busy session (which would otherwise just queue a
+ * message) can be interrupted.
+ */
+async function handleStop(body: StopRequest): Promise<{ status: number; body: Record<string, unknown> }> {
+  const { from, to } = body;
+  if (!from || !to) {
+    return { status: 400, body: { ok: false, error: 'missing required fields: from, to' } };
+  }
+  if (!checkRateLimit(from)) {
+    return { status: 429, body: { ok: false, error: 'rate limit exceeded' } };
+  }
+
+  const result = resolveTarget(from, to);
+  if (!result.ok) {
+    return { status: 404, body: { ok: false, error: result.error, available: result.available } };
+  }
+  recordSend(from);
+
+  // Lazy import: command-handler pulls in the whole daemon graph, so importing
+  // it eagerly here would create a heavy module cycle (and broke hook-server's
+  // own tests). Only loaded when /stop is actually called.
+  const { stopSessionNow } = await import('./command-handler.js');
+  const stopped: string[] = [];
+  const notStopped: string[] = [];
+  for (const target of result.targets) {
+    if (stopSessionNow(target.name)) stopped.push(target.name);
+    else notStopped.push(target.name);
+  }
+
+  if (result.targets.length === 1) {
+    const target = result.targets[0].name;
+    const ok = stopped.length === 1;
+    return {
+      status: 200,
+      body: { ok, stopped: ok, target, ...(ok ? {} : { error: 'session not found or not stoppable' }) },
+    };
+  }
+
+  return {
+    status: 200,
+    body: { ok: notStopped.length === 0, stopped, ...(notStopped.length > 0 ? { notStopped } : {}) },
+  };
+}
+
 // ─── Body Parser ─────────────────────────────────────────────────────────────
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -450,6 +505,31 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
         const body = await readBody(req);
         const parsed = JSON.parse(body) as SendRequest;
         const result = await handleSend(parsed);
+        res.writeHead(result.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result.body));
+      } catch (err) {
+        if ((err as Error).message === 'body too large') {
+          res.writeHead(413);
+          res.end(JSON.stringify({ ok: false, error: 'request body too large' }));
+        } else {
+          res.writeHead(400);
+          res.end(JSON.stringify({ ok: false, error: 'bad request' }));
+        }
+      }
+      return;
+    }
+
+    if (url === '/stop') {
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        res.writeHead(415);
+        res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+        return;
+      }
+      try {
+        const body = await readBody(req);
+        const parsed = JSON.parse(body) as StopRequest;
+        const result = await handleStop(parsed);
         res.writeHead(result.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result.body));
       } catch (err) {

@@ -1,4 +1,5 @@
 import { COOKIE_CSRF, COOKIE_SESSION } from './cookie-names.js';
+import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from './preview-types.js';
 
 export const PREVIEW_SENSITIVE_HEADERS = new Set([
   'cookie',
@@ -59,6 +60,45 @@ export function normalizePreviewUpstreamPath(path: string): string {
   const [pathname, search = ''] = path.split('?', 2);
   const normalizedPath = `/${pathname}`.replace(/\/+/g, '/');
   return search ? `${normalizedPath}?${search}` : normalizedPath;
+}
+
+/**
+ * Remove the preview access token from a `path?query` string BEFORE it is
+ * forwarded to the local upstream (run 8a975732-23a A13). The token authorizes
+ * the browser→proxy hop only; the upstream is untrusted (its access logs, error
+ * pages, HMR output may persist this replayable credential), so it MUST NOT
+ * leave the proxy.
+ *
+ * Rules:
+ * - Deletes EVERY occurrence of the exact key `preview_access_token` (decoded,
+ *   case-SENSITIVE — matching how auth reads it), including repeated, empty-value
+ *   (`?k=`) and value-less (`?k`) forms.
+ * - All OTHER query parameters keep their value AND order, byte-for-byte
+ *   (we keep the original `pair` substring; only the decoded key drives the
+ *   delete decision, so other params are never re-encoded).
+ * - Does NOT touch a fragment (`#...`): browsers never send fragments to the
+ *   server, so neither HTTP nor WS upstream paths contain one.
+ *
+ * The single entry point for both the HTTP upstream path (`getUpstreamPath`)
+ * and the WS upgrade upstream path.
+ */
+export function stripPreviewAccessTokenFromUpstreamPath(pathWithQuery: string): string {
+  const qIndex = pathWithQuery.indexOf('?');
+  if (qIndex === -1) return pathWithQuery;
+  const pathname = pathWithQuery.slice(0, qIndex);
+  const query = pathWithQuery.slice(qIndex + 1);
+  if (query === '') return pathname; // "path?" -> "path"
+  const kept: string[] = [];
+  for (const pair of query.split('&')) {
+    if (pair === '') continue; // collapse empty segments (e.g. from "&&")
+    const eq = pair.indexOf('=');
+    const rawKey = eq === -1 ? pair : pair.slice(0, eq);
+    let decodedKey: string;
+    try { decodedKey = decodeURIComponent(rawKey); } catch { decodedKey = rawKey; }
+    if (decodedKey === PREVIEW_ACCESS_TOKEN_QUERY_PARAM) continue; // drop all forms
+    kept.push(pair);
+  }
+  return kept.length > 0 ? `${pathname}?${kept.join('&')}` : pathname;
 }
 
 // Headers that must pass through for WebSocket upgrade requests (would otherwise be stripped).
@@ -192,6 +232,40 @@ export function rewritePreviewRedirectLocation(params: {
   }
   const url = new URL(params.location, `http://127.0.0.1:${params.port}`);
   return `${previewRoutePrefix(params.serverId, params.previewId)}${url.pathname}${url.search}`;
+}
+
+/**
+ * Append the browser→proxy preview access token to an (already preview-prefixed)
+ * redirect `Location`, but ONLY when it is not already present (run 8a975732-23a
+ * A13/A14 — access spec "redirect token append"). Presence is decided with
+ * `URLSearchParams.has` — NEVER a `.includes` substring match — so a pathname or
+ * another param's VALUE that merely contains the literal `preview_access_token`
+ * is never mistaken for the query key.
+ *
+ * The token authorizes only the browser→proxy hop; the upstream segment is
+ * stripped separately by `stripPreviewAccessTokenFromUpstreamPath`, so the two
+ * contracts do not conflict (append for the browser, strip for the upstream).
+ *
+ * `base` is any absolute URL used solely to parse a relative `location` (its
+ * origin is never emitted; only `pathname + search + hash` is returned). When
+ * `token` is falsy, or `location` cannot be parsed, the input is returned
+ * unchanged.
+ */
+export function appendPreviewAccessTokenIfMissing(
+  location: string,
+  base: string,
+  token: string | null | undefined,
+): string {
+  if (!token) return location;
+  try {
+    const url = new URL(location, base);
+    if (!url.searchParams.has(PREVIEW_ACCESS_TOKEN_QUERY_PARAM)) {
+      url.searchParams.set(PREVIEW_ACCESS_TOKEN_QUERY_PARAM, token);
+    }
+    return `${url.pathname}${url.search}${url.hash}`;
+  } catch {
+    return location;
+  }
 }
 
 export function filterPreviewResponseHeaders(headers: Headers): Headers {

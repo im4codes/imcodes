@@ -23,6 +23,8 @@ import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
 import type { UsageContextWindowSource } from '@shared/usage-context-window.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate, mergeP2pStatusResponseDiscussions } from './p2p-run-mapping.js';
+import { matchDiscussionIndex, reconcileDiscussionEntry, reconcileClassicList, isBarActiveDiscussion, makeOptimisticDiscussionEntry, discussionErrorReasonKey, shouldToastDiscussionError, classifyDiscussionStop, removeDiscussionByRequestId } from './discussion-reconcile.js';
+import { PENDING_START_TIMEOUT_MS, DISCUSSION_RECONCILE_HIDDEN_MS } from '@shared/discussion-ui.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
@@ -30,6 +32,7 @@ import { LoginPage } from './pages/LoginPage.js';
 import { SessionTabs } from './components/SessionTabs.js';
 // TransportChatView removed — transport sessions use unified ChatView via timelineEmitter
 import { SessionPane } from './components/SessionPane.js';
+import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
 import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
@@ -47,6 +50,7 @@ import { CloneSessionGroupDialog } from './components/CloneSessionGroupDialog.js
 import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
+import { shouldDismissPendingQuestion } from './ask-question-dismiss.js';
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
 import { RepoPage, type RepoPageTabKey } from './pages/RepoPage.js';
 import { ingestSessionRepoContext } from './session-repo-context-store.js';
@@ -78,6 +82,7 @@ import {
 } from './components/pinnedPanelTypes.js';
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { formatDaemonVersionShort } from './util/format-version.js';
+import { safeLocalStorageRemoveItem, safeLocalStorageSetItem } from './local-storage-quota.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import {
   isNavigableMainSession,
@@ -88,7 +93,8 @@ import {
 } from './session-list-merge.js';
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
-import { parseString, usePref } from './hooks/usePref.js';
+import { parseString, parseBooleanish, usePref } from './hooks/usePref.js';
+import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 import { PREF_KEY_DEFAULT_SHELL, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from './constants/prefs.js';
 import {
   p2pSubSessionParentSignature,
@@ -133,12 +139,15 @@ import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timel
 import { isP2pDiscussionVisibleInSubSessionBar } from './p2p-discussion-scope.js';
 import {
   extractTransportPendingMessages,
+  extractTransportPendingVersion,
   mergeTransportPendingEntriesForIdleState,
   mergeTransportPendingEntriesForRunningState,
   mergeTransportPendingMessagesForIdleState,
   mergeTransportPendingMessagesForRunningState,
+  nextTransportQueueVersion,
   normalizeTransportPendingEntries,
   removeTransportPendingEntryForUserMessage,
+  shouldApplyTransportQueueSnapshot,
 } from './transport-queue.js';
 import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
@@ -206,6 +215,30 @@ type AppUpdateNotice = {
   dismissed?: boolean;
 };
 
+const FAST_SERVER_SWITCH_SPLASH_KEY = 'imcodes:fast-server-switch-splash';
+const DAEMON_ONLINE_WS_RECOVERY_INITIAL_MS = 5_000;
+const DAEMON_ONLINE_WS_RECOVERY_INTERVAL_MS = 5_000;
+
+function markFastServerSwitchSplash(): void {
+  try {
+    sessionStorage.setItem(FAST_SERVER_SWITCH_SPLASH_KEY, '1');
+  } catch {
+    // Ignore storage failures; switching servers should still reload normally.
+  }
+}
+
+function takeFastServerSwitchSplashFlag(): boolean {
+  try {
+    const flagged = sessionStorage.getItem(FAST_SERVER_SWITCH_SPLASH_KEY) === '1';
+    if (flagged) {
+      sessionStorage.removeItem(FAST_SERVER_SWITCH_SPLASH_KEY);
+    }
+    return flagged;
+  } catch {
+    return false;
+  }
+}
+
 export function isTextEntryElement(el: HTMLElement | null): boolean {
   if (!el) return false;
   const tag = el.tagName;
@@ -264,13 +297,15 @@ function readLegacyPinnedSessionTabs(): string[] {
 }
 
 export function getFilePreviewInitialPath(request: FileBrowserPreviewRequest): string {
-  if (request.rootPath) return request.rootPath;
+  // Root the left file tree at the previewed file's OWN parent directory so the
+  // list shows its siblings. rootPath (the project/diff base) is only used as a
+  // fallback for a bare filename that has no directory component.
   const slash = request.path.lastIndexOf('/');
   const backslash = request.path.lastIndexOf('\\');
   const idx = Math.max(slash, backslash);
   if (idx > 0) return request.path.slice(0, idx);
   if (idx === 0) return request.path[0] ?? '~';
-  return '~';
+  return request.rootPath ?? '~';
 }
 
 export function updateServerDaemonVersion<T extends { id: string; daemonVersion?: string | null }>(
@@ -320,6 +355,10 @@ function getRepoDesktopWindowId(parentSubId?: string | null): string {
 
 export function App() {
   const { t: trans } = useTranslation();
+  const [globalFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
+  useEffect(() => {
+    applyGlobalFontPrefs(globalFontPrefs);
+  }, [globalFontPrefs.family, globalFontPrefs.cjkFamily]);
   const [auth, setAuth] = useState<AuthState | null>(() => {
     try {
       const raw = localStorage.getItem('rcc_auth');
@@ -639,19 +678,27 @@ export function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Dismiss splash after minimum display time (let animation play)
-  // Skip splash entirely for native auth callback — needs to render immediately
+  // The HTML splash masks JS/native startup work. Normal page opens keep a short
+  // minimum animation; explicit server-switch reloads take the fast path.
   useEffect(() => {
     const splash = document.getElementById('splash');
     if (!splash) { setSplashDone(true); return; }
+    if (!nativeReady && !nativeCallback) return;
     if (nativeCallback) { splash.remove(); setSplashDone(true); return; }
-    const minMs = 1100; // keep the startup splash lively without holding the app back
-    const t = setTimeout(() => {
+    const fastServerSwitch = takeFastServerSwitchSplashFlag();
+    const minMs = fastServerSwitch ? 0 : 1100;
+    const exitMs = 120;
+    let exitTimer: ReturnType<typeof setTimeout> | undefined;
+    const startExit = () => {
       splash.classList.add('splash-exit');
-      setTimeout(() => { splash.remove(); setSplashDone(true); }, 320);
-    }, minMs);
-    return () => clearTimeout(t);
-  }, []);
+      exitTimer = setTimeout(() => { splash.remove(); setSplashDone(true); }, exitMs);
+    };
+    const timer = setTimeout(startExit, minMs);
+    return () => {
+      clearTimeout(timer);
+      if (exitTimer) clearTimeout(exitTimer);
+    };
+  }, [nativeReady]);
 
   // Native: init push notifications after login
   useEffect(() => {
@@ -729,6 +776,27 @@ export function App() {
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, [auth]);
+
+  // Re-sync the session list — which carries the daemon-authoritative transport
+  // send queue (`transportPendingMessages`) — every time the app returns to the
+  // foreground. The WS reconnect path (socket_open / probe_recovered) and the
+  // native resume hook already request it, but a socket that quietly survived
+  // backgrounding never fires a reconnect, so a phone unlocked after the screen
+  // was off would keep showing a stale/empty queue ("熄屏发出的队列信息重开 app
+  // 不会同步"). This request is cheap + idempotent; the short cooldown dedupes the
+  // reconnect+foreground double-fire and rapid desktop tab switches.
+  useEffect(() => {
+    let lastSyncAt = 0;
+    const onVisibleSyncSessions = () => {
+      if (document.visibilityState !== 'visible') return;
+      const now = Date.now();
+      if (now - lastSyncAt < 1500) return;
+      lastSyncAt = now;
+      wsRef.current?.requestSessionList();
+    };
+    document.addEventListener('visibilitychange', onVisibleSyncSessions);
+    return () => document.removeEventListener('visibilitychange', onVisibleSyncSessions);
+  }, []);
 
   useEffect(() => {
     if (!auth) return;
@@ -1066,11 +1134,17 @@ export function App() {
   const openSubIdsRef = useRef(openSubIds);
   openSubIdsRef.current = openSubIds;
   const persistOpenSubIds = useCallback((next: Set<string>) => {
-    const mainSession = localStorage.getItem('rcc_session');
+    let mainSession: string | null = null;
+    try {
+      mainSession = localStorage.getItem('rcc_session');
+    } catch {
+      return;
+    }
     if (!mainSession) return;
     const ids = Array.from(next);
-    if (ids.length > 0) localStorage.setItem(`rcc_open_subs_${mainSession}`, JSON.stringify(ids));
-    else localStorage.removeItem(`rcc_open_subs_${mainSession}`);
+    const storageKey = `rcc_open_subs_${mainSession}`;
+    if (ids.length > 0) safeLocalStorageSetItem(storageKey, JSON.stringify(ids));
+    else safeLocalStorageRemoveItem(storageKey);
   }, []);
   const setOpenSubIds = useCallback((updater: Set<string> | ((prev: Set<string>) => Set<string>)) => {
     if (typeof updater !== 'function') {
@@ -1139,6 +1213,34 @@ export function App() {
   const bumpStack = useCallback(() => setStackVersion((n) => n + 1), []);
   const isMobileRef = useRef(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent));
 
+  // Active (frontmost) sub-session. Managed EXPLICITLY rather than re-derived
+  // from the mutable window stack on every render: opening/focusing a window
+  // sets it directly (`activateSubId`), and it STAYS PUT while that sub remains
+  // open — so background stack churn (WS-driven re-ensures, z-index bumps, the
+  // stack-sync effect) can never silently reassign the active highlight to a
+  // different window. It is re-derived ONLY when the active sub is gone (closed
+  // or session switched), picking the next frontmost. This is what makes opening
+  // an Nth window reliable: the just-opened one is the active one, full stop —
+  // no count-dependent race that left it dashed/inactive and un-closable.
+  const [focusedSubId, setFocusedSubIdState] = useState<string | null>(null);
+  const focusedSubIdRef = useRef(focusedSubId);
+  focusedSubIdRef.current = focusedSubId;
+  const recomputeFocusedSubId = useCallback(() => {
+    setFocusedSubIdState((prev) => {
+      if (isMobileRef.current) return null;
+      // Sticky: keep the current active sub while it is still open.
+      if (prev && openSubIdsRef.current.has(prev)) return prev;
+      return getFrontmostSubSessionId(stackRef.current!, openSubIdsRef.current);
+    });
+  }, []);
+  const activateSubId = useCallback((id: string) => {
+    setFocusedSubIdState(isMobileRef.current ? null : id);
+  }, []);
+  // Backstop: re-derive on any stack change (sticky — never steals focus from a
+  // still-open active sub; only reassigns once it's gone). Also keeps the
+  // `stackVersion` counter live so z-index consumers re-render on stack changes.
+  useEffect(() => { recomputeFocusedSubId(); }, [stackVersion, recomputeFocusedSubId]);
+
   /** Idempotent register; raises if `bringToFront` is requested. Bumps version only on real change. */
   const ensureDesktopWindow = useCallback((id: string, meta: DesktopWindowMeta, opts?: { bringToFront?: boolean }) => {
     if (isMobileRef.current) return;
@@ -1158,8 +1260,11 @@ export function App() {
 
   /** Remove a window (and its children). Bumps only if anything was actually removed. */
   const removeDesktopWindow = useCallback((id: string) => {
-    if (stackRef.current!.removeWindow(id)) bumpStack();
-  }, []);
+    if (stackRef.current!.removeWindow(id)) {
+      bumpStack();
+      recomputeFocusedSubId();
+    }
+  }, [recomputeFocusedSubId]);
 
   /**
    * Read effective z-index. Cheap and called during render. Consumers must
@@ -1181,11 +1286,6 @@ export function App() {
   const openSubIdsKeyMemo = useMemo(() => openSubIdsKey(openSubIds), [openSubIds]);
   const maximizedSubIdsRef = useRef(maximizedSubIds);
   maximizedSubIdsRef.current = maximizedSubIds;
-  const focusedSubId = useMemo(
-    () => (isMobileRef.current ? null : getFrontmostSubSessionId(stackRef.current!, openSubIds)),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- deps are intentionally [stackVersion, key] to avoid invalidating on every Set re-creation
-    [stackVersion, openSubIdsKeyMemo],
-  );
   const flashIdleSession = useCallback((sessionName: string) => {
     setIdleFlashTokens((prev) => {
       const next = new Map(prev);
@@ -1193,8 +1293,6 @@ export function App() {
       return next;
     });
   }, []);
-  const focusedSubIdRef = useRef(focusedSubId);
-  focusedSubIdRef.current = focusedSubId;
 
   useEffect(() => {
     if (sessionsLoaded && sessions.length === 0) {
@@ -1290,10 +1388,25 @@ export function App() {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [discussionPrefs, _setDiscussionPrefs] = useState<DiscussionPrefs | null>(null);
   const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
+  // Wall-clock when the current AskUserQuestion was shown. Used to auto-dismiss
+  // a stale card once the model self-continues (the SDK proceeds on its own if
+  // the question goes unanswered), while ignoring the question's own trailing
+  // message-completion flush that arrives in the same instant.
+  const pendingQuestionAtRef = useRef(0);
   const [discussions, setDiscussions] = useState<Array<{
     id: string;
     topic: string;
     state: string;
+    /** Web requestId for an optimistic launch (classic discussion startup feedback). */
+    requestId?: string;
+    /** True while the entry is an optimistic local placeholder (pre-`discussion.started`). */
+    pending?: boolean;
+    /** Raw failure string from the daemon — internal only, never rendered. */
+    error?: string;
+    /** i18n key for the user-facing failure reason (rendered in place of raw error). */
+    displayReasonKey?: string;
+    /** Internal copy of the raw failure for logs/detail (never rendered). */
+    rawError?: string;
     modeKey?: string;
     currentRound: number;
     maxRounds: number;
@@ -1393,7 +1506,11 @@ export function App() {
       ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(openId), getSubSessionDesktopWindowMeta(openId));
     }
     ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id), getSubSessionDesktopWindowMeta(id), { bringToFront: true });
-  }, [ensureDesktopWindow, getSubSessionDesktopWindowMeta]);
+    // `id` was just raised to the front — it IS the active sub now. Set it
+    // explicitly so the highlight/active-window state can't lag or be reassigned
+    // by the stack-sync churn that follows an open.
+    activateSubId(id);
+  }, [activateSubId, ensureDesktopWindow, getSubSessionDesktopWindowMeta]);
 
   const setSubSessionMaximized = useCallback((id: string, maximized: boolean) => {
     setMaximizedSubIds((prev) => {
@@ -1530,6 +1647,7 @@ export function App() {
   const closeAllSubSessionWindows = useCallback(() => {
     setMaximizedSubIds(new Set());
     setOpenSubIds(new Set());
+    recomputeFocusedSubId();
     if (isMobileRef.current) return;
     const stack = stackRef.current!;
     let changed = false;
@@ -1538,7 +1656,7 @@ export function App() {
       if (stack.removeWindow(entry.id)) changed = true;
     }
     if (changed) bumpStack();
-  }, [bumpStack, setOpenSubIds]);
+  }, [bumpStack, recomputeFocusedSubId, setOpenSubIds]);
 
   const restoreQuickClosedSubSessionWindows = useCallback((ids: string[]) => {
     if (isMobileRef.current || ids.length === 0) return;
@@ -1691,8 +1809,8 @@ export function App() {
   }, [previewFileRequest, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
 
   const setActiveSession = useCallback((name: string | null, opts?: { keepSubWindows?: boolean }) => {
-    if (name) localStorage.setItem('rcc_session', name);
-    else localStorage.removeItem('rcc_session');
+    if (name) safeLocalStorageSetItem('rcc_session', name);
+    else safeLocalStorageRemoveItem('rcc_session');
     setActiveSessionState(name);
     if (!opts?.keepSubWindows) {
       setMaximizedSubIds(new Set());
@@ -1803,6 +1921,81 @@ export function App() {
   }, [auth, manualDashboard, selectedServerId, servers, serversLoaded, setActiveSession]);
 
   const wsRef = useRef<WsClient | null>(null);
+
+  // ── Classic discussion startup feedback (optimistic launch + failure UX) ──
+  // Always read the latest translator inside stable callbacks.
+  const transRef = useRef(trans);
+  transRef.current = trans;
+  // requestIds this tab dispatched — gates initiator-only failure toasts.
+  const initiatedRequestIdsRef = useRef<Set<string>>(new Set());
+  // Backstop timers keyed by requestId (send OK but no started/error).
+  const pendingStartTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  const clearPendingStartTimer = useCallback((requestId?: string) => {
+    if (!requestId) return;
+    const timer = pendingStartTimersRef.current.get(requestId);
+    if (timer) { clearTimeout(timer); pendingStartTimersRef.current.delete(requestId); }
+  }, []);
+
+  // Mirror the P2P terminal cleanup cadence (~120s): keep the finished card
+  // briefly, then drop it from client state so terminal entries don't pile up.
+  const scheduleClassicDiscussionCleanup = useCallback((id: string) => {
+    setTimeout(() => {
+      setDiscussions((prev) => prev.filter((d) => d.id !== id));
+    }, DISCUSSION_RECONCILE_HIDDEN_MS * 2);
+  }, []);
+
+  const pushDiscussionFailureToast = useCallback((reasonKey: string) => {
+    const t = transRef.current;
+    const id = Date.now() + Math.random();
+    setToasts((prev) => [...prev, {
+      id, sessionName: '', project: '', kind: 'notification',
+      title: t('discussion.start_failed_title'),
+      message: t(reasonKey),
+    }]);
+    setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
+  }, []);
+
+  // App owns the optimistic launch state and mints the requestId so the
+  // pending card is inserted BEFORE the (synchronously-throwing) send.
+  const handleStartDiscussion = useCallback((payload: {
+    topic: string;
+    cwd: string;
+    participants: Array<{ agentType: string; model?: string; roleId: string; roleLabel?: string; rolePrompt?: string; sessionName?: string }>;
+    maxRounds?: number;
+    verdictIdx?: number;
+  }) => {
+    const ws = wsRef.current;
+    if (!ws) return;
+    const requestId = crypto.randomUUID();
+    setDiscussions((prev) => [...prev, makeOptimisticDiscussionEntry(
+      requestId, { topic: payload.topic, maxRounds: payload.maxRounds }, Date.now(),
+    )]);
+    initiatedRequestIdsRef.current.add(requestId);
+    if (initiatedRequestIdsRef.current.size > 64) {
+      const oldest = initiatedRequestIdsRef.current.values().next().value;
+      if (oldest !== undefined) initiatedRequestIdsRef.current.delete(oldest);
+    }
+    try {
+      ws.discussionStart(payload.topic, payload.cwd, payload.participants, payload.maxRounds, payload.verdictIdx, requestId);
+      const timer = setTimeout(() => {
+        pendingStartTimersRef.current.delete(requestId);
+        initiatedRequestIdsRef.current.delete(requestId);
+        setDiscussions((prev) => prev.map((d) => (d.requestId === requestId && d.pending)
+          ? { ...d, pending: false, state: 'failed', displayReasonKey: 'discussion.error.generic' }
+          : d));
+        pushDiscussionFailureToast('discussion.error.generic');
+      }, PENDING_START_TIMEOUT_MS);
+      pendingStartTimersRef.current.set(requestId, timer);
+    } catch {
+      // Dispatch-time failure (WS not connected → synchronous throw): drop the
+      // optimistic entry in the same tick, show a localized offline toast.
+      setDiscussions((prev) => removeDiscussionByRequestId(prev, requestId));
+      initiatedRequestIdsRef.current.delete(requestId);
+      pushDiscussionFailureToast('discussion.start_failed_offline');
+    }
+    setShowDiscussionDialog(false);
+  }, [pushDiscussionFailureToast]);
   const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } | null>(null);
 
   useEffect(() => {
@@ -1837,6 +2030,17 @@ export function App() {
   }, [clearSubSessionMaximized, closeSubSession, removeDesktopWindow]);
 
   const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
+  // Weekly (7d) quota opt-in (per-user pref → all servers). Tell the daemon
+  // whether the user authorized reading the local Claude token; re-sent on
+  // (re)connect and server switch so every server honors the single pref.
+  const weeklyQuotaOptIn = usePref<boolean>(CLAUDE_WEEKLY_QUOTA_PREF_KEY, { parse: parseBooleanish });
+  useEffect(() => {
+    // Wait for the pref to load — sending `false` during the unloaded phase
+    // would make the daemon drop its cached/persisted quota on every page load
+    // (and re-fetch), which is a big part of the "quota flickers" symptom.
+    if (!connected || !weeklyQuotaOptIn.loaded) return;
+    wsRef.current?.setClaudeWeeklyQuotaOptIn(weeklyQuotaOptIn.value === true);
+  }, [connected, weeklyQuotaOptIn.loaded, weeklyQuotaOptIn.value, selectedServerId]);
   const subSessionParentSignature = useMemo(
     () => p2pSubSessionParentSignature(subSessions),
     [subSessions],
@@ -1904,6 +2108,24 @@ export function App() {
   // subSessionsRef itself is declared earlier (forward-declared before
   // bringSubToFront so the callback can close over it). Just sync each render.
   subSessionsRef.current = subSessions;
+
+  // Auto-navigate to the session that raised an AskUserQuestion so the operator
+  // sees its context (the card itself is a global overlay, but the underlying
+  // view should follow). Runs once per question (tracked by toolUseId).
+  const navigatedQuestionRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!pendingQuestion) { navigatedQuestionRef.current = null; return; }
+    if (navigatedQuestionRef.current === pendingQuestion.toolUseId) return;
+    navigatedQuestionRef.current = pendingQuestion.toolUseId;
+    const sid = pendingQuestion.sessionName;
+    if (isSubSessionName(sid)) {
+      const sub = subSessionsRef.current.find((s) => s.sessionName === sid);
+      if (sub) openSubSessionWindow(sub.id);
+    } else {
+      setActiveSession(sid);
+    }
+  }, [pendingQuestion, openSubSessionWindow, setActiveSession]);
+
   const visibleSubSessionStackKey = useMemo(
     () => visibleSubSessions
       .map((sub) => `${sub.id}:${sub.serverId ?? selectedServerId ?? ''}`)
@@ -1933,15 +2155,30 @@ export function App() {
       }
     }
 
+    // Remove a sub-session window ONLY when its sub is no longer OPEN — NOT when
+    // it is merely absent from `currentlyOpen` (i.e. missing from this render's
+    // `visibleSubSessions`). `visibleSubSessions` gets a fresh array on every
+    // inbound sub-session WS tick, so while opening a 3rd window a background
+    // update can momentarily exclude the just-opened sub and evict its freshly
+    // created stack entry — leaving its card dashed/inactive and un-closable
+    // (close on an inactive window is a focus-only no-op) until another card was
+    // clicked (which re-ensured the window). `openSubIds` is the source of truth
+    // for "should this window exist"; it is scoped per main session (reset on
+    // session switch), so windows are still torn down on close and on switching
+    // the active session.
     for (const entry of stack.getOrderForTests()) {
       if (entry.meta.kind !== DESKTOP_WINDOW_KINDS.subSession) continue;
-      if (!entry.meta.subId || !currentlyOpen.has(entry.meta.subId)) {
+      if (!entry.meta.subId || !openSubIdsRef.current.has(entry.meta.subId)) {
         if (stack.removeWindow(entry.id)) changed = true;
       }
     }
 
     if (changed) bumpStack();
-  }, [bumpStack, getSubSessionDesktopWindowMeta, openSubIdsKeyMemo, visibleSubSessionStackKey, visibleSubSessions]);
+    // Re-derive the active sub after stack churn. Sticky: a no-op while the
+    // active sub is still open; only reassigns when it's gone (e.g. on a
+    // main-session switch that cleared the old session's open set).
+    recomputeFocusedSubId();
+  }, [bumpStack, getSubSessionDesktopWindowMeta, openSubIdsKeyMemo, recomputeFocusedSubId, visibleSubSessionStackKey, visibleSubSessions]);
 
   useEffect(() => {
     const liveSessionNames = new Set<string>([
@@ -2170,6 +2407,9 @@ export function App() {
             const initialScope = initialActive ? { sessionName: initialActive } : undefined;
             ws.p2pListDiscussions(initialScope);
             ws.p2pStatus(initialScope);
+            // Re-sync classic discussions too (not just the P2P path) so a run
+            // that finished while backgrounded is reconciled out of the bar.
+            ws.discussionList();
           }
           if (!isProbeRecovered) requestActiveTimelineRefresh({ resetCooldowns: true });
           // Timeout: if session_list never arrives, stop blocking the UI
@@ -2326,13 +2566,35 @@ export function App() {
           }
         }
         if (event.type === 'ask.question') {
+          pendingQuestionAtRef.current = Date.now();
           setPendingQuestion({
             sessionName: event.sessionId,
             toolUseId: String(event.payload.toolUseId ?? ''),
             questions: (event.payload.questions as PendingQuestion['questions']) ?? [],
+            ...(typeof event.payload.waitMs === 'number' ? { waitMs: event.payload.waitMs } : {}),
           });
         }
+        // Auto-dismiss a stale question card only once the model's turn is
+        // actually done (session idle). The SDK self-continues if the question
+        // goes unanswered, but answering is interrupt-based — so we KEEP the card
+        // up the whole time the model is working on its auto-choice, letting the
+        // user override it mid-run. The grace ignores an idle "blip" at the
+        // instant the question's tool call pauses the turn.
+        if (isIdleSessionStateTimelineEvent(event)) {
+          setPendingQuestion((pq) => (
+            shouldDismissPendingQuestion(
+              pq ? { sessionName: pq.sessionName, askedAt: pendingQuestionAtRef.current } : null,
+              { sessionId: event.sessionId, sessionIdle: true },
+              Date.now(),
+            ) ? null : pq
+          ));
+        }
         if (event.type === 'user.message' && !event.sessionId.startsWith('deck_sub_')) {
+          // A drained message enters the timeline as user.message carrying the
+          // post-drain queue version. Advancing the baseline here (even when no
+          // entry needs removal) guarantees a later stale snapshot can't
+          // resurrect it, regardless of which drain event arrives first.
+          const incomingVersion = extractTransportPendingVersion(event.payload.pendingMessageVersion);
           setSessions((prev) => prev.map((s) => {
             if (s.name !== event.sessionId) return s;
             const nextQueue = removeTransportPendingEntryForUserMessage(
@@ -2345,12 +2607,18 @@ export function App() {
               },
               event.sessionId,
             );
-            if (!nextQueue.changed) return s;
+            const advancedVersion = nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion);
+            if (!nextQueue.changed) {
+              return advancedVersion === s.transportPendingMessageVersion
+                ? s
+                : { ...s, transportPendingMessageVersion: advancedVersion };
+            }
             return {
               ...s,
               state: s.state === 'queued' && nextQueue.messages.length === 0 ? 'running' as SessionInfo['state'] : s.state,
               transportPendingMessages: nextQueue.messages,
               transportPendingMessageEntries: nextQueue.entries,
+              transportPendingMessageVersion: advancedVersion,
             };
           }));
         }
@@ -2358,6 +2626,7 @@ export function App() {
         if (event.type === 'session.state' && !event.sessionId.startsWith('deck_sub_')) {
           const liveState = String(event.payload.state ?? '');
           const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessages');
+          const incomingVersion = extractTransportPendingVersion(event.payload.pendingMessageVersion);
           if (liveState === 'queued') {
             const pendingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
             const pendingEntries = normalizeTransportPendingEntries(
@@ -2365,58 +2634,76 @@ export function App() {
               pendingMessages,
               event.sessionId,
             );
-            setSessions((prev) => prev.map((s) =>
-              s.name === event.sessionId
-                ? {
-                    ...s,
-                    state: 'queued' as SessionInfo['state'],
-                    transportPendingMessages: pendingMessages,
-                    transportPendingMessageEntries: pendingEntries,
-                  }
-                : s,
-            ));
+            setSessions((prev) => prev.map((s) => {
+              if (s.name !== event.sessionId) return s;
+              // Drop a stale `queued` snapshot wholesale: it would otherwise
+              // both resurrect drained entries AND wrongly downgrade a session
+              // that has since moved past queued.
+              if (!shouldApplyTransportQueueSnapshot(s.transportPendingMessageVersion, incomingVersion)) return s;
+              return {
+                ...s,
+                state: 'queued' as SessionInfo['state'],
+                transportPendingMessages: pendingMessages,
+                transportPendingMessageEntries: pendingEntries,
+                transportPendingMessageVersion: nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion),
+              };
+            }));
           } else if (liveState === 'running') {
-            setSessions((prev) => prev.map((s) =>
-              s.name === event.sessionId
-                ? {
-                    ...s,
-                    state: 'running' as SessionInfo['state'],
-                    transportPendingMessages: mergeTransportPendingMessagesForRunningState(
+            setSessions((prev) => prev.map((s) => {
+              if (s.name !== event.sessionId) return s;
+              const applyPending = shouldApplyTransportQueueSnapshot(s.transportPendingMessageVersion, incomingVersion);
+              return {
+                ...s,
+                state: 'running' as SessionInfo['state'],
+                transportPendingMessages: applyPending
+                  ? mergeTransportPendingMessagesForRunningState(
                       s.transportPendingMessages,
                       event.payload.pendingMessages,
                       hasPendingMessagesField,
-                    ),
-                    transportPendingMessageEntries: mergeTransportPendingEntriesForRunningState(
+                    )
+                  : (s.transportPendingMessages ?? []),
+                transportPendingMessageEntries: applyPending
+                  ? mergeTransportPendingEntriesForRunningState(
                       s.transportPendingMessageEntries,
                       event.payload.pendingMessageEntries,
                       event.payload.pendingMessages,
                       hasPendingMessagesField,
                       event.sessionId,
-                    ),
-                  }
-                : s,
-            ));
+                    )
+                  : (s.transportPendingMessageEntries ?? []),
+                transportPendingMessageVersion: applyPending
+                  ? nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion)
+                  : s.transportPendingMessageVersion,
+              };
+            }));
           } else if (liveState === 'idle') {
-            setSessions((prev) => prev.map((s) =>
-              s.name === event.sessionId
-                ? {
-                    ...s,
-                    state: liveState as SessionInfo['state'],
-                    transportPendingMessages: mergeTransportPendingMessagesForIdleState(
+            setSessions((prev) => prev.map((s) => {
+              if (s.name !== event.sessionId) return s;
+              const applyPending = shouldApplyTransportQueueSnapshot(s.transportPendingMessageVersion, incomingVersion);
+              return {
+                ...s,
+                state: liveState as SessionInfo['state'],
+                transportPendingMessages: applyPending
+                  ? mergeTransportPendingMessagesForIdleState(
                       s.transportPendingMessages,
                       event.payload.pendingMessages,
                       hasPendingMessagesField,
-                    ),
-                    transportPendingMessageEntries: mergeTransportPendingEntriesForIdleState(
+                    )
+                  : (s.transportPendingMessages ?? []),
+                transportPendingMessageEntries: applyPending
+                  ? mergeTransportPendingEntriesForIdleState(
                       s.transportPendingMessageEntries,
                       event.payload.pendingMessageEntries,
                       event.payload.pendingMessages,
                       hasPendingMessagesField,
                       event.sessionId,
-                    ),
-                  }
-                : s,
-            ));
+                    )
+                  : (s.transportPendingMessageEntries ?? []),
+                transportPendingMessageVersion: applyPending
+                  ? nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion)
+                  : s.transportPendingMessageVersion,
+              };
+            }));
           }
         }
         if (event.type === 'session.state') {
@@ -2426,11 +2713,16 @@ export function App() {
         if (event.type === 'usage.update') {
           // Model detection
           if (event.payload.model) {
-            const modelStr = String(event.payload.model).toLowerCase();
+            const rawModel = String(event.payload.model);
+            const modelStr = rawModel.toLowerCase();
+            // Preserve the full Claude id (e.g. "claude-opus-4-8") so the ctx-bar
+            // label can surface the version ("opus-4.8"). The model picker still
+            // normalizes this to its canonical option via
+            // normalizeClaudeCodeModelId, so selection is unaffected.
             const claudeM: string | null =
-              modelStr.includes('opus') ? 'opus[1M]' :
-              modelStr.includes('sonnet') ? 'sonnet' :
-              modelStr.includes('haiku') ? 'haiku' : null;
+              (modelStr.includes('opus') || modelStr.includes('sonnet') || modelStr.includes('haiku'))
+                ? rawModel
+                : null;
             const gptM = modelStr.match(/\b(gpt-5(?:\.\d+)?(?:-\w+)?)\b/);
             const gemM = modelStr.match(/\b(gemini[- ]\d[\w.-]*)\b/);
             const det = claudeM ?? (gptM ? gptM[1] : null) ?? (gemM ? gemM[1] : null);
@@ -2549,42 +2841,100 @@ export function App() {
         watchProjectionStore.removeSubSession(msg.sessionName);
       }
       if (msg.type === 'discussion.started') {
-        setDiscussions((prev) => [
-          ...prev,
-          { id: msg.discussionId, topic: msg.topic, state: 'setup', currentRound: 0, maxRounds: msg.maxRounds, completedHops: 0, totalHops: msg.totalHops ?? 0, startedAt: Date.now() },
-        ]);
+        clearPendingStartTimer(msg.requestId);
+        setDiscussions((prev) => {
+          const idx = matchDiscussionIndex(prev, msg);
+          if (idx >= 0) {
+            const next = [...prev];
+            next[idx] = reconcileDiscussionEntry(prev[idx], {
+              id: msg.discussionId,
+              state: 'setup',
+              topic: msg.topic,
+              maxRounds: msg.maxRounds,
+              totalHops: msg.totalHops,
+              filePath: msg.filePath,
+            });
+            return next;
+          }
+          return [...prev, {
+            id: msg.discussionId, requestId: msg.requestId, topic: msg.topic, state: 'setup',
+            currentRound: 0, maxRounds: msg.maxRounds, completedHops: 0,
+            totalHops: msg.totalHops ?? 0, startedAt: Date.now(),
+          }];
+        });
       }
       if (msg.type === 'discussion.update') {
-        setDiscussions((prev) => prev.map((d) =>
-          d.id === msg.discussionId
-            ? { ...d, state: msg.state, currentRound: msg.currentRound, maxRounds: msg.maxRounds, completedHops: msg.completedHops ?? d.completedHops, totalHops: msg.totalHops ?? d.totalHops, currentSpeaker: msg.currentSpeaker }
-            : d,
-        ));
+        clearPendingStartTimer(msg.requestId);
+        setDiscussions((prev) => {
+          const idx = matchDiscussionIndex(prev, msg);
+          if (idx < 0) return prev;
+          const next = [...prev];
+          next[idx] = reconcileDiscussionEntry(prev[idx], {
+            id: msg.discussionId,
+            state: msg.state,
+            currentRound: msg.currentRound,
+            maxRounds: msg.maxRounds,
+            completedHops: msg.completedHops,
+            totalHops: msg.totalHops,
+            currentSpeaker: msg.currentSpeaker ?? undefined,
+            filePath: msg.filePath,
+          });
+          return next;
+        });
       }
       if (msg.type === 'discussion.done') {
-        setDiscussions((prev) => prev.map((d) =>
-          d.id === msg.discussionId
-            ? { ...d, state: 'done', conclusion: msg.conclusion, filePath: msg.filePath }
-            : d,
-        ));
+        setDiscussions((prev) => {
+          const idx = matchDiscussionIndex(prev, msg);
+          if (idx < 0) return prev;
+          const next = [...prev];
+          next[idx] = reconcileDiscussionEntry(prev[idx], { state: 'done', conclusion: msg.conclusion, filePath: msg.filePath });
+          return next;
+        });
+        if (typeof msg.discussionId === 'string') scheduleClassicDiscussionCleanup(msg.discussionId);
       }
       if (msg.type === 'discussion.error') {
-        if (msg.discussionId) {
-          setDiscussions((prev) => prev.map((d) =>
-            d.id === msg.discussionId ? { ...d, state: 'failed', error: msg.error ?? undefined } : d,
-          ));
+        clearPendingStartTimer(msg.requestId);
+        // Map the daemon's stable error token to a localized key; the raw error
+        // string is kept only as rawError (never rendered) — initiator-only toast.
+        const reasonKey = discussionErrorReasonKey(msg.error);
+        let matchedId: string | undefined;
+        setDiscussions((prev) => {
+          const idx = matchDiscussionIndex(prev, msg);
+          if (idx < 0) return prev;
+          matchedId = prev[idx].id;
+          const next = [...prev];
+          next[idx] = reconcileDiscussionEntry(prev[idx], {
+            state: 'failed',
+            displayReasonKey: reasonKey,
+            rawError: typeof msg.error === 'string' ? msg.error : undefined,
+          });
+          return next;
+        });
+        if (shouldToastDiscussionError(msg.requestId, initiatedRequestIdsRef.current)) {
+          initiatedRequestIdsRef.current.delete(msg.requestId as string);
+          pushDiscussionFailureToast(reasonKey);
         }
+        if (matchedId) scheduleClassicDiscussionCleanup(matchedId);
       }
       if (msg.type === 'discussion.list') {
-        // Merge live discussions from daemon with existing DB history
-        // Preserve active P2P entries (p2p_ prefix) — they come from p2p.run_update, not discussion.list
-        setDiscussions((prev) => {
-          const liveIds = new Set(msg.discussions.map((d: { id: string }) => d.id));
-          const dbHistory = prev.filter((d) => !liveIds.has(d.id) && (d.state === 'done' || d.state === 'failed'));
-          const activeP2p = prev.filter((d) => d.id.startsWith('p2p_') && d.state !== 'done' && d.state !== 'failed');
-          const mapped = msg.discussions.map((d) => ({ ...d, completedHops: d.completedHops ?? 0, totalHops: d.totalHops ?? 0 }));
-          return [...mapped, ...dbHistory, ...activeP2p];
-        });
+        // Single requestId-aware reconciler: preserve unresolved pending entries,
+        // merge present entries in place (no daemon-shaped replacement), keep
+        // terminal history + p2p_ entries, drop resolved active classic entries
+        // absent from the live set (finished daemon-side).
+        setDiscussions((prev) => reconcileClassicList(
+          prev,
+          (msg.discussions ?? []) as Array<Record<string, unknown> & { id: string; requestId?: string }>,
+          (item) => ({
+            ...(item as Record<string, unknown>),
+            id: item.id as string,
+            topic: (item.topic as string) ?? '',
+            state: (item.state as string) ?? 'setup',
+            currentRound: (item.currentRound as number) ?? 0,
+            maxRounds: (item.maxRounds as number) ?? 3,
+            completedHops: 0,
+            totalHops: 0,
+          }) as (typeof prev)[number],
+        ));
       }
       // ── P2P Quick Discussion progress → map to discussions state ──────────
       if (msg.type === P2P_WORKFLOW_MSG.CONFLICT) {
@@ -2625,6 +2975,7 @@ export function App() {
         setDiscussions((prev) => mergeP2pStatusResponseDiscussions(prev, mapped, {
           runId: typeof msg.runId === 'string' ? msg.runId : undefined,
           runFound: !!msg.run,
+          fullList: Array.isArray(msg.runs),
         }));
       }
       if (msg.type === REPO_MSG.DETECTED || msg.type === REPO_MSG.DETECT_RESPONSE) {
@@ -2676,9 +3027,11 @@ export function App() {
         }
       }
       if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
-        const message = msg.reason === 'transport_busy'
-          ? trans('toast.upgrade_blocked_transport_busy')
-          : trans('toast.upgrade_blocked_p2p_active');
+        const message = msg.reason === 'toolchain_unavailable'
+          ? trans('toast.upgrade_blocked_toolchain_unavailable')
+          : msg.reason === 'transport_busy'
+            ? trans('toast.upgrade_blocked_transport_busy')
+            : trans('toast.upgrade_blocked_p2p_active');
         const id = Date.now() + Math.random();
         setToasts((prev) => [...prev, {
           id,
@@ -2866,12 +3219,19 @@ export function App() {
     let lastResumeCheckAt = 0;
     let lastResumeCheckWasForce = false;
     let hiddenSinceAt = 0;
+    let lastDiscussionResyncAt = 0;
     const handleResume = (forceIfStale = false, refreshTimeline = false) => {
       const now = Date.now();
       if (now - lastResumeCheckAt < 500 && (!forceIfStale || lastResumeCheckWasForce)) return;
       lastResumeCheckAt = now;
       lastResumeCheckWasForce = forceIfStale;
       ws.resumeConnection(forceIfStale);
+      // Cooldown-gated classic discussion re-sync so a run that ended while
+      // backgrounded disappears from the bar without a reload (absorbs alt-tab churn).
+      if (now - lastDiscussionResyncAt > DISCUSSION_RECONCILE_HIDDEN_MS) {
+        lastDiscussionResyncAt = now;
+        ws.discussionList();
+      }
       if (refreshTimeline) requestActiveTimelineRefresh({ resetCooldowns: true });
     };
     const onVisibility = () => {
@@ -2879,7 +3239,7 @@ export function App() {
         hiddenSinceAt = Date.now();
         return;
       }
-      const wasLongHidden = hiddenSinceAt > 0 && Date.now() - hiddenSinceAt > 60_000;
+      const wasLongHidden = hiddenSinceAt > 0 && Date.now() - hiddenSinceAt > DISCUSSION_RECONCILE_HIDDEN_MS;
       hiddenSinceAt = 0;
       handleResume(wasLongHidden, wasLongHidden);
       // Short-hide (alt-tab etc.) still needs a timeline catch-up — the bare
@@ -3257,7 +3617,7 @@ export function App() {
     // Restore previously selected session for this server
     const savedSession = localStorage.getItem(`rcc_session_${serverId}`);
     if (savedSession) {
-      localStorage.setItem('rcc_session', savedSession);
+      safeLocalStorageSetItem('rcc_session', savedSession);
     } else {
       localStorage.removeItem('rcc_session');
     }
@@ -3268,6 +3628,7 @@ export function App() {
 
     // Full page reload — guarantees all components, WS connections, and pinned
     // panels start fresh with the new server. Avoids stale WS/state bugs.
+    markFastServerSwitchSplash();
     window.location.reload();
   }, []);
 
@@ -3297,13 +3658,13 @@ export function App() {
       }
       // Activate parent main session first
       if (sub.parentSession) {
-        localStorage.setItem('rcc_session', sub.parentSession);
+        safeLocalStorageSetItem('rcc_session', sub.parentSession);
         setActiveSession(sub.parentSession, { keepSubWindows: true });
       }
       setOpenSubIds((prev) => new Set([...prev, subId]));
       bringSubToFront(subId);
     } else {
-      localStorage.setItem('rcc_session', session);
+      safeLocalStorageSetItem('rcc_session', session);
       setActiveSession(session);
     }
     if (quote) {
@@ -3418,7 +3779,7 @@ export function App() {
   }
 
   if (!nativeReady || !splashDone) {
-    return null; // Wait for splash animation + native init
+    return null; // Wait for startup readiness while the HTML splash remains visible
   }
 
   if (isNative() && !nativeServerUrl) {
@@ -3759,6 +4120,34 @@ export function App() {
     : null;
   const daemonVersionForDisplay = daemonStats?.daemonVersion ?? selectedServerInfo?.daemonVersion ?? null;
   const daemonBadgeState = getDaemonBadgeState(connected, connecting, daemonOnline, selectedServerInfo);
+
+  useEffect(() => {
+    if (!auth || !selectedServerId || connected || !isServerOnline(selectedServerInfo)) return;
+    let stopped = false;
+    const shouldPulse = () => {
+      if (stopped) return false;
+      if (!isServerOnline(selectedServerInfo)) return false;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return false;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return false;
+      return true;
+    };
+    const pulse = () => {
+      if (!shouldPulse()) return;
+      wsRef.current?.reconnectNow(true);
+    };
+    const initial = setTimeout(pulse, DAEMON_ONLINE_WS_RECOVERY_INITIAL_MS);
+    const interval = setInterval(pulse, DAEMON_ONLINE_WS_RECOVERY_INTERVAL_MS);
+    return () => {
+      stopped = true;
+      clearTimeout(initial);
+      clearInterval(interval);
+    };
+  }, [
+    auth,
+    selectedServerId,
+    selectedServerInfo,
+    connected,
+  ]);
 
   useEffect(() => {
     if (showInitialConnectingGate) {
@@ -4365,15 +4754,23 @@ export function App() {
                 // a badge even when the user is viewing a session
                 // unrelated to the running discussions. Lets the user
                 // notice and click through without losing track.
-                totalRunningDiscussions={discussions.filter((d) => d.state !== 'done').length}
+                totalRunningDiscussions={discussions.filter(isBarActiveDiscussion).length}
                 onStopDiscussion={(id) => {
-                  if (id.startsWith('p2p_')) {
-                    // P2P runs use p2p.cancel with the actual run ID (strip p2p_ prefix)
-                    wsRef.current?.send({ type: P2P_WORKFLOW_MSG.CANCEL, runId: id.slice(4) });
-                    // Remove from UI immediately
-                    setDiscussions((prev) => prev.filter((d) => d.id !== id));
-                  } else {
-                    wsRef.current?.discussionStop(id);
+                  switch (classifyDiscussionStop(id)) {
+                    case 'local':
+                      // Optimistic pending entry — no daemon run exists yet; drop it
+                      // locally only. Never discussionStop('pending_*') (the daemon
+                      // Map cannot resolve a pending id).
+                      setDiscussions((prev) => prev.filter((d) => d.id !== id));
+                      break;
+                    case 'p2p-cancel':
+                      // P2P runs use p2p.cancel with the actual run ID (strip p2p_ prefix)
+                      wsRef.current?.send({ type: P2P_WORKFLOW_MSG.CANCEL, runId: id.slice(4) });
+                      setDiscussions((prev) => prev.filter((d) => d.id !== id));
+                      break;
+                    case 'daemon-stop':
+                      wsRef.current?.discussionStop(id);
+                      break;
                   }
                 }}
                 ws={wsRef.current}
@@ -4584,7 +4981,15 @@ export function App() {
       )}
 
       {showDiscussionsPage && selectedServerId && (
-        <FloatingPanel id="discussions" title={trans('p2p.discussions.title')} onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }} defaultW={800} defaultH={600} zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.discussions, 5040)} onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.discussions)}>
+        <FloatingPanel
+          id="discussions"
+          title={trans('p2p.discussions.title')}
+          onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
+          defaultW={800}
+          defaultH={600}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.discussions, isMobile ? 6500 : 5040)}
+          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.discussions)}
+        >
           <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
             <DiscussionsPage
               ws={wsRef.current}
@@ -4743,6 +5148,7 @@ export function App() {
               onBack={() => setShowCronManager(false)}
               onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); })}
               servers={servers.map(s => ({ id: s.id, name: s.name }))}
+              ws={wsRef.current}
             />
           </FloatingPanel>
         ) : null;
@@ -4967,7 +5373,7 @@ export function App() {
 
       {showDiscussionDialog && wsRef.current && (
         <StartDiscussionDialog
-          ws={wsRef.current}
+          onStartRequested={handleStartDiscussion}
           defaultCwd={activeSessionInfo?.projectDir}
           existingSessions={subSessions.map((s): SubSessionOption => ({
             sessionName: s.sessionName,

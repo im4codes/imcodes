@@ -622,6 +622,7 @@ export interface SubSessionData {
   transportConfig?: Record<string, unknown> | null;
   transportPendingMessages?: string[] | null;
   transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> | null;
+  transportPendingMessageVersion?: number | null;
 }
 
 export async function listSubSessions(serverId: string): Promise<SubSessionData[]> {

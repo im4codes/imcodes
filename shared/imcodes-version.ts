@@ -21,6 +21,29 @@ export function parseImcodesVersion(version: string): ImcodesVersionParts | null
   };
 }
 
+/** npm dist-tags imcodes publishes to: 'latest' (stable) and 'dev'. */
+export type ReleaseChannel = 'latest' | 'dev';
+
+export const RELEASE_CHANNELS: readonly ReleaseChannel[] = ['latest', 'dev'];
+
+/**
+ * Infer the release channel a version string belongs to. Stable releases are a
+ * clean `MAJOR.MINOR.PATCH`; dev builds carry a prerelease segment (published
+ * under the `dev` dist-tag, e.g. `2026.5.2059-dev.2036`). Any prerelease is
+ * treated as the dev channel — a non-stable build should never be mistaken for
+ * `latest`. Unparseable input falls back to `latest`.
+ */
+export function getReleaseChannel(version: string): ReleaseChannel {
+  const parts = parseImcodesVersion(version);
+  if (parts && parts.prerelease.length > 0) return 'dev';
+  return 'latest';
+}
+
+/** Narrow an arbitrary string to a ReleaseChannel, or null if it isn't one. */
+export function asReleaseChannel(value: string): ReleaseChannel | null {
+  return (RELEASE_CHANNELS as readonly string[]).includes(value) ? (value as ReleaseChannel) : null;
+}
+
 function comparePrereleasePart(a: string, b: string): number {
   const aIsNum = /^\d+$/.test(a);
   const bIsNum = /^\d+$/.test(b);

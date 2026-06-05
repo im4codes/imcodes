@@ -101,14 +101,14 @@ describe('Sidebar contract', () => {
 });
 
 describe('StartDiscussionDialog contract', () => {
-  it('saves preferences and starts a mixed new/reused-session discussion', async () => {
+  it('saves preferences and submits a mixed new/reused-session discussion via onStartRequested', async () => {
     const { StartDiscussionDialog } = await import('../../src/components/StartDiscussionDialog.js');
-    const discussionStart = vi.fn();
+    const onStartRequested = vi.fn();
     const onClose = vi.fn();
 
     render(
       <StartDiscussionDialog
-        ws={{ discussionStart } as any}
+        onStartRequested={onStartRequested}
         defaultCwd="/repo"
         existingSessions={[
           { sessionName: 'deck_sub_existing', label: 'Existing reviewer', type: 'gemini' },
@@ -125,16 +125,17 @@ describe('StartDiscussionDialog contract', () => {
       />,
     );
 
-    expect(screen.getAllByText('Start Discussion')).toHaveLength(2);
+    // Header title and footer button now use t() keys (mock returns the key).
+    expect(screen.getByText('discussion.dialog_title')).toBeTruthy();
     expect(screen.getByDisplayValue('/repo')).toBeTruthy();
-    fireEvent.input(screen.getByPlaceholderText('Describe what you want the agents to discuss...'), {
+    fireEvent.input(screen.getByPlaceholderText('discussion.topic_placeholder'), {
       target: { value: 'Ship the file preview worker safely' },
     });
 
-    fireEvent.click(screen.getByText('+ Add'));
+    fireEvent.click(screen.getByText('discussion.add_participant'));
     expect(screen.getAllByText('discussion.arbiter')).toHaveLength(2);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Start Discussion' }));
+    fireEvent.click(screen.getByRole('button', { name: 'discussion.start_button' }));
 
     expect(saveUserPrefMock).toHaveBeenCalledWith('discussion_prefs', {
       participants: [
@@ -145,42 +146,66 @@ describe('StartDiscussionDialog contract', () => {
       verdictIdx: 1,
       maxRounds: 5,
     });
-    expect(discussionStart).toHaveBeenCalledWith(
-      'Ship the file preview worker safely',
-      '/repo',
-      [
+    expect(onStartRequested).toHaveBeenCalledWith({
+      topic: 'Ship the file preview worker safely',
+      cwd: '/repo',
+      participants: [
         { agentType: 'gemini', model: 'opus[1M]', roleId: 'critic', roleLabel: undefined, rolePrompt: undefined, sessionName: 'deck_sub_existing' },
         { agentType: 'codex', model: undefined, roleId: 'custom', roleLabel: 'QA', rolePrompt: 'Find regressions', sessionName: undefined },
         { agentType: 'claude-code', model: 'sonnet', roleId: 'pragmatist', roleLabel: undefined, rolePrompt: undefined, sessionName: undefined },
       ],
-      5,
-      1,
-    );
+      maxRounds: 5,
+      verdictIdx: 1,
+    });
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it('supports role removal, agent switches, validation, and overlay close', async () => {
+  it('guards double-submit so onStartRequested dispatches exactly once', async () => {
     const { StartDiscussionDialog } = await import('../../src/components/StartDiscussionDialog.js');
-    const discussionStart = vi.fn();
+    const onStartRequested = vi.fn();
     const onClose = vi.fn();
 
-    const { container } = render(
+    render(
       <StartDiscussionDialog
-        ws={{ discussionStart } as any}
+        onStartRequested={onStartRequested}
         existingSessions={[]}
         onClose={onClose}
       />,
     );
 
-    const startButton = screen.getByRole('button', { name: 'Start Discussion' }) as HTMLButtonElement;
+    const startButton = screen.getByRole('button', { name: 'discussion.start_button' }) as HTMLButtonElement;
     expect(startButton.disabled).toBe(true);
 
-    fireEvent.input(screen.getByPlaceholderText('Describe what you want the agents to discuss...'), {
+    fireEvent.input(screen.getByPlaceholderText('discussion.topic_placeholder'), {
       target: { value: 'Compare two approaches' },
     });
     expect(startButton.disabled).toBe(false);
 
-    fireEvent.click(screen.getByText('+ Add'));
+    // Two rapid clicks must dispatch only once (synchronous in-flight guard).
+    fireEvent.click(startButton);
+    fireEvent.click(startButton);
+    expect(onStartRequested).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('supports role removal, agent switches, and overlay close', async () => {
+    const { StartDiscussionDialog } = await import('../../src/components/StartDiscussionDialog.js');
+    const onStartRequested = vi.fn();
+    const onClose = vi.fn();
+
+    const { container } = render(
+      <StartDiscussionDialog
+        onStartRequested={onStartRequested}
+        existingSessions={[]}
+        onClose={onClose}
+      />,
+    );
+
+    fireEvent.input(screen.getByPlaceholderText('discussion.topic_placeholder'), {
+      target: { value: 'Compare two approaches' },
+    });
+
+    fireEvent.click(screen.getByText('discussion.add_participant'));
     fireEvent.click(screen.getAllByText('✕')[1]);
     expect(screen.getAllByText('discussion.arbiter')).toHaveLength(1);
 

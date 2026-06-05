@@ -46,6 +46,9 @@
     "retry": "重试"
   },
   "chat": {
+    "dpad": {
+      "title": "方向键 — 拖动发送方向键"
+    },
     "sendFailedReason": {
       "daemonOffline": "连接中断",
       "ackTimeout": "代理无响应",
@@ -90,6 +93,44 @@
     "show_file_panel": "打开文件面板",
     "hide_file_panel": "关闭文件面板",
     "sync_history": "强制同步聊天记录",
+    "sdk_agents_toggle": "Agents",
+    "sdk_agents_toggle_aria": "切换 SDK agents 状态，{{count}} 个运行中",
+    "sdk_agents_badge_aria": "{{count}} 个 SDK agents 运行中",
+    "sdk_agents_panel_title": "Agents",
+    "sdk_agents_close": "关闭 Agents 面板",
+    "sdk_agents_running_count": "{{count}} 个运行中",
+    "sdk_agents_active_section": "进行中",
+    "sdk_agents_recent_section": "最近",
+    "sdk_agents_diagnostics_section": "诊断",
+    "sdk_agents_provider_claude": "Claude SDK",
+    "sdk_agents_provider_codex": "Codex SDK",
+    "sdk_agents_provider_qwen": "Qwen",
+    "sdk_agents_provider_gemini": "Gemini SDK",
+    "sdk_agents_provider_unknown": "SDK agent",
+    "sdk_agents_status_pending": "等待中",
+    "sdk_agents_status_running": "运行中",
+    "sdk_agents_status_complete": "已完成",
+    "sdk_agents_status_error": "错误",
+    "sdk_agents_status_interrupted": "已中断",
+    "sdk_agents_status_stale": "已过期",
+    "sdk_agents_status_unknown": "未知",
+    "sdk_agents_id": "ID",
+    "sdk_agents_model": "模型",
+    "sdk_agents_started_at": "启动",
+    "sdk_agents_duration": "运行时长",
+    "sdk_agents_tokens": "Token",
+    "sdk_agents_prompt": "Prompt",
+    "sdk_agents_result": "结果",
+    "sdk_agents_running_children": "{{count}} 个子 agent 运行中",
+    "sdk_agents_receiver_count": "{{count}} 个接收方",
+    "sdk_agents_diagnostic_unsupported_runtime": "运行时未暴露 agent 状态",
+    "sdk_agents_diagnostic_unknown_runtime_support": "运行时支持状态未知",
+    "sdk_agents_diagnostic_malformed_payload": "agent 元数据格式异常",
+    "sdk_agents_diagnostic_missing_id": "缺少 agent 标识",
+    "sdk_agents_diagnostic_unknown_state": "未知 provider 状态",
+    "sdk_agents_diagnostic_stale_without_terminal": "状态在完成前已过期",
+    "sdk_agents_diagnostic_snapshot_only": "provider 仅提供快照状态",
+    "sdk_agents_diagnostic_generic": "agent 状态诊断",
     "html_preview": "渲染 HTML",
     "html_preview_title": "渲染 HTML 预览",
     "html_preview_open_new_window": "在新窗口中预览",
@@ -183,7 +224,33 @@
     "file_change_no_after": "（无新文本）",
     "file_change_derived_no_preview": "（无可用预览）",
     "file_change_coarse_hint": "仅有文件路径，未提供 diff 文本。",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "font": {
+      "dialogLabel": "字体",
+      "typeLabel": "字体类型",
+      "codeTab": "代码",
+      "cjkTab": "中文",
+      "familyLabel": "代码字体",
+      "cjkFamilyLabel": "中文字体",
+      "allBuiltInCjk": "全部系统内置中文字体",
+      "cjkFamilies": {
+        "system-cjk": "系统中文",
+        "pingfang-sc": "苹方简体",
+        "songti-sc": "宋体-简",
+        "kaiti-sc": "楷体-简",
+        "stheiti": "华文黑体",
+        "stsong": "华文宋体",
+        "stkaiti": "华文楷体",
+        "stfangsong": "华文仿宋",
+        "microsoft-yahei": "微软雅黑",
+        "simsun": "宋体",
+        "nsimsun": "新宋体",
+        "dengxian": "等线",
+        "kaiti": "楷体",
+        "fangsong": "仿宋",
+        "microsoft-jhenghei": "微软正黑体"
+      }
+    }
   },
   "session": {
     "restart": "↺ 重启",
@@ -369,6 +436,9 @@
     "codex_limit_title": "{{label}} 剩余 {{percent}}% · 重置于 {{reset}}",
     "provider_plan_title": "方案：{{value}}",
     "provider_quota_title": "额度：{{value}}",
+    "weekly_quota_authorize": "显示周限额",
+    "weekly_quota_authorize_hint": "授权读取本机 Claude token 以显示每周（7 天）限额",
+    "weekly_quota_confirm": "这将读取本机的 Claude 登录令牌（token）以获取每周（7 天）限额。确认授权？",
     "provider_quota_usage_title": "额度进度：{{value}}",
     "history_loading_label": "历史",
     "history_step_cache": "本地缓存",
@@ -540,7 +610,8 @@
     "finished": "完成了",
     "upgrade_blocked_title": "升级已阻止",
     "upgrade_blocked_p2p_active": "团队 仍在运行。请先停止，再升级 daemon。",
-    "upgrade_blocked_transport_busy": "还有 transport session 正在 turn 中。等它回到 idle 再升级 daemon。"
+    "upgrade_blocked_transport_busy": "还有 transport session 正在 turn 中。等它回到 idle 再升级 daemon。",
+    "upgrade_blocked_toolchain_unavailable": "daemon 主机上的 Node 已丢失（工具链被删除）。请重新安装 Node——在此之前自动升级已禁用。"
   },
   "discussion": {
     "role_critic": "批判者",
@@ -548,7 +619,25 @@
     "role_innovator": "创新者",
     "role_custom": "自定义...",
     "arbiter": "裁决者",
-    "arbiter_active": "⚖️ 裁决者"
+    "arbiter_active": "⚖️ 裁决者",
+    "starting": "启动中…",
+    "start_failed_title": "讨论启动失败",
+    "start_failed_offline": "当前离线 —— 请重新连接后再试。",
+    "dialog_title": "发起讨论",
+    "start_button": "发起讨论",
+    "field_topic": "主题",
+    "topic_placeholder": "描述你想让各 Agent 讨论的内容…",
+    "field_cwd": "工作目录",
+    "field_participants": "参与者",
+    "add_participant": "+ 添加",
+    "field_max_rounds": "最大轮数",
+    "team_label": "Team",
+    "complete_status": "已完成",
+    "failed_status": "失败",
+    "error": {
+      "missing_fields": "缺少必填项(主题以及至少两名参与者)。",
+      "generic": "讨论启动失败,请重试。"
+    }
   },
   "new_session": {
     "project_required": "项目名称不能为空",
@@ -764,6 +853,8 @@
       "agents": "智能体",
       "search_project_files": "搜索项目文件",
       "quick_discussion_with_agent": "与智能体快速讨论",
+      "team": "团队",
+      "team_desc": "发起团队讨论",
       "select_mode": "选择模式",
       "all_agents": "全部 Agent",
       "sessions": "个会话",
@@ -786,6 +877,7 @@
     "dropdown": {
       "tab_combos": "组合流程",
       "tab_workflows": "高级工作流",
+      "solo_hint": "选择下面的流程启动工作流",
       "team_intro_title": "团队讨论",
       "team_intro_body": "多代理先讨论并总结，再实施用户请求；增加轮数会基于上一轮结果继续复核和加固。",
       "team_intro_tooltip": "讨论 → 总结 → 实施 → 复核；多轮会把上一轮结果带入下一轮。",
@@ -818,6 +910,7 @@
     "combo_send_confirm_skip": "下次不再提示，直接发送",
     "combo_empty_message_warning": "组合流程发送必须带正文。先补充实际问题或指令再发送。",
     "combo_requires_participants_hint": "请先到 团队 设置里选择参与者，再启用组合流程。",
+    "member_cannot_initiate_discussion": "该会话已被设为团队成员，不能发起讨论。请改用其它 session 启动（建议使用最顶级模型）。",
     "settings_enabled": "参与",
     "settings_mode": "模式",
     "settings_skip": "跳过",
@@ -1234,7 +1327,9 @@
     "empty": "输入本机端口和路径后即可打开预览。",
     "noServer": "请先选择一个服务器。",
     "previewing": "预览中：",
-    "initialPathNote": "这个路径只决定初始打开页面；加载后，后续导航按端口范围处理，而不是按这个路径限制。"
+    "initialPathNote": "这个路径只决定初始打开页面；加载后，后续导航按端口范围处理，而不是按这个路径限制。",
+    "portHistoryLabel": "最近使用的端口",
+    "pathHistoryLabel": "最近使用的路径"
   },
   "cron": {
     "title": "定时任务",
@@ -1258,6 +1353,12 @@
     "action_type": "操作类型",
     "action_command": "命令",
     "action_p2p": "团队 讨论",
+    "send_target": "接收会话",
+    "send_target_placeholder": "接收方会话名、标签或代理类型",
+    "send_message": "消息内容",
+    "send_message_placeholder": "输入要发送的消息...",
+    "send_reply": "要求接收方回复",
+    "send_broadcast": "广播给同项目会话",
     "command": "命令",
     "command_placeholder": "输入发送给代理的命令...",
     "shell_hint": "提示：Shell 窗口可直接执行脚本，只需填写脚本路径即可（如 /path/to/script.sh）",
@@ -2003,5 +2104,11 @@
       "enforced": "强制",
       "additive": "附加"
     }
+  },
+  "todos": {
+    "title": "任务清单",
+    "progress": "{{done}}/{{total}}",
+    "collapse": "折叠",
+    "expand": "展开"
   }
 }

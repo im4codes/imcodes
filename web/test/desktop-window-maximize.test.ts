@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SUPPORTED_LOCALES } from '../src/i18n/locales/index.js';
 import {
+  clampGeometryFullyIntoWorkspace,
   clampGeometryToWorkspace,
   geometryFromWorkspace,
   normalizeWindowGeometry,
@@ -102,6 +103,21 @@ describe('desktop-window-maximize helpers', () => {
     expect(clampGeometryToWorkspace(geometry, workspace, { minW: 300, minH: 200, visibleMargin: 32 })).toEqual({
       x: 80 + 32 - 420,
       y: 48,
+      w: 420,
+      h: 360,
+    });
+  });
+
+  it('clamps restored floating geometry fully into the current workspace', () => {
+    expect(clampGeometryFullyIntoWorkspace({ x: -500, y: -20, w: 420, h: 360 }, workspace, { minW: 300, minH: 200 })).toEqual({
+      x: 80,
+      y: 48,
+      w: 420,
+      h: 360,
+    });
+    expect(clampGeometryFullyIntoWorkspace({ x: 2000, y: 2000, w: 420, h: 360 }, workspace, { minW: 300, minH: 200 })).toEqual({
+      x: 80 + 900 - 420,
+      y: 48 + 640 - 360,
       w: 420,
       h: 360,
     });

@@ -46,6 +46,9 @@
     "retry": "Retry"
   },
   "chat": {
+    "dpad": {
+      "title": "Arrow keys — drag to move"
+    },
     "sendFailedReason": {
       "daemonOffline": "Connection lost",
       "ackTimeout": "No response from agent",
@@ -90,6 +93,44 @@
     "show_file_panel": "Open file panel",
     "hide_file_panel": "Close file panel",
     "sync_history": "Sync chat history",
+    "sdk_agents_toggle": "Agents",
+    "sdk_agents_toggle_aria": "Toggle SDK agents status, {{count}} running",
+    "sdk_agents_badge_aria": "{{count}} SDK agents running",
+    "sdk_agents_panel_title": "Agents",
+    "sdk_agents_close": "Close Agents panel",
+    "sdk_agents_running_count": "{{count}} running",
+    "sdk_agents_active_section": "Active",
+    "sdk_agents_recent_section": "Recent",
+    "sdk_agents_diagnostics_section": "Diagnostics",
+    "sdk_agents_provider_claude": "Claude SDK",
+    "sdk_agents_provider_codex": "Codex SDK",
+    "sdk_agents_provider_qwen": "Qwen",
+    "sdk_agents_provider_gemini": "Gemini SDK",
+    "sdk_agents_provider_unknown": "SDK agent",
+    "sdk_agents_status_pending": "Pending",
+    "sdk_agents_status_running": "Running",
+    "sdk_agents_status_complete": "Complete",
+    "sdk_agents_status_error": "Error",
+    "sdk_agents_status_interrupted": "Interrupted",
+    "sdk_agents_status_stale": "Stale",
+    "sdk_agents_status_unknown": "Unknown",
+    "sdk_agents_id": "ID",
+    "sdk_agents_model": "Model",
+    "sdk_agents_started_at": "Started",
+    "sdk_agents_duration": "Duration",
+    "sdk_agents_tokens": "Tokens",
+    "sdk_agents_prompt": "Prompt",
+    "sdk_agents_result": "Result",
+    "sdk_agents_running_children": "{{count}} child running",
+    "sdk_agents_receiver_count": "{{count}} receivers",
+    "sdk_agents_diagnostic_unsupported_runtime": "Runtime does not expose agent status",
+    "sdk_agents_diagnostic_unknown_runtime_support": "Runtime support is unknown",
+    "sdk_agents_diagnostic_malformed_payload": "Malformed agent metadata",
+    "sdk_agents_diagnostic_missing_id": "Missing agent identity",
+    "sdk_agents_diagnostic_unknown_state": "Unknown provider state",
+    "sdk_agents_diagnostic_stale_without_terminal": "Status went stale before completion",
+    "sdk_agents_diagnostic_snapshot_only": "Snapshot-only provider status",
+    "sdk_agents_diagnostic_generic": "Agent status diagnostic",
     "html_preview": "Render HTML",
     "html_preview_title": "Render HTML preview",
     "html_preview_open_new_window": "Open preview in new window",
@@ -183,7 +224,33 @@
     "file_change_no_after": "(no new text)",
     "file_change_derived_no_preview": "(no preview available)",
     "file_change_coarse_hint": "File path available, but no diff text was provided.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "font": {
+      "dialogLabel": "Font",
+      "typeLabel": "Font type",
+      "codeTab": "Code",
+      "cjkTab": "CJK",
+      "familyLabel": "Font family",
+      "cjkFamilyLabel": "CJK font",
+      "allBuiltInCjk": "All built-in CJK fonts",
+      "cjkFamilies": {
+        "system-cjk": "System CJK",
+        "pingfang-sc": "PingFang SC",
+        "songti-sc": "Songti SC",
+        "kaiti-sc": "Kaiti SC",
+        "stheiti": "STHeiti",
+        "stsong": "STSong",
+        "stkaiti": "STKaiti",
+        "stfangsong": "STFangsong",
+        "microsoft-yahei": "Microsoft YaHei",
+        "simsun": "SimSun",
+        "nsimsun": "NSimSun",
+        "dengxian": "DengXian",
+        "kaiti": "KaiTi",
+        "fangsong": "FangSong",
+        "microsoft-jhenghei": "Microsoft JhengHei"
+      }
+    }
   },
   "session": {
     "restart": "↺ Restart",
@@ -369,6 +436,9 @@
     "codex_limit_title": "{{label}} left {{percent}}% · resets {{reset}}",
     "provider_plan_title": "Plan: {{value}}",
     "provider_quota_title": "Quota: {{value}}",
+    "weekly_quota_authorize": "Show weekly limit",
+    "weekly_quota_authorize_hint": "Authorize reading your local Claude token to show the weekly (7-day) limit",
+    "weekly_quota_confirm": "This reads your local Claude login token to fetch the weekly (7-day) limit. Authorize?",
     "provider_quota_usage_title": "Quota usage: {{value}}",
     "history_loading_label": "History",
     "history_step_cache": "cache",
@@ -540,7 +610,8 @@
     "finished": "finished",
     "upgrade_blocked_title": "Upgrade blocked",
     "upgrade_blocked_p2p_active": "Team is still running. Stop it before upgrading the daemon.",
-    "upgrade_blocked_transport_busy": "A transport session is still in a turn. Wait until it goes idle before upgrading the daemon."
+    "upgrade_blocked_transport_busy": "A transport session is still in a turn. Wait until it goes idle before upgrading the daemon.",
+    "upgrade_blocked_toolchain_unavailable": "Node is missing on the daemon host (toolchain removed). Reinstall Node — auto-upgrade is disabled until then."
   },
   "discussion": {
     "role_critic": "Critic",
@@ -548,7 +619,25 @@
     "role_innovator": "Innovator",
     "role_custom": "Custom...",
     "arbiter": "Arbiter",
-    "arbiter_active": "⚖️ Arbiter"
+    "arbiter_active": "⚖️ Arbiter",
+    "starting": "Starting…",
+    "start_failed_title": "Couldn't start discussion",
+    "start_failed_offline": "You're offline — reconnect and try again.",
+    "dialog_title": "Start Discussion",
+    "start_button": "Start Discussion",
+    "field_topic": "Topic",
+    "topic_placeholder": "Describe what you want the agents to discuss…",
+    "field_cwd": "Working Directory",
+    "field_participants": "Participants",
+    "add_participant": "+ Add",
+    "field_max_rounds": "Max Rounds",
+    "team_label": "Team",
+    "complete_status": "Complete",
+    "failed_status": "Failed",
+    "error": {
+      "missing_fields": "Missing required fields (topic and at least two participants).",
+      "generic": "Failed to start the discussion. Please try again."
+    }
   },
   "new_session": {
     "project_required": "Project name is required",
@@ -764,6 +853,8 @@
       "agents": "Agents",
       "search_project_files": "Search project files",
       "quick_discussion_with_agent": "Quick Discussion with an agent",
+      "team": "Team",
+      "team_desc": "Start a Team discussion",
       "select_mode": "Select Mode",
       "all_agents": "All Agents",
       "sessions": "sessions",
@@ -786,6 +877,7 @@
     "dropdown": {
       "tab_combos": "Combos",
       "tab_workflows": "Workflows",
+      "solo_hint": "Select a flow below to start a workflow",
       "team_intro_title": "Team discussion",
       "team_intro_body": "Agents discuss, summarize, implement, then review the result. Extra rounds repeat the loop to harden the outcome.",
       "team_intro_tooltip": "Discussion → summary → implementation → review. More rounds repeat the loop on the previous result.",
@@ -818,6 +910,7 @@
     "combo_send_confirm_skip": "Don't ask again, send directly next time",
     "combo_empty_message_warning": "Combo send requires a real message. Add some prompt text before sending.",
     "combo_requires_participants_hint": "Choose Team participants in Settings to enable combo modes.",
+    "member_cannot_initiate_discussion": "This session is a Team member, so it can't start a discussion. Start it from another session — a top-tier model is recommended.",
     "settings_enabled": "Participate",
     "settings_mode": "Mode",
     "settings_skip": "Skip",
@@ -1234,7 +1327,9 @@
     "empty": "Enter a localhost port and path, then open the preview.",
     "noServer": "Select a server first.",
     "previewing": "Previewing:",
-    "initialPathNote": "Path sets only the initial page. After load, navigation is scoped by port, not by this path."
+    "initialPathNote": "Path sets only the initial page. After load, navigation is scoped by port, not by this path.",
+    "portHistoryLabel": "Recent ports",
+    "pathHistoryLabel": "Recent paths"
   },
   "cron": {
     "title": "Scheduled Tasks",
@@ -1258,6 +1353,12 @@
     "action_type": "Action Type",
     "action_command": "Command",
     "action_p2p": "Team Discussion",
+    "send_target": "Recipient",
+    "send_target_placeholder": "Exact session name, label, or agent type",
+    "send_message": "Message",
+    "send_message_placeholder": "Enter the message to send...",
+    "send_reply": "Ask recipient to reply",
+    "send_broadcast": "Broadcast to sibling sessions",
     "command": "Command",
     "command_placeholder": "Enter command for the agent...",
     "shell_hint": "Tip: Shell sessions can run scripts directly — just enter the script path (e.g. /path/to/script.sh)",
@@ -2003,5 +2104,11 @@
       "enforced": "Enforced",
       "additive": "Additive"
     }
+  },
+  "todos": {
+    "title": "Tasks",
+    "progress": "{{done}}/{{total}}",
+    "collapse": "Collapse",
+    "expand": "Expand"
   }
 }

@@ -48,6 +48,14 @@ import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
+import type { SdkSubagentDetail } from '../../shared/sdk-subagent-status.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_SCHEMA_VERSION,
+  SDK_SUBAGENT_STATUS,
+} from '../../shared/sdk-subagent-status.js';
 
 // ── Mock provider factory ────────────────────────────────────────────────────
 
@@ -108,6 +116,34 @@ function makeMessage(overrides: Partial<AgentMessage> = {}): AgentMessage {
     timestamp: Date.now(),
     status: 'complete',
     ...overrides,
+  };
+}
+
+function makeSdkSubagentDetail(overrides: {
+  summary?: string;
+  input?: SdkSubagentDetail['input'];
+  output?: string;
+  raw?: unknown;
+  meta?: Partial<SdkSubagentDetail['meta']>;
+} = {}): SdkSubagentDetail {
+  return {
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary: overrides.summary ?? 'Working in child agent',
+    ...(overrides.input !== undefined ? { input: overrides.input } : {}),
+    ...(overrides.output !== undefined ? { output: overrides.output } : {}),
+    ...(overrides.raw !== undefined ? { raw: overrides.raw } : {}),
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+      canonicalKey: 'claude:sess-sdk:task-1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+      taskId: 'task-1',
+      ...overrides.meta,
+    },
   };
 }
 
@@ -846,6 +882,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(call![0]).toBe('sess-tool');
       expect(call![2]).toEqual({ tool: 'list_directory', input: { path: '/tmp' }, detail: { kind: 'tool_use', input: { path: '/tmp' } } });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:call');
+      expect(call![3].hidden).not.toBe(true);
     });
 
     it('emits tool.result for completed tools with stable eventId', () => {
@@ -865,6 +902,228 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(call![0]).toBe('sess-tool');
       expect(call![2]).toEqual({ output: 'done', detail: { kind: 'tool_result', output: 'done' } });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:result');
+      expect(call![3].hidden).not.toBe(true);
+    });
+
+    it('emits a visible checklist tool.call for completed-only update_plan snapshots', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-plan', {
+        id: 'todo-1',
+        name: 'update_plan',
+        status: 'complete',
+        input: {
+          plan: [
+            { content: '梳理登录需求', status: 'completed' },
+            { content: '实现登录表单', status: 'pending' },
+          ],
+        },
+        detail: {
+          kind: 'plan',
+          summary: 'Plan',
+          input: {
+            plan: [
+              { content: '梳理登录需求', status: 'completed' },
+              { content: '实现登录表单', status: 'pending' },
+            ],
+          },
+        },
+      });
+
+      const call = emitMock.mock.calls.find((c) => c[1] === 'tool.call');
+      const result = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
+      expect(call).toBeDefined();
+      expect(call![0]).toBe('sess-plan');
+      expect(call![2]).toMatchObject({
+        tool: 'update_plan',
+        input: {
+          plan: [
+            { content: '梳理登录需求', status: 'completed' },
+            { content: '实现登录表单', status: 'pending' },
+          ],
+        },
+      });
+      expect(call![3]).toMatchObject({
+        eventId: 'transport-tool:sess-plan:todo-1:call',
+      });
+      expect(call![3].hidden).not.toBe(true);
+      expect(result?.[3]).toMatchObject({
+        eventId: 'transport-tool:sess-plan:todo-1:result',
+      });
+      expect(appendMock).toHaveBeenCalledWith('sess-plan', expect.objectContaining({
+        type: 'tool.call',
+        tool: 'update_plan',
+      }));
+    });
+
+    it('emits hidden tool.call for running SDK sub-agent snapshots', async () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      const detail = makeSdkSubagentDetail({
+        input: { action: 'start' },
+        meta: {
+          canonicalKey: 'claude:sess-sdk:task-running',
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          active: true,
+          terminal: false,
+          taskId: 'task-running',
+        },
+      });
+
+      fireTool('sess-sdk', {
+        id: 'sdk-task-running',
+        name: 'Task',
+        status: 'running',
+        input: { action: 'start' },
+        detail,
+      });
+      await Promise.resolve();
+
+      const call = emitMock.mock.calls.find((c) => c[1] === 'tool.call');
+      expect(call).toBeDefined();
+      expect(call![0]).toBe('sess-sdk');
+      expect(call![2]).toMatchObject({
+        tool: 'Task',
+        input: { action: 'start' },
+        detail: {
+          kind: SDK_SUBAGENT_DETAIL_KIND,
+          meta: { canonicalKey: 'claude:sess-sdk:task-running' },
+        },
+      });
+      expect(call![3]).toMatchObject({
+        eventId: 'transport-tool:sess-sdk:sdk-task-running:call',
+        hidden: true,
+      });
+      expect(appendMock).not.toHaveBeenCalled();
+      expect(emitMock.mock.calls.some((c) => c[1] === 'file.change')).toBe(false);
+    });
+
+    it('emits hidden tool.result for terminal SDK sub-agent snapshots and preserves canonicalKey', async () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      const canonicalKey = 'claude:sess-sdk:task-terminal';
+      const runningDetail = makeSdkSubagentDetail({
+        meta: {
+          canonicalKey,
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          active: true,
+          terminal: false,
+          taskId: 'task-terminal',
+        },
+      });
+      const terminalDetail = makeSdkSubagentDetail({
+        output: 'complete',
+        meta: {
+          canonicalKey,
+          normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+          active: false,
+          terminal: true,
+          taskId: 'task-terminal',
+        },
+      });
+
+      fireTool('sess-sdk', {
+        id: 'sdk-task-terminal',
+        name: 'Task',
+        status: 'running',
+        detail: runningDetail,
+      });
+      fireTool('sess-sdk', {
+        id: 'sdk-task-terminal',
+        name: 'Task',
+        status: 'complete',
+        output: 'complete',
+        detail: terminalDetail,
+      });
+      await Promise.resolve();
+
+      const call = emitMock.mock.calls.find((c) => c[1] === 'tool.call');
+      const result = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
+      expect(call?.[3]?.hidden).toBe(true);
+      expect(result?.[3]?.hidden).toBe(true);
+      expect(call?.[2]?.detail?.meta?.canonicalKey).toBe(canonicalKey);
+      expect(result?.[2]?.detail?.meta?.canonicalKey).toBe(canonicalKey);
+      expect(result?.[2]).toMatchObject({
+        output: 'complete',
+        detail: {
+          kind: SDK_SUBAGENT_DETAIL_KIND,
+          meta: {
+            canonicalKey,
+            normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+            active: false,
+            terminal: true,
+          },
+        },
+      });
+      expect(appendMock).not.toHaveBeenCalled();
+    });
+
+    it('drops malformed SDK sub-agent details instead of rendering them as ordinary tools', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-sdk', {
+        id: 'sdk-task-malformed',
+        name: 'Task',
+        status: 'running',
+        detail: {
+          kind: SDK_SUBAGENT_DETAIL_KIND,
+          raw: { prompt: 'SECRET_PROMPT' },
+          meta: {
+            isSdkSubagent: true,
+            schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+            provider: 'unknown-provider',
+            providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+            canonicalKey: 'claude:sess-sdk:task-malformed',
+            normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+            active: true,
+            terminal: false,
+          },
+        },
+      });
+
+      expect(emitMock.mock.calls.some((c) => c[1] === 'tool.call' || c[1] === 'tool.result')).toBe(false);
+      expect(appendMock).not.toHaveBeenCalled();
+    });
+
+    it('emits hidden tool.result for errored SDK sub-agent snapshots without a visible call', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-sdk', {
+        id: 'sdk-task-error',
+        name: 'Task',
+        status: 'error',
+        output: 'failed',
+        detail: makeSdkSubagentDetail({
+          meta: {
+            canonicalKey: 'claude:sess-sdk:task-error',
+            normalizedStatus: SDK_SUBAGENT_STATUS.ERROR,
+            active: false,
+            terminal: true,
+            taskId: 'task-error',
+          },
+        }),
+      });
+
+      expect(emitMock.mock.calls.some((c) => c[1] === 'tool.call')).toBe(false);
+      const result = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
+      expect(result).toBeDefined();
+      expect(result![2]).toMatchObject({
+        error: 'error',
+        detail: {
+          kind: SDK_SUBAGENT_DETAIL_KIND,
+          meta: {
+            canonicalKey: 'claude:sess-sdk:task-error',
+            normalizedStatus: SDK_SUBAGENT_STATUS.ERROR,
+          },
+        },
+      });
+      expect(JSON.stringify(result![2])).not.toContain('failed');
+      expect(result![3].hidden).toBe(true);
     });
 
     it('normalizes codex-sdk fileChange payloads into hidden raw events plus file.change', () => {
@@ -1008,6 +1267,8 @@ describe('transport-relay (timeline-emitter based)', () => {
         { status: 'compacting', label: 'Compacting conversation...' },
         expect.objectContaining({ source: 'daemon', confidence: 'high' }),
       );
+      expect(emitMock.mock.calls.some((c) => c[1] === 'tool.call' || c[1] === 'tool.result')).toBe(false);
+      expect(appendMock).not.toHaveBeenCalled();
     });
 
     it('emits unlabeled status updates so the frontend can clear stale status text', () => {
@@ -1048,6 +1309,97 @@ describe('transport-relay (timeline-emitter based)', () => {
         type: TRANSPORT_EVENT.CHAT_APPROVAL,
         requestId: 'approval-1',
       }));
+    });
+  });
+
+  // ── wireProviderToRelay — onToolCall: AskUserQuestion ────────────────────
+  describe('onToolCall AskUserQuestion', () => {
+    const askInput = {
+      questions: [{
+        question: 'Pick an approach',
+        header: 'Approach',
+        multiSelect: false,
+        options: [
+          { label: 'A', description: 'first' },
+          { label: 'B', description: 'second' },
+        ],
+      }],
+    };
+
+    it('emits ask.question (not a raw tool.call) once the call completes with its input', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      // Input streams in incrementally — the completed call carries the questions.
+      fireTool('sess-a', { id: 'tu-1', name: 'AskUserQuestion', status: 'complete', input: askInput });
+
+      const askCalls = emitMock.mock.calls.filter((c) => c[1] === 'ask.question');
+      const toolCalls = emitMock.mock.calls.filter((c) => c[1] === 'tool.call');
+      expect(toolCalls).toHaveLength(0); // no raw "> AskUserQuestion {...}" line
+      expect(askCalls).toHaveLength(1);
+      const [sessionId, , payload, meta] = askCalls[0];
+      expect(sessionId).toBe('sess-a');
+      expect(payload.toolUseId).toBe('tu-1');
+      expect(payload.questions).toEqual(askInput.questions);
+      expect(payload.waitMs).toBe(60_000); // ASK_QUESTION_WAIT_MS — drives the web countdown
+      expect(meta.eventId).toBe('transport-ask:sess-a:tu-1');
+    });
+
+    it('does NOT emit at running (input not streamed yet) — avoids an empty card', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-a', { id: 'tu-2', name: 'AskUserQuestion', status: 'running', input: undefined });
+
+      expect(emitMock).not.toHaveBeenCalled();
+    });
+
+    it('does not emit when the completed call carries no questions', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-a', { id: 'tu-3', name: 'AskUserQuestion', status: 'complete', input: {} });
+
+      expect(emitMock).not.toHaveBeenCalled();
+    });
+
+    it('wraps a flat single-question input shape', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      const flat = { question: 'Pick', header: 'H', multiSelect: false, options: [{ label: 'A', description: 'a' }] };
+      fireTool('sess-a', { id: 'tu-4', name: 'AskUserQuestion', status: 'complete', input: flat });
+
+      const askCalls = emitMock.mock.calls.filter((c) => c[1] === 'ask.question');
+      expect(askCalls).toHaveLength(1);
+      expect(askCalls[0][2].questions).toEqual([flat]);
+    });
+
+    it('suppresses the tool_result of an answered AskUserQuestion (no stray error line)', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      // Card emitted for the completed call…
+      fireTool('sess-z', { id: 'tu-ans', name: 'AskUserQuestion', status: 'complete', input: askInput });
+      emitMock.mockClear();
+      // …then the SDK re-emits its tool_result as a generic name:'tool' event,
+      // marked error because the answer came via canUseTool deny.
+      fireTool('sess-z', { id: 'tu-ans', name: 'tool', status: 'error', output: '[H] A', detail: { kind: 'tool_result' } });
+
+      expect(emitMock).not.toHaveBeenCalled(); // suppressed — no "< error:" line
+    });
+
+    it('still emits a normal tool.call for non-AskUserQuestion tools', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-a', { id: 'tu-read', name: 'Read', status: 'running', input: { file_path: '/x' } });
+
+      const askCalls = emitMock.mock.calls.filter((c) => c[1] === 'ask.question');
+      const toolCalls = emitMock.mock.calls.filter((c) => c[1] === 'tool.call');
+      expect(askCalls).toHaveLength(0);
+      expect(toolCalls).toHaveLength(1);
+      expect(toolCalls[0][2].tool).toBe('Read');
     });
   });
 });

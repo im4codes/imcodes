@@ -427,6 +427,12 @@ export class ServerLink {
       // or await a response event before acting on `send()`.
       return false;
     }
+    const now = Date.now();
+    const silenceMs = this.getOpenSocketSilenceMs(now);
+    if (silenceMs > HEARTBEAT_MS + PONG_TIMEOUT_MS) {
+      this.recycleSilentConnection('send_silent_connection', silenceMs);
+      return false;
+    }
     try {
       this.seq++;
       const serialized = stringifyForServerSend(msg, this.seq);
@@ -746,6 +752,11 @@ export class ServerLink {
     this.heartbeatTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
         const now = Date.now();
+        const silenceMs = this.getOpenSocketSilenceMs(now);
+        if (silenceMs > HEARTBEAT_MS + PONG_TIMEOUT_MS) {
+          this.recycleSilentConnection('heartbeat_silent_connection', silenceMs);
+          return;
+        }
         const sent = this.trySend({ type: 'heartbeat', daemonVersion: this.daemonVersion, ...collectSystemStats() });
         this.recordRuntimeLinkStatus({
           state: sent ? 'connected' : 'disconnected',
@@ -786,7 +797,7 @@ export class ServerLink {
       if (silenceMs > HEARTBEAT_MS + PONG_TIMEOUT_MS) {
         // Haven't received anything for heartbeat interval + timeout — dead connection
         logger.warn({ silenceMs }, 'ServerLink watchdog: connection silent, forcing reconnect');
-        this.forceReconnect();
+        this.forceReconnect('watchdog_silent_connection');
         return;
       }
     }, WATCHDOG_MS);
@@ -796,8 +807,19 @@ export class ServerLink {
     if (this.watchdogTimer) { clearInterval(this.watchdogTimer); this.watchdogTimer = undefined; }
   }
 
+  private getOpenSocketSilenceMs(now = Date.now()): number {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return 0;
+    if (this.lastPong <= 0) return 0;
+    return Math.max(0, now - this.lastPong);
+  }
+
+  private recycleSilentConnection(reason: string, silenceMs: number): void {
+    logger.warn({ silenceMs, reason }, 'ServerLink: open socket has no inbound proof, forcing reconnect');
+    this.forceReconnect(reason);
+  }
+
   /** Kill current connection and force immediate reconnect */
-  private forceReconnect(): void {
+  private forceReconnect(reason = 'watchdog_forced_reconnect'): void {
     this.stopHeartbeat();
     this.stopWatchdog();
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = undefined; }
@@ -808,7 +830,7 @@ export class ServerLink {
     this.recordRuntimeLinkStatus({
       state: 'disconnected',
       lastDisconnectedAt: Date.now(),
-      lastError: 'watchdog_forced_reconnect',
+      lastError: reason,
     });
     // Reset backoff for forced reconnects — we want to come back fast
     this.backoffMs = INITIAL_BACKOFF_MS;

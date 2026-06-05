@@ -114,6 +114,21 @@ async function getPipeline(): Promise<any> {
       logger.info({ model: EMBEDDING_MODEL, dtype: EMBEDDING_DTYPE, cacheDir: env.cacheDir }, 'Loading embedding model...');
       const p = await pipeline('feature-extraction', EMBEDDING_MODEL, {
         dtype: EMBEDDING_DTYPE,
+        // Cap onnxruntime's native thread pools. By default ORT sizes its
+        // intra-op pool to the host core count (24 on the 215 server), and
+        // every native thread anchors its own ~64 MB glibc malloc arena that
+        // glibc never returns to the OS. Measured on 215 (2026-05-31, 24
+        // cores): RSS plateaued at ~1.1 GB — ~730 MB of resident anonymous
+        // arenas — while V8 heapUsed was only ~247 MB, so forced GC could
+        // never move it. This model is tiny (384-dim q8 MiniLM, ~19 ms
+        // warmup); one thread is ample and removes the arena-per-thread
+        // multiplier at the source. Pairs with MALLOC_ARENA_MAX=2 in the
+        // systemd unit (see bind-flow.ts / setup-flow.ts), which is the
+        // global backstop for the same problem across sharp/libuv too.
+        session_options: {
+          intraOpNumThreads: 1,
+          interOpNumThreads: 1,
+        },
       });
       logger.info({ model: EMBEDDING_MODEL, dim: EMBEDDING_DIM }, 'Embedding model loaded');
       pipelineInstance = p;

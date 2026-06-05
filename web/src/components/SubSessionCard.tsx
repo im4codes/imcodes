@@ -8,7 +8,7 @@ import type { JSX } from 'preact';
 import { useTranslation } from 'react-i18next';
 import { ChatView } from './ChatView.js';
 import { resolveContextWindow } from '../model-context.js';
-import { shortModelLabel } from '../model-label.js';
+import { bestModelLabel } from '../model-label.js';
 import { TerminalView } from './TerminalView.js';
 import { useTimeline } from '../hooks/useTimeline.js';
 import { cancelSessionViaHttp } from '../api.js';
@@ -307,7 +307,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
 
   const legacyCodexModel = useMemo(() => loadLegacyCodexModelPreferenceForModelessSession(sub, detectedModel, lastUsage?.model), [sub, detectedModel, lastUsage]);
   const effectiveModel = useMemo(() => resolveEffectiveSessionModel(sub, detectedModel, lastUsage?.model, legacyCodexModel), [sub, detectedModel, lastUsage, legacyCodexModel]);
-  const modelLabel = useMemo(() => shortModelLabel(effectiveModel), [effectiveModel]);
+  const modelLabel = useMemo(() => bestModelLabel(effectiveModel, lastUsage?.model), [effectiveModel, lastUsage]);
 
   // Per-card width override (persisted in localStorage)
   const [localW, setLocalW] = useState(() => loadCardW(sub.id, cardW));

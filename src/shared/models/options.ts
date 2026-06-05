@@ -6,7 +6,16 @@ export function normalizeClaudeCodeModelId(value: string | null | undefined): Cl
   const trimmed = value.trim();
   if (!trimmed) return undefined;
   if (trimmed === 'opus') return 'opus[1M]';
-  return CLAUDE_CODE_MODEL_IDS.includes(trimmed as ClaudeCodeModelId) ? (trimmed as ClaudeCodeModelId) : undefined;
+  if (CLAUDE_CODE_MODEL_IDS.includes(trimmed as ClaudeCodeModelId)) return trimmed as ClaudeCodeModelId;
+  // Map a version-bearing / full Claude id (e.g. "claude-opus-4-8[1m]") to its
+  // canonical picker option by family, so the model picker still pre-selects
+  // correctly even when the detected/stored model preserves its version for the
+  // ctx-bar label.
+  const lower = trimmed.toLowerCase();
+  if (lower.includes('opus')) return 'opus[1M]';
+  if (lower.includes('sonnet')) return 'sonnet';
+  if (lower.includes('haiku')) return 'haiku';
+  return undefined;
 }
 
 export const CODEX_MODEL_IDS = ['gpt-5.4', 'gpt-5.5', 'gpt-5.4-mini', 'gpt-5.3-codex-spark', 'gpt-5.2'] as const;

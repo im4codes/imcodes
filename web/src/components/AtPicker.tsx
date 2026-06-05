@@ -8,6 +8,8 @@ import type { ServerMessage } from '../ws-client.js';
 import {
   buildP2pConfigSelection,
   COMBO_PRESETS,
+  isComboMode,
+  parseModePipeline,
   type P2pSavedConfig,
 } from '@shared/p2p-modes.js';
 import { P2pComboManager } from './P2pComboManager.js';
@@ -32,13 +34,15 @@ interface AtPickerProps {
   onSelectFile: (path: string) => void;
   onSelectAgent: (session: string, mode: string) => void;
   onSelectAllConfig?: (config: P2pSavedConfig, rounds: number, modeOverride: string) => void;
+  /** Launch a Team discussion directly with the chosen combo/mode and round count. */
+  onLaunchTeam?: (modeKey: string, rounds: number) => void;
   p2pConfig?: P2pSavedConfig | null;
   onClose: () => void;
-  onStageChange?: (stage: 'choose' | 'files' | 'agents' | 'mode') => void;
+  onStageChange?: (stage: 'choose' | 'files' | 'agents' | 'mode' | 'team') => void;
   visible: boolean;
 }
 
-type Category = 'choose' | 'files' | 'agents';
+type Category = 'choose' | 'files' | 'agents' | 'team';
 
 const MODES = ['audit', 'review', 'plan', 'brainstorm', 'discuss'] as const;
 
@@ -169,6 +173,7 @@ export function AtPicker({
   onSelectFile,
   onSelectAgent,
   onSelectAllConfig,
+  onLaunchTeam,
   p2pConfig,
   onClose,
   onStageChange,
@@ -186,8 +191,21 @@ export function AtPicker({
   const [configModeOverride, setConfigModeOverride] = useState<string>('config');
   const [configPickerFocus, setConfigPickerFocus] = useState<'mode' | 'rounds' | 'combo'>('rounds');
   const [comboHighlight, setComboHighlight] = useState(0);
+  const [teamRoundsIdx, setTeamRoundsIdx] = useState(0);
   const CONFIG_ROUNDS_OPTIONS = [1, 2, 3, 5] as const;
   const { customCombos, saveCustomCombos, allCombos } = useP2pCustomCombos();
+  // Team stage lists combos only — preset combos + custom combos. Single modes
+  // are pointless for launching a Team discussion flow.
+  const teamComboOptions = useMemo(
+    () => [...COMBO_PRESETS.map((c) => c.key), ...allCombos.custom],
+    [allCombos],
+  );
+  const teamOptionLabel = useCallback(
+    (key: string) => (isComboMode(key)
+      ? parseModePipeline(key).map((m) => t(`p2p.mode_${m}`, m)).join(' › ')
+      : t(`p2p.mode_${key}`, key)),
+    [t],
+  );
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestIdRef = useRef<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -393,15 +411,29 @@ export function AtPicker({
       // Category chooser
       if (category === 'choose') {
         if (e.key === 'Escape') { e.preventDefault(); onClose(); return; }
-        if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
-          e.preventDefault();
-          setHighlightIdx((h) => (h === 0 ? 1 : 0));
-          return;
-        }
+        if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx((h) => (h + 1) % 3); return; }
+        if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx((h) => (h + 2) % 3); return; }
         if (e.key === 'Enter') {
           e.preventDefault(); e.stopPropagation();
-          setCategory(highlightIdx === 0 ? 'files' : 'agents');
-          setHighlightIdx(0);
+          if (highlightIdx === 1) { setCategory('team'); setHighlightIdx(0); setTeamRoundsIdx(0); }
+          else { setCategory(highlightIdx === 0 ? 'files' : 'agents'); setHighlightIdx(0); }
+          return;
+        }
+        return;
+      }
+
+      // Team discussion: ↑↓ pick combo, ←→ pick rounds, Enter launches directly.
+      if (category === 'team') {
+        if (e.key === 'Escape') { e.preventDefault(); onClose(); return; }
+        if (e.key === 'Backspace') { e.preventDefault(); setCategory('choose'); setHighlightIdx(1); return; }
+        if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx((h) => Math.max(0, h - 1)); return; }
+        if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx((h) => Math.min(teamComboOptions.length - 1, h + 1)); return; }
+        if (e.key === 'ArrowLeft') { e.preventDefault(); setTeamRoundsIdx((i) => Math.max(0, i - 1)); return; }
+        if (e.key === 'ArrowRight') { e.preventDefault(); setTeamRoundsIdx((i) => Math.min(CONFIG_ROUNDS_OPTIONS.length - 1, i + 1)); return; }
+        if (e.key === 'Enter') {
+          e.preventDefault(); e.stopPropagation();
+          const key = teamComboOptions[highlightIdx];
+          if (key) onLaunchTeam?.(key, CONFIG_ROUNDS_OPTIONS[teamRoundsIdx]);
           return;
         }
         return;
@@ -451,7 +483,7 @@ export function AtPicker({
         }
       }
     },
-    [visible, category, highlightIdx, fileResults, agents, modeAgent, modeHighlight, configRoundsPicker, configRoundsHighlight, configModeOverride, configPickerFocus, comboHighlight, p2pConfig, onClose, onSelectFile, onSelectAgent, onSelectAllConfig],
+    [visible, category, highlightIdx, fileResults, agents, modeAgent, modeHighlight, configRoundsPicker, configRoundsHighlight, configModeOverride, configPickerFocus, comboHighlight, teamRoundsIdx, teamComboOptions, p2pConfig, onClose, onSelectFile, onSelectAgent, onSelectAllConfig, onLaunchTeam],
   );
 
   useEffect(() => {
@@ -632,13 +664,51 @@ export function AtPicker({
         <div
           data-hl={highlightIdx === 1 ? 'true' : undefined}
           style={highlightIdx === 1 ? categoryHighlightStyle : categoryStyle}
-          onClick={() => { setCategory('agents'); setHighlightIdx(0); }}
+          onClick={() => { setCategory('team'); setHighlightIdx(0); setTeamRoundsIdx(0); }}
           onMouseEnter={() => setHighlightIdx(1)}
+        >
+          <span style={{ fontSize: 16 }}>👥</span>
+          <span style={{ fontWeight: 500 }}>{t('p2p.picker.team')}</span>
+          <span style={dimStyle}>{t('p2p.picker.team_desc')}</span>
+        </div>
+        <div
+          data-hl={highlightIdx === 2 ? 'true' : undefined}
+          style={highlightIdx === 2 ? categoryHighlightStyle : categoryStyle}
+          onClick={() => { setCategory('agents'); setHighlightIdx(0); }}
+          onMouseEnter={() => setHighlightIdx(2)}
         >
           <span style={{ fontSize: 16 }}>🤖</span>
           <span style={{ fontWeight: 500 }}>{t('p2p.picker.agents')}</span>
           <span style={dimStyle}>{t('p2p.picker.quick_discussion_with_agent')}</span>
         </div>
+      </div>
+    );
+  }
+
+  // ── Team discussion: pick combo (↑↓) + rounds (←→), Enter launches ──
+  if (category === 'team') {
+    const teamRounds = CONFIG_ROUNDS_OPTIONS[teamRoundsIdx];
+    return (
+      <div ref={containerRef} style={containerStyle}>
+        <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(1); }}>← {t('p2p.picker.back')}</div>
+        <div style={groupLabelStyle}>
+          {t('p2p.picker.team')} · {t('p2p.settings_rounds')}: ◂ {teamRounds} ▸
+        </div>
+        {teamComboOptions.map((key, idx) => {
+          const hl = idx === highlightIdx;
+          return (
+            <div
+              key={key}
+              data-hl={hl ? 'true' : undefined}
+              style={hl ? itemHighlightStyle : itemStyle}
+              onClick={() => onLaunchTeam?.(key, teamRounds)}
+              onMouseEnter={() => setHighlightIdx(idx)}
+            >
+              <span style={{ fontWeight: 500 }}>{teamOptionLabel(key)}</span>
+            </div>
+          );
+        })}
+        <div style={{ ...dimStyle, padding: '4px 12px 6px' }}>↑↓ · ◂▸ {t('p2p.settings_rounds')} · ⏎</div>
       </div>
     );
   }

@@ -213,20 +213,27 @@ async function ensureTmuxServer(): Promise<void> {
 
 /** Run a tmux command with array args (no shell — safe from injection). */
 async function tmuxRun(...args: string[]): Promise<string> {
-  await ensureTmuxServer();
-  try {
-    const { stdout } = await execFile('tmux', args);
-    return stdout.trim();
-  } catch (error) {
-    if (!isRecoverableTmuxServerError(error)) throw error;
-    // tmux exits when the last session dies. Under rapid create/kill loops,
-    // a cached "server exists" assumption can race with the server shutting
-    // down between commands. Re-prime once, then retry the original command.
-    tmuxServerChecked = false;
+  let lastError: unknown;
+  const attempts = 3;
+  for (let attempt = 0; attempt < attempts; attempt++) {
     await ensureTmuxServer();
-    const { stdout } = await execFile('tmux', args);
-    return stdout.trim();
+    try {
+      const { stdout } = await execFile('tmux', args);
+      return stdout.trim();
+    } catch (error) {
+      if (!isRecoverableTmuxServerError(error)) throw error;
+      lastError = error;
+      // tmux exits when the last session dies. Under rapid create/kill loops,
+      // a cached "server exists" assumption can race with the server shutting
+      // down between commands. Re-prime and retry the original command a few
+      // times so CI does not fail on a single tmux-server restart window.
+      tmuxServerChecked = false;
+      if (attempt < attempts - 1) {
+        await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+      }
+    }
   }
+  throw lastError;
 }
 
 // ── Raw send primitives (backend-dispatched) ────────────────────────────────────
@@ -486,7 +493,7 @@ export async function listSessions(): Promise<string[]> {
     return raw.split('\n').filter(Boolean);
   } catch (e: any) {
     const err = String(e.stderr || e.message || '');
-    if (err.includes('no sessions') || err.includes('no server running') || err.includes('No such file or directory') || err.includes('error connecting')) return [];
+    if (err.includes('no sessions') || isRecoverableTmuxServerError(e)) return [];
     throw e;
   }
 }
@@ -512,6 +519,33 @@ export async function isPaneAlive(name: string): Promise<boolean> {
   try {
     const raw = await tmuxRun('list-panes', '-t', name, '-F', '#{pane_dead}');
     return raw.trim() === '0';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check whether a concrete pane *target* (e.g. a tmux "%5" pane id) currently
+ * resolves to a live pane.
+ *
+ * Unlike `sessionExists`/`isPaneAlive` (which take a session NAME), this
+ * validates a specific paneId. It exists so we can reject a STALE paneId — a
+ * migrated `sessions.json` on a fresh box, or one left over after a tmux-server
+ * restart, points at a `%N` that no longer exists — BEFORE committing to a
+ * pipe-pane reader against a pane that is already gone. Returns false on any
+ * lookup error (a transient tmux failure is treated as "not streamable now",
+ * exactly as the subsequent `pipe-pane` would have failed anyway).
+ */
+export async function paneExists(paneTarget: string): Promise<boolean> {
+  if (!paneTarget) return false;
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    return c.conptyIsPaneAlive(paneTarget);
+  }
+  if (BACKEND === 'wezterm') return weztermIsPaneAlive(paneTarget);
+  try {
+    const raw = await tmuxRun('display-message', '-p', '-t', paneTarget, '#{pane_id}');
+    return raw.trim().length > 0;
   } catch {
     return false;
   }
@@ -822,6 +856,23 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
     throw new Error(`Invalid session name for pipe-pane: ${session}`);
   }
 
+  // ── Hard guard: the target pane MUST exist before we touch the FIFO ─────────
+  // Order matters. Below we mkfifo + spawn a `cat` reader and ONLY THEN run
+  // `tmux pipe-pane`. If the paneId is stale (a migrated sessions.json on a
+  // fresh box, or a cold start before the tmux session is recreated) the
+  // pipe-pane writer never attaches — but the reader is already spawned. A
+  // FIFO reader with no writer blocks in the kernel (D-state); it ignores
+  // SIGTERM/SIGKILL, counts against load, and — because the daemon's own
+  // systemd unit uses KillMode=process — survives a daemon restart and BRICKS
+  // it (observed on a migrated box: ~12 unkillable `cat` children stalled the
+  // restart). Verifying the pane up-front means a dead pane fails fast with
+  // NO FIFO and NO reader — the caller's normal rebind path takes over. This
+  // is the authoritative fix; callers may also pre-resolve a live pane, but
+  // this chokepoint guarantees no reader is ever orphaned.
+  if (!(await paneExists(paneId))) {
+    throw new Error(`pipe-pane target pane does not exist: ${paneId || '(empty)'} (session ${session})`);
+  }
+
   // Stop any existing pipe for this session
   await stopPipePaneStream(session).catch(() => {});
 
@@ -942,21 +993,30 @@ export async function stopPipePaneStream(session: string): Promise<void> {
   await fsp.rmdir(info.dir).catch(() => {});
 }
 
+/** Liveness check: true if a process with `pid` exists (EPERM = alive but not ours). */
+function isPidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
+}
+
 /**
- * Clean up any FIFO temp dirs leftover from a previous daemon run with the same PID.
- * Only removes dirs scoped to the current process.pid.
+ * Clean up FIFO temp dirs (`imcodes-pty-<pid>-<rand>`) left behind by PREVIOUS
+ * daemon runs. This used to be scoped to the CURRENT process.pid, so dirs
+ * orphaned by an earlier run (especially after an unclean SIGKILL) accumulated
+ * in /tmp forever — 12+ per restart. Now we sweep every `imcodes-pty-*` dir
+ * whose owning pid is no longer alive; dirs owned by a running process (this
+ * daemon, or another live one on the box) are left untouched.
  */
 export async function cleanupOrphanFifos(): Promise<void> {
   if (BACKEND === 'conpty') return;
   const tmpDir = os.tmpdir();
-  const prefix = `imcodes-pty-${process.pid}-`;
   try {
     const entries = await fsp.readdir(tmpDir);
     for (const entry of entries) {
-      if (entry.startsWith(prefix)) {
-        const dirPath = path.join(tmpDir, entry);
-        await fsp.rm(dirPath, { recursive: true, force: true }).catch(() => {});
-      }
+      const match = /^imcodes-pty-(\d+)-/.exec(entry);
+      if (!match) continue;
+      if (isPidAlive(Number(match[1]))) continue; // owner still running — keep it
+      await fsp.rm(path.join(tmpDir, entry), { recursive: true, force: true }).catch(() => {});
     }
   } catch {
     // Best-effort cleanup

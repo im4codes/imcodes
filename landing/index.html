@@ -40,6 +40,10 @@ h1 span { color: var(--accent); }
 .lang-switch button.active { color: var(--accent); border-color: var(--accent); }
 .lang-switch button:hover { border-color: #333; }
 
+.hero-couplet { margin: 18px 0 8px; padding: 10px 0 10px 12px; border-left: 2px solid var(--accent); color: #fff; font-size: 15px; line-height: 1.6; }
+.hero-couplet cite { display: block; margin-top: 6px; font-style: normal; opacity: 0.65; font-size: 13px; }
+@media (max-width: 600px) { .hero-couplet { font-size: 14px; margin: 12px 0 6px; } }
+
 .prompt::before { content: '$ '; color: var(--accent); }
 .prompt { color: #fff; margin-bottom: 4px; }
 .output { color: var(--dim); margin-bottom: 20px; padding-left: 18px; }
@@ -236,6 +240,11 @@ footer {
 </header>
 
 <section>
+  <blockquote class="hero-couplet">
+    <span data-i18n="couplet_l1">Two heads are better than one.</span><br>
+    <span data-i18n="couplet_l2">But minds in concert don't answer fate, they author it.</span><br>
+    <cite>— IM.codes</cite>
+  </blockquote>
   <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.</p>
   <div class="prompt">imcodes bind https://app.im.codes/bind/&lt;key&gt;<span class="cursor"></span></div>
   <div class="output" data-i18n="hero_output">bound to app.im.codes &middot; daemon started &middot; registered as system service</div>
@@ -548,6 +557,8 @@ const I18N = {
   'zh-CN': {
     tagline: '给 AI agent 的 IM。共享记忆、托管 MCP 工具、受监督执行，以及跨模型审计。',
     hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层，以及一套托管 MCP 工具面。它会把已完成的工作沉淀成可复用上下文，再在后续 session 中注入或召回合适的历史，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。内置 Auto supervision 可在每轮完成后判断任务是否完成、是否继续自动执行，并可选进入审计/返工闭环后再把控制权交还给你。团队讨论功能让多个模型相互审阅对方的方案和实现——能有效减少单模型的遗漏、盲点和偏差。',
+    couplet_l1: '三个臭皮匠，顶个诸葛亮。',
+    couplet_l2: '三个诸葛亮，谈笑定阴阳。',
     hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
     self_host_warning: '<strong>强烈建议自行部署。</strong><code>app.im.codes</code> 是共享测试实例，无可用性保证，可能被限流、攻击或不可用。这是个人项目，不提供商用保障。正式使用请部署到自己的服务器。',
     h_screenshots: '截图', h_why: '为什么', h_memory: '共享代理上下文', h_mcp: '托管 MCP 工具', h_not: '它不是什么', h_features: '功能', h_arch: '架构', h_download: '下载', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
@@ -632,6 +643,8 @@ const I18N = {
   'zh-TW': {
     tagline: '給 AI agent 的 IM。共享記憶、託管 MCP 工具、受監督執行，以及跨模型審計。',
     hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層，以及一套託管 MCP 工具面。它會把已完成的工作沉澱成可重用上下文，再在後續 session 中注入或召回合適的歷史，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。團隊討論功能讓多個模型互相審閱對方的方案和實作——能有效減少單模型的遺漏、盲點和偏差。',
+    couplet_l1: '三個臭皮匠，頂個諸葛亮。',
+    couplet_l2: '三個諸葛亮，談笑定陰陽。',
     hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
     self_host_warning: '<strong>強烈建議自行部署。</strong><code>app.im.codes</code> 是共享測試實例，無可用性保證，可能被限流、攻擊或不可用。這是個人專案，不提供商用保障。正式使用請部署到自己的伺服器。',
     h_screenshots: '截圖', h_why: '為什麼', h_memory: '共享代理上下文', h_mcp: '託管 MCP 工具', h_not: '它不是什麼', h_features: '功能', h_arch: '架構', h_download: '下載', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
@@ -716,6 +729,9 @@ const I18N = {
   ja: {
     tagline: 'エージェントのための IM。共有メモリ、managed MCP tools、監督付き実行、そして AI プロバイダー横断の監査。',
     hero_intro: 'IM.codes は coding agent に、プロバイダーをまたぐ共有メモリレイヤーと managed MCP tool surface を提供します。完了した作業を再利用可能なコンテキストとして蓄積し、Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw などの後続 session に適切な履歴を注入またはリコールします。Built-in Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。Team ディスカッションを内蔵 — 複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。',
+    // TODO(native-review): JA hero couplet — 默认「天下」(可换「乾坤」);「三人の孔明」措辞待母语者确认
+    couplet_l1: '三人寄れば文殊の知恵。',
+    couplet_l2: 'されど三人の孔明、談笑のうちに天下を定む。',
     hero_output: 'app.im.codes にバインド完了 · デーモン起動 · システムサービスとして登録',
     self_host_warning: '<strong>セルフホスティングを強く推奨します。</strong><code>app.im.codes</code> は共有テストインスタンスであり、稼働保証はありません。レート制限、攻撃対象、利用不可の可能性があります。個人プロジェクトのため商用サポートはありません。評価以外の用途では自社インフラにデプロイしてください。',
     h_screenshots: 'スクリーンショット', h_why: '背景', h_memory: '共有エージェントコンテキスト', h_mcp: 'managed MCP tools', h_not: 'これは何ではないか', h_features: '機能', h_arch: 'アーキテクチャ', h_download: 'ダウンロード', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
@@ -800,6 +816,9 @@ const I18N = {
   ko: {
     tagline: '에이전트를 위한 IM. 공유 메모리, managed MCP tools, 감독된 실행, 그리고 AI 제공자 전반의 교차 감사.',
     hero_intro: 'IM.codes는 coding agent를 위한 provider 간 공유 메모리 레이어와 managed MCP tool surface를 제공합니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw 등 이후 session에 적절한 기록을 주입하거나 다시 recall합니다. 내장된 Auto supervision은 완료된 턴을 판정하고, 자동 계속과 감사/재작업 루프까지 수행한 뒤 제어를 돌려줄 수 있습니다. Team 토론 기능 내장 — 여러 모델이 서로의 계획과 구현을 리뷰하고 감사하여, 단일 모델의 누락·맹점·편향을 효과적으로 줄입니다.',
+    // TODO(native-review): KO hero couplet — 第一句「백지장도 맞들면 낫다」承接弱,待母语者重写;默认「천하」
+    couplet_l1: '백지장도 맞들면 낫다.',
+    couplet_l2: '허나 세 명의 제갈량, 담소 속에 천하를 정한다.',
     hero_output: 'app.im.codes에 바인딩 완료 · 데몬 시작됨 · 시스템 서비스로 등록됨',
     self_host_warning: '<strong>셀프 호스팅을 강력히 권장합니다.</strong> <code>app.im.codes</code>는 공유 테스트 인스턴스로 가동 보장이 없으며, 속도 제한, 공격 대상이 되거나 사용 불가할 수 있습니다. 개인 프로젝트로 상업적 지원은 제공되지 않습니다. 평가 이외의 용도에는 자체 인프라에 배포하세요.',
     h_screenshots: '스크린샷', h_why: '배경', h_memory: '공유 에이전트 컨텍스트', h_mcp: 'managed MCP tools', h_not: '무엇이 아닌가', h_features: '기능', h_arch: '아키텍처', h_download: '다운로드', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
@@ -1082,7 +1101,12 @@ function applyLang() {
   const dict = currentLang === 'en' ? _enSnap : (I18N[currentLang] || {});
   document.querySelectorAll('[data-i18n]').forEach(el => {
     const key = el.getAttribute('data-i18n');
-    if (dict[key]) el.innerHTML = dict[key];
+    // Fall back to the English snapshot when a non-EN dict lacks the key, so a
+    // missing translation shows English instead of leaving the previous
+    // language's text in place (e.g. es/ru intentionally omit the couplet keys).
+    let val = dict[key];
+    if (val == null && currentLang !== 'en') val = _enSnap[key];
+    if (val != null) el.innerHTML = val;
   });
   document.querySelectorAll('.lang-switch button').forEach(btn => {
     btn.classList.toggle('active', btn.getAttribute('data-lang') === currentLang);

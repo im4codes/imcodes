@@ -8,15 +8,18 @@ import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { CRON_STATUS } from '../../../shared/cron-types.js';
+import { MEMORY_MCP_CAPS } from '../../../shared/memory-mcp-contracts.js';
 import { MEMORY_MCP_SOURCE_FIELDS, stripMemoryMcpSourceProvenance } from '../../../shared/memory-mcp-provenance.js';
 import { P2P_MODE_KEYS } from '../../../shared/p2p-modes.js';
 import { dispatchJobNow } from '../cron/job-dispatch.js';
+import { WsBridge } from '../ws/bridge.js';
+import { RESOURCE_TOPICS } from '../../../shared/resource-events.js';
 
 type CronRouteEnv = { Bindings: Env; Variables: { userId: string; role: string; cronDaemonLocal?: boolean } };
 
 export const cronApiRoutes = new Hono<CronRouteEnv>();
 
-const MIN_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const MIN_INTERVAL_MS = MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES * 60 * 1000;
 
 const rolePattern = /^(brain|w\d+)$/;
 const sessionNamePattern = /^deck_sub_[a-zA-Z0-9_-]+$/;
@@ -213,6 +216,8 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
   );
 
   await logAudit({ userId, action: 'cron.create', details: { id, name, cronExpr, projectName } }, c.env.DB);
+  // Notify open browser views (incl. crons created externally via MCP) to refetch.
+  WsBridge.publishResourceChanged(serverId, RESOURCE_TOPICS.cron, { action: 'create' });
 
   return c.json({ id, name, cronExpr, projectName, targetRole, targetSessionName: targetSessionName ?? null, action: persistedAction, timezone: timezone ?? null, status: CRON_STATUS.ACTIVE, nextRunAt: validation.nextRunAt, expiresAt: expiresAt ?? null }, 201);
 });
@@ -281,6 +286,7 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   );
 
   await logAudit({ userId, action: 'cron.update', details: { id: jobId } }, c.env.DB);
+  WsBridge.publishResourceChanged(job.server_id, RESOURCE_TOPICS.cron, { action: 'update' });
   return c.json({ ok: true });
 });
 
@@ -315,6 +321,7 @@ cronApiRoutes.patch('/:id/status', requireCronAuth(), async (c) => {
   );
 
   await logAudit({ userId, action: 'cron.status', details: { id: jobId, status: newStatus } }, c.env.DB);
+  WsBridge.publishResourceChanged(job.server_id, RESOURCE_TOPICS.cron, { action: 'status' });
   return c.json({ ok: true });
 });
 
@@ -337,6 +344,7 @@ cronApiRoutes.delete('/:id', requireCronAuth(), async (c) => {
   await c.env.DB.execute('DELETE FROM cron_jobs WHERE id = $1', [jobId]);
 
   await logAudit({ userId, action: 'cron.delete', details: { id: jobId } }, c.env.DB);
+  WsBridge.publishResourceChanged(job.server_id, RESOURCE_TOPICS.cron, { action: 'delete' });
   return c.json({ ok: true });
 });
 

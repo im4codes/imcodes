@@ -7,12 +7,14 @@ import { apiFetch, ApiError } from './api.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import type { ResourceChangedMessage } from '@shared/resource-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-messages.js';
 import { TRANSPORT_EVENT } from '@shared/transport-events.js';
 import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
+import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
 import {
   SESSION_GROUP_CLONE_MSG,
   type SessionGroupCloneCancelRequest,
@@ -110,6 +112,7 @@ export type SessionEventReason =
   | 'socket_closed';
 
 export type ServerMessage =
+  | ResourceChangedMessage
   | { type: 'terminal.diff'; diff: TerminalDiff }
   | { type: 'terminal.history'; sessionName: string; content: string }
   | { type: 'terminal.stream_reset'; session: string; reason: string }
@@ -125,6 +128,7 @@ export type ServerMessage =
   | { type: typeof DAEMON_MSG.DISCONNECTED }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'p2p_active'; activeRunIds?: string[] }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'transport_busy'; activeSessionNames?: string[]; blockedSessions?: TransportUpgradeBlockedSession[] }
+  | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'toolchain_unavailable'; nodeBinPresent?: boolean; npmAvailable?: boolean }
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
   | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; userCreated?: boolean; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
@@ -142,10 +146,10 @@ export type ServerMessage =
   | { type: 'subsession.shells'; shells: string[] }
   | { type: 'subsession.response'; sessionName: string; status: 'working' | 'idle'; response?: string }
   | { type: 'discussion.started'; requestId?: string; discussionId: string; topic: string; maxRounds: number; totalHops?: number; filePath: string; participants: Array<{ sessionName: string; roleLabel: string; agentType: string; model?: string }> }
-  | { type: 'discussion.update'; discussionId: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; lastResponse?: string }
+  | { type: 'discussion.update'; requestId?: string; discussionId: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string | null; filePath?: string; lastResponse?: string }
   | { type: 'discussion.done'; discussionId: string; filePath: string; conclusion: string }
   | { type: 'discussion.error'; discussionId?: string; requestId?: string; error: string }
-  | { type: 'discussion.list'; discussions: Array<{ id: string; topic: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
+  | { type: 'discussion.list'; discussions: Array<{ id: string; requestId?: string; topic: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
   | { type: 'daemon.stats'; daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number }
   | FsLsResponse
   | FsReadResponse
@@ -278,6 +282,17 @@ const P2P_WORKFLOW_REQUEST_TIMEOUT_MS = 30_000;
  *  liveness during normal use; foreground probes only need to fire after a
  *  genuine sleep/background gap. */
 const PROBE_FRESHNESS_MS = 5_000;
+/** When a user interaction requests fresh data (opening a sub-session,
+ *  subscribing to a terminal, asking for timeline history) and the socket has
+ *  NOT proven liveness for at least one full heartbeat+pong window, eagerly
+ *  verify the socket instead of letting the interaction stall on a zombie
+ *  (readyState=OPEN but path dead). Without this, recovery waited for either the
+ *  heartbeat watchdog (~2 missed cycles ≈ 36s) or a manual tab switch — the
+ *  reported "click a sub-session, nothing happens until I refresh / switch tab".
+ *  Set to one heartbeat + one pong timeout so a healthy socket (which pongs
+ *  every ~10s) is never probed by ordinary interaction — only a genuinely
+ *  stalled one is. */
+const INTERACTION_PROBE_STALE_MS = HEARTBEAT_MS + PONG_TIMEOUT_MS;
 
 function createP2pWorkflowRequestId(): string {
   const requestId = globalThis.crypto?.randomUUID?.()
@@ -596,6 +611,26 @@ export class WsClient {
   }
 
   /**
+   * Eagerly verify the socket when a user interaction needs fresh data, so a
+   * zombie socket (readyState=OPEN but path dead) is recovered by the
+   * interaction itself rather than only by the slow heartbeat watchdog or a
+   * manual tab switch. No-op unless we previously saw a pong and it has since
+   * gone stale beyond a full heartbeat+pong window — healthy sockets (pong
+   * ~every 10s) and freshly-connected sockets are never probed here, so this
+   * adds no "probing" UI churn during normal use. probeConnection() itself is
+   * idempotent (skips when a probe is already in flight or a recent pong proved
+   * liveness), making this safe to call on every interaction.
+   */
+  private maybeProbeForInteraction(): void {
+    if (this._destroyed) return;
+    if (!this._connected) return;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (this._lastPongAt === 0) return; // just connected — heartbeat will prove liveness shortly
+    if (Date.now() - this._lastPongAt < INTERACTION_PROBE_STALE_MS) return;
+    this.probeConnection();
+  }
+
+  /**
    * Foreground/native-app resume entrypoint. Normal tab focus uses the cheap
    * probe path, but native resume or a long background gap can request a
    * stronger stale check. This keeps healthy sockets stable while bounding
@@ -626,6 +661,7 @@ export class WsClient {
   }
 
   subscribeTerminal(sessionName: string, raw: boolean): void {
+    this.maybeProbeForInteraction();
     this.setP2pWorkflowRequestScope({ sessionName });
     this.terminalBaseSubscriptions.set(sessionName, raw);
     this.syncTerminalSubscription(sessionName);
@@ -642,6 +678,7 @@ export class WsClient {
   }
 
   holdTerminalRaw(sessionName: string): () => void {
+    this.maybeProbeForInteraction();
     this.terminalRawHolds.set(sessionName, (this.terminalRawHolds.get(sessionName) ?? 0) + 1);
     this.syncTerminalSubscription(sessionName);
     let released = false;
@@ -851,6 +888,13 @@ export class WsClient {
     this.send({ type: 'get_sessions' });
   }
 
+  /** Authorize (or revoke) the daemon reading the local Claude token for the
+   *  weekly (7d) quota. Driven by the per-user `claude_weekly_quota` pref; sent
+   *  on every (re)connect and on toggle so each server the user visits honors it. */
+  setClaudeWeeklyQuotaOptIn(enabled: boolean): void {
+    this.send({ type: CLAUDE_QUOTA_MSG.SET_OPT_IN, enabled });
+  }
+
   async cloneSessionGroup(payload: Omit<SessionGroupCloneRequest, 'type'>): Promise<void> {
     if (payload.serverId && payload.sourceMainSessionName) {
       await apiFetch(`/api/server/${encodeURIComponent(payload.serverId)}/sessions/${encodeURIComponent(payload.sourceMainSessionName)}/group-clone`, {
@@ -923,9 +967,14 @@ export class WsClient {
     }>,
     maxRounds?: number,
     verdictIdx?: number,
-  ): void {
-    const requestId = crypto.randomUUID();
-    this.send({ type: 'discussion.start', requestId, topic, cwd, participants, maxRounds, verdictIdx });
+    requestId?: string,
+  ): string {
+    // The caller (App) mints the requestId so it can insert the optimistic
+    // pending entry BEFORE this send (which throws synchronously when the
+    // socket is not open). Falls back to a generated id for legacy callers.
+    const id = requestId ?? crypto.randomUUID();
+    this.send({ type: 'discussion.start', requestId: id, topic, cwd, participants, maxRounds, verdictIdx });
+    return id;
   }
 
   discussionStatus(discussionId: string): void {
@@ -938,11 +987,11 @@ export class WsClient {
   }
 
   /**
-   * @deprecated Use {@link p2pListDiscussions} instead. The legacy
-   * `discussion.list` daemon command predates the project-scoped p2p workflow
-   * messages and is not enforced by the daemon's scope guards. All app
-   * call sites were migrated to `p2pListDiscussions(scope)`. Kept on the
-   * client only until the daemon-side `discussion.list` route is retired.
+   * Request the daemon's current in-memory classic discussions. Used to
+   * reconcile the discussion bar on connect / reconnect / foreground-resume so
+   * a run that finished while the app was backgrounded is removed without a
+   * full page reload. Travels over the daemon WS (inherently pod-sticky), so
+   * it carries no separate `serverId` routing.
    */
   discussionList(): void {
     this.send({ type: 'discussion.list' });
@@ -1299,6 +1348,11 @@ export class WsClient {
       ...(afterTs !== undefined ? { afterTs } : {}),
       ...(beforeTs !== undefined ? { beforeTs } : {}),
     });
+    // Probe AFTER sending (not before): the send must run while the socket is
+    // still logically connected. If the socket turned out to be a zombie, the
+    // send is silently lost, but this kicks recovery so the window's foreground
+    // auto-sync refetch lands on a healthy socket instead of waiting ~36s.
+    this.maybeProbeForInteraction();
     return requestId;
   }
 

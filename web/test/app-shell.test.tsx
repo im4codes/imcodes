@@ -3,6 +3,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 
 const {
   apiFetchMock,
@@ -21,6 +22,7 @@ const {
     connect: ReturnType<typeof vi.fn>;
     disconnect: ReturnType<typeof vi.fn>;
     requestSessionList: ReturnType<typeof vi.fn>;
+    setClaudeWeeklyQuotaOptIn: ReturnType<typeof vi.fn>;
     subscribeTerminal: ReturnType<typeof vi.fn>;
     unsubscribeTerminal: ReturnType<typeof vi.fn>;
     subscribeTransportSession: ReturnType<typeof vi.fn>;
@@ -31,10 +33,12 @@ const {
     send: ReturnType<typeof vi.fn>;
     p2pListDiscussions: ReturnType<typeof vi.fn>;
     p2pStatus: ReturnType<typeof vi.fn>;
+    discussionList: ReturnType<typeof vi.fn>;
     discussionStop: ReturnType<typeof vi.fn>;
     askAnswer: ReturnType<typeof vi.fn>;
     repoDetect: ReturnType<typeof vi.fn>;
     resumeConnection: ReturnType<typeof vi.fn>;
+    reconnectNow: ReturnType<typeof vi.fn>;
     onMessage(handler: (message: any) => void): () => void;
     onLatency(handler: ((ms: number) => void) | null): void;
     emit(message: any): void;
@@ -112,6 +116,7 @@ vi.mock('../src/ws-client.js', () => ({
     connect = vi.fn(() => { this.connected = true; });
     disconnect = vi.fn(() => { this.connected = false; });
     requestSessionList = vi.fn();
+    setClaudeWeeklyQuotaOptIn = vi.fn();
     subscribeTerminal = vi.fn();
     unsubscribeTerminal = vi.fn();
     subscribeTransportSession = vi.fn();
@@ -122,10 +127,12 @@ vi.mock('../src/ws-client.js', () => ({
     send = vi.fn();
     p2pListDiscussions = vi.fn();
     p2pStatus = vi.fn();
+    discussionList = vi.fn();
     discussionStop = vi.fn();
     askAnswer = vi.fn();
     repoDetect = vi.fn();
     resumeConnection = vi.fn();
+    reconnectNow = vi.fn();
 
     constructor() {
       wsInstances.push(this);
@@ -177,6 +184,7 @@ vi.mock('../src/hooks/useUnreadCounts.js', () => ({
 
 vi.mock('../src/hooks/usePref.js', () => ({
   parseString: (value: unknown) => String(value),
+  parseBooleanish: (value: unknown) => value === true,
   usePref: () => ({ loaded: true, value: '/bin/bash' }),
 }));
 
@@ -353,9 +361,23 @@ vi.mock('../src/components/SessionPane.js', () => ({
 }));
 vi.mock('../src/components/SubSessionBar.js', () => ({
   SUBSESSION_BAR_COLLAPSED_STORAGE_KEY: 'subsession_bar_collapsed',
-  SubSessionBar: ({ onCollapsedChange, onNew, onOpen, onOpenMaximized, onViewCron, onViewDiscussions, onViewDiscussion, onViewRepo, onStopDiscussion, subSessions }: any) => (
-    <div>
+  SubSessionBar: ({ onCollapsedChange, onNew, onOpen, onOpenMaximized, onViewCron, onViewDiscussions, onViewDiscussion, onViewRepo, onStopDiscussion, subSessions, discussions = [], totalRunningDiscussions = 0 }: any) => (
+    <div data-testid="app-shell-subsession-bar" data-running-discussions={String(totalRunningDiscussions)}>
       sub-session-bar
+      {discussions.map((discussion: any) => (
+        <div
+          key={discussion.id}
+          data-testid={`app-shell-p2p-discussion-${discussion.id}`}
+          data-state={discussion.state}
+        >
+          {discussion.topic}
+          {(discussion.nodes ?? []).map((node: any) => (
+            <span key={`${discussion.id}-${node.label}`} data-testid={`app-shell-p2p-node-${discussion.id}-${node.label}`}>
+              {node.label}:{node.status}
+            </span>
+          ))}
+        </div>
+      ))}
       <button onClick={() => onCollapsedChange?.(true)}>subbar-collapse</button>
       <button onClick={onNew}>subbar-new</button>
       <button onClick={() => onOpen?.(subSessions?.[0]?.id)}>subbar-open</button>
@@ -551,6 +573,13 @@ function sessionList() {
   };
 }
 
+async function getActiveWsClient() {
+  await waitFor(() => {
+    expect(wsInstances.some((instance) => instance.messageHandlers.length > 0)).toBe(true);
+  });
+  return wsInstances.findLast((instance) => instance.messageHandlers.length > 0) ?? wsInstances[wsInstances.length - 1];
+}
+
 beforeEach(() => {
   vi.resetModules();
   localStorage.clear();
@@ -629,6 +658,96 @@ describe('App shell', () => {
     expect(view.container.textContent).toContain('session-pane:deck_alpha_brain');
     expect(view.container.textContent).toContain('session-tree');
     expect(ws.connect).toHaveBeenCalled();
+  }, 20_000);
+
+  it('clears stale P2P progress from the session bar when a full status response has no active runs', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+
+    await act(async () => {
+      ws.emit({
+        type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+        run: {
+          id: 'run-status-bar',
+          status: 'running',
+          mode_key: 'discuss',
+          current_round: 1,
+          total_rounds: 1,
+          total_hops: 2,
+          active_phase: 'hop',
+          initiator_session: 'deck_alpha_brain',
+          all_nodes: [
+            { label: 'Cx1', agentType: 'codex-sdk', status: 'completed', phase: 'hop' },
+            { label: 'Cu1', agentType: 'cursor-headless', status: 'running', phase: 'hop' },
+          ],
+        },
+      });
+    });
+
+    const row = await screen.findByTestId('app-shell-p2p-discussion-p2p_run-status-bar');
+    expect(row.getAttribute('data-state')).toBe('running');
+    expect(screen.getByTestId('app-shell-p2p-node-p2p_run-status-bar-Cx1').textContent).toBe('Cx1:done');
+    expect(screen.getByTestId('app-shell-subsession-bar').getAttribute('data-running-discussions')).toBe('1');
+
+    await act(async () => {
+      ws.emit({
+        type: P2P_WORKFLOW_MSG.STATUS_RESPONSE,
+        requestId: 'p2p-status-empty',
+        runs: [],
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('app-shell-p2p-discussion-p2p_run-status-bar')).toBeNull();
+      expect(screen.getByTestId('app-shell-subsession-bar').getAttribute('data-running-discussions')).toBe('0');
+    });
+  }, 20_000);
+
+  it('nudges browser WebSocket recovery when daemon heartbeat is fresh but the tab is disconnected', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date('2026-05-31T12:00:00Z'));
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      expect(await screen.findByText('session-tabs')).toBeTruthy();
+      const ws = wsInstances[wsInstances.length - 1];
+      expect(ws.reconnectNow).not.toHaveBeenCalled();
+
+      await act(async () => {
+        await vi.runOnlyPendingTimersAsync();
+      });
+
+      expect(wsInstances.some((instance) => instance.reconnectNow.mock.calls.some((call) => call[0] === true))).toBe(true);
+
+      const activeWs = wsInstances.find((instance) => instance.reconnectNow.mock.calls.length > 0) ?? ws;
+      act(() => {
+        activeWs.emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+      });
+
+      const callsAfterConnect = activeWs.reconnectNow.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+
+      expect(activeWs.reconnectNow).toHaveBeenCalledTimes(callsAfterConnect);
+    } finally {
+      vi.useRealTimers();
+    }
   }, 20_000);
 
   it('brings a newly opened sub-session window above restored open sub-session windows', async () => {
@@ -909,6 +1028,48 @@ describe('App shell', () => {
     }
   }, 20_000);
 
+  it('keeps the mobile Team discussions page above an open sub-session window', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      useSubSessionsState.subSessions = [
+        {
+          id: 'sub-1',
+          sessionName: 'deck_sub_alpha_helper',
+          parentSession: 'deck_alpha_brain',
+          label: 'Helper',
+          description: 'Helper session',
+          cwd: '/work/alpha',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'idle',
+          serverId: 'srv-1',
+        },
+      ];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      fireEvent.click(screen.getByText('subbar-open-sub-1'));
+
+      const subWindow = await screen.findByTestId('sub-session-window-sub-1');
+      fireEvent.click(screen.getByText('subbar-discussions'));
+      const discussionsPanel = await screen.findByTestId('floating-panel-discussions');
+
+      await waitFor(() => {
+        expect(Number((discussionsPanel as HTMLElement).style.zIndex)).toBeGreaterThan(Number((subWindow as HTMLElement).style.zIndex));
+      });
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
   it('closes all open sub-session windows when clicking the active main session tab', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
@@ -1005,6 +1166,52 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('subbar-open-sub-2'));
     expect(await screen.findByTestId('sub-session-window-sub-2')).toBeTruthy();
     expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
+  }, 20_000);
+
+  it('marks the most-recently opened sub-session window active, regardless of how many are open', async () => {
+    // Regression: opening a 3rd (or Nth) window left it inactive (dashed accent,
+    // un-closable) because the active sub was re-derived from the mutable window
+    // stack and lost a race with background churn. The active sub is now set
+    // explicitly on open, so the just-opened window is always the active one.
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = ['a', 'b', 'c'].map((suffix, i) => ({
+      id: `sub-${i + 1}`,
+      sessionName: `deck_sub_alpha_${suffix}`,
+      parentSession: 'deck_alpha_brain',
+      label: suffix.toUpperCase(),
+      description: '',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    }));
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('subbar-open-sub-1'));
+    fireEvent.click(screen.getByText('subbar-open-sub-2'));
+    fireEvent.click(screen.getByText('subbar-open-sub-3'));
+
+    // The just-opened sub-3 is active; the earlier two are open but inactive.
+    await waitFor(() => {
+      expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-active')).toBe('true');
+    });
+    expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-active')).toBe('false');
+    expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-active')).toBe('false');
+
+    // Re-activating an older window flips active over to it (and only it).
+    fireEvent.mouseDown(screen.getByTestId('sub-session-window-sub-1'));
+    await waitFor(() => {
+      expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-active')).toBe('true');
+    });
+    expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-active')).toBe('false');
   }, 20_000);
 
   it('executes app-level shell callbacks and websocket message reducers', async () => {

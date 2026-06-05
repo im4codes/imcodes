@@ -30,6 +30,19 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
   const programmaticWriteRef = useRef(false);
   // Guard: true while overlay is open
   const openRef = useRef(false);
+  const autoStartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const setListeningState = useCallback((next: boolean) => {
+    if (next && !openRef.current) return;
+    listeningRef.current = next;
+    setListening(next);
+  }, []);
+
+  const clearAutoStartTimer = useCallback(() => {
+    if (!autoStartTimerRef.current) return;
+    clearTimeout(autoStartTimerRef.current);
+    autoStartTimerRef.current = null;
+  }, []);
 
   useEffect(() => {
     if (!open) { openRef.current = false; return; }
@@ -69,17 +82,20 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
     vv?.addEventListener('resize', onResize);
 
     // Start voice session at end of initial text (not 0)
-    const timer = setTimeout(() => startSession(init.length), 150);
+    clearAutoStartTimer();
+    autoStartTimerRef.current = setTimeout(() => {
+      autoStartTimerRef.current = null;
+      void startSession(init.length);
+    }, 150);
     return () => {
-      clearTimeout(timer);
+      clearAutoStartTimer();
       openRef.current = false;
       vv?.removeEventListener('resize', onResize);
       VoiceInput.onAudioLevel(null);
       VoiceInput.stopListening();
-      setListening(false);
-      listeningRef.current = false;
+      setListeningState(false);
     };
-  }, [open]);
+  }, [open, clearAutoStartTimer, setListeningState]);
 
   /** Start a new recognition session, inserting at given position */
   const startSession = useCallback(async (atPos: number) => {
@@ -119,25 +135,29 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
         });
         ta.scrollTop = ta.scrollHeight;
         setHasText(!!ta.value.trim());
+      }, (next) => {
+        if (sessionTokenRef.current !== token) return;
+        if (!openRef.current && next) return;
+        setListeningState(next);
       });
       // Check guards after async — overlay may have closed or session may have changed
       if (ok && sessionTokenRef.current === token && openRef.current) {
-        setListening(true);
-        listeningRef.current = true;
+        setListeningState(true);
+      } else if (!ok && sessionTokenRef.current === token) {
+        setListeningState(false);
       }
     } catch { /* ignore */ }
-  }, []);
+  }, [setListeningState]);
 
   /** Stop current session and commit voice zone */
   const commitAndStop = useCallback(async () => {
     sessionTokenRef.current++;
     await VoiceInput.stopListening();
-    setListening(false);
-    listeningRef.current = false;
+    setListeningState(false);
     // Commit: advance insertPos past the committed voice text
     insertPosRef.current += voiceLenRef.current;
     voiceLenRef.current = 0;
-  }, []);
+  }, [setListeningState]);
 
   /** Stop, commit, then restart at new cursor position */
   const restartAtCursor = useCallback(async (newPos: number) => {
@@ -151,30 +171,29 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
       setBars(Array(BAR_COUNT).fill(2));
       barsRef.current = Array(BAR_COUNT).fill(2);
     } else {
+      clearAutoStartTimer();
       const ta = taRef.current;
       const pos = ta ? (ta.selectionStart ?? ta.value.length) : 0;
-      startSession(pos);
+      void startSession(pos);
     }
-  }, [startSession, commitAndStop]);
+  }, [startSession, commitAndStop, clearAutoStartTimer]);
 
   const handleSend = useCallback(() => {
     const text = (taRef.current?.value ?? '').trim();
     if (!text) return;
     sessionTokenRef.current++;
     VoiceInput.stopListening();
-    setListening(false);
-    listeningRef.current = false;
+    setListeningState(false);
     onSend(text);
     onClose();
-  }, [onSend, onClose]);
+  }, [onSend, onClose, setListeningState]);
 
   const handleClose = useCallback(() => {
     sessionTokenRef.current++;
     VoiceInput.stopListening();
-    setListening(false);
-    listeningRef.current = false;
+    setListeningState(false);
     onClose();
-  }, [onClose]);
+  }, [onClose, setListeningState]);
 
   /** User manually edited the textarea — commit voice zone and stop recognition */
   const handleInput = useCallback(() => {

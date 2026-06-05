@@ -1,6 +1,6 @@
 import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
-import { getServerById, getDbSessionsByServer, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession } from '../db/queries.js';
+import { getServerById, getDbSessionsByServer, getSubSessionsByServer, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession } from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import type { ServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
@@ -8,6 +8,14 @@ import { logAudit } from '../security/audit.js';
 import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
+import {
+  WORKER_SESSION_SNAPSHOT_INCOMPLETE_REASON,
+  WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT,
+  buildWorkerSessionSnapshotCompleteResponse,
+  buildWorkerSessionSnapshotIncompleteResponse,
+  normalizeWorkerSessionRows,
+  normalizeWorkerSubSessionRows,
+} from '../../../shared/worker-session-snapshot.js';
 import { getPodIdentity } from '../util/pod-identity.js';
 import { isSessionAgentType } from '../../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
@@ -40,6 +48,47 @@ export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: 
 sessionMgmtRoutes.use('/*', requireAuth());
 
 // ── Session persistence (daemon syncs these) ───────────────────────────────
+
+/** GET /api/server/:id/session-snapshot — paired daemon startup snapshot with trust metadata */
+sessionMgmtRoutes.get(`/:id/${WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT}`, async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+
+  try {
+    const [allSessions, subSessions] = await Promise.all([
+      getDbSessionsByServer(c.env.DB, serverId),
+      getSubSessionsByServer(c.env.DB, serverId),
+    ]);
+    const sessions = allSessions.filter((s) => !s.name.startsWith('deck_sub_'));
+    const normalizedSessions = normalizeWorkerSessionRows(sessions);
+    const normalizedSubSessions = normalizeWorkerSubSessionRows(subSessions);
+    if (!normalizedSessions.ok || !normalizedSubSessions.ok) {
+      logger.warn({
+        serverId,
+        sessionIssues: normalizedSessions.issues,
+        subSessionIssues: normalizedSubSessions.issues,
+      }, 'session snapshot contains invalid rows');
+      return c.json(buildWorkerSessionSnapshotIncompleteResponse({
+        serverId,
+        reason: WORKER_SESSION_SNAPSHOT_INCOMPLETE_REASON.INVALID_ROW,
+      }), 503);
+    }
+
+    return c.json(buildWorkerSessionSnapshotCompleteResponse({
+      serverId,
+      sessions: normalizedSessions.rows,
+      subSessions: normalizedSubSessions.rows,
+    }));
+  } catch (err) {
+    logger.warn({ err, serverId }, 'session snapshot query failed');
+    return c.json(buildWorkerSessionSnapshotIncompleteResponse({
+      serverId,
+      reason: WORKER_SESSION_SNAPSHOT_INCOMPLETE_REASON.QUERY_FAILED,
+    }), 503);
+  }
+});
 
 /** GET /api/server/:id/sessions — list all sessions for a server (used by daemon on startup) */
 sessionMgmtRoutes.get('/:id/sessions', async (c) => {

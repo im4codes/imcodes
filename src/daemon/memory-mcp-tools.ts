@@ -16,6 +16,7 @@ import {
   MEMORY_MCP_TOOL_NAMES,
   buildMcpDisabledResult,
   buildMcpErrorResult,
+  MEMORY_MCP_CAPS,
   pickAllowedMcpArgs,
   type MemoryMcpToolName,
 } from '../../shared/memory-mcp-contracts.js';
@@ -36,8 +37,8 @@ import { listMcpMemorySummaries, searchMcpMemoryRecall, type MemoryMcpListProjec
 import type { MemorySearchQuery } from '../context/memory-search.js';
 import { saveObservation, savePreference } from '../context/memory-write-tools.js';
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
-import { listSessions as listStoredSessions, type SessionRecord } from '../store/session-store.js';
-import { dispatchSendMessage, listSendTargets, type SendToolDeps } from './send-tool.js';
+import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
+import { dispatchSendMessage, dispatchSendStop, listSendTargets, type SendToolDeps } from './send-tool.js';
 import { cronMcpCreate, cronMcpDelete, cronMcpList, cronMcpUpdate, type CronMcpClientOptions } from './cron-mcp-client.js';
 import { registerMemoryShortRef, resolveMemoryShortRef } from '../context/memory-short-ref.js';
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
@@ -163,6 +164,11 @@ function parseExpiresAt(value: unknown): number | null | undefined {
 
 function sanitizeCaughtError(err: unknown): ToolResult {
   return error(MCP_ERROR_REASONS.INTERNAL_ERROR, sanitizeMcpErrorMessage(err));
+}
+
+async function refreshSendSessionStore(deps: MemoryMcpToolDeps): Promise<void> {
+  if (deps.sendDeps?.listSessions) return;
+  await loadStore({ probe: false });
 }
 
 function memoryGate(
@@ -460,7 +466,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (gate) return gate;
       return savePreferenceTool(pickAllowedMcpArgs(input, ['text', 'idempotencyKey']), memoryCaller()) as unknown as ToolResult;
     },
-    [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: (input) => {
+    [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: async (input) => {
+      await refreshSendSessionStore(deps);
       const args = pickAllowedMcpArgs(input, ['query', 'limit']);
       return listSendTargets(caller, {
         query: stringArg(args, 'query'),
@@ -471,12 +478,26 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }) as unknown as ToolResult;
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
+      await refreshSendSessionStore(deps);
       const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'broadcast', 'idempotencyKey']);
       return dispatchSendMessage(caller, {
         target: stringArg(args, 'target'),
         message: stringArg(args, 'message'),
         files: stringArrayArg(args, 'files'),
         reply: boolArg(args, 'reply'),
+        broadcast: boolArg(args, 'broadcast'),
+        idempotencyKey: stringArg(args, 'idempotencyKey'),
+      }, {
+        ...deps.sendDeps,
+        isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
+        exactTargetOnly: true,
+      }) as unknown as Promise<ToolResult>;
+    },
+    [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: async (input) => {
+      await refreshSendSessionStore(deps);
+      const args = pickAllowedMcpArgs(input, ['target', 'broadcast', 'idempotencyKey']);
+      return dispatchSendStop(caller, {
+        target: stringArg(args, 'target'),
         broadcast: boolArg(args, 'broadcast'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
       }, {
@@ -605,25 +626,30 @@ const schemas = {
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: z.object({
     query: z.string().optional().describe('Optional target filter.'),
-    limit: z.number().int().min(1).max(100).optional().describe('Optional result limit.'),
+    limit: z.number().int().min(1).max(100).optional().describe('Optional result limit. Returns only sendable sibling sessions in the caller project; the caller itself and stopped sessions are excluded.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
-    target: z.string().describe('Sibling target from send_list_targets.'),
+    target: z.string().describe('Exact sibling target from send_list_targets. The caller session is not a valid target; if send_list_targets returns no items, direct send_message cannot succeed.'),
     message: z.string().describe('Message text to send.'),
     files: z.array(z.string()).optional().describe('Project-root file path references; no bytes are transferred.'),
     reply: z.boolean().optional().describe('Ask target to reply to the caller session.'),
     broadcast: z.boolean().optional().describe('Broadcast within the caller project.'),
     idempotencyKey: z.string().optional().describe('Retry key for accepted send replay.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: z.object({
+    target: z.string().optional().describe('Exact sibling target from send_list_targets to force-stop. Required unless broadcast is true. The caller session is not a valid target.'),
+    broadcast: z.boolean().optional().describe('Force-stop every sendable sibling session in the caller project.'),
+    idempotencyKey: z.string().optional().describe('Retry key for accepted stop replay.'),
+  }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: z.object({
     name: z.string().describe('Cron job name.'),
-    cronExpr: z.string().describe('Cron expression accepted by the cron service.'),
+    cronExpr: z.string().describe(`Cron expression accepted by the cron service. The next two runs must be at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart; every-minute expressions such as "* * * * *" are rejected.`),
     projectName: z.string().optional().describe('Project name; defaults to caller project when available.'),
-    targetRole: z.string().optional().describe('Target role for the scheduled job row.'),
-    targetSessionName: z.string().nullable().optional().describe('Optional direct target session for the job row.'),
-    action: z.record(z.string(), z.unknown()).describe('Structured send action.'),
-    timezone: z.string().optional().describe('Optional cron timezone.'),
-    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Optional expiration timestamp or ISO string, capped at 90 days.'),
+    targetRole: z.string().optional().describe('Source role for the scheduled job row when targetSessionName is omitted; defaults to the project brain session.'),
+    targetSessionName: z.string().nullable().optional().describe('Optional direct source session for the job row. Send action targets are resolved as siblings of this source session; the source cannot send to itself.'),
+    action: z.record(z.string(), z.unknown()).describe('Structured send action with shape { type: "send", target, message, reply?, broadcast?, idempotencyKey? }. The target is resolved at execution time from the scheduled source session selected by targetSessionName or targetRole.'),
+    timezone: z.string().optional().describe('Optional cron timezone for schedule evaluation only. It does not affect expiresAt parsing.'),
+    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Optional absolute expiration time as epoch milliseconds or an ISO string with an explicit offset or Z suffix, capped at 90 days. It prevents future dispatches after that instant but does not retract already dispatched messages.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_LIST]: z.object({
     projectName: z.string().optional().describe('Optional project filter.'),
@@ -632,13 +658,13 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE]: z.object({
     id: z.string().describe('Cron job id.'),
     name: z.string().optional().describe('Optional replacement job name.'),
-    cronExpr: z.string().optional().describe('Optional replacement cron expression.'),
+    cronExpr: z.string().optional().describe(`Optional replacement cron expression. The next two runs must be at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart.`),
     projectName: z.string().optional().describe('Optional replacement project name.'),
-    targetRole: z.string().optional().describe('Optional replacement target role.'),
-    targetSessionName: z.string().nullable().optional().describe('Optional replacement direct target session.'),
-    action: z.record(z.string(), z.unknown()).optional().describe('Optional replacement structured send action.'),
-    timezone: z.string().optional().describe('Optional replacement timezone.'),
-    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Optional replacement expiration timestamp or ISO string.'),
+    targetRole: z.string().optional().describe('Optional replacement source role when targetSessionName is omitted.'),
+    targetSessionName: z.string().nullable().optional().describe('Optional replacement direct source session. Send action targets are resolved as siblings of this source session.'),
+    action: z.record(z.string(), z.unknown()).optional().describe('Optional replacement structured send action; non-send actions are rejected for MCP writes.'),
+    timezone: z.string().optional().describe('Optional replacement cron timezone for schedule evaluation only. It does not affect expiresAt parsing.'),
+    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Optional replacement absolute expiration time as epoch milliseconds or an ISO string with an explicit offset or Z suffix. It prevents future dispatches after that instant but does not retract already dispatched messages.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_DELETE]: z.object({
     id: z.string().describe('Cron job id to delete.'),

@@ -20,6 +20,17 @@ export const DAEMON_SERVER_LINK_FRESH_MS = 30_000;
 export const DAEMON_STORAGE_CRITICAL_FREE_BYTES = 512 * 1024 * 1024;
 export const DAEMON_STORAGE_LOW_FREE_BYTES = 2 * 1024 * 1024 * 1024;
 
+export interface DaemonResourceSnapshot {
+  /** epoch ms when the snapshot was taken (for freshness display) */
+  capturedAt: number;
+  /** process.memoryUsage() fields, in bytes */
+  rssBytes: number;
+  heapTotalBytes: number;
+  heapUsedBytes: number;
+  externalBytes: number;
+  arrayBuffersBytes: number;
+}
+
 export interface DaemonRuntimeStatus {
   pid: number;
   startedAt: number;
@@ -27,6 +38,8 @@ export interface DaemonRuntimeStatus {
   restartCount: number;
   version?: string;
   serverLink?: DaemonServerLinkRuntimeStatus;
+  resources?: DaemonResourceSnapshot;
+  diagnostics?: DaemonRuntimeDiagnosticsSnapshot;
 }
 
 export type DaemonServerLinkRuntimeState = 'connecting' | 'connected' | 'disconnected';
@@ -59,6 +72,75 @@ export interface DaemonServerLinkRuntimeUpdate {
   lastSendFailedAt?: number;
   lastError?: string;
   clearError?: boolean;
+}
+
+export interface DaemonRuntimeDiagnosticsSnapshot {
+  capturedAt: number;
+  transportQueues?: DaemonTransportQueuesSnapshot;
+  p2p?: DaemonP2pRuntimeSnapshot;
+}
+
+export interface DaemonTransportQueuesSnapshot {
+  sessionCount: number;
+  totalPendingCount: number;
+  totalResendCount: number;
+  totalActiveDispatchCount: number;
+  sessions: DaemonTransportQueueSessionSnapshot[];
+}
+
+export interface DaemonTransportQueueSessionSnapshot {
+  sessionName: string;
+  agentType?: string;
+  status?: string;
+  sending?: boolean;
+  pendingCount: number;
+  pendingVersion?: number;
+  activeDispatchCount?: number;
+  stalePendingRecoveryActive?: boolean;
+  providerSessionBound?: boolean;
+  lastActivityAt?: number;
+  lastActivityAgeMs?: number;
+  resendCount: number;
+  resendEntries?: Array<{
+    commandId: string;
+    queuedAt: number;
+    ageMs: number;
+    textPreview?: string;
+  }>;
+}
+
+export interface DaemonP2pRuntimeSnapshot {
+  activeCount: number;
+  discussionWriteQueueCount?: number;
+  discussionWritePendingBytes?: number;
+  runs: DaemonP2pRunSnapshot[];
+}
+
+export interface DaemonP2pRunSnapshot {
+  id: string;
+  discussionId: string;
+  status: string;
+  runPhase?: string;
+  activePhase?: string;
+  currentRound?: number;
+  totalRounds?: number;
+  currentTargetSession?: string | null;
+  currentTargetLabel?: string | null;
+  hopStartedAt?: number | null;
+  hopElapsedMs?: number | null;
+  executionAttempt?: number | null;
+  executionCycleCurrent?: number | null;
+  executionCycleTotal?: number | null;
+  executionMarkerPath?: string | null;
+  error?: string | null;
+}
+
+let runtimeDiagnosticsProvider: (() => DaemonRuntimeDiagnosticsSnapshot | null | undefined) | null = null;
+
+export function setDaemonRuntimeDiagnosticsProvider(
+  provider: (() => DaemonRuntimeDiagnosticsSnapshot | null | undefined) | null,
+): void {
+  runtimeDiagnosticsProvider = provider;
 }
 
 export type DaemonServerLinkFreshness =
@@ -261,6 +343,8 @@ export function readDaemonRuntimeStatus(baseDir: string = defaultDaemonRuntimeSt
     const restartCount = coerceNonNegativeSafeInteger(parsed.restartCount);
     if (pid === null || startedAt === null || updatedAt === null || restartCount === null) return null;
     const serverLink = parseDaemonServerLinkRuntimeStatus(parsed.serverLink);
+    const resources = parseDaemonResourceSnapshot(parsed.resources);
+    const diagnostics = parseDaemonRuntimeDiagnosticsSnapshot(parsed.diagnostics);
     return {
       pid,
       startedAt,
@@ -268,6 +352,8 @@ export function readDaemonRuntimeStatus(baseDir: string = defaultDaemonRuntimeSt
       restartCount,
       ...(typeof parsed.version === 'string' && parsed.version ? { version: parsed.version } : {}),
       ...(serverLink ? { serverLink } : {}),
+      ...(resources ? { resources } : {}),
+      ...(diagnostics ? { diagnostics } : {}),
     };
   } catch {
     return null;
@@ -295,6 +381,11 @@ export function recordDaemonStart(input: {
     updatedAt: nowMs,
     restartCount,
     ...(input.version ? { version: input.version } : {}),
+    // Heap can only be observed from inside the daemon process itself, so we
+    // ride it along on writes that already happen (start + heartbeat) — no
+    // dedicated polling timer / extra disk writes.
+    resources: captureDaemonResourceSnapshot(nowMs),
+    ...definedDiagnostics(),
   };
 
   return writeDaemonRuntimeStatus(next, baseDir, nowMs);
@@ -330,9 +421,69 @@ export function recordDaemonServerLinkStatus(input: DaemonServerLinkRuntimeUpdat
     updatedAt: nowMs,
     restartCount: samePid && previous ? previous.restartCount : previous?.restartCount ?? 0,
     ...(input.version ?? previous?.version ? { version: input.version ?? previous?.version } : {}),
+    // Capture a fresh heap snapshot on this heartbeat-driven write — heap is
+    // only observable from inside the daemon, and this write happens anyway
+    // (throttled to ~10s), so there is no extra disk I/O for it.
+    resources: captureDaemonResourceSnapshot(nowMs),
     serverLink: nextLink,
+    ...definedDiagnostics(),
   };
   return writeDaemonRuntimeStatus(next, baseDir, nowMs);
+}
+
+function definedDiagnostics(): { diagnostics?: DaemonRuntimeDiagnosticsSnapshot } {
+  if (!runtimeDiagnosticsProvider) return {};
+  try {
+    const diagnostics = runtimeDiagnosticsProvider();
+    return diagnostics ? { diagnostics } : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Capture a memory snapshot of the CURRENT process (the daemon). */
+function captureDaemonResourceSnapshot(nowMs: number): DaemonResourceSnapshot {
+  const m = process.memoryUsage();
+  return {
+    capturedAt: nowMs,
+    rssBytes: m.rss,
+    heapTotalBytes: m.heapTotal,
+    heapUsedBytes: m.heapUsed,
+    externalBytes: m.external,
+    arrayBuffersBytes: m.arrayBuffers ?? 0,
+  };
+}
+
+/**
+ * Read another process's resident set size (RSS) live, on demand — used by
+ * `imcodes status` so RSS is accurate at view time rather than as-of the last
+ * daemon write. (Heap is NOT obtainable this way: a process's V8 heap is only
+ * visible from inside that process, hence the self-reported snapshot above.)
+ */
+export function readProcessRssBytes(
+  pid: number,
+  runner: ExecFileSyncLike = execFileSync,
+  platform: NodeJS.Platform = process.platform,
+): number | null {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    if (platform === 'win32') {
+      const script = `$p = Get-Process -Id ${pid} -ErrorAction Stop; [int64]$p.WorkingSet64`;
+      const out = runner(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+        UTF8_STDIO_OPTIONS,
+      );
+      const bytes = Number(String(out).trim());
+      return Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : null;
+    }
+    // Unix `ps` reports RSS in kilobytes.
+    const out = runner('ps', ['-p', String(pid), '-o', 'rss='], UTF8_STDIO_OPTIONS);
+    const kb = Number(String(out).trim());
+    return Number.isSafeInteger(kb) && kb >= 0 ? kb * 1024 : null;
+  } catch {
+    return null;
+  }
 }
 
 export function getDaemonServerLinkFreshness(
@@ -433,6 +584,160 @@ function parseDaemonServerLinkRuntimeStatus(value: unknown): DaemonServerLinkRun
     ...definedNonNegativeInteger('lastHeartbeatSentAt', raw.lastHeartbeatSentAt),
     ...definedNonNegativeInteger('lastSendFailedAt', raw.lastSendFailedAt),
     ...definedString('lastError', raw.lastError),
+  };
+}
+
+function parseDaemonResourceSnapshot(value: unknown): DaemonResourceSnapshot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const capturedAt = coerceNonNegativeSafeInteger(raw.capturedAt);
+  const rssBytes = coerceNonNegativeSafeInteger(raw.rssBytes);
+  const heapTotalBytes = coerceNonNegativeSafeInteger(raw.heapTotalBytes);
+  const heapUsedBytes = coerceNonNegativeSafeInteger(raw.heapUsedBytes);
+  const externalBytes = coerceNonNegativeSafeInteger(raw.externalBytes);
+  if (capturedAt === null || rssBytes === null || heapTotalBytes === null || heapUsedBytes === null || externalBytes === null) {
+    return null;
+  }
+  return {
+    capturedAt,
+    rssBytes,
+    heapTotalBytes,
+    heapUsedBytes,
+    externalBytes,
+    arrayBuffersBytes: coerceNonNegativeSafeInteger(raw.arrayBuffersBytes) ?? 0,
+  };
+}
+
+function parseDaemonRuntimeDiagnosticsSnapshot(value: unknown): DaemonRuntimeDiagnosticsSnapshot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const capturedAt = coerceNonNegativeSafeInteger(raw.capturedAt);
+  if (capturedAt === null) return null;
+  const transportQueues = parseDaemonTransportQueuesSnapshot(raw.transportQueues);
+  const p2p = parseDaemonP2pRuntimeSnapshot(raw.p2p);
+  return {
+    capturedAt,
+    ...(transportQueues ? { transportQueues } : {}),
+    ...(p2p ? { p2p } : {}),
+  };
+}
+
+function parseDaemonTransportQueuesSnapshot(value: unknown): DaemonTransportQueuesSnapshot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const sessionCount = coerceNonNegativeSafeInteger(raw.sessionCount);
+  const totalPendingCount = coerceNonNegativeSafeInteger(raw.totalPendingCount);
+  const totalResendCount = coerceNonNegativeSafeInteger(raw.totalResendCount);
+  const totalActiveDispatchCount = coerceNonNegativeSafeInteger(raw.totalActiveDispatchCount);
+  if (
+    sessionCount === null
+    || totalPendingCount === null
+    || totalResendCount === null
+    || totalActiveDispatchCount === null
+  ) {
+    return null;
+  }
+  const sessions = Array.isArray(raw.sessions)
+    ? raw.sessions.map(parseDaemonTransportQueueSessionSnapshot).filter((item): item is DaemonTransportQueueSessionSnapshot => !!item)
+    : [];
+  return { sessionCount, totalPendingCount, totalResendCount, totalActiveDispatchCount, sessions };
+}
+
+function parseDaemonTransportQueueSessionSnapshot(value: unknown): DaemonTransportQueueSessionSnapshot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const sessionName = typeof raw.sessionName === 'string' && raw.sessionName.trim() ? raw.sessionName : null;
+  const pendingCount = coerceNonNegativeSafeInteger(raw.pendingCount);
+  const resendCount = coerceNonNegativeSafeInteger(raw.resendCount);
+  if (!sessionName || pendingCount === null || resendCount === null) return null;
+  const pendingVersion = coerceNonNegativeSafeInteger(raw.pendingVersion);
+  const activeDispatchCount = coerceNonNegativeSafeInteger(raw.activeDispatchCount);
+  const lastActivityAt = coerceNonNegativeSafeInteger(raw.lastActivityAt);
+  const lastActivityAgeMs = coerceNonNegativeSafeInteger(raw.lastActivityAgeMs);
+  const resendEntries = Array.isArray(raw.resendEntries)
+    ? raw.resendEntries.map(parseDaemonTransportResendEntrySnapshot).filter((item): item is NonNullable<DaemonTransportQueueSessionSnapshot['resendEntries']>[number] => !!item)
+    : undefined;
+  return {
+    sessionName,
+    ...definedString('agentType', raw.agentType),
+    ...definedString('status', raw.status),
+    ...(typeof raw.sending === 'boolean' ? { sending: raw.sending } : {}),
+    pendingCount,
+    ...(pendingVersion !== null ? { pendingVersion } : {}),
+    ...(activeDispatchCount !== null ? { activeDispatchCount } : {}),
+    ...(typeof raw.stalePendingRecoveryActive === 'boolean' ? { stalePendingRecoveryActive: raw.stalePendingRecoveryActive } : {}),
+    ...(typeof raw.providerSessionBound === 'boolean' ? { providerSessionBound: raw.providerSessionBound } : {}),
+    ...(lastActivityAt !== null ? { lastActivityAt } : {}),
+    ...(lastActivityAgeMs !== null ? { lastActivityAgeMs } : {}),
+    resendCount,
+    ...(resendEntries && resendEntries.length ? { resendEntries } : {}),
+  };
+}
+
+function parseDaemonTransportResendEntrySnapshot(value: unknown): NonNullable<DaemonTransportQueueSessionSnapshot['resendEntries']>[number] | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const commandId = typeof raw.commandId === 'string' && raw.commandId.trim() ? raw.commandId : null;
+  const queuedAt = coerceNonNegativeSafeInteger(raw.queuedAt);
+  const ageMs = coerceNonNegativeSafeInteger(raw.ageMs);
+  if (!commandId || queuedAt === null || ageMs === null) return null;
+  return {
+    commandId,
+    queuedAt,
+    ageMs,
+    ...definedString('textPreview', raw.textPreview),
+  };
+}
+
+function parseDaemonP2pRuntimeSnapshot(value: unknown): DaemonP2pRuntimeSnapshot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const activeCount = coerceNonNegativeSafeInteger(raw.activeCount);
+  if (activeCount === null) return null;
+  const discussionWriteQueueCount = coerceNonNegativeSafeInteger(raw.discussionWriteQueueCount);
+  const discussionWritePendingBytes = coerceNonNegativeSafeInteger(raw.discussionWritePendingBytes);
+  const runs = Array.isArray(raw.runs)
+    ? raw.runs.map(parseDaemonP2pRunSnapshot).filter((item): item is DaemonP2pRunSnapshot => !!item)
+    : [];
+  return {
+    activeCount,
+    ...(discussionWriteQueueCount !== null ? { discussionWriteQueueCount } : {}),
+    ...(discussionWritePendingBytes !== null ? { discussionWritePendingBytes } : {}),
+    runs,
+  };
+}
+
+function parseDaemonP2pRunSnapshot(value: unknown): DaemonP2pRunSnapshot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id : null;
+  const discussionId = typeof raw.discussionId === 'string' && raw.discussionId.trim() ? raw.discussionId : null;
+  const status = typeof raw.status === 'string' && raw.status.trim() ? raw.status : null;
+  if (!id || !discussionId || !status) return null;
+  const currentRound = coerceNonNegativeSafeInteger(raw.currentRound);
+  const totalRounds = coerceNonNegativeSafeInteger(raw.totalRounds);
+  const hopStartedAt = coerceNonNegativeSafeInteger(raw.hopStartedAt);
+  const hopElapsedMs = coerceNonNegativeSafeInteger(raw.hopElapsedMs);
+  const executionAttempt = coerceNonNegativeSafeInteger(raw.executionAttempt);
+  const executionCycleCurrent = coerceNonNegativeSafeInteger(raw.executionCycleCurrent);
+  const executionCycleTotal = coerceNonNegativeSafeInteger(raw.executionCycleTotal);
+  return {
+    id,
+    discussionId,
+    status,
+    ...definedString('runPhase', raw.runPhase),
+    ...definedString('activePhase', raw.activePhase),
+    ...(currentRound !== null ? { currentRound } : {}),
+    ...(totalRounds !== null ? { totalRounds } : {}),
+    ...(typeof raw.currentTargetSession === 'string' || raw.currentTargetSession === null ? { currentTargetSession: raw.currentTargetSession } : {}),
+    ...(typeof raw.currentTargetLabel === 'string' || raw.currentTargetLabel === null ? { currentTargetLabel: raw.currentTargetLabel } : {}),
+    ...(hopStartedAt !== null ? { hopStartedAt } : {}),
+    ...(hopElapsedMs !== null ? { hopElapsedMs } : {}),
+    ...(executionAttempt !== null ? { executionAttempt } : {}),
+    ...(executionCycleCurrent !== null ? { executionCycleCurrent } : {}),
+    ...(executionCycleTotal !== null ? { executionCycleTotal } : {}),
+    ...(typeof raw.executionMarkerPath === 'string' || raw.executionMarkerPath === null ? { executionMarkerPath: raw.executionMarkerPath } : {}),
+    ...(typeof raw.error === 'string' || raw.error === null ? { error: raw.error } : {}),
   };
 }
 

@@ -5,6 +5,7 @@ import {
   clearSendIdempotencyCacheForTests,
   dispatchCronSend,
   dispatchSendMessage,
+  dispatchSendStop,
   listSendTargets,
 } from '../../src/daemon/send-tool.js';
 import { isSendDispatchId, isSendMessageId } from '../../shared/send-message-id.js';
@@ -90,6 +91,65 @@ describe('send-tool', () => {
     expect(result.deliveries).toHaveLength(1);
     expect(dispatchMessage).toHaveBeenCalledTimes(1);
     expect(dispatchMessage.mock.calls[0][1]).toBe('hello');
+  });
+
+  it('send_stop force-stops a resolved sibling via cancelSession', async () => {
+    const cancelSession = vi.fn().mockResolvedValue(true);
+    const result = await dispatchSendStop(caller, { target: 'Coder' }, {
+      listSessions: () => [
+        session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' }),
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' }),
+      ],
+      cancelSession,
+    });
+
+    expect(result.status).toBe('accepted');
+    if (result.status !== 'accepted') throw new Error('expected accepted');
+    expect(isSendDispatchId(result.dispatchId)).toBe(true);
+    expect(result.deliveries).toEqual([{ target: 'deck_alpha_w1', status: 'delivered' }]);
+    expect(cancelSession).toHaveBeenCalledTimes(1);
+    expect(cancelSession.mock.calls[0][0].name).toBe('deck_alpha_w1');
+  });
+
+  it('send_stop broadcast stops every sibling', async () => {
+    const cancelSession = vi.fn().mockResolvedValue(true);
+    const result = await dispatchSendStop(caller, { broadcast: true }, {
+      listSessions: () => [
+        session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' }),
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' }),
+        session({ name: 'deck_alpha_w2', projectName: 'alpha', role: 'w2', label: 'Coder2' }),
+      ],
+      cancelSession,
+    });
+
+    expect(result.status).toBe('accepted');
+    if (result.status !== 'accepted') throw new Error('expected accepted');
+    expect(cancelSession).toHaveBeenCalledTimes(2);
+    expect(result.deliveries.map((d) => d.target).sort()).toEqual(['deck_alpha_w1', 'deck_alpha_w2']);
+  });
+
+  it('send_stop errors when cancelSession is not configured', async () => {
+    const result = await dispatchSendStop(caller, { target: 'Coder' }, {
+      listSessions: () => [
+        session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' }),
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' }),
+      ],
+    });
+    expect(result.status).toBe('error');
+    if (result.status !== 'error') throw new Error('expected error');
+    expect(result.reason).toBe('internal_error');
+  });
+
+  it('send_stop reports failure when the target cannot be stopped', async () => {
+    const cancelSession = vi.fn().mockResolvedValue(false);
+    const result = await dispatchSendStop(caller, { target: 'Coder' }, {
+      listSessions: () => [
+        session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' }),
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' }),
+      ],
+      cancelSession,
+    });
+    expect(result.status).toBe('error');
   });
 
   it('treats sub-sessions as siblings of their parent project for target listing and dispatch', async () => {

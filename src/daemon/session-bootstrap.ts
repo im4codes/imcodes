@@ -1,19 +1,6 @@
 import type { SessionRecord } from '../store/session-store.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
-
-export interface WorkerSessionSnapshot {
-  name: string;
-  project_name: string;
-  role: string;
-  agent_type: string;
-  project_dir: string;
-  state: string;
-  label?: string | null;
-  requested_model?: string | null;
-  active_model?: string | null;
-  effort?: SessionRecord['effort'] | null;
-  transport_config?: Record<string, unknown> | string | null;
-}
+import type { WorkerSessionSnapshot } from '../../shared/worker-session-snapshot.js';
 
 export interface WorkerSessionPersistBody {
   projectName: string;
@@ -71,12 +58,7 @@ export function mergeWorkerSessionSnapshot(
   existing: SessionRecord | undefined,
   snapshot: WorkerSessionSnapshot,
 ): SessionRecord {
-  const rawServerConfig = typeof snapshot.transport_config === 'string'
-    ? JSON.parse(snapshot.transport_config)
-    : snapshot.transport_config;
-  const serverConfig = (rawServerConfig && typeof rawServerConfig === 'object' && !Array.isArray(rawServerConfig))
-    ? rawServerConfig as Record<string, unknown>
-    : undefined;
+  const serverConfig = snapshot.transport_config ?? undefined;
   // Merge strategy: the server's `transport_config` column defaults to `{}` at row
   // creation and stays there until someone explicitly pushes supervision settings.
   // A plain overwrite (`serverConfig ?? existing`) would wipe client-set supervision
@@ -94,8 +76,8 @@ export function mergeWorkerSessionSnapshot(
     role: snapshot.role as 'brain' | `w${number}`,
     agentType: snapshot.agent_type,
     projectDir: snapshot.project_dir,
-    state: snapshot.state as SessionRecord['state'],
-    label: snapshot.label ?? undefined,
+    state: existing?.state ?? snapshot.state,
+    label: snapshot.label ?? existing?.label,
     requestedModel: snapshot.requested_model ?? existing?.requestedModel,
     activeModel: snapshot.active_model ?? existing?.activeModel,
     modelDisplay: snapshot.active_model ?? existing?.modelDisplay,

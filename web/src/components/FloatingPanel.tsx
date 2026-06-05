@@ -8,7 +8,7 @@ import type { ComponentChildren } from 'preact';
 import { useTranslation } from 'react-i18next';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
 import {
-  clampGeometryToWorkspace,
+  clampGeometryFullyIntoWorkspace,
   geometryFromWorkspace,
   normalizeWindowGeometry,
   reserveWorkspaceBottom,
@@ -39,7 +39,6 @@ interface Props {
 
 const MIN_W = 360;
 const MIN_H = 280;
-const DRAG_MARGIN = 32;
 
 function currentViewportBounds(): WorkspaceBounds {
   return reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
@@ -52,15 +51,10 @@ function currentViewportBounds(): WorkspaceBounds {
 
 function clampGeomToViewport(geom: WindowGeometry): WindowGeometry {
   const bounds = currentViewportBounds();
-  const clamped = clampGeometryToWorkspace(geom, bounds, {
+  return clampGeometryFullyIntoWorkspace(geom, bounds, {
     minW: MIN_W,
     minH: MIN_H,
-    visibleMargin: DRAG_MARGIN,
   });
-  return {
-    ...clamped,
-    y: Math.min(clamped.y, Math.max(bounds.y, bounds.y + bounds.h - clamped.h)),
-  };
 }
 
 function loadGeom(id: string, dw: number, dh: number): WindowGeometry {
@@ -130,12 +124,9 @@ export function FloatingPanel({
   // ── Drag ─────────────────────────────────────────────────────────────────
   const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
 
-  const clampPos = useCallback((x: number, y: number, w: number) => {
-    const topBound = currentViewportBounds().y;
-    return {
-      x: Math.min(Math.max(x, DRAG_MARGIN - w), window.innerWidth - DRAG_MARGIN),
-      y: Math.min(Math.max(y, topBound), Math.max(topBound, window.innerHeight - DRAG_MARGIN)),
-    };
+  const clampPos = useCallback((x: number, y: number, w: number, h = geomRef.current.h) => {
+    const clamped = clampGeomToViewport({ x, y, w, h });
+    return { x: clamped.x, y: clamped.y };
   }, []);
 
   const startDrag = useCallback((e: MouseEvent) => {

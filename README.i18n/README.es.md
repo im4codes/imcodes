@@ -5,6 +5,10 @@
 
 **El IM para agentes. Memoria compartida, herramientas MCP gestionadas, ejecución supervisada y auditoría cruzada entre proveedores de IA.**
 
+> Two heads are better than one.<br>
+> But minds in concert don't answer fate, they author it.<br>
+> — IM.codes
+
 IM.codes ofrece a los coding agents una capa de memoria compartida entre proveedores y una superficie MCP gestionada. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent), además de terminal, archivos, vistas Git, localhost preview, notificaciones, flujos multiagente y streaming nativo para agentes transport. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión Team integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.
 
 > **Nota:** Este archivo es una traducción. **El README en inglés (`../README.md`) es la versión canónica.** Si hay alguna diferencia, prevalece la versión en inglés.

@@ -6,6 +6,8 @@ import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/pr
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { CronManager } from '../src/pages/CronManager.js';
 import type { SessionInfo } from '../src/types.js';
+import type { WsClient } from '../src/ws-client.js';
+import { RESOURCE_EVENT_MSG, RESOURCE_TOPICS } from '@shared/resource-events.js';
 
 const apiFetch = vi.fn();
 
@@ -48,6 +50,16 @@ function cronJob(overrides: Partial<any> = {}) {
     created_at: Date.now(),
     ...overrides,
   };
+}
+
+function expectedDateTimeLocalValue(ts: number): string {
+  const date = new Date(ts);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+  ].join('-') + `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 describe('CronManager', () => {
@@ -182,6 +194,113 @@ describe('CronManager', () => {
     expect(await screen.findByText('Current job')).toBeDefined();
     expect(screen.queryByText('cron.read_only')).toBeNull();
     expect((screen.getByText('✎') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('shows send action target and message in the list and edit form', async () => {
+    apiFetch.mockResolvedValueOnce({
+      jobs: [cronJob({
+        id: 'send-job',
+        name: 'Send reminder',
+        target_session_name: 'deck_sub_52123h2r',
+        action: JSON.stringify({
+          type: 'send',
+          target: 'deck_sub_audit',
+          message: 'line one\nline two',
+          reply: true,
+        }),
+      })],
+    });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        onBack={vi.fn()}
+        servers={[{ id: 'srv-current', name: 'Current' }]}
+      />,
+    );
+
+    expect(await screen.findByText('Send reminder')).toBeDefined();
+    expect(screen.getByText((_text, node) => node?.textContent === 'common.send → deck_sub_audit: line one line two')).toBeDefined();
+
+    fireEvent.click(screen.getByText('✎'));
+
+    expect(screen.getByDisplayValue('deck_sub_audit')).toBeDefined();
+    expect((screen.getByPlaceholderText('cron.send_message_placeholder') as HTMLTextAreaElement).value).toBe('line one\nline two');
+    expect((screen.getByLabelText('cron.send_reply') as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('creates send cron jobs from the normal form', async () => {
+    apiFetch
+      .mockResolvedValueOnce({ jobs: [] })
+      .mockResolvedValueOnce({})
+      .mockResolvedValue({ jobs: [] });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        onBack={vi.fn()}
+        servers={[{ id: 'srv-current', name: 'Current' }]}
+      />,
+    );
+
+    expect(await screen.findByText('cron.no_tasks')).toBeDefined();
+    fireEvent.click(screen.getByTitle('cron.create'));
+
+    fireEvent.input(screen.getByPlaceholderText('cron.name_placeholder'), { target: { value: 'Send check' } });
+    fireEvent.input(screen.getByPlaceholderText('0 9 * * 1-5'), { target: { value: '0 11 * * *' } });
+    fireEvent.click(screen.getByLabelText('common.send'));
+    fireEvent.input(screen.getByPlaceholderText('cron.send_target_placeholder'), { target: { value: 'deck_sub_audit' } });
+    fireEvent.input(screen.getByPlaceholderText('cron.send_message_placeholder'), { target: { value: 'Please check this task' } });
+    fireEvent.click(screen.getByLabelText('cron.send_reply'));
+    fireEvent.click(screen.getByText('cron.save'));
+
+    await waitFor(() => expect(apiFetch).toHaveBeenCalledWith('/api/cron', expect.objectContaining({ method: 'POST' })));
+    const createCall = apiFetch.mock.calls.find(([url]) => url === '/api/cron');
+    const payload = JSON.parse(String(createCall?.[1]?.body));
+    expect(payload).toMatchObject({
+      name: 'Send check',
+      cronExpr: '0 11 * * *',
+      action: {
+        type: 'send',
+        target: 'deck_sub_audit',
+        message: 'Please check this task',
+        reply: true,
+      },
+    });
+  });
+
+  it('shows persisted expiration timestamps in the browser local timezone when editing', async () => {
+    const expiresAt = Date.UTC(2026, 5, 1, 2, 47, 30);
+    apiFetch.mockResolvedValueOnce({
+      jobs: [cronJob({
+        id: 'expiring-job',
+        name: 'Expiring job',
+        expires_at: expiresAt,
+      })],
+    });
+
+    const { container } = render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        onBack={vi.fn()}
+        servers={[{ id: 'srv-current', name: 'Current' }]}
+      />,
+    );
+
+    expect(await screen.findByText('Expiring job')).toBeDefined();
+    fireEvent.click(screen.getByText('✎'));
+
+    const expiresInput = container.querySelector('input[type="datetime-local"]') as HTMLInputElement;
+    expect(expiresInput.value).toBe(expectedDateTimeLocalValue(expiresAt));
   });
 
   it('blocks saving inline cron commands longer than 1500 chars and shows a file-reference hint', async () => {
@@ -471,5 +590,62 @@ describe('CronManager', () => {
     fireEvent.click(screen.getByLabelText('cron.show_all_servers'));
     await waitFor(() => expect(apiFetch).toHaveBeenCalledWith('/api/cron?'));
     expect(localStorage.getItem('rcc_cron_show_all')).toBe('1');
+  });
+
+  it('refetches the jobs list when the window regains focus (external/MCP cron)', async () => {
+    apiFetch
+      .mockResolvedValueOnce({ jobs: [cronJob({ id: 'job-1', name: 'First job' })] })
+      .mockResolvedValue({ jobs: [cronJob({ id: 'job-1', name: 'First job' }), cronJob({ id: 'job-2', name: 'MCP job' })] });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        onBack={vi.fn()}
+        servers={[{ id: 'srv-current', name: 'Current' }]}
+      />,
+    );
+
+    expect(await screen.findByText('First job')).toBeDefined();
+    expect(screen.queryByText('MCP job')).toBeNull();
+
+    // A cron created externally (e.g. via MCP) isn't pushed here; regaining
+    // window focus must silently refetch and surface it without a page reload.
+    window.dispatchEvent(new Event('focus'));
+
+    expect(await screen.findByText('MCP job')).toBeDefined();
+  });
+
+  it('refetches when the server pushes a cron resource.changed event (e.g. MCP create)', async () => {
+    let wsHandler: ((msg: unknown) => void) | null = null;
+    const ws = {
+      onMessage: (fn: (msg: unknown) => void) => { wsHandler = fn; return () => { wsHandler = null; }; },
+    } as unknown as WsClient;
+
+    apiFetch
+      .mockResolvedValueOnce({ jobs: [cronJob({ id: 'job-1', name: 'First job' })] })
+      .mockResolvedValue({ jobs: [cronJob({ id: 'job-1', name: 'First job' }), cronJob({ id: 'job-2', name: 'MCP job' })] });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        onBack={vi.fn()}
+        servers={[{ id: 'srv-current', name: 'Current' }]}
+        ws={ws}
+      />,
+    );
+
+    expect(await screen.findByText('First job')).toBeDefined();
+    expect(screen.queryByText('MCP job')).toBeNull();
+
+    // The server pushes a cron change (any source, incl. MCP) → list refetches.
+    wsHandler?.({ type: RESOURCE_EVENT_MSG.CHANGED, topic: RESOURCE_TOPICS.cron, serverId: 'srv-current' });
+
+    expect(await screen.findByText('MCP job')).toBeDefined();
   });
 });

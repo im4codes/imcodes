@@ -1,7 +1,7 @@
-import { access, copyFile, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { access, copyFile, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { homedir } from 'node:os';
-import { extname, resolve, sep } from 'node:path';
+import { extname, join, resolve, sep } from 'node:path';
 import { TextDecoder } from 'node:util';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import readline, { type Interface as ReadlineInterface } from 'node:readline';
@@ -41,6 +41,19 @@ import { getDefaultCodexMcpArgs } from './getDefaultCodexMcpArgs.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_SCHEMA_VERSION,
+  SDK_SUBAGENT_STATUS,
+  buildSdkSubagentSafeDetail,
+  makeCodexSubagentCanonicalKey,
+  type SdkSubagentDetail,
+  type SdkSubagentDiagnosticCode,
+  type SdkSubagentNormalizedStatus,
+} from '../../../shared/sdk-subagent-status.js';
 
 const CODEX_BIN = 'codex';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
@@ -52,6 +65,56 @@ const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
 const IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER = '# IM.codes runtime instructions';
 const GENERATED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
+const CODEX_COLLAB_MAX_RECEIVERS = 100;
+const CODEX_COLLAB_MAX_STATE_KEYS = 200;
+const CODEX_COLLAB_MAX_ID_CHARS = 160;
+const CODEX_RUNTIME_SUBAGENT_METHODS = new Set([
+  'subagent_notification',
+  'subagent/notification',
+  'subagent/status',
+  'agent/subagent_notification',
+  'agent/subagent/status',
+  'runtime/subagent_notification',
+  'runtime/subagent/status',
+]);
+const CODEX_RUNTIME_SUBAGENT_ITEM_TYPES = new Set([
+  'subagentnotification',
+  'subagentstatus',
+  'runtimesubagent',
+  'runtimesubagentnotification',
+]);
+const CODEX_RAW_SPAWN_AGENT_FUNCTION_NAMES = new Set(['spawn_agent', 'spawnAgent']);
+const CODEX_RAW_CHECKLIST_FUNCTION_NAMES = new Set([
+  'todowrite',
+  'todo_write',
+  'write_todos',
+  'update_plan',
+  'updateplan',
+  'update_todo_list',
+  'set_plan',
+  'setplan',
+]);
+const CODEX_RAW_CHECKLIST_HISTORY_TAIL_BYTES = 512 * 1024;
+const CODEX_RAW_CHECKLIST_HISTORY_CLOCK_SKEW_MS = 5_000;
+const CODEX_RAW_CHECKLIST_POLL_INTERVAL_MS = 2_000;
+const CODEX_RAW_CHECKLIST_POLL_WINDOW_MS = 20_000;
+
+interface CodexRawSpawnAgentCall {
+  sessionId: string;
+  callId: string;
+  args: Record<string, any>;
+}
+
+interface CodexTrackedSubagentThread {
+  sessionId: string;
+  callId: string;
+  agentId: string;
+  agentName?: string;
+  prompt?: string;
+  model?: string;
+  lastStatus?: unknown;
+  usageTotalTokens?: number;
+}
 
 
 function errorMessage(err: unknown): string {
@@ -62,6 +125,49 @@ function getCodexHome(env: Record<string, string | undefined>): string {
   return typeof env.CODEX_HOME === 'string' && env.CODEX_HOME.trim()
     ? resolve(env.CODEX_HOME.trim())
     : resolve(homedir(), '.codex');
+}
+
+function codexSessionDir(codexHome: string, date: Date): string {
+  const yyyy = date.getUTCFullYear();
+  const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(date.getUTCDate()).padStart(2, '0');
+  return join(codexHome, 'sessions', String(yyyy), mm, dd);
+}
+
+function recentCodexSessionDirs(codexHome: string): string[] {
+  const dirs: string[] = [];
+  for (let i = 0; i < 30; i += 1) {
+    dirs.push(codexSessionDir(codexHome, new Date(Date.now() - i * 86_400_000)));
+  }
+  return dirs;
+}
+
+async function findCodexRolloutPathByUuid(env: Record<string, string | undefined>, uuid: string): Promise<string | null> {
+  const codexHome = getCodexHome(env);
+  let latestPath: string | null = null;
+  let latestMtime = -1;
+  for (const dir of recentCodexSessionDirs(codexHome)) {
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      if (!name.startsWith('rollout-') || !name.endsWith('.jsonl') || !name.includes(uuid)) continue;
+      const candidate = join(dir, name);
+      try {
+        const info = await stat(candidate);
+        if (info.mtimeMs > latestMtime) {
+          latestMtime = info.mtimeMs;
+          latestPath = candidate;
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+  return latestPath;
 }
 
 function isCodexAuthFailureMessage(message: string): boolean {
@@ -255,6 +361,11 @@ type PendingRequest = {
   reject: (error: Error) => void;
 };
 
+type GeneratedImageTrackingSnapshot = {
+  dir: string;
+  knownPaths: Set<string>;
+};
+
 export interface CodexDiscoveredModel {
   id: string;
   name?: string;
@@ -307,8 +418,17 @@ interface CodexSdkSessionState {
   lastStatusSignature: string | null;
   pendingSessionSystemTextUpdate?: string;
   pendingSessionSystemTextUpdateTurnId?: string;
-  generatedImageKnownPaths: Set<string>;
+  completedTurnIds: Set<string>;
+  completedCompactTurnIds: Set<string>;
+  generatedImageTracking: GeneratedImageTrackingSnapshot | null;
   generatedImagePaths: string[];
+  rawChecklistStartedAt: number;
+  rawChecklistRolloutPath?: string;
+  rawChecklistRolloutOffset?: number;
+  rawChecklistSeenCallIds: Set<string>;
+  rawChecklistScanPromise?: Promise<void>;
+  rawChecklistPollTimer: ReturnType<typeof setTimeout> | null;
+  rawChecklistPollUntil: number;
 }
 
 function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
@@ -405,6 +525,13 @@ function readThreadStatus(params: Record<string, any>): string | undefined {
   return typeof nested === 'string' && nested.trim() ? nested.trim() : undefined;
 }
 
+function readTurnStatus(params: Record<string, any>): string | undefined {
+  return meaningfulString(params.turn?.status)
+    ?? meaningfulString(params.status)
+    ?? meaningfulString(params.turnStatus)
+    ?? meaningfulString(params.turn_status);
+}
+
 function normalizeStatusName(status: string | undefined): string {
   return (status ?? '').replace(/[_\s-]+/g, '').toLowerCase();
 }
@@ -427,13 +554,653 @@ function isThreadIdleStatus(status: string | undefined): boolean {
     || normalized === 'notloaded';
 }
 
-function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
-  const meaningfulString = (value: unknown): string | undefined => {
-    if (typeof value !== 'string') return undefined;
-    const trimmed = value.trim();
-    return trimmed ? trimmed : undefined;
+function meaningfulString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length <= CODEX_COLLAB_MAX_ID_CHARS ? trimmed : trimmed.slice(0, CODEX_COLLAB_MAX_ID_CHARS);
+}
+
+function meaningfulStringArray(value: unknown): { values: string[]; malformed: boolean } {
+  if (!Array.isArray(value)) {
+    return { values: [], malformed: value !== undefined };
+  }
+  if (value.length > CODEX_COLLAB_MAX_RECEIVERS) return { values: [], malformed: true };
+  const values: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string') return { values: [], malformed: true };
+    const trimmed = entry.trim();
+    if (!trimmed || trimmed.length > CODEX_COLLAB_MAX_ID_CHARS) return { values: [], malformed: true };
+    const stringValue = meaningfulString(trimmed);
+    if (!stringValue) return { values: [], malformed: true };
+    values.push(stringValue);
+  }
+  return { values, malformed: false };
+}
+
+function readCodexAgentStates(value: unknown): { states: Record<string, unknown>; malformed: boolean } {
+  if (value === undefined) return { states: {}, malformed: false };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { states: {}, malformed: true };
+  const keys = Object.keys(value as Record<string, unknown>);
+  if (keys.length > CODEX_COLLAB_MAX_STATE_KEYS || keys.some((key) => key.length > CODEX_COLLAB_MAX_ID_CHARS)) {
+    return { states: {}, malformed: true };
+  }
+  return { states: value as Record<string, unknown>, malformed: false };
+}
+
+function readCodexChildStatus(value: unknown): string | undefined {
+  if (typeof value === 'string') return meaningfulString(value);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  return meaningfulString(record.status)
+    ?? meaningfulString(record.state)
+    ?? meaningfulString(record.lifecycleStatus);
+}
+
+function isCodexRunningChildStatus(status: string | undefined): boolean {
+  const normalized = normalizeStatusName(status);
+  return normalized === 'pendinginit' || normalized === 'running';
+}
+
+function isKnownCodexChildStatus(status: string | undefined): boolean {
+  const normalized = normalizeStatusName(status);
+  return normalized === 'pendinginit'
+    || normalized === 'running'
+    || normalized === 'completed'
+    || normalized === 'errored'
+    || normalized === 'shutdown'
+    || normalized === 'notfound'
+    || normalized === 'interrupted'
+    || normalized === 'stale';
+}
+
+function childStatusSummary(counts: Map<string, number>): string {
+  if (counts.size === 0) return 'receivers:0';
+  const summary = [...counts.entries()].map(([status, count]) => `${status}:${count}`).join(', ');
+  return summary.length <= 160 ? summary : `${summary.slice(0, 157)}...`;
+}
+
+type CodexCollabChildSummary = {
+  receiverCount: number;
+  runningChildCount: number;
+  childStatusSummary: string;
+  diagnosticCode?: SdkSubagentDiagnosticCode;
+};
+
+function summarizeCodexCollabChildren(item: Record<string, any>, diagnosticOnly: boolean): CodexCollabChildSummary {
+  const receiverThreads = meaningfulStringArray(item.receiverThreadIds);
+  const agentStates = readCodexAgentStates(item.agentsStates);
+  const receiverIds = receiverThreads.values;
+  const receiverSet = new Set(receiverIds);
+  const stateKeys = Object.keys(agentStates.states).filter((key) => key.trim());
+  const extraKeys = stateKeys.filter((key) => !receiverSet.has(key));
+  const hasMissingState = receiverIds.some((receiverId) => !(receiverId in agentStates.states));
+  const counts = new Map<string, number>();
+  let hasUnknownChildState = false;
+
+  for (const receiverId of receiverIds) {
+    const status = readCodexChildStatus(agentStates.states[receiverId]);
+    const statusKey = status ?? 'missing';
+    counts.set(statusKey, (counts.get(statusKey) ?? 0) + 1);
+    if (!status || !isKnownCodexChildStatus(status)) hasUnknownChildState = true;
+  }
+  if (extraKeys.length > 0) counts.set('extra', extraKeys.length);
+
+  const malformed = item.receiverThreadIds === undefined
+    || receiverThreads.malformed
+    || agentStates.malformed
+    || hasMissingState
+    || extraKeys.length > 0;
+  const diagnosticCode = malformed
+    ? SDK_SUBAGENT_DIAGNOSTIC.MALFORMED_PAYLOAD
+    : hasUnknownChildState
+      ? SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE
+      : undefined;
+  const runningChildCount = diagnosticOnly || diagnosticCode
+    ? 0
+    : receiverIds.reduce((count, receiverId) => (
+        count + (isCodexRunningChildStatus(readCodexChildStatus(agentStates.states[receiverId])) ? 1 : 0)
+      ), 0);
+
+  return {
+    receiverCount: receiverIds.length,
+    runningChildCount,
+    childStatusSummary: childStatusSummary(counts),
+    diagnosticCode,
   };
+}
+
+function mapCodexCollabStatus(
+  rawStatus: string,
+  diagnosticCode: SdkSubagentDiagnosticCode | undefined,
+): {
+  toolStatus: ToolCallEvent['status'];
+  normalizedStatus: SdkSubagentNormalizedStatus;
+  active: boolean;
+  terminal: boolean;
+  diagnosticCode?: SdkSubagentDiagnosticCode;
+} {
+  if (diagnosticCode) {
+    return {
+      toolStatus: 'error',
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode,
+    };
+  }
+
+  const normalized = normalizeStatusName(rawStatus);
+  if (normalized === 'inprogress') {
+    return {
+      toolStatus: 'running',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    };
+  }
+  if (normalized === 'completed' || normalized === 'complete') {
+    return {
+      toolStatus: 'complete',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    };
+  }
+  if (normalized === 'failed' || normalized === 'error' || normalized === 'errored') {
+    return {
+      toolStatus: 'error',
+      normalizedStatus: SDK_SUBAGENT_STATUS.ERROR,
+      active: false,
+      terminal: true,
+    };
+  }
+
+  return {
+    toolStatus: 'error',
+    normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+    active: false,
+    terminal: true,
+    diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function readNestedRuntimeSubagentRecord(value: unknown): Record<string, any> | undefined {
+  if (!isRecord(value)) return undefined;
+  const record = value;
+  const type = meaningfulString(record.type);
+  const hasRuntimeShape = Boolean(
+    meaningfulString(record.agent_path)
+    ?? meaningfulString(record.agentPath)
+    ?? meaningfulString(record.agent_id)
+    ?? meaningfulString(record.agentId)
+    ?? meaningfulString(record.path)
+    ?? meaningfulString(record.status)
+    ?? meaningfulString(record.state)
+    ?? (type && CODEX_RUNTIME_SUBAGENT_ITEM_TYPES.has(normalizeStatusName(type))),
+  );
+  if (hasRuntimeShape) return record;
+  for (const key of ['subagent', 'subAgent', 'agent', 'notification', 'data', 'event']) {
+    const nested = readNestedRuntimeSubagentRecord(record[key]);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+function readRuntimeSubagentId(record: Record<string, any>): string | undefined {
+  return meaningfulString(record.agent_path)
+    ?? meaningfulString(record.agentPath)
+    ?? meaningfulString(record.agent_id)
+    ?? meaningfulString(record.agentId)
+    ?? meaningfulString(record.path)
+    ?? meaningfulString(record.id);
+}
+
+function readRuntimeSubagentName(record: Record<string, any>): string | undefined {
+  return meaningfulString(record.name)
+    ?? meaningfulString(record.nickname)
+    ?? meaningfulString(record.displayName)
+    ?? meaningfulString(record.display_name)
+    ?? meaningfulString(record.label);
+}
+
+function readRuntimeSubagentModel(record: Record<string, any>): string | undefined {
+  return meaningfulString(record.model)
+    ?? meaningfulString(record.agentModel)
+    ?? meaningfulString(record.agent_model)
+    ?? meaningfulString(record.modelId)
+    ?? meaningfulString(record.model_id);
+}
+
+function readRuntimeSubagentStatus(record: Record<string, any>): string | undefined {
+  return meaningfulString(record.status)
+    ?? meaningfulString(record.state)
+    ?? meaningfulString(record.lifecycleStatus)
+    ?? meaningfulString(record.lifecycle_status);
+}
+
+function readRuntimeSubagentStatusInfo(record: Record<string, any>): { status?: string; message?: string } {
+  const direct = readRuntimeSubagentStatus(record);
+  if (direct) return { status: direct };
+  const statusRecord = isRecord(record.status) ? record.status : isRecord(record.state) ? record.state : undefined;
+  if (!statusRecord) return {};
+  const nested = readRuntimeSubagentStatus(statusRecord);
+  if (nested) return { status: nested };
+  for (const key of ['completed', 'complete', 'shutdown', 'running', 'pending', 'failed', 'error', 'interrupted', 'cancelled', 'canceled', 'stopped', 'killed']) {
+    if (key in statusRecord) {
+      return { status: key, message: meaningfulString(statusRecord[key]) };
+    }
+  }
+  return {};
+}
+
+function readRuntimeSubagentPrompt(record: Record<string, any>): string | undefined {
+  return meaningfulString(record.prompt)
+    ?? meaningfulString(record.description)
+    ?? meaningfulString(record.instruction)
+    ?? meaningfulString(record.instructions)
+    ?? meaningfulString(record.message);
+}
+
+function readRuntimeSubagentUsageTotalTokens(record: Record<string, any>): number | undefined {
+  return finiteNumber(record.usageTotalTokens)
+    ?? finiteNumber(record.usage_total_tokens)
+    ?? finiteNumber(record.totalTokens)
+    ?? finiteNumber(record.total_tokens);
+}
+
+function mapCodexRuntimeSubagentStatus(
+  rawStatus: string,
+  diagnosticCode: SdkSubagentDiagnosticCode | undefined,
+): {
+  toolStatus: ToolCallEvent['status'];
+  normalizedStatus: SdkSubagentNormalizedStatus;
+  active: boolean;
+  terminal: boolean;
+  diagnosticCode?: SdkSubagentDiagnosticCode;
+} {
+  if (diagnosticCode) {
+    return {
+      toolStatus: 'error',
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode,
+    };
+  }
+
+  const normalized = normalizeStatusName(rawStatus);
+  if (
+    normalized === 'pending'
+    || normalized === 'queued'
+    || normalized === 'starting'
+    || normalized === 'created'
+    || normalized === 'spawned'
+  ) {
+    return {
+      toolStatus: 'running',
+      normalizedStatus: SDK_SUBAGENT_STATUS.PENDING,
+      active: true,
+      terminal: false,
+    };
+  }
+  if (
+    normalized === 'running'
+    || normalized === 'active'
+    || normalized === 'started'
+    || normalized === 'working'
+    || normalized === 'inprogress'
+  ) {
+    return {
+      toolStatus: 'running',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    };
+  }
+  if (
+    normalized === 'shutdown'
+    || normalized === 'complete'
+    || normalized === 'completed'
+    || normalized === 'done'
+    || normalized === 'success'
+    || normalized === 'succeeded'
+    || normalized === 'finished'
+  ) {
+    return {
+      toolStatus: 'complete',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    };
+  }
+  if (
+    normalized === 'failed'
+    || normalized === 'failure'
+    || normalized === 'error'
+    || normalized === 'errored'
+    || normalized === 'crashed'
+  ) {
+    return {
+      toolStatus: 'error',
+      normalizedStatus: SDK_SUBAGENT_STATUS.ERROR,
+      active: false,
+      terminal: true,
+    };
+  }
+  if (
+    normalized === 'interrupted'
+    || normalized === 'cancelled'
+    || normalized === 'canceled'
+    || normalized === 'stopped'
+    || normalized === 'killed'
+  ) {
+    return {
+      toolStatus: 'error',
+      normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED,
+      active: false,
+      terminal: true,
+    };
+  }
+
+  return {
+    toolStatus: 'error',
+    normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+    active: false,
+    terminal: true,
+    diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
+  };
+}
+
+function runtimeSubagentToolFromPayload(
+  sessionId: string,
+  payload: Record<string, any>,
+  lifecycle?: 'started' | 'completed',
+): ToolCallEvent | null {
+  const record = readNestedRuntimeSubagentRecord(payload) ?? payload;
+  const rawAgentPath = readRuntimeSubagentId(record);
+  const fallbackId = lifecycle ? `${lifecycle}-missing-id` : 'notification-missing-id';
+  const agentPath = rawAgentPath ?? fallbackId;
+  const statusInfo = readRuntimeSubagentStatusInfo(record);
+  const rawStatus = statusInfo.status
+    ?? (lifecycle === 'started' ? 'running' : lifecycle === 'completed' ? 'shutdown' : undefined);
+  const diagnosticCode = rawAgentPath
+    ? (rawStatus ? undefined : SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE)
+    : SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID;
+  const statusMapping = mapCodexRuntimeSubagentStatus(rawStatus ?? 'unknown', diagnosticCode);
+  const canonicalKey = makeCodexSubagentCanonicalKey(sessionId, `runtime:${agentPath}`);
+  const agentName = readRuntimeSubagentName(record);
+  const model = readRuntimeSubagentModel(record);
+  const prompt = readRuntimeSubagentPrompt(record);
+  const usageTotalTokens = readRuntimeSubagentUsageTotalTokens(record);
+  const summary = agentName ? `Codex sub-agent ${agentName}` : rawAgentPath ? `Codex sub-agent ${rawAgentPath}` : 'Codex sub-agent';
+  const output = statusMapping.terminal ? (statusInfo.message ?? rawStatus ?? 'unknown') : undefined;
+  const detail = buildSdkSubagentSafeDetail({
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary,
+    input: {
+      action: 'codex-runtime-subagent',
+      description: prompt ?? summary,
+    },
+    ...(output ? { output } : {}),
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT,
+      canonicalKey,
+      normalizedStatus: statusMapping.normalizedStatus,
+      ...(rawStatus ? { rawStatus } : {}),
+      active: statusMapping.active,
+      terminal: statusMapping.terminal,
+      parentSessionId: sessionId,
+      parentItemId: canonicalKey,
+      ...(rawAgentPath ? { agentPath: rawAgentPath } : {}),
+      ...(agentName ? { agentName } : {}),
+      ...(model ? { model } : {}),
+      ...(record.backgrounded === true ? { backgrounded: true } : {}),
+      ...(usageTotalTokens !== undefined ? { usageTotalTokens } : {}),
+      diagnosticCode: statusMapping.diagnosticCode,
+    },
+  } satisfies SdkSubagentDetail, { allowRaw: false });
+
+  return {
+    id: canonicalKey,
+    name: 'Codex Sub-agent',
+    status: statusMapping.toolStatus,
+    ...(detail.input ? { input: detail.input } : {}),
+    ...(detail.output ? { output: detail.output } : {}),
+    detail,
+  };
+}
+
+function isCodexRuntimeSubagentMethod(method: string, params: Record<string, any>): boolean {
+  if (CODEX_RUNTIME_SUBAGENT_METHODS.has(method)) return true;
+  const type = meaningfulString(params.type);
+  return Boolean(type && CODEX_RUNTIME_SUBAGENT_ITEM_TYPES.has(normalizeStatusName(type)));
+}
+
+function parseCodexRuntimeSubagentTag(line: string): Record<string, any> | null {
+  const match = /^<subagent_notification>([\s\S]+)<\/subagent_notification>$/.exec(line.trim());
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[1]!);
+    return isRecord(parsed) ? { type: 'subagent_notification', ...parsed } : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseJsonRecord(value: unknown): Record<string, any> | undefined {
+  if (isRecord(value)) return value;
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function rawChecklistText(item: Record<string, unknown>): string | undefined {
+  for (const key of ['content', 'step', 'text', 'title', 'task', 'description', 'name']) {
+    const value = item[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function rawChecklistStatus(value: unknown): 'pending' | 'in_progress' | 'completed' {
+  const normalized = normalizeStatusName(typeof value === 'string' ? value : undefined);
+  if (normalized === 'completed' || normalized === 'complete' || normalized === 'done' || normalized === 'finished' || normalized === 'checked') {
+    return 'completed';
+  }
+  if (normalized === 'inprogress' || normalized === 'active' || normalized === 'doing' || normalized === 'running' || normalized === 'started') {
+    return 'in_progress';
+  }
+  return 'pending';
+}
+
+function rawChecklistInputFromArgs(args: Record<string, any>): { plan: Array<{ content: string; status: string }> } | null {
+  const rawItems = Array.isArray(args.plan)
+    ? args.plan
+    : Array.isArray(args.todos)
+      ? args.todos
+      : Array.isArray(args.tasks)
+        ? args.tasks
+        : Array.isArray(args.steps)
+          ? args.steps
+          : null;
+  if (!rawItems) return null;
+  const plan: Array<{ content: string; status: string }> = [];
+  for (const rawItem of rawItems) {
+    if (!isRecord(rawItem)) continue;
+    const content = rawChecklistText(rawItem);
+    if (!content) continue;
+    plan.push({ content, status: rawChecklistStatus(rawItem.status) });
+  }
+  return plan.length ? { plan } : null;
+}
+
+function rawChecklistToolFromFunctionCall(sessionId: string, item: Record<string, any>): ToolCallEvent | null {
+  const name = meaningfulString(item.name);
+  const normalizedName = name?.replace(/[\s-]+/g, '_').toLowerCase();
+  if (!name || !normalizedName || !CODEX_RAW_CHECKLIST_FUNCTION_NAMES.has(normalizedName)) return null;
+  const args = parseJsonRecord(item.arguments);
+  if (!args) return null;
+  const input = rawChecklistInputFromArgs(args);
+  if (!input) return null;
+  const id = meaningfulString(item.call_id) ?? meaningfulString(item.callId) ?? meaningfulString(item.id) ?? `codex-raw-checklist-${sessionId}`;
+  return {
+    id,
+    name,
+    status: 'complete',
+    input,
+    detail: { kind: 'plan', summary: 'Plan', input, meta: {}, raw: item },
+  };
+}
+
+function rawChecklistToolFromJsonlLine(sessionId: string, line: string, minTimestampMs: number): ToolCallEvent | null {
+  if (!line.trim()) return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!isRecord(raw) || raw.type !== 'response_item') return null;
+  const timestamp = typeof raw.timestamp === 'string' ? new Date(raw.timestamp).getTime() : NaN;
+  if (Number.isFinite(timestamp) && timestamp < minTimestampMs) return null;
+  const payload = isRecord(raw.payload) ? raw.payload : null;
+  if (!payload || payload.type !== 'function_call') return null;
+  return rawChecklistToolFromFunctionCall(sessionId, payload);
+}
+
+function readRawSpawnAgentId(record: Record<string, any>): string | undefined {
+  return meaningfulString(record.agent_id)
+    ?? meaningfulString(record.agentId)
+    ?? meaningfulString(record.thread_id)
+    ?? meaningfulString(record.threadId)
+    ?? meaningfulString(record.id);
+}
+
+function buildRawSpawnAgentRuntimePayload(
+  call: CodexRawSpawnAgentCall,
+  output: Record<string, any>,
+): Record<string, any> {
+  const agentId = readRawSpawnAgentId(output);
+  const agentName = meaningfulString(output.nickname)
+    ?? meaningfulString(output.name)
+    ?? meaningfulString(call.args.nickname)
+    ?? meaningfulString(call.args.name)
+    ?? meaningfulString(call.args.agent_type)
+    ?? meaningfulString(call.args.agentType);
+  const prompt = meaningfulString(call.args.message)
+    ?? meaningfulString(call.args.prompt)
+    ?? meaningfulString(call.args.instructions);
+  const model = meaningfulString(call.args.model)
+    ?? meaningfulString(call.args.agentId)
+    ?? meaningfulString(call.args.agent_id);
+  return {
+    ...(agentId ? { agent_id: agentId } : {}),
+    status: 'running',
+    ...(agentName ? { nickname: agentName } : {}),
+    ...(prompt ? { prompt } : {}),
+    ...(model ? { model } : {}),
+    backgrounded: true,
+  };
+}
+
+function rawSpawnAgentToolFromOutput(call: CodexRawSpawnAgentCall, output: unknown): ToolCallEvent | null {
+  const outputRecord = parseJsonRecord(output) ?? {};
+  return runtimeSubagentToolFromPayload(
+    call.sessionId,
+    buildRawSpawnAgentRuntimePayload(call, outputRecord),
+  );
+}
+
+function collabAgentToolFromItem(
+  sessionId: string,
+  item: Record<string, any>,
+  lifecycle: 'started' | 'completed',
+): ToolCallEvent {
+  const rawItemId = meaningfulString(item.id);
+  const parentItemId = rawItemId ?? `malformed-${lifecycle}`;
+  const missingIdDiagnostic = rawItemId ? undefined : SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID;
+  const fallbackRawStatus = lifecycle === 'started' ? 'inProgress' : 'completed';
+  const rawStatus = meaningfulString(item.status) ?? fallbackRawStatus;
+  const childSummary = summarizeCodexCollabChildren(item, Boolean(missingIdDiagnostic));
+  const effectiveRawStatus = childSummary.runningChildCount > 0 ? 'inProgress' : rawStatus;
+  const statusMapping = mapCodexCollabStatus(effectiveRawStatus, missingIdDiagnostic ?? childSummary.diagnosticCode);
+  const receiverCount = childSummary.receiverCount;
+  const receiverLabel = receiverCount === 1 ? '1 receiver' : `${receiverCount} receivers`;
+  const summary = statusMapping.diagnosticCode
+    ? `Codex collaboration diagnostic (${receiverLabel})`
+    : `Codex collaboration agent (${receiverLabel})`;
+  const model = readRuntimeSubagentModel(item);
+  const prompt = readRuntimeSubagentPrompt(item);
+  const output = statusMapping.toolStatus === 'complete'
+    ? 'completed'
+    : statusMapping.toolStatus === 'error'
+      ? (statusMapping.diagnosticCode ? 'diagnostic' : 'failed')
+      : undefined;
+  const detail = buildSdkSubagentSafeDetail({
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary,
+    input: {
+      action: 'codex-collaboration',
+      receiverCount,
+      description: prompt ?? summary,
+    },
+    ...(output ? { output } : {}),
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT,
+      canonicalKey: makeCodexSubagentCanonicalKey(sessionId, parentItemId),
+      normalizedStatus: statusMapping.normalizedStatus,
+      rawStatus: effectiveRawStatus,
+      active: statusMapping.active,
+      terminal: statusMapping.terminal,
+      parentSessionId: sessionId,
+      parentItemId,
+      ...(model ? { model } : {}),
+      receiverCount,
+      runningChildCount: statusMapping.diagnosticCode || statusMapping.terminal ? 0 : childSummary.runningChildCount,
+      childStatusSummary: childSummary.childStatusSummary,
+      diagnosticCode: statusMapping.diagnosticCode,
+    },
+  } satisfies SdkSubagentDetail, { allowRaw: false });
+
+  return {
+    id: rawItemId ?? `codex-collab-${sessionId}-${lifecycle}-malformed`,
+    name: 'Codex Collaboration',
+    status: statusMapping.toolStatus,
+    ...(detail.input ? { input: detail.input } : {}),
+    ...(detail.output ? { output: detail.output } : {}),
+    detail,
+  };
+}
+
+export function toolFromItem(sessionId: string, item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
+  if (typeof item.type === 'string' && CODEX_RUNTIME_SUBAGENT_ITEM_TYPES.has(normalizeStatusName(item.type))) {
+    return runtimeSubagentToolFromPayload(sessionId, item, lifecycle);
+  }
   switch (item.type) {
+    case 'subagentNotification':
+    case 'subagent_notification':
+    case 'subagentStatus':
+    case 'subagent_status':
+    case 'runtimeSubagent':
+    case 'runtime_subagent':
+      return runtimeSubagentToolFromPayload(sessionId, item, lifecycle);
+    case 'collabAgentToolCall':
+      return collabAgentToolFromItem(sessionId, item, lifecycle);
     case 'commandExecution':
       return {
         id: item.id,
@@ -564,6 +1331,28 @@ function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'complet
         },
       };
     }
+    case 'todo_list': {
+      // Codex's running plan/checklist (app-server TodoListItem: items of
+      // { text, completed }). Surface it as an update_plan tool.call so the
+      // shared timeline + web checklist render it like CC/Qwen/Gemini todos.
+      // `update_plan` is intentionally file-tool-shaped so transport-relay
+      // emits the completed call with its input (matching the web normalizer).
+      const todoItems = Array.isArray(item.items) ? item.items : [];
+      const plan = todoItems
+        .map((t: Record<string, unknown>) => ({
+          content: typeof t?.text === 'string' ? t.text.trim() : '',
+          status: t?.completed === true ? 'completed' : 'pending',
+        }))
+        .filter((t: { content: string }) => t.content);
+      const input = { plan };
+      return {
+        id: item.id ?? `codex-todo-${sessionId}`,
+        name: 'update_plan',
+        status: lifecycle === 'completed' ? 'complete' : 'running',
+        input,
+        detail: { kind: 'plan', summary: 'Plan', input, meta: {}, raw: item },
+      };
+    }
     default:
       return null;
   }
@@ -607,6 +1396,8 @@ export class CodexSdkProvider implements TransportProvider {
   private pendingRequests = new Map<number, PendingRequest>();
   private appServerAuthFingerprint: string | null = null;
   private appServerRestart: Promise<void> | null = null;
+  private rawSpawnAgentCalls = new Map<string, CodexRawSpawnAgentCall>();
+  private trackedSubagentThreads = new Map<string, CodexTrackedSubagentThread>();
 
   async connect(config: ProviderConfig): Promise<void> {
     const binaryPath = this.resolveBinaryPath(config);
@@ -664,8 +1455,17 @@ export class CodexSdkProvider implements TransportProvider {
       lastStatusSignature: null,
       pendingSessionSystemTextUpdate: undefined,
       pendingSessionSystemTextUpdateTurnId: undefined,
-      generatedImageKnownPaths: new Set(),
+      completedTurnIds: existing?.completedTurnIds ?? new Set(),
+      completedCompactTurnIds: existing?.completedCompactTurnIds ?? new Set(),
+      generatedImageTracking: null,
       generatedImagePaths: [],
+      rawChecklistStartedAt: Date.now(),
+      rawChecklistRolloutPath: existing?.rawChecklistRolloutPath,
+      rawChecklistRolloutOffset: existing?.rawChecklistRolloutOffset,
+      rawChecklistSeenCallIds: existing?.rawChecklistSeenCallIds ?? new Set(),
+      rawChecklistScanPromise: undefined,
+      rawChecklistPollTimer: null,
+      rawChecklistPollUntil: 0,
     });
     if (config.resumeId || config.effort) this.emitSessionInfo(routeId, { ...(config.resumeId ? { resumeId: config.resumeId } : {}), ...(config.effort ? { effort: config.effort } : {}) });
     return routeId;
@@ -676,6 +1476,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state) return;
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
+    this.clearRawChecklistPollTimer(state);
     if (state.threadId && state.loaded) {
       await this.request('thread/unsubscribe', { threadId: state.threadId }).catch(() => {});
       this.threadToSession.delete(state.threadId);
@@ -771,7 +1572,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearCancelTimer(state);
     state.lastUsage = undefined;
     state.lastStatusSignature = null;
-    state.generatedImageKnownPaths = new Set();
+    state.generatedImageTracking = null;
     state.generatedImagePaths = [];
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
     if (this.isCompactCommand(payload)) {
@@ -828,6 +1629,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearStatus(sessionId, state);
       state.runningTurnId = undefined;
       state.pendingComplete = undefined;
+      this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
       this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
     }, CANCEL_INTERRUPT_TIMEOUT_MS);
@@ -845,6 +1647,7 @@ export class CodexSdkProvider implements TransportProvider {
     for (const [sessionId, state] of this.sessions) {
       this.clearCancelTimer(state);
       this.clearCompactTimers(state);
+      this.clearRawChecklistPollTimer(state);
       if (!options.clearSessions) {
         this.clearStatus(sessionId, state);
         state.loaded = false;
@@ -868,6 +1671,8 @@ export class CodexSdkProvider implements TransportProvider {
       void killProcessTree(child);
     }
     this.threadToSession.clear();
+    this.rawSpawnAgentCalls.clear();
+    this.trackedSubagentThreads.clear();
     this.appServerAuthFingerprint = null;
     if (options.clearSessions) {
       this.sessions.clear();
@@ -998,6 +1803,9 @@ export class CodexSdkProvider implements TransportProvider {
         ...(state.effort ? { effort: state.effort } : {}),
       });
       state.runningTurnId = result?.turn?.id;
+      if (state.runningTurnId) {
+        state.completedTurnIds.delete(state.runningTurnId);
+      }
       if (shouldInjectStableUpdate) {
         state.pendingSessionSystemTextUpdate = desiredSessionSystemText;
         state.pendingSessionSystemTextUpdateTurnId = state.runningTurnId;
@@ -1005,8 +1813,10 @@ export class CodexSdkProvider implements TransportProvider {
       if (state.cancelled && state.runningTurnId) {
         await this.interruptRunningTurn(sessionId, state, state.runningTurnId);
       }
+      if (state.runningTurnId) this.armRawChecklistPolling(sessionId, state);
     } catch (err) {
       state.runningTurnId = undefined;
+      this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
       const error = this.normalizeError(err);
       if (this.isCodexAuthError(error)) {
@@ -1195,9 +2005,7 @@ export class CodexSdkProvider implements TransportProvider {
     return resolve(getCodexHome(this.codexGeneratedImageEnv(state)), 'generated_images', state.threadId);
   }
 
-  private async listGeneratedImagePaths(state: CodexSdkSessionState): Promise<string[]> {
-    const dir = this.codexGeneratedImageDir(state);
-    if (!dir) return [];
+  private async listGeneratedImagePathsInDir(dir: string): Promise<string[]> {
     try {
       const entries = await readdir(dir, { withFileTypes: true });
       return entries
@@ -1210,23 +2018,38 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async prepareGeneratedImageTracking(sessionId: string, state: CodexSdkSessionState): Promise<void> {
-    const existingPaths = await this.listGeneratedImagePaths(state);
-    state.generatedImageKnownPaths = new Set(existingPaths);
+    const dir = this.codexGeneratedImageDir(state);
+    if (!dir) {
+      state.generatedImageTracking = null;
+      state.generatedImagePaths = [];
+      return;
+    }
+    const existingPaths = await this.listGeneratedImagePathsInDir(dir);
+    state.generatedImageTracking = {
+      dir,
+      knownPaths: new Set(existingPaths),
+    };
     state.generatedImagePaths = [];
     logger.debug({
       provider: this.id,
       sessionId,
       threadId: state.threadId,
+      generatedImageDir: dir,
       knownGeneratedImages: existingPaths.length,
     }, 'Codex SDK prepared generated image path tracking');
   }
 
   private async detectNewGeneratedImagePaths(
-    state: CodexSdkSessionState,
-    knownPaths: ReadonlySet<string>,
+    snapshot: GeneratedImageTrackingSnapshot | null,
   ): Promise<string[]> {
-    const paths = await this.listGeneratedImagePaths(state);
-    return paths.filter((path) => !knownPaths.has(path));
+    if (!snapshot) return [];
+    const paths = await this.listGeneratedImagePathsInDir(snapshot.dir);
+    const freshPaths: string[] = [];
+    for (const path of paths) {
+      if (snapshot.knownPaths.has(path)) continue;
+      freshPaths.push(path);
+    }
+    return freshPaths;
   }
 
   private handleLine(line: string): void {
@@ -1236,6 +2059,11 @@ export class CodexSdkProvider implements TransportProvider {
     try {
       msg = JSON.parse(trimmed);
     } catch (err) {
+      const runtimeSubagentPayload = parseCodexRuntimeSubagentTag(trimmed);
+      if (runtimeSubagentPayload) {
+        this.emitRuntimeSubagentNotification(runtimeSubagentPayload);
+        return;
+      }
       logger.warn({ provider: this.id, line: trimmed, err }, 'Failed to parse Codex app-server line');
       return;
     }
@@ -1258,6 +2086,266 @@ export class CodexSdkProvider implements TransportProvider {
     });
   }
 
+  private resolveRuntimeSubagentSession(params: Record<string, any>): string | undefined {
+    const threadId = readParamThreadId(params);
+    if (threadId) return this.threadToSession.get(threadId);
+    const activeSessions = [...this.sessions.entries()]
+      .filter(([, state]) => state.runningTurnId || state.runningCompact)
+      .map(([sessionId]) => sessionId);
+    if (activeSessions.length === 1) return activeSessions[0];
+    if (this.sessions.size === 1) return [...this.sessions.keys()][0];
+    return undefined;
+  }
+
+  private emitRuntimeSubagentNotification(params: Record<string, any>): void {
+    const sessionId = this.resolveRuntimeSubagentSession(params);
+    const state = sessionId ? this.sessions.get(sessionId) : null;
+    if (!sessionId || !state) return;
+    if (state.cancelled) return;
+    this.clearStatus(sessionId, state);
+    const tool = runtimeSubagentToolFromPayload(sessionId, params);
+    if (!tool) return;
+    for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+  }
+
+  private async readRawChecklistHistoryChunk(state: CodexSdkSessionState): Promise<string | null> {
+    if (!state.threadId) return null;
+    const env = { ...process.env, ...(state.env ?? {}) };
+    const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(env, state.threadId);
+    if (!rolloutPath) return null;
+    state.rawChecklistRolloutPath = rolloutPath;
+
+    let fh: Awaited<ReturnType<typeof open>> | null = null;
+    try {
+      fh = await open(rolloutPath, 'r');
+      const { size } = await fh.stat();
+      const priorOffset = state.rawChecklistRolloutOffset;
+      const shouldDiscardInitialPartial = priorOffset === undefined || priorOffset > size;
+      const start = shouldDiscardInitialPartial
+        ? Math.max(0, size - CODEX_RAW_CHECKLIST_HISTORY_TAIL_BYTES)
+        : priorOffset;
+      if (start >= size) {
+        state.rawChecklistRolloutOffset = size;
+        return null;
+      }
+      const buffer = Buffer.allocUnsafe(size - start);
+      const { bytesRead } = await fh.read(buffer, 0, buffer.length, start);
+      if (bytesRead <= 0) return null;
+
+      let processStart = 0;
+      if (shouldDiscardInitialPartial && start > 0) {
+        const firstNewline = buffer.indexOf(10, 0);
+        if (firstNewline < 0 || firstNewline >= bytesRead) return null;
+        processStart = firstNewline + 1;
+      }
+
+      let processEnd = bytesRead;
+      if (buffer[bytesRead - 1] !== 10) {
+        const lastNewline = buffer.lastIndexOf(10, bytesRead - 1);
+        if (lastNewline < processStart) {
+          state.rawChecklistRolloutOffset = start + processStart;
+          return null;
+        }
+        processEnd = lastNewline + 1;
+      }
+      if (processEnd <= processStart) return null;
+
+      state.rawChecklistRolloutOffset = start + processEnd;
+      const chunk = buffer.subarray(processStart, processEnd).toString('utf8');
+      return chunk;
+    } catch (err) {
+      logger.debug({ provider: this.id, threadId: state.threadId, rolloutPath, err }, 'Codex SDK raw checklist history scan failed');
+      return null;
+    } finally {
+      if (fh) await fh.close().catch(() => {});
+    }
+  }
+
+  private async scanRawChecklistHistory(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+    const chunk = await this.readRawChecklistHistoryChunk(state);
+    if (!chunk) return;
+    const minTimestamp = state.rawChecklistStartedAt - CODEX_RAW_CHECKLIST_HISTORY_CLOCK_SKEW_MS;
+    for (const line of chunk.split('\n')) {
+      const tool = rawChecklistToolFromJsonlLine(sessionId, line, minTimestamp);
+      if (!tool) continue;
+      if (state.rawChecklistSeenCallIds.has(tool.id)) continue;
+      state.rawChecklistSeenCallIds.add(tool.id);
+      for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+    }
+  }
+
+  private queueRawChecklistHistoryScan(sessionId: string, state: CodexSdkSessionState): void {
+    if (!state.threadId || state.rawChecklistScanPromise) return;
+    state.rawChecklistScanPromise = this.scanRawChecklistHistory(sessionId, state)
+      .catch((err) => logger.debug({ provider: this.id, sessionId, threadId: state.threadId, err }, 'Codex SDK raw checklist history scan failed'))
+      .finally(() => {
+        state.rawChecklistScanPromise = undefined;
+      });
+  }
+
+  private clearRawChecklistPollTimer(state: CodexSdkSessionState): void {
+    if (state.rawChecklistPollTimer) clearTimeout(state.rawChecklistPollTimer);
+    state.rawChecklistPollTimer = null;
+    state.rawChecklistPollUntil = 0;
+  }
+
+  private armRawChecklistPolling(sessionId: string, state: CodexSdkSessionState): void {
+    if (!state.threadId) return;
+    state.rawChecklistPollUntil = Date.now() + CODEX_RAW_CHECKLIST_POLL_WINDOW_MS;
+    if (state.rawChecklistPollTimer) return;
+    const tick = () => {
+      state.rawChecklistPollTimer = null;
+      if (!this.sessions.has(sessionId)) return;
+      if (!state.threadId || Date.now() > state.rawChecklistPollUntil) {
+        this.clearRawChecklistPollTimer(state);
+        return;
+      }
+      this.queueRawChecklistHistoryScan(sessionId, state);
+      state.rawChecklistPollTimer = setTimeout(tick, CODEX_RAW_CHECKLIST_POLL_INTERVAL_MS);
+      state.rawChecklistPollTimer.unref?.();
+    };
+    state.rawChecklistPollTimer = setTimeout(tick, CODEX_RAW_CHECKLIST_POLL_INTERVAL_MS);
+    state.rawChecklistPollTimer.unref?.();
+  }
+
+  private handleRawResponseItem(params: Record<string, any>): boolean {
+    const threadId = readParamThreadId(params);
+    const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+    const state = sessionId ? this.sessions.get(sessionId) : null;
+    const item = isRecord(params.item) ? params.item : undefined;
+    if (!sessionId || !state || !item) return false;
+    if (state.cancelled) return true;
+
+    if (item.type === 'function_call') {
+      const name = meaningfulString(item.name);
+      const checklistTool = rawChecklistToolFromFunctionCall(sessionId, item);
+      if (checklistTool) {
+        state.rawChecklistSeenCallIds.add(checklistTool.id);
+        for (const cb of this.toolCallCallbacks) cb(sessionId, checklistTool);
+        return true;
+      }
+      if (!name || !CODEX_RAW_SPAWN_AGENT_FUNCTION_NAMES.has(name)) return false;
+      const callId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
+      if (!callId) return true;
+      this.rawSpawnAgentCalls.set(callId, {
+        sessionId,
+        callId,
+        args: parseJsonRecord(item.arguments) ?? {},
+      });
+      return true;
+    }
+
+    if (item.type !== 'function_call_output') return false;
+    const callId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
+    if (!callId) return false;
+    const call = this.rawSpawnAgentCalls.get(callId);
+    if (!call) return false;
+    this.rawSpawnAgentCalls.delete(callId);
+
+    const outputRecord = parseJsonRecord(item.output) ?? {};
+    const tool = rawSpawnAgentToolFromOutput(call, outputRecord);
+    if (tool) {
+      for (const cb of this.toolCallCallbacks) cb(call.sessionId, tool);
+    }
+
+    const agentId = readRawSpawnAgentId(outputRecord);
+    if (agentId) {
+      this.trackedSubagentThreads.set(agentId, {
+        sessionId: call.sessionId,
+        callId,
+        agentId,
+        agentName: meaningfulString(outputRecord.nickname)
+          ?? meaningfulString(outputRecord.name)
+          ?? meaningfulString(call.args.nickname)
+          ?? meaningfulString(call.args.name)
+          ?? meaningfulString(call.args.agent_type)
+          ?? meaningfulString(call.args.agentType),
+        prompt: meaningfulString(call.args.message)
+          ?? meaningfulString(call.args.prompt)
+          ?? meaningfulString(call.args.instructions),
+        model: meaningfulString(call.args.model)
+          ?? meaningfulString(call.args.agentId)
+          ?? meaningfulString(call.args.agent_id),
+      });
+    }
+    return true;
+  }
+
+  private codexSubagentUsageTotalTokens(usage: CodexSdkSessionState['lastUsage']): number | undefined {
+    if (!usage) return undefined;
+    const total = finiteNumber(usage.total_tokens);
+    if (total !== undefined) return total;
+    const codexTotalInput = finiteNumber(usage.codex_total_input_tokens);
+    const codexTotalOutput = finiteNumber(usage.codex_total_output_tokens);
+    if (codexTotalInput !== undefined || codexTotalOutput !== undefined) {
+      return (codexTotalInput ?? 0) + (codexTotalOutput ?? 0);
+    }
+    return usage.input_tokens + usage.cache_read_input_tokens + usage.output_tokens;
+  }
+
+  private emitTrackedSubagentSnapshot(tracked: CodexTrackedSubagentThread, status: unknown): ToolCallEvent | null {
+    const tool = runtimeSubagentToolFromPayload(tracked.sessionId, {
+      agent_id: tracked.agentId,
+      status,
+      ...(tracked.agentName ? { nickname: tracked.agentName } : {}),
+      ...(tracked.prompt ? { prompt: tracked.prompt } : {}),
+      ...(tracked.model ? { model: tracked.model } : {}),
+      ...(tracked.usageTotalTokens !== undefined ? { usageTotalTokens: tracked.usageTotalTokens } : {}),
+      backgrounded: true,
+    });
+    if (!tool) return null;
+    for (const cb of this.toolCallCallbacks) cb(tracked.sessionId, tool);
+    return tool;
+  }
+
+  private handleTrackedSubagentTokenUsage(params: Record<string, any>): boolean {
+    const threadId = readParamThreadId(params);
+    const tracked = threadId ? this.trackedSubagentThreads.get(threadId) : undefined;
+    if (!threadId || !tracked) return false;
+    const usage = normalizeCodexTokenUsage(params);
+    if (!usage) return true;
+    const usageTotalTokens = this.codexSubagentUsageTotalTokens(usage);
+    if (usageTotalTokens !== undefined) tracked.usageTotalTokens = usageTotalTokens;
+    this.emitTrackedSubagentSnapshot(tracked, tracked.lastStatus ?? 'running');
+    return true;
+  }
+
+  private handleTrackedSubagentTurnCompleted(params: Record<string, any>): boolean {
+    const threadId = readParamThreadId(params);
+    const tracked = threadId ? this.trackedSubagentThreads.get(threadId) : undefined;
+    if (!threadId || !tracked) return false;
+    const rawStatus = readTurnStatus(params);
+    const normalized = normalizeStatusName(rawStatus);
+    const status = normalized === 'completed' || normalized === 'complete' || normalized === 'succeeded' || normalized === 'success'
+      ? { completed: rawStatus ?? 'completed' }
+      : normalized === 'interrupted' || normalized === 'cancelled' || normalized === 'canceled'
+        ? 'interrupted'
+        : rawStatus ?? 'completed';
+    tracked.lastStatus = status;
+    this.emitTrackedSubagentSnapshot(tracked, status);
+    this.trackedSubagentThreads.delete(threadId);
+    return true;
+  }
+
+  private handleTrackedSubagentThreadStatus(params: Record<string, any>): boolean {
+    const threadId = readParamThreadId(params);
+    const tracked = threadId ? this.trackedSubagentThreads.get(threadId) : undefined;
+    if (!threadId || !tracked) return false;
+    const rawStatus = readThreadStatus(params);
+    if (!rawStatus) return true;
+    const status = isThreadActiveStatus(rawStatus)
+      ? 'running'
+      : isThreadIdleStatus(rawStatus)
+        ? { completed: rawStatus }
+        : rawStatus;
+    tracked.lastStatus = status;
+    const tool = this.emitTrackedSubagentSnapshot(tracked, status);
+    if ((tool?.detail as SdkSubagentDetail | undefined)?.meta?.terminal) {
+      this.trackedSubagentThreads.delete(threadId);
+    }
+    return true;
+  }
+
   private async handleNotification(method: string, params: Record<string, any>): Promise<void> {
     if (method === 'thread/started') {
       const threadId = params.thread?.id;
@@ -1273,6 +2361,7 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (method === 'thread/tokenUsage/updated') {
+      if (this.handleTrackedSubagentTokenUsage(params)) return;
       const threadId = readParamThreadId(params);
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
@@ -1284,6 +2373,7 @@ export class CodexSdkProvider implements TransportProvider {
         usage: normalizedUsage,
         ...(state.model ? { model: state.model } : {}),
       });
+      this.queueRawChecklistHistoryScan(sessionId, state);
       return;
     }
 
@@ -1297,12 +2387,14 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (method === 'thread/status/changed') {
+      if (this.handleTrackedSubagentThreadStatus(params)) return;
       const threadId = readParamThreadId(params);
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
-      if (!sessionId || !state || !state.runningCompact) return;
+      if (!sessionId || !state) return;
       const status = readThreadStatus(params);
       if (isThreadActiveStatus(status)) {
+        if (!state.runningCompact) return;
         state.compactObserved = true;
         this.clearCompactSettleTimer(state);
         this.emitStatus(sessionId, state, {
@@ -1312,8 +2404,24 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
       if (isThreadIdleStatus(status)) {
-        this.completeCompact(sessionId, state, readParamTurnId(params));
+        if (state.runningCompact) {
+          this.completeCompact(sessionId, state, readParamTurnId(params));
+          return;
+        }
+        if (state.runningTurnId) {
+          await this.completeTurn(sessionId, state, readParamTurnId(params) ?? state.runningTurnId);
+        }
       }
+      return;
+    }
+
+    if (isCodexRuntimeSubagentMethod(method, params)) {
+      this.emitRuntimeSubagentNotification(params);
+      return;
+    }
+
+    if (method === 'rawResponseItem/completed') {
+      this.handleRawResponseItem(params);
       return;
     }
 
@@ -1373,7 +2481,7 @@ export class CodexSdkProvider implements TransportProvider {
 
       this.clearStatus(sessionId, state);
 
-      const tool = toolFromItem(item, method === 'item/started' ? 'started' : 'completed');
+      const tool = toolFromItem(sessionId, item, method === 'item/started' ? 'started' : 'completed');
       if (tool) {
         for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
       }
@@ -1398,16 +2506,26 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (method === 'turn/completed') {
+      if (this.handleTrackedSubagentTurnCompleted(params)) return;
       const threadId = readParamThreadId(params);
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       const turn = params.turn ?? {};
       const status = turn.status;
+      const turnId = readParamTurnId(params);
+
+      if (turnId && state.completedCompactTurnIds.has(turnId)) {
+        return;
+      }
+      if (turnId && state.completedTurnIds.has(turnId)) {
+        return;
+      }
 
       if (status === 'failed') {
         this.clearCancelTimer(state);
         this.clearCompactTimers(state);
+        this.clearRawChecklistPollTimer(state);
         this.clearStatus(sessionId, state);
         state.runningCompact = false;
         state.compactObserved = false;
@@ -1425,6 +2543,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (status === 'interrupted') {
         this.clearCancelTimer(state);
         this.clearCompactTimers(state);
+        this.clearRawChecklistPollTimer(state);
         state.runningCompact = false;
         state.compactObserved = false;
         if (!state.runningTurnId && state.cancelled) {
@@ -1446,6 +2565,7 @@ export class CodexSdkProvider implements TransportProvider {
 
       if (state.cancelled) {
         this.clearCancelTimer(state);
+        this.clearRawChecklistPollTimer(state);
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         state.pendingComplete = undefined;
@@ -1457,50 +2577,66 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
 
-      this.clearCancelTimer(state);
-      this.clearStatus(sessionId, state);
-      this.commitPendingSessionSystemTextUpdate(state, typeof turn.id === 'string' ? turn.id : undefined);
-      const messageId = state.currentMessageId ?? `${sessionId}:agent-message`;
-      const currentText = state.currentText;
-      const usage = state.lastUsage;
-      const model = state.model;
-      const resumeId = state.threadId;
-      const knownGeneratedImagePaths = new Set(state.generatedImageKnownPaths);
-      const alreadyDetectedImagePaths = [...state.generatedImagePaths];
-      state.runningTurnId = undefined;
-      const newlyDetectedImagePaths = await this.detectNewGeneratedImagePaths(state, knownGeneratedImagePaths);
-      const generatedImagePaths = [
-        ...alreadyDetectedImagePaths,
-        ...newlyDetectedImagePaths.filter((path) => !alreadyDetectedImagePaths.includes(path)),
-      ];
-      if (newlyDetectedImagePaths.length > 0) {
-        logger.info({
-          provider: this.id,
-          sessionId,
-          threadId: resumeId,
-          generatedImagePaths: newlyDetectedImagePaths,
-        }, 'Codex SDK detected generated image output paths');
-      }
-      const content = appendDetectedGeneratedImagePaths(currentText, generatedImagePaths);
-      const completed: AgentMessage = {
-        id: messageId,
-        sessionId,
-        kind: 'text',
-        role: 'assistant',
-        content,
-        timestamp: Date.now(),
-        status: 'complete',
-        metadata: {
-          ...(usage ? { usage } : {}),
-          ...(model ? { model } : {}),
-          ...(resumeId ? { resumeId } : {}),
-        },
-      };
-      state.pendingComplete = completed;
-      state.pendingComplete = undefined;
-      for (const cb of this.completeCallbacks) cb(sessionId, completed);
+      await this.completeTurn(sessionId, state, turnId);
       return;
     }
+  }
+
+  private async completeTurn(sessionId: string, state: CodexSdkSessionState, turnId?: string): Promise<void> {
+    this.clearCancelTimer(state);
+    this.clearStatus(sessionId, state);
+    this.queueRawChecklistHistoryScan(sessionId, state);
+    this.clearRawChecklistPollTimer(state);
+    this.commitPendingSessionSystemTextUpdate(state, turnId);
+    this.rememberCompletedTurn(state, turnId);
+    const messageId = state.currentMessageId ?? `${sessionId}:agent-message`;
+    const currentText = state.currentText;
+    const usage = state.lastUsage;
+    const model = state.model;
+    const resumeId = state.threadId;
+    const generatedImageTracking = state.generatedImageTracking;
+    const alreadyDetectedImagePaths = [...state.generatedImagePaths];
+    state.runningTurnId = undefined;
+    state.generatedImageTracking = null;
+    const newlyDetectedImagePaths = await this.detectNewGeneratedImagePaths(generatedImageTracking);
+    const generatedImagePaths = [
+      ...alreadyDetectedImagePaths,
+      ...newlyDetectedImagePaths.filter((path) => !alreadyDetectedImagePaths.includes(path)),
+    ];
+    if (newlyDetectedImagePaths.length > 0) {
+      logger.info({
+        provider: this.id,
+        sessionId,
+        threadId: resumeId,
+        generatedImagePaths: newlyDetectedImagePaths,
+      }, 'Codex SDK detected generated image output paths');
+    }
+    const content = appendDetectedGeneratedImagePaths(currentText, generatedImagePaths);
+    const completed: AgentMessage = {
+      id: messageId,
+      sessionId,
+      kind: 'text',
+      role: 'assistant',
+      content,
+      timestamp: Date.now(),
+      status: 'complete',
+      metadata: {
+        ...(usage ? { usage } : {}),
+        ...(model ? { model } : {}),
+        ...(resumeId ? { resumeId } : {}),
+      },
+    };
+    state.pendingComplete = completed;
+    state.pendingComplete = undefined;
+    for (const cb of this.completeCallbacks) cb(sessionId, completed);
+  }
+
+  private rememberCompletedTurn(state: CodexSdkSessionState, turnId?: string): void {
+    if (!turnId) return;
+    state.completedTurnIds.add(turnId);
+    if (state.completedTurnIds.size <= 50) return;
+    const oldest = state.completedTurnIds.values().next().value;
+    if (oldest) state.completedTurnIds.delete(oldest);
   }
 
   private request(method: string, params: Record<string, any>, timeoutMs?: number): Promise<any> {
@@ -1535,10 +2671,13 @@ export class CodexSdkProvider implements TransportProvider {
   private completeCompact(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
+    this.clearRawChecklistPollTimer(state);
     this.clearStatus(sessionId, state);
     state.runningCompact = false;
     state.runningTurnId = undefined;
     state.compactObserved = false;
+    state.generatedImageTracking = null;
+    this.rememberCompletedCompactTurn(state, turnId);
     this.clearPendingSessionSystemTextUpdate(state);
     state.currentMessageId = null;
     state.currentText = '';
@@ -1559,6 +2698,14 @@ export class CodexSdkProvider implements TransportProvider {
       },
     };
     for (const cb of this.completeCallbacks) cb(sessionId, completed);
+  }
+
+  private rememberCompletedCompactTurn(state: CodexSdkSessionState, turnId?: string): void {
+    if (!turnId) return;
+    state.completedCompactTurnIds.add(turnId);
+    if (state.completedCompactTurnIds.size <= 20) return;
+    const oldest = state.completedCompactTurnIds.values().next().value;
+    if (oldest) state.completedCompactTurnIds.delete(oldest);
   }
 
   /**
@@ -1697,6 +2844,7 @@ export class CodexSdkProvider implements TransportProvider {
   private cancelCompactLocally(sessionId: string, state: CodexSdkSessionState): void {
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
+    this.clearRawChecklistPollTimer(state);
     this.clearStatus(sessionId, state);
     state.runningCompact = false;
     state.runningTurnId = undefined;

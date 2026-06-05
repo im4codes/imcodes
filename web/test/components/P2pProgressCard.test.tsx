@@ -141,6 +141,28 @@ describe('P2pProgressCard', () => {
     expect(screen.getAllByText('phase_execution').length).toBeGreaterThan(0);
   });
 
+  it('renders completed progress aliases with the done styling', () => {
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_completed_alias_render',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 1,
+      total_hops: 2,
+      active_phase: 'hop',
+      all_nodes: [
+        { label: 'w1', agentType: 'codex', status: 'completed', phase: 'hop' },
+        { label: 'w2', agentType: 'codex', status: 'running', phase: 'hop' },
+      ],
+    });
+
+    const { container } = render(<P2pProgressCard discussion={discussion} />);
+
+    const w1Node = [...container.querySelectorAll('.discussions-progress-node')]
+      .find((node) => node.textContent?.includes('w1'));
+    expect(w1Node?.className).toContain('is-done');
+  });
+
   it('shows a close action for failed discussions', () => {
     const onStopDiscussion = vi.fn();
 

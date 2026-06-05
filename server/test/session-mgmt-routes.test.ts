@@ -1,10 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import {
+  WORKER_SESSION_SNAPSHOT_INCOMPLETE_REASON,
+  WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT,
+} from '../../shared/worker-session-snapshot.js';
 
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
 const mockUpsertDbSession = vi.fn();
 const mockUpdateSession = vi.fn();
+const mockGetDbSessionsByServer = vi.fn<(...args: unknown[]) => Promise<unknown[]>>(async () => []);
+const mockGetSubSessionsByServer = vi.fn<(...args: unknown[]) => Promise<unknown[]>>(async () => []);
 const sendToDaemonMock = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
@@ -18,7 +24,8 @@ vi.mock('../src/security/authorization.js', () => ({
 
 vi.mock('../src/db/queries.js', () => ({
   getServerById: vi.fn(async () => ({ id: 'srv-1' })),
-  getDbSessionsByServer: vi.fn(async () => []),
+  getDbSessionsByServer: (...args: unknown[]) => mockGetDbSessionsByServer(...args),
+  getSubSessionsByServer: (...args: unknown[]) => mockGetSubSessionsByServer(...args),
   upsertDbSession: (...args: unknown[]) => mockUpsertDbSession(...args),
   deleteDbSession: vi.fn(),
   updateSessionLabel: vi.fn(),
@@ -46,6 +53,8 @@ describe('session-mgmt persistence routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockResolveServerRole.mockResolvedValue('owner');
+    mockGetDbSessionsByServer.mockResolvedValue([]);
+    mockGetSubSessionsByServer.mockResolvedValue([]);
   });
 
   async function buildApp() {
@@ -58,6 +67,68 @@ describe('session-mgmt persistence routes', () => {
     app.route('/api/server', sessionMgmtRoutes);
     return app;
   }
+
+  it('GET /session-snapshot returns paired complete metadata for daemon sync', async () => {
+    mockGetDbSessionsByServer.mockResolvedValueOnce([
+      {
+        name: 'deck_proj_brain',
+        project_name: 'proj',
+        role: 'brain',
+        agent_type: 'claude-code',
+        project_dir: '/tmp/proj',
+        state: 'idle',
+        label: null,
+        requested_model: null,
+        active_model: null,
+        effort: null,
+        transport_config: {},
+      },
+    ]);
+    mockGetSubSessionsByServer.mockResolvedValueOnce([
+      {
+        id: 'child',
+        type: 'claude-code',
+        cwd: '/tmp/proj/sub',
+        parent_session: 'deck_proj_brain',
+        label: null,
+        requested_model: null,
+        active_model: null,
+        effort: null,
+        transport_config: {},
+      },
+    ]);
+    const app = await buildApp();
+
+    const res = await app.request(`/api/server/srv-1/${WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT}`);
+    const body = await res.json() as {
+      complete: boolean;
+      serverId: string;
+      counts: { sessions: number; subSessions: number };
+      sessions: Array<{ name: string }>;
+      subSessions: Array<{ id: string }>;
+    };
+
+    expect(res.status).toBe(200);
+    expect(body.complete).toBe(true);
+    expect(body.serverId).toBe('srv-1');
+    expect(body.counts).toEqual({ sessions: 1, subSessions: 1 });
+    expect(body.sessions).toEqual([expect.objectContaining({ name: 'deck_proj_brain' })]);
+    expect(body.subSessions).toEqual([expect.objectContaining({ id: 'child' })]);
+  });
+
+  it('GET /session-snapshot returns incomplete instead of complete empty when the query fails', async () => {
+    mockGetDbSessionsByServer.mockRejectedValueOnce(new Error('db down'));
+    const app = await buildApp();
+
+    const res = await app.request(`/api/server/srv-1/${WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT}`);
+    const body = await res.json() as { complete: boolean; reason: string };
+
+    expect(res.status).toBe(503);
+    expect(body).toMatchObject({
+      complete: false,
+      reason: WORKER_SESSION_SNAPSHOT_INCOMPLETE_REASON.QUERY_FAILED,
+    });
+  });
 
   it('PUT /sessions/:name persists label plus requestedModel/activeModel/effort/transportConfig', async () => {
     const app = await buildApp();

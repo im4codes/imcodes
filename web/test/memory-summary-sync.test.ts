@@ -37,7 +37,7 @@ describe('memory summary sync message', () => {
       limit: 5,
     });
     expect(message).toContain('SYNC ONLY');
-    expect(message).toContain('Recent summaries (2/5, max 3600 chars):');
+    expect(message).toContain('Recent summaries (2/5, max 7200 chars):');
     expect(message).toContain('1. [ref: proj:aaaaaaaaaa] [repo-1] Newest summary');
     expect(message).toContain('2. [ref: proj:1111111111] [repo-1] Older summary');
     expect(message).toContain('"tool":"get_memory_sources"');
@@ -197,7 +197,7 @@ describe('memory summary sync message', () => {
       projectionClass: 'recent_summary',
       limit: 10,
     });
-    expect(message).toContain('Recent summaries (10/10, max 3600 chars):');
+    expect(message).toContain('Recent summaries (10/10, max 7200 chars):');
     expect(message).toContain('1. [ref: proj:a12] [repo-1] Summary 12');
     expect(message).toContain('10. [ref: proj:a3] [repo-1] Summary 3');
     expect(message).not.toContain('Summary 2');
@@ -205,12 +205,19 @@ describe('memory summary sync message', () => {
 
   it('keeps the default sync bounded and truncates oversized summaries', async () => {
     const hugeSummary = `${'A'.repeat(2_000)}\nSHOULD_NOT_APPEAR`;
+    // 8 oversized summaries (newest→oldest). Each is per-record-capped at 1_200,
+    // so the 7_200 total budget admits exactly 6; the 2 oldest overflow and are
+    // dropped — exercising both per-record truncation AND total-budget bounding.
     getPersonalCloudMemory.mockResolvedValueOnce({
       records: [
-        { id: 'oldest', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Oldest summary', updatedAt: 100 },
-        { id: 'newest', projectId: 'repo-1', projectionClass: 'recent_summary', summary: hugeSummary, updatedAt: 400 },
-        { id: 'middle-2', projectId: 'repo-1', projectionClass: 'recent_summary', summary: hugeSummary, updatedAt: 300 },
-        { id: 'middle-1', projectId: 'repo-1', projectionClass: 'recent_summary', summary: hugeSummary, updatedAt: 200 },
+        { id: 'r1', projectId: 'repo-1', projectionClass: 'recent_summary', summary: hugeSummary, updatedAt: 800 },
+        { id: 'r2', projectId: 'repo-1', projectionClass: 'recent_summary', summary: hugeSummary, updatedAt: 700 },
+        { id: 'r3', projectId: 'repo-1', projectionClass: 'recent_summary', summary: hugeSummary, updatedAt: 600 },
+        { id: 'r4', projectId: 'repo-1', projectionClass: 'recent_summary', summary: hugeSummary, updatedAt: 500 },
+        { id: 'r5', projectId: 'repo-1', projectionClass: 'recent_summary', summary: hugeSummary, updatedAt: 400 },
+        { id: 'r6', projectId: 'repo-1', projectionClass: 'recent_summary', summary: hugeSummary, updatedAt: 300 },
+        { id: 'r7', projectId: 'repo-1', projectionClass: 'recent_summary', summary: hugeSummary, updatedAt: 200 },
+        { id: 'oldest', projectId: 'repo-1', projectionClass: 'recent_summary', summary: `OLDEST_DROPPED ${hugeSummary}`, updatedAt: 100 },
       ],
     });
 
@@ -221,10 +228,10 @@ describe('memory summary sync message', () => {
       projectionClass: 'recent_summary',
       limit: 10,
     });
-    expect(message).toContain('Recent summaries (3/10, max 3600 chars):');
+    expect(message).toContain('Recent summaries (6/10, max 7200 chars):');
     expect(message).toContain('[truncated for token budget; use get_memory_sources with the sourceLookup below for exact details]');
-    expect(message).not.toContain('Oldest summary');
-    expect(message).not.toContain('SHOULD_NOT_APPEAR');
-    expect(message!.length).toBeLessThan(5_000);
+    expect(message).not.toContain('OLDEST_DROPPED'); // overflowed the 7_200 budget → dropped
+    expect(message).not.toContain('SHOULD_NOT_APPEAR'); // per-record truncation at 1_200
+    expect(message!.length).toBeLessThan(10_000);
   });
 });

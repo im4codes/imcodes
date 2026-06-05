@@ -21,7 +21,7 @@ function collectDescriptions(schema: { description?: string; properties?: Readon
 }
 
 describe('memory MCP shared contracts', () => {
-  it('exposes exactly the eleven MVP tool names', () => {
+  it('exposes exactly the twelve MVP tool names', () => {
     expect(MEMORY_MCP_TOOL_NAME_LIST).toEqual([
       'search_memory',
       'list_memory_summaries',
@@ -30,6 +30,7 @@ describe('memory MCP shared contracts', () => {
       'save_preference',
       'send_list_targets',
       'send_message',
+      'send_stop',
       'cron_create',
       'cron_list',
       'cron_update',
@@ -52,6 +53,17 @@ describe('memory MCP shared contracts', () => {
     const files = send.inputSchema.properties?.files as { description?: string } | undefined;
     expect(files?.description).toMatch(/path references/i);
     expect(files?.description).toMatch(/not read or transferred/i);
+  });
+
+  it('documents scoped send target discovery and self-target rejection', () => {
+    const sendList = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS];
+    const sendMessage = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
+
+    expect(sendList.description).toContain('current caller session');
+    expect(sendList.description).toContain('stopped sessions are excluded');
+    expect(sendList.description).toContain('if this returns no items');
+    expect(sendMessage.description).toContain('caller session is not a valid target');
+    expect(sendMessage.description).toContain('empty send_list_targets result');
   });
 
   it('provides operational tool and parameter descriptions without secret/doc leakage', () => {
@@ -97,6 +109,7 @@ describe('memory MCP shared contracts', () => {
       SEND_MESSAGE_MAX_BYTES: 64 * 1024,
       SEND_FILES_MAX_COUNT: 32,
       SEND_FILE_PATH_MAX_CHARS: 512,
+      CRON_MIN_INTERVAL_MINUTES: 5,
       CRON_EXPIRES_AT_MAX_DAYS: 90,
       CRON_LIST_MAX_LIMIT: 100,
       LIST_MEMORY_SUMMARIES_DEFAULT_LIMIT: 20,
@@ -168,6 +181,25 @@ describe('memory MCP shared contracts', () => {
     ]);
     expect(cronUpdate.required).toEqual(['id']);
     expect(cronUpdate.properties ?? {}).not.toHaveProperty('schedule');
+  });
+
+  it('documents cron scheduling limits and structured send source-target resolution', () => {
+    const cronCreate = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CREATE];
+    const cronUpdate = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE];
+    const createProps = cronCreate.inputSchema.properties ?? {};
+    const updateProps = cronUpdate.inputSchema.properties ?? {};
+
+    expect(cronCreate.description).toContain('at least 5 minutes');
+    expect((createProps.cronExpr as { description?: string }).description).toContain('* * * * *');
+    expect((createProps.targetSessionName as { description?: string }).description).toContain('source session');
+    expect((createProps.action as { description?: string }).description).toContain('send_list_targets');
+    expect((createProps.action as { description?: string }).description).toContain('selected by targetSessionName or targetRole');
+    expect((createProps.timezone as { description?: string }).description).toContain('schedule evaluation only');
+    expect((createProps.expiresAt as { description?: string }).description).toContain('explicit offset or Z suffix');
+    expect((createProps.expiresAt as { description?: string }).description).toContain('does not retract messages already dispatched');
+    expect(cronUpdate.description).toContain('at least 5 minutes');
+    expect((updateProps.action as { description?: string }).description).toContain('selected by targetSessionName or targetRole');
+    expect((updateProps.expiresAt as { description?: string }).description).toContain('does not retract already dispatched messages');
   });
 
   // ── memory-source-server-routing change ─────────────────────────────

@@ -42,6 +42,22 @@ import {
   MEMORY_MCP_STATUS,
   type MemoryMcpProviderStatusView,
 } from '../../../shared/memory-ws.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_SCHEMA_VERSION,
+  SDK_SUBAGENT_STATUS,
+  buildSdkSubagentSafeDetail,
+  isSdkRuntimeSubagentEventName,
+  makeQwenSubagentCanonicalKey,
+  parseSdkRuntimeSubagentTag,
+  startsWithSdkRuntimeSubagentTag,
+  type SdkSubagentDetail,
+  type SdkSubagentDiagnosticCode,
+  type SdkSubagentNormalizedStatus,
+} from '../../../shared/sdk-subagent-status.js';
 
 const execFileAsync = promisify(execFile);
 const QWEN_BIN = 'qwen';
@@ -96,6 +112,10 @@ function extractSyntheticApiError(text: string | undefined): string | undefined 
   if (typeof text !== 'string') return undefined;
   const match = text.trim().match(/^\[API Error:\s*(.+)\]$/i);
   return match?.[1]?.trim() || undefined;
+}
+
+function startsWithSyntheticApiError(text: string | undefined): boolean {
+  return typeof text === 'string' && /^\s*\[API Error:/i.test(text);
 }
 
 function toQwenCompactPayload(payload: ProviderContextPayload): ProviderContextPayload {
@@ -179,6 +199,18 @@ function resolveQwenReasoningSetting(
 
 function isReasoningContentReplayError(message: string): boolean {
   return /reasoning_content[\s\S]*thinking mode[\s\S]*passed back/i.test(message);
+}
+
+function isConversationHistoryReplayError(message: string): boolean {
+  return /tool call result[\s\S]*does not follow[\s\S]*tool call/i.test(message)
+    || /tool result[\s\S]*does not follow[\s\S]*tool call/i.test(message)
+    || /tool_call[\s\S]*result[\s\S]*follow/i.test(message)
+    || /invalid params[\s\S]*tool call result/i.test(message)
+    || /\b2013\b[\s\S]*tool call result/i.test(message);
+}
+
+function isFreshConversationReplayError(message: string): boolean {
+  return isReasoningContentReplayError(message) || isConversationHistoryReplayError(message);
 }
 
 function isEmptyResponseError(message: string): boolean {
@@ -292,6 +324,210 @@ function sanitizeUsageForDisplay(usage: QwenUsage | undefined, model?: string): 
     };
   }
   return usage;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function meaningfulString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeStatusName(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s_-]+/g, '');
+}
+
+function readNestedRuntimeSubagentRecord(payload: Record<string, unknown>): Record<string, unknown> | undefined {
+  for (const key of ['subagent', 'subAgent', 'agent', 'notification', 'data', 'event']) {
+    const nested = payload[key];
+    if (isRecord(nested)) return nested;
+  }
+  return undefined;
+}
+
+function isRuntimeSubagentPayload(payload: Record<string, unknown>): boolean {
+  const eventName = meaningfulString(payload.subtype)
+    ?? meaningfulString(payload.method)
+    ?? meaningfulString(payload.event)
+    ?? meaningfulString(payload.type);
+  return isSdkRuntimeSubagentEventName(eventName);
+}
+
+function readRuntimeSubagentId(record: Record<string, unknown>): string | undefined {
+  return meaningfulString(record.agent_path)
+    ?? meaningfulString(record.agentPath)
+    ?? meaningfulString(record.agent_id)
+    ?? meaningfulString(record.agentId)
+    ?? meaningfulString(record.subagent_id)
+    ?? meaningfulString(record.subagentId)
+    ?? meaningfulString(record.path)
+    ?? meaningfulString(record.id);
+}
+
+function readRuntimeSubagentName(record: Record<string, unknown>): string | undefined {
+  return meaningfulString(record.agent_name)
+    ?? meaningfulString(record.agentName)
+    ?? meaningfulString(record.name)
+    ?? meaningfulString(record.label);
+}
+
+function readRuntimeSubagentModel(record: Record<string, unknown>, fallback?: string): string | undefined {
+  return meaningfulString(record.model)
+    ?? meaningfulString(record.agentModel)
+    ?? meaningfulString(record.agent_model)
+    ?? meaningfulString(record.modelId)
+    ?? meaningfulString(record.model_id)
+    ?? meaningfulString(fallback);
+}
+
+function readRuntimeSubagentPrompt(record: Record<string, unknown>): string | undefined {
+  return meaningfulString(record.prompt)
+    ?? meaningfulString(record.description)
+    ?? meaningfulString(record.task)
+    ?? meaningfulString(record.request);
+}
+
+function readRuntimeSubagentStatusInfo(record: Record<string, unknown>): { status?: string; message?: string } {
+  const value = record.status ?? record.state ?? record.phase ?? record.lifecycle;
+  if (typeof value === 'string') return { status: value };
+  if (isRecord(value)) {
+    const [key] = Object.keys(value);
+    if (key) return { status: key, message: meaningfulString(value[key]) };
+  }
+  return {};
+}
+
+function mapQwenRuntimeSubagentStatus(
+  rawStatus: string,
+  diagnosticCode: SdkSubagentDiagnosticCode | undefined,
+): {
+  toolStatus: ToolCallEvent['status'];
+  normalizedStatus: SdkSubagentNormalizedStatus;
+  active: boolean;
+  terminal: boolean;
+  diagnosticCode?: SdkSubagentDiagnosticCode;
+} {
+  if (diagnosticCode) {
+    return {
+      toolStatus: 'error',
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode,
+    };
+  }
+
+  const normalized = normalizeStatusName(rawStatus);
+  if (
+    normalized === 'pending'
+    || normalized === 'queued'
+    || normalized === 'starting'
+    || normalized === 'created'
+    || normalized === 'spawned'
+  ) {
+    return { toolStatus: 'running', normalizedStatus: SDK_SUBAGENT_STATUS.PENDING, active: true, terminal: false };
+  }
+  if (
+    normalized === 'running'
+    || normalized === 'active'
+    || normalized === 'started'
+    || normalized === 'working'
+    || normalized === 'inprogress'
+  ) {
+    return { toolStatus: 'running', normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING, active: true, terminal: false };
+  }
+  if (
+    normalized === 'shutdown'
+    || normalized === 'complete'
+    || normalized === 'completed'
+    || normalized === 'done'
+    || normalized === 'success'
+    || normalized === 'succeeded'
+    || normalized === 'finished'
+  ) {
+    return { toolStatus: 'complete', normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE, active: false, terminal: true };
+  }
+  if (
+    normalized === 'failed'
+    || normalized === 'failure'
+    || normalized === 'error'
+    || normalized === 'errored'
+    || normalized === 'crashed'
+  ) {
+    return { toolStatus: 'error', normalizedStatus: SDK_SUBAGENT_STATUS.ERROR, active: false, terminal: true };
+  }
+  if (
+    normalized === 'interrupted'
+    || normalized === 'cancelled'
+    || normalized === 'canceled'
+    || normalized === 'stopped'
+    || normalized === 'killed'
+  ) {
+    return { toolStatus: 'error', normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED, active: false, terminal: true };
+  }
+  return {
+    toolStatus: 'error',
+    normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+    active: false,
+    terminal: true,
+    diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
+  };
+}
+
+function qwenRuntimeSubagentToolFromPayload(
+  sessionId: string,
+  state: QwenSessionState,
+  payload: Record<string, unknown>,
+): ToolCallEvent {
+  const record = readNestedRuntimeSubagentRecord(payload) ?? payload;
+  const rawAgentPath = readRuntimeSubagentId(record);
+  const agentPath = rawAgentPath ?? 'notification-missing-id';
+  const statusInfo = readRuntimeSubagentStatusInfo(record);
+  const diagnosticCode = rawAgentPath
+    ? (statusInfo.status ? undefined : SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE)
+    : SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID;
+  const statusMapping = mapQwenRuntimeSubagentStatus(statusInfo.status ?? 'unknown', diagnosticCode);
+  const canonicalKey = makeQwenSubagentCanonicalKey(sessionId, `runtime:${agentPath}`);
+  const agentName = readRuntimeSubagentName(record);
+  const model = readRuntimeSubagentModel(record, state.model);
+  const prompt = readRuntimeSubagentPrompt(record);
+  const summary = agentName ? `Qwen sub-agent ${agentName}` : rawAgentPath ? `Qwen sub-agent ${rawAgentPath}` : 'Qwen sub-agent';
+  const output = statusMapping.terminal ? (statusInfo.message ?? statusInfo.status ?? 'unknown') : undefined;
+  const detail = buildSdkSubagentSafeDetail({
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary,
+    input: {
+      action: 'qwen-runtime-subagent',
+      description: prompt ?? summary,
+    },
+    ...(output ? { output } : {}),
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: SDK_SUBAGENT_PROVIDERS.QWEN,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.QWEN_RUNTIME_AGENT,
+      canonicalKey,
+      normalizedStatus: statusMapping.normalizedStatus,
+      ...(statusInfo.status ? { rawStatus: statusInfo.status } : {}),
+      active: statusMapping.active,
+      terminal: statusMapping.terminal,
+      parentSessionId: sessionId,
+      parentItemId: canonicalKey,
+      ...(rawAgentPath ? { agentPath: rawAgentPath } : {}),
+      ...(agentName ? { agentName } : {}),
+      ...(model ? { model } : {}),
+      diagnosticCode: statusMapping.diagnosticCode,
+    },
+  } satisfies SdkSubagentDetail, { allowRaw: false });
+  return {
+    id: canonicalKey,
+    name: 'Agent',
+    status: statusMapping.toolStatus,
+    ...(detail.input ? { input: detail.input } : {}),
+    ...(detail.output ? { output: detail.output } : {}),
+    detail,
+  };
 }
 
 function buildQwenMemoryMcpEnv(config: SessionConfig): Record<string, string> | undefined {
@@ -612,7 +848,7 @@ export class QwenProvider implements TransportProvider {
     let reasoningFallbackScheduled = false;
 
     const sawVisibleTurnProgress = (): boolean => {
-      return state.currentText.length > 0
+      return (state.currentText.length > 0 && !startsWithSyntheticApiError(state.currentText))
         || !!state.pendingFinalText
         || state.toolUseById.size > 0
         || state.emittedToolSignatures.size > 0;
@@ -634,7 +870,7 @@ export class QwenProvider implements TransportProvider {
     const maybeRetryWithFreshConversation = async (messageText: string, details?: unknown): Promise<boolean> => {
       if (reasoningFallbackScheduled || reasoningReplayFallbackBudget <= 0) return false;
       if (sawVisibleTurnProgress()) return false;
-      if (!isReasoningContentReplayError(messageText)) return false;
+      if (!isFreshConversationReplayError(messageText)) return false;
       reasoningFallbackScheduled = true;
       completed = true;
       state.child = null;
@@ -645,7 +881,7 @@ export class QwenProvider implements TransportProvider {
       await this.ensureSettingsPath(state);
       logger.warn(
         { provider: this.id, sessionId, conversationId: state.qwenConversationId, message: messageText, details },
-        'Qwen provider rejected missing reasoning_content; retrying turn in a fresh high-thinking conversation',
+        'Qwen provider rejected replayed conversation history; retrying turn in a fresh conversation',
       );
       await this.send(
         sessionId,
@@ -714,10 +950,15 @@ export class QwenProvider implements TransportProvider {
         name: tool.name,
         input: tool.input ?? null,
         output: tool.output ?? null,
+        ...(tool.detail?.kind === SDK_SUBAGENT_DETAIL_KIND ? { detail: tool.detail } : {}),
       });
       if (state.emittedToolSignatures.get(tool.id) === signature) return;
       state.emittedToolSignatures.set(tool.id, signature);
       this.toolCallCallbacks.forEach((cb) => cb(sessionId, tool));
+    };
+
+    const emitRuntimeSubagent = (record: Record<string, unknown>): void => {
+      emitTool(qwenRuntimeSubagentToolFromPayload(sessionId, state, record));
     };
 
     const rl = readline.createInterface({ input: child.stdout! });
@@ -728,6 +969,11 @@ export class QwenProvider implements TransportProvider {
       try {
         payload = JSON.parse(trimmed) as QwenStreamMessage;
       } catch {
+        return;
+      }
+
+      if (isRuntimeSubagentPayload(payload as unknown as Record<string, unknown>)) {
+        emitRuntimeSubagent(payload as unknown as Record<string, unknown>);
         return;
       }
 
@@ -795,7 +1041,23 @@ export class QwenProvider implements TransportProvider {
         if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && typeof event.delta.text === 'string') {
           this.clearStatus(sessionId, state);
           state.currentMessageId ??= randomUUID();
-          state.currentText += event.delta.text;
+          const nextText = state.currentText + event.delta.text;
+          const runtimeSubagentPayload = parseSdkRuntimeSubagentTag(nextText);
+          if (runtimeSubagentPayload) {
+            state.currentMessageId = null;
+            state.currentText = '';
+            emitRuntimeSubagent(runtimeSubagentPayload);
+            return;
+          }
+          if (startsWithSdkRuntimeSubagentTag(nextText)) {
+            state.currentText = nextText;
+            return;
+          }
+          if (startsWithSyntheticApiError(nextText)) {
+            state.currentText = nextText;
+            return;
+          }
+          state.currentText = nextText;
           this.deltaCallbacks.forEach((cb) => cb(sessionId, {
             messageId: state.currentMessageId!,
             type: 'text',
@@ -866,6 +1128,13 @@ export class QwenProvider implements TransportProvider {
         }
         const finalText = collectAssistantText(payload.message?.content);
         if (finalText) {
+          const runtimeSubagentPayload = parseSdkRuntimeSubagentTag(finalText);
+          if (runtimeSubagentPayload) {
+            state.pendingFinalText = undefined;
+            state.pendingFinalMetadata = undefined;
+            emitRuntimeSubagent(runtimeSubagentPayload);
+            return;
+          }
           const syntheticApiError = extractSyntheticApiError(finalText);
           if (syntheticApiError) {
             recoverOrEmitProviderError(syntheticApiError, payload);

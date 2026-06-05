@@ -33,6 +33,7 @@ import {
   type ChangeFile,
 } from '../git-status-store.js';
 import { filePreviewStatesEqual } from '../file-preview-state.js';
+import { FILE_BROWSER_SNAPSHOT_KEY_PREFIX } from '../local-storage-quota.js';
 
 const PREF_KEY = 'fb_prefer_editor';
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
@@ -163,7 +164,6 @@ interface FileBrowserSnapshot {
 
 const FILE_BROWSER_SNAPSHOT_TTL_MS = 5 * 60_000;
 const FILE_BROWSER_SNAPSHOT_MAX_NODES = 400;
-const FILE_BROWSER_SNAPSHOT_KEY_PREFIX = 'rcc_fb_snapshot_v1';
 
 function buildFileBrowserSnapshotKey(
   startPath: string,
@@ -263,6 +263,22 @@ export interface FileBrowserPreviewUpdate {
   preferDiff?: boolean;
   previewViewMode?: HtmlPreviewViewMode;
   preview: FileBrowserPreviewState;
+}
+
+/**
+ * Parent directory of a path, handling both Unix (/) and Windows (\) separators
+ * and the Windows drive-root case (C: → C:\). Returns null when there is no
+ * parent (already at a root). Mirrors the logic in `goUp`.
+ */
+export function getParentDir(p: string): string | null {
+  const normalized = p.replace(/[/\\]+$/, '');
+  const sep = normalized.includes('\\') ? '\\' : '/';
+  const idx = normalized.lastIndexOf(sep);
+  if (idx < 0) return null;
+  if (idx === 0) return sep; // direct child of the unix root → '/'
+  let parent = normalized.slice(0, idx);
+  if (/^[A-Za-z]:$/.test(parent)) parent += '\\'; // Windows drive root: C: → C:\
+  return parent;
 }
 
 export function mergePreviewState(
@@ -424,6 +440,12 @@ export function FileBrowser({
     () => new Set(highlightPath ? [highlightPath] : []),
   );
   const [currentLabel, setCurrentLabel] = useState(initialTreeSnapshot?.currentLabel ?? startPath);
+  // Refs so callbacks/handlers that are defined BEFORE `navigateTo` / read
+  // `currentLabel` (fetchPreview, the WS message handler) can use the latest
+  // value without a declaration-order or stale-closure problem.
+  const navigateToRef = useRef<(path: string) => void>(() => {});
+  const currentLabelRef = useRef(currentLabel);
+  useEffect(() => { currentLabelRef.current = currentLabel; }, [currentLabel]);
   const [error, setError] = useState<string | null>(null);
   const [showHidden, setShowHidden] = useState(DEFAULT_SHOW_HIDDEN_FILES);
   const [preview, setPreview] = useState<FileBrowserPreviewState>(() => initialPreview ?? { status: 'idle' });
@@ -475,6 +497,11 @@ export function FileBrowser({
   useEffect(() => { try { localStorage.setItem('rcc_fb_tree_width', String(treeWidth)); } catch {} }, [treeWidth]);
 
   const [panelView, setPanelViewRaw] = useState<'files' | 'changes'>(() => {
+    // A from-chat file preview (autoPreviewPath set) must open on the Files tab
+    // so the left directory listing of the file's folder shows immediately —
+    // ignore the shared `rcc_fb_tab` browse preference, which belongs to the
+    // sidebar file manager and would otherwise drop us on the Changes tab.
+    if (autoPreviewPath) return 'files';
     try {
       const saved = localStorage.getItem('rcc_fb_tab');
       if (saved === 'files' || saved === 'changes') return saved;
@@ -502,6 +529,8 @@ export function FileBrowser({
   const previewScrollSnapshotRef = useRef<PreviewScrollSnapshot | null>(null);
   const mountedRef = useRef(true);
   const dismissedAutoPreviewPathRef = useRef<string | null>(null);
+  const autoPreviewPathRef = useRef(autoPreviewPath);
+  useEffect(() => { autoPreviewPathRef.current = autoPreviewPath; }, [autoPreviewPath]);
   const previewTabOverridePathRef = useRef<string | null>(null);
   const nextPreviewCycleIdRef = useRef(1);
   const activePreviewCycleRef = useRef<PendingPreviewRequest | null>(null);
@@ -729,6 +758,21 @@ export function FileBrowser({
         const dlId = msg.downloadId;
 
         if (msg.status === 'error') {
+          if (msg.error === FS_READ_ERROR_CODES.IS_DIRECTORY) {
+            // The target is a directory, not a file — this is NOT a failed
+            // preview. Open the folder's listing in the left tree and clear the
+            // preview pane instead of showing "preview failed".
+            // When the directory IS the auto-preview target (e.g. a folder path
+            // clicked in chat), mark it dismissed first so the auto-preview
+            // effect does not immediately re-trigger fetchPreview() for it —
+            // otherwise navigate→idle→re-fetch loops forever and the UI flickers.
+            if (filePath === autoPreviewPathRef.current) {
+              dismissedAutoPreviewPathRef.current = filePath;
+            }
+            navigateToRef.current(filePath);
+            setPreview({ status: 'idle' });
+            return;
+          }
           if (pending.reason === 'refresh') {
             previewRefreshBackoffUntilRef.current = Date.now() + PREVIEW_REFRESH_FAILURE_BACKOFF_MS;
             return;
@@ -916,6 +960,15 @@ export function FileBrowser({
     if (editDirtyRef.current) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
     }
+    // Keep the LEFT file list in sync with the previewed file's folder: re-root
+    // the tree to the file's parent directory (its siblings) when we aren't
+    // already showing it. Runs for both inline and external (onPreviewFile)
+    // preview modes since FileBrowser is the left list in both.
+    const parentDir = getParentDir(filePath);
+    if (parentDir && parentDir !== currentLabelRef.current) {
+      navigateToRef.current(parentDir);
+      setSelectedPaths(new Set([filePath]));
+    }
     if (onPreviewFile) {
       onPreviewFile({
         path: filePath,
@@ -1013,6 +1066,7 @@ export function FileBrowser({
     setCanGoBack(historyIdxRef.current > 0);
     jumpTo(newPath);
   }, [jumpTo]);
+  useEffect(() => { navigateToRef.current = navigateTo; }, [navigateTo]);
 
   const goBack = useCallback(() => {
     if (historyIdxRef.current <= 0) return;

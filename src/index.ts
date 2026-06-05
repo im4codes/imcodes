@@ -48,6 +48,14 @@ process.on('unhandledRejection', (reason) => {
 // Also catch warnings — node-pty sometimes emits MaxListenersExceededWarning
 // which we want to log but not crash on.
 process.on('warning', (warning) => {
+  // node:sqlite emits an ExperimentalWarning on first load in every thread
+  // (main + each SQLite worker); it's non-actionable noise (the bundled SQLite
+  // is already current) and is suppressed at `emitWarning` for the threads we
+  // control. Filter here too as defense-in-depth so it can never reach the
+  // daemon log even if some path loads node:sqlite before the shim installs.
+  if (warning.name === 'ExperimentalWarning' && /SQLite is an experimental feature/i.test(warning.message)) {
+    return;
+  }
   console.warn('[imcodes-daemon] warning:', warning.name, warning.message);
   // Don't forward warnings — too noisy.
 });
@@ -59,12 +67,13 @@ import { Command } from 'commander';
 import { bindFlow } from './bind/bind-flow.js';
 import logger from './util/logger.js';
 import { execSync } from 'child_process';
-import { homedir } from 'os';
+import { cpus, freemem, homedir, loadavg, totalmem } from 'os';
 import { existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
 import { printDirectSendResult, printSendResult } from './cli/send-output.js';
+import { resolveLiveHookPort } from './daemon/hook-port.js';
 import {
   formatDurationSeconds,
   getDaemonServerLinkFreshness,
@@ -72,13 +81,17 @@ import {
   readDaemonRestartCount,
   readDaemonRuntimeStatus,
   readPersistedDaemonUptimeSeconds,
+  readProcessRssBytes,
   readProcessUptimeSeconds,
   type DaemonFilesystemSpace,
+  type DaemonResourceSnapshot,
   type DaemonRuntimeStatus,
   type DaemonServerLinkFreshness,
 } from './util/daemon-status.js';
 
 import { PROJECT_ROOT } from './util/project-root.js';
+import { asReleaseChannel, getReleaseChannel } from '../shared/imcodes-version.js';
+import { INSTALLER_CONFIG_BASENAME, normalizeRegistryBase } from '../shared/installer-contract.js';
 
 const { version } = JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')) as { version: string };
 
@@ -108,6 +121,94 @@ function formatDaemonLinkStatus(
   if (freshness.status === 'stale') return `\x1b[31mstale\x1b[0m (state ${link.state}${proofSuffix}${errorSuffix})`;
   if (freshness.status === 'connecting') return `\x1b[33mconnecting\x1b[0m${proofSuffix}${errorSuffix}`;
   return `\x1b[31mdisconnected\x1b[0m${proofSuffix}${errorSuffix}`;
+}
+
+interface SystemResourcesView {
+  memUsedBytes: number;
+  memTotalBytes: number;
+  memUsedPercent: number;
+  load: { '1m': number; '5m': number; '15m': number } | null;
+  cpuCount: number;
+}
+
+function collectSystemResources(): SystemResourcesView {
+  const memTotalBytes = totalmem();
+  const memFreeBytes = freemem();
+  const memUsedBytes = Math.max(0, memTotalBytes - memFreeBytes);
+  const memUsedPercent = memTotalBytes > 0 ? Math.round((memUsedBytes / memTotalBytes) * 100) : 0;
+  // loadavg() returns [0,0,0] on Windows — surface it as null rather than fake zeros.
+  const raw = process.platform === 'win32' ? null : loadavg();
+  return {
+    memUsedBytes,
+    memTotalBytes,
+    memUsedPercent,
+    load: raw ? { '1m': +raw[0].toFixed(2), '5m': +raw[1].toFixed(2), '15m': +raw[2].toFixed(2) } : null,
+    cpuCount: cpus().length,
+  };
+}
+
+function formatDaemonMemory(
+  resources: DaemonResourceSnapshot | null,
+  liveRssBytes: number | null,
+  nowMs: number = Date.now(),
+): string {
+  // RSS is read live from the OS at view time; only the V8 heap breakdown comes
+  // from the daemon's self-reported snapshot (a process's heap is invisible to
+  // any other process).
+  const rss = liveRssBytes ?? resources?.rssBytes ?? null;
+  const rssStr = rss !== null ? `rss ${formatBytes(rss)}` : 'rss n/a';
+  if (!resources) {
+    return `${rssStr} · heap \x1b[33mn/a\x1b[0m (restart daemon to report heap)`;
+  }
+  const ageSec = Math.max(0, Math.floor((nowMs - resources.capturedAt) / 1000));
+  const heapPct = resources.heapTotalBytes > 0
+    ? Math.round((resources.heapUsedBytes / resources.heapTotalBytes) * 100)
+    : 0;
+  return `heap ${formatBytes(resources.heapUsedBytes)} / ${formatBytes(resources.heapTotalBytes)} (${heapPct}%)`
+    + ` · ${rssStr}`
+    + ` · ext ${formatBytes(resources.externalBytes)}`
+    + ` \x1b[90m(heap ${formatDurationSeconds(ageSec)} ago)\x1b[0m`;
+}
+
+function formatSystemResources(s: SystemResourcesView): string {
+  const memColor = s.memUsedPercent >= 95 ? '\x1b[31m' : s.memUsedPercent >= 85 ? '\x1b[33m' : '';
+  const memReset = memColor ? '\x1b[0m' : '';
+  const load = s.load ? ` · load ${s.load['1m']} ${s.load['5m']} ${s.load['15m']}` : '';
+  return `mem ${formatBytes(s.memUsedBytes)} / ${formatBytes(s.memTotalBytes)} ${memColor}(${s.memUsedPercent}%)${memReset}${load} · ${s.cpuCount} cpu`;
+}
+
+function formatTransportQueueStatus(runtimeStatus: DaemonRuntimeStatus | null): string {
+  const queues = runtimeStatus?.diagnostics?.transportQueues;
+  if (!queues) return '\x1b[33munknown\x1b[0m';
+  const color = queues.totalPendingCount > 0 || queues.totalResendCount > 0 ? '\x1b[33m' : '\x1b[32m';
+  const busy = queues.totalActiveDispatchCount > 0 ? ` · active ${queues.totalActiveDispatchCount}` : '';
+  const stuck = queues.sessions
+    .filter((session) => session.pendingCount > 0 || session.resendCount > 0)
+    .slice(0, 3)
+    .map((session) => {
+      const pending = session.pendingCount > 0 ? `pending=${session.pendingCount}` : '';
+      const resend = session.resendCount > 0 ? `resend=${session.resendCount}` : '';
+      return `${session.sessionName}(${[pending, resend].filter(Boolean).join(',')})`;
+    });
+  const suffix = stuck.length > 0 ? ` · ${stuck.join(' ')}` : '';
+  return `${color}pending ${queues.totalPendingCount}, resend ${queues.totalResendCount}\x1b[0m${busy}${suffix}`;
+}
+
+function formatP2pRuntimeStatus(runtimeStatus: DaemonRuntimeStatus | null): string {
+  const p2p = runtimeStatus?.diagnostics?.p2p;
+  if (!p2p) return '\x1b[33munknown\x1b[0m';
+  const color = p2p.activeCount > 0 || (p2p.discussionWritePendingBytes ?? 0) > 0 ? '\x1b[33m' : '\x1b[32m';
+  const write = p2p.discussionWritePendingBytes && p2p.discussionWritePendingBytes > 0
+    ? ` · write ${formatBytes(p2p.discussionWritePendingBytes)}`
+    : '';
+  const runs = p2p.runs.slice(0, 2).map((run) => {
+    const elapsed = run.hopElapsedMs !== null && run.hopElapsedMs !== undefined
+      ? ` ${formatDurationSeconds(Math.floor(run.hopElapsedMs / 1000))}`
+      : '';
+    return `${run.id}:${run.status}/${run.activePhase ?? 'n/a'}${elapsed}`;
+  });
+  const suffix = runs.length > 0 ? ` · ${runs.join(' ')}` : '';
+  return `${color}active ${p2p.activeCount}\x1b[0m${write}${suffix}`;
 }
 
 function formatStorageStatus(storage: DaemonFilesystemSpace | null): string {
@@ -349,6 +450,12 @@ program
       : null;
     const linkFreshness = getDaemonServerLinkFreshness(currentRuntimeStatus);
     const storageStatus = readDaemonFilesystemSpace();
+    const daemonResources = currentRuntimeStatus?.resources ?? null;
+    // RSS read live from the OS at view time (accurate now, not as-of last write).
+    const daemonRssBytes = daemonRunning && Number.isSafeInteger(daemonPidNumber)
+      ? readProcessRssBytes(daemonPidNumber)
+      : null;
+    const systemResources = collectSystemResources();
 
     if (opts.json) {
       console.log(JSON.stringify({
@@ -368,6 +475,21 @@ program
             }
             : null,
           storage: storageStatus,
+          memory: {
+            heap: daemonResources
+              ? {
+                usedBytes: daemonResources.heapUsedBytes,
+                totalBytes: daemonResources.heapTotalBytes,
+                externalBytes: daemonResources.externalBytes,
+                arrayBuffersBytes: daemonResources.arrayBuffersBytes,
+                capturedAt: daemonResources.capturedAt,
+              }
+              : null,
+            rssBytes: daemonRssBytes ?? daemonResources?.rssBytes ?? null,
+            rssLive: daemonRssBytes !== null,
+          },
+          system: systemResources,
+          diagnostics: currentRuntimeStatus?.diagnostics ?? null,
           server: creds ? { url: creds.workerUrl, serverId: creds.serverId } : null,
         },
         sessions: sessions.map((s) => ({ ...s, tmuxAlive: liveSet.has(s.name) })),
@@ -386,6 +508,12 @@ program
     console.log(`  Status:  ${daemonRunning ? `\x1b[32mrunning\x1b[0m${detailSuffix}` : `\x1b[31mstopped\x1b[0m${detailSuffix}`}`);
     console.log(`  Link:    ${daemonRunning ? formatDaemonLinkStatus(currentRuntimeStatus, linkFreshness) : '\x1b[31mstopped\x1b[0m'}`);
     console.log(`  Storage: ${formatStorageStatus(storageStatus)}`);
+    if (daemonRunning) {
+      console.log(`  Memory:  ${formatDaemonMemory(daemonResources, daemonRssBytes)}`);
+    }
+    console.log(`  Queues:  ${daemonRunning ? formatTransportQueueStatus(currentRuntimeStatus) : '\x1b[31mstopped\x1b[0m'}`);
+    console.log(`  P2P:     ${daemonRunning ? formatP2pRuntimeStatus(currentRuntimeStatus) : '\x1b[31mstopped\x1b[0m'}`);
+    console.log(`  System:  ${formatSystemResources(systemResources)}`);
     if (creds) {
       console.log(`  Server:  ${creds.workerUrl}`);
       console.log(`  ID:      ${creds.serverId}`);
@@ -439,7 +567,7 @@ program
     // ── --list mode: show available siblings ───────────────────────────────
     if (opts.list) {
       // Try hook server first, fall back to session store
-      const hookPort = readHookPort();
+      const hookPort = await resolveLiveHookPort();
       if (hookPort) {
         try {
           const res = await postToHookServer(hookPort, '/list', {
@@ -512,7 +640,7 @@ program
     const files = opts.files ? opts.files.split(',').map((f) => f.trim()).filter(Boolean) : undefined;
 
     // Try hook server IPC first (preferred — daemon handles target resolution, queuing, etc.)
-    const hookPort = readHookPort();
+    const hookPort = await resolveLiveHookPort();
     if (hookPort) {
       try {
         const detectedFrom = await detectSenderSession().catch(() => '');
@@ -585,17 +713,6 @@ program
     printDirectSendResult(name);
   });
 
-/** Read hook server port from ~/.imcodes/hook-port. Returns null if unavailable. */
-function readHookPort(): number | null {
-  try {
-    const portPath = join(homedir(), '.imcodes', 'hook-port');
-    const raw = readFileSync(portPath, 'utf8').trim();
-    const port = parseInt(raw, 10);
-    return Number.isFinite(port) && port > 1024 && port < 65536 ? port : null;
-  } catch {
-    return null;
-  }
-}
 
 /** POST JSON to the hook server and return parsed response. */
 async function postToHookServer(port: number, path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -706,25 +823,67 @@ program
 
 program
   .command('upgrade')
-  .description('Upgrade imcodes to latest version and restart daemon')
-  .option('--version <ver>', 'Install specific version instead of latest')
-  .action((opts: { version?: string }) => {
-    const pkg = opts.version ? `imcodes@${opts.version}` : 'imcodes@latest';
+  .description('Upgrade imcodes and restart daemon (auto-detects dev vs stable channel)')
+  // Positional version, NOT a `--version` flag: commander reserves `--version`
+  // for the program-level `.version()` (top of file), so a subcommand
+  // `--version <ver>` is shadowed — `imcodes upgrade --version X` just prints
+  // the running version and exits without upgrading. A positional argument
+  // sidesteps that entirely. Accepts a full version or a dist-tag (latest|dev).
+  .argument('[version]', 'Version or dist-tag to install (e.g. 2026.5.2477-dev.2586, latest, dev); overrides --channel')
+  .option('--channel <channel>', 'Release channel: latest (stable) | dev — defaults to the channel this build is on')
+  .action((versionArg: string | undefined, opts: { channel?: string }) => {
     const platform = process.platform;
+
+    // ── Resolve target package spec + channel ──────────────────────────────
+    // Stable builds are clean MAJOR.MINOR.PATCH (npm dist-tag `latest`); dev
+    // builds carry a `-dev.N` prerelease (dist-tag `dev`). Default to whichever
+    // channel THIS build is on, so `imcodes upgrade` keeps a dev box on dev and
+    // a stable box on stable unless explicitly told otherwise.
+    let pkgTag: string;
+    let channelLabel: string;
+    if (versionArg) {
+      pkgTag = versionArg;
+      channelLabel = `pinned ${versionArg}`;
+    } else {
+      let channel = getReleaseChannel(version);
+      if (opts.channel) {
+        const requested = asReleaseChannel(opts.channel.toLowerCase());
+        if (!requested) {
+          console.error(`Invalid --channel '${opts.channel}' (use: latest | dev)`);
+          process.exit(1);
+        }
+        channel = requested;
+        channelLabel = `${channel} channel (requested)`;
+      } else {
+        channelLabel = `${channel} channel (auto-detected from v${version})`;
+      }
+      pkgTag = channel;
+    }
+    const pkg = `imcodes@${pkgTag}`;
+
+    // Resolve the npm registry the installer recorded for this machine
+    // (~/.imcodes/install.json), so a manual upgrade in a restricted-network
+    // region resolves through the same mirror the daemon's auto-upgrade uses.
+    let registry: string | null = null;
+    try {
+      const raw = readFileSync(join(homedir(), '.imcodes', INSTALLER_CONFIG_BASENAME), 'utf8');
+      registry = normalizeRegistryBase((JSON.parse(raw) as { npmRegistry?: unknown }).npmRegistry);
+    } catch { /* no install.json — use npm's ambient/default registry */ }
 
     // Detect package manager: npm global or from a git clone?
     const selfPath = realpathSync(process.argv[1]);
     const isGlobal = selfPath.includes('node_modules');
 
-    console.log(`Upgrading to ${pkg}...`);
+    console.log(`Upgrading to ${pkg}  (${channelLabel})${registry ? `  via ${registry}` : ''}...`);
 
     // Step 1: Install new version (do NOT kill daemon — upgrade may be running from
     // a daemon-managed session, so killing it would kill ourselves).
     if (isGlobal) {
       const npmBin = resolve(dirname(process.execPath), platform === 'win32' ? 'npm.cmd' : 'npm');
       const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
+      const regFlag = registry ? ` --registry "${registry}"` : '';
       try {
-        execSync(`"${npmCmd}" install -g ${pkg}`, { stdio: 'inherit' });
+        execSync(`"${npmCmd}" install -g ${pkg}${regFlag}`, { stdio: 'inherit' });
       } catch {
         console.error('npm install failed.');
         process.exit(1);

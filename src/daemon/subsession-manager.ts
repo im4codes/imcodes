@@ -302,6 +302,7 @@ export async function stopSubSession(
         serverLink.send({ type: 'subsession.closed', id, sessionName });
       }
       removeSession(sessionName);
+      timelineEmitter.forgetSession(sessionName);
     },
     emitFailure: async (_record, failure) => {
       const message = buildSubSessionCloseFailureMessage(failure);
@@ -481,23 +482,17 @@ export async function readSubSessionResponse(sessionName: string): Promise<{ sta
     ? (record.state === 'idle' ? 'idle' : 'thinking')
     : detectStatus(lines, agentType);
   if (status !== 'idle') return { status: 'working' };
-  // `readPreferred` may throw `TimelinePreferredReadError` when the SQLite
-  // projection is unavailable (commit 42dfabec contract change). Fall back
-  // to the JSONL `read()` path so a transiently-broken projection doesn't
-  // turn this RPC into a rejected promise — the caller would surface that
-  // as a hard failure even though the captured-pane text fallback below is
-  // perfectly serviceable.
+  // SQLite projection is the sole chat-history read source. If it's
+  // transiently unavailable we leave `events` empty and let the captured-pane
+  // text fallback below serve the response — no JSONL `read()` fallback (that
+  // synchronous main-thread read amplified event-loop saturation under load,
+  // and JSONL is now write/backup-only).
   let events: Awaited<ReturnType<typeof timelineStore.readPreferred>> = [];
   try {
     events = await timelineStore.readPreferred(sessionName);
   } catch (err) {
     const { default: lifecycleLogger } = await import('../util/logger.js');
-    lifecycleLogger.warn({ err, sessionName }, 'readSubSessionResponse: readPreferred failed, falling back to JSONL');
-    try {
-      events = timelineStore.read(sessionName);
-    } catch (fallbackErr) {
-      lifecycleLogger.warn({ err: fallbackErr, sessionName }, 'readSubSessionResponse: JSONL fallback also failed');
-    }
+    lifecycleLogger.warn({ err, sessionName }, 'readSubSessionResponse: projection read failed; using captured-pane text (no JSONL fallback)');
   }
   const lastUserMsgIdx = events.map((e) => e.type).lastIndexOf('user.message');
   const responseEvents = lastUserMsgIdx >= 0 ? events.slice(lastUserMsgIdx + 1) : events;

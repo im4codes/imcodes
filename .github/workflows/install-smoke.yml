@@ -1,0 +1,118 @@
+# Install Smoke — SIDE workflow, NOT part of the gating CI pipeline.
+#
+# Verifies the one-click install path produces a usable `imcodes` on
+# Linux / macOS / Windows. Per design:
+#   - It does NOT install the published `imcodes@latest` from the registry.
+#     Instead it packs the CURRENT repo (npm pack) and installs that tarball
+#     globally — "can it install at all", testing the actual artifact this
+#     branch produces, with no dependency on what's published.
+#   - It is a separate workflow (not wired into ci.yml) and is NOT a required
+#     check, so it never blocks merges. It only runs when the install surface
+#     changes (paths filter below) — not on ordinary code pushes — so it stays
+#     out of the way of normal dev.
+#   - It adds NO new tooling dependency: only npm, `bash -n`, and the built-in
+#     PowerShell parser (preinstalled pwsh on the Ubuntu runner).
+#
+# Trigger note: GitHub fires `workflow_dispatch` and `schedule` only from the
+# repository's default branch. While this workflow lives on a non-default
+# working branch, those two triggers can't reach it — so the paths-scoped
+# `push` trigger below (install-surface files only) is what actually runs it
+# without waiting for it to land on the default branch.
+#
+# The installer scripts themselves (landing/install.sh|ps1) do a registry
+# install of imcodes@<channel>; that pulls "latest", which we deliberately do
+# not exercise here. We do statically syntax-check those scripts so an
+# accidental syntax break is still caught.
+name: Install Smoke
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC (only fires once this reaches the default branch)
+  push:
+    branches: [dev, master]
+    paths:
+      - 'landing/install.sh'
+      - 'landing/install.ps1'
+      - 'gen-env.sh'
+      - 'package.json'
+      - '.github/workflows/install-smoke.yml'
+
+concurrency:
+  group: install-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION_PRIMARY: '24'
+
+jobs:
+  # Pack the current repo and install the tarball globally on each OS, then
+  # assert the CLI launches. Proves "the daemon installs and runs" without
+  # touching the npm registry or the published version.
+  install-smoke:
+    name: Install Smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      # The daemon detects its terminal backend at startup, so even
+      # `imcodes --version` needs a multiplexer present. ubuntu-latest ships
+      # tmux; Windows uses ConPTY; macOS runners have neither, so install tmux
+      # there — this mirrors a real macOS prerequisite (README requires tmux).
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux
+      - name: Install dependencies
+        run: npm ci
+      - name: Build daemon (populate dist/)
+        run: npm run build
+      - name: Pack, global-install the tarball, and verify the CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `npm pack` prints the tarball filename on its last stdout line.
+          tarball="$(npm pack 2>/dev/null | tail -n1)"
+          echo "Packed: $tarball"
+          test -f "$tarball"
+          npm install -g "./$tarball"
+          # The CLI must launch and report a version. `set -e` fails the step
+          # if `imcodes` is not on PATH or exits non-zero.
+          ver="$(imcodes --version)"
+          echo "imcodes --version -> ${ver}"
+          test -n "$ver"
+
+  # Zero-dependency static syntax check of the one-click install scripts, so a
+  # syntax break is caught even though we don't execute their registry-install
+  # path here.
+  install-script-syntax:
+    name: Install Script Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax check (install.sh, gen-env.sh)
+        run: |
+          set -euo pipefail
+          bash -n landing/install.sh
+          bash -n gen-env.sh
+          echo "shell installers parse cleanly"
+      - name: PowerShell parse check (install.ps1)
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'landing/install.ps1').Path, [ref]$null, [ref]$errors) | Out-Null
+          if ($errors -and $errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+          Write-Host 'install.ps1 parses cleanly'

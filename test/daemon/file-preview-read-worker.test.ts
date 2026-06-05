@@ -25,6 +25,7 @@ function deps(overrides: Partial<PreviewReadWorkerDependencies> = {}): PreviewRe
       staleRead: FS_READ_ERROR_CODES.STALE_READ,
       invalidRequest: FS_READ_ERROR_CODES.INVALID_REQUEST,
       internalError: FS_READ_ERROR_CODES.INTERNAL_ERROR,
+      isDirectory: FS_READ_ERROR_CODES.IS_DIRECTORY,
     },
     previewReasons: {
       binary: FS_READ_PREVIEW_REASONS.BINARY,
@@ -89,6 +90,40 @@ describe('file preview read worker', () => {
       phase: 'preflight',
       kind: 'error',
       error: FS_READ_ERROR_CODES.FORBIDDEN_PATH,
+      sanitized: true,
+    });
+  });
+
+  it('returns is_directory (not a failed preview) when the path is a directory', async () => {
+    const result = await handlePreviewReadWorkerRequest({
+      ...identity,
+      phase: 'preflight',
+      rawPath: 'some-folder',
+    }, deps({
+      stat: vi.fn(async () => ({ mtimeMs: 1000, size: 0, isFile: () => false, isDirectory: () => true })),
+    }));
+
+    expect(result).toMatchObject({
+      phase: 'preflight',
+      kind: 'error',
+      error: FS_READ_ERROR_CODES.IS_DIRECTORY,
+      sanitized: true,
+    });
+  });
+
+  it('still returns internal_error for a non-file that is not a directory (e.g. a socket)', async () => {
+    const result = await handlePreviewReadWorkerRequest({
+      ...identity,
+      phase: 'preflight',
+      rawPath: 'a.sock',
+    }, deps({
+      stat: vi.fn(async () => ({ mtimeMs: 1000, size: 0, isFile: () => false, isDirectory: () => false })),
+    }));
+
+    expect(result).toMatchObject({
+      phase: 'preflight',
+      kind: 'error',
+      error: FS_READ_ERROR_CODES.INTERNAL_ERROR,
       sanitized: true,
     });
   });

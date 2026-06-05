@@ -5,6 +5,12 @@ import {
   type TimelineDetailFieldPath,
   type TimelineDetailRef,
 } from '../../shared/timeline-protocol.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  buildSdkSubagentMinimalReplayDetail,
+  buildSdkSubagentTimelinePayload,
+  parseSdkSubagentDetail,
+} from '../../shared/sdk-subagent-status.js';
 
 export const DEFAULT_TIMELINE_HISTORY_MAX_EVENT_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_EVENT;
 export const DEFAULT_TIMELINE_HISTORY_MAX_RESPONSE_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
@@ -216,6 +222,18 @@ function sanitizeToolDetail(detail: unknown, stats: MutableSanitizeStats): unkno
   if (!detail || typeof detail !== 'object' || Array.isArray(detail)) {
     return sanitizeValue(detail, NORMAL_POLICY, stats);
   }
+  const sdkDetail = parseSdkSubagentDetail(detail);
+  if (sdkDetail.kind === 'ok') {
+    return sdkDetail.detail;
+  }
+  if (sdkDetail.kind === 'malformed-sdk') {
+    stats.truncatedValues += 1;
+    return {
+      kind: SDK_SUBAGENT_DETAIL_KIND,
+      malformed: true,
+      reason: sdkDetail.reason,
+    };
+  }
   const out: Record<string, unknown> = {};
   const record = detail as Record<string, unknown>;
   let count = 0;
@@ -271,6 +289,20 @@ function sanitizeTextPayload(
 function sanitizePayload(event: TimelineEvent, stats: MutableSanitizeStats, policy = NORMAL_POLICY): Record<string, unknown> {
   const payload = event.payload ?? {};
   if (event.type === 'tool.call' || event.type === 'tool.result') {
+    const sdkDetail = parseSdkSubagentDetail(payload.detail);
+    if (sdkDetail.kind === 'ok') {
+      const sdkPayload = buildSdkSubagentTimelinePayload({
+        id: event.eventId,
+        name: typeof payload.tool === 'string' ? payload.tool : 'Agent',
+        status: event.type === 'tool.call'
+          ? 'running'
+          : sdkDetail.detail.meta.normalizedStatus === 'error' || sdkDetail.detail.meta.normalizedStatus === 'unknown'
+            ? 'error'
+            : 'complete',
+        detail: sdkDetail.detail,
+      }, { allowRaw: Boolean(sdkDetail.detail.meta.diagnosticCode) });
+      if (sdkPayload) return sdkPayload.payload;
+    }
     const out: Record<string, unknown> = {};
     let count = 0;
     for (const key in payload) {
@@ -307,6 +339,13 @@ function minimalPayload(event: TimelineEvent, originalPayloadBytes: number, stat
     historyPayloadTruncated: true,
     originalPayloadBytesBucket: bucketBytes(originalPayloadBytes),
   };
+  const sdkDetail = parseSdkSubagentDetail(payload.detail);
+  if ((event.type === 'tool.call' || event.type === 'tool.result') && sdkDetail.kind === 'ok') {
+    if (typeof payload.tool === 'string') out.tool = payload.tool;
+    out.detail = buildSdkSubagentMinimalReplayDetail(sdkDetail.detail);
+    stats.truncatedValues += 1;
+    return out;
+  }
   if (isTextTimelineEvent(event) && typeof payload.text === 'string') out.text = payload.text;
   else if (typeof payload.text === 'string') out.text = truncateStringByUtf8Bytes(payload.text, TIGHT_STRING_BYTES);
   if (typeof payload.tool === 'string') out.tool = payload.tool;
@@ -314,6 +353,14 @@ function minimalPayload(event: TimelineEvent, originalPayloadBytes: number, stat
   if (typeof payload.output === 'string') out.output = truncateStringByUtf8Bytes(payload.output, TIGHT_STRING_BYTES);
   stats.truncatedValues += 1;
   return out;
+}
+
+function compareTimelineEventsForReplay(a: TimelineEvent, b: TimelineEvent): number {
+  return a.ts - b.ts || a.seq - b.seq || a.eventId.localeCompare(b.eventId);
+}
+
+function isNewerTimelineEvent(candidate: TimelineEvent, current: TimelineEvent): boolean {
+  return compareTimelineEventsForReplay(candidate, current) >= 0;
 }
 
 function detailStringAtPath(event: TimelineEvent, fieldPath: string): string | undefined {
@@ -376,6 +423,12 @@ function collectDetailRefs(event: TimelineEvent, sink: TimelineHistoryDetailSink
   return refs;
 }
 
+function shouldCollectDetailRefsFromSanitizedEvent(event: TimelineEvent): boolean {
+  if (event.type !== 'tool.call' && event.type !== 'tool.result') return false;
+  const parsed = parseSdkSubagentDetail(event.payload?.detail);
+  return parsed.kind !== 'not-sdk';
+}
+
 function bucketBytes(bytes: number): string {
   if (bytes < 1024) return '<1KiB';
   if (bytes < 4 * 1024) return '1-4KiB';
@@ -414,7 +467,9 @@ export function sanitizeTimelineHistoryEventForTransport(
     event: next,
     bytes,
     truncated,
-    detailRefs: options.collectDetailRefs === false ? [] : collectDetailRefs(event, options.detailSink),
+    detailRefs: options.collectDetailRefs === false
+      ? []
+      : collectDetailRefs(shouldCollectDetailRefsFromSanitizedEvent(event) ? next : event, options.detailSink),
   };
 }
 
@@ -423,13 +478,19 @@ export function sanitizeTimelineHistoryEventsForTransport(
   options: TimelineHistorySanitizeOptions = {},
 ): TimelineHistorySanitizeResult {
   const maxResponseBytes = Math.max(64 * 1024, Math.trunc(options.maxResponseBytes ?? DEFAULT_TIMELINE_HISTORY_MAX_RESPONSE_BYTES));
-  const selectedEntries: Array<ReturnType<typeof sanitizeTimelineHistoryEventForTransport>> = [];
+  const dedupedByEventId = new Map<string, TimelineEvent>();
+  for (const event of events) {
+    const current = dedupedByEventId.get(event.eventId);
+    if (!current || isNewerTimelineEvent(event, current)) dedupedByEventId.set(event.eventId, event);
+  }
+  const inputEvents = Array.from(dedupedByEventId.values()).sort(compareTimelineEventsForReplay);
+  const selectedEntries: Array<ReturnType<typeof sanitizeTimelineHistoryEventForTransport> & { originalEvent: TimelineEvent }> = [];
   let payloadBytes = 2;
   let droppedEvents = 0;
   let truncatedEvents = 0;
 
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const entry = sanitizeTimelineHistoryEventForTransport(events[index]!, {
+  for (let index = inputEvents.length - 1; index >= 0; index -= 1) {
+    const entry = sanitizeTimelineHistoryEventForTransport(inputEvents[index]!, {
       ...options,
       collectDetailRefs: false,
     });
@@ -438,17 +499,17 @@ export function sanitizeTimelineHistoryEventsForTransport(
       droppedEvents += index + 1;
       break;
     }
-    selectedEntries.push(entry);
+    selectedEntries.push({ ...entry, originalEvent: inputEvents[index]! });
     payloadBytes = nextBytes;
     if (entry.truncated) truncatedEvents += 1;
   }
   selectedEntries.reverse();
   const selected = selectedEntries.map((entry) => entry.event);
-  const selectedEventIds = new Set(selected.map((event) => event.eventId));
   const detailRefs = options.detailSink
-    ? events
-      .filter((event) => selectedEventIds.has(event.eventId))
-      .flatMap((event) => collectDetailRefs(event, options.detailSink))
+    ? selectedEntries.flatMap((entry) => collectDetailRefs(
+        shouldCollectDetailRefsFromSanitizedEvent(entry.originalEvent) ? entry.event : entry.originalEvent,
+        options.detailSink,
+      ))
     : [];
 
   if (droppedEvents > 0) truncatedEvents += droppedEvents;

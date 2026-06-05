@@ -5,6 +5,7 @@ import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from '../agent/provider-quota.js';
 import { getClaudeSdkRuntimeConfig } from '../agent/sdk-runtime-config.js';
+import { getClaudeUsageQuota } from '../agent/claude-usage-quota.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { getCopilotRuntimeConfig } from '../agent/copilot-runtime-config.js';
@@ -46,6 +47,9 @@ export interface SessionListItem extends SessionContextBootstrapState {
   transportConfig?: Record<string, unknown>;
   transportPendingMessages?: string[];
   transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }>;
+  /** Monotonic version of the pending-queue snapshot. Lets the UI ignore
+   *  stale snapshots delivered out of order. See TransportSessionRuntime. */
+  transportPendingMessageVersion?: number;
 }
 
 function resolveTransportSessionListState(
@@ -53,6 +57,9 @@ function resolveTransportSessionListState(
   runtime: ReturnType<typeof getTransportRuntime> | undefined,
 ): SessionListItem['state'] {
   if (!runtime) return record.state;
+  runtime.drainPendingIfIdle?.('session-list');
+  runtime.settleInactiveInProgressStatus?.('session-list');
+  runtime.cancelStaleActiveTurnWithPending?.({ reason: 'session-list' });
   const status = runtime.getStatus();
   if (status === 'error') return 'error';
   if (status === 'streaming' || status === 'thinking' || status === 'tool_running' || status === 'permission') {
@@ -103,6 +110,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     transportConfig: s.transportConfig,
     transportPendingMessages: runtime?.pendingMessages ?? [],
     transportPendingMessageEntries: runtime?.pendingEntries ?? [],
+    transportPendingMessageVersion: runtime?.pendingVersion ?? 0,
   };
 }
 
@@ -145,6 +153,9 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   const needsCursorHydration = sessions.some((s) => s.agentType === 'cursor-headless');
   const qwenRuntime = needsQwenHydration ? await getQwenRuntimeConfig().catch(() => null) : null;
   const claudeSdkRuntime = needsClaudeSdkHydration ? await getClaudeSdkRuntimeConfig().catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig) : null;
+  // Option B (best-effort, ≤1 fetch / 30min): proactive 5h+weekly quota pulled
+  // from /api/oauth/usage. null → fall back to the SDK rate_limit_event quota.
+  const claudeUsageQuota = needsClaudeSdkHydration ? await getClaudeUsageQuota().catch(() => null) : null;
   const codexRuntime = needsCodexHydration ? await getCodexRuntimeConfig().catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig) : null;
   const copilotRuntime = needsCopilotHydration ? await getCopilotRuntimeConfig().catch(() => null) : null;
   const cursorRuntime = needsCursorHydration ? await getCursorRuntimeConfig().catch(() => null) : null;
@@ -177,7 +188,13 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
       if (hydrated.planLabel !== s.planLabel || hydrated.permissionLabel !== s.permissionLabel || hydrated.quotaLabel !== s.quotaLabel || hydrated.quotaUsageLabel != s.quotaUsageLabel) {
         upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
       }
-      return { ...baseItem(s), ...hydrated };
+      // Override with the proactive /api/oauth/usage quota when available
+      // (display-only; the rate_limit_event quota on the record stays the
+      // fallback when B is unreachable, e.g. a headless macOS Keychain).
+      const quotaOverride = claudeUsageQuota
+        ? { quotaLabel: claudeUsageQuota.quotaLabel, quotaMeta: claudeUsageQuota.quotaMeta }
+        : {};
+      return { ...baseItem(s), ...hydrated, ...quotaOverride };
     }
     if (s.agentType === 'codex' || s.agentType === 'codex-sdk') {
       const hydrated: Partial<SessionRecord> = {

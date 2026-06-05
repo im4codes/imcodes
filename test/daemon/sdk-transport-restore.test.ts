@@ -80,6 +80,9 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: vi.fn(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
     mocks.claudeRuns.push({ prompt, options });
     async function* gen() {
+      if (prompt.includes('[transport-always-fail]')) {
+        throw new Error('simulated persistent transport failure');
+      }
       if (prompt.includes('[transport-retry-once]')) {
         const seen = mocks.claudeFailures.get(prompt) ?? 0;
         mocks.claudeFailures.set(prompt, seen + 1);
@@ -145,7 +148,7 @@ vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn()
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
 import { getTransportRuntime, launchTransportSession, relaunchSessionWithSettings, restoreTransportSessions, setSessionEventCallback, setSessionPersistCallback } from '../../src/agent/session-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
-import { clearAllResend, enqueueResend, getResendCount } from '../../src/daemon/transport-resend-queue.js';
+import { clearAllResend, enqueueResend, getResendCount, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 
 const flush = async () => {
@@ -584,6 +587,88 @@ describe('sdk transport session restore', () => {
     expect(getResendCount('deck_sdk_retry_brain')).toBe(0);
     expect(getTransportRuntime('deck_sdk_retry_brain')).toBeDefined();
     expect(getTransportRuntime('deck_sdk_retry_brain')).not.toBe(firstRuntime);
+  });
+
+  it('auto-restart preserves messages queued behind the failed active turn', async () => {
+    await connectProvider('claude-code-sdk', {});
+    await launchTransportSession({
+      name: 'deck_sdk_retry_pending_brain',
+      projectName: 'sdkretry',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/sdk-retry-pending',
+      requestedModel: 'sonnet',
+      ccSessionId: 'cc-session-retry-pending',
+    });
+
+    const firstRuntime = getTransportRuntime('deck_sdk_retry_pending_brain');
+    expect(firstRuntime).toBeDefined();
+
+    expect(firstRuntime!.send('Please retry me [transport-retry-once]', 'cmd-retry-active')).toBe('sent');
+    expect(firstRuntime!.send('follow up one', 'cmd-retry-pending-1')).toBe('queued');
+    expect(firstRuntime!.send('follow up two', 'cmd-retry-pending-2')).toBe('queued');
+
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if (mocks.claudeRuns.length >= 3 && getResendCount('deck_sdk_retry_pending_brain') === 0) break;
+      await flush();
+    }
+
+    expect(mocks.claudeRuns.map((run) => run.prompt)).toEqual([
+      'Please retry me [transport-retry-once]',
+      'Please retry me [transport-retry-once]',
+      'follow up one\n\nfollow up two',
+    ]);
+    expect(getResendCount('deck_sdk_retry_pending_brain')).toBe(0);
+    expect(getTransportRuntime('deck_sdk_retry_pending_brain')).toBeDefined();
+    expect(getTransportRuntime('deck_sdk_retry_pending_brain')).not.toBe(firstRuntime);
+  });
+
+  it('rate-limited auto-recovery still preserves active and pending messages for later resend', async () => {
+    await connectProvider('claude-code-sdk', {});
+    await launchTransportSession({
+      name: 'deck_sdk_retry_limited_brain',
+      projectName: 'sdkretry',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/sdk-retry-limited',
+      requestedModel: 'sonnet',
+      ccSessionId: 'cc-session-retry-limited',
+    });
+
+    const firstRuntime = getTransportRuntime('deck_sdk_retry_limited_brain');
+    expect(firstRuntime).toBeDefined();
+
+    expect(firstRuntime!.send('Please retry me [transport-always-fail]', 'cmd-retry-limit-active')).toBe('sent');
+    expect(firstRuntime!.send('limited follow up one', 'cmd-retry-limit-pending-1')).toBe('queued');
+    expect(firstRuntime!.send('limited follow up two', 'cmd-retry-limit-pending-2')).toBe('queued');
+
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const recoveryStopped = timelineEmitterEmitMock.mock.calls.some((call) => (
+        call[0] === 'deck_sdk_retry_limited_brain'
+          && call[1] === 'assistant.text'
+          && typeof call[2]?.text === 'string'
+          && call[2].text.includes('Transport recovery stopped')
+      ));
+      if (recoveryStopped && getResendCount('deck_sdk_retry_limited_brain') >= 3) break;
+      await flush();
+    }
+
+    expect(timelineEmitterEmitMock.mock.calls).toEqual(expect.arrayContaining([
+      expect.arrayContaining([
+        'deck_sdk_retry_limited_brain',
+        'assistant.text',
+        expect.objectContaining({
+          text: expect.stringContaining('Transport recovery stopped'),
+        }),
+      ]),
+    ]));
+    expect(getResendEntries('deck_sdk_retry_limited_brain').map((entry) => entry.commandId)).toEqual([
+      'cmd-retry-limit-active',
+      'cmd-retry-limit-pending-1',
+      'cmd-retry-limit-pending-2',
+    ]);
   });
 
   it('emits startup memory.context when the first transport turn carries the seeded memory', { timeout: 30_000 }, async () => {

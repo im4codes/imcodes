@@ -20,6 +20,9 @@ export interface Config {
     heartbeatInterval: number;
     reconnectBase: number;
     reconnectMax: number;
+    /** When false, the daemon refuses its own auto-upgrade (manual `imcodes
+     *  upgrade` still works). Default true. */
+    autoUpgrade: boolean;
   };
   agents: {
     defaultType: string;
@@ -140,4 +143,13 @@ export async function loadConfig(): Promise<Config> {
 
 export function resetConfigCache(): void {
   cachedConfig = null;
+}
+
+/**
+ * Synchronously return the already-loaded config, or null if loadConfig() has
+ * not run yet. Use on hot paths that must not add async file I/O (the daemon
+ * loads config once at startup, so it is cached by the time these run).
+ */
+export function getLoadedConfig(): Config | null {
+  return cachedConfig;
 }

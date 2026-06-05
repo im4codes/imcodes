@@ -46,6 +46,9 @@
     "retry": "再試行"
   },
   "chat": {
+    "dpad": {
+      "title": "矢印キー — ドラッグで移動"
+    },
     "sendFailedReason": {
       "daemonOffline": "接続が切れました",
       "ackTimeout": "エージェントから応答がありません",
@@ -90,6 +93,44 @@
     "show_file_panel": "ファイルパネルを開く",
     "hide_file_panel": "ファイルパネルを閉じる",
     "sync_history": "チャット履歴を同期",
+    "sdk_agents_toggle": "Agents",
+    "sdk_agents_toggle_aria": "SDK agents ステータスを切り替え、{{count}} 件実行中",
+    "sdk_agents_badge_aria": "{{count}} 件の SDK agents が実行中",
+    "sdk_agents_panel_title": "Agents",
+    "sdk_agents_close": "Agents パネルを閉じる",
+    "sdk_agents_running_count": "{{count}} 件実行中",
+    "sdk_agents_active_section": "実行中",
+    "sdk_agents_recent_section": "最近",
+    "sdk_agents_diagnostics_section": "診断",
+    "sdk_agents_provider_claude": "Claude SDK",
+    "sdk_agents_provider_codex": "Codex SDK",
+    "sdk_agents_provider_qwen": "Qwen",
+    "sdk_agents_provider_gemini": "Gemini SDK",
+    "sdk_agents_provider_unknown": "SDK agent",
+    "sdk_agents_status_pending": "待機中",
+    "sdk_agents_status_running": "実行中",
+    "sdk_agents_status_complete": "完了",
+    "sdk_agents_status_error": "エラー",
+    "sdk_agents_status_interrupted": "中断",
+    "sdk_agents_status_stale": "期限切れ",
+    "sdk_agents_status_unknown": "不明",
+    "sdk_agents_id": "ID",
+    "sdk_agents_model": "モデル",
+    "sdk_agents_started_at": "開始",
+    "sdk_agents_duration": "実行時間",
+    "sdk_agents_tokens": "トークン",
+    "sdk_agents_prompt": "Prompt",
+    "sdk_agents_result": "結果",
+    "sdk_agents_running_children": "{{count}} 件の子 agent が実行中",
+    "sdk_agents_receiver_count": "{{count}} 件の受信先",
+    "sdk_agents_diagnostic_unsupported_runtime": "runtime が agent ステータスを公開していません",
+    "sdk_agents_diagnostic_unknown_runtime_support": "runtime サポート状態が不明です",
+    "sdk_agents_diagnostic_malformed_payload": "agent メタデータが不正です",
+    "sdk_agents_diagnostic_missing_id": "agent 識別子がありません",
+    "sdk_agents_diagnostic_unknown_state": "provider 状態が不明です",
+    "sdk_agents_diagnostic_stale_without_terminal": "完了前にステータスが期限切れになりました",
+    "sdk_agents_diagnostic_snapshot_only": "provider ステータスは snapshot のみです",
+    "sdk_agents_diagnostic_generic": "agent ステータス診断",
     "html_preview": "HTML をレンダー",
     "html_preview_title": "レンダー済み HTML プレビュー",
     "html_preview_open_new_window": "プレビューを新しいウィンドウで開く",
@@ -183,7 +224,33 @@
     "file_change_no_after": "（新しいテキストなし）",
     "file_change_derived_no_preview": "（プレビューなし）",
     "file_change_coarse_hint": "ファイルパスはありますが、diff テキストはありません。",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "font": {
+      "dialogLabel": "フォント",
+      "typeLabel": "フォント種別",
+      "codeTab": "コード",
+      "cjkTab": "日本語",
+      "familyLabel": "コードフォント",
+      "cjkFamilyLabel": "日本語フォント",
+      "allBuiltInCjk": "すべての内蔵 CJK フォント",
+      "cjkFamilies": {
+        "system-cjk": "システム CJK",
+        "pingfang-sc": "PingFang SC",
+        "songti-sc": "Songti SC",
+        "kaiti-sc": "Kaiti SC",
+        "stheiti": "STHeiti",
+        "stsong": "STSong",
+        "stkaiti": "STKaiti",
+        "stfangsong": "STFangsong",
+        "microsoft-yahei": "Microsoft YaHei",
+        "simsun": "SimSun",
+        "nsimsun": "NSimSun",
+        "dengxian": "DengXian",
+        "kaiti": "KaiTi",
+        "fangsong": "FangSong",
+        "microsoft-jhenghei": "Microsoft JhengHei"
+      }
+    }
   },
   "session": {
     "restart": "↺ 再起動",
@@ -369,6 +436,9 @@
     "codex_limit_title": "{{label}} 残り {{percent}}% · リセット {{reset}}",
     "provider_plan_title": "プラン: {{value}}",
     "provider_quota_title": "上限: {{value}}",
+    "weekly_quota_authorize": "週間上限を表示",
+    "weekly_quota_authorize_hint": "ローカルの Claude トークンの読み取りを許可して週間（7日）の上限を表示します",
+    "weekly_quota_confirm": "週間（7日）の上限を取得するため、ローカルの Claude ログイントークンを読み取ります。許可しますか？",
     "provider_quota_usage_title": "利用状況: {{value}}",
     "history_loading_label": "履歴",
     "history_step_cache": "キャッシュ",
@@ -539,7 +609,8 @@
   "toast": {
     "finished": "完了",
     "upgrade_blocked_title": "アップグレードはブロックされました",
-    "upgrade_blocked_p2p_active": "Team がまだ実行中です。daemon をアップグレードする前に停止してください。"
+    "upgrade_blocked_p2p_active": "Team がまだ実行中です。daemon をアップグレードする前に停止してください。",
+    "upgrade_blocked_toolchain_unavailable": "daemon ホストの Node が見つかりません（ツールチェーンが削除されました）。Node を再インストールしてください。それまで自動アップグレードは無効です。"
   },
   "discussion": {
     "role_critic": "批評家",
@@ -547,7 +618,25 @@
     "role_innovator": "革新者",
     "role_custom": "カスタム...",
     "arbiter": "仲裁者",
-    "arbiter_active": "⚖️ 仲裁者"
+    "arbiter_active": "⚖️ 仲裁者",
+    "starting": "開始中…",
+    "start_failed_title": "ディスカッションを開始できませんでした",
+    "start_failed_offline": "オフラインです。再接続してからもう一度お試しください。",
+    "dialog_title": "ディスカッションを開始",
+    "start_button": "ディスカッションを開始",
+    "field_topic": "トピック",
+    "topic_placeholder": "エージェントに議論させたい内容を記述してください…",
+    "field_cwd": "作業ディレクトリ",
+    "field_participants": "参加者",
+    "add_participant": "+ 追加",
+    "field_max_rounds": "最大ラウンド数",
+    "team_label": "チーム",
+    "complete_status": "完了",
+    "failed_status": "失敗",
+    "error": {
+      "missing_fields": "必須項目が不足しています(トピックと参加者2名以上)。",
+      "generic": "ディスカッションを開始できませんでした。もう一度お試しください。"
+    }
   },
   "new_session": {
     "project_required": "プロジェクト名は必須です",
@@ -763,6 +852,8 @@
       "agents": "エージェント",
       "search_project_files": "プロジェクトファイルを検索",
       "quick_discussion_with_agent": "エージェントとクイックディスカッション",
+      "team": "Team",
+      "team_desc": "チーム討論を開始",
       "select_mode": "モードを選択",
       "all_agents": "全エージェント",
       "sessions": "セッション",
@@ -785,6 +876,7 @@
     "dropdown": {
       "tab_combos": "コンボ",
       "tab_workflows": "ワークフロー",
+      "solo_hint": "下のフローを選んでワークフローを開始",
       "team_intro_title": "Team ディスカッション",
       "team_intro_body": "エージェントが討議、要約、実装を行い、その結果をレビューします。ラウンドを増やすとこのループを繰り返して成果を強化します。",
       "team_intro_tooltip": "討議 → 要約 → 実装 → レビュー。ラウンドを増やすと前回の結果をもとにループを繰り返します。",
@@ -817,6 +909,7 @@
     "combo_send_confirm_skip": "次回から確認せず直接送信する",
     "combo_empty_message_warning": "コンボ送信には本文が必要です。実際の依頼内容を入力してから送信してください。",
     "combo_requires_participants_hint": "コンボモードを有効にするには、先に Team 設定で参加者を選んでください。",
+    "member_cannot_initiate_discussion": "このセッションは Team のメンバーのため、ディスカッションを開始できません。別のセッションから開始してください（最上位モデルを推奨）。",
     "settings_enabled": "参加",
     "settings_mode": "モード",
     "settings_skip": "スキップ",
@@ -1233,7 +1326,9 @@
     "empty": "ローカルポートとパスを入力してからプレビューを開いてください。",
     "noServer": "先にサーバーを選択してください。",
     "previewing": "プレビュー中：",
-    "initialPathNote": "このパスは最初に開くページだけを指定します。読み込み後の移動範囲はこのパスではなくポート単位です。"
+    "initialPathNote": "このパスは最初に開くページだけを指定します。読み込み後の移動範囲はこのパスではなくポート単位です。",
+    "portHistoryLabel": "最近のポート",
+    "pathHistoryLabel": "最近のパス"
   },
   "cron": {
     "title": "スケジュールタスク",
@@ -1257,6 +1352,12 @@
     "action_type": "アクション種別",
     "action_command": "コマンド",
     "action_p2p": "Teamディスカッション",
+    "send_target": "送信先",
+    "send_target_placeholder": "正確なセッション名、ラベル、またはエージェント種別",
+    "send_message": "メッセージ",
+    "send_message_placeholder": "送信するメッセージを入力...",
+    "send_reply": "送信先に返信を依頼",
+    "send_broadcast": "兄弟セッションへ一斉送信",
     "command": "コマンド",
     "command_placeholder": "エージェントに送るコマンドを入力...",
     "shell_hint": "ヒント：Shellセッションはスクリプトを直接実行できます。スクリプトのパスを入力してください（例: /path/to/script.sh）",
@@ -2002,5 +2103,11 @@
       "enforced": "強制",
       "additive": "追加"
     }
+  },
+  "todos": {
+    "title": "タスク",
+    "progress": "{{done}}/{{total}}",
+    "collapse": "折りたたむ",
+    "expand": "展開"
   }
 }

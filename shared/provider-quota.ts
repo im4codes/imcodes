@@ -47,10 +47,12 @@ export function formatResetDateTime(epochSeconds: number | undefined): string | 
 
 function formatQuotaWindow(window: ProviderQuotaWindow | null | undefined, fallbackWindowLabel: string, nowMs: number): string | undefined {
   if (!window) return undefined;
-  const parts = [
-    formatWindowDuration(window.windowDurationMins, fallbackWindowLabel),
-    formatPercent(window.usedPercent) ?? '—',
-  ];
+  const parts = [formatWindowDuration(window.windowDurationMins, fallbackWindowLabel)];
+  // The percent is only known for some sources (Codex always; the token-free
+  // Claude rate_limit_event omits it when healthy). Show it only when present
+  // rather than a bare "—" placeholder.
+  const percent = formatPercent(window.usedPercent);
+  if (percent) parts.push(percent);
   const remaining = formatRemainingTime(window.resetsAt, nowMs);
   const resetAt = formatResetDateTime(window.resetsAt);
   if (remaining) parts.push(remaining);

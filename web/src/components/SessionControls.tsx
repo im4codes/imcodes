@@ -14,6 +14,7 @@ import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
+import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
 import { isFutureWorkflowSchema } from '@shared/p2p-workflow-validators.js';
 import {
@@ -601,7 +602,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
-  const [atPickerStage, setAtPickerStage] = useState<'choose' | 'files' | 'agents' | 'mode'>('choose');
+  const [atPickerStage, setAtPickerStage] = useState<'choose' | 'files' | 'agents' | 'mode' | 'team'>('choose');
   const atJustClosedRef = useRef(false);
   const atSelectionLockRef = useRef(false);
   const atSelectionSnapshotRef = useRef('');
@@ -1706,6 +1707,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return Object.values(p2pSavedConfig.sessions).some((entry) => entry?.enabled && entry.mode !== 'skip');
   }, [p2pSavedConfig]);
 
+  // A session that is itself an enabled P2P participant ("member") must not
+  // start its own Team discussion from its Team dropdown — discussions spawn
+  // their own sub-sessions, so a member launching one would nest the team
+  // under a participant. The host/root session (the launcher) is never a
+  // member. When this is true we reject the combo/workflow launch and steer
+  // the user to start the discussion from another (non-member) session.
+  const isCurrentSessionP2pMember = useMemo(() => {
+    const name = activeSession?.name;
+    if (!name || name === rootSession) return false;
+    const entry = p2pSavedConfig?.sessions?.[name];
+    return !!entry?.enabled && entry.mode !== 'skip';
+  }, [activeSession?.name, rootSession, p2pSavedConfig]);
+
   // P2P config is per server + main-session (sub-sessions follow parent), stored on server for cross-device sync.
   const p2pConfigKey = rootSession ? p2pSessionConfigPrefKey(rootSession, serverId) : null;
   const p2pSavedConfigPref = usePref<P2pSavedConfig>(p2pConfigKey, {
@@ -2057,9 +2071,41 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return commandId;
   }, [activeSession, makeCommandId, serverId, ws]);
 
+  // Optimistic stop feedback. The cancel command is fire-and-forget on a
+  // priority lane (server/daemon never queue it), but the button only flips
+  // colour/state after the session.state round-trip + the provider actually
+  // interrupting the model (up to ~1.5s for the Claude SDK). Without local
+  // feedback the tap looks ignored. Fire on pointerdown (don't wait for the
+  // ~300ms synthetic click, which is also dispatched late when streaming
+  // jank keeps the main thread busy) and show a "stopping" pulse instantly.
+  const [stopRequested, setStopRequested] = useState(false);
+  const stopPressGuardRef = useRef(0);
+
+  const showStopFeedback = useCallback(() => {
+    stopPressGuardRef.current = Date.now();
+    setStopRequested(true);
+  }, []);
+
+  const handleStopPress = useCallback(() => {
+    const now = Date.now();
+    if (now - stopPressGuardRef.current < 600) return; // dedupe pointerdown + click
+    showStopFeedback();
+    cancelActiveTransportTurn();
+  }, [cancelActiveTransportTurn, showStopFeedback]);
+
+  // Clear the optimistic state once the turn actually settles (session leaves
+  // the running state) or after a safety timeout so a stuck turn re-enables it.
+  useEffect(() => {
+    if (!stopRequested) return;
+    if (!isRunningSessionState(activeSession?.state)) { setStopRequested(false); return; }
+    const timer = setTimeout(() => setStopRequested(false), 4000);
+    return () => clearTimeout(timer);
+  }, [stopRequested, activeSession?.state]);
+
   const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}, commandId = makeCommandId()): string | null => {
     if (!activeSession) return null;
     if (effectiveRuntimeType === 'transport' && text.trim() === '/stop') {
+      showStopFeedback();
       return cancelActiveTransportTurn(commandId);
     }
     const payload = {
@@ -2084,7 +2130,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       });
     }
     return commandId;
-  }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, makeCommandId, serverId, ws]);
+  }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, makeCommandId, serverId, showStopFeedback, ws]);
 
   const sendQueuedMessageMutation = useCallback((type: 'session.edit_queued_message' | 'session.undo_queued_message', payload: Record<string, unknown>) => {
     if (!ws || !activeSession) return false;
@@ -2124,6 +2170,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
     };
     if (effectiveRuntimeType === 'transport' && !isP2pSend && payload.text.trim() === '/stop') {
+      showStopFeedback();
       if (!cancelActiveTransportTurn()) return;
       if (options?.clearComposer) clearComposerState();
       return;
@@ -2191,7 +2238,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (options?.clearComposer) {
       clearComposerState();
     }
-  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, transportSendShouldQueue]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, showStopFeedback, transportSendShouldQueue]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -2292,9 +2339,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     requestSend(buildSendPayload(), { clearComposer: true });
   }, [buildSendPayload, requestSend]);
 
-  const handleDirectComboSelect = useCallback((mode: string) => {
+  const handleDirectComboSelect = useCallback((mode: string, roundsOverride?: number) => {
     setP2pOpen(false);
-    const selection = p2pSavedConfig ? buildP2pConfigSelection(p2pSavedConfig, mode) : null;
+    if (isCurrentSessionP2pMember) {
+      showSendWarning(t('p2p.member_cannot_initiate_discussion'));
+      return;
+    }
+    const selection = p2pSavedConfig
+      ? buildP2pConfigSelection(p2pSavedConfig, mode, roundsOverride ?? p2pSavedConfig.rounds ?? 1)
+      : null;
     const payloadOptions: BuildSendPayloadOptions = selection
       ? {
           modeOverride: mode,
@@ -2307,7 +2360,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         }
       : { modeOverride: mode };
     requestSend(buildSendPayload(payloadOptions), { clearComposer: true });
-  }, [buildSendPayload, p2pSavedConfig, requestSend]);
+  }, [buildSendPayload, isCurrentSessionP2pMember, p2pSavedConfig, requestSend, showSendWarning, t]);
 
   /*
    * R3 v2 PR-κ — Click-to-launch a saved workflow from the P2P dropdown.
@@ -2321,6 +2374,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
    */
   const handleDirectWorkflowSelect = useCallback((workflowId: string) => {
     setP2pOpen(false);
+    if (isCurrentSessionP2pMember) {
+      showSendWarning(t('p2p.member_cannot_initiate_discussion'));
+      return;
+    }
     if (!p2pSavedConfig || workflowLibraryItems.length === 0) return;
     const target = workflowLibraryItems.find((entry) => entry.id === workflowId);
     if (!target) return;
@@ -2337,7 +2394,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       syntheticConfigOverride: selection,
     };
     requestSend(buildSendPayload(payloadOptions), { clearComposer: true });
-  }, [buildSendPayload, p2pSavedConfig, requestSend, workflowLibraryItems]);
+  }, [buildSendPayload, isCurrentSessionP2pMember, p2pSavedConfig, requestSend, showSendWarning, t, workflowLibraryItems]);
 
   const handleComboSendCancel = useCallback(() => {
     maybePersistComboSendSkip();
@@ -2368,7 +2425,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
     if (e.key === 'Escape' && effectiveRuntimeType === 'transport' && isRunningSessionState(activeSession?.state)) {
       e.preventDefault();
-      cancelActiveTransportTurn();
+      handleStopPress();
       return;
     }
 
@@ -2795,28 +2852,46 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           {/* Transport sessions: single Stop button instead of terminal shortcuts */}
           {isTransport ? (
             <button
-              class="shortcut-btn shortcut-btn-icon"
+              class={`shortcut-btn shortcut-btn-icon shortcut-btn-stop${stopRequested ? ' shortcut-btn-stop-pending' : ''}`}
               title={`${t('session.stop_plain')} (/stop)`}
               aria-label={t('session.stop_plain')}
               disabled={disabled || activeSession?.state === 'stopped'}
-              onClick={() => {
-                cancelActiveTransportTurn();
-              }}
+              onPointerDown={(e) => { e.preventDefault(); handleStopPress(); }}
+              onClick={handleStopPress}
               style={isRunningSessionState(activeSession?.state) ? { color: '#f87171' } : undefined}
             >
               <span aria-hidden="true">■</span>
             </button>
-          ) : SHORTCUTS.map((s) => (
-            <button
-              key={s.label}
-              class={`shortcut-btn${s.wide ? ' shortcut-btn-wide' : ''}`}
-              title={s.title}
-              disabled={disabled}
-              onClick={() => handleShortcut(s.data)}
-            >
-              {s.label}
-            </button>
-          ))}
+          ) : SHORTCUTS.map((s) => {
+            // Mobile: collapse the separate ↑/↓ buttons into one drag D-pad
+            // (rendered once at the ↑ slot; ↓ is folded in). It sends the
+            // same standard arrow sequences down the same handleShortcut path,
+            // so ncdu/vim/less TUI handling is inherited unchanged, and adds
+            // left/right. Desktop keeps the discrete buttons.
+            if (isMobileLayout && s.data === DPAD_ARROW_SEQUENCES.down) return null;
+            if (isMobileLayout && s.data === DPAD_ARROW_SEQUENCES.up) {
+              return (
+                <MobileDpad
+                  key="dpad"
+                  disabled={disabled}
+                  title={t('chat.dpad.title')}
+                  ariaLabel={t('chat.dpad.title')}
+                  onDirection={(seq) => handleShortcut(seq)}
+                />
+              );
+            }
+            return (
+              <button
+                key={s.label}
+                class={`shortcut-btn${s.wide ? ' shortcut-btn-wide' : ''}`}
+                title={s.title}
+                disabled={disabled}
+                onClick={() => handleShortcut(s.data)}
+              >
+                {s.label}
+              </button>
+            );
+          })}
         </div>}
 
         {canQuickControlSupervision && (
@@ -3296,7 +3371,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 }}
                 style={{ color: getP2pMenuItemColor('solo', p2pMode === 'solo'), fontWeight: p2pMode === 'solo' ? 700 : 600 }}
               >
-                {p2pMode === 'solo' ? '● ' : '○ '}{getP2pModeLabel('solo', t)}
+                {p2pMode === 'solo' ? '● ' : '○ '}{t('p2p.dropdown.solo_hint', 'Select a flow below to start a workflow')}
               </button>
               <div class="menu-divider" />
               {/*
@@ -3724,6 +3799,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 sel?.addRange(range);
               } catch { /* jsdom lacks Selection API */ }
             }}
+            onLaunchTeam={(modeKey, rounds) => {
+              // From the @ picker → TEAM stage: strip the @, close the picker,
+              // and launch the discussion directly (reuses the member-gated
+              // combo launcher with the chosen round count).
+              const text = divRef.current?.textContent ?? '';
+              const before = text.replace(/@[^\s@]*$/, '');
+              if (divRef.current) divRef.current.textContent = before;
+              setHasText(before.trim().length > 0);
+              setAtPickerOpen(false);
+              setAtPickerStage('choose');
+              atJustClosedRef.current = true;
+              setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
+              handleDirectComboSelect(modeKey, rounds);
+            }}
             p2pConfig={p2pSavedConfig}
             onClose={() => { setAtPickerOpen(false); setAtPickerStage('choose'); }}
             onStageChange={setAtPickerStage}
@@ -3762,12 +3851,27 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               // Detect @/@@: use end of text (contentEditable anchorOffset is unreliable)
               const text = currentText;
 
-              // @@ → jump straight to agents picker
-              const doubleAt = text.match(/@@([^\s]*)$/);
+              // @@ → open the TEAM dropdown (combos / workflows). Selecting one
+              // launches a team discussion immediately with the current composer
+              // text as the topic. (Single-agent @@ selection was removed — it
+              // had little value vs. the combo/flow team discussion.) Strip the
+              // @@ trigger but keep the preceding text as the topic.
+              const doubleAt = text.match(/@@[\w-]*$/);
               if (doubleAt) {
-                setAtPickerOpen(true);
-                setAtPickerStage('agents');
-                setAtQuery(doubleAt[1]);
+                const before = text.replace(/@@[\w-]*$/, '');
+                if (divRef.current) divRef.current.textContent = before;
+                setHasText(!!before.trim());
+                setAtPickerOpen(false);
+                setAtPickerStage('choose');
+                setP2pOpen(true);
+                try {
+                  const sel = window.getSelection();
+                  const range = document.createRange();
+                  range.selectNodeContents(divRef.current!);
+                  range.collapse(false);
+                  sel?.removeAllRanges();
+                  sel?.addRange(range);
+                } catch { /* jsdom lacks Selection API */ }
               } else {
                 // Single @ → choose stage (files + agents menu)
                 const singleAt = text.match(/@([^\s@]*)$/);
@@ -3809,6 +3913,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           {showEmbeddedVoiceButton && (
             <button
               class="btn btn-voice btn-voice-embedded"
+              // Open on pointerdown (fires synchronously at touch-start) so the
+              // tap is never lost to the ~300ms click delay or to a re-render
+              // unmounting this conditionally-rendered button mid-gesture (the
+              // timeline re-renders constantly while an agent streams).
+              // preventDefault stops the tap from falling through to focus the
+              // input. onClick is kept as an idempotent fallback.
+              onPointerDown={(e) => { e.preventDefault(); setVoiceOpen(true); }}
               onClick={() => setVoiceOpen(true)}
               disabled={inputDisabled}
               title={t('voice.voice_input')}

@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { render, cleanup, waitFor } from '@testing-library/preact';
+import { render, cleanup, waitFor, act } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { useSubSessions } from '../src/hooks/useSubSessions.js';
 
@@ -121,5 +121,65 @@ describe('useSubSessions rebuild gating', () => {
         runtimeType: 'transport',
       }),
     ]);
+  });
+
+  // Regression: a half-open socket healed by a ping/pong probe arrives as a
+  // `connected`/`probe_recovered` event WITHOUT the `connected` boolean ever
+  // flipping. Sub-session reload + rebuild (→ subsession.sync carrying fresh
+  // runtime state) must still re-fire, otherwise a sub-session that went idle
+  // while the frontend was away stays stuck on `running` (perpetual card pulse).
+  it('resyncs sub-sessions on probe-recovery reconnect even when `connected` never flips', async () => {
+    const handlers: Array<(msg: any) => void> = [];
+    const ws = {
+      subSessionRebuildAll: vi.fn(),
+      onMessage: vi.fn((cb: (msg: any) => void) => { handlers.push(cb); return () => {}; }),
+    } as any;
+    const fire = (msg: any) => { for (const h of [...handlers]) h(msg); };
+    const sub = { id: 's1', type: 'shell', shellBin: null, cwd: null, label: null, parentSession: 'deck_probetest_w1', createdAt: Date.now(), updatedAt: Date.now() };
+    listSubSessions.mockResolvedValue([sub]); // same membership on every load
+
+    function Harness() {
+      // `connected` stays true the whole test — a probe recovery never flips it.
+      useSubSessions('srv1', ws, true, null);
+      return null;
+    }
+    render(<Harness />);
+
+    await waitFor(() => expect(listSubSessions).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(ws.subSessionRebuildAll).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      fire({ type: 'session.event', event: 'connected', session: '', state: 'connected', reason: 'probe_recovered' });
+    });
+
+    // Reload re-fires, cascading into a fresh rebuild → subsession.sync(state).
+    await waitFor(() => expect(listSubSessions).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(ws.subSessionRebuildAll).toHaveBeenCalledTimes(2));
+  });
+
+  // The trigger is precise: only `probe_recovered` (where the boolean can't flip)
+  // re-syncs. A `probe_start` (`probing`) event must NOT reload, or every flaky
+  // probe cycle would hammer the API.
+  it('does not resync on a probe-start event', async () => {
+    const handlers: Array<(msg: any) => void> = [];
+    const ws = {
+      subSessionRebuildAll: vi.fn(),
+      onMessage: vi.fn((cb: (msg: any) => void) => { handlers.push(cb); return () => {}; }),
+    } as any;
+    const fire = (msg: any) => { for (const h of [...handlers]) h(msg); };
+    listSubSessions.mockResolvedValue([{ id: 's1', type: 'shell', shellBin: null, cwd: null, label: null, parentSession: 'deck_probetest_w1', createdAt: Date.now(), updatedAt: Date.now() }]);
+
+    function Harness() {
+      useSubSessions('srv1', ws, true, null);
+      return null;
+    }
+    render(<Harness />);
+    await waitFor(() => expect(listSubSessions).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      fire({ type: 'session.event', event: 'probing', session: '', state: 'probing', reason: 'probe_start' });
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(listSubSessions).toHaveBeenCalledTimes(1);
   });
 });

@@ -3,6 +3,7 @@ import {
   enqueueResend,
   getResendEntries,
   getResendCount,
+  listResendQueues,
   clearResend,
   clearAllResend,
   drainResend,
@@ -27,6 +28,24 @@ describe('transport-resend-queue', () => {
     enqueueResend('beta', { text: 'b', commandId: 'cb', queuedAt: 0 });
     expect(getResendEntries('alpha').map((e) => e.commandId)).toEqual(['ca']);
     expect(getResendEntries('beta').map((e) => e.commandId)).toEqual(['cb']);
+  });
+
+  it('listResendQueues exposes a non-mutating all-session snapshot for diagnostics', () => {
+    enqueueResend('alpha', { text: 'a', commandId: 'ca', queuedAt: 10 });
+    enqueueResend('beta', { text: 'b', commandId: 'cb', queuedAt: 20 });
+
+    const snapshot = listResendQueues();
+    expect(snapshot.map((queue) => queue.sessionName).sort()).toEqual(['alpha', 'beta']);
+    expect(snapshot.find((queue) => queue.sessionName === 'alpha')?.entries.map((entry) => entry.commandId)).toEqual(['ca']);
+
+    snapshot.find((queue) => queue.sessionName === 'alpha')?.entries.push({
+      text: 'mutated',
+      commandId: 'mutated',
+      queuedAt: 30,
+    });
+
+    expect(getResendEntries('alpha').map((entry) => entry.commandId)).toEqual(['ca']);
+    expect(getResendEntries('beta').map((entry) => entry.commandId)).toEqual(['cb']);
   });
 
   it('drops the oldest entry once MAX_RESEND_ENTRIES is exceeded', () => {

@@ -32,6 +32,19 @@ let db: DatabaseSyncInstance | null = null;
 function ensureDb(): DatabaseSyncInstance {
   if (db) return db;
   const instance = new DatabaseSync(dbPath, { readOnly: true });
+  // The read worker previously opened the DB with NO pragmas: a single
+  // SQLITE_BUSY (writer checkpointing the WAL) made the query throw, the pool
+  // reported the job as failed, and the request degraded to an error/empty
+  // response. busy_timeout lets the read block-and-retry inside this worker
+  // thread (off the main event loop) instead of failing fast. query_only is a
+  // belt-and-braces guard that this connection never writes. cache/mmap keep
+  // hot reads off disk for the 500MB+ projection DB.
+  instance.exec(`
+    PRAGMA busy_timeout = 4000;
+    PRAGMA query_only = ON;
+    PRAGMA cache_size = -16000;
+    PRAGMA mmap_size = 268435456;
+  `);
   db = instance;
   return instance;
 }
@@ -78,6 +91,10 @@ function rowToEvent(row: Record<string, unknown>): TimelineEvent {
   };
 }
 
+function compareTimelineEventsForReplay(a: TimelineEvent, b: TimelineEvent): number {
+  return a.ts - b.ts || a.seq - b.seq || a.eventId.localeCompare(b.eventId);
+}
+
 function buildRangeSql(base: string, afterTs?: number, beforeTs?: number): { sql: string; params: unknown[] } {
   const clauses = [base];
   const params: unknown[] = [];
@@ -117,13 +134,12 @@ export function collectSelectedDetailCandidates(
   selectedEvents: readonly TimelineEvent[],
 ): TimelineHistoryWorkerDetailCandidate[] {
   if (selectedEvents.length === 0) return [];
-  const selectedIds = new Set(selectedEvents.map((event) => event.eventId));
   const candidates: TimelineHistoryWorkerDetailCandidate[] = [];
   const seen = new Set<string>();
   let candidateBytes = 0;
 
-  for (const event of originalEvents) {
-    if (!selectedIds.has(event.eventId)) continue;
+  void originalEvents;
+  for (const event of selectedEvents) {
     for (const candidate of collectTimelineHistoryDetailCandidates(event)) {
       const key = `${candidate.eventId}:${candidate.fieldPath}`;
       if (seen.has(key)) continue;
@@ -168,14 +184,14 @@ export async function handleTimelineHistoryWorkerRequest(
       );
     }
 
-    const events = [...substantive, ...stateEvents].sort((a, b) => a.ts - b.ts);
+    const events = [...substantive, ...stateEvents].sort(compareTimelineEventsForReplay);
     const readMs = Date.now() - tRead;
     const trimmedSubstantive = substantive.length > limit ? substantive.slice(substantive.length - limit) : substantive;
     let trimmed: TimelineEvent[];
     if (trimmedSubstantive.length > 0 && stateEvents.length > 0) {
       const cutoffTs = trimmedSubstantive[0]!.ts;
       const relevantState = stateEvents.filter((event) => event.ts >= cutoffTs);
-      trimmed = [...trimmedSubstantive, ...relevantState].sort((a, b) => a.ts - b.ts);
+      trimmed = [...trimmedSubstantive, ...relevantState].sort(compareTimelineEventsForReplay);
     } else {
       trimmed = trimmedSubstantive;
     }

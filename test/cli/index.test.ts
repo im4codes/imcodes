@@ -86,4 +86,24 @@ describe('imcodes CLI program', () => {
     expect(help).toContain('Start the daemon via system service');
     expect(help).toContain('--foreground');
   });
+
+  it('upgrade takes a positional [version], not a shadowed --version flag', async () => {
+    const program = createProgram();
+    const { out } = captureProgram(program);
+
+    await expect(program.parseAsync(['node', 'imcodes', 'upgrade', '--help'])).rejects.toMatchObject({
+      code: 'commander.helpDisplayed',
+      exitCode: 0,
+    });
+
+    const help = out.join('');
+    expect(help).toContain('Usage: imcodes upgrade');
+    // Positional version arg so `imcodes upgrade 2026.5.2477-dev.2586` works.
+    expect(help).toContain('[version]');
+    expect(help).toContain('--channel');
+    // Must NOT be a `--version <ver>` subcommand flag: the program-level
+    // .version() shadows it, so it would silently print the version and exit
+    // without upgrading (the bug this positional argument replaces).
+    expect(help).not.toMatch(/--version <ver>/);
+  });
 });

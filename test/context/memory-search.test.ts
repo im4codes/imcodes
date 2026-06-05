@@ -36,6 +36,29 @@ describe('memory-search', () => {
     expect(result.stats.totalRecords).toBeGreaterThan(0);
   });
 
+  it('matches processed projections when query tokens are present but not contiguous', () => {
+    writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-tokenized'],
+      summary: 'mock projection fallback source mentions alpha.test.im.codes for MCP expansion',
+      content: {},
+      updatedAt: 100,
+    });
+
+    const result = searchLocalMemory({
+      query: 'alpha.test.im.codes MCP expansion',
+      namespace,
+      projectionClass: 'recent_summary',
+      limit: 5,
+    });
+
+    expect(result.items.map((item) => item.summary)).toContain(
+      'mock projection fallback source mentions alpha.test.im.codes for MCP expansion',
+    );
+    expect(result.items[0]?.matchKind).toBe('exact');
+  });
+
   it('filters by repo', async () => {
     const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },

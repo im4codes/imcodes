@@ -149,6 +149,24 @@ function rectWithBottom(bottom: number): DOMRect {
   };
 }
 
+function rectAt(top: number, height: number): DOMRect {
+  return {
+    x: 0,
+    y: top,
+    width: 320,
+    height,
+    top,
+    right: 320,
+    bottom: top + height,
+    left: 0,
+    toJSON: () => ({}),
+  };
+}
+
+function setElementRect(el: HTMLElement, top: number, height: number): void {
+  el.getBoundingClientRect = () => rectAt(top, height);
+}
+
 
 describe('SubSessionWindow metadata wiring', () => {
   const ws = {
@@ -558,20 +576,24 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
   afterEach(() => {
     vi.useRealTimers();
     cleanup();
+    document.documentElement.classList.remove('kb-open', 'input-focused');
     document.querySelectorAll('.tab-bar').forEach((node) => node.remove());
   });
 
-  it('on mobile leaves the main controls area visible below the sub-session window', async () => {
+  it('on mobile only reserves the bottom sub-session button bar below the sub-session window', async () => {
     const originalUserAgent = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const viewportHeight = window.innerHeight;
     const controls = document.createElement('div');
     controls.className = 'controls-wrapper';
     Object.defineProperty(controls, 'offsetHeight', { configurable: true, value: 132 });
-    const subBar = document.createElement('div');
-    subBar.className = 'subsession-bar';
-    Object.defineProperty(subBar, 'offsetHeight', { configurable: true, value: 48 });
+    const subCardBar = document.createElement('div');
+    subCardBar.className = 'subcard-bar';
+    Object.defineProperty(subCardBar, 'offsetHeight', { configurable: true, value: 88 });
+    setElementRect(subCardBar, viewportHeight - 88, 88);
+    setElementRect(controls, viewportHeight - 132, 132);
     document.body.appendChild(controls);
-    document.body.appendChild(subBar);
+    document.body.appendChild(subCardBar);
 
     const sub = makeSubSession();
     const { container, unmount } = render(
@@ -591,32 +613,39 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       />,
     );
 
+    const initialPanel = container.querySelector('.subsession-window') as HTMLElement | null;
+    expect(initialPanel?.style.bottom).toBe('88px');
+    expect(initialPanel?.style.height).toContain('88px');
+
     await waitFor(() => {
       const panel = container.querySelector('.subsession-window') as HTMLElement | null;
       expect(panel).toBeTruthy();
-      expect(panel?.style.bottom).toBe('48px');
-      expect(panel?.style.height).toContain('48px');
+      expect(panel?.style.bottom).toBe('88px');
+      expect(panel?.style.height).toContain('88px');
       expect(panel?.style.zIndex).toBe('6000');
     });
 
     unmount();
     controls.remove();
-    subBar.remove();
+    subCardBar.remove();
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
   });
 
-  it('on mobile ignores the sub-window composer controls and reserves space for the main controls', async () => {
+  it('on mobile ignores both main and sub-window composer controls when reserving bottom space', async () => {
     const originalUserAgent = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const viewportHeight = window.innerHeight;
 
     const mainControls = document.createElement('div');
     mainControls.className = 'controls-wrapper';
     Object.defineProperty(mainControls, 'offsetHeight', { configurable: true, value: 148 });
-    const subBar = document.createElement('div');
-    subBar.className = 'subsession-bar';
-    Object.defineProperty(subBar, 'offsetHeight', { configurable: true, value: 44 });
+    const subCardBar = document.createElement('div');
+    subCardBar.className = 'subcard-bar';
+    Object.defineProperty(subCardBar, 'offsetHeight', { configurable: true, value: 72 });
+    setElementRect(subCardBar, viewportHeight - 72, 72);
+    setElementRect(mainControls, viewportHeight - 148, 148);
     document.body.appendChild(mainControls);
-    document.body.appendChild(subBar);
+    document.body.appendChild(subCardBar);
 
     const sub = makeSubSession();
     const { container, unmount } = render(
@@ -640,22 +669,24 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       const internalControls = container.querySelector('.subsession-window .controls-wrapper') as HTMLElement | null;
       const panel = container.querySelector('.subsession-window') as HTMLElement | null;
       expect(internalControls).toBeTruthy();
-      expect(panel?.style.bottom).toBe('44px');
-      expect(panel?.style.height).toContain('44px');
+      expect(panel?.style.bottom).toBe('72px');
+      expect(panel?.style.height).toContain('72px');
     });
 
     unmount();
     mainControls.remove();
-    subBar.remove();
+    subCardBar.remove();
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
   });
 
-  it('on mobile falls back to the main controls height when no external sub-session bar exists', async () => {
+  it('on mobile does not reserve main controls height when no external sub-session bar exists', async () => {
     const originalUserAgent = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const viewportHeight = window.innerHeight;
     const controls = document.createElement('div');
     controls.className = 'controls-wrapper';
     Object.defineProperty(controls, 'offsetHeight', { configurable: true, value: 132 });
+    setElementRect(controls, viewportHeight - 132, 132);
     document.body.appendChild(controls);
 
     const sub = makeSubSession();
@@ -678,12 +709,64 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
 
     await waitFor(() => {
       const panel = container.querySelector('.subsession-window') as HTMLElement | null;
-      expect(panel?.style.bottom).toBe('132px');
-      expect(panel?.style.height).toContain('132px');
+      expect(panel?.style.bottom).toBe('0px');
+      expect(panel?.style.height).toContain('0px');
     });
 
     unmount();
     controls.remove();
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+  });
+
+  it('on mobile releases the sub-session bar reserve when the keyboard hides that bar', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const viewportHeight = window.innerHeight;
+    let subCardBarTop = viewportHeight - 88;
+    let subCardBarHeight = 88;
+    const subCardBar = document.createElement('div');
+    subCardBar.className = 'subcard-bar';
+    Object.defineProperty(subCardBar, 'offsetHeight', { configurable: true, get: () => subCardBarHeight });
+    subCardBar.getBoundingClientRect = () => rectAt(subCardBarTop, subCardBarHeight);
+    document.body.appendChild(subCardBar);
+
+    const sub = makeSubSession();
+    const { container, unmount } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={6000}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const panel = container.querySelector('.subsession-window') as HTMLElement | null;
+      expect(panel?.style.bottom).toBe('88px');
+    });
+
+    subCardBarTop = 0;
+    subCardBarHeight = 0;
+    document.documentElement.classList.add('input-focused');
+    window.dispatchEvent(new Event('resize'));
+
+    await waitFor(() => {
+      const panel = container.querySelector('.subsession-window') as HTMLElement | null;
+      expect(panel?.style.bottom).toBe('0px');
+      expect(panel?.style.height).toContain('0px');
+    });
+
+    unmount();
+    subCardBar.remove();
+    document.documentElement.classList.remove('input-focused');
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
   });
   it('clamps a persisted off-screen window back into the visible viewport', async () => {
@@ -713,7 +796,7 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     await waitFor(() => {
       const panel = container.querySelector('.subsession-window') as HTMLElement | null;
       expect(panel).toBeTruthy();
-      expect(panel?.style.left).toBe(`${window.innerWidth - 32}px`);
+      expect(panel?.style.left).toBe(`${window.innerWidth - 620}px`);
       expect(panel?.style.top).toBe(`${window.innerHeight - 100 - 480}px`);
     });
   });

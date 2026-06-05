@@ -328,19 +328,17 @@ export interface PostSummaryExecutionPromptSpec extends P2pExecutionMarkerSpec {
   markerPath: string;
 }
 
-export function buildPostSummaryExecutionPrompt(
-  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>,
-  markerSpec?: PostSummaryExecutionPromptSpec,
-  options: { attempt?: number; deadlineAt?: number } = {},
-): string {
+function buildPostSummaryExecutionBasePrompt(run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>): string {
   const template = P2P_POST_SUMMARY_EXECUTE_TEMPLATES[run.locale ?? ''] ?? P2P_POST_SUMMARY_EXECUTE_TEMPLATES.en;
-  const basePrompt = template
+  return template
     .replaceAll('{{discussionFile}}', run.contextFilePath)
     .replaceAll('{{request}}', run.userText);
-  const langLine = buildP2pLanguageInstruction(run.locale);
-  const appendLanguageInstruction = (prompt: string) => langLine ? `${prompt}\n\n${langLine}` : prompt;
-  if (!markerSpec) return appendLanguageInstruction(basePrompt);
+}
 
+function buildPostSummaryExecutionProofBlock(
+  markerSpec: PostSummaryExecutionPromptSpec,
+  options: { attempt?: number; deadlineAt?: number } = {},
+): string {
   const successMarker = stringifyP2pExecutionMarker(buildP2pExecutionMarker(markerSpec, 'completed')).trimEnd();
   const failureMarker = stringifyP2pExecutionMarker({
     ...buildP2pExecutionMarker(markerSpec, 'failed'),
@@ -353,9 +351,7 @@ export function buildPostSummaryExecutionPrompt(
     ? `\nThis is retry attempt ${options.attempt}; the required marker has not been observed yet.`
     : '';
 
-  return appendLanguageInstruction(`${basePrompt}
-
-Execution proof required before the P2P workflow can continue:
+  return `Execution proof required before the P2P workflow can continue:
 - After you have directly executed the original request, write this exact JSON marker to: ${markerSpec.markerPath}
 - Keep runId, cycleIndex, cycleTotal, nonce, and status exactly as shown. Do not write the marker before doing the work.
 - If you cannot complete the request, write the failed marker instead and include a short error field.
@@ -369,7 +365,65 @@ ${successMarker}
 Failed marker:
 \`\`\`json
 ${failureMarker}
-\`\`\``);
+\`\`\``;
+}
+
+function buildInlinePostSummaryExecutionInstruction(
+  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>,
+  markerSpec: PostSummaryExecutionPromptSpec,
+): string {
+  return `After writing the required summary or plan, continue in the same turn and directly execute the user's original request. Do not wait for a separate follow-up prompt.
+
+${buildPostSummaryExecutionBasePrompt(run)}
+
+${buildPostSummaryExecutionProofBlock(markerSpec)}`;
+}
+
+function buildPostSummaryExecutionConfirmationPrompt(
+  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>,
+  executionSpec: PostSummaryExecutionPromptSpec,
+  executionMarker: P2pExecutionMarker,
+  markerSpec: PostSummaryExecutionPromptSpec,
+  options: { attempt?: number; deadlineAt?: number } = {},
+): string {
+  const langLine = buildP2pLanguageInstruction(run.locale);
+  const markerSummary = [
+    `Execution marker file: ${executionSpec.markerPath}`,
+    `Execution marker status: ${executionMarker.status}`,
+    executionMarker.summary ? `Execution summary: ${executionMarker.summary}` : null,
+    executionMarker.changedFiles?.length ? `Changed files: ${executionMarker.changedFiles.join(', ')}` : null,
+    executionMarker.tests?.length ? `Tests: ${executionMarker.tests.join(', ')}` : null,
+  ].filter((line): line is string => line !== null).join('\n');
+
+  const prompt = `Team execution follow-up verification.
+
+Discussion file: ${run.contextFilePath}
+Original user request: "${run.userText}"
+
+${markerSummary}
+
+Re-check the original request, the discussion evidence, and the work you just completed. If anything is incomplete, missing, or only partially done, finish it now in this same session. Only after you have verified the request is genuinely complete should you write the completed confirmation marker. If you cannot complete it, write the failed marker with a short reason.
+
+Do not just say it is done. Verify it against the request and complete any missing work.
+
+${buildPostSummaryExecutionProofBlock(markerSpec, options)}`;
+
+  return langLine ? `${prompt}\n\n${langLine}` : prompt;
+}
+
+export function buildPostSummaryExecutionPrompt(
+  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>,
+  markerSpec?: PostSummaryExecutionPromptSpec,
+  options: { attempt?: number; deadlineAt?: number } = {},
+): string {
+  const basePrompt = buildPostSummaryExecutionBasePrompt(run);
+  const langLine = buildP2pLanguageInstruction(run.locale);
+  const appendLanguageInstruction = (prompt: string) => langLine ? `${prompt}\n\n${langLine}` : prompt;
+  if (!markerSpec) return appendLanguageInstruction(basePrompt);
+
+  return appendLanguageInstruction(`${basePrompt}
+
+${buildPostSummaryExecutionProofBlock(markerSpec, options)}`);
 }
 
 const P2P_SUPPORTED_I18N_LOCALES = new Set(['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']);
@@ -390,6 +444,7 @@ export function getP2pRun(id: string): P2pRun | undefined { return activeRuns.ge
 export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 
 export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
+  const isTerminalRun = P2P_TERMINAL_RUN_STATUSES.has(run.status);
   const projectedCurrentRound = Math.min(Math.max(1, run.currentRound), Math.max(1, run.rounds));
   const completedHopCount = run.hopStates.filter((hop) => hop.status === 'completed').length;
   const currentRoundCompletedHopCount = run.hopStates.filter(
@@ -400,12 +455,14 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     (hop.status === 'running' || hop.status === 'dispatched'),
   );
   const currentHopState = activeHopStates[0] ?? null;
-  const currentHop = currentHopState?.session
-    ?? run.activeTargetSessions[0]
-    ?? run.currentTargetSession
-    ?? (run.activePhase === 'initial' || run.activePhase === 'summary' || run.activePhase === 'execution'
-      ? run.initiatorSession
-      : null);
+  const currentHop = isTerminalRun
+    ? null
+    : currentHopState?.session
+      ?? run.activeTargetSessions[0]
+      ?? run.currentTargetSession
+      ?? (run.activePhase === 'initial' || run.activePhase === 'summary' || run.activePhase === 'execution'
+        ? run.initiatorSession
+        : null);
   const hopCounts = countHopStates(run.hopStates);
   const legacyPipelineLength = !run.advancedP2pEnabled && isComboMode(run.mode)
     ? Math.max(1, parseModePipeline(run.mode).length)
@@ -464,7 +521,7 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     flow_step_current: legacyFlowStepCurrent ?? undefined,
     flow_step_total: legacyFlowStepTotal ?? undefined,
     skipped_hops: run.skippedHops,
-    active_phase: run.activePhase,
+    ...(isTerminalRun ? {} : { active_phase: run.activePhase }),
     execution_attempt: run.executionAttempt ?? null,
     execution_cycle_current: run.executionCycleCurrent ?? null,
     execution_cycle_total: run.executionCycleTotal ?? null,
@@ -626,6 +683,9 @@ let IDLE_POLL_MS = 3_000;
 let GRACE_PERIOD_DEFAULT_MS = 180_000; // 3 min — complex analysis (subagent research + write) takes time
 let MIN_PROCESSING_MS = 30_000; // Don't trust idle detection until 30s after dispatch
 let FILE_SETTLE_CYCLES = 3; // File must stop growing for 3 poll cycles (9s) to be "settled"
+let MARKER_PROMPT_RETRY_AFTER_MS = 60_000; // Marker prompts may be retried, but only after queue-aware idle.
+let POST_SUMMARY_CONFIRMATION_DELAY_MS = 10_000; // Let the execution marker/status settle before the follow-up check.
+let QUEUE_STUCK_STOP_AFTER_MS = 300_000; // 5 min — stop only when transport queue/turn is stale
 let ROUND_HOP_CLEANUP_DELAY_MS = 0;
 
 /** Override poll interval for tests. */
@@ -636,8 +696,60 @@ export function _setGracePeriodMs(ms: number): void { GRACE_PERIOD_DEFAULT_MS = 
 export function _setMinProcessingMs(ms: number): void { MIN_PROCESSING_MS = ms; }
 /** Override file settle cycles for tests. */
 export function _setFileSettleCycles(n: number): void { FILE_SETTLE_CYCLES = n; }
+/** Override marker retry delay for tests. */
+export function _setMarkerPromptRetryAfterMs(ms: number): void { MARKER_PROMPT_RETRY_AFTER_MS = ms; }
+/** Override follow-up confirmation delay for tests. */
+export function _setPostSummaryConfirmationDelayMs(ms: number): void { POST_SUMMARY_CONFIRMATION_DELAY_MS = ms; }
+/** Override stale queue watchdog threshold for tests. */
+export function _setQueueStuckStopAfterMs(ms: number): void { QUEUE_STUCK_STOP_AFTER_MS = ms; }
 /** Override round hop artifact cleanup delay for tests. */
 export function _setRoundHopCleanupDelayMs(ms: number): void { ROUND_HOP_CLEANUP_DELAY_MS = ms; }
+
+async function maybeStopStaleP2pTransportQueue(args: {
+  run: P2pRun;
+  session: string;
+  dispatchStartedAt: number;
+  alreadyStopped: boolean;
+  reason: string;
+}): Promise<boolean> {
+  if (args.alreadyStopped) return true;
+  const runtime = getTransportRuntime(args.session);
+  if (!runtime) return false;
+
+  const now = Date.now();
+  const snapshot = runtime.getDiagnosticSnapshot(now);
+  const blocked = snapshot.sending || snapshot.pendingCount > 0 || snapshot.activeDispatchCount > 0;
+  if (!blocked) return false;
+
+  const dispatchAgeMs = Math.max(0, now - args.dispatchStartedAt);
+  if (dispatchAgeMs < QUEUE_STUCK_STOP_AFTER_MS || snapshot.lastActivityAgeMs < QUEUE_STUCK_STOP_AFTER_MS) {
+    return false;
+  }
+
+  logger.warn(
+    {
+      runId: args.run.id,
+      session: args.session,
+      reason: args.reason,
+      dispatchAgeMs,
+      queueStuckStopAfterMs: QUEUE_STUCK_STOP_AFTER_MS,
+      status: snapshot.status,
+      sending: snapshot.sending,
+      pendingCount: snapshot.pendingCount,
+      activeDispatchCount: snapshot.activeDispatchCount,
+      lastActivityAgeMs: snapshot.lastActivityAgeMs,
+    },
+    'P2P: transport queue appears stale — stopping active turn once to allow queued work to drain',
+  );
+
+  try {
+    await runtime.cancel();
+    return true;
+  } catch (err) {
+    logger.warn({ runId: args.run.id, session: args.session, err }, 'P2P: stale transport queue stop failed');
+    return true;
+  }
+}
 
 // ── Idle event registry (callback-driven, no polling) ─────────────────────
 
@@ -1179,6 +1291,8 @@ interface PostSummaryExecutionGateOptions {
   cycleIndex: number;
   cycleTotal: number;
   timeoutMs?: number;
+  initialPromptAlreadyDispatched?: boolean;
+  spec?: PostSummaryExecutionRuntimeSpec;
 }
 
 interface PostSummaryExecutionRuntimeSpec extends PostSummaryExecutionPromptSpec {
@@ -1192,6 +1306,16 @@ function createPostSummaryExecutionSpec(run: P2pRun, options: PostSummaryExecuti
     cycleTotal: options.cycleTotal,
     nonce: randomUUID(),
     markerPath: join(dirname(run.contextFilePath), `${run.id}.cycle${options.cycleIndex}.execution-marker.json`),
+  };
+}
+
+function createPostSummaryExecutionConfirmationSpec(run: P2pRun, spec: PostSummaryExecutionRuntimeSpec): PostSummaryExecutionRuntimeSpec {
+  return {
+    runId: run.id,
+    cycleIndex: spec.cycleIndex,
+    cycleTotal: spec.cycleTotal,
+    nonce: randomUUID(),
+    markerPath: join(dirname(run.contextFilePath), `${run.id}.cycle${spec.cycleIndex}.execution-confirmation-marker.json`),
   };
 }
 
@@ -1210,10 +1334,11 @@ async function appendPostSummaryExecutionAudit(
   spec: PostSummaryExecutionRuntimeSpec,
   marker: P2pExecutionMarker,
   attempts: number,
+  heading = `P2P Original Request Execution Confirmed (cycle ${spec.cycleIndex}/${spec.cycleTotal})`,
 ): Promise<void> {
   const lines = [
     '',
-    `## P2P Original Request Execution Confirmed (cycle ${spec.cycleIndex}/${spec.cycleTotal})`,
+    `## ${heading}`,
     '',
     `Marker file: ${spec.markerPath}`,
     `Status: ${marker.status}`,
@@ -1290,6 +1415,27 @@ async function dispatchPostSummaryExecutionAttempt(
   deadlineAt: number,
 ): Promise<boolean> {
   const prompt = buildPostSummaryExecutionPrompt(run, spec, { attempt, deadlineAt });
+  return dispatchPostSummaryPrompt(run, prompt, attempt, 'P2P: failed to dispatch post-summary execution prompt');
+}
+
+async function dispatchPostSummaryExecutionConfirmationAttempt(
+  run: P2pRun,
+  executionSpec: PostSummaryExecutionRuntimeSpec,
+  executionMarker: P2pExecutionMarker,
+  spec: PostSummaryExecutionRuntimeSpec,
+  attempt: number,
+  deadlineAt: number,
+): Promise<boolean> {
+  const prompt = buildPostSummaryExecutionConfirmationPrompt(run, executionSpec, executionMarker, spec, { attempt, deadlineAt });
+  return dispatchPostSummaryPrompt(run, prompt, attempt, 'P2P: failed to dispatch post-summary execution confirmation prompt');
+}
+
+async function dispatchPostSummaryPrompt(
+  run: P2pRun,
+  prompt: string,
+  attempt: number,
+  failureLogMessage: string,
+): Promise<boolean> {
   const session = run.initiatorSession;
   try {
     const transportRuntime = getTransportRuntime(session);
@@ -1301,27 +1447,26 @@ async function dispatchPostSummaryExecutionAttempt(
     }
     return true;
   } catch (err) {
-    logger.warn({ runId: run.id, session, attempt, err }, 'P2P: failed to dispatch post-summary execution prompt');
+    logger.warn({ runId: run.id, session, attempt, err }, failureLogMessage);
     return false;
   }
 }
 
-async function isPostSummaryExecutionRetryReady(
+async function isPostSummaryMarkerRetryReady(
   run: P2pRun,
   session: string,
-  startedAt: number,
-  idleEventReceived: boolean,
+  dispatchStartedAt: number,
 ): Promise<boolean> {
+  if (Date.now() - dispatchStartedAt < MARKER_PROMPT_RETRY_AFTER_MS) return false;
+
   const transportRuntime = getTransportRuntime(session);
   if (transportRuntime) {
-    const status = transportRuntime.getStatus();
-    if (status === 'error' && !transportRuntime.sending && transportRuntime.pendingCount === 0) return true;
-    return !transportRuntime.sending && transportRuntime.pendingCount === 0 && status === 'idle';
+    const snapshot = transportRuntime.getDiagnosticSnapshot(Date.now());
+    if (snapshot.sending || snapshot.pendingCount > 0 || snapshot.activeDispatchCount > 0) return false;
+    return snapshot.status === 'idle' || snapshot.status === 'error';
   }
 
-  const elapsed = Date.now() - startedAt;
-  if (!idleEventReceived && elapsed < MIN_PROCESSING_MS) return false;
-
+  if (Date.now() - dispatchStartedAt < MIN_PROCESSING_MS) return false;
   const record = getSession(session);
   const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
   const useStoreState = agentType === 'gemini';
@@ -1330,9 +1475,80 @@ async function isPostSummaryExecutionRetryReady(
       ? record?.state === 'idle'
       : await detectStatusAsync(session, agentType) === 'idle';
   } catch (err) {
-    logger.debug({ runId: run.id, session, err }, 'P2P: idle detection failed while waiting for post-summary execution marker');
-    return idleEventReceived;
+    logger.debug({ runId: run.id, session, err }, 'P2P: idle detection failed while waiting to retry marker prompt');
+    return false;
   }
+}
+
+async function runPostSummaryExecutionConfirmationGate(
+  run: P2pRun,
+  serverLink: ServerLink | null,
+  executionSpec: PostSummaryExecutionRuntimeSpec,
+  executionMarker: P2pExecutionMarker,
+  timeoutMs: number,
+): Promise<{ spec: PostSummaryExecutionRuntimeSpec; marker: P2pExecutionMarker; attempts: number } | null> {
+  const session = run.initiatorSession;
+  const spec = createPostSummaryExecutionConfirmationSpec(run, executionSpec);
+  const deadlineAt = Date.now() + timeoutMs;
+  let attempt = 0;
+  let dispatchStartedAt = Date.now();
+  let queueStopSent = false;
+
+  const sendAttempt = async () => {
+    attempt += 1;
+    dispatchStartedAt = Date.now();
+    run.runPhase = 'executing_original_request';
+    run.activePhase = 'execution';
+    run.hopStartedAt = dispatchStartedAt;
+    run.executionAttempt = attempt;
+    run.executionCycleCurrent = spec.cycleIndex;
+    run.executionCycleTotal = spec.cycleTotal;
+    run.executionMarkerPath = spec.markerPath;
+    pushState(run, serverLink);
+    return dispatchPostSummaryExecutionConfirmationAttempt(run, executionSpec, executionMarker, spec, attempt, deadlineAt);
+  };
+
+  if (!await sendAttempt()) {
+    failRun(run, 'dispatch_failed', 'post_summary_execution_confirmation_dispatch_failed', serverLink);
+    return null;
+  }
+
+  while (Date.now() < deadlineAt) {
+    if (run._cancelled || isTerminal(run.status)) return null;
+    if (!ensureRunDeadline(run, serverLink)) return null;
+
+    const markerState = await readPostSummaryExecutionMarker(spec);
+    if (markerState?.ok) {
+      logger.info({ runId: run.id, cycleIndex: spec.cycleIndex, cycleTotal: spec.cycleTotal, attempts: attempt }, 'P2P: post-summary execution confirmation marker confirmed');
+      return { spec, marker: markerState.marker, attempts: attempt };
+    }
+    if (markerState && !markerState.ok) {
+      if (markerState.failedByAgent) {
+        failRun(run, 'post_summary_execution_confirmation_failed', markerState.reason, serverLink);
+        return null;
+      }
+    }
+
+    queueStopSent = await maybeStopStaleP2pTransportQueue({
+      run,
+      session,
+      dispatchStartedAt,
+      alreadyStopped: queueStopSent,
+      reason: 'confirmation_marker_missing',
+    });
+    if (await isPostSummaryMarkerRetryReady(run, session, dispatchStartedAt)) {
+      logger.warn(
+        { runId: run.id, session, attempt, markerPath: spec.markerPath },
+        'P2P: confirmation marker still missing after queue-aware idle — retrying confirmation prompt',
+      );
+      if (await sendAttempt()) queueStopSent = false;
+    }
+    await sleep(Math.min(IDLE_POLL_MS, Math.max(1, deadlineAt - Date.now())));
+  }
+
+  logger.warn({ runId: run.id, session, timeoutMs, markerPath: spec.markerPath }, 'P2P: post-summary execution confirmation marker timed out');
+  failRun(run, 'timed_out', 'post_summary_execution_confirmation_timeout', serverLink);
+  return null;
 }
 
 async function runPostSummaryExecutionGate(
@@ -1343,77 +1559,91 @@ async function runPostSummaryExecutionGate(
   const session = run.initiatorSession;
   const timeoutMs = Math.max(1, options.timeoutMs ?? (run.timeoutMs * 3));
   const deadlineAt = Date.now() + timeoutMs;
-  const spec = createPostSummaryExecutionSpec(run, options);
+  const spec = options.spec ?? createPostSummaryExecutionSpec(run, options);
   let attempt = 0;
-  let lastDispatchAt = 0;
-  let idleEventReceived = false;
-  let idleWaiter: IdleWaiterHandle | undefined;
-
-  const armIdleWaiter = () => {
-    if (idleWaiter) idleWaiter.cancel();
-    idleEventReceived = false;
-    idleWaiter = waitForIdleEvent(session, Math.max(1, deadlineAt - Date.now()));
-    idleWaiter.promise.then((ok) => {
-      if (ok) idleEventReceived = true;
-    });
-  };
+  let dispatchStartedAt = Date.now();
+  let queueStopSent = false;
 
   const sendAttempt = async () => {
     attempt += 1;
-    lastDispatchAt = Date.now();
+    dispatchStartedAt = Date.now();
     run.runPhase = 'executing_original_request';
     run.activePhase = 'execution';
-    run.hopStartedAt = lastDispatchAt;
+    run.hopStartedAt = dispatchStartedAt;
     run.executionAttempt = attempt;
     run.executionCycleCurrent = spec.cycleIndex;
     run.executionCycleTotal = spec.cycleTotal;
     run.executionMarkerPath = spec.markerPath;
     pushState(run, serverLink);
-    armIdleWaiter();
     return dispatchPostSummaryExecutionAttempt(run, spec, attempt, deadlineAt);
   };
 
-  await sendAttempt();
-  const retryDelayMs = Math.max(IDLE_POLL_MS, Math.min(MIN_PROCESSING_MS, 5_000));
-  let lastInvalidMarkerReason: string | null = null;
+  if (options.initialPromptAlreadyDispatched) {
+    attempt = 1;
+    dispatchStartedAt = Date.now();
+    run.runPhase = 'executing_original_request';
+    run.activePhase = 'execution';
+    run.hopStartedAt = dispatchStartedAt;
+    run.executionAttempt = attempt;
+    run.executionCycleCurrent = spec.cycleIndex;
+    run.executionCycleTotal = spec.cycleTotal;
+    run.executionMarkerPath = spec.markerPath;
+    pushState(run, serverLink);
+  } else if (!await sendAttempt()) {
+    failRun(run, 'dispatch_failed', 'post_summary_execution_dispatch_failed', serverLink);
+    return false;
+  }
 
-  try {
-    while (Date.now() < deadlineAt) {
-      if (run._cancelled || isTerminal(run.status)) return false;
-      if (!ensureRunDeadline(run, serverLink)) return false;
+  while (Date.now() < deadlineAt) {
+    if (run._cancelled || isTerminal(run.status)) return false;
+    if (!ensureRunDeadline(run, serverLink)) return false;
 
-      const markerState = await readPostSummaryExecutionMarker(spec);
-      if (markerState?.ok) {
-        await appendPostSummaryExecutionAudit(run, spec, markerState.marker, attempt);
-        logger.info({ runId: run.id, cycleIndex: spec.cycleIndex, cycleTotal: spec.cycleTotal, attempts: attempt }, 'P2P: post-summary execution marker confirmed');
-        return true;
+    const markerState = await readPostSummaryExecutionMarker(spec);
+    if (markerState?.ok) {
+      const confirmationDelayMs = Math.min(
+        POST_SUMMARY_CONFIRMATION_DELAY_MS,
+        Math.max(0, deadlineAt - Date.now() - 1),
+      );
+      if (confirmationDelayMs > 0) {
+        await sleep(confirmationDelayMs);
+        if (run._cancelled || isTerminal(run.status)) return false;
+        if (!ensureRunDeadline(run, serverLink)) return false;
       }
-      if (markerState && !markerState.ok) {
-        lastInvalidMarkerReason = markerState.reason;
-        if (markerState.failedByAgent) {
-          failRun(run, 'post_summary_execution_failed', markerState.reason, serverLink);
-          return false;
-        }
-      }
-
-      await sleep(Math.min(IDLE_POLL_MS, Math.max(1, deadlineAt - Date.now())));
-      if (run._cancelled || isTerminal(run.status)) return false;
-      if (!ensureRunDeadline(run, serverLink)) return false;
-
-      if (Date.now() - lastDispatchAt < retryDelayMs) continue;
-      const retryReady = await isPostSummaryExecutionRetryReady(run, session, lastDispatchAt, idleEventReceived);
-      if (!retryReady || Date.now() >= deadlineAt) continue;
-      logger.warn({
-        runId: run.id,
-        session,
-        attempt,
-        markerPath: spec.markerPath,
-        lastInvalidMarkerReason,
-      }, 'P2P: initiator idle before execution marker; retrying post-summary execution prompt');
-      await sendAttempt();
+      const confirmation = await runPostSummaryExecutionConfirmationGate(run, serverLink, spec, markerState.marker, timeoutMs);
+      if (!confirmation) return false;
+      await appendPostSummaryExecutionAudit(run, spec, markerState.marker, attempt);
+      await appendPostSummaryExecutionAudit(
+        run,
+        confirmation.spec,
+        confirmation.marker,
+        confirmation.attempts,
+        `P2P Original Request Execution Reconfirmed (cycle ${confirmation.spec.cycleIndex}/${confirmation.spec.cycleTotal})`,
+      );
+      logger.info({ runId: run.id, cycleIndex: spec.cycleIndex, cycleTotal: spec.cycleTotal, attempts: attempt }, 'P2P: post-summary execution marker confirmed');
+      return true;
     }
-  } finally {
-    if (idleWaiter) idleWaiter.cancel();
+    if (markerState && !markerState.ok) {
+      if (markerState.failedByAgent) {
+        failRun(run, 'post_summary_execution_failed', markerState.reason, serverLink);
+        return false;
+      }
+    }
+
+    queueStopSent = await maybeStopStaleP2pTransportQueue({
+      run,
+      session,
+      dispatchStartedAt,
+      alreadyStopped: queueStopSent,
+      reason: 'execution_marker_missing',
+    });
+    if (await isPostSummaryMarkerRetryReady(run, session, dispatchStartedAt)) {
+      logger.warn(
+        { runId: run.id, session, attempt, markerPath: spec.markerPath },
+        'P2P: execution marker still missing after queue-aware idle — retrying post-summary execution prompt',
+      );
+      if (await sendAttempt()) queueStopSent = false;
+    }
+    await sleep(Math.min(IDLE_POLL_MS, Math.max(1, deadlineAt - Date.now())));
   }
 
   logger.warn({ runId: run.id, session, timeoutMs, markerPath: spec.markerPath }, 'P2P: post-summary execution marker timed out');
@@ -1463,6 +1693,12 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     const roundModeKey = combo ? getLegacyModeKeyForExecutionRound(run.mode, run.currentRound) : run.mode;
     const rp = roundPrompt(run.currentRound, run.rounds, combo ? roundModeKey : undefined);
     const roundLabel = run.rounds > 1 ? ` (round ${run.currentRound}/${run.rounds})` : '';
+    const isFlowCycleStart = ((run.currentRound - 1) % pipelineLength) === 0;
+    const currentFlowCycle = Math.ceil(run.currentRound / pipelineLength);
+    const flowCycleTotal = Math.ceil(run.rounds / pipelineLength);
+    const previousCycleAuditScope = isFlowCycleStart && currentFlowCycle > 1
+      ? await buildPreviousCycleAuditScopeInstruction(run, currentFlowCycle - 1, flowCycleTotal)
+      : '';
 
     // Restore full target list for this round (skipped sessions are not retried)
     if (run.currentRound > 1) {
@@ -1472,17 +1708,10 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 
     const targets = [...run.remainingTargets];
 
-    const isFlowCycleStart = ((run.currentRound - 1) % pipelineLength) === 0;
-
-    // ── Phase 1: Initiator initial analysis (first step of each complete flow cycle) ──
-    if (isFlowCycleStart) {
+    // ── Phase 1: Initiator initial analysis (start of the whole discussion only) ──
+    if (run.currentRound === 1) {
       if (run._cancelled) return;
       run.activePhase = 'initial';
-      const currentFlowCycle = Math.ceil(run.currentRound / pipelineLength);
-      const flowCycleTotal = Math.ceil(run.rounds / pipelineLength);
-      const previousCycleAuditScope = currentFlowCycle > 1
-        ? await buildPreviousCycleAuditScopeInstruction(run, currentFlowCycle - 1, flowCycleTotal)
-        : '';
       const initialHeader = `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Initial Analysis${roundLabel}`;
       const initialPrompt = buildHopPrompt(run, roundModeConfig, {
         session: run.initiatorSession,
@@ -1510,10 +1739,14 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
         const hopLabel = `${discussionParticipantName(target.session)} — ${capitalize(hopMode)} (hop ${i + 1}/${totalHops}${roundLabel})`;
         hop.section_header = hopLabel;
         const hopModeConfig = combo ? roundModeConfig : (getP2pMode(target.mode) ?? modeConfig);
+        const hopInstruction = [
+          previousCycleAuditScope,
+          `Read the discussion file and provide your ${hopMode} analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
+        ].filter(Boolean).join('\n\n');
         const hopPrompt = buildHopPrompt(run, hopModeConfig, {
           session: target.session,
           sectionHeader: hopLabel,
-          instruction: `Read the discussion file and provide your ${hopMode} analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
+          instruction: hopInstruction,
           isInitial: false,
           filePath: hop.artifact_path,
         }, rp);
@@ -1545,34 +1778,51 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       run.activePhase = 'summary';
       const isLastRound = run.currentRound === run.rounds;
       const isFlowCycleEnd = (run.currentRound % pipelineLength) === 0;
+      const shouldRunExecutionGate = isFlowCycleEnd || isLastRound;
+      const inlineExecutionSpec = shouldRunExecutionGate
+        ? createPostSummaryExecutionSpec(run, {
+          cycleIndex: Math.ceil(run.currentRound / pipelineLength),
+          cycleTotal: Math.ceil(run.rounds / pipelineLength),
+        })
+        : null;
       const summaryModeConfig = isLastRound && combo
         ? getLegacyModeForExecutionRound(run.mode, run.rounds) // last pipeline mode for final summary
         : roundModeConfig;
       const roundSummaryHeader = isLastRound
         ? `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Final Summary`
         : `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Round ${run.currentRound}/${run.rounds} Summary`;
+      const inlineExecutionInstruction = inlineExecutionSpec
+        ? `\n\n${buildInlinePostSummaryExecutionInstruction(run, inlineExecutionSpec)}`
+        : '';
+      const nonFinalSummaryGuard = inlineExecutionSpec
+        ? 'For the summary/kickoff portion, write analysis only into the discussion file first. After that section is written, follow the execution block below in the same turn.'
+        : 'IMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.';
       const roundSummaryInstruction = isLastRound
-        ? `${summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.`
-        : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). Append to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`;
+        ? `${summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.${inlineExecutionInstruction}`
+        : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). This summary is also the next-round kickoff; the orchestrator will dispatch the next participant hops after this summary completes and will not send a separate initiator initial-analysis prompt for that next round. Append to the file.\n${nonFinalSummaryGuard}${inlineExecutionInstruction}`;
       const roundSummaryPrompt = buildHopPrompt(run, summaryModeConfig, {
         session: run.initiatorSession,
         sectionHeader: roundSummaryHeader,
         instruction: `${roundSummaryInstruction}\nThe orchestrator has already appended each completed hop's evidence into the discussion file. If you write the final plan to another file, still append a short completion note under the new final-summary heading in the discussion file that records the chosen output file path.`,
         isInitial: false,
+        allowsExecution: inlineExecutionSpec !== null,
       }, rp);
       logger.info({ runId: run.id, round: run.currentRound, isLastRound, roundMode: roundModeKey }, isLastRound ? 'P2P: Final summary — initiator' : 'P2P: Round summary — initiator');
       const summaryOk = await dispatchHop(run, run.initiatorSession, roundSummaryPrompt, serverLink, {
         sectionHeader: roundSummaryHeader,
         required: true,
+        executionMarkerSpec: inlineExecutionSpec,
       });
       if (!summaryOk && (run._cancelled || isTerminal(run.status))) return;
       run.summaryPhase = summaryOk ? 'completed' : 'failed';
       if (run._cancelled || isTerminal(run.status)) return;
-      if (isFlowCycleEnd) {
+      if (inlineExecutionSpec) {
         const executionOk = await runPostSummaryExecutionGate(run, serverLink, {
-          cycleIndex: Math.ceil(run.currentRound / pipelineLength),
-          cycleTotal: Math.ceil(run.rounds / pipelineLength),
+          cycleIndex: inlineExecutionSpec.cycleIndex,
+          cycleTotal: inlineExecutionSpec.cycleTotal,
           timeoutMs: run.timeoutMs * 3,
+          spec: inlineExecutionSpec,
+          initialPromptAlreadyDispatched: true,
         });
         if (run._cancelled || isTerminal(run.status)) return;
         if (!executionOk) return;
@@ -3088,24 +3338,32 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   const resolvedFinalSummaryPrompt = finalRoundSummaryPrompt
     ?? legacyModeSummaryPrompt
     ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.';
+  const inlineExecutionSpec = createPostSummaryExecutionSpec(run, {
+    cycleIndex: 1,
+    cycleTotal: 1,
+  });
   const finalPrompt = buildHopPrompt(run, getP2pMode(finalRound?.modeKey ?? run.mode), {
     session: run.initiatorSession,
     sectionHeader: `${discussionParticipantNameWithMode(run.initiatorSession, finalRound?.modeKey ?? run.mode)} — Final Summary`,
-    instruction: `${resolvedFinalSummaryPrompt}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.`,
+    instruction: `${resolvedFinalSummaryPrompt}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.\n\n${buildInlinePostSummaryExecutionInstruction(run, inlineExecutionSpec)}`,
     isInitial: false,
+    allowsExecution: true,
   });
   const summaryOk = await dispatchHop(run, run.initiatorSession, finalPrompt, serverLink, {
     sectionHeader: `${discussionParticipantNameWithMode(run.initiatorSession, finalRound?.modeKey ?? run.mode)} — Final Summary`,
     required: true,
+    executionMarkerSpec: inlineExecutionSpec,
   });
   if (!summaryOk && (run._cancelled || isTerminal(run.status))) return;
   run.summaryPhase = summaryOk ? 'completed' : 'failed';
   if (run._cancelled || isTerminal(run.status)) return;
 
   const executionOk = await runPostSummaryExecutionGate(run, serverLink, {
-    cycleIndex: 1,
-    cycleTotal: 1,
+    cycleIndex: inlineExecutionSpec.cycleIndex,
+    cycleTotal: inlineExecutionSpec.cycleTotal,
     timeoutMs: run.timeoutMs * 3,
+    spec: inlineExecutionSpec,
+    initialPromptAlreadyDispatched: true,
   });
   if (!executionOk || run._cancelled || isTerminal(run.status)) return;
 
@@ -3132,6 +3390,22 @@ interface DispatchHopOptions {
   filePath?: string;
   hop?: P2pHopRuntime | null;
   required?: boolean;
+  executionMarkerSpec?: PostSummaryExecutionRuntimeSpec | null;
+}
+
+function normalizeDiscussionSectionHeader(value: string): string {
+  return value.toLowerCase().replace(/[–—]/g, '-').replace(/--/g, '-');
+}
+
+async function discussionFileContainsSectionHeader(filePath: string, sectionHeader: string): Promise<boolean> {
+  try {
+    const content = await readFile(filePath, 'utf8');
+    return normalizeDiscussionSectionHeader(content).includes(
+      normalizeDiscussionSectionHeader(`## ${sectionHeader}`),
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function dispatchHop(
@@ -3172,7 +3446,17 @@ async function dispatchHop(
 
   const watchPath = localCopyPath ?? sourcePath;
   if (hop) hop.working_path = watchPath;
-  const MAX_RETRIES = 1;
+  const MAX_RETRIES = 0;
+  // Required legacy hops (initiator initial-analysis + round summaries) get a
+  // doubled wait window because they are more important than ordinary
+  // participant hops. If they still produce no output, mark that legacy hop
+  // skipped and continue with the evidence we have instead of re-sending the
+  // same prompt after a successful dispatch. Advanced workflow rounds keep
+  // their strict per-round timeout semantics.
+  const REQUIRED_HOP_TIMEOUT_MULTIPLIER = 2;
+  const effectiveTimeoutMs = required
+    ? run.timeoutMs * REQUIRED_HOP_TIMEOUT_MULTIPLIER
+    : run.timeoutMs;
 
   const finishHop = async (status: P2pHopStatus, error: string | null = null) => {
     if (localCopyPath && status === 'completed') {
@@ -3194,6 +3478,16 @@ async function dispatchHop(
       run.completedHops.push(target);
     }
   };
+
+  if (sectionHeader && await discussionFileContainsSectionHeader(watchPath, sectionHeader)) {
+    logger.warn(
+      { runId: run.id, session, sectionHeader },
+      'P2P: section already exists in discussion file — completing hop without duplicate dispatch',
+    );
+    await finishHop('completed');
+    pushState(run, serverLink);
+    return true;
+  }
 
   const abortForOverallTimeout = async () => {
     if (hop) {
@@ -3236,18 +3530,19 @@ async function dispatchHop(
     }
 
     let idleEventReceived = false;
-    const idleWaiter = waitForIdleEvent(session, run.timeoutMs);
+    const idleWaiter = waitForIdleEvent(session, effectiveTimeoutMs);
     idleWaiter.promise.then((ok) => { idleEventReceived = ok; });
 
     const GRACE_PERIOD_MS = GRACE_PERIOD_DEFAULT_MS;
     const dispatchTime = Date.now();
-    const deadline = dispatchTime + run.timeoutMs;
+    const deadline = dispatchTime + effectiveTimeoutMs;
     const hardDeadline = deadline + 60_000;
     let fileGrew = false;
     let lastSize = sizeBefore;
     let lastGrowthAt = 0;
     let headingFound = false;
     let headingFoundAt = 0;
+    let queueStopSent = false;
 
     while (Date.now() < deadline) {
       if (!ensureRunDeadline(run, serverLink)) {
@@ -3294,8 +3589,7 @@ async function dispatchHop(
         }
         if (sectionHeader && !headingFound && currentSize > sizeBefore) {
           const content = await readFile(watchPath, 'utf8');
-          const norm = (s: string) => s.toLowerCase().replace(/[–—]/g, '-').replace(/--/g, '-');
-          if (norm(content).includes(norm(`## ${sectionHeader}`))) {
+          if (normalizeDiscussionSectionHeader(content).includes(normalizeDiscussionSectionHeader(`## ${sectionHeader}`))) {
             headingFound = true;
             headingFoundAt = Date.now();
             if (!fileGrew) {
@@ -3315,6 +3609,25 @@ async function dispatchHop(
         return true;
       }
 
+      if (options.executionMarkerSpec) {
+        const markerState = await readPostSummaryExecutionMarker(options.executionMarkerSpec);
+        if (markerState?.ok || markerState?.failedByAgent) {
+          logger.info(
+            {
+              runId: run.id,
+              session,
+              markerPath: options.executionMarkerSpec.markerPath,
+              markerStatus: markerState.marker?.status,
+            },
+            'P2P: inline execution marker found while waiting for summary hop completion',
+          );
+          idleWaiter.cancel();
+          await finishHop('completed');
+          pushState(run, serverLink);
+          return true;
+        }
+      }
+
       const settleForGrowth = IDLE_POLL_MS * FILE_SETTLE_CYCLES;
       if (!headingFound && fileGrew && (lastSize - sizeBefore) > 500 &&
           lastGrowthAt > 0 && (Date.now() - lastGrowthAt) >= settleForGrowth &&
@@ -3332,6 +3645,16 @@ async function dispatchHop(
       const pastGrace = (Date.now() - dispatchTime) > GRACE_PERIOD_MS;
       const settleMs = IDLE_POLL_MS * FILE_SETTLE_CYCLES;
       const fileSettled = fileGrew && lastGrowthAt > 0 && (Date.now() - lastGrowthAt) >= settleMs;
+
+      if (!fileGrew && !headingFound) {
+        queueStopSent = await maybeStopStaleP2pTransportQueue({
+          run,
+          session,
+          dispatchStartedAt: dispatchTime,
+          alreadyStopped: queueStopSent,
+          reason: 'discussion_section_missing',
+        });
+      }
 
       if (fileSettled || (pastGrace && !fileGrew)) {
         let idleConfirmed = false;
@@ -3395,16 +3718,10 @@ async function dispatchHop(
             }
           } catch {}
 
-          if (attempt < MAX_RETRIES) {
-            logger.warn({ runId: run.id, session, attempt }, 'P2P: agent went idle without writing to file, retrying');
-            idleWaiter.cancel();
-            break;
-          }
-          logger.warn({ runId: run.id, session }, 'P2P: agent idle without file change after retry');
-          idleWaiter.cancel();
-          await finishHop('failed', 'idle_without_file_change');
-          pushState(run, serverLink);
-          return false;
+          // Idle without output is not proof that the prompt was not delivered.
+          // Keep waiting until the hop timeout instead of sending a duplicate
+          // prompt into a potentially slow/queued model turn.
+          continue;
         }
       }
     }
@@ -3436,6 +3753,37 @@ async function dispatchHop(
       }
     }
 
+    // Resilience for non-skippable hops: if the host actually wrote content to
+    // the discussion file but never emitted a clean completion signal (e.g.
+    // growth stayed under the settle threshold, or it never went idle), do NOT
+    // nuke the entire run on the final deadline. The partial analysis/summary
+    // is already on disk and is far more useful than a hard failure. Accept it
+    // as completed and let the discussion continue.
+    if (required && fileGrew) {
+      try {
+        const finalSize = (await stat(watchPath)).size;
+        if (finalSize > sizeBefore) {
+          logger.warn(
+            { runId: run.id, session, grown: finalSize - sizeBefore },
+            'P2P: required hop hit deadline with partial content — accepting partial work instead of failing run',
+          );
+          await finishHop('completed');
+          pushState(run, serverLink);
+          return true;
+        }
+      } catch {}
+    }
+
+    if (required && !fileGrew && !run.advancedP2pEnabled) {
+      logger.warn(
+        { runId: run.id, session, activePhase: run.activePhase },
+        'P2P: required hop produced no discussion output — marking hop skipped without failing run',
+      );
+      await finishHop('failed', 'idle_without_file_change');
+      pushState(run, serverLink);
+      return false;
+    }
+
     logger.warn({ runId: run.id, session }, 'P2P: hop timed out');
     await finishHop('timed_out', 'timed_out');
     if (required) failRun(run, 'timed_out', session, serverLink);
@@ -3454,6 +3802,7 @@ export interface HopOpts {
   instruction: string;
   isInitial: boolean;
   filePath?: string;
+  allowsExecution?: boolean;
 }
 
 export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts, roundPrefix = ''): string {
@@ -3477,9 +3826,10 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
   // Claude Code from parsing two paths and executing the task twice.
   // Stronger phrasing needed for Gemini/Codex to execute reliably.
   //
-  // Final summary may include execution instructions — use different framing
-  // so the LLM writes the summary first, then acts on the user's request.
+  // Summary prompts may include execution instructions — use framing that has
+  // the LLM write the discussion section first, then act on the user's request.
   const isFinalSummary = opts.sectionHeader.includes('Final Summary');
+  const allowsExecution = opts.allowsExecution === true;
   parts.push(``);
   parts.push(`[P2P Discussion Task — run ${run.id}]`);
   parts.push(``);
@@ -3497,7 +3847,11 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
     parts.push(opts.instruction);
   } else {
     parts.push(`This is a dedicated discussion file for multi-agent analysis: ${filePath}`);
-    parts.push(`All output MUST go into this file. Do NOT modify any other files or run any commands.`);
+    if (allowsExecution) {
+      parts.push(`Write the required discussion section into this file first. After that section is written, continue with the execution instructions in this same prompt.`);
+    } else {
+      parts.push(`All output MUST go into this file. Do NOT modify any other files or run any commands.`);
+    }
     parts.push(`Your identity for this discussion run is "${discussionParticipantName(opts.session)}". When later rounds refer to this code name, they mean you.`);
     parts.push(``);
     parts.push(`Steps:`);
@@ -3505,13 +3859,19 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
     parts.push(`2. ${opts.instruction}`);
     parts.push(`3. Add a new heading "## ${opts.sectionHeader}" at the end of this file and write your analysis below it`);
     parts.push(``);
-    parts.push(`Rules: ALL analysis goes into this same file. Do NOT edit code files. Do NOT implement fixes.`);
+    if (allowsExecution) {
+      parts.push(`Rules: The analysis/summary portion goes into this same file under the requested heading. Do not edit code files before that section is written; then follow the execution block and write the required marker.`);
+    } else {
+      parts.push(`Rules: ALL analysis goes into this same file. Do NOT edit code files. Do NOT implement fixes.`);
+    }
     parts.push(`For this task, if the discussion file does not explicitly provide the relevant code, diff, or file paths, treat the current project codebase in your working directory as the referenced context for the audit.`);
     parts.push(`You MUST inspect the relevant source files in the current project codebase directly and base your analysis on that code.`);
     parts.push(`Do NOT respond that code context is missing if the working-directory project codebase is available.`);
   }
   parts.push(`Do NOT ask for confirmation. Do NOT explain your plan. Start immediately.`);
-  parts.push(`After writing to the file, print a brief response summary of what you wrote, then say: Done`);
+  parts.push(allowsExecution
+    ? `After writing to the file and completing the execution instructions, print a brief response summary of what you did, then say: Done`
+    : `After writing to the file, print a brief response summary of what you wrote, then say: Done`);
 
   // Time budget: let the agent know how long it has for this hop
   const budgetMinutes = Math.floor(run.timeoutMs / 60_000);

@@ -403,6 +403,11 @@ Environment=NODE_ENV=production
 # Mirrors the flags there so the one-click setup and the manual bind
 # install produce equivalent units.
 Environment="NODE_OPTIONS=--expose-gc --max-old-space-size=8192"
+# Caps glibc malloc arenas — see bind-flow.ts for the full rationale.
+# Mirrors that unit so one-click setup and manual bind behave identically.
+# Bounds the ~730 MB of off-heap arena RSS that onnxruntime/sharp native
+# threads accumulate on multi-core hosts (glibc-only; no-op on macOS).
+Environment="MALLOC_ARENA_MAX=2"
 StandardOutput=append:${logPath}
 StandardError=append:${logPath}
 

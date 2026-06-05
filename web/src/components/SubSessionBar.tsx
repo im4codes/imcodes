@@ -14,7 +14,7 @@ import { reorderSubSessions } from '../api.js';
 import { formatLabel } from '../format-label.js';
 import { getAgentBadgeLabel } from '../agent-display.js';
 import { resolveContextWindow } from '../model-context.js';
-import { shortModelLabel } from '../model-label.js';
+import { bestModelLabel } from '../model-label.js';
 import { P2pProgressCard } from './P2pProgressCard.js';
 import type { P2pProgressDiscussion } from './P2pProgressCard.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
@@ -203,7 +203,7 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFl
   const abbr = getAgentBadgeLabel(sub.type);
   const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(sub, detectedModel, usage?.model);
   const effectiveModel = resolveEffectiveSessionModel(sub, detectedModel, usage?.model, legacyCodexModel);
-  const model = effectiveModel ? shortModelLabel(effectiveModel) : null;
+  const model = bestModelLabel(effectiveModel, usage?.model);
   let ctxPct = 0;
   if (usage) {
     const ctx = resolveContextWindow(
@@ -1106,7 +1106,11 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 sub={sub}
                 accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
                 isOpen={openIds.has(sub.id)}
-                isFocused={focusedSubId === sub.id}
+                // Desktop: focusedSubId marks the single active card. Mobile only
+                // ever opens ONE sub-session, so that open card IS the active one
+                // (focusedSubId is null on mobile) — treat open as active there so
+                // it gets the SOLID bottom accent, not the dashed open-only one.
+                isFocused={isMobile ? openIds.has(sub.id) : focusedSubId === sub.id}
                 idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
                 usage={subUsages?.get(`deck_sub_${sub.id}`)}
                 detectedModel={detectedModels?.get(sub.sessionName)}

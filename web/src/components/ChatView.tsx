@@ -20,10 +20,18 @@ import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
 } from '@shared/session-control-commands.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_STATUS,
+} from '@shared/sdk-subagent-status.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
+import { AgentTodoList } from './AgentTodoList.js';
+import { computeFollowThresholds } from './chat-follow-thresholds.js';
 import type { ChatLocalImagePreviewLoader, ChatLocalImagePreviewResult } from './ChatLocalImagePreview.js';
 import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { isLikelyDomainPath, renderChatPathActions, type ChatPathDownloadHandler } from '../chat-path-actions.js';
@@ -44,6 +52,11 @@ import {
 import { domNodeToPlainText, selectionToPlainText } from '../util/dom-to-text.js';
 import { selectionSignature } from '../util/selection-signature.js';
 import { ZoomedTextDialog } from './ZoomedTextDialog.js';
+import {
+  deriveSdkSubagentStatusRows,
+  type SdkSubagentDiagnostic,
+  type SdkSubagentStatusRow,
+} from '../timeline/sdk-subagent-aggregator.js';
 
 interface Props {
   events: TimelineEvent[];
@@ -898,12 +911,36 @@ function useTouchChatGestures(): boolean {
 const LONG_PRESS_MS = 400;
 const panelWidthKey = (id: string | null | undefined) => `chatFilePanelWidth:${id ?? '_'}`;
 const panelOpenKey  = (id: string | null | undefined) => `chatFilePanelOpen:${id ?? '_'}`;
+// SDK agents panel toggle. GLOBAL within a device class — one switch shared by
+// every chat window + tab, synced live — but SEPARATE for touch/phone vs desktop
+// (the key is suffixed by platform) so "手机开关手机, 电脑开关电脑". Default OPEN
+// until the user closes it; only an explicit '0' counts as closed.
+const SDK_AGENTS_OPEN_KEY = 'chatSdkAgentsPanelOpen';
+const SDK_AGENTS_OPEN_EVENT = 'deck:sdk-agents-panel-open-changed';
+function sdkAgentsOpenKey(): string {
+  let platform = 'desktop';
+  try {
+    if (typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+        && window.matchMedia(TOUCH_GESTURE_MEDIA_QUERY).matches) {
+      platform = 'mobile';
+    }
+  } catch { /* ignore — fall back to desktop */ }
+  return `${SDK_AGENTS_OPEN_KEY}:${platform}`;
+}
 
 function readPanelWidth(id: string | null | undefined): number {
   try { return parseInt(localStorage.getItem(panelWidthKey(id)) ?? String(FILE_PANEL_DEFAULT), 10); } catch { return FILE_PANEL_DEFAULT; }
 }
 function readPanelOpen(id: string | null | undefined): boolean {
   try { return localStorage.getItem(panelOpenKey(id)) === '1'; } catch { return false; }
+}
+function readSdkAgentsOpen(): boolean {
+  // Default OPEN when never set; only an explicit '0' means the user closed it.
+  try { return localStorage.getItem(sdkAgentsOpenKey()) !== '0'; } catch { return true; }
+}
+function writeSdkAgentsOpen(next: boolean): void {
+  try { localStorage.setItem(sdkAgentsOpenKey(), next ? '1' : '0'); } catch { /* ignore */ }
+  try { window.dispatchEvent(new CustomEvent(SDK_AGENTS_OPEN_EVENT)); } catch { /* ignore */ }
 }
 
 /** Find a chat event element by its eventId without relying on CSS.escape —
@@ -944,6 +981,300 @@ function findScrollParent(start: HTMLElement): HTMLElement {
   return start;
 }
 
+type ChatTranslate = (key: string, options?: Record<string, unknown>) => string;
+
+function sdkAgentsProviderLabel(t: ChatTranslate, row: Pick<SdkSubagentStatusRow | SdkSubagentDiagnostic, 'provider'>): string {
+  switch (row.provider) {
+    case SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK:
+      return t('chat.sdk_agents_provider_claude');
+    case SDK_SUBAGENT_PROVIDERS.CODEX_SDK:
+      return t('chat.sdk_agents_provider_codex');
+    case SDK_SUBAGENT_PROVIDERS.QWEN:
+      return t('chat.sdk_agents_provider_qwen');
+    case SDK_SUBAGENT_PROVIDERS.GEMINI_SDK:
+      return t('chat.sdk_agents_provider_gemini');
+    default:
+      return t('chat.sdk_agents_provider_unknown');
+  }
+}
+
+function sdkAgentsStatusLabel(t: ChatTranslate, status: SdkSubagentStatusRow['normalizedStatus'] | SdkSubagentDiagnostic['normalizedStatus']): string {
+  switch (status) {
+    case SDK_SUBAGENT_STATUS.PENDING:
+      return t('chat.sdk_agents_status_pending');
+    case SDK_SUBAGENT_STATUS.RUNNING:
+      return t('chat.sdk_agents_status_running');
+    case SDK_SUBAGENT_STATUS.COMPLETE:
+      return t('chat.sdk_agents_status_complete');
+    case SDK_SUBAGENT_STATUS.ERROR:
+      return t('chat.sdk_agents_status_error');
+    case SDK_SUBAGENT_STATUS.INTERRUPTED:
+      return t('chat.sdk_agents_status_interrupted');
+    case SDK_SUBAGENT_STATUS.STALE:
+      return t('chat.sdk_agents_status_stale');
+    case SDK_SUBAGENT_STATUS.UNKNOWN:
+    default:
+      return t('chat.sdk_agents_status_unknown');
+  }
+}
+
+function sdkAgentsDiagnosticLabel(t: ChatTranslate, diagnostic: SdkSubagentDiagnostic): string {
+  switch (diagnostic.diagnosticCode) {
+    case SDK_SUBAGENT_DIAGNOSTIC.UNSUPPORTED_RUNTIME:
+      return t('chat.sdk_agents_diagnostic_unsupported_runtime');
+    case SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_RUNTIME_SUPPORT:
+      return t('chat.sdk_agents_diagnostic_unknown_runtime_support');
+    case SDK_SUBAGENT_DIAGNOSTIC.MALFORMED_PAYLOAD:
+      return t('chat.sdk_agents_diagnostic_malformed_payload');
+    case SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID:
+      return t('chat.sdk_agents_diagnostic_missing_id');
+    case SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE:
+      return t('chat.sdk_agents_diagnostic_unknown_state');
+    case SDK_SUBAGENT_DIAGNOSTIC.STALE_WITHOUT_TERMINAL:
+      return t('chat.sdk_agents_diagnostic_stale_without_terminal');
+    case SDK_SUBAGENT_DIAGNOSTIC.SNAPSHOT_ONLY:
+      return t('chat.sdk_agents_diagnostic_snapshot_only');
+    default:
+      return t('chat.sdk_agents_diagnostic_generic');
+  }
+}
+
+function sdkAgentsRowSummary(row: SdkSubagentStatusRow): string {
+  return row.summary
+    || row.agentName
+    || row.childStatusSummary
+    || row.rawStatus
+    || row.agentPath
+    || row.receiverThreadId
+    || row.taskId
+    || row.parentItemId
+    || row.canonicalKey;
+}
+
+function sdkAgentsDiagnosticSummary(diagnostic: SdkSubagentDiagnostic): string | null {
+  return diagnostic.summary || diagnostic.childStatusSummary || diagnostic.rawStatus || diagnostic.canonicalKey || null;
+}
+
+function sdkAgentsStatusClass(status: SdkSubagentStatusRow['normalizedStatus'] | SdkSubagentDiagnostic['normalizedStatus']): string {
+  switch (status) {
+    case SDK_SUBAGENT_STATUS.PENDING:
+      return 'pending';
+    case SDK_SUBAGENT_STATUS.RUNNING:
+      return 'running';
+    case SDK_SUBAGENT_STATUS.COMPLETE:
+      return 'complete';
+    case SDK_SUBAGENT_STATUS.ERROR:
+      return 'error';
+    case SDK_SUBAGENT_STATUS.INTERRUPTED:
+      return 'interrupted';
+    case SDK_SUBAGENT_STATUS.STALE:
+      return 'stale';
+    default:
+      return 'unknown';
+  }
+}
+
+function formatSdkAgentClockTime(ts: number): string {
+  const date = new Date(ts);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function formatSdkAgentDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function formatSdkAgentTokenCount(tokens: number): string {
+  return new Intl.NumberFormat().format(Math.max(0, Math.floor(tokens)));
+}
+
+function SdkAgentsGlyph() {
+  return (
+    <svg
+      class="chat-sdk-agents-glyph"
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.8"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M12 7.5v3.2" />
+      <path d="M7.7 14.2l2.8-2" />
+      <path d="M16.3 14.2l-2.8-2" />
+      <circle cx="12" cy="5.2" r="2.4" />
+      <circle cx="5.8" cy="16" r="2.4" />
+      <circle cx="18.2" cy="16" r="2.4" />
+      <path d="M9.1 20.4h5.8" />
+    </svg>
+  );
+}
+
+function hasSdkSubagentTimelineEvent(events: readonly TimelineEvent[]): boolean {
+  return events.some((event) => {
+    if (event.type !== 'tool.call' && event.type !== 'tool.result') return false;
+    const detail = event.payload?.detail;
+    return Boolean(detail && typeof detail === 'object' && !Array.isArray(detail)
+      && (detail as { kind?: unknown }).kind === SDK_SUBAGENT_DETAIL_KIND);
+  });
+}
+
+function SdkAgentsPanel({
+  rows,
+  diagnostics,
+  runningCount,
+  now,
+  onClose,
+}: {
+  rows: SdkSubagentStatusRow[];
+  diagnostics: SdkSubagentDiagnostic[];
+  runningCount: number;
+  now: number;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const activeRows = rows.filter((row) => row.active);
+  const terminalRows = rows.filter((row) => !row.active);
+  return (
+    <div class="chat-sdk-agents-panel" role="region" aria-label={t('chat.sdk_agents_panel_title')}>
+      <div class="chat-sdk-agents-header">
+        <div class="chat-sdk-agents-heading">
+          <span class="chat-sdk-agents-title">{t('chat.sdk_agents_panel_title')}</span>
+          <span class="chat-sdk-agents-subtitle">{t('chat.sdk_agents_running_count', { count: runningCount })}</span>
+        </div>
+        <button
+          type="button"
+          class="chat-sdk-agents-close"
+          onClick={onClose}
+          aria-label={t('chat.sdk_agents_close')}
+          title={t('chat.sdk_agents_close')}
+        >
+          ×
+        </button>
+      </div>
+      <div class="chat-sdk-agents-body">
+        {/* No "Active" title — running agents are the panel's default; the
+            header subtitle already shows the running count. Saves a row. */}
+        {activeRows.length > 0 && (
+          <section class="chat-sdk-agents-section" aria-label={t('chat.sdk_agents_active_section')}>
+            {activeRows.map((row) => (
+              <SdkAgentsRow key={row.canonicalKey} row={row} now={now} />
+            ))}
+          </section>
+        )}
+        {terminalRows.length > 0 && (
+          <section class="chat-sdk-agents-section" aria-label={t('chat.sdk_agents_recent_section')}>
+            <div class="chat-sdk-agents-section-title">{t('chat.sdk_agents_recent_section')}</div>
+            {terminalRows.map((row) => (
+              <SdkAgentsRow key={row.canonicalKey} row={row} now={now} />
+            ))}
+          </section>
+        )}
+        {diagnostics.length > 0 && (
+          <section class="chat-sdk-agents-section" aria-label={t('chat.sdk_agents_diagnostics_section')}>
+            <div class="chat-sdk-agents-section-title">{t('chat.sdk_agents_diagnostics_section')}</div>
+            {diagnostics.map((diagnostic) => (
+              <SdkAgentsDiagnosticRow key={diagnostic.id} diagnostic={diagnostic} />
+            ))}
+          </section>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SdkAgentsRow({ row, now }: { row: SdkSubagentStatusRow; now: number }) {
+  const { t } = useTranslation();
+  const statusClass = sdkAgentsStatusClass(row.normalizedStatus);
+  const statusLabel = sdkAgentsStatusLabel(t, row.normalizedStatus);
+  const summary = sdkAgentsRowSummary(row);
+  const durationMs = row.active ? now - row.startTs : row.ts - row.startTs;
+  return (
+    <div class={`chat-sdk-agent-row ${row.active ? 'active' : 'terminal'} status-${statusClass}`}>
+      <div class="chat-sdk-agent-row-top">
+        <span class="chat-sdk-agent-provider">{sdkAgentsProviderLabel(t, row)}</span>
+        <span class="chat-sdk-agent-status">{statusLabel}</span>
+      </div>
+      <div class="chat-sdk-agent-summary">{summary}</div>
+      {/* Short stats flow inline and wrap (use the width) instead of one tall
+          full-width row each. */}
+      <div class="chat-sdk-agent-stats">
+        {(row.agentPath || row.taskId || row.parentItemId) && (
+          <div class="chat-sdk-agent-detail chat-sdk-agent-stat">
+            <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_id')}</span>
+            <span class="chat-sdk-agent-detail-value">{row.agentPath || row.taskId || row.parentItemId}</span>
+          </div>
+        )}
+        {row.model && (
+          <div class="chat-sdk-agent-detail chat-sdk-agent-stat">
+            <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_model')}</span>
+            <span class="chat-sdk-agent-detail-value">{row.model}</span>
+          </div>
+        )}
+        <div class="chat-sdk-agent-detail chat-sdk-agent-stat">
+          <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_started_at')}</span>
+          <span class="chat-sdk-agent-detail-value">{formatSdkAgentClockTime(row.startTs)}</span>
+        </div>
+        <div class="chat-sdk-agent-detail chat-sdk-agent-stat">
+          <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_duration')}</span>
+          <span class="chat-sdk-agent-detail-value">{formatSdkAgentDuration(durationMs)}</span>
+        </div>
+        {typeof row.usageTotalTokens === 'number' && Number.isFinite(row.usageTotalTokens) && (
+          <div class="chat-sdk-agent-detail chat-sdk-agent-stat">
+            <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_tokens')}</span>
+            <span class="chat-sdk-agent-detail-value">{formatSdkAgentTokenCount(row.usageTotalTokens)}</span>
+          </div>
+        )}
+      </div>
+      {row.description && (
+        <div class="chat-sdk-agent-detail">
+          <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_prompt')}</span>
+          <span class="chat-sdk-agent-detail-value">{row.description}</span>
+        </div>
+      )}
+      {row.output && row.terminal && (
+        <div class="chat-sdk-agent-detail">
+          <span class="chat-sdk-agent-detail-label">{t('chat.sdk_agents_result')}</span>
+          <span class="chat-sdk-agent-detail-value">{row.output}</span>
+        </div>
+      )}
+      <div class="chat-sdk-agent-meta">
+        {row.active && typeof row.runningChildCount === 'number' && (
+          <span>{t('chat.sdk_agents_running_children', { count: row.runningChildCount })}</span>
+        )}
+        {typeof row.receiverCount === 'number' && (
+          <span>{t('chat.sdk_agents_receiver_count', { count: row.receiverCount })}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnostic }) {
+  const { t } = useTranslation();
+  const statusClass = sdkAgentsStatusClass(diagnostic.normalizedStatus);
+  const summary = sdkAgentsDiagnosticSummary(diagnostic);
+  return (
+    <div class={`chat-sdk-agent-row diagnostic status-${statusClass}`}>
+      <div class="chat-sdk-agent-row-top">
+        <span class="chat-sdk-agent-provider">{sdkAgentsProviderLabel(t, diagnostic)}</span>
+        <span class="chat-sdk-agent-status">{sdkAgentsDiagnosticLabel(t, diagnostic)}</span>
+      </div>
+      {summary && <div class="chat-sdk-agent-summary">{summary}</div>}
+    </div>
+  );
+}
+
 export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
   const { t } = useTranslation();
   const [syncDisabled, setSyncDisabled] = useState(false);
@@ -981,6 +1312,17 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const lastScrollTopRef = useRef(0);
+  // Y of the active touch's start, for detecting an explicit finger-down
+  // (content scrolls up) gesture that should pause follow-mode immediately.
+  const touchStartYRef = useRef(0);
+  // Epoch ms of the last "LAST SENT" pin-banner show/hide. The banner is a
+  // flow sibling of `.chat-view`, so toggling it resizes the scroll area by
+  // ~60px and fires the ResizeObserver — which must NOT re-pin to bottom (the
+  // banner only appears because the user scrolled UP). Used to suppress that
+  // observer's re-pin for a short window after a banner toggle, so the height
+  // oscillation can't snap the user back to the bottom (works for any input
+  // method, including scrollbar drag that emits no wheel/touch).
+  const bannerToggleAtRef = useRef(0);
   const suppressLoadOlderUntilRef = useRef(0);
   // ── Programmatic-scroll guard ────────────────────────────────────────────
   // `scrollToBottom` writes `el.scrollTop` directly, which fires a synthetic
@@ -1051,9 +1393,22 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // Split-screen file panel — width and open state are per-session
   const [showFilePanel, setShowFilePanel] = useState(() => readPanelOpen(sessionId));
   const [filePanelWidth, setFilePanelWidth] = useState(() => readPanelWidth(sessionId));
+  // GLOBAL toggle (not per-session): defaults open, synced across windows/tabs.
+  const [desiredAgentsOpen, setDesiredAgentsOpen] = useState(readSdkAgentsOpen);
   const dragStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const filePanelWidthRef = useRef(filePanelWidth);
   filePanelWidthRef.current = filePanelWidth;
+  // Keep this window's toggle in sync when the global switch flips elsewhere
+  // (another open chat window, or another browser tab).
+  useEffect(() => {
+    const onChange = () => setDesiredAgentsOpen(readSdkAgentsOpen());
+    window.addEventListener(SDK_AGENTS_OPEN_EVENT, onChange);
+    window.addEventListener('storage', onChange);
+    return () => {
+      window.removeEventListener(SDK_AGENTS_OPEN_EVENT, onChange);
+      window.removeEventListener('storage', onChange);
+    };
+  }, []);
 
   // Re-load per-session values when sessionId changes
   const prevSessionIdRef = useRef(sessionId);
@@ -1071,6 +1426,15 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       return next;
     });
   }, [sessionId]);
+
+  const setDesiredAgentsPanelOpen = useCallback((next: boolean) => {
+    // Persist + broadcast; every window's listener (incl. this one) updates state.
+    writeSdkAgentsOpen(next);
+  }, []);
+
+  const toggleAgentsPanel = useCallback(() => {
+    setDesiredAgentsPanelOpen(!desiredAgentsOpen);
+  }, [desiredAgentsOpen, setDesiredAgentsPanelOpen]);
 
   const onDragStart = useCallback((e: MouseEvent) => {
     e.preventDefault();
@@ -1295,6 +1659,25 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const handleChooserPickSimple = useCallback(() => {
     void showToolCallsPref.save(false);
   }, [showToolCallsPref]);
+  const [sdkAgentsNow, setSdkAgentsNow] = useState(() => Date.now());
+  const hasSdkAgentEvents = useMemo(() => hasSdkSubagentTimelineEvent(events), [events]);
+  useEffect(() => {
+    if (!hasSdkAgentEvents) return;
+    setSdkAgentsNow(Date.now());
+  }, [hasSdkAgentEvents, events]);
+  const sdkAgentsStatus = useMemo(
+    () => deriveSdkSubagentStatusRows(events, sdkAgentsNow),
+    [events, sdkAgentsNow],
+  );
+  const hasAgentsStatusRows = sdkAgentsStatus.rows.length > 0 || sdkAgentsStatus.diagnostics.length > 0;
+  useEffect(() => {
+    if (preview || !hasAgentsStatusRows) return undefined;
+    const timer = window.setInterval(() => setSdkAgentsNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [hasAgentsStatusRows, preview]);
+  const canShowAgentsControl = !preview;
+  const hasRunningSdkAgents = sdkAgentsStatus.runningCount > 0;
+  const showAgentsPane = canShowAgentsControl && desiredAgentsOpen && hasRunningSdkAgents;
 
   // Preview cards (SubSessionCard) are small thumbnails; slice events to a
   // bounded tail BEFORE buildViewItems so it doesn't walk thousands of items
@@ -1498,6 +1881,13 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     return () => observer.disconnect();
   }, [lastSentUserMessage?.eventId, preview]);
 
+  // Stamp when the pin banner toggles so the ResizeObserver can tell its own
+  // ~60px height shift apart from a genuine viewport resize (sub-session bar,
+  // keyboard) and skip re-pinning to bottom for the former. See bannerToggleAtRef.
+  useEffect(() => {
+    bannerToggleAtRef.current = Date.now();
+  }, [pinnedAboveViewport]);
+
   // Auto-scroll only on visible new events — agent.status / assistant.thinking / usage.update
   // events are filtered from the chat view but still part of `events`, so using the raw last ts
   // would trigger spurious scrolls while the agent is running without any new visible content.
@@ -1613,6 +2003,46 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // Scroll anchor preservation: save scrollHeight before prepend, restore after
   const scrollAnchorRef = useRef<{ scrollHeight: number } | null>(null);
 
+  // Pause "stick to bottom" follow mode. Shared by handleScroll's distance
+  // threshold and the explicit wheel/touch up-gesture handlers below.
+  const disengageFollow = () => {
+    if (!autoScrollRef.current) return;
+    autoScrollRef.current = false;
+    newSinceUnfollowRef.current = 0;
+    setNewSinceUnfollow(0);
+    countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
+    setShowScrollBtn(true);
+    lastScrollActivityRef.current = Date.now();
+  };
+
+  // An explicit upward wheel/touch gesture is unambiguous "stop following"
+  // intent. Honour it the instant it happens — BEFORE the next programmatic
+  // `scrollToBottom` (streaming, ResizeObserver, the "LAST SENT" pin banner
+  // toggling height) can re-pin the view. The distance-threshold path in
+  // handleScroll loses this race at certain heights in Safari, where only a
+  // large fast swipe escapes; this path makes a gentle scroll-up reliable.
+  // These events are never synthesised by scrollToBottom, so they can't
+  // false-trigger. Re-engagement stays distance-based (scroll back to bottom).
+  const handleUserScrollUpIntent = () => {
+    if (preview || !autoScrollRef.current) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    if (el.scrollHeight - el.clientHeight < 8) return; // nothing to scroll into
+    disengageFollow();
+  };
+  const handleWheel = (e: WheelEvent) => {
+    if (e.deltaY < 0) handleUserScrollUpIntent();
+  };
+  const handleTouchStart = (e: TouchEvent) => {
+    touchStartYRef.current = e.touches[0]?.clientY ?? 0;
+  };
+  const handleTouchMove = (e: TouchEvent) => {
+    const y = e.touches[0]?.clientY ?? 0;
+    // Finger moving DOWN (clientY increases) drags content UP toward older
+    // history. 6px deadzone avoids reacting to taps / micro-jitter.
+    if (y - touchStartYRef.current > 6) handleUserScrollUpIntent();
+  };
+
   const handleScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
@@ -1643,19 +2073,15 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       requestAnimationFrame(() => scrollToBottom(true));
       return;
     }
-    // Adaptive + hysteresis thresholds. Avoid flicker around the boundary
-    // (one threshold flapping during streaming layout) and avoid mobile
-    // over-engagement (a flat 150 px swallows ~42 % of a 360 px landscape
-    // viewport but only 14 % of a 1080 px desktop pane).
+    // Adaptive + hysteresis thresholds (avoid boundary flicker during streaming
+    // layout; avoid mobile over-engagement), with a short-content guard so
+    // follow-mode is always escapable by scrolling up even when the content
+    // barely overflows the viewport. See chat-follow-thresholds.ts. This is the
+    // secondary disengage path; the primary is the wheel/touch gesture handler.
     const distance = scrollHeight - scrollTop - clientHeight;
-    const disengageThreshold = Math.max(180, Math.round(0.25 * clientHeight));
-    const reengageThreshold = Math.max(60, Math.round(0.10 * clientHeight));
+    const { disengageThreshold, reengageThreshold } = computeFollowThresholds(clientHeight, scrollHeight);
     if (wasAutoFollowing && distance > disengageThreshold) {
-      autoScrollRef.current = false;
-      // Reset count so it starts fresh from this pause
-      newSinceUnfollowRef.current = 0;
-      setNewSinceUnfollow(0);
-      countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
+      disengageFollow();
     } else if (!wasAutoFollowing && distance < reengageThreshold) {
       autoScrollRef.current = true;
       newSinceUnfollowRef.current = 0;
@@ -1696,9 +2122,19 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       const nextClientHeight = el.clientHeight;
       if (nextClientHeight === prevClientHeight) return;
       prevClientHeight = nextClientHeight;
-      if (!preview && autoScrollRef.current) {
-        requestAnimationFrame(() => scrollToBottom());
-      }
+      if (preview) return;
+      // If this resize was the pin banner toggling its own ~60px height, do NOT
+      // re-pin — the banner only appears because the user scrolled UP, so
+      // re-pinning would snap them back and (since that re-hides the banner)
+      // start the height-oscillation jitter loop. A genuine viewport resize
+      // (sub-session bar, keyboard) has no recent banner toggle and still pins.
+      if (Date.now() - bannerToggleAtRef.current < 300) return;
+      // Re-check follow state INSIDE the rAF: a user scroll-up that disengages
+      // during the frame gap must still win, or we'd snap them back against
+      // their intent.
+      requestAnimationFrame(() => {
+        if (autoScrollRef.current) scrollToBottom();
+      });
     });
 
     ro.observe(el);
@@ -1924,6 +2360,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   }, [isTouchDevice, preview, openCtxMenu]);
 
   const canShowFilePanel = !preview && !!ws;
+  const hasRightPanel = showAgentsPane || (canShowFilePanel && showFilePanel);
   // Per-machine chat-window font preference (family + size). Stored in
   // localStorage under `imcodes_fontPrefs:chat`; not synced across devices,
   // because each machine's display, OS font availability, and viewing
@@ -1955,8 +2392,8 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const showHistoryProgress = !preview && historySteps.some((step) => step.state === 'pending' || step.state === 'running');
   const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
   return (
-    <div class={`chat-view-wrap${canShowFilePanel && showFilePanel ? ' chat-split' : ''}`}>
-      {(onForceSync || canShowFilePanel) && (
+    <div class={`chat-view-wrap${hasRightPanel ? ' chat-split' : ''}`}>
+      {(canShowAgentsControl || onForceSync || canShowFilePanel) && (
         <div class="chat-top-actions">
           {onForceSync && (
             <button
@@ -1967,6 +2404,27 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               aria-label={t('chat.sync_history')}
             >
               ↻
+            </button>
+          )}
+          {canShowAgentsControl && (
+            <button
+              type="button"
+              class={`chat-panel-toggle chat-sdk-agents-toggle${desiredAgentsOpen ? ' active' : ''}`}
+              onClick={toggleAgentsPanel}
+              title={t('chat.sdk_agents_toggle')}
+              aria-label={t('chat.sdk_agents_toggle_aria', { count: sdkAgentsStatus.runningCount })}
+              aria-expanded={showAgentsPane}
+            >
+              <SdkAgentsGlyph />
+              {/* Always show the count badge — including 0 — so the toggle reads
+                  as a status indicator (its green `.active` frame already shows
+                  open/closed). The 0 state is muted so it doesn't imply running. */}
+              <span
+                class={`chat-sdk-agents-badge${sdkAgentsStatus.runningCount === 0 ? ' chat-sdk-agents-badge-zero' : ''}`}
+                aria-label={t('chat.sdk_agents_badge_aria', { count: sdkAgentsStatus.runningCount })}
+              >
+                {sdkAgentsStatus.runningCount}
+              </span>
             </button>
           )}
           {canShowFilePanel && (
@@ -2068,6 +2526,9 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           </div>
         )}
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} style={chatFontStyle} onScroll={preview ? undefined : handleScroll}
+          onWheel={preview ? undefined : handleWheel}
+          onTouchStart={preview ? undefined : handleTouchStart}
+          onTouchMove={preview ? undefined : handleTouchMove}
           // Keyboard parity for the floating "↓" button: End force-engages
           // follow and jumps to bottom. tabIndex={-1} keeps it scriptable
           // without inserting it into the natural tab order.
@@ -2086,6 +2547,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             setCtxMenu(null);
           } : undefined}
         >
+          {!preview && <AgentTodoList events={events} sessionState={sessionState} />}
           {loading ? (
             <div class="chat-loading">{t('chat.loading')}</div>
           ) : viewItems.length === 0 ? (
@@ -2307,6 +2769,15 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
           </div>
         )}
       </div>
+      {showAgentsPane && (
+        <SdkAgentsPanel
+          rows={sdkAgentsStatus.rows}
+          diagnostics={sdkAgentsStatus.diagnostics}
+          runningCount={sdkAgentsStatus.runningCount}
+          now={sdkAgentsNow}
+          onClose={() => setDesiredAgentsPanelOpen(false)}
+        />
+      )}
       {canShowFilePanel && showFilePanel && ws && (
         <>
           <div class="chat-panel-drag" onMouseDown={onDragStart} />

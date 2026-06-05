@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
@@ -207,7 +207,7 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
 }));
 
 import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
-import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
+import { PROVIDER_ERROR_CODES, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import {
@@ -220,6 +220,16 @@ import {
 } from '../../shared/memory-mcp-env.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_STATUS,
+  isSdkSubagentDetail,
+  makeCodexSubagentCanonicalKey,
+  type SdkSubagentDetail,
+} from '../../shared/sdk-subagent-status.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -241,6 +251,55 @@ async function writeCodexAuthFile(codexHome: string, version: number): Promise<v
     join(codexHome, 'auth.json'),
     JSON.stringify({ version, pad: 'x'.repeat(version) }),
   );
+}
+
+async function writeCodexRolloutFile(codexHome: string, threadId: string, lines: unknown[]): Promise<string> {
+  const now = new Date();
+  const dir = join(
+    codexHome,
+    'sessions',
+    String(now.getUTCFullYear()),
+    String(now.getUTCMonth() + 1).padStart(2, '0'),
+    String(now.getUTCDate()).padStart(2, '0'),
+  );
+  await mkdir(dir, { recursive: true });
+  const rolloutPath = join(dir, `rollout-test-${threadId}.jsonl`);
+  await writeFile(rolloutPath, `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`);
+  return rolloutPath;
+}
+
+function emitCodexItem(
+  child: { emits: (msg: Record<string, any>) => void },
+  method: 'item/started' | 'item/completed',
+  item: Record<string, any>,
+): void {
+  child.emits({
+    method,
+    params: { threadId: 'thread-1', turnId: 'turn-1', item },
+  });
+}
+
+function collabItem(overrides: Record<string, any> = {}): Record<string, any> {
+  return {
+    id: 'collab-1',
+    type: 'collabAgentToolCall',
+    status: 'inProgress',
+    receiverThreadIds: ['agent-a'],
+    agentsStates: { 'agent-a': { status: 'running' } },
+    ...overrides,
+  };
+}
+
+function expectCodexSubagentDetail(
+  tool: ToolCallEvent,
+  providerKind = SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT,
+): SdkSubagentDetail {
+  expect(isSdkSubagentDetail(tool.detail)).toBe(true);
+  const detail = tool.detail as SdkSubagentDetail;
+  expect(detail.kind).toBe(SDK_SUBAGENT_DETAIL_KIND);
+  expect(detail.meta.provider).toBe(SDK_SUBAGENT_PROVIDERS.CODEX_SDK);
+  expect(detail.meta.providerKind).toBe(providerKind);
+  return detail;
 }
 
 describe('CodexSdkProvider', () => {
@@ -366,6 +425,959 @@ describe('CodexSdkProvider', () => {
     expect(childProcessMock.children).toHaveLength(2);
     expect(firstChild.child.killed).toBe(true);
     await provider.disconnect();
+  });
+
+  it('emits SDK sub-agent snapshots for Codex collaboration start, completion, and failure', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab', 'coordinate work');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/started', collabItem({
+      model: 'haiku',
+      receiverThreadIds: ['agent-a', 'agent-b'],
+      agentsStates: {
+        'agent-a': { status: 'pendingInit' },
+        'agent-b': { status: 'running' },
+      },
+    }));
+    emitCodexItem(child, 'item/completed', collabItem({
+      status: 'completed',
+      receiverThreadIds: ['agent-a', 'agent-b'],
+      agentsStates: {
+        'agent-a': { status: 'completed' },
+        'agent-b': { status: 'completed' },
+      },
+    }));
+    emitCodexItem(child, 'item/completed', collabItem({
+      id: 'collab-failed',
+      status: 'failed',
+      receiverThreadIds: ['agent-c'],
+      agentsStates: { 'agent-c': { status: 'errored' } },
+    }));
+    await flush();
+
+    expect(tools).toHaveLength(3);
+    expect(tools[0]).toMatchObject({
+      id: 'collab-1',
+      name: 'Codex Collaboration',
+      status: 'running',
+      input: {
+        action: 'codex-collaboration',
+        receiverCount: 2,
+      },
+    });
+    const startedDetail = expectCodexSubagentDetail(tools[0]!);
+    expect(startedDetail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-collab', 'collab-1'),
+      parentItemId: 'collab-1',
+      receiverCount: 2,
+      runningChildCount: 2,
+      childStatusSummary: 'pendingInit:1, running:1',
+      model: 'haiku',
+      rawStatus: 'inProgress',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    });
+    expect(startedDetail.meta.diagnosticCode).toBeUndefined();
+
+    expect(tools[1]!.status).toBe('complete');
+    const completedDetail = expectCodexSubagentDetail(tools[1]!);
+    expect(completedDetail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-collab', 'collab-1'),
+      parentItemId: 'collab-1',
+      receiverCount: 2,
+      runningChildCount: 0,
+      childStatusSummary: 'completed:2',
+      rawStatus: 'completed',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    });
+    expect(completedDetail.meta.diagnosticCode).toBeUndefined();
+
+    expect(tools[2]!.status).toBe('error');
+    const failedDetail = expectCodexSubagentDetail(tools[2]!);
+    expect(failedDetail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-collab', 'collab-failed'),
+      parentItemId: 'collab-failed',
+      receiverCount: 1,
+      runningChildCount: 0,
+      childStatusSummary: 'errored:1',
+      rawStatus: 'failed',
+      normalizedStatus: SDK_SUBAGENT_STATUS.ERROR,
+      active: false,
+      terminal: true,
+    });
+  });
+
+  it('handles empty Codex collaboration receiver lists without inventing child work', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-empty', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-empty', 'coordinate work');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/started', collabItem({
+      id: 'collab-empty',
+      receiverThreadIds: [],
+      agentsStates: {},
+    }));
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]!.status).toBe('running');
+    const detail = expectCodexSubagentDetail(tools[0]!);
+    expect(detail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-collab-empty', 'collab-empty'),
+      parentItemId: 'collab-empty',
+      receiverCount: 0,
+      runningChildCount: 0,
+      childStatusSummary: 'receivers:0',
+      rawStatus: 'inProgress',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    });
+    expect(detail.meta.diagnosticCode).toBeUndefined();
+  });
+
+  it('diagnoses mismatched and extra Codex collaboration child state without counting it as running', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-mismatch', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-mismatch', 'coordinate work');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/started', collabItem({
+      id: 'collab-missing-state',
+      receiverThreadIds: ['agent-a', 'agent-b'],
+      agentsStates: { 'agent-a': { status: 'running' } },
+    }));
+    emitCodexItem(child, 'item/started', collabItem({
+      id: 'collab-extra-state',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: {
+        'agent-a': { status: 'running' },
+        'agent-extra': { status: 'running' },
+      },
+    }));
+    await flush();
+
+    expect(tools).toHaveLength(2);
+    const missingDetail = expectCodexSubagentDetail(tools[0]!);
+    expect(tools[0]!.status).toBe('error');
+    expect(missingDetail.meta).toMatchObject({
+      parentItemId: 'collab-missing-state',
+      receiverCount: 2,
+      runningChildCount: 0,
+      childStatusSummary: 'running:1, missing:1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.MALFORMED_PAYLOAD,
+    });
+
+    const extraDetail = expectCodexSubagentDetail(tools[1]!);
+    expect(tools[1]!.status).toBe('error');
+    expect(extraDetail.meta).toMatchObject({
+      parentItemId: 'collab-extra-state',
+      receiverCount: 1,
+      runningChildCount: 0,
+      childStatusSummary: 'running:1, extra:1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.MALFORMED_PAYLOAD,
+    });
+  });
+
+  it('diagnoses unknown Codex child states without counting them as running', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-unknown-child', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-unknown-child', 'coordinate work');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/started', collabItem({
+      id: 'collab-unknown-child',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: { 'agent-a': { status: 'paused' } },
+    }));
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]!.status).toBe('error');
+    const detail = expectCodexSubagentDetail(tools[0]!);
+    expect(detail.meta).toMatchObject({
+      parentItemId: 'collab-unknown-child',
+      runningChildCount: 0,
+      childStatusSummary: 'paused:1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
+    });
+  });
+
+  it('keeps Codex completed lifecycle snapshots running when child state is still running', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-completed-stale-status', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-completed-stale-status', 'coordinate work');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/completed', collabItem({
+      id: 'collab-stale-status',
+      status: 'inProgress',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: { 'agent-a': { status: 'running' } },
+    }));
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]!.status).toBe('running');
+    const detail = expectCodexSubagentDetail(tools[0]!);
+    expect(detail.meta).toMatchObject({
+      parentItemId: 'collab-stale-status',
+      rawStatus: 'inProgress',
+      runningChildCount: 1,
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    });
+    expect(detail.meta.diagnosticCode).toBeUndefined();
+  });
+
+  it('keeps Codex completed collaboration actions running while child agents are still running', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-completed-running-child', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-completed-running-child', 'coordinate work');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/completed', collabItem({
+      id: 'collab-running-after-dispatch',
+      tool: 'spawnAgent',
+      status: 'completed',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: { 'agent-a': { status: 'running' } },
+    }));
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]!.status).toBe('running');
+    expect(tools[0]!.output).toBeUndefined();
+    const detail = expectCodexSubagentDetail(tools[0]!);
+    expect(detail.meta).toMatchObject({
+      parentItemId: 'collab-running-after-dispatch',
+      receiverCount: 1,
+      runningChildCount: 1,
+      childStatusSummary: 'running:1',
+      rawStatus: 'inProgress',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    });
+    expect(detail.output).toBeUndefined();
+    expect(detail.meta.diagnosticCode).toBeUndefined();
+  });
+
+  it('diagnoses malformed Codex collaboration item ids without throwing or counting running work', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-malformed', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-malformed', 'coordinate work');
+    const child = childProcessMock.children[0];
+    expect(() => emitCodexItem(child, 'item/started', collabItem({ id: { bad: true } }))).not.toThrow();
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]!.status).toBe('error');
+    const detail = expectCodexSubagentDetail(tools[0]!);
+    expect(detail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-collab-malformed', 'malformed-started'),
+      parentItemId: 'malformed-started',
+      receiverCount: 1,
+      runningChildCount: 0,
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID,
+    });
+  });
+
+  it('surfaces bounded Codex child prompts for collaboration rows without raw payloads', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-prompt-safe', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    const sensitivePrompt = 'SECRET CHILD PROMPT: clone the private repo and paste the token';
+    await provider.send('route-collab-prompt-safe', 'coordinate work');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/started', collabItem({
+      id: 'collab-prompt',
+      prompt: sensitivePrompt,
+      childPrompt: sensitivePrompt,
+      prompts: [sensitivePrompt],
+      agentsStates: {
+        'agent-a': {
+          status: 'running',
+          prompt: sensitivePrompt,
+        },
+      },
+    }));
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    const detail = expectCodexSubagentDetail(tools[0]!);
+    expect(tools[0]!.input).toMatchObject({
+      action: 'codex-collaboration',
+      receiverCount: 1,
+      description: sensitivePrompt,
+    });
+    expect(detail).toMatchObject({
+      input: {
+        action: 'codex-collaboration',
+        receiverCount: 1,
+        description: sensitivePrompt,
+      },
+    });
+    expect(detail.raw).toBeUndefined();
+  });
+
+  it('emits SDK sub-agent snapshots for Codex runtime subagent notifications', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-runtime-subagent', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-runtime-subagent', 'spawn a helper');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'subagent_notification',
+      params: {
+        threadId: 'thread-1',
+        agent_path: '019e7f1c-4e8c-7180-ae0d-577b994c9473',
+        status: 'running',
+        name: 'Jason',
+        prompt: 'Coordinate the worker handoff',
+      },
+    });
+    child.emits({
+      method: 'subagent/status',
+      params: {
+        threadId: 'thread-1',
+        subagent: {
+          agentPath: '019e7f1c-4e8c-7180-ae0d-577b994c9473',
+          status: { completed: 'Completed the worker handoff.' },
+          nickname: 'Jason',
+        },
+      },
+    });
+    await flush();
+
+    const expectedKey = makeCodexSubagentCanonicalKey(
+      'route-runtime-subagent',
+      'runtime:019e7f1c-4e8c-7180-ae0d-577b994c9473',
+    );
+
+    expect(tools).toHaveLength(2);
+    expect(tools[0]).toMatchObject({
+      id: expectedKey,
+      name: 'Codex Sub-agent',
+      status: 'running',
+      input: { action: 'codex-runtime-subagent', description: 'Coordinate the worker handoff' },
+    });
+    const runningDetail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(runningDetail.summary).toBe('Codex sub-agent Jason');
+    expect(runningDetail.input).toMatchObject({
+      action: 'codex-runtime-subagent',
+      description: 'Coordinate the worker handoff',
+    });
+    expect(runningDetail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      parentItemId: expectedKey,
+      agentPath: '019e7f1c-4e8c-7180-ae0d-577b994c9473',
+      agentName: 'Jason',
+      rawStatus: 'running',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    });
+    expect(runningDetail.meta.diagnosticCode).toBeUndefined();
+
+    expect(tools[1]).toMatchObject({
+      id: expectedKey,
+      name: 'Codex Sub-agent',
+      status: 'complete',
+      output: 'Completed the worker handoff.',
+    });
+    const shutdownDetail = expectCodexSubagentDetail(tools[1]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(shutdownDetail.output).toBe('Completed the worker handoff.');
+    expect(shutdownDetail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      rawStatus: 'completed',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+    });
+  });
+
+  it('emits SDK sub-agent snapshots for raw Codex runtime subagent notification tags', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-runtime-subagent-tag', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-runtime-subagent-tag', 'spawn a helper');
+    const child = childProcessMock.children[0];
+    child.child.stdout.write(
+      '<subagent_notification>{"agent_path":"019e7f1c-raw","status":"running"}</subagent_notification>\n',
+    );
+    await flush();
+
+    const expectedKey = makeCodexSubagentCanonicalKey('route-runtime-subagent-tag', 'runtime:019e7f1c-raw');
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: expectedKey,
+      name: 'Codex Sub-agent',
+      status: 'running',
+    });
+    const detail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(detail.summary).toBe('Codex sub-agent 019e7f1c-raw');
+    expect(detail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      agentPath: '019e7f1c-raw',
+      rawStatus: 'running',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+    });
+  });
+
+  it('surfaces raw update_plan function calls as checklist tool events', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-raw-update-plan', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-raw-update-plan', 'make a checklist');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call',
+          name: 'update_plan',
+          call_id: 'call-plan-1',
+          arguments: JSON.stringify({
+            explanation: 'probe',
+            plan: [
+              { step: '梳理登录需求', status: 'completed' },
+              { step: '实现登录表单', status: 'in_progress' },
+              { step: '补充测试', status: 'pending' },
+            ],
+          }),
+        },
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: 'call-plan-1',
+      name: 'update_plan',
+      status: 'complete',
+      input: {
+        plan: [
+          { content: '梳理登录需求', status: 'completed' },
+          { content: '实现登录表单', status: 'in_progress' },
+          { content: '补充测试', status: 'pending' },
+        ],
+      },
+      detail: {
+        kind: 'plan',
+        summary: 'Plan',
+      },
+    });
+  });
+
+  it('surfaces raw update_plan calls from the Codex rollout when app-server omits the item', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-plan-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = new CodexSdkProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-rollout-update-plan', cwd: '/tmp/project' });
+
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall((_, tool) => tools.push(tool));
+
+      await provider.send('route-rollout-update-plan', 'make a checklist');
+      const child = childProcessMock.children[0];
+      const nowIso = new Date().toISOString();
+      const oldIso = new Date(Date.now() - 60_000).toISOString();
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: oldIso,
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'update_plan',
+            call_id: 'call-old-plan',
+            arguments: JSON.stringify({ plan: [{ step: 'old stale plan', status: 'in_progress' }] }),
+          },
+        },
+        {
+          timestamp: nowIso,
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'update_plan',
+            call_id: 'call-rollout-plan',
+            arguments: JSON.stringify({
+              plan: [
+                { step: '生成任务清单', status: 'completed' },
+                { step: '检查 timeline 落盘', status: 'in_progress' },
+                { step: '验证前端可渲染', status: 'pending' },
+              ],
+            }),
+          },
+        },
+      ]);
+
+      child.emits({
+        method: 'thread/tokenUsage/updated',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          tokenUsage: { last: { inputTokens: 10, cachedInputTokens: 2, outputTokens: 3 } },
+        },
+      });
+      await waitForCondition(() => tools.length === 1, 5000);
+
+      expect(tools).toHaveLength(1);
+      expect(tools[0]).toMatchObject({
+        id: 'call-rollout-plan',
+        name: 'update_plan',
+        status: 'complete',
+        input: {
+          plan: [
+            { content: '生成任务清单', status: 'completed' },
+            { content: '检查 timeline 落盘', status: 'in_progress' },
+            { content: '验证前端可渲染', status: 'pending' },
+          ],
+        },
+      });
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('polls the Codex rollout briefly for raw update_plan calls without waiting for token usage', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-plan-poll-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = new CodexSdkProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-rollout-update-plan-poll', cwd: '/tmp/project' });
+
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall((_, tool) => tools.push(tool));
+
+      await provider.send('route-rollout-update-plan-poll', 'make a checklist');
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'function_call',
+            name: 'UpdatePlan',
+            call_id: 'call-rollout-plan-polled',
+            arguments: JSON.stringify({
+              plan: [
+                { step: '创建轮询测试清单', status: 'completed' },
+                { step: '等待 rollout 扫描', status: 'in_progress' },
+                { step: '确认前端可消费', status: 'pending' },
+              ],
+            }),
+          },
+        },
+      ]);
+
+      await waitForCondition(() => tools.length === 1);
+
+      expect(tools[0]).toMatchObject({
+        id: 'call-rollout-plan-polled',
+        name: 'UpdatePlan',
+        status: 'complete',
+        input: {
+          plan: [
+            { content: '创建轮询测试清单', status: 'completed' },
+            { content: '等待 rollout 扫描', status: 'in_progress' },
+            { content: '确认前端可消费', status: 'pending' },
+          ],
+        },
+      });
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('does not discard the first complete rollout line after advancing the scan offset', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-plan-offset-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = new CodexSdkProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-rollout-update-plan-offset', cwd: '/tmp/project' });
+
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall((_, tool) => tools.push(tool));
+
+      await provider.send('route-rollout-update-plan-offset', 'make a checklist');
+      const child = childProcessMock.children[0];
+      const rolloutPath = await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'not a checklist' }],
+          },
+        },
+      ]);
+
+      child.emits({
+        method: 'thread/tokenUsage/updated',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          tokenUsage: { last: { inputTokens: 10, cachedInputTokens: 2, outputTokens: 3 } },
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(tools).toHaveLength(0);
+
+      await appendFile(rolloutPath, `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'update_plan',
+          call_id: 'call-rollout-plan-after-offset',
+          arguments: JSON.stringify({
+            plan: [
+              { step: '启动清单创建', status: 'in_progress' },
+              { step: '更新清单推进', status: 'pending' },
+            ],
+          }),
+        },
+      })}\n`);
+
+      child.emits({
+        method: 'thread/tokenUsage/updated',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          tokenUsage: { last: { inputTokens: 11, cachedInputTokens: 2, outputTokens: 4 } },
+        },
+      });
+      await waitForCondition(() => tools.length === 1);
+
+      expect(tools[0]).toMatchObject({
+        id: 'call-rollout-plan-after-offset',
+        name: 'update_plan',
+        status: 'complete',
+        input: {
+          plan: [
+            { content: '启动清单创建', status: 'in_progress' },
+            { content: '更新清单推进', status: 'pending' },
+          ],
+        },
+      });
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('emits backgrounded SDK sub-agent snapshots for raw spawn_agent response items', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-raw-spawn-agent', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-raw-spawn-agent', 'spawn a helper');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call',
+          name: 'spawn_agent',
+          call_id: 'call-spawn-1',
+          arguments: JSON.stringify({
+            agent_type: 'worker',
+            message: 'Wait for 100 seconds',
+            model: 'gpt-5.5',
+          }),
+        },
+      },
+    });
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call_output',
+          call_id: 'call-spawn-1',
+          output: JSON.stringify({
+            agent_id: '019e8422-0fed-7c12-ad2a-34da47e4e788',
+            nickname: 'Huygens',
+          }),
+        },
+      },
+    });
+    await flush();
+
+    const expectedKey = makeCodexSubagentCanonicalKey(
+      'route-raw-spawn-agent',
+      'runtime:019e8422-0fed-7c12-ad2a-34da47e4e788',
+    );
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: expectedKey,
+      name: 'Codex Sub-agent',
+      status: 'running',
+      input: { action: 'codex-runtime-subagent', description: 'Wait for 100 seconds' },
+    });
+    const runningDetail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(runningDetail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      agentPath: '019e8422-0fed-7c12-ad2a-34da47e4e788',
+      agentName: 'Huygens',
+      model: 'gpt-5.5',
+      rawStatus: 'running',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+      backgrounded: true,
+    });
+
+    child.emits({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId: '019e8422-0fed-7c12-ad2a-34da47e4e788',
+        turnId: 'turn-subagent-1',
+        tokenUsage: {
+          last: { inputTokens: 13, cachedInputTokens: 3, outputTokens: 5 },
+          total: { inputTokens: 123, cachedInputTokens: 20, outputTokens: 45, totalTokens: 168 },
+          modelContextWindow: 258400,
+        },
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(2);
+    expect(tools[1]).toMatchObject({
+      id: expectedKey,
+      name: 'Codex Sub-agent',
+      status: 'running',
+    });
+    const usageDetail = expectCodexSubagentDetail(tools[1]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(usageDetail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      usageTotalTokens: 168,
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+      backgrounded: true,
+    });
+
+    child.emits({
+      method: 'thread/status/changed',
+      params: {
+        threadId: '019e8422-0fed-7c12-ad2a-34da47e4e788',
+        status: 'idle',
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(3);
+    expect(tools[2]).toMatchObject({
+      id: expectedKey,
+      name: 'Codex Sub-agent',
+      status: 'complete',
+      output: 'idle',
+    });
+    const completeDetail = expectCodexSubagentDetail(tools[2]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(completeDetail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      usageTotalTokens: 168,
+      rawStatus: 'completed',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+      backgrounded: true,
+    });
+
+    child.emits({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId: '019e8422-0fed-7c12-ad2a-34da47e4e788',
+        turnId: 'turn-subagent-late',
+        tokenUsage: {
+          total: { inputTokens: 200, outputTokens: 100, totalTokens: 300 },
+        },
+      },
+    });
+    await flush();
+    expect(tools).toHaveLength(3);
+  });
+
+  it('marks raw spawn_agent sub-agent rows complete from child turn completion', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-raw-spawn-agent-turn-complete', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-raw-spawn-agent-turn-complete', 'spawn a helper');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call',
+          name: 'spawn_agent',
+          call_id: 'call-spawn-turn-complete',
+          arguments: JSON.stringify({ message: 'Do one quick task' }),
+        },
+      },
+    });
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call_output',
+          call_id: 'call-spawn-turn-complete',
+          output: JSON.stringify({ agent_id: '019e8422-turn-complete', nickname: 'Huygens' }),
+        },
+      },
+    });
+    await flush();
+
+    const expectedKey = makeCodexSubagentCanonicalKey(
+      'route-raw-spawn-agent-turn-complete',
+      'runtime:019e8422-turn-complete',
+    );
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: expectedKey,
+      status: 'running',
+    });
+
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: '019e8422-turn-complete',
+        turn: { id: 'turn-child', status: 'completed', error: null },
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(2);
+    expect(tools[1]).toMatchObject({
+      id: expectedKey,
+      status: 'complete',
+      output: 'completed',
+    });
+    const completeDetail = expectCodexSubagentDetail(tools[1]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(completeDetail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+      backgrounded: true,
+    });
+  });
+
+  it('diagnoses Codex runtime subagent notifications without an agent id', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-runtime-subagent-missing-id', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-runtime-subagent-missing-id', 'spawn a helper');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'subagent_notification',
+      params: {
+        threadId: 'thread-1',
+        status: 'running',
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]!.status).toBe('error');
+    const detail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(detail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-runtime-subagent-missing-id', 'runtime:notification-missing-id'),
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID,
+    });
   });
 
   it('starts a thread, captures resume id, emits tool calls, streams message deltas, and completes', async () => {
@@ -497,6 +1509,51 @@ describe('CodexSdkProvider', () => {
       }),
     ]);
     expect(sessionInfo).toContainEqual({ resumeId: 'thread-1' });
+  });
+
+  it('completes a normal turn from idle thread status when turn/completed is missing', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-idle-status-complete', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('route-idle-status-complete', 'hello');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
+    });
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
+    await waitForCondition(() => completed.length === 1);
+
+    expect(completed).toEqual(['Done']);
+    await provider.send('route-idle-status-complete', 'next');
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
+  });
+
+  it('does not duplicate a normal completion after idle status fallback', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-idle-status-no-duplicate', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('route-idle-status-no-duplicate', 'hello');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
+    });
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
+    await waitForCondition(() => completed.length === 1);
+
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    expect(completed).toEqual(['Done']);
   });
 
   it('resumes with stored thread id on existing session', async () => {
@@ -1213,6 +2270,51 @@ describe('CodexSdkProvider', () => {
     expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
   });
 
+  it('ignores duplicate compact turn completion without scanning stale generated images', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-compact-images-'));
+    const provider = new CodexSdkProvider();
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-compact-image-scan', cwd: '/tmp/project' });
+
+      const imageDir = join(codexHome, 'generated_images', 'thread-1');
+      await mkdir(imageDir, { recursive: true });
+      const staleImagePath = join(imageDir, 'ig_previous.png');
+      await writeFile(staleImagePath, 'old-png');
+
+      const completed: string[] = [];
+      provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+      await provider.send('route-compact-image-scan', '/compact');
+
+      const child = childProcessMock.children[0];
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'compact-turn-item',
+          item: { id: 'compact-item', type: 'contextCompaction' },
+        },
+      });
+      child.emits({
+        method: 'turn/completed',
+        params: {
+          threadId: 'thread-1',
+          turn: { id: 'compact-turn-item', status: 'completed', error: null },
+        },
+      });
+      await flush();
+
+      expect(completed).toEqual(['Codex context compacted.']);
+      expect(completed.join('\n')).not.toContain('Generated image path detected by IM.codes');
+      expect(completed.join('\n')).not.toContain(staleImagePath);
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
   it('settles accepted compact requests that emit no native completion signal', async () => {
     vi.useFakeTimers();
     const provider = new CodexSdkProvider();
@@ -1723,6 +2825,51 @@ describe('CodexSdkProvider', () => {
     const detail = tools[1].detail as { summary?: string; input?: Record<string, unknown> };
     expect(detail.summary).toBe('apple stock today');
     expect(detail.input).toEqual({ query: 'apple stock today', action: { type: 'search', query: 'apple stock today' } });
+  });
+
+  it('surfaces Codex todo_list completed items as update_plan tool calls', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-todo-list', cwd: '/tmp/project' });
+
+    const tools: Array<{ name: string; status: string; input: unknown; detail?: unknown }> = [];
+    provider.onToolCall((_, tool) => tools.push({ name: tool.name, status: tool.status, input: tool.input, detail: tool.detail }));
+
+    await provider.send('route-todo-list', 'make a plan');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          id: 'todo-1',
+          type: 'todo_list',
+          items: [
+            { text: '梳理登录需求', completed: true },
+            { text: '实现登录表单', completed: false },
+          ],
+        },
+      },
+    });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      name: 'update_plan',
+      status: 'complete',
+      input: {
+        plan: [
+          { content: '梳理登录需求', status: 'completed' },
+          { content: '实现登录表单', status: 'pending' },
+        ],
+      },
+    });
+    expect(tools[0].detail).toMatchObject({
+      kind: 'plan',
+      summary: 'Plan',
+    });
   });
 
   it('applies thinking level to subsequent Codex SDK turns', async () => {

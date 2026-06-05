@@ -42,16 +42,66 @@ export const PREVIEW_TERMINAL_OUTCOME = {
 
 export type PreviewTerminalOutcome = (typeof PREVIEW_TERMINAL_OUTCOME)[keyof typeof PREVIEW_TERMINAL_OUTCOME];
 
+/**
+ * Read a positive-integer override from an env var when running under Node
+ * (daemon/server). Browser-safe: when `process` is absent (web bundle) or the
+ * value is missing/invalid, the compiled-in default is used. Used so preview
+ * limits are env-tunable (per design A21 — tests set small thresholds; public
+ * deployments can tighten) without breaking the browser build.
+ */
+function previewLimitFromEnv(name: string, def: number): number {
+  try {
+    const raw = (typeof process !== 'undefined' && process.env) ? process.env[name] : undefined;
+    if (raw == null || raw === '') return def;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.trunc(n) : def;
+  } catch {
+    return def;
+  }
+}
+
 export const PREVIEW_LIMITS = {
   MAX_REQUEST_BYTES: 10 * 1024 * 1024,
-  MAX_RESPONSE_BYTES: 50 * 1024 * 1024,
+  MAX_RESPONSE_BYTES: previewLimitFromEnv('PREVIEW_MAX_RESPONSE_BYTES', 50 * 1024 * 1024),
   DEFAULT_TTL_MS: 30 * 60 * 1000,
   DEFAULT_IDLE_TTL_MS: 10 * 60 * 1000,
+  /**
+   * Absolute hard ceiling on a preview's lifetime (run 8a975732-23a A9).
+   * Activity slides `expiresAt` (DEFAULT_TTL_MS each touch) but never past
+   * `createdAt + PREVIEW_MAX_LIFETIME_HARD_MS` — so a long-running dev session
+   * survives, but a single stream is not unbounded (the byte-cap-exemption × TTL
+   * coupling guard).
+   */
+  PREVIEW_MAX_LIFETIME_HARD_MS: previewLimitFromEnv('PREVIEW_MAX_LIFETIME_HARD_MS', 8 * 60 * 60 * 1000),
   RESPONSE_START_TIMEOUT_MS: 30_000,
   STREAM_IDLE_TIMEOUT_MS: 120_000,
   MAX_ACTIVE_PREVIEWS_PER_USER_PER_SERVER: 8,
+  /**
+   * Per-request COUNT rate-limit constants — DEPRECATED (run 85582241/8a975732):
+   * the count-based limiter (`previewRateLimiter`) misfires on a real SPA first
+   * paint (dozens–hundreds of sub-resource requests) and is removed from the
+   * proxy path. Replaced by the in-flight concurrency floor below. Kept only so
+   * any lingering reference still type-checks; do NOT reintroduce count limiting.
+   */
   MAX_REQUESTS_PER_WINDOW: 120,
   REQUEST_RATE_WINDOW_MS: 60_000,
+  /**
+   * In-flight (concurrent unsettled) HTTP request floor — the resource-dimension
+   * abuse guard that replaces per-request count limiting. Defaults are high
+   * enough that a normal SPA first paint (browsers cap ~6 concurrent/host) never
+   * trips it; only scripted abuse against the loopback upstream is blocked. WS
+   * tunnels are NOT counted here (they have MAX_WS_PER_PREVIEW). env-tunable.
+   */
+  MAX_INFLIGHT_PREVIEW_HTTP_PER_PREVIEW: previewLimitFromEnv('PREVIEW_MAX_INFLIGHT_PER_PREVIEW', 64),
+  MAX_INFLIGHT_PREVIEW_HTTP_PER_SERVER: previewLimitFromEnv('PREVIEW_MAX_INFLIGHT_PER_SERVER', 256),
+  /**
+   * Unconsumed-buffer high-watermark for a streaming response on the server side
+   * (run 8a975732-23a A7). Measured in BYTES (via ByteLengthQueuingStrategy or an
+   * explicit unconsumed-byte counter — NOT ReadableStreamDefaultController
+   * .desiredSize). Exceeding it deterministically closes the stream. MUST ship in
+   * the same PR as the streaming byte-cap exemption.
+   */
+  MAX_PREVIEW_STREAM_BUFFER_BYTES: previewLimitFromEnv('PREVIEW_MAX_STREAM_BUFFER_BYTES', 16 * 1024 * 1024),
   MAX_WS_PER_PREVIEW: 8,
   MAX_WS_PER_SERVER: 16,
   MAX_WS_MESSAGE_BYTES: 1_048_576, // 1MB
@@ -59,6 +109,20 @@ export const PREVIEW_LIMITS = {
   WS_OPEN_TIMEOUT_MS: 15_000, // 15 seconds
   MAX_WS_PENDING_QUEUE_BYTES: 65_536, // 64KB
 } as const;
+
+/**
+ * Browser-local MRU history cap for the preview port/path input dropdowns
+ * (run 8a975732-23a B / capability local-web-preview-input-history). Web-side
+ * constant; not env-tunable.
+ */
+export const LOCAL_PREVIEW_HISTORY_MAX = 10;
+
+/**
+ * HTTP status returned when the in-flight preview concurrency floor is hit
+ * (run 8a975732-23a A5). 503 (not 429) to distinguish from the removed
+ * count-based rate limiter. Pairs with PREVIEW_ERROR.INFLIGHT_LIMIT.
+ */
+export const PREVIEW_INFLIGHT_REJECT_HTTP_STATUS = 503;
 
 export const PREVIEW_ERROR = {
   FORBIDDEN: 'forbidden',
@@ -71,6 +135,7 @@ export const PREVIEW_ERROR = {
   UPSTREAM_UNREACHABLE: 'upstream_unreachable',
   UPSTREAM_ERROR: 'upstream_error',
   LIMIT_EXCEEDED: 'limit_exceeded',
+  INFLIGHT_LIMIT: 'inflight_limit',
   ABORTED: 'aborted',
   TIMEOUT: 'timeout',
   INVALID_REQUEST: 'invalid_request',

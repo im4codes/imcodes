@@ -96,6 +96,22 @@ import type { TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getDefaultAcpMcpServers } from './getDefaultMcpServers.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_SCHEMA_VERSION,
+  SDK_SUBAGENT_STATUS,
+  buildSdkSubagentSafeDetail,
+  isSdkRuntimeSubagentEventName,
+  makeGeminiSubagentCanonicalKey,
+  parseSdkRuntimeSubagentTag,
+  startsWithSdkRuntimeSubagentTag,
+  type SdkSubagentDetail,
+  type SdkSubagentDiagnosticCode,
+  type SdkSubagentNormalizedStatus,
+} from '../../../shared/sdk-subagent-status.js';
 
 const GEMINI_BIN = 'gemini';
 /** ACP mode id we request once per session. Matches the `yolo` mode advertised
@@ -155,6 +171,211 @@ interface MergedToolCall {
   content: ToolCallContent[];
   rawInput?: unknown;
   rawOutput?: unknown;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function meaningfulString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeStatusName(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s_-]+/g, '');
+}
+
+function isGeminiRuntimeSubagentPayload(payload: Record<string, unknown>): boolean {
+  const eventName = meaningfulString(payload.sessionUpdate)
+    ?? meaningfulString(payload.subtype)
+    ?? meaningfulString(payload.method)
+    ?? meaningfulString(payload.event)
+    ?? meaningfulString(payload.type);
+  return isSdkRuntimeSubagentEventName(eventName);
+}
+
+function readNestedRuntimeSubagentRecord(payload: Record<string, unknown>): Record<string, unknown> | undefined {
+  for (const key of ['subagent', 'subAgent', 'agent', 'notification', 'data', 'event']) {
+    const nested = payload[key];
+    if (isRecord(nested)) return nested;
+  }
+  return undefined;
+}
+
+function readRuntimeSubagentId(record: Record<string, unknown>): string | undefined {
+  return meaningfulString(record.agent_path)
+    ?? meaningfulString(record.agentPath)
+    ?? meaningfulString(record.agent_id)
+    ?? meaningfulString(record.agentId)
+    ?? meaningfulString(record.subagent_id)
+    ?? meaningfulString(record.subagentId)
+    ?? meaningfulString(record.path)
+    ?? meaningfulString(record.id);
+}
+
+function readRuntimeSubagentName(record: Record<string, unknown>): string | undefined {
+  return meaningfulString(record.agent_name)
+    ?? meaningfulString(record.agentName)
+    ?? meaningfulString(record.name)
+    ?? meaningfulString(record.label);
+}
+
+function readRuntimeSubagentModel(record: Record<string, unknown>, fallback?: string): string | undefined {
+  return meaningfulString(record.model)
+    ?? meaningfulString(record.agentModel)
+    ?? meaningfulString(record.agent_model)
+    ?? meaningfulString(record.modelId)
+    ?? meaningfulString(record.model_id)
+    ?? meaningfulString(fallback);
+}
+
+function readRuntimeSubagentPrompt(record: Record<string, unknown>): string | undefined {
+  return meaningfulString(record.prompt)
+    ?? meaningfulString(record.description)
+    ?? meaningfulString(record.task)
+    ?? meaningfulString(record.request);
+}
+
+function readRuntimeSubagentStatusInfo(record: Record<string, unknown>): { status?: string; message?: string } {
+  const value = record.status ?? record.state ?? record.phase ?? record.lifecycle;
+  if (typeof value === 'string') return { status: value };
+  if (isRecord(value)) {
+    const [key] = Object.keys(value);
+    if (key) return { status: key, message: meaningfulString(value[key]) };
+  }
+  return {};
+}
+
+function mapGeminiRuntimeSubagentStatus(
+  rawStatus: string,
+  diagnosticCode: SdkSubagentDiagnosticCode | undefined,
+): {
+  toolStatus: ToolCallEvent['status'];
+  normalizedStatus: SdkSubagentNormalizedStatus;
+  active: boolean;
+  terminal: boolean;
+  diagnosticCode?: SdkSubagentDiagnosticCode;
+} {
+  if (diagnosticCode) {
+    return {
+      toolStatus: 'error',
+      normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+      active: false,
+      terminal: true,
+      diagnosticCode,
+    };
+  }
+
+  const normalized = normalizeStatusName(rawStatus);
+  if (
+    normalized === 'pending'
+    || normalized === 'queued'
+    || normalized === 'starting'
+    || normalized === 'created'
+    || normalized === 'spawned'
+  ) {
+    return { toolStatus: 'running', normalizedStatus: SDK_SUBAGENT_STATUS.PENDING, active: true, terminal: false };
+  }
+  if (
+    normalized === 'running'
+    || normalized === 'active'
+    || normalized === 'started'
+    || normalized === 'working'
+    || normalized === 'inprogress'
+  ) {
+    return { toolStatus: 'running', normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING, active: true, terminal: false };
+  }
+  if (
+    normalized === 'shutdown'
+    || normalized === 'complete'
+    || normalized === 'completed'
+    || normalized === 'done'
+    || normalized === 'success'
+    || normalized === 'succeeded'
+    || normalized === 'finished'
+  ) {
+    return { toolStatus: 'complete', normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE, active: false, terminal: true };
+  }
+  if (
+    normalized === 'failed'
+    || normalized === 'failure'
+    || normalized === 'error'
+    || normalized === 'errored'
+    || normalized === 'crashed'
+  ) {
+    return { toolStatus: 'error', normalizedStatus: SDK_SUBAGENT_STATUS.ERROR, active: false, terminal: true };
+  }
+  if (
+    normalized === 'interrupted'
+    || normalized === 'cancelled'
+    || normalized === 'canceled'
+    || normalized === 'stopped'
+    || normalized === 'killed'
+  ) {
+    return { toolStatus: 'error', normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED, active: false, terminal: true };
+  }
+  return {
+    toolStatus: 'error',
+    normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+    active: false,
+    terminal: true,
+    diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
+  };
+}
+
+function geminiRuntimeSubagentToolFromPayload(
+  sessionId: string,
+  state: GeminiSdkSessionState,
+  payload: Record<string, unknown>,
+): ToolCallEvent {
+  const record = readNestedRuntimeSubagentRecord(payload) ?? payload;
+  const rawAgentPath = readRuntimeSubagentId(record);
+  const agentPath = rawAgentPath ?? 'notification-missing-id';
+  const statusInfo = readRuntimeSubagentStatusInfo(record);
+  const diagnosticCode = rawAgentPath
+    ? (statusInfo.status ? undefined : SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE)
+    : SDK_SUBAGENT_DIAGNOSTIC.MISSING_ID;
+  const statusMapping = mapGeminiRuntimeSubagentStatus(statusInfo.status ?? 'unknown', diagnosticCode);
+  const canonicalKey = makeGeminiSubagentCanonicalKey(sessionId, `runtime:${agentPath}`);
+  const agentName = readRuntimeSubagentName(record);
+  const model = readRuntimeSubagentModel(record, state.model);
+  const prompt = readRuntimeSubagentPrompt(record);
+  const summary = agentName ? `Gemini sub-agent ${agentName}` : rawAgentPath ? `Gemini sub-agent ${rawAgentPath}` : 'Gemini sub-agent';
+  const output = statusMapping.terminal ? (statusInfo.message ?? statusInfo.status ?? 'unknown') : undefined;
+  const detail = buildSdkSubagentSafeDetail({
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary,
+    input: {
+      action: 'gemini-runtime-subagent',
+      description: prompt ?? summary,
+    },
+    ...(output ? { output } : {}),
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: SDK_SUBAGENT_PROVIDERS.GEMINI_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.GEMINI_RUNTIME_AGENT,
+      canonicalKey,
+      normalizedStatus: statusMapping.normalizedStatus,
+      ...(statusInfo.status ? { rawStatus: statusInfo.status } : {}),
+      active: statusMapping.active,
+      terminal: statusMapping.terminal,
+      parentSessionId: sessionId,
+      parentItemId: canonicalKey,
+      ...(rawAgentPath ? { agentPath: rawAgentPath } : {}),
+      ...(agentName ? { agentName } : {}),
+      ...(model ? { model } : {}),
+      diagnosticCode: statusMapping.diagnosticCode,
+    },
+  } satisfies SdkSubagentDetail, { allowRaw: false });
+  return {
+    id: canonicalKey,
+    name: 'Agent',
+    status: statusMapping.toolStatus,
+    ...(detail.input ? { input: detail.input } : {}),
+    ...(detail.output ? { output: detail.output } : {}),
+    detail,
+  };
 }
 
 export class GeminiSdkProvider implements TransportProvider {
@@ -799,6 +1020,11 @@ export class GeminiSdkProvider implements TransportProvider {
     if (state.replaying) {
       return;
     }
+    const updateRecord = update as unknown as Record<string, unknown>;
+    if (isGeminiRuntimeSubagentPayload(updateRecord)) {
+      this.emitRuntimeSubagentNotification(routeId, state, updateRecord);
+      return;
+    }
     switch (update.sessionUpdate) {
       case 'agent_message_chunk':
         this.handleAgentChunk(routeId, state, update);
@@ -814,6 +1040,12 @@ export class GeminiSdkProvider implements TransportProvider {
         return;
       case 'tool_call_update':
         this.handleToolCallUpdate(routeId, state, update);
+        return;
+      case 'plan':
+        // Gemini's task checklist arrives as an ACP `plan` update (not a tool
+        // call). Surface it as a synthetic `plan` tool.call so the shared
+        // timeline + web checklist render it like CC/Codex/Qwen todos.
+        this.handlePlan(routeId, state, update);
         return;
       case 'current_mode_update':
         // Just informational — the user may have switched mode through the
@@ -847,7 +1079,6 @@ export class GeminiSdkProvider implements TransportProvider {
       }
       case 'available_commands_update':
       case 'user_message_chunk':
-      case 'plan':
       case 'config_option_update':
       case 'session_info_update':
         // Ignore for now. `user_message_chunk` arrives during history replay
@@ -875,6 +1106,21 @@ export class GeminiSdkProvider implements TransportProvider {
     // new assistant message. Fall back to our own UUID if the agent doesn't
     // populate it (older CLI versions).
     const incomingId = (update as unknown as { messageId?: string | null }).messageId ?? null;
+    const baseText = incomingId && incomingId !== state.currentMessageId ? '' : state.currentText;
+    const nextText = baseText + chunkText;
+    const runtimeSubagentPayload = parseSdkRuntimeSubagentTag(nextText);
+    if (runtimeSubagentPayload) {
+      state.currentMessageId = null;
+      state.currentText = '';
+      this.emitRuntimeSubagentNotification(sessionId, state, runtimeSubagentPayload);
+      return;
+    }
+    if (startsWithSdkRuntimeSubagentTag(nextText)) {
+      state.currentText = nextText;
+      state.currentMessageId ??= (update as unknown as { messageId?: string | null }).messageId ?? randomUUID();
+      return;
+    }
+
     if (incomingId && incomingId !== state.currentMessageId) {
       state.currentMessageId = incomingId;
       state.currentText = '';
@@ -882,7 +1128,7 @@ export class GeminiSdkProvider implements TransportProvider {
       state.currentMessageId = randomUUID();
     }
 
-    state.currentText += chunkText;
+    state.currentText = nextText;
     const delta: MessageDelta = {
       messageId: state.currentMessageId,
       type: 'text',
@@ -960,15 +1206,52 @@ export class GeminiSdkProvider implements TransportProvider {
         raw: merged,
       },
     };
-    const signature = JSON.stringify({
-      status: evt.status,
-      name: evt.name,
-      input: evt.input ?? null,
-      output: evt.output ?? null,
+    this.emitToolCallEvent(sessionId, state, evt);
+  }
+
+  private handlePlan(
+    sessionId: string,
+    state: GeminiSdkSessionState,
+    update: SessionUpdate,
+  ): void {
+    const input = geminiPlanEntriesToInput((update as unknown as { entries?: unknown }).entries);
+    if (!input) return;
+    this.clearStatus(sessionId, state);
+    // Stable id so each plan revision overwrites the same timeline event in
+    // place. Name `plan` is deliberately NOT file-tool-shaped so transport-relay
+    // emits it as a plain tool.call; the web checklist keys off the input shape.
+    this.emitToolCallEvent(sessionId, state, {
+      id: `gemini-plan:${sessionId}`,
+      name: 'plan',
+      status: 'running',
+      input,
+      detail: { kind: 'plan', summary: 'Plan', input, meta: {}, raw: update as unknown as Record<string, unknown> },
     });
-    if (state.emittedToolSignatures.get(merged.toolCallId) === signature) return;
-    state.emittedToolSignatures.set(merged.toolCallId, signature);
-    for (const cb of this.toolCallCallbacks) cb(sessionId, evt);
+  }
+
+  private emitRuntimeSubagentNotification(
+    sessionId: string,
+    state: GeminiSdkSessionState,
+    record: Record<string, unknown>,
+  ): void {
+    this.emitToolCallEvent(sessionId, state, geminiRuntimeSubagentToolFromPayload(sessionId, state, record));
+  }
+
+  private emitToolCallEvent(
+    sessionId: string,
+    state: GeminiSdkSessionState,
+    tool: ToolCallEvent,
+  ): void {
+    const signature = JSON.stringify({
+      status: tool.status,
+      name: tool.name,
+      input: tool.input ?? null,
+      output: tool.output ?? null,
+      ...(tool.detail?.kind === SDK_SUBAGENT_DETAIL_KIND ? { detail: tool.detail } : {}),
+    });
+    if (state.emittedToolSignatures.get(tool.id) === signature) return;
+    state.emittedToolSignatures.set(tool.id, signature);
+    for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────
@@ -1055,6 +1338,28 @@ export class GeminiSdkProvider implements TransportProvider {
 /** Extract a text string from a ContentBlock if it's a textual variant.
  *  Gemini's agent_message_chunk and agent_thought_chunk carry TextContent;
  *  image/audio/resource variants are silently dropped. */
+/**
+ * Map ACP plan-update entries to the checklist `tool.call` input shape the web
+ * recognizes ({ plan: [{ content, status }] }). ACP PlanEntry has { content,
+ * priority, status }; some builds use `title`. Exported for unit testing.
+ */
+export function geminiPlanEntriesToInput(entries: unknown): { plan: Array<{ content: string; status: string }> } | null {
+  if (!Array.isArray(entries)) return null;
+  const plan: Array<{ content: string; status: string }> = [];
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') continue;
+    const record = entry as Record<string, unknown>;
+    const rawText = typeof record.content === 'string'
+      ? record.content
+      : typeof record.title === 'string' ? record.title : '';
+    const content = rawText.trim();
+    if (!content) continue;
+    const status = typeof record.status === 'string' ? record.status : 'pending';
+    plan.push({ content, status });
+  }
+  return plan.length > 0 ? { plan } : null;
+}
+
 function extractTextFromContent(block: ContentBlock): string {
   if (!block || typeof block !== 'object') return '';
   if (block.type === 'text' && typeof block.text === 'string') return block.text;

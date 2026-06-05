@@ -130,6 +130,15 @@ export interface SessionStore {
   sessions: Record<string, SessionRecord>;
 }
 
+export interface LoadStoreOptions {
+  /**
+   * Probe terminal-backed sessions after loading. Disable for short-lived
+   * read-only consumers such as MCP tool calls that only need a fresh
+   * persisted snapshot.
+   */
+  probe?: boolean;
+}
+
 let writeTimer: ReturnType<typeof setTimeout> | null = null;
 let writeTimerPath: string | null = null;
 let writeQueue: Promise<void> = Promise.resolve();
@@ -160,15 +169,31 @@ function pruneNonPersistableSessions(): boolean {
   return Object.keys(store.sessions).length !== before;
 }
 
-export async function loadStore(): Promise<SessionStore> {
+export async function loadStore(options: LoadStoreOptions = {}): Promise<SessionStore> {
   await drainPendingWritesForRead();
   await mkdir(storeDir(), { recursive: true });
   try {
     const raw = await readFile(storePath(), 'utf8');
     store = JSON.parse(raw) as SessionStore;
-  } catch {
-    store = { sessions: {} };
+  } catch (err) {
+    // Reset to an empty store ONLY when the file genuinely doesn't exist. A
+    // transient read/parse failure (a concurrent writer truncating the file
+    // mid-read, an empty read while another process rewrites it, or an IO
+    // hiccup under load) must NOT wipe every session — keep the last good
+    // in-memory store. Otherwise a reload (e.g. send_message's refresh) can
+    // momentarily expose zero sessions, which surfaced as flaky CI:
+    // `send_message` intermittently returned status:'error' (target not found).
+    if ((err as { code?: string } | null)?.code === 'ENOENT') {
+      store = { sessions: {} };
+    }
   }
+  // Read-only consumers (probe:false — e.g. an MCP tool refreshing its send
+  // targets) return the freshly-read snapshot as-is: NO prune/reconcile/probe
+  // and NO scheduleWrite. Such a consumer does not own sessions.json, and
+  // letting it write back its (possibly stale) in-memory store would clobber
+  // the daemon's external writes — intermittently dropping a just-added session
+  // and failing send_message (flaky CI at the memory-mcp send-refresh path).
+  if (options.probe === false) return store;
   if (pruneNonPersistableSessions()) scheduleWrite();
   if (reconcilePersistedSessions()) scheduleWrite();
   // Probe actual state of each session via terminal detection.
@@ -220,6 +245,7 @@ async function probeSessionStates(): Promise<void> {
   try {
     const { detectStatusAsync } = await import('../agent/detect.js');
     const { timelineEmitter } = await import('../daemon/timeline-emitter.js');
+    let mutated = false;
     for (const s of Object.values(store.sessions)) {
       if (s.state !== 'running') continue;
       if (s.runtimeType === 'transport') {
@@ -237,10 +263,11 @@ async function probeSessionStates(): Promise<void> {
       if (newState !== s.state) {
         s.state = newState;
         s.updatedAt = Date.now();
+        mutated = true;
         try { timelineEmitter.emit(s.name, 'session.state', { state: newState }); } catch { /* emitter may not be ready */ }
       }
     }
-    scheduleWrite();
+    if (mutated) scheduleWrite();
   } catch { /* probeSessionStates is best-effort — don't crash daemon */ }
 }
 

@@ -247,6 +247,25 @@ describe('mergeSessionListEntry — general field behavior', () => {
     expect(nulled.quotaMeta?.primary?.usedPercent).toBe(22);
   });
 
+  it('preserves claude-code-sdk quota when a transient session_list omits it (no flicker)', () => {
+    const existing = makeExisting({
+      agentType: 'claude-code-sdk',
+      planLabel: 'Max',
+      quotaLabel: '5h 14% 4h27m 5/31 00:40 · 7d 45% 2d19h 6/2 16:00',
+      quotaMeta: {
+        primary: { usedPercent: 14, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+        secondary: { usedPercent: 45, windowDurationMins: 10080, resetsAt: 1_800_500_000 },
+      },
+    });
+    // A buildSessionList pass where the /api/oauth/usage poll was null (idle /
+    // 30-min throttle / transient): the daemon omits quota. The footer must keep
+    // the last value, not flicker blank.
+    const merged = mergeSessionListEntry({ ...BASE_INCOMING, agentType: 'claude-code-sdk' }, existing);
+    expect(merged.quotaLabel).toBe('5h 14% 4h27m 5/31 00:40 · 7d 45% 2d19h 6/2 16:00');
+    expect(merged.quotaMeta?.primary?.usedPercent).toBe(14);
+    expect(merged.quotaMeta?.secondary?.usedPercent).toBe(45);
+  });
+
   it('allows non-codex quota display to clear when daemon reports no quota', () => {
     const existing = makeExisting({
       agentType: 'qwen',
@@ -370,5 +389,89 @@ describe('session navigation visibility', () => {
     expect(isNavigableMainSession({ name: 'deck_proj_brain', role: 'brain' })).toBe(true);
     expect(isNavigableMainSession({ name: 'deck_proj_brain', role: 'w1' })).toBe(false);
     expect(isNavigableMainSession({ name: 'custom_session', role: 'brain' })).toBe(true);
+  });
+});
+
+describe('mergeSessionListEntry — pending-queue version guard', () => {
+  // Regression: UI/daemon queue desync. A `session_list` heartbeat can be
+  // built before a drain but delivered after it. Without the version guard it
+  // would replace the (correctly cleared) queue with its stale pre-drain
+  // snapshot, resurrecting already-drained entries in the UI.
+  const existing: SessionInfo = {
+    name: 'deck_proj_brain',
+    project: 'proj',
+    role: 'brain',
+    agentType: 'codex-sdk',
+    state: 'running',
+    runtimeType: 'transport',
+    transportPendingMessages: [],
+    transportPendingMessageEntries: [],
+    transportPendingMessageVersion: 7,
+  };
+
+  it('ignores a stale snapshot (older version) and keeps the existing cleared queue', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'running',
+      transportPendingMessages: ['stale one', 'stale two'],
+      transportPendingMessageEntries: [
+        { clientMessageId: 'm1', text: 'stale one' },
+        { clientMessageId: 'm2', text: 'stale two' },
+      ],
+      transportPendingMessageVersion: 5, // older than existing (7)
+    }, existing);
+    expect(merged.transportPendingMessages).toEqual([]);
+    expect(merged.transportPendingMessageEntries).toEqual([]);
+    expect(merged.transportPendingMessageVersion).toBe(7);
+  });
+
+  it('applies a newer snapshot and advances the baseline', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'queued',
+      transportPendingMessages: ['fresh one'],
+      transportPendingMessageEntries: [{ clientMessageId: 'm9', text: 'fresh one' }],
+      transportPendingMessageVersion: 9,
+    }, existing);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'm9', text: 'fresh one' }]);
+    expect(merged.transportPendingMessageVersion).toBe(9);
+  });
+
+  it('accepts an equal-version snapshot (idempotent redelivery)', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'queued',
+      transportPendingMessages: ['v7 entry'],
+      transportPendingMessageEntries: [{ clientMessageId: 'm7', text: 'v7 entry' }],
+      transportPendingMessageVersion: 7,
+    }, existing);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'm7', text: 'v7 entry' }]);
+    expect(merged.transportPendingMessageVersion).toBe(7);
+  });
+
+  it('accepts a fresh-runtime snapshot (version 0) even when the baseline is higher', () => {
+    // After a provider restart the runtime version resets to 0; that snapshot
+    // must win so the queue does not get stuck behind a stale-high baseline.
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'idle',
+      transportPendingMessages: [],
+      transportPendingMessageEntries: [],
+      transportPendingMessageVersion: 0,
+    }, existing);
+    expect(merged.transportPendingMessageVersion).toBe(0);
+  });
+
+  it('applies snapshots from a legacy daemon that omits the version (backward compatible)', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'queued',
+      transportPendingMessages: ['legacy one'],
+      transportPendingMessageEntries: [{ clientMessageId: 'mL', text: 'legacy one' }],
+      // no transportPendingMessageVersion
+    }, existing);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'mL', text: 'legacy one' }]);
+    // Baseline unchanged when the snapshot is unversioned.
+    expect(merged.transportPendingMessageVersion).toBe(7);
   });
 });

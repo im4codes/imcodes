@@ -38,6 +38,8 @@ describe('ServerLink', () => {
   afterEach(() => {
     link.disconnect();
     __setServerLinkDataPlaneQueueConfigForTests(null);
+    mockWsInstance.readyState = 1;
+    vi.useRealTimers();
   });
 
   it('constructs without connecting', () => {
@@ -172,6 +174,28 @@ describe('ServerLink', () => {
       lastHeartbeatAckAt: expect.any(Number),
       clearError: true,
     });
+  });
+
+  it('recycles an OPEN socket when heartbeat proof stops arriving', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    expect(openHandler).toBeDefined();
+    openHandler?.();
+
+    mockWsInstance.close.mockClear();
+    recordDaemonServerLinkStatusMock.mockClear();
+
+    await vi.advanceTimersByTimeAsync(20_001);
+
+    expect(mockWsInstance.close).toHaveBeenCalled();
+    expect(recordDaemonServerLinkStatusMock).toHaveBeenCalledWith(expect.objectContaining({
+      state: 'disconnected',
+      lastError: 'heartbeat_silent_connection',
+    }));
   });
 
   it('accepts Blob binary messages from Node WebSocket without throwing', async () => {

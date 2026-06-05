@@ -91,6 +91,8 @@ describe('fs-read shared error constants', () => {
     expect(FS_READ_ERROR_CODES.STALE_READ).toBe('stale_read');
     expect(FS_READ_ERROR_CODES.INVALID_REQUEST).toBe('invalid_request');
     expect(FS_READ_ERROR_CODES.INTERNAL_ERROR).toBe('internal_error');
+    expect(FS_READ_ERROR_CODES.IS_DIRECTORY).toBe('is_directory');
+    expect(FS_READ_ERROR_CODE_VALUES).toContain(FS_READ_ERROR_CODES.IS_DIRECTORY);
     expect(new Set(FS_READ_ERROR_CODE_VALUES).size).toBe(FS_READ_ERROR_CODE_VALUES.length);
   });
 

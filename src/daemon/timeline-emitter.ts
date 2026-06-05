@@ -358,6 +358,21 @@ export class TimelineEmitter {
     merged.sort((a, b) => a.seq - b.seq);
     return { events: merged, truncated: false, source: TIMELINE_RESPONSE_SOURCES.RING_BUFFER_JSONL };
   }
+
+  /**
+   * Drop all in-memory state for a session that has been permanently removed
+   * (stopped/closed). Without this the per-session ring buffer + seq/state/
+   * dedup maps are retained for EVERY session that ever emitted — an unbounded
+   * leak as sub-sessions and discussion sessions churn (the daemon climbs to
+   * multiple GB and eventually wedges). The on-disk timeline (timelineStore) is
+   * untouched, so deep history still replays from it via the slow path.
+   */
+  forgetSession(sessionId: string): void {
+    this.buffer.delete(sessionId);
+    this.seqMap.delete(sessionId);
+    this.lastSessionState.delete(sessionId);
+    this.recentUserMsg.delete(sessionId);
+  }
 }
 
 export const timelineEmitter = new TimelineEmitter();

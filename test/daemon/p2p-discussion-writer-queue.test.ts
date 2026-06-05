@@ -19,6 +19,7 @@ import {
   __resetP2pDiscussionWriteQueueForTests,
   enqueueP2pDiscussionWrite,
   flushP2pDiscussionWriteQueue,
+  listP2pDiscussionWriteQueueSnapshots,
 } from '../../src/daemon/p2p-discussion-writer.js';
 
 let tmpRoot: string;
@@ -52,6 +53,24 @@ describe('p2p discussion writer queue', () => {
     await flushP2pDiscussionWriteQueue(filePath);
     const lines = readFileSync(filePath, 'utf8').split('\n').filter(Boolean);
     expect(lines).toEqual(Array.from({ length: 50 }, (_, i) => String(i)));
+  });
+
+  it('exposes write queue snapshots for status diagnostics', async () => {
+    enqueueP2pDiscussionWrite(filePath, 'diagnostic-segment\n');
+
+    const during = listP2pDiscussionWriteQueueSnapshots().find((queue) => queue.filePath === filePath);
+    expect(during).toBeDefined();
+    expect(during?.draining || during?.pendingSegments === 1).toBe(true);
+
+    await flushP2pDiscussionWriteQueue(filePath);
+
+    const after = listP2pDiscussionWriteQueueSnapshots().find((queue) => queue.filePath === filePath);
+    expect(after).toMatchObject({
+      filePath,
+      pendingSegments: 0,
+      pendingBytes: 0,
+      draining: false,
+    });
   });
 
   it('drops oldest pending segments when the queue exceeds the byte cap', async () => {

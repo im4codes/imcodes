@@ -4,6 +4,11 @@
 
 **エージェントのための IM。共有メモリ、管理対象 MCP ツール、監督付き実行、そして AI プロバイダー横断の監査。**
 
+<!-- TODO(native-review): JA hero couplet — 默认「天下」(可换「乾坤」);「三人の孔明」措辞待母语者确认 -->
+> 三人寄れば文殊の知恵。<br>
+> されど三人の孔明、談笑のうちに天下を定む。<br>
+> — IM.codes
+
 IM.codes は coding agent のための、プロバイダーをまたぐ共有メモリレイヤーと管理対象 MCP tool surface です。完了した作業を再利用可能なコンテキストとして蓄積し、適切な履歴を後続 session に注入または recall します。対応先は Claude Code、Codex、Gemini CLI、GitHub Copilot、Cursor、OpenCode、OpenClaw、Qwen などで、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携、transport 系 agent のネイティブストリーミングも備えています。内蔵の Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。Team ディスカッションを内蔵——複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。
 
 > これは翻訳版です。**正式な内容は英語版 README（`../README.md`）です。** 差異がある場合は英語版を優先してください。

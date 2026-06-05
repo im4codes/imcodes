@@ -15,6 +15,8 @@ html { position: fixed; }
   --chrome-accent-2: #34d399;
   --chrome-accent-3: #a78bfa;
   --chrome-warm: #f59e0b;
+  --imcodes-app-font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --imcodes-app-cjk-font-family: 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
 }
 /* Global: all fixed full-screen overlays respect iOS safe area (status bar/notch) */
 .dialog-overlay, .ask-dialog-overlay, .fb-overlay, .mobile-fb-overlay { padding-top: var(--sat); }
@@ -22,7 +24,7 @@ html { position: fixed; }
 body {
   background: var(--chrome-bg);
   color: #e2e8f0;
-  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-family: var(--imcodes-app-font-family);
   font-size: 14px;
   overflow: hidden;
 }
@@ -66,7 +68,7 @@ body {
 .tab.active { color: #f8fafc; background: linear-gradient(180deg, rgba(34,211,238,0.16), rgba(15,23,42,0.92)); border-color: rgba(34,211,238,0.32); box-shadow: 0 0 0 1px rgba(34,211,238,0.10), 0 0 18px rgba(34,211,238,0.14), inset 0 1px 0 rgba(255,255,255,0.06); }
 .tab.active::before { background: linear-gradient(90deg, var(--chrome-accent), var(--chrome-accent-2)); box-shadow: 0 0 10px rgba(34,211,238,0.62); }
 .tab.brain { color: #c4b5fd; }
-.tab.brain.active { color: #ede9fe; background: linear-gradient(180deg, rgba(167,139,250,0.18), rgba(15,23,42,0.94)); border-color: rgba(167,139,250,0.34); border-top-color: transparent; border-bottom-color: #8b5cf6; border-bottom-width: 4px; box-shadow: 0 0 0 1px rgba(167,139,250,0.12), 0 0 18px rgba(167,139,250,0.16), inset 0 1px 0 rgba(255,255,255,0.06); }
+.tab.brain.active { color: #ede9fe; background: linear-gradient(180deg, rgba(167,139,250,0.18), rgba(15,23,42,0.94)); border-color: rgba(167,139,250,0.34); border-top-color: transparent; border-bottom-color: #8b5cf6; border-bottom-width: 2px; box-shadow: 0 0 0 1px rgba(167,139,250,0.12), 0 0 18px rgba(167,139,250,0.16), inset 0 1px 0 rgba(255,255,255,0.06); }
 .tab.brain.active::before { background: linear-gradient(90deg, var(--chrome-accent-3), var(--chrome-accent)); box-shadow: 0 0 10px rgba(167,139,250,0.62); }
 @media (pointer: coarse) { .tab { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; touch-action: pan-x; } }
 .tab.idle::after { content: '●'; margin-left: 6px; color: var(--chrome-accent-2); font-size: 7px; vertical-align: middle; text-shadow: 0 0 8px rgba(52,211,153,0.75); }
@@ -189,7 +191,7 @@ body {
 }
 .shortcuts-row { display: flex; align-items: center; border-bottom: 1px solid rgba(125,211,252,0.14); background: linear-gradient(180deg, rgba(17,27,45,0.58), rgba(8,13,22,0.24)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.035); position: relative; z-index: 1; }
 .shortcuts { display: flex; gap: 4px; padding: 4px 8px; overflow-x: auto; scrollbar-width: none; flex: 1; min-width: 0; }
-.shortcuts-transport { flex: 1 1 auto; min-width: 0; margin-left: 0; }
+.shortcuts-transport { flex: 1 1 auto; min-width: 0; margin-left: 0; padding-left: 0; }
 .shortcuts::-webkit-scrollbar { display: none; }
 .shortcuts-model { padding: 4px 8px 4px 0; flex-shrink: 0; position: relative; }
 .session-ctx-wrap { display: flex; align-items: center; gap: 4px; padding: 4px 8px 4px 0; flex-shrink: 0; cursor: default; }
@@ -198,11 +200,56 @@ body {
 .session-ctx-bar::after { content: ''; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.22), transparent); opacity: 0.45; pointer-events: none; }
 .session-ctx-input { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, var(--chrome-accent-2), var(--chrome-accent)); border-radius: 999px; box-shadow: 0 0 10px rgba(52,211,153,0.42); }
 .session-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, var(--chrome-accent-3), #818cf8); border-radius: 999px; box-shadow: 0 0 10px rgba(129,140,248,0.36); }
-.shortcut-btn { flex-shrink: 0; padding: 4px 8px; background: rgba(15,23,42,0.58); border: 1px solid rgba(125,211,252,0.16); border-radius: 7px; color: #7b8797; font-size: 11px; font-family: inherit; cursor: pointer; transition: color 0.12s, border-color 0.12s, background 0.12s, box-shadow 0.12s; white-space: nowrap; box-shadow: inset 0 1px 0 rgba(255,255,255,0.03); }
+.shortcut-btn { flex-shrink: 0; padding: 4px 8px; background: rgba(15,23,42,0.58); border: 1px solid rgba(125,211,252,0.16); border-radius: 7px; color: #7b8797; font-size: 11px; font-family: inherit; cursor: pointer; transition: color 0.12s, border-color 0.12s, background 0.12s, box-shadow 0.12s; white-space: nowrap; box-shadow: inset 0 1px 0 rgba(255,255,255,0.03); touch-action: manipulation; }
+/* Instant optimistic feedback while a stop is in flight (before the session
+   state round-trip + provider interrupt land). */
+.shortcut-btn-stop-pending { animation: shortcut-btn-stop-pulse 0.42s ease-in-out infinite; border-color: rgba(248,113,113,0.95) !important; background: rgba(127,29,29,0.72) !important; color: #fecaca !important; text-shadow: 0 0 10px rgba(254,202,202,0.85); position: relative; z-index: 2; }
+@keyframes shortcut-btn-stop-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 0 0 rgba(239,68,68,0), inset 0 0 0 1px rgba(254,202,202,0.12); }
+  42% { opacity: 0.56; transform: scale(1.16); box-shadow: 0 0 24px 5px rgba(248,113,113,0.62), 0 0 44px 10px rgba(220,38,38,0.34), inset 0 0 18px rgba(254,202,202,0.36); }
+  68% { opacity: 1; transform: scale(1.08); box-shadow: 0 0 14px 3px rgba(248,113,113,0.48), inset 0 0 14px rgba(254,202,202,0.28); }
+}
+/* Agent task list (TodoWrite / todo_write / update_plan) — pinned checklist at
+   the top of the chat scroll viewport, auto-updating as the agent progresses. */
+.agent-todos { position: sticky; top: 0; z-index: 5; margin: 0 0 10px; padding: 9px 10px; background: linear-gradient(180deg, rgba(30,47,76,0.96), rgba(14,22,36,0.98)), rgba(15,23,42,0.98); border: 1px solid rgba(147,197,253,0.48); border-radius: 10px; box-shadow: 0 0 0 1px rgba(59,130,246,0.18) inset, 0 8px 22px rgba(0,0,0,0.42), 0 0 18px rgba(59,130,246,0.12); backdrop-filter: blur(6px); }
+.agent-todos::before { content: ''; display: block; height: 2px; margin: -9px -10px 8px; border-radius: 10px 10px 0 0; background: linear-gradient(90deg, rgba(96,165,250,0.82), rgba(52,211,153,0.58), rgba(168,85,247,0.72)); opacity: 0.85; }
+.agent-todos-complete { opacity: 0.72; }
+.agent-todos-header { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; width: 100%; padding: 0; background: none; border: none; cursor: pointer; font: inherit; text-align: left; color: inherit; }
+.agent-todos-collapsed .agent-todos-header { margin-bottom: 0; }
+.agent-todos-collapsed::before { margin-bottom: 7px; }
+.agent-todos-chevron { font-size: 10px; color: #93c5fd; flex-shrink: 0; line-height: 1; }
+.agent-todos-title { font-size: 12px; font-weight: 700; color: #e2e8f0; letter-spacing: 0.02em; }
+.agent-todos-count { font-size: 11px; color: #bfdbfe; font-variant-numeric: tabular-nums; flex-shrink: 0; margin-left: auto; }
+.agent-todos-header:hover .agent-todos-title { color: #f8fafc; }
+.agent-todos-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; max-height: 188px; overflow-y: auto; }
+.agent-todos-item { display: flex; align-items: flex-start; gap: 7px; font-size: 12.5px; line-height: 1.4; color: #cbd5e1; }
+.agent-todos-icon { flex-shrink: 0; width: 14px; text-align: center; line-height: 1.4; }
+.agent-todos-text { min-width: 0; word-break: break-word; }
+.agent-todos-item-pending .agent-todos-icon { color: #5f7087; }
+.agent-todos-item-in_progress .agent-todos-text { color: #f8fafc; font-weight: 600; }
+.agent-todos-item-in_progress .agent-todos-icon { color: #38bdf8; }
+.agent-todos-item-completed .agent-todos-icon { color: #34d399; }
+.agent-todos-item-completed .agent-todos-text { color: #6b7a8d; text-decoration: line-through; }
 .shortcut-btn:hover:not(:disabled) { background: rgba(8,145,178,0.14); border-color: rgba(34,211,238,0.42); color: #dbeafe; box-shadow: 0 0 12px rgba(34,211,238,0.12), inset 0 1px 0 rgba(255,255,255,0.05); }
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
 .shortcut-btn-icon { width: 28px; min-width: 28px; padding: 4px 0; display: inline-flex; align-items: center; justify-content: center; }
+.shortcut-btn-stop { width: 44px; min-width: 44px; font-size: 18px; line-height: 1; }
+/* Mobile arrow D-pad — replaces the separate up/down buttons on small screens.
+ * Drag toward a direction to send that arrow key. touch-action:none keeps the
+ * drag from scrolling the page; the four glyphs sit around a center. */
+.shortcut-dpad { position: relative; width: 36px; min-width: 36px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+.shortcut-dpad .dpad-arrow { position: absolute; font-size: 7px; line-height: 1; color: #5b6573; pointer-events: none; transition: color 0.1s, text-shadow 0.1s; }
+.shortcut-dpad .dpad-arrow-up { top: 3px; left: 50%; transform: translateX(-50%); }
+.shortcut-dpad .dpad-arrow-down { bottom: 3px; left: 50%; transform: translateX(-50%); }
+.shortcut-dpad .dpad-arrow-left { left: 4px; top: 50%; transform: translateY(-50%); }
+.shortcut-dpad .dpad-arrow-right { right: 4px; top: 50%; transform: translateY(-50%); }
+.shortcut-dpad.shortcut-dpad-active { border-color: rgba(34,211,238,0.5); background: rgba(8,145,178,0.16); box-shadow: 0 0 12px rgba(34,211,238,0.14), inset 0 1px 0 rgba(255,255,255,0.05); }
+.shortcut-dpad.dpad-dir-up .dpad-arrow-up,
+.shortcut-dpad.dpad-dir-down .dpad-arrow-down,
+.shortcut-dpad.dpad-dir-left .dpad-arrow-left,
+.shortcut-dpad.dpad-dir-right .dpad-arrow-right { color: #67e8f9; text-shadow: 0 0 6px rgba(34,211,238,0.7); }
+.shortcut-dpad[data-disabled="true"] { opacity: 0.4; pointer-events: none; }
 /* Tool-call toggle wrench (UsageFooter). Three visual states correspond to
  * the show_tool_calls preference:
  *   - off  → grey border, dim icon (default tool-row hidden state)
@@ -304,7 +351,7 @@ body {
   background: rgba(2, 6, 23, 0.72);
   z-index: 4090;
 }
-.controls-input-with-trailing { padding-right: 42px; }
+.controls-input-with-trailing { padding-right: 64px; }
 .btn-input-expand {
   width: 28px;
   height: 28px;
@@ -739,7 +786,23 @@ body {
   .controls-composer { min-height: 32px; }
   .shortcuts-row { overflow: visible; }
   .shortcuts { gap: 3px; padding: 4px 4px 4px 6px; }
-  .shortcuts-transport { flex: 1 1 auto; min-width: 30px; max-width: none; }
+  .shortcuts-transport { flex: 1 1 auto; min-width: 30px; max-width: none; overflow: visible; padding-left: 0; }
+  /* Bigger stop tap-target on mobile. Extra height comes from padding that is
+     cancelled by equal negative vertical margins, so the button's margin-box
+     (which drives the toolbar row height) is unchanged — the toolbar does not
+     grow; the button just extends a few px above/below (overflow:visible
+     above keeps it from being clipped). */
+  .shortcut-btn-icon.shortcut-btn-stop {
+    min-width: 64px;
+    width: 64px;
+    padding-top: 8px;
+    padding-bottom: 8px;
+    margin-top: -5px;
+    margin-bottom: -5px;
+    font-size: 22px;
+    line-height: 1;
+    border-radius: 8px;
+  }
   .shortcuts-model { padding: 4px 4px 4px 0; }
   .shortcuts-model .shortcut-btn {
     max-width: 82px;
@@ -776,14 +839,22 @@ body {
     border-radius: 12px;
   }
   .btn-voice-embedded {
-    right: 6px;
-    width: 30px;
-    height: 30px;
+    right: 5px;
+    /* Fill the input's height (absolute-positioned, so it never pushes the
+       input taller) and make it comfortably wide for an easy tap target. */
+    top: 4px;
+    bottom: 4px;
+    transform: none;
+    width: 54px;
+    height: auto;
     padding: 0;
+    /* Remove the 300ms tap delay / double-tap zoom on touch so the press
+       registers immediately and is not mistaken for a gesture. */
+    touch-action: manipulation;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    border-radius: 999px;
+    border-radius: 10px;
     background: rgba(15,23,42,0.82);
     border: 1px solid rgba(125,211,252,0.18);
     color: #cbd5e1;
@@ -791,6 +862,9 @@ body {
   .controls-composer-mobile-expanded .btn-voice-embedded {
     top: 10px;
     right: 10px;
+    bottom: auto;
+    height: 34px;
+    width: 54px;
     transform: none;
   }
   .controls-wrapper-mobile-expanded .btn-input-expand-floating {
@@ -1292,17 +1366,74 @@ body {
 .chat-view::-webkit-scrollbar-track { background: #1e293b; border-radius: 3px; }
 .chat-view::-webkit-scrollbar-thumb { background: linear-gradient(180deg, #3b82f6, #6366f1, #3b82f6); border-radius: 3px; box-shadow: 0 0 8px #6366f1cc; }
 .chat-view::-webkit-scrollbar-thumb:hover { background: linear-gradient(180deg, #60a5fa, #818cf8, #60a5fa); box-shadow: 0 0 12px #818cf8ee; }
-/* Top-right control cluster: force-sync (↻) + file-panel toggle (⊞). */
+/* Top-right control cluster: Agents, force-sync (↻), and file-panel toggle (⊞). */
 .chat-top-actions { position: absolute; top: 6px; right: 8px; z-index: 10; display: flex; gap: 6px; align-items: center; }
-.chat-panel-toggle { background: rgba(15,23,42,.85); border: 1px solid #334155; border-radius: 5px; color: #64748b; cursor: pointer; padding: 3px 7px; font-size: 14px; line-height: 1; transition: color .15s, border-color .15s; }
+.chat-panel-toggle { background: rgba(15,23,42,.85); border: 1px solid #334155; border-radius: 5px; color: #64748b; cursor: pointer; padding: 3px 7px; font-size: 14px; line-height: 1; transition: color .15s, border-color .15s, background .15s, box-shadow .15s; }
+.chat-sdk-agents-toggle { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-width: 28px; min-height: 24px; padding: 3px 6px; color: #8b9dc7; }
+.chat-sdk-agents-glyph { width: 16px; height: 16px; flex: 0 0 auto; }
+/* Count rides the glyph's top-right corner as a superscript (absolute), so it
+   never widens the button — the toggle stays a compact icon at every count. */
+.chat-sdk-agents-badge { position: absolute; top: -4px; right: -2px; display: inline-flex; align-items: center; justify-content: center; min-width: 13px; height: 13px; padding: 0 3px; border-radius: 999px; background: #16a34a; color: #ecfdf5; font-size: 9px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; box-shadow: 0 0 0 1px rgba(187,247,208,0.18); pointer-events: none; }
+/* No agents running: keep the count visible (0) but mute it so the green badge
+   isn't mistaken for "running". The toggle's own .active frame shows open/closed. */
+.chat-sdk-agents-badge-zero { background: #334155; color: #94a3b8; box-shadow: 0 0 0 1px rgba(148,163,184,0.16); }
 .chat-sync-btn[disabled] { opacity: .55; cursor: default; }
 .chat-sync-btn.spinning { animation: chat-spinner-rotate 0.8s linear infinite; }
 .chat-panel-toggle:hover, .chat-panel-toggle.active { color: #818cf8; border-color: #6366f1; }
+.chat-sdk-agents-toggle.active { background: rgba(20,83,45,0.28); border-color: rgba(52,211,153,0.62); color: #86efac; box-shadow: 0 0 0 1px rgba(52,211,153,0.18), 0 0 12px rgba(52,211,153,0.16); }
+.chat-sdk-agents-toggle.active:hover { background: rgba(20,83,45,0.42); border-color: rgba(74,222,128,0.78); color: #bbf7d0; }
 /* Drag handle between chat and file panel */
 .chat-panel-drag { width: 4px; flex-shrink: 0; cursor: col-resize; background: #1e293b; transition: background .15s; }
 .chat-panel-drag:hover { background: #6366f1; }
 /* Split file panel container */
 .chat-file-panel { display: flex; flex-direction: column; border-left: 1px solid #334155; background: #0f172a; overflow: hidden; min-width: 220px; }
+.chat-sdk-agents-panel { display: flex; flex-direction: column; width: clamp(260px, 28vw, 360px); min-width: 240px; flex-shrink: 0; border-left: 1px solid #334155; background: #0f172a; overflow: hidden; }
+.chat-sdk-agents-header { display: flex; align-items: center; gap: 8px; padding: 6px 9px; background: #1e293b; border-bottom: 1px solid #334155; min-height: 30px; box-sizing: border-box; }
+/* Title + running-count subtitle share one row ("Agents · 2 running"). */
+.chat-sdk-agents-heading { flex: 1; min-width: 0; display: flex; flex-direction: row; align-items: baseline; gap: 6px; }
+.chat-sdk-agents-title { flex: 0 0 auto; font-size: 12px; color: #dbeafe; font-weight: 800; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-sdk-agents-subtitle { flex: 0 1 auto; min-width: 0; font-size: 10px; color: #94a3b8; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-sdk-agents-subtitle::before { content: '·'; margin-right: 5px; color: #475569; }
+.chat-sdk-agents-close { flex: 0 0 auto; background: none; border: none; color: #64748b; cursor: pointer; font-size: 14px; line-height: 1; padding: 3px 6px; border-radius: 4px; }
+.chat-sdk-agents-close:hover { color: #e2e8f0; background: rgba(148,163,184,0.12); }
+.chat-sdk-agents-body { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 9px; display: flex; flex-direction: column; gap: 10px; scrollbar-width: thin; scrollbar-color: #475569 #0f172a; }
+.chat-sdk-agents-section { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.chat-sdk-agents-section-title { color: #94a3b8; font-size: 10px; font-weight: 800; letter-spacing: 0; text-transform: uppercase; }
+.chat-sdk-agent-row { min-width: 0; display: flex; flex-direction: column; gap: 4px; padding: 7px 9px; border: 1px solid rgba(71,85,105,0.85); border-left: 3px solid #64748b; border-radius: 7px; background: rgba(15,23,42,0.72); box-shadow: inset 0 1px 0 rgba(255,255,255,0.03); }
+.chat-sdk-agent-row.active { border-left-color: #22c55e; }
+.chat-sdk-agent-row.terminal { border-left-color: #64748b; }
+.chat-sdk-agent-row.diagnostic { border-left-color: #f59e0b; }
+.chat-sdk-agent-row.status-error { border-left-color: #ef4444; }
+.chat-sdk-agent-row.status-stale,
+.chat-sdk-agent-row.status-unknown { border-left-color: #f59e0b; }
+.chat-sdk-agent-row-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+.chat-sdk-agent-provider { min-width: 0; color: #dbeafe; font-size: 12px; font-weight: 700; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-sdk-agent-status { flex: 0 0 auto; color: #94a3b8; font-size: 10px; font-weight: 800; line-height: 1.2; text-transform: uppercase; }
+.chat-sdk-agent-summary { color: #cbd5e1; font-size: 12px; line-height: 1.35; word-break: break-word; overflow-wrap: anywhere; }
+.chat-sdk-agent-detail { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px; align-items: start; color: #94a3b8; font-size: 10px; line-height: 1.25; min-width: 0; }
+.chat-sdk-agent-detail-label { color: #64748b; font-weight: 800; text-transform: uppercase; }
+.chat-sdk-agent-detail-value { min-width: 0; color: #cbd5e1; word-break: break-word; overflow-wrap: anywhere; }
+/* Short stats (ID/Model/Started/Duration) flow inline and wrap to use the card
+   width instead of one tall row each; long fields (summary/prompt/result) clamp
+   to 2 lines so a card stays short. */
+.chat-sdk-agent-stats { display: flex; flex-wrap: wrap; gap: 2px 12px; min-width: 0; }
+.chat-sdk-agent-stat { display: inline-flex; align-items: baseline; gap: 4px; min-width: 0; max-width: 100%; }
+.chat-sdk-agent-stat .chat-sdk-agent-detail-value { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+.chat-sdk-agent-summary,
+.chat-sdk-agent-detail:not(.chat-sdk-agent-stat) .chat-sdk-agent-detail-value { display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.chat-sdk-agent-meta { display: flex; flex-wrap: wrap; gap: 5px; color: #94a3b8; font-size: 10px; line-height: 1.2; }
+.chat-sdk-agent-meta:empty { display: none; }
+@media (max-width: 640px) {
+  .chat-view-wrap.chat-split { flex-direction: column !important; }
+  .chat-sdk-agents-panel,
+  .chat-file-panel { width: 100% !important; min-width: 0; min-height: 150px; max-height: min(42dvh, 320px); border-left: 0; border-top: 1px solid #334155; }
+  /* Agents panel on phones: cap at ~one agent card tall — its body scrolls for
+     more — so a burst of sub-agents doesn't bury the chat. */
+  .chat-sdk-agents-panel { min-height: 0; max-height: 140px; }
+  .chat-panel-drag { display: none; }
+  .chat-top-actions { top: 5px; right: 6px; gap: 5px; }
+  .chat-sdk-agents-toggle { max-width: 112px; }
+}
 .chat-attachment-row { display: inline-flex; align-items: center; gap: 4px; margin-top: 4px; }
 .chat-attachment-dl { background: #172337; border: 1px solid #334155; border-radius: 6px; color: #94a3b8; padding: 3px 8px; font-size: 12px; cursor: pointer; text-align: left; }
 .chat-attachment-dl:hover { color: #e2e8f0; border-color: #475569; }
@@ -1602,6 +1733,17 @@ body {
 .subcard-open,
 .subcard-focused,
 .subcard-running-pulse { border-top-color: var(--subsession-accent-color, #38bdf8) !important; border-top-width: 3px; }
+/* Active sub-session → SOLID 2px bottom accent, mirroring the top strip so the
+   active card is bracketed top + bottom by its own colour. The dock card uses
+   .subcard-focused; the collapsed bar button uses .focused. Desktop marks the
+   single active card via focusedSubId; mobile (only ever ONE open sub-session)
+   marks its open card .focused in JS so it lands here too. */
+.subcard-focused,
+.subsession-card.focused { border-bottom-color: var(--subsession-accent-color, #38bdf8) !important; border-bottom-width: 2px; border-bottom-style: solid; }
+/* Desktop can open MULTIPLE sub-sessions but only ONE is active. An opened-but-
+   not-active bar button gets a DASHED 2px bottom accent so it still reads as
+   "open" without competing with the active card's solid bar. */
+.subsession-card.open:not(.focused) { border-bottom-color: var(--subsession-accent-color, #38bdf8) !important; border-bottom-width: 2px; border-bottom-style: dashed; }
 .subcard:not(.subcard-running-pulse):not(.subcard-focused) { transition: border-color 0.3s ease-out, box-shadow 0.3s ease-out; }
 
 @keyframes idle-flash-opacity { 0%, 100% { opacity: 0; } 50% { opacity: 1; } }
@@ -1639,7 +1781,7 @@ body {
 .subcard-input-area { flex-shrink: 0; border-top: 1px solid rgba(125,211,252,0.12); background: linear-gradient(180deg, #0a101b, #080d16); padding: 5px 6px; display: flex; flex-direction: column; gap: 3px; border-radius: 0 0 8px 8px; }
 .subcard-input-row { display: flex; align-items: stretch; gap: 6px; }
 .subcard-input-main { flex: 1; min-width: 0; }
-.subcard-stop-btn { flex: 0 0 auto; width: 30px; min-width: 30px; border-radius: 6px; border: 1px solid rgba(239,68,68,0.55); background: rgba(127,29,29,0.32); color: #f87171; cursor: pointer; font-size: 11px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; padding: 0; transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease; }
+.subcard-stop-btn { flex: 0 0 auto; width: 40px; min-width: 40px; margin-left: -6px; border-radius: 0 6px 6px 0; border: 1px solid rgba(239,68,68,0.55); background: rgba(127,29,29,0.32); color: #f87171; cursor: pointer; font-size: 11px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; padding: 0; transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease; }
 .subcard-stop-btn:hover:not(:disabled) { background: rgba(127,29,29,0.48); border-color: rgba(248,113,113,0.8); color: #fca5a5; }
 .subcard-stop-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .subcard-input-area .menu-dropdown { z-index: 10000; right: auto; left: 0; max-width: calc(100vw - 24px); }
@@ -1674,7 +1816,7 @@ body {
 /* Quick input trigger in shortcuts row: hidden by default, shown when shell input is hidden */
 .shell-quick-trigger { display: none !important; }
 .kb-open .shell-terminal-pane .shell-quick-trigger { display: inline-flex !important; color: #fbbf24 !important; }
-.subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 54px; min-height: 54px; padding: 6px 10px; background: linear-gradient(180deg, rgba(17,27,45,0.92), rgba(10,16,27,0.92)); border: 1px solid rgba(125,211,252,0.16); border-top: 3px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: transform 0.15s, border-color 0.15s, background 0.15s, color 0.15s, box-shadow 0.15s; flex-shrink: 0; position: relative; isolation: isolate; overflow: hidden; box-shadow: inset 0 1px 0 rgba(255,255,255,0.035); }
+.subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 54px; min-height: 54px; padding: 6px 1px; background: linear-gradient(180deg, rgba(17,27,45,0.92), rgba(10,16,27,0.92)); border: 1px solid rgba(125,211,252,0.16); border-top: 3px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: transform 0.15s, border-color 0.15s, background 0.15s, color 0.15s, box-shadow 0.15s; flex-shrink: 0; position: relative; isolation: isolate; overflow: hidden; box-shadow: inset 0 1px 0 rgba(255,255,255,0.035); }
 .subsession-card::before { content: ''; position: absolute; inset: 0; background: linear-gradient(135deg, rgba(34,211,238,0.12), transparent 38%, rgba(52,211,153,0.08)); opacity: 0; transition: opacity 0.15s; pointer-events: none; }
 .subsession-card:hover, .subsession-card.open { border-color: rgba(34,211,238,0.44); background: linear-gradient(180deg, rgba(15,40,62,0.92), rgba(10,20,34,0.94)); color: #dbeafe; }
 .subsession-card:hover::before, .subsession-card.open::before, .subsession-card.focused::before { opacity: 1; }
@@ -1698,7 +1840,12 @@ body {
 .subsession-window { display: flex; flex-direction: column; background: linear-gradient(180deg, #0f1724, #090d15); border: 1px solid var(--subsession-accent-color, #38bdf8); border-radius: 8px; box-shadow: 0 12px 38px rgba(0,0,0,0.62), 0 0 0 1px rgba(255,255,255,0.025), 0 0 24px rgba(34,211,238,0.12); overflow: hidden; min-width: 300px; min-height: 200px; isolation: isolate; }
 .subsession-window::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--subsession-accent-color, #38bdf8); opacity: 0.45; box-shadow: 0 0 10px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 45%, transparent); pointer-events: none; z-index: 3; transition: height 0.15s, opacity 0.15s, box-shadow 0.15s; }
 .subsession-window-active { box-shadow: 0 14px 42px rgba(0,0,0,0.68), 0 0 0 1px rgba(96,165,250,0.22), 0 0 28px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 28%, transparent); }
-.subsession-window-active::before { height: 5px; opacity: 1; box-shadow: 0 0 14px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 72%, transparent); }
+.subsession-window-active::before { height: 3px; opacity: 1; box-shadow: 0 0 14px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 72%, transparent); }
+/* Mirror the top accent strip onto the BOTTOM edge of an active sub-session
+   window so the focused window is bracketed top + bottom by its own colour,
+   matching the dock card (.subcard) / bar button (.subsession-card). 2px is
+   enough for the bottom — the top strip stays the dominant 5px indicator. */
+.subsession-window-active::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: var(--subsession-accent-color, #38bdf8); opacity: 1; box-shadow: 0 0 12px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 60%, transparent); pointer-events: none; z-index: 3; }
 .subsession-window-maximized { border: 2px solid var(--subsession-accent-color, #38bdf8); box-shadow: 0 0 0 1px rgba(15,23,42,0.75), 0 8px 32px rgba(0,0,0,0.6), 0 0 24px rgba(34,211,238,0.12); box-sizing: border-box; }
 .subsession-header { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: linear-gradient(180deg, rgba(17,27,45,0.98), rgba(10,16,27,0.98)); border-bottom: 1px solid rgba(125,211,252,0.16); cursor: move; user-select: none; flex-shrink: 0; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
 .subsession-drag-icon { color: rgba(34,211,238,0.48); font-size: 16px; cursor: grab; text-shadow: 0 0 8px rgba(34,211,238,0.16); }
@@ -1722,6 +1869,8 @@ body {
 .session-usage-codex-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; align-items: center; }
 .session-usage-codex-quota { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; margin-bottom: 2px; }
 .session-usage-codex-line { color: #64748b; font-size: 9px; line-height: 1.2; text-align: right; }
+.session-usage-weekly-authorize { background: none; border: none; padding: 0; margin: 0; font: inherit; font-size: 9px; line-height: 1.2; text-align: right; color: var(--chrome-accent, #22d3ee); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.session-usage-weekly-authorize:hover { color: #67e8f9; }
 .session-ctx-input { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, var(--chrome-accent-2), var(--chrome-accent)); border-radius: 999px; box-shadow: 0 0 10px rgba(52,211,153,0.42); }
 .session-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, var(--chrome-accent-3), #818cf8); border-radius: 999px; box-shadow: 0 0 10px rgba(129,140,248,0.36); }
 
@@ -1981,7 +2130,16 @@ body {
 /* ── Discussion dialog ────────────────────────────────────────────────────── */
 .discussion-participant-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px 8px; background: #0f172a; border: 1px solid #1e293b; border-radius: 6px; }
 .discussion-verdict-badge { font-size: 14px; margin-left: 2px; flex-shrink: 0; }
-.discussion-panel { display: flex; flex-direction: column; gap: 8px; padding: 8px; }
+.discussion-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  box-sizing: border-box;
+}
 .discussion-panel .discussions-progress-card {
   border-radius: 10px;
 }
@@ -2193,6 +2351,9 @@ body {
 .discussions-progress-card {
   position: relative;
   overflow: hidden;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
   background:
     linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(2, 6, 23, 0.96)),
     linear-gradient(135deg, rgba(59, 130, 246, 0.10), rgba(34, 197, 94, 0.06));
@@ -2297,17 +2458,22 @@ body {
   flex-direction: column;
   gap: 6px;
   margin-bottom: 8px;
+  min-width: 0;
+  max-width: 100%;
 }
 .discussions-progress-line {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-width: 0;
+  max-width: 100%;
 }
 .discussions-progress-line-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  min-width: 0;
 }
 .discussions-progress-line-label {
   font-size: 10px;
@@ -2359,6 +2525,8 @@ body {
   height: 16px;
   border-radius: 999px;
   overflow: hidden;
+  min-width: 0;
+  max-width: 100%;
 }
 .discussions-progress-segments-round { height: 18px; }
 .discussions-progress-segments-hop { height: 14px; }
@@ -2397,7 +2565,7 @@ body {
 .discussions-progress-segment.is-pending .discussions-progress-segment-index {
   color: rgba(148, 163, 184, 0.75);
 }
-.discussions-progress-nodes { display: flex; flex-wrap: nowrap; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+.discussions-progress-nodes { display: flex; flex-wrap: nowrap; gap: 6px; overflow-x: auto; min-width: 0; max-width: 100%; scrollbar-width: none; }
 .discussions-progress-nodes::-webkit-scrollbar { display: none; }
 .discussions-progress-node {
   display: inline-flex;
@@ -2607,6 +2775,9 @@ body {
 .ask-dialog-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 9999; padding: calc(var(--sat, 0px) + 16px) 16px calc(env(safe-area-inset-bottom, 0px) + 16px); }
 .ask-dialog { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; width: 100%; max-width: 480px; max-height: 100%; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 16px; }
 .ask-question-block { display: flex; flex-direction: column; gap: 8px; }
+.ask-status { font-size: 12px; font-weight: 600; border-radius: 8px; padding: 8px 10px; line-height: 1.4; }
+.ask-status-waiting { color: #fbbf24; background: rgba(251,191,36,0.10); border: 1px solid rgba(251,191,36,0.28); }
+.ask-status-retained { color: #94a3b8; background: rgba(148,163,184,0.10); border: 1px solid rgba(148,163,184,0.24); }
 .ask-header { font-size: 11px; font-weight: 600; color: #818cf8; text-transform: uppercase; letter-spacing: 0.05em; }
 .ask-question { font-size: 14px; color: #e2e8f0; line-height: 1.5; }
 .ask-options { display: flex; flex-direction: column; gap: 6px; }

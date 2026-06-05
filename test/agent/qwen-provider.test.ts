@@ -85,6 +85,12 @@ import type { AgentMessage } from '../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_STATUS,
+} from '../../shared/sdk-subagent-status.js';
+import {
   IMCODES_DAEMON_NAMESPACE_ENV,
   IMCODES_DAEMON_PROJECT_NAME_ENV,
   IMCODES_DAEMON_PROJECT_ROOT_ENV,
@@ -145,6 +151,58 @@ describe('QwenProvider', () => {
       status: MEMORY_MCP_STATUS.READY,
       connected: true,
       degradedReasons: [],
+    });
+  });
+
+  it('emits SDK subagent snapshots for Qwen runtime subagent notifications', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-runtime-subagent',
+      cwd: '/tmp/project',
+      agentId: 'qwen3-coder-plus',
+    });
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_sessionId, tool) => tools.push(tool));
+
+    await provider.send('sess-runtime-subagent', 'spawn a helper');
+    const spawned = lastSpawn();
+    spawned.child.stdout.write(`${JSON.stringify({
+      type: 'system',
+      subtype: 'subagent_notification',
+      subagent: {
+        agent_path: '019e-qwen-agent',
+        name: 'planner',
+        status: 'running',
+        prompt: 'Check the Qwen handoff',
+      },
+    })}\n`);
+    spawned.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'OK' })}\n`);
+    spawned.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: 'qwen:sess-runtime-subagent:runtime:019e-qwen-agent',
+      name: 'Agent',
+      status: 'running',
+      input: { action: 'qwen-runtime-subagent', description: 'Check the Qwen handoff' },
+      detail: {
+        kind: SDK_SUBAGENT_DETAIL_KIND,
+        summary: 'Qwen sub-agent planner',
+        meta: {
+          provider: SDK_SUBAGENT_PROVIDERS.QWEN,
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.QWEN_RUNTIME_AGENT,
+          canonicalKey: 'qwen:sess-runtime-subagent:runtime:019e-qwen-agent',
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          active: true,
+          terminal: false,
+          parentSessionId: 'sess-runtime-subagent',
+          agentPath: '019e-qwen-agent',
+          agentName: 'planner',
+          model: 'qwen3-coder-plus',
+        },
+      },
     });
   });
 
@@ -1129,6 +1187,61 @@ describe('QwenProvider', () => {
       model: { generationConfig: { reasoning: { effort: 'high' } } },
     });
     third.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-reasoning-fallback-ok', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    third.child.emit('close', 0, null);
+    await flushIO();
+    await flushIO();
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(3);
+    expect(completed).toEqual(['First OK', 'OK']);
+    expect(errors).toEqual([]);
+  });
+
+  it('retries qwen tool-call history replay errors in a fresh conversation', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-tool-history-replay-error',
+      cwd: '/tmp/project',
+      agentId: 'qwen3-coder-plus',
+    });
+
+    const errors: string[] = [];
+    const completed: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.message));
+    provider.onComplete((_sid, msg) => completed.push(String(msg.content)));
+
+    await provider.send('sess-tool-history-replay-error', 'first turn');
+    await waitForSpawnCount(1);
+    const first = lastSpawn();
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-first-tool-ok', content: [{ type: 'text', text: 'First OK' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-tool-history-replay-error', 'retry after malformed tool history');
+    await waitForSpawnCount(2);
+    const second = lastSpawn();
+    expect(second.args).toContain('--resume');
+
+    const apiErrorText = '[API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"invalid params, tool call result does not follow tool call (2013)"}}]';
+    second.child.stdout.write(`${JSON.stringify({
+      type: 'stream_event',
+      event: { type: 'message_start', message: { id: 'msg-api-error-stream' } },
+    })}\n`);
+    second.child.stdout.write(`${JSON.stringify({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: apiErrorText } },
+    })}\n`);
+    second.child.stdout.write(`${JSON.stringify({
+      type: 'result',
+      is_error: false,
+      result: apiErrorText,
+    })}\n`);
+    await waitForSpawnCount(3);
+
+    const third = lastSpawn();
+    expect(third.args).toContain('--session-id');
+    expect(third.args).not.toContain('--resume');
+    third.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-tool-history-fallback-ok', content: [{ type: 'text', text: 'OK' }] } })}\n`);
     third.child.emit('close', 0, null);
     await flushIO();
     await flushIO();

@@ -793,8 +793,10 @@ describe('SharedContextManagementPanel', () => {
     })));
   });
 
-  it('keeps memory browsing on all projects by default and explains cloud-only personal memory', async () => {
-    getPersonalCloudMemoryMock.mockResolvedValueOnce({
+  it('auto-scopes personal memory to the selected project and explains cloud-only personal memory', async () => {
+    // Auto-select can run loadMemoryViews twice (initial, then scoped to the
+    // active project), so make the cloud mock persistent rather than once.
+    getPersonalCloudMemoryMock.mockResolvedValue({
       stats: {
         totalRecords: 16059,
         matchedRecords: 16059,
@@ -841,8 +843,6 @@ describe('SharedContextManagementPanel', () => {
 
     const localQuery = [...sent].reverse().find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
     expect(localQuery).toBeDefined();
-    expect(localQuery).not.toHaveProperty('canonicalRepoId');
-    expect(localQuery).not.toHaveProperty('projectId');
 
     await act(async () => {
       for (const handler of messageHandlers) handler({
@@ -871,7 +871,7 @@ describe('SharedContextManagementPanel', () => {
     expect(await screen.findByText('Large synced personal memory set')).toBeDefined();
   });
 
-  it('adds daemon memory project indexes to the browse dropdown without forcing a default project filter', async () => {
+  it('adds daemon memory project indexes to the unified project dropdown', async () => {
     const sent: Array<Record<string, unknown>> = [];
     const messageHandlers = new Set<(message: unknown) => void>();
     const ws = {
@@ -895,8 +895,6 @@ describe('SharedContextManagementPanel', () => {
 
     const localQuery = [...sent].reverse().find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
     expect(localQuery).toBeDefined();
-    expect(localQuery).not.toHaveProperty('canonicalRepoId');
-    expect(localQuery).not.toHaveProperty('projectId');
 
     await act(async () => {
       for (const handler of messageHandlers) handler({
@@ -934,7 +932,6 @@ describe('SharedContextManagementPanel', () => {
     });
 
     const browseSelect = await screen.findByLabelText('sharedContext.management.memoryBrowseProjectFilter') as HTMLSelectElement;
-    expect(browseSelect.value).toBe('');
     const optionValues = Array.from(browseSelect.options).map((option) => option.value);
     expect(optionValues).toContain('github.com/im4codes/imcodes');
     expect(optionValues).toContain('local/201eaffedeeb');
@@ -1155,8 +1152,9 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
     });
     await act(async () => {
-      const browseSelect = screen.getByLabelText('sharedContext.management.memoryBrowseProjectFilter') as HTMLSelectElement;
-      fireEvent.input(browseSelect, { target: { value: 'github.com/acme/repo' } });
+      // The active project is already auto-selected, so re-picking it is a no-op.
+      // Toggling "show archived" re-runs loadMemoryViews to start the second load.
+      fireEvent.click(screen.getByText('sharedContext.management.memoryShowArchived'));
     });
 
     await act(async () => {
@@ -1377,10 +1375,13 @@ describe('SharedContextManagementPanel', () => {
     });
 
     await waitFor(() => {
+      // The dir-only project resolves to its canonical id and is auto-selected,
+      // so the personal query is scoped to the canonical id (not the directory).
       const latestPersonalQuery = [...sent].reverse().find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
-      expect(latestPersonalQuery).toBeTruthy();
-      expect(latestPersonalQuery).not.toHaveProperty('canonicalRepoId');
-      expect(latestPersonalQuery).not.toHaveProperty('projectId');
+      expect(latestPersonalQuery).toMatchObject({
+        canonicalRepoId: 'github.com/acme/repo',
+        projectId: 'github.com/acme/repo',
+      });
     });
 
     await act(async () => {

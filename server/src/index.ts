@@ -42,8 +42,8 @@ import { shutdownEmbeddingPool } from './util/embedding-pool.js';
 import { fileTransferRoutes } from './routes/file-transfer.js';
 import { passkeyRoutes } from './routes/passkey-auth.js';
 import { localWebPreviewRoutes } from './routes/local-web-preview.js';
-import { LocalWebPreviewRegistry } from './preview/registry.js';
-import { sanitizePreviewRequestHeaders } from '../../shared/preview-policy.js';
+import { resolveLocalPreviewAccess, commitAuthorizedAccess } from './preview/access.js';
+import { sanitizePreviewRequestHeaders, stripPreviewAccessTokenFromUpstreamPath } from '../../shared/preview-policy.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM, PREVIEW_LIMITS } from '../../shared/preview-types.js';
 import { COOKIE_SESSION, COOKIE_PREVIEW_ACCESS } from '../../shared/cookie-names.js';
 import { healthCheckCron } from './cron/health-check.js';
@@ -322,7 +322,7 @@ export function buildApp(env: Env) {
 
 // ── WebSocket upgrade handler ─────────────────────────────────────────────────
 
-function setupWebSocketUpgrade(server: import('node:http').Server, env: Env) {
+export function setupWebSocketUpgrade(server: import('node:http').Server, env: Env) {
   const wss = new WebSocketServer({ noServer: true });
   // Compile trust function once — same proxy-addr library used by HTTP middleware
   const wsTrust = proxyAddr.compile(
@@ -439,51 +439,43 @@ async function handlePreviewWsUpgrade(
     return;
   }
 
-  // 2. Resolve preview access token from query param or cookie header
+  // 2. Resolve the preview access token (query param or cookie) and any session
+  //    identity (cookie JWT), then run the SAME pure authorization function the
+  //    HTTP route uses (run 8a975732-23a P0.1/P0.2). This closes the prior gap
+  //    where WS upgrade skipped resolveServerRole — a revoked/downgraded user
+  //    (role === 'none') is now rejected with 403 just like HTTP. No side
+  //    effects (no Set-Cookie — WS upgrade has no Hono Context).
   const previewAccessToken = url.searchParams.get(PREVIEW_ACCESS_TOKEN_QUERY_PARAM)
     ?? parseCookieHeader(req.headers['cookie'] ?? '', COOKIE_PREVIEW_ACCESS)
     ?? null;
 
-  // 3. Try session auth (cookie JWT); if no session auth, fall back to preview access token
-  let userId: string | null = null;
+  let sessionUserId: string | null = null;
   const sessionCookieToken = parseCookieHeader(req.headers['cookie'] ?? '', COOKIE_SESSION);
   if (sessionCookieToken && env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(sessionCookieToken, env.JWT_SIGNING_KEY);
     if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket') {
-      userId = payload.sub;
+      sessionUserId = payload.sub;
     }
   }
 
-  const registry = LocalWebPreviewRegistry.get(serverId);
-
-  if (!userId && previewAccessToken) {
-    const fromToken = registry.authorizeWithAccessToken(previewId, previewAccessToken);
-    if (fromToken) {
-      userId = fromToken.userId;
-    }
-  }
-
-  if (!userId) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n');
+  const access = await resolveLocalPreviewAccess({
+    db: env.DB,
+    serverId,
+    previewId,
+    previewAccessToken,
+    session: sessionUserId ? { userId: sessionUserId } : null,
+  });
+  if (!access.ok) {
+    const statusLine = access.status === 401 ? '401 Unauthorized'
+      : access.status === 404 ? '404 Not Found'
+      : '403 Forbidden';
+    socket.write(`HTTP/1.1 ${statusLine}\r\nContent-Length: 0\r\n\r\n`);
     socket.destroy();
     return;
   }
+  const preview = access.preview;
 
-  // 4. Verify previewId exists and is not expired
-  const preview = registry.get(previewId);
-  if (!preview) {
-    socket.write('HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n');
-    socket.destroy();
-    return;
-  }
-
-  if (preview.userId !== userId) {
-    socket.write('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n');
-    socket.destroy();
-    return;
-  }
-
-  // 5. Check per-preview and per-server WS tunnel limits
+  // 3. Check per-preview and per-server WS tunnel limits
   const bridge = WsBridge.get(serverId);
   if (bridge.getPreviewWsCount(previewId) >= PREVIEW_LIMITS.MAX_WS_PER_PREVIEW) {
     socket.write('HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Length: 0\r\n\r\n');
@@ -496,18 +488,22 @@ async function handlePreviewWsUpgrade(
     return;
   }
 
-  // 6. Verify daemon is connected
+  // 4. Verify daemon is connected
   if (!bridge.isDaemonConnected()) {
     socket.write(`HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n`);
     socket.destroy();
     return;
   }
 
-  // 7. Extract upstream path (strip preview route prefix)
-  const upstreamPath = rawPath || '/';
-  const upstreamPathWithQuery = `${upstreamPath}${url.search}`;
+  // Authorized → commit the TTL slide (commit, not peek). No Set-Cookie here.
+  commitAuthorizedAccess(serverId, previewId);
 
-  // 8. Sanitize headers for upstream
+  // 5. Build the upstream path WITH the access token stripped — the same shared
+  //    single entry point the HTTP getUpstreamPath uses (run 8a975732-23a P0.3).
+  const upstreamPath = rawPath || '/';
+  const upstreamPathWithQuery = stripPreviewAccessTokenFromUpstreamPath(`${upstreamPath}${url.search}`);
+
+  // 6. Sanitize headers for upstream
   const reqHeaders = new Headers(req.headers as Record<string, string>);
   const sanitizedHeaders = sanitizePreviewRequestHeaders(reqHeaders, previewId);
 
@@ -515,7 +511,7 @@ async function handlePreviewWsUpgrade(
   const protocolHeader = req.headers['sec-websocket-protocol'] ?? '';
   const protocols = protocolHeader ? protocolHeader.split(',').map((p) => p.trim()).filter(Boolean) : [];
 
-  // 9. Generate wsId (32 hex chars, consistent with requestId format)
+  // 7. Generate wsId (32 hex chars, consistent with requestId format)
   const wsId = crypto.randomUUID().replace(/-/g, '');
 
   logger.info({
@@ -526,9 +522,37 @@ async function handlePreviewWsUpgrade(
     protocols,
   }, 'Preview WS tunnel upgrade');
 
-  // 10. Accept WS upgrade and hand off to bridge
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    bridge.createPreviewWsTunnel(wsId, previewId, preview.port, upstreamPathWithQuery, ws, sanitizedHeaders, protocols);
+  // 8. Defer the browser handshake until the daemon reports the upstream-
+  //    negotiated subprotocol (run 8a975732-23a P1.5.1), then complete the
+  //    handshake echoing exactly that protocol so the browser's
+  //    `WebSocket.protocol` matches the upstream end-to-end. The `ws` library
+  //    echoes whatever `Sec-WebSocket-Protocol` the request carries, so we
+  //    overwrite it to the single negotiated value (or delete it for "none").
+  bridge.beginPreviewWsTunnel({
+    wsId,
+    previewId,
+    port: preview.port,
+    path: upstreamPathWithQuery,
+    headers: sanitizedHeaders,
+    protocols,
+    completeUpgrade: (selectedProtocol) => new Promise((resolve) => {
+      if (socket.destroyed || !socket.writable) {
+        resolve(null);
+        return;
+      }
+      if (selectedProtocol) {
+        req.headers['sec-websocket-protocol'] = selectedProtocol;
+      } else {
+        delete req.headers['sec-websocket-protocol'];
+      }
+      try {
+        wss.handleUpgrade(req, socket, head, (ws) => resolve(ws as unknown as import('ws').WebSocket));
+      } catch (err) {
+        logger.warn({ serverId, previewId, wsId, err }, 'Preview WS handleUpgrade failed');
+        try { socket.destroy(); } catch { /* ignore */ }
+        resolve(null);
+      }
+    }),
   });
 }
 

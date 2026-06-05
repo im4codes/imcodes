@@ -468,4 +468,67 @@ describe('WsBridge preview WS tunnels', () => {
       expect(bridge.getServerWsCount()).toBe(0);
     });
   });
+
+  // ── deferred upgrade + WS subprotocol via WS_OPENED.protocol (P1.5.1) ─────────
+  describe('beginPreviewWsTunnel (deferred upgrade / subprotocol)', () => {
+    it('sends preview.ws.open and counts a pending upgrade before WS_OPENED', async () => {
+      const { bridge, daemon } = await setupBridge();
+      bridge.beginPreviewWsTunnel({
+        wsId, previewId, port: 3000, path: '/ws',
+        headers: {}, protocols: ['graphql-ws'],
+        completeUpgrade: async () => new MockWs() as never,
+      });
+      // ws.open relayed to daemon
+      const open = daemon.sentStrings.find((s) => s.includes(PREVIEW_MSG.WS_OPEN));
+      expect(open).toBeDefined();
+      // pending upgrade counts toward the WS ceilings
+      expect(bridge.getPreviewWsCount(previewId)).toBe(1);
+      expect(bridge.getServerWsCount()).toBe(1);
+    });
+
+    it('completes the handshake with the upstream-negotiated protocol from WS_OPENED', async () => {
+      const { bridge, daemon } = await setupBridge();
+      let negotiated: string | undefined = 'NOT_CALLED';
+      const browserWs = new MockWs();
+      bridge.beginPreviewWsTunnel({
+        wsId, previewId, port: 3000, path: '/ws',
+        headers: {}, protocols: ['graphql-ws', 'graphql-transport-ws'],
+        completeUpgrade: async (protocol) => { negotiated = protocol; return browserWs as never; },
+      });
+
+      // Daemon reports the upstream selected `graphql-ws`.
+      daemon.emit('message', Buffer.from(JSON.stringify({
+        type: PREVIEW_MSG.WS_OPENED,
+        wsId,
+        protocol: 'graphql-ws',
+      })), false);
+      await flushAsync();
+
+      // completeUpgrade received exactly the negotiated protocol, and the tunnel
+      // is now an active (no longer pending) tunnel.
+      expect(negotiated).toBe('graphql-ws');
+      expect(bridge.getPreviewWsCount(previewId)).toBe(1);
+    });
+
+    it('fails the deferred handshake (completeUpgrade(undefined)) when daemon reports WS_ERROR', async () => {
+      const { bridge, daemon } = await setupBridge();
+      let calledWith: string | undefined = 'NOT_CALLED';
+      bridge.beginPreviewWsTunnel({
+        wsId, previewId, port: 3000, path: '/ws',
+        headers: {}, protocols: ['chat'],
+        completeUpgrade: async (protocol) => { calledWith = protocol; return null; },
+      });
+
+      daemon.emit('message', Buffer.from(JSON.stringify({
+        type: PREVIEW_MSG.WS_ERROR,
+        wsId,
+        error: 'connection refused',
+      })), false);
+      await flushAsync();
+
+      expect(calledWith).toBeUndefined();
+      // pending upgrade cleared → no tunnel
+      expect(bridge.getServerWsCount()).toBe(0);
+    });
+  });
 });

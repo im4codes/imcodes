@@ -3,12 +3,14 @@ import { marked } from 'marked';
 import { App } from './app.js';
 import './styles.css';
 import './i18n/index.js';
-// JetBrains Mono — bundled webfont (OFL 1.1). Used as the default chat
-// font and always available regardless of the user's installed system
-// fonts. Only regular + bold weights are loaded to keep the bundle small
-// (~120KB total, gzipped ~70KB). Italic / other weights are not needed.
+// Bundled programmer webfonts (OFL 1.1). JetBrains Mono is the default;
+// Cascadia Mono is available in the chat font picker even when it is not
+// installed on the user's machine. Only regular + bold weights are loaded
+// because italic / other weights are not needed for chat rendering.
 import '@fontsource/jetbrains-mono/400.css';
 import '@fontsource/jetbrains-mono/700.css';
+import '@fontsource/cascadia-mono/latin-400.css';
+import '@fontsource/cascadia-mono/latin-700.css';
 
 // Global marked config: all links open in new tab
 marked.use({

@@ -5,7 +5,9 @@ import type { ServerMessage } from './ws-client.js';
 
 const DEFAULT_SUMMARY_SYNC_LIMIT = 10;
 const SUMMARY_SYNC_MAX_RECORD_CHARS = 1_200;
-const SUMMARY_SYNC_MAX_TOTAL_SUMMARY_CHARS = 3_600;
+// Total char budget for the synced "recent summaries" block. At 1_200/record
+// this fits up to ~6 full recent summaries before truncating.
+const SUMMARY_SYNC_MAX_TOTAL_SUMMARY_CHARS = 7_200;
 const SUMMARY_SYNC_TRUNCATED_NOTE = '[truncated for token budget; use get_memory_sources with the sourceLookup below for exact details]';
 const LOCAL_MEMORY_SUMMARY_TIMEOUT_MS = 8_000;
 

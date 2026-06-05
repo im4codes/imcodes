@@ -1,4 +1,8 @@
-import { mapP2pStatusToUiState, type P2pActivePhase, type P2pProgressNodeStatus } from '@shared/p2p-status.js';
+import {
+  mapP2pStatusToUiState,
+  normalizeP2pProgressNodeStatus,
+  type P2pActivePhase,
+} from '@shared/p2p-status.js';
 import {
   P2P_WORKFLOW_DIAGNOSTIC_CODES,
   P2P_WORKFLOW_DIAGNOSTIC_PHASES,
@@ -97,7 +101,7 @@ function mapLegacyNodes(source: Record<string, any>) {
     ccPreset: n.ccPreset ?? n.cc_preset ?? null,
     mode: typeof n.mode === 'string' ? n.mode : undefined,
     phase: typeof n.phase === 'string' ? n.phase as 'initial' | 'hop' | 'summary' | 'execution' : undefined,
-    status: String(n.status ?? 'pending') as P2pProgressNodeStatus,
+    status: normalizeP2pProgressNodeStatus(n.status),
   })) : undefined;
 }
 
@@ -110,7 +114,7 @@ function mapAdvancedNodes(source: Record<string, any>) {
     ccPreset: null,
     mode: typeof n.preset === 'string' ? n.preset : undefined,
     phase: 'hop' as const,
-    status: String(n.status ?? 'pending') as P2pProgressNodeStatus,
+    status: normalizeP2pProgressNodeStatus(n.status),
   })) : undefined;
 }
 
@@ -242,7 +246,7 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
   };
 }
 
-function isTerminalDiscussionState(state: unknown): boolean {
+export function isTerminalDiscussionState(state: unknown): boolean {
   return state === 'done' || state === 'failed';
 }
 
@@ -275,17 +279,32 @@ export function mergeP2pDiscussionUpdate<T extends {
   };
 }
 
-export function mergeP2pStatusResponseDiscussions<T extends { id: string; startedAt?: number; hopStartedAt?: number }>(
+export function mergeP2pStatusResponseDiscussions<T extends {
+  id: string;
+  startedAt?: number;
+  hopStartedAt?: number;
+  state?: unknown;
+}>(
   existing: readonly T[],
   incoming: readonly T[],
-  options: { runId?: string; runFound?: boolean } = {},
+  options: { runId?: string; runFound?: boolean; fullList?: boolean } = {},
 ): T[] {
   const explicitMissingRunId = options.runId && options.runFound === false
     ? `p2p_${options.runId}`
     : null;
-  const merged = explicitMissingRunId
-    ? existing.filter((d) => d.id !== explicitMissingRunId)
-    : [...existing];
+  const incomingIds = new Set(incoming.map((entry) => entry.id));
+  const merged = existing.filter((d) => {
+    if (explicitMissingRunId && d.id === explicitMissingRunId) return false;
+    if (
+      options.fullList === true
+      && d.id.startsWith('p2p_')
+      && !incomingIds.has(d.id)
+      && !isTerminalDiscussionState(d.state)
+    ) {
+      return false;
+    }
+    return true;
+  });
 
   for (const entry of incoming) {
     const idx = merged.findIndex((d) => d.id === entry.id);

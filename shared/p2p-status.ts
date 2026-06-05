@@ -74,6 +74,33 @@ export const P2P_PROGRESS_NODE_STATUS_VALUES = [
 
 export type P2pProgressNodeStatus = (typeof P2P_PROGRESS_NODE_STATUS_VALUES)[number];
 
+const P2P_PROGRESS_NODE_DONE_ALIASES = new Set<string>([
+  'done',
+  'completed',
+]);
+
+const P2P_PROGRESS_NODE_ACTIVE_ALIASES = new Set<string>([
+  'active',
+  'running',
+  'dispatched',
+]);
+
+const P2P_PROGRESS_NODE_SKIPPED_ALIASES = new Set<string>([
+  'skipped',
+  'failed',
+  'timed_out',
+  'cancelled',
+]);
+
+/** Normalize daemon/server progress aliases into the four UI node states. */
+export function normalizeP2pProgressNodeStatus(status: unknown): P2pProgressNodeStatus {
+  const value = typeof status === 'string' ? status : '';
+  if (P2P_PROGRESS_NODE_DONE_ALIASES.has(value)) return 'done';
+  if (P2P_PROGRESS_NODE_ACTIVE_ALIASES.has(value)) return 'active';
+  if (P2P_PROGRESS_NODE_SKIPPED_ALIASES.has(value)) return 'skipped';
+  return 'pending';
+}
+
 export const P2P_PROGRESS_NODE_PHASE_VALUES = [
   'initial',
   'hop',

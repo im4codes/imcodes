@@ -2,6 +2,14 @@ import { describe, expect, it, vi } from 'vitest';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { sanitizeTimelineHistoryEventsForTransport } from '../../src/daemon/timeline-history-sanitize.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_SCHEMA_VERSION,
+  SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_DIAGNOSTIC,
+} from '../../shared/sdk-subagent-status.js';
 
 function event(overrides: Partial<TimelineEvent>): TimelineEvent {
   return {
@@ -149,6 +157,160 @@ describe('timeline history transport sanitization', () => {
     }]);
   });
 
+  it('collects detail refs from the safe projection for SDK sub-agent events', () => {
+    const refs: Array<{ fieldPath: string; value: string }> = [];
+    const hugeRawOutput = `sdk-sensitive:${'s'.repeat(64 * 1024)}`;
+    const result = sanitizeTimelineHistoryEventsForTransport([
+      event({
+        eventId: 'sdk-safe-ref-source',
+        type: 'tool.result',
+        hidden: true,
+        payload: {
+          output: hugeRawOutput,
+          detail: {
+            kind: SDK_SUBAGENT_DETAIL_KIND,
+            summary: 'SDK failed',
+            raw: { prompt: hugeRawOutput },
+            meta: {
+              isSdkSubagent: true,
+              schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+              provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+              providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+              canonicalKey: 'claude:deck_hist:task-safe-ref',
+              normalizedStatus: SDK_SUBAGENT_STATUS.ERROR,
+              active: false,
+              terminal: true,
+              taskId: 'task-safe-ref',
+            },
+          },
+        },
+      }),
+    ], {
+      detailSink: {
+        put: (input) => {
+          refs.push({ fieldPath: input.fieldPath, value: input.value });
+          return {
+            detailId: `td_${refs.length}`,
+            eventId: input.eventId,
+            fieldPath: input.fieldPath,
+            previewBytes: input.previewBytes,
+            expiresAt: 123,
+          };
+        },
+      },
+    });
+
+    expect(result.events).toHaveLength(1);
+    expect(result.detailRefs).toEqual([]);
+    expect(refs).toEqual([]);
+    expect(JSON.stringify(result.events[0])).not.toContain(hugeRawOutput);
+    expect(JSON.stringify(result.events[0])).not.toContain('sdk-sensitive');
+  });
+
+  it('uses timeline order, not input order, when folding duplicate stable SDK event ids', () => {
+    const newest = event({
+      eventId: 'transport-tool:deck_hist:sdk-task:call',
+      type: 'tool.call',
+      ts: 10,
+      seq: 10,
+      hidden: true,
+      payload: {
+        tool: 'Agent',
+        detail: {
+          kind: SDK_SUBAGENT_DETAIL_KIND,
+          summary: 'Newest progress',
+          meta: {
+            isSdkSubagent: true,
+            schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+            provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+            providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+            canonicalKey: 'claude:deck_hist:task-order',
+            normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+            active: true,
+            terminal: false,
+            taskId: 'task-order',
+          },
+        },
+      },
+    });
+    const older = event({
+      ...newest,
+      ts: 1,
+      seq: 1,
+      payload: {
+        tool: 'Agent',
+        detail: {
+          kind: SDK_SUBAGENT_DETAIL_KIND,
+          summary: 'Older progress',
+          meta: {
+            isSdkSubagent: true,
+            schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+            provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+            providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+            canonicalKey: 'claude:deck_hist:task-order',
+            normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+            active: true,
+            terminal: false,
+            taskId: 'task-order',
+          },
+        },
+      },
+    });
+
+    const result = sanitizeTimelineHistoryEventsForTransport([newest, older]);
+
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]?.payload.detail).toMatchObject({
+      summary: 'Newest progress',
+      meta: { canonicalKey: 'claude:deck_hist:task-order' },
+    });
+  });
+
+  it('bounds diagnostic SDK raw payloads before history transport', () => {
+    const wideRaw: Record<string, string | string[]> = {
+      messages: ['secret child prompt'],
+    };
+    for (let index = 0; index < 32; index += 1) {
+      wideRaw[`visible_${index}`] = 'x'.repeat(64 * 1024);
+    }
+    const result = sanitizeTimelineHistoryEventsForTransport([
+      event({
+        eventId: 'sdk-diagnostic-raw-budget',
+        type: 'tool.result',
+        hidden: true,
+        payload: {
+          detail: {
+            kind: SDK_SUBAGENT_DETAIL_KIND,
+            summary: 'Malformed payload',
+            raw: wideRaw,
+            meta: {
+              isSdkSubagent: true,
+              schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+              provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+              providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+              canonicalKey: 'claude:deck_hist:diagnostic',
+              normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
+              active: false,
+              terminal: true,
+              diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.MALFORMED_PAYLOAD,
+            },
+          },
+        },
+      }),
+    ]);
+
+    expect(result.events).toHaveLength(1);
+    expect(Buffer.byteLength(JSON.stringify(result.events[0]), 'utf8')).toBeLessThan(8 * 1024);
+    expect(JSON.stringify(result.events[0])).not.toContain('secret child prompt');
+    expect(result.events[0]?.payload.detail).toMatchObject({
+      kind: SDK_SUBAGENT_DETAIL_KIND,
+      raw: {
+        truncated: true,
+        originalBytesBucket: expect.any(String),
+      },
+    });
+  });
+
   it('bounds extremely wide synthetic objects without allocating a full transport payload', () => {
     const wideRaw: Record<string, unknown> = {};
     for (let index = 0; index < 2_000; index += 1) {
@@ -252,5 +414,78 @@ describe('timeline history transport sanitization', () => {
     expect(result.truncatedEvents).toBeGreaterThan(0);
     expect(payloadToJson).not.toHaveBeenCalled();
     expect(eventToJson).not.toHaveBeenCalled();
+  });
+
+  it('deduplicates stable event ids and strips normal SDK sub-agent raw fields for history', () => {
+    const oldProgress = event({
+      eventId: 'transport-tool:deck_hist:sdk-task:call',
+      type: 'tool.call',
+      ts: 1,
+      seq: 1,
+      hidden: true,
+      payload: {
+        tool: 'Agent',
+        detail: {
+          kind: SDK_SUBAGENT_DETAIL_KIND,
+          summary: 'Old progress',
+          raw: { prompt: 'SECRET_OLD_PROMPT' },
+          meta: {
+            isSdkSubagent: true,
+            schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+            provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+            providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+            canonicalKey: 'claude:deck_hist:task-1',
+            normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+            active: true,
+            terminal: false,
+            taskId: 'task-1',
+            description: 'SECRET_DESCRIPTION',
+          },
+        },
+      },
+    });
+    const latestProgress = event({
+      ...oldProgress,
+      ts: 2,
+      seq: 2,
+      payload: {
+        tool: 'Agent',
+        detail: {
+          kind: SDK_SUBAGENT_DETAIL_KIND,
+          summary: 'Latest progress',
+          raw: { prompt: 'SECRET_LATEST_PROMPT' },
+          meta: {
+            isSdkSubagent: true,
+            schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+            provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+            providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+            canonicalKey: 'claude:deck_hist:task-1',
+            normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+            active: true,
+            terminal: false,
+            taskId: 'task-1',
+            description: 'SECRET_DESCRIPTION',
+          },
+        },
+      },
+    });
+
+    const result = sanitizeTimelineHistoryEventsForTransport([oldProgress, latestProgress]);
+
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]?.payload.detail).toMatchObject({
+      kind: SDK_SUBAGENT_DETAIL_KIND,
+      summary: 'Latest progress',
+      meta: {
+        canonicalKey: 'claude:deck_hist:task-1',
+        normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+        active: true,
+        terminal: false,
+        taskId: 'task-1',
+      },
+    });
+    expect(JSON.stringify(result.events[0])).not.toContain('SECRET');
+    expect(JSON.stringify(result.events[0])).not.toContain('raw');
+    expect(JSON.stringify(result.events[0])).not.toContain('description');
   });
 });

@@ -46,6 +46,9 @@
     "retry": "다시 시도"
   },
   "chat": {
+    "dpad": {
+      "title": "방향키 — 드래그하여 이동"
+    },
     "sendFailedReason": {
       "daemonOffline": "연결이 끊어졌습니다",
       "ackTimeout": "에이전트 응답 없음",
@@ -90,6 +93,44 @@
     "show_file_panel": "파일 패널 열기",
     "hide_file_panel": "파일 패널 닫기",
     "sync_history": "채팅 기록 동기화",
+    "sdk_agents_toggle": "Agents",
+    "sdk_agents_toggle_aria": "SDK agents 상태 전환, {{count}}개 실행 중",
+    "sdk_agents_badge_aria": "SDK agents {{count}}개 실행 중",
+    "sdk_agents_panel_title": "Agents",
+    "sdk_agents_close": "Agents 패널 닫기",
+    "sdk_agents_running_count": "{{count}}개 실행 중",
+    "sdk_agents_active_section": "활성",
+    "sdk_agents_recent_section": "최근",
+    "sdk_agents_diagnostics_section": "진단",
+    "sdk_agents_provider_claude": "Claude SDK",
+    "sdk_agents_provider_codex": "Codex SDK",
+    "sdk_agents_provider_qwen": "Qwen",
+    "sdk_agents_provider_gemini": "Gemini SDK",
+    "sdk_agents_provider_unknown": "SDK agent",
+    "sdk_agents_status_pending": "대기 중",
+    "sdk_agents_status_running": "실행 중",
+    "sdk_agents_status_complete": "완료",
+    "sdk_agents_status_error": "오류",
+    "sdk_agents_status_interrupted": "중단됨",
+    "sdk_agents_status_stale": "오래됨",
+    "sdk_agents_status_unknown": "알 수 없음",
+    "sdk_agents_id": "ID",
+    "sdk_agents_model": "모델",
+    "sdk_agents_started_at": "시작",
+    "sdk_agents_duration": "실행 시간",
+    "sdk_agents_tokens": "토큰",
+    "sdk_agents_prompt": "Prompt",
+    "sdk_agents_result": "결과",
+    "sdk_agents_running_children": "하위 agent {{count}}개 실행 중",
+    "sdk_agents_receiver_count": "수신자 {{count}}개",
+    "sdk_agents_diagnostic_unsupported_runtime": "runtime이 agent 상태를 제공하지 않습니다",
+    "sdk_agents_diagnostic_unknown_runtime_support": "runtime 지원 상태를 알 수 없습니다",
+    "sdk_agents_diagnostic_malformed_payload": "agent 메타데이터 형식이 잘못되었습니다",
+    "sdk_agents_diagnostic_missing_id": "agent 식별자가 없습니다",
+    "sdk_agents_diagnostic_unknown_state": "알 수 없는 provider 상태",
+    "sdk_agents_diagnostic_stale_without_terminal": "완료 전에 상태가 오래되었습니다",
+    "sdk_agents_diagnostic_snapshot_only": "provider 상태가 snapshot 전용입니다",
+    "sdk_agents_diagnostic_generic": "agent 상태 진단",
     "html_preview": "HTML 렌더링",
     "html_preview_title": "렌더링된 HTML 미리보기",
     "html_preview_open_new_window": "새 창에서 미리보기 열기",
@@ -183,7 +224,33 @@
     "file_change_no_after": "(새 텍스트 없음)",
     "file_change_derived_no_preview": "(미리보기 없음)",
     "file_change_coarse_hint": "파일 경로는 있지만 diff 텍스트가 제공되지 않았습니다.",
-    "file_change_renamed_from": "{{oldPath}} → {{newPath}}"
+    "file_change_renamed_from": "{{oldPath}} → {{newPath}}",
+    "font": {
+      "dialogLabel": "글꼴",
+      "typeLabel": "글꼴 유형",
+      "codeTab": "코드",
+      "cjkTab": "한국어",
+      "familyLabel": "코드 글꼴",
+      "cjkFamilyLabel": "한국어 글꼴",
+      "allBuiltInCjk": "내장 CJK 글꼴 모두 보기",
+      "cjkFamilies": {
+        "system-cjk": "시스템 CJK",
+        "pingfang-sc": "PingFang SC",
+        "songti-sc": "Songti SC",
+        "kaiti-sc": "Kaiti SC",
+        "stheiti": "STHeiti",
+        "stsong": "STSong",
+        "stkaiti": "STKaiti",
+        "stfangsong": "STFangsong",
+        "microsoft-yahei": "Microsoft YaHei",
+        "simsun": "SimSun",
+        "nsimsun": "NSimSun",
+        "dengxian": "DengXian",
+        "kaiti": "KaiTi",
+        "fangsong": "FangSong",
+        "microsoft-jhenghei": "Microsoft JhengHei"
+      }
+    }
   },
   "session": {
     "restart": "↺ 재시작",
@@ -369,6 +436,9 @@
     "codex_limit_title": "{{label}} {{percent}}% 남음 · {{reset}}에 재설정",
     "provider_plan_title": "플랜: {{value}}",
     "provider_quota_title": "한도: {{value}}",
+    "weekly_quota_authorize": "주간 한도 표시",
+    "weekly_quota_authorize_hint": "로컬 Claude 토큰 읽기를 허용하여 주간(7일) 한도를 표시합니다",
+    "weekly_quota_confirm": "주간(7일) 한도를 가져오기 위해 로컬 Claude 로그인 토큰을 읽습니다. 인증하시겠습니까?",
     "provider_quota_usage_title": "사용량: {{value}}",
     "history_loading_label": "기록",
     "history_step_cache": "캐시",
@@ -539,7 +609,8 @@
   "toast": {
     "finished": "완료됨",
     "upgrade_blocked_title": "업그레이드 차단됨",
-    "upgrade_blocked_p2p_active": "Team가 아직 실행 중입니다. daemon을 업그레이드하기 전에 먼저 중지하세요."
+    "upgrade_blocked_p2p_active": "Team가 아직 실행 중입니다. daemon을 업그레이드하기 전에 먼저 중지하세요.",
+    "upgrade_blocked_toolchain_unavailable": "daemon 호스트에 Node가 없습니다(툴체인 제거됨). Node를 다시 설치하세요. 그 전까지 자동 업그레이드가 비활성화됩니다."
   },
   "discussion": {
     "role_critic": "비평가",
@@ -547,7 +618,25 @@
     "role_innovator": "혁신가",
     "role_custom": "사용자 정의...",
     "arbiter": "중재자",
-    "arbiter_active": "⚖️ 중재자"
+    "arbiter_active": "⚖️ 중재자",
+    "starting": "시작 중…",
+    "start_failed_title": "토론을 시작하지 못했습니다",
+    "start_failed_offline": "오프라인 상태입니다. 다시 연결한 후 시도하세요.",
+    "dialog_title": "토론 시작",
+    "start_button": "토론 시작",
+    "field_topic": "주제",
+    "topic_placeholder": "에이전트가 논의할 내용을 설명하세요…",
+    "field_cwd": "작업 디렉터리",
+    "field_participants": "참여자",
+    "add_participant": "+ 추가",
+    "field_max_rounds": "최대 라운드",
+    "team_label": "팀",
+    "complete_status": "완료",
+    "failed_status": "실패",
+    "error": {
+      "missing_fields": "필수 항목이 누락되었습니다 (주제 및 참여자 2명 이상).",
+      "generic": "토론을 시작하지 못했습니다. 다시 시도하세요."
+    }
   },
   "new_session": {
     "project_required": "프로젝트 이름은 필수입니다",
@@ -763,6 +852,8 @@
       "agents": "에이전트",
       "search_project_files": "프로젝트 파일 검색",
       "quick_discussion_with_agent": "에이전트와 빠른 토론",
+      "team": "Team",
+      "team_desc": "팀 토론 시작",
       "select_mode": "모드 선택",
       "all_agents": "모든 에이전트",
       "sessions": "세션",
@@ -785,6 +876,7 @@
     "dropdown": {
       "tab_combos": "콤보",
       "tab_workflows": "워크플로",
+      "solo_hint": "아래 흐름을 선택해 워크플로를 시작",
       "team_intro_title": "Team 토론",
       "team_intro_body": "에이전트가 토론하고 요약한 뒤 구현하고 결과를 검토합니다. 라운드를 늘리면 이 루프를 반복해 결과를 강화합니다.",
       "team_intro_tooltip": "토론 → 요약 → 구현 → 검토. 라운드를 늘리면 이전 결과를 바탕으로 루프를 반복합니다.",
@@ -817,6 +909,7 @@
     "combo_send_confirm_skip": "다음부터 묻지 않고 바로 전송",
     "combo_empty_message_warning": "콤보 전송에는 실제 메시지 본문이 필요합니다. 내용을 입력한 뒤 전송하세요.",
     "combo_requires_participants_hint": "콤보 모드를 쓰려면 먼저 Team 설정에서 참여자를 선택하세요.",
+    "member_cannot_initiate_discussion": "이 세션은 Team 멤버이므로 토론을 시작할 수 없습니다. 다른 세션에서 시작하세요(최상위 모델 권장).",
     "settings_enabled": "참여",
     "settings_mode": "모드",
     "settings_skip": "건너뛰기",
@@ -1233,7 +1326,9 @@
     "empty": "로컬 포트와 경로를 입력한 다음 미리보기를 여세요.",
     "noServer": "먼저 서버를 선택하세요.",
     "previewing": "미리보기 중：",
-    "initialPathNote": "이 경로는 처음 여는 페이지만 지정합니다. 로드 후 탐색 범위는 이 경로가 아니라 포트 기준입니다."
+    "initialPathNote": "이 경로는 처음 여는 페이지만 지정합니다. 로드 후 탐색 범위는 이 경로가 아니라 포트 기준입니다.",
+    "portHistoryLabel": "최근 포트",
+    "pathHistoryLabel": "최근 경로"
   },
   "cron": {
     "title": "예약 작업",
@@ -1257,6 +1352,12 @@
     "action_type": "작업 유형",
     "action_command": "명령",
     "action_p2p": "Team 토론",
+    "send_target": "받는 세션",
+    "send_target_placeholder": "정확한 세션 이름, 라벨 또는 에이전트 유형",
+    "send_message": "메시지",
+    "send_message_placeholder": "보낼 메시지를 입력하세요...",
+    "send_reply": "받는 쪽에 답장 요청",
+    "send_broadcast": "형제 세션에 브로드캐스트",
     "command": "명령",
     "command_placeholder": "에이전트에 보낼 명령을 입력하세요...",
     "shell_hint": "팁: Shell 세션은 스크립트를 직접 실행할 수 있습니다. 스크립트 경로만 입력하세요 (예: /path/to/script.sh)",
@@ -2002,5 +2103,11 @@
       "enforced": "강제",
       "additive": "추가"
     }
+  },
+  "todos": {
+    "title": "작업",
+    "progress": "{{done}}/{{total}}",
+    "collapse": "접기",
+    "expand": "펼치기"
   }
 }

@@ -1069,7 +1069,7 @@ afterEach(() => {
 
     const menu = screen.getByTestId('p2p-dropdown');
     const rounds = within(menu).getByTestId('p2p-dropdown-rounds');
-    const solo = within(menu).getByRole('button', { name: /Team$/i });
+    const solo = within(menu).getByRole('button', { name: /solo_hint$/i });
     expect(rounds.compareDocumentPosition(solo) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 
     fireEvent.click(within(rounds).getByTestId('p2p-dropdown-round-2'));
@@ -2814,11 +2814,39 @@ afterEach(() => {
     // Transport sessions cancel the SDK turn directly instead of sending
     // `/stop` as chat text.
     expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
+    expect(screen.getByRole('button', { name: /^stop$/i }).classList.contains('shortcut-btn-stop-pending')).toBe(true);
     expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({
       sessionName: 'qwen-session',
       text: '/stop',
     }));
     expect(ws.sendInput).not.toHaveBeenCalled();
+  });
+
+  it('pressing Escape in a running transport sub-session uses the same Stop feedback', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'deck_sub_worker',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+        })}
+        subSessionId="worker"
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    expectUrgentCancelPayload(ws, { sessionName: 'deck_sub_worker' });
+    expect(screen.getByRole('button', { name: /^stop$/i }).classList.contains('shortcut-btn-stop-pending')).toBe(true);
+    expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({
+      sessionName: 'deck_sub_worker',
+      text: '/stop',
+    }));
   });
 
   it('keeps transport Stop enabled even when session state is idle', () => {
@@ -3327,6 +3355,28 @@ afterEach(() => {
 
     expect(input.textContent).toBe('@@w1(discuss) ');
     getSelectionSpy.mockRestore();
+  });
+
+  it('@@ opens the Team dropdown (combos/workflows) and strips the trigger, keeping the topic', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        sessions={[mainSession]}
+        subSessions={[
+          { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
+        ]}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'audit this module @@';
+    fireEvent.input(input);
+    // The @@ trigger is stripped; the preceding text is kept as the discussion topic.
+    expect(input.textContent).toBe('audit this module ');
+    // The Team dropdown (combos/workflows) opens — not the single-agent picker.
+    expect(screen.getByTestId('p2p-dropdown-tab-combos')).toBeDefined();
   });
 
   it('sends p2pAtTargets in textbox order, not selection order', () => {

@@ -21,6 +21,9 @@ export interface PreviewReadWorkerErrorCodes {
   staleRead: FsReadErrorCode;
   invalidRequest: FsReadErrorCode;
   internalError: FsReadErrorCode;
+  /** Optional: code returned when the path is a directory. Falls back to
+   *  internalError when a caller (e.g. an older test deps) doesn't supply it. */
+  isDirectory?: FsReadErrorCode;
 }
 
 export interface PreviewReadWorkerPreviewReasons {
@@ -33,6 +36,7 @@ export interface PreviewReadWorkerStatView {
   mtimeMs: number;
   size: number;
   isFile?: () => boolean;
+  isDirectory?: () => boolean;
 }
 
 export interface PreviewReadWorkerDependencies {
@@ -138,6 +142,11 @@ async function handlePreflight(
 
   const stats = await deps.stat(realPath);
   if (stats.isFile && !stats.isFile()) {
+    // A directory is not a "failed" preview — signal it distinctly so the
+    // client can open the folder listing instead of showing a preview error.
+    if (stats.isDirectory?.()) {
+      return workerError(message, deps.errorCodes.isDirectory ?? deps.errorCodes.internalError);
+    }
     return workerError(message, deps.errorCodes.internalError);
   }
 
@@ -325,6 +334,7 @@ export async function createDefaultPreviewReadWorkerDependencies(): Promise<Prev
       staleRead: pickString(errorContainer, ['STALE_READ', 'staleRead']) as FsReadErrorCode,
       invalidRequest: pickString(errorContainer, ['INVALID_REQUEST', 'invalidRequest']) as FsReadErrorCode,
       internalError: pickString(errorContainer, ['INTERNAL_ERROR', 'internalError']) as FsReadErrorCode,
+      isDirectory: pickString(errorContainer, ['IS_DIRECTORY', 'isDirectory']) as FsReadErrorCode,
     },
     previewReasons: {
       binary: pickString(previewReasonContainer, ['BINARY', 'binary']) as FsReadPreviewReason,

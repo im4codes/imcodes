@@ -16,10 +16,16 @@ import { resolveContextWindow } from '../util/model-context.js';
 import { getSession } from '../store/session-store.js';
 import { getCachedPresetContextWindow } from './cc-presets.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
+import { ASK_QUESTION_WAIT_MS } from '../../shared/ask-question-timing.js';
 import { normalizeCodexSdkFileChange, normalizeQwenFileChange } from './file-change-normalizer.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '../../shared/usage-context-window.js';
 import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
+import {
+  buildSdkSubagentTimelinePayload,
+  normalizeSdkSubagentKeyComponent,
+  parseSdkSubagentDetail,
+} from '../../shared/sdk-subagent-status.js';
 
 let sendToServer: ((msg: Record<string, unknown>) => void) | null = null;
 const inFlightMessages = new Map<string, { messageId: string; eventId: string; text: string }>();
@@ -33,6 +39,19 @@ const pendingStreamUpdates = new Map<string, {
 const STREAM_UPDATE_INTERVAL_MS = 40;
 const pendingFileLikeTools = new Map<string, ToolCallEvent>();
 const completedFileLikeTools = new Set<string>();
+const CHECKLIST_TOOL_NAMES = new Set([
+  'todowrite',
+  'todo_write',
+  'write_todos',
+  'update_plan',
+  'update_todo_list',
+  'set_plan',
+]);
+// `${sessionName}:${toolUseId}` of AskUserQuestion calls surfaced as ask.question
+// cards. Their tool_result (which the SDK re-emits as a generic name:'tool' event,
+// marked is_error when the answer came back via canUseTool deny) is suppressed so
+// it doesn't render as a stray "< error: <answer>" line in the timeline.
+const askQuestionToolIds = new Set<string>();
 const MAX_TRACKED_FILE_TOOLS = 512;
 
 function isCompactControlCompletion(message: AgentMessage): boolean {
@@ -58,6 +77,56 @@ function rememberPendingFileLikeTool(key: string, tool: ToolCallEvent): void {
   if (pendingFileLikeTools.size <= MAX_TRACKED_FILE_TOOLS) return;
   const oldestKey = pendingFileLikeTools.keys().next().value;
   if (oldestKey) pendingFileLikeTools.delete(oldestKey);
+}
+
+function isChecklistTool(tool: ToolCallEvent): boolean {
+  const name = tool.name.toLowerCase();
+  const detailKind = String(tool.detail?.kind ?? '').toLowerCase();
+  return CHECKLIST_TOOL_NAMES.has(name) || detailKind === 'plan';
+}
+
+function emitChecklistToolCall(sessionName: string, tool: ToolCallEvent): void {
+  timelineEmitter.emit(sessionName, 'tool.call', {
+    tool: tool.name,
+    ...(tool.input !== undefined ? { input: tool.input } : {}),
+    ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
+  }, {
+    source: 'daemon',
+    confidence: 'high',
+    eventId: `transport-tool:${sessionName}:${tool.id}:call`,
+  });
+  void appendTransportEvent(sessionName, {
+    type: 'tool.call',
+    sessionId: sessionName,
+    tool: tool.name,
+    ...(tool.input !== undefined ? { input: tool.input } : {}),
+    ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
+  });
+}
+
+function emitToolResult(sessionName: string, tool: ToolCallEvent): void {
+  timelineEmitter.emit(sessionName, 'tool.result', {
+    ...(tool.status === 'error'
+      ? { error: tool.output ?? 'error' }
+      : tool.output !== undefined
+        ? { output: tool.output }
+        : {}),
+    ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
+  }, {
+    source: 'daemon',
+    confidence: 'high',
+    eventId: `transport-tool:${sessionName}:${tool.id}:result`,
+  });
+  void appendTransportEvent(sessionName, {
+    type: 'tool.result',
+    sessionId: sessionName,
+    ...(tool.status === 'error'
+      ? { error: tool.output ?? 'error' }
+      : tool.output !== undefined
+        ? { output: tool.output }
+        : {}),
+    ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
+  });
 }
 
 function emitStreamingAssistantText(sessionName: string, eventId: string, text: string): void {
@@ -297,6 +366,98 @@ export function wireProviderToRelay(provider: TransportProvider): void {
   provider.onToolCall?.((providerSid: string, tool: ToolCallEvent) => {
     const sessionName = resolveSessionName(providerSid);
     if (!sessionName) return;
+
+    // Suppress the tool_result of an AskUserQuestion we already surfaced as a
+    // card. The SDK re-emits it as a generic name:'tool' event (is_error when the
+    // answer was delivered via canUseTool deny) — rendering it would show a
+    // confusing "< error: <answer>" line. The card + the model's continuation
+    // already convey the outcome.
+    const askResultKey = `${sessionName}:${tool.id}`;
+    if (tool.name !== 'AskUserQuestion' && askQuestionToolIds.has(askResultKey)) {
+      if (tool.status !== 'running') askQuestionToolIds.delete(askResultKey);
+      return;
+    }
+
+    // AskUserQuestion is an interactive tool: surface it as an `ask.question`
+    // event so the web renders the question/options dialog (same payload shape
+    // the process/JSONL path emits) instead of a raw `> AskUserQuestion {...}`
+    // tool-call line. The chosen answer comes back via `ask.answer` and is
+    // delivered to the provider as the next user turn (see handleAskAnswer).
+    if (tool.name === 'AskUserQuestion') {
+      // The tool input (the questions) streams in incrementally, so it is only
+      // populated once the call is COMPLETE — emitting at 'running' would surface
+      // an empty card. The SDK self-continues without a tool_result, so the
+      // completed call is the right (and only) moment to show the question.
+      if (tool.status !== 'running') {
+        const askInput = (tool.input ?? {}) as Record<string, unknown>;
+        const questions = Array.isArray(askInput.questions)
+          ? askInput.questions
+          : (askInput.question || askInput.options ? [askInput] : []);
+        if (questions.length > 0) {
+          askQuestionToolIds.add(`${sessionName}:${tool.id}`);
+          timelineEmitter.emit(sessionName, 'ask.question', {
+            toolUseId: tool.id,
+            questions,
+            waitMs: ASK_QUESTION_WAIT_MS,
+          }, {
+            source: 'daemon',
+            confidence: 'high',
+            eventId: `transport-ask:${sessionName}:${tool.id}`,
+          });
+        }
+      }
+      return;
+    }
+
+    const sdkDetail = parseSdkSubagentDetail(tool.detail);
+    if (sdkDetail.kind === 'malformed-sdk') {
+      logger.warn({ toolId: tool.id, reason: sdkDetail.reason }, 'transport-relay: dropping malformed sdk sub-agent detail');
+      return;
+    }
+    if (sdkDetail.kind === 'ok') {
+      const sdkPayload = buildSdkSubagentTimelinePayload({
+        ...tool,
+        detail: sdkDetail.detail,
+      }, {
+        allowRaw: Boolean(sdkDetail.detail.meta.diagnosticCode),
+      });
+      if (!sdkPayload) return;
+      const eventToolId = normalizeSdkSubagentKeyComponent(tool.id || sdkDetail.detail.meta.canonicalKey);
+      // Agents replay uses main timeline (via timelineEmitter), NOT transport JSONL.
+      // SDK tool.call/tool.result are hidden from transport history (transport-history only
+      // keeps user.message / assistant.text / tool.result for normal tools).  Do NOT
+      // appendTransportEvent here — it would write dead entries that shouldKeepTransportHistoryEvent
+      // would immediately discard, wasting memory and polluting the transport log.
+      if (tool.status === 'running') {
+        timelineEmitter.emit(sessionName, 'tool.call', sdkPayload.payload, {
+          source: 'daemon',
+          confidence: 'high',
+          eventId: `transport-tool:${sessionName}:${eventToolId}:call`,
+          hidden: true,
+        });
+        return;
+      }
+
+      timelineEmitter.emit(sessionName, 'tool.result', sdkPayload.payload, {
+        source: 'daemon',
+        confidence: 'high',
+        eventId: `transport-tool:${sessionName}:${eventToolId}:result`,
+        hidden: true,
+      });
+      return;
+    }
+
+    if (isChecklistTool(tool)) {
+      // Plan/checklist snapshots are state, not file edits. In particular,
+      // Codex SDK can surface a `todo_list` item only at completion; if we let
+      // `update_plan` flow into the generic file-like deferral path (because
+      // its name contains "update"), the web receives only tool.result and the
+      // pinned checklist has no tool.call to render.
+      emitChecklistToolCall(sessionName, tool);
+      if (tool.status !== 'running') emitToolResult(sessionName, tool);
+      return;
+    }
+
     const fileChangeKey = `${sessionName}:${tool.id}`;
 
     const initialToolKind = String(tool.detail?.kind ?? '').toLowerCase();
@@ -433,28 +594,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       return;
     }
 
-    timelineEmitter.emit(sessionName, 'tool.result', {
-      ...(tool.status === 'error'
-        ? { error: tool.output ?? 'error' }
-        : tool.output !== undefined
-          ? { output: tool.output }
-          : {}),
-      ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
-    }, {
-      source: 'daemon',
-      confidence: 'high',
-      eventId: `transport-tool:${sessionName}:${tool.id}:result`,
-    });
-    void appendTransportEvent(sessionName, {
-      type: 'tool.result',
-      sessionId: sessionName,
-      ...(tool.status === 'error'
-        ? { error: tool.output ?? 'error' }
-        : tool.output !== undefined
-          ? { output: tool.output }
-          : {}),
-      ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
-    });
+    emitToolResult(sessionName, tool);
   });
 
   provider.onStatus?.((providerSid: string, status: ProviderStatusUpdate) => {

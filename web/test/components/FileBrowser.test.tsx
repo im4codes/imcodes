@@ -28,7 +28,7 @@ vi.mock('../../src/components/FilePreviewPane.js', () => ({
   default: (props: { content: string }) => <div data-testid="mock-file-preview">{props.content}</div>,
 }));
 
-import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState } from '../../src/components/FileBrowser.js';
+import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState, getParentDir } from '../../src/components/FileBrowser.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 
@@ -2032,5 +2032,60 @@ describe('FileBrowser', () => {
     }
 
     expect(fsListDir.mock.calls.length).toBeGreaterThan(callsBefore);
+  });
+});
+
+describe('getParentDir', () => {
+  it('returns the parent of a unix path', () => {
+    expect(getParentDir('/a/b/c.txt')).toBe('/a/b');
+    expect(getParentDir('/a/b/')).toBe('/a'); // trailing slash ignored
+    expect(getParentDir('/a')).toBe('/');     // direct child of root
+  });
+  it('returns the parent of a windows path, including the drive root', () => {
+    expect(getParentDir('C:\\a\\b.txt')).toBe('C:\\a');
+    expect(getParentDir('C:\\a')).toBe('C:\\'); // drive root keeps trailing backslash
+  });
+  it('returns null when there is no parent', () => {
+    expect(getParentDir('/')).toBeNull();
+    expect(getParentDir('foo')).toBeNull();
+    expect(getParentDir('')).toBeNull();
+  });
+});
+
+describe('FileBrowser — file-manager preview/folder sync', () => {
+  it('previewing a file re-roots the left list to the file\'s parent directory (bug A)', async () => {
+    const { ws, fsListDir } = makeWsFactory();
+    await act(async () => {
+      render(
+        <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user"
+          autoPreviewPath="/home/user/sub/deep.ts" onConfirm={vi.fn()} />,
+      );
+    });
+    // The left tree navigated to the previewed file's folder (its siblings).
+    await waitFor(() => expect(fsListDir).toHaveBeenCalledWith('/home/user/sub', true, true));
+  });
+
+  it('previewing a folder opens its listing instead of "preview failed" (bug B)', async () => {
+    const { ws, fsListDir, sendMsg } = makeWsFactory();
+    await act(async () => {
+      render(
+        <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user"
+          autoPreviewPath="/home/user/somedir" onConfirm={vi.fn()} />,
+      );
+    });
+    // Daemon reports the "file" preview target is actually a directory.
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/somedir',
+        status: 'error',
+        error: FS_READ_ERROR_CODES.IS_DIRECTORY,
+      } as unknown as ServerMessage);
+    });
+    // The folder's listing is opened in the left tree (navigated into it)...
+    await waitFor(() => expect(fsListDir).toHaveBeenCalledWith('/home/user/somedir', true, true));
+    // ...and no "preview failed" error is rendered.
+    expect(screen.queryByText('file_browser.preview_error')).toBeNull();
   });
 });
