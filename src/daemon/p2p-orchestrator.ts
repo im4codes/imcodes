@@ -1811,6 +1811,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       const summaryOk = await dispatchHop(run, run.initiatorSession, roundSummaryPrompt, serverLink, {
         sectionHeader: roundSummaryHeader,
         required: true,
+        executionMarkerSpec: inlineExecutionSpec,
       });
       if (!summaryOk && (run._cancelled || isTerminal(run.status))) return;
       run.summaryPhase = summaryOk ? 'completed' : 'failed';
@@ -3351,6 +3352,7 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   const summaryOk = await dispatchHop(run, run.initiatorSession, finalPrompt, serverLink, {
     sectionHeader: `${discussionParticipantNameWithMode(run.initiatorSession, finalRound?.modeKey ?? run.mode)} — Final Summary`,
     required: true,
+    executionMarkerSpec: inlineExecutionSpec,
   });
   if (!summaryOk && (run._cancelled || isTerminal(run.status))) return;
   run.summaryPhase = summaryOk ? 'completed' : 'failed';
@@ -3388,6 +3390,7 @@ interface DispatchHopOptions {
   filePath?: string;
   hop?: P2pHopRuntime | null;
   required?: boolean;
+  executionMarkerSpec?: PostSummaryExecutionRuntimeSpec | null;
 }
 
 function normalizeDiscussionSectionHeader(value: string): string {
@@ -3444,15 +3447,12 @@ async function dispatchHop(
   const watchPath = localCopyPath ?? sourcePath;
   if (hop) hop.working_path = watchPath;
   const MAX_RETRIES = 0;
-  // Required hops (initiator initial-analysis + round summaries) cannot be
-  // skipped — a timeout here fails the ENTIRE run, unlike participant hops
-  // which are tolerant (Promise.allSettled + required:false → skipped). Give
-  // these non-skippable hops a doubled wait window so a host that is
-  // deliberating (large context, deep reasoning) isn't killed at the base
-  // deadline and take the whole discussion down with it. Do not auto-resend
-  // the same prompt after a successful dispatch: a queued-empty transport has
-  // accepted the message, and duplicate analysis/summary prompts corrupt the
-  // shared discussion file.
+  // Required legacy hops (initiator initial-analysis + round summaries) get a
+  // doubled wait window because they are more important than ordinary
+  // participant hops. If they still produce no output, mark that legacy hop
+  // skipped and continue with the evidence we have instead of re-sending the
+  // same prompt after a successful dispatch. Advanced workflow rounds keep
+  // their strict per-round timeout semantics.
   const REQUIRED_HOP_TIMEOUT_MULTIPLIER = 2;
   const effectiveTimeoutMs = required
     ? run.timeoutMs * REQUIRED_HOP_TIMEOUT_MULTIPLIER
@@ -3609,6 +3609,25 @@ async function dispatchHop(
         return true;
       }
 
+      if (options.executionMarkerSpec) {
+        const markerState = await readPostSummaryExecutionMarker(options.executionMarkerSpec);
+        if (markerState?.ok || markerState?.failedByAgent) {
+          logger.info(
+            {
+              runId: run.id,
+              session,
+              markerPath: options.executionMarkerSpec.markerPath,
+              markerStatus: markerState.marker?.status,
+            },
+            'P2P: inline execution marker found while waiting for summary hop completion',
+          );
+          idleWaiter.cancel();
+          await finishHop('completed');
+          pushState(run, serverLink);
+          return true;
+        }
+      }
+
       const settleForGrowth = IDLE_POLL_MS * FILE_SETTLE_CYCLES;
       if (!headingFound && fileGrew && (lastSize - sizeBefore) > 500 &&
           lastGrowthAt > 0 && (Date.now() - lastGrowthAt) >= settleForGrowth &&
@@ -3753,6 +3772,16 @@ async function dispatchHop(
           return true;
         }
       } catch {}
+    }
+
+    if (required && !fileGrew && !run.advancedP2pEnabled) {
+      logger.warn(
+        { runId: run.id, session, activePhase: run.activePhase },
+        'P2P: required hop produced no discussion output — marking hop skipped without failing run',
+      );
+      await finishHop('failed', 'idle_without_file_change');
+      pushState(run, serverLink);
+      return false;
     }
 
     logger.warn({ runId: run.id, session }, 'P2P: hop timed out');

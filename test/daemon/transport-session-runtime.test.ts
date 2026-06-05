@@ -180,6 +180,7 @@ describe('TransportSessionRuntime', () => {
       sending: true,
       pendingCount: 1,
       activeDispatchCount: 1,
+      stalePendingRecoveryActive: false,
       providerSessionBound: true,
       lastActivityAgeMs: 250,
     });
@@ -1541,6 +1542,116 @@ ${PREFERENCE_CONTEXT_END}`;
     expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before + 1);
     const resentPayload = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
     expect(resentPayload.userMessage).toBe('queued-after-invariant-break');
+  });
+
+  it('drainPendingIfIdle sends queued messages when an idle runtime still has pending work', async () => {
+    runtime.send('first', 'cmd-first');
+    await flushDispatch();
+    runtime.send('queued-after-idle', 'cmd-queued-idle');
+    expect(runtime.pendingCount).toBe(1);
+
+    const internal = runtime as unknown as {
+      _status: 'idle';
+      _sending: boolean;
+      _activeTurn: unknown;
+    };
+    internal._status = 'idle';
+    internal._sending = false;
+    internal._activeTurn = null;
+
+    const before = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(runtime.drainPendingIfIdle('test-idle-pending')).toBe(true);
+    await flushDispatch();
+
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.sending).toBe(true);
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before + 1);
+    const resentPayload = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(resentPayload.userMessage).toBe('queued-after-idle');
+  });
+
+  it('cancels a stale active turn once so queued messages drain through the normal cancel callback', async () => {
+    runtime.send('first', 'cmd-first');
+    await flushDispatch();
+    runtime.send('queued-after-stale-active', 'cmd-queued-stale');
+    expect(runtime.pendingCount).toBe(1);
+
+    const internal = runtime as unknown as {
+      _lastActivityAt: number;
+    };
+    internal._lastActivityAt = 1_000;
+
+    expect(runtime.cancelStaleActiveTurnWithPending({
+      reason: 'test-stale-active',
+      nowMs: 11_001,
+      staleMs: 10_000,
+    })).toBe(true);
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(runtime.getDiagnosticSnapshot(11_001).stalePendingRecoveryActive).toBe(true);
+
+    expect(runtime.cancelStaleActiveTurnWithPending({
+      reason: 'test-stale-active-duplicate',
+      nowMs: 20_000,
+      staleMs: 10_000,
+    })).toBe(false);
+    expect(mock.provider.cancel).toHaveBeenCalledTimes(1);
+
+    const beforeDrainSendCount = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
+    mock.fireError('sess-1', { code: 'CANCELLED', message: 'cancelled stale turn', recoverable: true });
+    await flushDispatch();
+
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.sending).toBe(true);
+    expect(runtime.getDiagnosticSnapshot(20_000).stalePendingRecoveryActive).toBe(false);
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(beforeDrainSendCount + 1);
+    const resentPayload = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(resentPayload.userMessage).toBe('queued-after-stale-active');
+  });
+
+  it('ignores late provider deltas after a turn has already settled', async () => {
+    runtime.send('first', 'cmd-first');
+    await flushDispatch();
+    mock.fireDelta('sess-1');
+    expect(runtime.getStatus()).toBe('streaming');
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('idle');
+
+    mock.fireDelta('sess-1');
+
+    expect(runtime.getStatus()).toBe('idle');
+  });
+
+  it('settles a stale in-progress status when no active turn or queued work exists', async () => {
+    const internal = runtime as unknown as {
+      _status: 'streaming';
+      _sending: boolean;
+      _activeTurn: unknown;
+      _activeDispatchEntries: PendingTransportMessage[];
+    };
+    internal._status = 'streaming';
+    internal._sending = false;
+    internal._activeTurn = null;
+    internal._activeDispatchEntries = [];
+
+    expect(runtime.settleInactiveInProgressStatus('test-inactive-streaming')).toBe(true);
+
+    expect(runtime.getStatus()).toBe('idle');
+  });
+
+  it('does not cancel a recently active turn with queued work', async () => {
+    runtime.send('first', 'cmd-first');
+    await flushDispatch();
+    runtime.send('queued-while-live', 'cmd-queued-live');
+    const lastActivityAt = runtime.lastActivityAt;
+
+    expect(runtime.cancelStaleActiveTurnWithPending({
+      reason: 'test-live-active',
+      nowMs: lastActivityAt + 9_999,
+      staleMs: 10_000,
+    })).toBe(false);
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+    expect(runtime.pendingCount).toBe(1);
   });
 
   it('truncates user-authored description and systemPrompt to USER_SESSION_TEXT_MAX_CHARS', async () => {

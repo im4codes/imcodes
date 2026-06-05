@@ -68,6 +68,7 @@ import {
   _setFileSettleCycles,
   _setGracePeriodMs,
   _setIdlePollMs,
+  _setMarkerPromptRetryAfterMs,
   _setMinProcessingMs,
   _setPostSummaryConfirmationDelayMs,
   _setRoundHopCleanupDelayMs,
@@ -141,6 +142,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   _setIdlePollMs(20);
   _setGracePeriodMs(80);
+  _setMarkerPromptRetryAfterMs(0);
   _setMinProcessingMs(0);
   _setFileSettleCycles(1);
   _setPostSummaryConfirmationDelayMs(0);
@@ -186,6 +188,7 @@ afterEach(async () => {
 
   _setIdlePollMs(3000);
   _setGracePeriodMs(180000);
+  _setMarkerPromptRetryAfterMs(60000);
   _setMinProcessingMs(30000);
   _setFileSettleCycles(3);
   _setPostSummaryConfirmationDelayMs(10000);

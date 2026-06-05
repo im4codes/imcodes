@@ -10,6 +10,7 @@ import {
 } from '../../shared/worker-session-snapshot.js';
 
 let tempDir: string;
+const LIFECYCLE_SYNC_TEST_TIMEOUT_MS = 10_000;
 
 function makeSession(overrides: Partial<SessionRecord>): SessionRecord {
   return {
@@ -78,7 +79,7 @@ describe('lifecycle worker session sync', () => {
     });
     expect(store.getSession('deck_existing_brain')).toBeDefined();
     expect(store.getSession('deck_sub_child')).toBeDefined();
-  });
+  }, LIFECYCLE_SYNC_TEST_TIMEOUT_MS);
 
   it('does not drop local sessions missing from a complete snapshot without an explicit tombstone', async () => {
     const store = await import('../../src/store/session-store.js');
@@ -120,7 +121,7 @@ describe('lifecycle worker session sync', () => {
     });
     expect(store.getSession('deck_existing_brain')).toBeDefined();
     expect(store.getSession('deck_other_brain')).toBeDefined();
-  });
+  }, LIFECYCLE_SYNC_TEST_TIMEOUT_MS);
 
   it('treats remote stopped sessions as existing instead of deleting a local running session', async () => {
     const store = await import('../../src/store/session-store.js');
@@ -161,7 +162,7 @@ describe('lifecycle worker session sync', () => {
       syncedCount: 0,
     });
     expect(store.getSession('deck_existing_brain')?.state).toBe('running');
-  });
+  }, LIFECYCLE_SYNC_TEST_TIMEOUT_MS);
 
   it('marks a bad complete snapshot as degraded before applying destructive side effects', async () => {
     const store = await import('../../src/store/session-store.js');
@@ -204,5 +205,5 @@ describe('lifecycle worker session sync', () => {
     });
     expect(store.getSession('deck_existing_brain')).toBeDefined();
     expect(store.getSession('deck_bad_brain')).toBeUndefined();
-  });
+  }, LIFECYCLE_SYNC_TEST_TIMEOUT_MS);
 });

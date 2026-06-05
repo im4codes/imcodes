@@ -183,6 +183,139 @@ describe('buildSessionList', () => {
     ]));
   });
 
+  it('nudges an idle transport runtime to drain pending messages before returning the list', async () => {
+    const store = await import('../../src/store/session-store.js');
+    store.upsertSession({
+      name: 'deck_qwen_idle_pending_brain',
+      projectName: 'demo',
+      role: 'brain',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      providerId: 'qwen',
+      providerSessionId: 'sid-idle-pending',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    let status = 'idle';
+    let pendingMessages = ['queued after idle'];
+    let pendingEntries = [{ clientMessageId: 'msg-idle-pending', text: 'queued after idle' }];
+    const drainPendingIfIdle = vi.fn(() => {
+      status = 'thinking';
+      pendingMessages = [];
+      pendingEntries = [];
+      return true;
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      getStatus: () => status,
+      drainPendingIfIdle,
+      get pendingMessages() { return pendingMessages; },
+      get pendingEntries() { return pendingEntries; },
+      pendingVersion: 2,
+    });
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    const sessions = await buildSessionList();
+
+    expect(drainPendingIfIdle).toHaveBeenCalledWith('session-list');
+    expect(sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'deck_qwen_idle_pending_brain',
+        state: 'running',
+        transportPendingMessages: [],
+        transportPendingMessageEntries: [],
+      }),
+    ]));
+  });
+
+  it('nudges a stale active transport runtime with queued messages before returning the list', async () => {
+    const store = await import('../../src/store/session-store.js');
+    store.upsertSession({
+      name: 'deck_codex_stale_pending_brain',
+      projectName: 'demo',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'sid-stale-pending',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    const cancelStaleActiveTurnWithPending = vi.fn(() => true);
+    getTransportRuntimeMock.mockReturnValue({
+      getStatus: () => 'streaming',
+      drainPendingIfIdle: vi.fn(() => false),
+      cancelStaleActiveTurnWithPending,
+      pendingMessages: ['queued while phantom active'],
+      pendingEntries: [{ clientMessageId: 'msg-stale-pending', text: 'queued while phantom active' }],
+      pendingVersion: 7,
+    });
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    const sessions = await buildSessionList();
+
+    expect(cancelStaleActiveTurnWithPending).toHaveBeenCalledWith({ reason: 'session-list' });
+    expect(sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'deck_codex_stale_pending_brain',
+        state: 'running',
+        transportPendingMessages: ['queued while phantom active'],
+        transportPendingMessageVersion: 7,
+      }),
+    ]));
+  });
+
+  it('settles an inactive in-progress transport runtime before returning the list', async () => {
+    const store = await import('../../src/store/session-store.js');
+    store.upsertSession({
+      name: 'deck_codex_inactive_streaming_brain',
+      projectName: 'demo',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'sid-inactive-streaming',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    let status = 'streaming';
+    const settleInactiveInProgressStatus = vi.fn(() => {
+      status = 'idle';
+      return true;
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      getStatus: () => status,
+      drainPendingIfIdle: vi.fn(() => false),
+      settleInactiveInProgressStatus,
+      cancelStaleActiveTurnWithPending: vi.fn(() => false),
+      pendingMessages: [],
+      pendingEntries: [],
+      pendingVersion: 3,
+    });
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    const sessions = await buildSessionList();
+
+    expect(settleInactiveInProgressStatus).toHaveBeenCalledWith('session-list');
+    expect(sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'deck_codex_inactive_streaming_brain',
+        state: 'idle',
+        transportPendingMessages: [],
+        transportPendingMessageEntries: [],
+        transportPendingMessageVersion: 3,
+      }),
+    ]));
+  });
+
   it('preset-backed qwen sessions surface preset model + BYO tier, dropping OAuth labels', async () => {
     const store = await import('../../src/store/session-store.js');
     // Persisted record looks like an OAuth qwen session (e.g. created before

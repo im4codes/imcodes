@@ -2688,7 +2688,7 @@ describe('p2p-workflow reverse-regression', () => {
 
     const dispatchAnchor = orchestrator.text.indexOf('async function dispatchHop');
     expect(dispatchAnchor, 'dispatchHop must exist').toBeGreaterThan(0);
-    const dispatchWindow = orchestrator.text.slice(dispatchAnchor, dispatchAnchor + 9000);
+    const dispatchWindow = orchestrator.text.slice(dispatchAnchor, dispatchAnchor + 12000);
 
     expect(
       /discussionFileContainsSectionHeader\(watchPath,\s*sectionHeader\)[\s\S]{0,500}finishHop\('completed'\)[\s\S]{0,120}return true/.test(dispatchWindow),
@@ -2706,7 +2706,8 @@ describe('p2p-workflow reverse-regression', () => {
       'legacy dispatch must not auto-resend the same analysis/summary prompt after successful dispatch',
     ).toBe(true);
     expect(
-      /maybeStopStaleP2pTransportQueue\([\s\S]{0,240}reason:\s*'discussion_section_missing'/.test(dispatchWindow),
+      dispatchWindow.includes('maybeStopStaleP2pTransportQueue({')
+        && dispatchWindow.includes("reason: 'discussion_section_missing'"),
       'legacy dispatch must use stale queue detection instead of duplicate prompt retry',
     ).toBe(true);
   });

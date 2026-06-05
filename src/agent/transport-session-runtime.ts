@@ -63,6 +63,7 @@ export interface TransportRuntimeDiagnosticSnapshot {
   pendingCount: number;
   pendingVersion: number;
   activeDispatchCount: number;
+  stalePendingRecoveryActive: boolean;
   providerSessionBound: boolean;
   lastActivityAt: number;
   lastActivityAgeMs: number;
@@ -70,10 +71,13 @@ export interface TransportRuntimeDiagnosticSnapshot {
 
 const DEFAULT_TRANSPORT_CONTEXT_BUDGET_MS = 2_500;
 const DEFAULT_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 60_000;
+const DEFAULT_TRANSPORT_STALE_PENDING_RECOVERY_MS = 300_000;
 const MIN_TRANSPORT_CONTEXT_BUDGET_MS = 50;
 const MAX_TRANSPORT_CONTEXT_BUDGET_MS = 30_000;
 const MIN_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 50;
 const MAX_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 10 * 60_000;
+const MIN_TRANSPORT_STALE_PENDING_RECOVERY_MS = 10_000;
+const MAX_TRANSPORT_STALE_PENDING_RECOVERY_MS = 30 * 60_000;
 
 type TimeoutOutcome<T> =
   | { timedOut: false; value: T }
@@ -113,6 +117,16 @@ export function getTransportProviderSendTimeoutMs(): number {
     MIN_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS,
     MAX_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS,
     { allowZero: true },
+  );
+}
+
+export function getTransportStalePendingRecoveryMs(): number {
+  return readBoundedTimeoutMs(
+    'IMCODES_TRANSPORT_STALE_PENDING_RECOVERY_MS',
+    DEFAULT_TRANSPORT_STALE_PENDING_RECOVERY_MS,
+    MIN_TRANSPORT_STALE_PENDING_RECOVERY_MS,
+    MAX_TRANSPORT_STALE_PENDING_RECOVERY_MS,
+    { allowZero: false },
   );
 }
 
@@ -245,6 +259,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** True once the active dispatch has crossed into provider.send(). */
   private _activeDispatchProviderStarted = false;
   private _activeDispatchId: number | null = null;
+  private _activeDispatchStaleRecoveryStarted = false;
   private _nextDispatchId = 0;
   private readonly _locallyCancelledDispatchIds = new Set<number>();
 
@@ -265,6 +280,13 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.provider.onDelta((sid: string, _delta: MessageDelta) => {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
+        if (!this.hasActiveTurnWork()) {
+          logger.warn(
+            { sessionKey: this.sessionKey, status: this._status },
+            'transport runtime ignored provider delta without active turn',
+          );
+          return;
+        }
         if (this._activeDispatchCancelled) return;
         this.setStatus('streaming');
       }),
@@ -282,6 +304,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             this._locallyCancelledDispatchIds.delete(this._activeDispatchId);
           }
           this._activeDispatchId = null;
+          this._activeDispatchStaleRecoveryStarted = false;
           if (!this._drainPending()) {
             this.setStatus('idle');
           }
@@ -297,6 +320,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._activeDispatchEntries = [];
         this._activeDispatchProviderStarted = false;
         this._activeDispatchId = null;
+        this._activeDispatchStaleRecoveryStarted = false;
         // Drain pending messages before transitioning to idle.
         // If there are queued messages, merge and send — status stays running.
         if (!this._drainPending()) {
@@ -314,6 +338,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           this._locallyCancelledDispatchIds.delete(this._activeDispatchId);
         }
         this._activeDispatchId = null;
+        this._activeDispatchStaleRecoveryStarted = false;
         // Only drain pending on recoverable/cancel errors — unrecoverable errors
         // (auth failure, provider down) would just fail again and consume queued messages.
         const canDrain = error.code === 'CANCELLED' || error.recoverable;
@@ -412,10 +437,120 @@ export class TransportSessionRuntime implements SessionRuntime {
       pendingCount: this._pendingMessages.length,
       pendingVersion: this._pendingVersion,
       activeDispatchCount: this._activeDispatchEntries.length,
+      stalePendingRecoveryActive: this._activeDispatchStaleRecoveryStarted,
       providerSessionBound: !!this._providerSessionId,
       lastActivityAt: this._lastActivityAt,
       lastActivityAgeMs: Math.max(0, nowMs - this._lastActivityAt),
     };
+  }
+
+  /**
+   * Repair the only invalid queue-visible idle state: no active turn, runtime
+   * status idle, but queued messages are still waiting. This can happen when a
+   * provider surfaces an idle/finished status without a matching completion
+   * callback. The daemon polls session-list frequently, so nudging here keeps
+   * the queue moving without requiring a user Stop click.
+   */
+  drainPendingIfIdle(reason = 'idle-observed'): boolean {
+    if (this._status !== 'idle') return false;
+    return this.drainPendingIfNoActiveTurn(reason);
+  }
+
+  /**
+   * Repair a stale presentation-only running status. A transport runtime can
+   * only be legitimately in-progress while it has an active turn, active
+   * dispatch entries, a send in flight, or queued work. If all of those are
+   * absent, `streaming`/`thinking` is a stale status bit and must not keep the
+   * UI showing "working".
+   */
+  settleInactiveInProgressStatus(reason = 'inactive-in-progress-observed'): boolean {
+    if (!this.isInProgressStatus(this._status)) return false;
+    if (this.hasActiveTurnWork() || this._pendingMessages.length > 0) return false;
+    logger.warn(
+      {
+        sessionKey: this.sessionKey,
+        reason,
+        status: this._status,
+        pendingVersion: this._pendingVersion,
+        lastActivityAt: this._lastActivityAt,
+      },
+      'transport runtime in-progress status had no active turn; settling to idle',
+    );
+    this.setStatus('idle');
+    return true;
+  }
+
+  /**
+   * Queue-visible watchdog for the harder split-brain case: the provider/UI
+   * has gone quiet, but the runtime never received onComplete/onError, so an
+   * active dispatch pins `_sending=true` and queued user messages never drain.
+   * We do not abandon the active turn locally because late provider callbacks
+   * are not dispatch-id scoped. Instead, nudge the provider's normal cancel
+   * path once; its recoverable CANCELLED callback owns the existing drain path.
+   */
+  cancelStaleActiveTurnWithPending(options?: {
+    reason?: string;
+    nowMs?: number;
+    staleMs?: number;
+  }): boolean {
+    if (this._activeDispatchStaleRecoveryStarted) return false;
+    if (!this._providerSessionId) return false;
+    if (this._pendingMessages.length === 0) return false;
+    if (!this._sending && !this._activeTurn && this._activeDispatchEntries.length === 0) return false;
+    const nowMs = options?.nowMs ?? Date.now();
+    const staleMs = options?.staleMs ?? getTransportStalePendingRecoveryMs();
+    const lastActivityAgeMs = Math.max(0, nowMs - this._lastActivityAt);
+    if (lastActivityAgeMs < staleMs) return false;
+
+    this._activeDispatchStaleRecoveryStarted = true;
+    logger.warn(
+      {
+        sessionKey: this.sessionKey,
+        reason: options?.reason ?? 'stale-pending',
+        status: this._status,
+        sending: this._sending,
+        activeDispatchCount: this._activeDispatchEntries.length,
+        pendingCount: this._pendingMessages.length,
+        pendingVersion: this._pendingVersion,
+        lastActivityAgeMs,
+        staleMs,
+      },
+      'transport runtime active turn is stale with queued messages; cancelling once so pending work can drain',
+    );
+    void this.cancel().catch((err) => {
+      this._activeDispatchStaleRecoveryStarted = false;
+      logger.warn(
+        { err, sessionKey: this.sessionKey, pendingCount: this._pendingMessages.length },
+        'transport stale pending recovery cancel failed',
+      );
+    });
+    return true;
+  }
+
+  private drainPendingIfNoActiveTurn(reason: string): boolean {
+    if (this._sending || this._activeTurn) return false;
+    if (this._pendingMessages.length === 0 || !this._providerSessionId) return false;
+    logger.warn(
+      {
+        sessionKey: this.sessionKey,
+        pendingCount: this._pendingMessages.length,
+        pendingVersion: this._pendingVersion,
+        reason,
+      },
+      'transport runtime idle with pending messages; draining queued messages',
+    );
+    return this._drainPending();
+  }
+
+  private hasActiveTurnWork(): boolean {
+    return this._sending || !!this._activeTurn || this._activeDispatchEntries.length > 0;
+  }
+
+  private isInProgressStatus(status: AgentStatus): boolean {
+    return status === 'streaming'
+      || status === 'thinking'
+      || status === 'tool_running'
+      || status === 'permission';
   }
 
   setContextBootstrapResolver(
@@ -621,6 +756,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
     this._activeDispatchId = null;
+    this._activeDispatchStaleRecoveryStarted = false;
     this._locallyCancelledDispatchIds.clear();
     if (this._pendingMessages.length > 0) {
       logger.warn(
@@ -640,17 +776,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   // ── Internal ────────────────────────────────────────────────────────────────
 
   private setStatus(status: AgentStatus): void {
-    if (status === 'idle' && this._pendingMessages.length > 0 && !this._sending && !this._activeTurn) {
-      logger.warn(
-        {
-          sessionKey: this.sessionKey,
-          pendingCount: this._pendingMessages.length,
-          pendingVersion: this._pendingVersion,
-        },
-        'transport runtime attempted to enter idle with pending messages; draining defensively',
-      );
-      if (this._drainPending()) return;
-    }
+    if (status === 'idle' && this.drainPendingIfNoActiveTurn('setStatus')) return;
     if (this._status === status) return;
     this._status = status;
     if (!this._onStatusChange) return;
@@ -696,6 +822,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
     this._activeDispatchId = dispatchId;
+    this._activeDispatchStaleRecoveryStarted = false;
     this._activeDispatchEntries = (dispatchedEntries ?? [{
       clientMessageId: clientMessageId ?? randomUUID(),
       text: message,
@@ -870,6 +997,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (this._activeDispatchId === dispatchId) {
           this._activeDispatchId = null;
         }
+        this._activeDispatchStaleRecoveryStarted = false;
         this._locallyCancelledDispatchIds.delete(dispatchId);
         // Preserve the in-flight payload so session-manager can replay it
         // after automatically rebuilding the transport runtime.
@@ -943,6 +1071,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._activeDispatchProviderStarted = false;
       this._activeDispatchCancelled = false;
       this._activeDispatchId = null;
+      this._activeDispatchStaleRecoveryStarted = false;
       // Last-resort status update; `setStatus` itself is isolated post-C1b
       // but wrap defensively in case future code regresses that contract.
       try { this.setStatus('error'); } catch { /* swallow */ }
@@ -967,6 +1096,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._activeDispatchCancelled = false;
       this._activeDispatchProviderStarted = false;
       this._activeDispatchId = null;
+      this._activeDispatchStaleRecoveryStarted = false;
       return;
     }
     this._sending = false;
@@ -976,6 +1106,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
     this._activeDispatchId = null;
+    this._activeDispatchStaleRecoveryStarted = false;
     if (!this._drainPending()) {
       this.setStatus('idle');
     }

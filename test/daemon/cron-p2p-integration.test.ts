@@ -69,7 +69,9 @@ import {
   _setIdlePollMs,
   _setGracePeriodMs,
   _setMinProcessingMs,
+  _setMarkerPromptRetryAfterMs,
   _setFileSettleCycles,
+  _setPostSummaryConfirmationDelayMs,
   notifySessionIdle,
   type P2pRun,
   type P2pRunStatus,
@@ -126,7 +128,9 @@ beforeEach(async () => {
   _setIdlePollMs(50);
   _setGracePeriodMs(100);
   _setMinProcessingMs(0);
+  _setMarkerPromptRetryAfterMs(0);
   _setFileSettleCycles(1);
+  _setPostSummaryConfirmationDelayMs(0);
 
   tempProjectDir = join(tmpdir(), `cron-p2p-integ-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   await mkdir(tempProjectDir, { recursive: true });
@@ -163,7 +167,9 @@ afterEach(async () => {
   _setIdlePollMs(3_000);
   _setGracePeriodMs(180_000);
   _setMinProcessingMs(30_000);
+  _setMarkerPromptRetryAfterMs(60_000);
   _setFileSettleCycles(3);
+  _setPostSummaryConfirmationDelayMs(10_000);
   await rm(tempProjectDir, { recursive: true, force: true }).catch(() => {});
 });
 

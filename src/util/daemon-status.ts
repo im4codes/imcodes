@@ -96,6 +96,7 @@ export interface DaemonTransportQueueSessionSnapshot {
   pendingCount: number;
   pendingVersion?: number;
   activeDispatchCount?: number;
+  stalePendingRecoveryActive?: boolean;
   providerSessionBound?: boolean;
   lastActivityAt?: number;
   lastActivityAgeMs?: number;
@@ -664,6 +665,7 @@ function parseDaemonTransportQueueSessionSnapshot(value: unknown): DaemonTranspo
     pendingCount,
     ...(pendingVersion !== null ? { pendingVersion } : {}),
     ...(activeDispatchCount !== null ? { activeDispatchCount } : {}),
+    ...(typeof raw.stalePendingRecoveryActive === 'boolean' ? { stalePendingRecoveryActive: raw.stalePendingRecoveryActive } : {}),
     ...(typeof raw.providerSessionBound === 'boolean' ? { providerSessionBound: raw.providerSessionBound } : {}),
     ...(lastActivityAt !== null ? { lastActivityAt } : {}),
     ...(lastActivityAgeMs !== null ? { lastActivityAgeMs } : {}),

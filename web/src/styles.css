@@ -203,8 +203,12 @@ body {
 .shortcut-btn { flex-shrink: 0; padding: 4px 8px; background: rgba(15,23,42,0.58); border: 1px solid rgba(125,211,252,0.16); border-radius: 7px; color: #7b8797; font-size: 11px; font-family: inherit; cursor: pointer; transition: color 0.12s, border-color 0.12s, background 0.12s, box-shadow 0.12s; white-space: nowrap; box-shadow: inset 0 1px 0 rgba(255,255,255,0.03); touch-action: manipulation; }
 /* Instant optimistic feedback while a stop is in flight (before the session
    state round-trip + provider interrupt land). */
-.shortcut-btn-stop-pending { animation: shortcut-btn-stop-pulse 0.7s ease-in-out infinite; border-color: rgba(248,113,113,0.6) !important; color: #f87171 !important; }
-@keyframes shortcut-btn-stop-pulse { 0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(248,113,113,0); } 50% { opacity: 0.55; box-shadow: 0 0 10px 1px rgba(248,113,113,0.35); } }
+.shortcut-btn-stop-pending { animation: shortcut-btn-stop-pulse 0.42s ease-in-out infinite; border-color: rgba(248,113,113,0.95) !important; background: rgba(127,29,29,0.72) !important; color: #fecaca !important; text-shadow: 0 0 10px rgba(254,202,202,0.85); position: relative; z-index: 2; }
+@keyframes shortcut-btn-stop-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 0 0 rgba(239,68,68,0), inset 0 0 0 1px rgba(254,202,202,0.12); }
+  42% { opacity: 0.56; transform: scale(1.16); box-shadow: 0 0 24px 5px rgba(248,113,113,0.62), 0 0 44px 10px rgba(220,38,38,0.34), inset 0 0 18px rgba(254,202,202,0.36); }
+  68% { opacity: 1; transform: scale(1.08); box-shadow: 0 0 14px 3px rgba(248,113,113,0.48), inset 0 0 14px rgba(254,202,202,0.28); }
+}
 /* Agent task list (TodoWrite / todo_write / update_plan) — pinned checklist at
    the top of the chat scroll viewport, auto-updating as the agent progresses. */
 .agent-todos { position: sticky; top: 0; z-index: 5; margin: 0 0 10px; padding: 9px 10px; background: linear-gradient(180deg, rgba(30,47,76,0.96), rgba(14,22,36,0.98)), rgba(15,23,42,0.98); border: 1px solid rgba(147,197,253,0.48); border-radius: 10px; box-shadow: 0 0 0 1px rgba(59,130,246,0.18) inset, 0 8px 22px rgba(0,0,0,0.42), 0 0 18px rgba(59,130,246,0.12); backdrop-filter: blur(6px); }

@@ -209,6 +209,7 @@ describe('daemon status helpers', () => {
             pendingCount: 1,
             pendingVersion: 3,
             activeDispatchCount: 0,
+            stalePendingRecoveryActive: true,
             providerSessionBound: true,
             lastActivityAt: 10_500,
             lastActivityAgeMs: 500,
@@ -249,6 +250,7 @@ describe('daemon status helpers', () => {
       recordDaemonStart({ pid: 500, nowMs: 11_000, baseDir: dir, version: 'diag' });
       const status = readDaemonRuntimeStatus(dir);
       expect(status?.diagnostics?.transportQueues?.totalPendingCount).toBe(1);
+      expect(status?.diagnostics?.transportQueues?.sessions[0]?.stalePendingRecoveryActive).toBe(true);
       expect(status?.diagnostics?.transportQueues?.sessions[0]?.resendEntries?.[0]?.commandId).toBe('cmd-1');
       expect(status?.diagnostics?.p2p?.runs[0]?.id).toBe('run-1');
     } finally {

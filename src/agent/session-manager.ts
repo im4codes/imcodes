@@ -1022,6 +1022,9 @@ export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): Da
   const sessions = [...sessionNames].sort().map((sessionName) => {
     const runtime = transportRuntimes.get(sessionName);
     const record = getSession(sessionName);
+    runtime?.drainPendingIfIdle?.('transport-queue-diagnostics');
+    runtime?.settleInactiveInProgressStatus?.('transport-queue-diagnostics');
+    runtime?.cancelStaleActiveTurnWithPending?.({ reason: 'transport-queue-diagnostics', nowMs });
     const runtimeSnapshot = runtime?.getDiagnosticSnapshot(nowMs);
     const resendEntries = resendBySession.get(sessionName) ?? [];
     return {
@@ -1032,6 +1035,7 @@ export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): Da
       pendingCount: runtimeSnapshot?.pendingCount ?? 0,
       ...(runtimeSnapshot ? { pendingVersion: runtimeSnapshot.pendingVersion } : {}),
       ...(runtimeSnapshot ? { activeDispatchCount: runtimeSnapshot.activeDispatchCount } : {}),
+      ...(runtimeSnapshot ? { stalePendingRecoveryActive: runtimeSnapshot.stalePendingRecoveryActive } : {}),
       ...(runtimeSnapshot ? { providerSessionBound: runtimeSnapshot.providerSessionBound } : {}),
       ...(runtimeSnapshot ? { lastActivityAt: runtimeSnapshot.lastActivityAt } : {}),
       ...(runtimeSnapshot ? { lastActivityAgeMs: runtimeSnapshot.lastActivityAgeMs } : {}),

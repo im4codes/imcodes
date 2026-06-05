@@ -2814,11 +2814,39 @@ afterEach(() => {
     // Transport sessions cancel the SDK turn directly instead of sending
     // `/stop` as chat text.
     expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
+    expect(screen.getByRole('button', { name: /^stop$/i }).classList.contains('shortcut-btn-stop-pending')).toBe(true);
     expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({
       sessionName: 'qwen-session',
       text: '/stop',
     }));
     expect(ws.sendInput).not.toHaveBeenCalled();
+  });
+
+  it('pressing Escape in a running transport sub-session uses the same Stop feedback', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'deck_sub_worker',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+        })}
+        subSessionId="worker"
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    expectUrgentCancelPayload(ws, { sessionName: 'deck_sub_worker' });
+    expect(screen.getByRole('button', { name: /^stop$/i }).classList.contains('shortcut-btn-stop-pending')).toBe(true);
+    expect(gatherSendCalls(ws)).not.toContainEqual(expect.objectContaining({
+      sessionName: 'deck_sub_worker',
+      text: '/stop',
+    }));
   });
 
   it('keeps transport Stop enabled even when session state is idle', () => {

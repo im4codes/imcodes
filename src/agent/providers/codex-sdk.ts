@@ -418,6 +418,7 @@ interface CodexSdkSessionState {
   lastStatusSignature: string | null;
   pendingSessionSystemTextUpdate?: string;
   pendingSessionSystemTextUpdateTurnId?: string;
+  completedTurnIds: Set<string>;
   completedCompactTurnIds: Set<string>;
   generatedImageTracking: GeneratedImageTrackingSnapshot | null;
   generatedImagePaths: string[];
@@ -1454,6 +1455,7 @@ export class CodexSdkProvider implements TransportProvider {
       lastStatusSignature: null,
       pendingSessionSystemTextUpdate: undefined,
       pendingSessionSystemTextUpdateTurnId: undefined,
+      completedTurnIds: existing?.completedTurnIds ?? new Set(),
       completedCompactTurnIds: existing?.completedCompactTurnIds ?? new Set(),
       generatedImageTracking: null,
       generatedImagePaths: [],
@@ -1801,6 +1803,9 @@ export class CodexSdkProvider implements TransportProvider {
         ...(state.effort ? { effort: state.effort } : {}),
       });
       state.runningTurnId = result?.turn?.id;
+      if (state.runningTurnId) {
+        state.completedTurnIds.delete(state.runningTurnId);
+      }
       if (shouldInjectStableUpdate) {
         state.pendingSessionSystemTextUpdate = desiredSessionSystemText;
         state.pendingSessionSystemTextUpdateTurnId = state.runningTurnId;
@@ -2386,9 +2391,10 @@ export class CodexSdkProvider implements TransportProvider {
       const threadId = readParamThreadId(params);
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
-      if (!sessionId || !state || !state.runningCompact) return;
+      if (!sessionId || !state) return;
       const status = readThreadStatus(params);
       if (isThreadActiveStatus(status)) {
+        if (!state.runningCompact) return;
         state.compactObserved = true;
         this.clearCompactSettleTimer(state);
         this.emitStatus(sessionId, state, {
@@ -2398,7 +2404,13 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
       if (isThreadIdleStatus(status)) {
-        this.completeCompact(sessionId, state, readParamTurnId(params));
+        if (state.runningCompact) {
+          this.completeCompact(sessionId, state, readParamTurnId(params));
+          return;
+        }
+        if (state.runningTurnId) {
+          await this.completeTurn(sessionId, state, readParamTurnId(params) ?? state.runningTurnId);
+        }
       }
       return;
     }
@@ -2506,6 +2518,9 @@ export class CodexSdkProvider implements TransportProvider {
       if (turnId && state.completedCompactTurnIds.has(turnId)) {
         return;
       }
+      if (turnId && state.completedTurnIds.has(turnId)) {
+        return;
+      }
 
       if (status === 'failed') {
         this.clearCancelTimer(state);
@@ -2562,53 +2577,66 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
 
-      this.clearCancelTimer(state);
-      this.clearStatus(sessionId, state);
-      this.queueRawChecklistHistoryScan(sessionId, state);
-      this.clearRawChecklistPollTimer(state);
-      this.commitPendingSessionSystemTextUpdate(state, turnId);
-      const messageId = state.currentMessageId ?? `${sessionId}:agent-message`;
-      const currentText = state.currentText;
-      const usage = state.lastUsage;
-      const model = state.model;
-      const resumeId = state.threadId;
-      const generatedImageTracking = state.generatedImageTracking;
-      const alreadyDetectedImagePaths = [...state.generatedImagePaths];
-      state.runningTurnId = undefined;
-      state.generatedImageTracking = null;
-      const newlyDetectedImagePaths = await this.detectNewGeneratedImagePaths(generatedImageTracking);
-      const generatedImagePaths = [
-        ...alreadyDetectedImagePaths,
-        ...newlyDetectedImagePaths.filter((path) => !alreadyDetectedImagePaths.includes(path)),
-      ];
-      if (newlyDetectedImagePaths.length > 0) {
-        logger.info({
-          provider: this.id,
-          sessionId,
-          threadId: resumeId,
-          generatedImagePaths: newlyDetectedImagePaths,
-        }, 'Codex SDK detected generated image output paths');
-      }
-      const content = appendDetectedGeneratedImagePaths(currentText, generatedImagePaths);
-      const completed: AgentMessage = {
-        id: messageId,
-        sessionId,
-        kind: 'text',
-        role: 'assistant',
-        content,
-        timestamp: Date.now(),
-        status: 'complete',
-        metadata: {
-          ...(usage ? { usage } : {}),
-          ...(model ? { model } : {}),
-          ...(resumeId ? { resumeId } : {}),
-        },
-      };
-      state.pendingComplete = completed;
-      state.pendingComplete = undefined;
-      for (const cb of this.completeCallbacks) cb(sessionId, completed);
+      await this.completeTurn(sessionId, state, turnId);
       return;
     }
+  }
+
+  private async completeTurn(sessionId: string, state: CodexSdkSessionState, turnId?: string): Promise<void> {
+    this.clearCancelTimer(state);
+    this.clearStatus(sessionId, state);
+    this.queueRawChecklistHistoryScan(sessionId, state);
+    this.clearRawChecklistPollTimer(state);
+    this.commitPendingSessionSystemTextUpdate(state, turnId);
+    this.rememberCompletedTurn(state, turnId);
+    const messageId = state.currentMessageId ?? `${sessionId}:agent-message`;
+    const currentText = state.currentText;
+    const usage = state.lastUsage;
+    const model = state.model;
+    const resumeId = state.threadId;
+    const generatedImageTracking = state.generatedImageTracking;
+    const alreadyDetectedImagePaths = [...state.generatedImagePaths];
+    state.runningTurnId = undefined;
+    state.generatedImageTracking = null;
+    const newlyDetectedImagePaths = await this.detectNewGeneratedImagePaths(generatedImageTracking);
+    const generatedImagePaths = [
+      ...alreadyDetectedImagePaths,
+      ...newlyDetectedImagePaths.filter((path) => !alreadyDetectedImagePaths.includes(path)),
+    ];
+    if (newlyDetectedImagePaths.length > 0) {
+      logger.info({
+        provider: this.id,
+        sessionId,
+        threadId: resumeId,
+        generatedImagePaths: newlyDetectedImagePaths,
+      }, 'Codex SDK detected generated image output paths');
+    }
+    const content = appendDetectedGeneratedImagePaths(currentText, generatedImagePaths);
+    const completed: AgentMessage = {
+      id: messageId,
+      sessionId,
+      kind: 'text',
+      role: 'assistant',
+      content,
+      timestamp: Date.now(),
+      status: 'complete',
+      metadata: {
+        ...(usage ? { usage } : {}),
+        ...(model ? { model } : {}),
+        ...(resumeId ? { resumeId } : {}),
+      },
+    };
+    state.pendingComplete = completed;
+    state.pendingComplete = undefined;
+    for (const cb of this.completeCallbacks) cb(sessionId, completed);
+  }
+
+  private rememberCompletedTurn(state: CodexSdkSessionState, turnId?: string): void {
+    if (!turnId) return;
+    state.completedTurnIds.add(turnId);
+    if (state.completedTurnIds.size <= 50) return;
+    const oldest = state.completedTurnIds.values().next().value;
+    if (oldest) state.completedTurnIds.delete(oldest);
   }
 
   private request(method: string, params: Record<string, any>, timeoutMs?: number): Promise<any> {

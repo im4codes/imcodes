@@ -2081,13 +2081,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [stopRequested, setStopRequested] = useState(false);
   const stopPressGuardRef = useRef(0);
 
+  const showStopFeedback = useCallback(() => {
+    stopPressGuardRef.current = Date.now();
+    setStopRequested(true);
+  }, []);
+
   const handleStopPress = useCallback(() => {
     const now = Date.now();
     if (now - stopPressGuardRef.current < 600) return; // dedupe pointerdown + click
-    stopPressGuardRef.current = now;
-    setStopRequested(true);
+    showStopFeedback();
     cancelActiveTransportTurn();
-  }, [cancelActiveTransportTurn]);
+  }, [cancelActiveTransportTurn, showStopFeedback]);
 
   // Clear the optimistic state once the turn actually settles (session leaves
   // the running state) or after a safety timeout so a stuck turn re-enables it.
@@ -2101,6 +2105,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}, commandId = makeCommandId()): string | null => {
     if (!activeSession) return null;
     if (effectiveRuntimeType === 'transport' && text.trim() === '/stop') {
+      showStopFeedback();
       return cancelActiveTransportTurn(commandId);
     }
     const payload = {
@@ -2125,7 +2130,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       });
     }
     return commandId;
-  }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, makeCommandId, serverId, ws]);
+  }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, makeCommandId, serverId, showStopFeedback, ws]);
 
   const sendQueuedMessageMutation = useCallback((type: 'session.edit_queued_message' | 'session.undo_queued_message', payload: Record<string, unknown>) => {
     if (!ws || !activeSession) return false;
@@ -2165,6 +2170,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
     };
     if (effectiveRuntimeType === 'transport' && !isP2pSend && payload.text.trim() === '/stop') {
+      showStopFeedback();
       if (!cancelActiveTransportTurn()) return;
       if (options?.clearComposer) clearComposerState();
       return;
@@ -2232,7 +2238,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (options?.clearComposer) {
       clearComposerState();
     }
-  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, transportSendShouldQueue]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, showStopFeedback, transportSendShouldQueue]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -2419,7 +2425,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
     if (e.key === 'Escape' && effectiveRuntimeType === 'transport' && isRunningSessionState(activeSession?.state)) {
       e.preventDefault();
-      cancelActiveTransportTurn();
+      handleStopPress();
       return;
     }
 
