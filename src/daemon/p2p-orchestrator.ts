@@ -444,6 +444,7 @@ export function getP2pRun(id: string): P2pRun | undefined { return activeRuns.ge
 export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 
 export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
+  const isTerminalRun = P2P_TERMINAL_RUN_STATUSES.has(run.status);
   const projectedCurrentRound = Math.min(Math.max(1, run.currentRound), Math.max(1, run.rounds));
   const completedHopCount = run.hopStates.filter((hop) => hop.status === 'completed').length;
   const currentRoundCompletedHopCount = run.hopStates.filter(
@@ -454,12 +455,14 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     (hop.status === 'running' || hop.status === 'dispatched'),
   );
   const currentHopState = activeHopStates[0] ?? null;
-  const currentHop = currentHopState?.session
-    ?? run.activeTargetSessions[0]
-    ?? run.currentTargetSession
-    ?? (run.activePhase === 'initial' || run.activePhase === 'summary' || run.activePhase === 'execution'
-      ? run.initiatorSession
-      : null);
+  const currentHop = isTerminalRun
+    ? null
+    : currentHopState?.session
+      ?? run.activeTargetSessions[0]
+      ?? run.currentTargetSession
+      ?? (run.activePhase === 'initial' || run.activePhase === 'summary' || run.activePhase === 'execution'
+        ? run.initiatorSession
+        : null);
   const hopCounts = countHopStates(run.hopStates);
   const legacyPipelineLength = !run.advancedP2pEnabled && isComboMode(run.mode)
     ? Math.max(1, parseModePipeline(run.mode).length)
@@ -518,7 +521,7 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     flow_step_current: legacyFlowStepCurrent ?? undefined,
     flow_step_total: legacyFlowStepTotal ?? undefined,
     skipped_hops: run.skippedHops,
-    active_phase: run.activePhase,
+    ...(isTerminalRun ? {} : { active_phase: run.activePhase }),
     execution_attempt: run.executionAttempt ?? null,
     execution_cycle_current: run.executionCycleCurrent ?? null,
     execution_cycle_total: run.executionCycleTotal ?? null,
@@ -680,6 +683,9 @@ let IDLE_POLL_MS = 3_000;
 let GRACE_PERIOD_DEFAULT_MS = 180_000; // 3 min — complex analysis (subagent research + write) takes time
 let MIN_PROCESSING_MS = 30_000; // Don't trust idle detection until 30s after dispatch
 let FILE_SETTLE_CYCLES = 3; // File must stop growing for 3 poll cycles (9s) to be "settled"
+let MARKER_PROMPT_RETRY_AFTER_MS = 60_000; // Marker prompts may be retried, but only after queue-aware idle.
+let POST_SUMMARY_CONFIRMATION_DELAY_MS = 10_000; // Let the execution marker/status settle before the follow-up check.
+let QUEUE_STUCK_STOP_AFTER_MS = 300_000; // 5 min — stop only when transport queue/turn is stale
 let ROUND_HOP_CLEANUP_DELAY_MS = 0;
 
 /** Override poll interval for tests. */
@@ -690,8 +696,60 @@ export function _setGracePeriodMs(ms: number): void { GRACE_PERIOD_DEFAULT_MS = 
 export function _setMinProcessingMs(ms: number): void { MIN_PROCESSING_MS = ms; }
 /** Override file settle cycles for tests. */
 export function _setFileSettleCycles(n: number): void { FILE_SETTLE_CYCLES = n; }
+/** Override marker retry delay for tests. */
+export function _setMarkerPromptRetryAfterMs(ms: number): void { MARKER_PROMPT_RETRY_AFTER_MS = ms; }
+/** Override follow-up confirmation delay for tests. */
+export function _setPostSummaryConfirmationDelayMs(ms: number): void { POST_SUMMARY_CONFIRMATION_DELAY_MS = ms; }
+/** Override stale queue watchdog threshold for tests. */
+export function _setQueueStuckStopAfterMs(ms: number): void { QUEUE_STUCK_STOP_AFTER_MS = ms; }
 /** Override round hop artifact cleanup delay for tests. */
 export function _setRoundHopCleanupDelayMs(ms: number): void { ROUND_HOP_CLEANUP_DELAY_MS = ms; }
+
+async function maybeStopStaleP2pTransportQueue(args: {
+  run: P2pRun;
+  session: string;
+  dispatchStartedAt: number;
+  alreadyStopped: boolean;
+  reason: string;
+}): Promise<boolean> {
+  if (args.alreadyStopped) return true;
+  const runtime = getTransportRuntime(args.session);
+  if (!runtime) return false;
+
+  const now = Date.now();
+  const snapshot = runtime.getDiagnosticSnapshot(now);
+  const blocked = snapshot.sending || snapshot.pendingCount > 0 || snapshot.activeDispatchCount > 0;
+  if (!blocked) return false;
+
+  const dispatchAgeMs = Math.max(0, now - args.dispatchStartedAt);
+  if (dispatchAgeMs < QUEUE_STUCK_STOP_AFTER_MS || snapshot.lastActivityAgeMs < QUEUE_STUCK_STOP_AFTER_MS) {
+    return false;
+  }
+
+  logger.warn(
+    {
+      runId: args.run.id,
+      session: args.session,
+      reason: args.reason,
+      dispatchAgeMs,
+      queueStuckStopAfterMs: QUEUE_STUCK_STOP_AFTER_MS,
+      status: snapshot.status,
+      sending: snapshot.sending,
+      pendingCount: snapshot.pendingCount,
+      activeDispatchCount: snapshot.activeDispatchCount,
+      lastActivityAgeMs: snapshot.lastActivityAgeMs,
+    },
+    'P2P: transport queue appears stale — stopping active turn once to allow queued work to drain',
+  );
+
+  try {
+    await runtime.cancel();
+    return true;
+  } catch (err) {
+    logger.warn({ runId: args.run.id, session: args.session, err }, 'P2P: stale transport queue stop failed');
+    return true;
+  }
+}
 
 // ── Idle event registry (callback-driven, no polling) ─────────────────────
 
@@ -1394,22 +1452,21 @@ async function dispatchPostSummaryPrompt(
   }
 }
 
-async function isPostSummaryExecutionRetryReady(
+async function isPostSummaryMarkerRetryReady(
   run: P2pRun,
   session: string,
-  startedAt: number,
-  idleEventReceived: boolean,
+  dispatchStartedAt: number,
 ): Promise<boolean> {
+  if (Date.now() - dispatchStartedAt < MARKER_PROMPT_RETRY_AFTER_MS) return false;
+
   const transportRuntime = getTransportRuntime(session);
   if (transportRuntime) {
-    const status = transportRuntime.getStatus();
-    if (status === 'error' && !transportRuntime.sending && transportRuntime.pendingCount === 0) return true;
-    return !transportRuntime.sending && transportRuntime.pendingCount === 0 && status === 'idle';
+    const snapshot = transportRuntime.getDiagnosticSnapshot(Date.now());
+    if (snapshot.sending || snapshot.pendingCount > 0 || snapshot.activeDispatchCount > 0) return false;
+    return snapshot.status === 'idle' || snapshot.status === 'error';
   }
 
-  const elapsed = Date.now() - startedAt;
-  if (!idleEventReceived && elapsed < MIN_PROCESSING_MS) return false;
-
+  if (Date.now() - dispatchStartedAt < MIN_PROCESSING_MS) return false;
   const record = getSession(session);
   const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
   const useStoreState = agentType === 'gemini';
@@ -1418,8 +1475,8 @@ async function isPostSummaryExecutionRetryReady(
       ? record?.state === 'idle'
       : await detectStatusAsync(session, agentType) === 'idle';
   } catch (err) {
-    logger.debug({ runId: run.id, session, err }, 'P2P: idle detection failed while waiting for post-summary execution marker');
-    return idleEventReceived;
+    logger.debug({ runId: run.id, session, err }, 'P2P: idle detection failed while waiting to retry marker prompt');
+    return false;
   }
 }
 
@@ -1434,74 +1491,59 @@ async function runPostSummaryExecutionConfirmationGate(
   const spec = createPostSummaryExecutionConfirmationSpec(run, executionSpec);
   const deadlineAt = Date.now() + timeoutMs;
   let attempt = 0;
-  let lastDispatchAt = 0;
-  let idleEventReceived = false;
-  let idleWaiter: IdleWaiterHandle | undefined;
-
-  const armIdleWaiter = () => {
-    if (idleWaiter) idleWaiter.cancel();
-    idleEventReceived = false;
-    idleWaiter = waitForIdleEvent(session, Math.max(1, deadlineAt - Date.now()));
-    idleWaiter.promise.then((ok) => {
-      if (ok) idleEventReceived = true;
-    });
-  };
+  let dispatchStartedAt = Date.now();
+  let queueStopSent = false;
 
   const sendAttempt = async () => {
     attempt += 1;
-    lastDispatchAt = Date.now();
+    dispatchStartedAt = Date.now();
     run.runPhase = 'executing_original_request';
     run.activePhase = 'execution';
-    run.hopStartedAt = lastDispatchAt;
+    run.hopStartedAt = dispatchStartedAt;
     run.executionAttempt = attempt;
     run.executionCycleCurrent = spec.cycleIndex;
     run.executionCycleTotal = spec.cycleTotal;
     run.executionMarkerPath = spec.markerPath;
     pushState(run, serverLink);
-    armIdleWaiter();
     return dispatchPostSummaryExecutionConfirmationAttempt(run, executionSpec, executionMarker, spec, attempt, deadlineAt);
   };
 
-  await sendAttempt();
-  const retryDelayMs = Math.max(IDLE_POLL_MS, Math.min(MIN_PROCESSING_MS, 5_000));
-  let lastInvalidMarkerReason: string | null = null;
+  if (!await sendAttempt()) {
+    failRun(run, 'dispatch_failed', 'post_summary_execution_confirmation_dispatch_failed', serverLink);
+    return null;
+  }
 
-  try {
-    while (Date.now() < deadlineAt) {
-      if (run._cancelled || isTerminal(run.status)) return null;
-      if (!ensureRunDeadline(run, serverLink)) return null;
+  while (Date.now() < deadlineAt) {
+    if (run._cancelled || isTerminal(run.status)) return null;
+    if (!ensureRunDeadline(run, serverLink)) return null;
 
-      const markerState = await readPostSummaryExecutionMarker(spec);
-      if (markerState?.ok) {
-        logger.info({ runId: run.id, cycleIndex: spec.cycleIndex, cycleTotal: spec.cycleTotal, attempts: attempt }, 'P2P: post-summary execution confirmation marker confirmed');
-        return { spec, marker: markerState.marker, attempts: attempt };
-      }
-      if (markerState && !markerState.ok) {
-        lastInvalidMarkerReason = markerState.reason;
-        if (markerState.failedByAgent) {
-          failRun(run, 'post_summary_execution_confirmation_failed', markerState.reason, serverLink);
-          return null;
-        }
-      }
-
-      await sleep(Math.min(IDLE_POLL_MS, Math.max(1, deadlineAt - Date.now())));
-      if (run._cancelled || isTerminal(run.status)) return null;
-      if (!ensureRunDeadline(run, serverLink)) return null;
-
-      if (Date.now() - lastDispatchAt < retryDelayMs) continue;
-      const retryReady = await isPostSummaryExecutionRetryReady(run, session, lastDispatchAt, idleEventReceived);
-      if (!retryReady || Date.now() >= deadlineAt) continue;
-      logger.warn({
-        runId: run.id,
-        session,
-        attempt,
-        markerPath: spec.markerPath,
-        lastInvalidMarkerReason,
-      }, 'P2P: initiator idle before execution confirmation marker; retrying confirmation prompt');
-      await sendAttempt();
+    const markerState = await readPostSummaryExecutionMarker(spec);
+    if (markerState?.ok) {
+      logger.info({ runId: run.id, cycleIndex: spec.cycleIndex, cycleTotal: spec.cycleTotal, attempts: attempt }, 'P2P: post-summary execution confirmation marker confirmed');
+      return { spec, marker: markerState.marker, attempts: attempt };
     }
-  } finally {
-    if (idleWaiter) idleWaiter.cancel();
+    if (markerState && !markerState.ok) {
+      if (markerState.failedByAgent) {
+        failRun(run, 'post_summary_execution_confirmation_failed', markerState.reason, serverLink);
+        return null;
+      }
+    }
+
+    queueStopSent = await maybeStopStaleP2pTransportQueue({
+      run,
+      session,
+      dispatchStartedAt,
+      alreadyStopped: queueStopSent,
+      reason: 'confirmation_marker_missing',
+    });
+    if (await isPostSummaryMarkerRetryReady(run, session, dispatchStartedAt)) {
+      logger.warn(
+        { runId: run.id, session, attempt, markerPath: spec.markerPath },
+        'P2P: confirmation marker still missing after queue-aware idle — retrying confirmation prompt',
+      );
+      if (await sendAttempt()) queueStopSent = false;
+    }
+    await sleep(Math.min(IDLE_POLL_MS, Math.max(1, deadlineAt - Date.now())));
   }
 
   logger.warn({ runId: run.id, session, timeoutMs, markerPath: spec.markerPath }, 'P2P: post-summary execution confirmation marker timed out');
@@ -1519,98 +1561,89 @@ async function runPostSummaryExecutionGate(
   const deadlineAt = Date.now() + timeoutMs;
   const spec = options.spec ?? createPostSummaryExecutionSpec(run, options);
   let attempt = 0;
-  let lastDispatchAt = 0;
-  let idleEventReceived = false;
-  let idleWaiter: IdleWaiterHandle | undefined;
-
-  const armIdleWaiter = () => {
-    if (idleWaiter) idleWaiter.cancel();
-    idleEventReceived = false;
-    idleWaiter = waitForIdleEvent(session, Math.max(1, deadlineAt - Date.now()));
-    idleWaiter.promise.then((ok) => {
-      if (ok) idleEventReceived = true;
-    });
-  };
+  let dispatchStartedAt = Date.now();
+  let queueStopSent = false;
 
   const sendAttempt = async () => {
     attempt += 1;
-    lastDispatchAt = Date.now();
+    dispatchStartedAt = Date.now();
     run.runPhase = 'executing_original_request';
     run.activePhase = 'execution';
-    run.hopStartedAt = lastDispatchAt;
+    run.hopStartedAt = dispatchStartedAt;
     run.executionAttempt = attempt;
     run.executionCycleCurrent = spec.cycleIndex;
     run.executionCycleTotal = spec.cycleTotal;
     run.executionMarkerPath = spec.markerPath;
     pushState(run, serverLink);
-    armIdleWaiter();
     return dispatchPostSummaryExecutionAttempt(run, spec, attempt, deadlineAt);
   };
 
   if (options.initialPromptAlreadyDispatched) {
     attempt = 1;
-    lastDispatchAt = Date.now();
+    dispatchStartedAt = Date.now();
     run.runPhase = 'executing_original_request';
     run.activePhase = 'execution';
-    run.hopStartedAt = lastDispatchAt;
+    run.hopStartedAt = dispatchStartedAt;
     run.executionAttempt = attempt;
     run.executionCycleCurrent = spec.cycleIndex;
     run.executionCycleTotal = spec.cycleTotal;
     run.executionMarkerPath = spec.markerPath;
     pushState(run, serverLink);
-    armIdleWaiter();
-  } else {
-    await sendAttempt();
+  } else if (!await sendAttempt()) {
+    failRun(run, 'dispatch_failed', 'post_summary_execution_dispatch_failed', serverLink);
+    return false;
   }
-  const retryDelayMs = Math.max(IDLE_POLL_MS, Math.min(MIN_PROCESSING_MS, 5_000));
-  let lastInvalidMarkerReason: string | null = null;
 
-  try {
-    while (Date.now() < deadlineAt) {
-      if (run._cancelled || isTerminal(run.status)) return false;
-      if (!ensureRunDeadline(run, serverLink)) return false;
+  while (Date.now() < deadlineAt) {
+    if (run._cancelled || isTerminal(run.status)) return false;
+    if (!ensureRunDeadline(run, serverLink)) return false;
 
-      const markerState = await readPostSummaryExecutionMarker(spec);
-      if (markerState?.ok) {
-        const confirmation = await runPostSummaryExecutionConfirmationGate(run, serverLink, spec, markerState.marker, timeoutMs);
-        if (!confirmation) return false;
-        await appendPostSummaryExecutionAudit(run, spec, markerState.marker, attempt);
-        await appendPostSummaryExecutionAudit(
-          run,
-          confirmation.spec,
-          confirmation.marker,
-          confirmation.attempts,
-          `P2P Original Request Execution Reconfirmed (cycle ${confirmation.spec.cycleIndex}/${confirmation.spec.cycleTotal})`,
-        );
-        logger.info({ runId: run.id, cycleIndex: spec.cycleIndex, cycleTotal: spec.cycleTotal, attempts: attempt }, 'P2P: post-summary execution marker confirmed');
-        return true;
+    const markerState = await readPostSummaryExecutionMarker(spec);
+    if (markerState?.ok) {
+      const confirmationDelayMs = Math.min(
+        POST_SUMMARY_CONFIRMATION_DELAY_MS,
+        Math.max(0, deadlineAt - Date.now() - 1),
+      );
+      if (confirmationDelayMs > 0) {
+        await sleep(confirmationDelayMs);
+        if (run._cancelled || isTerminal(run.status)) return false;
+        if (!ensureRunDeadline(run, serverLink)) return false;
       }
-      if (markerState && !markerState.ok) {
-        lastInvalidMarkerReason = markerState.reason;
-        if (markerState.failedByAgent) {
-          failRun(run, 'post_summary_execution_failed', markerState.reason, serverLink);
-          return false;
-        }
-      }
-
-      await sleep(Math.min(IDLE_POLL_MS, Math.max(1, deadlineAt - Date.now())));
-      if (run._cancelled || isTerminal(run.status)) return false;
-      if (!ensureRunDeadline(run, serverLink)) return false;
-
-      if (Date.now() - lastDispatchAt < retryDelayMs) continue;
-      const retryReady = await isPostSummaryExecutionRetryReady(run, session, lastDispatchAt, idleEventReceived);
-      if (!retryReady || Date.now() >= deadlineAt) continue;
-      logger.warn({
-        runId: run.id,
-        session,
-        attempt,
-        markerPath: spec.markerPath,
-        lastInvalidMarkerReason,
-      }, 'P2P: initiator idle before execution marker; retrying post-summary execution prompt');
-      await sendAttempt();
+      const confirmation = await runPostSummaryExecutionConfirmationGate(run, serverLink, spec, markerState.marker, timeoutMs);
+      if (!confirmation) return false;
+      await appendPostSummaryExecutionAudit(run, spec, markerState.marker, attempt);
+      await appendPostSummaryExecutionAudit(
+        run,
+        confirmation.spec,
+        confirmation.marker,
+        confirmation.attempts,
+        `P2P Original Request Execution Reconfirmed (cycle ${confirmation.spec.cycleIndex}/${confirmation.spec.cycleTotal})`,
+      );
+      logger.info({ runId: run.id, cycleIndex: spec.cycleIndex, cycleTotal: spec.cycleTotal, attempts: attempt }, 'P2P: post-summary execution marker confirmed');
+      return true;
     }
-  } finally {
-    if (idleWaiter) idleWaiter.cancel();
+    if (markerState && !markerState.ok) {
+      if (markerState.failedByAgent) {
+        failRun(run, 'post_summary_execution_failed', markerState.reason, serverLink);
+        return false;
+      }
+    }
+
+    queueStopSent = await maybeStopStaleP2pTransportQueue({
+      run,
+      session,
+      dispatchStartedAt,
+      alreadyStopped: queueStopSent,
+      reason: 'execution_marker_missing',
+    });
+    if (await isPostSummaryMarkerRetryReady(run, session, dispatchStartedAt)) {
+      logger.warn(
+        { runId: run.id, session, attempt, markerPath: spec.markerPath },
+        'P2P: execution marker still missing after queue-aware idle — retrying post-summary execution prompt',
+      );
+      if (await sendAttempt()) queueStopSent = false;
+    }
+    await sleep(Math.min(IDLE_POLL_MS, Math.max(1, deadlineAt - Date.now())));
   }
 
   logger.warn({ runId: run.id, session, timeoutMs, markerPath: spec.markerPath }, 'P2P: post-summary execution marker timed out');
@@ -3357,6 +3390,21 @@ interface DispatchHopOptions {
   required?: boolean;
 }
 
+function normalizeDiscussionSectionHeader(value: string): string {
+  return value.toLowerCase().replace(/[–—]/g, '-').replace(/--/g, '-');
+}
+
+async function discussionFileContainsSectionHeader(filePath: string, sectionHeader: string): Promise<boolean> {
+  try {
+    const content = await readFile(filePath, 'utf8');
+    return normalizeDiscussionSectionHeader(content).includes(
+      normalizeDiscussionSectionHeader(`## ${sectionHeader}`),
+    );
+  } catch {
+    return false;
+  }
+}
+
 async function dispatchHop(
   run: P2pRun,
   session: string,
@@ -3395,14 +3443,16 @@ async function dispatchHop(
 
   const watchPath = localCopyPath ?? sourcePath;
   if (hop) hop.working_path = watchPath;
-  const MAX_RETRIES = 1;
+  const MAX_RETRIES = 0;
   // Required hops (initiator initial-analysis + round summaries) cannot be
   // skipped — a timeout here fails the ENTIRE run, unlike participant hops
   // which are tolerant (Promise.allSettled + required:false → skipped). Give
-  // these non-skippable hops a doubled wait window per attempt so a host that
-  // is deliberating (large context, deep reasoning) isn't killed at the base
-  // deadline and take the whole discussion down with it. Combined with the
-  // existing MAX_RETRIES re-dispatch, a required hop gets a generous budget.
+  // these non-skippable hops a doubled wait window so a host that is
+  // deliberating (large context, deep reasoning) isn't killed at the base
+  // deadline and take the whole discussion down with it. Do not auto-resend
+  // the same prompt after a successful dispatch: a queued-empty transport has
+  // accepted the message, and duplicate analysis/summary prompts corrupt the
+  // shared discussion file.
   const REQUIRED_HOP_TIMEOUT_MULTIPLIER = 2;
   const effectiveTimeoutMs = required
     ? run.timeoutMs * REQUIRED_HOP_TIMEOUT_MULTIPLIER
@@ -3428,6 +3478,16 @@ async function dispatchHop(
       run.completedHops.push(target);
     }
   };
+
+  if (sectionHeader && await discussionFileContainsSectionHeader(watchPath, sectionHeader)) {
+    logger.warn(
+      { runId: run.id, session, sectionHeader },
+      'P2P: section already exists in discussion file — completing hop without duplicate dispatch',
+    );
+    await finishHop('completed');
+    pushState(run, serverLink);
+    return true;
+  }
 
   const abortForOverallTimeout = async () => {
     if (hop) {
@@ -3482,6 +3542,7 @@ async function dispatchHop(
     let lastGrowthAt = 0;
     let headingFound = false;
     let headingFoundAt = 0;
+    let queueStopSent = false;
 
     while (Date.now() < deadline) {
       if (!ensureRunDeadline(run, serverLink)) {
@@ -3528,8 +3589,7 @@ async function dispatchHop(
         }
         if (sectionHeader && !headingFound && currentSize > sizeBefore) {
           const content = await readFile(watchPath, 'utf8');
-          const norm = (s: string) => s.toLowerCase().replace(/[–—]/g, '-').replace(/--/g, '-');
-          if (norm(content).includes(norm(`## ${sectionHeader}`))) {
+          if (normalizeDiscussionSectionHeader(content).includes(normalizeDiscussionSectionHeader(`## ${sectionHeader}`))) {
             headingFound = true;
             headingFoundAt = Date.now();
             if (!fileGrew) {
@@ -3566,6 +3626,16 @@ async function dispatchHop(
       const pastGrace = (Date.now() - dispatchTime) > GRACE_PERIOD_MS;
       const settleMs = IDLE_POLL_MS * FILE_SETTLE_CYCLES;
       const fileSettled = fileGrew && lastGrowthAt > 0 && (Date.now() - lastGrowthAt) >= settleMs;
+
+      if (!fileGrew && !headingFound) {
+        queueStopSent = await maybeStopStaleP2pTransportQueue({
+          run,
+          session,
+          dispatchStartedAt: dispatchTime,
+          alreadyStopped: queueStopSent,
+          reason: 'discussion_section_missing',
+        });
+      }
 
       if (fileSettled || (pastGrace && !fileGrew)) {
         let idleConfirmed = false;
@@ -3629,16 +3699,10 @@ async function dispatchHop(
             }
           } catch {}
 
-          if (attempt < MAX_RETRIES) {
-            logger.warn({ runId: run.id, session, attempt }, 'P2P: agent went idle without writing to file, retrying');
-            idleWaiter.cancel();
-            break;
-          }
-          logger.warn({ runId: run.id, session }, 'P2P: agent idle without file change after retry');
-          idleWaiter.cancel();
-          await finishHop('failed', 'idle_without_file_change');
-          pushState(run, serverLink);
-          return false;
+          // Idle without output is not proof that the prompt was not delivered.
+          // Keep waiting until the hop timeout instead of sending a duplicate
+          // prompt into a potentially slow/queued model turn.
+          continue;
         }
       }
     }

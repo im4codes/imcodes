@@ -2677,4 +2677,118 @@ describe('p2p-workflow reverse-regression', () => {
       'The verbose legacy injection MUST be removed from command-handler.ts',
     ).toBe(false);
   });
+
+  it('#80 legacy P2P dispatch MUST short-circuit duplicate section prompts (R3 v2 PR-ρ)', () => {
+    const orchestrator = read('src/daemon/p2p-orchestrator.ts');
+
+    expect(
+      /async\s+function\s+discussionFileContainsSectionHeader\s*\(/.test(orchestrator.text),
+      'orchestrator must provide a helper that detects existing discussion section headings',
+    ).toBe(true);
+
+    const dispatchAnchor = orchestrator.text.indexOf('async function dispatchHop');
+    expect(dispatchAnchor, 'dispatchHop must exist').toBeGreaterThan(0);
+    const dispatchWindow = orchestrator.text.slice(dispatchAnchor, dispatchAnchor + 9000);
+
+    expect(
+      /discussionFileContainsSectionHeader\(watchPath,\s*sectionHeader\)[\s\S]{0,500}finishHop\('completed'\)[\s\S]{0,120}return true/.test(dispatchWindow),
+      'dispatchHop must complete without sending when the expected section heading already exists',
+    ).toBe(true);
+
+    expect(
+      dispatchWindow.indexOf('discussionFileContainsSectionHeader(watchPath, sectionHeader)')
+        < dispatchWindow.indexOf('transportRuntime.send(prompt)'),
+      'duplicate-heading short-circuit must run before transportRuntime.send(prompt)',
+    ).toBe(true);
+
+    expect(
+      /const\s+MAX_RETRIES\s*=\s*0/.test(dispatchWindow),
+      'legacy dispatch must not auto-resend the same analysis/summary prompt after successful dispatch',
+    ).toBe(true);
+    expect(
+      /maybeStopStaleP2pTransportQueue\([\s\S]{0,240}reason:\s*'discussion_section_missing'/.test(dispatchWindow),
+      'legacy dispatch must use stale queue detection instead of duplicate prompt retry',
+    ).toBe(true);
+  });
+
+  it('#81 P2P marker gates MUST watchdog stale queues without blind prompt retry (R3 v2 PR-ρ)', () => {
+    const orchestrator = read('src/daemon/p2p-orchestrator.ts');
+
+    expect(
+      orchestrator.text.includes('QUEUE_STUCK_STOP_AFTER_MS = 300_000'),
+      'P2P stale queue watchdog must default to 5 minutes',
+    ).toBe(true);
+    expect(
+      orchestrator.text.includes('MARKER_PROMPT_RETRY_AFTER_MS = 60_000'),
+      'marker-missing retries must be throttled',
+    ).toBe(true);
+    expect(
+      orchestrator.text.includes('POST_SUMMARY_CONFIRMATION_DELAY_MS = 10_000'),
+      'execution follow-up confirmation must wait briefly after the execution marker is observed',
+    ).toBe(true);
+    expect(
+      /async\s+function\s+maybeStopStaleP2pTransportQueue\s*\(/.test(orchestrator.text)
+        && /runtime\.cancel\(\)/.test(orchestrator.text),
+      'P2P must stop a stale active transport turn once so queued work can drain',
+    ).toBe(true);
+    expect(
+      /async\s+function\s+isPostSummaryMarkerRetryReady\s*\(/.test(orchestrator.text)
+        && /snapshot\.sending\s*\|\|\s*snapshot\.pendingCount\s*>\s*0\s*\|\|\s*snapshot\.activeDispatchCount\s*>\s*0/.test(orchestrator.text),
+      'marker retry readiness must require an empty transport queue/active-dispatch state',
+    ).toBe(true);
+
+    const executionGateAnchor = orchestrator.text.indexOf('async function runPostSummaryExecutionGate');
+    expect(executionGateAnchor, 'runPostSummaryExecutionGate must exist').toBeGreaterThan(0);
+    const executionGateWindow = orchestrator.text.slice(executionGateAnchor, executionGateAnchor + 5200);
+    expect(
+      /POST_SUMMARY_CONFIRMATION_DELAY_MS[\s\S]{0,360}runPostSummaryExecutionConfirmationGate/.test(executionGateWindow),
+      'execution gate must delay the follow-up prompt after observing the execution marker',
+    ).toBe(true);
+    expect(
+      /maybeStopStaleP2pTransportQueue\([\s\S]{0,260}reason:\s*'execution_marker_missing'/.test(executionGateWindow),
+      'execution marker gate must watchdog stale queues while waiting for marker',
+    ).toBe(true);
+    expect(
+      /isPostSummaryMarkerRetryReady\(run,\s*session,\s*dispatchStartedAt\)[\s\S]{0,260}retrying post-summary execution prompt/.test(executionGateWindow),
+      'execution marker gate must retry the marker prompt only after queue-aware idle',
+    ).toBe(true);
+
+    const confirmationAnchor = orchestrator.text.indexOf('async function runPostSummaryExecutionConfirmationGate');
+    expect(confirmationAnchor, 'runPostSummaryExecutionConfirmationGate must exist').toBeGreaterThan(0);
+    const confirmationWindow = orchestrator.text.slice(confirmationAnchor, confirmationAnchor + 4400);
+    expect(
+      /maybeStopStaleP2pTransportQueue\([\s\S]{0,260}reason:\s*'confirmation_marker_missing'/.test(confirmationWindow),
+      'confirmation marker gate must watchdog stale queues while waiting for marker',
+    ).toBe(true);
+    expect(
+      /isPostSummaryMarkerRetryReady\(run,\s*session,\s*dispatchStartedAt\)[\s\S]{0,260}retrying confirmation prompt/.test(confirmationWindow),
+      'confirmation marker gate must retry the marker prompt only after queue-aware idle',
+    ).toBe(true);
+  });
+
+  it('#82 terminal P2P runs MUST NOT be projected as active diagnostics (R3 v2 PR-σ)', () => {
+    const diagnostics = read('src/daemon/runtime-diagnostics.ts');
+    expect(
+      diagnostics.text.includes('P2P_TERMINAL_RUN_STATUSES'),
+      'runtime diagnostics must know which retained P2P runs are terminal',
+    ).toBe(true);
+    expect(
+      /activeRuns\s*=\s*runs\.filter\(\(run\)\s*=>\s*!P2P_TERMINAL_RUN_STATUSES\.has\(run\.status\)\)/.test(diagnostics.text),
+      'runtime diagnostics must compute activeRuns by excluding completed/failed/cancelled/timed_out runs',
+    ).toBe(true);
+    expect(
+      /activeCount:\s*activeRuns\.length/.test(diagnostics.text),
+      'runtime diagnostics activeCount must not use retained runs.length',
+    ).toBe(true);
+
+    const orchestrator = read('src/daemon/p2p-orchestrator.ts');
+    expect(
+      /const\s+isTerminalRun\s*=\s*P2P_TERMINAL_RUN_STATUSES\.has\(run\.status\)/.test(orchestrator.text),
+      'serializeP2pRun must classify terminal runs before building the public payload',
+    ).toBe(true);
+    expect(
+      /\.\.\.\(isTerminalRun\s*\?\s*\{\}\s*:\s*\{\s*active_phase:\s*run\.activePhase\s*\}\)/.test(orchestrator.text),
+      'serializeP2pRun must omit active_phase for terminal runs retained during cleanup grace',
+    ).toBe(true);
+  });
 });

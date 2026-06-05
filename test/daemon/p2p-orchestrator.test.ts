@@ -69,6 +69,7 @@ import {
   _setGracePeriodMs,
   _setIdlePollMs,
   _setMinProcessingMs,
+  _setPostSummaryConfirmationDelayMs,
   _setRoundHopCleanupDelayMs,
   type P2pRun,
   type P2pRunStatus,
@@ -142,6 +143,7 @@ beforeEach(async () => {
   _setGracePeriodMs(80);
   _setMinProcessingMs(0);
   _setFileSettleCycles(1);
+  _setPostSummaryConfirmationDelayMs(0);
   _setRoundHopCleanupDelayMs(0);
   autoWriteExecutionMarkers = true;
 
@@ -186,6 +188,7 @@ afterEach(async () => {
   _setGracePeriodMs(180000);
   _setMinProcessingMs(30000);
   _setFileSettleCycles(3);
+  _setPostSummaryConfirmationDelayMs(10000);
   _setRoundHopCleanupDelayMs(0);
   await rm(tempProjectDir, { recursive: true, force: true }).catch(() => {});
 });
@@ -985,7 +988,7 @@ describe('P2P orchestrator — parallel rounds', () => {
 
     expect(payload.status).toBe('completed');
     expect(payload.mode_key).toBe('audit');
-    expect(payload.active_phase).toBeDefined();
+    expect(payload.active_phase).toBeUndefined();
     expect(Array.isArray(payload.all_nodes)).toBe(true);
     expect(Array.isArray(payload.hop_states)).toBe(true);
     expect(payload.run_phase).toBe('completed');
