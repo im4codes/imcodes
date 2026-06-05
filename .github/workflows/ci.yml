@@ -647,6 +647,7 @@ jobs:
             BUILD_TIME=${{ steps.ts.outputs.value }}
             OTA_VERSION=${{ steps.ota.outputs.version }}
             APP_VERSION=${{ steps.version_meta.outputs.npm_version }}
+            IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=1
           cache-from: type=gha
           cache-to: type=gha,mode=max
           load: true
@@ -674,6 +675,7 @@ jobs:
             BUILD_TIME=${{ steps.ts.outputs.value }}
             OTA_VERSION=${{ steps.ota.outputs.version }}
             APP_VERSION=${{ steps.version_meta.outputs.npm_version }}
+            IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=1
           cache-from: type=gha
           cache-to: type=gha,mode=max
           push: true
