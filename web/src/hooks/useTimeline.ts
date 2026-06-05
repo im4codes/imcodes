@@ -23,6 +23,7 @@ import {
   MSG_DAEMON_OFFLINE,
   type AckFailureReason,
 } from '@shared/ack-protocol.js';
+import { TIMELINE_SNAPSHOT_STORAGE_PREFIX } from '../local-storage-quota.js';
 
 /** Map an AckFailureReason to a localized message suitable for failureReason payload. */
 function localizedAckFailureReason(reason: AckFailureReason): string {
@@ -282,7 +283,6 @@ const TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS = 1;
 const USER_MSG_DEDUP_WINDOW_MS = 5_000;
 const PROVISIONAL_TRANSPORT_HISTORY_PREFIX = 'transport-history:';
 const OPTIMISTIC_EVENT_ID_PREFIX = 'optimistic:';
-const TIMELINE_SNAPSHOT_STORAGE_PREFIX = 'rcc_timeline_snapshot:';
 const TIMELINE_SNAPSHOT_WRITE_DELAY_MS = 750;
 // Streaming assistant.text deltas are NOT written to IDB per-tick (too frequent —
 // see shouldPersistTimelineEvent). Instead, persist the LATEST streaming text to

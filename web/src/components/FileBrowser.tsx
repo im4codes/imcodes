@@ -33,6 +33,7 @@ import {
   type ChangeFile,
 } from '../git-status-store.js';
 import { filePreviewStatesEqual } from '../file-preview-state.js';
+import { FILE_BROWSER_SNAPSHOT_KEY_PREFIX } from '../local-storage-quota.js';
 
 const PREF_KEY = 'fb_prefer_editor';
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
@@ -163,7 +164,6 @@ interface FileBrowserSnapshot {
 
 const FILE_BROWSER_SNAPSHOT_TTL_MS = 5 * 60_000;
 const FILE_BROWSER_SNAPSHOT_MAX_NODES = 400;
-const FILE_BROWSER_SNAPSHOT_KEY_PREFIX = 'rcc_fb_snapshot_v1';
 
 function buildFileBrowserSnapshotKey(
   startPath: string,

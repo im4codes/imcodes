@@ -82,6 +82,7 @@ import {
 } from './components/pinnedPanelTypes.js';
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { formatDaemonVersionShort } from './util/format-version.js';
+import { safeLocalStorageRemoveItem, safeLocalStorageSetItem } from './local-storage-quota.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import {
   isNavigableMainSession,
@@ -1133,11 +1134,17 @@ export function App() {
   const openSubIdsRef = useRef(openSubIds);
   openSubIdsRef.current = openSubIds;
   const persistOpenSubIds = useCallback((next: Set<string>) => {
-    const mainSession = localStorage.getItem('rcc_session');
+    let mainSession: string | null = null;
+    try {
+      mainSession = localStorage.getItem('rcc_session');
+    } catch {
+      return;
+    }
     if (!mainSession) return;
     const ids = Array.from(next);
-    if (ids.length > 0) localStorage.setItem(`rcc_open_subs_${mainSession}`, JSON.stringify(ids));
-    else localStorage.removeItem(`rcc_open_subs_${mainSession}`);
+    const storageKey = `rcc_open_subs_${mainSession}`;
+    if (ids.length > 0) safeLocalStorageSetItem(storageKey, JSON.stringify(ids));
+    else safeLocalStorageRemoveItem(storageKey);
   }, []);
   const setOpenSubIds = useCallback((updater: Set<string> | ((prev: Set<string>) => Set<string>)) => {
     if (typeof updater !== 'function') {
@@ -1802,8 +1809,8 @@ export function App() {
   }, [previewFileRequest, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
 
   const setActiveSession = useCallback((name: string | null, opts?: { keepSubWindows?: boolean }) => {
-    if (name) localStorage.setItem('rcc_session', name);
-    else localStorage.removeItem('rcc_session');
+    if (name) safeLocalStorageSetItem('rcc_session', name);
+    else safeLocalStorageRemoveItem('rcc_session');
     setActiveSessionState(name);
     if (!opts?.keepSubWindows) {
       setMaximizedSubIds(new Set());
@@ -3610,7 +3617,7 @@ export function App() {
     // Restore previously selected session for this server
     const savedSession = localStorage.getItem(`rcc_session_${serverId}`);
     if (savedSession) {
-      localStorage.setItem('rcc_session', savedSession);
+      safeLocalStorageSetItem('rcc_session', savedSession);
     } else {
       localStorage.removeItem('rcc_session');
     }
@@ -3651,13 +3658,13 @@ export function App() {
       }
       // Activate parent main session first
       if (sub.parentSession) {
-        localStorage.setItem('rcc_session', sub.parentSession);
+        safeLocalStorageSetItem('rcc_session', sub.parentSession);
         setActiveSession(sub.parentSession, { keepSubWindows: true });
       }
       setOpenSubIds((prev) => new Set([...prev, subId]));
       bringSubToFront(subId);
     } else {
-      localStorage.setItem('rcc_session', session);
+      safeLocalStorageSetItem('rcc_session', session);
       setActiveSession(session);
     }
     if (quote) {
