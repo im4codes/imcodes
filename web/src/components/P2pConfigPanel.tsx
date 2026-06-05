@@ -306,6 +306,7 @@ const closeBtnStyle: Record<string, string | number> = {
 
 const bodyStyle: Record<string, string | number> = {
   flex: 1,
+  minHeight: 0,
   overflowY: 'auto',
   padding: '12px 20px',
 };
@@ -991,6 +992,11 @@ export function P2pConfigPanel({
     zIndex: 9999,
     padding: isMobile ? 'calc(env(safe-area-inset-top, 0px) + 12px) 0 0' : 16,
   };
+  const mobilePanelHeight = 'calc(var(--vvh, 100dvh) - env(safe-area-inset-top, 0px) - 12px)';
+  const mobileFooterStyle: Record<string, string | number> = {
+    ...footerStyle,
+    padding: '12px 20px calc(env(safe-area-inset-bottom, 0px) + 16px)',
+  };
   const panelStyle: Record<string, string | number> = {
     background: '#1e293b',
     border: '1px solid #334155',
@@ -1004,10 +1010,11 @@ export function P2pConfigPanel({
      */
     width: isMobile ? '100vw' : 'min(1400px, calc(100vw - 32px))',
     maxWidth: isMobile ? '100vw' : 1400,
-    height: isMobile ? 'calc(100vh - env(safe-area-inset-top, 0px) - 12px)' : 'auto',
-    maxHeight: isMobile ? 'calc(100vh - env(safe-area-inset-top, 0px) - 12px)' : '90vh',
+    height: isMobile ? mobilePanelHeight : 'auto',
+    maxHeight: isMobile ? mobilePanelHeight : '90vh',
     display: 'flex',
     flexDirection: 'column',
+    minHeight: 0,
     boxShadow: isMobile ? 'none' : '0 8px 32px rgba(0,0,0,0.5)',
     overflow: 'hidden',
   };
@@ -1686,7 +1693,7 @@ export function P2pConfigPanel({
         </div>
 
         {/* Footer */}
-        <div style={footerStyle}>
+        <div style={isMobile ? mobileFooterStyle : footerStyle}>
           {(saveError || saveWarning) && (
             <div style={{ flex: 1, alignSelf: 'center', color: saveError ? '#fca5a5' : '#fcd34d', fontSize: 12, paddingRight: 12 }}>
               {saveError ?? saveWarning}

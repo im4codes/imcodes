@@ -4981,7 +4981,15 @@ export function App() {
       )}
 
       {showDiscussionsPage && selectedServerId && (
-        <FloatingPanel id="discussions" title={trans('p2p.discussions.title')} onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }} defaultW={800} defaultH={600} zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.discussions, 5040)} onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.discussions)}>
+        <FloatingPanel
+          id="discussions"
+          title={trans('p2p.discussions.title')}
+          onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
+          defaultW={800}
+          defaultH={600}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.discussions, isMobile ? 6500 : 5040)}
+          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.discussions)}
+        >
           <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
             <DiscussionsPage
               ws={wsRef.current}
