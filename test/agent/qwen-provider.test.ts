@@ -1196,6 +1196,61 @@ describe('QwenProvider', () => {
     expect(errors).toEqual([]);
   });
 
+  it('retries qwen tool-call history replay errors in a fresh conversation', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-tool-history-replay-error',
+      cwd: '/tmp/project',
+      agentId: 'qwen3-coder-plus',
+    });
+
+    const errors: string[] = [];
+    const completed: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.message));
+    provider.onComplete((_sid, msg) => completed.push(String(msg.content)));
+
+    await provider.send('sess-tool-history-replay-error', 'first turn');
+    await waitForSpawnCount(1);
+    const first = lastSpawn();
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-first-tool-ok', content: [{ type: 'text', text: 'First OK' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-tool-history-replay-error', 'retry after malformed tool history');
+    await waitForSpawnCount(2);
+    const second = lastSpawn();
+    expect(second.args).toContain('--resume');
+
+    const apiErrorText = '[API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"invalid params, tool call result does not follow tool call (2013)"}}]';
+    second.child.stdout.write(`${JSON.stringify({
+      type: 'stream_event',
+      event: { type: 'message_start', message: { id: 'msg-api-error-stream' } },
+    })}\n`);
+    second.child.stdout.write(`${JSON.stringify({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: apiErrorText } },
+    })}\n`);
+    second.child.stdout.write(`${JSON.stringify({
+      type: 'result',
+      is_error: false,
+      result: apiErrorText,
+    })}\n`);
+    await waitForSpawnCount(3);
+
+    const third = lastSpawn();
+    expect(third.args).toContain('--session-id');
+    expect(third.args).not.toContain('--resume');
+    third.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-tool-history-fallback-ok', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    third.child.emit('close', 0, null);
+    await flushIO();
+    await flushIO();
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(3);
+    expect(completed).toEqual(['First OK', 'OK']);
+    expect(errors).toEqual([]);
+  });
+
   it('does not retry transient errors after partial output has streamed', async () => {
     const provider = new QwenProvider();
     await provider.connect({});

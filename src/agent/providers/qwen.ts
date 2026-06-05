@@ -114,6 +114,10 @@ function extractSyntheticApiError(text: string | undefined): string | undefined 
   return match?.[1]?.trim() || undefined;
 }
 
+function startsWithSyntheticApiError(text: string | undefined): boolean {
+  return typeof text === 'string' && /^\s*\[API Error:/i.test(text);
+}
+
 function toQwenCompactPayload(payload: ProviderContextPayload): ProviderContextPayload {
   const {
     sessionSystemText: _sessionSystemText,
@@ -195,6 +199,18 @@ function resolveQwenReasoningSetting(
 
 function isReasoningContentReplayError(message: string): boolean {
   return /reasoning_content[\s\S]*thinking mode[\s\S]*passed back/i.test(message);
+}
+
+function isConversationHistoryReplayError(message: string): boolean {
+  return /tool call result[\s\S]*does not follow[\s\S]*tool call/i.test(message)
+    || /tool result[\s\S]*does not follow[\s\S]*tool call/i.test(message)
+    || /tool_call[\s\S]*result[\s\S]*follow/i.test(message)
+    || /invalid params[\s\S]*tool call result/i.test(message)
+    || /\b2013\b[\s\S]*tool call result/i.test(message);
+}
+
+function isFreshConversationReplayError(message: string): boolean {
+  return isReasoningContentReplayError(message) || isConversationHistoryReplayError(message);
 }
 
 function isEmptyResponseError(message: string): boolean {
@@ -832,7 +848,7 @@ export class QwenProvider implements TransportProvider {
     let reasoningFallbackScheduled = false;
 
     const sawVisibleTurnProgress = (): boolean => {
-      return state.currentText.length > 0
+      return (state.currentText.length > 0 && !startsWithSyntheticApiError(state.currentText))
         || !!state.pendingFinalText
         || state.toolUseById.size > 0
         || state.emittedToolSignatures.size > 0;
@@ -854,7 +870,7 @@ export class QwenProvider implements TransportProvider {
     const maybeRetryWithFreshConversation = async (messageText: string, details?: unknown): Promise<boolean> => {
       if (reasoningFallbackScheduled || reasoningReplayFallbackBudget <= 0) return false;
       if (sawVisibleTurnProgress()) return false;
-      if (!isReasoningContentReplayError(messageText)) return false;
+      if (!isFreshConversationReplayError(messageText)) return false;
       reasoningFallbackScheduled = true;
       completed = true;
       state.child = null;
@@ -865,7 +881,7 @@ export class QwenProvider implements TransportProvider {
       await this.ensureSettingsPath(state);
       logger.warn(
         { provider: this.id, sessionId, conversationId: state.qwenConversationId, message: messageText, details },
-        'Qwen provider rejected missing reasoning_content; retrying turn in a fresh high-thinking conversation',
+        'Qwen provider rejected replayed conversation history; retrying turn in a fresh conversation',
       );
       await this.send(
         sessionId,
@@ -1034,6 +1050,10 @@ export class QwenProvider implements TransportProvider {
             return;
           }
           if (startsWithSdkRuntimeSubagentTag(nextText)) {
+            state.currentText = nextText;
+            return;
+          }
+          if (startsWithSyntheticApiError(nextText)) {
             state.currentText = nextText;
             return;
           }

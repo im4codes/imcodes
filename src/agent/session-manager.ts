@@ -1173,13 +1173,17 @@ async function recoverTransportRuntimeAfterError(
       effort: record.effort,
       transportConfig: record.transportConfig,
       ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
+      // Qwen-compatible API providers can reject a resumed conversation when
+      // their persisted tool-call chain is invalid (e.g. "tool call result
+      // does not follow tool call"). Auto-recovery must rotate the provider
+      // conversation instead of binding the same poisoned qwen session again.
+      ...(record.agentType === 'qwen' ? { fresh: true } : {}),
       ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
       ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
       ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk' || record.agentType === 'kimi-sdk') && record.providerResumeId
         ? { providerResumeId: record.providerResumeId }
         : {}),
       ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
-      ...(record.agentType === 'qwen' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
       ...(record.parentSession ? { parentSession: record.parentSession } : {}),
       ...(record.userCreated ? { userCreated: true } : {}),
     });
