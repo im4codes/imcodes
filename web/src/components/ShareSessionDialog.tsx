@@ -72,7 +72,7 @@ export function ShareSessionDialog({ target, onClose }: Props) {
     try {
       const share = await createShare(target.serverId, {
         target: selectedTarget,
-        targetUser: trimmedUser,
+        targetUserId: trimmedUser,
         role,
       });
       setTargetUser('');

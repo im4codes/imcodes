@@ -43,9 +43,12 @@ const shareTargetInputSchema = z.discriminatedUnion('kind', [
 
 const createShareSchema = z.object({
   target: shareTargetInputSchema,
-  targetUserId: z.string().min(1),
+  targetUserId: z.string().min(1).optional(),
+  targetUser: z.string().min(1).optional(),
   role: shareRoleSchema,
   expiresAt: z.number().int().positive().nullable().optional(),
+}).refine((body) => body.targetUserId !== undefined || body.targetUser !== undefined, {
+  message: 'missing_target_user',
 });
 
 const updateShareSchema = z.object({
@@ -59,14 +62,15 @@ const openShareSchema = z.object({ target: shareTargetInputSchema });
 const ticketSchema = z.object({ target: shareTargetInputSchema });
 
 function managedShareView(share: Awaited<ReturnType<typeof listManagedShares>>[number], user?: { id: string; display_name: string | null; username: string | null } | null) {
+  const targetUserId = user?.id ?? share.targetUserId;
+  const targetUserDisplayName = user ? (user.display_name ?? user.username ?? user.id) : share.targetUserId;
   return {
     id: share.id,
     target: share.target,
     targetRef: shareTargetRef(share.target),
-    targetUser: user ? {
-      id: user.id,
-      displayName: user.display_name ?? user.username ?? user.id,
-    } : { id: share.targetUserId, displayName: share.targetUserId },
+    targetUser: { id: targetUserId, displayName: targetUserDisplayName },
+    targetUserId,
+    targetUserDisplayName,
     role: share.role,
     status: share.revokedAt !== null ? 'revoked' : 'active',
     expiresAt: share.expiresAt,
@@ -95,6 +99,20 @@ function recipientShareEntry(share: Awaited<ReturnType<typeof listActiveSharesFo
 async function requireServerManager(db: Env['DB'], serverId: string, userId: string): Promise<boolean> {
   const role = await resolveServerRole(db, serverId, userId);
   return role === 'owner' || role === 'admin';
+}
+
+async function resolveTargetUser(db: Env['DB'], input: string): Promise<{ id: string; display_name: string | null; username: string | null } | null> {
+  const identifier = input.trim();
+  if (!identifier) return null;
+  const row = await db.queryOne<{ id: string; display_name: string | null; username: string | null }>(
+    `SELECT id, display_name, username
+       FROM users
+      WHERE id = $1 OR lower(username) = lower($1)
+      ORDER BY CASE WHEN id = $1 THEN 0 ELSE 1 END
+      LIMIT 1`,
+    [identifier],
+  );
+  return row ?? null;
 }
 
 async function auditShareLifecycle(c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>, params: {
@@ -243,6 +261,7 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = createShareSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const targetUserInput = parsed.data.targetUserId ?? parsed.data.targetUser ?? '';
   if (parsed.data.target.serverId !== serverId) return c.json({ error: 'invalid_body', reason: 'server_mismatch' }, 400);
   const normalizedTarget = normalizeShareTargetInput(parsed.data.target as ShareTargetInput);
   const now = Date.now();
@@ -252,23 +271,24 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
       actionType: 'share.create',
       decision: 'rejected',
       actorUserId: userId,
-      targetUserId: parsed.data.targetUserId,
+      targetUserId: null,
       target: normalizedTarget,
       reason: 'share-role-denied',
       createdAt: now,
     });
     return c.json({ error: 'forbidden' }, 403);
   }
-  if (parsed.data.targetUserId === userId) return c.json({ error: 'invalid_body', reason: 'self_share_denied' }, 400);
+  const targetUser = await resolveTargetUser(c.env.DB, targetUserInput);
+  if (!targetUser) return c.json({ error: 'invalid_body', reason: 'target_user_unavailable' }, 400);
+  const targetUserId = targetUser.id;
+  if (targetUserId === userId) return c.json({ error: 'invalid_body', reason: 'self_share_denied' }, 400);
   const target = await normalizeExistingShareTarget(c.env.DB, parsed.data.target as ShareTargetInput);
   if (!target) return c.json({ error: 'invalid_body', reason: 'share-target-unavailable' }, 400);
-  const targetUser = await c.env.DB.queryOne<{ id: string }>('SELECT id FROM users WHERE id = $1', [parsed.data.targetUserId]);
-  if (!targetUser) return c.json({ error: 'invalid_body', reason: 'target_user_unavailable' }, 400);
 
   const share = await createOrUpdateShare(c.env.DB, {
     id: randomHex(16),
     target,
-    targetUserId: parsed.data.targetUserId,
+    targetUserId,
     role: parsed.data.role as ShareRole,
     createdBy: userId,
     expiresAt: parsed.data.expiresAt ?? null,
@@ -278,14 +298,14 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
     actionType: share.createdAt === now ? 'share.create' : 'share.update',
     decision: share.createdAt === now ? 'accepted' : 'updated',
     actorUserId: userId,
-    targetUserId: parsed.data.targetUserId,
+    targetUserId,
     target,
     shareId: share.id,
     snapshot: { role: share.role, expiresAt: share.expiresAt },
     createdAt: now,
   });
   void WsBridge.get(serverId).revalidateShareSocketsForUser(share.targetUserId);
-  return c.json({ share: managedShareView(share) }, share.createdAt === now ? 201 : 200);
+  return c.json({ share: managedShareView(share, targetUser) }, share.createdAt === now ? 201 : 200);
 });
 
 tabSharingRoutes.patch('/server/:serverId/shares/:shareId', requireAuth(), async (c) => {

@@ -388,7 +388,7 @@ describe('collaborative tab sharing UI', () => {
     await waitFor(() => expect(apiMocks.createShare).toHaveBeenCalledTimes(1));
     expect(apiMocks.createShare).toHaveBeenCalledWith('srv-1', {
       target: { kind: 'server', serverId: 'srv-1' },
-      targetUser: 'user@example.test',
+      targetUserId: 'user@example.test',
       role: 'participant',
     });
     expect(await screen.findByText('User Example')).not.toBeNull();

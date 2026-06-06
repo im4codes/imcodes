@@ -61,6 +61,20 @@ describe('git-status-store — refresh resilience', () => {
     expect(ws.fsGitStatus).toHaveBeenCalledTimes(2);
   });
 
+  it('skips shared git status refresh without throwing while websocket is disconnected', () => {
+    const { ws } = makeFakeWs();
+    const repo = '/repo/disconnected';
+    vi.mocked(ws.fsGitStatus).mockImplementationOnce(() => {
+      throw new Error('WebSocket not connected');
+    });
+
+    expect(() => requestSharedChanges(ws, repo, false)).not.toThrow();
+    expect(ws.fsGitStatus).toHaveBeenCalledTimes(1);
+
+    requestSharedChanges(ws, repo, false);
+    expect(ws.fsGitStatus).toHaveBeenCalledTimes(2);
+  });
+
   it('non-force request also breaks through once the in-flight timeout elapses', () => {
     vi.useFakeTimers();
     const { ws } = makeFakeWs();

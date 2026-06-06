@@ -642,6 +642,11 @@ describe('WsClient', () => {
     expect(() => client.send({ type: 'ping' })).toThrow('WebSocket not connected');
   });
 
+  it('skips Claude weekly quota opt-in without throwing while disconnected', () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    expect(() => client.setClaudeWeeklyQuotaOptIn(true)).not.toThrow();
+  });
+
   describe('dead-socket detection (pong timeout)', () => {
     it('force-reconnects a new socket after two missed heartbeat pongs', async () => {
       // Regression: mobile OS commonly half-closes the TCP on background

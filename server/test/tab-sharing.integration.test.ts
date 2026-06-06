@@ -330,6 +330,33 @@ describe('tab sharing APIs', () => {
     expect(conflicting.status).toBe(400);
   });
 
+  it('accepts username recipient aliases and the legacy targetUser create field', async () => {
+    const app = makeApp();
+    const { ownerId, recipientId, serverId } = await seedShareTarget();
+    await db.execute('UPDATE users SET username = $1, display_name = $2 WHERE id = $3', ['emma', 'Emma', recipientId]);
+
+    const created = await app.request(`/api/server/${serverId}/shares`, {
+      method: 'POST',
+      headers: authHeaders(ownerId),
+      body: JSON.stringify({
+        target: { kind: 'server', serverId },
+        targetUser: 'EMMA',
+        role: 'viewer',
+      }),
+    });
+
+    expect(created.status).toBe(201);
+    const body = await created.json() as { share: { targetUser: { id: string; displayName: string }; targetUserId: string; targetUserDisplayName: string } };
+    expect(body.share.targetUser).toMatchObject({ id: recipientId, displayName: 'Emma' });
+    expect(body.share.targetUserId).toBe(recipientId);
+    expect(body.share.targetUserDisplayName).toBe('Emma');
+    const row = await db.queryOne<{ target_user_id: string }>(
+      'SELECT target_user_id FROM server_shares WHERE server_id = $1 AND target_user_id = $2',
+      [serverId, recipientId],
+    );
+    expect(row?.target_user_id).toBe(recipientId);
+  });
+
   it('lets recipients discover/open active shares without becoming server members', async () => {
     const app = makeApp();
     const { ownerId, recipientId, serverId, sessionName } = await seedShareTarget();
@@ -613,8 +640,10 @@ describe('tab sharing APIs', () => {
       targetRef: sessionName,
       targetUser: {
         id: recipientId,
-        displayName: recipientId,
+        displayName: 'Shared Recipient',
       },
+      targetUserId: recipientId,
+      targetUserDisplayName: 'Shared Recipient',
       role: 'participant',
       status: 'active',
       createdBy: ownerId,
@@ -630,6 +659,8 @@ describe('tab sharing APIs', () => {
         id: recipientId,
         displayName: 'Shared Recipient',
       },
+      targetUserId: recipientId,
+      targetUserDisplayName: 'Shared Recipient',
       createdBy: ownerId,
       role: 'participant',
     });

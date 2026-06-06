@@ -100,6 +100,10 @@ function abandonInFlight(entry: SharedChangesEntry): void {
   entry.inFlightStartedAt = 0;
 }
 
+function isWebSocketNotConnectedError(error: unknown): boolean {
+  return error instanceof Error && error.message === 'WebSocket not connected';
+}
+
 export function subscribeSharedChanges(key: string, listener: SharedChangesListener): () => void {
   const entry = getEntry(key);
   entry.listeners.add(listener);
@@ -147,7 +151,14 @@ export function requestSharedChanges(ws: WsClient, repoPath: string, force = fal
       return;
     }
   }
-  const requestId = ws.fsGitStatus(repoPath, { includeStats: true });
+  let requestId: string;
+  try {
+    requestId = ws.fsGitStatus(repoPath, { includeStats: true });
+  } catch (error) {
+    if (!isWebSocketNotConnectedError(error)) throw error;
+    entry.queued = false;
+    return;
+  }
   entry.inFlightRequestId = requestId;
   entry.inFlightStartedAt = Date.now();
   entry.queued = false;

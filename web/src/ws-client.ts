@@ -894,6 +894,7 @@ export class WsClient {
    *  weekly (7d) quota. Driven by the per-user `claude_weekly_quota` pref; sent
    *  on every (re)connect and on toggle so each server the user visits honors it. */
   setClaudeWeeklyQuotaOptIn(enabled: boolean): void {
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.send({ type: CLAUDE_QUOTA_MSG.SET_OPT_IN, enabled });
   }
 

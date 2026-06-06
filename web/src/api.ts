@@ -493,7 +493,9 @@ export async function cancelSessionViaHttp(
 
 export interface CreateShareRequest {
   target: ShareTarget;
-  targetUser: string;
+  targetUserId: string;
+  /** Backward-compatible alias for older callers; createShare sends targetUserId on the wire. */
+  targetUser?: string;
   role: ShareRole;
 }
 
@@ -503,6 +505,31 @@ export interface CreateShareResponse {
 
 export interface ListSharesResponse {
   shares: ShareGrantSummary[];
+}
+
+function normalizeShareGrantSummary(value: unknown): ShareGrantSummary {
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+  const targetUser = raw.targetUser && typeof raw.targetUser === 'object'
+    ? raw.targetUser as Record<string, unknown>
+    : {};
+  const targetUserId = typeof raw.targetUserId === 'string'
+    ? raw.targetUserId
+    : typeof targetUser.id === 'string'
+      ? targetUser.id
+      : '';
+  const targetUserDisplayName = typeof raw.targetUserDisplayName === 'string'
+    ? raw.targetUserDisplayName
+    : typeof targetUser.displayName === 'string'
+      ? targetUser.displayName
+      : targetUserId;
+  return {
+    ...(raw as Partial<ShareGrantSummary>),
+    id: typeof raw.id === 'string' ? raw.id : '',
+    targetUserId,
+    targetUserDisplayName,
+    role: raw.role === 'participant' ? 'participant' : 'viewer',
+    status: typeof raw.status === 'string' ? raw.status as ShareGrantSummary['status'] : 'active',
+  };
 }
 
 function buildShareTargetParams(target: ShareTarget): URLSearchParams {
@@ -518,15 +545,20 @@ export async function listSharesForTarget(serverId: string, target: ShareTarget)
   const res = await apiFetch<ListSharesResponse>(
     `/api/server/${encodeURIComponent(serverId)}/shares?${params.toString()}`,
   );
-  return Array.isArray(res.shares) ? res.shares : [];
+  return Array.isArray(res.shares) ? res.shares.map(normalizeShareGrantSummary) : [];
 }
 
 export async function createShare(serverId: string, request: CreateShareRequest): Promise<ShareGrantSummary> {
+  const targetUserId = request.targetUserId || request.targetUser || '';
   const res = await apiFetch<CreateShareResponse>(`/api/server/${encodeURIComponent(serverId)}/shares`, {
     method: 'POST',
-    body: JSON.stringify(request),
+    body: JSON.stringify({
+      target: request.target,
+      targetUserId,
+      role: request.role,
+    }),
   });
-  return res.share;
+  return normalizeShareGrantSummary(res.share);
 }
 
 export interface SharedEntrySummary {
