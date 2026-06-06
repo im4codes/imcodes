@@ -88,8 +88,9 @@ import {
 } from '../../../shared/preview-types.js';
 import { isStreamingResponse } from '../../../shared/preview-stream-policy.js';
 import { LocalWebPreviewRegistry, setPreviewActiveRelayHook, setPreviewEvictedHook } from '../preview/registry.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, getSubSessionsByServer, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
 import { toDiscussionCommentView } from '../share/discussion-comment-view.js';
+import { resolveCoveredSessionNames } from '../share/covered-sessions.js';
 import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
@@ -2533,6 +2534,7 @@ export class WsBridge {
   ): void {
     this.browserShareStates.set(ws, {
       userId,
+      actorDisplayName: userId,
       ticketId: options.ticketId,
       target: options.target,
       snapshot: options.snapshot,
@@ -2540,6 +2542,7 @@ export class WsBridge {
       coveredSessionNames: this.baseCoveredSessionNames(options.target),
     });
     this.handleBrowserConnection(ws, userId, db, options.isMobile ?? false);
+    void this.refreshShareActorDisplayName(ws);
     void this.refreshShareCoveredSessions(ws);
   }
 
@@ -2934,7 +2937,9 @@ export class WsBridge {
         closeSocket: true,
       };
     }
-    const current = await this.applyShareCoverage(ws, state, coverage);
+    await this.refreshShareActorDisplayName(ws);
+    const refreshedState = this.browserShareStates.get(ws) ?? state;
+    const current = await this.applyShareCoverage(ws, refreshedState, coverage);
     const sessionName = commandSessionName(msg);
     const runtimeType = sessionName ? await this.resolveSessionRuntimeType(sessionName) : 'unknown';
     const decision = evaluateShareCommand({
@@ -3227,19 +3232,31 @@ export class WsBridge {
     this.browserShareStates.set(ws, { ...current, coveredSessionNames });
   }
 
-  private async resolveShareCoveredSessionNames(target: ShareTarget): Promise<string[] | undefined> {
-    if (target.kind === 'server') return undefined;
-    const names = new Set(this.baseCoveredSessionNames(target) ?? []);
-    if (target.kind !== 'main' || !this.db) return [...names];
+  private async refreshShareActorDisplayName(ws: WebSocket): Promise<void> {
+    const state = this.browserShareStates.get(ws);
+    if (!state || !this.db) return;
+    if (state.actorDisplayName !== state.userId) return;
     try {
-      const subSessions = await getSubSessionsByServer(this.db, target.serverId);
-      for (const subSession of subSessions) {
-        if (subSession.parent_session === target.sessionName) names.add(`deck_sub_${subSession.id}`);
-      }
+      const user = await getUserById(this.db, state.userId);
+      const current = this.browserShareStates.get(ws);
+      if (!current || current.ticketId !== state.ticketId) return;
+      this.browserShareStates.set(ws, {
+        ...current,
+        actorDisplayName: user?.display_name ?? user?.username ?? current.userId,
+      });
+    } catch (err) {
+      logger.warn({ err, serverId: this.serverId, userId: state.userId }, 'Failed to resolve share actor display name');
+    }
+  }
+
+  private async resolveShareCoveredSessionNames(target: ShareTarget): Promise<string[] | undefined> {
+    if (!this.db) return this.baseCoveredSessionNames(target);
+    try {
+      return await resolveCoveredSessionNames(this.db, target);
     } catch (err) {
       logger.warn({ err, serverId: this.serverId, target }, 'Failed to refresh covered share sub-sessions');
     }
-    return [...names];
+    return this.baseCoveredSessionNames(target);
   }
 
   private shareStateLooksExpired(state: ShareScopedSocketState): boolean {

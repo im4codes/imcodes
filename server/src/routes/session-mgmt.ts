@@ -9,6 +9,7 @@ import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
 import {
   deriveShareTransitionKey,
+  listActiveSharesForUser,
   shareTargetFromSessionName,
   writeShareAuditEvent,
   type EffectiveCoverage,
@@ -17,6 +18,8 @@ import {
   type ShareTarget,
 } from '../db/tab-sharing.js';
 import { resolveHttpShareAccess, resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
+import { buildCoversSessionPredicate, resolveCoveredSessionNames } from '../share/covered-sessions.js';
+import { evaluateP2pSendTargetScope } from '../share/p2p-send-scope.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import {
   WORKER_SESSION_SNAPSHOT_INCOMPLETE_REASON,
@@ -633,6 +636,23 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
         await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'rejected', reason: 'share-role-denied', actionId, now });
         return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
       }
+      const p2pScopeTarget = await httpP2pScopeTarget(c.env.DB, {
+        userId,
+        serverId,
+        requestedTarget: target,
+        coverage: access.actor.coverage,
+        now,
+      });
+      const coveredSessionNames = await resolveCoveredSessionNames(c.env.DB, p2pScopeTarget);
+      const p2pScopeReason = evaluateP2pSendTargetScope({
+        msg: body,
+        target: p2pScopeTarget,
+        coversSession: buildCoversSessionPredicate(p2pScopeTarget, coveredSessionNames),
+      });
+      if (p2pScopeReason) {
+        await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'rejected', reason: p2pScopeReason, actionId, now });
+        return c.json({ error: 'forbidden', reason: p2pScopeReason }, 403);
+      }
       const rateLimitReason = evaluateHttpShareRateLimit({ bridge: WsBridge.get(serverId), userId, serverId, sessionName: targetSessionName ?? '', commandType: 'session.send', now });
       if (rateLimitReason) {
         await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'rejected', reason: rateLimitReason, actionId, now });
@@ -741,6 +761,21 @@ async function buildHttpSharedActor(
     authorizedAt: params.coverage.authorizedAt,
     queuedAt: params.now,
   };
+}
+
+async function httpP2pScopeTarget(
+  db: Env['DB'],
+  params: { userId: string; serverId: string; requestedTarget: ShareTarget; coverage: EffectiveCoverage; now: number },
+): Promise<ShareTarget> {
+  const coveringShareIds = new Set(params.coverage.coveringShareIds);
+  const activeShares = await listActiveSharesForUser(db, params.userId, params.now);
+  const hasParticipantServerGrant = activeShares.some((share) => (
+    share.serverId === params.serverId
+    && coveringShareIds.has(share.id)
+    && share.target.kind === 'server'
+    && share.role === 'participant'
+  ));
+  return hasParticipantServerGrant ? { kind: 'server', serverId: params.serverId } : params.requestedTarget;
 }
 
 function evaluateHttpShareRateLimit(params: {

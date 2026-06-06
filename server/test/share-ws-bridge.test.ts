@@ -85,7 +85,7 @@ function makeDb(
       if (sql.includes('runtime_type')) return { runtime_type: runtimeType };
       if (sql.includes('SELECT 1 FROM sessions')) return { exists: 1 };
       if (sql.includes('SELECT 1 FROM sub_sessions')) return { exists: 1 };
-      if (sql.includes('SELECT display_name, username FROM users')) return { display_name: 'Shared User', username: 'shared-user' };
+      if (sql.includes('FROM users')) return { id: 'shared-user', display_name: 'Shared User', username: 'shared-user' };
       if (sql.includes('SELECT * FROM discussion_comments')) return discussionComments.get(String(params?.[0] ?? '')) ?? null;
       return null;
     },
@@ -375,8 +375,53 @@ describe('WsBridge share-scoped sockets', () => {
         });
       } else {
         expect(sharedPolicy.disposition).toBe('allow');
+        if (actualPolicy?.kind === 'allow-covered-read') {
+          expect(actualPolicy.requireTarget).toBe(sharedPolicy.scope === 'concrete-tab');
+        }
       }
     }
+  });
+
+  it('denies targetless shared terminal and chat read commands before daemon forwarding', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const shared = new MockWs();
+    bridge.handleShareBrowserConnection(shared as never, 'shared-user', makeDb(), {
+      ticketId: 'share-ticket-1',
+      target,
+      snapshot: coverage(target, 'viewer', now),
+    });
+
+    const targetlessReadCommands = [
+      'terminal.subscribe',
+      'terminal.unsubscribe',
+      'terminal.snapshot_request',
+      TRANSPORT_MSG.CHAT_SUBSCRIBE,
+      TRANSPORT_MSG.CHAT_UNSUBSCRIBE,
+      TRANSPORT_MSG.CHAT_HISTORY,
+    ];
+    for (const [index, type] of targetlessReadCommands.entries()) {
+      shared.emit('message', JSON.stringify({ type, requestId: `targetless-${index}` }));
+      await flushAsync();
+    }
+
+    for (const type of targetlessReadCommands) {
+      expect(shared.sentJson).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'error',
+          code: SHARE_REASONS.DIRECT_SURFACE_DENIED,
+          originalType: type,
+        }),
+      ]));
+    }
+    expect(daemon.sentJson.some((msg) => targetlessReadCommands.includes(String(msg.type)))).toBe(false);
   });
 
   it('covers direct-surface bridge commands and denies unknown commands by inventory', async () => {
@@ -528,6 +573,7 @@ describe('WsBridge share-scoped sockets', () => {
       target,
       snapshot: coverage(target, 'participant', now),
     });
+    await flushAsync();
 
     shared.emit('message', JSON.stringify({
       type: 'session.send',
@@ -543,6 +589,7 @@ describe('WsBridge share-scoped sockets', () => {
       commandId: 'cmd-participant',
       sharedActor: {
         actorUserId: 'shared-user',
+        actorDisplayName: 'Shared User',
         effectiveActorRole: 'participant',
         actionId: 'cmd-participant',
         origin: 'shared-tab',

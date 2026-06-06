@@ -1,5 +1,6 @@
 import type { Database } from '../db/client.js';
 import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
+import { evaluateP2pSendTargetScope } from '../share/p2p-send-scope.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import { P2P_WORKFLOW_MSG } from '../../../shared/p2p-workflow-messages.js';
@@ -12,6 +13,7 @@ import {
   type ShareAuthorizationSnapshot,
   type ShareDenialReason,
   type ShareScopedTicketClaims,
+  type SharedActorEnvelope,
   type ShareTarget,
 } from '../../../shared/tab-sharing.js';
 import { REPO_MSG } from '../../../shared/repo-types.js';
@@ -35,6 +37,7 @@ export type ShareReason = Extract<
 
 export type ShareScopedSocketState = {
   userId: string;
+  actorDisplayName: string;
   ticketId: string;
   target: ShareTarget;
   snapshot: ShareAuthorizationSnapshot;
@@ -55,7 +58,7 @@ export type ShareCommandDecision =
   | { allowed: false; reason: ShareReason; closeSocket?: boolean };
 
 type ShareCommandPolicy =
-  | { kind: 'allow-covered-read' }
+  | { kind: 'allow-covered-read'; requireTarget: boolean }
   | { kind: 'participant-discussion-start' }
   | { kind: 'participant-send' }
   | { kind: 'participant-cancel' }
@@ -91,16 +94,16 @@ function denyFromShared(sharedCommand: string): ShareCommandPolicy {
 }
 
 export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInventoryEntry[] = [
-  { bridgeCommand: 'terminal.subscribe', sharedCommand: SHARE_BROWSER_COMMANDS.TERMINAL_OUTPUT, policy: { kind: 'allow-covered-read' } },
-  { bridgeCommand: 'terminal.unsubscribe', sharedCommand: SHARE_BROWSER_COMMANDS.TERMINAL_OUTPUT, policy: { kind: 'allow-covered-read' } },
-  { bridgeCommand: 'terminal.snapshot_request', sharedCommand: SHARE_BROWSER_COMMANDS.TERMINAL_SNAPSHOT, policy: { kind: 'allow-covered-read' } },
-  { bridgeCommand: TRANSPORT_MSG.CHAT_SUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read' } },
-  { bridgeCommand: TRANSPORT_MSG.CHAT_UNSUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read' } },
-  { bridgeCommand: TRANSPORT_MSG.CHAT_HISTORY, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read' } },
+  { bridgeCommand: 'terminal.subscribe', sharedCommand: SHARE_BROWSER_COMMANDS.TERMINAL_OUTPUT, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: 'terminal.unsubscribe', sharedCommand: SHARE_BROWSER_COMMANDS.TERMINAL_OUTPUT, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: 'terminal.snapshot_request', sharedCommand: SHARE_BROWSER_COMMANDS.TERMINAL_SNAPSHOT, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: TRANSPORT_MSG.CHAT_SUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: TRANSPORT_MSG.CHAT_UNSUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: TRANSPORT_MSG.CHAT_HISTORY, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: 'discussion.start', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_START, policy: { kind: 'participant-discussion-start' } },
   { bridgeCommand: 'session.send', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_SEND, policy: { kind: 'participant-send' } },
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_CANCEL, policy: { kind: 'participant-cancel' } },
-  { bridgeCommand: 'discussion.comment', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT, policy: { kind: 'allow-covered-read' } },
+  { bridgeCommand: 'discussion.comment', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT, policy: { kind: 'allow-covered-read', requireTarget: false } },
 
   { bridgeCommand: 'session.start', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_START, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SESSION_START) },
   { bridgeCommand: 'session.stop', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_STOP, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SESSION_STOP) },
@@ -137,8 +140,28 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: 'cron.create', sharedCommand: SHARE_BROWSER_COMMANDS.CRON_MUTATE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.CRON_MUTATE) },
 ];
 
+function assertShareCommandInventoryEntry(entry: ShareBridgeCommandInventoryEntry): void {
+  if (entry.policy.kind === 'deny') return;
+  const sharedPolicy = getShareScopedCommandPolicy(entry.sharedCommand);
+  if (sharedPolicy.disposition !== 'allow') {
+    throw new Error(`Share WS command ${entry.sharedCommand} must be allowed by shared policy`);
+  }
+  if (entry.policy.kind === 'allow-covered-read') {
+    if (entry.policy.requireTarget !== (sharedPolicy.scope === 'concrete-tab')) {
+      throw new Error(`Share WS command ${entry.bridgeCommand} target requirement does not match shared policy`);
+    }
+    return;
+  }
+  if (sharedPolicy.minRole !== 'participant') {
+    throw new Error(`Share WS command ${entry.sharedCommand} must require participant role`);
+  }
+}
+
 export const SHARE_SCOPED_COMMAND_POLICY = new Map<string, ShareCommandPolicy>(
-  SHARE_WS_COMMAND_POLICY_INVENTORY.map((entry) => [entry.bridgeCommand, entry.policy]),
+  SHARE_WS_COMMAND_POLICY_INVENTORY.map((entry) => {
+    assertShareCommandInventoryEntry(entry);
+    return [entry.bridgeCommand, entry.policy];
+  }),
 );
 
 type DaemonMessagePolicy = {
@@ -237,9 +260,10 @@ export function buildSharedActorEnvelope(
   state: ShareScopedSocketState,
   actionId: string,
   now: number,
-): Record<string, unknown> {
+): SharedActorEnvelope {
   return {
     actorUserId: state.userId,
+    actorDisplayName: state.actorDisplayName,
     snapshot: state.snapshot,
     primaryShareId: state.snapshot.primaryShareId,
     effectiveActorRole: state.snapshot.effectiveRole,
@@ -264,7 +288,11 @@ export function evaluateShareCommand(input: {
 
   const sessionName = commandSessionName(input.msg);
   if (policy.kind === 'allow-covered-read') {
-    if (!sessionName) return { allowed: true };
+    if (!sessionName) {
+      return policy.requireTarget
+        ? { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED }
+        : { allowed: true };
+    }
     return shareStateCoversSession(input.state, sessionName)
       ? { allowed: true }
       : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
@@ -377,66 +405,11 @@ function hasUnscopedDiscussionParticipant(msg: Record<string, unknown>): boolean
 }
 
 function evaluateP2pSendScope(msg: Record<string, unknown>, state: ShareScopedSocketState): ShareReason | null {
-  const targets = p2pSendTargets(msg);
-  if (!targets.hasP2pRouting) return null;
-  if (state.target.kind === 'server') return null;
-  if (targets.hasUnboundedExpansion) return SHARE_REASONS.DIRECT_SURFACE_DENIED;
-  if (targets.sessions.some((name) => !shareStateCoversSession(state, name))) {
-    return SHARE_REASONS.DIRECT_SURFACE_DENIED;
-  }
-  return null;
-}
-
-function p2pSendTargets(msg: Record<string, unknown>): {
-  hasP2pRouting: boolean;
-  hasUnboundedExpansion: boolean;
-  sessions: string[];
-} {
-  const sessions = new Set<string>();
-  let hasP2pRouting = false;
-  let hasUnboundedExpansion = false;
-  let requestedAllExpansion = false;
-
-  const directTargetSession = typeof msg.directTargetSession === 'string' ? msg.directTargetSession.trim() : '';
-  if (directTargetSession) {
-    hasP2pRouting = true;
-    if (directTargetSession === '__all__') requestedAllExpansion = true;
-    else sessions.add(directTargetSession);
-  }
-
-  const atTargets = Array.isArray(msg.p2pAtTargets) ? msg.p2pAtTargets : [];
-  for (const target of atTargets) {
-    if (!target || typeof target !== 'object') continue;
-    const session = (target as Record<string, unknown>).session;
-    if (typeof session !== 'string' || !session.trim()) continue;
-    hasP2pRouting = true;
-    if (session.trim() === '__all__') requestedAllExpansion = true;
-    else sessions.add(session.trim());
-  }
-
-  let configEnabledCount = 0;
-  const config = msg.p2pSessionConfig && typeof msg.p2pSessionConfig === 'object' && !Array.isArray(msg.p2pSessionConfig)
-    ? msg.p2pSessionConfig as Record<string, unknown>
-    : null;
-  if (config) {
-    hasP2pRouting = true;
-    for (const [sessionName, entry] of Object.entries(config)) {
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
-      const record = entry as Record<string, unknown>;
-      if (record.enabled === true && record.mode !== 'skip') {
-        sessions.add(sessionName);
-        configEnabledCount += 1;
-      }
-    }
-  }
-
-  if (typeof msg.p2pMode === 'string' && msg.p2pMode.trim()) {
-    hasP2pRouting = true;
-    if (sessions.size === 0) hasUnboundedExpansion = true;
-  }
-  if (requestedAllExpansion && configEnabledCount === 0) hasUnboundedExpansion = true;
-
-  return { hasP2pRouting, hasUnboundedExpansion, sessions: [...sessions] };
+  return evaluateP2pSendTargetScope({
+    msg,
+    target: state.target,
+    coversSession: (sessionName) => shareStateCoversSession(state, sessionName),
+  }) as ShareReason | null;
 }
 
 export function filterShareDaemonMessage(

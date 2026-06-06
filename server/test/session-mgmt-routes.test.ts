@@ -14,11 +14,12 @@ const mockGetSubSessionsByServer = vi.fn<(...args: unknown[]) => Promise<unknown
 const mockResolveHttpShareAccess = vi.fn();
 const mockResolveServerMemberAccessOrShareDeny = vi.fn();
 const mockDbQueryOne = vi.fn();
+const mockDbQuery = vi.fn(async () => []);
 const mockDbExecute = vi.fn(async () => ({ changes: 1 }));
 const sendToDaemonMock = vi.fn();
 const countSharePendingCommandsForUserMock = vi.fn(() => 0);
 const getActiveDispatchIdForSessionMock = vi.fn(() => 'dispatch-1');
-const mockDb = { queryOne: mockDbQueryOne, execute: mockDbExecute };
+const mockDb = { queryOne: mockDbQueryOne, query: mockDbQuery, execute: mockDbExecute };
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -73,6 +74,7 @@ describe('session-mgmt persistence routes', () => {
       actor: { kind: 'server-member', effectiveActorRole: 'server-manager' },
     });
     mockDbQueryOne.mockResolvedValue(null);
+    mockDbQuery.mockResolvedValue([]);
     mockDbExecute.mockResolvedValue({ changes: 1 });
     countSharePendingCommandsForUserMock.mockReturnValue(0);
     getActiveDispatchIdForSessionMock.mockReturnValue('dispatch-1');
@@ -461,6 +463,149 @@ describe('session-mgmt persistence routes', () => {
       },
     });
     expect(mockDbExecute).toHaveBeenCalled();
+  });
+
+  it('POST /session/send denies tab-share P2P routing extras outside live coverage before daemon relay', async () => {
+    const coverage = {
+      target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+      effectiveRole: 'participant',
+      historyCutoffAt: 1_000,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: ['share-1'],
+      primaryShareId: 'share-1',
+      authorizedAt: 2_000,
+    };
+    mockResolveServerRole.mockResolvedValue('none');
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant', coverage },
+    });
+    const app = await buildApp();
+
+    const deniedBodies = [
+      { commandId: 'cmd-direct', directTargetSession: 'deck_other_brain' },
+      { commandId: 'cmd-at', p2pAtTargets: [{ session: 'deck_other_brain', mode: 'review' }] },
+      { commandId: 'cmd-config', p2pSessionConfig: { deck_other_brain: { enabled: true, mode: 'review' } } },
+      { commandId: 'cmd-implicit', p2pMode: 'review' },
+      { commandId: 'cmd-all', directTargetSession: '__all__' },
+    ];
+
+    for (const extra of deniedBodies) {
+      sendToDaemonMock.mockClear();
+      mockDbExecute.mockClear();
+      const res = await app.request('/api/server/srv-1/session/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sessionName: 'deck_proj_brain',
+          text: 'hello',
+          ...extra,
+        }),
+      });
+
+      expect(res.status).toBe(403);
+      await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-direct-surface-denied' });
+      expect(sendToDaemonMock).not.toHaveBeenCalled();
+      expect(mockDbExecute).toHaveBeenCalled();
+    }
+  });
+
+  it('POST /session/send lets a shared main tab P2P-route to its covered child sub-session', async () => {
+    const coverage = {
+      target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+      effectiveRole: 'participant',
+      historyCutoffAt: 1_000,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: ['share-1'],
+      primaryShareId: 'share-1',
+      authorizedAt: 2_000,
+    };
+    mockResolveServerRole.mockResolvedValue('none');
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant', coverage },
+    });
+    mockGetSubSessionsByServer.mockResolvedValue([
+      { id: 'child_1', parent_session: 'deck_proj_brain' },
+    ]);
+    mockDbQueryOne.mockResolvedValue({ display_name: 'Shared User', username: 'shared' });
+    const app = await buildApp();
+
+    const res = await app.request('/api/server/srv-1/session/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionName: 'deck_proj_brain',
+        text: 'hello child',
+        commandId: 'cmd-child',
+        p2pAtTargets: [{ session: 'deck_sub_child_1', mode: 'review' }],
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual(expect.objectContaining({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      commandId: 'cmd-child',
+      p2pAtTargets: [{ session: 'deck_sub_child_1', mode: 'review' }],
+      sharedActor: expect.objectContaining({
+        actorUserId: 'user-1',
+        actorDisplayName: 'Shared User',
+      }),
+    }));
+  });
+
+  it('POST /session/send preserves participant server-share broad P2P routing', async () => {
+    const coverage = {
+      target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+      effectiveRole: 'participant',
+      historyCutoffAt: 1_000,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: ['server-share-1'],
+      primaryShareId: 'server-share-1',
+      authorizedAt: 2_000,
+    };
+    mockResolveServerRole.mockResolvedValue('none');
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant', coverage },
+    });
+    mockDbQuery.mockResolvedValue([
+      {
+        target_kind: 'server',
+        id: 'server-share-1',
+        server_id: 'srv-1',
+        session_name: null,
+        sub_session_id: null,
+        target_user_id: 'user-1',
+        role: 'participant',
+        created_by: 'owner-1',
+        created_at: 1_000,
+        updated_at: 1_000,
+        expires_at: null,
+        revoked_at: null,
+      },
+    ]);
+    mockDbQueryOne.mockResolvedValue({ display_name: 'Shared User', username: 'shared' });
+    const app = await buildApp();
+
+    const res = await app.request('/api/server/srv-1/session/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionName: 'deck_proj_brain',
+        text: 'server-wide dispatch',
+        commandId: 'cmd-server-wide',
+        p2pMode: 'review',
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual(expect.objectContaining({
+      type: 'session.send',
+      commandId: 'cmd-server-wide',
+      p2pMode: 'review',
+    }));
   });
 
   it('POST /session/send denies share viewers before daemon relay', async () => {
