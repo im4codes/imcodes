@@ -34,6 +34,7 @@ import { SessionTabs } from './components/SessionTabs.js';
 import { SessionPane } from './components/SessionPane.js';
 import { ShareSessionDialog } from './components/ShareSessionDialog.js';
 import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
+import { SharedStateIndicator } from './components/SharedStateIndicator.js';
 import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
@@ -76,7 +77,7 @@ import {
   getSubSessionAccentColorMap,
 } from './subsession-accent-colors.js';
 import type { PanelRenderContext } from './components/PinnedPanelRegistry.js';
-import type { ShareDialogTarget, ShareTarget } from './tab-sharing-ui.js';
+import { shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
 import './components/pinnedPanelTypes.js'; // register all panel types
 import {
   LOCAL_WEB_PREVIEW_PANEL_TYPE,
@@ -120,7 +121,7 @@ import {
 } from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient } from './ws-client.js';
-import { configure as configureApi, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, type SharedEntrySummary } from './api.js';
+import { configure as configureApi, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
 import { initPushNotifications, resetPushBadge } from './push-notifications.js';
@@ -350,6 +351,40 @@ function formatSharedAccessError(error: unknown): string {
   return String(error || 'share_failed');
 }
 
+function buildSharedOutStateFromShares(shares: ShareGrantSummary[]): SharedStateSummary | null {
+  const activeShares = shares.filter((share) => share.status === 'active');
+  if (activeShares.length === 0) return null;
+  return {
+    status: 'active',
+    effectiveRole: activeShares.some((share) => share.role === 'participant') ? 'participant' : 'viewer',
+    outgoing: true,
+    users: activeShares.map((share) => ({
+      id: share.targetUserId,
+      displayName: share.targetUserDisplayName,
+      role: share.role,
+      status: share.status,
+    })),
+  };
+}
+
+function indexManagedSharedStates(shares: ShareGrantSummary[]): Map<string, SharedStateSummary> {
+  const grouped = new Map<string, ShareGrantSummary[]>();
+  for (const share of shares) {
+    if (share.status !== 'active') continue;
+    const key = shareTargetKey(share.target);
+    if (!key) continue;
+    const existing = grouped.get(key);
+    if (existing) existing.push(share);
+    else grouped.set(key, [share]);
+  }
+  const states = new Map<string, SharedStateSummary>();
+  for (const [key, groupedShares] of grouped) {
+    const state = buildSharedOutStateFromShares(groupedShares);
+    if (state) states.set(key, state);
+  }
+  return states;
+}
+
 type RepoPanelTarget = {
   sessionId: string | null;
   projectDir: string;
@@ -379,6 +414,7 @@ export function App() {
       return null;
     }
   });
+  const [managedShares, setManagedShares] = useState<ShareGrantSummary[]>([]);
   const clearAuthState = useCallback(async (reason?: string) => {
     console.warn('[auth] clearing auth state', reason ?? '');
     clearApiKey();
@@ -400,6 +436,7 @@ export function App() {
     setSelectedShareTarget(null);
     setSharedEntries([]);
     setSharedEntriesError(null);
+    setManagedShares([]);
     setManualDashboard(false);
     setAutoEnteringRecent(false);
   }, []);
@@ -950,6 +987,22 @@ export function App() {
     void refreshSharedEntries();
   }, [refreshSharedEntries]);
 
+  const refreshManagedShares = useCallback(async () => {
+    if (!auth || !selectedServerId || selectedShareTarget) {
+      setManagedShares([]);
+      return;
+    }
+    try {
+      setManagedShares(await listManagedSharesForServer(selectedServerId));
+    } catch {
+      setManagedShares([]);
+    }
+  }, [auth, selectedServerId, selectedShareTarget]);
+
+  useEffect(() => {
+    void refreshManagedShares();
+  }, [refreshManagedShares]);
+
   // Fetch sessions from DB immediately when auth + server are available
   useEffect(() => {
     if (!auth || !selectedServerId || selectedShareTarget) return;
@@ -1005,6 +1058,33 @@ export function App() {
   const navigableMainSessions = useMemo(
     () => sessions.filter(isNavigableMainSession),
     [sessions],
+  );
+  const managedSharedStateByTarget = useMemo(() => indexManagedSharedStates(managedShares), [managedShares]);
+  const selectedServerSharedOutState = useMemo(() => {
+    if (!selectedServerId) return null;
+    return managedSharedStateByTarget.get(`server:${selectedServerId}`) ?? null;
+  }, [managedSharedStateByTarget, selectedServerId]);
+  const managedSharedServerStateById = useMemo(() => {
+    const states = new Map<string, SharedStateSummary>();
+    if (selectedServerId && selectedServerSharedOutState) states.set(selectedServerId, selectedServerSharedOutState);
+    return states;
+  }, [selectedServerId, selectedServerSharedOutState]);
+  const managedSharedSessionStateByName = useMemo(() => {
+    const states = new Map<string, SharedStateSummary>();
+    if (!selectedServerId) return states;
+    for (const session of navigableMainSessions) {
+      const directState = managedSharedStateByTarget.get(`main:${selectedServerId}:${session.name}`);
+      const state = directState ?? selectedServerSharedOutState;
+      if (state) states.set(session.name, state);
+    }
+    return states;
+  }, [managedSharedStateByTarget, navigableMainSessions, selectedServerId, selectedServerSharedOutState]);
+  const visibleMainSessions = useMemo(
+    () => navigableMainSessions.map((session) => {
+      const sharedState = managedSharedSessionStateByName.get(session.name) ?? session.sharedState;
+      return sharedState === session.sharedState ? session : { ...session, sharedState };
+    }),
+    [managedSharedSessionStateByName, navigableMainSessions],
   );
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [activeSession, setActiveSessionState] = useState<string | null>(
@@ -2070,6 +2150,20 @@ export function App() {
     activeSession,
     Boolean(selectedShareTarget),
   );
+  const managedSharedSubSessionStateById = useMemo(() => {
+    const states = new Map<string, SharedStateSummary>();
+    if (!selectedServerId) return states;
+    for (const sub of subSessions) {
+      const directState = managedSharedStateByTarget.get(`subsession:${selectedServerId}:${sub.id}`)
+        ?? managedSharedStateByTarget.get(`subsession:${selectedServerId}:${sub.sessionName}`);
+      const parentState = sub.parentSession ? managedSharedSessionStateByName.get(sub.parentSession) : null;
+      const state = directState ?? parentState ?? selectedServerSharedOutState;
+      if (!state) continue;
+      states.set(sub.id, state);
+      states.set(sub.sessionName, state);
+    }
+    return states;
+  }, [managedSharedSessionStateByName, managedSharedStateByTarget, selectedServerId, selectedServerSharedOutState, subSessions]);
 
   const handleOpenSharedEntry = useCallback(async (entry: SharedEntrySummary) => {
     if (openingSharedEntryId) return;
@@ -4339,6 +4433,7 @@ export function App() {
             onHome={handleBackToDashboard}
             isAdmin={isAdmin}
             onAdmin={() => setShowAdminPage(true)}
+            sharedServerStates={managedSharedServerStateById}
           />
           <Sidebar
             collapsed={sidebarCollapsed}
@@ -4381,8 +4476,9 @@ export function App() {
             {/* Session tree */}
             <SessionTree
               serverId={selectedServerId}
-              sessions={navigableMainSessions}
+              sessions={visibleMainSessions}
               subSessions={subSessions}
+              sharedSubSessionStates={managedSharedSubSessionStateById}
               activeSession={activeSession}
               unreadCounts={unreadCounts}
               idleFlashTokens={idleFlashTokens}
@@ -4568,6 +4664,7 @@ export function App() {
                 >
                   <span class="mobile-server-btn-icon" aria-hidden="true">☁</span>
                   <span class="mobile-server-btn-name">{resolvedSelectedServerName ?? 'Server'}</span>
+                  <SharedStateIndicator state={selectedServerSharedOutState} iconOnly variant="shared-out" />
                   <span class="mobile-server-btn-chevron" aria-hidden="true">▾</span>
                 </button>
                 {showMobileServerMenu && (
@@ -4590,7 +4687,8 @@ export function App() {
                           onClick={() => { handleSelectServer(s.id, s.name); setShowMobileServerMenu(false); }}
                         >
                           <span style={{ color: online ? '#4ade80' : '#475569' }}>{online ? '●' : '○'}</span>
-                          {' '}{s.name}
+                          <span class="mobile-server-menu-name">{s.name}</span>
+                          <SharedStateIndicator state={managedSharedServerStateById.get(s.id) ?? null} iconOnly variant="shared-out" />
                         </button>
                       );
                     })}
@@ -4656,7 +4754,7 @@ export function App() {
             {showMobileServerMenu && <div class="mobile-server-backdrop" onClick={() => setShowMobileServerMenu(false)} />}
 
             <SessionTabs
-              sessions={navigableMainSessions}
+              sessions={visibleMainSessions}
               activeSession={activeSession}
               connected={connected}
               latencyMs={latencyMs}
@@ -4895,6 +4993,7 @@ export function App() {
             {selectedServerId && (
               <SubSessionBar
                 subSessions={visibleSubSessions}
+                sharedSubSessionStates={managedSharedSubSessionStateById}
                 openIds={openSubIds}
                 maximizedIds={maximizedSubIds}
                 desktopLayoutCapable={desktopLayoutCapable}
@@ -5046,8 +5145,9 @@ export function App() {
               {/* Session tree — collapsible via sidebar toggle */}
               {!mobileHideTabBar && <SessionTree
                 serverId={selectedServerId}
-                sessions={navigableMainSessions}
+                sessions={visibleMainSessions}
                 subSessions={subSessions}
+                sharedSubSessionStates={managedSharedSubSessionStateById}
                 activeSession={activeSession}
                 unreadCounts={unreadCounts}
                 idleFlashTokens={idleFlashTokens}
@@ -5478,6 +5578,7 @@ export function App() {
         <ShareSessionDialog
           target={shareDialogTarget}
           onClose={() => setShareDialogTarget(null)}
+          onSharesChanged={() => void refreshManagedShares()}
         />
       )}
 

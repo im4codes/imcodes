@@ -21,6 +21,7 @@ export interface SharedStateSummary {
   effectiveRole?: ShareRole | null;
   status?: ShareStatus | null;
   users?: SharedUserSummary[];
+  outgoing?: boolean;
   activeDispatchId?: string | null;
   unavailableReason?: string | null;
 }
@@ -74,8 +75,17 @@ export interface ShareGrantSummary {
   targetUserDisplayName: string;
   role: ShareRole;
   status: ShareStatus;
+  target?: ShareTarget;
+  targetRef?: string;
   targetLabel?: string | null;
   expiresAt?: number | string | null;
+}
+
+export function shareTargetKey(target: ShareTarget | null | undefined): string | null {
+  if (!target) return null;
+  if (target.kind === 'server') return `server:${target.serverId}`;
+  if (target.kind === 'main') return `main:${target.serverId}:${target.sessionName}`;
+  return `subsession:${target.serverId}:${target.subSessionId}`;
 }
 
 export function buildCurrentTabShareTarget(target: ShareDialogTarget): ShareTarget {

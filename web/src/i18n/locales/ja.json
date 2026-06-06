@@ -78,6 +78,7 @@
     "scope": { "current": "共有スコープ" },
     "indicator": "{{scope}} は {{role}} として共有中 · {{status}}",
     "indicatorCompact": "{{role}} として共有中 · {{status}}",
+    "indicatorSharedOut": "他のユーザーと共有中",
     "actorLabel": "{{name}} · {{role}}",
     "status": {
       "active": "有効",

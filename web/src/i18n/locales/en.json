@@ -82,6 +82,7 @@
     },
     "indicator": "{{scope}} shared as {{role}} · {{status}}",
     "indicatorCompact": "Shared as {{role}} · {{status}}",
+    "indicatorSharedOut": "Shared with others",
     "actorLabel": "{{name}} · {{role}}",
     "status": {
       "active": "Active",

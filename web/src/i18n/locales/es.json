@@ -78,6 +78,7 @@
     "scope": { "current": "Alcance compartido" },
     "indicator": "{{scope}} compartido como {{role}} · {{status}}",
     "indicatorCompact": "Compartido como {{role}} · {{status}}",
+    "indicatorSharedOut": "Compartido con otros",
     "actorLabel": "{{name}} · {{role}}",
     "status": {
       "active": "Activo",

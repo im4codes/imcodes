@@ -78,6 +78,7 @@
     "scope": { "current": "공유 범위" },
     "indicator": "{{scope}}이(가) {{role}}로 공유됨 · {{status}}",
     "indicatorCompact": "{{role}}로 공유됨 · {{status}}",
+    "indicatorSharedOut": "다른 사용자와 공유됨",
     "actorLabel": "{{name}} · {{role}}",
     "status": {
       "active": "활성",

@@ -78,6 +78,7 @@
     "scope": { "current": "分享範圍" },
     "indicator": "{{scope}} 以 {{role}} 分享 · {{status}}",
     "indicatorCompact": "以 {{role}} 分享 · {{status}}",
+    "indicatorSharedOut": "已分享給別人",
     "actorLabel": "{{name}} · {{role}}",
     "status": {
       "active": "有效",

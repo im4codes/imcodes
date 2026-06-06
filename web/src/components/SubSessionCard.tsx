@@ -26,6 +26,8 @@ import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
+import type { SharedStateSummary } from '../tab-sharing-ui.js';
+import { SharedStateIndicator } from './SharedStateIndicator.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -74,6 +76,7 @@ interface Props {
   onTransportConfigSaved?: (subId: string, transportConfig: Record<string, unknown> | null) => void;
   /** Whether this sub-session is participating in an active P2P discussion. */
   inP2p?: boolean;
+  sharedState?: SharedStateSummary | null;
   accentColor?: string;
   previewHydrateDelayMs?: number;
 }
@@ -114,7 +117,7 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
   };
 }
 
-export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160 }: Props) {
+export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const isShell = sub.type === 'shell' || sub.type === 'script';
@@ -355,6 +358,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
         <span class="subcard-icon">{icon}</span>
         <span class="subcard-label">{label}</span>
         {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
+        <SharedStateIndicator state={sharedState} iconOnly />
         {badge && <span class="subcard-badge">{badge}</span>}
         {busy && <span class="subcard-running">●</span>}
         {modelLabel && <span class="subcard-model">{modelLabel}</span>}

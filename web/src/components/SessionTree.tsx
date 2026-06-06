@@ -23,6 +23,8 @@ import { formatLabel } from '../format-label.js';
 import { getAgentBadgeConfig } from '../agent-display.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
+import type { SharedStateSummary } from '../tab-sharing-ui.js';
+import { SharedStateIndicator } from './SharedStateIndicator.js';
 
 interface Props {
   serverId?: string | null;
@@ -33,6 +35,7 @@ interface Props {
   unreadCounts: Map<string, number>;
   /** Per-session idle flash replay token. */
   idleFlashTokens?: Map<string, number>;
+  sharedSubSessionStates?: ReadonlyMap<string, SharedStateSummary>;
   /** Set of sub-session labels participating in active P2P discussions. */
   p2pSessionLabels?: Set<string>;
   onSelectSession: (sessionName: string) => void;
@@ -86,12 +89,13 @@ interface NodeProps {
   isSub?: boolean;
   unread: number;
   idleFlashToken: number;
+  sharedState?: SharedStateSummary | null;
   inP2p?: boolean;
   onClick: () => void;
 }
 
 function SessionNode({
-  label, agentType, state, isActive, isTransport, isSub, unread, idleFlashToken, inP2p, onClick,
+  label, agentType, state, isActive, isTransport, isSub, unread, idleFlashToken, sharedState, inP2p, onClick,
 }: NodeProps) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -128,6 +132,7 @@ function SessionNode({
 
       {/* P2P badge */}
       {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
+      <SharedStateIndicator state={sharedState} iconOnly />
 
       {/* Spacer */}
       <span class="session-tree-spacer" />
@@ -170,6 +175,7 @@ function SessionTreeInner({
   activeSession,
   unreadCounts,
   idleFlashTokens,
+  sharedSubSessionStates,
   p2pSessionLabels,
   onSelectSession,
   onSelectSubSession,
@@ -296,6 +302,7 @@ function SessionTreeInner({
                 isSub={false}
                 unread={unread}
                 idleFlashToken={idleFlashToken}
+                sharedState={session.sharedState}
                 inP2p={!!p2pSessionLabels?.has(session.name)}
                 onClick={() => onSelectSession(session.name)}
               />
@@ -324,6 +331,7 @@ function SessionTreeInner({
                   isSub={true}
                   unread={subUnread}
                   idleFlashToken={subIdleFlashToken}
+                  sharedState={sharedSubSessionStates?.get(sub.id) ?? sharedSubSessionStates?.get(sub.sessionName)}
                   inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
                   onClick={() => onSelectSubSession(sub)}
                 />

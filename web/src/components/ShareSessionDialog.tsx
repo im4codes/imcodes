@@ -13,6 +13,7 @@ import {
 interface Props {
   target: ShareDialogTarget;
   onClose: () => void;
+  onSharesChanged?: () => void;
 }
 
 type TargetChoice = 'current-tab' | 'server';
@@ -27,7 +28,7 @@ function getGrantDisplayName(grant: ShareGrantSummary): string {
   return grant.targetUserDisplayName?.trim() || grant.targetUserId;
 }
 
-export function ShareSessionDialog({ target, onClose }: Props) {
+export function ShareSessionDialog({ target, onClose, onSharesChanged }: Props) {
   const { t } = useTranslation();
   const [targetChoice, setTargetChoice] = useState<TargetChoice>('current-tab');
   const [role, setRole] = useState<ShareRole>('viewer');
@@ -78,12 +79,13 @@ export function ShareSessionDialog({ target, onClose }: Props) {
       });
       setTargetUser('');
       setShares((current) => [share, ...current.filter((item) => item.id !== share.id)]);
+      onSharesChanged?.();
     } catch (err) {
       setError(formatShareError(err));
     } finally {
       setSubmitting(false);
     }
-  }, [role, selectedTarget, submitting, target.serverId, targetUser]);
+  }, [onSharesChanged, role, selectedTarget, submitting, target.serverId, targetUser]);
 
   const replaceShare = useCallback((nextShare: ShareGrantSummary) => {
     setShares((current) => current.map((item) => item.id === nextShare.id ? nextShare : item));
@@ -95,12 +97,13 @@ export function ShareSessionDialog({ target, onClose }: Props) {
     setError(null);
     try {
       replaceShare(await updateShare(target.serverId, share.id, { role: nextRole }));
+      onSharesChanged?.();
     } catch (err) {
       setError(formatShareError(err));
     } finally {
       setUpdatingShareId(null);
     }
-  }, [replaceShare, target.serverId, updatingShareId]);
+  }, [onSharesChanged, replaceShare, target.serverId, updatingShareId]);
 
   const handleRevoke = useCallback(async (share: ShareGrantSummary) => {
     if (updatingShareId) return;
@@ -110,12 +113,13 @@ export function ShareSessionDialog({ target, onClose }: Props) {
     setError(null);
     try {
       replaceShare(await revokeShare(target.serverId, share.id));
+      onSharesChanged?.();
     } catch (err) {
       setError(formatShareError(err));
     } finally {
       setUpdatingShareId(null);
     }
-  }, [replaceShare, t, target.serverId, updatingShareId]);
+  }, [onSharesChanged, replaceShare, t, target.serverId, updatingShareId]);
 
   return (
     <div class="ask-dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>

@@ -553,6 +553,11 @@ export async function listSharesForTarget(serverId: string, target: ShareTarget)
   return Array.isArray(res.shares) ? res.shares.map(normalizeShareGrantSummary) : [];
 }
 
+export async function listManagedSharesForServer(serverId: string): Promise<ShareGrantSummary[]> {
+  const res = await apiFetch<ListSharesResponse>(`/api/server/${encodeURIComponent(serverId)}/shares`);
+  return Array.isArray(res.shares) ? res.shares.map(normalizeShareGrantSummary) : [];
+}
+
 export async function createShare(serverId: string, request: CreateShareRequest): Promise<ShareGrantSummary> {
   const targetUserId = request.targetUserId || request.targetUser || '';
   const res = await apiFetch<CreateShareResponse>(`/api/server/${encodeURIComponent(serverId)}/shares`, {
