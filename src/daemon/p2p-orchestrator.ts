@@ -704,6 +704,7 @@ let FILE_SETTLE_CYCLES = 3; // File must stop growing for 3 poll cycles (9s) to 
 let MARKER_PROMPT_RETRY_AFTER_MS = 60_000; // Marker prompts may be retried, but only after queue-aware idle.
 let POST_SUMMARY_CONFIRMATION_DELAY_MS = 10_000; // Let the execution marker/status settle before the follow-up check.
 let QUEUE_STUCK_STOP_AFTER_MS = 300_000; // 5 min — stop only when transport queue/turn is stale
+let QUEUED_PROMPT_STOP_AFTER_MS = 60_000; // 1 min — P2P-owned prompt is visibly queued behind stale work
 let ROUND_HOP_CLEANUP_DELAY_MS = 0;
 
 /** Override poll interval for tests. */
@@ -720,6 +721,8 @@ export function _setMarkerPromptRetryAfterMs(ms: number): void { MARKER_PROMPT_R
 export function _setPostSummaryConfirmationDelayMs(ms: number): void { POST_SUMMARY_CONFIRMATION_DELAY_MS = ms; }
 /** Override stale queue watchdog threshold for tests. */
 export function _setQueueStuckStopAfterMs(ms: number): void { QUEUE_STUCK_STOP_AFTER_MS = ms; }
+/** Override queued P2P prompt watchdog threshold for tests. */
+export function _setQueuedPromptStopAfterMs(ms: number): void { QUEUED_PROMPT_STOP_AFTER_MS = ms; }
 /** Override round hop artifact cleanup delay for tests. */
 export function _setRoundHopCleanupDelayMs(ms: number): void { ROUND_HOP_CLEANUP_DELAY_MS = ms; }
 
@@ -729,19 +732,53 @@ async function maybeStopStaleP2pTransportQueue(args: {
   dispatchStartedAt: number;
   alreadyStopped: boolean;
   reason: string;
+  staleAfterMs?: number;
 }): Promise<boolean> {
   if (args.alreadyStopped) return true;
   const runtime = getTransportRuntime(args.session);
   if (!runtime) return false;
 
   const now = Date.now();
+  if (runtime.drainPendingIfIdle(`p2p-${args.reason}`)) {
+    logger.info(
+      { runId: args.run.id, session: args.session, reason: args.reason },
+      'P2P: drained queued transport prompt after observing idle runtime',
+    );
+    return false;
+  }
+
   const snapshot = runtime.getDiagnosticSnapshot(now);
   const blocked = snapshot.sending || snapshot.pendingCount > 0 || snapshot.activeDispatchCount > 0;
   if (!blocked) return false;
 
+  const staleAfterMs = args.staleAfterMs ?? QUEUE_STUCK_STOP_AFTER_MS;
   const dispatchAgeMs = Math.max(0, now - args.dispatchStartedAt);
-  if (dispatchAgeMs < QUEUE_STUCK_STOP_AFTER_MS || snapshot.lastActivityAgeMs < QUEUE_STUCK_STOP_AFTER_MS) {
+  if (dispatchAgeMs < staleAfterMs || snapshot.lastActivityAgeMs < staleAfterMs) {
     return false;
+  }
+
+  const cancelStarted = runtime.cancelStaleActiveTurnWithPending({
+    reason: `p2p-${args.reason}`,
+    nowMs: now,
+    staleMs: staleAfterMs,
+  });
+  if (cancelStarted) {
+    logger.warn(
+      {
+        runId: args.run.id,
+        session: args.session,
+        reason: args.reason,
+        dispatchAgeMs,
+        queueStuckStopAfterMs: staleAfterMs,
+        status: snapshot.status,
+        sending: snapshot.sending,
+        pendingCount: snapshot.pendingCount,
+        activeDispatchCount: snapshot.activeDispatchCount,
+        lastActivityAgeMs: snapshot.lastActivityAgeMs,
+      },
+      'P2P: stale active transport turn has queued prompt — requested runtime recovery cancel',
+    );
+    return true;
   }
 
   logger.warn(
@@ -750,7 +787,7 @@ async function maybeStopStaleP2pTransportQueue(args: {
       session: args.session,
       reason: args.reason,
       dispatchAgeMs,
-      queueStuckStopAfterMs: QUEUE_STUCK_STOP_AFTER_MS,
+      queueStuckStopAfterMs: staleAfterMs,
       status: snapshot.status,
       sending: snapshot.sending,
       pendingCount: snapshot.pendingCount,
@@ -767,6 +804,55 @@ async function maybeStopStaleP2pTransportQueue(args: {
     logger.warn({ runId: args.run.id, session: args.session, err }, 'P2P: stale transport queue stop failed');
     return true;
   }
+}
+
+async function dispatchP2pPromptToSession(args: {
+  run: P2pRun;
+  session: string;
+  prompt: string;
+  allowDuplicate?: boolean;
+  reason: string;
+}): Promise<'sent' | 'queued' | 'tmux'> {
+  const transportRuntime = getTransportRuntime(args.session);
+  if (transportRuntime) {
+    timelineEmitter.emit(args.session, 'user.message', {
+      text: args.prompt,
+      ...(args.allowDuplicate ? { allowDuplicate: true } : {}),
+    });
+    const result = transportRuntime.send(args.prompt);
+    if (result === 'queued') {
+      emitP2pTransportQueuedState(args.run, args.session, transportRuntime, args.reason);
+      transportRuntime.drainPendingIfIdle(`p2p-${args.reason}-post-send`);
+    }
+    return result;
+  }
+  await sendKeysDelayedEnter(args.session, args.prompt);
+  return 'tmux';
+}
+
+function emitP2pTransportQueuedState(
+  run: P2pRun,
+  session: string,
+  runtime: NonNullable<ReturnType<typeof getTransportRuntime>>,
+  reason: string,
+): void {
+  logger.warn(
+    {
+      runId: run.id,
+      session,
+      reason,
+      pendingCount: runtime.pendingCount,
+      pendingVersion: runtime.pendingVersion,
+    },
+    'P2P: transport prompt queued behind active turn',
+  );
+  timelineEmitter.emit(session, 'session.state', {
+    state: 'queued',
+    pendingCount: runtime.pendingCount,
+    pendingMessages: runtime.pendingMessages,
+    pendingMessageEntries: runtime.pendingEntries,
+    pendingMessageVersion: runtime.pendingVersion,
+  }, { source: 'daemon', confidence: 'high' });
 }
 
 // ── Idle event registry (callback-driven, no polling) ─────────────────────
@@ -1458,13 +1544,13 @@ async function dispatchPostSummaryPrompt(
 ): Promise<boolean> {
   const session = run.initiatorSession;
   try {
-    const transportRuntime = getTransportRuntime(session);
-    if (transportRuntime) {
-      timelineEmitter.emit(session, 'user.message', { text: prompt, allowDuplicate: true });
-      transportRuntime.send(prompt);
-    } else {
-      await sendKeysDelayedEnter(session, prompt);
-    }
+    await dispatchP2pPromptToSession({
+      run,
+      session,
+      prompt,
+      allowDuplicate: true,
+      reason: 'post_summary_prompt',
+    });
     return true;
   } catch (err) {
     logger.warn({ runId: run.id, session, attempt, err }, failureLogMessage);
@@ -3526,15 +3612,16 @@ async function dispatchHop(
 
     let sizeBefore = 0;
     try { sizeBefore = (await stat(watchPath)).size; } catch {}
+    let queuedDispatch = false;
 
     try {
-      const transportRuntime = getTransportRuntime(session);
-      if (transportRuntime) {
-        timelineEmitter.emit(session, 'user.message', { text: prompt });
-        transportRuntime.send(prompt);
-      } else {
-        await sendKeysDelayedEnter(session, prompt);
-      }
+      const dispatchResult = await dispatchP2pPromptToSession({
+        run,
+        session,
+        prompt,
+        reason: sectionHeader ? 'discussion_section_prompt' : 'discussion_prompt',
+      });
+      queuedDispatch = dispatchResult === 'queued';
     } catch (err) {
       if (attempt < MAX_RETRIES) {
         logger.warn({ runId: run.id, session, attempt }, 'P2P: dispatch failed, will retry');
@@ -3673,6 +3760,7 @@ async function dispatchHop(
           dispatchStartedAt: dispatchTime,
           alreadyStopped: queueStopSent,
           reason: 'discussion_section_missing',
+          staleAfterMs: queuedDispatch ? QUEUED_PROMPT_STOP_AFTER_MS : undefined,
         });
       }
 

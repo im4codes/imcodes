@@ -2697,8 +2697,8 @@ describe('p2p-workflow reverse-regression', () => {
 
     expect(
       dispatchWindow.indexOf('discussionFileContainsSectionHeader(watchPath, sectionHeader)')
-        < dispatchWindow.indexOf('transportRuntime.send(prompt)'),
-      'duplicate-heading short-circuit must run before transportRuntime.send(prompt)',
+        < dispatchWindow.indexOf('dispatchP2pPromptToSession({'),
+      'duplicate-heading short-circuit must run before queue-aware P2P prompt dispatch',
     ).toBe(true);
 
     expect(
@@ -2790,6 +2790,46 @@ describe('p2p-workflow reverse-regression', () => {
     expect(
       /\.\.\.\(isTerminalRun\s*\?\s*\{\}\s*:\s*\{\s*active_phase:\s*run\.activePhase\s*\}\)/.test(orchestrator.text),
       'serializeP2pRun must omit active_phase for terminal runs retained during cleanup grace',
+    ).toBe(true);
+  });
+
+  it('#83 P2P transport dispatch MUST be queue-aware instead of treating queued prompts as delivered', () => {
+    const orchestrator = read('src/daemon/p2p-orchestrator.ts');
+
+    expect(
+      orchestrator.text.includes('QUEUED_PROMPT_STOP_AFTER_MS = 60_000'),
+      'P2P queued prompt watchdog must use a shorter threshold than generic stale queue recovery',
+    ).toBe(true);
+    expect(
+      /async\s+function\s+dispatchP2pPromptToSession\s*\(/.test(orchestrator.text),
+      'P2P must dispatch transport prompts through a queue-aware helper',
+    ).toBe(true);
+    expect(
+      /const\s+result\s*=\s*transportRuntime\.send\(args\.prompt\)/.test(orchestrator.text)
+        && /if\s*\(result\s*===\s*'queued'\)/.test(orchestrator.text),
+      'P2P must inspect transportRuntime.send() and handle queued results explicitly',
+    ).toBe(true);
+    expect(
+      /emitP2pTransportQueuedState\(args\.run,\s*args\.session,\s*transportRuntime,\s*args\.reason\)/.test(orchestrator.text)
+        && /transportRuntime\.drainPendingIfIdle\(`p2p-\$\{args\.reason\}-post-send`\)/.test(orchestrator.text),
+      'queued P2P prompts must emit an authoritative queue snapshot and immediately nudge idle runtimes',
+    ).toBe(true);
+
+    const dispatchAnchor = orchestrator.text.indexOf('async function dispatchHop');
+    expect(dispatchAnchor, 'dispatchHop must exist').toBeGreaterThan(0);
+    const dispatchWindow = orchestrator.text.slice(dispatchAnchor, dispatchAnchor + 14500);
+    expect(
+      /const\s+dispatchResult\s*=\s*await\s+dispatchP2pPromptToSession\(/.test(dispatchWindow)
+        && /queuedDispatch\s*=\s*dispatchResult\s*===\s*'queued'/.test(dispatchWindow),
+      'dispatchHop must remember whether the P2P prompt entered the transport pending queue',
+    ).toBe(true);
+    expect(
+      /staleAfterMs:\s*queuedDispatch\s*\?\s*QUEUED_PROMPT_STOP_AFTER_MS\s*:\s*undefined/.test(dispatchWindow),
+      'queued P2P prompts must use the short queued-prompt watchdog while waiting for discussion output',
+    ).toBe(true);
+    expect(
+      /runtime\.cancelStaleActiveTurnWithPending\(/.test(orchestrator.text),
+      'P2P stale recovery should prefer runtime pending-message recovery before raw cancel',
     ).toBe(true);
   });
 });

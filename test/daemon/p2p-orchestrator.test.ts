@@ -58,6 +58,7 @@ vi.mock('../../src/util/logger.js', () => ({
   },
 }));
 
+import { getTransportRuntime } from '../../src/agent/session-manager.js';
 import {
   startP2pRun,
   cancelP2pRun,
@@ -71,6 +72,7 @@ import {
   _setMarkerPromptRetryAfterMs,
   _setMinProcessingMs,
   _setPostSummaryConfirmationDelayMs,
+  _setQueuedPromptStopAfterMs,
   _setRoundHopCleanupDelayMs,
   type P2pRun,
   type P2pRunStatus,
@@ -146,7 +148,10 @@ beforeEach(async () => {
   _setMinProcessingMs(0);
   _setFileSettleCycles(1);
   _setPostSummaryConfirmationDelayMs(0);
+  _setQueuedPromptStopAfterMs(40);
   _setRoundHopCleanupDelayMs(0);
+  vi.mocked(getTransportRuntime).mockReset();
+  vi.mocked(getTransportRuntime).mockReturnValue(undefined);
   autoWriteExecutionMarkers = true;
 
   tempProjectDir = join(tmpdir(), `p2p-par-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
@@ -192,6 +197,7 @@ afterEach(async () => {
   _setMinProcessingMs(30000);
   _setFileSettleCycles(3);
   _setPostSummaryConfirmationDelayMs(10000);
+  _setQueuedPromptStopAfterMs(60000);
   _setRoundHopCleanupDelayMs(0);
   await rm(tempProjectDir, { recursive: true, force: true }).catch(() => {});
 });
@@ -210,6 +216,105 @@ describe('P2P orchestrator — parallel rounds', () => {
     const done = await waitForStatus(run.id, ['completed']);
     expect(done.hopStates).toHaveLength(1);
     expect(done.hopStates[0].artifact_path).toContain(`${done.id}.round1.hop1.md`);
+  });
+
+  it('nudges stale active transport work when a P2P prompt is queued behind it', async () => {
+    const cancelStaleActiveTurnWithPending = vi.fn().mockReturnValue(true);
+    const fakeRuntime = {
+      send: vi.fn().mockReturnValue('queued'),
+      pendingCount: 1,
+      pendingVersion: 7,
+      pendingMessages: ['queued p2p prompt'],
+      pendingEntries: [{ clientMessageId: 'queued-p2p-1', text: 'queued p2p prompt' }],
+      drainPendingIfIdle: vi.fn().mockReturnValue(false),
+      getDiagnosticSnapshot: vi.fn().mockReturnValue({
+        status: 'thinking',
+        sending: true,
+        pendingCount: 1,
+        pendingVersion: 7,
+        activeDispatchCount: 1,
+        stalePendingRecoveryActive: false,
+        providerSessionBound: true,
+        lastActivityAt: Date.now() - 1_000,
+        lastActivityAgeMs: 1_000,
+      }),
+      cancelStaleActiveTurnWithPending,
+      cancel: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) =>
+      session === 'deck_proj_w1' ? fakeRuntime as any : undefined,
+    );
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'queued transport p2p prompt',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      180,
+    );
+
+    await waitForStatus(run.id, ['completed', 'timed_out'], 3_000);
+
+    expect(fakeRuntime.send).toHaveBeenCalled();
+    expect(fakeRuntime.drainPendingIfIdle).toHaveBeenCalledWith('p2p-discussion_section_prompt-post-send');
+    expect(cancelStaleActiveTurnWithPending).toHaveBeenCalledWith(expect.objectContaining({
+      reason: 'p2p-discussion_section_missing',
+      staleMs: 40,
+    }));
+    expect(fakeRuntime.cancel).not.toHaveBeenCalled();
+  });
+
+  it('drains a queued P2P prompt immediately when the transport runtime is already idle', async () => {
+    const cancelStaleActiveTurnWithPending = vi.fn().mockReturnValue(false);
+    const fakeRuntime = {
+      send: vi.fn().mockReturnValue('queued'),
+      pendingCount: 1,
+      pendingVersion: 11,
+      pendingMessages: ['queued p2p prompt'],
+      pendingEntries: [{ clientMessageId: 'queued-p2p-2', text: 'queued p2p prompt' }],
+      drainPendingIfIdle: vi.fn()
+        .mockReturnValueOnce(true)
+        .mockReturnValue(false),
+      getDiagnosticSnapshot: vi.fn().mockReturnValue({
+        status: 'idle',
+        sending: false,
+        pendingCount: 0,
+        pendingVersion: 12,
+        activeDispatchCount: 0,
+        stalePendingRecoveryActive: false,
+        providerSessionBound: true,
+        lastActivityAt: Date.now(),
+        lastActivityAgeMs: 0,
+      }),
+      cancelStaleActiveTurnWithPending,
+      cancel: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) =>
+      session === 'deck_proj_w1' ? fakeRuntime as any : undefined,
+    );
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'idle queued transport p2p prompt',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      180,
+    );
+
+    await waitForStatus(run.id, ['completed', 'timed_out'], 3_000);
+
+    expect(fakeRuntime.send).toHaveBeenCalled();
+    expect(fakeRuntime.drainPendingIfIdle).toHaveBeenCalledWith('p2p-discussion_section_prompt-post-send');
+    expect(cancelStaleActiveTurnWithPending).not.toHaveBeenCalled();
+    expect(fakeRuntime.cancel).not.toHaveBeenCalled();
   });
 
   it('serializes shared actor and share scope metadata for shared P2P runs', async () => {
