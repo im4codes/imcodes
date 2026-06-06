@@ -176,6 +176,7 @@ import { evaluateSharedCommandRateLimit } from '../share/share-rate-limit.js';
 import {
   SHARE_BROWSER_COMMANDS,
   SHARE_DISCUSSION_EVENTS,
+  rawSubSessionIdFromDisplayName,
   type SharedActorEnvelope,
 } from '../../../shared/tab-sharing.js';
 
@@ -218,6 +219,7 @@ const BROWSER_RATE_LIMIT_ENABLED = false;
 // at typical egress rates without holding meaningful memory (a single ws
 // per session, queue is reset on overflow anyway).
 const QUEUE_MAX_BYTES = 4 * 1024 * 1024;
+const SUBSESSION_OWNERSHIP_RETRY_DELAYS_MS = [50, 150, 350] as const;
 
 /**
  * Safe ws.send: checks readyState, wraps in try/catch.
@@ -2833,7 +2835,7 @@ export class WsBridge {
         const sessionName = msg.session;
         const rawMode = typeof msg.raw === 'boolean' ? msg.raw : true;
         const revision = this.bumpTerminalSubscriptionRevision(ws, sessionName);
-        void this.verifySessionOwnership(sessionName).then((allowed) => {
+        void this.verifySessionOwnershipWithSubSessionRetry(sessionName).then((allowed) => {
           if (!allowed) {
             logger.warn({ serverId: this.serverId, sessionName }, 'terminal.subscribe: session not owned by this server — rejected');
             return;
@@ -2854,7 +2856,7 @@ export class WsBridge {
         const forceHistory = (msg as { forceHistory?: unknown }).forceHistory === true;
         const alreadySubscribed = this.transportSubscriptions.get(ws)?.has(sessionId) ?? false;
         const revision = this.bumpTransportSubscriptionRevision(ws, sessionId);
-        void this.verifySessionOwnership(sessionId).then((allowed) => {
+        void this.verifySessionOwnershipWithSubSessionRetry(sessionId).then((allowed) => {
           if (!allowed) {
             logger.warn({ serverId: this.serverId, sessionId }, 'chat.subscribe: session not owned by this server — rejected');
             return;
@@ -4839,6 +4841,7 @@ export class WsBridge {
    */
   private async verifySessionOwnership(sessionName: string): Promise<boolean> {
     if (!this.db) return true; // no db = dev/test mode, allow all
+    if (this.activeSubSessions.has(sessionName)) return true;
     try {
       // Check regular sessions
       const row = await this.db.queryOne<Record<string, unknown>>(
@@ -4863,6 +4866,17 @@ export class WsBridge {
       logger.warn({ serverId: this.serverId, sessionName, err }, 'verifySessionOwnership: db error — denying');
       return false; // fail-closed: deny on transient DB errors to prevent unauthorized access
     }
+  }
+
+  private async verifySessionOwnershipWithSubSessionRetry(sessionName: string): Promise<boolean> {
+    if (await this.verifySessionOwnership(sessionName)) return true;
+    if (!rawSubSessionIdFromDisplayName(sessionName)) return false;
+
+    for (const delayMs of SUBSESSION_OWNERSHIP_RETRY_DELAYS_MS) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      if (await this.verifySessionOwnership(sessionName)) return true;
+    }
+    return false;
   }
 
   private async verifyRepoCheckoutAuthorization(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {

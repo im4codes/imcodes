@@ -101,12 +101,12 @@ describe('SubSessionCard', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     cleanup();
     localStorage.clear();
-    vi.useRealTimers();
   });
 
-  it('defers timeline hydration for closed preview cards until after first paint', async () => {
+  it('attaches the live timeline before closed preview hydration', async () => {
     vi.useFakeTimers();
     render(
       <SubSessionCard
@@ -122,9 +122,9 @@ describe('SubSessionCard', () => {
       />,
     );
 
-    expect(useTimelineSpy).toHaveBeenLastCalledWith(null, null, undefined, {
+    expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: false,
-      isVisible: true,
+      isVisible: false,
     });
 
     await act(async () => {
@@ -135,6 +135,33 @@ describe('SubSessionCard', () => {
       isActiveSession: false,
       isVisible: true,
     });
+  });
+
+  it('passes streaming assistant text to the card ChatView before hydration delay completes', () => {
+    timelineEvents = [{
+      eventId: 'stream-1',
+      sessionId: 'deck_sub_sub-card-1',
+      type: 'assistant.text',
+      payload: { text: 'partial stream', streaming: true },
+    }];
+
+    render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        isFocused={false}
+        previewHydrateDelayMs={1200}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const props = chatViewPropsSpy.mock.calls.at(-1)?.[0];
+    expect(props.events).toEqual(timelineEvents);
+    expect(props.events[0].payload).toMatchObject({ text: 'partial stream', streaming: true });
   });
 
   it('forces preview scroll to bottom after sending from the card input', async () => {

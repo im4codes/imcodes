@@ -113,6 +113,32 @@ function makeDb(tokenHash: string) {
   return db as unknown as import('../src/db/client.js').Database;
 }
 
+function makeSubSessionOwnershipRaceDb(options: {
+  subId: string;
+  allowAfterChecks?: number;
+}) {
+  let subChecks = 0;
+  const allowAfterChecks = options.allowAfterChecks ?? 2;
+  const db = {
+    queryOne: async (sql: string, params?: unknown[]) => {
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', user_id: 'test-user' };
+      if (sql.includes('FROM sessions WHERE')) return null;
+      if (sql.includes('FROM sub_sessions WHERE')) {
+        subChecks += 1;
+        return params?.[1] === options.subId && subChecks >= allowAfterChecks ? { ok: 1 } : null;
+      }
+      return null;
+    },
+    query: async () => [],
+    execute: async () => ({ changes: 1 }),
+    exec: async () => {},
+    transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => fn(db as unknown as import('../src/db/client.js').Database),
+    close: () => {},
+    getSubChecks: () => subChecks,
+  };
+  return db as unknown as import('../src/db/client.js').Database & { getSubChecks: () => number };
+}
+
 function makeRepoCheckoutDb(options: {
   allowMain?: boolean;
   allowSub?: boolean;
@@ -3291,6 +3317,96 @@ describe('WsBridge', () => {
         .filter((msg) => msg.type === 'timeline.event');
       expect(timelineEvents).toHaveLength(1);
       expect(timelineEvents[0].event.payload.text).toBe('live repair works');
+    });
+
+    it('retries live transport subscription ownership for newly created sub-sessions', async () => {
+      const bridge = WsBridge.get(serverId);
+      const db = makeSubSessionOwnershipRaceDb({ subId: 'race-live' });
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', db);
+      daemonWs.sent.length = 0;
+      browserWs.emit('message', JSON.stringify({
+        type: 'chat.subscribe',
+        sessionId: 'deck_sub_race-live',
+        forceHistory: false,
+      }));
+
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      await flushAsync();
+      expect(db.getSubChecks()).toBeGreaterThanOrEqual(2);
+      expect(daemonWs.sentStrings.filter((s) => JSON.parse(s).type === 'chat.subscribe')).toHaveLength(0);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'evt-race-live',
+          sessionId: 'deck_sub_race-live',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          type: 'assistant.text',
+          payload: { text: 'sub live stream', streaming: true },
+        },
+      }));
+      await flushAsync();
+
+      const timelineEvents = browserWs.sentStrings
+        .map((s) => JSON.parse(s))
+        .filter((msg) => msg.type === 'timeline.event');
+      expect(timelineEvents).toHaveLength(1);
+      expect(timelineEvents[0].event.payload).toMatchObject({ text: 'sub live stream', streaming: true });
+    });
+
+    it('retries terminal subscription ownership for newly created process sub-sessions', async () => {
+      const bridge = WsBridge.get(serverId);
+      const db = makeSubSessionOwnershipRaceDb({ subId: 'race-term' });
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', db);
+      daemonWs.sent.length = 0;
+      browserWs.emit('message', JSON.stringify({
+        type: 'terminal.subscribe',
+        session: 'deck_sub_race-term',
+        raw: false,
+      }));
+
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      await flushAsync();
+      expect(db.getSubChecks()).toBeGreaterThanOrEqual(2);
+      expect(daemonWs.sentStrings.map((s) => JSON.parse(s))).toContainEqual({
+        type: 'terminal.subscribe',
+        session: 'deck_sub_race-term',
+        raw: false,
+      });
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'evt-race-term',
+          sessionId: 'deck_sub_race-term',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          type: 'assistant.text',
+          payload: { text: 'process sub stream', streaming: true },
+        },
+      }));
+      await flushAsync();
+
+      const timelineEvents = browserWs.sentStrings
+        .map((s) => JSON.parse(s))
+        .filter((msg) => msg.type === 'timeline.event');
+      expect(timelineEvents).toHaveLength(1);
+      expect(timelineEvents[0].event.payload).toMatchObject({ text: 'process sub stream', streaming: true });
     });
 
     it('forwards chat.subscribe again after unsubscribe', async () => {

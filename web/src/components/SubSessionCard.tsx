@@ -138,12 +138,12 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   // daemon echo).
   const timeline = isShell
     ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, retryOptimisticMessage: undefined }
-    : useTimeline(timelineHydrated ? sub.sessionName : null, ws, serverId, {
+    : useTimeline(sub.sessionName, ws, serverId, {
       isActiveSession: !!isFocused,
-      // Open card = visible; participate in resume broadcast (rate-limited by
-      // the 15s success-only cooldown). Hidden/unhydrated cards pass null
-      // sessionName above so the hook stays inert.
-      isVisible: true,
+      // Keep the live timeline hook attached even while preview hydration is
+      // delayed. Without this, sub-session cards miss the typewriter phase and
+      // only jump to cached/final text when the timer flips `timelineHydrated`.
+      isVisible: timelineHydrated || isOpen || !!isFocused,
     });
   const { events, refreshing } = timeline;
   const addOptimisticUserMessage = 'addOptimisticUserMessage' in timeline ? timeline.addOptimisticUserMessage : undefined;
