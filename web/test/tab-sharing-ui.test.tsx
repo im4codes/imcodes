@@ -276,7 +276,7 @@ describe('collaborative tab sharing UI', () => {
 
     const indicator = screen.getByLabelText('Shared as Viewer · Active');
     expect(indicator.getAttribute('role')).not.toBe('button');
-    expect(indicator.closest('button')).toBeNull();
+    expect(indicator.closest('button')).toBe(screen.getByRole('tab', { name: /Alpha/ }));
     expect(indicator).toHaveProperty('onclick', null);
   });
 
@@ -313,7 +313,7 @@ describe('collaborative tab sharing UI', () => {
     for (const label of ['Shared as Viewer · Revoked', 'Shared as Participant · Expired', 'Shared as Viewer · Target unavailable']) {
       const indicator = screen.getByLabelText(label);
       expect(indicator.getAttribute('role')).not.toBe('button');
-      expect(indicator.closest('button')).toBeNull();
+      expect(indicator.closest('button')?.getAttribute('role')).toBe('tab');
     }
   });
 
