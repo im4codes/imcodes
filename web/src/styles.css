@@ -619,6 +619,203 @@ body {
 .openspec-change-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 .openspec-change-action-wrap { position: relative; flex-shrink: 0; }
 .openspec-change-action-btn { padding: 4px 8px; font-size: 11px; white-space: nowrap; }
+.openspec-change-action-btn-auto {
+  color: #a5f3fc;
+  border-color: rgba(34, 211, 238, 0.42);
+  background: linear-gradient(135deg, rgba(8, 47, 73, 0.86), rgba(30, 41, 59, 0.82));
+  box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.12), 0 0 14px rgba(34, 211, 238, 0.12);
+}
+.openspec-change-action-btn-auto:hover:not(:disabled) {
+  color: #ecfeff;
+  border-color: rgba(125, 211, 252, 0.72);
+  box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.2), 0 0 18px rgba(34, 211, 238, 0.22);
+}
+.openspec-auto-current-run,
+.openspec-auto-launcher {
+  margin: 6px;
+  padding: 10px;
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(8, 13, 30, 0.96), rgba(15, 23, 42, 0.9));
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.08), 0 14px 34px rgba(2, 6, 23, 0.24);
+}
+.openspec-auto-current-run { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.openspec-auto-current-run-redacted { border-color: rgba(251, 191, 36, 0.32); }
+.openspec-auto-kicker {
+  color: #67e8f9;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.openspec-auto-change,
+.openspec-auto-current-title {
+  min-width: 0;
+  color: #f8fafc;
+  font-size: 13px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.openspec-auto-current-meta,
+.openspec-auto-launcher-meta,
+.openspec-auto-detail-note,
+.openspec-auto-finding {
+  color: #94a3b8;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.openspec-auto-launcher-head,
+.openspec-auto-details-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.openspec-auto-icon-btn {
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, 0.78);
+  color: #cbd5e1;
+  cursor: pointer;
+}
+.openspec-auto-icon-btn:hover { color: #fff; border-color: rgba(125, 211, 252, 0.55); }
+.openspec-auto-preset-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin: 10px 0 8px;
+}
+.openspec-auto-preset {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid rgba(71, 85, 105, 0.8);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.76);
+  color: #dbe7f5;
+  text-align: left;
+  cursor: pointer;
+}
+.openspec-auto-preset span { display: block; font-size: 12px; font-weight: 700; }
+.openspec-auto-preset small { display: block; margin-top: 3px; color: #94a3b8; font-size: 10px; }
+.openspec-auto-preset-active {
+  border-color: rgba(34, 211, 238, 0.72);
+  background: linear-gradient(135deg, rgba(14, 116, 144, 0.28), rgba(59, 130, 246, 0.14));
+  box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.18), 0 0 18px rgba(34, 211, 238, 0.18);
+}
+.openspec-auto-warning,
+.openspec-auto-error {
+  margin-top: 8px;
+  padding: 8px;
+  border-radius: 7px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.openspec-auto-warning {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #fde68a;
+  background: rgba(120, 53, 15, 0.24);
+  border: 1px solid rgba(251, 191, 36, 0.28);
+}
+.openspec-auto-warning-subtle {
+  color: #fef3c7;
+  font-size: 11px;
+  margin-top: 4px;
+  opacity: 0.88;
+}
+.openspec-auto-error {
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.24);
+  border: 1px solid rgba(248, 113, 113, 0.26);
+}
+.openspec-auto-start-btn { width: 100%; margin-top: 10px; }
+.openspec-auto-mini-btn { padding: 4px 8px; font-size: 11px; white-space: nowrap; }
+.openspec-auto-session-progress { margin: 0 8px 6px; }
+.openspec-auto-runbar {
+  border-color: rgba(34, 211, 238, 0.24);
+  background: linear-gradient(135deg, rgba(3, 7, 18, 0.92), rgba(15, 23, 42, 0.9));
+}
+.openspec-auto-runbar-head { align-items: center; }
+.openspec-auto-view-btn { color: #bfdbfe; border-color: rgba(96, 165, 250, 0.35); }
+.openspec-auto-taskbar { margin-top: 0; background: rgba(15, 23, 42, 0.9); }
+.openspec-auto-taskfill { background: linear-gradient(90deg, #06b6d4, #8b5cf6); }
+.openspec-auto-finding { margin-top: 6px; }
+.openspec-auto-details-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(2, 6, 23, 0.62);
+}
+.openspec-auto-details-panel {
+  width: min(720px, calc(100vw - 32px));
+  max-height: min(760px, calc(var(--vvh, 100dvh) - 32px));
+  overflow: auto;
+  padding: 16px;
+  border: 1px solid rgba(56, 189, 248, 0.26);
+  border-radius: 10px;
+  background: linear-gradient(145deg, rgba(2, 6, 23, 0.98), rgba(15, 23, 42, 0.96));
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5), inset 0 0 0 1px rgba(148, 163, 184, 0.08);
+  color: #dbe7f5;
+}
+.openspec-auto-details-head h3 { margin: 2px 0 0; color: #f8fafc; font-size: 18px; }
+.openspec-auto-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 14px 0;
+}
+.openspec-auto-detail-row,
+.openspec-auto-score,
+.openspec-auto-evidence {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid rgba(71, 85, 105, 0.58);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.62);
+}
+.openspec-auto-detail-row span,
+.openspec-auto-score span {
+  display: block;
+  margin-bottom: 3px;
+  color: #94a3b8;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+.openspec-auto-detail-row strong,
+.openspec-auto-score strong {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: #f8fafc;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.openspec-auto-detail-section { margin-top: 12px; }
+.openspec-auto-detail-section h4 { margin: 0 0 6px; color: #e2e8f0; font-size: 12px; }
+.openspec-auto-detail-section ul { margin: 6px 0 0 18px; padding: 0; color: #cbd5e1; font-size: 12px; }
+.openspec-auto-score-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+.openspec-auto-score small,
+.openspec-auto-evidence small {
+  display: block;
+  margin-top: 4px;
+  color: #94a3b8;
+  font-size: 10px;
+  line-height: 1.3;
+}
+.openspec-auto-evidence { display: flex; justify-content: space-between; gap: 8px; margin-top: 6px; }
+.openspec-auto-details-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 .openspec-submenu { z-index: 2147483647; }
 .openspec-submenu-inline { position: static; width: 100%; min-width: 0; max-width: none; max-height: none; margin-top: 6px; overflow: visible; }
 .openspec-folder-overlay { z-index: 2147483645; }
@@ -978,10 +1175,19 @@ body {
     background: rgba(249, 115, 22, 0.16);
     color: #fdba74;
   }
-  .openspec-change-actions { display: none; grid-template-columns: repeat(3, minmax(0, 1fr)); width: 100%; gap: 4px; }
+  .openspec-change-actions { display: none; grid-template-columns: repeat(4, minmax(0, 1fr)); width: 100%; gap: 4px; }
   .openspec-change-actions-visible { display: grid; }
   .openspec-change-action-wrap { min-width: 0; }
   .openspec-change-action-btn { width: 100%; padding: 5px 6px; font-size: 10px; }
+  .openspec-auto-preset-grid,
+  .openspec-auto-detail-grid,
+  .openspec-auto-score-grid { grid-template-columns: 1fr; }
+  .openspec-auto-details-backdrop { align-items: flex-end; padding: 8px; }
+  .openspec-auto-details-panel {
+    width: 100%;
+    max-height: calc(var(--vvh, 100dvh) - 16px);
+    border-radius: 12px 12px 0 0;
+  }
   .openspec-folder-modal {
     width: 100vw;
     height: calc(var(--vvh, 100dvh) - var(--sat, 0px));

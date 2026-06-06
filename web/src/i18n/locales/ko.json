@@ -24,7 +24,9 @@
     "this_feature": "이 기능"
   },
   "share": {
-    "menu": { "shareTab": "공유" },
+    "menu": {
+      "shareTab": "공유"
+    },
     "dialogTitle": "액세스 공유",
     "dialogSubtitle": "{{target}}에 범위가 제한된 액세스를 부여합니다.",
     "target": {
@@ -75,7 +77,9 @@
     },
     "create": "공유 만들기",
     "creating": "만드는 중...",
-    "scope": { "current": "공유 범위" },
+    "scope": {
+      "current": "공유 범위"
+    },
     "indicator": "{{scope}}이(가) {{role}}로 공유됨 · {{status}}",
     "indicatorCompact": "{{role}}로 공유됨 · {{status}}",
     "indicatorSharedOut": "다른 사용자와 공유됨",
@@ -1146,6 +1150,94 @@
     "implement_action": "구현",
     "achieve_action": "완료",
     "propose_action": "제안",
+    "auto": {
+      "action": "Auto",
+      "kicker": "자동 전달",
+      "launcher_title": "자동 전달",
+      "details_title": "Auto Deliver 세부 정보",
+      "current_run": "현재 Auto Deliver",
+      "no_change": "선택된 변경 없음",
+      "start": "Auto Deliver 시작",
+      "stop": "중지",
+      "stopping": "중지 중...",
+      "view": "보기",
+      "tasks": "Tasks",
+      "tasks_unknown": "작업 알 수 없음",
+      "tasks_progress": "{{checked}}/{{total}} tasks",
+      "prompt_count": "{{count}} prompts",
+      "prompt_count_label": "Implementation prompts",
+      "materialized_limits": "Spec audit {{spec}} · implementation audit {{impl}}",
+      "preset_limits": "Spec {{spec}} · Impl {{impl}}",
+      "conflict_active": "Auto Deliver is already running for {{change}}.",
+      "redacted_conflict": "같은 그룹의 다른 세션에서 Auto Deliver가 실행 중입니다.",
+      "conflict_summary": "자세한 정보는 참여 세션에서만 표시됩니다.",
+      "lock_manual_actions": "이 세션 그룹에서 Auto Deliver가 실행 중입니다.",
+      "status_label": "Status",
+      "stage_label": "Stage",
+      "elapsed": "경과 시간",
+      "preset_label": "Preset",
+      "owning_session": "Owning session",
+      "launched_from": "Launched from",
+      "execution_session": "Execution session",
+      "spec_round": "Spec audit round",
+      "impl_round": "Implementation audit round",
+      "active_p2p": "Active Team run",
+      "combo_id": "Combo",
+      "verdict": "Verdict",
+      "terminal_reason": "Terminal reason",
+      "task_stats": "Task status",
+      "scores": "Scores",
+      "scores_empty": "아직 점수가 없습니다",
+      "evidence": "증거",
+      "evidence_stale": "오래됨",
+      "error": {
+        "missing_change": "Select an OpenSpec change first.",
+        "active_run": "이 세션 그룹에서 Auto Deliver가 이미 실행 중입니다.",
+        "manual_team_busy": "수동 Team 실행이 이 세션 그룹을 사용 중입니다.",
+        "unsupported_runtime": "Auto Deliver에는 transport 기반 코딩 세션이 필요합니다.",
+        "launch_failed": "Failed to start Auto Deliver."
+      },
+      "preset": {
+        "fast": "빠름",
+        "standard": "표준",
+        "strict": "엄격",
+        "deep": "심층"
+      },
+      "status": {
+        "launching": "Launching",
+        "active": "Active",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped",
+        "proposed": "Proposed",
+        "implementation_task_loop": "Implementing"
+      },
+      "stage": {
+        "proposed": "Proposed",
+        "spec_audit_repair": "Spec audit",
+        "implementation_task_loop": "Implementation",
+        "implementation_audit_repair": "Implementation audit",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped",
+        "stopping": "Stopping"
+      },
+      "score_module": {
+        "spec": "Spec",
+        "tasks": "Tasks",
+        "implementation": "Implementation",
+        "tests": "Tests",
+        "risk": "Risk"
+      },
+      "provenance": {
+        "daemon": "Daemon",
+        "implementation_reported": "Implementation reported",
+        "audit_reported": "Audit reported",
+        "none": "None"
+      }
+    },
     "propose_from_discussion_action": "최근 논의에서 생성",
     "propose_from_description_action": "아래 설명에서 생성",
     "audit_implementation_prompt": "{{reference}}에 대해 OpenSpec 산출물을 기준으로 엄격한 구현 감사를 수행하세요. 모든 불일치, 누락, 회귀 위험, 경계 사례 공백, 누락된 테스트를 찾아낸 뒤 코드, 테스트, 필요한 보조 변경까지 직접 수정하세요. 구현에 맞춰 명세 산출물도 움직여야 한다면 같은 작업 안에서 {{reference}} 아래 OpenSpec 파일까지 직접 갱신하세요. 보고서로 끝내지 말고 구현을 명세와 완전히 일치시키세요.",

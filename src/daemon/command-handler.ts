@@ -128,6 +128,8 @@ import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from '../../sha
 import { compileP2pWorkflowDraft } from '../../shared/p2p-workflow-compiler.js';
 import { materializeOldAdvancedConfigToWorkflowDraft } from '../../shared/p2p-workflow-materialize.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
+import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
+import { handleOpenSpecAutoDeliverCommand } from './openspec-auto-deliver-orchestrator.js';
 import { SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
 import { getP2pConfigStoreScope, handleSessionGroupCloneCancel, handleSessionGroupCloneCommand } from './session-group-clone.js';
 import { buildDefaultP2pStaticPolicy } from '../../shared/p2p-workflow-policy.js';
@@ -1539,6 +1541,11 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case P2P_WORKFLOW_MSG.STATUS:
       void traceCommandAsync(cmd, 'web_command.p2p_status', () => handleP2pStatus(cmd, serverLink));
       break;
+    case OPENSPEC_AUTO_DELIVER_MSG.LAUNCH:
+    case OPENSPEC_AUTO_DELIVER_MSG.STOP:
+    case OPENSPEC_AUTO_DELIVER_MSG.STATUS_REQUEST:
+      void traceCommandAsync(cmd, 'web_command.openspec_auto_deliver', () => handleOpenSpecAutoDeliverCommand(cmd, serverLink));
+      break;
     case CC_PRESET_MSG.LIST:
       void handleCcPresetsList(serverLink);
       break;
@@ -2948,6 +2955,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         hopTimeoutMs: p2pHopTimeoutMs,
         sharedActor,
         shareScope,
+        launchOrigin: {
+          kind: 'manual',
+          commandId: effectiveId,
+        },
         ...(compiledFromEnvelope
           ? {
               advanced: {

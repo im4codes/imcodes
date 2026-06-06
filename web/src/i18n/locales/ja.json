@@ -13,7 +13,7 @@
     "quote_block": "全文引用",
     "copied": "コピーしました！",
     "generating": "生成中...",
-    "starting": "起動中...",
+    "starting": "開始中...",
     "yes": "はい",
     "connected": "接続済み",
     "disconnected": "切断済み",
@@ -24,7 +24,9 @@
     "this_feature": "この機能"
   },
   "share": {
-    "menu": { "shareTab": "共有" },
+    "menu": {
+      "shareTab": "共有"
+    },
     "dialogTitle": "アクセスを共有",
     "dialogSubtitle": "{{target}} へのスコープ付きアクセスを付与します。",
     "target": {
@@ -75,7 +77,9 @@
     },
     "create": "共有を作成",
     "creating": "作成中...",
-    "scope": { "current": "共有スコープ" },
+    "scope": {
+      "current": "共有スコープ"
+    },
     "indicator": "{{scope}} は {{role}} として共有中 · {{status}}",
     "indicatorCompact": "{{role}} として共有中 · {{status}}",
     "indicatorSharedOut": "他のユーザーと共有中",
@@ -1146,6 +1150,94 @@
     "implement_action": "実装",
     "achieve_action": "完了",
     "propose_action": "提案",
+    "auto": {
+      "action": "Auto",
+      "kicker": "自動デリバリー",
+      "launcher_title": "自動デリバリー",
+      "details_title": "Auto Deliver 詳細",
+      "current_run": "現在の Auto Deliver",
+      "no_change": "変更が選択されていません",
+      "start": "Auto Deliver を開始",
+      "stop": "停止",
+      "stopping": "停止中...",
+      "view": "表示",
+      "tasks": "Tasks",
+      "tasks_unknown": "タスク不明",
+      "tasks_progress": "{{checked}}/{{total}} tasks",
+      "prompt_count": "{{count}} prompts",
+      "prompt_count_label": "Implementation prompts",
+      "materialized_limits": "Spec audit {{spec}} · implementation audit {{impl}}",
+      "preset_limits": "Spec {{spec}} · Impl {{impl}}",
+      "conflict_active": "Auto Deliver is already running for {{change}}.",
+      "redacted_conflict": "同じグループの別セッションで Auto Deliver が実行中です。",
+      "conflict_summary": "詳細は参加セッションでのみ表示されます。",
+      "lock_manual_actions": "このセッショングループで Auto Deliver が実行中です。",
+      "status_label": "Status",
+      "stage_label": "Stage",
+      "elapsed": "経過時間",
+      "preset_label": "Preset",
+      "owning_session": "Owning session",
+      "launched_from": "Launched from",
+      "execution_session": "Execution session",
+      "spec_round": "Spec audit round",
+      "impl_round": "Implementation audit round",
+      "active_p2p": "Active Team run",
+      "combo_id": "Combo",
+      "verdict": "Verdict",
+      "terminal_reason": "Terminal reason",
+      "task_stats": "Task status",
+      "scores": "Scores",
+      "scores_empty": "スコアはまだありません",
+      "evidence": "証跡",
+      "evidence_stale": "古い",
+      "error": {
+        "missing_change": "Select an OpenSpec change first.",
+        "active_run": "このセッショングループでは Auto Deliver がすでに実行中です。",
+        "manual_team_busy": "手動 Team 実行がこのセッショングループを使用中です。",
+        "unsupported_runtime": "Auto Deliver には transport ベースのコーディングセッションが必要です。",
+        "launch_failed": "Failed to start Auto Deliver."
+      },
+      "preset": {
+        "fast": "高速",
+        "standard": "標準",
+        "strict": "厳格",
+        "deep": "深い"
+      },
+      "status": {
+        "launching": "Launching",
+        "active": "Active",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped",
+        "proposed": "Proposed",
+        "implementation_task_loop": "Implementing"
+      },
+      "stage": {
+        "proposed": "Proposed",
+        "spec_audit_repair": "Spec audit",
+        "implementation_task_loop": "Implementation",
+        "implementation_audit_repair": "Implementation audit",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped",
+        "stopping": "Stopping"
+      },
+      "score_module": {
+        "spec": "Spec",
+        "tasks": "Tasks",
+        "implementation": "Implementation",
+        "tests": "Tests",
+        "risk": "Risk"
+      },
+      "provenance": {
+        "daemon": "Daemon",
+        "implementation_reported": "Implementation reported",
+        "audit_reported": "Audit reported",
+        "none": "None"
+      }
+    },
     "propose_from_discussion_action": "直近の議論から生成",
     "propose_from_description_action": "下の説明から生成",
     "audit_implementation_prompt": "{{reference}} について、OpenSpec の成果物に照らした厳格な実装監査を実施してください。不一致、抜け漏れ、回帰リスク、境界ケースの欠落、未整備のテストをすべて洗い出し、そのうえでコード、テスト、必要な関連修正まで直してください。実装に合わせて仕様成果物も動かす必要がある場合は、同じ作業の中で {{reference}} 配下の OpenSpec ファイルも直接更新してください。レポートだけで終わらせず、実装を仕様完全準拠まで持っていってください。",

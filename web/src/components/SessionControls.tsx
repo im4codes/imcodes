@@ -16,6 +16,16 @@ import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
+import {
+  OpenSpecAutoDeliverCurrentRunEntry,
+  OpenSpecAutoDeliverDetailsPanel,
+  OpenSpecAutoDeliverLauncher,
+  OpenSpecAutoDeliverRunBar,
+} from './OpenSpecAutoDeliver.js';
+import { OpenSpecChangeRow } from './OpenSpecChangeRow.js';
+import { useOpenSpecAutoDeliver } from '../hooks/useOpenSpecAutoDeliver.js';
+import { isOpenSpecAutoDeliverActiveProjection } from '../openspec-auto-deliver.js';
+import type { OpenSpecAutoDeliverPresetId } from '../openspec-auto-deliver.js';
 import { isFutureWorkflowSchema } from '@shared/p2p-workflow-validators.js';
 import {
   P2P_CAPABILITY_FRESHNESS_TTL_MS,
@@ -630,6 +640,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [openSpecProposeMenuOpen, setOpenSpecProposeMenuOpen] = useState(false);
   const [openSpecExpandedChange, setOpenSpecExpandedChange] = useState<string | null>(null);
   const [openSpecFolderPath, setOpenSpecFolderPath] = useState<string | null>(null);
+  const [openSpecAutoLauncherChange, setOpenSpecAutoLauncherChange] = useState<string | null>(null);
+  const [openSpecAutoLaunchingChange, setOpenSpecAutoLaunchingChange] = useState<string | null>(null);
+  const [openSpecAutoDetailsOpen, setOpenSpecAutoDetailsOpen] = useState(false);
   const [openSpecLayoutTick, setOpenSpecLayoutTick] = useState(0);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModelPreference);
@@ -676,6 +689,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
+  const openSpecAutoDeliver = useOpenSpecAutoDeliver({
+    ws,
+    serverId,
+    sessionName: activeSession?.name,
+    openSpecOpen,
+  });
+  const openSpecAutoProjection = openSpecAutoDeliver.projection;
+  const openSpecAutoActive = isOpenSpecAutoDeliverActiveProjection(openSpecAutoProjection);
+  const openSpecAutoActionLockReason = openSpecAutoActive ? t('openspec.auto.lock_manual_actions') : undefined;
   const effectiveRuntimeType = activeSession ? resolveSessionInfoRuntimeType(activeSession) : undefined;
   const transportSendShouldQueue = effectiveRuntimeType === 'transport'
     && !!activeSession
@@ -1275,6 +1297,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecProposeMenuOpen(false);
     setOpenSpecExpandedChange(null);
     setOpenSpecFolderPath(null);
+    setOpenSpecAutoLauncherChange(null);
+    setOpenSpecAutoDetailsOpen(false);
     openSpecRequestIdRef.current = null;
   }, [activeSession?.projectDir, clearOpenSpecRequestTimer]);
 
@@ -1317,6 +1341,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         setOpenSpecOpen(false);
         setOpenSpecAuditMenu(null);
         setOpenSpecProposeMenuOpen(false);
+        setOpenSpecAutoLauncherChange(null);
       }
     };
     const handlePointerDown = (e: PointerEvent) => handleOutsidePointer(e.target);
@@ -1523,8 +1548,30 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecFolderPath(`${openSpecChangesPath}/${changeName}`);
     setOpenSpecAuditMenu(null);
     setOpenSpecProposeMenuOpen(false);
+    setOpenSpecAutoLauncherChange(null);
     setOpenSpecOpen(false);
   }, [openSpecChangesPath]);
+
+  const openOpenSpecAutoLauncher = useCallback((changeName: string) => {
+    setOpenSpecAuditMenu(null);
+    setOpenSpecProposeMenuOpen(false);
+    setOpenSpecAutoLauncherChange(changeName);
+  }, []);
+
+  const launchOpenSpecAutoDeliver = useCallback((changeName: string, presetId: OpenSpecAutoDeliverPresetId) => {
+    const requestId = openSpecAutoDeliver.launch({ changeName, presetId });
+    if (!requestId) return;
+    setOpenSpecAutoLaunchingChange(changeName);
+  }, [openSpecAutoDeliver]);
+
+  useEffect(() => {
+    if (!openSpecAutoLaunchingChange || !openSpecAutoProjection) return;
+    if (openSpecAutoProjection.changeName !== openSpecAutoLaunchingChange) return;
+    setOpenSpecAutoLaunchingChange(null);
+    setOpenSpecAutoLauncherChange(null);
+    setOpenSpecOpen(false);
+    setOpenSpecAutoDetailsOpen(true);
+  }, [openSpecAutoLaunchingChange, openSpecAutoProjection]);
 
   const openP2pConfigPanel = useCallback((tab: P2pConfigTab = 'participants') => {
     const open = () => {
@@ -2848,6 +2895,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>,
         document.body,
       )}
+      {openSpecAutoDetailsOpen && (
+        <OpenSpecAutoDeliverDetailsPanel
+          projection={openSpecAutoProjection}
+          stopPending={openSpecAutoDeliver.stopPending}
+          onClose={() => setOpenSpecAutoDetailsOpen(false)}
+          onStop={() => { openSpecAutoDeliver.stop(); }}
+        />
+      )}
       {/* Header control row — compact mode keeps meta controls but still hides terminal shortcuts */}
       {!hideShortcuts && (!compact || showCompactMetaControls) && <div class="shortcuts-row">
         {!compact && <div class={`shortcuts${isTransport ? ' shortcuts-transport' : ''}`}>
@@ -2989,6 +3044,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             {openSpecOpen && renderOpenSpecDropdown(
               <>
                 <div class="openspec-dropdown-scroll">
+                {openSpecAutoProjection && (
+                  <OpenSpecAutoDeliverCurrentRunEntry
+                    projection={openSpecAutoProjection}
+                    onView={() => setOpenSpecAutoDetailsOpen(true)}
+                  />
+                )}
                 <div class="p2p-menu-section-label openspec-section-label">{t('openspec.changes')}</div>
                 {openSpecLoading && (
                   <div class="p2p-menu-section-label openspec-section-meta">{t('common.loading')}</div>
@@ -3002,127 +3063,90 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   <div class="p2p-menu-section-label openspec-section-meta">{t('openspec.empty')}</div>
                 )}
                 {!openSpecLoading && !openSpecError && openSpecChanges.map((changeName) => (
-                  <div
+                  <OpenSpecChangeRow
                     key={changeName}
-                    class={`openspec-change-row${isOpenSpecMobile ? ' openspec-change-row-mobile' : ''}${openSpecExpandedChange === changeName ? ' openspec-change-row-expanded' : ''}`}
-                  >
-                    <div class="openspec-change-header">
-                      <button
-                        class="menu-item openspec-change-name"
-                        onClick={() => {
-                          if (!openSpecChangesPath) return;
-                          appendToInput([toComposerReference(`${openSpecChangesPath}/${changeName}`)]);
-                          setOpenSpecAuditMenu(null);
-                          setOpenSpecProposeMenuOpen(false);
-                          setOpenSpecOpen(false);
-                        }}
-                      >
-                        <span class="openspec-change-ref-prefix" aria-hidden="true">@</span>
-                        <span class="openspec-change-name-text">{changeName}</span>
-                      </button>
-                      <button
-                        type="button"
-                        class="openspec-change-folder-btn"
-                        title={t('sidebar.pinned_repo')}
-                        aria-label={t('sidebar.pinned_repo')}
-                        onClick={() => openOpenSpecChangeFolder(changeName)}
-                      >
-                        <span class="fb-create-icon fb-create-icon-folder" aria-hidden="true" />
-                      </button>
-                      {isOpenSpecMobile && (
-                        <button
-                          type="button"
-                          class="openspec-change-toggle"
-                          aria-label={openSpecExpandedChange === changeName ? `collapse ${changeName}` : `expand ${changeName}`}
-                          aria-expanded={openSpecExpandedChange === changeName}
-                          onClick={() => {
-                            setOpenSpecAuditMenu(null);
-                            setOpenSpecProposeMenuOpen(false);
-                            setOpenSpecExpandedChange((current) => current === changeName ? null : changeName);
-                          }}
-                        >
-                          {openSpecExpandedChange === changeName ? '▾' : '▸'}
-                        </button>
-                      )}
-                    </div>
-                    <div
-                      class={`openspec-change-actions${!isOpenSpecMobile || openSpecExpandedChange === changeName ? ' openspec-change-actions-visible' : ''}`}
-                      hidden={isOpenSpecMobile && openSpecExpandedChange !== changeName}
-                    >
-                      <div class="openspec-change-action-wrap">
-                        <button
-                          class="btn btn-secondary openspec-change-action-btn"
-                          ref={(el) => {
-                            if (el) openSpecAuditButtonRefs.current.set(changeName, el);
-                            else openSpecAuditButtonRefs.current.delete(changeName);
-                          }}
-                          onClick={() => {
-                            setOpenSpecProposeMenuOpen(false);
-                            setOpenSpecAuditMenu((current) => current === changeName ? null : changeName);
-                          }}
-                        >
-                          {t('openspec.audit_action')}
-                        </button>
-                        {openSpecAuditMenu === changeName && renderOpenSpecSubmenu(
-                          <>
-                            <button
-                              class="menu-item"
-                              onClick={() => {
-                                if (!openSpecChangesPath) return;
-                                const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
-                                insertOpenSpecPrompt('audit_implementation', reference);
-                                setOpenSpecAuditMenu(null);
-                                setOpenSpecOpen(false);
-                              }}
-                            >
-                              {t('openspec.audit_implementation_action')}
-                            </button>
-                            <button
-                              class="menu-item"
-                              onClick={() => {
-                                if (!openSpecChangesPath) return;
-                                const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
-                                insertOpenSpecPrompt('audit_spec', reference);
-                                setOpenSpecAuditMenu(null);
-                                setOpenSpecOpen(false);
-                              }}
-                            >
-                              {t('openspec.audit_spec_action')}
-                            </button>
-                          </>,
-                          openSpecAuditButtonRefs.current.get(changeName) ?? null,
-                          180,
-                        )}
-                      </div>
-                      <button
-                        class="btn btn-secondary openspec-change-action-btn"
-                        onClick={() => {
-                          if (!openSpecChangesPath) return;
-                          const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
-                          insertOpenSpecPrompt('implement', reference);
-                          setOpenSpecAuditMenu(null);
-                          setOpenSpecProposeMenuOpen(false);
-                          setOpenSpecOpen(false);
-                        }}
-                      >
-                        {t('openspec.implement_action')}
-                      </button>
-                      <button
-                        class="btn btn-secondary openspec-change-action-btn"
-                        onClick={() => {
-                          if (!openSpecChangesPath) return;
-                          const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
-                          sendOpenSpecPrompt(t('openspec.achieve_prompt', { reference }));
-                          setOpenSpecAuditMenu(null);
-                          setOpenSpecProposeMenuOpen(false);
-                          setOpenSpecOpen(false);
-                        }}
-                      >
-                        {t('openspec.achieve_action')}
-                      </button>
-                    </div>
-                  </div>
+                    changeName={changeName}
+                    mobile={isOpenSpecMobile}
+                    expanded={openSpecExpandedChange === changeName}
+                    auditMenuOpen={openSpecAuditMenu === changeName}
+                    actionsDisabled={openSpecAutoActive}
+                    disabledReason={openSpecAutoActionLockReason}
+                    onAppendReference={() => {
+                      if (!openSpecChangesPath) return;
+                      appendToInput([toComposerReference(`${openSpecChangesPath}/${changeName}`)]);
+                      setOpenSpecAuditMenu(null);
+                      setOpenSpecProposeMenuOpen(false);
+                      setOpenSpecAutoLauncherChange(null);
+                      setOpenSpecOpen(false);
+                    }}
+                    onOpenFolder={() => openOpenSpecChangeFolder(changeName)}
+                    onToggleExpanded={() => {
+                      setOpenSpecAuditMenu(null);
+                      setOpenSpecProposeMenuOpen(false);
+                      setOpenSpecAutoLauncherChange(null);
+                      setOpenSpecExpandedChange((current) => current === changeName ? null : changeName);
+                    }}
+                    onToggleAuditMenu={() => {
+                      setOpenSpecProposeMenuOpen(false);
+                      setOpenSpecAutoLauncherChange(null);
+                      setOpenSpecAuditMenu((current) => current === changeName ? null : changeName);
+                    }}
+                    onAuditImplementation={() => {
+                      if (!openSpecChangesPath) return;
+                      const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                      insertOpenSpecPrompt('audit_implementation', reference);
+                      setOpenSpecAuditMenu(null);
+                      setOpenSpecOpen(false);
+                    }}
+                    onAuditSpec={() => {
+                      if (!openSpecChangesPath) return;
+                      const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                      insertOpenSpecPrompt('audit_spec', reference);
+                      setOpenSpecAuditMenu(null);
+                      setOpenSpecOpen(false);
+                    }}
+                    onImplement={() => {
+                      if (!openSpecChangesPath) return;
+                      const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                      insertOpenSpecPrompt('implement', reference);
+                      setOpenSpecAuditMenu(null);
+                      setOpenSpecProposeMenuOpen(false);
+                      setOpenSpecOpen(false);
+                    }}
+                    onAchieve={() => {
+                      if (!openSpecChangesPath) return;
+                      const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                      sendOpenSpecPrompt(t('openspec.achieve_prompt', { reference }));
+                      setOpenSpecAuditMenu(null);
+                      setOpenSpecProposeMenuOpen(false);
+                      setOpenSpecOpen(false);
+                    }}
+                    onAuto={() => openOpenSpecAutoLauncher(changeName)}
+                    auditButtonRef={(el) => {
+                      if (el) openSpecAuditButtonRefs.current.set(changeName, el);
+                      else openSpecAuditButtonRefs.current.delete(changeName);
+                    }}
+                    renderAuditSubmenu={(content, minWidth) => renderOpenSpecSubmenu(
+                      content,
+                      openSpecAuditButtonRefs.current.get(changeName) ?? null,
+                      minWidth,
+                    )}
+                  />
                 ))}
+                <OpenSpecAutoDeliverLauncher
+                  open={!!openSpecAutoLauncherChange}
+                  changeName={openSpecAutoLauncherChange}
+                  conflictProjection={openSpecAutoProjection}
+                  launchPending={openSpecAutoDeliver.launchPending}
+                  error={openSpecAutoDeliver.lastError}
+                  onClose={() => {
+                    openSpecAutoDeliver.clearError();
+                    setOpenSpecAutoLaunchingChange(null);
+                    setOpenSpecAutoLauncherChange(null);
+                  }}
+                  onLaunch={launchOpenSpecAutoDeliver}
+                  onViewCurrent={() => setOpenSpecAutoDetailsOpen(true)}
+                />
                 </div>
                 <div class="openspec-dropdown-footer">
                   <div class="openspec-change-action-wrap openspec-footer-action-wrap">
@@ -3132,8 +3156,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                       ref={(el) => {
                         openSpecProposeButtonRef.current = el;
                       }}
+                      disabled={openSpecAutoActive}
+                      title={openSpecAutoActionLockReason}
                       onClick={() => {
+                        if (openSpecAutoActive) return;
                         setOpenSpecAuditMenu(null);
+                        setOpenSpecAutoLauncherChange(null);
                         setOpenSpecProposeMenuOpen((open) => !open);
                       }}
                     >
@@ -3311,9 +3339,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           <button
             class={`shortcut-btn p2p-mode-btn${p2pMode === 'solo' ? ' p2p-mode-btn-solo' : ''}`}
             data-onboarding="p2p-mode"
-            onClick={() => setP2pOpen((o) => !o)}
-            disabled={disabled}
-            title={p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `${t('p2p.team_button', 'Team')}: ${getP2pModeLabel(p2pMode, t)}`}
+            onClick={() => {
+              if (openSpecAutoActive) return;
+              setP2pOpen((o) => !o);
+            }}
+            disabled={disabled || openSpecAutoActive}
+            title={openSpecAutoActionLockReason ?? (p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `${t('p2p.team_button', 'Team')}: ${getP2pModeLabel(p2pMode, t)}`)}
             style={{ color: getP2pModeColor(p2pMode), fontSize: 10, fontWeight: p2pMode === 'solo' ? 600 : 700 }}
           >
             {p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `${t('p2p.team_button', 'Team')}:${getP2pModeLabel(p2pMode, t)}`}
@@ -3321,8 +3352,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           <button
             class="shortcut-btn p2p-settings-btn"
             onClick={() => { setP2pOpen(false); openP2pConfigPanel('participants'); }}
-            disabled={disabled}
-            title={t('p2p.settings_title')}
+            disabled={disabled || openSpecAutoActive}
+            title={openSpecAutoActionLockReason ?? t('p2p.settings_title')}
             aria-label={t('p2p.settings_button')}
           >
             <span class="p2p-settings-icon" aria-hidden="true">⚙</span>
@@ -3529,6 +3560,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           )}
         </div>}
       </div>}
+
+      {openSpecAutoProjection && openSpecAutoProjection.visibility !== 'conflict' && (
+        <div class="openspec-auto-session-progress">
+          <OpenSpecAutoDeliverRunBar
+            projection={openSpecAutoProjection}
+            stopPending={openSpecAutoDeliver.stopPending}
+            onView={() => setOpenSpecAutoDetailsOpen(true)}
+            onStop={() => { openSpecAutoDeliver.stop(); }}
+          />
+        </div>
+      )}
 
       {pendingTransportApproval && effectiveRuntimeType === 'transport' && (
         <div

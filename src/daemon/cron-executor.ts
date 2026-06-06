@@ -320,6 +320,12 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
             fileContents: [],
             serverLink,
             rounds: rounds ?? 1,
+            launchOrigin: {
+              kind: 'cron',
+              commandId: `cron-${jobId}-${executionId ?? 'now'}-${lastDaemonBusyAttempt}`,
+              cronJobId: jobId,
+              ...(executionId ? { cronExecutionId: executionId } : {}),
+            },
             advanced: {
               kind: 'envelope_compiled',
               bound: prepared.bound!,
@@ -337,6 +343,12 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
             fileContents: [],
             serverLink,
             rounds: rounds ?? 1,
+            launchOrigin: {
+              kind: 'cron',
+              commandId: `cron-${jobId}-${executionId ?? 'now'}-${lastDaemonBusyAttempt}`,
+              cronJobId: jobId,
+              ...(executionId ? { cronExecutionId: executionId } : {}),
+            },
           });
         }
         // Link cron execution to P2P discussion so frontend can navigate

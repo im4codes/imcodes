@@ -134,6 +134,17 @@ import {
   sanitizeP2pRunForPersistAndBroadcast,
   sanitizeP2pRunUpdateForBroadcast,
 } from '../p2p-workflow-sanitize.js';
+import {
+  OpenSpecAutoDeliverProjectionCache,
+  type OpenSpecAutoDeliverConflictSummary,
+  type OpenSpecAutoDeliverSanitizedProjection,
+} from '../openspec-auto-deliver-projection.js';
+import {
+  OPENSPEC_AUTO_DELIVER_PROTOCOL_NAMESPACE,
+  OPENSPEC_AUTO_DELIVER_MSG,
+  isOpenSpecAutoDeliverMessageType,
+  isOpenSpecAutoDeliverTerminalStage,
+} from '../../../shared/openspec-auto-deliver-constants.js';
 import { sanitizeProjectName } from '../../../shared/sanitize-project-name.js';
 import {
   SESSION_GROUP_CLONE_CAPABILITY_V1,
@@ -998,6 +1009,9 @@ export class WsBridge {
   private providerStatus = new Map<string, boolean>();
   /** Cached advanced P2P capabilities for the current authenticated daemon socket. */
   private daemonP2pWorkflowCapabilities: DaemonP2pWorkflowCapabilities | null = null;
+  /** Latest sanitized OpenSpec Auto Deliver projections; protocol routing waits for shared message constants. */
+  private openspecAutoDeliverProjectionCache = new OpenSpecAutoDeliverProjectionCache();
+  private pendingOpenSpecAutoDeliverRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout>; sessionName?: string }>();
   /** idempotencyKey → initiating user/source, used to copy user-scoped P2P preferences after daemon success. */
   private sessionGroupCloneContexts = new Map<string, SessionGroupCloneOperationContext>();
   /**
@@ -2491,6 +2505,7 @@ export class WsBridge {
         }
         this.providerStatus.clear();
         this.daemonP2pWorkflowCapabilities = null;
+        this.openspecAutoDeliverProjectionCache.clearActive();
         this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }));
         void clearProviderStatus(db, this.serverId).catch(() => {});
         updateServerStatus(db, this.serverId, 'offline').catch((err) =>
@@ -2723,6 +2738,45 @@ export class WsBridge {
 
       if (msg.type === SESSION_GROUP_CLONE_MSG.START || msg.type === SESSION_GROUP_CLONE_MSG.CANCEL) {
         await this.handleBrowserSessionGroupCloneCommand(ws, msg);
+        return;
+      }
+
+      const isOpenSpecAutoDeliverNamespace = browserMessageType.startsWith(`${OPENSPEC_AUTO_DELIVER_PROTOCOL_NAMESPACE}.`);
+      if (isOpenSpecAutoDeliverNamespace && !isOpenSpecAutoDeliverMessageType(browserMessageType)) {
+        safeSend(ws, JSON.stringify({
+          type: 'error',
+          code: 'unknown_openspec_auto_deliver_type',
+          originalType: browserMessageType,
+          requestId: msg.requestId,
+        }));
+        return;
+      }
+
+      if (isOpenSpecAutoDeliverMessageType(browserMessageType)) {
+        if (
+          browserMessageType !== OPENSPEC_AUTO_DELIVER_MSG.LAUNCH
+          && browserMessageType !== OPENSPEC_AUTO_DELIVER_MSG.STOP
+          && browserMessageType !== OPENSPEC_AUTO_DELIVER_MSG.STATUS_REQUEST
+        ) {
+          safeSend(ws, JSON.stringify({
+            type: 'error',
+            code: 'wrong_peer',
+            originalType: browserMessageType,
+            requestId: msg.requestId,
+          }));
+          return;
+        }
+        if (typeof msg.serverId === 'string' && msg.serverId !== this.serverId) {
+          safeSend(ws, JSON.stringify({
+            type: 'error',
+            code: 'wrong_server',
+            originalType: browserMessageType,
+            requestId: msg.requestId,
+          }));
+          return;
+        }
+        this.registerPendingOpenSpecAutoDeliverRequest(ws, msg);
+        this.sendToDaemon(JSON.stringify({ ...msg, serverId: this.serverId }));
         return;
       }
 
@@ -3808,6 +3862,32 @@ export class WsBridge {
       this.pendingP2pWorkflowRequests.delete(requestId);
       if (pending.socket.readyState === WebSocket.OPEN) {
         pending.socket.send(JSON.stringify(msg));
+      }
+      return;
+    }
+
+    if (type.startsWith(`${OPENSPEC_AUTO_DELIVER_PROTOCOL_NAMESPACE}.`) && !isOpenSpecAutoDeliverMessageType(type)) {
+      logger.warn({ serverId: this.serverId, type }, 'unknown OpenSpec Auto Deliver daemon message — dropped');
+      return;
+    }
+
+    if (isOpenSpecAutoDeliverMessageType(type)) {
+      const rawProjection = (msg as Record<string, unknown>).projection ?? (msg as Record<string, unknown>).run;
+      const projection = rawProjection == null
+        ? null
+        : this.openspecAutoDeliverProjectionCache.remember(rawProjection);
+      const responseMsg: Record<string, unknown> = {
+        ...msg,
+        ...(projection ? { projection } : { projection: null }),
+      };
+      this.completePendingOpenSpecAutoDeliverRequest(responseMsg);
+      if (projection && type !== OPENSPEC_AUTO_DELIVER_MSG.STATUS_PROJECTION) {
+        const terminal = type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL || projection.terminal === true;
+        this.broadcastOpenSpecAutoDeliverProjection(
+          terminal ? OPENSPEC_AUTO_DELIVER_MSG.TERMINAL : OPENSPEC_AUTO_DELIVER_MSG.PROJECTION,
+          projection,
+          terminal ? { terminal: true } : {},
+        );
       }
       return;
     }
@@ -6551,5 +6631,119 @@ export class WsBridge {
     // getDaemonP2pWorkflowCapabilities(now).
     if (!this.daemonWs || this.daemonWs.readyState !== WebSocket.OPEN) return false;
     return this.daemonP2pWorkflowCapabilities?.capabilities.includes(capability) ?? false;
+  }
+
+  private registerPendingOpenSpecAutoDeliverRequest(ws: WebSocket, msg: Record<string, unknown>): void {
+    const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
+    if (!requestId) return;
+    const sessionName = typeof msg.sessionName === 'string' ? msg.sessionName : undefined;
+    const existing = this.pendingOpenSpecAutoDeliverRequests.get(requestId);
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => {
+      this.pendingOpenSpecAutoDeliverRequests.delete(requestId);
+    }, 30_000);
+    this.pendingOpenSpecAutoDeliverRequests.set(requestId, { socket: ws, timer, sessionName });
+  }
+
+  private completePendingOpenSpecAutoDeliverRequest(msg: Record<string, unknown>): boolean {
+    const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
+    if (!requestId) return false;
+    const pending = this.pendingOpenSpecAutoDeliverRequests.get(requestId);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    this.pendingOpenSpecAutoDeliverRequests.delete(requestId);
+    if (pending.socket.readyState === WebSocket.OPEN) {
+      const projection = msg.projection as OpenSpecAutoDeliverSanitizedProjection | null | undefined;
+      const participating = !projection || !pending.sessionName || pending.sessionName === projection.owningMainSessionName
+        || pending.sessionName === projection.launchedFromSessionName
+        || pending.sessionName === projection.targetImplementationSessionName;
+      if (projection && !participating) {
+        const conflict = this.openspecAutoDeliverProjectionCache.getConflictSummaryForOwningMainSession(projection.owningMainSessionName);
+        pending.socket.send(JSON.stringify({
+          ...msg,
+          type: OPENSPEC_AUTO_DELIVER_MSG.CONFLICT_SUMMARY,
+          projection: conflict,
+        }));
+      } else {
+        pending.socket.send(JSON.stringify(msg));
+      }
+    }
+    return true;
+  }
+
+  private broadcastOpenSpecAutoDeliverProjection(
+    type: string,
+    projection: OpenSpecAutoDeliverSanitizedProjection,
+    extra: Record<string, unknown> = {},
+  ): void {
+    const message = JSON.stringify({ type, projection, ...extra });
+    const aliases = new Set<string>([projection.owningMainSessionName]);
+    if (projection.launchedFromSessionName) aliases.add(projection.launchedFromSessionName);
+    if (projection.targetImplementationSessionName) aliases.add(projection.targetImplementationSessionName);
+    for (const sessionName of aliases) {
+      this.sendJsonToSessionSubscribers(sessionName, message);
+    }
+    if (projection.terminal === true || isOpenSpecAutoDeliverTerminalStage(projection.status)) return;
+    const conflict = this.openspecAutoDeliverProjectionCache.getConflictSummaryForOwningMainSession(projection.owningMainSessionName);
+    if (!conflict) return;
+    const conflictMessage = JSON.stringify({ type: OPENSPEC_AUTO_DELIVER_MSG.CONFLICT_SUMMARY, projection: conflict });
+    for (const sessionName of this.getOpenSpecAutoDeliverSubscribedSiblingSessions(projection)) {
+      this.sendJsonToSessionSubscribers(sessionName, conflictMessage);
+    }
+  }
+
+  private getOpenSpecAutoDeliverSubscribedSiblingSessions(
+    projection: OpenSpecAutoDeliverSanitizedProjection,
+  ): Set<string> {
+    const sessions = new Set<string>();
+    const addSessions = (subscribed: Iterable<string>) => {
+      for (const sessionName of subscribed) {
+        if (this.isOpenSpecAutoDeliverParticipant(sessionName, projection)) continue;
+        if (!this.isSessionUnderOpenSpecOwner(sessionName, projection.owningMainSessionName)) continue;
+        sessions.add(sessionName);
+      }
+    };
+    for (const [, subscribed] of this.browserSubscriptions) addSessions(subscribed.keys());
+    for (const [, subscribed] of this.transportSubscriptions) addSessions(subscribed.values());
+    return sessions;
+  }
+
+  private isOpenSpecAutoDeliverParticipant(
+    sessionName: string,
+    projection: OpenSpecAutoDeliverSanitizedProjection,
+  ): boolean {
+    return sessionName === projection.owningMainSessionName
+      || sessionName === projection.launchedFromSessionName
+      || sessionName === projection.targetImplementationSessionName;
+  }
+
+  private isSessionUnderOpenSpecOwner(sessionName: string, owningMainSessionName: string): boolean {
+    if (sessionName === owningMainSessionName) return true;
+    let current: string | undefined = sessionName;
+    const seen = new Set<string>();
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const parent = this.activeSubSessions.get(current)?.parentSession;
+      if (!parent) return false;
+      if (parent === owningMainSessionName) return true;
+      current = parent;
+    }
+    return false;
+  }
+
+  rememberOpenSpecAutoDeliverProjectionForTests(raw: unknown): OpenSpecAutoDeliverSanitizedProjection | null {
+    return this.openspecAutoDeliverProjectionCache.remember(raw);
+  }
+
+  getOpenSpecAutoDeliverProjectionForSessionForTests(
+    sessionName: string,
+  ): OpenSpecAutoDeliverSanitizedProjection | null {
+    return this.openspecAutoDeliverProjectionCache.getFullProjectionForSession(sessionName);
+  }
+
+  getOpenSpecAutoDeliverConflictSummaryForTests(
+    owningMainSessionName: string,
+  ): OpenSpecAutoDeliverConflictSummary | null {
+    return this.openspecAutoDeliverProjectionCache.getConflictSummaryForOwningMainSession(owningMainSessionName);
   }
 }

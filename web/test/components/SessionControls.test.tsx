@@ -28,6 +28,32 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.implement_action') return 'implement_action';
       if (key === 'openspec.achieve_action') return 'achieve_action';
       if (key === 'openspec.propose_action') return 'propose_action';
+      if (key === 'openspec.auto.action') return 'Auto';
+      if (key === 'openspec.auto.launcher_title') return 'Auto Deliver';
+      if (key === 'openspec.auto.details_title') return 'Auto Deliver details';
+      if (key === 'openspec.auto.current_run') return 'Current Auto Deliver';
+      if (key === 'openspec.auto.kicker') return 'Auto Deliver';
+      if (key === 'openspec.auto.start') return 'Start Auto Deliver';
+      if (key === 'openspec.auto.view') return 'View';
+      if (key === 'openspec.auto.stop') return 'Stop Auto Deliver';
+      if (key === 'openspec.auto.lock_manual_actions') return 'Auto Deliver owns Team lane';
+      if (key === 'openspec.auto.conflict_summary') return 'Details are visible only in participating sessions.';
+      if (key === 'openspec.auto.error.missing_change') return 'Select a change first';
+      if (key === 'openspec.auto.error.active_run') return 'Auto Deliver already running';
+      if (key === 'openspec.auto.error.manual_team_busy') return 'Manual Team is busy';
+      if (key === 'openspec.auto.error.unsupported_runtime') return 'Unsupported runtime';
+      if (key === 'openspec.auto.error.launch_failed') return 'Launch failed';
+      if (key === 'openspec.auto.preset.fast') return 'Fast';
+      if (key === 'openspec.auto.preset.standard') return 'Standard';
+      if (key === 'openspec.auto.preset.strict') return 'Strict';
+      if (key === 'openspec.auto.preset.deep') return 'Deep';
+      if (key === 'openspec.auto.preset_limits') return `Spec ${opts?.spec ?? ''} · Impl ${opts?.impl ?? ''}`;
+      if (key === 'openspec.auto.materialized_limits') return `Spec audit-repair ${opts?.spec ?? ''} · Implementation audit-repair ${opts?.impl ?? ''}`;
+      if (key === 'openspec.auto.tasks_progress') return `${opts?.checked ?? 0}/${opts?.total ?? 0} tasks`;
+      if (key === 'openspec.auto.prompt_count') return `${opts?.count ?? 0} prompts`;
+      if (key === 'openspec.auto.conflict_active') return `${opts?.change ?? ''} already running`;
+      if (key.startsWith('openspec.auto.status.')) return key.split('.').pop() ?? key;
+      if (key.startsWith('openspec.auto.stage.')) return key.split('.').pop() ?? key;
       if (key === 'openspec.propose_from_discussion_action') return 'propose_from_discussion_action';
       if (key === 'openspec.propose_from_description_action') return 'propose_from_description_action';
       if (key === 'openspec.audit_implementation_prompt') {
@@ -227,6 +253,7 @@ vi.mock('../../src/api.js', () => ({
   onUserPrefChanged: (...args: unknown[]) => onUserPrefChangedMock(...args as Parameters<typeof onUserPrefChangedMock>),
 }));
 
+import { OpenSpecAutoDeliverLauncher } from '../../src/components/OpenSpecAutoDeliver.js';
 import { OPENSPEC_LIST_REQUEST_TIMEOUT_MS, SessionControls } from '../../src/components/SessionControls.js';
 import type { SessionInfo } from '../../src/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
@@ -1034,9 +1061,8 @@ afterEach(() => {
     await waitFor(() => expect(ws.send).toHaveBeenCalledTimes(1));
 
     ws.emit({ type: DAEMON_MSG.RECONNECTED });
-    await flushAsync();
 
-    expect(ws.send).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(ws.send).toHaveBeenCalledTimes(2));
     expect(ws.send).toHaveBeenLastCalledWith({
       type: P2P_CONFIG_MSG.SAVE,
       requestId: expect.any(String),
@@ -1245,6 +1271,401 @@ afterEach(() => {
     fireEvent.click(changeButton);
 
     expect(screen.getByRole('textbox').textContent).toBe('@openspec/changes/change-a');
+  });
+
+  it('opens Auto Deliver launcher from each openspec change row without inserting a prompt', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+
+    expect(screen.getByTestId('openspec-auto-launcher')).toBeDefined();
+    expect(screen.getByText('Standard')).toBeDefined();
+    expect(screen.getByRole('textbox').textContent).toBe('');
+
+    fireEvent.click(screen.getByTestId('openspec-auto-preset-strict'));
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.launch',
+      serverId: 'srv-1',
+      sessionName: 'my-session',
+      changeName: 'change-a',
+      presetId: 'strict',
+      requestId: expect.any(String),
+    }));
+    expect(screen.getByRole('textbox').textContent).toBe('');
+  });
+
+  it('keeps Auto Deliver launch bound to preset buttons, not editable combo ids or raw requirement text', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox');
+    input.textContent = 'raw requirement text should stay in chat and must not become an Auto Deliver launch source';
+    fireEvent.input(input);
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+    const launcher = screen.getByTestId('openspec-auto-launcher');
+    expect(within(launcher).getByTestId('openspec-auto-preset-fast')).toBeDefined();
+    expect(within(launcher).getByTestId('openspec-auto-preset-standard')).toBeDefined();
+    expect(within(launcher).getByTestId('openspec-auto-preset-strict')).toBeDefined();
+    expect(within(launcher).getByTestId('openspec-auto-preset-deep')).toBeDefined();
+    expect(within(launcher).queryByRole('textbox')).toBeNull();
+    expect(within(launcher).queryByRole('combobox')).toBeNull();
+    expect(within(launcher).queryByDisplayValue(/openspec_auto_deliver/i)).toBeNull();
+
+    fireEvent.click(within(launcher).getByRole('button', { name: 'Start Auto Deliver' }));
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.launch',
+      serverId: 'srv-1',
+      sessionName: 'my-session',
+      changeName: 'change-a',
+      presetId: 'standard',
+      requestId: expect.any(String),
+    }));
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining('raw requirement text'),
+    }));
+    expect(input.textContent).toBe('raw requirement text should stay in chat and must not become an Auto Deliver launch source');
+  });
+
+  it('shows local Auto Deliver launch validation when no change is selected', () => {
+    render(
+      <OpenSpecAutoDeliverLauncher
+        open
+        changeName={null}
+        onClose={vi.fn()}
+        onLaunch={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByTestId('openspec-auto-error').textContent).toBe('Select a change first');
+    expect((screen.getByRole('button', { name: 'Start Auto Deliver' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('keeps the Auto Deliver launcher open and renders Team-busy launch errors', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+    ws.emit({
+      type: 'openspec_auto_deliver.launch_error',
+      error: 'team_lane_busy',
+    });
+    await flushAsync();
+
+    expect(screen.getByTestId('openspec-auto-launcher')).toBeDefined();
+    expect(screen.getByText('Manual Team is busy')).toBeDefined();
+    expect(screen.queryByTestId('openspec-auto-details')).toBeNull();
+  });
+
+  it('keeps the Auto Deliver launcher open and renders unsupported-runtime launch errors', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'my-session',
+          projectDir: '/repo',
+          agentType: 'codex',
+          runtimeType: 'process',
+        })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+    ws.emit({
+      type: 'openspec_auto_deliver.launch_error',
+      error: 'transport_runtime_required',
+    });
+    await flushAsync();
+
+    expect(screen.getByTestId('openspec-auto-launcher')).toBeDefined();
+    expect(screen.getByText('Unsupported runtime')).toBeDefined();
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.launch',
+      changeName: 'change-a',
+      presetId: 'standard',
+    }));
+  });
+
+  it('opens Auto Deliver details after a matching launch ack projection', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+    ws.emit({
+      type: 'openspec_auto_deliver.launch_ack',
+      projection: {
+        runId: 'auto-ack',
+        projectionVersion: 1,
+        visibility: 'full',
+        changeName: 'change-a',
+        status: 'active',
+        stage: 'spec_audit_repair',
+        taskStats: { total: 2, checked: 1, unchecked: 1 },
+      },
+    });
+    await flushAsync();
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('openspec-auto-launcher')).toBeNull();
+      expect(screen.getByTestId('openspec-auto-details')).toBeDefined();
+    });
+  });
+
+  it('renders Auto Deliver projections, ignores stale updates, and locks manual Team/OpenSpec actions', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    ws.emit({
+      type: 'openspec_auto_deliver.projection',
+      projection: {
+        runId: 'auto-1',
+        projectionVersion: 2,
+        visibility: 'full',
+        changeName: 'change-a',
+        status: 'active',
+        stage: 'implementation_task_loop',
+        startedAt: Date.now() - 1000,
+        taskStats: { total: 4, checked: 2, unchecked: 2 },
+        implementationPromptCount: 3,
+        canStop: true,
+        recentFinding: 'fresh finding',
+      },
+    });
+    await flushAsync();
+
+    ws.emit({
+      type: 'openspec_auto_deliver.projection',
+      projection: {
+        runId: 'auto-1',
+        projectionVersion: 1,
+        visibility: 'full',
+        changeName: 'old-change',
+        status: 'active',
+        stage: 'spec_audit_repair',
+        taskStats: { total: 1, checked: 0, unchecked: 1 },
+        recentFinding: 'stale finding',
+      },
+    });
+    await flushAsync();
+
+    expect(screen.getByTestId('openspec-auto-runbar')).toBeDefined();
+    expect(screen.getByText('change-a')).toBeDefined();
+    expect(screen.getByText('fresh finding')).toBeDefined();
+    expect(screen.queryByText('old-change')).toBeNull();
+
+    const teamButton = screen.getByRole('button', { name: /^team$/i });
+    expect((teamButton as HTMLButtonElement).disabled).toBe(true);
+    expect(teamButton.getAttribute('title')).toBe('Auto Deliver owns Team lane');
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    expect(screen.getByText('Current Auto Deliver')).toBeDefined();
+    const auditButton = screen.getByRole('button', { name: 'audit_action' }) as HTMLButtonElement;
+    const achieveButton = screen.getByRole('button', { name: 'achieve_action' }) as HTMLButtonElement;
+    expect(auditButton.disabled).toBe(true);
+    expect(auditButton.getAttribute('title')).toBe('Auto Deliver owns Team lane');
+    expect((screen.getByRole('button', { name: 'implement_action' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(achieveButton.disabled).toBe(true);
+    expect(achieveButton.getAttribute('title')).toBe('Auto Deliver owns Team lane');
+    expect((screen.getByRole('button', { name: 'propose_action' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(auditButton);
+    fireEvent.click(achieveButton);
+    expect(screen.queryByRole('button', { name: 'audit_implementation_action' })).toBeNull();
+    expect(gatherSendCalls(ws)).toEqual([]);
+    expect(screen.getByRole('textbox').textContent).toBe('');
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'View' })[0]);
+    expect(screen.getByTestId('openspec-auto-details')).toBeDefined();
+  });
+
+  it('renders redacted Auto Deliver conflict entries without details actions', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'sibling-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    ws.emit({
+      type: 'openspec_auto_deliver.projection',
+      projection: {
+        runId: 'auto-conflict',
+        projectionVersion: 1,
+        visibility: 'conflict',
+        changeName: 'change-a',
+        status: 'active',
+        stage: 'implementation_task_loop',
+        conflictReason: 'Owned by another visible session',
+      },
+    });
+    await flushAsync();
+
+    expect(screen.queryByTestId('openspec-auto-runbar')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    await flushAsync();
+
+    const entry = screen.getByTestId('openspec-auto-conflict-entry');
+    expect(within(entry).getByText('Owned by another visible session')).toBeDefined();
+    expect(within(entry).getByText('Details are visible only in participating sessions.')).toBeDefined();
+    expect(within(entry).queryByRole('button', { name: 'View' })).toBeNull();
+  });
+
+  it('renders Auto Deliver run state in a participating sub-session', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'deck_sub_worker-alpha',
+          projectDir: '/repo',
+          agentType: 'codex',
+        })}
+        subSessions={[
+          { sessionName: 'deck_sub_worker-alpha', type: 'codex', label: 'Worker Alpha', state: 'idle', parentSession: 'deck_main' },
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    ws.emit({
+      type: 'openspec_auto_deliver.projection',
+      projection: {
+        runId: 'auto-sub',
+        projectionVersion: 1,
+        visibility: 'full',
+        changeName: 'change-sub',
+        status: 'active',
+        stage: 'implementation_task_loop',
+        owningMainSessionName: 'deck_main',
+        targetImplementationSessionName: 'deck_sub_worker-alpha',
+        taskStats: { total: 3, checked: 2, unchecked: 1 },
+        canStop: true,
+      },
+    });
+    await flushAsync();
+
+    expect(screen.getByTestId('openspec-auto-runbar')).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    await flushAsync();
+
+    const entry = screen.getByTestId('openspec-auto-current-entry');
+    expect(within(entry).getByText('change-sub')).toBeDefined();
+    expect(within(entry).getByText('deck_main → deck_sub_worker-alpha')).toBeDefined();
   });
 
   it('opens an openspec change folder in the file browser and can insert files from it', async () => {

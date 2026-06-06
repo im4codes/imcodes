@@ -24,7 +24,9 @@
     "this_feature": "Эта функция"
   },
   "share": {
-    "menu": { "shareTab": "Поделиться" },
+    "menu": {
+      "shareTab": "Поделиться"
+    },
     "dialogTitle": "Предоставить доступ",
     "dialogSubtitle": "Предоставьте ограниченный доступ к {{target}}.",
     "target": {
@@ -75,7 +77,9 @@
     },
     "create": "Создать доступ",
     "creating": "Создание...",
-    "scope": { "current": "Область доступа" },
+    "scope": {
+      "current": "Область доступа"
+    },
     "indicator": "{{scope}} предоставлена как {{role}} · {{status}}",
     "indicatorCompact": "Доступ как {{role}} · {{status}}",
     "indicatorSharedOut": "Доступ открыт другим",
@@ -1146,6 +1150,94 @@
     "implement_action": "Реализация",
     "achieve_action": "Завершить",
     "propose_action": "Предложить",
+    "auto": {
+      "action": "Auto",
+      "kicker": "Автодоставка",
+      "launcher_title": "Автодоставка",
+      "details_title": "Детали Auto Deliver",
+      "current_run": "Текущий Auto Deliver",
+      "no_change": "Изменение не выбрано",
+      "start": "Запустить Auto Deliver",
+      "stop": "Остановить",
+      "stopping": "Остановка...",
+      "view": "Открыть",
+      "tasks": "Tasks",
+      "tasks_unknown": "Задачи неизвестны",
+      "tasks_progress": "{{checked}}/{{total}} tasks",
+      "prompt_count": "{{count}} prompts",
+      "prompt_count_label": "Implementation prompts",
+      "materialized_limits": "Spec audit {{spec}} · implementation audit {{impl}}",
+      "preset_limits": "Spec {{spec}} · Impl {{impl}}",
+      "conflict_active": "Auto Deliver is already running for {{change}}.",
+      "redacted_conflict": "В этой группе сеансов уже выполняется Auto Deliver.",
+      "conflict_summary": "Подробности видны только участвующим сеансам.",
+      "lock_manual_actions": "Auto Deliver выполняется для этой группы сеансов.",
+      "status_label": "Status",
+      "stage_label": "Stage",
+      "elapsed": "Время",
+      "preset_label": "Preset",
+      "owning_session": "Owning session",
+      "launched_from": "Launched from",
+      "execution_session": "Execution session",
+      "spec_round": "Spec audit round",
+      "impl_round": "Implementation audit round",
+      "active_p2p": "Active Team run",
+      "combo_id": "Combo",
+      "verdict": "Verdict",
+      "terminal_reason": "Terminal reason",
+      "task_stats": "Task status",
+      "scores": "Scores",
+      "scores_empty": "Оценок пока нет",
+      "evidence": "Доказательства",
+      "evidence_stale": "Устарело",
+      "error": {
+        "missing_change": "Select an OpenSpec change first.",
+        "active_run": "Auto Deliver уже выполняется для этой группы сеансов.",
+        "manual_team_busy": "Ручной запуск Team уже использует эту группу сеансов.",
+        "unsupported_runtime": "Auto Deliver требуется сеанс кодирования на transport.",
+        "launch_failed": "Failed to start Auto Deliver."
+      },
+      "preset": {
+        "fast": "Быстро",
+        "standard": "Стандарт",
+        "strict": "Строго",
+        "deep": "Глубоко"
+      },
+      "status": {
+        "launching": "Launching",
+        "active": "Active",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped",
+        "proposed": "Proposed",
+        "implementation_task_loop": "Implementing"
+      },
+      "stage": {
+        "proposed": "Proposed",
+        "spec_audit_repair": "Spec audit",
+        "implementation_task_loop": "Implementation",
+        "implementation_audit_repair": "Implementation audit",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped",
+        "stopping": "Stopping"
+      },
+      "score_module": {
+        "spec": "Spec",
+        "tasks": "Tasks",
+        "implementation": "Implementation",
+        "tests": "Tests",
+        "risk": "Risk"
+      },
+      "provenance": {
+        "daemon": "Daemon",
+        "implementation_reported": "Implementation reported",
+        "audit_reported": "Audit reported",
+        "none": "None"
+      }
+    },
     "propose_from_discussion_action": "Из недавнего обсуждения",
     "propose_from_description_action": "Из описания ниже",
     "audit_implementation_prompt": "Проведи строгий аудит реализации {{reference}} по его артефактам OpenSpec. Выяви каждое расхождение, упущение, риск регрессии, пробел в пограничных сценариях и недостающий тест; затем исправь код, тесты и все необходимые сопутствующие изменения. Если по ходу нужно синхронизировать спецификацию, обнови в той же задаче соответствующие файлы OpenSpec внутри {{reference}}. Не останавливайся на отчете: доведи реализацию до полного соответствия спецификации.",

@@ -24,7 +24,9 @@
     "this_feature": "Esta función"
   },
   "share": {
-    "menu": { "shareTab": "Compartir" },
+    "menu": {
+      "shareTab": "Compartir"
+    },
     "dialogTitle": "Compartir acceso",
     "dialogSubtitle": "Concede acceso limitado a {{target}}.",
     "target": {
@@ -75,7 +77,9 @@
     },
     "create": "Crear recurso compartido",
     "creating": "Creando...",
-    "scope": { "current": "Alcance compartido" },
+    "scope": {
+      "current": "Alcance compartido"
+    },
     "indicator": "{{scope}} compartido como {{role}} · {{status}}",
     "indicatorCompact": "Compartido como {{role}} · {{status}}",
     "indicatorSharedOut": "Compartido con otros",
@@ -1146,6 +1150,94 @@
     "implement_action": "Implementar",
     "achieve_action": "Completar",
     "propose_action": "Proponer",
+    "auto": {
+      "action": "Auto",
+      "kicker": "Entrega automática",
+      "launcher_title": "Entrega automática",
+      "details_title": "Detalles de Auto Deliver",
+      "current_run": "Entrega automática actual",
+      "no_change": "Ningún cambio seleccionado",
+      "start": "Iniciar entrega automática",
+      "stop": "Detener",
+      "stopping": "Deteniendo...",
+      "view": "Ver",
+      "tasks": "Tasks",
+      "tasks_unknown": "Tareas desconocidas",
+      "tasks_progress": "{{checked}}/{{total}} tasks",
+      "prompt_count": "{{count}} prompts",
+      "prompt_count_label": "Implementation prompts",
+      "materialized_limits": "Spec audit {{spec}} · implementation audit {{impl}}",
+      "preset_limits": "Spec {{spec}} · Impl {{impl}}",
+      "conflict_active": "Auto Deliver is already running for {{change}}.",
+      "redacted_conflict": "Otra sesión del grupo está ejecutando Auto Deliver.",
+      "conflict_summary": "Los detalles solo son visibles en sesiones participantes.",
+      "lock_manual_actions": "Auto Deliver está ejecutándose para este grupo de sesión.",
+      "status_label": "Status",
+      "stage_label": "Stage",
+      "elapsed": "Tiempo",
+      "preset_label": "Preset",
+      "owning_session": "Owning session",
+      "launched_from": "Launched from",
+      "execution_session": "Execution session",
+      "spec_round": "Spec audit round",
+      "impl_round": "Implementation audit round",
+      "active_p2p": "Active Team run",
+      "combo_id": "Combo",
+      "verdict": "Verdict",
+      "terminal_reason": "Terminal reason",
+      "task_stats": "Task status",
+      "scores": "Scores",
+      "scores_empty": "Sin puntuaciones todavía",
+      "evidence": "Evidencia",
+      "evidence_stale": "Obsoleta",
+      "error": {
+        "missing_change": "Select an OpenSpec change first.",
+        "active_run": "Auto Deliver ya se está ejecutando para este grupo de sesión.",
+        "manual_team_busy": "Una ejecución manual de Team ya está usando este grupo de sesión.",
+        "unsupported_runtime": "Auto Deliver requiere una sesión de codificación basada en transport.",
+        "launch_failed": "Failed to start Auto Deliver."
+      },
+      "preset": {
+        "fast": "Rápido",
+        "standard": "Estándar",
+        "strict": "Estricto",
+        "deep": "Profundo"
+      },
+      "status": {
+        "launching": "Launching",
+        "active": "Active",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped",
+        "proposed": "Proposed",
+        "implementation_task_loop": "Implementing"
+      },
+      "stage": {
+        "proposed": "Proposed",
+        "spec_audit_repair": "Spec audit",
+        "implementation_task_loop": "Implementation",
+        "implementation_audit_repair": "Implementation audit",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped",
+        "stopping": "Stopping"
+      },
+      "score_module": {
+        "spec": "Spec",
+        "tasks": "Tasks",
+        "implementation": "Implementation",
+        "tests": "Tests",
+        "risk": "Risk"
+      },
+      "provenance": {
+        "daemon": "Daemon",
+        "implementation_reported": "Implementation reported",
+        "audit_reported": "Audit reported",
+        "none": "None"
+      }
+    },
     "propose_from_discussion_action": "Desde la discusión reciente",
     "propose_from_description_action": "Desde la descripción de abajo",
     "audit_implementation_prompt": "Realiza una auditoría estricta de la implementación de {{reference}} contra sus artefactos de OpenSpec. Identifica cada discrepancia, omisión, riesgo de regresión, hueco en casos límite y prueba faltante; después corrige el código, las pruebas y cualquier cambio de soporte necesario. Si la implementación exige mover también la especificación, actualiza en la misma tarea los archivos de OpenSpec bajo {{reference}}. No te detengas en un informe: deja la implementación totalmente alineada con la especificación.",

@@ -107,6 +107,11 @@ import ruLocale from '../../web/src/i18n/locales/ru.json' with { type: 'json' };
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import {
+  evaluateP2pLaunchAdmission,
+  sanitizeP2pLaunchOriginForProjection,
+  type P2pLaunchOrigin,
+} from './p2p-launch-admission.js';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -150,6 +155,7 @@ export interface StartP2pRunOptions {
   contextReducer?: P2pContextReducerConfig;
   sharedActor?: SharedActorEnvelope;
   shareScope?: SharedP2pRunScope;
+  launchOrigin?: P2pLaunchOrigin;
 }
 
 export interface SharedP2pRunScope {
@@ -190,6 +196,7 @@ export interface P2pRun {
   locale?: string;
   timeoutMs: number;
   resultSummary: string | null;
+  strictAuthoritativeResult: string | null;
   /** Compatibility-only projection for legacy consumers; advanced loop retries may repeat sessions here. */
   completedHops: P2pTarget[];
   /** Compatibility-only projection for legacy consumers; advanced loop retries may repeat sessions here. */
@@ -259,6 +266,12 @@ export interface P2pRun {
    * runs that obey the full v1 contract from legacy ones.
    */
   advancedSourceKind?: StartP2pRunAdvancedSource['kind'];
+  /**
+   * Admission/provenance metadata for the launch path that created this run.
+   * Kept daemon-local until the shared Auto Deliver contracts land; projection
+   * uses an allowlist sanitizer so raw prompts/provider internals never leak.
+   */
+  launchOrigin?: P2pLaunchOrigin;
   deadlineAt?: number | null;
   currentRoundId?: string | null;
   currentExecutionStep: number;
@@ -501,7 +514,7 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     return acc;
   }, {});
 
-  return {
+  const payload: P2pRunUpdatePayload = {
     id: run.id,
     discussion_id: run.discussionId,
     server_id: '', // filled by bridge from auth context
@@ -693,6 +706,11 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
       return nodes;
     })(),
   };
+  const launchOrigin = sanitizeP2pLaunchOriginForProjection(run.launchOrigin);
+  if (launchOrigin) {
+    (payload as Record<string, unknown>).launch_origin = launchOrigin;
+  }
+  return payload;
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────
@@ -1029,6 +1047,14 @@ export async function startP2pRun(...args:
   } = opts;
   // Validate same domain
   const mainSession = extractMainSession(initiatorSession);
+  const admission = evaluateP2pLaunchAdmission({
+    mainSession,
+    origin: opts.launchOrigin,
+    activeRuns: listP2pRuns(),
+  });
+  if (!admission.ok) {
+    throw new Error(`p2p_launch_blocked:${admission.reason}:${admission.activeAutoDeliverRunId}`);
+  }
   for (const t of targets) {
     if (extractMainSession(t.session) !== mainSession) {
       throw new Error(`Cross-domain P2P not supported: ${t.session} is not in ${mainSession}`);
@@ -1097,6 +1123,7 @@ export async function startP2pRun(...args:
     locale,
     timeoutMs: Math.min(hopTimeoutMs ?? modeConfig?.defaultTimeoutMs ?? 300_000, 600_000),
     resultSummary: null,
+    strictAuthoritativeResult: null,
     completedHops: [],
     skippedHops: [],
     error: null,
@@ -1173,6 +1200,7 @@ export async function startP2pRun(...args:
       ? advancedSource.bound
       : undefined,
     advancedSourceKind: advancedSource?.kind,
+    launchOrigin: opts.launchOrigin,
   };
 
   activeRuns.set(runId, run);
@@ -1814,24 +1842,28 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 
     const targets = [...run.remainingTargets];
 
-    // ── Phase 1: Initiator initial analysis (start of the whole discussion only) ──
-    if (run.currentRound === 1) {
-      if (run._cancelled) return;
-      run.activePhase = 'initial';
-      const initialHeader = `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Initial Analysis${roundLabel}`;
-      const initialPrompt = buildHopPrompt(run, roundModeConfig, {
-        session: run.initiatorSession,
-        sectionHeader: initialHeader,
-        instruction: [
-          previousCycleAuditScope,
-          'Read the discussion file and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
-        ].filter(Boolean).join('\n\n'),
-        isInitial: true,
-      }, rp);
-      const initialOk = await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, { sectionHeader: initialHeader, required: true });
-      if (!initialOk && (run._cancelled || isTerminal(run.status))) return;
-      if (run._cancelled || isTerminal(run.status)) return;
-    }
+    // ── Phase 1: Initiator kickoff analysis for this round ──
+    // Every round needs an explicit initiator pass. Later rounds are not a
+    // repeat of round 1: they audit prior findings plus any execution evidence
+    // before participant hops deepen the discussion.
+    if (run._cancelled) return;
+    run.activePhase = 'initial';
+    const initialHeader = `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Initial Analysis${roundLabel}`;
+    const initialInstruction = run.currentRound === 1
+      ? 'Read the discussion file and provide your initial analysis. Append your output to the file.'
+      : 'Read the discussion file, review all previous round outputs and any implementation/execution evidence, then provide the initiator kickoff analysis for this round. Call out what prior findings were weak, incomplete, contradicted, or still need deeper investigation. Append your output to the file.';
+    const initialPrompt = buildHopPrompt(run, roundModeConfig, {
+      session: run.initiatorSession,
+      sectionHeader: initialHeader,
+      instruction: [
+        previousCycleAuditScope,
+        `${initialInstruction}\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
+      ].filter(Boolean).join('\n\n'),
+      isInitial: true,
+    }, rp);
+    const initialOk = await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, { sectionHeader: initialHeader, required: true });
+    if (!initialOk && (run._cancelled || isTerminal(run.status))) return;
+    if (run._cancelled || isTerminal(run.status)) return;
 
     // ── Phase 2: Sub-session hops ──
     run.activePhase = 'hop';
@@ -1905,7 +1937,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
         : 'IMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.';
       const roundSummaryInstruction = isLastRound
         ? `${summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.${inlineExecutionInstruction}`
-        : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). This summary is also the next-round kickoff; the orchestrator will dispatch the next participant hops after this summary completes and will not send a separate initiator initial-analysis prompt for that next round. Append to the file.\n${nonFinalSummaryGuard}${inlineExecutionInstruction}`;
+        : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). This summary prepares the next round, but the orchestrator will still dispatch a separate next-round initiator initial-analysis prompt before participant hops. Append to the file.\n${nonFinalSummaryGuard}${inlineExecutionInstruction}`;
       const roundSummaryPrompt = buildHopPrompt(run, summaryModeConfig, {
         session: run.initiatorSession,
         sectionHeader: roundSummaryHeader,
@@ -1958,7 +1990,8 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
         await fh.read(buf, 0, length, size - length);
         // Drop the leading partial UTF-8 sequence if any; 2000 chars
         // downstream further trims to exactly the wanted window.
-        run.resultSummary = buf.toString('utf8').slice(-2000);
+        const summary = buf.toString('utf8').slice(-2000);
+        run.resultSummary = summary;
       }
     } finally {
       if (fh) { try { await fh.close(); } catch { /* best-effort */ } }
@@ -3118,6 +3151,10 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
       }
     }
 
+    if (run.launchOrigin?.kind === 'openspec_auto_deliver' && authoritativeSegment.trim()) {
+      run.strictAuthoritativeResult = authoritativeSegment;
+    }
+
     await validateArtifactOutputsForRound(run, round, artifactBaseline).catch((err) => {
       failRun(run, 'failed', err instanceof Error ? err.message : String(err), serverLink);
     });
@@ -3481,6 +3518,9 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   try {
     fullContent = await readFile(run.contextFilePath, 'utf8');
     run.resultSummary = fullContent.slice(-2000);
+    if (run.launchOrigin?.kind === 'openspec_auto_deliver') {
+      run.strictAuthoritativeResult = fullContent;
+    }
   } catch { /* ignore */ }
   run.completedAt = new Date().toISOString();
   transition(run, 'completed', serverLink);

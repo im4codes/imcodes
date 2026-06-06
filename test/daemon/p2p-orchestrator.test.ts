@@ -77,6 +77,11 @@ import {
   type P2pRun,
   type P2pRunStatus,
 } from '../../src/daemon/p2p-orchestrator.js';
+import {
+  clearAutoDeliverP2pLocksForTests,
+  registerAutoDeliverP2pLock,
+  releaseAutoDeliverP2pLock,
+} from '../../src/daemon/p2p-launch-admission.js';
 
 let tempProjectDir: string;
 let autoWriteExecutionMarkers = true;
@@ -142,6 +147,7 @@ async function waitForNoRoundHopArtifacts(projectDir: string, runId: string, max
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  clearAutoDeliverP2pLocksForTests();
   _setIdlePollMs(20);
   _setGracePeriodMs(80);
   _setMarkerPromptRetryAfterMs(0);
@@ -161,6 +167,7 @@ beforeEach(async () => {
     if (name === 'deck_proj_brain') return { agentType: 'claude-code', projectDir: tempProjectDir, parentSession: undefined, label: 'brain' };
     if (name === 'deck_proj_w1') return { agentType: 'claude-code', projectDir: tempProjectDir, parentSession: undefined, label: 'w1' };
     if (name === 'deck_proj_w2') return { agentType: 'claude-code', projectDir: tempProjectDir, parentSession: undefined, label: 'w2' };
+    if (name === 'deck_sub_worker') return { agentType: 'claude-code', projectDir: tempProjectDir, parentSession: 'deck_proj_brain', label: 'sub' };
     if (name === 'deck_other_w2') return { agentType: 'claude-code', projectDir: join(tempProjectDir, 'other'), parentSession: undefined, label: 'w2x' };
     return null;
   });
@@ -200,6 +207,7 @@ afterEach(async () => {
   _setQueuedPromptStopAfterMs(60000);
   _setRoundHopCleanupDelayMs(0);
   await rm(tempProjectDir, { recursive: true, force: true }).catch(() => {});
+  clearAutoDeliverP2pLocksForTests();
 });
 
 describe('P2P orchestrator — parallel rounds', () => {
@@ -360,6 +368,148 @@ describe('P2P orchestrator — parallel rounds', () => {
     });
   });
 
+  it('blocks manual P2P launch while the owning main session has an Auto Deliver lock', async () => {
+    registerAutoDeliverP2pLock({
+      runId: 'auto-run-1',
+      owningMainSessionName: 'deck_proj',
+      generation: 3,
+      allowedComboIds: ['openspec_auto_deliver.implementation_audit_repair'],
+    });
+
+    await expect(startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'manual while auto deliver is active',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      launchOrigin: { kind: 'manual', commandId: 'manual-1' },
+    })).rejects.toThrow('p2p_launch_blocked:auto_deliver_active:auto-run-1');
+  });
+
+  it('blocks force-like manual and OpenSpec preset launches while Auto Deliver owns the Team lane', async () => {
+    registerAutoDeliverP2pLock({
+      runId: 'auto-run-force',
+      owningMainSessionName: 'deck_proj',
+      generation: 3,
+      allowedComboIds: ['openspec_auto_deliver.implementation_audit_repair'],
+    });
+
+    await expect(startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'manual force while auto deliver is active',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      launchOrigin: { kind: 'manual', commandId: 'manual-force-command' },
+    })).rejects.toThrow('p2p_launch_blocked:auto_deliver_active:auto-run-force');
+
+    await expect(startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'manual openspec preset while auto deliver is active',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      advancedPresetKey: 'openspec',
+      launchOrigin: { kind: 'manual', commandId: 'manual-openspec-preset' },
+    })).rejects.toThrow('p2p_launch_blocked:auto_deliver_active:auto-run-force');
+  });
+
+  it('blocks manual P2P launched from a sub-session when the owning main session is locked', async () => {
+    registerAutoDeliverP2pLock({
+      runId: 'auto-run-sub',
+      owningMainSessionName: 'deck_proj',
+      generation: 5,
+      allowedComboIds: ['openspec_auto_deliver.implementation_audit_repair'],
+    });
+
+    await expect(startP2pRun({
+      initiatorSession: 'deck_sub_worker',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'manual sub-session launch while auto deliver is active',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      launchOrigin: { kind: 'manual', commandId: 'manual-sub-1' },
+    })).rejects.toThrow('p2p_launch_blocked:auto_deliver_active:auto-run-sub');
+  });
+
+  it('restores normal manual Team launch behavior after the Auto Deliver lock is released', async () => {
+    registerAutoDeliverP2pLock({
+      runId: 'auto-run-release',
+      owningMainSessionName: 'deck_proj',
+      generation: 1,
+      allowedComboIds: ['openspec_auto_deliver.spec_audit_repair'],
+    });
+
+    await expect(startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'manual launch before release',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      launchOrigin: { kind: 'manual', commandId: 'manual-before-release' },
+    })).rejects.toThrow('p2p_launch_blocked:auto_deliver_active:auto-run-release');
+
+    expect(releaseAutoDeliverP2pLock('deck_proj', 'auto-run-release')).toBe(true);
+
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'manual launch after release',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      launchOrigin: { kind: 'manual', commandId: 'manual-after-release' },
+    });
+
+    expect(run.launchOrigin).toEqual({ kind: 'manual', commandId: 'manual-after-release' });
+    expect(run.mainSession).toBe('deck_proj');
+  });
+
+  it('allows Auto Deliver-owned P2P launch when metadata matches the active lock', async () => {
+    registerAutoDeliverP2pLock({
+      runId: 'auto-run-2',
+      owningMainSessionName: 'deck_proj',
+      generation: 7,
+      allowedComboIds: ['openspec_auto_deliver.spec_audit_repair'],
+    });
+
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'auto deliver audit-repair',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      launchOrigin: {
+        kind: 'openspec_auto_deliver',
+        commandId: 'auto-command-1',
+        autoDeliver: {
+          runId: 'auto-run-2',
+          changeName: 'openspec-auto-delivery',
+          owningMainSessionName: 'deck_proj',
+          generation: 7,
+          stage: 'spec_audit_repair',
+          attemptId: 'attempt-1',
+          comboId: 'openspec_auto_deliver.spec_audit_repair',
+        },
+      },
+    });
+
+    expect(serializeP2pRun(run)).toMatchObject({
+      launch_origin: {
+        kind: 'openspec_auto_deliver',
+        commandId: 'auto-command-1',
+        autoDeliver: {
+          runId: 'auto-run-2',
+          changeName: 'openspec-auto-delivery',
+          owningMainSessionName: 'deck_proj',
+          generation: 7,
+          stage: 'spec_audit_repair',
+          attemptId: 'attempt-1',
+          comboId: 'openspec_auto_deliver.spec_audit_repair',
+        },
+      },
+    });
+  });
+
   it('removes legacy round hop artifacts after merging them into the main discussion file', async () => {
     const run = await startP2pRun(
       'deck_proj_brain',
@@ -425,7 +575,7 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(payload.flow_step_current).toBe(2);
     expect(payload.flow_step_total).toBe(2);
     const content = await readFile(done.contextFilePath, 'utf8');
-    expect(content.match(/Initial Analysis/g)?.length).toBe(1);
+    expect(content.match(/Initial Analysis/g)?.length).toBe(4);
   });
 
   it('inlines original-request execution into each complete legacy combo-cycle summary and follows up to confirm', async () => {
@@ -520,8 +670,10 @@ describe('P2P orchestrator — parallel rounds', () => {
     );
 
     await waitForStatus(run.id, ['completed'], 5000);
-    expect(initialPrompts).toHaveLength(1);
+    expect(initialPrompts).toHaveLength(2);
     expect(initialPrompts[0]).not.toContain('Previous cycle audit scope');
+    expect(initialPrompts[1]).toContain('Previous cycle audit scope');
+    expect(initialPrompts[1]).toContain('review all previous round outputs and any implementation/execution evidence');
     expect(nextCycleHopPrompts).toHaveLength(1);
     expect(nextCycleHopPrompts[0]).toContain('Previous cycle audit scope');
     expect(nextCycleHopPrompts[0]).toContain('Treat cycle 1/2 outputs as the primary audit scope');
@@ -1212,6 +1364,7 @@ describe('P2P orchestrator — parallel rounds', () => {
       userText: 'helper diagnostics payload',
       timeoutMs: 120000,
       resultSummary: null,
+      strictAuthoritativeResult: null,
       completedHops: [],
       skippedHops: [],
       error: null,
@@ -1292,6 +1445,7 @@ describe('P2P orchestrator — parallel rounds', () => {
       userText: 'latest step serialization',
       timeoutMs: 120000,
       resultSummary: null,
+      strictAuthoritativeResult: null,
       completedHops: [],
       skippedHops: [],
       error: null,
@@ -1411,6 +1565,7 @@ describe('P2P orchestrator — parallel rounds', () => {
       userText: 'parallel progress',
       timeoutMs: 120000,
       resultSummary: null,
+      strictAuthoritativeResult: null,
       completedHops: [],
       skippedHops: [],
       error: null,

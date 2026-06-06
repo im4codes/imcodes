@@ -951,6 +951,10 @@ class SupervisionAutomation {
           fileContents: args.fileContents as unknown as Array<{ path: string; content: string }>,
           serverLink: this.serverLink,
           rounds: args.rounds,
+          launchOrigin: {
+            kind: 'supervision',
+            supervisionRunId: `${args.sessionName}:${attempt}`,
+          },
           advanced: {
             kind: 'supervision_internal',
             advancedRounds: args.advancedRounds,

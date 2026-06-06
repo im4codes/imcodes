@@ -24,7 +24,9 @@
     "this_feature": "此功能"
   },
   "share": {
-    "menu": { "shareTab": "共享" },
+    "menu": {
+      "shareTab": "共享"
+    },
     "dialogTitle": "共享访问",
     "dialogSubtitle": "向 {{target}} 授予受限访问。",
     "target": {
@@ -75,7 +77,9 @@
     },
     "create": "创建共享",
     "creating": "正在创建...",
-    "scope": { "current": "共享范围" },
+    "scope": {
+      "current": "共享范围"
+    },
     "indicator": "{{scope}} 以 {{role}} 共享 · {{status}}",
     "indicatorCompact": "以 {{role}} 共享 · {{status}}",
     "indicatorSharedOut": "已共享给别人",
@@ -1147,6 +1151,94 @@
     "implement_action": "实现",
     "achieve_action": "完成",
     "propose_action": "Propose",
+    "auto": {
+      "action": "Auto",
+      "kicker": "自动交付",
+      "launcher_title": "自动交付",
+      "details_title": "自动交付详情",
+      "current_run": "当前自动交付",
+      "no_change": "未选择变更",
+      "start": "启动自动交付",
+      "stop": "停止",
+      "stopping": "停止中...",
+      "view": "查看",
+      "tasks": "任务",
+      "tasks_unknown": "任务未知",
+      "tasks_progress": "{{checked}}/{{total}} 个任务",
+      "prompt_count": "{{count}} 次提示",
+      "prompt_count_label": "实现提示次数",
+      "materialized_limits": "Spec 审计 {{spec}} · 实现审计 {{impl}}",
+      "preset_limits": "Spec {{spec}} · 实现 {{impl}}",
+      "conflict_active": "{{change}} 正在自动交付。",
+      "redacted_conflict": "同一会话组已有 Auto Deliver 在运行。",
+      "conflict_summary": "详细信息仅参与会话可见。",
+      "lock_manual_actions": "Auto Deliver 正在运行，已锁定该会话组的 Team 操作。",
+      "status_label": "状态",
+      "stage_label": "阶段",
+      "elapsed": "耗时",
+      "preset_label": "预设",
+      "owning_session": "所属主会话",
+      "launched_from": "启动会话",
+      "execution_session": "执行会话",
+      "spec_round": "Spec 审计轮次",
+      "impl_round": "实现审计轮次",
+      "active_p2p": "活跃 Team 运行",
+      "combo_id": "Combo",
+      "verdict": "结论",
+      "terminal_reason": "结束原因",
+      "task_stats": "任务状态",
+      "scores": "评分",
+      "scores_empty": "暂无评分",
+      "evidence": "证据",
+      "evidence_stale": "已过期",
+      "error": {
+        "missing_change": "请先选择一个 OpenSpec 变更。",
+        "active_run": "该会话组已有 Auto Deliver 在运行。",
+        "manual_team_busy": "该会话组已有手动 Team 运行占用中。",
+        "unsupported_runtime": "Auto Deliver 需要基于 transport 的编码会话。",
+        "launch_failed": "启动 Auto Deliver 失败。"
+      },
+      "preset": {
+        "fast": "快速",
+        "standard": "标准",
+        "strict": "严格",
+        "deep": "深度"
+      },
+      "status": {
+        "launching": "启动中",
+        "active": "运行中",
+        "passed": "通过",
+        "needs_human": "需要人工",
+        "failed": "失败",
+        "stopped": "已停止",
+        "proposed": "已提案",
+        "implementation_task_loop": "实现中"
+      },
+      "stage": {
+        "proposed": "提案",
+        "spec_audit_repair": "Spec 审计",
+        "implementation_task_loop": "实现",
+        "implementation_audit_repair": "实现审计",
+        "passed": "通过",
+        "needs_human": "需要人工",
+        "failed": "失败",
+        "stopped": "已停止",
+        "stopping": "停止中"
+      },
+      "score_module": {
+        "spec": "Spec",
+        "tasks": "任务",
+        "implementation": "实现",
+        "tests": "测试",
+        "risk": "风险"
+      },
+      "provenance": {
+        "daemon": "Daemon",
+        "implementation_reported": "实现侧报告",
+        "audit_reported": "审计侧报告",
+        "none": "无"
+      }
+    },
     "propose_from_discussion_action": "根据最近讨论生成",
     "propose_from_description_action": "根据下面的描述生成",
     "audit_implementation_prompt": "对 {{reference}} 执行严格的实现审计，逐项对照其 OpenSpec 产物。找出所有不一致、遗漏、回归风险、边界场景缺口和缺失测试；然后直接修复代码、测试以及必要的配套改动。如果实现推进过程中需要同步变更规范产物，也要在同一次任务里直接更新 {{reference}} 下的 OpenSpec 文件。不要停留在报告层面，必须把实现修到与规范完全一致。",

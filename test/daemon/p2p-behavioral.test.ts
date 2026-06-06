@@ -28,6 +28,7 @@ function makeRun(overrides: Partial<P2pRun> = {}): P2pRun {
     locale: undefined,
     timeoutMs: 300000,
     resultSummary: null,
+    strictAuthoritativeResult: null,
     completedHops: [],
     skippedHops: [],
     error: null,
