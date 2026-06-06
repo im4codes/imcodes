@@ -660,6 +660,51 @@ describe('App shell', () => {
     expect(ws.connect).toHaveBeenCalled();
   }, 20_000);
 
+  it('subscribes sdk sub-sessions to transport live events even when runtimeType is missing', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-sdk',
+        sessionName: 'deck_sub_alpha_sdk',
+        parentSession: 'deck_alpha_brain',
+        label: 'SDK',
+        description: 'SDK session',
+        cwd: '/work/alpha',
+        type: 'claude-code-sdk',
+        runtimeType: undefined,
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+      {
+        id: 'sub-process',
+        sessionName: 'deck_sub_alpha_process',
+        parentSession: 'deck_alpha_brain',
+        label: 'Process',
+        description: 'Process session',
+        cwd: '/work/alpha',
+        type: 'claude-code',
+        runtimeType: undefined,
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    const ws = wsInstances[0];
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+
+    await waitFor(() => {
+      expect(ws.subscribeTransportSession).toHaveBeenCalledWith('deck_sub_alpha_sdk', { replayHistory: false });
+    });
+    expect(ws.subscribeTransportSession).not.toHaveBeenCalledWith('deck_sub_alpha_process', expect.anything());
+  }, 20_000);
+
   it('clears stale P2P progress from the session bar when a full status response has no active runs', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');

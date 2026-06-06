@@ -87,6 +87,7 @@ import {
   type PreviewWsOpenedMessage,
 } from '../../../shared/preview-types.js';
 import { isStreamingResponse } from '../../../shared/preview-stream-policy.js';
+import { getSessionRuntimeType } from '../../../shared/agent-types.js';
 import { LocalWebPreviewRegistry, setPreviewActiveRelayHook, setPreviewEvictedHook } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
 import { toDiscussionCommentView } from '../share/discussion-comment-view.js';
@@ -4055,7 +4056,11 @@ export class WsBridge {
         const label = typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined;
         const parentSession = typeof msg.parentSession === 'string' && msg.parentSession ? msg.parentSession : undefined;
         const agentType = typeof msg.sessionType === 'string' && msg.sessionType ? msg.sessionType : undefined;
-        const runtimeType = typeof msg.runtimeType === 'string' ? msg.runtimeType : undefined;
+        const runtimeType = typeof msg.runtimeType === 'string'
+          ? msg.runtimeType
+          : agentType
+            ? getSessionRuntimeType(agentType)
+            : undefined;
         this.activeSubSessions.set(subSessionName, { name: subSessionName, label, parentSession, agentType, runtimeType });
         this.sessionRuntimeTypes.set(subSessionName, this.normalizeRuntimeType(runtimeType));
         if (msg.state === 'idle') this.activeDispatchIds.delete(subSessionName);
@@ -4070,6 +4075,11 @@ export class WsBridge {
           logger.warn({ id: msg.id }, 'Skipping sub-session DB sync without sessionType');
           return;
         }
+        const persistedRuntimeType = typeof msg.runtimeType === 'string'
+          ? msg.runtimeType
+          : sessionType
+            ? getSessionRuntimeType(sessionType)
+            : null;
         await createSubSession(
           db,
           msg.id as string,
@@ -4081,7 +4091,7 @@ export class WsBridge {
           (msg.ccSessionId as string) || null,
           (msg.geminiSessionId as string) || null,
           (msg.parentSession as string) || null,
-          (msg.runtimeType as string) || null,
+          persistedRuntimeType,
           (msg.providerId as string) || null,
           (msg.providerSessionId as string) || null,
           (msg.description as string) || null,
@@ -4101,7 +4111,7 @@ export class WsBridge {
           label: msg.label || null,
           parentSession: msg.parentSession || null,
           ccPresetId: (msg.ccPresetId as string) || null,
-          runtimeType: msg.runtimeType || null,
+          runtimeType: persistedRuntimeType,
           providerId: msg.providerId || null,
           providerSessionId: msg.providerSessionId || null,
           requestedModel: msg.requestedModel || null,

@@ -2041,15 +2041,15 @@ describe('WsBridge', () => {
   // ── Sub-session sync + P2P conflict relay ─────────────────────────────────
 
   describe('sub-session sync and P2P conflict relay', () => {
-    async function setupAuthBridge() {
+    async function setupAuthBridge(db = makeDb('valid-hash')) {
       const bridge = WsBridge.get(serverId);
       const daemonWs = new MockWs();
-      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
       daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
       await flushAsync();
 
       const browserWs = new MockWs();
-      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', db);
       browserWs.sent.length = 0;
 
       return { bridge, daemonWs, browserWs };
@@ -2089,6 +2089,37 @@ describe('WsBridge', () => {
       expect(msg.effort).toBe('high');
       expect(msg.transportConfig).toEqual({ provider: { mode: 'safe' } });
       expect(msg.state).toBe('idle');
+    });
+
+    it('infers transport runtime for sdk subsession.sync payloads that omit runtimeType', async () => {
+      const executeCalls: unknown[][] = [];
+      const db = makeDb('valid-hash') as unknown as {
+        execute: (sql: string, params: unknown[]) => Promise<{ changes: number }>;
+      };
+      db.execute = async (_sql: string, params: unknown[]) => {
+        executeCalls.push(params);
+        return { changes: 1 };
+      };
+      const { daemonWs, browserWs } = await setupAuthBridge(db as never);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.sync',
+        id: 'sdk-no-runtime',
+        sessionType: 'claude-code-sdk',
+        shellBin: null,
+        cwd: '/home/user/project',
+        label: 'sdk worker',
+        parentSession: 'deck_myapp_brain',
+      }));
+      await flushAsync();
+
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('subsession.created');
+      expect(msg.sessionName).toBe('deck_sub_sdk-no-runtime');
+      expect(msg.sessionType).toBe('claude-code-sdk');
+      expect(msg.runtimeType).toBe('transport');
+      const createSubSessionCall = executeCalls.find((params) => params[0] === 'sdk-no-runtime');
+      expect(createSubSessionCall?.[9]).toBe('transport');
     });
 
     it('ignores leaked test subsession.sync payloads', async () => {

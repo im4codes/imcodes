@@ -3548,9 +3548,9 @@ export function App() {
 
   // Subscribe to structured transport chat/timeline updates for ALL transport sessions.
   // SDK-backed sessions must remain globally subscribed regardless of which panel is active.
-  // Key includes runtimeType so effect re-runs when WebSocket merge corrects null→'transport'
-  // for copilot/cursor sessions loaded from a pre-migration DB (runtime_type was NULL).
-  const transportSessionKey = sessions.map((s) => `${s.name}:${s.runtimeType}`).sort().join(',');
+  // Key includes runtimeType + agentType so effect re-runs when WebSocket merge
+  // corrects null→'transport' or a pre-migration row relies on agentType fallback.
+  const transportSessionKey = sessions.map((s) => `${s.name}:${s.runtimeType}:${s.agentType}`).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || sessions.length === 0) return;
@@ -3570,7 +3570,7 @@ export function App() {
   // server's per-browser rate limit (120 msgs / 10s), collaterally dropping
   // `session.send` messages and leaving the chat bubble spinning for 30s.
   // `transportSessionKey` already captures every semantic change
-  // (session names + runtimeType), so the string key is sufficient.
+  // (session names + runtimeType + agentType), so the string key is sufficient.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, transportSessionKey]);
 
@@ -3593,8 +3593,9 @@ export function App() {
   }, [connected, subSessionNamesKey]);
 
   // Subscribe to structured transport updates for ALL transport sub-sessions too.
-  // Key includes runtimeType so effect re-runs when WebSocket merge corrects null→'transport'.
-  const transportSubSessionKey = subSessions.map((s) => `${s.sessionName}:${s.runtimeType}`).sort().join(',');
+  // Key includes runtimeType + type so effect re-runs when WebSocket merge
+  // corrects null→'transport' or a pre-migration row relies on type fallback.
+  const transportSubSessionKey = subSessions.map((s) => `${s.sessionName}:${s.runtimeType}:${s.type}`).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || subSessions.length === 0) return;
