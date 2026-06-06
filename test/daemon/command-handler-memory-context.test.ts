@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 const {
   getSessionMock,
@@ -233,6 +237,12 @@ const originalFeatureEnv = {
   namespaceRegistry: process.env.IMCODES_MEM_FEATURE_NAMESPACE_REGISTRY,
   observationStore: process.env.IMCODES_MEM_FEATURE_OBSERVATION_STORE,
 };
+
+async function createGitRepoWithOrigin(projectDir: string, originUrl: string): Promise<void> {
+  await mkdir(projectDir, { recursive: true });
+  await execFileAsync('git', ['init'], { cwd: projectDir });
+  await execFileAsync('git', ['remote', 'add', 'origin', originUrl], { cwd: projectDir });
+}
 
 function restoreFeatureEnv(): void {
   if (originalFeatureEnv.configPath === undefined) delete process.env.IMCODES_MEMORY_FEATURE_CONFIG_PATH;
@@ -929,21 +939,7 @@ describe('handleWebCommand memory context timeline', () => {
   it('validates manual memory project directories before trusting canonical repo ids', async () => {
     const tempDir = await mkdtemp(join(tmpdir(), 'imcodes-manual-memory-'));
     const projectDir = join(tempDir, 'codedeck');
-    await mkdir(projectDir);
-    await mkdir(join(projectDir, '.git', 'objects'), { recursive: true });
-    await mkdir(join(projectDir, '.git', 'refs', 'heads'), { recursive: true });
-    await writeFile(join(projectDir, '.git', 'HEAD'), 'ref: refs/heads/main\n');
-    await writeFile(join(projectDir, '.git', 'config'), [
-      '[core]',
-      '\trepositoryformatversion = 0',
-      '\tfilemode = true',
-      '\tbare = false',
-      '\tlogallrefupdates = true',
-      '[remote "origin"]',
-      '\turl = git@github.com:imcodes/codedeck.git',
-      '\tfetch = +refs/heads/*:refs/remotes/origin/*',
-      '',
-    ].join('\n'));
+    await createGitRepoWithOrigin(projectDir, 'git@github.com:imcodes/codedeck.git');
     listSessionsMock.mockReturnValue([{ name: 'deck_codedeck_brain', projectDir }]);
 
     try {
@@ -982,21 +978,7 @@ describe('handleWebCommand memory context timeline', () => {
   it('rejects manual memory create when project directory identity does not match the requested canonical id', async () => {
     const tempDir = await mkdtemp(join(tmpdir(), 'imcodes-manual-memory-mismatch-'));
     const projectDir = join(tempDir, 'codedeck');
-    await mkdir(projectDir);
-    await mkdir(join(projectDir, '.git', 'objects'), { recursive: true });
-    await mkdir(join(projectDir, '.git', 'refs', 'heads'), { recursive: true });
-    await writeFile(join(projectDir, '.git', 'HEAD'), 'ref: refs/heads/main\n');
-    await writeFile(join(projectDir, '.git', 'config'), [
-      '[core]',
-      '\trepositoryformatversion = 0',
-      '\tfilemode = true',
-      '\tbare = false',
-      '\tlogallrefupdates = true',
-      '[remote "origin"]',
-      '\turl = git@github.com:imcodes/codedeck.git',
-      '\tfetch = +refs/heads/*:refs/remotes/origin/*',
-      '',
-    ].join('\n'));
+    await createGitRepoWithOrigin(projectDir, 'git@github.com:imcodes/codedeck.git');
     listSessionsMock.mockReturnValue([{ name: 'deck_codedeck_brain', projectDir }]);
 
     try {
