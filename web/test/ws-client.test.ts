@@ -238,7 +238,7 @@ describe('WsClient', () => {
     client.connect();
     expect(client.connecting).toBe(true);
 
-    await vi.advanceTimersByTimeAsync(15_000);
+    await vi.advanceTimersByTimeAsync(30_000);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(client.connected).toBe(false);
     // The first hung ticket attempt has yielded to a reconnect timer.
