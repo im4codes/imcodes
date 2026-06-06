@@ -6723,7 +6723,7 @@ export class WsBridge {
     const seen = new Set<string>();
     while (current && !seen.has(current)) {
       seen.add(current);
-      const parent = this.activeSubSessions.get(current)?.parentSession;
+      const parent: string | undefined = this.activeSubSessions.get(current)?.parentSession;
       if (!parent) return false;
       if (parent === owningMainSessionName) return true;
       current = parent;
