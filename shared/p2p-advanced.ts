@@ -460,7 +460,7 @@ export function resolveP2pRoundPlan(options: ResolveP2pRoundPlanOptions): P2pRes
     };
   }
 
-  if (advancedPresetKey && advancedPresetKey !== 'openspec') {
+  if (advancedPresetKey && advancedPresetKey !== 'openspec' && !advancedRounds?.length) {
     throw new Error(`Unknown advanced P2P preset: ${advancedPresetKey}`);
   }
 

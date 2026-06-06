@@ -449,6 +449,48 @@ describe('DiscussionsPage', () => {
     ).toBeLessThanOrEqual(1);
   });
 
+  it('loads Auto Deliver recovery rows into the dedicated list tab', async () => {
+    const { container } = render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_sub_1' }} />);
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.list_request',
+      sessionName: 'deck_sub_1',
+    }));
+
+    await act(async () => {
+      handler?.({ type: 'p2p.list_discussions_response', discussions: [] } as ServerMessage);
+      handler?.({
+        type: 'openspec_auto_deliver.list_response',
+        rows: [{
+          runId: 'auto-run-1',
+          projectionVersion: 2,
+          visibility: 'full',
+          changeName: 'openspec-auto-delivery',
+          status: 'active',
+          stage: 'implementation_task_loop',
+          owningMainSessionName: 'deck_proj_brain',
+          targetImplementationSessionName: 'deck_sub_1',
+          selectedTeamComboId: 'audit>review>plan',
+        }],
+      } as unknown as ServerMessage);
+    });
+
+    expect(screen.getByRole('button', { name: 'openspec.auto.list_title' })).toBeDefined();
+    expect(screen.getByRole('button', { name: 'p2p.discussions.title' })).toBeDefined();
+
+    fireEvent.click(screen.getByRole('button', { name: 'openspec.auto.list_title' }));
+    expect(screen.getAllByText('openspec-auto-delivery').length).toBeGreaterThanOrEqual(1);
+    const autoRow = container.querySelector('.discussions-list-item') as HTMLElement;
+    expect(autoRow).toBeTruthy();
+    expect(autoRow.textContent).toContain('implementation_task_loop');
+    expect(autoRow.textContent).toContain('active');
+
+    fireEvent.click(autoRow);
+    expect(autoRow.className).toContain('active');
+    expect(screen.getByText('deck_proj_brain')).toBeDefined();
+    expect(screen.getByText('deck_sub_1')).toBeDefined();
+    expect(screen.getByText('audit>review>plan')).toBeDefined();
+  });
+
   it('clicking a live progress card with NO fileId is a no-op (orphan run mid-bind)', async () => {
     const liveDiscussion = {
       id: 'p2p_orphan',

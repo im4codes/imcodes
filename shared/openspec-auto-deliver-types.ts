@@ -5,11 +5,14 @@ import type {
   OpenSpecAutoDeliverComboWriteMode,
   OpenSpecAutoDeliverEvidenceProvenance,
   OpenSpecAutoDeliverMutationScope,
+  OpenSpecAutoDeliverProjectionVisibility,
   OpenSpecAutoDeliverPresetId,
   OpenSpecAutoDeliverRoundLimits,
   OpenSpecAutoDeliverScoreModuleId,
   OpenSpecAutoDeliverStage,
+  OpenSpecAutoDeliverStagePromptId,
   OpenSpecAutoDeliverStrictResultChannel,
+  OpenSpecAutoDeliverViewMode,
   OpenSpecAutoDeliverVerdict,
 } from './openspec-auto-deliver-constants.js';
 
@@ -20,6 +23,11 @@ export interface OpenSpecAutoDeliverLaunchRequest {
   projectName?: string;
   changeName: string;
   presetId: OpenSpecAutoDeliverPresetId;
+  materializedLimits?: OpenSpecAutoDeliverRoundLimits & {
+    maxImplementationPrompts?: number;
+    maxElapsedMinutes?: number;
+  };
+  selectedTeamComboId?: string;
 }
 
 export interface OpenSpecAutoDeliverStopRequest {
@@ -85,7 +93,8 @@ export interface OpenSpecAutoDeliverP2pMetadata {
   changeName: string;
   resolvedChangeRootIdentity: string;
   stage: Extract<OpenSpecAutoDeliverStage, 'spec_audit_repair' | 'implementation_audit_repair'>;
-  designatedComboId: OpenSpecAutoDeliverComboId;
+  selectedTeamComboId: string;
+  activeOpenSpecPromptId: OpenSpecAutoDeliverStagePromptId;
   roundIndex: number;
   attemptId: string;
   generation: number;
@@ -110,6 +119,7 @@ export interface OpenSpecAutoDeliverComboDescriptor {
 }
 
 export interface OpenSpecAutoDeliverProjection {
+  visibility?: Extract<OpenSpecAutoDeliverProjectionVisibility, 'full'>;
   projectionVersion: number;
   runId: string;
   changeName: string;
@@ -130,7 +140,9 @@ export interface OpenSpecAutoDeliverProjection {
   specAuditRepairRound: number;
   implementationAuditRepairRound: number;
   activeP2pRunId?: string;
-  activeComboId?: OpenSpecAutoDeliverComboId;
+  selectedTeamComboId?: string;
+  activeOpenSpecPromptId?: OpenSpecAutoDeliverStagePromptId;
+  canStop?: boolean;
   latestVerdict?: OpenSpecAutoDeliverVerdict;
   moduleScores?: OpenSpecAutoDeliverModuleScore[];
   latestRepairSummary?: string;
@@ -140,11 +152,139 @@ export interface OpenSpecAutoDeliverProjection {
 }
 
 export interface OpenSpecAutoDeliverConflictSummary {
+  visibility?: Extract<OpenSpecAutoDeliverProjectionVisibility, 'conflict'>;
+  projectionVersion?: number;
   runId: string;
   owningMainSessionName: string;
   status: OpenSpecAutoDeliverStage;
   stage: OpenSpecAutoDeliverStage;
   reason: string;
+  canStop?: false;
+}
+
+export interface OpenSpecAutoDeliverBrowserTaskStats {
+  total: number;
+  checked: number;
+  unchecked: number;
+  uncheckedLabels?: string[];
+  items?: Array<{ line?: number; checked: boolean; label: string }>;
+}
+
+export interface OpenSpecAutoDeliverBrowserModuleScore {
+  module: OpenSpecAutoDeliverScoreModuleId | string;
+  score: number;
+  maxScore?: number;
+  max_score?: number;
+  summary?: string;
+}
+
+export interface OpenSpecAutoDeliverBrowserEvidence {
+  label?: string;
+  provenance?: OpenSpecAutoDeliverEvidenceProvenance | string;
+  source?: OpenSpecAutoDeliverEvidenceProvenance | string;
+  summary?: string;
+  command?: string;
+  exitCode?: number;
+  stale?: boolean;
+}
+
+export interface OpenSpecAutoDeliverBrowserFullProjection {
+  visibility: Extract<OpenSpecAutoDeliverProjectionVisibility, 'full'>;
+  projectionVersion: number;
+  generation: number;
+  runId: string;
+  changeName: string;
+  presetId?: OpenSpecAutoDeliverPresetId | string;
+  status: OpenSpecAutoDeliverStage | string;
+  stage: OpenSpecAutoDeliverStage | string;
+  startedAt?: number;
+  elapsedMs?: number;
+  owningMainSessionName?: string;
+  launchedFromSessionName?: string;
+  targetImplementationSessionName?: string;
+  materializedLimits?: OpenSpecAutoDeliverRoundLimits & {
+    maxImplementationPrompts?: number;
+    maxElapsedMinutes?: number;
+  };
+  specAuditRepairRound?: number;
+  implementationAuditRepairRound?: number;
+  specAuditRound?: { current: number; total: number };
+  implementationAuditRound?: { current: number; total: number };
+  implementationPromptCount?: number;
+  taskStats?: OpenSpecAutoDeliverBrowserTaskStats;
+  activeP2pRunId?: string | null;
+  selectedTeamComboId?: string | null;
+  activeOpenSpecPromptId?: OpenSpecAutoDeliverStagePromptId | string | null;
+  latestVerdict?: OpenSpecAutoDeliverVerdict | string | null;
+  moduleScores?: OpenSpecAutoDeliverBrowserModuleScore[];
+  latestRepairSummary?: string | null;
+  evidence?: OpenSpecAutoDeliverBrowserEvidence[];
+  validationEvidenceProvenance?: string[];
+  recentFinding?: string | null;
+  terminalReason?: string | null;
+  terminal?: boolean;
+  updatedAt?: string;
+  canStop?: boolean;
+  canDismiss?: boolean;
+}
+
+export interface OpenSpecAutoDeliverBrowserConflictProjection {
+  visibility: Extract<OpenSpecAutoDeliverProjectionVisibility, 'conflict'>;
+  projectionVersion: number;
+  runId: string;
+  owningMainSessionName: string;
+  status?: OpenSpecAutoDeliverStage | string;
+  stage?: OpenSpecAutoDeliverStage | string;
+  busy: true;
+  reason: string;
+  conflictReason: string;
+  canStop: false;
+  changeName?: never;
+  presetId?: never;
+  launchedFromSessionName?: never;
+  targetImplementationSessionName?: never;
+  materializedLimits?: never;
+  specAuditRepairRound?: never;
+  implementationAuditRepairRound?: never;
+  specAuditRound?: never;
+  implementationAuditRound?: never;
+  implementationPromptCount?: never;
+  taskStats?: never;
+  activeP2pRunId?: never;
+  selectedTeamComboId?: never;
+  activeOpenSpecPromptId?: never;
+  latestVerdict?: never;
+  moduleScores?: never;
+  latestRepairSummary?: never;
+  evidence?: never;
+  validationEvidenceProvenance?: never;
+  recentFinding?: never;
+  terminalReason?: never;
+  terminal?: never;
+  updatedAt?: never;
+  canDismiss?: never;
+}
+
+export type OpenSpecAutoDeliverBrowserProjection =
+  | OpenSpecAutoDeliverBrowserFullProjection
+  | OpenSpecAutoDeliverBrowserConflictProjection;
+
+export interface OpenSpecAutoDeliverListRow {
+  projectionVersion: number;
+  visibility: OpenSpecAutoDeliverProjectionVisibility;
+  runId: string;
+  owningMainSessionName: string;
+  status: OpenSpecAutoDeliverStage | string;
+  stage: OpenSpecAutoDeliverStage | string;
+  viewMode?: OpenSpecAutoDeliverViewMode;
+  changeName?: string;
+  presetId?: OpenSpecAutoDeliverPresetId;
+  selectedTeamComboId?: string;
+  targetImplementationSessionName?: string;
+  launchedFromSessionName?: string;
+  elapsedMs?: number;
+  terminalReason?: string;
+  reason?: string;
 }
 
 export type OpenSpecAutoDeliverValidationSeverity = 'error' | 'warning';

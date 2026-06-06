@@ -1153,14 +1153,20 @@
     "auto": {
       "action": "Auto",
       "kicker": "自動デリバリー",
+      "custom": "カスタム",
       "launcher_title": "自動デリバリー",
       "details_title": "Auto Deliver 詳細",
       "current_run": "現在の Auto Deliver",
+      "list_title": "Auto Deliver",
+      "list_empty": "Auto Deliver の実行はまだありません。",
+      "list_select": "Auto Deliver の実行を選択してください。",
       "no_change": "変更が選択されていません",
       "start": "Auto Deliver を開始",
       "stop": "停止",
       "stopping": "停止中...",
       "view": "表示",
+      "compact": "コンパクト",
+      "expand": "展開",
       "tasks": "Tasks",
       "tasks_unknown": "タスク不明",
       "tasks_progress": "{{checked}}/{{total}} tasks",
@@ -1183,6 +1189,7 @@
       "impl_round": "Implementation audit round",
       "active_p2p": "Active Team run",
       "combo_id": "Combo",
+      "active_prompt": "OpenSpec prompt",
       "verdict": "Verdict",
       "terminal_reason": "Terminal reason",
       "task_stats": "Task status",
@@ -1195,7 +1202,12 @@
         "active_run": "このセッショングループでは Auto Deliver がすでに実行中です。",
         "manual_team_busy": "手動 Team 実行がこのセッショングループを使用中です。",
         "unsupported_runtime": "Auto Deliver には transport ベースのコーディングセッションが必要です。",
-        "launch_failed": "Failed to start Auto Deliver."
+        "launch_failed": "Failed to start Auto Deliver.",
+        "invalid_rounds": "Round counts are outside the allowed range.",
+        "daemon_offline": "Daemon is offline. Try again after it reconnects.",
+        "launch_timeout": "Auto Deliver launch timed out. Try again.",
+        "custom_combo_unsupported": "Custom Team combos are not supported for Auto Deliver yet.",
+        "strict_result_failed": "The audit did not return a valid strict result."
       },
       "preset": {
         "fast": "高速",
@@ -1236,7 +1248,10 @@
         "implementation_reported": "Implementation reported",
         "audit_reported": "Audit reported",
         "none": "None"
-      }
+      },
+      "spec_rounds": "Spec audit rounds",
+      "impl_rounds": "Implementation audit rounds",
+      "team_combo": "Team combo"
     },
     "propose_from_discussion_action": "直近の議論から生成",
     "propose_from_description_action": "下の説明から生成",

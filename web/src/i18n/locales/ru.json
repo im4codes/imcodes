@@ -1153,14 +1153,20 @@
     "auto": {
       "action": "Auto",
       "kicker": "Автодоставка",
+      "custom": "Пользовательский",
       "launcher_title": "Автодоставка",
       "details_title": "Детали Auto Deliver",
       "current_run": "Текущий Auto Deliver",
+      "list_title": "Auto Deliver",
+      "list_empty": "Запуски Auto Deliver пока не обнаружены.",
+      "list_select": "Выберите запуск Auto Deliver.",
       "no_change": "Изменение не выбрано",
       "start": "Запустить Auto Deliver",
       "stop": "Остановить",
       "stopping": "Остановка...",
       "view": "Открыть",
+      "compact": "Свернуть",
+      "expand": "Развернуть",
       "tasks": "Tasks",
       "tasks_unknown": "Задачи неизвестны",
       "tasks_progress": "{{checked}}/{{total}} tasks",
@@ -1183,6 +1189,7 @@
       "impl_round": "Implementation audit round",
       "active_p2p": "Active Team run",
       "combo_id": "Combo",
+      "active_prompt": "OpenSpec prompt",
       "verdict": "Verdict",
       "terminal_reason": "Terminal reason",
       "task_stats": "Task status",
@@ -1195,7 +1202,12 @@
         "active_run": "Auto Deliver уже выполняется для этой группы сеансов.",
         "manual_team_busy": "Ручной запуск Team уже использует эту группу сеансов.",
         "unsupported_runtime": "Auto Deliver требуется сеанс кодирования на transport.",
-        "launch_failed": "Failed to start Auto Deliver."
+        "launch_failed": "Failed to start Auto Deliver.",
+        "invalid_rounds": "Round counts are outside the allowed range.",
+        "daemon_offline": "Daemon is offline. Try again after it reconnects.",
+        "launch_timeout": "Auto Deliver launch timed out. Try again.",
+        "custom_combo_unsupported": "Custom Team combos are not supported for Auto Deliver yet.",
+        "strict_result_failed": "The audit did not return a valid strict result."
       },
       "preset": {
         "fast": "Быстро",
@@ -1236,7 +1248,10 @@
         "implementation_reported": "Implementation reported",
         "audit_reported": "Audit reported",
         "none": "None"
-      }
+      },
+      "spec_rounds": "Spec audit rounds",
+      "impl_rounds": "Implementation audit rounds",
+      "team_combo": "Team combo"
     },
     "propose_from_discussion_action": "Из недавнего обсуждения",
     "propose_from_description_action": "Из описания ниже",

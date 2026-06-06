@@ -4,6 +4,97 @@ import { describe, expect, it } from 'vitest';
 import { SUPPORTED_LOCALES } from '../src/i18n/locales/index.js';
 
 const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+const OPENSPEC_AUTO_DELIVER_KEYS = [
+  'openspec.auto.action',
+  'openspec.auto.kicker',
+  'openspec.auto.custom',
+  'openspec.auto.launcher_title',
+  'openspec.auto.details_title',
+  'openspec.auto.current_run',
+  'openspec.auto.spec_rounds',
+  'openspec.auto.impl_rounds',
+  'openspec.auto.team_combo',
+  'openspec.auto.active_prompt',
+  'openspec.auto.compact',
+  'openspec.auto.expand',
+  'openspec.auto.list_title',
+  'openspec.auto.list_empty',
+  'openspec.auto.list_select',
+  'openspec.auto.no_change',
+  'openspec.auto.start',
+  'openspec.auto.stop',
+  'openspec.auto.stopping',
+  'openspec.auto.view',
+  'openspec.auto.tasks',
+  'openspec.auto.tasks_unknown',
+  'openspec.auto.tasks_progress',
+  'openspec.auto.prompt_count',
+  'openspec.auto.prompt_count_label',
+  'openspec.auto.materialized_limits',
+  'openspec.auto.preset_limits',
+  'openspec.auto.conflict_active',
+  'openspec.auto.redacted_conflict',
+  'openspec.auto.conflict_summary',
+  'openspec.auto.lock_manual_actions',
+  'openspec.auto.status_label',
+  'openspec.auto.stage_label',
+  'openspec.auto.elapsed',
+  'openspec.auto.preset_label',
+  'openspec.auto.owning_session',
+  'openspec.auto.launched_from',
+  'openspec.auto.execution_session',
+  'openspec.auto.spec_round',
+  'openspec.auto.impl_round',
+  'openspec.auto.active_p2p',
+  'openspec.auto.combo_id',
+  'openspec.auto.verdict',
+  'openspec.auto.terminal_reason',
+  'openspec.auto.task_stats',
+  'openspec.auto.scores',
+  'openspec.auto.scores_empty',
+  'openspec.auto.evidence',
+  'openspec.auto.evidence_stale',
+  'openspec.auto.error.missing_change',
+  'openspec.auto.error.active_run',
+  'openspec.auto.error.manual_team_busy',
+  'openspec.auto.error.unsupported_runtime',
+  'openspec.auto.error.launch_failed',
+  'openspec.auto.error.invalid_rounds',
+  'openspec.auto.error.daemon_offline',
+  'openspec.auto.error.launch_timeout',
+  'openspec.auto.error.custom_combo_unsupported',
+  'openspec.auto.error.strict_result_failed',
+  'openspec.auto.preset.fast',
+  'openspec.auto.preset.standard',
+  'openspec.auto.preset.strict',
+  'openspec.auto.preset.deep',
+  'openspec.auto.status.launching',
+  'openspec.auto.status.active',
+  'openspec.auto.status.passed',
+  'openspec.auto.status.needs_human',
+  'openspec.auto.status.failed',
+  'openspec.auto.status.stopped',
+  'openspec.auto.status.proposed',
+  'openspec.auto.status.implementation_task_loop',
+  'openspec.auto.stage.proposed',
+  'openspec.auto.stage.spec_audit_repair',
+  'openspec.auto.stage.implementation_task_loop',
+  'openspec.auto.stage.implementation_audit_repair',
+  'openspec.auto.stage.passed',
+  'openspec.auto.stage.needs_human',
+  'openspec.auto.stage.failed',
+  'openspec.auto.stage.stopped',
+  'openspec.auto.stage.stopping',
+  'openspec.auto.score_module.spec',
+  'openspec.auto.score_module.tasks',
+  'openspec.auto.score_module.implementation',
+  'openspec.auto.score_module.tests',
+  'openspec.auto.score_module.risk',
+  'openspec.auto.provenance.daemon',
+  'openspec.auto.provenance.implementation_reported',
+  'openspec.auto.provenance.audit_reported',
+  'openspec.auto.provenance.none',
+] as const;
 const CLONE_UI_KEYS = [
   'menu',
   'title',
@@ -155,7 +246,24 @@ const CHAT_FONT_CJK_FAMILY_KEYS = [
   'microsoft-jhenghei',
 ] as const;
 
+function readPath(value: unknown, path: string): unknown {
+  return path.split('.').reduce<unknown>((current, key) => (
+    current && typeof current === 'object' ? (current as Record<string, unknown>)[key] : undefined
+  ), value);
+}
+
 describe('generic i18n coverage guard', () => {
+  it('keeps OpenSpec Auto Deliver translation keys present in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      for (const key of OPENSPEC_AUTO_DELIVER_KEYS) {
+        const value = readPath(messages, key);
+        expect(value, `${locale}:${key}`).toEqual(expect.any(String));
+        expect((value as string | undefined)?.trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+      }
+    }
+  });
+
   it('keeps memory post-1.1 translation keys present in every locale', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as {

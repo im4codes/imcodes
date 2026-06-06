@@ -27,7 +27,7 @@ describe('P2P launch admission — Auto Deliver lock', () => {
       runId: 'auto-run-1',
       owningMainSessionName: 'deck_proj',
       generation: 2,
-      allowedComboIds: ['openspec_auto_deliver.implementation_audit_repair'],
+      selectedTeamComboId: 'audit>review>plan',
     });
 
     expect(evaluateP2pLaunchAdmission({
@@ -42,12 +42,15 @@ describe('P2P launch admission — Auto Deliver lock', () => {
     });
   });
 
-  it('allows only matching Auto Deliver metadata and designated combo ids through the lock', () => {
+  it('allows only matching Auto Deliver metadata, stage, round, combo, and prompt through the lock', () => {
     registerAutoDeliverP2pLock({
       runId: 'auto-run-2',
       owningMainSessionName: 'deck_proj',
       generation: 7,
-      allowedComboIds: ['openspec_auto_deliver.spec_audit_repair'],
+      stage: 'spec_audit_repair',
+      roundIndex: 1,
+      selectedTeamComboId: 'audit>review>plan',
+      activeOpenSpecPromptId: 'proposal_audit',
     });
 
     const matchingOrigin = {
@@ -58,8 +61,10 @@ describe('P2P launch admission — Auto Deliver lock', () => {
         owningMainSessionName: 'deck_proj',
         generation: 7,
         stage: 'spec_audit_repair',
+        roundIndex: 1,
         attemptId: 'attempt-1',
-        comboId: 'openspec_auto_deliver.spec_audit_repair',
+        selectedTeamComboId: 'audit>review>plan',
+        activeOpenSpecPromptId: 'proposal_audit',
       },
     };
 
@@ -73,8 +78,10 @@ describe('P2P launch admission — Auto Deliver lock', () => {
       { ...matchingOrigin, autoDeliver: { ...matchingOrigin.autoDeliver, runId: 'other-run' } },
       { ...matchingOrigin, autoDeliver: { ...matchingOrigin.autoDeliver, owningMainSessionName: 'deck_other' } },
       { ...matchingOrigin, autoDeliver: { ...matchingOrigin.autoDeliver, generation: 8 } },
-      { ...matchingOrigin, autoDeliver: { ...matchingOrigin.autoDeliver, comboId: 'openspec' } },
-      { ...matchingOrigin, autoDeliver: { ...matchingOrigin.autoDeliver, comboId: undefined } },
+      { ...matchingOrigin, autoDeliver: { ...matchingOrigin.autoDeliver, stage: 'implementation_audit_repair' } },
+      { ...matchingOrigin, autoDeliver: { ...matchingOrigin.autoDeliver, roundIndex: 2 } },
+      { ...matchingOrigin, autoDeliver: { ...matchingOrigin.autoDeliver, selectedTeamComboId: 'brainstorm>discuss>plan' } },
+      { ...matchingOrigin, autoDeliver: { ...matchingOrigin.autoDeliver, activeOpenSpecPromptId: 'implementation_audit' } },
     ]) {
       expect(evaluateP2pLaunchAdmission({
         mainSession: 'deck_proj',

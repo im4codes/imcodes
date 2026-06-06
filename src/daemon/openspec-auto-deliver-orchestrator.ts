@@ -9,17 +9,20 @@ import { getTransportRuntime } from '../agent/session-manager.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import {
-  resolveOpenSpecAutoDeliverCombo,
+  activeOpenSpecPromptIdForAutoDeliverStage,
+  evaluateOpenSpecAutoDeliverComboCompatibility,
+  materializeOpenSpecAutoDeliverStageRound,
 } from '../../shared/openspec-auto-deliver-combos.js';
 import {
-  OPENSPEC_AUTO_DELIVER_COMBO_IDS,
+  OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
+  OPENSPEC_AUTO_DELIVER_LAUNCH_ORIGIN,
   OPENSPEC_AUTO_DELIVER_MSG,
   isOpenSpecAutoDeliverTerminalStage,
   materializeOpenSpecAutoDeliverPreset,
-  type OpenSpecAutoDeliverComboId,
   type OpenSpecAutoDeliverPresetId,
+  type OpenSpecAutoDeliverStagePromptId,
   type OpenSpecAutoDeliverStage,
   type OpenSpecAutoDeliverVerdict,
 } from '../../shared/openspec-auto-deliver-constants.js';
@@ -42,7 +45,6 @@ import {
   parseOpenSpecAutoDeliverAuthoritativeJsonPayload,
   parseOpenSpecTasksMarkdown,
   validateOpenSpecAutoDeliverChangeSlug,
-  validateOpenSpecAutoDeliverComboDescriptor,
   validateOpenSpecAutoDeliverLaunchRequest,
   validateOpenSpecAutoDeliverRequestId,
   validateOpenSpecAutoDeliverVerdictPayload,
@@ -151,6 +153,7 @@ interface AutoDeliverRun {
   launchedFromSessionName: string;
   targetImplementationSessionName: string;
   presetId: OpenSpecAutoDeliverPresetId;
+  selectedTeamComboId: string;
   materializedLimits: OpenSpecAutoDeliverProjection['materializedLimits'];
   status: AutoDeliverRunStatus;
   stage: OpenSpecAutoDeliverStage;
@@ -167,7 +170,8 @@ interface AutoDeliverRun {
   activeCommandId?: string;
   activeAudit?: {
     p2pRunId: string;
-    comboId: OpenSpecAutoDeliverComboId;
+    selectedTeamComboId: string;
+    activeOpenSpecPromptId: OpenSpecAutoDeliverStagePromptId;
     stage: AuditRepairStage;
     attemptId: string;
     roundIndex: number;
@@ -188,7 +192,7 @@ type LaunchResult =
 const runsById = new Map<string, AutoDeliverRun>();
 const activeRunByOwner = new Map<string, string>();
 const terminalRunByOwner = new Map<string, AutoDeliverRun>();
-const requestProjectionById = new Map<string, OpenSpecAutoDeliverProjection>();
+const requestProjectionByFingerprint = new Map<string, OpenSpecAutoDeliverProjection>();
 const auditPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let timelineUnsubscribe: (() => void) | null = null;
 const execFileAsync = promisify(execFile);
@@ -269,6 +273,7 @@ function enforceElapsedLimit(run: AutoDeliverRun): OpenSpecAutoDeliverProjection
 
 function buildProjection(run: AutoDeliverRun): OpenSpecAutoDeliverProjection {
   return {
+    visibility: 'full',
     projectionVersion: run.projectionVersion,
     runId: run.runId,
     changeName: run.changeName,
@@ -290,11 +295,13 @@ function buildProjection(run: AutoDeliverRun): OpenSpecAutoDeliverProjection {
     specAuditRepairRound: run.specAuditRepairRound,
     implementationAuditRepairRound: run.implementationAuditRepairRound,
     activeP2pRunId: run.activeAudit?.p2pRunId,
+    selectedTeamComboId: run.selectedTeamComboId,
+    activeOpenSpecPromptId: run.activeAudit?.activeOpenSpecPromptId,
+    canStop: !isOpenSpecAutoDeliverTerminalStage(run.status),
     latestRepairSummary: run.latestRepairSummary,
     latestVerdict: run.latestVerdict,
     moduleScores: run.moduleScores ? run.moduleScores.map((score) => ({ ...score })) : undefined,
     evidence: run.evidence ? run.evidence.map((entry) => ({ ...entry })) : undefined,
-    activeComboId: run.activeAudit?.comboId,
     lastMessage: run.latestMessage,
     terminalReason: run.terminalReason,
   };
@@ -304,11 +311,33 @@ function bumpProjection(run: AutoDeliverRun): OpenSpecAutoDeliverProjection {
   run.projectionVersion += 1;
   run.updatedAt = Date.now();
   const projection = buildProjection(run);
-  for (const requestId of run.requestIds.keys()) {
-    run.requestIds.set(requestId, projection);
-    requestProjectionById.set(requestId, projection);
+  for (const fingerprint of run.requestIds.keys()) {
+    run.requestIds.set(fingerprint, projection);
+    requestProjectionByFingerprint.set(fingerprint, projection);
   }
   return projection;
+}
+
+function openSpecAutoDeliverLaunchFingerprint(input: {
+  requestId: string;
+  sessionName: string;
+  changeName: string;
+  presetId: string;
+  selectedTeamComboId: string;
+  materializedLimits: unknown;
+}): string {
+  return JSON.stringify(input);
+}
+
+function forgetRequestProjectionFingerprints(run: AutoDeliverRun): void {
+  for (const fingerprint of run.requestIds.keys()) {
+    requestProjectionByFingerprint.delete(fingerprint);
+  }
+  run.requestIds.clear();
+}
+
+function effectiveMaxImplementationPrompts(run: AutoDeliverRun): number {
+  return run.materializedLimits.maxImplementationPrompts ?? OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS;
 }
 
 async function resolveChangeRoot(sessionName: string, changeName: string): Promise<{ ok: true; projectRoot: string; root: string } | { ok: false; error: string }> {
@@ -328,7 +357,39 @@ async function resolveChangeRoot(sessionName: string, changeName: string): Promi
   const proposalOk = await stat(join(resolved, 'proposal.md')).then((s) => s.isFile()).catch(() => false);
   const tasksOk = await stat(join(resolved, 'tasks.md')).then((s) => s.isFile()).catch(() => false);
   if (!proposalOk || !tasksOk) return { ok: false, error: 'missing_required_artifacts' };
+  if (!(await hasOpenSpecDelta(resolved))) return { ok: false, error: 'missing_spec_delta' };
   return { ok: true, projectRoot, root: resolved };
+}
+
+async function hasOpenSpecDelta(changeRoot: string): Promise<boolean> {
+  const specsRoot = join(changeRoot, 'specs');
+  const resolvedSpecsRoot = await realpath(specsRoot).catch(() => null);
+  if (!resolvedSpecsRoot || !(resolvedSpecsRoot === changeRoot || resolvedSpecsRoot.startsWith(`${changeRoot}/`))) {
+    return false;
+  }
+  const stack = [specsRoot];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current) continue;
+    const resolvedCurrent = await realpath(current).catch(() => null);
+    if (!resolvedCurrent || !(resolvedCurrent === changeRoot || resolvedCurrent.startsWith(`${changeRoot}/`))) {
+      return false;
+    }
+    const entries = await readdir(current, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const fullPath = join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+      } else if (entry.isFile() && entry.name === 'spec.md') {
+        const resolvedFile = await realpath(fullPath).catch(() => null);
+        if (!resolvedFile || !(resolvedFile === changeRoot || resolvedFile.startsWith(`${changeRoot}/`))) {
+          return false;
+        }
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 async function readTaskStats(changeRoot: string): Promise<OpenSpecAutoDeliverTaskStats> {
@@ -398,6 +459,7 @@ function uncheckedTaskLabels(stats: OpenSpecAutoDeliverTaskStats): string[] {
 
 function buildImplementationPrompt(run: AutoDeliverRun): string {
   const remaining = uncheckedTaskLabels(run.taskStats);
+  const maxImplementationPrompts = effectiveMaxImplementationPrompts(run);
   const validationSummary = run.evidence?.filter((entry) => entry.source === 'daemon').map((entry) => `- ${entry.summary}`).join('\n')
     || '- No daemon validation recommendations are available.';
   const remainingBlock = remaining.length > 0
@@ -408,7 +470,7 @@ function buildImplementationPrompt(run: AutoDeliverRun): string {
     '',
     `Run id: ${run.runId}`,
     `Generation: ${run.generation}`,
-    `Implementation prompt: ${run.implementationPromptCount + 1}/${OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS}`,
+    `Implementation prompt: ${run.implementationPromptCount + 1}/${maxImplementationPrompts}`,
     '',
     'Implement only this OpenSpec change. Do not commit, push, or stage files. Do not modify unrelated OpenSpec changes or docs.',
     'Work through the remaining tasks below. Mark tasks.md checkboxes only after the work is genuinely complete.',
@@ -428,7 +490,7 @@ function dispatchImplementationPrompt(run: AutoDeliverRun): OpenSpecAutoDeliverP
   if (!transitionAllowed(run, 'implementation_prompt_dispatched')) {
     return terminalize(run, 'failed', 'invalid_transition_implementation_prompt');
   }
-  if (run.implementationPromptCount >= OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS) {
+  if (run.implementationPromptCount >= effectiveMaxImplementationPrompts(run)) {
     return terminalize(run, 'needs_human', 'implementation_prompt_limit_reached');
   }
   const runtime = getTransportRuntime(run.targetImplementationSessionName);
@@ -453,12 +515,6 @@ function dispatchImplementationPrompt(run: AutoDeliverRun): OpenSpecAutoDeliverP
   }
   run.latestMessage = 'implementation_prompt_dispatched';
   return broadcastProjection(run);
-}
-
-function auditComboIdForStage(stage: AuditRepairStage): OpenSpecAutoDeliverComboId {
-  return stage === 'spec_audit_repair'
-    ? OPENSPEC_AUTO_DELIVER_COMBO_IDS.SPEC_AUDIT_REPAIR
-    : OPENSPEC_AUTO_DELIVER_COMBO_IDS.IMPLEMENTATION_AUDIT_REPAIR;
 }
 
 function auditRoundLimit(run: AutoDeliverRun, stage: AuditRepairStage): number {
@@ -551,7 +607,8 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
       changeName: metadata.changeName,
       resolvedChangeRootIdentity: metadata.resolvedChangeRootIdentity,
       stage: metadata.stage,
-      designatedComboId: metadata.designatedComboId,
+      selectedTeamComboId: metadata.selectedTeamComboId,
+      activeOpenSpecPromptId: metadata.activeOpenSpecPromptId,
       roundIndex: metadata.roundIndex,
       attemptId: metadata.attemptId,
       owningMainSessionName: metadata.owningMainSessionName,
@@ -582,7 +639,8 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
     `Stage: ${metadata.stage}`,
     `Generation: ${metadata.generation}`,
     `Attempt id: ${metadata.attemptId}`,
-    `Designated combo id: ${metadata.designatedComboId}`,
+    `Selected Team combo id: ${metadata.selectedTeamComboId}`,
+    `Active OpenSpec prompt id: ${metadata.activeOpenSpecPromptId}`,
     `Round: ${metadata.roundIndex}/${auditRoundLimit(run, metadata.stage)}`,
     `Owning main session: ${metadata.owningMainSessionName}`,
     `Execution session: ${metadata.executionSessionName}`,
@@ -595,11 +653,12 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
     metadata.stage === 'implementation_audit_repair' ? changedFiles : '',
     metadata.stage === 'implementation_audit_repair' ? diffStat : '',
     '',
-    'Return exactly one authoritative fenced JSON payload in your final result. Do not include another JSON fence.',
+    'Return exactly one authoritative fenced JSON payload through the runtime-bounded strict result segment. Do not include another JSON fence.',
     'The JSON must preserve the auto_deliver metadata exactly and must include canonical module scores.',
     '',
-    'Required JSON object shape, shown inline to avoid seeding an extra authoritative fence:',
-    JSON.stringify(payloadSkeleton, null, 2),
+    `Required top-level fields: ${Object.keys(payloadSkeleton).join(', ')}.`,
+    `Required auto_deliver fields: ${Object.keys(payloadSkeleton.auto_deliver).join(', ')}.`,
+    'Required module score ids: spec, tasks, implementation, tests, risk.',
   ].join('\n');
 }
 
@@ -613,7 +672,8 @@ function validateAuditMetadata(input: unknown, expected: OpenSpecAutoDeliverP2pM
     && actual.changeName === expected.changeName
     && actual.resolvedChangeRootIdentity === expected.resolvedChangeRootIdentity
     && actual.stage === expected.stage
-    && actual.designatedComboId === expected.designatedComboId
+    && actual.selectedTeamComboId === expected.selectedTeamComboId
+    && actual.activeOpenSpecPromptId === expected.activeOpenSpecPromptId
     && actual.roundIndex === expected.roundIndex
     && actual.attemptId === expected.attemptId
     && actual.owningMainSessionName === expected.owningMainSessionName
@@ -626,22 +686,21 @@ function repairSummaryText(repairs: OpenSpecAutoDeliverRepairSummary[]): string 
   return repairs.map((repair) => `${repair.files.join(', ') || '(unspecified files)'}: ${repair.reason}`).join('; ');
 }
 
-function validateFinalPass(run: AutoDeliverRun, verdict: OpenSpecAutoDeliverVerdictPayload): string | null {
+function validateFinalPass(run: AutoDeliverRun, verdict: OpenSpecAutoDeliverVerdictPayload, changedFiles: string[] = []): string | null {
   if (verdict.verdict !== 'PASS') return null;
   if (run.taskStats.total <= 0) return 'tasks_missing_checkboxes';
   if (run.taskStats.unchecked > 0) return 'audit_pass_with_unchecked_tasks';
   if (verdict.unchecked_tasks.length > 0) return 'audit_pass_with_reported_unchecked_tasks';
   if (verdict.required_changes.length > 0) return 'audit_pass_with_required_changes';
+  const repairedFiles = new Set(verdict.repairs_applied.flatMap((repair) => repair.files));
+  const uncoveredChangedFiles = changedFiles.filter((file) => !repairedFiles.has(file));
+  if (uncoveredChangedFiles.length > 0) return 'audit_pass_with_uncovered_changed_files';
   return null;
 }
 
 async function consumeAuditDiscussion(run: AutoDeliverRun, p2pRun: P2pRun, expected: OpenSpecAutoDeliverP2pMetadata): Promise<OpenSpecAutoDeliverVerdictPayload | null> {
   const strictResult = (p2pRun as P2pRun & { strictAuthoritativeResult?: string | null }).strictAuthoritativeResult;
-  const text = typeof strictResult === 'string' && strictResult.trim()
-    ? strictResult
-    : typeof p2pRun.resultSummary === 'string' && p2pRun.resultSummary.trim()
-      ? p2pRun.resultSummary
-      : '';
+  const text = typeof strictResult === 'string' && strictResult.trim() ? strictResult : '';
   const parsed = parseOpenSpecAutoDeliverAuthoritativeJsonPayload(text);
   if (!parsed.ok) {
     run.latestMessage = parsed.issues.map((entry) => entry.code).join(',') || 'invalid_authoritative_json';
@@ -684,6 +743,7 @@ function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 
   activeRunByOwner.delete(run.owningMainSessionName);
   terminalRunByOwner.set(run.owningMainSessionName, run);
   releaseAutoDeliverP2pLock(run.owningMainSessionName, run.runId);
+  forgetRequestProjectionFingerprints(run);
   return bumpProjection(run);
 }
 
@@ -740,7 +800,12 @@ async function advanceAfterAuditVerdict(run: AutoDeliverRun, stage: AuditRepairS
         stale: false,
       },
     ]);
-    const finalFailure = validateFinalPass(run, verdict);
+    if (gitEvidence.changedFiles.length > 0 && verdict.repairs_applied.length === 0) {
+      const projection = terminalize(run, 'needs_human', 'audit_pass_with_changed_files_without_repairs');
+      send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+      return;
+    }
+    const finalFailure = validateFinalPass(run, verdict, gitEvidence.changedFiles);
     if (finalFailure) {
       const projection = terminalize(run, 'needs_human', finalFailure);
       send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
@@ -768,7 +833,8 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
     !active
     || active.attemptId !== expected.attemptId
     || active.stage !== expected.stage
-    || active.comboId !== expected.designatedComboId
+    || active.selectedTeamComboId !== expected.selectedTeamComboId
+    || active.activeOpenSpecPromptId !== expected.activeOpenSpecPromptId
     || active.generation !== expected.generation
   ) {
     return;
@@ -814,11 +880,14 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
   if (!(await refreshChangeRoot(run))) {
     return terminalizeAndSend(run, 'failed', run.latestMessage ?? 'change_root_invalid');
   }
-  const comboId = auditComboIdForStage(stage);
-  const descriptor = resolveOpenSpecAutoDeliverCombo(comboId);
-  const descriptorValidation = validateOpenSpecAutoDeliverComboDescriptor(descriptor);
-  if (!descriptor || !descriptorValidation.ok || descriptor.capability.stage !== stage) {
-    return terminalizeAndSend(run, 'failed', 'designated_combo_unavailable');
+  const activeOpenSpecPromptId = activeOpenSpecPromptIdForAutoDeliverStage(stage);
+  const compatibility = evaluateOpenSpecAutoDeliverComboCompatibility(run.selectedTeamComboId, stage, activeOpenSpecPromptId);
+  if (!compatibility.ok) {
+    return terminalizeAndSend(run, 'failed', compatibility.reason ?? 'selected_combo_unavailable');
+  }
+  const materialized = materializeOpenSpecAutoDeliverStageRound(stage, run.selectedTeamComboId);
+  if ('error' in materialized) {
+    return terminalizeAndSend(run, 'failed', materialized.error ?? 'stage_materialization_failed');
   }
   const roundIndex = incrementAuditRound(run, stage);
   const attemptId = `${run.runId}:${stage}:${run.generation}:${roundIndex}`;
@@ -830,7 +899,8 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
     changeName: run.changeName,
     resolvedChangeRootIdentity: run.changeRootIdentity,
     stage,
-    designatedComboId: comboId,
+    selectedTeamComboId: run.selectedTeamComboId,
+    activeOpenSpecPromptId,
     roundIndex,
     attemptId,
     generation: run.generation,
@@ -860,12 +930,22 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
   }
   run.activeAudit = {
     p2pRunId: '',
-    comboId,
+    selectedTeamComboId: run.selectedTeamComboId,
+    activeOpenSpecPromptId,
     stage,
     attemptId,
     roundIndex,
     generation: run.generation,
   };
+  registerAutoDeliverP2pLock({
+    runId: run.runId,
+    owningMainSessionName: run.owningMainSessionName,
+    generation: run.generation,
+    stage,
+    roundIndex,
+    selectedTeamComboId: run.selectedTeamComboId,
+    activeOpenSpecPromptId,
+  });
   const p2pRun = await startP2pRun({
     initiatorSession: run.targetImplementationSessionName,
     targets: [],
@@ -874,10 +954,10 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
     serverLink: run.serverLink,
     modeOverride: 'audit',
     advanced: {
-      kind: 'supervision_internal',
-      advancedPresetKey: comboId,
-      advancedRounds: descriptor.rounds,
-      advancedRunTimeoutMs: Math.max(1, descriptor.rounds[0]?.timeoutMinutes ?? 10) * 60_000,
+      kind: OPENSPEC_AUTO_DELIVER_LAUNCH_ORIGIN,
+      advancedPresetKey: activeOpenSpecPromptId,
+      advancedRounds: [materialized.round],
+      advancedRunTimeoutMs: Math.max(1, materialized.round.timeoutMinutes ?? 10) * 60_000,
     },
     launchOrigin: {
       kind: 'openspec_auto_deliver',
@@ -888,8 +968,10 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
         owningMainSessionName: run.owningMainSessionName,
         generation: run.generation,
         stage,
+        roundIndex,
         attemptId,
-        comboId,
+        selectedTeamComboId: run.selectedTeamComboId,
+        activeOpenSpecPromptId,
       },
     },
   });
@@ -1004,8 +1086,6 @@ async function launch(request: OpenSpecAutoDeliverLaunchRequest, serverLink: Ser
   }
   const requestId = validateOpenSpecAutoDeliverRequestId(launchValidation.value.requestId);
   if (!requestId.ok) return { ok: false, error: 'invalid_request_id' };
-  const cached = requestProjectionById.get(requestId.value);
-  if (cached) return { ok: true, projection: cached };
 
   const change = validateOpenSpecAutoDeliverChangeSlug(launchValidation.value.changeName);
   if (!change.ok) return { ok: false, error: 'invalid_change_name' };
@@ -1015,6 +1095,19 @@ async function launch(request: OpenSpecAutoDeliverLaunchRequest, serverLink: Ser
   if (session.runtimeType !== 'transport') return { ok: false, error: 'unsupported_runtime' };
 
   const owner = resolveOpenSpecAutoDeliverOwningMainSession(sessionName);
+  const presetId = launchValidation.value.presetId;
+  const materializedLimits = launchValidation.value.materializedLimits ?? materializeOpenSpecAutoDeliverPreset(presetId);
+  const selectedTeamComboId = launchValidation.value.selectedTeamComboId ?? OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID;
+  const launchFingerprint = openSpecAutoDeliverLaunchFingerprint({
+    requestId: requestId.value,
+    sessionName,
+    changeName: change.value,
+    presetId,
+    selectedTeamComboId,
+    materializedLimits,
+  });
+  const cached = requestProjectionByFingerprint.get(launchFingerprint);
+  if (cached) return { ok: true, projection: cached };
   const existing = activeRunForOwner(owner);
   if (existing && !isOpenSpecAutoDeliverTerminalStage(existing.status)) {
     return { ok: false, error: 'auto_deliver_active', projection: buildProjection(existing) };
@@ -1022,12 +1115,32 @@ async function launch(request: OpenSpecAutoDeliverLaunchRequest, serverLink: Ser
   if (hasActiveP2pRunForMainSession(listP2pRuns(), owner)) {
     return { ok: false, error: 'team_lane_busy' };
   }
+  const firstAuditStage: AuditRepairStage = materializedLimits.specAuditRepairRounds > 0
+    ? 'spec_audit_repair'
+    : 'implementation_audit_repair';
+  const compatibility = evaluateOpenSpecAutoDeliverComboCompatibility(
+    selectedTeamComboId,
+    firstAuditStage,
+    activeOpenSpecPromptIdForAutoDeliverStage(firstAuditStage),
+  );
+  if (!compatibility.ok) return { ok: false, error: compatibility.reason ?? 'selected_combo_unavailable' };
 
+  registerAutoDeliverP2pLock({
+    runId: `launch:${owner}`,
+    owningMainSessionName: owner,
+    generation: 0,
+    selectedTeamComboId,
+  });
   const resolved = await resolveChangeRoot(sessionName, change.value);
-  if (!resolved.ok) return { ok: false, error: resolved.error };
+  if (!resolved.ok) {
+    releaseAutoDeliverP2pLock(owner, `launch:${owner}`);
+    return { ok: false, error: resolved.error };
+  }
   const taskStats = await readTaskStats(resolved.root).catch(() => null);
-  if (!taskStats || taskStats.total <= 0) return { ok: false, error: 'tasks_missing_checkboxes' };
-  const presetId = launchValidation.value.presetId;
+  if (!taskStats || taskStats.total <= 0) {
+    releaseAutoDeliverP2pLock(owner, `launch:${owner}`);
+    return { ok: false, error: 'tasks_missing_checkboxes' };
+  }
   const now = Date.now();
   const run: AutoDeliverRun = {
     runId: `auto_${randomUUID().slice(0, 12)}`,
@@ -1039,7 +1152,8 @@ async function launch(request: OpenSpecAutoDeliverLaunchRequest, serverLink: Ser
     launchedFromSessionName: sessionName,
     targetImplementationSessionName: sessionName,
     presetId,
-    materializedLimits: materializeOpenSpecAutoDeliverPreset(presetId),
+    selectedTeamComboId,
+    materializedLimits,
     status: 'proposed',
     stage: 'proposed',
     generation: 1,
@@ -1061,14 +1175,11 @@ async function launch(request: OpenSpecAutoDeliverLaunchRequest, serverLink: Ser
     runId: run.runId,
     owningMainSessionName: owner,
     generation: run.generation,
-    allowedComboIds: [
-      OPENSPEC_AUTO_DELIVER_COMBO_IDS.SPEC_AUDIT_REPAIR,
-      OPENSPEC_AUTO_DELIVER_COMBO_IDS.IMPLEMENTATION_AUDIT_REPAIR,
-    ],
+    selectedTeamComboId: run.selectedTeamComboId,
   });
   const projection = buildProjection(run);
-  run.requestIds.set(requestId.value, projection);
-  requestProjectionById.set(requestId.value, projection);
+  run.requestIds.set(launchFingerprint, projection);
+  requestProjectionByFingerprint.set(launchFingerprint, projection);
   return { ok: true, projection };
 }
 
@@ -1171,5 +1282,5 @@ export function clearOpenSpecAutoDeliverRunsForTests(): void {
   runsById.clear();
   activeRunByOwner.clear();
   terminalRunByOwner.clear();
-  requestProjectionById.clear();
+  requestProjectionByFingerprint.clear();
 }

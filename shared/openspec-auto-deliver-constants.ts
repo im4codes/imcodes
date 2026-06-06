@@ -8,6 +8,8 @@ export const OPENSPEC_AUTO_DELIVER_MSG = {
   STOP_ACK: 'openspec_auto_deliver.stop_ack',
   STATUS_REQUEST: 'openspec_auto_deliver.status_request',
   STATUS_PROJECTION: 'openspec_auto_deliver.status_projection',
+  LIST_REQUEST: 'openspec_auto_deliver.list_request',
+  LIST_RESPONSE: 'openspec_auto_deliver.list_response',
   PROJECTION: 'openspec_auto_deliver.projection',
   CONFLICT_SUMMARY: 'openspec_auto_deliver.conflict_summary',
   TERMINAL: 'openspec_auto_deliver.terminal',
@@ -15,7 +17,7 @@ export const OPENSPEC_AUTO_DELIVER_MSG = {
 
 export type OpenSpecAutoDeliverMsgType = (typeof OPENSPEC_AUTO_DELIVER_MSG)[keyof typeof OPENSPEC_AUTO_DELIVER_MSG];
 
-export const OPENSPEC_AUTO_DELIVER_PRESET_IDS = ['fast', 'standard', 'strict', 'deep'] as const;
+export const OPENSPEC_AUTO_DELIVER_PRESET_IDS = ['fast', 'standard', 'strict', 'deep', 'custom'] as const;
 export type OpenSpecAutoDeliverPresetId = (typeof OPENSPEC_AUTO_DELIVER_PRESET_IDS)[number];
 
 export const OPENSPEC_AUTO_DELIVER_PRESET_LIMITS = {
@@ -23,6 +25,7 @@ export const OPENSPEC_AUTO_DELIVER_PRESET_LIMITS = {
   standard: { specAuditRepairRounds: 1, implementationAuditRepairRounds: 2 },
   strict: { specAuditRepairRounds: 2, implementationAuditRepairRounds: 2 },
   deep: { specAuditRepairRounds: 2, implementationAuditRepairRounds: 3 },
+  custom: { specAuditRepairRounds: 1, implementationAuditRepairRounds: 2 },
 } as const satisfies Record<OpenSpecAutoDeliverPresetId, OpenSpecAutoDeliverRoundLimits>;
 
 export const OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET_ID = 'standard' as const satisfies OpenSpecAutoDeliverPresetId;
@@ -32,8 +35,18 @@ export interface OpenSpecAutoDeliverRoundLimits {
   implementationAuditRepairRounds: number;
 }
 
+export const OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MIN = 0 as const;
+export const OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX = 3 as const;
+export const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MIN = 1 as const;
+export const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX = 5 as const;
 export const OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS = 12 as const;
 export const OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES = 60 as const;
+export const OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID = 'audit>review>plan' as const;
+export const OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_PROMPT_ID = 'proposal_audit' as const;
+export const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_PROMPT_ID = 'implementation_audit' as const;
+export type OpenSpecAutoDeliverStagePromptId =
+  | typeof OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_PROMPT_ID
+  | typeof OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_PROMPT_ID;
 
 export const OPENSPEC_AUTO_DELIVER_STAGES = [
   'proposed',
@@ -109,6 +122,10 @@ export type OpenSpecAutoDeliverMutationScope = (typeof OPENSPEC_AUTO_DELIVER_MUT
 
 export const OPENSPEC_AUTO_DELIVER_LOCK_OWNER = 'openspec_auto_deliver' as const;
 export const OPENSPEC_AUTO_DELIVER_LAUNCH_ORIGIN = 'openspec_auto_deliver_internal' as const;
+export const OPENSPEC_AUTO_DELIVER_PROJECTION_VISIBILITIES = ['full', 'conflict'] as const;
+export type OpenSpecAutoDeliverProjectionVisibility = (typeof OPENSPEC_AUTO_DELIVER_PROJECTION_VISIBILITIES)[number];
+export const OPENSPEC_AUTO_DELIVER_VIEW_MODES = ['fullRunbar', 'compactRecovery', 'conflict', 'hidden'] as const;
+export type OpenSpecAutoDeliverViewMode = (typeof OPENSPEC_AUTO_DELIVER_VIEW_MODES)[number];
 
 export const OPENSPEC_AUTO_DELIVER_REQUEST_ID_MAX_BYTES = 128 as const;
 export const OPENSPEC_AUTO_DELIVER_CHANGE_SLUG_MAX_BYTES = 160 as const;

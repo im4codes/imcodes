@@ -1,9 +1,20 @@
 import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET_ID,
+  OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
   OPENSPEC_AUTO_DELIVER_MSG,
   OPENSPEC_AUTO_DELIVER_PRESET_LIMITS,
+  OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX,
+  OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MIN,
+  OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX,
+  OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MIN,
   type OpenSpecAutoDeliverPresetId,
 } from '@shared/openspec-auto-deliver-constants.js';
+import type {
+  OpenSpecAutoDeliverBrowserProjection,
+  OpenSpecAutoDeliverLaunchRequest,
+  OpenSpecAutoDeliverStatusRequest,
+  OpenSpecAutoDeliverStopRequest,
+} from '@shared/openspec-auto-deliver-types.js';
 
 export { OPENSPEC_AUTO_DELIVER_MSG };
 
@@ -17,122 +28,42 @@ export const OPENSPEC_AUTO_DELIVER_PRESETS = [
 ] as const;
 
 export type { OpenSpecAutoDeliverPresetId };
+export type {
+  OpenSpecAutoDeliverBrowserConflictProjection,
+  OpenSpecAutoDeliverBrowserEvidence as OpenSpecAutoDeliverEvidence,
+  OpenSpecAutoDeliverBrowserFullProjection,
+  OpenSpecAutoDeliverBrowserModuleScore as OpenSpecAutoDeliverModuleScore,
+  OpenSpecAutoDeliverBrowserProjection as OpenSpecAutoDeliverProjection,
+  OpenSpecAutoDeliverBrowserTaskStats as OpenSpecAutoDeliverTaskStats,
+  OpenSpecAutoDeliverListRow,
+} from '@shared/openspec-auto-deliver-types.js';
 
 export const OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET: OpenSpecAutoDeliverPresetId = OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET_ID;
+export const OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO = OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID;
+export const OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS = {
+  specMin: OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MIN,
+  specMax: OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX,
+  implementationMin: OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MIN,
+  implementationMax: OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX,
+} as const;
 
-export type OpenSpecAutoDeliverStatus =
-  | 'launching'
-  | 'active'
-  | 'passed'
-  | 'needs_human'
-  | 'failed'
-  | 'stopped';
-
-export type OpenSpecAutoDeliverStage =
-  | 'proposed'
-  | 'spec_audit_repair'
-  | 'implementation_task_loop'
-  | 'implementation_audit_repair'
-  | 'passed'
-  | 'needs_human'
-  | 'failed'
-  | 'stopped';
-
-export type OpenSpecAutoDeliverVerdict = 'PASS' | 'REWORK' | 'BLOCKED';
-
-export interface OpenSpecAutoDeliverTaskStats {
-  total: number;
-  checked: number;
-  unchecked: number;
-  uncheckedLabels?: string[];
-  items?: Array<{ line?: number; checked: boolean; label: string }>;
-}
-
-export interface OpenSpecAutoDeliverModuleScore {
-  module: 'spec' | 'tasks' | 'implementation' | 'tests' | 'risk' | string;
-  score: number;
-  maxScore?: number;
-  max_score?: number;
-  summary?: string;
-}
-
-export interface OpenSpecAutoDeliverEvidence {
-  label?: string;
-  provenance?: 'daemon' | 'implementation_reported' | 'audit_reported' | 'none' | string;
-  source?: 'daemon' | 'implementation_reported' | 'audit_reported' | 'none' | string;
-  summary?: string;
-  command?: string;
-  exitCode?: number;
-  stale?: boolean;
-}
-
-export interface OpenSpecAutoDeliverProjection {
-  runId: string;
-  projectionVersion: number;
-  visibility?: 'full' | 'conflict';
-  changeName: string;
-  presetId?: OpenSpecAutoDeliverPresetId | string;
-  status: OpenSpecAutoDeliverStatus | string;
-  stage: OpenSpecAutoDeliverStage | string;
-  startedAt?: number;
-  elapsedMs?: number;
-  owningMainSessionName?: string;
-  launchedFromSessionName?: string;
-  targetImplementationSessionName?: string;
-  materializedLimits?: {
-    specAuditRepairRounds: number;
-    implementationAuditRepairRounds: number;
-    maxImplementationPrompts?: number;
-    maxElapsedMinutes?: number;
-  };
-  specAuditRepairRound?: number;
-  implementationAuditRepairRound?: number;
-  specAuditRound?: { current: number; total: number };
-  implementationAuditRound?: { current: number; total: number };
-  implementationPromptCount?: number;
-  taskStats?: OpenSpecAutoDeliverTaskStats;
-  activeP2pRunId?: string | null;
-  activeComboId?: string | null;
-  latestVerdict?: OpenSpecAutoDeliverVerdict | string | null;
-  moduleScores?: OpenSpecAutoDeliverModuleScore[];
-  latestRepairSummary?: string | null;
-  evidence?: OpenSpecAutoDeliverEvidence[];
-  recentFinding?: string | null;
-  terminalReason?: string | null;
-  conflictReason?: string | null;
-  canStop?: boolean;
-  canDismiss?: boolean;
-}
-
-export interface OpenSpecAutoDeliverLaunchPayload {
+export interface OpenSpecAutoDeliverLaunchPayload extends OpenSpecAutoDeliverLaunchRequest {
   type: typeof OPENSPEC_AUTO_DELIVER_MSG.LAUNCH;
-  requestId: string;
-  serverId?: string;
-  sessionName: string;
-  changeName: string;
-  presetId: OpenSpecAutoDeliverPresetId;
 }
 
-export interface OpenSpecAutoDeliverStopPayload {
+export interface OpenSpecAutoDeliverStopPayload extends OpenSpecAutoDeliverStopRequest {
   type: typeof OPENSPEC_AUTO_DELIVER_MSG.STOP;
-  requestId: string;
-  serverId?: string;
-  sessionName: string;
-  runId: string;
 }
 
-export interface OpenSpecAutoDeliverStatusRequestPayload {
+export interface OpenSpecAutoDeliverStatusRequestPayload extends OpenSpecAutoDeliverStatusRequest {
   type: typeof OPENSPEC_AUTO_DELIVER_MSG.STATUS_REQUEST;
-  requestId: string;
-  serverId?: string;
-  sessionName: string;
 }
 
-export function isOpenSpecAutoDeliverTerminalStatus(status: OpenSpecAutoDeliverStatus | string | undefined): boolean {
+export function isOpenSpecAutoDeliverTerminalStatus(status: string | undefined): boolean {
   return status === 'passed' || status === 'needs_human' || status === 'failed' || status === 'stopped';
 }
 
-export function isOpenSpecAutoDeliverActiveProjection(projection: OpenSpecAutoDeliverProjection | null | undefined): boolean {
+export function isOpenSpecAutoDeliverActiveProjection(projection: OpenSpecAutoDeliverBrowserProjection | null | undefined): boolean {
   return !!projection && !isOpenSpecAutoDeliverTerminalStatus(projection.status);
 }
 

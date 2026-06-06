@@ -8,8 +8,10 @@ export interface P2pAutoDeliverLaunchMetadata {
   owningMainSessionName: string;
   generation: number;
   stage: string;
+  roundIndex?: number;
   attemptId?: string;
-  comboId?: string;
+  selectedTeamComboId?: string;
+  activeOpenSpecPromptId?: string;
 }
 
 export interface P2pLaunchOrigin {
@@ -33,7 +35,10 @@ export interface AutoDeliverP2pLock {
   runId: string;
   owningMainSessionName: string;
   generation: number;
-  allowedComboIds?: readonly string[];
+  stage?: string;
+  roundIndex?: number;
+  selectedTeamComboId?: string;
+  activeOpenSpecPromptId?: string;
 }
 
 export interface P2pLaunchAdmissionInput {
@@ -56,7 +61,6 @@ const activeAutoDeliverLocks = new Map<string, AutoDeliverP2pLock>();
 export function registerAutoDeliverP2pLock(lock: AutoDeliverP2pLock): void {
   activeAutoDeliverLocks.set(lock.owningMainSessionName, {
     ...lock,
-    allowedComboIds: lock.allowedComboIds ? [...lock.allowedComboIds] : undefined,
   });
 }
 
@@ -70,9 +74,7 @@ export function releaseAutoDeliverP2pLock(owningMainSessionName: string, runId?:
 
 export function getAutoDeliverP2pLock(owningMainSessionName: string): AutoDeliverP2pLock | undefined {
   const existing = activeAutoDeliverLocks.get(owningMainSessionName);
-  return existing
-    ? { ...existing, allowedComboIds: existing.allowedComboIds ? [...existing.allowedComboIds] : undefined }
-    : undefined;
+  return existing ? { ...existing } : undefined;
 }
 
 export function clearAutoDeliverP2pLocksForTests(): void {
@@ -86,14 +88,19 @@ export function evaluateP2pLaunchAdmission(input: P2pLaunchAdmissionInput): P2pL
   const autoDeliver = input.origin?.kind === 'openspec_auto_deliver'
     ? input.origin.autoDeliver
     : undefined;
-  const comboAllowed = !lock.allowedComboIds?.length
-    || (typeof autoDeliver?.comboId === 'string' && lock.allowedComboIds.includes(autoDeliver.comboId));
   if (
     autoDeliver
     && autoDeliver.runId === lock.runId
     && autoDeliver.owningMainSessionName === lock.owningMainSessionName
     && autoDeliver.generation === lock.generation
-    && comboAllowed
+    && lock.stage !== undefined
+    && autoDeliver.stage === lock.stage
+    && lock.roundIndex !== undefined
+    && autoDeliver.roundIndex === lock.roundIndex
+    && lock.selectedTeamComboId !== undefined
+    && autoDeliver.selectedTeamComboId === lock.selectedTeamComboId
+    && lock.activeOpenSpecPromptId !== undefined
+    && autoDeliver.activeOpenSpecPromptId === lock.activeOpenSpecPromptId
   ) {
     return { ok: true };
   }
@@ -120,8 +127,10 @@ export function sanitizeP2pLaunchOriginForProjection(origin: P2pLaunchOrigin | u
       owningMainSessionName: origin.autoDeliver.owningMainSessionName,
       generation: origin.autoDeliver.generation,
       stage: origin.autoDeliver.stage,
+      ...(origin.autoDeliver.roundIndex != null ? { roundIndex: origin.autoDeliver.roundIndex } : {}),
       ...(origin.autoDeliver.attemptId ? { attemptId: origin.autoDeliver.attemptId } : {}),
-      ...(origin.autoDeliver.comboId ? { comboId: origin.autoDeliver.comboId } : {}),
+      ...(origin.autoDeliver.selectedTeamComboId ? { selectedTeamComboId: origin.autoDeliver.selectedTeamComboId } : {}),
+      ...(origin.autoDeliver.activeOpenSpecPromptId ? { activeOpenSpecPromptId: origin.autoDeliver.activeOpenSpecPromptId } : {}),
     };
   }
   return base;

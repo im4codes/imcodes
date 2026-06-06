@@ -2,7 +2,9 @@ import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET,
+  OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO,
   OPENSPEC_AUTO_DELIVER_PRESETS,
+  OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS,
   isOpenSpecAutoDeliverActiveProjection,
   isOpenSpecAutoDeliverTerminalStatus,
   materializedPresetLimits,
@@ -10,6 +12,7 @@ import {
   type OpenSpecAutoDeliverProjection,
 } from '../openspec-auto-deliver.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { useP2pCustomCombos } from './p2p-combos.js';
 
 export interface OpenSpecAutoDeliverLauncherProps {
   changeName: string | null;
@@ -19,15 +22,21 @@ export interface OpenSpecAutoDeliverLauncherProps {
   launchPending?: boolean;
   error?: string | null;
   onClose: () => void;
-  onLaunch: (changeName: string, presetId: OpenSpecAutoDeliverPresetId) => void;
+  onLaunch: (changeName: string, presetId: OpenSpecAutoDeliverPresetId, options: {
+    selectedTeamComboId: string;
+    materializedLimits: { specAuditRepairRounds: number; implementationAuditRepairRounds: number };
+  }) => void;
   onViewCurrent?: () => void;
 }
 
 export interface OpenSpecAutoDeliverRunBarProps {
   projection: OpenSpecAutoDeliverProjection;
   stopPending?: boolean;
+  compact?: boolean;
   onView: () => void;
   onStop: () => void;
+  onToggleCompact?: () => void;
+  onHide?: () => void;
 }
 
 export interface OpenSpecAutoDeliverDetailsPanelProps {
@@ -93,16 +102,58 @@ export function OpenSpecAutoDeliverLauncher({
 }: OpenSpecAutoDeliverLauncherProps) {
   const { t } = useTranslation();
   const [presetId, setPresetId] = useState<OpenSpecAutoDeliverPresetId>(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET);
+  const [specRounds, setSpecRounds] = useState(materializedPresetLimits(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET).specAuditRepairRounds);
+  const [implementationRounds, setImplementationRounds] = useState(materializedPresetLimits(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET).implementationAuditRepairRounds);
+  const [selectedTeamComboId, setSelectedTeamComboId] = useState(OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO);
+  const { allCombos } = useP2pCustomCombos();
   const hasConflict = isOpenSpecAutoDeliverActiveProjection(conflictProjection);
+  const comboOptions = useMemo(() => {
+    const options: Array<{ key: string; label: string; custom?: boolean }> = [
+      ...allCombos.presets.map((combo) => ({
+        key: combo.key,
+        label: combo.key === OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO
+          ? 'Audit-Review-Plan'
+          : combo.pipeline.join(' > '),
+      })),
+      ...allCombos.custom.map((key) => ({ key, label: key, custom: true })),
+    ];
+    const seen = new Set<string>();
+    return options.filter((option) => {
+      if (seen.has(option.key)) return false;
+      seen.add(option.key);
+      return true;
+    });
+  }, [allCombos]);
 
   useEffect(() => {
-    if (open) setPresetId(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET);
+    if (!open) return;
+    const defaults = materializedPresetLimits(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET);
+    setPresetId(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET);
+    setSpecRounds(defaults.specAuditRepairRounds);
+    setImplementationRounds(defaults.implementationAuditRepairRounds);
+    setSelectedTeamComboId(OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO);
   }, [open, changeName]);
 
   if (!open) return null;
 
-  const selectedLimits = materializedPresetLimits(presetId);
-  const validationError = !changeName ? 'openspec.auto.error.missing_change' : error;
+  const selectedLimits = { specAuditRepairRounds: specRounds, implementationAuditRepairRounds: implementationRounds };
+  const invalidRounds = !Number.isInteger(specRounds)
+    || specRounds < OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.specMin
+    || specRounds > OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.specMax
+    || !Number.isInteger(implementationRounds)
+    || implementationRounds < OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.implementationMin
+    || implementationRounds > OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.implementationMax;
+  const incompatibleCombo = selectedTeamComboId !== OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO;
+  const validationError = !changeName
+    ? 'openspec.auto.error.missing_change'
+    : invalidRounds
+      ? 'openspec.auto.error.invalid_rounds'
+      : incompatibleCombo
+        ? 'openspec.auto.error.custom_combo_unsupported'
+      : error;
+  const handleTeamComboChange = (event: Event) => {
+    setSelectedTeamComboId((event.target as HTMLSelectElement).value);
+  };
   return (
     <div class="openspec-auto-launcher" data-testid="openspec-auto-launcher">
       <div class="openspec-auto-launcher-head">
@@ -116,7 +167,13 @@ export function OpenSpecAutoDeliverLauncher({
       </div>
       {hasConflict && conflictProjection ? (
         <div class="openspec-auto-warning" data-testid="openspec-auto-conflict">
-          <div>{t('openspec.auto.conflict_active', { change: conflictProjection.changeName })}</div>
+          <div>
+            {t('openspec.auto.conflict_active', {
+              change: conflictProjection.visibility === 'full'
+                ? conflictProjection.changeName
+                : conflictProjection.owningMainSessionName,
+            })}
+          </div>
           {error && <div class="openspec-auto-warning-subtle">{error.includes('.') ? t(error) : error}</div>}
           <button class="btn btn-secondary openspec-auto-mini-btn" type="button" onClick={onViewCurrent}>
             {t('openspec.auto.view')}
@@ -133,7 +190,11 @@ export function OpenSpecAutoDeliverLauncher({
                   type="button"
                   class={`openspec-auto-preset ${active ? 'openspec-auto-preset-active' : ''}`}
                   data-testid={`openspec-auto-preset-${preset.id}`}
-                  onClick={() => setPresetId(preset.id)}
+                  onClick={() => {
+                    setPresetId(preset.id);
+                    setSpecRounds(preset.specAuditRepairRounds);
+                    setImplementationRounds(preset.implementationAuditRepairRounds);
+                  }}
                 >
                   <span>{t(preset.labelKey)}</span>
                   <small>
@@ -146,6 +207,49 @@ export function OpenSpecAutoDeliverLauncher({
               );
             })}
           </div>
+          <div class="openspec-auto-controls-grid">
+            <label class="openspec-auto-field">
+              <span>{t('openspec.auto.spec_rounds')}</span>
+              <input
+                type="number"
+                min={OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.specMin}
+                max={OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.specMax}
+                value={specRounds}
+                onInput={(event) => {
+                  setPresetId('custom');
+                  setSpecRounds(Number((event.target as HTMLInputElement).value));
+                }}
+              />
+            </label>
+            <label class="openspec-auto-field">
+              <span>{t('openspec.auto.impl_rounds')}</span>
+              <input
+                type="number"
+                min={OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.implementationMin}
+                max={OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.implementationMax}
+                value={implementationRounds}
+                onInput={(event) => {
+                  setPresetId('custom');
+                  setImplementationRounds(Number((event.target as HTMLInputElement).value));
+                }}
+              />
+            </label>
+            <label class="openspec-auto-field openspec-auto-field-wide">
+              <span>{t('openspec.auto.team_combo')}</span>
+              <select value={selectedTeamComboId} onInput={handleTeamComboChange} onChange={handleTeamComboChange}>
+                {comboOptions.map((combo) => (
+                  <option key={combo.key} value={combo.key}>
+                    {combo.custom ? `${combo.label} (${t('openspec.auto.custom')})` : combo.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          {incompatibleCombo && (
+            <div class="openspec-auto-warning-subtle" data-testid="openspec-auto-combo-warning">
+              {t('openspec.auto.error.custom_combo_unsupported')}
+            </div>
+          )}
           <div class="openspec-auto-launcher-meta">
             {t('openspec.auto.materialized_limits', {
               spec: selectedLimits.specAuditRepairRounds,
@@ -160,8 +264,11 @@ export function OpenSpecAutoDeliverLauncher({
           <button
             class="btn btn-primary openspec-auto-start-btn"
             type="button"
-            disabled={disabled || !changeName || launchPending}
-            onClick={() => changeName && onLaunch(changeName, presetId)}
+            disabled={disabled || !changeName || launchPending || invalidRounds || incompatibleCombo}
+            onClick={() => {
+              if (disabled || !changeName || launchPending || invalidRounds || incompatibleCombo) return;
+              onLaunch(changeName, presetId, { selectedTeamComboId, materializedLimits: selectedLimits });
+            }}
           >
             {launchPending ? t('common.starting') : t('openspec.auto.start')}
           </button>
@@ -174,8 +281,11 @@ export function OpenSpecAutoDeliverLauncher({
 export function OpenSpecAutoDeliverRunBar({
   projection,
   stopPending = false,
+  compact = false,
   onView,
   onStop,
+  onToggleCompact,
+  onHide,
 }: OpenSpecAutoDeliverRunBarProps) {
   const { t } = useTranslation();
   const active = !isOpenSpecAutoDeliverTerminalStatus(projection.status);
@@ -184,6 +294,29 @@ export function OpenSpecAutoDeliverRunBar({
   const stageLabel = t(stageKey(projection.stage), projection.stage);
   const taskText = taskProgressText(projection, t);
   const canStop = projection.canStop !== false && active;
+  const statusLabel = t(statusKey(projection.status), projection.status);
+
+  if (compact) {
+    return (
+      <div class="openspec-auto-runbar openspec-auto-runbar-compact discussions-progress-card" data-testid="openspec-auto-runbar">
+        <div class="discussions-progress-head openspec-auto-runbar-head">
+          <div class="discussions-progress-titlewrap">
+            <div class="discussions-progress-kicker">{t('openspec.auto.kicker')}</div>
+            <div class="discussions-progress-title">{projection.changeName}</div>
+          </div>
+          <span class="discussions-progress-badge discussions-progress-badge-phase">{stageLabel}</span>
+          <button class="discussions-progress-stop openspec-auto-view-btn" type="button" onClick={onView}>
+            {t('openspec.auto.view')}
+          </button>
+          {onToggleCompact && (
+            <button class="discussions-progress-stop openspec-auto-view-btn" type="button" onClick={onToggleCompact}>
+              {t('openspec.auto.expand')}
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div class="openspec-auto-runbar discussions-progress-card" data-testid="openspec-auto-runbar">
@@ -196,6 +329,16 @@ export function OpenSpecAutoDeliverRunBar({
         <button class="discussions-progress-stop openspec-auto-view-btn" type="button" onClick={onView}>
           {t('openspec.auto.view')}
         </button>
+        {onToggleCompact && (
+          <button class="discussions-progress-stop openspec-auto-view-btn" type="button" onClick={onToggleCompact}>
+            {t('openspec.auto.compact')}
+          </button>
+        )}
+        {onHide && (
+          <button class="discussions-progress-stop openspec-auto-view-btn" type="button" onClick={onHide}>
+            {t('common.hide')}
+          </button>
+        )}
         {canStop && (
           <button class="discussions-progress-stop" type="button" disabled={stopPending} onClick={onStop}>
             {stopPending ? t('openspec.auto.stopping') : t('openspec.auto.stop')}
@@ -204,7 +347,7 @@ export function OpenSpecAutoDeliverRunBar({
       </div>
       <div class="discussions-progress-meta">
         <span class="discussions-progress-badge discussions-progress-badge-mode">
-          {t(statusKey(projection.status), projection.status)}
+          {statusLabel}
         </span>
         <span class="discussions-progress-badge discussions-progress-badge-phase">{stageLabel}</span>
         <span class="discussions-progress-badge">{taskText}</span>
@@ -282,7 +425,8 @@ export function OpenSpecAutoDeliverDetailsPanel({
           <DetailRow label={t('openspec.auto.impl_round')} value={formatRoundPair(projection.implementationAuditRound, projection.implementationAuditRepairRound)} />
           <DetailRow label={t('openspec.auto.prompt_count_label')} value={projection.implementationPromptCount} />
           <DetailRow label={t('openspec.auto.active_p2p')} value={projection.activeP2pRunId} />
-          <DetailRow label={t('openspec.auto.combo_id')} value={projection.activeComboId} />
+          <DetailRow label={t('openspec.auto.combo_id')} value={projection.selectedTeamComboId} />
+          <DetailRow label={t('openspec.auto.active_prompt')} value={projection.activeOpenSpecPromptId} />
           <DetailRow label={t('openspec.auto.verdict')} value={projection.latestVerdict} />
           <DetailRow label={t('openspec.auto.terminal_reason')} value={projection.terminalReason} />
         </div>
@@ -360,7 +504,9 @@ export function OpenSpecAutoDeliverCurrentRunEntry({
     >
       <div>
         <div class="openspec-auto-kicker">{t('openspec.auto.current_run')}</div>
-        <div class="openspec-auto-current-title">{projection.changeName}</div>
+        <div class="openspec-auto-current-title">
+          {redacted ? projection.owningMainSessionName : projection.changeName}
+        </div>
         <div class="openspec-auto-current-meta">
           {t(statusKey(projection.status), projection.status)} · {t(stageKey(projection.stage), projection.stage)}
         </div>

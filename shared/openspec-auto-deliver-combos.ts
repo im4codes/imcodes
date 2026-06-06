@@ -1,10 +1,12 @@
 import type { P2pAdvancedRound } from './p2p-advanced.js';
 import {
+  OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
   OPENSPEC_AUTO_DELIVER_COMBO_IDS,
-  type OpenSpecAutoDeliverComboId,
+  OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_PROMPT_ID,
+  OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_PROMPT_ID,
+  type OpenSpecAutoDeliverStage,
+  type OpenSpecAutoDeliverStagePromptId,
 } from './openspec-auto-deliver-constants.js';
-import type { OpenSpecAutoDeliverComboDescriptor } from './openspec-auto-deliver-types.js';
-import { validateOpenSpecAutoDeliverComboDescriptor } from './openspec-auto-deliver-validators.js';
 
 const SPEC_AUDIT_REPAIR_ROUNDS: P2pAdvancedRound[] = [
   {
@@ -18,9 +20,7 @@ const SPEC_AUDIT_REPAIR_ROUNDS: P2pAdvancedRound[] = [
     timeoutMinutes: 8,
     verdictPolicy: 'none',
     effectiveSummaryPrompt:
-      'Return exactly one JSON payload for OpenSpec Auto Deliver with verdict, module_scores, unchecked_tasks, required_changes, repairs_applied, and evidence. Apply safe in-scope OpenSpec artifact repairs before returning PASS.',
-    promptAppend:
-      'You are the designated OpenSpec Auto Deliver spec audit-repair combo. Audit proposal/design/specs/tasks, apply safe in-scope artifact repairs, and return strict JSON only through the authoritative result channel. Return BLOCKED for unclear or unsafe scope.',
+      'Return the OpenSpec Auto Deliver authoritative JSON only through the runtime-bounded strict result segment.',
   },
 ];
 
@@ -34,66 +34,62 @@ const IMPLEMENTATION_AUDIT_REPAIR_ROUNDS: P2pAdvancedRound[] = [
     timeoutMinutes: 10,
     verdictPolicy: 'none',
     effectiveSummaryPrompt:
-      'Return exactly one JSON payload for OpenSpec Auto Deliver with verdict, module_scores, unchecked_tasks, required_changes, repairs_applied, and evidence. Apply safe in-scope implementation repairs before returning PASS.',
-    promptAppend:
-      'You are the designated OpenSpec Auto Deliver implementation audit-repair combo. Audit implementation against OpenSpec artifacts, tasks.md, diff, tests, and risk. Apply safe in-scope product/test/tasks.md repairs and return strict JSON only through the authoritative result channel. Return BLOCKED for unclear or unsafe scope.',
+      'Return the OpenSpec Auto Deliver authoritative JSON only through the runtime-bounded strict result segment.',
   },
 ];
 
-export const OPENSPEC_AUTO_DELIVER_COMBO_DESCRIPTORS = [
-  {
-    id: OPENSPEC_AUTO_DELIVER_COMBO_IDS.SPEC_AUDIT_REPAIR,
-    title: 'OpenSpec Auto Deliver Spec Audit-Repair',
-    capability: {
-      stage: 'spec_audit_repair',
-      requiredPermissionScope: 'artifact_generation',
-      allowedMutationScopes: ['openspec_change_artifacts', 'tasks_md'],
-      writeMode: 'single_authoritative_writer',
-      strictResultChannel: 'authoritative_summary_json',
-      minTransportParticipants: 1,
-      supportsGenerationMetadata: true,
-      supportsStopCancellation: true,
-    },
-    rounds: SPEC_AUDIT_REPAIR_ROUNDS,
-  },
-  {
-    id: OPENSPEC_AUTO_DELIVER_COMBO_IDS.IMPLEMENTATION_AUDIT_REPAIR,
-    title: 'OpenSpec Auto Deliver Implementation Audit-Repair',
-    capability: {
-      stage: 'implementation_audit_repair',
-      requiredPermissionScope: 'implementation',
-      allowedMutationScopes: ['product_files', 'tests', 'tasks_md'],
-      writeMode: 'single_authoritative_writer',
-      strictResultChannel: 'authoritative_summary_json',
-      minTransportParticipants: 1,
-      supportsGenerationMetadata: true,
-      supportsStopCancellation: true,
-    },
-    rounds: IMPLEMENTATION_AUDIT_REPAIR_ROUNDS,
-  },
-] as const satisfies readonly OpenSpecAutoDeliverComboDescriptor[];
+export type OpenSpecAutoDeliverAuditRepairStage = Extract<OpenSpecAutoDeliverStage, 'spec_audit_repair' | 'implementation_audit_repair'>;
 
-export function resolveOpenSpecAutoDeliverCombo(
-  id: OpenSpecAutoDeliverComboId,
-): OpenSpecAutoDeliverComboDescriptor | null {
-  const descriptor = OPENSPEC_AUTO_DELIVER_COMBO_DESCRIPTORS.find((entry) => entry.id === id);
-  if (!descriptor) return null;
+export interface OpenSpecAutoDeliverCompatibilityResult {
+  ok: boolean;
+  reason?: 'custom_combo_unsupported' | 'legacy_combo_unsupported' | 'combo_unsupported' | 'invalid_stage_prompt';
+}
+
+export function activeOpenSpecPromptIdForAutoDeliverStage(
+  stage: OpenSpecAutoDeliverAuditRepairStage,
+): OpenSpecAutoDeliverStagePromptId {
+  return stage === 'spec_audit_repair'
+    ? OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_PROMPT_ID
+    : OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_PROMPT_ID;
+}
+
+export function evaluateOpenSpecAutoDeliverComboCompatibility(
+  selectedTeamComboId: string,
+  stage: OpenSpecAutoDeliverAuditRepairStage,
+  activeOpenSpecPromptId = activeOpenSpecPromptIdForAutoDeliverStage(stage),
+): OpenSpecAutoDeliverCompatibilityResult {
+  if (
+    selectedTeamComboId === OPENSPEC_AUTO_DELIVER_COMBO_IDS.SPEC_AUDIT_REPAIR
+    || selectedTeamComboId === OPENSPEC_AUTO_DELIVER_COMBO_IDS.IMPLEMENTATION_AUDIT_REPAIR
+  ) {
+    return { ok: false, reason: 'legacy_combo_unsupported' };
+  }
+  if (
+    (stage === 'spec_audit_repair' && activeOpenSpecPromptId !== OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_PROMPT_ID)
+    || (stage === 'implementation_audit_repair' && activeOpenSpecPromptId !== OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_PROMPT_ID)
+  ) {
+    return { ok: false, reason: 'invalid_stage_prompt' };
+  }
+  if (selectedTeamComboId === OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID) {
+    return { ok: true };
+  }
+  return { ok: false, reason: 'custom_combo_unsupported' };
+}
+
+export function materializeOpenSpecAutoDeliverStageRound(
+  stage: OpenSpecAutoDeliverAuditRepairStage,
+  selectedTeamComboId: string = OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
+): { round: P2pAdvancedRound; activeOpenSpecPromptId: OpenSpecAutoDeliverStagePromptId } | { error: OpenSpecAutoDeliverCompatibilityResult['reason'] } {
+  const activeOpenSpecPromptId = activeOpenSpecPromptIdForAutoDeliverStage(stage);
+  const compatibility = evaluateOpenSpecAutoDeliverComboCompatibility(selectedTeamComboId, stage, activeOpenSpecPromptId);
+  if (!compatibility.ok) return { error: compatibility.reason ?? 'combo_unsupported' };
+  const template = stage === 'spec_audit_repair' ? SPEC_AUDIT_REPAIR_ROUNDS[0] : IMPLEMENTATION_AUDIT_REPAIR_ROUNDS[0];
+  if (!template) return { error: 'combo_unsupported' };
   return {
-    ...descriptor,
-    capability: {
-      ...descriptor.capability,
-      allowedMutationScopes: [...descriptor.capability.allowedMutationScopes],
+    activeOpenSpecPromptId,
+    round: {
+      ...template,
+      artifactOutputs: template.artifactOutputs ? [...template.artifactOutputs] : undefined,
     },
-    rounds: descriptor.rounds.map((round) => ({ ...round, artifactOutputs: round.artifactOutputs ? [...round.artifactOutputs] : undefined })),
   };
 }
-
-export function assertOpenSpecAutoDeliverCombosValid(): void {
-  for (const descriptor of OPENSPEC_AUTO_DELIVER_COMBO_DESCRIPTORS) {
-    const result = validateOpenSpecAutoDeliverComboDescriptor(descriptor);
-    if (!result.ok) {
-      throw new Error(`Invalid OpenSpec Auto Deliver combo ${descriptor.id}: ${result.issues.map((entry) => entry.code).join(', ')}`);
-    }
-  }
-}
-

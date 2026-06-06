@@ -68,6 +68,7 @@ import {
 import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from '../../shared/p2p-workflow-diagnostics.js';
 import { evaluateP2pLogic } from '../../shared/p2p-workflow-logic-evaluator.js';
 import type { P2pWorkflowVariableValue } from '../../shared/p2p-workflow-types.js';
+import { OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES } from '../../shared/openspec-auto-deliver-constants.js';
 import {
   P2P_ROUTING_HISTORY_RETENTION_COUNT,
   P2P_SCRIPT_RETRIABLE_DIAGNOSTIC_CODES,
@@ -317,6 +318,18 @@ export interface P2pRun {
 // ── In-memory store ───────────────────────────────────────────────────────
 
 const activeRuns = new Map<string, P2pRun>();
+
+function byteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function extractOpenSpecAutoDeliverStrictSegment(content: string): string | null {
+  if (byteLength(content) > OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES) return null;
+  const matches = [...content.matchAll(/```json\s*([\s\S]*?)```/g)];
+  if (matches.length !== 1) return null;
+  const segment = matches[0]?.[0] ?? '';
+  return byteLength(segment) <= OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES ? segment : null;
+}
 
 /**
  * Audit fix (94b9b837-822 / N1) — module-level registry of "currently
@@ -1022,7 +1035,7 @@ export async function startP2pRun(...args:
   // while letting `prepareAdvancedWorkflowLaunch` and `supervision-automation`
   // funnel through the typed discriminated union.
   const advancedSource: StartP2pRunAdvancedSource | undefined = opts.advanced;
-  const advancedPresetKey = advancedSource?.kind === 'supervision_internal'
+  const advancedPresetKey = advancedSource?.kind === 'supervision_internal' || advancedSource?.kind === 'openspec_auto_deliver_internal'
     ? advancedSource.advancedPresetKey
     : opts.advancedPresetKey;
   const advancedRounds = advancedSource
@@ -3519,7 +3532,7 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
     fullContent = await readFile(run.contextFilePath, 'utf8');
     run.resultSummary = fullContent.slice(-2000);
     if (run.launchOrigin?.kind === 'openspec_auto_deliver') {
-      run.strictAuthoritativeResult = fullContent;
+      run.strictAuthoritativeResult = extractOpenSpecAutoDeliverStrictSegment(fullContent);
     }
   } catch { /* ignore */ }
   run.completedAt = new Date().toISOString();

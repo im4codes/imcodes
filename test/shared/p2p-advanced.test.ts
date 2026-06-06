@@ -100,6 +100,30 @@ describe('resolveP2pRoundPlan', () => {
     expect(() => resolveP2pRoundPlan({ advancedRounds: rounds })).toThrow(/must declare artifact outputs/i);
   });
 
+  it('allows internal advanced keys when explicit advanced rounds are supplied', () => {
+    const rounds: P2pAdvancedRound[] = [
+      {
+        id: 'spec_audit_repair_apply',
+        title: 'OpenSpec Spec Audit-Repair',
+        preset: 'proposal_audit',
+        executionMode: 'single_main',
+        permissionScope: 'artifact_generation',
+        artifactConvention: 'openspec_convention',
+        artifactOutputs: ['openspec/changes'],
+        timeoutMinutes: 8,
+      },
+    ];
+
+    const plan = resolveP2pRoundPlan({
+      advancedPresetKey: 'proposal_audit',
+      advancedRounds: rounds,
+    });
+
+    expect(plan.advanced).toBe(true);
+    expect(plan.rounds).toHaveLength(1);
+    expect(plan.rounds[0]?.id).toBe('spec_audit_repair_apply');
+  });
+
   it('rejects forced_rework rounds whose maxTriggers are below minTriggers', () => {
     const rounds: P2pAdvancedRound[] = [
       {

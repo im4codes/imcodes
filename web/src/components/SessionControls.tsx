@@ -698,6 +698,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const openSpecAutoProjection = openSpecAutoDeliver.projection;
   const openSpecAutoActive = isOpenSpecAutoDeliverActiveProjection(openSpecAutoProjection);
   const openSpecAutoActionLockReason = openSpecAutoActive ? t('openspec.auto.lock_manual_actions') : undefined;
+  const [openSpecAutoRunbarCompact, setOpenSpecAutoRunbarCompact] = useState(false);
+  const [openSpecAutoRunbarHiddenRunId, setOpenSpecAutoRunbarHiddenRunId] = useState<string | null>(null);
+  const openSpecAutoRunbarHidden = openSpecAutoRunbarHiddenRunId === openSpecAutoProjection?.runId;
+  const openSpecAutoRunbarSessionVisible = !!activeSession?.name
+    && !!openSpecAutoProjection
+    && openSpecAutoProjection.visibility !== 'conflict'
+    && (
+      activeSession.name === openSpecAutoProjection.launchedFromSessionName
+      || activeSession.name === openSpecAutoProjection.targetImplementationSessionName
+    );
   const effectiveRuntimeType = activeSession ? resolveSessionInfoRuntimeType(activeSession) : undefined;
   const transportSendShouldQueue = effectiveRuntimeType === 'transport'
     && !!activeSession
@@ -1558,8 +1568,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecAutoLauncherChange(changeName);
   }, []);
 
-  const launchOpenSpecAutoDeliver = useCallback((changeName: string, presetId: OpenSpecAutoDeliverPresetId) => {
-    const requestId = openSpecAutoDeliver.launch({ changeName, presetId });
+  const launchOpenSpecAutoDeliver = useCallback((changeName: string, presetId: OpenSpecAutoDeliverPresetId, options?: {
+    selectedTeamComboId: string;
+    materializedLimits: { specAuditRepairRounds: number; implementationAuditRepairRounds: number };
+  }) => {
+    const requestId = openSpecAutoDeliver.launch({ changeName, presetId, ...options });
     if (!requestId) return;
     setOpenSpecAutoLaunchingChange(changeName);
   }, [openSpecAutoDeliver]);
@@ -1572,6 +1585,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecOpen(false);
     setOpenSpecAutoDetailsOpen(true);
   }, [openSpecAutoLaunchingChange, openSpecAutoProjection]);
+
+  useEffect(() => {
+    setOpenSpecAutoRunbarHiddenRunId(null);
+    setOpenSpecAutoRunbarCompact(false);
+  }, [openSpecAutoProjection?.runId]);
 
   const openP2pConfigPanel = useCallback((tab: P2pConfigTab = 'participants') => {
     const open = () => {
@@ -3561,13 +3579,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>}
       </div>}
 
-      {openSpecAutoProjection && openSpecAutoProjection.visibility !== 'conflict' && (
+      {openSpecAutoRunbarSessionVisible && !openSpecAutoRunbarHidden && openSpecAutoProjection && (
         <div class="openspec-auto-session-progress">
           <OpenSpecAutoDeliverRunBar
             projection={openSpecAutoProjection}
             stopPending={openSpecAutoDeliver.stopPending}
+            compact={openSpecAutoRunbarCompact}
             onView={() => setOpenSpecAutoDetailsOpen(true)}
             onStop={() => { openSpecAutoDeliver.stop(); }}
+            onToggleCompact={() => setOpenSpecAutoRunbarCompact((value) => !value)}
+            onHide={() => setOpenSpecAutoRunbarHiddenRunId(openSpecAutoProjection.runId)}
           />
         </div>
       )}

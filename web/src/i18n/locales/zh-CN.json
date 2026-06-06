@@ -1154,14 +1154,20 @@
     "auto": {
       "action": "Auto",
       "kicker": "自动交付",
+      "custom": "自定义",
       "launcher_title": "自动交付",
       "details_title": "自动交付详情",
       "current_run": "当前自动交付",
+      "list_title": "Auto Deliver",
+      "list_empty": "还没有收到 Auto Deliver 运行。",
+      "list_select": "选择一个 Auto Deliver 运行。",
       "no_change": "未选择变更",
       "start": "启动自动交付",
       "stop": "停止",
       "stopping": "停止中...",
       "view": "查看",
+      "compact": "紧凑",
+      "expand": "展开",
       "tasks": "任务",
       "tasks_unknown": "任务未知",
       "tasks_progress": "{{checked}}/{{total}} 个任务",
@@ -1184,6 +1190,7 @@
       "impl_round": "实现审计轮次",
       "active_p2p": "活跃 Team 运行",
       "combo_id": "Combo",
+      "active_prompt": "OpenSpec 提示词",
       "verdict": "结论",
       "terminal_reason": "结束原因",
       "task_stats": "任务状态",
@@ -1196,7 +1203,12 @@
         "active_run": "该会话组已有 Auto Deliver 在运行。",
         "manual_team_busy": "该会话组已有手动 Team 运行占用中。",
         "unsupported_runtime": "Auto Deliver 需要基于 transport 的编码会话。",
-        "launch_failed": "启动 Auto Deliver 失败。"
+        "launch_failed": "启动 Auto Deliver 失败。",
+        "invalid_rounds": "Round counts are outside the allowed range.",
+        "daemon_offline": "Daemon is offline. Try again after it reconnects.",
+        "launch_timeout": "Auto Deliver launch timed out. Try again.",
+        "custom_combo_unsupported": "Auto Deliver 暂不支持自定义 Team combo。",
+        "strict_result_failed": "审计没有返回有效的严格结果。"
       },
       "preset": {
         "fast": "快速",
@@ -1237,7 +1249,10 @@
         "implementation_reported": "实现侧报告",
         "audit_reported": "审计侧报告",
         "none": "无"
-      }
+      },
+      "spec_rounds": "Spec audit rounds",
+      "impl_rounds": "Implementation audit rounds",
+      "team_combo": "Team combo"
     },
     "propose_from_discussion_action": "根据最近讨论生成",
     "propose_from_description_action": "根据下面的描述生成",

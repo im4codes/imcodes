@@ -2830,6 +2830,7 @@ describe('WsBridge', () => {
           changeName: 'change-secret',
           owningMainSessionName: 'deck_proj_brain',
           projectionVersion: 1,
+          generation: 1,
           rawPrompt: 'do not leak',
         },
       }));
@@ -2842,6 +2843,7 @@ describe('WsBridge', () => {
       OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
       OPENSPEC_AUTO_DELIVER_MSG.STOP,
       OPENSPEC_AUTO_DELIVER_MSG.STATUS_REQUEST,
+      OPENSPEC_AUTO_DELIVER_MSG.LIST_REQUEST,
     ])('rejects %s for the wrong serverId before daemon forwarding', async (type) => {
       const { daemonWs, browserWs } = await setupAuthBridge();
       daemonWs.sent.length = 0;
@@ -2887,6 +2889,204 @@ describe('WsBridge', () => {
       });
     });
 
+    it('rejects forged OpenSpec Auto Deliver STOP built from conflict metadata before daemon forwarding', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      const bridge = WsBridge.get(serverId);
+      daemonWs.sent.length = 0;
+      browserWs.sent.length = 0;
+
+      bridge.rememberOpenSpecAutoDeliverProjectionForTests({
+        runId: 'auto-forged-stop-run',
+        changeName: 'openspec-auto-delivery',
+        owningMainSessionName: 'deck_proj_brain',
+        launchedFromSessionName: 'deck_sub_launcher',
+        targetImplementationSessionName: 'deck_sub_worker',
+        projectionVersion: 12,
+        generation: 3,
+        status: 'implementation_task_loop',
+        stage: 'implementation_task_loop',
+        selectedTeamComboId: 'audit>review>plan',
+      });
+
+      browserWs.emit('message', JSON.stringify({
+        type: OPENSPEC_AUTO_DELIVER_MSG.STOP,
+        requestId: 'auto-forged-stop',
+        sessionName: 'deck_proj_brain',
+        runId: 'auto-forged-stop-run',
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((raw) => {
+        const msg = JSON.parse(raw) as Record<string, unknown>;
+        return msg.type === OPENSPEC_AUTO_DELIVER_MSG.STOP;
+      })).toBe(false);
+      const stopAck = browserWs.sentStrings
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.STOP_ACK);
+      expect(stopAck).toMatchObject({
+        requestId: 'auto-forged-stop',
+        ok: false,
+        error: 'unauthorized_session',
+      });
+    });
+
+    it('returns OpenSpec Auto Deliver list rows from bridge cache without daemon forwarding', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      const bridge = WsBridge.get(serverId);
+      daemonWs.sent.length = 0;
+      browserWs.sent.length = 0;
+
+      bridge.rememberOpenSpecAutoDeliverProjectionForTests({
+        runId: 'auto-list-run',
+        changeName: 'openspec-auto-delivery',
+        owningMainSessionName: 'deck_proj_brain',
+        launchedFromSessionName: 'deck_sub_launcher',
+        targetImplementationSessionName: 'deck_sub_worker',
+        projectionVersion: 11,
+        generation: 2,
+        status: 'implementation_task_loop',
+        stage: 'implementation_task_loop',
+        selectedTeamComboId: 'audit>review>plan',
+      });
+
+      browserWs.emit('message', JSON.stringify({
+        type: OPENSPEC_AUTO_DELIVER_MSG.LIST_REQUEST,
+        requestId: 'auto-list-1',
+        sessionName: 'deck_sub_worker',
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((raw) => raw.includes(OPENSPEC_AUTO_DELIVER_MSG.LIST_REQUEST))).toBe(false);
+      const listResponse = browserWs.sentStrings
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.LIST_RESPONSE);
+      expect(listResponse).toMatchObject({
+        requestId: 'auto-list-1',
+        rows: [
+          {
+            runId: 'auto-list-run',
+            visibility: 'full',
+            changeName: 'openspec-auto-delivery',
+            selectedTeamComboId: 'audit>review>plan',
+            targetImplementationSessionName: 'deck_sub_worker',
+          },
+        ],
+      });
+    });
+
+    it('does not overwrite OpenSpec Auto Deliver pending requests when sockets reuse the same requestId', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const participant = new MockWs();
+      const sibling = new MockWs();
+      bridge.handleBrowserConnection(participant as never, 'participant', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(sibling as never, 'sibling', makeDb('valid-hash'));
+      participant.sent.length = 0;
+      sibling.sent.length = 0;
+
+      for (const [socket, sessionName] of [[participant, 'deck_sub_launcher'], [sibling, 'deck_sub_sibling']] as const) {
+        socket.emit('message', JSON.stringify({
+          type: OPENSPEC_AUTO_DELIVER_MSG.STATUS_REQUEST,
+          requestId: 'auto-status-shared',
+          sessionName,
+        }));
+      }
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: OPENSPEC_AUTO_DELIVER_MSG.STATUS_PROJECTION,
+        requestId: 'auto-status-shared',
+        projection: {
+          runId: 'auto-run-shared',
+          changeName: 'openspec-auto-delivery',
+          owningMainSessionName: 'deck_proj_brain',
+          launchedFromSessionName: 'deck_sub_launcher',
+          targetImplementationSessionName: 'deck_sub_worker',
+          projectionVersion: 9,
+          generation: 3,
+          status: 'implementation_task_loop',
+          stage: 'implementation_task_loop',
+          latestRepairSummary: 'private repair summary',
+          taskStats: { total: 1, checked: 0, unchecked: 1, items: [{ checked: false, label: 'private task' }] },
+        },
+      }));
+      await flushAsync();
+
+      const participantMessages = participant.sentStrings.map((raw) => JSON.parse(raw) as Record<string, unknown>);
+      const siblingMessages = sibling.sentStrings.map((raw) => JSON.parse(raw) as Record<string, unknown>);
+      expect(participantMessages).toHaveLength(1);
+      expect(participantMessages[0]).toMatchObject({
+        type: OPENSPEC_AUTO_DELIVER_MSG.STATUS_PROJECTION,
+        requestId: 'auto-status-shared',
+        projection: {
+          runId: 'auto-run-shared',
+          visibility: 'full',
+          changeName: 'openspec-auto-delivery',
+        },
+      });
+      expect(siblingMessages).toHaveLength(1);
+      expect(siblingMessages[0]).toMatchObject({
+        type: OPENSPEC_AUTO_DELIVER_MSG.STATUS_PROJECTION,
+        requestId: 'auto-status-shared',
+        projection: null,
+        error: 'duplicate_request_id',
+      });
+      expect(JSON.stringify(siblingMessages[0])).not.toContain('openspec-auto-delivery');
+      expect(JSON.stringify(siblingMessages[0])).not.toContain('private task');
+      expect(JSON.stringify(siblingMessages[0])).not.toContain('private repair summary');
+    });
+
+    it('does not return full OpenSpec Auto Deliver status when the request has no sessionName', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const requester = new MockWs();
+      bridge.handleBrowserConnection(requester as never, 'requester', makeDb('valid-hash'));
+      requester.sent.length = 0;
+
+      requester.emit('message', JSON.stringify({
+        type: OPENSPEC_AUTO_DELIVER_MSG.STATUS_REQUEST,
+        requestId: 'auto-status-no-session',
+      }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: OPENSPEC_AUTO_DELIVER_MSG.STATUS_PROJECTION,
+        requestId: 'auto-status-no-session',
+        projection: {
+          runId: 'auto-run-no-session',
+          changeName: 'openspec-auto-delivery',
+          owningMainSessionName: 'deck_proj_brain',
+          launchedFromSessionName: 'deck_sub_launcher',
+          targetImplementationSessionName: 'deck_sub_worker',
+          projectionVersion: 10,
+          generation: 4,
+          status: 'implementation_task_loop',
+          stage: 'implementation_task_loop',
+          latestRepairSummary: 'private repair summary',
+        },
+      }));
+      await flushAsync();
+
+      const messages = requester.sentStrings.map((raw) => JSON.parse(raw) as Record<string, unknown>);
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({
+        type: OPENSPEC_AUTO_DELIVER_MSG.STATUS_PROJECTION,
+        requestId: 'auto-status-no-session',
+        projection: null,
+        error: 'unauthorized_session',
+      });
+      expect(JSON.stringify(messages[0])).not.toContain('openspec-auto-delivery');
+      expect(JSON.stringify(messages[0])).not.toContain('private repair summary');
+    });
+
     it('singlecasts OpenSpec Auto Deliver status replies and broadcasts projections only to participating sessions', async () => {
       const bridge = WsBridge.get(serverId);
       const daemonWs = new MockWs();
@@ -2925,6 +3125,7 @@ describe('WsBridge', () => {
           launchedFromSessionName: 'deck_sub_launcher',
           targetImplementationSessionName: 'deck_sub_worker',
           projectionVersion: 7,
+          generation: 4,
           status: 'running',
           stage: 'implementation_task_loop',
           latestRepairSummary: 'fixed token=abc1234567890abcdef',
@@ -3003,6 +3204,7 @@ describe('WsBridge', () => {
           launchedFromSessionName: 'deck_sub_launcher',
           targetImplementationSessionName: 'deck_sub_worker',
           projectionVersion: 8,
+          generation: 5,
           status: 'implementation_task_loop',
           stage: 'implementation_task_loop',
           latestRepairSummary: 'private repair summary token=abc123',
@@ -3052,6 +3254,7 @@ describe('WsBridge', () => {
           changeName: 'openspec-auto-delivery',
           owningMainSessionName: 'deck_proj_brain',
           projectionVersion: 5,
+          generation: 5,
           stage: 'implementation_audit_repair',
         },
       }));
@@ -3062,6 +3265,7 @@ describe('WsBridge', () => {
           changeName: 'openspec-auto-delivery',
           owningMainSessionName: 'deck_proj_brain',
           projectionVersion: 4,
+          generation: 4,
           stage: 'spec_audit_repair',
         },
       }));
@@ -3086,12 +3290,14 @@ describe('WsBridge', () => {
         changeName: 'active-change',
         owningMainSessionName: 'deck_active_brain',
         projectionVersion: 1,
+        generation: 1,
       });
       bridge.rememberOpenSpecAutoDeliverProjectionForTests({
         runId: 'terminal-run',
         changeName: 'terminal-change',
         owningMainSessionName: 'deck_terminal_brain',
         projectionVersion: 1,
+        generation: 1,
         terminal: true,
       });
 

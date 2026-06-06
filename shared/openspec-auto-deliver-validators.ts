@@ -2,9 +2,16 @@ import {
   OPENSPEC_AUTO_DELIVER_CHANGE_SLUG_MAX_BYTES,
   OPENSPEC_AUTO_DELIVER_COMBO_IDS,
   OPENSPEC_AUTO_DELIVER_COMBO_WRITE_MODES,
+  OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
+  OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
+  OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
+  OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX,
+  OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MIN,
   OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE,
   OPENSPEC_AUTO_DELIVER_MUTATION_SCOPES,
   OPENSPEC_AUTO_DELIVER_PRESET_IDS,
+  OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX,
+  OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MIN,
   OPENSPEC_AUTO_DELIVER_REQUEST_ID_MAX_BYTES,
   OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS,
   OPENSPEC_AUTO_DELIVER_STRICT_RESULT_CHANNELS,
@@ -13,6 +20,7 @@ import {
   type OpenSpecAutoDeliverComboId,
   type OpenSpecAutoDeliverPresetId,
   type OpenSpecAutoDeliverScoreModuleId,
+  materializeOpenSpecAutoDeliverPreset,
 } from './openspec-auto-deliver-constants.js';
 import type {
   OpenSpecAutoDeliverComboDescriptor,
@@ -126,6 +134,31 @@ export function validateOpenSpecAutoDeliverLaunchRequest(input: unknown): OpenSp
   if (typeof input.sessionName !== 'string' || input.sessionName.length === 0) issues.push(issue('invalid_session_name', 'sessionName is required.', 'sessionName'));
   if (!isOneOf(input.presetId, OPENSPEC_AUTO_DELIVER_PRESET_IDS)) issues.push(issue('invalid_preset_id', 'presetId is invalid.', 'presetId'));
   if (input.projectName !== undefined && typeof input.projectName !== 'string') issues.push(issue('invalid_project_name', 'projectName must be a string.', 'projectName'));
+  const selectedTeamComboId = typeof input.selectedTeamComboId === 'string' && input.selectedTeamComboId.trim()
+    ? input.selectedTeamComboId.trim()
+    : OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID;
+  const presetLimits = isOneOf(input.presetId, OPENSPEC_AUTO_DELIVER_PRESET_IDS)
+    ? materializeOpenSpecAutoDeliverPreset(input.presetId)
+    : materializeOpenSpecAutoDeliverPreset('standard');
+  const rawLimits: Record<string, unknown> = isRecord(input.materializedLimits)
+    ? input.materializedLimits
+    : { ...presetLimits };
+  const specRounds = typeof rawLimits.specAuditRepairRounds === 'number' ? rawLimits.specAuditRepairRounds : Number.NaN;
+  const implRounds = typeof rawLimits.implementationAuditRepairRounds === 'number' ? rawLimits.implementationAuditRepairRounds : Number.NaN;
+  const maxPrompts = typeof rawLimits.maxImplementationPrompts === 'number' ? rawLimits.maxImplementationPrompts : OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS;
+  const maxMinutes = typeof rawLimits.maxElapsedMinutes === 'number' ? rawLimits.maxElapsedMinutes : OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES;
+  if (!Number.isInteger(specRounds) || specRounds < OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MIN || specRounds > OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX) {
+    issues.push(issue('invalid_spec_audit_rounds', 'Spec audit-repair rounds are out of bounds.', 'materializedLimits.specAuditRepairRounds'));
+  }
+  if (!Number.isInteger(implRounds) || implRounds < OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MIN || implRounds > OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX) {
+    issues.push(issue('invalid_implementation_audit_rounds', 'Implementation audit-repair rounds are out of bounds.', 'materializedLimits.implementationAuditRepairRounds'));
+  }
+  if (!Number.isInteger(maxPrompts) || maxPrompts < 1 || maxPrompts > 100) {
+    issues.push(issue('invalid_max_implementation_prompts', 'maxImplementationPrompts is out of bounds.', 'materializedLimits.maxImplementationPrompts'));
+  }
+  if (!Number.isInteger(maxMinutes) || maxMinutes < 1 || maxMinutes > 24 * 60) {
+    issues.push(issue('invalid_max_elapsed_minutes', 'maxElapsedMinutes is out of bounds.', 'materializedLimits.maxElapsedMinutes'));
+  }
   if (issues.length > 0) return { ok: false, issues };
   return {
     ok: true,
@@ -135,6 +168,13 @@ export function validateOpenSpecAutoDeliverLaunchRequest(input: unknown): OpenSp
       sessionName: input.sessionName as string,
       changeName: slug.ok ? slug.value : '',
       presetId: input.presetId as OpenSpecAutoDeliverPresetId,
+      selectedTeamComboId,
+      materializedLimits: {
+        specAuditRepairRounds: specRounds as number,
+        implementationAuditRepairRounds: implRounds as number,
+        maxImplementationPrompts: maxPrompts as number,
+        maxElapsedMinutes: maxMinutes as number,
+      },
       ...(typeof input.projectName === 'string' ? { projectName: input.projectName } : {}),
     },
     issues: [],
@@ -225,6 +265,9 @@ export function validateOpenSpecAutoDeliverVerdictPayload(input: unknown): OpenS
 }
 
 export function parseOpenSpecAutoDeliverAuthoritativeJsonPayload(text: string): OpenSpecAutoDeliverValidationResult<unknown> {
+  if (byteLength(text) > OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES) {
+    return { ok: false, issues: [issue('authoritative_input_too_large', 'Authoritative result input exceeds byte limit.')] };
+  }
   const matches = [...text.matchAll(/```json\s*([\s\S]*?)```/g)];
   if (matches.length !== 1) {
     return { ok: false, issues: [issue(matches.length === 0 ? 'missing_authoritative_json' : 'multiple_authoritative_json', 'Expected exactly one authoritative JSON fence.')] };

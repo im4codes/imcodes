@@ -3,82 +3,16 @@ import {
   P2P_SANITIZE_MAX_ARRAY_ITEMS,
   P2P_SANITIZE_MAX_STRING_BYTES,
 } from '../../shared/p2p-workflow-constants.js';
+import type {
+  OpenSpecAutoDeliverBrowserConflictProjection,
+  OpenSpecAutoDeliverBrowserFullProjection,
+  OpenSpecAutoDeliverListRow,
+} from '../../shared/openspec-auto-deliver-types.js';
+import { materializeOpenSpecAutoDeliverPreset } from '../../shared/openspec-auto-deliver-constants.js';
 import { redactSensitiveText } from '../../shared/redact-secrets.js';
 
-export type OpenSpecAutoDeliverSanitizedProjection = {
-  runId: string;
-  changeName: string;
-  status?: string;
-  stage?: string;
-  presetId?: string;
-  owningMainSessionName: string;
-  launchedFromSessionName?: string;
-  targetImplementationSessionName?: string;
-  projectionVersion: number;
-  terminal?: boolean;
-  elapsedMs?: number;
-  taskStats?: {
-    total: number;
-    checked: number;
-    unchecked: number;
-    uncheckedLabels?: string[];
-  };
-  materializedLimits?: {
-    specAuditRepairRounds?: number;
-    implementationAuditRepairRounds?: number;
-    maxImplementationPrompts?: number;
-    maxElapsedMinutes?: number;
-  };
-  specAuditRepairRound?: number;
-  implementationAuditRepairRound?: number;
-  specAuditRound?: {
-    current: number;
-    total: number;
-  };
-  implementationAuditRound?: {
-    current: number;
-    total: number;
-  };
-  implementationPromptCount?: number;
-  activeP2pRunId?: string;
-  activeComboId?: string;
-  latestVerdict?: string;
-  moduleScores?: Array<{
-    module: string;
-    score: number;
-    maxScore: number;
-    summary?: string;
-  }>;
-  latestRepairSummary?: string;
-  evidence?: Array<{
-    source: string;
-    summary: string;
-    command?: string;
-    exitCode?: number;
-    stale?: boolean;
-  }>;
-  validationEvidenceProvenance?: string[];
-  recentFinding?: string;
-  terminalReason?: string;
-  updatedAt?: string;
-  visibility?: 'full' | 'conflict';
-  canStop?: boolean;
-  canDismiss?: boolean;
-};
-
-export type OpenSpecAutoDeliverConflictSummary = {
-  runId: string;
-  changeName: string;
-  owningMainSessionName: string;
-  status?: string;
-  stage?: string;
-  busy: true;
-  reason: string;
-  conflictReason: string;
-  projectionVersion: number;
-  visibility: 'conflict';
-  canStop: false;
-};
+export type OpenSpecAutoDeliverSanitizedProjection = OpenSpecAutoDeliverBrowserFullProjection;
+export type OpenSpecAutoDeliverConflictSummary = OpenSpecAutoDeliverBrowserConflictProjection;
 
 type CacheEntry = {
   projection: OpenSpecAutoDeliverSanitizedProjection;
@@ -230,16 +164,16 @@ export function sanitizeOpenSpecAutoDeliverProjection(
 ): OpenSpecAutoDeliverSanitizedProjection | null {
   if (!isRecord(raw)) return null;
   if (hasForbiddenField(raw)) {
-    // Any private-looking envelope marks the raw projection as untrusted. We
-    // still build a projection from allowlisted fields, but nested private data
-    // never receives a recursive clone path.
+    // Keep the output allowlisted. Private envelope fields are intentionally
+    // not copied below.
   }
 
   const runId = sanitizeString(raw.runId);
   const changeName = sanitizeString(raw.changeName);
   const owningMainSessionName = sanitizeString(raw.owningMainSessionName);
   const projectionVersion = sanitizeNonNegativeInteger(raw.projectionVersion);
-  if (!runId || !changeName || !owningMainSessionName || projectionVersion === undefined) return null;
+  const generation = sanitizeNonNegativeInteger(raw.generation);
+  if (!runId || !changeName || !owningMainSessionName || projectionVersion === undefined || generation === undefined) return null;
 
   const terminal = raw.terminal === true || ['passed', 'needs_human', 'failed', 'stopped'].includes(String(raw.status ?? ''));
   const projection: OpenSpecAutoDeliverSanitizedProjection = {
@@ -247,19 +181,21 @@ export function sanitizeOpenSpecAutoDeliverProjection(
     changeName,
     owningMainSessionName,
     projectionVersion,
+    generation,
     visibility: 'full',
+    status: sanitizeString(raw.status) ?? 'active',
+    stage: sanitizeString(raw.stage) ?? sanitizeString(raw.status) ?? 'proposed',
     canStop: !terminal,
     canDismiss: true,
   };
 
   const stringFields = [
-    'status',
-    'stage',
     'presetId',
     'launchedFromSessionName',
     'targetImplementationSessionName',
     'activeP2pRunId',
-    'activeComboId',
+    'selectedTeamComboId',
+    'activeOpenSpecPromptId',
     'latestVerdict',
     'latestRepairSummary',
     'terminalReason',
@@ -314,6 +250,16 @@ export function sanitizeOpenSpecAutoDeliverProjection(
   const recentFinding = sanitizeString(raw.recentFinding ?? raw.lastMessage);
   if (recentFinding) projection.recentFinding = recentFinding;
 
+  projection.presetId ??= 'standard';
+  projection.launchedFromSessionName ??= projection.owningMainSessionName;
+  projection.targetImplementationSessionName ??= projection.launchedFromSessionName;
+  projection.selectedTeamComboId ??= 'audit>review>plan';
+  projection.materializedLimits ??= materializeOpenSpecAutoDeliverPreset('standard');
+  projection.taskStats ??= { total: 0, checked: 0, unchecked: 0 };
+  projection.implementationPromptCount ??= 0;
+  projection.specAuditRepairRound ??= 0;
+  projection.implementationAuditRepairRound ??= 0;
+
   return projection;
 }
 
@@ -356,7 +302,6 @@ export class OpenSpecAutoDeliverProjectionCache {
     if (!projection) return null;
     return {
       runId: projection.runId,
-      changeName: projection.changeName,
       owningMainSessionName: projection.owningMainSessionName,
       status: projection.status,
       stage: projection.stage,
@@ -367,6 +312,22 @@ export class OpenSpecAutoDeliverProjectionCache {
       visibility: 'conflict',
       canStop: false,
     };
+  }
+
+  getListRowsForSession(sessionName: string): OpenSpecAutoDeliverListRow[] {
+    const rows: OpenSpecAutoDeliverListRow[] = [];
+    const visibleFullOwner = this.ownerByAlias.get(sessionName);
+    for (const [owningMainSessionName, entry] of this.byOwningMainSession) {
+      if (owningMainSessionName === visibleFullOwner) {
+        rows.push(this.toFullListRow(entry.projection));
+        continue;
+      }
+      if (!entry.terminal) {
+        const conflict = this.getConflictSummaryForOwningMainSession(owningMainSessionName);
+        if (conflict) rows.push(this.toConflictListRow(conflict));
+      }
+    }
+    return rows.sort((a, b) => b.projectionVersion - a.projectionVersion);
   }
 
   clearActive(): void {
@@ -386,5 +347,41 @@ export class OpenSpecAutoDeliverProjectionCache {
     const existing = this.byOwningMainSession.get(owningMainSessionName);
     if (!existing) return;
     for (const alias of existing.aliases) this.ownerByAlias.delete(alias);
+  }
+
+  private toFullListRow(projection: OpenSpecAutoDeliverSanitizedProjection): OpenSpecAutoDeliverListRow {
+    return {
+      projectionVersion: projection.projectionVersion,
+      generation: projection.generation,
+      visibility: 'full',
+      runId: projection.runId,
+      owningMainSessionName: projection.owningMainSessionName,
+      status: projection.status,
+      stage: projection.stage,
+      viewMode: projection.terminal === true ? 'compactRecovery' : 'fullRunbar',
+      changeName: projection.changeName,
+      presetId: projection.presetId as OpenSpecAutoDeliverListRow['presetId'],
+      selectedTeamComboId: projection.selectedTeamComboId ?? undefined,
+      targetImplementationSessionName: projection.targetImplementationSessionName,
+      launchedFromSessionName: projection.launchedFromSessionName,
+      elapsedMs: projection.elapsedMs,
+      terminalReason: projection.terminalReason ?? undefined,
+    };
+  }
+
+  private toConflictListRow(conflict: OpenSpecAutoDeliverConflictSummary): OpenSpecAutoDeliverListRow {
+    if (!conflict.status || !conflict.stage) {
+      throw new Error('invalid_openspec_auto_deliver_conflict_row');
+    }
+    return {
+      projectionVersion: conflict.projectionVersion,
+      visibility: 'conflict',
+      runId: conflict.runId,
+      owningMainSessionName: conflict.owningMainSessionName,
+      status: conflict.status,
+      stage: conflict.stage,
+      viewMode: 'conflict',
+      reason: conflict.conflictReason,
+    };
   }
 }

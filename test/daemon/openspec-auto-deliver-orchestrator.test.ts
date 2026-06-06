@@ -56,14 +56,16 @@ import {
   handleOpenSpecAutoDeliverCommand,
 } from '../../src/daemon/openspec-auto-deliver-orchestrator.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
+import { getAutoDeliverP2pLock } from '../../src/daemon/p2p-launch-admission.js';
 
 let projectDir: string;
 
 async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): Promise<void> {
   const root = join(projectDir, 'openspec', 'changes', name);
-  await mkdir(root, { recursive: true });
+  await mkdir(join(root, 'specs', 'demo'), { recursive: true });
   await writeFile(join(root, 'proposal.md'), '# Proposal\n', 'utf8');
   await writeFile(join(root, 'tasks.md'), tasks, 'utf8');
+  await writeFile(join(root, 'specs', 'demo', 'spec.md'), '## ADDED Requirements\n\n### Requirement: Demo\n\n#### Scenario: Demo\n- **WHEN** demo\n- **THEN** demo\n', 'utf8');
 }
 
 async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean, maxMs = 1000): Promise<Record<string, unknown>> {
@@ -105,7 +107,8 @@ function parseAuditMetadata(run: MockP2pRun): Record<string, unknown> {
     changeName: origin.changeName,
     resolvedChangeRootIdentity: lineValue('Resolved change root identity'),
     stage: lineValue('Stage') || origin.stage,
-    designatedComboId: lineValue('Designated combo id') || origin.comboId,
+    selectedTeamComboId: lineValue('Selected Team combo id') || origin.selectedTeamComboId,
+    activeOpenSpecPromptId: lineValue('Active OpenSpec prompt id') || origin.activeOpenSpecPromptId,
     roundIndex: Number((lineValue('Round') || '0/0').split('/')[0]),
     attemptId: lineValue('Attempt id') || origin.attemptId,
     owningMainSessionName: lineValue('Owning main session') || origin.owningMainSessionName,
@@ -261,7 +264,8 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && (msg.projection as { stage?: string } | undefined)?.stage === 'implementation_audit_repair',
     );
-    expect(auditProjection.projection.activeComboId).toBe(OPENSPEC_AUTO_DELIVER_COMBO_IDS.IMPLEMENTATION_AUDIT_REPAIR);
+    expect(auditProjection.projection.selectedTeamComboId).toBe('audit>review>plan');
+    expect(auditProjection.projection.activeOpenSpecPromptId).toBe('implementation_audit');
 
     await completeLatestAudit('completed');
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
@@ -297,7 +301,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(terminal?.projection.moduleScores).toHaveLength(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.length);
   });
 
-  it('starts the designated spec audit-repair combo for presets with spec rounds', async () => {
+  it('starts the materialized spec audit-repair stage for presets with spec rounds', async () => {
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
       requestId: 'req-spec-audit',
@@ -308,12 +312,13 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
 
     expect(startP2pRunMock).toHaveBeenCalledWith(expect.objectContaining({
       advanced: expect.objectContaining({
-        advancedPresetKey: OPENSPEC_AUTO_DELIVER_COMBO_IDS.SPEC_AUDIT_REPAIR,
+        advancedPresetKey: 'proposal_audit',
       }),
       launchOrigin: expect.objectContaining({
         kind: 'openspec_auto_deliver',
         autoDeliver: expect.objectContaining({
-          comboId: OPENSPEC_AUTO_DELIVER_COMBO_IDS.SPEC_AUDIT_REPAIR,
+          selectedTeamComboId: 'audit>review>plan',
+          activeOpenSpecPromptId: 'proposal_audit',
           stage: 'spec_audit_repair',
         }),
       }),
@@ -441,6 +446,18 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     let terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('audit_metadata_mismatch');
+    expect(getAutoDeliverP2pLock('deck_demo_brain')).toBeUndefined();
+
+    const terminalCountAfterStale = serverLinkMock.send.mock.calls.filter((call) =>
+      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL,
+    ).length;
+    const projectionCountAfterStale = serverLinkMock.send.mock.calls.filter((call) =>
+      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION,
+    ).length;
+    await completeLatestAudit('completed');
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toHaveLength(terminalCountAfterStale);
+    expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION)).toHaveLength(projectionCountAfterStale);
 
     clearOpenSpecAutoDeliverRunsForTests();
     serverLinkMock.send.mockClear();
@@ -623,6 +640,32 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     }, serverLinkMock as never);
     error = serverLinkMock.send.mock.calls.map((call) => call[0]).find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ERROR);
     expect(error?.error).toBe('invalid_change_root');
+    expect(getAutoDeliverP2pLock('deck_demo_brain')).toBeUndefined();
+    expect(startP2pRunMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects specs symlink escapes before launch lock acquisition', async () => {
+    const changeRoot = join(projectDir, 'openspec', 'changes', 'specs-escape');
+    const outsideSpecsRoot = join(projectDir, 'outside-specs');
+    await mkdir(join(changeRoot), { recursive: true });
+    await mkdir(join(outsideSpecsRoot, 'demo'), { recursive: true });
+    await writeFile(join(changeRoot, 'proposal.md'), '# Proposal\n', 'utf8');
+    await writeFile(join(changeRoot, 'tasks.md'), '- [ ] first\n', 'utf8');
+    await writeFile(join(outsideSpecsRoot, 'demo', 'spec.md'), '## ADDED Requirements\n\n### Requirement: Escaped\n\n#### Scenario: Escaped\n- **WHEN** demo\n- **THEN** demo\n', 'utf8');
+    await symlink(outsideSpecsRoot, join(changeRoot, 'specs'), 'dir');
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-specs-symlink-escape',
+      sessionName: 'deck_demo_brain',
+      changeName: 'specs-escape',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    const error = serverLinkMock.send.mock.calls.map((call) => call[0]).find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ERROR);
+    expect(error?.error).toBe('missing_spec_delta');
+    expect(getAutoDeliverP2pLock('deck_demo_brain')).toBeUndefined();
+    expect(startP2pRunMock).not.toHaveBeenCalled();
   });
 
   it('bounds implementation prompts and instructs agents not to commit, push, or stage', async () => {
@@ -699,6 +742,44 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(cancelP2pRunMock).toHaveBeenCalledWith('p2p-1', serverLinkMock);
     const terminal = serverLinkMock.send.mock.calls.map((call) => call[0]).find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL);
     expect(terminal?.projection.status).toBe('stopped');
+  });
+
+  it('ignores late audit results after stop terminalization and releases the P2P lock', async () => {
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-stop-late-audit',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+    }, serverLinkMock as never);
+
+    const ack = serverLinkMock.send.mock.calls.map((call) => call[0]).find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK);
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
+    expect(getAutoDeliverP2pLock('deck_demo_brain')).toMatchObject({ runId: ack.projection.runId });
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.STOP,
+      requestId: 'req-stop-before-late-audit',
+      sessionName: 'deck_demo_brain',
+      runId: ack.projection.runId,
+    }, serverLinkMock as never);
+    const stopTerminal = serverLinkMock.send.mock.calls.map((call) => call[0]).find((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.terminalReason === 'user_stopped');
+    expect(stopTerminal?.projection.status).toBe('stopped');
+    expect(getAutoDeliverP2pLock('deck_demo_brain')).toBeUndefined();
+
+    const terminalCountAfterStop = serverLinkMock.send.mock.calls.filter((call) =>
+      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL,
+    ).length;
+    const projectionCountAfterStop = serverLinkMock.send.mock.calls.filter((call) =>
+      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION,
+    ).length;
+    await completeLatestAudit('completed');
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+
+    expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toHaveLength(terminalCountAfterStop);
+    expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION)).toHaveLength(projectionCountAfterStop);
+    expect(getAutoDeliverP2pLock('deck_demo_brain')).toBeUndefined();
   });
 
   it('denies non-participant sibling stop and preserves terminal status on late stop', async () => {

@@ -1153,14 +1153,20 @@
     "auto": {
       "action": "Auto",
       "kicker": "Entrega automática",
+      "custom": "Personalizado",
       "launcher_title": "Entrega automática",
       "details_title": "Detalles de Auto Deliver",
       "current_run": "Entrega automática actual",
+      "list_title": "Auto Deliver",
+      "list_empty": "Aún no se ha observado ninguna ejecución de Auto Deliver.",
+      "list_select": "Selecciona una ejecución de Auto Deliver.",
       "no_change": "Ningún cambio seleccionado",
       "start": "Iniciar entrega automática",
       "stop": "Detener",
       "stopping": "Deteniendo...",
       "view": "Ver",
+      "compact": "Compactar",
+      "expand": "Expandir",
       "tasks": "Tasks",
       "tasks_unknown": "Tareas desconocidas",
       "tasks_progress": "{{checked}}/{{total}} tasks",
@@ -1183,6 +1189,7 @@
       "impl_round": "Implementation audit round",
       "active_p2p": "Active Team run",
       "combo_id": "Combo",
+      "active_prompt": "OpenSpec prompt",
       "verdict": "Verdict",
       "terminal_reason": "Terminal reason",
       "task_stats": "Task status",
@@ -1195,7 +1202,12 @@
         "active_run": "Auto Deliver ya se está ejecutando para este grupo de sesión.",
         "manual_team_busy": "Una ejecución manual de Team ya está usando este grupo de sesión.",
         "unsupported_runtime": "Auto Deliver requiere una sesión de codificación basada en transport.",
-        "launch_failed": "Failed to start Auto Deliver."
+        "launch_failed": "Failed to start Auto Deliver.",
+        "invalid_rounds": "Round counts are outside the allowed range.",
+        "daemon_offline": "Daemon is offline. Try again after it reconnects.",
+        "launch_timeout": "Auto Deliver launch timed out. Try again.",
+        "custom_combo_unsupported": "Custom Team combos are not supported for Auto Deliver yet.",
+        "strict_result_failed": "The audit did not return a valid strict result."
       },
       "preset": {
         "fast": "Rápido",
@@ -1236,7 +1248,10 @@
         "implementation_reported": "Implementation reported",
         "audit_reported": "Audit reported",
         "none": "None"
-      }
+      },
+      "spec_rounds": "Spec audit rounds",
+      "impl_rounds": "Implementation audit rounds",
+      "team_combo": "Team combo"
     },
     "propose_from_discussion_action": "Desde la discusión reciente",
     "propose_from_description_action": "Desde la descripción de abajo",

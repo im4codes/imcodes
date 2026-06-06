@@ -1,14 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import {
+  OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
+  OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
+  OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
   OPENSPEC_AUTO_DELIVER_COMBO_IDS,
   materializeOpenSpecAutoDeliverPreset,
 } from '../../shared/openspec-auto-deliver-constants.js';
 import {
-  OPENSPEC_AUTO_DELIVER_COMBO_DESCRIPTORS,
-  assertOpenSpecAutoDeliverCombosValid,
-  resolveOpenSpecAutoDeliverCombo,
+  evaluateOpenSpecAutoDeliverComboCompatibility,
+  materializeOpenSpecAutoDeliverStageRound,
 } from '../../shared/openspec-auto-deliver-combos.js';
 import { buildOpenSpecAutoDeliverValidationRecommendations } from '../../shared/openspec-auto-deliver-validation-recommendations.js';
+import type {
+  OpenSpecAutoDeliverBrowserConflictProjection,
+  OpenSpecAutoDeliverBrowserFullProjection,
+  OpenSpecAutoDeliverListRow,
+} from '../../shared/openspec-auto-deliver-types.js';
 import {
   parseOpenSpecAutoDeliverAuthoritativeJsonPayload,
   parseOpenSpecTasksMarkdown,
@@ -47,6 +54,55 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
       specAuditRepairRounds: 2,
       implementationAuditRepairRounds: 3,
     });
+  });
+
+  it('validates custom materialized launch limits and fills implementation defaults', () => {
+    const result = validateOpenSpecAutoDeliverLaunchRequest({
+      requestId: 'req-custom',
+      serverId: 'srv-1',
+      sessionName: 'deck_proj_brain',
+      changeName: 'openspec-auto-delivery',
+      presetId: 'custom',
+      selectedTeamComboId: OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
+      materializedLimits: {
+        specAuditRepairRounds: 3,
+        implementationAuditRepairRounds: 5,
+      },
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      value: {
+        requestId: 'req-custom',
+        serverId: 'srv-1',
+        sessionName: 'deck_proj_brain',
+        changeName: 'openspec-auto-delivery',
+        presetId: 'custom',
+        selectedTeamComboId: OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
+        materializedLimits: {
+          specAuditRepairRounds: 3,
+          implementationAuditRepairRounds: 5,
+          maxImplementationPrompts: OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
+          maxElapsedMinutes: OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
+        },
+      },
+      issues: [],
+    });
+
+    expect(validateOpenSpecAutoDeliverLaunchRequest({
+      requestId: 'req-bad-spec',
+      sessionName: 'deck_proj_brain',
+      changeName: 'openspec-auto-delivery',
+      presetId: 'custom',
+      materializedLimits: { specAuditRepairRounds: 4, implementationAuditRepairRounds: 1 },
+    }).ok).toBe(false);
+    expect(validateOpenSpecAutoDeliverLaunchRequest({
+      requestId: 'req-bad-impl',
+      sessionName: 'deck_proj_brain',
+      changeName: 'openspec-auto-delivery',
+      presetId: 'custom',
+      materializedLimits: { specAuditRepairRounds: 0, implementationAuditRepairRounds: 0 },
+    }).ok).toBe(false);
   });
 
   it('parses task checkboxes outside fenced code and counts nested items', () => {
@@ -93,15 +149,7 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
     }).ok).toBe(false);
   });
 
-  it('validates designated combo descriptors and resolver copies', () => {
-    assertOpenSpecAutoDeliverCombosValid();
-    expect(OPENSPEC_AUTO_DELIVER_COMBO_DESCRIPTORS).toHaveLength(2);
-    const specCombo = resolveOpenSpecAutoDeliverCombo(OPENSPEC_AUTO_DELIVER_COMBO_IDS.SPEC_AUDIT_REPAIR);
-    expect(specCombo?.capability.requiredPermissionScope).toBe('artifact_generation');
-    expect(specCombo?.capability.allowedMutationScopes).toContain('openspec_change_artifacts');
-    if (specCombo) specCombo.capability.allowedMutationScopes.length = 0;
-    expect(resolveOpenSpecAutoDeliverCombo(OPENSPEC_AUTO_DELIVER_COMBO_IDS.SPEC_AUDIT_REPAIR)?.capability.allowedMutationScopes).toContain('openspec_change_artifacts');
-
+  it('keeps stage materialization helpers valid but denies legacy ids as selected Team combos', () => {
     const invalid = validateOpenSpecAutoDeliverComboDescriptor({
       id: OPENSPEC_AUTO_DELIVER_COMBO_IDS.IMPLEMENTATION_AUDIT_REPAIR,
       title: 'Invalid',
@@ -119,6 +167,38 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
     });
     expect(invalid.ok).toBe(false);
     expect(invalid.issues.map((entry) => entry.code)).toContain('implementation_combo_analysis_only');
+
+    expect(evaluateOpenSpecAutoDeliverComboCompatibility(
+      OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
+      'spec_audit_repair',
+      'proposal_audit',
+    )).toEqual({ ok: true });
+    expect(evaluateOpenSpecAutoDeliverComboCompatibility(
+      'audit>plan',
+      'spec_audit_repair',
+      'proposal_audit',
+    )).toEqual({ ok: false, reason: 'custom_combo_unsupported' });
+    expect(evaluateOpenSpecAutoDeliverComboCompatibility(
+      OPENSPEC_AUTO_DELIVER_COMBO_IDS.SPEC_AUDIT_REPAIR,
+      'spec_audit_repair',
+      'proposal_audit',
+    )).toEqual({ ok: false, reason: 'legacy_combo_unsupported' });
+    expect(evaluateOpenSpecAutoDeliverComboCompatibility(
+      OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
+      'implementation_audit_repair',
+      'proposal_audit',
+    )).toEqual({ ok: false, reason: 'invalid_stage_prompt' });
+
+    const specRound = materializeOpenSpecAutoDeliverStageRound('spec_audit_repair', OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID);
+    expect(specRound).toEqual(expect.objectContaining({
+      activeOpenSpecPromptId: 'proposal_audit',
+      round: expect.objectContaining({ preset: 'proposal_audit', permissionScope: 'artifact_generation' }),
+    }));
+    const implementationRound = materializeOpenSpecAutoDeliverStageRound('implementation_audit_repair', OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID);
+    expect(implementationRound).toEqual(expect.objectContaining({
+      activeOpenSpecPromptId: 'implementation_audit',
+      round: expect.objectContaining({ preset: 'implementation_audit', permissionScope: 'implementation' }),
+    }));
   });
 
   it('validates strict verdict payloads', () => {
@@ -135,10 +215,54 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
 
   it('extracts exactly one authoritative JSON payload', () => {
     expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload(`Before\n\`\`\`json\n${JSON.stringify(validVerdictPayload())}\n\`\`\``).ok).toBe(true);
-    expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload(`${'x'.repeat(70 * 1024)}\n\`\`\`json\n${JSON.stringify(validVerdictPayload())}\n\`\`\``).ok).toBe(true);
+    expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload(`${'x'.repeat(70 * 1024)}\n\`\`\`json\n${JSON.stringify(validVerdictPayload())}\n\`\`\``).ok).toBe(false);
     expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload('no json here').ok).toBe(false);
     expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload('```json\n{}\n```\n```json\n{}\n```').ok).toBe(false);
     expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload('```json\n{ nope }\n```').ok).toBe(false);
+  });
+
+  it('keeps browser projection and list row contracts redaction-safe', () => {
+    const full: OpenSpecAutoDeliverBrowserFullProjection = {
+      visibility: 'full',
+      projectionVersion: 1,
+      runId: 'run-1',
+      changeName: 'openspec-auto-delivery',
+      status: 'implementation_task_loop',
+      stage: 'implementation_task_loop',
+      owningMainSessionName: 'deck_proj_brain',
+      selectedTeamComboId: OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
+      activeOpenSpecPromptId: 'implementation_audit',
+      taskStats: { total: 1, checked: 0, unchecked: 1, uncheckedLabels: ['private task'] },
+    };
+    const conflict: OpenSpecAutoDeliverBrowserConflictProjection = {
+      visibility: 'conflict',
+      projectionVersion: 2,
+      runId: 'run-2',
+      owningMainSessionName: 'deck_other_brain',
+      status: 'spec_audit_repair',
+      stage: 'spec_audit_repair',
+      busy: true,
+      reason: 'auto_deliver_active',
+      conflictReason: 'auto_deliver_active',
+      canStop: false,
+    };
+    const row: OpenSpecAutoDeliverListRow = {
+      projectionVersion: 1,
+      visibility: 'full',
+      runId: full.runId,
+      owningMainSessionName: full.owningMainSessionName ?? 'deck_proj_brain',
+      status: full.status,
+      stage: full.stage,
+      viewMode: 'fullRunbar',
+      changeName: full.changeName,
+      selectedTeamComboId: full.selectedTeamComboId ?? undefined,
+    };
+
+    expect(full.changeName).toBe('openspec-auto-delivery');
+    expect(row.viewMode).toBe('fullRunbar');
+    expect(Object.keys(conflict)).not.toContain('changeName');
+    expect(Object.keys(conflict)).not.toContain('taskStats');
+    expect(Object.keys(conflict)).not.toContain('evidence');
   });
 
   it('recommends safe validation commands and flags unsafe scripts', () => {

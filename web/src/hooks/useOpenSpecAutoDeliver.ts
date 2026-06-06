@@ -10,6 +10,8 @@ import {
   type OpenSpecAutoDeliverStopPayload,
 } from '../openspec-auto-deliver.js';
 
+const OPEN_SPEC_AUTO_DELIVER_LAUNCH_TIMEOUT_MS = 30_000;
+
 interface Options {
   ws: WsClient | null;
   serverId?: string;
@@ -20,6 +22,8 @@ interface Options {
 interface LaunchOptions {
   changeName: string;
   presetId?: OpenSpecAutoDeliverPresetId;
+  selectedTeamComboId?: string;
+  materializedLimits?: OpenSpecAutoDeliverLaunchPayload['materializedLimits'];
 }
 
 interface State {
@@ -41,16 +45,19 @@ function makeRequestId(prefix: string): string {
 function normalizeProjection(raw: unknown): OpenSpecAutoDeliverProjection | null {
   if (!raw || typeof raw !== 'object') return null;
   const projection = raw as Partial<OpenSpecAutoDeliverProjection>;
+  const visibility = projection.visibility === 'conflict' ? 'conflict' : 'full';
   if (
     typeof projection.runId !== 'string'
-    || typeof projection.changeName !== 'string'
     || typeof projection.status !== 'string'
     || typeof projection.stage !== 'string'
   ) {
     return null;
   }
+  if (visibility === 'full' && typeof projection.changeName !== 'string') return null;
+  if (visibility === 'conflict' && typeof projection.owningMainSessionName !== 'string') return null;
   return {
     ...projection,
+    visibility,
     conflictReason: typeof projection.conflictReason === 'string'
       ? projection.conflictReason
       : typeof (raw as { reason?: unknown }).reason === 'string'
@@ -114,6 +121,20 @@ function normalizeLaunchError(error: unknown): string {
   ) {
     return 'openspec.auto.error.unsupported_runtime';
   }
+  if (
+    normalized === 'daemon_offline'
+    || normalized === 'daemon_unavailable'
+    || normalized === 'daemon_disconnected'
+  ) {
+    return 'openspec.auto.error.daemon_offline';
+  }
+  if (
+    normalized === 'launch_timeout'
+    || normalized === 'request_timeout'
+    || normalized === 'timeout'
+  ) {
+    return 'openspec.auto.error.launch_timeout';
+  }
   return trimmed.includes('.') ? trimmed : 'openspec.auto.error.launch_failed';
 }
 
@@ -128,6 +149,16 @@ export function useOpenSpecAutoDeliver({
   const [stopPending, setStopPending] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
   const latestProjectionRef = useRef<OpenSpecAutoDeliverProjection | null>(null);
+  const launchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeLaunchRequestIdRef = useRef<string | null>(null);
+
+  const clearLaunchTimeout = useCallback(() => {
+    if (launchTimeoutRef.current) {
+      clearTimeout(launchTimeoutRef.current);
+      launchTimeoutRef.current = null;
+    }
+    activeLaunchRequestIdRef.current = null;
+  }, []);
 
   const applyProjection = useCallback((next: OpenSpecAutoDeliverProjection | null) => {
     if (!next) return;
@@ -140,10 +171,11 @@ export function useOpenSpecAutoDeliver({
       return;
     }
     latestProjectionRef.current = next;
+    clearLaunchTimeout();
     setProjection(next);
     setLaunchPending(false);
     setStopPending(false);
-  }, []);
+  }, [clearLaunchTimeout]);
 
   const requestStatus = useCallback(() => {
     if (!ws || !sessionName) return null;
@@ -158,7 +190,7 @@ export function useOpenSpecAutoDeliver({
     return requestId;
   }, [serverId, sessionName, ws]);
 
-  const launch = useCallback(({ changeName, presetId = OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET }: LaunchOptions) => {
+  const launch = useCallback(({ changeName, presetId = OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET, selectedTeamComboId, materializedLimits }: LaunchOptions) => {
     const trimmedChangeName = changeName.trim();
     if (!ws || !sessionName || !trimmedChangeName) {
       setLastError('openspec.auto.error.missing_change');
@@ -172,12 +204,23 @@ export function useOpenSpecAutoDeliver({
       sessionName,
       changeName: trimmedChangeName,
       presetId,
+      ...(selectedTeamComboId ? { selectedTeamComboId } : {}),
+      ...(materializedLimits ? { materializedLimits } : {}),
     };
+    clearLaunchTimeout();
+    activeLaunchRequestIdRef.current = requestId;
     setLaunchPending(true);
     setLastError(null);
+    launchTimeoutRef.current = setTimeout(() => {
+      if (activeLaunchRequestIdRef.current !== requestId) return;
+      activeLaunchRequestIdRef.current = null;
+      launchTimeoutRef.current = null;
+      setLaunchPending(false);
+      setLastError('openspec.auto.error.launch_timeout');
+    }, OPEN_SPEC_AUTO_DELIVER_LAUNCH_TIMEOUT_MS);
     ws.send(payload);
     return requestId;
-  }, [serverId, sessionName, ws]);
+  }, [clearLaunchTimeout, serverId, sessionName, ws]);
 
   const stop = useCallback((runId = projection?.runId) => {
     if (!ws || !sessionName || !runId) return null;
@@ -204,6 +247,7 @@ export function useOpenSpecAutoDeliver({
         return;
       }
       if (raw.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ERROR) {
+        clearLaunchTimeout();
         setLastError(normalizeLaunchError(raw.error));
         setLaunchPending(false);
         const conflictProjection = normalizeProjection(raw.projection ?? raw.conflict);
@@ -217,20 +261,23 @@ export function useOpenSpecAutoDeliver({
         return;
       }
     });
-  }, [applyProjection, ws]);
+  }, [applyProjection, clearLaunchTimeout, ws]);
 
   useEffect(() => {
     latestProjectionRef.current = null;
+    clearLaunchTimeout();
     setProjection(null);
     setLastError(null);
     setLaunchPending(false);
     setStopPending(false);
     requestStatus();
-  }, [requestStatus, sessionName]);
+  }, [clearLaunchTimeout, requestStatus, sessionName]);
 
   useEffect(() => {
     if (openSpecOpen) requestStatus();
   }, [openSpecOpen, requestStatus]);
+
+  useEffect(() => () => clearLaunchTimeout(), [clearLaunchTimeout]);
 
   return useMemo(() => ({
     projection,

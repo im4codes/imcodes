@@ -42,7 +42,12 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.auto.error.active_run') return 'Auto Deliver already running';
       if (key === 'openspec.auto.error.manual_team_busy') return 'Manual Team is busy';
       if (key === 'openspec.auto.error.unsupported_runtime') return 'Unsupported runtime';
+      if (key === 'openspec.auto.error.daemon_offline') return 'Daemon offline';
+      if (key === 'openspec.auto.error.launch_timeout') return 'Launch timed out';
+      if (key === 'openspec.auto.error.invalid_rounds') return 'Invalid rounds';
+      if (key === 'openspec.auto.error.custom_combo_unsupported') return 'Custom Team combos are not supported for Auto Deliver yet';
       if (key === 'openspec.auto.error.launch_failed') return 'Launch failed';
+      if (key === 'openspec.auto.custom') return 'Custom';
       if (key === 'openspec.auto.preset.fast') return 'Fast';
       if (key === 'openspec.auto.preset.standard') return 'Standard';
       if (key === 'openspec.auto.preset.strict') return 'Strict';
@@ -1316,7 +1321,7 @@ afterEach(() => {
     expect(screen.getByRole('textbox').textContent).toBe('');
   });
 
-  it('keeps Auto Deliver launch bound to preset buttons, not editable combo ids or raw requirement text', async () => {
+  it('keeps Auto Deliver launch bound to OpenSpec changes while sending combo id and materialized limits', async () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -1350,7 +1355,8 @@ afterEach(() => {
     expect(within(launcher).getByTestId('openspec-auto-preset-strict')).toBeDefined();
     expect(within(launcher).getByTestId('openspec-auto-preset-deep')).toBeDefined();
     expect(within(launcher).queryByRole('textbox')).toBeNull();
-    expect(within(launcher).queryByRole('combobox')).toBeNull();
+    expect(within(launcher).getAllByRole('spinbutton')).toHaveLength(2);
+    expect(within(launcher).getByRole('combobox')).toBeDefined();
     expect(within(launcher).queryByDisplayValue(/openspec_auto_deliver/i)).toBeNull();
 
     fireEvent.click(within(launcher).getByRole('button', { name: 'Start Auto Deliver' }));
@@ -1361,12 +1367,103 @@ afterEach(() => {
       sessionName: 'my-session',
       changeName: 'change-a',
       presetId: 'standard',
+      selectedTeamComboId: 'audit>review>plan',
+      materializedLimits: {
+        specAuditRepairRounds: 1,
+        implementationAuditRepairRounds: 2,
+      },
       requestId: expect.any(String),
     }));
     expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
       text: expect.stringContaining('raw requirement text'),
     }));
     expect(input.textContent).toBe('raw requirement text should stay in chat and must not become an Auto Deliver launch source');
+  });
+
+  it('defaults the Auto Deliver Team combo to the audit-review-plan machine id', () => {
+    const onLaunch = vi.fn();
+    render(
+      <OpenSpecAutoDeliverLauncher
+        open
+        changeName="change-a"
+        onClose={vi.fn()}
+        onLaunch={onLaunch}
+      />,
+    );
+
+    const comboSelect = screen.getByRole('combobox') as HTMLSelectElement;
+    expect(comboSelect.value).toBe('audit>review>plan');
+    expect(within(comboSelect).getByRole('option', { name: 'Audit-Review-Plan' })).toBeDefined();
+    expect(within(comboSelect).getByRole('option', { name: 'brainstorm > discuss > plan' })).toBeDefined();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+    expect(onLaunch).toHaveBeenCalledWith('change-a', 'standard', {
+      selectedTeamComboId: 'audit>review>plan',
+      materializedLimits: {
+        specAuditRepairRounds: 1,
+        implementationAuditRepairRounds: 2,
+      },
+    });
+  });
+
+  it('keeps numeric controls editable after preset quick setters and launches custom exact limits', () => {
+    const onLaunch = vi.fn();
+    render(
+      <OpenSpecAutoDeliverLauncher
+        open
+        changeName="change-a"
+        onClose={vi.fn()}
+        onLaunch={onLaunch}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('openspec-auto-preset-fast'));
+    expect(screen.getByText('Spec audit-repair 0 · Implementation audit-repair 1')).toBeDefined();
+
+    const [specRounds, implementationRounds] = screen.getAllByRole('spinbutton') as HTMLInputElement[];
+    fireEvent.input(specRounds!, { target: { value: '3' } });
+    fireEvent.input(implementationRounds!, { target: { value: '5' } });
+
+    expect((specRounds as HTMLInputElement).value).toBe('3');
+    expect((implementationRounds as HTMLInputElement).value).toBe('5');
+    expect(screen.getByText('Spec audit-repair 3 · Implementation audit-repair 5')).toBeDefined();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+    expect(onLaunch).toHaveBeenCalledWith('change-a', 'custom', {
+      selectedTeamComboId: 'audit>review>plan',
+      materializedLimits: {
+        specAuditRepairRounds: 3,
+        implementationAuditRepairRounds: 5,
+      },
+    });
+  });
+
+  it('lists saved custom Team combos in the Auto Deliver launcher and blocks them with a compatibility reason before launch', async () => {
+    const onLaunch = vi.fn();
+    render(
+      <OpenSpecAutoDeliverLauncher
+        open
+        changeName="change-a"
+        onClose={vi.fn()}
+        onLaunch={onLaunch}
+      />,
+    );
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('imcodes:user-pref-changed', {
+        detail: { key: 'p2p_custom_combos', value: JSON.stringify(['audit>plan']) },
+      }));
+    });
+
+    const comboSelect = screen.getByRole('combobox') as HTMLSelectElement;
+    await waitFor(() => expect(within(comboSelect).getByRole('option', { name: 'audit>plan (Custom)' })).toBeDefined());
+    fireEvent.change(comboSelect, { target: { value: 'audit>plan' } });
+
+    expect(screen.getByTestId('openspec-auto-combo-warning').textContent).toBe('Custom Team combos are not supported for Auto Deliver yet');
+    expect((screen.getByRole('button', { name: 'Start Auto Deliver' }) as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+    expect(onLaunch).not.toHaveBeenCalled();
   });
 
   it('shows local Auto Deliver launch validation when no change is selected', () => {
@@ -1525,6 +1622,8 @@ afterEach(() => {
         projectionVersion: 2,
         visibility: 'full',
         changeName: 'change-a',
+        launchedFromSessionName: 'my-session',
+        targetImplementationSessionName: 'my-session',
         status: 'active',
         stage: 'implementation_task_loop',
         startedAt: Date.now() - 1000,
@@ -1610,6 +1709,7 @@ afterEach(() => {
         changeName: 'change-a',
         status: 'active',
         stage: 'implementation_task_loop',
+        owningMainSessionName: 'deck_main',
         conflictReason: 'Owned by another visible session',
       },
     });
@@ -1666,6 +1766,72 @@ afterEach(() => {
     const entry = screen.getByTestId('openspec-auto-current-entry');
     expect(within(entry).getByText('change-sub')).toBeDefined();
     expect(within(entry).getByText('deck_main → deck_sub_worker-alpha')).toBeDefined();
+  });
+
+  it('supports compact, hide, recovery, and run-id reset for the Auto Deliver runbar', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    ws.emit({
+      type: 'openspec_auto_deliver.projection',
+      projection: {
+        runId: 'auto-compact-1',
+        projectionVersion: 1,
+        visibility: 'full',
+        changeName: 'change-a',
+        launchedFromSessionName: 'my-session',
+        targetImplementationSessionName: 'my-session',
+        status: 'active',
+        stage: 'implementation_task_loop',
+        taskStats: { total: 5, checked: 2, unchecked: 3 },
+        recentFinding: 'compact finding',
+        canStop: true,
+      },
+    });
+    await flushAsync();
+
+    const fullRunbar = screen.getByTestId('openspec-auto-runbar');
+    expect(fullRunbar.className).not.toContain('openspec-auto-runbar-compact');
+    fireEvent.click(within(fullRunbar).getByRole('button', { name: 'compact' }));
+    expect(screen.getByTestId('openspec-auto-runbar').className).toContain('openspec-auto-runbar-compact');
+
+    fireEvent.click(within(screen.getByTestId('openspec-auto-runbar')).getByRole('button', { name: 'expand' }));
+    fireEvent.click(within(screen.getByTestId('openspec-auto-runbar')).getByRole('button', { name: 'hide' }));
+    expect(screen.queryByTestId('openspec-auto-runbar')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    await flushAsync();
+    const recoveryEntry = screen.getByTestId('openspec-auto-current-entry');
+    expect(within(recoveryEntry).getByText('change-a')).toBeDefined();
+    fireEvent.click(within(recoveryEntry).getByRole('button', { name: 'View' }));
+    expect(screen.getByTestId('openspec-auto-details')).toBeDefined();
+
+    ws.emit({
+      type: 'openspec_auto_deliver.projection',
+      projection: {
+        runId: 'auto-compact-2',
+        projectionVersion: 1,
+        visibility: 'full',
+        changeName: 'change-b',
+        launchedFromSessionName: 'my-session',
+        targetImplementationSessionName: 'my-session',
+        status: 'active',
+        stage: 'spec_audit_repair',
+        taskStats: { total: 2, checked: 0, unchecked: 2 },
+        canStop: true,
+      },
+    });
+    await flushAsync();
+
+    const resetRunbar = screen.getByTestId('openspec-auto-runbar');
+    expect(resetRunbar.className).not.toContain('openspec-auto-runbar-compact');
+    expect(within(resetRunbar).getByText('change-b')).toBeDefined();
   });
 
   it('opens an openspec change folder in the file browser and can insert files from it', async () => {

@@ -373,7 +373,7 @@ describe('P2P orchestrator — parallel rounds', () => {
       runId: 'auto-run-1',
       owningMainSessionName: 'deck_proj',
       generation: 3,
-      allowedComboIds: ['openspec_auto_deliver.implementation_audit_repair'],
+      selectedTeamComboId: 'audit>review>plan',
     });
 
     await expect(startP2pRun({
@@ -391,7 +391,7 @@ describe('P2P orchestrator — parallel rounds', () => {
       runId: 'auto-run-force',
       owningMainSessionName: 'deck_proj',
       generation: 3,
-      allowedComboIds: ['openspec_auto_deliver.implementation_audit_repair'],
+      selectedTeamComboId: 'audit>review>plan',
     });
 
     await expect(startP2pRun({
@@ -419,7 +419,7 @@ describe('P2P orchestrator — parallel rounds', () => {
       runId: 'auto-run-sub',
       owningMainSessionName: 'deck_proj',
       generation: 5,
-      allowedComboIds: ['openspec_auto_deliver.implementation_audit_repair'],
+      selectedTeamComboId: 'audit>review>plan',
     });
 
     await expect(startP2pRun({
@@ -437,7 +437,7 @@ describe('P2P orchestrator — parallel rounds', () => {
       runId: 'auto-run-release',
       owningMainSessionName: 'deck_proj',
       generation: 1,
-      allowedComboIds: ['openspec_auto_deliver.spec_audit_repair'],
+      selectedTeamComboId: 'audit>review>plan',
     });
 
     await expect(startP2pRun({
@@ -469,7 +469,10 @@ describe('P2P orchestrator — parallel rounds', () => {
       runId: 'auto-run-2',
       owningMainSessionName: 'deck_proj',
       generation: 7,
-      allowedComboIds: ['openspec_auto_deliver.spec_audit_repair'],
+      stage: 'spec_audit_repair',
+      roundIndex: 1,
+      selectedTeamComboId: 'audit>review>plan',
+      activeOpenSpecPromptId: 'proposal_audit',
     });
 
     const run = await startP2pRun({
@@ -487,8 +490,10 @@ describe('P2P orchestrator — parallel rounds', () => {
           owningMainSessionName: 'deck_proj',
           generation: 7,
           stage: 'spec_audit_repair',
+          roundIndex: 1,
           attemptId: 'attempt-1',
-          comboId: 'openspec_auto_deliver.spec_audit_repair',
+          selectedTeamComboId: 'audit>review>plan',
+          activeOpenSpecPromptId: 'proposal_audit',
         },
       },
     });
@@ -503,8 +508,10 @@ describe('P2P orchestrator — parallel rounds', () => {
           owningMainSessionName: 'deck_proj',
           generation: 7,
           stage: 'spec_audit_repair',
+          roundIndex: 1,
           attemptId: 'attempt-1',
-          comboId: 'openspec_auto_deliver.spec_audit_repair',
+          selectedTeamComboId: 'audit>review>plan',
+          activeOpenSpecPromptId: 'proposal_audit',
         },
       },
     });
