@@ -88,7 +88,7 @@ import {
 } from '../../../shared/preview-types.js';
 import { isStreamingResponse } from '../../../shared/preview-stream-policy.js';
 import { LocalWebPreviewRegistry, setPreviewActiveRelayHook, setPreviewEvictedHook } from '../preview/registry.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, getSubSessionsByServer, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
 import { toDiscussionCommentView } from '../share/discussion-comment-view.js';
 import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
@@ -119,7 +119,7 @@ import {
   evaluateShareCommand,
   filterShareDaemonMessage,
   resolveShareCoverageFromDb,
-  shareTargetCoversSession,
+  shareStateCoversSession,
   shareTargetKey,
   type EffectiveCoverage,
   type ShareCoverageResolver,
@@ -2537,8 +2537,10 @@ export class WsBridge {
       target: options.target,
       snapshot: options.snapshot,
       connectedAt: shareClockNow(),
+      coveredSessionNames: this.baseCoveredSessionNames(options.target),
     });
     this.handleBrowserConnection(ws, userId, db, options.isMobile ?? false);
+    void this.refreshShareCoveredSessions(ws);
   }
 
   async revalidateShareSocketForTests(ws: WebSocket): Promise<void> {
@@ -2932,7 +2934,7 @@ export class WsBridge {
         closeSocket: true,
       };
     }
-    const current = this.applyShareCoverage(ws, state, coverage);
+    const current = await this.applyShareCoverage(ws, state, coverage);
     const sessionName = commandSessionName(msg);
     const runtimeType = sessionName ? await this.resolveSessionRuntimeType(sessionName) : 'unknown';
     const decision = evaluateShareCommand({
@@ -3187,15 +3189,16 @@ export class WsBridge {
     });
   }
 
-  private applyShareCoverage(
+  private async applyShareCoverage(
     ws: WebSocket,
     state: ShareScopedSocketState,
     coverage: EffectiveCoverage,
-  ): ShareScopedSocketState {
+  ): Promise<ShareScopedSocketState> {
     const next: ShareScopedSocketState = {
       ...state,
       target: coverage.target,
       snapshot: coverage,
+      coveredSessionNames: await this.resolveShareCoveredSessionNames(coverage.target),
     };
     if (state.snapshot.effectiveRole !== coverage.effectiveRole) {
       safeSend(ws, JSON.stringify({
@@ -3207,6 +3210,36 @@ export class WsBridge {
     }
     this.browserShareStates.set(ws, next);
     return next;
+  }
+
+  private baseCoveredSessionNames(target: ShareTarget): string[] | undefined {
+    if (target.kind === 'server') return undefined;
+    if (target.kind === 'main') return [target.sessionName];
+    return [`deck_sub_${target.subSessionId}`];
+  }
+
+  private async refreshShareCoveredSessions(ws: WebSocket): Promise<void> {
+    const state = this.browserShareStates.get(ws);
+    if (!state) return;
+    const coveredSessionNames = await this.resolveShareCoveredSessionNames(state.target);
+    const current = this.browserShareStates.get(ws);
+    if (!current || current.ticketId !== state.ticketId) return;
+    this.browserShareStates.set(ws, { ...current, coveredSessionNames });
+  }
+
+  private async resolveShareCoveredSessionNames(target: ShareTarget): Promise<string[] | undefined> {
+    if (target.kind === 'server') return undefined;
+    const names = new Set(this.baseCoveredSessionNames(target) ?? []);
+    if (target.kind !== 'main' || !this.db) return [...names];
+    try {
+      const subSessions = await getSubSessionsByServer(this.db, target.serverId);
+      for (const subSession of subSessions) {
+        if (subSession.parent_session === target.sessionName) names.add(`deck_sub_${subSession.id}`);
+      }
+    } catch (err) {
+      logger.warn({ err, serverId: this.serverId, target }, 'Failed to refresh covered share sub-sessions');
+    }
+    return [...names];
   }
 
   private shareStateLooksExpired(state: ShareScopedSocketState): boolean {
@@ -3222,7 +3255,7 @@ export class WsBridge {
       this.teardownShareSocket(ws, this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED);
       return;
     }
-    this.applyShareCoverage(ws, state, coverage);
+    await this.applyShareCoverage(ws, state, coverage);
   }
 
   private async sweepShareSockets(): Promise<void> {
@@ -4567,7 +4600,7 @@ export class WsBridge {
   private canShareSocketReceiveSession(ws: WebSocket, sessionName: string, data: string | Buffer): boolean {
     const state = this.browserShareStates.get(ws);
     if (!state) return true;
-    if (!shareTargetCoversSession(state.target, sessionName)) return false;
+    if (!shareStateCoversSession(state, sessionName)) return false;
     if (typeof data !== 'string') return true;
     const msg = this.tryParseJsonRecord(data);
     return !msg || !!this.filterShareOutgoingJson(ws, msg, data);
@@ -5028,14 +5061,14 @@ export class WsBridge {
       this.removeInflight(entry.commandId);
       return false;
     }
-    const current = this.applyShareCoverage(entry.browser, state, coverage);
-    if (!shareTargetCoversSession(current.target, entry.sessionName)) {
+    const current = await this.applyShareCoverage(entry.browser, state, coverage);
+    if (!shareStateCoversSession(current, entry.sessionName)) {
       this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.TARGET_UNAVAILABLE);
       this.removeInflight(entry.commandId);
       return false;
     }
     const sameTarget = shareTargetKey(current.target) === shareTargetKey(entry.share.target);
-    if (!sameTarget || !shareTargetCoversSession(current.target, entry.sessionName)) {
+    if (!sameTarget || !shareStateCoversSession(current, entry.sessionName)) {
       this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.TARGET_UNAVAILABLE);
       this.removeInflight(entry.commandId);
       return false;

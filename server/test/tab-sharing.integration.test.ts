@@ -387,9 +387,18 @@ describe('tab sharing APIs', () => {
       body: JSON.stringify({ target: { kind: 'main', serverId, sessionName } }),
     });
     expect(open.status).toBe(200);
-    const openBody = await open.json() as { coverage: { effectiveRole: string; historyCutoffAt: number }; sessions: Array<{ sessionName: string }> };
+    const openBody = await open.json() as {
+      coverage: { effectiveRole: string; historyCutoffAt: number };
+      sessions: Array<{ sessionName: string }>;
+      subSessions: Array<{ subSessionId: string; sessionName: string; parentSessionName: string | null }>;
+    };
     expect(openBody.coverage).toMatchObject({ effectiveRole: 'viewer', historyCutoffAt: 0 });
     expect(openBody.sessions).toEqual([expect.objectContaining({ sessionName })]);
+    expect(openBody.subSessions).toEqual([expect.objectContaining({
+      subSessionId,
+      sessionName: `deck_sub_${subSessionId}`,
+      parentSessionName: sessionName,
+    })]);
 
     const openServer = await app.request('/api/shares/open', {
       method: 'POST',
@@ -761,7 +770,15 @@ describe('tab sharing APIs', () => {
           agentType: 'codex',
         },
       ],
-      subSessions: [],
+      subSessions: [
+        {
+          subSessionId,
+          sessionName: `deck_sub_${subSessionId}`,
+          title: 'Sub Label',
+          type: 'codex',
+          parentSessionName: sessionName,
+        },
+      ],
     });
     expect(openBody).not.toHaveProperty('shares');
     expect(openBody).not.toHaveProperty('targetUser');

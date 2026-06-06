@@ -211,9 +211,9 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
   const subRows = await getSubSessionsByServer(c.env.DB, target.serverId);
   const subSessions = target.kind === 'server'
     ? subRows
-    : target.kind === 'subsession'
-      ? subRows.filter((subSession) => subSession.id === target.subSessionId)
-      : [];
+    : target.kind === 'main'
+      ? subRows.filter((subSession) => subSession.parent_session === target.sessionName)
+      : subRows.filter((subSession) => subSession.id === target.subSessionId);
   const sessions = target.kind === 'server'
     ? mainRows
     : target.kind === 'main'

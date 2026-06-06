@@ -39,6 +39,7 @@ export type ShareScopedSocketState = {
   target: ShareTarget;
   snapshot: ShareAuthorizationSnapshot;
   connectedAt: number;
+  coveredSessionNames?: readonly string[];
 };
 
 export type ShareCoverageResolver = (input: {
@@ -223,6 +224,11 @@ export function shareTargetCoversSession(target: ShareTarget, sessionName: strin
   return parseSubSessionName(sessionName) === target.subSessionId;
 }
 
+export function shareStateCoversSession(state: ShareScopedSocketState, sessionName: string): boolean {
+  return shareTargetCoversSession(state.target, sessionName)
+    || !!state.coveredSessionNames?.includes(sessionName);
+}
+
 export function isConcreteShareTarget(target: ShareTarget): boolean {
   return target.kind === 'main' || target.kind === 'subsession';
 }
@@ -259,7 +265,7 @@ export function evaluateShareCommand(input: {
   const sessionName = commandSessionName(input.msg);
   if (policy.kind === 'allow-covered-read') {
     if (!sessionName) return { allowed: true };
-    return shareTargetCoversSession(input.state.target, sessionName)
+    return shareStateCoversSession(input.state, sessionName)
       ? { allowed: true }
       : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
   }
@@ -273,7 +279,7 @@ export function evaluateShareCommand(input: {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
     const referencedSessions = commandReferencedSessionNames(input.msg);
-    if (referencedSessions.some((name) => !shareTargetCoversSession(input.state.target, name))) {
+    if (referencedSessions.some((name) => !shareStateCoversSession(input.state, name))) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
     const actionId = typeof input.msg.requestId === 'string' && input.msg.requestId.trim()
@@ -296,7 +302,7 @@ export function evaluateShareCommand(input: {
     };
   }
 
-  if (!sessionName || !shareTargetCoversSession(input.state.target, sessionName)) {
+  if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
     return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
   }
 
@@ -375,7 +381,7 @@ function evaluateP2pSendScope(msg: Record<string, unknown>, state: ShareScopedSo
   if (!targets.hasP2pRouting) return null;
   if (state.target.kind === 'server') return null;
   if (targets.hasUnboundedExpansion) return SHARE_REASONS.DIRECT_SURFACE_DENIED;
-  if (targets.sessions.some((name) => !shareTargetCoversSession(state.target, name))) {
+  if (targets.sessions.some((name) => !shareStateCoversSession(state, name))) {
     return SHARE_REASONS.DIRECT_SURFACE_DENIED;
   }
   return null;
@@ -443,7 +449,7 @@ export function filterShareDaemonMessage(
   const target = policy.target(msg);
   if (!target) return null;
   if (target.serverId && target.serverId !== state.target.serverId) return null;
-  if (target.kind !== 'server' && !shareTargetCoversSession(state.target, sessionNameFromTarget(target))) return null;
+  if (target.kind !== 'server' && !shareStateCoversSession(state, sessionNameFromTarget(target))) return null;
   return policy.redact ? policy.redact(msg, state) : msg;
 }
 
@@ -601,6 +607,8 @@ function p2pRunScopedTarget(msg: Record<string, unknown>): ShareTarget | null {
 }
 
 function subsessionCreatedTarget(msg: Record<string, unknown>): ShareTarget | null {
+  const parentSession = typeof msg.parentSession === 'string' ? msg.parentSession.trim() : '';
+  if (parentSession) return { kind: 'main', serverId: '', sessionName: parentSession };
   const id = typeof msg.id === 'string' ? msg.id : '';
   const sessionName = typeof msg.sessionName === 'string' ? msg.sessionName : (id ? `deck_sub_${id}` : '');
   return sessionName ? sessionNameToShareTarget('', sessionName) : null;
@@ -616,7 +624,7 @@ function redactSessionList(msg: Record<string, unknown>, state: ShareScopedSocke
     ? msg.sessions.filter((item) => {
       if (!item || typeof item !== 'object') return false;
       const name = (item as Record<string, unknown>).name;
-      return typeof name === 'string' && shareTargetCoversSession(state.target, name);
+      return typeof name === 'string' && shareStateCoversSession(state, name);
     })
     : [];
   return { ...msg, sessions };

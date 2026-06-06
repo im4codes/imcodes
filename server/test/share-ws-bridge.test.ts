@@ -71,7 +71,13 @@ type AuditInsert = {
   idempotencyKey: string;
 };
 
-function makeDb(runtimeType: 'process' | 'transport' | null = null, auditRows: AuditInsert[] = []) {
+function makeDb(
+  runtimeType: 'process' | 'transport' | null = null,
+  auditRows: AuditInsert[] = [],
+  options: {
+    subSessions?: Array<{ id: string; parent_session: string | null }>;
+  } = {},
+) {
   const discussionComments = new Map<string, Record<string, unknown>>();
   const db = {
     queryOne: async (sql: string, params?: unknown[]) => {
@@ -83,7 +89,19 @@ function makeDb(runtimeType: 'process' | 'transport' | null = null, auditRows: A
       if (sql.includes('SELECT * FROM discussion_comments')) return discussionComments.get(String(params?.[0] ?? '')) ?? null;
       return null;
     },
-    query: async () => [],
+    query: async (sql: string, params?: unknown[]) => {
+      if (sql.includes('FROM sub_sessions')) {
+        const serverIdParam = params?.[0];
+        const parentSessionParam = params?.[1];
+        return (options.subSessions ?? [])
+          .filter((row) => (
+            typeof serverIdParam !== 'string'
+            || typeof parentSessionParam !== 'string'
+            || row.parent_session === parentSessionParam
+          ));
+      }
+      return [];
+    },
     execute: async (sql: string, params?: unknown[]) => {
       if (sql.includes('INSERT INTO discussion_comments') && params) {
         discussionComments.set(String(params[0]), {
@@ -530,6 +548,66 @@ describe('WsBridge share-scoped sockets', () => {
         origin: 'shared-tab',
       },
     });
+  });
+
+  it('treats a shared main tab as covering its existing child sub-sessions over WS', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
+    const db = makeDb('transport', [], {
+      subSessions: [{ id: 'child_1', parent_session: 'deck_proj_brain' }],
+    });
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const shared = new MockWs();
+    bridge.handleShareBrowserConnection(shared as never, 'shared-user', db, {
+      ticketId: 'share-ticket-1',
+      target,
+      snapshot: coverage(target, 'participant', now),
+    });
+    await flushAsync();
+
+    shared.emit('message', JSON.stringify({
+      type: 'session.send',
+      commandId: 'cmd-child',
+      sessionName: 'deck_sub_child_1',
+      text: 'hello child',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'session.send',
+        commandId: 'cmd-child',
+        sessionName: 'deck_sub_child_1',
+        sharedActor: expect.objectContaining({ actorUserId: 'shared-user' }),
+      }),
+    ]));
+
+    shared.emit('message', JSON.stringify({
+      type: TRANSPORT_MSG.CHAT_SUBSCRIBE,
+      sessionId: 'deck_sub_child_1',
+    }));
+    await flushAsync();
+    shared.sent.length = 0;
+    daemon.emit('message', JSON.stringify({
+      type: 'chat.delta',
+      sessionId: 'deck_sub_child_1',
+      text: 'child output',
+    }));
+    await flushAsync();
+
+    expect(shared.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'chat.delta',
+        sessionId: 'deck_sub_child_1',
+        text: 'child output',
+      }),
+    ]));
   });
 
   it('validates share-scoped P2P routing extras before participant session.send forwarding', async () => {
