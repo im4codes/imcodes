@@ -58,6 +58,21 @@
       "title": "Usuarios compartidos",
       "empty": "Aún no hay usuarios compartidos"
     },
+    "manage": {
+      "roleFor": "Rol para {{user}}",
+      "revoke": "Revocar",
+      "revokeConfirm": "¿Revocar el acceso de {{user}}?"
+    },
+    "sharedWithMe": {
+      "title": "Compartido conmigo",
+      "empty": "No hay pestañas ni servidores compartidos",
+      "refresh": "Actualizar acceso compartido",
+      "kind": {
+        "server": "Servidor",
+        "tab": "Pestaña",
+        "subsession": "Subsesión"
+      }
+    },
     "create": "Crear recurso compartido",
     "creating": "Creando...",
     "scope": { "current": "Alcance compartido" },

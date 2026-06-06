@@ -77,6 +77,7 @@ export function useSubSessions(
   ws: WsClient | null,
   connected: boolean,
   activeSession?: string | null,
+  disableHttpLoad = false,
 ) {
   const [subSessions, setSubSessions] = useState<SubSession[]>([]);
   const [loadedServerId, setLoadedServerId] = useState<string | null>(null);
@@ -110,6 +111,11 @@ export function useSubSessions(
   const loadedGenRef = useRef(0);
   useEffect(() => {
     if (!serverId) { setSubSessions([]); setLoadedServerId(null); return; }
+    if (disableHttpLoad) {
+      setLoadedServerId(serverId);
+      rebuiltRef.current = false;
+      return;
+    }
     if (!connected) {
       rebuiltRef.current = false;
       return;
@@ -144,7 +150,39 @@ export function useSubSessions(
     load();
 
     return () => { if (timer) clearTimeout(timer); };
-  }, [serverId, connected, reconnectTick]);
+  }, [serverId, connected, reconnectTick, disableHttpLoad]);
+
+  const hydrateShared = useCallback((serverIdForShare: string, list: Array<{
+    subSessionId: string;
+    title: string;
+    type: string;
+    parentSessionName: string | null;
+  }>) => {
+    const now = Date.now();
+    setSubSessions((prev) => {
+      const previousById = new Map(prev.map((existing) => [existing.id, existing] as const));
+      return list.map((item) => mergeLoadedSubSession({
+        id: item.subSessionId,
+        serverId: serverIdForShare,
+        type: item.type,
+        runtimeType: getSessionRuntimeType(item.type),
+        providerId: getSessionRuntimeType(item.type) === 'transport' ? item.type : null,
+        providerSessionId: null,
+        shellBin: null,
+        cwd: null,
+        label: item.title,
+        closedAt: null,
+        createdAt: now,
+        updatedAt: now,
+        ccSessionId: null,
+        geminiSessionId: null,
+        parentSession: item.parentSessionName,
+        description: null,
+        ccPresetId: null,
+      }, previousById.get(item.subSessionId)));
+    });
+    setLoadedServerId(serverIdForShare);
+  }, []);
 
   // Rebuild all when daemon connects (once per connection)
   useEffect(() => {
@@ -661,5 +699,5 @@ export function useSubSessions(
     [subSessions, activeSession],
   );
 
-  return { subSessions, visibleSubSessions, loadedServerId, create, close, restart, rename, updateLocal };
+  return { subSessions, visibleSubSessions, loadedServerId, create, close, restart, rename, updateLocal, hydrateShared };
 }

@@ -58,6 +58,21 @@
       "title": "共享用户",
       "empty": "还没有共享用户"
     },
+    "manage": {
+      "roleFor": "{{user}} 的角色",
+      "revoke": "撤销",
+      "revokeConfirm": "撤销 {{user}} 的访问？"
+    },
+    "sharedWithMe": {
+      "title": "别人共享给我",
+      "empty": "没有共享的标签或服务器",
+      "refresh": "刷新共享访问",
+      "kind": {
+        "server": "服务器",
+        "tab": "标签",
+        "subsession": "子会话"
+      }
+    },
     "create": "创建共享",
     "creating": "正在创建...",
     "scope": { "current": "共享范围" },

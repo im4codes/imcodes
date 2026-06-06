@@ -8,6 +8,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { SessionTabs } from '../src/components/SessionTabs.js';
 import { ShareSessionDialog } from '../src/components/ShareSessionDialog.js';
+import { SharedEntriesPanel } from '../src/components/SharedEntriesPanel.js';
 import { SessionControls } from '../src/components/SessionControls.js';
 import { discoverSharedEntries, openSharedEntry } from '../src/api.js';
 import { formatSharedActorLabel, sharedActorRoleLabelKey } from '../src/tab-sharing-ui.js';
@@ -18,6 +19,8 @@ const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.c
 const apiMocks = vi.hoisted(() => ({
   listSharesForTarget: vi.fn(),
   createShare: vi.fn(),
+  updateShare: vi.fn(),
+  revokeShare: vi.fn(),
 }));
 
 vi.mock('../src/api.js', async (importOriginal) => {
@@ -26,6 +29,8 @@ vi.mock('../src/api.js', async (importOriginal) => {
     ...actual,
     listSharesForTarget: apiMocks.listSharesForTarget,
     createShare: apiMocks.createShare,
+    updateShare: apiMocks.updateShare,
+    revokeShare: apiMocks.revokeShare,
   };
 });
 
@@ -52,6 +57,15 @@ const messages: Record<string, string> = {
   'share.list.label': 'Shared users',
   'share.list.title': 'Shared users',
   'share.list.empty': 'No shared users yet',
+  'share.manage.roleFor': 'Role for {{user}}',
+  'share.manage.revoke': 'Revoke',
+  'share.manage.revokeConfirm': 'Revoke access for {{user}}?',
+  'share.sharedWithMe.title': 'Shared with me',
+  'share.sharedWithMe.empty': 'No shared tabs or servers',
+  'share.sharedWithMe.refresh': 'Refresh shared access',
+  'share.sharedWithMe.kind.server': 'Server',
+  'share.sharedWithMe.kind.tab': 'Tab',
+  'share.sharedWithMe.kind.subsession': 'Sub-session',
   'share.create': 'Create share',
   'share.creating': 'Creating...',
   'share.scope.current': 'Shared scope',
@@ -394,6 +408,85 @@ describe('collaborative tab sharing UI', () => {
     expect(await screen.findByText('User Example')).not.toBeNull();
     expect(screen.queryByText('user@example.test')).toBeNull();
     expect(screen.queryByText('share-1')).toBeNull();
+  });
+
+  it('lets managers update and revoke existing shares from the share dialog', async () => {
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    apiMocks.listSharesForTarget.mockResolvedValue([
+      {
+        id: 'share-1',
+        targetUserId: 'user-1',
+        targetUserDisplayName: 'User One',
+        role: 'viewer',
+        status: 'active',
+      },
+    ]);
+    apiMocks.updateShare.mockResolvedValue({
+      id: 'share-1',
+      targetUserId: 'user-1',
+      targetUserDisplayName: 'User One',
+      role: 'participant',
+      status: 'active',
+    });
+    apiMocks.revokeShare.mockResolvedValue({
+      id: 'share-1',
+      targetUserId: 'user-1',
+      targetUserDisplayName: 'User One',
+      role: 'participant',
+      status: 'revoked',
+    });
+
+    render(
+      <ShareSessionDialog
+        target={{
+          serverId: 'srv-1',
+          serverLabel: 'Workstation',
+          sessionName: 'deck_alpha_brain',
+          tabLabel: 'Alpha',
+        }}
+        onClose={() => {}}
+      />,
+    );
+
+    expect(await screen.findByText('User One')).not.toBeNull();
+    const roleSelect = screen.getByLabelText('Role for User One') as HTMLSelectElement;
+    roleSelect.value = 'participant';
+    fireEvent.input(roleSelect);
+    await waitFor(() => expect(apiMocks.updateShare).toHaveBeenCalledWith('srv-1', 'share-1', { role: 'participant' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke' }));
+    await waitFor(() => expect(apiMocks.revokeShare).toHaveBeenCalledWith('srv-1', 'share-1'));
+    expect(await screen.findByText('Revoked')).not.toBeNull();
+  });
+
+  it('renders recipient shared entries and opens the selected target', () => {
+    const onOpen = vi.fn();
+    const onRefresh = vi.fn();
+    render(
+      <SharedEntriesPanel
+        entries={[
+          {
+            id: 'share-1',
+            serverId: 'srv-1',
+            serverName: 'Workstation',
+            role: 'participant',
+            status: 'active',
+            targetLabel: 'Alpha',
+            target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_alpha_brain' },
+          },
+        ]}
+        onOpen={onOpen}
+        onRefresh={onRefresh}
+      />,
+    );
+
+    expect(screen.getByText('Shared with me')).not.toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /Alpha/ }));
+    expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({
+      target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_alpha_brain' },
+    }));
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh shared access' }));
+    expect(onRefresh).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the send-adjacent share menu wired to active sub-session context', () => {

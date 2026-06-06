@@ -58,6 +58,21 @@
       "title": "共有ユーザー",
       "empty": "共有ユーザーはまだいません"
     },
+    "manage": {
+      "roleFor": "{{user}} のロール",
+      "revoke": "取り消し",
+      "revokeConfirm": "{{user}} のアクセスを取り消しますか？"
+    },
+    "sharedWithMe": {
+      "title": "自分に共有",
+      "empty": "共有されたタブまたはサーバーはありません",
+      "refresh": "共有アクセスを更新",
+      "kind": {
+        "server": "サーバー",
+        "tab": "タブ",
+        "subsession": "サブセッション"
+      }
+    },
     "create": "共有を作成",
     "creating": "作成中...",
     "scope": { "current": "共有スコープ" },

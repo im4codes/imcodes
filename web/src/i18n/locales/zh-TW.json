@@ -58,6 +58,21 @@
       "title": "分享使用者",
       "empty": "尚無分享使用者"
     },
+    "manage": {
+      "roleFor": "{{user}} 的角色",
+      "revoke": "撤銷",
+      "revokeConfirm": "撤銷 {{user}} 的存取？"
+    },
+    "sharedWithMe": {
+      "title": "別人分享給我",
+      "empty": "沒有分享的標籤或伺服器",
+      "refresh": "重新整理分享存取",
+      "kind": {
+        "server": "伺服器",
+        "tab": "標籤",
+        "subsession": "子工作階段"
+      }
+    },
     "create": "建立分享",
     "creating": "正在建立...",
     "scope": { "current": "分享範圍" },

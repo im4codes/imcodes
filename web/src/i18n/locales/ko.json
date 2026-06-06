@@ -58,6 +58,21 @@
       "title": "공유 사용자",
       "empty": "아직 공유 사용자가 없습니다"
     },
+    "manage": {
+      "roleFor": "{{user}}의 역할",
+      "revoke": "철회",
+      "revokeConfirm": "{{user}}의 액세스를 철회할까요?"
+    },
+    "sharedWithMe": {
+      "title": "나에게 공유됨",
+      "empty": "공유된 탭 또는 서버가 없습니다",
+      "refresh": "공유 액세스 새로고침",
+      "kind": {
+        "server": "서버",
+        "tab": "탭",
+        "subsession": "하위 세션"
+      }
+    },
     "create": "공유 만들기",
     "creating": "만드는 중...",
     "scope": { "current": "공유 범위" },

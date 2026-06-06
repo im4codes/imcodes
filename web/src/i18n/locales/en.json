@@ -60,6 +60,21 @@
       "title": "Shared users",
       "empty": "No shared users yet"
     },
+    "manage": {
+      "roleFor": "Role for {{user}}",
+      "revoke": "Revoke",
+      "revokeConfirm": "Revoke access for {{user}}?"
+    },
+    "sharedWithMe": {
+      "title": "Shared with me",
+      "empty": "No shared tabs or servers",
+      "refresh": "Refresh shared access",
+      "kind": {
+        "server": "Server",
+        "tab": "Tab",
+        "subsession": "Sub-session"
+      }
+    },
     "create": "Create share",
     "creating": "Creating...",
     "scope": {

@@ -373,8 +373,13 @@ describe('tab sharing APIs', () => {
 
     const discover = await app.request('/api/shares', { headers: authHeaders(recipientId) });
     expect(discover.status).toBe(200);
-    const discoverBody = await discover.json() as { shares: Array<{ serverId: string; historyCutoffAt: number }> };
-    expect(discoverBody.shares).toEqual([expect.objectContaining({ serverId, historyCutoffAt: 0 })]);
+    const discoverBody = await discover.json() as { shares: Array<{ serverId: string; serverName: string; targetLabel: string; historyCutoffAt: number }> };
+    expect(discoverBody.shares).toEqual([expect.objectContaining({
+      serverId,
+      serverName: 'Share Target',
+      targetLabel: 'Share Target',
+      historyCutoffAt: 0,
+    })]);
 
     const open = await app.request('/api/shares/open', {
       method: 'POST',
@@ -673,6 +678,8 @@ describe('tab sharing APIs', () => {
       expect.objectContaining({
         id: expect.any(String),
         serverId,
+        serverName: 'Share Target',
+        targetLabel: 'Main Label',
         targetRef: sessionName,
         targetSessionName: sessionName,
         role: 'participant',

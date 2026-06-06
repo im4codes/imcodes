@@ -507,6 +507,11 @@ export interface ListSharesResponse {
   shares: ShareGrantSummary[];
 }
 
+export interface UpdateShareRequest {
+  role?: ShareRole;
+  expiresAt?: number | null;
+}
+
 function normalizeShareGrantSummary(value: unknown): ShareGrantSummary {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {};
   const targetUser = raw.targetUser && typeof raw.targetUser === 'object'
@@ -561,6 +566,25 @@ export async function createShare(serverId: string, request: CreateShareRequest)
   return normalizeShareGrantSummary(res.share);
 }
 
+export async function updateShare(serverId: string, shareId: string, request: UpdateShareRequest): Promise<ShareGrantSummary> {
+  const res = await apiFetch<CreateShareResponse>(
+    `/api/server/${encodeURIComponent(serverId)}/shares/${encodeURIComponent(shareId)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(request),
+    },
+  );
+  return normalizeShareGrantSummary(res.share);
+}
+
+export async function revokeShare(serverId: string, shareId: string): Promise<ShareGrantSummary> {
+  const res = await apiFetch<CreateShareResponse>(
+    `/api/server/${encodeURIComponent(serverId)}/shares/${encodeURIComponent(shareId)}`,
+    { method: 'DELETE' },
+  );
+  return normalizeShareGrantSummary(res.share);
+}
+
 export interface SharedEntrySummary {
   id: string;
   serverId: string;
@@ -571,10 +595,39 @@ export interface SharedEntrySummary {
   targetLabel: string;
 }
 
+function shareTargetFallbackLabel(target: ShareTarget): string {
+  if (target.kind === 'server') return target.serverId;
+  if (target.kind === 'main') return target.sessionName;
+  return target.subSessionDisplayName || `deck_sub_${target.subSessionId}`;
+}
+
+function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary {
+  const raw = value && typeof value === 'object' ? value as Partial<SharedEntrySummary> & Record<string, unknown> : {};
+  const fallbackTarget: ShareTarget = { kind: 'server', serverId: typeof raw.serverId === 'string' ? raw.serverId : '' };
+  const target: ShareTarget = raw.target && typeof raw.target === 'object'
+    ? raw.target as ShareTarget
+    : fallbackTarget;
+  const serverId = typeof raw.serverId === 'string'
+    ? raw.serverId
+    : target.serverId;
+  const targetLabel = typeof raw.targetLabel === 'string' && raw.targetLabel.trim()
+    ? raw.targetLabel
+    : shareTargetFallbackLabel(target);
+  return {
+    id: typeof raw.id === 'string' ? raw.id : '',
+    serverId,
+    serverName: typeof raw.serverName === 'string' && raw.serverName.trim() ? raw.serverName : serverId,
+    role: raw.role === 'participant' ? 'participant' : 'viewer',
+    status: typeof raw.status === 'string' ? raw.status as SharedEntrySummary['status'] : 'active',
+    target,
+    targetLabel,
+  };
+}
+
 export async function discoverSharedEntries(): Promise<SharedEntrySummary[]> {
   const res = await apiFetch<{ shares?: SharedEntrySummary[]; entries?: SharedEntrySummary[] }>('/api/shares');
   const entries = res.shares ?? res.entries;
-  return Array.isArray(entries) ? entries : [];
+  return Array.isArray(entries) ? entries.map(normalizeSharedEntrySummary) : [];
 }
 
 export interface OpenSharedEntryResponse {

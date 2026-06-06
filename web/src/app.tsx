@@ -33,6 +33,7 @@ import { SessionTabs } from './components/SessionTabs.js';
 // TransportChatView removed — transport sessions use unified ChatView via timelineEmitter
 import { SessionPane } from './components/SessionPane.js';
 import { ShareSessionDialog } from './components/ShareSessionDialog.js';
+import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
 import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
@@ -75,7 +76,7 @@ import {
   getSubSessionAccentColorMap,
 } from './subsession-accent-colors.js';
 import type { PanelRenderContext } from './components/PinnedPanelRegistry.js';
-import type { ShareDialogTarget } from './tab-sharing-ui.js';
+import type { ShareDialogTarget, ShareTarget } from './tab-sharing-ui.js';
 import './components/pinnedPanelTypes.js'; // register all panel types
 import {
   LOCAL_WEB_PREVIEW_PANEL_TYPE,
@@ -119,7 +120,7 @@ import {
 } from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient } from './ws-client.js';
-import { configure as configureApi, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns } from './api.js';
+import { configure as configureApi, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
 import { initPushNotifications, resetPushBadge } from './push-notifications.js';
@@ -343,6 +344,12 @@ interface WatchSessionRow {
   isSubSession?: boolean;
 }
 
+function formatSharedAccessError(error: unknown): string {
+  if (error instanceof ApiError) return error.body || error.message;
+  if (error instanceof Error) return error.message;
+  return String(error || 'share_failed');
+}
+
 type RepoPanelTarget = {
   sessionId: string | null;
   projectDir: string;
@@ -390,6 +397,9 @@ export function App() {
     setServersSynced(false);
     setSelectedServerId(null);
     setSelectedServerName(null);
+    setSelectedShareTarget(null);
+    setSharedEntries([]);
+    setSharedEntriesError(null);
     setManualDashboard(false);
     setAutoEnteringRecent(false);
   }, []);
@@ -415,6 +425,11 @@ export function App() {
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
   const [shareDialogTarget, setShareDialogTarget] = useState<ShareDialogTarget | null>(null);
+  const [selectedShareTarget, setSelectedShareTarget] = useState<ShareTarget | null>(null);
+  const [sharedEntries, setSharedEntries] = useState<SharedEntrySummary[]>([]);
+  const [sharedEntriesLoading, setSharedEntriesLoading] = useState(false);
+  const [sharedEntriesError, setSharedEntriesError] = useState<string | null>(null);
+  const [openingSharedEntryId, setOpeningSharedEntryId] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [mobileHideServerBar, setMobileHideServerBar] = useState(() => localStorage.getItem('mobile_hide_server_bar') === '1');
   const [mobileHideTabBar, setMobileHideTabBar] = useState(() => localStorage.getItem('mobile_hide_tab_bar') === '1');
@@ -494,8 +509,10 @@ export function App() {
   }, [selectedServerId]);
 
   const resolvedSelectedServerName = useMemo(
-    () => getSelectedServerName(selectedServerId, servers, selectedServerName),
-    [selectedServerId, selectedServerName, servers],
+    () => selectedShareTarget
+      ? selectedServerName
+      : getSelectedServerName(selectedServerId, servers, selectedServerName),
+    [selectedServerId, selectedServerName, servers, selectedShareTarget],
   );
 
   useEffect(() => {
@@ -511,6 +528,7 @@ export function App() {
 
   useEffect(() => {
     if (!serversSynced) return;
+    if (selectedShareTarget) return;
     if (!shouldResetSelectedServer(selectedServerId, servers, serversLoaded)) return;
     setSelectedServerId(null);
     setSelectedServerName(null);
@@ -519,7 +537,7 @@ export function App() {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
-  }, [selectedServerId, servers, serversLoaded]);
+  }, [selectedServerId, servers, serversLoaded, serversSynced, selectedShareTarget]);
 
   useEffect(() => {
     let cleanup = () => {};
@@ -910,9 +928,31 @@ export function App() {
     return () => clearInterval(id);
   }, [auth, loadServers]);
 
+  const refreshSharedEntries = useCallback(async () => {
+    if (!auth) {
+      setSharedEntries([]);
+      setSharedEntriesError(null);
+      return;
+    }
+    setSharedEntriesLoading(true);
+    setSharedEntriesError(null);
+    try {
+      setSharedEntries(await discoverSharedEntries());
+    } catch (err) {
+      setSharedEntries([]);
+      setSharedEntriesError(formatSharedAccessError(err));
+    } finally {
+      setSharedEntriesLoading(false);
+    }
+  }, [auth]);
+
+  useEffect(() => {
+    void refreshSharedEntries();
+  }, [refreshSharedEntries]);
+
   // Fetch sessions from DB immediately when auth + server are available
   useEffect(() => {
-    if (!auth || !selectedServerId) return;
+    if (!auth || !selectedServerId || selectedShareTarget) return;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 5_000); // 5s timeout — don't block UI on slow network
     apiFetch<{ sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; agent_version?: string; state: string; project_dir?: string; runtime_type?: 'process' | 'transport'; label?: string | null; description?: string | null }> }>(
@@ -959,7 +999,7 @@ export function App() {
       }
     }).catch(() => { clearTimeout(timer); /* WS fallback */ });
     return () => { clearTimeout(timer); ctrl.abort(); };
-  }, [auth, selectedServerId]);
+  }, [auth, selectedServerId, selectedShareTarget]);
 
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const navigableMainSessions = useMemo(
@@ -2023,12 +2063,84 @@ export function App() {
   }, [auth, selectedServerId]);
 
   // ── Sub-sessions ───────────────────────────────────────────────────────────
-  const { subSessions, visibleSubSessions, loadedServerId, create: createSubSession, close: closeSubSession, restart: restartSubSession, rename: renameSubSession, updateLocal: updateSubLocal } = useSubSessions(
+  const { subSessions, visibleSubSessions, loadedServerId, create: createSubSession, close: closeSubSession, restart: restartSubSession, rename: renameSubSession, updateLocal: updateSubLocal, hydrateShared: hydrateSharedSubSessions } = useSubSessions(
     (nativeReady && auth) ? selectedServerId : null,
     wsRef.current,
     connected,
     activeSession,
+    Boolean(selectedShareTarget),
   );
+
+  const handleOpenSharedEntry = useCallback(async (entry: SharedEntrySummary) => {
+    if (openingSharedEntryId) return;
+    setOpeningSharedEntryId(entry.id);
+    setSharedEntriesError(null);
+    try {
+      const opened = await openSharedEntry(entry.target);
+      const nextServer: ServerInfo = {
+        id: opened.server.id,
+        name: opened.server.name,
+        status: opened.server.status ?? 'online',
+        lastHeartbeatAt: opened.server.lastHeartbeatAt ?? Date.now(),
+        createdAt: Date.now(),
+      };
+      const mappedSessions: SessionInfo[] = opened.sessions.map((session) => {
+        const parsed = parseMainSessionName(session.sessionName);
+        return {
+          name: session.sessionName,
+          project: session.title || parsed?.project || session.sessionName,
+          role: parsed?.role ?? 'brain',
+          agentType: session.agentType || 'unknown',
+          state: session.state as SessionInfo['state'],
+          label: session.title,
+          sharedState: {
+            effectiveRole: opened.coverage.effectiveRole,
+            status: 'active',
+            scopeLabel: entry.targetLabel,
+          },
+        };
+      });
+
+      setSelectedShareTarget(opened.target);
+      setManualDashboard(false);
+      setSelectedServerId(opened.server.id);
+      setSelectedServerName(opened.server.name);
+      setServers((prev) => (
+        prev.some((server) => server.id === nextServer.id)
+          ? prev.map((server) => server.id === nextServer.id ? { ...server, ...nextServer } : server)
+          : [nextServer, ...prev]
+      ));
+      setServersLoaded(true);
+      setSessions(mappedSessions);
+      setSessionsLoaded(true);
+      hydrateSharedSubSessions(opened.server.id, opened.subSessions);
+
+      const openedTarget = opened.target;
+      const activeFromTarget = openedTarget.kind === 'main'
+        ? openedTarget.sessionName
+        : openedTarget.kind === 'subsession'
+          ? (opened.subSessions.find((sub) => sub.subSessionId === openedTarget.subSessionId)?.parentSessionName ?? null)
+          : (mappedSessions.find(isNavigableMainSession)?.name ?? null);
+      safeLocalStorageSetItem('rcc_server', opened.server.id);
+      safeLocalStorageSetItem('rcc_server_name', opened.server.name);
+      if (activeFromTarget) {
+        safeLocalStorageSetItem('rcc_session', activeFromTarget);
+      } else {
+        localStorage.removeItem('rcc_session');
+      }
+      setActiveSession(activeFromTarget, { keepSubWindows: true });
+      if (openedTarget.kind === 'subsession') {
+        setOpenSubIds((prev) => new Set([...prev, openedTarget.subSessionId]));
+      }
+      setShowMobileServerMenu(false);
+      setMobileSidebarOpen(false);
+    } catch (err) {
+      setSharedEntriesError(formatSharedAccessError(err));
+    } finally {
+      setOpeningSharedEntryId(null);
+    }
+  }, [hydrateSharedSubSessions, openingSharedEntryId, setActiveSession]);
+
   const closeSubSessionAndClearMaximized = useCallback((id: string) => {
     clearSubSessionMaximized(id);
     removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
@@ -2380,7 +2492,7 @@ export function App() {
   useEffect(() => {
     if (!auth || !selectedServerId) return;
 
-    const ws = new WsClient(auth.baseUrl, selectedServerId);
+    const ws = new WsClient(auth.baseUrl, selectedServerId, { shareTarget: selectedShareTarget });
     wsRef.current = ws;
 
     const unsub = ws.onMessage((msg) => {
@@ -3314,7 +3426,7 @@ export function App() {
       for (const timer of resubscribeTimersRef.current) clearTimeout(timer);
       resubscribeTimersRef.current.clear();
     };
-  }, [auth, selectedServerId]);
+  }, [auth, selectedServerId, selectedShareTarget]);
 
   // Subscribe to terminal for ALL sessions when connected.
   // SDK/transport sessions must remain passively subscribed so shared timeline
@@ -3594,6 +3706,9 @@ export function App() {
     setSessions([]);
     setActiveSession(null);
     setSelectedServerId(null);
+    setSelectedShareTarget(null);
+    setSharedEntries([]);
+    setSharedEntriesError(null);
     setDiscussions([]);
     setRepoContexts(new Map());
     setManualDashboard(false);
@@ -3611,6 +3726,7 @@ export function App() {
   const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {
     autoEntryRunRef.current++;
     setManualDashboard(false);
+    setSelectedShareTarget(null);
     // Save current active session for the server we're leaving
     const prevServer = localStorage.getItem('rcc_server');
     const currentSession = localStorage.getItem('rcc_session');
@@ -3750,6 +3866,7 @@ export function App() {
     localStorage.removeItem('rcc_session');
     setSelectedServerId(null);
     setSelectedServerName(null);
+    setSelectedShareTarget(null);
     setActiveSession(null);
     setShowMobileServerMenu(false);
   }, [setActiveSession]);
@@ -4252,6 +4369,14 @@ export function App() {
                 {trans('sharedContext.diagnostics.title')}
               </button>
             </div>
+            <SharedEntriesPanel
+              entries={sharedEntries}
+              loading={sharedEntriesLoading}
+              error={sharedEntriesError}
+              openingEntryId={openingSharedEntryId}
+              onOpen={(entry) => void handleOpenSharedEntry(entry)}
+              onRefresh={() => void refreshSharedEntries()}
+            />
             {/* Session tree */}
             <SessionTree
               serverId={selectedServerId}
@@ -4468,6 +4593,21 @@ export function App() {
                         </button>
                       );
                     })}
+                    {sharedEntries.length > 0 && (
+                      <div class="mobile-server-menu-shared">
+                        <div class="mobile-server-menu-shared-title">{trans('share.sharedWithMe.title')}</div>
+                        {sharedEntries.map((entry) => (
+                          <button
+                            key={entry.id}
+                            class="mobile-server-menu-item"
+                            onClick={() => { void handleOpenSharedEntry(entry); setShowMobileServerMenu(false); }}
+                          >
+                            <span>↗</span>
+                            {' '}{entry.targetLabel}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                     <div style={{ padding: '6px 12px', borderTop: '1px solid #334155' }}>
                       <LanguageSwitcher />
                     </div>
@@ -4892,6 +5032,14 @@ export function App() {
                       </button>
                     );
                   })}
+                  <SharedEntriesPanel
+                    entries={sharedEntries}
+                    loading={sharedEntriesLoading}
+                    error={sharedEntriesError}
+                    openingEntryId={openingSharedEntryId}
+                    onOpen={(entry) => void handleOpenSharedEntry(entry)}
+                    onRefresh={() => void refreshSharedEntries()}
+                  />
                 </div>
               )}
               {/* Session tree — collapsible via sidebar toggle */}

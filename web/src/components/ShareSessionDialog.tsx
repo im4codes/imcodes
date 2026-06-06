@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { ApiError, createShare, listSharesForTarget } from '../api.js';
+import { ApiError, createShare, listSharesForTarget, revokeShare, updateShare } from '../api.js';
 import {
   buildCurrentTabShareTarget,
   isParticipantRole,
@@ -36,6 +36,7 @@ export function ShareSessionDialog({ target, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [shares, setShares] = useState<ShareGrantSummary[]>([]);
   const [sharesLoading, setSharesLoading] = useState(false);
+  const [updatingShareId, setUpdatingShareId] = useState<string | null>(null);
 
   const selectedTarget = useMemo<ShareTarget>(() => (
     targetChoice === 'server'
@@ -83,6 +84,38 @@ export function ShareSessionDialog({ target, onClose }: Props) {
       setSubmitting(false);
     }
   }, [role, selectedTarget, submitting, target.serverId, targetUser]);
+
+  const replaceShare = useCallback((nextShare: ShareGrantSummary) => {
+    setShares((current) => current.map((item) => item.id === nextShare.id ? nextShare : item));
+  }, []);
+
+  const handleRoleChange = useCallback(async (share: ShareGrantSummary, nextRole: ShareRole) => {
+    if (share.role === nextRole || updatingShareId) return;
+    setUpdatingShareId(share.id);
+    setError(null);
+    try {
+      replaceShare(await updateShare(target.serverId, share.id, { role: nextRole }));
+    } catch (err) {
+      setError(formatShareError(err));
+    } finally {
+      setUpdatingShareId(null);
+    }
+  }, [replaceShare, target.serverId, updatingShareId]);
+
+  const handleRevoke = useCallback(async (share: ShareGrantSummary) => {
+    if (updatingShareId) return;
+    const displayName = getGrantDisplayName(share);
+    if (!window.confirm(t('share.manage.revokeConfirm', { user: displayName }))) return;
+    setUpdatingShareId(share.id);
+    setError(null);
+    try {
+      replaceShare(await revokeShare(target.serverId, share.id));
+    } catch (err) {
+      setError(formatShareError(err));
+    } finally {
+      setUpdatingShareId(null);
+    }
+  }, [replaceShare, t, target.serverId, updatingShareId]);
 
   return (
     <div class="ask-dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -158,10 +191,33 @@ export function ShareSessionDialog({ target, onClose }: Props) {
           ) : (
             shares.map((share) => (
               <div class="share-list-row" key={share.id}>
-                <div class="share-list-name">{getGrantDisplayName(share)}</div>
-                <div class="share-list-meta">
-                  <span>{t(`share.role.${share.role}`)}</span>
-                  <span>{t(`share.status.${share.status}`)}</span>
+                <div class="share-list-main">
+                  <div class="share-list-name">{getGrantDisplayName(share)}</div>
+                  <div class="share-list-meta">
+                    <span>{t(`share.status.${share.status}`)}</span>
+                    {share.targetLabel && <span>{share.targetLabel}</span>}
+                  </div>
+                </div>
+                <div class="share-list-actions">
+                  <select
+                    class="share-role-select"
+                    aria-label={t('share.manage.roleFor', { user: getGrantDisplayName(share) })}
+                    value={share.role}
+                    disabled={share.status !== 'active' || updatingShareId === share.id}
+                    onInput={(e) => void handleRoleChange(share, (e.currentTarget as HTMLSelectElement).value as ShareRole)}
+                    onChange={(e) => void handleRoleChange(share, (e.currentTarget as HTMLSelectElement).value as ShareRole)}
+                  >
+                    <option value="viewer">{t('share.role.viewer')}</option>
+                    <option value="participant">{t('share.role.participant')}</option>
+                  </select>
+                  <button
+                    class="share-revoke-btn"
+                    type="button"
+                    disabled={share.status !== 'active' || updatingShareId === share.id}
+                    onClick={() => void handleRevoke(share)}
+                  >
+                    {t('share.manage.revoke')}
+                  </button>
                 </div>
               </div>
             ))

@@ -81,16 +81,51 @@ function managedShareView(share: Awaited<ReturnType<typeof listManagedShares>>[n
   };
 }
 
-function recipientShareEntry(share: Awaited<ReturnType<typeof listActiveSharesForUser>>[number]) {
+function fallbackTargetLabel(share: Awaited<ReturnType<typeof listActiveSharesForUser>>[number]): string {
+  if (share.target.kind === 'server') return share.serverId;
+  if (share.target.kind === 'main') return share.target.sessionName;
+  return shareTargetSessionName(share.target) ?? share.target.subSessionId;
+}
+
+async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<typeof listActiveSharesForUser>>[number]) {
+  let serverName: string | null = null;
+  let targetLabel: string | null = null;
+  if (share.target.kind === 'server') {
+    const row = await db.queryOne<{ name: string }>('SELECT name FROM servers WHERE id = $1', [share.serverId]);
+    serverName = row?.name ?? null;
+    targetLabel = row?.name ?? null;
+  } else if (share.target.kind === 'main') {
+    const row = await db.queryOne<{ server_name: string; label: string | null; project_name: string | null }>(
+      `SELECT sv.name AS server_name, s.label, s.project_name
+         FROM sessions s
+         JOIN servers sv ON sv.id = s.server_id
+        WHERE s.server_id = $1 AND s.name = $2`,
+      [share.serverId, share.target.sessionName],
+    );
+    serverName = row?.server_name ?? null;
+    targetLabel = row?.label?.trim() || row?.project_name?.trim() || null;
+  } else {
+    const row = await db.queryOne<{ server_name: string; label: string | null; type: string | null }>(
+      `SELECT sv.name AS server_name, ss.label, ss.type
+         FROM sub_sessions ss
+         JOIN servers sv ON sv.id = ss.server_id
+        WHERE ss.server_id = $1 AND ss.id = $2`,
+      [share.serverId, share.target.subSessionId],
+    );
+    serverName = row?.server_name ?? null;
+    targetLabel = row?.label?.trim() || row?.type?.trim() || null;
+  }
   return {
     id: share.id,
     serverId: share.serverId,
+    serverName: serverName ?? share.serverId,
     target: share.target,
     targetRef: shareTargetRef(share.target),
     targetSessionName: shareTargetSessionName(share.target),
     role: share.role,
     availability: 'available',
     status: 'active',
+    targetLabel: targetLabel ?? fallbackTargetLabel(share),
     historyCutoffAt: 0,
     expiresAt: share.expiresAt,
   };
@@ -153,7 +188,7 @@ async function auditShareLifecycle(c: Context<{ Bindings: Env; Variables: { user
 tabSharingRoutes.get('/shares', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const shares = await listActiveSharesForUser(c.env.DB, userId, Date.now());
-  return c.json({ shares: shares.map(recipientShareEntry) });
+  return c.json({ shares: await Promise.all(shares.map((share) => recipientShareEntry(c.env.DB, share))) });
 });
 
 tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
@@ -245,7 +280,18 @@ tabSharingRoutes.get('/server/:serverId/shares', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId') ?? '';
   if (!await requireServerManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
-  const shares = await listManagedShares(c.env.DB, serverId);
+  const targetKind = c.req.query('targetKind');
+  const requestedTarget = targetKind === 'server'
+    ? normalizeShareTargetInput({ kind: 'server', serverId })
+    : targetKind === 'main'
+      ? normalizeShareTargetInput({ kind: 'main', serverId, sessionName: c.req.query('sessionName') ?? '' })
+      : targetKind === 'subsession'
+        ? normalizeShareTargetInput({ kind: 'subsession', serverId, subSessionId: c.req.query('subSessionId') ?? '' })
+        : null;
+  const shares = (await listManagedShares(c.env.DB, serverId)).filter((share) => (
+    !requestedTarget
+      || (share.target.kind === requestedTarget.kind && shareTargetRef(share.target) === shareTargetRef(requestedTarget))
+  ));
   const userIds = [...new Set(shares.map((share) => share.targetUserId))];
   const users = userIds.length === 0 ? [] : await c.env.DB.query<{ id: string; display_name: string | null; username: string | null }>(
     `SELECT id, display_name, username FROM users WHERE id = ANY($1::text[])`,
@@ -335,7 +381,7 @@ tabSharingRoutes.patch('/server/:serverId/shares/:shareId', requireAuth(), async
     createdAt: now,
   });
   void WsBridge.get(serverId).revalidateShareSocketsForUser(share.targetUserId);
-  return c.json({ share: managedShareView(share) });
+  return c.json({ share: managedShareView(share, await resolveTargetUser(c.env.DB, share.targetUserId)) });
 });
 
 tabSharingRoutes.delete('/server/:serverId/shares/:shareId', requireAuth(), async (c) => {
@@ -356,7 +402,7 @@ tabSharingRoutes.delete('/server/:serverId/shares/:shareId', requireAuth(), asyn
     createdAt: now,
   });
   void WsBridge.get(serverId).revalidateShareSocketsForUser(share.targetUserId);
-  return c.json({ share: managedShareView(share) });
+  return c.json({ share: managedShareView(share, await resolveTargetUser(c.env.DB, share.targetUserId)) });
 });
 
 tabSharingRoutes.get('/server/:serverId/share-audit', requireAuth(), async (c) => {

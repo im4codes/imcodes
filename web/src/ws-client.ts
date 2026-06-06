@@ -17,6 +17,7 @@ import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
 import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
+import type { ShareTarget } from './tab-sharing-ui.js';
 import {
   SESSION_GROUP_CLONE_MSG,
   type SessionGroupCloneCancelRequest,
@@ -325,6 +326,7 @@ export class WsClient {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private baseUrl: string;
   private serverId: string;
+  private shareTarget: ShareTarget | null;
   private _connected = false;
   private _connecting = false;
   private _destroyed = false;
@@ -403,9 +405,10 @@ export class WsClient {
     pendingSnapshot: ReturnType<typeof setTimeout> | null;
   }>();
 
-  constructor(baseUrl: string, serverId: string) {
+  constructor(baseUrl: string, serverId: string, options: { shareTarget?: ShareTarget | null } = {}) {
     this.baseUrl = baseUrl;
     this.serverId = serverId;
+    this.shareTarget = options.shareTarget ?? null;
   }
 
   get connected(): boolean {
@@ -1425,11 +1428,17 @@ export class WsClient {
         this.wsTicketTimer = ticketTimer;
       });
       const data = await Promise.race([
-        apiFetch<{ ticket: string }>('/api/auth/ws-ticket', {
-          method: 'POST',
-          body: JSON.stringify({ serverId: this.serverId }),
-          signal: ticketAbort.signal,
-        }),
+        this.shareTarget
+          ? apiFetch<{ ticket: string }>('/api/shares/ws-ticket', {
+            method: 'POST',
+            body: JSON.stringify({ target: this.shareTarget }),
+            signal: ticketAbort.signal,
+          })
+          : apiFetch<{ ticket: string }>('/api/auth/ws-ticket', {
+            method: 'POST',
+            body: JSON.stringify({ serverId: this.serverId }),
+            signal: ticketAbort.signal,
+          }),
         ticketTimeout,
       ]);
       ticket = data.ticket;
