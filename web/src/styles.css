@@ -87,6 +87,8 @@ body {
 .share-state-indicator-icon-only { width: 18px; height: 18px; min-width: 18px; margin-left: 4px; padding: 0; justify-content: center; border-color: rgba(34,211,238,0.58); background: rgba(8,145,178,0.36); color: #f0fdff; box-shadow: 0 0 0 1px rgba(34,211,238,0.18), 0 0 12px rgba(34,211,238,0.24); }
 .share-state-indicator-icon-only .share-state-icon { font-size: 11px; }
 .share-state-indicator-shared-out { border-color: rgba(125,211,252,0.60); background: rgba(14,116,144,0.34); color: #ecfeff; }
+.tab > .share-state-indicator-icon-only { width: auto; height: auto; min-width: 0; margin-left: 5px; padding: 0; border: none; background: transparent; color: #a5f3fc; box-shadow: none; }
+.tab > .share-state-indicator-icon-only .share-state-icon { font-size: 12px; filter: drop-shadow(0 0 5px rgba(34,211,238,0.55)); }
 .share-state-dot { width: 5px; height: 5px; border-radius: 999px; background: #34d399; box-shadow: 0 0 8px rgba(52,211,153,0.65); flex-shrink: 0; }
 .share-state-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .tab-tool { margin-left: 5px; font-size: 9px; color: var(--chrome-accent); opacity: 0.9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60px; vertical-align: middle; }

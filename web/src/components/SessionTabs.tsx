@@ -488,6 +488,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                 {agentBadge(s.agentType)}
                 {getLabel(s)}
                 {p2pSessionLabels?.has(s.name) && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
+                <SharedStateIndicator state={s.sharedState} iconOnly />
                 {/* tool call indicator removed — too flashy */}
                 {isActive && (
                   <span class="tab-ws-dot" style={{ color: connected ? latencyColor : '#ef4444' }} title={connected ? (latencyMs != null ? `${latencyMs}ms` : 'Connected') : 'Disconnected'}>
@@ -496,7 +497,6 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                 )}
               </button>
             )}
-            {!renaming && <SharedStateIndicator state={s.sharedState} compact />}
           </div>
         );
       })}
