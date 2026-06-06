@@ -359,7 +359,7 @@ describe('tab sharing APIs', () => {
 
   it('lets recipients discover/open active shares without becoming server members', async () => {
     const app = makeApp();
-    const { ownerId, recipientId, serverId, sessionName } = await seedShareTarget();
+    const { ownerId, recipientId, serverId, sessionName, subSessionId } = await seedShareTarget();
     await createOrUpdateShare(db, {
       id: id('share'),
       target: { kind: 'server', serverId },
@@ -390,6 +390,49 @@ describe('tab sharing APIs', () => {
     const openBody = await open.json() as { coverage: { effectiveRole: string; historyCutoffAt: number }; sessions: Array<{ sessionName: string }> };
     expect(openBody.coverage).toMatchObject({ effectiveRole: 'viewer', historyCutoffAt: 0 });
     expect(openBody.sessions).toEqual([expect.objectContaining({ sessionName })]);
+
+    const openServer = await app.request('/api/shares/open', {
+      method: 'POST',
+      headers: authHeaders(recipientId),
+      body: JSON.stringify({ target: { kind: 'server', serverId } }),
+    });
+    expect(openServer.status).toBe(200);
+    const openServerBody = await openServer.json() as {
+      sessions: Array<{ sessionName: string }>;
+      subSessions: Array<{ subSessionId: string; sessionName: string; parentSessionName: string | null }>;
+    };
+    expect(openServerBody.sessions).toEqual(expect.arrayContaining([expect.objectContaining({ sessionName })]));
+    expect(openServerBody.subSessions).toEqual(expect.arrayContaining([expect.objectContaining({
+      subSessionId,
+      sessionName: `deck_sub_${subSessionId}`,
+      parentSessionName: sessionName,
+    })]));
+  });
+
+  it('opens a shared sub-session with its parent main session for tree rendering', async () => {
+    const app = makeApp();
+    const { ownerId, recipientId, serverId, sessionName, subSessionId } = await seedShareTarget();
+    await createOrUpdateShare(db, {
+      id: id('share'),
+      target: { kind: 'subsession', serverId, subSessionId },
+      targetUserId: recipientId,
+      role: 'viewer',
+      createdBy: ownerId,
+      now: 5_000,
+    });
+
+    const open = await app.request('/api/shares/open', {
+      method: 'POST',
+      headers: authHeaders(recipientId),
+      body: JSON.stringify({ target: { kind: 'subsession', serverId, subSessionId } }),
+    });
+    expect(open.status).toBe(200);
+    const openBody = await open.json() as {
+      sessions: Array<{ sessionName: string }>;
+      subSessions: Array<{ subSessionId: string; parentSessionName: string | null }>;
+    };
+    expect(openBody.sessions).toEqual([expect.objectContaining({ sessionName })]);
+    expect(openBody.subSessions).toEqual([expect.objectContaining({ subSessionId, parentSessionName: sessionName })]);
   });
 
   it('issues share-scoped websocket tickets with bounded claims', async () => {

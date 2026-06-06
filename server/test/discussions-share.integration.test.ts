@@ -181,8 +181,18 @@ describe('share-scoped discussion comments', () => {
     });
 
     expect(res.status).toBe(201);
-    const payload = await res.json() as { type: string; comment: { id: string; actor_envelope: unknown } };
+    const payload = await res.json() as { type: string; comment: { id: string; actor_envelope: unknown; actorEnvelope?: Record<string, unknown>; createdByUserId?: string; createdAt?: number } };
     expect(payload.type).toBe(SHARE_DISCUSSION_EVENTS.COMMENT_CREATED);
+    expect(payload.comment.createdByUserId).toBe(recipientId);
+    expect(payload.comment.createdAt).toBe(2_000);
+    expect(payload.comment.actorEnvelope).toMatchObject({
+      actorUserId: recipientId,
+      actorDisplayName: 'Shared Recipient',
+      effectiveActorRole: 'viewer',
+      actionId: 'comment-request-1',
+      origin: 'shared-server',
+      primaryShareId: share.id,
+    });
 
     const row = await db.queryOne<{ actor_envelope: unknown; created_by_user_id: string }>(
       'SELECT actor_envelope, created_by_user_id FROM discussion_comments WHERE id = $1',
@@ -210,10 +220,19 @@ describe('share-scoped discussion comments', () => {
       headers: authHeaders(recipientId),
     });
     expect(readRes.status).toBe(200);
-    const readPayload = await readRes.json() as { comments: Array<{ id: string; body: string }>; targetRef: string };
+    const readPayload = await readRes.json() as { comments: Array<{ id: string; body: string; actorEnvelope?: Record<string, unknown>; createdAt?: number }>; targetRef: string };
     expect(readPayload.targetRef).toBe(serverId);
     expect(readPayload.comments).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: payload.comment.id, body: 'Looks good from here.' }),
+      expect.objectContaining({
+        id: payload.comment.id,
+        body: 'Looks good from here.',
+        createdAt: 2_000,
+        actorEnvelope: expect.objectContaining({
+          actorUserId: recipientId,
+          actorDisplayName: 'Shared Recipient',
+          effectiveActorRole: 'viewer',
+        }),
+      }),
     ]));
   });
 

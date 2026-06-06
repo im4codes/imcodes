@@ -312,6 +312,24 @@ describe('Watch routes', () => {
   });
 
   it('GET /api/server/:id/timeline/history strips non-watch-safe payload fields instead of failing decode', async () => {
+    const sharedActor = {
+      actorUserId: 'user-shared',
+      actorDisplayName: 'Ada Shared',
+      effectiveActorRole: 'participant',
+      origin: 'shared-tab',
+      actionId: 'share-send-1',
+      authorizedAt: 1,
+      primaryShareId: 'share-1',
+      snapshot: {
+        target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        authorizedAt: 1,
+        primaryShareId: 'share-1',
+        coveringShareIds: ['share-1'],
+        nextCoverageRecheckAt: null,
+      },
+    };
     mockRequestTimelineHistory.mockResolvedValue({
       epoch: 9,
       events: [
@@ -327,8 +345,8 @@ describe('Watch routes', () => {
           eventId: 'e-2',
           sessionId: 'deck_proj_brain',
           ts: 110,
-          type: 'tool.call',
-          payload: { tool: { raw: { shape: 'kept-out-of-watch' } } },
+          type: 'user.message',
+          payload: { text: 'shared prompt', sharedActor, nested: { raw: 'dropped' } },
         },
         {
           bad: 'row',
@@ -345,7 +363,7 @@ describe('Watch routes', () => {
       epoch: 9,
       events: [
         { eventId: 'e-1', sessionId: 'deck_proj_brain', ts: 100, type: 'assistant.text', payload: { text: 'hello' } },
-        { eventId: 'e-2', sessionId: 'deck_proj_brain', ts: 110, type: 'tool.call', payload: {} },
+        { eventId: 'e-2', sessionId: 'deck_proj_brain', ts: 110, type: 'user.message', payload: { text: 'shared prompt', sharedActor } },
       ],
       actualPayloadBytes: expect.any(Number),
       hasMore: false,

@@ -112,6 +112,8 @@ export function useSubSessions(
   useEffect(() => {
     if (!serverId) { setSubSessions([]); setLoadedServerId(null); return; }
     if (disableHttpLoad) {
+      const gen = ++loadGenRef.current;
+      loadedGenRef.current = gen;
       setLoadedServerId(serverId);
       rebuiltRef.current = false;
       return;
@@ -186,6 +188,7 @@ export function useSubSessions(
 
   // Rebuild all when daemon connects (once per connection)
   useEffect(() => {
+    if (disableHttpLoad) return;
     if (!connected || !ws || subSessions.length === 0 || rebuiltRef.current) return;
     if (loadedServerId !== serverId) return;
     if (loadedGenRef.current !== loadGenRef.current) return;
@@ -208,7 +211,7 @@ export function useSubSessions(
       effort: s.effort,
       transportConfig: s.transportConfig,
     })));
-  }, [connected, ws, subSessions]);
+  }, [connected, ws, subSessions, disableHttpLoad, loadedServerId, serverId]);
 
   // Reset rebuild flag when disconnected
   useEffect(() => {

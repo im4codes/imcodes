@@ -1938,6 +1938,74 @@ describe('ChatView', () => {
     }
   });
 
+  it('shows date and time in the pinned last-sent banner', async () => {
+    const originalIntersectionObserver = globalThis.IntersectionObserver;
+    let observerCallback: IntersectionObserverCallback | null = null;
+    class IntersectionObserverMock {
+      root: Element | Document | null = null;
+      rootMargin = '';
+      thresholds = [];
+      constructor(callback: IntersectionObserverCallback) {
+        observerCallback = callback;
+      }
+      observe = vi.fn();
+      unobserve = vi.fn();
+      disconnect = vi.fn();
+      takeRecords = vi.fn(() => []);
+    }
+    globalThis.IntersectionObserver = IntersectionObserverMock as unknown as typeof IntersectionObserver;
+
+    try {
+      const ts = new Date('2026-04-17T12:34:00Z').getTime();
+      const { container } = render(
+        <ChatView
+          events={[
+            {
+              eventId: 'evt-pinned-user',
+              type: 'user.message',
+              ts,
+              payload: {
+                text: 'Pull latest code',
+                sharedActor: {
+                  actorDisplayName: 'Ada Shared',
+                  effectiveActorRole: 'participant',
+                },
+              },
+            },
+            {
+              eventId: 'evt-assistant',
+              type: 'assistant.text',
+              ts: ts + 1,
+              payload: { text: 'Done', streaming: false },
+            },
+          ] as any}
+          loading={false}
+          sessionId="deck_main_brain"
+        />,
+      );
+
+      const target = container.querySelector('[data-event-id="evt-pinned-user"]') as Element;
+      await act(async () => {
+        observerCallback?.([
+          {
+            target,
+            isIntersecting: false,
+            rootBounds: { top: 100 } as DOMRectReadOnly,
+            boundingClientRect: { bottom: 50 } as DOMRectReadOnly,
+          } as IntersectionObserverEntry,
+        ], {} as IntersectionObserver);
+      });
+
+      expect(container.querySelector('.chat-pinned-last-sent-label')?.textContent).toBe('chat.pinned_last_sent_label');
+      expect(container.querySelector('.chat-pinned-last-sent-actor')?.textContent).toBe('Ada Shared · Participant');
+      const timeText = container.querySelector('.chat-pinned-last-sent-time')?.textContent ?? '';
+      expect(timeText).toBe(new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }));
+      expect(container.querySelector('.chat-pinned-last-sent-text')?.textContent).toBe('Pull latest code');
+    } finally {
+      globalThis.IntersectionObserver = originalIntersectionObserver;
+    }
+  });
+
   it('renders shared actor labels for share-originated user messages', () => {
     const { container } = render(
       <ChatView

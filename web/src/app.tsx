@@ -2194,6 +2194,7 @@ export function App() {
   const prevActiveSessionRef = useRef<string | null>(null);
   useEffect(() => {
     const prev = prevActiveSessionRef.current;
+    if (selectedShareTarget) return;
     if (!activeSession || activeSession === prev) return;
     if (!connected || loadedServerId !== selectedServerId) return;
     if (!defaultShellPref.loaded) return;
@@ -2202,7 +2203,7 @@ export function App() {
     if (visibleSubSessions.length > 0) return;
     const shell = defaultShellPref.value || '/bin/bash';
     void createSubSession('shell', shell);
-  }, [activeSession, connected, loadedServerId, selectedServerId, visibleSubSessions.length, createSubSession, defaultShellPref.loaded, defaultShellPref.value]);
+  }, [activeSession, connected, loadedServerId, selectedServerId, selectedShareTarget, visibleSubSessions.length, createSubSession, defaultShellPref.loaded, defaultShellPref.value]);
 
   // Load P2P config — determine which sessions are enabled for P2P tagging
   useEffect(() => {
@@ -4393,8 +4394,8 @@ export function App() {
               onSelectSubSession={(sub) => {
                 selectSubSessionFromTree(sub);
               }}
-              onNewSession={() => setShowNewSession(true)}
-              onNewSubSession={() => setShowSubDialog(true)}
+              onNewSession={selectedShareTarget ? undefined : () => setShowNewSession(true)}
+              onNewSubSession={selectedShareTarget ? undefined : () => setShowSubDialog(true)}
             />
 
             {/* P2P ring progress — show active P2P runs */}
@@ -4911,7 +4912,7 @@ export function App() {
                 onRestore={restoreSubSession}
                 onRestoreThenClose={minimizeSubSessionWindow}
                 onRestart={restartSubSession}
-                onNew={() => setShowSubDialog(true)}
+                onNew={selectedShareTarget ? undefined : () => setShowSubDialog(true)}
                 onViewDiscussions={() => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(null); setShowDiscussionsPage(true); })}
                 onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); })}
                 discussions={discussions.filter((d) => isP2pDiscussionVisibleInSubSessionBar(d, {
@@ -5060,8 +5061,8 @@ export function App() {
                   selectSubSessionFromTree(sub);
                   closeSidebar();
                 }}
-                onNewSession={() => { setShowNewSession(true); closeSidebar(); }}
-                onNewSubSession={() => { setShowSubDialog(true); closeSidebar(); }}
+                onNewSession={selectedShareTarget ? undefined : () => { setShowNewSession(true); closeSidebar(); }}
+                onNewSubSession={selectedShareTarget ? undefined : () => { setShowSubDialog(true); closeSidebar(); }}
               />}
               {/* P2P ring progress */}
               {discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
@@ -5602,7 +5603,7 @@ export function App() {
         />
       )}
 
-      {showSubDialog && (
+      {showSubDialog && !selectedShareTarget && (
         <StartSubSessionDialog
           ws={wsRef.current}
           defaultCwd={activeSessionInfo?.projectDir}

@@ -89,7 +89,7 @@ interface Props {
   onRestore?: (id: string) => void;
   onRestoreThenClose?: (id: string) => void;
   onRestart: (id: string) => void;
-  onNew: () => void;
+  onNew?: () => void;
   onViewDiscussions?: () => void;
   onViewDiscussion?: (fileId: string) => void;
   onViewRepo?: () => void;
@@ -930,14 +930,16 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             </span>
           );
         })()}
-        <button
-          class={`subcard-toolbar-add${desktopLayoutCapable ? ' subcard-toolbar-add-desktop' : ''}`}
-          data-onboarding="new-sub-session"
-          onClick={onNew}
-          title={t('subsessionBar.new_sub_session')}
-        >
-          {desktopLayoutCapable ? t('subsessionBar.add_sub_session_short') : '+'}
-        </button>
+        {onNew && (
+          <button
+            class={`subcard-toolbar-add${desktopLayoutCapable ? ' subcard-toolbar-add-desktop' : ''}`}
+            data-onboarding="new-sub-session"
+            onClick={onNew}
+            title={t('subsessionBar.new_sub_session')}
+          >
+            {desktopLayoutCapable ? t('subsessionBar.add_sub_session_short') : '+'}
+          </button>
+        )}
         {onViewDiscussions && (
           <button
             class={`subcard-toolbar-btn${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
@@ -1059,7 +1061,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       )}
 
       {/* Empty state: no sub-sessions and expanded */}
-      {!collapsed && subSessions.length === 0 && discussions.length === 0 && (
+      {!collapsed && subSessions.length === 0 && discussions.length === 0 && onNew && (
         <div class="subcard-empty-state">
           {t('subsessionBar.empty_prefix')} <strong>+</strong> {t('subsessionBar.empty_suffix')}
         </div>

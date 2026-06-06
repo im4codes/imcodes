@@ -89,6 +89,7 @@ import {
 import { isStreamingResponse } from '../../../shared/preview-stream-policy.js';
 import { LocalWebPreviewRegistry, setPreviewActiveRelayHook, setPreviewEvictedHook } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
+import { toDiscussionCommentView } from '../share/discussion-comment-view.js';
 import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
@@ -3000,7 +3001,7 @@ export class WsBridge {
     this.broadcastShareDiscussionComment(target, {
       type: SHARE_DISCUSSION_EVENTS.COMMENT_CREATED,
       requestId: requestId ?? undefined,
-      comment,
+      comment: toDiscussionCommentView(comment),
       targetRef: shareTargetRef(target),
     });
   }

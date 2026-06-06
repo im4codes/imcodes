@@ -204,6 +204,10 @@ function formatMemoryContextTimestamp(ts: number | undefined): string | null {
   return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+function formatChatDateTime(ts: number): string {
+  return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
 type MemoryContextSection =
   | {
     key: string;
@@ -1362,10 +1366,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       if (p.pending === true || p.failed === true) continue;
       const text = typeof p.text === 'string' ? p.text : '';
       if (!text.trim()) continue;
-      return { eventId: e.eventId, text };
+      return { eventId: e.eventId, text, ts: e.ts, actorLabel: formatSharedActorLabel(t, p.sharedActor) };
     }
     return null;
-  }, [events]);
+  }, [events, t]);
   // Reset the expand state whenever the pinned target changes so a new
   // message never inherits the expanded state of an older one.
   useEffect(() => { setPinnedExpanded(false); }, [lastSentUserMessage?.eventId]);
@@ -2522,7 +2526,13 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               }
             }}
           >
-            <span class="chat-pinned-last-sent-label">{t('chat.pinned_last_sent_label', 'Last sent')}</span>
+            <span class="chat-pinned-last-sent-meta">
+              <span class="chat-pinned-last-sent-label">{t('chat.pinned_last_sent_label', 'Last sent')}</span>
+              {lastSentUserMessage.actorLabel && (
+                <span class="chat-pinned-last-sent-actor">{lastSentUserMessage.actorLabel}</span>
+              )}
+              <span class="chat-pinned-last-sent-time">{formatChatDateTime(lastSentUserMessage.ts)}</span>
+            </span>
             <span class="chat-pinned-last-sent-text">{lastSentUserMessage.text}</span>
           </div>
         )}

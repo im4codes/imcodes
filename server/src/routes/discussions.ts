@@ -37,6 +37,7 @@ import {
   shareTargetKey,
   type SharedActorEnvelope,
 } from '../../../shared/tab-sharing.js';
+import { toDiscussionCommentView } from '../share/discussion-comment-view.js';
 
 type SanitizedDbOrchestrationRun = DbOrchestrationRun & {
   progress_snapshot_diagnostics: string[];
@@ -256,7 +257,7 @@ discussionRoutes.get('/:id/discussions/comments', async (c) => {
   const actor = await resolveDiscussionActor(c.env.DB, serverId, userId, target, Date.now());
   if (!actor) return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
   const comments = await getDiscussionCommentsByScope(c.env.DB, serverId, target);
-  return c.json({ comments, targetRef: shareTargetRef(target) });
+  return c.json({ comments: comments.map(toDiscussionCommentView), targetRef: shareTargetRef(target) });
 });
 
 /** GET /api/server/:id/discussions/:discussionId — get discussion detail with rounds */
@@ -275,7 +276,7 @@ discussionRoutes.get('/:id/discussions/:discussionId', async (c) => {
 
   const rounds = await getDiscussionRounds(c.env.DB, discussionId, serverId);
   const comments = await getDiscussionCommentsByThread(c.env.DB, serverId, discussionId);
-  return c.json({ discussion, rounds, comments });
+  return c.json({ discussion, rounds, comments: comments.map(toDiscussionCommentView) });
 });
 
 /** GET /api/server/:id/discussions/:discussionId/runs — list orchestration runs */
@@ -352,9 +353,9 @@ discussionRoutes.post('/:id/discussions/comments', async (c) => {
     now,
   });
   void import('../ws/bridge.js').then(({ WsBridge }) => {
-    WsBridge.get(serverId).broadcastShareDiscussionComment(target, { type: SHARE_DISCUSSION_EVENTS.COMMENT_CREATED, comment, targetRef: shareTargetRef(target) });
+    WsBridge.get(serverId).broadcastShareDiscussionComment(target, { type: SHARE_DISCUSSION_EVENTS.COMMENT_CREATED, comment: toDiscussionCommentView(comment), targetRef: shareTargetRef(target) });
   }).catch(() => undefined);
-  return c.json({ type: SHARE_DISCUSSION_EVENTS.COMMENT_CREATED, comment, targetRef: shareTargetRef(target) }, 201);
+  return c.json({ type: SHARE_DISCUSSION_EVENTS.COMMENT_CREATED, comment: toDiscussionCommentView(comment), targetRef: shareTargetRef(target) }, 201);
 });
 
 /** GET /api/server/:id/p2p/runs — list recent P2P orchestration runs */

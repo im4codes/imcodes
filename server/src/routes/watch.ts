@@ -257,7 +257,7 @@ function sanitizeWatchTimelineEvent(raw: unknown): {
   sessionId: string;
   ts: number;
   type: string;
-  payload: { text?: string };
+  payload: { text?: string; sharedActor?: unknown };
 } | null {
   if (!raw || typeof raw !== 'object') return null;
   const event = raw as Record<string, unknown>;
@@ -270,12 +270,18 @@ function sanitizeWatchTimelineEvent(raw: unknown): {
     ? event.payload as Record<string, unknown>
     : null;
   const text = typeof payload?.text === 'string' ? payload.text : undefined;
+  const sharedActor = payload?.sharedActor && typeof payload.sharedActor === 'object'
+    ? payload.sharedActor
+    : undefined;
   return {
     eventId,
     sessionId,
     ts,
     type,
-    payload: text !== undefined ? { text } : {},
+    payload: {
+      ...(text !== undefined ? { text } : {}),
+      ...(sharedActor !== undefined ? { sharedActor } : {}),
+    },
   };
 }
 
