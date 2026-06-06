@@ -160,9 +160,15 @@ describe('SubSessionCard', () => {
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
 
     await waitFor(() => {
-      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: 'hello' });
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+        sessionName: 'deck_sub_sub-card-1',
+        text: 'hello',
+        commandId: expect.any(String),
+      }));
       expect(preview.scrollTop).toBe(1500);
     });
+    const sentPayload = ws.sendSessionCommand.mock.calls[0]?.[1];
+    expect(addOptimisticUserMessageSpy).toHaveBeenCalledWith('hello', sentPayload.commandId);
   });
 
   it('does not render idle-flash layer for idle cards by default', () => {
@@ -326,9 +332,14 @@ describe('SubSessionCard', () => {
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
 
     await waitFor(() => {
-      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: 'echo hi' });
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+        sessionName: 'deck_sub_sub-card-1',
+        text: 'echo hi',
+        commandId: expect.any(String),
+      }));
       expect(terminalScrollBottomSpy).toHaveBeenCalled();
     });
+    expect(addOptimisticUserMessageSpy).not.toHaveBeenCalled();
   });
 
   it('keeps shell cards in raw terminal preview mode', async () => {

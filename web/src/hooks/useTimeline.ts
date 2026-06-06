@@ -2236,6 +2236,16 @@ export function useTimeline(
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
       return result;
     });
+    if (commandId) {
+      // A browser may miss the immediate command.ack/user.message while the
+      // socket is resubscribing (most visible on sub-session windows). The
+      // message may already be running, so do one cheap tail catch-up instead
+      // of letting the local bubble spin until the 90s safety timeout.
+      fireHttpBackfillRef.current(1200, {
+        phase: 'refresh',
+        cooldownMs: 1500,
+      });
+    }
   }, [sessionId, clearOptimisticTimer, markOptimisticFailed]);
 
   const olderTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);

@@ -230,15 +230,18 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const handleCardSend = useCallback(() => {
     const text = cardInputRef.current?.value?.trim();
     if (!text || !ws || !connected) return;
+    const commandId = globalThis.crypto?.randomUUID?.()
+      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     try {
-      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text });
+      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, commandId });
     } catch (err) {
       console.warn('sub-session send failed; preserving draft for retry', err);
       return;
     }
+    addOptimisticUserMessage?.(text, commandId);
     cardInputRef.current!.value = '';
     requestAnimationFrame(() => { forceFollowLatest(); });
-  }, [ws, connected, sub.sessionName, forceFollowLatest]);
+  }, [addOptimisticUserMessage, ws, connected, sub.sessionName, forceFollowLatest]);
 
   const handleTransportStop = useCallback(() => {
     // Stop is highest-priority — must fire even when the WS is briefly in
