@@ -17,7 +17,7 @@ import { performance } from 'node:perf_hooks';
 import type { Database } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
-import { sha256Hex } from '../security/crypto.js';
+import { randomHex, sha256Hex } from '../security/crypto.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { RESOURCE_EVENT_MSG, type ResourceTopic } from '../../../shared/resource-events.js';
@@ -88,7 +88,7 @@ import {
 } from '../../../shared/preview-types.js';
 import { isStreamingResponse } from '../../../shared/preview-stream-policy.js';
 import { LocalWebPreviewRegistry, setPreviewActiveRelayHook, setPreviewEvictedHook } from '../preview/registry.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
 import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
@@ -112,6 +112,21 @@ import {
   P2P_CAPABILITY_FRESHNESS_TTL_MS,
 } from '../../../shared/p2p-workflow-constants.js';
 import { DaemonUpgradeCoordinator, type DaemonUpgradeSource, type RequestDaemonUpgradeResult } from './daemon-upgrade-coordinator.js';
+import {
+  SHARE_REASONS,
+  commandSessionName,
+  evaluateShareCommand,
+  filterShareDaemonMessage,
+  resolveShareCoverageFromDb,
+  shareTargetCoversSession,
+  shareTargetKey,
+  type EffectiveCoverage,
+  type ShareCoverageResolver,
+  type ShareCommandDecision,
+  type ShareReason,
+  type ShareScopedSocketState,
+  type ShareTarget,
+} from './share-policy.js';
 import {
   sanitizeP2pRunForPersistAndBroadcast,
   sanitizeP2pRunUpdateForBroadcast,
@@ -145,6 +160,21 @@ import {
   TIMELINE_REQUEST_ERROR_REASONS,
   isRecoverableTimelineRequestErrorReason,
 } from '../../../shared/timeline-history-errors.js';
+import {
+  deriveShareTransitionKey,
+  normalizeExistingShareTarget,
+  shareTargetFromSessionName,
+  shareTargetRef,
+  writeShareAuditEvent,
+  type ShareAuditActionType,
+  type ShareTargetInput,
+} from '../db/tab-sharing.js';
+import { evaluateSharedCommandRateLimit } from '../share/share-rate-limit.js';
+import {
+  SHARE_BROWSER_COMMANDS,
+  SHARE_DISCUSSION_EVENTS,
+  type SharedActorEnvelope,
+} from '../../../shared/tab-sharing.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
@@ -274,6 +304,7 @@ export interface WatchActiveMainSessionRow {
   project: string;
   state: string;
   agentType: string;
+  runtimeType?: string;
   label?: string;
 }
 
@@ -281,6 +312,7 @@ type WatchActiveSubSessionRow = {
   name: string;
   parentSession?: string;
   agentType?: string;
+  runtimeType?: string;
   label?: string;
 };
 
@@ -869,6 +901,11 @@ interface InflightCommand {
   sentAt: number;              // when the inflight was created (dispatch or buffer)
   dispatchAttempts: number;    // daemon sends attempted by the bridge
   timeoutTimer: ReturnType<typeof setTimeout> | null;
+  share?: {
+    userId: string;
+    target: ShareTarget;
+    requiredRole: 'participant';
+  };
 }
 
 type FsPendingRouteKind =
@@ -891,6 +928,11 @@ type PendingFsRouteMap = Map<string, PendingFsRoute>;
 
 // Periodic cleanup interval handle (module-level, shared across all bridge instances)
 let cleanupSweepHandle: ReturnType<typeof setInterval> | null = null;
+let shareClockNow = (): number => Date.now();
+
+export function __setShareBridgeClockForTests(clock: (() => number) | null): void {
+  shareClockNow = clock ?? (() => Date.now());
+}
 
 // ── WsBridge ─────────────────────────────────────────────────────────────────
 
@@ -937,6 +979,12 @@ export class WsBridge {
 
   /** browser socket → userId (for session ownership checks) */
   private browserUserIds = new Map<WebSocket, string>();
+  /** browser socket → live share-scoped authorization state */
+  private browserShareStates = new Map<WebSocket, ShareScopedSocketState>();
+  private shareCoverageResolver: ShareCoverageResolver = resolveShareCoverageFromDb;
+  private shareExpirySweepTimer: ReturnType<typeof setInterval> | null = null;
+  private sessionRuntimeTypes = new Map<string, 'process' | 'transport' | 'unknown'>();
+  private activeDispatchIds = new Map<string, string>();
 
   /** db reference for session ownership checks */
   private db: Database | null = null;
@@ -1089,6 +1137,10 @@ export class WsBridge {
     setPreviewEvictedHook((serverId, previewId) =>
       WsBridge.instances.get(serverId)?.terminatePreviewRelaysForPreview(previewId),
     );
+    this.shareExpirySweepTimer = setInterval(() => {
+      void this.sweepShareSockets();
+    }, 30_000);
+    this.shareExpirySweepTimer.unref?.();
   }
 
   static get(serverId: string): WsBridge {
@@ -2341,7 +2393,7 @@ export class WsBridge {
           this.graceTimer = null;
         }
         this.daemonOfflineAnnounced = false;
-        this.replayInflightToDaemon();
+        await this.replayInflightToDaemon();
         this.broadcastToBrowsers(JSON.stringify({ type: MSG_DAEMON_ONLINE }));
         this.startAckHousekeepingIfNeeded();
 
@@ -2463,6 +2515,78 @@ export class WsBridge {
 
   // ── Browser connection ─────────────────────────────────────────────────────
 
+  setShareCoverageResolverForTests(resolver: ShareCoverageResolver): void {
+    this.shareCoverageResolver = resolver;
+  }
+
+  handleShareBrowserConnection(
+    ws: WebSocket,
+    userId: string,
+    db: Database,
+    options: {
+      ticketId: string;
+      target: ShareTarget;
+      snapshot: EffectiveCoverage;
+      isMobile?: boolean;
+    },
+  ): void {
+    this.browserShareStates.set(ws, {
+      userId,
+      ticketId: options.ticketId,
+      target: options.target,
+      snapshot: options.snapshot,
+      connectedAt: shareClockNow(),
+    });
+    this.handleBrowserConnection(ws, userId, db, options.isMobile ?? false);
+  }
+
+  async revalidateShareSocketForTests(ws: WebSocket): Promise<void> {
+    await this.revalidateShareSocket(ws);
+  }
+
+  async sweepShareSocketsForTests(): Promise<void> {
+    await this.sweepShareSockets();
+  }
+
+  countSharePendingCommandsForUser(userId: string, sessionName: string, commandType: string): number {
+    return [...this.inflightCommands.values()].filter((entry) => (
+      entry.share?.userId === userId
+      && entry.sessionName === sessionName
+      && this.rawPayloadType(entry.rawPayload) === commandType
+    )).length;
+  }
+
+  getActiveDispatchIdForSession(sessionName: string): string | null {
+    return this.activeDispatchIds.get(sessionName) ?? null;
+  }
+
+  broadcastShareDiscussionComment(target: ShareTarget, payload: Record<string, unknown>): void {
+    const serialized = JSON.stringify(payload);
+    const targetRef = shareTargetKey(target);
+    for (const [ws, state] of this.browserShareStates) {
+      if (state.target.serverId !== target.serverId) continue;
+      if (state.target.kind !== 'server' && shareTargetKey(state.target) !== targetRef) continue;
+      safeSend(ws, serialized);
+    }
+  }
+
+  async revalidateShareSocketsForUser(userId: string): Promise<void> {
+    const sockets = [...this.browserShareStates]
+      .filter(([, state]) => state.userId === userId)
+      .map(([ws]) => ws);
+    await Promise.all(sockets.map((ws) => this.revalidateShareSocket(ws)));
+  }
+
+  async revalidateShareSocketsForTarget(target: ShareTarget): Promise<void> {
+    const sockets = [...this.browserShareStates]
+      .filter(([, state]) => (
+        state.target.serverId === target.serverId
+        && (state.target.kind === 'server' || shareTargetKey(state.target) === shareTargetKey(target))
+      ))
+      .map(([ws]) => ws);
+    await Promise.all(sockets.map((ws) => this.revalidateShareSocket(ws)));
+  }
+
   handleBrowserConnection(ws: WebSocket, userId: string, db: Database, isMobile = false): void {
     this.db = db;
     this.browserSockets.add(ws);
@@ -2470,14 +2594,17 @@ export class WsBridge {
     this.browserSubscriptions.set(ws, new Map());
     this.transportSubscriptions.set(ws, new Set());
     this.browserUserIds.set(ws, userId);
+    const shareState = this.browserShareStates.get(ws);
 
     // Push cached provider statuses so the browser has them immediately — no WS race.
-    for (const [providerId, connected] of this.providerStatus) {
-      safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected }));
-    }
-    // Push cached remote sessions for each connected provider
-    for (const [providerId, sessions] of this.providerRemoteSessions) {
-      safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions }));
+    if (!shareState) {
+      for (const [providerId, connected] of this.providerStatus) {
+        safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected }));
+      }
+      // Push cached remote sessions for each connected provider
+      for (const [providerId, sessions] of this.providerRemoteSessions) {
+        safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions }));
+      }
     }
     /*
      * R3 v2 PR-σ — Replay the cached `daemon.hello` to newly-connected
@@ -2492,7 +2619,7 @@ export class WsBridge {
      * capability picture as one that was open during the original
      * hello broadcast.
      */
-    if (this.daemonP2pWorkflowCapabilities) {
+    if (!shareState && this.daemonP2pWorkflowCapabilities) {
       safeSend(ws, JSON.stringify({
         type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
         daemonId: this.daemonP2pWorkflowCapabilities.daemonId,
@@ -2510,7 +2637,7 @@ export class WsBridge {
     }
 
     ws.on('message', async (data) => {
-      const raw = (data as Buffer).toString();
+      let raw = (data as Buffer).toString();
       if (Buffer.byteLength(raw, 'utf8') > MAX_BROWSER_PAYLOAD) {
         logger.warn({ serverId: this.serverId }, 'Browser message too large — dropped');
         try { ws.send(JSON.stringify({ type: 'error', error: 'payload_too_large' })); } catch { /* ignore */ }
@@ -2566,15 +2693,34 @@ export class WsBridge {
         return;
       }
 
+      if (this.browserShareStates.has(ws)) {
+        const shareCommandDecision = await this.evaluateShareScopedBrowserCommand(ws, msg);
+        if (!shareCommandDecision.allowed) {
+          this.rejectShareScopedBrowserCommand(ws, msg, shareCommandDecision.reason);
+          if (shareCommandDecision.closeSocket) {
+            try { ws.close(1008, shareCommandDecision.reason); } catch { /* ignore */ }
+          }
+          return;
+        }
+        if ('stampedMessage' in shareCommandDecision && shareCommandDecision.stampedMessage) {
+          msg = shareCommandDecision.stampedMessage;
+          raw = JSON.stringify(msg);
+        }
+      }
+      const browserMessageType = typeof msg.type === 'string' ? msg.type : '';
+      if (!browserMessageType) {
+        return;
+      }
+
       if (msg.type === SESSION_GROUP_CLONE_MSG.START || msg.type === SESSION_GROUP_CLONE_MSG.CANCEL) {
         await this.handleBrowserSessionGroupCloneCommand(ws, msg);
         return;
       }
 
-      const p2pBrowserMessage = parseP2pWorkflowMessageType(msg.type);
+      const p2pBrowserMessage = parseP2pWorkflowMessageType(browserMessageType);
       if (p2pBrowserMessage.kind === 'drop' && p2pBrowserMessage.reason === 'unknown_p2p_message') {
         incrementCounter('p2p.bridge.unknown_message_drop', { direction: 'browser_to_daemon' });
-        logger.warn({ serverId: this.serverId, type: msg.type }, 'unknown browser p2p message — dropped');
+        logger.warn({ serverId: this.serverId, type: browserMessageType }, 'unknown browser p2p message — dropped');
         return;
       }
       if (p2pBrowserMessage.kind === 'known') {
@@ -2584,12 +2730,12 @@ export class WsBridge {
           || descriptor.response
           || descriptor.serverHandling !== 'forward_to_daemon'
         ) {
-          incrementCounter('p2p.bridge.wrong_peer_drop', { direction: 'browser_to_daemon', type: msg.type });
-          logger.warn({ serverId: this.serverId, type: msg.type }, 'browser attempted disallowed p2p route — dropped');
+          incrementCounter('p2p.bridge.wrong_peer_drop', { direction: 'browser_to_daemon', type: browserMessageType });
+          logger.warn({ serverId: this.serverId, type: browserMessageType }, 'browser attempted disallowed p2p route — dropped');
           safeSend(ws, JSON.stringify({
             type: 'error',
             code: P2P_BRIDGE_ERROR_CODES.WRONG_PEER,
-            originalType: msg.type,
+            originalType: browserMessageType,
             requestId: msg.requestId,
           }));
           return;
@@ -2599,12 +2745,12 @@ export class WsBridge {
         }
       }
 
-      if (this.isBrowserForbiddenDaemonCommandType(msg.type)) {
-        logger.warn({ serverId: this.serverId, type: msg.type }, 'Browser attempted server-only daemon command — rejected');
+      if (this.isBrowserForbiddenDaemonCommandType(browserMessageType)) {
+        logger.warn({ serverId: this.serverId, type: browserMessageType }, 'Browser attempted server-only daemon command — rejected');
         safeSend(ws, JSON.stringify({
           type: 'error',
           code: 'server_only_command',
-          originalType: msg.type,
+          originalType: browserMessageType,
           requestId: msg.requestId,
         }));
         return;
@@ -2668,7 +2814,7 @@ export class WsBridge {
       // Validate and track timeline request ids for single-cast response routing.
       // This eliminates the race where terminal.subscribe's async ownership check hasn't completed
       // before the daemon responds with timeline data - without this, the response is silently dropped.
-      if (TIMELINE_REQUEST_TYPES.has(msg.type)) {
+      if (TIMELINE_REQUEST_TYPES.has(browserMessageType)) {
         if (!await this.verifyTimelineBrowserRequest(ws, msg)) return;
         if (typeof msg.requestId === 'string') {
           this.registerPendingTimelineRequest(ws, msg);
@@ -2725,6 +2871,11 @@ export class WsBridge {
         return;
       }
 
+      if (browserMessageType === SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT && this.browserShareStates.has(ws)) {
+        await this.handleShareDiscussionCommentCommand(ws, msg);
+        return;
+      }
+
       // ── command.ack reliability: intercept user sends and cancels ───────
       //
       // Three cases:
@@ -2758,6 +2909,387 @@ export class WsBridge {
       this.cleanupBrowserSocket(ws);
       this.maybeCleanup();
     });
+  }
+
+  private async evaluateShareScopedBrowserCommand(
+    ws: WebSocket,
+    msg: Record<string, unknown>,
+  ): Promise<ShareCommandDecision> {
+    const state = this.browserShareStates.get(ws);
+    if (!state) return { allowed: true };
+    const coverage = await this.resolveLiveShareCoverage(state);
+    if (!coverage) {
+      const decision: ShareCommandDecision = {
+        allowed: false,
+        reason: this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED,
+        closeSocket: true,
+      };
+      await this.auditShareScopedBrowserCommand(state, msg, decision);
+      return {
+        allowed: false,
+        reason: decision.reason,
+        closeSocket: true,
+      };
+    }
+    const current = this.applyShareCoverage(ws, state, coverage);
+    const sessionName = commandSessionName(msg);
+    const runtimeType = sessionName ? await this.resolveSessionRuntimeType(sessionName) : 'unknown';
+    const decision = evaluateShareCommand({
+      msg,
+      state: current,
+      now: shareClockNow(),
+      runtimeType,
+      activeDispatchId: sessionName ? this.activeDispatchIds.get(sessionName) ?? null : null,
+    });
+    if (decision.allowed && sessionName) {
+      const rateLimitReason = this.evaluateShareScopedRateLimit(current, msg, sessionName, shareClockNow());
+      if (rateLimitReason) {
+        const rateLimitedDecision: ShareCommandDecision = { allowed: false, reason: rateLimitReason };
+        await this.auditShareScopedBrowserCommand(current, msg, rateLimitedDecision);
+        return rateLimitedDecision;
+      }
+    }
+    await this.auditShareScopedBrowserCommand(current, msg, decision);
+    return decision;
+  }
+
+  private async handleShareDiscussionCommentCommand(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
+    const state = this.browserShareStates.get(ws);
+    if (!state || !this.db) return;
+    const now = shareClockNow();
+    const requestId = typeof msg.requestId === 'string' && msg.requestId.trim() ? msg.requestId.trim() : this.shareCommandActionId(msg);
+    const actionId = requestId ?? `share-comment-${randomHex(8)}`;
+    const target = await this.resolveShareDiscussionCommentTarget(state, msg);
+    if (!target) {
+      await this.auditShareDiscussionComment(state, state.target, actionId, 'rejected', 'share-target-unavailable', now);
+      this.rejectShareScopedBrowserCommand(ws, { ...msg, commandId: actionId }, SHARE_REASONS.TARGET_UNAVAILABLE);
+      return;
+    }
+    const body = typeof msg.body === 'string' ? msg.body.trim() : '';
+    if (!body || body.length > 20_000) {
+      await this.auditShareDiscussionComment(state, target, actionId, 'rejected', 'share-comment-invalid', now);
+      this.rejectShareScopedBrowserCommand(ws, { ...msg, commandId: actionId }, SHARE_REASONS.COMMENT_INVALID);
+      return;
+    }
+
+    const user = await getUserById(this.db, state.userId);
+    const actor: SharedActorEnvelope = {
+      actorUserId: state.userId,
+      actorDisplayName: user?.display_name ?? user?.username ?? state.userId,
+      snapshot: state.snapshot,
+      primaryShareId: state.snapshot.primaryShareId,
+      effectiveActorRole: state.snapshot.effectiveRole,
+      actionId,
+      origin: target.kind === 'server' ? 'shared-server' : 'shared-tab',
+      authorizedAt: state.snapshot.authorizedAt,
+      queuedAt: now,
+    };
+    const commentId = randomHex(16);
+    const comment = await insertDiscussionComment(this.db, {
+      id: commentId,
+      serverId: this.serverId,
+      threadId: typeof msg.threadId === 'string' && msg.threadId.trim() ? msg.threadId.trim() : null,
+      scope: target,
+      createdByUserId: state.userId,
+      actorEnvelope: actor,
+      authorizationSnapshot: state.snapshot,
+      body,
+      createdAt: now,
+    });
+    await this.auditShareDiscussionComment(state, target, actionId, 'accepted', null, now);
+    this.broadcastShareDiscussionComment(target, {
+      type: SHARE_DISCUSSION_EVENTS.COMMENT_CREATED,
+      requestId: requestId ?? undefined,
+      comment,
+      targetRef: shareTargetRef(target),
+    });
+  }
+
+  private async resolveShareDiscussionCommentTarget(
+    state: ShareScopedSocketState,
+    msg: Record<string, unknown>,
+  ): Promise<ShareTarget | null> {
+    if (!this.db) return null;
+    let target = state.target;
+    if (msg.scope && typeof msg.scope === 'object') {
+      const normalized = await normalizeExistingShareTarget(this.db, msg.scope as ShareTargetInput);
+      if (!normalized) return null;
+      target = normalized;
+    }
+    if (target.serverId !== this.serverId) return null;
+    if (state.target.kind !== 'server' && shareTargetKey(state.target) !== shareTargetKey(target)) return null;
+    return target;
+  }
+
+  private async auditShareDiscussionComment(
+    state: ShareScopedSocketState,
+    target: ShareTarget,
+    actionId: string,
+    decision: 'accepted' | 'rejected',
+    reason: ShareReason | null,
+    now: number,
+  ): Promise<void> {
+    if (!this.db) return;
+    try {
+      const auditEventId = randomHex(16);
+      await writeShareAuditEvent(this.db, {
+        id: auditEventId,
+        serverId: this.serverId,
+        actorKind: 'user',
+        actorUserId: state.userId,
+        targetUserId: state.userId,
+        effectiveActorRole: state.snapshot.effectiveRole,
+        target,
+        actionType: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT,
+        decision,
+        reason,
+        snapshot: state.snapshot,
+        primaryShareId: state.snapshot.primaryShareId,
+        actionId,
+        idempotencyKey: deriveShareTransitionKey({
+          actionType: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT,
+          target,
+          primaryShareId: state.snapshot.primaryShareId,
+          transitionEpochMs: now,
+          decision,
+          attemptId: auditEventId,
+        }),
+        createdAt: now,
+      });
+    } catch (err) {
+      logger.error({ err, serverId: this.serverId, actionId }, 'Share discussion comment audit write failed');
+    }
+  }
+
+  private async auditShareScopedBrowserCommand(
+    state: ShareScopedSocketState,
+    msg: Record<string, unknown>,
+    decision: ShareCommandDecision,
+  ): Promise<void> {
+    if (!this.db) return;
+    const actionType = this.shareAuditActionTypeForCommand(msg);
+    if (!actionType) return;
+    const now = shareClockNow();
+    const sessionName = commandSessionName(msg);
+    const target = sessionName
+      ? shareTargetFromSessionName(this.serverId, sessionName) ?? state.target
+      : state.target;
+    const actionId = this.shareCommandActionId(msg);
+    try {
+      const auditEventId = randomHex(16);
+      await writeShareAuditEvent(this.db, {
+        id: auditEventId,
+        serverId: this.serverId,
+        actorKind: 'user',
+        actorUserId: state.userId,
+        targetUserId: state.userId,
+        effectiveActorRole: state.snapshot.effectiveRole,
+        target,
+        actionType,
+        decision: decision.allowed ? 'accepted' : 'rejected',
+        reason: decision.allowed ? null : decision.reason,
+        snapshot: state.snapshot,
+        primaryShareId: state.snapshot.primaryShareId,
+        actionId,
+        idempotencyKey: deriveShareTransitionKey({
+          actionType,
+          target,
+          primaryShareId: state.snapshot.primaryShareId,
+          transitionEpochMs: now,
+          decision: decision.allowed ? 'accepted' : 'rejected',
+          attemptId: auditEventId,
+        }),
+        createdAt: now,
+      });
+    } catch (err) {
+      logger.error({ err, serverId: this.serverId, actionType, actionId }, 'Share command audit write failed');
+    }
+  }
+
+  private shareAuditActionTypeForCommand(msg: Record<string, unknown>): ShareAuditActionType | null {
+    const type = typeof msg.type === 'string' ? msg.type : '';
+    if (type === 'session.send') return 'session.send';
+    if (type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) return 'session.cancel';
+    if (type === 'discussion.start') return 'p2p.orchestration';
+    return null;
+  }
+
+  private shareCommandActionId(msg: Record<string, unknown>): string | null {
+    for (const key of ['actionId', 'commandId', 'requestId']) {
+      const value = msg[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return null;
+  }
+
+  private evaluateShareScopedRateLimit(
+    state: ShareScopedSocketState,
+    msg: Record<string, unknown>,
+    sessionName: string,
+    now: number,
+  ): ShareReason | null {
+    const type = typeof msg.type === 'string' ? msg.type : '';
+    if (type !== 'session.send' && type !== DAEMON_COMMAND_TYPES.SESSION_CANCEL) return null;
+    const commandId = typeof msg.commandId === 'string' ? msg.commandId.trim() : '';
+    if (commandId && this.inflightCommands.has(commandId)) return null;
+    if (type === 'session.send') {
+      const pending = [...this.inflightCommands.values()].filter((entry) => (
+        entry.share?.userId === state.userId
+        && entry.sessionName === sessionName
+        && this.rawPayloadType(entry.rawPayload) === 'session.send'
+      )).length;
+      return evaluateSharedCommandRateLimit({
+        userId: state.userId,
+        serverId: this.serverId,
+        sessionName,
+        commandType: 'session.send',
+        now,
+        pendingSendCount: pending,
+      });
+    }
+    return evaluateSharedCommandRateLimit({
+      userId: state.userId,
+      serverId: this.serverId,
+      sessionName,
+      commandType: 'session.cancel',
+      now,
+    });
+  }
+
+  private rejectShareScopedBrowserCommand(
+    ws: WebSocket,
+    msg: Record<string, unknown>,
+    reason: ShareReason,
+  ): void {
+    const sessionName = commandSessionName(msg);
+    if ((msg.type === 'session.send' || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) && typeof msg.commandId === 'string' && sessionName) {
+      this.emitCommandFailed(ws, msg.commandId, sessionName, reason);
+      return;
+    }
+    safeSend(ws, JSON.stringify({
+      type: 'error',
+      code: reason,
+      reason,
+      originalType: msg.type,
+      requestId: msg.requestId,
+    }));
+  }
+
+  private async resolveLiveShareCoverage(state: ShareScopedSocketState): Promise<EffectiveCoverage | null> {
+    if (!this.db) return null;
+    return this.shareCoverageResolver({
+      db: this.db,
+      serverId: this.serverId,
+      userId: state.userId,
+      target: state.target,
+      now: shareClockNow(),
+    });
+  }
+
+  private applyShareCoverage(
+    ws: WebSocket,
+    state: ShareScopedSocketState,
+    coverage: EffectiveCoverage,
+  ): ShareScopedSocketState {
+    const next: ShareScopedSocketState = {
+      ...state,
+      target: coverage.target,
+      snapshot: coverage,
+    };
+    if (state.snapshot.effectiveRole !== coverage.effectiveRole) {
+      safeSend(ws, JSON.stringify({
+        type: 'share.role_changed',
+        reason: SHARE_REASONS.ROLE_CHANGED,
+        effectiveRole: coverage.effectiveRole,
+        target: coverage.target,
+      }));
+    }
+    this.browserShareStates.set(ws, next);
+    return next;
+  }
+
+  private shareStateLooksExpired(state: ShareScopedSocketState): boolean {
+    const next = state.snapshot.nextCoverageRecheckAt;
+    return typeof next === 'number' && shareClockNow() >= next;
+  }
+
+  private async revalidateShareSocket(ws: WebSocket): Promise<void> {
+    const state = this.browserShareStates.get(ws);
+    if (!state) return;
+    const coverage = await this.resolveLiveShareCoverage(state);
+    if (!coverage) {
+      this.teardownShareSocket(ws, this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED);
+      return;
+    }
+    this.applyShareCoverage(ws, state, coverage);
+  }
+
+  private async sweepShareSockets(): Promise<void> {
+    const now = shareClockNow();
+    const candidates = [...this.browserShareStates]
+      .filter(([, state]) => typeof state.snapshot.nextCoverageRecheckAt === 'number' && state.snapshot.nextCoverageRecheckAt <= now);
+    await Promise.all(candidates.map(([ws]) => this.revalidateShareSocket(ws)));
+  }
+
+  private teardownShareSocket(ws: WebSocket, reason: ShareReason): void {
+    safeSend(ws, JSON.stringify({ type: 'share.teardown', reason }));
+    this.cleanupBrowserSocket(ws);
+    try { ws.close(1008, reason); } catch { /* ignore */ }
+  }
+
+  private async resolveSessionRuntimeType(sessionName: string): Promise<'process' | 'transport' | 'unknown'> {
+    const cached = this.sessionRuntimeTypes.get(sessionName);
+    if (cached) return cached;
+    const activeMain = this.activeMainSessions.get(sessionName);
+    if (activeMain?.runtimeType) return this.normalizeRuntimeType(activeMain.runtimeType);
+    const activeSub = this.activeSubSessions.get(sessionName);
+    if (activeSub?.runtimeType) return this.normalizeRuntimeType(activeSub.runtimeType);
+    if (!this.db) return 'unknown';
+    try {
+      const subSessionId = sessionName.match(/^deck_sub_([A-Za-z0-9_-]+)$/)?.[1];
+      const row = subSessionId
+        ? await this.db.queryOne<{ runtime_type: string | null }>(
+          'SELECT runtime_type FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
+          [this.serverId, subSessionId],
+        )
+        : await this.db.queryOne<{ runtime_type: string | null }>(
+          'SELECT runtime_type FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+          [this.serverId, sessionName],
+        );
+      const runtimeType = this.normalizeRuntimeType(row?.runtime_type ?? null);
+      this.sessionRuntimeTypes.set(sessionName, runtimeType);
+      return runtimeType;
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  private normalizeRuntimeType(value: string | null | undefined): 'process' | 'transport' | 'unknown' {
+    if (value === 'process' || value === 'transport') return value;
+    return 'unknown';
+  }
+
+  private updateActiveDispatchFromDaemonMessage(sessionId: string, msg: Record<string, unknown>): void {
+    const directDispatchId = this.firstStringField(msg, ['activeDispatchId', 'runningTurnId', 'dispatchId', 'messageId']);
+    if (directDispatchId && msg.type !== 'chat.complete' && msg.type !== 'chat.error') {
+      this.activeDispatchIds.set(sessionId, directDispatchId);
+      return;
+    }
+    if (msg.type === 'chat.status' && msg.status === 'idle') {
+      this.activeDispatchIds.delete(sessionId);
+      return;
+    }
+    if (msg.type === 'chat.complete' || msg.type === 'chat.error') {
+      this.activeDispatchIds.delete(sessionId);
+    }
+  }
+
+  private firstStringField(msg: Record<string, unknown>, keys: string[]): string | null {
+    for (const key of keys) {
+      const value = msg[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return null;
   }
 
   private async handleBrowserSessionGroupCloneCommand(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
@@ -3377,6 +3909,10 @@ export class WsBridge {
             : '';
         if (commandId) this.clearInflightOnAuthoritativeEcho(commandId);
       }
+      if (rawEvent.type === 'session.state') {
+        const payload = rawEvent.payload as Record<string, unknown> | undefined;
+        if (payload?.state === 'idle') this.activeDispatchIds.delete(sessionId);
+      }
       this.ingestRecentTextFromTimelineEvent(rawEvent);
       if (this.db) {
         void upsertSessionTextTailCacheEvent(this.db, this.serverId, rawEvent)
@@ -3468,7 +4004,10 @@ export class WsBridge {
         const label = typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined;
         const parentSession = typeof msg.parentSession === 'string' && msg.parentSession ? msg.parentSession : undefined;
         const agentType = typeof msg.sessionType === 'string' && msg.sessionType ? msg.sessionType : undefined;
-        this.activeSubSessions.set(subSessionName, { name: subSessionName, label, parentSession, agentType });
+        const runtimeType = typeof msg.runtimeType === 'string' ? msg.runtimeType : undefined;
+        this.activeSubSessions.set(subSessionName, { name: subSessionName, label, parentSession, agentType, runtimeType });
+        this.sessionRuntimeTypes.set(subSessionName, this.normalizeRuntimeType(runtimeType));
+        if (msg.state === 'idle') this.activeDispatchIds.delete(subSessionName);
       }
       void (async () => {
         const requestedType = typeof msg.sessionType === 'string' && msg.sessionType.trim()
@@ -3603,6 +4142,7 @@ export class WsBridge {
             this.recentTextBySession.delete(sessionName);
             this.activeSubSessions.delete(sessionName);
             this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName }));
+            void this.revalidateShareSocketsForTarget({ kind: 'subsession', serverId: this.serverId, subSessionId: id });
           })
           .catch((err) => {
             logger.error({ err, id, sessionName: msg.sessionName }, 'Failed to persist sub-session close from daemon');
@@ -3787,6 +4327,7 @@ export class WsBridge {
     if ((TRANSPORT_RELAY_TYPES as Set<string>).has(type)) {
       const sessionId = msg.sessionId as string | undefined;
       if (sessionId) {
+        this.updateActiveDispatchFromDaemonMessage(sessionId, msg);
         this.sendToTransportSubscribers(sessionId, JSON.stringify(msg));
       }
       return;
@@ -3905,9 +4446,12 @@ export class WsBridge {
       const project = typeof row.project === 'string' ? row.project : '';
       const state = typeof row.state === 'string' ? row.state : 'stopped';
       const agentType = typeof row.agentType === 'string' ? row.agentType : '';
+      const runtimeType = typeof row.runtimeType === 'string' ? row.runtimeType : undefined;
       const label = typeof row.label === 'string' && row.label.trim() ? row.label.trim() : undefined;
       if (!name) continue;
-      this.activeMainSessions.set(name, { name, project, state, agentType, label });
+      this.activeMainSessions.set(name, { name, project, state, agentType, runtimeType, label });
+      this.sessionRuntimeTypes.set(name, this.normalizeRuntimeType(runtimeType));
+      if (state === 'idle' || state === 'stopped') this.activeDispatchIds.delete(name);
     }
   }
 
@@ -3936,6 +4480,7 @@ export class WsBridge {
   private sendToSessionSubscribers(sessionName: string, data: string | Buffer): void {
     for (const [ws, sessions] of this.browserSubscriptions) {
       if (!sessions.has(sessionName)) continue;
+      if (!this.canShareSocketReceiveSession(ws, sessionName, data)) continue;
       const queue = this.getOrCreateQueue(sessionName, ws);
       queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws));
     }
@@ -3982,20 +4527,27 @@ export class WsBridge {
     for (const [ws, sessions] of this.browserSubscriptions) {
       if (!sessions.has(sessionName)) continue;
       if (sent.has(ws)) continue;
+      const msg = this.tryParseJsonRecord(json);
+      const outgoing = msg ? this.filterShareOutgoingJson(ws, msg, json) : json;
+      if (!outgoing) continue;
       sent.add(ws);
-      safeSend(ws, json);
+      safeSend(ws, outgoing);
     }
     for (const [ws, sessions] of this.transportSubscriptions) {
       if (!sessions.has(sessionName)) continue;
       if (sent.has(ws)) continue;
+      const msg = this.tryParseJsonRecord(json);
+      const outgoing = msg ? this.filterShareOutgoingJson(ws, msg, json) : json;
+      if (!outgoing) continue;
       sent.add(ws);
-      safeSend(ws, json);
+      safeSend(ws, outgoing);
     }
   }
 
   private sendToRawSessionSubscribers(sessionName: string, data: string | Buffer): void {
     for (const [ws, sessions] of this.browserSubscriptions) {
       if (sessions.get(sessionName) !== true) continue;
+      if (!this.canShareSocketReceiveSession(ws, sessionName, data)) continue;
       const queue = this.getOrCreateQueue(sessionName, ws);
       queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws));
     }
@@ -4004,8 +4556,20 @@ export class WsBridge {
   private sendToTransportSubscribers(sessionId: string, data: string): void {
     for (const [ws, sessions] of this.transportSubscriptions) {
       if (!sessions.has(sessionId)) continue;
-      safeSend(ws, data);
+      const msg = this.tryParseJsonRecord(data);
+      const outgoing = msg ? this.filterShareOutgoingJson(ws, msg, data) : data;
+      if (!outgoing) continue;
+      safeSend(ws, outgoing);
     }
+  }
+
+  private canShareSocketReceiveSession(ws: WebSocket, sessionName: string, data: string | Buffer): boolean {
+    const state = this.browserShareStates.get(ws);
+    if (!state) return true;
+    if (!shareTargetCoversSession(state.target, sessionName)) return false;
+    if (typeof data !== 'string') return true;
+    const msg = this.tryParseJsonRecord(data);
+    return !msg || !!this.filterShareOutgoingJson(ws, msg, data);
   }
 
   private handleQueueOverflow(sessionName: string, ws: WebSocket): void {
@@ -4174,6 +4738,7 @@ export class WsBridge {
     this.browserSockets.delete(ws);
     this.mobileSockets.delete(ws);
     this.browserUserIds.delete(ws);
+    this.browserShareStates.delete(ws);
     const sessions = this.browserSubscriptions.get(ws);
     if (sessions) {
       for (const sessionName of [...sessions.keys()]) {
@@ -4306,13 +4871,32 @@ export class WsBridge {
   }
 
   private broadcastToBrowsers(json: string): void {
+    const msg = this.tryParseJsonRecord(json);
     for (const bs of this.browserSockets) {
       try {
-        bs.send(json);
+        const outgoing = msg ? this.filterShareOutgoingJson(bs, msg, json) : json;
+        if (!outgoing) continue;
+        bs.send(outgoing);
       } catch {
         this.browserSockets.delete(bs);
       }
     }
+  }
+
+  private tryParseJsonRecord(json: string): Record<string, unknown> | null {
+    try {
+      const parsed = JSON.parse(json) as unknown;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private filterShareOutgoingJson(ws: WebSocket, msg: Record<string, unknown>, originalJson: string): string | null {
+    const state = this.browserShareStates.get(ws);
+    if (!state) return originalJson;
+    const filtered = filterShareDaemonMessage(msg, state);
+    return filtered ? JSON.stringify(filtered) : null;
   }
 
   // ── Ack reliability helpers ────────────────────────────────────────────
@@ -4344,9 +4928,10 @@ export class WsBridge {
         sentAt: Date.now(),
         dispatchAttempts: 0,
         timeoutTimer: null,
+        share: this.inflightShareMetadata(ws),
       };
       this.inflightCommands.set(commandId, entry);
-      this.dispatchInflightToDaemon(entry, false);
+      void this.dispatchInflightToDaemon(entry, false);
       this.startAckHousekeepingIfNeeded();
       return;
     }
@@ -4374,6 +4959,7 @@ export class WsBridge {
         sentAt: Date.now(),
         dispatchAttempts: 0,
         timeoutTimer: null,
+        share: this.inflightShareMetadata(ws),
       };
       this.inflightCommands.set(commandId, entry);
       this.startAckHousekeepingIfNeeded();
@@ -4385,27 +4971,85 @@ export class WsBridge {
   }
 
   /** Replay buffered + dispatched commands to the daemon after reconnect. */
-  private replayInflightToDaemon(): void {
+  private async replayInflightToDaemon(): Promise<void> {
     const ordered = [...this.inflightCommands.values()].sort((a, b) => a.sentAt - b.sentAt);
     for (const entry of ordered) {
       if (entry.state === 'acked') continue;
       try {
-        this.dispatchInflightToDaemon(entry, entry.dispatchAttempts > 0);
+        await this.dispatchInflightToDaemon(entry, entry.dispatchAttempts > 0);
       } catch (err) {
         logger.warn({ commandId: entry.commandId, err }, 'replayInflightToDaemon failed for entry');
       }
     }
   }
 
-  private dispatchInflightToDaemon(entry: InflightCommand, markBridgeRetry: boolean): void {
+  private async dispatchInflightToDaemon(entry: InflightCommand, markBridgeRetry: boolean): Promise<void> {
+    if (!await this.revalidateInflightShareCommand(entry)) return;
     const rawPayload = markBridgeRetry
       ? this.withBridgeRetryMarker(entry.rawPayload, entry.dispatchAttempts + 1)
       : entry.rawPayload;
     this.sendToDaemon(rawPayload);
+    if (entry.share && this.rawPayloadType(entry.rawPayload) === 'session.send') {
+      this.activeDispatchIds.set(entry.sessionName, entry.commandId);
+    }
     entry.dispatchAttempts += 1;
     entry.state = 'dispatched';
     if (entry.timeoutTimer) clearTimeout(entry.timeoutTimer);
     entry.timeoutTimer = setTimeout(() => this.onAckTimeout(entry.commandId), ACK_TIMEOUT_MS);
+  }
+
+  private inflightShareMetadata(ws: WebSocket): InflightCommand['share'] {
+    const state = this.browserShareStates.get(ws);
+    if (!state) return undefined;
+    return {
+      userId: state.userId,
+      target: state.target,
+      requiredRole: 'participant',
+    };
+  }
+
+  private async revalidateInflightShareCommand(entry: InflightCommand): Promise<boolean> {
+    if (!entry.share) return true;
+    const state = this.browserShareStates.get(entry.browser);
+    if (!state || state.userId !== entry.share.userId) {
+      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.REVOKED);
+      this.removeInflight(entry.commandId);
+      return false;
+    }
+    const coverage = await this.resolveLiveShareCoverage(state);
+    if (!coverage) {
+      this.emitCommandFailed(
+        entry.browser,
+        entry.commandId,
+        entry.sessionName,
+        this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED,
+      );
+      this.removeInflight(entry.commandId);
+      return false;
+    }
+    const current = this.applyShareCoverage(entry.browser, state, coverage);
+    if (!shareTargetCoversSession(current.target, entry.sessionName)) {
+      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.TARGET_UNAVAILABLE);
+      this.removeInflight(entry.commandId);
+      return false;
+    }
+    const sameTarget = shareTargetKey(current.target) === shareTargetKey(entry.share.target);
+    if (!sameTarget || !shareTargetCoversSession(current.target, entry.sessionName)) {
+      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.TARGET_UNAVAILABLE);
+      this.removeInflight(entry.commandId);
+      return false;
+    }
+    if (this.shareStateLooksExpired(current)) {
+      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.EXPIRED);
+      this.removeInflight(entry.commandId);
+      return false;
+    }
+    if (entry.share.requiredRole === 'participant' && current.snapshot.effectiveRole !== 'participant') {
+      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.ROLE_DENIED);
+      this.removeInflight(entry.commandId);
+      return false;
+    }
+    return true;
   }
 
   private withBridgeRetryMarker(rawPayload: string, retryAttempt: number): string {
@@ -4418,6 +5062,15 @@ export class WsBridge {
       });
     } catch {
       return rawPayload;
+    }
+  }
+
+  private rawPayloadType(rawPayload: string): string | null {
+    try {
+      const parsed = JSON.parse(rawPayload) as Record<string, unknown>;
+      return typeof parsed.type === 'string' ? parsed.type : null;
+    } catch {
+      return null;
     }
   }
 
@@ -4450,7 +5103,7 @@ export class WsBridge {
         },
         'command.ack timeout — retrying session.send',
       );
-      this.dispatchInflightToDaemon(entry, true);
+      void this.dispatchInflightToDaemon(entry, true);
       return;
     }
     if (!this.isDaemonConnected() && this.graceTimer) {
@@ -4501,7 +5154,7 @@ export class WsBridge {
     browser: WebSocket,
     commandId: string,
     sessionName: string,
-    reason: AckFailureReason,
+    reason: AckFailureReason | ShareReason,
   ): void {
     const payload = {
       type: MSG_COMMAND_FAILED,
@@ -5789,6 +6442,10 @@ export class WsBridge {
       && this.pendingPreviewWsUpgrades.size === 0
     ) {
       this.browserRateLimiter.stop();
+      if (this.shareExpirySweepTimer) {
+        clearInterval(this.shareExpirySweepTimer);
+        this.shareExpirySweepTimer = null;
+      }
       WsBridge.instances.delete(this.serverId);
     }
   }

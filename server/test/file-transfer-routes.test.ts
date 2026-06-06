@@ -5,10 +5,11 @@ import {
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
 
-const { sendFileTransferRequestMock, isDaemonConnectedMock, hasDaemonCapabilityMock } = vi.hoisted(() => ({
+const { sendFileTransferRequestMock, isDaemonConnectedMock, hasDaemonCapabilityMock, mockResolveServerMemberAccessOrShareDeny } = vi.hoisted(() => ({
   sendFileTransferRequestMock: vi.fn(),
   isDaemonConnectedMock: vi.fn(),
   hasDaemonCapabilityMock: vi.fn(),
+  mockResolveServerMemberAccessOrShareDeny: vi.fn(),
 }));
 
 vi.mock('../src/security/authorization.js', () => ({
@@ -33,6 +34,10 @@ vi.mock('../src/ws/bridge.js', () => ({
       hasDaemonCapability: hasDaemonCapabilityMock,
     }),
   },
+}));
+
+vi.mock('../src/routes/share-http-auth.js', () => ({
+  resolveServerMemberAccessOrShareDeny: (...args: unknown[]) => mockResolveServerMemberAccessOrShareDeny(...args),
 }));
 
 vi.mock('../src/util/logger.js', () => ({
@@ -62,6 +67,7 @@ describe('file-transfer upload route', () => {
     hasDaemonCapabilityMock.mockReset();
     isDaemonConnectedMock.mockReturnValue(true);
     hasDaemonCapabilityMock.mockReturnValue(true);
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
     sendFileTransferRequestMock.mockResolvedValue({
       type: 'file.upload_done',
       attachment: {
@@ -71,6 +77,25 @@ describe('file-transfer upload route', () => {
         downloadable: true,
       },
     });
+  });
+
+  it('rejects share-only uploads with the direct-surface reason before daemon relay', async () => {
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({
+      ok: false,
+      reason: 'share-direct-surface-denied',
+    });
+    const form = new FormData();
+    form.append('file', new File(['hello'], 'hello.txt', { type: 'text/plain' }));
+
+    const res = await makeApp().request('/api/server/srv-1/upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test' },
+      body: form,
+    });
+
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-direct-surface-denied' });
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
   });
 
   it('rejects oversized legacy uploads from content-length before daemon relay', async () => {

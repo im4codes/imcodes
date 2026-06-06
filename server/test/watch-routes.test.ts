@@ -20,6 +20,7 @@ const mockHasReceivedActiveMainSessionSnapshot = vi.fn();
 const mockSendToDaemon = vi.fn();
 const mockGetPodIdentity = vi.fn(() => 'pod-a');
 const mockDbQueryOne = vi.fn();
+const mockResolveHttpShareAccess = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -61,6 +62,10 @@ vi.mock('../src/util/pod-identity.js', () => ({
   getPodIdentity: () => mockGetPodIdentity(),
 }));
 
+vi.mock('../src/routes/share-http-auth.js', () => ({
+  resolveHttpShareAccess: (...args: unknown[]) => mockResolveHttpShareAccess(...args),
+}));
+
 function makeEnv(): Env {
   return {
     DB: {
@@ -100,6 +105,12 @@ describe('Watch routes', () => {
     vi.clearAllMocks();
     mockGetPodIdentity.mockReturnValue('pod-a');
     mockResolveServerRole.mockResolvedValue('owner');
+    mockResolveHttpShareAccess.mockImplementation(async () => {
+      const role = await mockResolveServerRole();
+      return role === 'none'
+        ? { membership: 'none', actor: { kind: 'none' } }
+        : { membership: role, actor: { kind: 'server-member', effectiveActorRole: role === 'member' ? 'server-member' : 'server-manager' } };
+    });
     mockGetServersByUserId.mockResolvedValue([]);
     mockGetDbSessionsByServer.mockResolvedValue([]);
     mockGetSubSessionsByServer.mockResolvedValue([]);
@@ -113,10 +124,10 @@ describe('Watch routes', () => {
     mockRequestTimelineHistory.mockResolvedValue({ epoch: 7, events: [] });
     mockDbQueryOne.mockImplementation(async (sql: string, params: unknown[]) => {
       if (sql.includes('FROM sessions')) {
-        return params[1] === 'deck_proj_brain' ? { ok: 1 } : null;
+        return { exists: params[1] === 'deck_proj_brain' };
       }
       if (sql.includes('FROM sub_sessions')) {
-        return params[1] === 'abc123' ? { ok: 1 } : null;
+        return { exists: params[1] === 'abc123' };
       }
       return null;
     });
@@ -404,6 +415,47 @@ describe('Watch routes', () => {
     }));
   });
 
+  it('GET /api/server/:id/timeline/history preserves share-scoped history before invite time', async () => {
+    mockResolveServerRole.mockResolvedValue('none');
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'viewer',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'viewer',
+          historyCutoffAt: 1_000,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-1'],
+          primaryShareId: 'share-1',
+          authorizedAt: 2_000,
+        },
+      },
+    });
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 11,
+      events: [
+        { eventId: 'before-share', sessionId: 'deck_proj_brain', ts: 999, type: 'assistant.text', payload: { text: 'old' } },
+        { eventId: 'visible', sessionId: 'deck_proj_brain', ts: 1_001, type: 'assistant.text', payload: { text: 'new' } },
+      ],
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain&afterTs=500');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { events: Array<{ eventId: string }> };
+    expect(body.events).toEqual([
+      { eventId: 'before-share', sessionId: 'deck_proj_brain', ts: 999, type: 'assistant.text', payload: { text: 'old' } },
+      { eventId: 'visible', sessionId: 'deck_proj_brain', ts: 1_001, type: 'assistant.text', payload: { text: 'new' } },
+    ]);
+    expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_proj_brain',
+      afterTs: 500,
+    }));
+  });
+
   it('GET /api/server/:id/timeline/history returns 503 when daemon is offline', async () => {
     mockRequestTimelineHistory.mockRejectedValue(new Error('daemon_offline'));
     const app = await buildTestApp();
@@ -448,6 +500,56 @@ describe('Watch routes', () => {
       budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL,
       includeDetails: true,
       abortSignal: expect.any(AbortSignal),
+    }));
+  });
+
+  it('GET /api/server/:id/timeline/history/full preserves share-scoped full history and detail refs before invite time', async () => {
+    mockResolveServerRole.mockResolvedValue('none');
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'viewer',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'viewer',
+          historyCutoffAt: 1_000,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-1'],
+          primaryShareId: 'share-1',
+          authorizedAt: 2_000,
+        },
+      },
+    });
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 12,
+      events: [
+        { eventId: 'before-share', sessionId: 'deck_proj_brain', ts: 999, type: 'tool.result', payload: { output: 'old secret' } },
+        { eventId: 'visible', sessionId: 'deck_proj_brain', ts: 1_001, type: 'tool.result', payload: { output: 'visible' } },
+      ],
+      detailRefs: [
+        { eventId: 'before-share', fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_TEXT, detailId: 'detail-before-share' },
+        { eventId: 'visible', fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_TEXT, detailId: 'detail-visible' },
+      ],
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&afterTs=500');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { events: Array<{ eventId: string }>; detailRefs?: Array<{ eventId: string }> };
+    expect(body.events).toEqual([
+      { eventId: 'before-share', sessionId: 'deck_proj_brain', ts: 999, type: 'tool.result', payload: { output: 'old secret' } },
+      { eventId: 'visible', sessionId: 'deck_proj_brain', ts: 1_001, type: 'tool.result', payload: { output: 'visible' } },
+    ]);
+    expect(body.detailRefs).toEqual([
+      { eventId: 'before-share', fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_TEXT, detailId: 'detail-before-share' },
+      { eventId: 'visible', fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_TEXT, detailId: 'detail-visible' },
+    ]);
+    expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_proj_brain',
+      afterTs: 500,
+      includeDetails: true,
     }));
   });
 
@@ -509,6 +611,59 @@ describe('Watch routes', () => {
       actualPayloadBytes: expect.any(Number),
       textTailTruncated: false,
     });
+  });
+
+  it('GET /api/server/:id/timeline/text-tail preserves cached and backfilled text before invite time', async () => {
+    mockResolveServerRole.mockResolvedValue('none');
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'viewer',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'viewer',
+          historyCutoffAt: 1_000,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-1'],
+          primaryShareId: 'share-1',
+          authorizedAt: 2_000,
+        },
+      },
+    });
+    mockGetSessionTextTailCache.mockResolvedValue([
+      { eventId: 'cached-old', ts: 999, type: 'assistant.text', text: 'old cached secret' },
+      { eventId: 'cached-visible', ts: 1_001, type: 'assistant.text', text: 'cached visible' },
+    ]);
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 1,
+      events: [
+        { eventId: 'backfill-old', sessionId: 'deck_proj_brain', ts: 990, type: 'user.message', payload: { text: 'old backfill secret' } },
+        { eventId: 'backfill-visible', sessionId: 'deck_proj_brain', ts: 1_010, type: 'assistant.text', payload: { text: 'backfill visible' } },
+      ],
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      events: [
+        { eventId: 'backfill-old', ts: 990, type: 'user.message', text: 'old backfill secret' },
+        { eventId: 'cached-old', ts: 999, type: 'assistant.text', text: 'old cached secret' },
+        { eventId: 'cached-visible', ts: 1_001, type: 'assistant.text', text: 'cached visible' },
+        { eventId: 'backfill-visible', ts: 1_010, type: 'assistant.text', text: 'backfill visible' },
+      ],
+      actualPayloadBytes: expect.any(Number),
+      textTailTruncated: false,
+    });
+    expect(mockReplaceSessionTextTailCache).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'deck_proj_brain', [
+      { eventId: 'backfill-old', ts: 990, type: 'user.message', text: 'old backfill secret' },
+      { eventId: 'cached-old', ts: 999, type: 'assistant.text', text: 'old cached secret' },
+      { eventId: 'cached-visible', ts: 1_001, type: 'assistant.text', text: 'cached visible' },
+      { eventId: 'backfill-visible', ts: 1_010, type: 'assistant.text', text: 'backfill visible' },
+    ]);
   });
 
   it('GET /api/server/:id/timeline/text-tail backfills missing recent text from daemon history and rewrites cache', async () => {

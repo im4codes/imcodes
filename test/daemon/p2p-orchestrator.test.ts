@@ -212,6 +212,49 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(done.hopStates[0].artifact_path).toContain(`${done.id}.round1.hop1.md`);
   });
 
+  it('serializes shared actor and share scope metadata for shared P2P runs', async () => {
+    const sharedActor = {
+      actorUserId: 'shared-user',
+      actorDisplayName: 'Shared User',
+      effectiveActorRole: 'participant',
+      origin: 'shared-tab',
+      actionId: 'share-p2p-serialize',
+      primaryShareId: 'share-1',
+      authorizedAt: 1_000,
+      queuedAt: 1_001,
+      snapshot: {
+        target: { kind: 'main', serverId: 'srv-main', sessionName: 'deck_proj_brain' },
+        effectiveRole: 'participant',
+        historyCutoffAt: 900,
+        authorizedAt: 1_000,
+        primaryShareId: 'share-1',
+        coveringShareIds: ['share-1'],
+        nextCoverageRecheckAt: null,
+      },
+    };
+    const shareScope = {
+      target: { kind: 'main', serverId: 'srv-main', sessionName: 'deck_proj_brain' },
+      historyCutoffAt: 900,
+      primaryShareId: 'share-1',
+      coveringShareIds: ['share-1'],
+    };
+
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'shared projection',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      sharedActor: sharedActor as any,
+      shareScope: shareScope as any,
+    });
+
+    expect(serializeP2pRun(run)).toMatchObject({
+      sharedActor,
+      shareScope,
+    });
+  });
+
   it('removes legacy round hop artifacts after merging them into the main discussion file', async () => {
     const run = await startP2pRun(
       'deck_proj_brain',

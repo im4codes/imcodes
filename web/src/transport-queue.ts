@@ -1,6 +1,9 @@
+import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
+
 export interface TransportPendingMessageEntry {
   clientMessageId: string;
   text: string;
+  sharedActor?: SharedActorEnvelope;
 }
 
 export interface TransportPendingQueueSnapshot {
@@ -103,7 +106,12 @@ export function extractTransportPendingMessageEntries(value: unknown): Transport
       ? (entry as { text: string }).text.trim()
       : '';
     if (!clientMessageId || !text) return [];
-    return [{ clientMessageId, text }];
+    const sharedActor = (entry as { sharedActor?: unknown }).sharedActor;
+    return [{
+      clientMessageId,
+      text,
+      ...(sharedActor && typeof sharedActor === 'object' ? { sharedActor: sharedActor as SharedActorEnvelope } : {}),
+    }];
   });
 }
 

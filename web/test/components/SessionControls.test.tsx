@@ -54,6 +54,14 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.transport_send_queued_count') {
         return `${opts?.count ?? 0} queued`;
       }
+      if (key === 'share.actorLabel') {
+        return `${String(opts?.name ?? '')} · ${String(opts?.role ?? '')}`;
+      }
+      if (key === 'share.role.viewer') return 'Viewer';
+      if (key === 'share.role.participant') return 'Participant';
+      if (key === 'share.role.serverMember') return 'Server member';
+      if (key === 'share.role.serverManager') return 'Server manager';
+      if (key === 'share.role.system') return 'System';
       if (key === 'session.send_placeholder') {
         return `Send to ${String(opts?.name ?? 'session')}…`;
       }
@@ -1978,6 +1986,93 @@ afterEach(() => {
 
     expect(screen.getByText('queued first')).toBeDefined();
     expect(screen.getByText('queued second')).toBeDefined();
+  });
+
+  it('renders shared actor labels on queued transport messages', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessages: ['shared queued'],
+          transportPendingMessageEntries: [
+            {
+              clientMessageId: 'msg-shared',
+              text: 'shared queued',
+              sharedActor: {
+                actorUserId: 'user-shared',
+                actorDisplayName: 'Ada Shared',
+                effectiveActorRole: 'participant',
+                origin: 'shared-tab',
+                actionId: 'action-shared',
+                primaryShareId: 'share-1',
+                authorizedAt: 1,
+                snapshot: {
+                  target: { kind: 'main', serverId: 'srv-1', sessionName: 'qwen-session' },
+                  effectiveRole: 'participant',
+                  historyCutoffAt: 1,
+                  authorizedAt: 1,
+                  primaryShareId: 'share-1',
+                  coveringShareIds: ['share-1'],
+                  expiresAt: null,
+                  nextCoverageRecheckAt: null,
+                },
+              },
+            },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByText('shared queued')).toBeDefined();
+    expect(screen.getByText('Ada Shared · Participant')).toBeDefined();
+  });
+
+  it('renders server-member actor labels on queued transport messages', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessages: ['member queued'],
+          transportPendingMessageEntries: [
+            {
+              clientMessageId: 'msg-member',
+              text: 'member queued',
+              sharedActor: {
+                actorUserId: 'user-member',
+                actorDisplayName: 'Mira Member',
+                effectiveActorRole: 'server-member',
+                origin: 'server-member',
+                actionId: 'action-member',
+                primaryShareId: null,
+                authorizedAt: 1,
+                snapshot: {
+                  target: { kind: 'main', serverId: 'srv-1', sessionName: 'qwen-session' },
+                  effectiveRole: 'participant',
+                  historyCutoffAt: 0,
+                  authorizedAt: 1,
+                  primaryShareId: null,
+                  coveringShareIds: [],
+                  nextCoverageRecheckAt: null,
+                },
+              },
+            },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByText('member queued')).toBeDefined();
+    expect(screen.getByText('Mira Member · Server member')).toBeDefined();
   });
 
   it('does not offer edit or delete actions for legacy queued fallback entries', () => {

@@ -65,7 +65,7 @@ function selectText(node: Text, start: number, end: number) {
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string) => {
+    t: (key: string, options?: Record<string, unknown>) => {
       const translations: Record<string, string> = {
         'session.state_idle': 'Agent idle — waiting for input',
         'session.state_running': 'Agent working...',
@@ -75,8 +75,15 @@ vi.mock('react-i18next', () => ({
         'session.state_stop_requested': 'Stop requested',
         'session.state_stopping': 'Stopping...',
         'session.state_compacting': 'Compacting context...',
+        'share.actorLabel': '{{name}} · {{role}}',
+        'share.role.viewer': 'Viewer',
+        'share.role.participant': 'Participant',
+        'share.role.serverMember': 'Server member',
+        'share.role.serverManager': 'Server manager',
+        'share.role.system': 'System',
       };
-      return translations[key] ?? key;
+      const template = translations[key] ?? key;
+      return template.replace(/\{\{(\w+)\}\}/g, (_, name) => String(options?.[name] ?? ''));
     },
   }),
 }));
@@ -1929,6 +1936,71 @@ describe('ChatView', () => {
     } finally {
       if (hadTouchStart) (window as Window & { ontouchstart?: unknown }).ontouchstart = originalTouchStart;
     }
+  });
+
+  it('renders shared actor labels for share-originated user messages', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-shared-user',
+            type: 'user.message',
+            ts: Date.now(),
+            payload: {
+              text: 'Shared prompt',
+              sharedActor: {
+                actorDisplayName: 'Ada Shared',
+                effectiveActorRole: 'participant',
+              },
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.querySelector('.chat-shared-actor-label')?.textContent).toBe('Ada Shared · Participant');
+    expect(screen.getByText('Shared prompt')).toBeTruthy();
+  });
+
+  it('renders member and system actor roles for user-originated timeline actions', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-member-user',
+            type: 'user.message',
+            ts: Date.now(),
+            payload: {
+              text: 'Manager prompt',
+              sharedActor: {
+                actorDisplayName: 'Mina Manager',
+                effectiveActorRole: 'server-manager',
+              },
+            },
+          },
+          {
+            eventId: 'evt-system-user',
+            type: 'user.message',
+            ts: Date.now() + 1,
+            payload: {
+              text: 'System replay',
+              sharedActor: {
+                actorDisplayName: 'System',
+                effectiveActorRole: 'system',
+              },
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    const labels = [...container.querySelectorAll('.chat-shared-actor-label')].map((node) => node.textContent);
+    expect(labels).toContain('Mina Manager · Server manager');
+    expect(labels).toContain('System · System');
   });
 
   it('shows the selected-text Copy and Quote popup in narrow desktop windows', async () => {

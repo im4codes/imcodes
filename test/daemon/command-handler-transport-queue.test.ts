@@ -586,20 +586,48 @@ describe('handleWebCommand transport queue behavior', () => {
   });
 
   it('emits queued session.state for queued transport sends without adding a timeline row', async () => {
+    const sharedActor = {
+      actorUserId: 'shared-user',
+      actorDisplayName: 'Shared User',
+      effectiveActorRole: 'participant',
+      origin: 'shared-tab',
+      actionId: 'shared-action',
+      primaryShareId: 'share-1',
+      authorizedAt: 1_000,
+      queuedAt: 1_001,
+      snapshot: {
+        target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_transport_brain' },
+        effectiveRole: 'participant',
+        historyCutoffAt: 900,
+        authorizedAt: 1_000,
+        primaryShareId: 'share-1',
+        coveringShareIds: ['share-1'],
+        expiresAt: null,
+        nextCoverageRecheckAt: null,
+      },
+    };
+    const send = vi.fn(() => 'queued');
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
-      send: vi.fn(() => 'queued'),
+      send,
       pendingCount: 2,
       pendingMessages: ['queued msg', 'queued msg 2'],
       pendingEntries: [
-        { clientMessageId: 'cmd-queued', text: 'queued msg' },
+        { clientMessageId: 'cmd-queued', text: 'queued msg', sharedActor },
         { clientMessageId: 'cmd-queued-2', text: 'queued msg 2' },
       ],
     });
 
-    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'queued msg', commandId: 'cmd-queued' }, serverLink as any);
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'queued msg',
+      commandId: 'cmd-queued',
+      sharedActor,
+    }, serverLink as any);
     await flushAsync();
 
+    expect(send).toHaveBeenCalledWith('queued msg', 'cmd-queued', undefined, undefined, { sharedActor });
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
@@ -608,7 +636,7 @@ describe('handleWebCommand transport queue behavior', () => {
         pendingCount: 2,
         pendingMessages: ['queued msg', 'queued msg 2'],
         pendingMessageEntries: [
-          { clientMessageId: 'cmd-queued', text: 'queued msg' },
+          { clientMessageId: 'cmd-queued', text: 'queued msg', sharedActor },
           { clientMessageId: 'cmd-queued-2', text: 'queued msg 2' },
         ],
       },

@@ -3,7 +3,8 @@
  */
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
-import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { requireAuth } from '../security/authorization.js';
+import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
 import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../../shared/transport/file-transfer.js';
@@ -168,8 +169,8 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   const serverId = c.req.param('id')!;
 
   // Permission check
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   const contentLengthHeader = c.req.header('content-length');
   const contentLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : Number.NaN;
@@ -380,8 +381,8 @@ fileTransferRoutes.post('/:id/uploads/:attachmentId/download-token', async (c) =
   const serverId = c.req.param('id')!;
   const attachmentId = c.req.param('attachmentId')!;
 
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   if (!/^[a-f0-9]+(\.[a-zA-Z0-9]+)?$/.test(attachmentId)) {
     return c.json({ error: 'invalid_attachment_id' }, 400);
@@ -423,8 +424,8 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
   }
 
   // Permission check
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   // Validate attachment ID format (hex + optional extension)
   if (!/^[a-f0-9]+(\.[a-zA-Z0-9]+)?$/.test(attachmentId)) {

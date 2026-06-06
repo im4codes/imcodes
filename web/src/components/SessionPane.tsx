@@ -76,6 +76,7 @@ export interface SessionPaneProps {
   onStopProject?: (project: string) => void;
   onRenameSession?: () => void;
   onSettings?: () => void;
+  onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   sessionPinned?: boolean;
   stopBlockedByPinned?: boolean;
   onToggleSessionPin?: (sessionName: string) => void;
@@ -118,6 +119,7 @@ export function SessionPane({
   onStopProject,
   onRenameSession,
   onSettings,
+  onShareSession,
   sessionPinned,
   stopBlockedByPinned,
   onToggleSessionPin,
@@ -431,6 +433,7 @@ export function SessionPane({
           onStopProject={onStopProject}
           onRenameSession={onRenameSession}
           onSettings={onSettings}
+          onShareSession={onShareSession}
           sessionPinned={sessionPinned}
           stopBlockedByPinned={stopBlockedByPinned}
           onToggleSessionPin={onToggleSessionPin}

@@ -23,6 +23,67 @@
     "hide": "隱藏",
     "this_feature": "此功能"
   },
+  "share": {
+    "menu": { "shareTab": "分享" },
+    "dialogTitle": "分享存取權",
+    "dialogSubtitle": "授予 {{target}} 受限存取權。",
+    "target": {
+      "label": "目標",
+      "currentTab": "目前標籤",
+      "server": "整個來源伺服器",
+      "serverFallback": "此伺服器"
+    },
+    "role": {
+      "label": "角色",
+      "viewer": "檢視者",
+      "participant": "參與者",
+      "serverMember": "伺服器成員",
+      "serverManager": "伺服器管理員",
+      "system": "系統"
+    },
+    "roleHelp": {
+      "viewer": "可檢視範圍內狀態並加入範圍內討論，但不能驅動代理。",
+      "participant": "可檢視範圍內狀態，並向涵蓋的具體標籤傳送提示。"
+    },
+    "trust": {
+      "title": "參與者信任說明",
+      "body": "代理未被沙箱隔離。UI/API 限制會減少直接控制面，但參與者提示仍可能影響代理在其可存取環境中的行為。"
+    },
+    "recipient": {
+      "label": "接收者",
+      "placeholder": "使用者 ID 或電子郵件"
+    },
+    "list": {
+      "label": "分享使用者",
+      "title": "分享使用者",
+      "empty": "尚無分享使用者"
+    },
+    "create": "建立分享",
+    "creating": "正在建立...",
+    "scope": { "current": "分享範圍" },
+    "indicator": "{{scope}} 以 {{role}} 分享 · {{status}}",
+    "indicatorCompact": "以 {{role}} 分享 · {{status}}",
+    "actorLabel": "{{name}} · {{role}}",
+    "status": {
+      "active": "有效",
+      "revoked": "已撤銷",
+      "expired": "已過期",
+      "target-unavailable": "目標不可用"
+    },
+    "reason": {
+      "share-role-denied": "此角色不能使用該操作。",
+      "share-direct-surface-denied": "分享存取中不可使用此介面。",
+      "share-rate-limited": "分享操作過多，請稍後再試。",
+      "share-revoked": "此分享已撤銷。",
+      "share-expired": "此分享已過期。",
+      "share-target-unavailable": "分享目標不可用。",
+      "share-role-changed": "分享角色已變更。",
+      "share-ticket-invalid": "分享存取票證無效。",
+      "share-cancel-unsupported": "此分享標籤不支援取消。",
+      "share-audit-duplicate": "此操作已記錄。",
+      "share-comment-invalid": "無法發布留言。"
+    }
+  },
   "window": {
     "maximize": "最大化",
     "restore": "還原",

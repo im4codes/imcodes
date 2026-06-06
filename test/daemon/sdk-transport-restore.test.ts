@@ -155,6 +155,16 @@ const flush = async () => {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 };
 
+function codexRunForSession(sessionName: string, mode?: 'start' | 'resume') {
+  return mocks.codexRuns.find((run) => {
+    const env = run.options.env;
+    return !!env
+      && typeof env === 'object'
+      && (env as Record<string, unknown>).IMCODES_SESSION === sessionName
+      && (!mode || run.mode === mode);
+  });
+}
+
 describe('sdk transport session restore', () => {
   let tempDir: string;
 
@@ -393,8 +403,7 @@ describe('sdk transport session restore', () => {
     runtime!.send('What token did I ask you to remember?');
     await flush();
 
-    expect(mocks.codexRuns).toHaveLength(1);
-    expect(mocks.codexRuns[0]).toMatchObject({ mode: 'resume', id: 'codex-thread-restore' });
+    expect(codexRunForSession('deck_sdk_cx_brain', 'resume')).toMatchObject({ mode: 'resume', id: 'codex-thread-restore' });
     expect(mocks.store.get('deck_sdk_cx_brain')?.state).toBe('idle');
     expect(mocks.store.get('deck_sdk_cx_brain')?.requestedModel).toBe('gpt-5.4');
     expect(mocks.store.get('deck_sdk_cx_brain')?.effort).toBe('medium');
@@ -422,7 +431,7 @@ describe('sdk transport session restore', () => {
     runtime!.send('launch with sanitized model');
     await flush();
 
-    expect(mocks.codexRuns[0]).toMatchObject({
+    expect(codexRunForSession('deck_sdk_cx_launch_opus_brain', 'start')).toMatchObject({
       mode: 'start',
       options: expect.objectContaining({ model: 'gpt-5.5' }),
     });
@@ -459,7 +468,7 @@ describe('sdk transport session restore', () => {
     runtime!.send('resume with sanitized model');
     await flush();
 
-    expect(mocks.codexRuns[0]).toMatchObject({
+    expect(codexRunForSession('deck_sdk_cx_opus_brain', 'resume')).toMatchObject({
       mode: 'resume',
       id: 'codex-thread-opus-restore',
       options: expect.objectContaining({ model: 'gpt-5.5' }),

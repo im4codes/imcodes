@@ -23,6 +23,67 @@
     "hide": "숨기기",
     "this_feature": "이 기능"
   },
+  "share": {
+    "menu": { "shareTab": "공유" },
+    "dialogTitle": "액세스 공유",
+    "dialogSubtitle": "{{target}}에 범위가 제한된 액세스를 부여합니다.",
+    "target": {
+      "label": "대상",
+      "currentTab": "현재 탭",
+      "server": "전체 원본 서버",
+      "serverFallback": "이 서버"
+    },
+    "role": {
+      "label": "역할",
+      "viewer": "뷰어",
+      "participant": "참가자",
+      "serverMember": "서버 멤버",
+      "serverManager": "서버 관리자",
+      "system": "시스템"
+    },
+    "roleHelp": {
+      "viewer": "범위 내 상태를 보고 에이전트를 조작하지 않는 범위 내 토론에 참여할 수 있습니다.",
+      "participant": "범위 내 상태를 보고 포함된 구체적인 탭에 프롬프트를 보낼 수 있습니다."
+    },
+    "trust": {
+      "title": "참가자 신뢰 고지",
+      "body": "에이전트는 샌드박스 처리되지 않습니다. UI/API 제한은 직접 제어를 줄이지만, 참가자 프롬프트는 접근 가능한 환경에서 동작하는 에이전트에 영향을 줄 수 있습니다."
+    },
+    "recipient": {
+      "label": "받는 사람",
+      "placeholder": "사용자 ID 또는 이메일"
+    },
+    "list": {
+      "label": "공유 사용자",
+      "title": "공유 사용자",
+      "empty": "아직 공유 사용자가 없습니다"
+    },
+    "create": "공유 만들기",
+    "creating": "만드는 중...",
+    "scope": { "current": "공유 범위" },
+    "indicator": "{{scope}}이(가) {{role}}로 공유됨 · {{status}}",
+    "indicatorCompact": "{{role}}로 공유됨 · {{status}}",
+    "actorLabel": "{{name}} · {{role}}",
+    "status": {
+      "active": "활성",
+      "revoked": "철회됨",
+      "expired": "만료됨",
+      "target-unavailable": "대상을 사용할 수 없음"
+    },
+    "reason": {
+      "share-role-denied": "이 역할은 해당 작업을 사용할 수 없습니다.",
+      "share-direct-surface-denied": "이 화면은 공유 액세스에서 사용할 수 없습니다.",
+      "share-rate-limited": "공유 작업이 너무 많습니다. 잠시 후 다시 시도하세요.",
+      "share-revoked": "이 공유는 철회되었습니다.",
+      "share-expired": "이 공유는 만료되었습니다.",
+      "share-target-unavailable": "공유 대상을 사용할 수 없습니다.",
+      "share-role-changed": "공유 역할이 변경되었습니다.",
+      "share-ticket-invalid": "공유 액세스 티켓이 유효하지 않습니다.",
+      "share-cancel-unsupported": "이 공유 탭에서는 취소가 지원되지 않습니다.",
+      "share-audit-duplicate": "이 작업은 이미 기록되었습니다.",
+      "share-comment-invalid": "댓글을 게시할 수 없습니다."
+    }
+  },
   "window": {
     "maximize": "최대화",
     "restore": "복원",

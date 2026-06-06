@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
 import {
   getSubSessionsByServer,
@@ -8,7 +8,8 @@ import {
   deleteSubSession,
   reorderSubSessions,
 } from '../db/queries.js';
-import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { requireAuth } from '../security/authorization.js';
+import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
 import { isSessionAgentType } from '../../../shared/agent-types.js';
@@ -16,15 +17,22 @@ import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 
 export const subSessionRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
+type SubSessionRouteContext = Context<{ Bindings: Env; Variables: { userId: string; role: string } }>;
 
 subSessionRoutes.use('/*', requireAuth());
+
+async function resolveSubSessionRouteAccess(c: SubSessionRouteContext, serverId: string, userId: string) {
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return { ok: false as const, response: c.json({ error: 'forbidden', reason: access.reason }, 403) };
+  return { ok: true as const, role: access.role };
+}
 
 /** GET /api/server/:id/sub-sessions — list active sub-sessions */
 subSessionRoutes.get('/:id/sub-sessions', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveSubSessionRouteAccess(c, serverId, userId);
+  if (!access.ok) return access.response;
 
   const subSessions = await getSubSessionsByServer(c.env.DB, serverId);
   return c.json({ subSessions });
@@ -34,7 +42,9 @@ subSessionRoutes.get('/:id/sub-sessions', async (c) => {
 subSessionRoutes.post('/:id/sub-sessions', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  const access = await resolveSubSessionRouteAccess(c, serverId, userId);
+  if (!access.ok) return access.response;
+  const role = access.role;
   if (role !== 'owner' && role !== 'admin') return c.json({ error: 'forbidden' }, 403);
 
   let body: {
@@ -101,7 +111,9 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
 subSessionRoutes.patch('/:id/sub-sessions/reorder', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  const access = await resolveSubSessionRouteAccess(c, serverId, userId);
+  if (!access.ok) return access.response;
+  const role = access.role;
   if (role !== 'owner' && role !== 'admin') return c.json({ error: 'forbidden' }, 403);
 
   let body: { ids: string[] };
@@ -122,7 +134,9 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const subId = c.req.param('subId')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  const access = await resolveSubSessionRouteAccess(c, serverId, userId);
+  if (!access.ok) return access.response;
+  const role = access.role;
   if (role !== 'owner' && role !== 'admin') return c.json({ error: 'forbidden' }, 403);
 
   const existing = await getSubSessionById(c.env.DB, subId, serverId);
@@ -227,9 +241,12 @@ subSessionRoutes.delete('/:id/sub-sessions/:subId', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const subId = c.req.param('subId')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  const access = await resolveSubSessionRouteAccess(c, serverId, userId);
+  if (!access.ok) return access.response;
+  const role = access.role;
   if (role !== 'owner' && role !== 'admin') return c.json({ error: 'forbidden' }, 403);
 
   await deleteSubSession(c.env.DB, subId, serverId);
+  void WsBridge.get(serverId).revalidateShareSocketsForTarget({ kind: 'subsession', serverId, subSessionId: subId });
   return c.json({ ok: true });
 });

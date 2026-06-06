@@ -21,6 +21,7 @@
 
 import logger from '../util/logger.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
+import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 
 /** Queued entry age limit. Matches hook-server.ts QUEUE_EXPIRY_MS (5 minutes). */
 export const RESEND_EXPIRY_MS = 5 * 60 * 1000;
@@ -36,6 +37,8 @@ export interface ResendEntry {
   commandId: string;
   /** Attachment refs at enqueue time. Not resolved lazily — we do not re-walk the store. */
   attachments?: TransportAttachment[];
+  /** Server-authored share actor for attribution only; never injected into provider prompts. */
+  sharedActor?: SharedActorEnvelope;
   /** Enqueue timestamp for expiry calculation. */
   queuedAt: number;
 }

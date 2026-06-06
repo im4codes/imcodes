@@ -1,4 +1,5 @@
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
+import type { SharedStateSummary } from './tab-sharing-ui.js';
 
 export type Priority = 0 | 1 | 2 | 3;
 
@@ -68,6 +69,8 @@ export interface SessionInfo {
   /** Newest pending-queue version the UI has applied for this session.
    *  Used to drop stale out-of-order snapshots. See transport-queue.ts. */
   transportPendingMessageVersion?: number;
+  /** Passive, share-scoped state supplied by share-aware server/bootstrap paths. */
+  sharedState?: SharedStateSummary | null;
 }
 
 export interface ServerInfo {

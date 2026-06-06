@@ -5,6 +5,7 @@ import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 const createSubSessionMock = vi.fn();
 const updateSubSessionMock = vi.fn();
 const sendToDaemonMock = vi.fn();
+const mockResolveServerMemberAccessOrShareDeny = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: any, next: any) => {
@@ -12,6 +13,10 @@ vi.mock('../src/security/authorization.js', () => ({
     return next();
   },
   resolveServerRole: vi.fn().mockResolvedValue('owner'),
+}));
+
+vi.mock('../src/routes/share-http-auth.js', () => ({
+  resolveServerMemberAccessOrShareDeny: (...args: unknown[]) => mockResolveServerMemberAccessOrShareDeny(...args),
 }));
 
 vi.mock('../src/db/queries.js', () => ({
@@ -27,6 +32,7 @@ vi.mock('../src/ws/bridge.js', () => ({
   WsBridge: {
     get: () => ({
       sendToDaemon: sendToDaemonMock,
+      revalidateShareSocketsForTarget: vi.fn(),
     }),
   },
 }));
@@ -43,6 +49,7 @@ app.route('/api/server', subSessionRoutes);
 describe('sub-session routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
     createSubSessionMock.mockImplementation(async (_db, id, serverId, type) => ({
       id,
       server_id: serverId,
@@ -67,6 +74,18 @@ describe('sub-session routes', () => {
       effort: null,
       transport_config: {},
     }));
+  });
+
+  it('denies share-only sub-session listing with the direct-surface reason', async () => {
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValueOnce({
+      ok: false,
+      reason: 'share-direct-surface-denied',
+    });
+
+    const res = await app.request('/api/server/srv1/sub-sessions');
+
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-direct-surface-denied' });
   });
 
   it('accepts claude-code-sdk sub-session type', async () => {

@@ -23,6 +23,67 @@
     "hide": "Ocultar",
     "this_feature": "Esta función"
   },
+  "share": {
+    "menu": { "shareTab": "Compartir" },
+    "dialogTitle": "Compartir acceso",
+    "dialogSubtitle": "Concede acceso limitado a {{target}}.",
+    "target": {
+      "label": "Destino",
+      "currentTab": "Pestaña actual",
+      "server": "Servidor de origen completo",
+      "serverFallback": "Este servidor"
+    },
+    "role": {
+      "label": "Rol",
+      "viewer": "Visualizador",
+      "participant": "Participante",
+      "serverMember": "Miembro del servidor",
+      "serverManager": "Administrador del servidor",
+      "system": "Sistema"
+    },
+    "roleHelp": {
+      "viewer": "Puede ver el estado del alcance y participar en debates del alcance sin dirigir al agente.",
+      "participant": "Puede ver el estado del alcance y enviar indicaciones a pestañas concretas cubiertas."
+    },
+    "trust": {
+      "title": "Aviso de confianza para participantes",
+      "body": "Los agentes no están en una zona aislada. Los límites de UI/API reducen controles directos, pero una indicación de participante puede influir en un agente que actúa en su entorno accesible."
+    },
+    "recipient": {
+      "label": "Destinatario",
+      "placeholder": "ID de usuario o correo"
+    },
+    "list": {
+      "label": "Usuarios compartidos",
+      "title": "Usuarios compartidos",
+      "empty": "Aún no hay usuarios compartidos"
+    },
+    "create": "Crear recurso compartido",
+    "creating": "Creando...",
+    "scope": { "current": "Alcance compartido" },
+    "indicator": "{{scope}} compartido como {{role}} · {{status}}",
+    "indicatorCompact": "Compartido como {{role}} · {{status}}",
+    "actorLabel": "{{name}} · {{role}}",
+    "status": {
+      "active": "Activo",
+      "revoked": "Revocado",
+      "expired": "Caducado",
+      "target-unavailable": "Destino no disponible"
+    },
+    "reason": {
+      "share-role-denied": "Este rol no puede usar esa acción.",
+      "share-direct-surface-denied": "Esta superficie no está disponible con acceso compartido.",
+      "share-rate-limited": "Demasiadas acciones compartidas. Inténtalo de nuevo pronto.",
+      "share-revoked": "Este recurso compartido fue revocado.",
+      "share-expired": "Este recurso compartido caducó.",
+      "share-target-unavailable": "El destino compartido no está disponible.",
+      "share-role-changed": "El rol compartido cambió.",
+      "share-ticket-invalid": "El ticket de acceso compartido no es válido.",
+      "share-cancel-unsupported": "Cancelar no es compatible con esta pestaña compartida.",
+      "share-audit-duplicate": "Esta acción ya fue registrada.",
+      "share-comment-invalid": "No se pudo publicar el comentario."
+    }
+  },
   "window": {
     "maximize": "Maximizar",
     "restore": "Restaurar",

@@ -52,7 +52,7 @@ async function resolveAuthedUserId(c: Context<HonoEnv>): Promise<string | null> 
   const cookieToken = cookieMatch ? decodeURIComponent(cookieMatch[1]) : null;
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const jwt = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
-    if (jwt && typeof jwt.sub === 'string' && jwt.type !== 'ws-ticket') {
+    if (jwt && typeof jwt.sub === 'string' && jwt.type !== 'ws-ticket' && jwt.type !== 'share-ws-ticket') {
       const user = await getUserById(c.env.DB, jwt.sub);
       if (user) return user.id;
     }
@@ -63,7 +63,7 @@ async function resolveAuthedUserId(c: Context<HonoEnv>): Promise<string | null> 
   if (auth?.startsWith('Bearer ')) {
     const bearerToken = auth.slice(7);
     const jwt = verifyJwt(bearerToken, c.env.JWT_SIGNING_KEY);
-    if (jwt && typeof jwt.sub === 'string' && jwt.type !== 'ws-ticket') {
+    if (jwt && typeof jwt.sub === 'string' && jwt.type !== 'ws-ticket' && jwt.type !== 'share-ws-ticket') {
       const user = await getUserById(c.env.DB, jwt.sub);
       if (user) return user.id;
     }

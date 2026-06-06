@@ -1,12 +1,22 @@
 import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
 import { getServerById, getDbSessionsByServer, getSubSessionsByServer, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession } from '../db/queries.js';
-import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { requireAuth } from '../security/authorization.js';
 import type { ServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
+import {
+  deriveShareTransitionKey,
+  shareTargetFromSessionName,
+  writeShareAuditEvent,
+  type EffectiveCoverage,
+  type ShareAuditActionType,
+  type ShareDenialReason,
+  type ShareTarget,
+} from '../db/tab-sharing.js';
+import { resolveHttpShareAccess, resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import {
   WORKER_SESSION_SNAPSHOT_INCOMPLETE_REASON,
@@ -16,6 +26,7 @@ import {
   normalizeWorkerSessionRows,
   normalizeWorkerSubSessionRows,
 } from '../../../shared/worker-session-snapshot.js';
+import { evaluateSharedCommandRateLimit } from '../share/share-rate-limit.js';
 import { getPodIdentity } from '../util/pod-identity.js';
 import { isSessionAgentType } from '../../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
@@ -27,6 +38,7 @@ import {
   mainSessionNameForProjectSlug,
   type SessionGroupCloneErrorCode,
 } from '../../../shared/session-group-clone.js';
+import type { SharedActorEnvelope } from '../../../shared/tab-sharing.js';
 
 export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -53,8 +65,8 @@ sessionMgmtRoutes.use('/*', requireAuth());
 sessionMgmtRoutes.get(`/:id/${WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT}`, async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   try {
     const [allSessions, subSessions] = await Promise.all([
@@ -94,8 +106,8 @@ sessionMgmtRoutes.get(`/:id/${WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT}`, async (c)
 sessionMgmtRoutes.get('/:id/sessions', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   const all = await getDbSessionsByServer(c.env.DB, serverId);
   const sessions = all.filter((s) => !s.name.startsWith('deck_sub_'));
@@ -107,7 +119,9 @@ sessionMgmtRoutes.put('/:id/sessions/:name', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const sessionName = c.req.param('name')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const role = access.role;
   if (role !== 'owner' && role !== 'admin') return c.json({ error: 'forbidden' }, 403);
 
   let body: Record<string, unknown>;
@@ -174,8 +188,8 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/label', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const sessionName = c.req.param('name')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   let body: { label?: string | null };
   try {
@@ -203,8 +217,8 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const sessionName = c.req.param('name')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   let body: {
     label?: string | null;
@@ -297,8 +311,8 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/rename', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const sessionName = c.req.param('name')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   let body: { name?: string };
   try {
@@ -328,17 +342,25 @@ sessionMgmtRoutes.delete('/:id/sessions/:name', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const sessionName = c.req.param('name')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const role = access.role;
   if (role !== 'owner' && role !== 'admin') return c.json({ error: 'forbidden' }, 403);
 
   await deleteDbSession(c.env.DB, serverId, sessionName);
+  const target = shareTargetFromSessionName(serverId, sessionName);
+  if (target) void WsBridge.get(serverId).revalidateShareSocketsForTarget(target);
   return c.json({ ok: true });
 });
 
 sessionMgmtRoutes.post('/:id/session/start', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) {
+    return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  }
+  const role = access.role;
   if (role !== 'owner' && role !== 'admin') {
     return c.json({ error: 'forbidden', reason: 'start requires admin or owner role' }, 403);
   }
@@ -364,7 +386,8 @@ sessionMgmtRoutes.post('/:id/sessions/:rootSession/group-clone', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const sourceMainSessionName = c.req.param('rootSession')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  const role: ServerRole = access.ok ? access.role : 'none';
 
   let body: Record<string, unknown>;
   try {
@@ -392,13 +415,13 @@ sessionMgmtRoutes.post('/:id/sessions/:rootSession/group-clone', async (c) => {
     targetProjectName: targetProjectNameResult.ok ? targetProjectNameResult.value : undefined,
   };
 
-  if (role !== 'owner' && role !== 'admin') {
+  if (!access.ok || (role !== 'owner' && role !== 'admin')) {
     await auditSessionGroupClone(c, {
       ...auditBase,
       outcome: 'forbidden',
       errorCode: 'forbidden',
     });
-    return c.json({ error: 'forbidden' }, 403);
+    return c.json({ error: 'forbidden', ...(!access.ok ? { reason: access.reason } : {}) }, 403);
   }
 
   if (!idempotencyKey) {
@@ -508,7 +531,10 @@ sessionMgmtRoutes.post('/:id/sessions/:rootSession/group-clone', async (c) => {
 
 sessionMgmtRoutes.post('/:id/session/stop', async (c) => {
   const userId = c.get('userId' as never) as string;
-  const role = await resolveServerRole(c.env.DB, c.req.param('id')!, userId);
+  const serverId = c.req.param('id')!;
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const role = access.role;
   if (role !== 'owner' && role !== 'admin') {
     return c.json({ error: 'forbidden', reason: 'stop requires admin or owner role' }, 403);
   }
@@ -517,10 +543,7 @@ sessionMgmtRoutes.post('/:id/session/stop', async (c) => {
 
 sessionMgmtRoutes.post('/:id/session/cancel', async (c) => {
   const userId = c.get('userId' as never) as string;
-  const role = await resolveServerRole(c.env.DB, c.req.param('id')!, userId);
-  if (role === 'none') {
-    return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
-  }
+  const serverId = c.req.param('id')!;
   let body: Record<string, unknown> = {};
   try {
     const parsed = await c.req.json();
@@ -531,6 +554,58 @@ sessionMgmtRoutes.post('/:id/session/cancel', async (c) => {
   const sessionName = typeof body.sessionName === 'string' ? body.sessionName : undefined;
   const session = typeof body.session === 'string' ? body.session : undefined;
   const commandId = typeof body.commandId === 'string' ? body.commandId : undefined;
+  const targetSessionName = commandSessionName(body);
+  const target = targetSessionName ? shareTargetFromSessionName(serverId, targetSessionName) : null;
+  if (target) {
+    const access = await resolveHttpShareAccess(c.env.DB, { serverId, userId, target });
+    if (access.actor.kind === 'share') {
+      const now = Date.now();
+      const actionId = actionIdFromBody(body);
+      if (access.actor.effectiveActorRole !== 'participant') {
+        await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.cancel', decision: 'rejected', reason: 'share-role-denied', actionId, now });
+        return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+      }
+      const observedDispatchId = typeof body.observedDispatchId === 'string' ? body.observedDispatchId.trim() : '';
+      if (!observedDispatchId) {
+        await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.cancel', decision: 'rejected', reason: 'share-target-unavailable', actionId, now });
+        return c.json({ error: 'not_canceled', reason: 'share-target-unavailable' }, 409);
+      }
+      const runtimeType = await getTrustedRuntimeType(c.env.DB, serverId, target);
+      if (runtimeType !== 'transport') {
+        await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.cancel', decision: 'rejected', reason: 'share-cancel-unsupported', actionId, now });
+        return c.json({ error: 'forbidden', reason: 'share-cancel-unsupported' }, 403);
+      }
+      const bridge = WsBridge.get(serverId);
+      const activeDispatchId = bridge.getActiveDispatchIdForSession(targetSessionName ?? '');
+      if (!activeDispatchId || activeDispatchId !== observedDispatchId) {
+        await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.cancel', decision: 'rejected', reason: 'share-target-unavailable', actionId, now });
+        return c.json({ error: 'not_canceled', reason: 'share-target-unavailable' }, 409);
+      }
+      const rateLimitReason = evaluateHttpShareRateLimit({ bridge, userId, serverId, sessionName: targetSessionName ?? '', commandType: DAEMON_COMMAND_TYPES.SESSION_CANCEL, now });
+      if (rateLimitReason) {
+        await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.cancel', decision: 'rejected', reason: rateLimitReason, actionId, now });
+        return c.json({ error: 'forbidden', reason: rateLimitReason }, 429);
+      }
+      await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.cancel', decision: 'accepted', actionId, now });
+      return relayToDaemon(c, DAEMON_COMMAND_TYPES.SESSION_CANCEL, {
+        ...(sessionName ? { sessionName } : session ? { session } : {}),
+        ...(commandId ? { commandId } : {}),
+        observedDispatchId,
+        sharedActor: await buildHttpSharedActor(c.env.DB, {
+          userId,
+          coverage: access.actor.coverage,
+          actionId,
+          now,
+        }),
+      });
+    }
+    if (access.actor.kind === 'none') {
+      return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
+    }
+  } else {
+    const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+    if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  }
   return relayToDaemon(c, DAEMON_COMMAND_TYPES.SESSION_CANCEL, {
     ...(sessionName ? { sessionName } : session ? { session } : {}),
     ...(commandId ? { commandId } : {}),
@@ -539,11 +614,53 @@ sessionMgmtRoutes.post('/:id/session/cancel', async (c) => {
 
 sessionMgmtRoutes.post('/:id/session/send', async (c) => {
   const userId = c.get('userId' as never) as string;
-  const role = await resolveServerRole(c.env.DB, c.req.param('id')!, userId);
-  if (role === 'none') {
-    return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
+  const serverId = c.req.param('id')!;
+  let body: Record<string, unknown> = {};
+  try {
+    const parsed = await c.req.json();
+    body = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {};
+  } catch {
+    // body is optional; daemon will validate required fields
   }
-  return relayToDaemon(c, 'session.send');
+  const targetSessionName = commandSessionName(body);
+  const target = targetSessionName ? shareTargetFromSessionName(serverId, targetSessionName) : null;
+  if (target) {
+    const access = await resolveHttpShareAccess(c.env.DB, { serverId, userId, target });
+    if (access.actor.kind === 'share') {
+      const now = Date.now();
+      const actionId = actionIdFromBody(body);
+      if (access.actor.effectiveActorRole !== 'participant') {
+        await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'rejected', reason: 'share-role-denied', actionId, now });
+        return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+      }
+      const rateLimitReason = evaluateHttpShareRateLimit({ bridge: WsBridge.get(serverId), userId, serverId, sessionName: targetSessionName ?? '', commandType: 'session.send', now });
+      if (rateLimitReason) {
+        await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'rejected', reason: rateLimitReason, actionId, now });
+        return c.json({ error: 'forbidden', reason: rateLimitReason }, 429);
+      }
+      await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'accepted', actionId, now });
+      const { type: _ignoredType, sharedActor: _ignoredSharedActor, shareScope: _ignoredShareScope, ...rest } = body;
+      void _ignoredType;
+      void _ignoredSharedActor;
+      void _ignoredShareScope;
+      return relayToDaemon(c, 'session.send', {
+        ...rest,
+        sharedActor: await buildHttpSharedActor(c.env.DB, {
+          userId,
+          coverage: access.actor.coverage,
+          actionId,
+          now,
+        }),
+      });
+    }
+    if (access.actor.kind === 'none') {
+      return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
+    }
+  } else {
+    const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+    if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  }
+  return relayToDaemon(c, 'session.send', stripBrowserShareFields(body));
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -552,12 +669,150 @@ type OptionalStringResult =
   | { ok: true; value: string | null | undefined }
   | { ok: false };
 
+type TrustedRuntimeType = 'process' | 'transport' | 'unknown';
+
 function readOptionalStringField(body: Record<string, unknown>, key: string): OptionalStringResult {
   if (!Object.prototype.hasOwnProperty.call(body, key)) return { ok: true, value: undefined };
   const value = body[key];
   if (value === null) return { ok: true, value: null };
   if (typeof value === 'string') return { ok: true, value };
   return { ok: false };
+}
+
+function commandSessionName(body: Record<string, unknown>): string | null {
+  for (const key of ['sessionName', 'session', 'sessionId'] as const) {
+    const value = body[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function actionIdFromBody(body: Record<string, unknown>): string {
+  for (const key of ['actionId', 'commandId'] as const) {
+    const value = body[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return `share-action-${randomHex(8)}`;
+}
+
+function stripBrowserShareFields(body: Record<string, unknown>): Record<string, unknown> {
+  const { type: _ignoredType, sharedActor: _ignoredSharedActor, shareScope: _ignoredShareScope, ...safeBody } = body;
+  void _ignoredType;
+  void _ignoredSharedActor;
+  void _ignoredShareScope;
+  return safeBody;
+}
+
+async function getTrustedRuntimeType(db: Env['DB'], serverId: string, target: ShareTarget): Promise<TrustedRuntimeType> {
+  const row = target.kind === 'subsession'
+    ? await db.queryOne<{ runtime_type: string | null }>(
+      'SELECT runtime_type FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
+      [serverId, target.subSessionId],
+    )
+    : await db.queryOne<{ runtime_type: string | null }>(
+      'SELECT runtime_type FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+      [serverId, target.kind === 'main' ? target.sessionName : ''],
+    );
+  return normalizeTrustedRuntimeType(row?.runtime_type ?? null);
+}
+
+function normalizeTrustedRuntimeType(value: string | null): TrustedRuntimeType {
+  if (value === 'transport') return 'transport';
+  if (value === 'process') return 'process';
+  return 'unknown';
+}
+
+async function buildHttpSharedActor(
+  db: Env['DB'],
+  params: { userId: string; coverage: EffectiveCoverage; actionId: string; now: number },
+): Promise<SharedActorEnvelope> {
+  const user = await db.queryOne<{ display_name: string | null; username: string | null }>(
+    'SELECT display_name, username FROM users WHERE id = $1',
+    [params.userId],
+  );
+  return {
+    actorUserId: params.userId,
+    actorDisplayName: user?.display_name ?? user?.username ?? params.userId,
+    snapshot: params.coverage,
+    primaryShareId: params.coverage.primaryShareId,
+    effectiveActorRole: params.coverage.effectiveRole,
+    actionId: params.actionId,
+    origin: params.coverage.target.kind === 'server' ? 'shared-server' : 'shared-tab',
+    authorizedAt: params.coverage.authorizedAt,
+    queuedAt: params.now,
+  };
+}
+
+function evaluateHttpShareRateLimit(params: {
+  bridge: Pick<WsBridge, 'countSharePendingCommandsForUser'>;
+  userId: string;
+  serverId: string;
+  sessionName: string;
+  commandType: string;
+  now: number;
+}): ShareDenialReason | null {
+  if (params.commandType === 'session.send') {
+    const pending = params.bridge.countSharePendingCommandsForUser(params.userId, params.sessionName, 'session.send');
+    return evaluateSharedCommandRateLimit({
+      userId: params.userId,
+      serverId: params.serverId,
+      sessionName: params.sessionName,
+      commandType: 'session.send',
+      now: params.now,
+      pendingSendCount: pending,
+    });
+  }
+  return evaluateSharedCommandRateLimit({
+    userId: params.userId,
+    serverId: params.serverId,
+    sessionName: params.sessionName,
+    commandType: 'session.cancel',
+    now: params.now,
+  });
+}
+
+async function auditHttpShareCommand(
+  c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>,
+  params: {
+    userId: string;
+    target: ShareTarget;
+    coverage: EffectiveCoverage;
+    actionType: Extract<ShareAuditActionType, 'session.send' | 'session.cancel'>;
+    decision: 'accepted' | 'rejected';
+    reason?: ShareDenialReason | null;
+    actionId: string;
+    now: number;
+  },
+): Promise<void> {
+  try {
+    const auditEventId = randomHex(16);
+    await writeShareAuditEvent(c.env.DB, {
+      id: auditEventId,
+      serverId: params.target.serverId,
+      actorKind: 'user',
+      actorUserId: params.userId,
+      targetUserId: params.userId,
+      effectiveActorRole: params.coverage.effectiveRole,
+      target: params.target,
+      actionType: params.actionType,
+      decision: params.decision,
+      reason: params.reason ?? null,
+      snapshot: params.coverage,
+      primaryShareId: params.coverage.primaryShareId,
+      actionId: params.actionId,
+      idempotencyKey: deriveShareTransitionKey({
+        actionType: params.actionType,
+        target: params.target,
+        primaryShareId: params.coverage.primaryShareId,
+        transitionEpochMs: params.now,
+        decision: params.decision,
+        attemptId: auditEventId,
+      }),
+      createdAt: params.now,
+    });
+  } catch (err) {
+    logger.error({ err, serverId: params.target.serverId, actionType: params.actionType }, 'HTTP share command audit write failed');
+  }
 }
 
 async function auditSessionGroupClone(
@@ -609,8 +864,8 @@ async function relayToDaemon(
     }
   }
 
-  const { type: _ignoredType, ...rest } = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
-  void _ignoredType;
+  const rawBody = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  const rest = bodyOverride === undefined ? stripBrowserShareFields(rawBody) : rawBody;
   const payload = JSON.stringify({ type: command, ...rest });
 
   try {

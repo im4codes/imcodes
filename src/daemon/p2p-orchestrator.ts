@@ -35,6 +35,11 @@ import {
   type P2pResolvedRound,
 } from '../../shared/p2p-advanced.js';
 import type {
+  SharedActorEnvelope,
+  ShareTarget,
+  ShareAuthorizationSnapshot,
+} from '../../shared/tab-sharing.js';
+import type {
   P2pBindRuntimeContext,
   P2pBoundWorkflow,
   StartP2pRunAdvancedSource,
@@ -143,6 +148,15 @@ export interface StartP2pRunOptions {
   advancedRunTimeoutMs?: number;
   /** @deprecated v1a passthrough — prefer `advanced` for new call sites. Removed in v1b. */
   contextReducer?: P2pContextReducerConfig;
+  sharedActor?: SharedActorEnvelope;
+  shareScope?: SharedP2pRunScope;
+}
+
+export interface SharedP2pRunScope {
+  target: ShareTarget;
+  historyCutoffAt: ShareAuthorizationSnapshot['historyCutoffAt'];
+  primaryShareId: ShareAuthorizationSnapshot['primaryShareId'];
+  coveringShareIds: ShareAuthorizationSnapshot['coveringShareIds'];
 }
 
 interface P2pHopRuntime extends P2pHopProgress {
@@ -205,6 +219,8 @@ export interface P2pRun {
   advancedP2pEnabled: boolean;
   resolvedRounds?: P2pResolvedRound[];
   helperEligibleSnapshot: P2pParticipantSnapshotEntry[];
+  sharedActor?: SharedActorEnvelope;
+  shareScope?: SharedP2pRunScope;
   contextReducer?: P2pContextReducerConfig;
   advancedRunTimeoutMs?: number;
   /**
@@ -569,6 +585,8 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     current_round_id: run.currentRoundId ?? null,
     current_execution_step: run.currentExecutionStep || null,
     current_round_attempt: run.currentRoundAttempt || null,
+    ...(run.sharedActor ? { sharedActor: run.sharedActor } : {}),
+    ...(run.shareScope ? { shareScope: run.shareScope } : {}),
     round_attempt_counts: run.advancedP2pEnabled ? { ...run.roundAttemptCounts } : undefined,
     round_jump_counts: run.advancedP2pEnabled ? { ...run.roundJumpCounts } : undefined,
     routing_history: run.advancedP2pEnabled ? [...routingHistory] : undefined,
@@ -1013,6 +1031,8 @@ export async function startP2pRun(...args:
     advancedP2pEnabled: resolvedPlan.advanced,
     resolvedRounds: resolvedPlan.advanced ? resolvedPlan.rounds : undefined,
     helperEligibleSnapshot: resolvedPlan.helperEligibleSnapshot ?? helperEligibleSnapshot,
+    sharedActor: opts.sharedActor,
+    shareScope: opts.shareScope,
     contextReducer: resolvedPlan.contextReducer,
     advancedRunTimeoutMs: resolvedPlan.advanced && resolvedPlan.overallRunTimeoutMinutes != null
       ? resolvedPlan.overallRunTimeoutMinutes * 60_000

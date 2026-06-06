@@ -1242,7 +1242,13 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       timelineEmitter.emit(
         sessionName,
         'user.message',
-        { text: entry.text, clientMessageId: entry.clientMessageId, allowDuplicate: true, pendingMessageVersion: drainedVersion },
+        {
+          text: entry.text,
+          clientMessageId: entry.clientMessageId,
+          allowDuplicate: true,
+          pendingMessageVersion: drainedVersion,
+          ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+        },
         { source: 'daemon', confidence: 'high', eventId: transportUserEventId(entry.clientMessageId) },
       );
     }
@@ -1680,16 +1686,29 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         try {
           await drainResend(s.name, (entry) => {
             const attachments = entry.attachments ?? [];
+            const sharedMetadata = entry.sharedActor ? { sharedActor: entry.sharedActor } : undefined;
             const result = entry.messagePreamble
-              ? runtime.send(
-                entry.text,
-                entry.commandId,
-                attachments.length > 0 ? attachments : undefined,
-                entry.messagePreamble,
-              )
+              ? (sharedMetadata
+                  ? runtime.send(
+                    entry.text,
+                    entry.commandId,
+                    attachments.length > 0 ? attachments : undefined,
+                    entry.messagePreamble,
+                    sharedMetadata,
+                  )
+                  : runtime.send(
+                    entry.text,
+                    entry.commandId,
+                    attachments.length > 0 ? attachments : undefined,
+                    entry.messagePreamble,
+                  ))
               : (attachments.length > 0
-                  ? runtime.send(entry.text, entry.commandId, attachments)
-                  : runtime.send(entry.text, entry.commandId));
+                  ? (sharedMetadata
+                      ? runtime.send(entry.text, entry.commandId, attachments, undefined, sharedMetadata)
+                      : runtime.send(entry.text, entry.commandId, attachments))
+                  : (sharedMetadata
+                      ? runtime.send(entry.text, entry.commandId, undefined, undefined, sharedMetadata)
+                      : runtime.send(entry.text, entry.commandId)));
             if (result === 'sent') {
               timelineEmitter.emit(
                 s.name,
@@ -1700,6 +1719,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
                   commandId: entry.commandId,
                   clientMessageId: entry.commandId,
                   ...(attachments.length > 0 ? { attachments } : {}),
+                  ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
                 },
                 { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
               );
@@ -2040,9 +2060,29 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     try {
       await drainResend(name, (entry) => {
         const attachments = entry.attachments ?? [];
-        const result = attachments.length > 0
-          ? runtime.send(entry.text, entry.commandId, attachments)
-          : runtime.send(entry.text, entry.commandId);
+        const sharedMetadata = entry.sharedActor ? { sharedActor: entry.sharedActor } : undefined;
+        const result = entry.messagePreamble
+          ? (sharedMetadata
+              ? runtime.send(
+                entry.text,
+                entry.commandId,
+                attachments.length > 0 ? attachments : undefined,
+                entry.messagePreamble,
+                sharedMetadata,
+              )
+              : runtime.send(
+                entry.text,
+                entry.commandId,
+                attachments.length > 0 ? attachments : undefined,
+                entry.messagePreamble,
+              ))
+          : (attachments.length > 0
+              ? (sharedMetadata
+                  ? runtime.send(entry.text, entry.commandId, attachments, undefined, sharedMetadata)
+                  : runtime.send(entry.text, entry.commandId, attachments))
+              : (sharedMetadata
+                  ? runtime.send(entry.text, entry.commandId, undefined, undefined, sharedMetadata)
+                  : runtime.send(entry.text, entry.commandId)));
         if (result === 'sent') {
           timelineEmitter.emit(
             name,
@@ -2053,6 +2093,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
               commandId: entry.commandId,
               clientMessageId: entry.commandId,
               ...(attachments.length > 0 ? { attachments } : {}),
+              ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
             },
             { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
           );

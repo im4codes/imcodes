@@ -317,6 +317,56 @@ describe('structured P2P routing via WS fields', () => {
     expect(rounds).toBeUndefined();
   });
 
+  it('threads server-authored shared actor metadata into structured P2P starts', async () => {
+    const sharedActor = {
+      actorUserId: 'shared-user',
+      actorDisplayName: 'Shared User',
+      effectiveActorRole: 'participant',
+      origin: 'shared-tab',
+      actionId: 'share-p2p-1',
+      primaryShareId: 'share-1',
+      authorizedAt: 1_000,
+      queuedAt: 1_001,
+      snapshot: {
+        target: { kind: 'main', serverId: 'srv-main', sessionName: 'deck_proj_brain' },
+        effectiveRole: 'participant',
+        historyCutoffAt: 900,
+        authorizedAt: 1_000,
+        primaryShareId: 'share-1',
+        coveringShareIds: ['share-1'],
+        nextCoverageRecheckAt: null,
+      },
+    };
+    const shareScope = {
+      target: { kind: 'main', serverId: 'srv-main', sessionName: 'deck_proj_brain' },
+      historyCutoffAt: 900,
+      primaryShareId: 'share-1',
+      coveringShareIds: ['share-1'],
+    };
+
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'review this code',
+      commandId: 'cmd-shared-p2p',
+      p2pMode: 'discuss',
+      p2pSessionConfig: {
+        deck_proj_w1: { enabled: true, mode: 'discuss' },
+      },
+      sharedActor,
+      shareScope,
+    }, mockServerLink as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(startP2pRun).toHaveBeenCalledTimes(1);
+    expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+      sharedActor,
+      shareScope,
+      targets: [{ session: 'deck_proj_w1', mode: 'discuss' }],
+    });
+  });
+
   it('config mode still uses per-session configured modes', async () => {
     handleWebCommand({
       type: 'session.send',

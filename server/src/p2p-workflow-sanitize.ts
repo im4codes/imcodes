@@ -19,6 +19,7 @@ import {
 } from '../../shared/p2p-workflow-diagnostics.js';
 import { buildPersistedSnapshotFromProjection } from '../../shared/p2p-workflow-projection.js';
 import type { P2pPersistedWorkflowSnapshot, P2pWorkflowStatusProjection } from '../../shared/p2p-workflow-types.js';
+import type { ShareAuthorizationSnapshot, SharedActorEnvelope, ShareTarget } from '../../shared/tab-sharing.js';
 
 const FORBIDDEN_KEYS = new Set([
   '__proto__',
@@ -95,6 +96,24 @@ export type SanitizedP2pOrchestrationRun = {
   advanced_p2p_enabled?: boolean;
   current_round_id?: string | null;
   advanced_nodes?: Array<Record<string, unknown>>;
+  scope_kind?: ShareTarget['kind'] | null;
+  scope_server_id?: string | null;
+  scope_session_name?: string | null;
+  scope_sub_session_id?: string | null;
+  created_by_user_id?: string | null;
+  authorization_snapshot?: ShareAuthorizationSnapshot | string | null;
+  primary_share_id?: string | null;
+  covering_share_ids?: string[] | string | null;
+  visible_after_ms?: number | null;
+  history_cutoff_at_ms?: number | null;
+  share_target_snapshot?: ShareTarget | string | null;
+  shareScope?: {
+    target: ShareTarget;
+    historyCutoffAt: number;
+    primaryShareId: string | null;
+    coveringShareIds: string[];
+  };
+  sharedActor?: SharedActorEnvelope;
 };
 
 export type SanitizedP2pRunUpdate = SanitizedP2pOrchestrationRun & Record<string, unknown>;
@@ -162,6 +181,127 @@ function optionalNumber(value: unknown): number | undefined {
 function nullableNumber(value: unknown): number | null | undefined {
   if (value === null) return null;
   return optionalNumber(value);
+}
+
+function normalizeShareTarget(value: unknown): ShareTarget | null {
+  if (!isRecord(value)) return null;
+  const kind = value.kind;
+  const serverId = typeof value.serverId === 'string' && value.serverId.trim() ? boundedString(value.serverId.trim()) : '';
+  if (!serverId) return null;
+  if (kind === 'server') return { kind, serverId };
+  if (kind === 'main') {
+    const sessionName = typeof value.sessionName === 'string' && value.sessionName.trim()
+      ? boundedString(value.sessionName.trim())
+      : '';
+    return sessionName ? { kind, serverId, sessionName } : null;
+  }
+  if (kind === 'subsession') {
+    const subSessionId = typeof value.subSessionId === 'string' && value.subSessionId.trim()
+      ? boundedString(value.subSessionId.trim())
+      : '';
+    return subSessionId && !subSessionId.startsWith('deck_sub_') ? { kind, serverId, subSessionId } : null;
+  }
+  return null;
+}
+
+function normalizeShareAuthorizationSnapshot(value: unknown): ShareAuthorizationSnapshot | null {
+  if (!isRecord(value)) return null;
+  const target = normalizeShareTarget(value.target);
+  const effectiveRole = value.effectiveRole;
+  const historyCutoffAt = numberValue(value.historyCutoffAt, 0);
+  const authorizedAt = optionalNumber(value.authorizedAt);
+  const nextCoverageRecheckAt = value.nextCoverageRecheckAt === null
+    ? null
+    : optionalNumber(value.nextCoverageRecheckAt) ?? null;
+  const coveringShareIds = Array.isArray(value.coveringShareIds)
+    ? value.coveringShareIds
+      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      .slice(0, P2P_SANITIZE_MAX_ARRAY_ITEMS)
+      .map((item) => boundedString(item.trim()))
+    : [];
+  const primaryShareId = typeof value.primaryShareId === 'string' && value.primaryShareId.trim()
+    ? boundedString(value.primaryShareId.trim())
+    : null;
+  if (!target || (effectiveRole !== 'viewer' && effectiveRole !== 'participant') || authorizedAt === undefined) {
+    return null;
+  }
+  return {
+    target,
+    effectiveRole,
+    historyCutoffAt,
+    nextCoverageRecheckAt,
+    coveringShareIds,
+    primaryShareId,
+    authorizedAt,
+  };
+}
+
+function normalizeSharedActor(value: unknown): SharedActorEnvelope | null {
+  if (!isRecord(value)) return null;
+  const snapshot = normalizeShareAuthorizationSnapshot(value.snapshot);
+  const actorUserId = typeof value.actorUserId === 'string' && value.actorUserId.trim()
+    ? boundedString(value.actorUserId.trim())
+    : '';
+  const actorDisplayName = typeof value.actorDisplayName === 'string' && value.actorDisplayName.trim()
+    ? boundedString(value.actorDisplayName.trim())
+    : actorUserId;
+  const effectiveActorRole = value.effectiveActorRole;
+  const actionId = typeof value.actionId === 'string' && value.actionId.trim()
+    ? boundedString(value.actionId.trim())
+    : '';
+  const origin = value.origin;
+  const authorizedAt = optionalNumber(value.authorizedAt);
+  if (
+    !snapshot ||
+    !actorUserId ||
+    !actionId ||
+    authorizedAt === undefined ||
+    !['viewer', 'participant', 'server-member', 'server-manager', 'system'].includes(String(effectiveActorRole)) ||
+    !['shared-server', 'shared-tab', 'server-member'].includes(String(origin))
+  ) {
+    return null;
+  }
+  return {
+    actorUserId,
+    actorDisplayName,
+    snapshot,
+    primaryShareId: typeof value.primaryShareId === 'string' && value.primaryShareId.trim()
+      ? boundedString(value.primaryShareId.trim())
+      : snapshot.primaryShareId,
+    effectiveActorRole: effectiveActorRole as SharedActorEnvelope['effectiveActorRole'],
+    actionId,
+    origin: origin as SharedActorEnvelope['origin'],
+    authorizedAt,
+    queuedAt: optionalNumber(value.queuedAt),
+    daemonAckedAt: optionalNumber(value.daemonAckedAt),
+  };
+}
+
+function normalizeShareScope(value: unknown, actor: SharedActorEnvelope | null): SanitizedP2pOrchestrationRun['shareScope'] | null {
+  if (!isRecord(value)) {
+    return actor ? {
+      target: actor.snapshot.target,
+      historyCutoffAt: actor.snapshot.historyCutoffAt,
+      primaryShareId: actor.snapshot.primaryShareId,
+      coveringShareIds: actor.snapshot.coveringShareIds,
+    } : null;
+  }
+  const target = normalizeShareTarget(value.target);
+  if (!target) return null;
+  const coveringShareIds = Array.isArray(value.coveringShareIds)
+    ? value.coveringShareIds
+      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      .slice(0, P2P_SANITIZE_MAX_ARRAY_ITEMS)
+      .map((item) => boundedString(item.trim()))
+    : actor?.snapshot.coveringShareIds ?? [];
+  return {
+    target,
+    historyCutoffAt: numberValue(value.historyCutoffAt, actor?.snapshot.historyCutoffAt ?? 0),
+    primaryShareId: typeof value.primaryShareId === 'string' && value.primaryShareId.trim()
+      ? boundedString(value.primaryShareId.trim())
+      : actor?.snapshot.primaryShareId ?? null,
+    coveringShareIds,
+  };
 }
 
 function truncateUtf8String(value: string, maxBytes: number): { value: string; truncated: boolean } {
@@ -660,6 +800,10 @@ export function sanitizeP2pOrchestrationRunForBridge(raw: unknown, overrides: {
   updatedAt?: string;
 }): SanitizedP2pOrchestrationRun {
   const source = isRecord(raw) ? raw : {};
+  const sharedActor = normalizeSharedActor(source.sharedActor);
+  const shareScope = normalizeShareScope(source.shareScope, sharedActor);
+  const authorizationSnapshot = sharedActor?.snapshot ?? normalizeShareAuthorizationSnapshot(source.authorization_snapshot);
+  const shareTarget = shareScope?.target ?? authorizationSnapshot?.target ?? normalizeShareTarget(source.share_target_snapshot ?? source.shareTargetSnapshot);
   const updatedAt = overrides.updatedAt ?? isoTimestamp(source.updated_at ?? source.updatedAt);
   const runForProjection = {
     id: source.id,
@@ -753,6 +897,30 @@ export function sanitizeP2pOrchestrationRunForBridge(raw: unknown, overrides: {
     'attempt',
     'step',
   ]));
+  if (shareTarget) {
+    addOptional(sanitized, 'scope_kind', shareTarget.kind);
+    addOptional(sanitized, 'scope_server_id', shareTarget.serverId);
+    addOptional(sanitized, 'scope_session_name', shareTarget.kind === 'main' ? shareTarget.sessionName : null);
+    addOptional(sanitized, 'scope_sub_session_id', shareTarget.kind === 'subsession' ? shareTarget.subSessionId : null);
+    addOptional(sanitized, 'share_target_snapshot', shareTarget);
+  }
+  if (authorizationSnapshot) {
+    addOptional(sanitized, 'authorization_snapshot', authorizationSnapshot);
+    addOptional(sanitized, 'primary_share_id', authorizationSnapshot.primaryShareId);
+    addOptional(sanitized, 'covering_share_ids', authorizationSnapshot.coveringShareIds);
+    addOptional(sanitized, 'visible_after_ms', optionalNumber(source.visible_after_ms) ?? optionalNumber(source.visibleAfterMs) ?? 0);
+    addOptional(sanitized, 'history_cutoff_at_ms', authorizationSnapshot.historyCutoffAt);
+  } else if (shareScope) {
+    addOptional(sanitized, 'primary_share_id', shareScope.primaryShareId);
+    addOptional(sanitized, 'covering_share_ids', shareScope.coveringShareIds);
+    addOptional(sanitized, 'visible_after_ms', optionalNumber(source.visible_after_ms) ?? optionalNumber(source.visibleAfterMs) ?? 0);
+    addOptional(sanitized, 'history_cutoff_at_ms', shareScope.historyCutoffAt);
+  }
+  if (sharedActor) {
+    addOptional(sanitized, 'created_by_user_id', sharedActor.actorUserId);
+    addOptional(sanitized, 'sharedActor', sharedActor);
+  }
+  if (shareScope) addOptional(sanitized, 'shareScope', shareScope);
   return sanitized;
 }
 

@@ -82,6 +82,9 @@ body {
 /* WS dot inline on active tab */
 .tab-ws-dot { margin-left: 6px; font-size: 7px; line-height: 1; vertical-align: middle; flex-shrink: 0; text-shadow: 0 0 8px currentColor; }
 .tab-latency { font-size: 9px; font-family: monospace; margin-left: 2px; vertical-align: middle; }
+.share-state-indicator { display: inline-flex; align-items: center; align-self: center; gap: 5px; min-width: 0; margin-left: 6px; padding: 2px 6px; border: 1px solid rgba(52,211,153,0.28); border-radius: 999px; color: #bbf7d0; background: rgba(20,83,45,0.22); font-size: 10px; line-height: 1.2; cursor: default; pointer-events: none; white-space: nowrap; }
+.share-state-dot { width: 5px; height: 5px; border-radius: 999px; background: #34d399; box-shadow: 0 0 8px rgba(52,211,153,0.65); flex-shrink: 0; }
+.share-state-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .tab-tool { margin-left: 5px; font-size: 9px; color: var(--chrome-accent); opacity: 0.9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60px; vertical-align: middle; }
 .tab-rename-input { padding: 0 10px; height: 34px; margin-top: 4px; background: #0b1220; border: 1px solid var(--chrome-accent); border-radius: 7px 7px 0 0; color: #e6edf3; font-family: inherit; font-size: 12px; outline: none; width: 120px; box-shadow: 0 0 12px rgba(34,211,238,0.18); }
 .tab-add-btn { width: 30px; height: 30px; margin: 3px 2px 4px; padding: 0; background: rgba(15,23,42,0.62); border: 1px solid rgba(125,211,252,0.18); border-radius: 7px; color: #64748b; font-size: 16px; cursor: pointer; transition: color 0.12s, border-color 0.12s, background 0.12s, box-shadow 0.12s; flex-shrink: 0; align-self: center; line-height: 1; position: relative; z-index: 1; }
@@ -102,6 +105,29 @@ body {
 @media (max-width: 640px) { .toast-container { bottom: 130px; right: 8px; left: 8px; } .toast { max-width: 100%; } }
 .tab-context-menu { position: fixed; background: #1c2128; border: 1px solid #30363d; border-radius: 6px; min-width: 150px; box-shadow: 0 8px 24px #00000080; z-index: 100; overflow: hidden; }
 .menu-divider { height: 1px; background: #21262d; margin: 2px 0; }
+.share-dialog { max-width: 520px; }
+.share-dialog-title { font-size: 18px; font-weight: 800; color: #f8fafc; }
+.share-dialog-subtitle { margin-top: 4px; font-size: 12px; line-height: 1.4; color: #94a3b8; }
+.share-field { display: flex; flex-direction: column; gap: 8px; }
+.share-field-label { font-size: 12px; font-weight: 700; color: #cbd5e1; }
+.share-choice-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.share-choice { display: inline-flex; align-items: center; gap: 7px; padding: 7px 9px; border: 1px solid rgba(125,211,252,0.18); border-radius: 7px; background: rgba(15,23,42,0.58); color: #dbeafe; font-size: 12px; cursor: pointer; }
+.share-choice input { margin: 0; accent-color: var(--chrome-accent); }
+.share-help { color: #94a3b8; font-size: 12px; line-height: 1.45; }
+.share-trust-disclosure { display: flex; flex-direction: column; gap: 5px; padding: 10px 12px; border: 1px solid rgba(245,158,11,0.38); border-radius: 8px; background: rgba(120,53,15,0.28); color: #fed7aa; font-size: 12px; line-height: 1.45; }
+.share-input { width: 100%; padding: 9px 10px; border: 1px solid rgba(125,211,252,0.22); border-radius: 7px; background: #0b1220; color: #e2e8f0; font: inherit; }
+.share-input:focus { outline: none; border-color: var(--chrome-accent); box-shadow: 0 0 0 2px rgba(34,211,238,0.14); }
+.share-error { padding: 9px 10px; border: 1px solid rgba(248,113,113,0.38); border-radius: 7px; background: rgba(127,29,29,0.32); color: #fecaca; font-size: 12px; line-height: 1.4; }
+.share-list { display: flex; flex-direction: column; gap: 6px; padding-top: 2px; }
+.share-list-title { font-size: 12px; font-weight: 800; color: #e2e8f0; }
+.share-list-empty { color: #64748b; font-size: 12px; }
+.share-list-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 9px; border: 1px solid rgba(125,211,252,0.12); border-radius: 7px; background: rgba(15,23,42,0.42); }
+.share-list-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #f8fafc; font-size: 12px; }
+.share-list-meta { display: inline-flex; gap: 7px; color: #93c5fd; font-size: 11px; white-space: nowrap; }
+.chat-shared-actor-label,
+.controls-queued-item-actor { display: inline-flex; align-items: center; max-width: 100%; color: #67e8f9; font-size: 10px; font-weight: 700; line-height: 1.2; letter-spacing: 0; opacity: 0.86; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-shared-actor-label { align-self: flex-end; margin: 0 2px 4px; }
+.controls-queued-item-actor { color: #93c5fd; font-weight: 650; }
 
 /* Terminal */
 .terminal-container { flex: 1; min-height: 0; overflow: hidden; background: #0f0f13; }

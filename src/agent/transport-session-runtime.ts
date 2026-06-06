@@ -47,6 +47,7 @@ import { buildTransportStartupMemory, type TransportContextBootstrap } from './r
 import { recordMemoryHits } from '../store/context-store.js';
 import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
+import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 
 export interface PendingTransportMessage {
   clientMessageId: string;
@@ -55,6 +56,12 @@ export interface PendingTransportMessage {
   /** Provider-visible per-turn context rendered through the shared context preamble path. */
   messagePreamble?: string;
   attachments?: TransportAttachment[];
+  /** Server-authored share actor for attribution only; never injected into provider prompts. */
+  sharedActor?: SharedActorEnvelope;
+}
+
+export interface TransportSendMetadata {
+  sharedActor?: SharedActorEnvelope;
 }
 
 export interface TransportRuntimeDiagnosticSnapshot {
@@ -626,6 +633,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     clientMessageId?: string,
     attachments?: TransportAttachment[],
     messagePreamble?: string,
+    metadata?: TransportSendMetadata,
   ): 'sent' | 'queued' {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
@@ -640,6 +648,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       text: message,
       ...(messagePreamble?.trim() ? { messagePreamble: messagePreamble.trim() } : {}),
       ...(attachments?.length ? { attachments } : {}),
+      ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
     };
 
     if (this._sending) {

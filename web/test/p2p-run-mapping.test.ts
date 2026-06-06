@@ -272,6 +272,39 @@ describe('mapP2pRunToDiscussion', () => {
     expect(discussion.fileId).toBe('disc_nav');
   });
 
+  it('preserves server-authored shared actor metadata from run payloads', () => {
+    const sharedActor = {
+      actorUserId: 'user-shared',
+      actorDisplayName: 'Ada Shared',
+      effectiveActorRole: 'participant',
+      origin: 'shared-tab',
+      actionId: 'share-action-1',
+      primaryShareId: 'share-1',
+      authorizedAt: 2_000,
+      snapshot: {
+        target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_alpha_brain' },
+        effectiveRole: 'participant',
+        historyCutoffAt: 1_000,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-1'],
+        primaryShareId: 'share-1',
+        authorizedAt: 2_000,
+      },
+    };
+
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_shared_actor',
+      status: 'running',
+      mode_key: 'review',
+      current_round: 1,
+      total_rounds: 1,
+      total_hops: 1,
+      sharedActor,
+    });
+
+    expect(discussion.sharedActor).toEqual(sharedActor);
+  });
+
   it('preserves timeout serialization for round and summary boundary failures', () => {
     const summaryTimeout = mapP2pRunToDiscussion({
       id: 'run_summary_timeout',

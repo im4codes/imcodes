@@ -32,6 +32,7 @@ import { LoginPage } from './pages/LoginPage.js';
 import { SessionTabs } from './components/SessionTabs.js';
 // TransportChatView removed — transport sessions use unified ChatView via timelineEmitter
 import { SessionPane } from './components/SessionPane.js';
+import { ShareSessionDialog } from './components/ShareSessionDialog.js';
 import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
@@ -74,6 +75,7 @@ import {
   getSubSessionAccentColorMap,
 } from './subsession-accent-colors.js';
 import type { PanelRenderContext } from './components/PinnedPanelRegistry.js';
+import type { ShareDialogTarget } from './tab-sharing-ui.js';
 import './components/pinnedPanelTypes.js'; // register all panel types
 import {
   LOCAL_WEB_PREVIEW_PANEL_TYPE,
@@ -95,6 +97,7 @@ import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { parseString, parseBooleanish, usePref } from './hooks/usePref.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
+import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import { PREF_KEY_DEFAULT_SHELL, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from './constants/prefs.js';
 import {
   p2pSubSessionParentSignature,
@@ -411,6 +414,7 @@ export function App() {
   const autoEntryRunRef = useRef(0);
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
+  const [shareDialogTarget, setShareDialogTarget] = useState<ShareDialogTarget | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [mobileHideServerBar, setMobileHideServerBar] = useState(() => localStorage.getItem('mobile_hide_server_bar') === '1');
   const [mobileHideTabBar, setMobileHideTabBar] = useState(() => localStorage.getItem('mobile_hide_tab_bar') === '1');
@@ -1453,6 +1457,8 @@ export function App() {
      *  hops). The bar matches against this set so any session involved
      *  in the discussion shows the bar. */
     participantSessions?: string[];
+    /** Server-authored actor metadata for share-originated discussions/P2P. */
+    sharedActor?: SharedActorEnvelope;
   }>>([]);
 
   /** Set of session names enabled in the P2P config for the active root session. */
@@ -2853,6 +2859,7 @@ export function App() {
               maxRounds: msg.maxRounds,
               totalHops: msg.totalHops,
               filePath: msg.filePath,
+              sharedActor: msg.sharedActor,
             });
             return next;
           }
@@ -2860,6 +2867,7 @@ export function App() {
             id: msg.discussionId, requestId: msg.requestId, topic: msg.topic, state: 'setup',
             currentRound: 0, maxRounds: msg.maxRounds, completedHops: 0,
             totalHops: msg.totalHops ?? 0, startedAt: Date.now(),
+            sharedActor: msg.sharedActor,
           }];
         });
       }
@@ -2878,6 +2886,7 @@ export function App() {
             totalHops: msg.totalHops,
             currentSpeaker: msg.currentSpeaker ?? undefined,
             filePath: msg.filePath,
+            sharedActor: msg.sharedActor,
           });
           return next;
         });
@@ -4001,6 +4010,25 @@ export function App() {
     subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession })),
     [subSessions]
   );
+  const openShareDialogForSession = useCallback((session: SessionInfo, subSessionId?: string | null) => {
+    if (!selectedServerId) return;
+    const sub = subSessionId
+      ? visibleSubSessions.find((item) => item.id === subSessionId || item.sessionName === session.name)
+      : null;
+    const tabLabel = sub
+      ? (sub.label?.trim() || sub.sessionName)
+      : (session.label?.trim() || session.project || session.name);
+    setShareDialogTarget({
+      serverId: selectedServerId,
+      serverLabel: resolvedSelectedServerName,
+      sessionName: sub?.sessionName ?? session.name,
+      tabLabel,
+      ...(sub ? {
+        subSessionId: sub.id,
+        subSessionDisplayName: sub.sessionName,
+      } : {}),
+    });
+  }, [resolvedSelectedServerName, selectedServerId, visibleSubSessions]);
   const [subSessionVisualOrderIds, setSubSessionVisualOrderIds] = useState<string[]>([]);
   const handleSubSessionVisualOrderChange = useCallback((ids: string[]) => {
     setSubSessionVisualOrderIds((prev) => {
@@ -4508,6 +4536,7 @@ export function App() {
                 transportConfig: session.transportConfig ?? null,
               })}
               onCloneSession={(session) => setCloneSessionTarget(session)}
+              onShareSession={openShareDialogForSession}
               renameRequest={renameRequest}
               onRenameHandled={() => setRenameRequest(null)}
               onRenameSession={handleRenameSession}
@@ -4597,6 +4626,7 @@ export function App() {
                 onStopProject={handleStopProject}
                 onRenameSession={() => setRenameRequest(s.name)}
                 onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null })}
+                onShareSession={openShareDialogForSession}
                 sessionPinned={pinnedTabs.has(s.name)}
                 stopBlockedByPinned={sessions.some((session) => session.project === s.project && pinnedTabs.has(session.name))}
                 onToggleSessionPin={togglePinnedTab}
@@ -5295,6 +5325,13 @@ export function App() {
         />
       )}
 
+      {shareDialogTarget && (
+        <ShareSessionDialog
+          target={shareDialogTarget}
+          onClose={() => setShareDialogTarget(null)}
+        />
+      )}
+
       {/* Sub-session windows (floating) — only show if not pinned */}
       {visibleSubSessions.filter((sub) => isMobile || !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName)).map((sub) => {
         const isOpen = openSubIds.has(sub.id);
@@ -5328,6 +5365,7 @@ export function App() {
                 if (label !== null) renameSubSession(sub.id, label);
               }}
               onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null })}
+              onShareSession={openShareDialogForSession}
               onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
               onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}

@@ -23,6 +23,67 @@
     "hide": "隐藏",
     "this_feature": "此功能"
   },
+  "share": {
+    "menu": { "shareTab": "共享" },
+    "dialogTitle": "共享访问",
+    "dialogSubtitle": "向 {{target}} 授予受限访问。",
+    "target": {
+      "label": "目标",
+      "currentTab": "当前标签",
+      "server": "整个源服务器",
+      "serverFallback": "此服务器"
+    },
+    "role": {
+      "label": "角色",
+      "viewer": "查看者",
+      "participant": "参与者",
+      "serverMember": "服务器成员",
+      "serverManager": "服务器管理员",
+      "system": "系统"
+    },
+    "roleHelp": {
+      "viewer": "可查看范围内状态并加入范围内讨论，但不能驱动代理。",
+      "participant": "可查看范围内状态，并向覆盖的具体标签发送提示。"
+    },
+    "trust": {
+      "title": "参与者信任说明",
+      "body": "代理未被沙箱隔离。UI/API 限制会减少直接控制面，但参与者提示仍可能影响代理在其可访问环境中的行为。"
+    },
+    "recipient": {
+      "label": "接收者",
+      "placeholder": "用户 ID 或邮箱"
+    },
+    "list": {
+      "label": "共享用户",
+      "title": "共享用户",
+      "empty": "还没有共享用户"
+    },
+    "create": "创建共享",
+    "creating": "正在创建...",
+    "scope": { "current": "共享范围" },
+    "indicator": "{{scope}} 以 {{role}} 共享 · {{status}}",
+    "indicatorCompact": "以 {{role}} 共享 · {{status}}",
+    "actorLabel": "{{name}} · {{role}}",
+    "status": {
+      "active": "有效",
+      "revoked": "已撤销",
+      "expired": "已过期",
+      "target-unavailable": "目标不可用"
+    },
+    "reason": {
+      "share-role-denied": "此角色不能使用该操作。",
+      "share-direct-surface-denied": "共享访问中不可使用此界面。",
+      "share-rate-limited": "共享操作过多，请稍后再试。",
+      "share-revoked": "此共享已撤销。",
+      "share-expired": "此共享已过期。",
+      "share-target-unavailable": "共享目标不可用。",
+      "share-role-changed": "共享角色已变更。",
+      "share-ticket-invalid": "共享访问票据无效。",
+      "share-cancel-unsupported": "此共享标签不支持取消。",
+      "share-audit-duplicate": "此操作已记录。",
+      "share-comment-invalid": "无法发布评论。"
+    }
+  },
   "window": {
     "maximize": "最大化",
     "restore": "还原",

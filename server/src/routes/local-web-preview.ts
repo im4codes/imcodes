@@ -1,9 +1,10 @@
 import { Hono } from 'hono';
 import { getCookie, setCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
-import { requireAuth, resolveAuth, resolveServerRole } from '../security/authorization.js';
+import { requireAuth, resolveAuth } from '../security/authorization.js';
 import { LocalWebPreviewRegistry, normalizeLocalPreviewPath } from '../preview/registry.js';
 import { commitAuthorizedAccess, resolveLocalPreviewAccess } from '../preview/access.js';
+import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { rewritePreviewHtmlDocument, shouldRewritePreviewHtml } from '../preview/policy.js';
 import {
   appendPreviewAccessTokenIfMissing,
@@ -85,8 +86,8 @@ function setPreviewAccessCookie(c: Parameters<typeof setCookie>[0], serverId: st
 localWebPreviewRoutes.post('/:id/local-web-preview', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: PREVIEW_ERROR.FORBIDDEN }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: PREVIEW_ERROR.FORBIDDEN, reason: access.reason }, 403);
 
   const body = await c.req.json().catch(() => null);
   const parsed = createSchema.safeParse(body satisfies CreatePreviewRequest | null);
@@ -118,8 +119,8 @@ localWebPreviewRoutes.post('/:id/local-web-preview', requireAuth(), async (c) =>
 localWebPreviewRoutes.delete('/:id/local-web-preview/:previewId', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: PREVIEW_ERROR.FORBIDDEN }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: PREVIEW_ERROR.FORBIDDEN, reason: access.reason }, 403);
 
   const previewIdParam = c.req.param('previewId')!;
   const ok = LocalWebPreviewRegistry.get(serverId).close(previewIdParam, userId);

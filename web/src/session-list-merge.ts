@@ -67,6 +67,7 @@ export interface IncomingSessionListEntry {
   transportPendingMessages?: unknown;
   transportPendingMessageEntries?: unknown;
   transportPendingMessageVersion?: unknown;
+  sharedState?: SessionInfo['sharedState'];
 }
 
 export function isSubSessionName(sessionName: string): boolean {
@@ -183,5 +184,6 @@ export function mergeSessionListEntry(
     transportPendingMessages: nextPendingMessages,
     transportPendingMessageEntries: nextPendingEntries,
     transportPendingMessageVersion: nextPendingVersion,
+    sharedState: incoming.sharedState ?? existing?.sharedState,
   };
 }

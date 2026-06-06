@@ -22,6 +22,7 @@ function preserveEntries(
       ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
       commandId: entry.clientMessageId,
       ...(entry.attachments?.length ? { attachments: entry.attachments } : {}),
+      ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
       queuedAt: Date.now(),
     });
     seenCommandIds.add(entry.clientMessageId);

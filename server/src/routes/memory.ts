@@ -19,7 +19,8 @@
 import { Hono } from 'hono';
 import { randomUUID } from 'node:crypto';
 import type { Env } from '../env.js';
-import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { requireAuth } from '../security/authorization.js';
+import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { WsBridge } from '../ws/bridge.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import { buildMemoryProjectionFallbackSource } from '../../../shared/memory-projection-source-fallback.js';
@@ -221,8 +222,8 @@ memoryRoutes.get('/memory/sources', requireAuth(), async (c) => {
   if (!projectionId) return c.json({ error: 'projection_id_required' }, 400);
   if (!projectId) return c.json({ error: 'not_found' }, 404);
 
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   const projectionRow = await loadAuthorizedProjectionSourceRow(c.env.DB, {
     projectionId,

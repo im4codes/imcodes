@@ -52,6 +52,7 @@ import {
 import { domNodeToPlainText, selectionToPlainText } from '../util/dom-to-text.js';
 import { selectionSignature } from '../util/selection-signature.js';
 import { ZoomedTextDialog } from './ZoomedTextDialog.js';
+import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import {
   deriveSdkSubagentStatusRows,
   type SdkSubagentDiagnostic,
@@ -3062,11 +3063,17 @@ const ChatEvent = memo(function ChatEvent({
       const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : undefined;
       const failureReason = typeof event.payload.failureReason === 'string' ? event.payload.failureReason : undefined;
       const stateClass = isPending ? ' chat-pending' : isFailed ? ' chat-failed' : '';
+      const sharedActorLabel = formatSharedActorLabel(t, event.payload.sharedActor);
       return (
         // data-event-id lets the pinned-last-message banner target this bubble
         // with an IntersectionObserver so the banner only shows when the real
         // bubble has scrolled off the top of the viewport.
         <div class={`chat-event chat-user${stateClass}`} data-event-id={event.eventId}>
+          {sharedActorLabel && (
+            <div class="chat-shared-actor-label" title={sharedActorLabel}>
+              {sharedActorLabel}
+            </div>
+          )}
           {attachments && serverId && attachments.map((att) => (
             <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
           ))}

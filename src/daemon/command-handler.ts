@@ -44,6 +44,7 @@ import { sendSubSessionSync } from './subsession-sync.js';
 import logger from '../util/logger.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
+import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import { hashSessionName } from '../../shared/session-hash.js';
 import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
@@ -63,7 +64,7 @@ import { exec as execCb, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 const execFileAsync = promisify(execFileCb);
-import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
+import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget, type SharedP2pRunScope } from './p2p-orchestrator.js';
 import { buildSessionList } from './session-list.js';
 import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
@@ -2554,6 +2555,12 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const commandId = cmd.commandId as string | undefined;
   const directTargetSession = (cmd as any).directTargetSession as string | undefined;
   const directTargetMode = ((cmd as any).directTargetMode as string | undefined) ?? 'discuss';
+  const sharedActor = cmd.sharedActor && typeof cmd.sharedActor === 'object'
+    ? cmd.sharedActor as SharedActorEnvelope
+    : undefined;
+  const shareScope = cmd.shareScope && typeof cmd.shareScope === 'object'
+    ? cmd.shareScope as SharedP2pRunScope
+    : undefined;
 
   if (!sessionName || !text) {
     logger.warn('session.send: missing sessionName or text');
@@ -2613,6 +2620,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       text: payloadText,
       allowDuplicate: true,
       commandId: effectiveId,
+      ...(sharedActor ? { sharedActor } : {}),
     };
     timelineEmitter.emit(
       sessionName,
@@ -2938,6 +2946,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         extraPrompt: p2pExtraPrompt,
         modeOverride: resolvedMode || undefined,
         hopTimeoutMs: p2pHopTimeoutMs,
+        sharedActor,
+        shareScope,
         ...(compiledFromEnvelope
           ? {
               advanced: {
@@ -3097,6 +3107,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     const enqueueResult = enqueueResend(sessionName, {
       text: displayText,
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
+      ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
       queuedAt: Date.now(),
     });
@@ -3137,7 +3148,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         state: 'queued',
         pendingCount: queued.length,
         pendingMessages: queued.map((e) => e.text),
-        pendingMessageEntries: queued.map((e) => ({ clientMessageId: e.commandId, text: e.text })),
+        pendingMessageEntries: queued.map((e) => ({
+          clientMessageId: e.commandId,
+          text: e.text,
+          ...(e.sharedActor ? { sharedActor: e.sharedActor } : {}),
+        })),
       },
       { source: 'daemon', confidence: 'high' },
     );
@@ -3180,6 +3195,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     const enqueueResultMissingSid = enqueueResend(sessionName, {
       text: displayText,
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
+      ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
       queuedAt: Date.now(),
     });
@@ -3215,7 +3231,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         state: 'queued',
         pendingCount: queued.length,
         pendingMessages: queued.map((e) => e.text),
-        pendingMessageEntries: queued.map((e) => ({ clientMessageId: e.commandId, text: e.text })),
+        pendingMessageEntries: queued.map((e) => ({
+          clientMessageId: e.commandId,
+          text: e.text,
+          ...(e.sharedActor ? { sharedActor: e.sharedActor } : {}),
+        })),
       },
       { source: 'daemon', confidence: 'high' },
     );
@@ -3497,16 +3517,29 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
       // send() is synchronous: dispatches immediately if idle, queues if busy.
       // Status changes come from transport runtime's onStatusChange callback.
+      const sharedMetadata = sharedActor ? { sharedActor } : undefined;
       const result = preferenceMessagePreamble
-        ? transportRuntime.send(
-          displayText,
-          effectiveId,
-          attachments.length > 0 ? attachments : undefined,
-          preferenceMessagePreamble,
-        )
+        ? (sharedMetadata
+            ? transportRuntime.send(
+              displayText,
+              effectiveId,
+              attachments.length > 0 ? attachments : undefined,
+              preferenceMessagePreamble,
+              sharedMetadata,
+            )
+            : transportRuntime.send(
+              displayText,
+              effectiveId,
+              attachments.length > 0 ? attachments : undefined,
+              preferenceMessagePreamble,
+            ))
         : (attachments.length > 0
-            ? transportRuntime.send(displayText, effectiveId, attachments)
-            : transportRuntime.send(displayText, effectiveId));
+            ? (sharedMetadata
+                ? transportRuntime.send(displayText, effectiveId, attachments, undefined, sharedMetadata)
+                : transportRuntime.send(displayText, effectiveId, attachments))
+            : (sharedMetadata
+                ? transportRuntime.send(displayText, effectiveId, undefined, undefined, sharedMetadata)
+                : transportRuntime.send(displayText, effectiveId)));
       if (shouldTrackSupervisionTaskRun) {
         if (result === 'queued') {
           supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
@@ -5510,10 +5543,14 @@ async function handleDiscussionStart(cmd: Record<string, unknown>, serverLink: S
   const cwd = cmd.cwd as string | undefined;
   const requestId = cmd.requestId as string | undefined;
   const rawParticipants = cmd.participants as Array<Record<string, unknown>> | undefined;
+  const shareEnvelope = {
+    ...(cmd.sharedActor ? { sharedActor: cmd.sharedActor } : {}),
+    ...(cmd.shareScope ? { shareScope: cmd.shareScope } : {}),
+  };
 
   if (!topic || !rawParticipants || rawParticipants.length < 2) {
     logger.warn('discussion.start: missing required fields');
-    try { serverLink.send({ type: 'discussion.error', requestId, error: 'missing_fields' }); } catch { /* ignore */ }
+    try { serverLink.send({ type: 'discussion.error', requestId, error: 'missing_fields', ...shareEnvelope }); } catch { /* ignore */ }
     return;
   }
 
@@ -5545,7 +5582,7 @@ async function handleDiscussionStart(cmd: Record<string, unknown>, serverLink: S
         verdictIdx: cmd.verdictIdx as number | undefined,
       },
       (msg) => {
-        try { serverLink.send(msg as Record<string, unknown>); } catch { /* not connected */ }
+        try { serverLink.send({ ...msg, ...shareEnvelope } as Record<string, unknown>); } catch { /* not connected */ }
       },
     );
 
@@ -5563,12 +5600,13 @@ async function handleDiscussionStart(cmd: Record<string, unknown>, serverLink: S
           agentType: p.agentType,
           model: p.model,
         })),
+        ...shareEnvelope,
       });
     } catch { /* not connected */ }
   } catch (err) {
     logger.error({ err }, 'discussion.start failed');
     const error = err instanceof Error ? err.message : String(err);
-    try { serverLink.send({ type: 'discussion.error', requestId, error }); } catch { /* ignore */ }
+    try { serverLink.send({ type: 'discussion.error', requestId, error, ...shareEnvelope }); } catch { /* ignore */ }
   }
 }
 

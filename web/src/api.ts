@@ -22,6 +22,7 @@ import {
   parseSupervisorDefaultConfig,
   type SupervisorDefaultConfig,
 } from '@shared/supervision-config.js';
+import type { ShareGrantSummary, ShareRole, ShareTarget } from './tab-sharing-ui.js';
 
 let _baseUrl = '';
 let _onAuthExpired: ((reason?: string) => void) | null = null;
@@ -487,6 +488,98 @@ export async function cancelSessionViaHttp(
   await apiFetch(`/api/server/${encodeURIComponent(serverId)}/session/cancel`, {
     method: 'POST',
     body: JSON.stringify(payload),
+  });
+}
+
+export interface CreateShareRequest {
+  target: ShareTarget;
+  targetUser: string;
+  role: ShareRole;
+}
+
+export interface CreateShareResponse {
+  share: ShareGrantSummary;
+}
+
+export interface ListSharesResponse {
+  shares: ShareGrantSummary[];
+}
+
+function buildShareTargetParams(target: ShareTarget): URLSearchParams {
+  const params = new URLSearchParams();
+  params.set('targetKind', target.kind);
+  if (target.kind === 'main') params.set('sessionName', target.sessionName);
+  if (target.kind === 'subsession') params.set('subSessionId', target.subSessionId);
+  return params;
+}
+
+export async function listSharesForTarget(serverId: string, target: ShareTarget): Promise<ShareGrantSummary[]> {
+  const params = buildShareTargetParams(target);
+  const res = await apiFetch<ListSharesResponse>(
+    `/api/server/${encodeURIComponent(serverId)}/shares?${params.toString()}`,
+  );
+  return Array.isArray(res.shares) ? res.shares : [];
+}
+
+export async function createShare(serverId: string, request: CreateShareRequest): Promise<ShareGrantSummary> {
+  const res = await apiFetch<CreateShareResponse>(`/api/server/${encodeURIComponent(serverId)}/shares`, {
+    method: 'POST',
+    body: JSON.stringify(request),
+  });
+  return res.share;
+}
+
+export interface SharedEntrySummary {
+  id: string;
+  serverId: string;
+  serverName: string;
+  role: ShareRole;
+  status: 'active' | 'revoked' | 'expired' | 'target-unavailable';
+  target: ShareTarget;
+  targetLabel: string;
+}
+
+export async function discoverSharedEntries(): Promise<SharedEntrySummary[]> {
+  const res = await apiFetch<{ shares?: SharedEntrySummary[]; entries?: SharedEntrySummary[] }>('/api/shares');
+  const entries = res.shares ?? res.entries;
+  return Array.isArray(entries) ? entries : [];
+}
+
+export interface OpenSharedEntryResponse {
+  server: {
+    id: string;
+    name: string;
+    status: string | null;
+    lastHeartbeatAt: number | null;
+  };
+  target: ShareTarget;
+  coverage: {
+    effectiveRole: ShareRole;
+    historyCutoffAt: number;
+    nextCoverageRecheckAt: number | null;
+    coveringShareIds: string[];
+    primaryShareId: string | null;
+    authorizedAt: number;
+  };
+  sessions: Array<{
+    sessionName: string;
+    title: string;
+    state: string;
+    agentType: string;
+  }>;
+  subSessions: Array<{
+    subSessionId: string;
+    sessionName: string;
+    title: string;
+    type: string;
+    parentSessionName: string | null;
+  }>;
+}
+
+export async function openSharedEntry(target: ShareTarget): Promise<OpenSharedEntryResponse> {
+  return apiFetch<OpenSharedEntryResponse>('/api/shares/open', {
+    method: 'POST',
+    body: JSON.stringify({ target }),
   });
 }
 

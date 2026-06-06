@@ -11,10 +11,32 @@ import {
   SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
 } from '../../shared/session-control-commands.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
+import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemoryMock = vi.hoisted(() => vi.fn());
 const searchLocalMemorySemanticMock = vi.hoisted(() => vi.fn());
+
+const sharedActorFixture: SharedActorEnvelope = {
+  actorUserId: 'user-shared',
+  actorDisplayName: 'Shared User',
+  effectiveActorRole: 'participant',
+  origin: 'shared-tab',
+  actionId: 'action-shared',
+  primaryShareId: 'share-1',
+  authorizedAt: 1_000,
+  queuedAt: 1_001,
+  snapshot: {
+    target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_test_brain' },
+    effectiveRole: 'participant',
+    historyCutoffAt: 900,
+    authorizedAt: 1_000,
+    primaryShareId: 'share-1',
+    coveringShareIds: ['share-1'],
+    expiresAt: null,
+    nextCoverageRecheckAt: null,
+  },
+};
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: {
@@ -1493,6 +1515,39 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(captured.messages.map((entry) => entry.text)).toEqual(['queued-a', 'queued-b', 'queued-c']);
     // The merged string also matches the join used by _drainPending.
     expect(captured.merged).toBe('queued-a\n\nqueued-b\n\nqueued-c');
+  });
+
+  it('preserves shared actor metadata on queued entries and drain callbacks without injecting it into provider text', async () => {
+    runtime.send('first', 'cmd-first');
+    await flushDispatch();
+    runtime.send('shared queued', 'cmd-shared', undefined, undefined, { sharedActor: sharedActorFixture });
+    expect(runtime.pendingEntries).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'cmd-shared',
+        text: 'shared queued',
+        sharedActor: sharedActorFixture,
+      }),
+    ]);
+
+    let received: PendingTransportMessage[] = [];
+    runtime.onDrain = (messages) => {
+      received = messages.map((entry) => ({ ...entry }));
+    };
+
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    expect(received).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'cmd-shared',
+        text: 'shared queued',
+        sharedActor: sharedActorFixture,
+      }),
+    ]);
+    const resentPayload = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(resentPayload.userMessage).toBe('shared queued');
+    expect(resentPayload).not.toHaveProperty('sharedActor');
+    expect(String(resentPayload.assembledMessage)).not.toContain('Shared User');
   });
 
   it('T5b (N1 contract): synchronous re-entrant runtime.send from onDrain listener queues into pending, never starts a parallel turn', async () => {

@@ -23,6 +23,67 @@
     "hide": "隠す",
     "this_feature": "この機能"
   },
+  "share": {
+    "menu": { "shareTab": "共有" },
+    "dialogTitle": "アクセスを共有",
+    "dialogSubtitle": "{{target}} へのスコープ付きアクセスを付与します。",
+    "target": {
+      "label": "対象",
+      "currentTab": "現在のタブ",
+      "server": "ソースサーバー全体",
+      "serverFallback": "このサーバー"
+    },
+    "role": {
+      "label": "ロール",
+      "viewer": "閲覧者",
+      "participant": "参加者",
+      "serverMember": "サーバーメンバー",
+      "serverManager": "サーバー管理者",
+      "system": "システム"
+    },
+    "roleHelp": {
+      "viewer": "スコープ内の状態を閲覧し、エージェントを操作せずにスコープ内の議論へ参加できます。",
+      "participant": "スコープ内の状態を閲覧し、対象の具体的なタブへプロンプトを送信できます。"
+    },
+    "trust": {
+      "title": "参加者への信頼に関する開示",
+      "body": "エージェントはサンドボックス化されていません。UI/API の制限は直接操作を減らしますが、参加者のプロンプトは、アクセス可能な環境で動作するエージェントに影響する可能性があります。"
+    },
+    "recipient": {
+      "label": "受信者",
+      "placeholder": "ユーザー ID またはメール"
+    },
+    "list": {
+      "label": "共有ユーザー",
+      "title": "共有ユーザー",
+      "empty": "共有ユーザーはまだいません"
+    },
+    "create": "共有を作成",
+    "creating": "作成中...",
+    "scope": { "current": "共有スコープ" },
+    "indicator": "{{scope}} は {{role}} として共有中 · {{status}}",
+    "indicatorCompact": "{{role}} として共有中 · {{status}}",
+    "actorLabel": "{{name}} · {{role}}",
+    "status": {
+      "active": "有効",
+      "revoked": "取り消し済み",
+      "expired": "期限切れ",
+      "target-unavailable": "対象を利用できません"
+    },
+    "reason": {
+      "share-role-denied": "このロールではその操作を使用できません。",
+      "share-direct-surface-denied": "この画面は共有アクセスでは利用できません。",
+      "share-rate-limited": "共有操作が多すぎます。しばらくしてから再試行してください。",
+      "share-revoked": "この共有は取り消されました。",
+      "share-expired": "この共有は期限切れです。",
+      "share-target-unavailable": "共有対象を利用できません。",
+      "share-role-changed": "共有ロールが変更されました。",
+      "share-ticket-invalid": "共有アクセスチケットが無効です。",
+      "share-cancel-unsupported": "この共有タブではキャンセルはサポートされていません。",
+      "share-audit-duplicate": "この操作はすでに記録されています。",
+      "share-comment-invalid": "コメントを投稿できませんでした。"
+    }
+  },
   "window": {
     "maximize": "最大化",
     "restore": "元に戻す",

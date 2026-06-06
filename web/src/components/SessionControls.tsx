@@ -34,6 +34,7 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import { isLegacyTransportPendingMessageId, normalizeTransportPendingEntries } from '../transport-queue.js';
+import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
   buildP2pConfigSelection,
@@ -65,6 +66,7 @@ import {
 } from '@shared/supervision-config.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
 import { shouldHideOptimisticUserMessageForSessionControl } from '@shared/session-control-commands.js';
+import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 
 interface Props {
   ws: WsClient | null;
@@ -78,6 +80,8 @@ interface Props {
   onRenameSession?: () => void;
   /** Called when Settings is selected in the menu. */
   onSettings?: () => void;
+  /** Called when Share is selected in the send-adjacent more menu. */
+  onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   /** Whether the active session tab is pinned. */
   sessionPinned?: boolean;
   /** Whether stopping the active project is blocked because one of its tabs is pinned. */
@@ -156,6 +160,7 @@ type LocalQueuedTransportEntry = {
   clientMessageId: string;
   text: string;
   status?: 'sending' | 'queued' | 'failed';
+  sharedActor?: SharedActorEnvelope;
 };
 
 function transportQueueHiddenStorageKey(serverId: string | undefined, sessionName: string): string {
@@ -594,7 +599,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -924,10 +929,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     && !subSessionId
     && !compact
     && !!onToggleSessionPin;
-  // Input only disabled when there's no session at all (can type while disconnected)
-  const inputDisabled = !hasSession;
-  // Send/action buttons disabled when disconnected or no session
-  const disabled = !connected || !hasSession;
+  const sharedState = activeSession?.sharedState ?? null;
+  const isShareScopedSession = !!sharedState;
+  const canSharedSessionSend = !isShareScopedSession
+    || (sharedState?.status === 'active' && sharedState.effectiveRole === 'participant');
+  // Input only disabled when there's no session or the active share cannot dispatch messages.
+  const inputDisabled = !hasSession || !canSharedSessionSend;
+  // Send/action buttons disabled when disconnected, missing a session, or share-scoped direct controls are unavailable.
+  const disabled = !connected || !hasSession || isShareScopedSession;
   const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isTransport = effectiveRuntimeType === 'transport';
@@ -2052,6 +2061,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const payload = {
       sessionName: activeSession.name,
       commandId,
+      ...(activeSession.sharedState?.activeDispatchId ? { observedDispatchId: activeSession.sharedState.activeDispatchId } : {}),
     };
     if (!ws) {
       if (!serverId) return null;
@@ -4063,6 +4073,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   <span class="session-action-menu-label">{t('session.clone.menu')}</span>
                 </button>
               )}
+              {onShareSession && activeSession && (
+                <button
+                  class="menu-item session-action-menu-item"
+                  onClick={() => {
+                    onShareSession(activeSession, subSessionId ?? null);
+                    setMenuOpen(false);
+                    resetConfirm();
+                  }}
+                >
+                  <SessionActionMenuIcon kind="share" />
+                  <span class="session-action-menu-label">{t('share.menu.shareTab')}</span>
+                </button>
+              )}
               <div class="menu-divider" />
               <button
                 class={`menu-item session-action-menu-item ${stopBlockedByPinned || confirm === 'stop' ? 'menu-item-danger' : ''}`}
@@ -4103,9 +4126,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               </button>
             </div>
             <div class="controls-queued-list">
-              {queuedTransportEntries.map((entry) => (
+              {queuedTransportEntries.map((entry) => {
+                const sharedActorLabel = formatSharedActorLabel(t, entry.sharedActor);
+                return (
                 <div class="controls-queued-item" key={entry.clientMessageId}>
                   <span class="controls-queued-item-text">{entry.text}</span>
+                  {sharedActorLabel && (
+                    <span class="controls-queued-item-actor" title={sharedActorLabel}>
+                      {sharedActorLabel}
+                    </span>
+                  )}
                   <span
                     class={`controls-queued-item-status controls-queued-item-status-${entry.status ?? 'queued'}`}
                     aria-label={
@@ -4140,7 +4170,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     </span>
                   )}
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         ) : (

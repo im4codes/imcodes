@@ -23,6 +23,71 @@
     "hide": "Hide",
     "this_feature": "This feature"
   },
+  "share": {
+    "menu": {
+      "shareTab": "Share"
+    },
+    "dialogTitle": "Share access",
+    "dialogSubtitle": "Grant scoped access to {{target}}.",
+    "target": {
+      "label": "Target",
+      "currentTab": "Current tab",
+      "server": "Whole source server",
+      "serverFallback": "This server"
+    },
+    "role": {
+      "label": "Role",
+      "viewer": "Viewer",
+      "participant": "Participant",
+      "serverMember": "Server member",
+      "serverManager": "Server manager",
+      "system": "System"
+    },
+    "roleHelp": {
+      "viewer": "Can view scoped state and join scoped discussion without driving the agent.",
+      "participant": "Can view scoped state and send prompts to covered concrete tabs."
+    },
+    "trust": {
+      "title": "Participant trust disclosure",
+      "body": "Agents are not sandboxed. UI/API limits reduce direct controls, but a participant prompt can still influence an agent acting in its accessible environment."
+    },
+    "recipient": {
+      "label": "Recipient",
+      "placeholder": "User ID or email"
+    },
+    "list": {
+      "label": "Shared users",
+      "title": "Shared users",
+      "empty": "No shared users yet"
+    },
+    "create": "Create share",
+    "creating": "Creating...",
+    "scope": {
+      "current": "Shared scope"
+    },
+    "indicator": "{{scope}} shared as {{role}} · {{status}}",
+    "indicatorCompact": "Shared as {{role}} · {{status}}",
+    "actorLabel": "{{name}} · {{role}}",
+    "status": {
+      "active": "Active",
+      "revoked": "Revoked",
+      "expired": "Expired",
+      "target-unavailable": "Target unavailable"
+    },
+    "reason": {
+      "share-role-denied": "This role cannot use that action.",
+      "share-direct-surface-denied": "This surface is not available in shared access.",
+      "share-rate-limited": "Too many shared actions. Try again shortly.",
+      "share-revoked": "This share was revoked.",
+      "share-expired": "This share expired.",
+      "share-target-unavailable": "The shared target is unavailable.",
+      "share-role-changed": "The shared role changed.",
+      "share-ticket-invalid": "The shared access ticket is invalid.",
+      "share-cancel-unsupported": "Cancel is not supported for this shared tab.",
+      "share-audit-duplicate": "This action was already recorded.",
+      "share-comment-invalid": "The comment could not be posted."
+    }
+  },
   "window": {
     "maximize": "Maximize",
     "restore": "Restore",
