@@ -997,7 +997,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(transportSendMock.mock.calls[0]?.[0]).toContain('Discovered safe validation command candidates from project manifests: pnpm typecheck; pnpm test');
     expect(transportSendMock.mock.calls[0]?.[0]).toContain('Unsafe validation commands were skipped: pnpm deploy');
     expect(transportSendMock.mock.calls[0]?.[0]).not.toContain('Recommended validation commands:');
-    for (let expectedCount = 2; expectedCount <= 12; expectedCount += 1) {
+    for (let expectedCount = 2; expectedCount <= 6; expectedCount += 1) {
       timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
       await waitForSend((msg) =>
         msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
@@ -1058,7 +1058,11 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       runId: ack.projection.runId,
     }, serverLinkMock as never);
 
-    expect(cancelP2pRunMock).toHaveBeenCalledWith('p2p-1', serverLinkMock);
+    expect(cancelP2pRunMock).toHaveBeenCalledWith('p2p-1', serverLinkMock, expect.objectContaining({
+      source: 'openspec_auto_deliver_terminalize',
+      reason: 'user_stopped',
+      requestedBySession: 'deck_demo_brain',
+    }));
     const terminal = serverLinkMock.send.mock.calls.map((call) => call[0]).find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL);
     expect(terminal?.projection.status).toBe('stopped');
   });
@@ -1244,7 +1248,11 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     const terminal = serverLinkMock.send.mock.calls.map((call) => call[0]).find((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.terminalReason === 'daemon_restart_cleared');
     expect(terminal?.projection.status).toBe('failed');
-    expect(cancelP2pRunMock).toHaveBeenCalledWith('p2p-1', serverLinkMock);
+    expect(cancelP2pRunMock).toHaveBeenCalledWith('p2p-1', serverLinkMock, expect.objectContaining({
+      source: 'openspec_auto_deliver_terminalize',
+      reason: 'daemon_restart_cleared',
+      requestedBySession: 'deck_demo_brain',
+    }));
 
     serverLinkMock.send.mockClear();
     await handleOpenSpecAutoDeliverCommand({

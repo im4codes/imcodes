@@ -34,6 +34,35 @@ import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-co
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
+function makeOpenSpecAutoDeliverProjection(overrides: Record<string, unknown> = {}) {
+  return {
+    runId: 'auto-run-1',
+    changeName: 'openspec-auto-delivery',
+    owningMainSessionName: 'deck_proj_brain',
+    launchedFromSessionName: 'deck_sub_launcher',
+    targetImplementationSessionName: 'deck_sub_worker',
+    projectionVersion: 1,
+    generation: 1,
+    presetId: 'standard',
+    materializedLimits: {
+      specAuditRepairRounds: 1,
+      implementationAuditRepairRounds: 2,
+      maxImplementationPrompts: 12,
+      maxElapsedMinutes: 240,
+    },
+    status: 'implementation_task_loop',
+    stage: 'implementation_task_loop',
+    elapsedMs: 0,
+    implementationPromptCount: 0,
+    taskStats: { total: 0, checked: 0, unchecked: 0 },
+    specAuditRepairRound: 0,
+    implementationAuditRepairRound: 0,
+    selectedTeamComboId: 'audit>review>plan',
+    activeOpenSpecPromptId: 'implementation_audit',
+    ...overrides,
+  };
+}
+
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
   closed = false;
@@ -3167,7 +3196,7 @@ describe('WsBridge', () => {
       daemonWs.emit('message', JSON.stringify({
         type: OPENSPEC_AUTO_DELIVER_MSG.STATUS_PROJECTION,
         requestId: 'auto-status-recover',
-        projection: {
+        projection: makeOpenSpecAutoDeliverProjection({
           runId: 'auto-run-1',
           changeName: 'openspec-auto-delivery',
           owningMainSessionName: 'deck_proj_brain',
@@ -3175,11 +3204,11 @@ describe('WsBridge', () => {
           targetImplementationSessionName: 'deck_sub_worker',
           projectionVersion: 7,
           generation: 4,
-          status: 'running',
+          status: 'implementation_task_loop',
           stage: 'implementation_task_loop',
           latestRepairSummary: 'fixed token=abc1234567890abcdef',
           rawPrompt: 'do not leak',
-        },
+        }),
       }));
       await flushAsync();
 
@@ -3246,7 +3275,7 @@ describe('WsBridge', () => {
 
       daemonWs.emit('message', JSON.stringify({
         type: OPENSPEC_AUTO_DELIVER_MSG.PROJECTION,
-        projection: {
+        projection: makeOpenSpecAutoDeliverProjection({
           runId: 'auto-run-1',
           changeName: 'openspec-auto-delivery',
           owningMainSessionName: 'deck_proj_brain',
@@ -3257,7 +3286,7 @@ describe('WsBridge', () => {
           status: 'implementation_task_loop',
           stage: 'implementation_task_loop',
           latestRepairSummary: 'private repair summary token=abc123',
-        },
+        }),
       }));
       await flushAsync();
 
@@ -3298,25 +3327,33 @@ describe('WsBridge', () => {
 
       daemonWs.emit('message', JSON.stringify({
         type: OPENSPEC_AUTO_DELIVER_MSG.PROJECTION,
-        projection: {
+        projection: makeOpenSpecAutoDeliverProjection({
           runId: 'auto-run-versioned',
           changeName: 'openspec-auto-delivery',
           owningMainSessionName: 'deck_proj_brain',
+          launchedFromSessionName: 'deck_proj_brain',
+          targetImplementationSessionName: 'deck_proj_brain',
           projectionVersion: 5,
           generation: 5,
+          status: 'implementation_audit_repair',
           stage: 'implementation_audit_repair',
-        },
+          activeOpenSpecPromptId: 'implementation_audit',
+        }),
       }));
       daemonWs.emit('message', JSON.stringify({
         type: OPENSPEC_AUTO_DELIVER_MSG.PROJECTION,
-        projection: {
+        projection: makeOpenSpecAutoDeliverProjection({
           runId: 'auto-run-versioned',
           changeName: 'openspec-auto-delivery',
           owningMainSessionName: 'deck_proj_brain',
+          launchedFromSessionName: 'deck_proj_brain',
+          targetImplementationSessionName: 'deck_proj_brain',
           projectionVersion: 4,
           generation: 4,
+          status: 'spec_audit_repair',
           stage: 'spec_audit_repair',
-        },
+          activeOpenSpecPromptId: 'proposal_audit',
+        }),
       }));
       await flushAsync();
 
@@ -3334,21 +3371,27 @@ describe('WsBridge', () => {
       daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
       await flushAsync();
 
-      bridge.rememberOpenSpecAutoDeliverProjectionForTests({
+      bridge.rememberOpenSpecAutoDeliverProjectionForTests(makeOpenSpecAutoDeliverProjection({
         runId: 'active-run',
         changeName: 'active-change',
         owningMainSessionName: 'deck_active_brain',
+        launchedFromSessionName: 'deck_active_brain',
+        targetImplementationSessionName: 'deck_active_brain',
         projectionVersion: 1,
         generation: 1,
-      });
-      bridge.rememberOpenSpecAutoDeliverProjectionForTests({
+      }));
+      bridge.rememberOpenSpecAutoDeliverProjectionForTests(makeOpenSpecAutoDeliverProjection({
         runId: 'terminal-run',
         changeName: 'terminal-change',
         owningMainSessionName: 'deck_terminal_brain',
+        launchedFromSessionName: 'deck_terminal_brain',
+        targetImplementationSessionName: 'deck_terminal_brain',
         projectionVersion: 1,
         generation: 1,
+        status: 'passed',
+        stage: 'passed',
         terminal: true,
-      });
+      }));
 
       daemonWs.close();
       await flushAsync();
