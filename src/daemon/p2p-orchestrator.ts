@@ -13,6 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatusAsync } from '../agent/detect.js';
 import { getSession } from '../store/session-store.js';
+import type { SessionRecord } from '../store/session-store.js';
 import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../agent/session-manager.js';
 import {
   P2P_BASELINE_PROMPT,
@@ -853,7 +854,7 @@ async function dispatchP2pPromptToSession(args: {
   allowDuplicate?: boolean;
   reason: string;
 }): Promise<'sent' | 'queued' | 'tmux'> {
-  const transportRuntime = getTransportRuntime(args.session);
+  const transportRuntime = await getOrRestoreP2pTransportRuntime(args.session);
   if (transportRuntime) {
     timelineEmitter.emit(args.session, 'user.message', {
       text: args.prompt,
@@ -866,8 +867,48 @@ async function dispatchP2pPromptToSession(args: {
     }
     return result;
   }
+  const record = getSession(args.session);
+  if (record?.runtimeType === 'transport') {
+    throw new Error(`missing_transport_runtime:${args.session}`);
+  }
   await sendKeysDelayedEnter(args.session, args.prompt);
   return 'tmux';
+}
+
+async function getOrRestoreP2pTransportRuntime(sessionName: string): Promise<ReturnType<typeof getTransportRuntime>> {
+  const existing = getTransportRuntime(sessionName);
+  if (existing) return existing;
+  const record = getSession(sessionName);
+  if (record?.runtimeType !== 'transport') return undefined;
+
+  await restoreP2pTransportRuntime(record, 'missing_runtime');
+  return getTransportRuntime(sessionName);
+}
+
+async function restoreP2pTransportRuntime(record: SessionRecord, reason: 'missing_runtime'): Promise<void> {
+  logger.warn({ session: record.name, reason }, 'P2P: restoring transport runtime before prompt dispatch');
+  await stopTransportRuntimeSession(record.name).catch(() => undefined);
+  await launchTransportSession({
+    name: record.name,
+    projectName: record.projectName,
+    role: record.role,
+    agentType: record.agentType as any,
+    projectDir: record.projectDir,
+    label: record.label,
+    description: record.description,
+    requestedModel: record.requestedModel,
+    effort: record.effort,
+    transportConfig: record.transportConfig,
+    ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
+    ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
+    ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
+    ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk' || record.agentType === 'kimi-sdk') && record.providerResumeId
+      ? { providerResumeId: record.providerResumeId } : {}),
+    ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
+    ...(record.agentType === 'qwen' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
+    ...(record.parentSession ? { parentSession: record.parentSession } : {}),
+    ...(record.userCreated ? { userCreated: true } : {}),
+  });
 }
 
 function emitP2pTransportQueuedState(

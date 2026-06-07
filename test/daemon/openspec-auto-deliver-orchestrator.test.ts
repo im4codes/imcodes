@@ -17,6 +17,7 @@ interface MockP2pRun {
   userText?: string;
   resultSummary?: string | null;
   strictAuthoritativeResult?: string | null;
+  error?: string | null;
 }
 
 const { getSessionMock, listSessionsMock, getSavedP2pConfigMock, getTransportRuntimeMock, serverLinkMock, transportSendMock, p2pRuns, startP2pRunMock, getP2pRunMock, listP2pRunsMock, cancelP2pRunMock } = vi.hoisted(() => ({
@@ -332,6 +333,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     );
     expect(auditProjection.projection.selectedTeamComboId).toBe('audit>review>plan');
     expect(auditProjection.projection.activeOpenSpecPromptId).toBe('implementation_audit');
+    expect(auditProjection.projection.implementationAuditRound).toEqual({ current: 0, total: 1 });
     const implementationLaunch = startP2pRunMock.mock.calls.at(-1)?.[0] as {
       modeOverride?: string;
       rounds?: number;
@@ -370,23 +372,27 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       presetId: 'standard',
     }, serverLinkMock as never);
 
-    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
+    const specAuditProjection = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
+    expect(specAuditProjection.projection.specAuditRound).toEqual({ current: 0, total: 1 });
     await completeLatestAudit('completed');
-    await waitForSend((msg) =>
+    const implementationPromptProjection = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && (msg.projection as { stage?: string; implementationPromptCount?: number }).stage === 'implementation_task_loop'
       && (msg.projection as { implementationPromptCount?: number }).implementationPromptCount === 1,
       2500,
     );
+    expect(implementationPromptProjection.projection.specAuditRound).toEqual({ current: 1, total: 1 });
 
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
-    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
+    const implementationAuditProjection = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
+    expect(implementationAuditProjection.projection.implementationAuditRound).toEqual({ current: 0, total: 2 });
     await completeLatestAudit('completed');
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.moduleScores).toHaveLength(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.length);
+    expect(terminal?.projection.implementationAuditRound).toEqual({ current: 1, total: 2 });
   });
 
   it('starts the materialized spec audit-repair stage for presets with spec rounds', async () => {
@@ -757,7 +763,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(terminal?.projection.status).toBe('passed');
   });
 
-  it('consumes a valid authoritative result file even when the wrapper P2P run fails', async () => {
+  it('surfaces wrapper P2P failures instead of misreporting missing authoritative JSON', async () => {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
@@ -769,11 +775,15 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
 
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
+    const p2pRun = [...p2pRuns.values()].at(-1)!;
+    p2pRun.error = 'dispatch_failed: tmux send-keys failed: can\'t find pane: deck_demo_brain';
     await completeLatestAudit('failed');
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
-    expect(terminal?.projection.status).toBe('passed');
-    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
+    expect(terminal?.projection.status).toBe('needs_human');
+    expect(terminal?.projection.terminalReason).toBe('audit_p2p_failed');
+    expect(terminal?.projection.evidence?.some((entry: { summary?: string }) => entry.summary?.includes('dispatch_failed'))).toBe(true);
+    expect(transportSendMock.mock.calls.some((call) => String(call[0] ?? '').includes('Problem: missing_authoritative_json'))).toBe(false);
   });
 
   it('rejects invalid presets and zero-task changes before acquiring a run', async () => {

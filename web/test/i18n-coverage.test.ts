@@ -101,6 +101,7 @@ const OPENSPEC_AUTO_DELIVER_KEYS = [
   'openspec.auto.ask.stop_summarize',
   'openspec.auto.ask.stop_summarize_desc',
   'openspec.auto.reason.missing_authoritative_json',
+  'openspec.auto.reason.audit_p2p_failed',
   'openspec.auto.reason.auto_deliver_active',
   'openspec.auto.reason.invalid_authoritative_json',
   'openspec.auto.reason.audit_metadata_mismatch',

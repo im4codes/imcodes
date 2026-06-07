@@ -120,6 +120,38 @@ async function writeFailedExecutionMarkerFromPrompt(prompt: string, error = 'age
   return true;
 }
 
+function makeFakeTransportRuntime(sessionName: string): Record<string, unknown> {
+  return {
+    providerSessionId: `${sessionName}:provider`,
+    pendingCount: 0,
+    pendingVersion: 0,
+    pendingMessages: [],
+    pendingEntries: [],
+    drainPendingIfIdle: vi.fn().mockReturnValue(false),
+    getDiagnosticSnapshot: vi.fn().mockReturnValue({
+      status: 'idle',
+      sending: false,
+      pendingCount: 0,
+      pendingVersion: 0,
+      activeDispatchCount: 0,
+      stalePendingRecoveryActive: false,
+      providerSessionBound: true,
+      lastActivityAt: Date.now(),
+      lastActivityAgeMs: 0,
+    }),
+    cancelStaleActiveTurnWithPending: vi.fn().mockReturnValue(false),
+    cancel: vi.fn().mockResolvedValue(undefined),
+    send: vi.fn((prompt: string) => {
+      const filePath = [...prompt.matchAll(/\/\S+?\.md/g)].at(-1)?.[0] ?? pathFromPrompt(prompt);
+      const heading = headingFromPrompt(prompt);
+      void appendFile(filePath, `\n## ${heading}\n\nTransport output from ${sessionName}.\n`, 'utf8')
+        .then(() => writeExecutionMarkerFromPrompt(prompt))
+        .then(() => setTimeout(() => notifySessionIdle(sessionName), 20));
+      return 'sent';
+    }),
+  };
+}
+
 async function waitForStatus(runId: string, expected: P2pRunStatus[], maxMs = 10000): Promise<P2pRun> {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
@@ -273,6 +305,50 @@ describe('P2P orchestrator — parallel rounds', () => {
     const done = await waitForStatus(run.id, ['completed']);
     expect(done.hopStates).toHaveLength(1);
     expect(done.hopStates[0].artifact_path).toContain(`${done.id}.round1.hop1.md`);
+  });
+
+  it('restores transport initiator runtime instead of falling back to tmux dispatch', async () => {
+    const runtimeBySession = new Map<string, any>();
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_sdk_brain') {
+        return {
+          name,
+          projectName: 'demo',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          providerId: 'codex-sdk',
+          providerSessionId: 'provider-old',
+          codexSessionId: 'codex-resume-id',
+          projectDir: tempProjectDir,
+          parentSession: undefined,
+          label: 'brain',
+        };
+      }
+      if (name === 'deck_sub_peer') return { agentType: 'claude-code', projectDir: tempProjectDir, parentSession: 'deck_sdk_brain', label: 'peer' };
+      return null;
+    });
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) => runtimeBySession.get(session));
+    launchTransportSessionMock.mockImplementation(async (opts: { name: string }) => {
+      runtimeBySession.set(opts.name, makeFakeTransportRuntime(opts.name));
+    });
+
+    const run = await startP2pRun(
+      'deck_sdk_brain',
+      [{ session: 'deck_sub_peer', mode: 'audit' }],
+      'transport restore p2p prompt',
+      [],
+      serverLinkMock as any,
+    );
+
+    await waitForStatus(run.id, ['completed'], 5_000);
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sdk_brain',
+      agentType: 'codex-sdk',
+      codexSessionId: 'codex-resume-id',
+    }));
+    expect(sendKeysDelayedEnterMock.mock.calls.some((call) => call[0] === 'deck_sdk_brain')).toBe(false);
+    expect(runtimeBySession.get('deck_sdk_brain')?.send).toHaveBeenCalled();
   });
 
   it('nudges stale active transport work when a P2P prompt is queued behind it', async () => {
@@ -1785,8 +1861,13 @@ describe('P2P orchestrator — parallel rounds', () => {
 
   it('cleans up clone-mode temporary sdk helper sessions after reducer use', async () => {
     let helperName: string | null = null;
+    const runtimeBySession = new Map<string, any>([
+      ['deck_proj_brain', makeFakeTransportRuntime('deck_proj_brain')],
+    ]);
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) => runtimeBySession.get(session));
     launchTransportSessionMock.mockImplementation(async (opts: any) => {
       helperName = opts.name;
+      runtimeBySession.set(opts.name, makeFakeTransportRuntime(opts.name));
     });
     getSessionMock.mockImplementation((name: string) => {
       if (name === 'deck_proj_brain') {
@@ -1982,6 +2063,13 @@ describe('P2P orchestrator — parallel rounds', () => {
   });
 
   it('launches and tears down clone-mode helper sessions', async () => {
+    const runtimeBySession = new Map<string, any>([
+      ['deck_proj_brain', makeFakeTransportRuntime('deck_proj_brain')],
+    ]);
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) => runtimeBySession.get(session));
+    launchTransportSessionMock.mockImplementation(async (opts: any) => {
+      runtimeBySession.set(opts.name, makeFakeTransportRuntime(opts.name));
+    });
     getSessionMock.mockImplementation((name: string) => {
       if (name === 'deck_proj_brain') return {
         agentType: 'claude-code-sdk',

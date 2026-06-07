@@ -1270,6 +1270,7 @@
       },
       "reason": {
         "auto_deliver_active": "此會話已經有 Auto Deliver 正在執行。",
+        "audit_p2p_failed": "Team/P2P 審計執行在產出結果前失敗。",
         "missing_authoritative_json": "審計沒有產出最終權威 JSON 結果。",
         "invalid_authoritative_json": "最終權威 JSON 結果無效。",
         "audit_metadata_mismatch": "審計結果元資料與本次 Auto Deliver 執行不匹配。",

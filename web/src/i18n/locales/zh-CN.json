@@ -1270,6 +1270,7 @@
       },
       "reason": {
         "auto_deliver_active": "此会话已经有 Auto Deliver 正在运行。",
+        "audit_p2p_failed": "Team/P2P 审计运行在产出结果前失败。",
         "missing_authoritative_json": "审计没有产出最终权威 JSON 结果。",
         "invalid_authoritative_json": "最终权威 JSON 结果无效。",
         "audit_metadata_mismatch": "审计结果元数据与本次 Auto Deliver 运行不匹配。",

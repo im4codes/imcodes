@@ -140,6 +140,8 @@ export interface OpenSpecAutoDeliverProjection {
   taskStats: OpenSpecAutoDeliverTaskStats;
   specAuditRepairRound: number;
   implementationAuditRepairRound: number;
+  specAuditRound?: { current: number; total: number };
+  implementationAuditRound?: { current: number; total: number };
   activeP2pRunId?: string;
   selectedTeamComboId?: string;
   activeOpenSpecPromptId?: OpenSpecAutoDeliverStagePromptId;

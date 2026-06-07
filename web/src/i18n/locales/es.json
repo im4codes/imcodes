@@ -1269,6 +1269,7 @@
       },
       "reason": {
         "auto_deliver_active": "Auto Deliver ya se está ejecutando para esta sesión.",
+        "audit_p2p_failed": "La auditoría Team/P2P falló antes de producir un resultado.",
         "missing_authoritative_json": "La auditoría no produjo un resultado JSON autoritativo final.",
         "invalid_authoritative_json": "El resultado JSON autoritativo final no es válido.",
         "audit_metadata_mismatch": "Los metadatos del resultado de auditoría no coinciden con esta ejecución de Auto Deliver.",

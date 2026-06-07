@@ -1269,6 +1269,7 @@
       },
       "reason": {
         "auto_deliver_active": "Auto Deliver уже выполняется для этой сессии.",
+        "audit_p2p_failed": "Аудит Team/P2P завершился ошибкой до создания результата.",
         "missing_authoritative_json": "Аудит не выдал финальный авторитетный результат JSON.",
         "invalid_authoritative_json": "Финальный авторитетный результат JSON недействителен.",
         "audit_metadata_mismatch": "Метаданные результата аудита не соответствуют этому запуску Auto Deliver.",

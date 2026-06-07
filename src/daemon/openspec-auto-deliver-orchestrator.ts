@@ -342,7 +342,21 @@ function enforceElapsedLimit(run: AutoDeliverRun): OpenSpecAutoDeliverProjection
   return terminalizeAndSend(run, 'needs_human', 'max_elapsed_time_reached');
 }
 
+function completedAuditRoundCount(run: AutoDeliverRun, stage: AuditRepairStage): number {
+  const startedCount = auditRoundCount(run, stage);
+  const activeInStage = run.activeAudit?.stage === stage ? 1 : 0;
+  return Math.max(0, startedCount - activeInStage);
+}
+
 function buildProjection(run: AutoDeliverRun): OpenSpecAutoDeliverProjection {
+  const specAuditRound = {
+    current: completedAuditRoundCount(run, 'spec_audit_repair'),
+    total: run.materializedLimits.specAuditRepairRounds,
+  };
+  const implementationAuditRound = {
+    current: completedAuditRoundCount(run, 'implementation_audit_repair'),
+    total: run.materializedLimits.implementationAuditRepairRounds,
+  };
   return {
     visibility: 'full',
     projectionVersion: run.projectionVersion,
@@ -365,6 +379,8 @@ function buildProjection(run: AutoDeliverRun): OpenSpecAutoDeliverProjection {
     taskStats: cloneTaskStats(run.taskStats),
     specAuditRepairRound: run.specAuditRepairRound,
     implementationAuditRepairRound: run.implementationAuditRepairRound,
+    specAuditRound,
+    implementationAuditRound,
     activeP2pRunId: run.activeAudit?.p2pRunId,
     selectedTeamComboId: run.selectedTeamComboId,
     activeOpenSpecPromptId: run.activeAudit?.activeOpenSpecPromptId,
@@ -609,6 +625,13 @@ function isRetryableAuditResultError(reason: string | undefined): boolean {
     || reason === 'authoritative_payload_too_large'
     || reason === 'invalid_authoritative_json'
     || reason === 'invalid_audit_verdict';
+}
+
+function p2pAuditFailureSummary(p2pRun: P2pRun): string {
+  const detail = p2pRun.error?.trim();
+  return detail
+    ? `Team/P2P audit run failed before producing an authoritative result. status=${p2pRun.status}; error=${detail}`
+    : `Team/P2P audit run failed before producing an authoritative result. status=${p2pRun.status}`;
 }
 
 function safeAutoDeliverResultBasename(run: AutoDeliverRun, stage: AuditRepairStage, generation: number, roundIndex: number): string {
@@ -1005,6 +1028,17 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
     return;
   }
   clearAuditPollTimer(runId);
+  if (p2pRun.status !== 'completed') {
+    run.evidence = mergeEvidence(run.evidence, [{
+      source: 'daemon',
+      summary: p2pAuditFailureSummary(p2pRun),
+      stale: false,
+    }]);
+    run.activeAudit = undefined;
+    const projection = terminalize(run, 'needs_human', 'audit_p2p_failed');
+    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+    return;
+  }
   const verdict = await consumeAuditResultFile(run, expected);
   if (!verdict) {
     const reason = run.latestMessage ?? 'invalid_audit_result';
