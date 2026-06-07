@@ -191,6 +191,22 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
   });
 
+  it('send() queues when any active-turn marker is present, even if the sending flag is stale', async () => {
+    runtime.send('first', 'msg-active-1');
+    await flushDispatch();
+
+    const internal = runtime as unknown as {
+      _sending: boolean;
+    };
+    internal._sending = false;
+
+    expect(runtime.send('second', 'msg-active-2')).toBe('queued');
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-active-2', text: 'second' },
+    ]);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
   it('diagnostic snapshot exposes active dispatch and pending queue state', async () => {
     runtime.send('first', 'cmd-first');
     await flushDispatch();

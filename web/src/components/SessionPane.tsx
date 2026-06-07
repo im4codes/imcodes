@@ -243,6 +243,10 @@ export function SessionPane({
   const effectiveRuntimeType = resolveSessionInfoRuntimeType(session);
   const isTransportSession = effectiveRuntimeType === 'transport';
   const effectiveViewMode: ViewMode = isTransportSession ? 'chat' : viewMode;
+  const controlsSession = useMemo<SessionInfo>(() => {
+    if (!isTransportSession || !liveSessionState || liveSessionState === session.state) return session;
+    return { ...session, state: liveSessionState as SessionInfo['state'] };
+  }, [isTransportSession, liveSessionState, session]);
 
   // ── Chat scroll + input ref ─────────────────────────────────────────────────
   const chatScrollFnRef = useRef<(() => void) | null>(null);
@@ -398,7 +402,7 @@ export function SessionPane({
       {isActive && (
         <SessionControls
           ws={ws}
-          activeSession={session}
+          activeSession={controlsSession}
           inputRef={inputRef}
           onAfterAction={onAfterAction}
           onSend={(_name, text, meta) => {

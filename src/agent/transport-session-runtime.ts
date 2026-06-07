@@ -651,7 +651,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
     };
 
-    if (this._sending) {
+    if (this.hasActiveTurnWork()) {
       this._pendingMessages.push(entry);
       this._pendingVersion++;
       return 'queued';
