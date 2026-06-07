@@ -189,6 +189,49 @@ describe('OpenSpec Auto Deliver server projection sanitizer', () => {
       maxElapsedMinutes: 240,
     });
   });
+
+  it('derives scalar-only active audit progress as completed attempts, not started attempts', () => {
+    const projection = sanitizeOpenSpecAutoDeliverProjection({
+      runId: 'run-active-audit',
+      changeName: 'change-active-audit',
+      owningMainSessionName: 'deck_proj_brain',
+      projectionVersion: 1,
+      generation: 1,
+      status: 'implementation_audit_repair',
+      stage: 'implementation_audit_repair',
+      activeP2pRunId: 'p2p-1',
+      implementationAuditRepairRound: 1,
+      materializedLimits: {
+        specAuditRepairRounds: 0,
+        implementationAuditRepairRounds: 1,
+        maxImplementationPrompts: 6,
+        maxElapsedMinutes: 180,
+      },
+    });
+
+    expect(projection?.implementationAuditRound).toEqual({ current: 0, total: 1 });
+  });
+
+  it('keeps scalar-only terminal audit progress completed after the active run is gone', () => {
+    const projection = sanitizeOpenSpecAutoDeliverProjection({
+      runId: 'run-terminal-audit',
+      changeName: 'change-terminal-audit',
+      owningMainSessionName: 'deck_proj_brain',
+      projectionVersion: 1,
+      generation: 1,
+      status: 'passed',
+      stage: 'passed',
+      implementationAuditRepairRound: 1,
+      materializedLimits: {
+        specAuditRepairRounds: 0,
+        implementationAuditRepairRounds: 1,
+        maxImplementationPrompts: 6,
+        maxElapsedMinutes: 180,
+      },
+    });
+
+    expect(projection?.implementationAuditRound).toEqual({ current: 1, total: 1 });
+  });
 });
 
 describe('OpenSpec Auto Deliver server projection cache', () => {
@@ -386,6 +429,7 @@ describe('OpenSpec Auto Deliver server projection cache', () => {
       stage: 'implementation_task_loop',
       presetId: 'standard',
       selectedTeamComboId: 'audit>review>plan',
+      lastMessage: 'spec_audit_repair_p2p_started',
       taskStats: { total: 2, checked: 1, unchecked: 1, items: [{ checked: false, label: 'private task' }] },
       evidence: [{ source: 'daemon', summary: 'private evidence' }],
     });
@@ -417,6 +461,7 @@ describe('OpenSpec Auto Deliver server projection cache', () => {
         runId: 'own-run',
         changeName: 'own-change',
         selectedTeamComboId: 'audit>review>plan',
+        recentFinding: 'spec_audit_repair_p2p_started',
       }),
     ]);
     const conflictRow = cache.getListRowsForSession('deck_owner_worker')[0];

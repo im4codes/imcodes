@@ -81,6 +81,25 @@ function sanitizeCounterPair(value: unknown): { current: number; total: number }
   return { current, total };
 }
 
+function deriveAuditRoundPair(options: {
+  explicitPair?: { current: number; total: number };
+  startedRound?: number;
+  total?: number;
+  stage: 'spec_audit_repair' | 'implementation_audit_repair';
+  projectionStage: string;
+  terminal: boolean;
+  activeP2pRunId?: string;
+}): { current: number; total: number } | undefined {
+  if (options.explicitPair) return options.explicitPair;
+  if (options.startedRound === undefined && options.total === undefined) return undefined;
+  const total = options.total ?? 0;
+  const activeInStage = !options.terminal
+    && options.projectionStage === options.stage
+    && !!options.activeP2pRunId;
+  const current = Math.max(0, (options.startedRound ?? 0) - (activeInStage ? 1 : 0));
+  return { current: Math.min(current, total), total };
+}
+
 function sanitizeTaskStats(value: unknown): OpenSpecAutoDeliverSanitizedProjection['taskStats'] | undefined {
   if (!isRecord(value)) return undefined;
   const total = sanitizeNonNegativeInteger(value.total);
@@ -316,16 +335,26 @@ export function sanitizeOpenSpecAutoDeliverProjection(
   const implementationAuditRepairRound = sanitizeNonNegativeInteger(raw.implementationAuditRepairRound);
   if (implementationAuditRepairRound !== undefined) projection.implementationAuditRepairRound = implementationAuditRepairRound;
 
-  const specAuditRound = sanitizeCounterPair(raw.specAuditRound)
-    ?? (specAuditRepairRound !== undefined || materializedLimits?.specAuditRepairRounds !== undefined
-      ? { current: specAuditRepairRound ?? 0, total: materializedLimits?.specAuditRepairRounds ?? 0 }
-      : undefined);
+  const specAuditRound = deriveAuditRoundPair({
+    explicitPair: sanitizeCounterPair(raw.specAuditRound),
+    startedRound: specAuditRepairRound,
+    total: materializedLimits?.specAuditRepairRounds,
+    stage: 'spec_audit_repair',
+    projectionStage: stage,
+    terminal,
+    activeP2pRunId: projection.activeP2pRunId ?? undefined,
+  });
   if (specAuditRound) projection.specAuditRound = specAuditRound;
 
-  const implementationAuditRound = sanitizeCounterPair(raw.implementationAuditRound)
-    ?? (implementationAuditRepairRound !== undefined || materializedLimits?.implementationAuditRepairRounds !== undefined
-      ? { current: implementationAuditRepairRound ?? 0, total: materializedLimits?.implementationAuditRepairRounds ?? 0 }
-      : undefined);
+  const implementationAuditRound = deriveAuditRoundPair({
+    explicitPair: sanitizeCounterPair(raw.implementationAuditRound),
+    startedRound: implementationAuditRepairRound,
+    total: materializedLimits?.implementationAuditRepairRounds,
+    stage: 'implementation_audit_repair',
+    projectionStage: stage,
+    terminal,
+    activeP2pRunId: projection.activeP2pRunId ?? undefined,
+  });
   if (implementationAuditRound) projection.implementationAuditRound = implementationAuditRound;
 
   const moduleScores = sanitizeModuleScores(raw.moduleScores);
@@ -459,6 +488,7 @@ export class OpenSpecAutoDeliverProjectionCache {
       launchedFromSessionName: projection.launchedFromSessionName,
       elapsedMs: projection.elapsedMs,
       terminalReason: projection.terminalReason ?? undefined,
+      recentFinding: projection.recentFinding ?? undefined,
     };
   }
 

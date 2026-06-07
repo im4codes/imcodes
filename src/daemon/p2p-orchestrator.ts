@@ -1085,7 +1085,7 @@ export async function startP2pRun(...args:
   // while letting `prepareAdvancedWorkflowLaunch` and `supervision-automation`
   // funnel through the typed discriminated union.
   const advancedSource: StartP2pRunAdvancedSource | undefined = opts.advanced;
-  const advancedPresetKey = advancedSource?.kind === 'supervision_internal' || advancedSource?.kind === 'openspec_auto_deliver_internal'
+  const advancedPresetKey = advancedSource?.kind === 'supervision_internal'
     ? advancedSource.advancedPresetKey
     : opts.advancedPresetKey;
   const advancedRounds = advancedSource

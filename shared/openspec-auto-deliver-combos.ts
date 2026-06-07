@@ -1,6 +1,6 @@
 import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
-  OPENSPEC_AUTO_DELIVER_COMBO_IDS,
+  OPENSPEC_AUTO_DELIVER_UNSUPPORTED_LEGACY_COMBO_IDS,
   OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_PROMPT_ID,
   OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_PROMPT_ID,
   type OpenSpecAutoDeliverStage,
@@ -28,8 +28,8 @@ export function evaluateOpenSpecAutoDeliverComboCompatibility(
   activeOpenSpecPromptId = activeOpenSpecPromptIdForAutoDeliverStage(stage),
 ): OpenSpecAutoDeliverCompatibilityResult {
   if (
-    selectedTeamComboId === OPENSPEC_AUTO_DELIVER_COMBO_IDS.SPEC_AUDIT_REPAIR
-    || selectedTeamComboId === OPENSPEC_AUTO_DELIVER_COMBO_IDS.IMPLEMENTATION_AUDIT_REPAIR
+    selectedTeamComboId === OPENSPEC_AUTO_DELIVER_UNSUPPORTED_LEGACY_COMBO_IDS.SPEC_AUDIT_REPAIR
+    || selectedTeamComboId === OPENSPEC_AUTO_DELIVER_UNSUPPORTED_LEGACY_COMBO_IDS.IMPLEMENTATION_AUDIT_REPAIR
   ) {
     return { ok: false, reason: 'legacy_combo_unsupported' };
   }

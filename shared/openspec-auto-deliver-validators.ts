@@ -6,6 +6,7 @@ import {
   OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX,
   OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MIN,
   OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE,
+  OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_VERDICT_FIELDS,
   OPENSPEC_AUTO_DELIVER_PRESET_IDS,
   OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX,
   OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MIN,
@@ -191,6 +192,10 @@ function validateStringArray(value: unknown, path: string): OpenSpecAutoDeliverV
   return value.flatMap((entry, index) => typeof entry === 'string' ? [] : [issue('invalid_string_array_item', 'Expected a string.', `${path}[${index}]`)]);
 }
 
+const OPENSPEC_AUTO_DELIVER_STRING_ARRAY_VERDICT_FIELDS = OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_VERDICT_FIELDS.filter((
+  field,
+): field is 'unchecked_tasks' | 'required_changes' => field === 'unchecked_tasks' || field === 'required_changes');
+
 export function validateOpenSpecAutoDeliverVerdictPayload(input: unknown): OpenSpecAutoDeliverValidationResult<OpenSpecAutoDeliverVerdictPayload> {
   if (!isRecord(input)) return { ok: false, issues: [issue('invalid_verdict_payload', 'Verdict payload must be an object.')] };
   const issues: OpenSpecAutoDeliverValidationIssue[] = [];
@@ -210,8 +215,9 @@ export function validateOpenSpecAutoDeliverVerdictPayload(input: unknown): OpenS
       if (!seen.has(moduleId)) issues.push(issue('missing_score_module', `Missing score module: ${moduleId}.`, 'module_scores'));
     }
   }
-  issues.push(...validateStringArray(input.unchecked_tasks, 'unchecked_tasks'));
-  issues.push(...validateStringArray(input.required_changes, 'required_changes'));
+  for (const field of OPENSPEC_AUTO_DELIVER_STRING_ARRAY_VERDICT_FIELDS) {
+    issues.push(...validateStringArray(input[field], field));
+  }
   if (!Array.isArray(input.repairs_applied)) {
     issues.push(issue('invalid_repairs_applied', 'repairs_applied must be an array.', 'repairs_applied'));
   } else {

@@ -46,6 +46,30 @@ export interface OpenSpecAutoDeliverDetailsPanelProps {
   onStop: () => void;
 }
 
+type TranslationFn = (key: string, opts?: Record<string, unknown>) => string;
+
+export type ProgressMetricKind = 'overall' | 'round' | 'tasks' | 'prompts' | 'stage';
+
+export interface ProgressMetric {
+  current: number;
+  total: number;
+  percent: number;
+  kind: ProgressMetricKind;
+}
+
+export interface OpenSpecAutoDeliverProgressMetrics {
+  overall: ProgressMetric;
+  currentStage: ProgressMetric;
+}
+
+const OVERALL_PROGRESS_PHASES = [
+  'proposed',
+  'spec_audit_repair',
+  'implementation_task_loop',
+  'implementation_audit_repair',
+] as const;
+const OVERALL_PROGRESS_TOTAL = OVERALL_PROGRESS_PHASES.length + 1;
+
 function formatElapsed(ms: number): string {
   const safe = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(safe / 3600);
@@ -81,7 +105,60 @@ function taskProgressText(projection: OpenSpecAutoDeliverProjection, t: (key: st
   return t('openspec.auto.tasks_progress', { checked: stats.checked, total: stats.total });
 }
 
+function clampProgressValue(value: number, total: number): number {
+  if (!Number.isFinite(value) || !Number.isFinite(total) || total <= 0) return 0;
+  return Math.max(0, Math.min(total, value));
+}
+
+function progressMetric(current: number, total: number, kind: ProgressMetricKind): ProgressMetric {
+  const safeTotal = Number.isFinite(total) && total > 0 ? total : 1;
+  const safeCurrent = clampProgressValue(current, safeTotal);
+  return {
+    current: safeCurrent,
+    total: safeTotal,
+    percent: Math.round((safeCurrent / safeTotal) * 100),
+    kind,
+  };
+}
+
+function counterPairMetric(pair: { current: number; total: number } | undefined): ProgressMetric {
+  if (pair && pair.total > 0) return progressMetric(pair.current, pair.total, 'round');
+  return progressMetric(0, 1, 'round');
+}
+
+export function computeOpenSpecAutoDeliverProgress(projection: OpenSpecAutoDeliverProjection): OpenSpecAutoDeliverProgressMetrics {
+  const status = projectionStatus(projection);
+  const stage = projectionStage(projection);
+  const terminal = isOpenSpecAutoDeliverTerminalStatus(status);
+  const phaseIndex = OVERALL_PROGRESS_PHASES.indexOf(stage as typeof OVERALL_PROGRESS_PHASES[number]);
+  const overallCurrent = terminal
+    ? OVERALL_PROGRESS_TOTAL
+    : phaseIndex >= 0 ? phaseIndex + 1 : 1;
+  let currentStage = progressMetric(0, 1, 'stage');
+
+  if (terminal) {
+    currentStage = progressMetric(1, 1, 'stage');
+  } else if (stage === 'spec_audit_repair') {
+    currentStage = counterPairMetric(projection.specAuditRound);
+  } else if (stage === 'implementation_audit_repair') {
+    currentStage = counterPairMetric(projection.implementationAuditRound);
+  } else if (stage === 'implementation_task_loop') {
+    const stats = projection.taskStats;
+    if (stats && stats.total > 0) {
+      currentStage = progressMetric(stats.checked, stats.total, 'tasks');
+    } else if (projection.materializedLimits?.maxImplementationPrompts && projection.materializedLimits.maxImplementationPrompts > 0) {
+      currentStage = progressMetric(projection.implementationPromptCount ?? 0, projection.materializedLimits.maxImplementationPrompts, 'prompts');
+    }
+  }
+
+  return {
+    overall: progressMetric(overallCurrent, OVERALL_PROGRESS_TOTAL, 'overall'),
+    currentStage,
+  };
+}
+
 function humanizeAutoDeliverCode(value: string): string {
+  if (/\s/.test(value) && !value.includes('_')) return value;
   return value
     .split('_')
     .filter(Boolean)
@@ -93,12 +170,27 @@ export function translateAutoDeliverReason(value: string | null | undefined, t: 
   if (!value) return undefined;
   if (value.startsWith('quality_gate_low_score:')) {
     const modules = value.slice('quality_gate_low_score:'.length).replace(/,/g, ', ');
-    return t('openspec.auto.reason.quality_gate_low_score', {
+    const key = 'openspec.auto.reason.quality_gate_low_score';
+    const fallback = `Quality gate stopped for low module score: ${modules}`;
+    const translated = t(key, {
       modules,
-      defaultValue: `Quality gate stopped for low module score: ${modules}`,
+      defaultValue: fallback,
     });
+    return translated === key ? fallback : translated;
   }
-  return t(`openspec.auto.reason.${value}`, { defaultValue: humanizeAutoDeliverCode(value) });
+  const key = `openspec.auto.reason.${value}`;
+  const fallback = humanizeAutoDeliverCode(value);
+  const translated = t(key, { defaultValue: fallback });
+  return translated === key ? fallback : translated;
+}
+
+export function translateAutoDeliverMessage(value: string | null | undefined, t: TranslationFn): string | undefined {
+  if (!value) return undefined;
+  const key = `openspec.auto.lifecycle.${value}`;
+  const fallback = `__missing_${key}__`;
+  const translated = t(key, { defaultValue: fallback });
+  if (translated !== fallback && translated !== key && translated !== value) return translated;
+  return translateAutoDeliverReason(value, t);
 }
 
 function uncheckedTaskLabels(projection: OpenSpecAutoDeliverProjection): string[] {
@@ -117,7 +209,7 @@ function formatRoundPair(pair: { current: number; total: number } | undefined, f
 
 function formatEvidenceSummary(summary: string | undefined, t: (key: string, opts?: Record<string, unknown>) => string): string | undefined {
   if (!summary) return undefined;
-  return translateAutoDeliverReason(summary, t);
+  return translateAutoDeliverMessage(summary, t);
 }
 
 function projectionElapsedMs(projection: OpenSpecAutoDeliverProjection, now: number): number {
@@ -125,6 +217,45 @@ function projectionElapsedMs(projection: OpenSpecAutoDeliverProjection, now: num
   if (typeof projection.elapsedMs === 'number' && Number.isFinite(projection.elapsedMs)) return projection.elapsedMs;
   if (typeof projection.startedAt === 'number' && Number.isFinite(projection.startedAt)) return now - projection.startedAt;
   return 0;
+}
+
+function progressPercentText(metric: ProgressMetric, t: TranslationFn): string {
+  return t('openspec.auto.progress_percent', { percent: metric.percent });
+}
+
+function progressCountText(metric: ProgressMetric, t: TranslationFn): string {
+  return t('openspec.auto.progress_count', { current: metric.current, total: metric.total });
+}
+
+function currentStageProgressText(projection: OpenSpecAutoDeliverProjection, metric: ProgressMetric, t: TranslationFn): string {
+  if (metric.kind === 'tasks') return taskProgressText(projection, t);
+  if (metric.kind === 'prompts') {
+    return t('openspec.auto.prompt_progress', { count: metric.current, total: metric.total });
+  }
+  if (metric.kind === 'round') return progressCountText(metric, t);
+  const stage = projectionStage(projection);
+  return t(stageKey(stage), { defaultValue: stage });
+}
+
+function progressLineValue(primary: string, metric: ProgressMetric, t: TranslationFn): string {
+  return `${primary} · ${progressPercentText(metric, t)}`;
+}
+
+function ProgressLine({ label, value, percent }: { label: string; value: string; percent: number }) {
+  return (
+    <div class="discussions-progress-line">
+      <div class="discussions-progress-line-head">
+        <span class="discussions-progress-line-label">{label}</span>
+        <span class="discussions-progress-line-value">{value}</span>
+      </div>
+      <div class="discussions-progress-bar openspec-auto-progressbar">
+        <div
+          class="discussions-progress-fill openspec-auto-progressfill"
+          style={{ width: `${Math.max(0, Math.min(100, percent))}%` }}
+        />
+      </div>
+    </div>
+  );
 }
 
 export function OpenSpecAutoDeliverLauncher({
@@ -352,6 +483,10 @@ export function OpenSpecAutoDeliverRunBar({
   const canStop = projection.canStop !== false && active;
   const statusLabel = t(statusKey(status), status);
   const title = projectionTitle(projection);
+  const progress = computeOpenSpecAutoDeliverProgress(projection);
+  const overallText = progressLineValue(progressCountText(progress.overall, t), progress.overall, t);
+  const currentStageText = progressLineValue(currentStageProgressText(projection, progress.currentStage, t), progress.currentStage, t);
+  const latestMessage = translateAutoDeliverMessage(projection.recentFinding, t);
 
   if (compact) {
     return (
@@ -362,6 +497,8 @@ export function OpenSpecAutoDeliverRunBar({
             <div class="discussions-progress-title">{title}</div>
           </div>
           <span class="discussions-progress-badge discussions-progress-badge-phase">{stageLabel}</span>
+          <span class="discussions-progress-badge">{overallText}</span>
+          {latestMessage && <span class="discussions-progress-badge">{latestMessage}</span>}
           <button class="discussions-progress-stop openspec-auto-view-btn" type="button" onClick={onView}>
             {t('openspec.auto.view')}
           </button>
@@ -415,21 +552,22 @@ export function OpenSpecAutoDeliverRunBar({
         )}
       </div>
       <div class="discussions-progress-lines">
-        <div class="discussions-progress-line">
-          <div class="discussions-progress-line-head">
-            <span class="discussions-progress-line-label">{t('openspec.auto.tasks')}</span>
-            <span class="discussions-progress-line-value">{taskText}</span>
-          </div>
-          <div class="discussions-progress-bar openspec-auto-taskbar">
-            <div
-              class="discussions-progress-fill openspec-auto-taskfill"
-              style={{ width: `${projection.taskStats && projection.taskStats.total > 0 ? Math.min(100, (projection.taskStats.checked / projection.taskStats.total) * 100) : 0}%` }}
-            />
-          </div>
-        </div>
+        <ProgressLine
+          label={t('openspec.auto.overall_progress')}
+          value={overallText}
+          percent={progress.overall.percent}
+        />
+        <ProgressLine
+          label={t('openspec.auto.current_stage_progress')}
+          value={currentStageText}
+          percent={progress.currentStage.percent}
+        />
       </div>
-      {projection.recentFinding && (
-        <div class="openspec-auto-finding">{projection.recentFinding}</div>
+      {latestMessage && (
+        <div class="openspec-auto-finding">
+          <span class="openspec-auto-finding-label">{t('openspec.auto.latest_message')}</span>
+          <span>{latestMessage}</span>
+        </div>
       )}
     </div>
   );
@@ -459,6 +597,7 @@ export function OpenSpecAutoDeliverDetailsPanel({
   const elapsed = projection ? formatElapsed(projectionElapsedMs(projection, now)) : '00:00';
   const scoreItems = useMemo(() => projection?.moduleScores ?? [], [projection?.moduleScores]);
   const auditResults = useMemo(() => projection?.auditResults ?? [], [projection?.auditResults]);
+  const latestMessage = translateAutoDeliverMessage(projection?.recentFinding, t);
   if (!projection) return null;
 
   return (
@@ -488,6 +627,7 @@ export function OpenSpecAutoDeliverDetailsPanel({
           <DetailRow label={t('openspec.auto.combo_id')} value={projection.selectedTeamComboId ? comboModeLabel(projection.selectedTeamComboId, t) : undefined} />
           <DetailRow label={t('openspec.auto.active_prompt')} value={projection.activeOpenSpecPromptId} />
           <DetailRow label={t('openspec.auto.verdict')} value={projection.latestVerdict} />
+          <DetailRow label={t('openspec.auto.latest_message')} value={latestMessage} />
           <DetailRow label={t('openspec.auto.terminal_reason')} value={translateAutoDeliverReason(projection.terminalReason, t)} />
         </div>
         <div class="openspec-auto-detail-section">
@@ -554,11 +694,10 @@ export function OpenSpecAutoDeliverDetailsPanel({
             </div>
           )}
         </div>
-        {(projection.latestRepairSummary || projection.recentFinding || projection.evidence?.length) && (
+        {(projection.latestRepairSummary || projection.evidence?.length) && (
           <div class="openspec-auto-detail-section">
             <h4>{t('openspec.auto.evidence')}</h4>
             {projection.latestRepairSummary && <div class="openspec-auto-detail-note">{projection.latestRepairSummary}</div>}
-            {projection.recentFinding && <div class="openspec-auto-detail-note">{formatEvidenceSummary(projection.recentFinding, t)}</div>}
             {projection.evidence?.map((item) => (
               <div class="openspec-auto-evidence" key={`${item.summary ?? item.label}:${item.source ?? item.provenance ?? ''}`}>
                 <span>{formatEvidenceSummary(item.summary ?? item.label, t)}</span>
@@ -598,6 +737,12 @@ export function OpenSpecAutoDeliverCurrentRunEntry({
     projection.owningMainSessionName,
     projection.targetImplementationSessionName,
   ].filter(Boolean).join(' → ');
+  const latestMessage = projection.visibility === 'full'
+    ? translateAutoDeliverMessage(projection.recentFinding, t)
+    : undefined;
+  const conflictReason = projection.visibility === 'conflict'
+    ? translateAutoDeliverReason(projection.conflictReason, t)
+    : undefined;
   return (
     <div
       class={`openspec-auto-current-run${redacted ? ' openspec-auto-current-run-redacted' : ''}`}
@@ -614,8 +759,11 @@ export function OpenSpecAutoDeliverCurrentRunEntry({
         {!redacted && route && (
           <div class="openspec-auto-current-meta">{route}</div>
         )}
+        {!redacted && latestMessage && (
+          <div class="openspec-auto-current-meta">{latestMessage}</div>
+        )}
         {redacted && (
-          <div class="openspec-auto-current-meta">{projection.conflictReason ?? t('openspec.auto.redacted_conflict')}</div>
+          <div class="openspec-auto-current-meta">{conflictReason ?? t('openspec.auto.redacted_conflict')}</div>
         )}
         {redacted && <div class="openspec-auto-current-meta">{t('openspec.auto.conflict_summary')}</div>}
       </div>

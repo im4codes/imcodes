@@ -1,5 +1,5 @@
-import { mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { lstat, mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -14,11 +14,14 @@ import {
 } from '../../shared/openspec-auto-deliver-combos.js';
 import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
+  OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_METADATA_FIELDS,
+  OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
   OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE,
   OPENSPEC_AUTO_DELIVER_MSG,
-  OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES,
+  OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS,
+  OPENSPEC_AUTO_DELIVER_TERMINAL_REASONS,
   isOpenSpecAutoDeliverTerminalStage,
   materializeOpenSpecAutoDeliverPreset,
   type OpenSpecAutoDeliverPresetId,
@@ -48,6 +51,7 @@ import {
   validateOpenSpecAutoDeliverLaunchRequest,
   validateOpenSpecAutoDeliverRequestId,
   validateOpenSpecAutoDeliverVerdictPayload,
+  parseOpenSpecAutoDeliverAuthoritativeJsonPayload,
 } from '../../shared/openspec-auto-deliver-validators.js';
 import { formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
 import {
@@ -213,10 +217,6 @@ export interface OpenSpecAutoDeliverUpgradeBlockReason {
   targetImplementationSessionName: string;
 }
 
-function byteLength(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
-}
-
 function clearAuditPollTimer(runId: string): void {
   const timer = auditPollTimers.get(runId);
   if (timer) clearTimeout(timer);
@@ -348,6 +348,21 @@ function mergeEvidence(
   for (const entry of existing ?? []) push(entry);
   for (const entry of incoming) push(entry);
   return output.slice(-80);
+}
+
+function recordImplementationReportedEvidence(run: AutoDeliverRun, text: string): void {
+  const command = run.activeCommandId;
+  const summary = text.trim().slice(0, 1000);
+  if (!summary) return;
+  const retained = command
+    ? (run.evidence ?? []).filter((entry) => !(entry.source === 'implementation_reported' && entry.command === command))
+    : (run.evidence ?? []);
+  run.evidence = mergeEvidence(retained, [{
+    source: 'implementation_reported',
+    summary,
+    ...(command ? { command } : {}),
+    stale: false,
+  }]);
 }
 
 function elapsedLimitExceeded(run: AutoDeliverRun): boolean {
@@ -680,6 +695,41 @@ async function buildAuthoritativeResultPath(run: AutoDeliverRun, stage: AuditRep
   return join(dir, safeAutoDeliverResultBasename(run, stage, generation, roundIndex));
 }
 
+function isPathWithin(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === '' || (!!rel && !rel.startsWith('..') && !isAbsolute(rel));
+}
+
+async function validateAuthoritativeResultPath(run: AutoDeliverRun, authoritativeResultPath: string): Promise<boolean> {
+  const projectRootReal = await realpath(run.projectRoot).catch(() => null);
+  if (!projectRootReal) return false;
+  const discussionsPath = join(run.projectRoot, '.imc', 'discussions');
+  const discussionsReal = await realpath(discussionsPath).catch(() => null);
+  if (!discussionsReal || !isPathWithin(projectRootReal, discussionsReal)) return false;
+  const resolvedExpectedDir = resolve(discussionsPath);
+  const resolvedCandidate = resolve(authoritativeResultPath);
+  if (!isPathWithin(resolvedExpectedDir, resolvedCandidate)) return false;
+  const candidateDirReal = await realpath(dirname(resolvedCandidate)).catch(() => null);
+  if (!candidateDirReal || !isPathWithin(discussionsReal, candidateDirReal)) return false;
+  const candidateStat = await lstat(resolvedCandidate).catch((error: unknown) => {
+    if (error && typeof error === 'object' && 'code' in error && (error as { code?: unknown }).code === 'ENOENT') {
+      return null;
+    }
+    return false;
+  });
+  if (candidateStat === false) return false;
+  if (candidateStat && !candidateStat.isFile() && !candidateStat.isSymbolicLink()) return false;
+  const candidateReal = await realpath(resolvedCandidate).catch((error: unknown) => {
+    if (error && typeof error === 'object' && 'code' in error && (error as { code?: unknown }).code === 'ENOENT') {
+      return null;
+    }
+    return false;
+  });
+  if (candidateReal === false) return false;
+  if (candidateReal && !isPathWithin(discussionsReal, candidateReal)) return false;
+  return true;
+}
+
 function incrementAuditRound(run: AutoDeliverRun, stage: AuditRepairStage): number {
   if (stage === 'spec_audit_repair') {
     run.specAuditRepairRound += 1;
@@ -748,34 +798,6 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
         '- Return REWORK when product code, tests, or tasks.md still need another implementation audit-repair attempt.',
       ].join('\n');
   const unchecked = uncheckedTaskLabels(run.taskStats);
-  const payloadSkeleton = {
-    auto_deliver: {
-      runId: metadata.runId,
-      changeName: metadata.changeName,
-      resolvedChangeRootIdentity: metadata.resolvedChangeRootIdentity,
-      stage: metadata.stage,
-      selectedTeamComboId: metadata.selectedTeamComboId,
-      activeOpenSpecPromptId: metadata.activeOpenSpecPromptId,
-      roundIndex: metadata.roundIndex,
-      attemptId: metadata.attemptId,
-      authoritativeResultPath: metadata.authoritativeResultPath,
-      owningMainSessionName: metadata.owningMainSessionName,
-      executionSessionName: metadata.executionSessionName,
-      generation: metadata.generation,
-    },
-    verdict: 'PASS | REWORK | BLOCKED',
-    module_scores: [
-      { module: 'spec', score: 0, max_score: 10, summary: '...' },
-      { module: 'tasks', score: 0, max_score: 10, summary: '...' },
-      { module: 'implementation', score: 0, max_score: 10, summary: '...' },
-      { module: 'tests', score: 0, max_score: 10, summary: '...' },
-      { module: 'risk', score: 0, max_score: 10, summary: '...' },
-    ],
-    unchecked_tasks: [],
-    required_changes: [],
-    repairs_applied: [],
-    evidence: [],
-  };
   const changedFiles = run.evidence?.find((entry) => entry.source === 'daemon' && entry.summary.startsWith('Changed files:'))?.summary ?? 'Changed files: unavailable.';
   const diffStat = run.evidence?.find((entry) => entry.source === 'daemon' && entry.summary.startsWith('Diff stat:'))?.summary ?? 'Diff stat: unavailable.';
   return [
@@ -818,9 +840,9 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
     'The daemon will read only that file as the authoritative result. Discussion text and summaries are for humans only and are not authoritative.',
     'The JSON file must preserve the auto_deliver metadata exactly and must include canonical module scores.',
     '',
-    `Required top-level fields: ${Object.keys(payloadSkeleton).join(', ')}.`,
-    `Required auto_deliver fields: ${Object.keys(payloadSkeleton.auto_deliver).join(', ')}.`,
-    'Required module score ids: spec, tasks, implementation, tests, risk.',
+    `Required top-level fields: ${OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS.join(', ')}.`,
+    `Required auto_deliver fields: ${OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_METADATA_FIELDS.join(', ')}.`,
+    `Required module score ids: ${OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.join(', ')}.`,
   ].join('\n');
 }
 
@@ -864,8 +886,8 @@ function buildAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpe
       generation: metadata.generation,
     }, null, 2),
     '',
-    'Required top-level fields: auto_deliver, verdict, module_scores, unchecked_tasks, required_changes, repairs_applied, evidence.',
-    'Required module score ids: spec, tasks, implementation, tests, risk.',
+    `Required top-level fields: ${OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS.join(', ')}.`,
+    `Required module score ids: ${OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.join(', ')}.`,
     '',
     stageVerdictScope,
   ].join('\n');
@@ -894,9 +916,15 @@ function dispatchAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: Open
 function validateAuditMetadata(input: unknown, expected: OpenSpecAutoDeliverP2pMetadata): boolean {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return false;
   const record = input as Record<string, unknown>;
+  for (const field of OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS) {
+    if (!(field in record)) return false;
+  }
   const meta = record.auto_deliver;
   if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return false;
   const actual = meta as Record<string, unknown>;
+  for (const field of OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_METADATA_FIELDS) {
+    if (!(field in actual)) return false;
+  }
   return actual.runId === expected.runId
     && actual.changeName === expected.changeName
     && actual.resolvedChangeRootIdentity === expected.resolvedChangeRootIdentity
@@ -929,25 +957,24 @@ function validateFinalPass(run: AutoDeliverRun, verdict: OpenSpecAutoDeliverVerd
 }
 
 async function consumeAuditResultFile(run: AutoDeliverRun, expected: OpenSpecAutoDeliverP2pMetadata): Promise<OpenSpecAutoDeliverVerdictPayload | null> {
+  if (!(await validateAuthoritativeResultPath(run, expected.authoritativeResultPath))) {
+    run.latestMessage = OPENSPEC_AUTO_DELIVER_TERMINAL_REASONS.INVALID_AUTHORITATIVE_RESULT_PATH;
+    run.lastAuditResultError = run.latestMessage;
+    return null;
+  }
   const text = await readFile(expected.authoritativeResultPath, 'utf8').catch(() => null);
   if (typeof text !== 'string' || !text.trim()) {
     run.latestMessage = 'missing_authoritative_json';
     run.lastAuditResultError = run.latestMessage;
     return null;
   }
-  if (byteLength(text) > OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES) {
-    run.latestMessage = 'authoritative_input_too_large';
+  const parsedPayload = parseOpenSpecAutoDeliverAuthoritativeJsonPayload(text);
+  if (!parsedPayload.ok) {
+    run.latestMessage = parsedPayload.issues[0]?.code ?? 'invalid_authoritative_json';
     run.lastAuditResultError = run.latestMessage;
     return null;
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    run.latestMessage = 'malformed_authoritative_json';
-    run.lastAuditResultError = run.latestMessage;
-    return null;
-  }
+  const parsed = parsedPayload.value;
   if (!validateAuditMetadata(parsed, expected)) {
     run.latestMessage = 'audit_metadata_mismatch';
     run.lastAuditResultError = run.latestMessage;
@@ -1412,15 +1439,10 @@ function ensureTimelineListener(): void {
       const eventCommandId = typeof (event.payload as Record<string, unknown>).commandId === 'string'
         ? (event.payload as Record<string, unknown>).commandId
         : undefined;
-      if (run && text.length > 0 && (!eventCommandId || eventCommandId === run.activeCommandId)) {
-        run.evidence = [
-          ...(run.evidence ?? []),
-          {
-            source: 'implementation_reported',
-            summary: text.slice(0, 1000),
-            stale: false,
-          },
-        ];
+      const streaming = (event.payload as Record<string, unknown>).streaming === true;
+      const memoryExcluded = (event.payload as Record<string, unknown>).memoryExcluded === true;
+      if (run && text.length > 0 && !streaming && !memoryExcluded && (!eventCommandId || eventCommandId === run.activeCommandId)) {
+        recordImplementationReportedEvidence(run, text);
       }
       return;
     }

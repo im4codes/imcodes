@@ -3,7 +3,10 @@ import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
   OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
-  OPENSPEC_AUTO_DELIVER_COMBO_IDS,
+  OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_METADATA_FIELDS,
+  OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS,
+  OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS,
+  OPENSPEC_AUTO_DELIVER_UNSUPPORTED_LEGACY_COMBO_IDS,
   isOpenSpecAutoDeliverStage,
   materializeOpenSpecAutoDeliverPreset,
 } from '../../shared/openspec-auto-deliver-constants.js';
@@ -29,13 +32,12 @@ import {
 function validVerdictPayload() {
   return {
     verdict: 'PASS',
-    module_scores: [
-      { module: 'spec', score: 9, max_score: 10, summary: 'Spec is aligned.' },
-      { module: 'tasks', score: 10, max_score: 10, summary: 'Tasks are complete.' },
-      { module: 'implementation', score: 8, max_score: 10, summary: 'Implementation is sound.' },
-      { module: 'tests', score: 7, max_score: 10, summary: 'Tests are adequate.' },
-      { module: 'risk', score: 8, max_score: 10, summary: 'Risk is bounded.' },
-    ],
+    module_scores: OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.map((module, index) => ({
+      module,
+      score: Math.max(7, 10 - index),
+      max_score: 10,
+      summary: `${module} is covered.`,
+    })),
     unchecked_tasks: [],
     required_changes: [],
     repairs_applied: [],
@@ -175,7 +177,7 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
       'proposal_audit',
     )).toEqual({ ok: false, reason: 'custom_combo_unsupported' });
     expect(evaluateOpenSpecAutoDeliverComboCompatibility(
-      OPENSPEC_AUTO_DELIVER_COMBO_IDS.SPEC_AUDIT_REPAIR,
+      OPENSPEC_AUTO_DELIVER_UNSUPPORTED_LEGACY_COMBO_IDS.SPEC_AUDIT_REPAIR,
       'spec_audit_repair',
       'proposal_audit',
     )).toEqual({ ok: false, reason: 'legacy_combo_unsupported' });
@@ -197,6 +199,20 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
     const contradictory = validVerdictPayload();
     contradictory.unchecked_tasks = ['Task still open'];
     expect(validateOpenSpecAutoDeliverVerdictPayload(contradictory).ok).toBe(false);
+  });
+
+  it('centralizes strict authoritative result field contracts', () => {
+    expect(OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS).toEqual([
+      'auto_deliver',
+      'verdict',
+      'module_scores',
+      'unchecked_tasks',
+      'required_changes',
+      'repairs_applied',
+      'evidence',
+    ]);
+    expect(OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_METADATA_FIELDS).toContain('authoritativeResultPath');
+    expect(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS).toEqual(['spec', 'tasks', 'implementation', 'tests', 'risk']);
   });
 
   it('parses only raw authoritative JSON payloads', () => {

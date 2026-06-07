@@ -12,6 +12,8 @@ vi.mock('react-i18next', () => ({
     t: (key: string, opts?: Record<string, unknown>) => {
       if (key === 'openspec.auto.reason.auto_deliver_active') return 'Auto Deliver is already running for this session.';
       if (key === 'openspec.auto.reason.missing_authoritative_json') return 'The audit did not produce a final authoritative JSON result.';
+      if (key === 'openspec.auto.lifecycle.spec_audit_repair_p2p_started') return 'Spec audit Team run started.';
+      if (key === 'openspec.auto.latest_message') return 'Latest';
       if (key === 'openspec.auto.status.implementation_task_loop') return 'Active';
       if (key === 'openspec.auto.stage.implementation_task_loop') return 'Implementation';
       if (key === 'openspec.auto.stage.implementation_audit_repair') return 'Implementation audit';
@@ -481,6 +483,7 @@ describe('DiscussionsPage', () => {
           owningMainSessionName: 'deck_proj_brain',
           targetImplementationSessionName: 'deck_sub_1',
           selectedTeamComboId: 'audit>review>plan',
+          recentFinding: 'spec_audit_repair_p2p_started',
         }],
       } as unknown as ServerMessage);
     });
@@ -494,14 +497,19 @@ describe('DiscussionsPage', () => {
     expect(autoRow).toBeTruthy();
     expect(autoRow.textContent).toContain('Implementation');
     expect(autoRow.textContent).toContain('Active');
+    expect(autoRow.textContent).toContain('Spec audit Team run started.');
     expect(autoRow.textContent).not.toContain('implementation_task_loop');
+    expect(autoRow.textContent).not.toContain('spec_audit_repair_p2p_started');
 
     fireEvent.click(autoRow);
     expect(autoRow.className).toContain('active');
     expect(screen.getByText('deck_proj_brain')).toBeDefined();
     expect(screen.getByText('deck_sub_1')).toBeDefined();
     expect(screen.getByText('Audit→Review→Plan')).toBeDefined();
+    expect(screen.getAllByText('Spec audit Team run started.').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('Latest')).toBeDefined();
     expect(screen.queryByText('audit>review>plan')).toBeNull();
+    expect(screen.queryByText('spec_audit_repair_p2p_started')).toBeNull();
   });
 
   it('can open directly on the Auto Deliver list tab', async () => {

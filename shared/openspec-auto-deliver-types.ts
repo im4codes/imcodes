@@ -272,6 +272,7 @@ export interface OpenSpecAutoDeliverListRow {
   launchedFromSessionName?: string;
   elapsedMs?: number;
   terminalReason?: string;
+  recentFinding?: string;
   reason?: string;
 }
 

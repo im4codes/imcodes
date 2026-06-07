@@ -396,6 +396,8 @@ export function normalizeOpenSpecAutoDeliverListRow(raw: unknown): OpenSpecAutoD
     const value = optionalString(raw, key);
     if (value) row[key] = value;
   }
+  const recentFinding = optionalString(raw, 'recentFinding') ?? optionalString(raw, 'lastMessage');
+  if (recentFinding) row.recentFinding = recentFinding;
   const elapsedMs = finiteNumber(raw.elapsedMs);
   if (elapsedMs !== undefined && elapsedMs >= 0) row.elapsedMs = elapsedMs;
   return row;
@@ -435,5 +437,6 @@ export function openSpecAutoDeliverRowFromProjection(projection: OpenSpecAutoDel
     launchedFromSessionName: projection.launchedFromSessionName,
     elapsedMs: projection.elapsedMs,
     terminalReason: projection.terminalReason ?? undefined,
+    recentFinding: projection.recentFinding ?? undefined,
   };
 }

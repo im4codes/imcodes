@@ -1219,6 +1219,42 @@ describe('App shell', () => {
     });
     expect(screen.getByTestId('app-shell-auto-deliver-runbar').textContent).toContain('openspec-auto-delivery');
 
+    await act(async () => {
+      ws.emit({
+        type: 'openspec_auto_deliver.status_projection',
+        projection: {
+          runId: 'auto-global-1',
+          projectionVersion: 0,
+          visibility: 'full',
+          changeName: 'stale-change',
+          status: 'stopped',
+          stage: 'stopped',
+          terminal: true,
+          launchedFromSessionName: 'deck_alpha_brain',
+          targetImplementationSessionName: 'deck_alpha_brain',
+          taskStats: { total: 1, checked: 1, unchecked: 0 },
+          canStop: false,
+        },
+      });
+      ws.emit({
+        type: 'openspec_auto_deliver.list_response',
+        rows: [
+          {
+            runId: 'bad-list-row',
+            projectionVersion: Number.POSITIVE_INFINITY,
+            visibility: 'full',
+            changeName: 'bad-list-row-change',
+            status: 'active',
+            stage: 'implementation_task_loop',
+            owningMainSessionName: 'deck_alpha_brain',
+          },
+        ],
+      });
+    });
+    expect(screen.getByTestId('app-shell-auto-deliver-runbar').textContent).toContain('openspec-auto-delivery');
+    expect(screen.getByTestId('app-shell-auto-deliver-runbar').textContent).not.toContain('stale-change');
+    expect(screen.getByTestId('app-shell-auto-deliver-runbar').textContent).not.toContain('bad-list-row-change');
+
     fireEvent.click(screen.getByText('subbar-auto-deliver-compact-run'));
     expect(screen.getByTestId('app-shell-auto-deliver-runbar').getAttribute('data-compact')).toBe('true');
 

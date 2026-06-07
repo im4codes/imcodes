@@ -327,19 +327,13 @@ export type P2pBindResult =
  *   in static reverse-regression checks (rather than being detected by a
  *   filename heuristic).
  *
- * - `openspec_auto_deliver_internal`: the rounds were synthesised by
- *   OpenSpec Auto Deliver stage materialization. They are daemon-owned,
- *   carry their own launch-origin metadata, and must not be resolved through
- *   user-facing combo or advanced preset lookup.
- *
  * Older callers (cron, tests) may still pass `advancedRounds` / `advancedPresetKey`
  * directly without `advanced`. v1a treats those as the legacy passthrough; v1b
  * deletes the deprecated fields and makes `advanced` the only entry point.
  */
 export type StartP2pRunAdvancedSource =
   | { kind: 'envelope_compiled'; bound: P2pBoundWorkflow; advancedRounds: P2pAdvancedRound[]; advancedRunTimeoutMs?: number; contextReducer?: P2pContextReducerConfig }
-  | { kind: 'supervision_internal'; advancedRounds: P2pAdvancedRound[]; advancedPresetKey?: string; advancedRunTimeoutMs?: number }
-  | { kind: 'openspec_auto_deliver_internal'; advancedRounds: P2pAdvancedRound[]; advancedPresetKey?: string; advancedRunTimeoutMs?: number };
+  | { kind: 'supervision_internal'; advancedRounds: P2pAdvancedRound[]; advancedPresetKey?: string; advancedRunTimeoutMs?: number };
 
 export interface P2pWorkflowRuntimePrivateState {
   runId: string;

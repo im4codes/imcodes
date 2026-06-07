@@ -4,7 +4,7 @@ import type { WsClient, ServerMessage, P2pWorkflowRequestScope } from '../ws-cli
 import { P2pProgressCard } from '../components/P2pProgressCard.js';
 import type { P2pProgressDiscussion } from '../components/P2pProgressCard.js';
 import { FilePreviewPane } from '../components/FilePreviewPane.js';
-import { translateAutoDeliverReason } from '../components/OpenSpecAutoDeliver.js';
+import { translateAutoDeliverMessage, translateAutoDeliverReason } from '../components/OpenSpecAutoDeliver.js';
 import { comboModeLabel } from '../components/p2p-combos.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import {
@@ -383,6 +383,7 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
   const formatAutoStatus = (status: string) => t(`openspec.auto.status.${status}`, status);
   const formatAutoStage = (stage: string) => t(`openspec.auto.stage.${stage}`, stage);
   const formatAutoCombo = (comboId: string) => comboModeLabel(comboId, t);
+  const formatAutoMessage = (message: string | undefined) => translateAutoDeliverMessage(message, t);
 
   // Find matching live discussion for progress display
   const activeLive = useMemo(
@@ -478,6 +479,11 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
                     <span style={{ color: '#64748b', fontSize: 11 }}>{formatAutoStage(row.stage)}</span>
                     <span class="discussions-list-time">{formatAutoStatus(row.status)}</span>
                   </div>
+                  {row.recentFinding && (
+                    <div class="discussions-list-meta">
+                      <span style={{ color: '#64748b', fontSize: 11 }}>{formatAutoMessage(row.recentFinding)}</span>
+                    </div>
+                  )}
                 </div>
               ))}
             </>
@@ -531,6 +537,9 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
                     )}
                     {selectedAutoDeliverRow.terminalReason && (
                       <div class="openspec-auto-detail-row"><span>{t('openspec.auto.terminal_reason')}</span><strong>{translateAutoDeliverReason(selectedAutoDeliverRow.terminalReason, t)}</strong></div>
+                    )}
+                    {selectedAutoDeliverRow.recentFinding && (
+                      <div class="openspec-auto-detail-row"><span>{t('openspec.auto.latest_message')}</span><strong>{formatAutoMessage(selectedAutoDeliverRow.recentFinding)}</strong></div>
                     )}
                     {selectedAutoDeliverRow.reason && (
                       <div class="openspec-auto-detail-row"><span>{t('openspec.auto.conflict_summary')}</span><strong>{translateAutoDeliverReason(selectedAutoDeliverRow.reason, t)}</strong></div>

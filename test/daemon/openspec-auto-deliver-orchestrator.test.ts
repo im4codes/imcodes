@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
-import { mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -68,6 +68,7 @@ import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { getAutoDeliverP2pLock } from '../../src/daemon/p2p-launch-admission.js';
 
 let projectDir: string;
+let extraTempDirs: string[];
 
 async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): Promise<void> {
   const root = join(projectDir, 'openspec', 'changes', name);
@@ -158,9 +159,28 @@ async function completeLatestAudit(status = 'completed', payloadOverrides: Recor
   await writeFile(String(origin.authoritativeResultPath), resultJson, 'utf8');
 }
 
+async function startFastImplementationAudit(requestId: string): Promise<MockP2pRun> {
+  await makeChange('demo-change', '- [x] first\n- [x] second\n');
+  await handleOpenSpecAutoDeliverCommand({
+    type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+    requestId,
+    sessionName: 'deck_demo_brain',
+    changeName: 'demo-change',
+    presetId: 'fast',
+  }, serverLinkMock as never);
+  timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+  await waitForSend((msg) =>
+    msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+    && msg.projection?.stage === 'implementation_audit_repair',
+    2500,
+  );
+  return [...p2pRuns.values()].at(-1)!;
+}
+
 describe('OpenSpec Auto Deliver daemon orchestrator', () => {
   beforeEach(async () => {
     projectDir = join(tmpdir(), `imcodes-auto-deliver-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    extraTempDirs = [];
     await makeChange('demo-change');
     serverLinkMock.send.mockClear();
     transportSendMock.mockClear();
@@ -209,6 +229,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
   afterEach(async () => {
     clearOpenSpecAutoDeliverRunsForTests();
     await rm(projectDir, { recursive: true, force: true });
+    await Promise.all(extraTempDirs.map((dir) => rm(dir, { recursive: true, force: true })));
   });
 
   it('launches from a sub-session, parses tasks, and returns idempotent launch ack', async () => {
@@ -259,6 +280,68 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(audit.userText).toContain('Do not return REWORK merely because product implementation or product tests remain unfinished');
     expect(audit.userText).toContain('leave unchecked_tasks and required_changes empty');
     expect(audit.userText).toContain('Return REWORK only when the OpenSpec artifacts themselves still need another spec-audit repair attempt');
+  });
+
+  it('preserves an explicit single implementation audit limit in launched audit prompts', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-impl-limit-one',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'deep',
+      materializedLimits: {
+        specAuditRepairRounds: 0,
+        implementationAuditRepairRounds: 1,
+        maxImplementationPrompts: 24,
+        maxElapsedMinutes: 480,
+      },
+    }, serverLinkMock as never);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    const audit = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair',
+      2500,
+    );
+    const p2pRun = [...p2pRuns.values()].at(-1)!;
+    expect(audit.projection.materializedLimits.implementationAuditRepairRounds).toBe(1);
+    expect(p2pRun.userText).toContain('Round: 1/1');
+    expect(startP2pRunMock).toHaveBeenLastCalledWith(expect.objectContaining({
+      rounds: 1,
+      modeOverride: 'audit>review>plan',
+    }));
+  });
+
+  it('records only final implementation assistant text as evidence before the audit prompt', async () => {
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-final-evidence',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    timelineEmitter.emit('deck_demo_brain', 'assistant.text', { text: 'Open', streaming: true });
+    timelineEmitter.emit('deck_demo_brain', 'assistant.text', { text: 'OpenSpec now reports `143', streaming: true });
+    timelineEmitter.emit('deck_demo_brain', 'assistant.text', {
+      text: 'Implemented final text with exact validation commands.',
+      streaming: false,
+    });
+
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair',
+      2500,
+    );
+
+    const audit = [...p2pRuns.values()].at(-1)!;
+    expect(audit.userText).toContain('- implementation_reported: Implemented final text with exact validation commands.');
+    expect(audit.userText).not.toContain('- implementation_reported: Open');
+    expect(audit.userText).not.toContain('OpenSpec now reports `143');
   });
 
   it('rejects launch before lock when no Team member configuration is saved', async () => {
@@ -679,6 +762,22 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect([...p2pRuns.values()]).toHaveLength(2);
   });
 
+  it('keeps valid missing authoritative result files classified as missing JSON', async () => {
+    const firstAudit = await startFastImplementationAudit('req-valid-missing-result-file');
+    const origin = parseAuditMetadata(firstAudit);
+    firstAudit.status = 'completed';
+    firstAudit.resultSummary = null;
+    firstAudit.strictAuthoritativeResult = null;
+
+    const repairPrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver needs the authoritative audit result file')
+      && text.includes('Problem: missing_authoritative_json'),
+      2500,
+    );
+    expect(repairPrompt).toContain(`Authoritative result file: ${origin.authoritativeResultPath}`);
+    expect(repairPrompt).not.toContain('invalid_authoritative_result_path');
+  });
+
   it('requests authoritative result file repair before consuming another audit-repair round', async () => {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     await handleOpenSpecAutoDeliverCommand({
@@ -882,6 +981,60 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.terminalReason).toBe('malformed_authoritative_json');
   }, 10_000);
+
+  it('rejects authoritative result files that symlink outside .imc/discussions', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-result-symlink-escape',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
+    const run = [...p2pRuns.values()].at(-1)!;
+    run.status = 'completed';
+    const origin = parseAuditMetadata(run);
+    const outsideDir = await mkdtemp(join(tmpdir(), 'imcodes-auto-deliver-outside-result-'));
+    extraTempDirs.push(outsideDir);
+    const outsideResult = join(outsideDir, 'authoritative.json');
+    await writeFile(outsideResult, JSON.stringify(auditPayload({ auto_deliver: origin }), null, 2), 'utf8');
+    await symlink(outsideResult, String(origin.authoritativeResultPath), 'file');
+
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    expect(terminal?.projection.status).toBe('needs_human');
+    expect(terminal?.projection.terminalReason).toBe('invalid_authoritative_result_path');
+    expect(transportSendMock.mock.calls.some((call) => String(call[0] ?? '').includes('Problem: invalid_authoritative_result_path'))).toBe(false);
+  });
+
+  it('rejects .imc/discussions directory symlink escapes with the same invalid-path classification', async () => {
+    await rm(join(projectDir, '.imc'), { recursive: true, force: true });
+    await mkdir(join(projectDir, '.imc'), { recursive: true });
+    const outsideDiscussions = await mkdtemp(join(tmpdir(), 'imcodes-auto-deliver-outside-discussions-'));
+    extraTempDirs.push(outsideDiscussions);
+    await symlink(outsideDiscussions, join(projectDir, '.imc', 'discussions'), 'dir');
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-discussions-symlink-escape',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
+    const run = [...p2pRuns.values()].at(-1)!;
+    run.status = 'completed';
+
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    expect(terminal?.projection.status).toBe('needs_human');
+    expect(terminal?.projection.terminalReason).toBe('invalid_authoritative_result_path');
+    expect(transportSendMock.mock.calls.some((call) => String(call[0] ?? '').includes('Problem: invalid_authoritative_result_path'))).toBe(false);
+  });
 
   it('ignores discussion JSON when the authoritative result file is missing', async () => {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');

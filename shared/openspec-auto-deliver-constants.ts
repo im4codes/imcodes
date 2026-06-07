@@ -61,6 +61,11 @@ export type OpenSpecAutoDeliverStage = (typeof OPENSPEC_AUTO_DELIVER_STAGES)[num
 export const OPENSPEC_AUTO_DELIVER_TERMINAL_STAGES = ['passed', 'needs_human', 'failed', 'stopped'] as const;
 export type OpenSpecAutoDeliverTerminalStage = (typeof OPENSPEC_AUTO_DELIVER_TERMINAL_STAGES)[number];
 
+export const OPENSPEC_AUTO_DELIVER_TERMINAL_REASONS = {
+  INVALID_AUTHORITATIVE_RESULT_PATH: 'invalid_authoritative_result_path',
+} as const;
+export type OpenSpecAutoDeliverTerminalReason = (typeof OPENSPEC_AUTO_DELIVER_TERMINAL_REASONS)[keyof typeof OPENSPEC_AUTO_DELIVER_TERMINAL_REASONS];
+
 export function isOpenSpecAutoDeliverMessageType(value: unknown): value is OpenSpecAutoDeliverMsgType {
   return typeof value === 'string'
     && (Object.values(OPENSPEC_AUTO_DELIVER_MSG) as string[]).includes(value);
@@ -89,6 +94,43 @@ export const OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS = [
 export type OpenSpecAutoDeliverScoreModuleId = (typeof OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS)[number];
 export const OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE = 6 as const;
 
+export const OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS = [
+  'auto_deliver',
+  'verdict',
+  'module_scores',
+  'unchecked_tasks',
+  'required_changes',
+  'repairs_applied',
+  'evidence',
+] as const;
+export type OpenSpecAutoDeliverAuthoritativeResultField = (typeof OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS)[number];
+
+export const OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_VERDICT_FIELDS = [
+  'verdict',
+  'module_scores',
+  'unchecked_tasks',
+  'required_changes',
+  'repairs_applied',
+  'evidence',
+] as const;
+export type OpenSpecAutoDeliverAuthoritativeVerdictField = (typeof OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_VERDICT_FIELDS)[number];
+
+export const OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_METADATA_FIELDS = [
+  'runId',
+  'changeName',
+  'resolvedChangeRootIdentity',
+  'stage',
+  'selectedTeamComboId',
+  'activeOpenSpecPromptId',
+  'roundIndex',
+  'attemptId',
+  'authoritativeResultPath',
+  'owningMainSessionName',
+  'executionSessionName',
+  'generation',
+] as const;
+export type OpenSpecAutoDeliverAuthoritativeMetadataField = (typeof OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_METADATA_FIELDS)[number];
+
 export const OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE = [
   'daemon',
   'implementation_reported',
@@ -97,11 +139,11 @@ export const OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE = [
 ] as const;
 export type OpenSpecAutoDeliverEvidenceProvenance = (typeof OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE)[number];
 
-export const OPENSPEC_AUTO_DELIVER_COMBO_IDS = {
+export const OPENSPEC_AUTO_DELIVER_UNSUPPORTED_LEGACY_COMBO_IDS = {
   SPEC_AUDIT_REPAIR: 'openspec_auto_deliver.spec_audit_repair',
   IMPLEMENTATION_AUDIT_REPAIR: 'openspec_auto_deliver.implementation_audit_repair',
 } as const;
-export type OpenSpecAutoDeliverComboId = (typeof OPENSPEC_AUTO_DELIVER_COMBO_IDS)[keyof typeof OPENSPEC_AUTO_DELIVER_COMBO_IDS];
+export type OpenSpecAutoDeliverUnsupportedLegacyComboId = (typeof OPENSPEC_AUTO_DELIVER_UNSUPPORTED_LEGACY_COMBO_IDS)[keyof typeof OPENSPEC_AUTO_DELIVER_UNSUPPORTED_LEGACY_COMBO_IDS];
 
 export const OPENSPEC_AUTO_DELIVER_COMBO_WRITE_MODES = [
   'single_authoritative_writer',
@@ -124,7 +166,6 @@ export const OPENSPEC_AUTO_DELIVER_MUTATION_SCOPES = [
 export type OpenSpecAutoDeliverMutationScope = (typeof OPENSPEC_AUTO_DELIVER_MUTATION_SCOPES)[number];
 
 export const OPENSPEC_AUTO_DELIVER_LOCK_OWNER = 'openspec_auto_deliver' as const;
-export const OPENSPEC_AUTO_DELIVER_LAUNCH_ORIGIN = 'openspec_auto_deliver_internal' as const;
 export const OPENSPEC_AUTO_DELIVER_PROJECTION_VISIBILITIES = ['full', 'conflict'] as const;
 export type OpenSpecAutoDeliverProjectionVisibility = (typeof OPENSPEC_AUTO_DELIVER_PROJECTION_VISIBILITIES)[number];
 export const OPENSPEC_AUTO_DELIVER_VIEW_MODES = ['fullRunbar', 'compactRecovery', 'conflict', 'hidden'] as const;

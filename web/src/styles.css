@@ -746,9 +746,22 @@ body {
 }
 .openspec-auto-runbar-head { align-items: center; }
 .openspec-auto-view-btn { color: #bfdbfe; border-color: rgba(96, 165, 250, 0.35); }
+.openspec-auto-progressbar,
 .openspec-auto-taskbar { margin-top: 0; background: rgba(15, 23, 42, 0.9); }
+.openspec-auto-progressfill,
 .openspec-auto-taskfill { background: linear-gradient(90deg, #06b6d4, #8b5cf6); }
-.openspec-auto-finding { margin-top: 6px; }
+.openspec-auto-finding {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  margin-top: 6px;
+}
+.openspec-auto-finding-label {
+  color: #93c5fd;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
 .openspec-auto-details-backdrop {
   position: fixed;
   inset: 0;
