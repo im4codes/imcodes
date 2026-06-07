@@ -732,6 +732,22 @@ jobs:
           yes | sdkmanager --licenses
           sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
 
+      - name: Warm Gradle wrapper distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if (cd web/android && ./gradlew --version --no-daemon); then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Gradle wrapper download failed on attempt ${attempt}; retrying..."
+              sleep $((attempt * 10))
+            fi
+          done
+          echo "Gradle wrapper download failed after 3 attempts."
+          exit 1
+
       - run: ./scripts/ci-npm-ci.sh .
 
       - run: npm ci
