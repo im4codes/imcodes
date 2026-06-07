@@ -807,6 +807,23 @@ body {
 .openspec-auto-detail-section { margin-top: 12px; }
 .openspec-auto-detail-section h4 { margin: 0 0 6px; color: #e2e8f0; font-size: 12px; }
 .openspec-auto-detail-section ul { margin: 6px 0 0 18px; padding: 0; color: #cbd5e1; font-size: 12px; }
+.openspec-auto-audit-results { display: grid; gap: 8px; }
+.openspec-auto-audit-result {
+  padding: 10px;
+  border: 1px solid rgba(56, 189, 248, 0.2);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.48);
+}
+.openspec-auto-audit-result-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: #cbd5e1;
+  font-size: 12px;
+}
+.openspec-auto-audit-result-head strong { color: #f8fafc; }
 .openspec-auto-score-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
 .openspec-auto-score small,
 .openspec-auto-evidence small {

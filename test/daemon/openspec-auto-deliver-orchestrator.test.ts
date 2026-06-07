@@ -285,13 +285,13 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(getOpenSpecAutoDeliverTransitionTarget('proposed', 'spec_audit_started')).toBe('spec_audit_repair');
     expect(getOpenSpecAutoDeliverTransitionTarget('proposed', 'implementation_prompt_dispatched')).toBe('implementation_task_loop');
     expect(getOpenSpecAutoDeliverTransitionTarget('spec_audit_repair', 'spec_audit_pass')).toBe('implementation_task_loop');
-    expect(getOpenSpecAutoDeliverTransitionTarget('spec_audit_repair', 'spec_audit_rework')).toBe('spec_audit_repair');
-    expect(getOpenSpecAutoDeliverTransitionTarget('spec_audit_repair', 'spec_audit_blocked')).toBe('needs_human');
+    expect(getOpenSpecAutoDeliverTransitionTarget('spec_audit_repair', 'spec_audit_rework')).toBe('implementation_task_loop');
+    expect(getOpenSpecAutoDeliverTransitionTarget('spec_audit_repair', 'spec_audit_blocked')).toBe('implementation_task_loop');
     expect(getOpenSpecAutoDeliverTransitionTarget('implementation_task_loop', 'implementation_idle_incomplete')).toBe('implementation_task_loop');
     expect(getOpenSpecAutoDeliverTransitionTarget('implementation_task_loop', 'implementation_idle_all_checked')).toBe('implementation_audit_repair');
     expect(getOpenSpecAutoDeliverTransitionTarget('implementation_audit_repair', 'implementation_audit_pass')).toBe('passed');
-    expect(getOpenSpecAutoDeliverTransitionTarget('implementation_audit_repair', 'implementation_audit_rework')).toBe('implementation_audit_repair');
-    expect(getOpenSpecAutoDeliverTransitionTarget('implementation_audit_repair', 'implementation_audit_blocked')).toBe('needs_human');
+    expect(getOpenSpecAutoDeliverTransitionTarget('implementation_audit_repair', 'implementation_audit_rework')).toBe('passed');
+    expect(getOpenSpecAutoDeliverTransitionTarget('implementation_audit_repair', 'implementation_audit_blocked')).toBe('passed');
     expect(getOpenSpecAutoDeliverTransitionTarget('passed', 'implementation_prompt_dispatched')).toBeNull();
     expect(getOpenSpecAutoDeliverTransitionTarget('needs_human', 'implementation_audit_pass')).toBeNull();
     expect(getOpenSpecAutoDeliverTransitionTarget('stopped', 'spec_audit_started')).toBeNull();
@@ -416,11 +416,19 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     const implementationAuditProjection = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
     expect(implementationAuditProjection.projection.implementationAuditRound).toEqual({ current: 0, total: 2 });
     await completeLatestAudit('completed');
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair'
+      && msg.projection?.implementationAuditRound?.current === 1,
+      2500,
+    );
+    await completeLatestAudit('completed');
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.moduleScores).toHaveLength(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.length);
-    expect(terminal?.projection.implementationAuditRound).toEqual({ current: 1, total: 2 });
+    expect(terminal?.projection.implementationAuditRound).toEqual({ current: 2, total: 2 });
+    expect(terminal?.projection.auditResults).toHaveLength(3);
   });
 
   it('starts the materialized spec audit-repair stage for presets with spec rounds', async () => {
@@ -546,7 +554,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(error?.error).toBe('team_lane_busy');
   });
 
-  it('requires final audit PASS to have all tasks checked', async () => {
+  it('adds one audit-fix round when final audit PASS still has unchecked tasks', async () => {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
@@ -561,24 +569,61 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     await makeChange('demo-change', '- [ ] first\n- [x] second\n');
     await completeLatestAudit('completed');
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
-    expect(terminal?.projection.status).toBe('needs_human');
-    expect(terminal?.projection.terminalReason).toBe('audit_pass_with_unchecked_tasks');
+    const gate = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.lastMessage === 'audit_pass_with_unchecked_tasks',
+      2500,
+    );
+    expect(gate.projection.status).toBe('implementation_audit_repair');
+    expect(gate.projection.implementationAuditRound).toEqual({ current: 1, total: 2 });
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair'
+      && msg.projection?.activeP2pRunId === 'p2p-2',
+      2500,
+    );
+    expect([...p2pRuns.values()]).toHaveLength(2);
   });
 
-  it('continues REWORK audit-repair rounds and stops when rounds are exhausted', async () => {
+  it('continues after a sufficiently scored spec audit REWORK and records the round scores', async () => {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
-      requestId: 'req-rework',
+      requestId: 'req-spec-rework',
       sessionName: 'deck_demo_brain',
       changeName: 'demo-change',
       presetId: 'standard',
     }, serverLinkMock as never);
 
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
-    await completeLatestAudit('completed');
-    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_task_loop', 2500);
+    await completeLatestAudit('completed', {
+      verdict: 'REWORK',
+      required_changes: ['clarify acceptance criteria'],
+    });
+
+    const next = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_task_loop',
+      2500,
+    );
+    expect(next.projection.latestVerdict).toBe('REWORK');
+    expect(next.projection.moduleScores).toHaveLength(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.length);
+    expect(next.projection.auditResults).toHaveLength(1);
+    expect(next.projection.auditResults?.[0]?.requiredChanges).toEqual(['clarify acceptance criteria']);
+    expect([...p2pRuns.values()]).toHaveLength(1);
+  });
+
+  it('completes with final scores when the final implementation audit reports sufficiently scored REWORK', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-rework',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
 
@@ -586,20 +631,52 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       verdict: 'REWORK',
       required_changes: ['tighten tests'],
     });
+
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_rework_scored');
+    expect(terminal?.projection.moduleScores).toHaveLength(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.length);
+    expect(terminal?.projection.auditResults).toHaveLength(1);
+    expect([...p2pRuns.values()]).toHaveLength(1);
+  });
+
+  it('adds one audit-fix round by default when a module score is below the quality threshold', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-low-score',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
+    await completeLatestAudit('completed', {
+      module_scores: OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.map((module) => ({
+        module,
+        score: module === 'tests' ? 5 : 8,
+        max_score: 10,
+        summary: `${module} scored`,
+      })),
+    });
+
+    const gate = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && String(msg.projection?.lastMessage ?? '').startsWith('quality_gate_low_score:'),
+      2500,
+    );
+    expect(gate.projection.status).toBe('implementation_audit_repair');
+    expect(gate.projection.implementationAuditRound).toEqual({ current: 1, total: 2 });
+    expect(gate.projection.auditResults).toHaveLength(1);
+
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair'
-      && msg.projection?.implementationAuditRepairRound === 2,
+      && msg.projection?.activeP2pRunId === 'p2p-2',
       2500,
     );
-    await completeLatestAudit('completed', {
-      verdict: 'REWORK',
-      required_changes: ['still missing tests'],
-    });
-
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
-    expect(terminal?.projection.status).toBe('needs_human');
-    expect(terminal?.projection.terminalReason).toBe('implementation_audit_rework_rounds_exhausted');
+    expect([...p2pRuns.values()]).toHaveLength(2);
   });
 
   it('requests authoritative result file repair before consuming another audit-repair round', async () => {
@@ -609,12 +686,9 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       requestId: 'req-missing-json-retry',
       sessionName: 'deck_demo_brain',
       changeName: 'demo-change',
-      presetId: 'standard',
+      presetId: 'fast',
     }, serverLinkMock as never);
 
-    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
-    await completeLatestAudit('completed');
-    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_task_loop', 2500);
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
 
@@ -639,7 +713,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       2500,
     );
 
-    expect([...p2pRuns.values()]).toHaveLength(2);
+    expect([...p2pRuns.values()]).toHaveLength(1);
     await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({ auto_deliver: origin }), null, 2), 'utf8');
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
@@ -712,7 +786,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
 
-  it('falls back to needs_human when the spec audit reports BLOCKED', async () => {
+  it('continues after a sufficiently scored spec audit BLOCKED verdict and records the round scores', async () => {
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
       requestId: 'req-blocked',
@@ -727,9 +801,14 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       required_changes: ['scope is unclear'],
     });
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
-    expect(terminal?.projection.status).toBe('needs_human');
-    expect(terminal?.projection.terminalReason).toBe('audit_blocked');
+    const next = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_task_loop',
+      2500,
+    );
+    expect(next.projection.latestVerdict).toBe('BLOCKED');
+    expect(next.projection.moduleScores).toHaveLength(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.length);
+    expect(next.projection.auditResults).toHaveLength(1);
   });
 
   it('rejects stale metadata and malformed or missing authoritative result files', async () => {

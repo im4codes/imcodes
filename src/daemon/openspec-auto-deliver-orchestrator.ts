@@ -16,6 +16,7 @@ import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
+  OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE,
   OPENSPEC_AUTO_DELIVER_MSG,
   OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES,
   isOpenSpecAutoDeliverTerminalStage,
@@ -27,6 +28,7 @@ import {
 } from '../../shared/openspec-auto-deliver-constants.js';
 import type {
   OpenSpecAutoDeliverEvidence,
+  OpenSpecAutoDeliverAuditResult,
   OpenSpecAutoDeliverLaunchRequest,
   OpenSpecAutoDeliverModuleScore,
   OpenSpecAutoDeliverRepairSummary,
@@ -95,8 +97,8 @@ const OPENSPEC_AUTO_DELIVER_TRANSITIONS: Record<OpenSpecAutoDeliverStage, Partia
   spec_audit_repair: {
     spec_audit_started: 'spec_audit_repair',
     spec_audit_pass: 'implementation_task_loop',
-    spec_audit_rework: 'spec_audit_repair',
-    spec_audit_blocked: 'needs_human',
+    spec_audit_rework: 'implementation_task_loop',
+    spec_audit_blocked: 'implementation_task_loop',
     implementation_prompt_dispatched: 'implementation_task_loop',
     stop: 'stopped',
     restart_cleanup: 'failed',
@@ -114,8 +116,8 @@ const OPENSPEC_AUTO_DELIVER_TRANSITIONS: Record<OpenSpecAutoDeliverStage, Partia
   implementation_audit_repair: {
     implementation_audit_started: 'implementation_audit_repair',
     implementation_audit_pass: 'passed',
-    implementation_audit_rework: 'implementation_audit_repair',
-    implementation_audit_blocked: 'needs_human',
+    implementation_audit_rework: 'passed',
+    implementation_audit_blocked: 'passed',
     stop: 'stopped',
     restart_cleanup: 'failed',
     runtime_error: 'failed',
@@ -179,6 +181,7 @@ interface AutoDeliverRun {
   };
   latestVerdict?: OpenSpecAutoDeliverVerdict;
   moduleScores?: OpenSpecAutoDeliverModuleScore[];
+  auditResults?: OpenSpecAutoDeliverAuditResult[];
   latestRepairSummary?: string;
   lastAuditResultError?: string;
   evidence?: OpenSpecAutoDeliverEvidence[];
@@ -195,8 +198,10 @@ const activeRunByOwner = new Map<string, string>();
 const terminalRunByOwner = new Map<string, AutoDeliverRun>();
 const requestProjectionByFingerprint = new Map<string, OpenSpecAutoDeliverProjection>();
 const auditPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const auditFixRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let timelineUnsubscribe: (() => void) | null = null;
 const execFileAsync = promisify(execFile);
+const OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS = process.env.NODE_ENV === 'test' ? 50 : 5 * 60_000;
 
 export interface OpenSpecAutoDeliverUpgradeBlockReason {
   runId: string;
@@ -216,6 +221,12 @@ function clearAuditPollTimer(runId: string): void {
   const timer = auditPollTimers.get(runId);
   if (timer) clearTimeout(timer);
   auditPollTimers.delete(runId);
+}
+
+function clearAuditFixRetryTimer(runId: string): void {
+  const timer = auditFixRetryTimers.get(runId);
+  if (timer) clearTimeout(timer);
+  auditFixRetryTimers.delete(runId);
 }
 
 function cloneTaskStats(stats: OpenSpecAutoDeliverTaskStats): OpenSpecAutoDeliverTaskStats {
@@ -258,14 +269,18 @@ function humanInterventionMessage(run: AutoDeliverRun, reason: string): string {
     `Owning session: ${run.owningMainSessionName}`,
     `Implementation session: ${run.targetImplementationSessionName}`,
     '',
-    'Reply in this session with the next instruction. The Auto Deliver run has stopped and will not continue until a human takes over.',
+    'Reply in this session with the next instruction. If this is a recoverable audit-fix gate, the daemon may automatically add one audit-fix round after the displayed wait unless you stop the run.',
   ].join('\n');
 }
 
-function emitHumanInterventionPrompt(run: AutoDeliverRun, reason: string): void {
+function emitHumanInterventionPrompt(run: AutoDeliverRun, reason: string, options: {
+  recoverable?: boolean;
+  waitMs?: number;
+  eventSuffix?: string;
+} = {}): void {
   const sessionName = humanInterventionSession(run);
   const message = humanInterventionMessage(run, reason);
-  const eventBase = `openspec-auto:${run.runId}:needs-human:${run.generation}`;
+  const eventBase = `openspec-auto:${run.runId}:${options.eventSuffix ?? 'needs-human'}:${run.generation}`;
   timelineEmitter.emit(sessionName, 'assistant.text', {
     text: message,
     streaming: false,
@@ -278,20 +293,33 @@ function emitHumanInterventionPrompt(run: AutoDeliverRun, reason: string): void 
   timelineEmitter.emit(sessionName, 'ask.question', {
     toolUseId: `${run.runId}:needs-human:${run.generation}`,
     message,
-    waitMs: 5 * 60_000,
+    waitMs: options.waitMs ?? 5 * 60_000,
     questions: [{
       header: 'OpenSpec Auto Deliver',
-      question: `Auto Deliver stopped with reason "${reason}". What should happen next in this session?`,
-      options: [
-        {
-          label: 'Review the failure and continue manually',
-          description: 'Send an instruction to inspect the stopped run, fix the issue, and report back.',
-        },
-        {
-          label: 'Stop here and summarize the current state',
-          description: 'Ask the agent to stop active work and provide a concise handoff.',
-        },
-      ],
+      question: options.recoverable
+        ? `Auto Deliver reached recoverable gate "${reason}". What should happen next in this session?`
+        : `Auto Deliver stopped with reason "${reason}". What should happen next in this session?`,
+      options: options.recoverable
+        ? [
+            {
+              label: 'Let Auto Deliver add one audit-fix round',
+              description: 'Do nothing; if there is no answer before the timer, the daemon starts one more audit-fix round.',
+            },
+            {
+              label: 'Stop and review manually',
+              description: 'Send a stop or follow-up instruction before the timer expires.',
+            },
+          ]
+        : [
+            {
+              label: 'Review the failure and continue manually',
+              description: 'Send an instruction to inspect the stopped run, fix the issue, and report back.',
+            },
+            {
+              label: 'Stop here and summarize the current state',
+              description: 'Ask the agent to stop active work and provide a concise handoff.',
+            },
+          ],
     }],
   }, {
     source: 'daemon',
@@ -384,6 +412,17 @@ function buildProjection(run: AutoDeliverRun): OpenSpecAutoDeliverProjection {
     latestRepairSummary: run.latestRepairSummary,
     latestVerdict: run.latestVerdict,
     moduleScores: run.moduleScores ? run.moduleScores.map((score) => ({ ...score })) : undefined,
+    auditResults: run.auditResults ? run.auditResults.map((result) => ({
+      ...result,
+      moduleScores: result.moduleScores.map((score) => ({ ...score })),
+      uncheckedTasks: [...result.uncheckedTasks],
+      requiredChanges: [...result.requiredChanges],
+      repairSummaries: result.repairSummaries.map((repair) => ({
+        files: [...repair.files],
+        reason: repair.reason,
+      })),
+      evidence: result.evidence.map((entry) => ({ ...entry })),
+    })) : undefined,
     evidence: run.evidence ? run.evidence.map((entry) => ({ ...entry })) : undefined,
     lastMessage: run.latestMessage,
     terminalReason: run.terminalReason,
@@ -980,6 +1019,7 @@ function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 
     if (active.p2pRunId) trackActiveAuditCancellation(run, active, reason);
     run.activeAudit = undefined;
   }
+  clearAuditFixRetryTimer(run.runId);
   run.status = status;
   run.stage = status;
   run.terminalReason = reason;
@@ -993,10 +1033,79 @@ function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 
   return bumpProjection(run);
 }
 
-async function advanceAfterAuditVerdict(run: AutoDeliverRun, stage: AuditRepairStage, verdict: OpenSpecAutoDeliverVerdictPayload): Promise<void> {
+function recordAuditResult(
+  run: AutoDeliverRun,
+  stage: AuditRepairStage,
+  verdict: OpenSpecAutoDeliverVerdictPayload,
+  active: Pick<NonNullable<AutoDeliverRun['activeAudit']>, 'roundIndex' | 'attemptId' | 'generation'>,
+): void {
+  const result: OpenSpecAutoDeliverAuditResult = {
+    stage,
+    roundIndex: active.roundIndex,
+    attemptId: active.attemptId,
+    generation: active.generation,
+    verdict: verdict.verdict,
+    moduleScores: verdict.module_scores.map((score) => ({ ...score })),
+    uncheckedTasks: [...verdict.unchecked_tasks],
+    requiredChanges: [...verdict.required_changes],
+    repairSummaries: verdict.repairs_applied.map((repair) => ({
+      files: [...repair.files],
+      reason: repair.reason,
+    })),
+    evidence: verdict.evidence.map((entry) => ({ ...entry })),
+    completedAt: Date.now(),
+  };
+  run.auditResults = [...(run.auditResults ?? []), result].slice(-20);
+}
+
+function lowScoringModules(verdict: OpenSpecAutoDeliverVerdictPayload): OpenSpecAutoDeliverModuleScore[] {
+  return verdict.module_scores.filter((score) => score.score < OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE);
+}
+
+function extendAuditRoundLimit(run: AutoDeliverRun, stage: AuditRepairStage): void {
+  const nextLimit = auditRoundCount(run, stage) + 1;
+  if (stage === 'spec_audit_repair') {
+    run.materializedLimits.specAuditRepairRounds = Math.max(run.materializedLimits.specAuditRepairRounds, nextLimit);
+    return;
+  }
+  run.materializedLimits.implementationAuditRepairRounds = Math.max(run.materializedLimits.implementationAuditRepairRounds, nextLimit);
+}
+
+function scheduleAuditFixRetry(run: AutoDeliverRun, stage: AuditRepairStage, reason: string): void {
+  clearAuditFixRetryTimer(run.runId);
+  extendAuditRoundLimit(run, stage);
+  run.status = stage;
+  run.stage = stage;
+  run.latestMessage = reason;
+  emitHumanInterventionPrompt(run, reason, {
+    recoverable: true,
+    waitMs: OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS,
+    eventSuffix: 'audit-fix-gate',
+  });
+  broadcastProjection(run);
+  auditFixRetryTimers.set(run.runId, setTimeout(() => {
+    auditFixRetryTimers.delete(run.runId);
+    const current = runsById.get(run.runId);
+    if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
+    if (current.activeAudit) return;
+    void startAuditRepairStageFailClosed(current, stage);
+  }, OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS));
+}
+
+function shouldRunAnotherConfiguredAuditRound(run: AutoDeliverRun, stage: AuditRepairStage): boolean {
+  return auditRoundCount(run, stage) < auditRoundLimit(run, stage);
+}
+
+async function advanceAfterAuditVerdict(
+  run: AutoDeliverRun,
+  stage: AuditRepairStage,
+  verdict: OpenSpecAutoDeliverVerdictPayload,
+  active: Pick<NonNullable<AutoDeliverRun['activeAudit']>, 'roundIndex' | 'attemptId' | 'generation'>,
+): Promise<void> {
   if (enforceElapsedLimit(run)) return;
   run.latestVerdict = verdict.verdict;
   run.moduleScores = verdict.module_scores.map((score) => ({ ...score }));
+  recordAuditResult(run, stage, verdict, active);
   run.evidence = mergeEvidence(run.evidence, verdict.evidence.map((entry) => ({ ...entry })), {
     staleExisting: verdict.repairs_applied.length > 0,
   });
@@ -1008,25 +1117,29 @@ async function advanceAfterAuditVerdict(run: AutoDeliverRun, stage: AuditRepairS
     return;
   }
 
-  if (verdict.verdict === 'BLOCKED') {
-    const projection = terminalize(run, 'needs_human', 'audit_blocked');
-    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+  const lowScores = lowScoringModules(verdict);
+  if (lowScores.length > 0) {
+    scheduleAuditFixRetry(
+      run,
+      stage,
+      `quality_gate_low_score:${lowScores.map((score) => `${score.module}=${score.score}`).join(',')}`,
+    );
     return;
   }
 
   if (stage === 'spec_audit_repair') {
-    if (verdict.verdict === 'PASS') {
-      run.latestMessage = 'spec_audit_passed';
-      run.evidence = mergeEvidence(run.evidence, await buildValidationEvidence(run));
-      dispatchImplementationPrompt(run);
+    if (shouldRunAnotherConfiguredAuditRound(run, stage)) {
+      await startAuditRepairStageFailClosed(run, stage);
       return;
     }
-    if (auditRoundCount(run, stage) < auditRoundLimit(run, stage)) {
-      await startAuditRepairStageFailClosed(run, 'spec_audit_repair');
-      return;
-    }
-    const projection = terminalize(run, 'needs_human', 'spec_audit_rework_rounds_exhausted');
-    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+    run.latestMessage = verdict.verdict === 'PASS' ? 'spec_audit_passed' : `spec_audit_${verdict.verdict.toLowerCase()}_scored`;
+    run.evidence = mergeEvidence(run.evidence, await buildValidationEvidence(run));
+    dispatchImplementationPrompt(run);
+    return;
+  }
+
+  if (shouldRunAnotherConfiguredAuditRound(run, stage)) {
+    await startAuditRepairStageFailClosed(run, stage);
     return;
   }
 
@@ -1047,14 +1160,12 @@ async function advanceAfterAuditVerdict(run: AutoDeliverRun, stage: AuditRepairS
       },
     ]);
     if (gitEvidence.changedFiles.length > 0 && verdict.repairs_applied.length === 0) {
-      const projection = terminalize(run, 'needs_human', 'audit_pass_with_changed_files_without_repairs');
-      send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+      scheduleAuditFixRetry(run, stage, 'audit_pass_with_changed_files_without_repairs');
       return;
     }
     const finalFailure = validateFinalPass(run, verdict, gitEvidence.changedFiles);
     if (finalFailure) {
-      const projection = terminalize(run, 'needs_human', finalFailure);
-      send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+      scheduleAuditFixRetry(run, stage, finalFailure);
       return;
     }
     const projection = terminalize(run, 'passed', 'final_audit_passed');
@@ -1062,11 +1173,7 @@ async function advanceAfterAuditVerdict(run: AutoDeliverRun, stage: AuditRepairS
     return;
   }
 
-  if (auditRoundCount(run, stage) < auditRoundLimit(run, stage)) {
-    await startAuditRepairStageFailClosed(run, 'implementation_audit_repair');
-    return;
-  }
-  const projection = terminalize(run, 'needs_human', 'implementation_audit_rework_rounds_exhausted');
+  const projection = terminalize(run, 'passed', verdict.verdict === 'BLOCKED' ? 'final_audit_blocked_scored' : 'final_audit_rework_scored');
   send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
 }
 
@@ -1122,8 +1229,9 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
+  const completedAudit = active;
   run.activeAudit = undefined;
-  await advanceAfterAuditVerdict(run, expected.stage, verdict).catch((error) => {
+  await advanceAfterAuditVerdict(run, expected.stage, verdict, completedAudit).catch((error) => {
     terminalizeAndSend(run, 'failed', error instanceof Error ? error.message : 'audit_advance_failed');
   });
 }
@@ -1552,6 +1660,8 @@ export function getActiveOpenSpecAutoDeliverRunsBlockingDaemonUpgrade(): OpenSpe
 export function clearOpenSpecAutoDeliverRunsForTests(): void {
   for (const timer of auditPollTimers.values()) clearTimeout(timer);
   auditPollTimers.clear();
+  for (const timer of auditFixRetryTimers.values()) clearTimeout(timer);
+  auditFixRetryTimers.clear();
   for (const run of runsById.values()) {
     releaseAutoDeliverP2pLock(run.owningMainSessionName, run.runId);
   }

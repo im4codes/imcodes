@@ -87,6 +87,7 @@ export const OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS = [
   'risk',
 ] as const;
 export type OpenSpecAutoDeliverScoreModuleId = (typeof OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS)[number];
+export const OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE = 6 as const;
 
 export const OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE = [
   'daemon',

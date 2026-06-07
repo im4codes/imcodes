@@ -91,6 +91,13 @@ function humanizeAutoDeliverCode(value: string): string {
 
 export function translateAutoDeliverReason(value: string | null | undefined, t: (key: string, opts?: Record<string, unknown>) => string): string | undefined {
   if (!value) return undefined;
+  if (value.startsWith('quality_gate_low_score:')) {
+    const modules = value.slice('quality_gate_low_score:'.length).replace(/,/g, ', ');
+    return t('openspec.auto.reason.quality_gate_low_score', {
+      modules,
+      defaultValue: `Quality gate stopped for low module score: ${modules}`,
+    });
+  }
   return t(`openspec.auto.reason.${value}`, { defaultValue: humanizeAutoDeliverCode(value) });
 }
 
@@ -451,6 +458,7 @@ export function OpenSpecAutoDeliverDetailsPanel({
   const now = useNowTicker(active);
   const elapsed = projection ? formatElapsed(projectionElapsedMs(projection, now)) : '00:00';
   const scoreItems = useMemo(() => projection?.moduleScores ?? [], [projection?.moduleScores]);
+  const auditResults = useMemo(() => projection?.auditResults ?? [], [projection?.auditResults]);
   if (!projection) return null;
 
   return (
@@ -490,6 +498,42 @@ export function OpenSpecAutoDeliverDetailsPanel({
               {uncheckedTaskLabels(projection).slice(0, 5).map((label) => <li key={label}>{label}</li>)}
             </ul>
           ) : null}
+        </div>
+        <div class="openspec-auto-detail-section">
+          <h4>{t('openspec.auto.audit_results')}</h4>
+          {auditResults.length === 0 ? (
+            <div class="openspec-auto-detail-note">{t('openspec.auto.audit_results_empty')}</div>
+          ) : (
+            <div class="openspec-auto-audit-results">
+              {auditResults.map((result) => (
+                <div class="openspec-auto-audit-result" key={`${result.stage}:${result.roundIndex}:${result.attemptId}`}>
+                  <div class="openspec-auto-audit-result-head">
+                    <span>
+                      {t(stageKey(result.stage), result.stage)} · {t('openspec.auto.round_index', { count: result.roundIndex })}
+                    </span>
+                    <strong>{result.verdict}</strong>
+                  </div>
+                  <div class="openspec-auto-score-grid">
+                    {result.moduleScores.map((score) => {
+                      const moduleId = typeof score.module === 'string' && score.module ? score.module : 'unknown';
+                      return (
+                        <div class="openspec-auto-score" key={`${result.attemptId}:${moduleId}`}>
+                          <span>{t(`openspec.auto.score_module.${moduleId}`, moduleId)}</span>
+                          <strong>{score.score}/{score.max_score ?? 10}</strong>
+                          {score.summary && <small>{score.summary}</small>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {result.requiredChanges.length > 0 && (
+                    <div class="openspec-auto-detail-note">
+                      {t('openspec.auto.required_changes')}: {result.requiredChanges.slice(0, 3).join('; ')}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         <div class="openspec-auto-detail-section">
           <h4>{t('openspec.auto.scores')}</h4>

@@ -9,9 +9,15 @@ import type {
   OpenSpecAutoDeliverListRow,
 } from '../../shared/openspec-auto-deliver-types.js';
 import {
+  OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE,
+  OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS,
+  OPENSPEC_AUTO_DELIVER_VERDICTS,
   isOpenSpecAutoDeliverStage,
   isOpenSpecAutoDeliverTerminalStage,
   materializeOpenSpecAutoDeliverPreset,
+  type OpenSpecAutoDeliverEvidenceProvenance,
+  type OpenSpecAutoDeliverScoreModuleId,
+  type OpenSpecAutoDeliverVerdict,
 } from '../../shared/openspec-auto-deliver-constants.js';
 import { redactSensitiveText } from '../../shared/redact-secrets.js';
 
@@ -30,6 +36,9 @@ type CacheEntry = {
 };
 
 const FORBIDDEN_FIELD_NAMES = new Set<string>(P2P_FORBIDDEN_ENVELOPE_FIELD_NAMES);
+const SCORE_MODULES = new Set<string>(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS);
+const VERDICTS = new Set<string>(OPENSPEC_AUTO_DELIVER_VERDICTS);
+const EVIDENCE_PROVENANCE = new Set<string>(OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE);
 const SENSITIVE_FIELD_NAME_PATTERN = /(?:^|[_-])(token|secret|key|password|credential|env|environment|prompt|provider|raw)(?:$|[_-])/i;
 const SECRET_KEY_VALUE_PATTERN = /\b(token|secret|api[_-]?key|access[_-]?token|credential)\s*[:=]\s*['"]?[^\s'"]+['"]?/gi;
 const ABSOLUTE_PATH_PATTERN = /(?:\/Users\/[^\s'")]+|\/home\/[^\s'")]+|\/tmp\/[^\s'")]+|[A-Za-z]:\\[^\s'")]+)/g;
@@ -105,9 +114,9 @@ function sanitizeModuleScores(value: unknown): OpenSpecAutoDeliverSanitizedProje
     const module = sanitizeString(item.module);
     const score = sanitizeNumber(item.score);
     const maxScore = sanitizeNumber(item.maxScore ?? item.max_score);
-    if (!module || score === undefined || maxScore === undefined) continue;
+    if (!module || !SCORE_MODULES.has(module) || score === undefined || maxScore === undefined) continue;
     output.push({
-      module,
+      module: module as OpenSpecAutoDeliverScoreModuleId,
       score,
       maxScore,
       ...(sanitizeString(item.summary) ? { summary: sanitizeString(item.summary) } : {}),
@@ -123,15 +132,78 @@ function sanitizeEvidence(value: unknown): OpenSpecAutoDeliverSanitizedProjectio
     if (!isRecord(item)) continue;
     const source = sanitizeString(item.source);
     const summary = sanitizeString(item.summary);
-    if (!source || !summary) continue;
+    if (!source || !EVIDENCE_PROVENANCE.has(source) || !summary) continue;
     const command = sanitizeString(item.command);
     const exitCode = sanitizeNumber(item.exitCode);
     output.push({
-      source,
+      source: source as OpenSpecAutoDeliverEvidenceProvenance,
       summary,
       ...(command ? { command } : {}),
       ...(exitCode !== undefined ? { exitCode } : {}),
       ...(item.stale === true ? { stale: true } : {}),
+    });
+  }
+  return output.length > 0 ? output : undefined;
+}
+
+function sanitizeRepairSummaries(value: unknown): Array<{ files: string[]; reason: string }> | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const output: Array<{ files: string[]; reason: string }> = [];
+  for (const item of value.slice(0, P2P_SANITIZE_MAX_ARRAY_ITEMS)) {
+    if (!isRecord(item)) continue;
+    const reason = sanitizeString(item.reason);
+    const files = sanitizeStringArray(item.files) ?? [];
+    if (!reason) continue;
+    output.push({ files, reason });
+  }
+  return output.length > 0 ? output : undefined;
+}
+
+function sanitizeAuditResults(value: unknown): OpenSpecAutoDeliverSanitizedProjection['auditResults'] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const output: NonNullable<OpenSpecAutoDeliverSanitizedProjection['auditResults']> = [];
+  for (const item of value.slice(0, P2P_SANITIZE_MAX_ARRAY_ITEMS)) {
+    if (!isRecord(item)) continue;
+    const stage = sanitizeString(item.stage);
+    const roundIndex = sanitizeNonNegativeInteger(item.roundIndex);
+    const attemptId = sanitizeString(item.attemptId);
+    const generation = sanitizeNonNegativeInteger(item.generation);
+    const verdict = sanitizeString(item.verdict);
+    const completedAt = sanitizeNonNegativeInteger(item.completedAt);
+    const moduleScores = sanitizeModuleScores(item.moduleScores);
+    if (
+      (stage !== 'spec_audit_repair' && stage !== 'implementation_audit_repair')
+      || roundIndex === undefined
+      || !attemptId
+      || generation === undefined
+      || !verdict
+      || !VERDICTS.has(verdict)
+      || !moduleScores
+      || completedAt === undefined
+    ) continue;
+    output.push({
+      stage,
+      roundIndex,
+      attemptId,
+      generation,
+      verdict: verdict as OpenSpecAutoDeliverVerdict,
+      moduleScores: moduleScores.map((score) => ({
+        module: score.module as OpenSpecAutoDeliverScoreModuleId,
+        score: score.score,
+        max_score: 10 as const,
+        summary: score.summary ?? '',
+      })),
+      uncheckedTasks: sanitizeStringArray(item.uncheckedTasks) ?? [],
+      requiredChanges: sanitizeStringArray(item.requiredChanges) ?? [],
+      repairSummaries: sanitizeRepairSummaries(item.repairSummaries) ?? [],
+      evidence: (sanitizeEvidence(item.evidence) ?? []).map((entry) => ({
+        source: (entry.source ?? 'audit_reported') as OpenSpecAutoDeliverEvidenceProvenance,
+        summary: entry.summary ?? '',
+        ...(entry.command ? { command: entry.command } : {}),
+        ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),
+        ...(entry.stale ? { stale: true } : {}),
+      })),
+      completedAt,
     });
   }
   return output.length > 0 ? output : undefined;
@@ -258,6 +330,9 @@ export function sanitizeOpenSpecAutoDeliverProjection(
 
   const moduleScores = sanitizeModuleScores(raw.moduleScores);
   if (moduleScores) projection.moduleScores = moduleScores;
+
+  const auditResults = sanitizeAuditResults(raw.auditResults);
+  if (auditResults) projection.auditResults = auditResults;
 
   const validationEvidenceProvenance = sanitizeStringArray(raw.validationEvidenceProvenance);
   if (validationEvidenceProvenance) projection.validationEvidenceProvenance = validationEvidenceProvenance;

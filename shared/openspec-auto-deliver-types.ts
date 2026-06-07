@@ -76,6 +76,20 @@ export interface OpenSpecAutoDeliverVerdictPayload {
   evidence: OpenSpecAutoDeliverEvidence[];
 }
 
+export interface OpenSpecAutoDeliverAuditResult {
+  stage: Extract<OpenSpecAutoDeliverStage, 'spec_audit_repair' | 'implementation_audit_repair'>;
+  roundIndex: number;
+  attemptId: string;
+  generation: number;
+  verdict: OpenSpecAutoDeliverVerdict;
+  moduleScores: OpenSpecAutoDeliverModuleScore[];
+  uncheckedTasks: string[];
+  requiredChanges: string[];
+  repairSummaries: OpenSpecAutoDeliverRepairSummary[];
+  evidence: OpenSpecAutoDeliverEvidence[];
+  completedAt: number;
+}
+
 export interface OpenSpecAutoDeliverP2pMetadata {
   owner: 'openspec_auto_deliver';
   runId: string;
@@ -118,6 +132,7 @@ export interface OpenSpecAutoDeliverProjection {
   canStop?: boolean;
   latestVerdict?: OpenSpecAutoDeliverVerdict;
   moduleScores?: OpenSpecAutoDeliverModuleScore[];
+  auditResults?: OpenSpecAutoDeliverAuditResult[];
   latestRepairSummary?: string;
   evidence?: OpenSpecAutoDeliverEvidence[];
   lastMessage?: string;
@@ -187,6 +202,7 @@ export interface OpenSpecAutoDeliverBrowserFullProjection {
   activeOpenSpecPromptId?: OpenSpecAutoDeliverStagePromptId | string | null;
   latestVerdict?: OpenSpecAutoDeliverVerdict | string | null;
   moduleScores?: OpenSpecAutoDeliverBrowserModuleScore[];
+  auditResults?: OpenSpecAutoDeliverAuditResult[];
   latestRepairSummary?: string | null;
   evidence?: OpenSpecAutoDeliverBrowserEvidence[];
   validationEvidenceProvenance?: string[];
@@ -225,6 +241,7 @@ export interface OpenSpecAutoDeliverBrowserConflictProjection {
   activeOpenSpecPromptId?: never;
   latestVerdict?: never;
   moduleScores?: never;
+  auditResults?: never;
   latestRepairSummary?: never;
   evidence?: never;
   validationEvidenceProvenance?: never;

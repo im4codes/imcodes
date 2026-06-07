@@ -12,6 +12,7 @@ import {
 } from '@shared/openspec-auto-deliver-constants.js';
 import type {
   OpenSpecAutoDeliverEvidence,
+  OpenSpecAutoDeliverAuditResult,
   OpenSpecAutoDeliverListRow,
   OpenSpecAutoDeliverModuleScore,
   OpenSpecAutoDeliverProjection,
@@ -178,6 +179,66 @@ function normalizeEvidence(value: unknown): OpenSpecAutoDeliverEvidence[] | unde
   return output.length > 0 ? output : undefined;
 }
 
+function normalizeRepairSummaries(value: unknown): OpenSpecAutoDeliverAuditResult['repairSummaries'] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const output = value
+    .filter(isRecord)
+    .map((item) => {
+      const reason = nonEmptyString(item.reason);
+      if (!reason) return null;
+      return {
+        files: normalizeStringArray(item.files) ?? [],
+        reason,
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => item !== null);
+  return output.length > 0 ? output : undefined;
+}
+
+function normalizeAuditResults(value: unknown): OpenSpecAutoDeliverAuditResult[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const output = value
+    .filter(isRecord)
+    .map((item) => {
+      const stage = normalizeStage(item.stage);
+      const roundIndex = nonNegativeInteger(item.roundIndex);
+      const attemptId = nonEmptyString(item.attemptId);
+      const generation = nonNegativeInteger(item.generation);
+      const verdict = normalizeVerdict(item.verdict);
+      const moduleScores = normalizeModuleScores(item.moduleScores);
+      const completedAt = nonNegativeInteger(item.completedAt);
+      if (!stage || roundIndex === undefined || !attemptId || generation === undefined || !verdict || !moduleScores || completedAt === undefined) {
+        return null;
+      }
+      return {
+        stage: stage as OpenSpecAutoDeliverAuditResult['stage'],
+        roundIndex,
+        attemptId,
+        generation,
+        verdict: verdict as OpenSpecAutoDeliverAuditResult['verdict'],
+        moduleScores: moduleScores.map((score) => ({
+          module: score.module as OpenSpecAutoDeliverAuditResult['moduleScores'][number]['module'],
+          score: score.score,
+          max_score: 10 as const,
+          summary: score.summary ?? '',
+        })),
+        uncheckedTasks: normalizeStringArray(item.uncheckedTasks) ?? [],
+        requiredChanges: normalizeStringArray(item.requiredChanges) ?? [],
+        repairSummaries: normalizeRepairSummaries(item.repairSummaries) ?? [],
+        evidence: normalizeEvidence(item.evidence)?.map((entry) => ({
+          source: (entry.source ?? entry.provenance ?? 'audit_reported') as OpenSpecAutoDeliverAuditResult['evidence'][number]['source'],
+          summary: entry.summary ?? entry.label ?? '',
+          ...(entry.command ? { command: entry.command } : {}),
+          ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),
+          ...(entry.stale ? { stale: true } : {}),
+        })) ?? [],
+        completedAt,
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => item !== null);
+  return output.length > 0 ? output : undefined;
+}
+
 function normalizePresetId(value: unknown): OpenSpecAutoDeliverPresetId | undefined {
   const presetId = nonEmptyString(value);
   return presetId && PRESET_VALUES.has(presetId) ? presetId as OpenSpecAutoDeliverPresetId : undefined;
@@ -284,6 +345,8 @@ export function normalizeOpenSpecAutoDeliverProjection(raw: unknown): OpenSpecAu
   if (implementationAuditRound) projection.implementationAuditRound = implementationAuditRound;
   const moduleScores = normalizeModuleScores(raw.moduleScores);
   if (moduleScores) projection.moduleScores = moduleScores;
+  const auditResults = normalizeAuditResults(raw.auditResults);
+  if (auditResults) projection.auditResults = auditResults;
   const evidence = normalizeEvidence(raw.evidence);
   if (evidence) projection.evidence = evidence;
   const validationEvidenceProvenance = normalizeStringArray(raw.validationEvidenceProvenance);

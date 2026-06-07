@@ -31,6 +31,7 @@ export const OPENSPEC_AUTO_DELIVER_PRESETS = [
 export type { OpenSpecAutoDeliverPresetId };
 export type {
   OpenSpecAutoDeliverBrowserConflictProjection,
+  OpenSpecAutoDeliverAuditResult,
   OpenSpecAutoDeliverBrowserEvidence as OpenSpecAutoDeliverEvidence,
   OpenSpecAutoDeliverBrowserFullProjection,
   OpenSpecAutoDeliverBrowserModuleScore as OpenSpecAutoDeliverModuleScore,
