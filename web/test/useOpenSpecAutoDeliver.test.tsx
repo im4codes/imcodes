@@ -46,6 +46,8 @@ describe('useOpenSpecAutoDeliver', () => {
         materializedLimits: {
           specAuditRepairRounds: 1,
           implementationAuditRepairRounds: 2,
+          maxImplementationPrompts: 12,
+          maxElapsedMinutes: 240,
         },
       });
       expect(requestId).toBeTruthy();
@@ -59,6 +61,8 @@ describe('useOpenSpecAutoDeliver', () => {
       materializedLimits: {
         specAuditRepairRounds: 1,
         implementationAuditRepairRounds: 2,
+        maxImplementationPrompts: 12,
+        maxElapsedMinutes: 240,
       },
     }));
 
@@ -76,6 +80,8 @@ describe('useOpenSpecAutoDeliver', () => {
         materializedLimits: {
           specAuditRepairRounds: 1,
           implementationAuditRepairRounds: 2,
+          maxImplementationPrompts: 12,
+          maxElapsedMinutes: 240,
         },
       });
     });
@@ -100,6 +106,7 @@ describe('useOpenSpecAutoDeliver', () => {
         type: 'openspec_auto_deliver.projection',
         projection: {
           runId: 'auto-run-1',
+          visibility: 'full',
           changeName: 'openspec-auto-delivery',
           status: 'implementation_task_loop',
           stage: 'implementation_task_loop',
@@ -146,5 +153,239 @@ describe('useOpenSpecAutoDeliver', () => {
 
     expect(result.current.stopPending).toBe(false);
     expect(result.current.lastError).toBe('openspec.auto.error.launch_failed');
+  });
+
+  it('constructs conflict projection state from an allowlist and blocks Stop', () => {
+    const ws = makeWs();
+    const { result } = renderHook(() => useOpenSpecAutoDeliver({
+      ws,
+      serverId: 'server-1',
+      sessionName: 'deck_sub_sibling',
+    }));
+
+    act(() => {
+      ws.emit({
+        type: 'openspec_auto_deliver.conflict_summary',
+        projection: {
+          runId: 'auto-conflict-1',
+          visibility: 'conflict',
+          projectionVersion: 7,
+          owningMainSessionName: 'deck_main_brain',
+          status: 'implementation_task_loop',
+          stage: 'implementation_task_loop',
+          busy: true,
+          reason: 'auto_deliver_active',
+          conflictReason: 'auto_deliver_active',
+          canStop: true,
+          changeName: 'private-change',
+          evidence: [{ summary: 'secret evidence' }],
+          validationOutput: 'npm test failed in /Users/k/private',
+          rawPrompt: 'private prompt body',
+          rawP2pInternals: { targetSessionName: 'deck_secret_worker' },
+          apiToken: 'secret-token',
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(result.current.projection).toMatchObject({
+      visibility: 'conflict',
+      runId: 'auto-conflict-1',
+      owningMainSessionName: 'deck_main_brain',
+      status: 'implementation_task_loop',
+      stage: 'implementation_task_loop',
+      conflictReason: 'auto_deliver_active',
+      canStop: false,
+    });
+    expect(result.current.projection).not.toHaveProperty('changeName');
+    expect(result.current.projection).not.toHaveProperty('evidence');
+    expect(result.current.projection).not.toHaveProperty('validationOutput');
+    expect(result.current.projection).not.toHaveProperty('rawPrompt');
+    expect(result.current.projection).not.toHaveProperty('rawP2pInternals');
+    expect(result.current.projection).not.toHaveProperty('apiToken');
+
+    act(() => {
+      expect(result.current.stop()).toBeNull();
+    });
+
+    expect(ws.send.mock.calls.some(([payload]) => (
+      (payload as { type?: string }).type === 'openspec_auto_deliver.stop'
+    ))).toBe(false);
+    expect(result.current.stopPending).toBe(false);
+  });
+
+  it('rejects malformed projection metadata instead of inventing defaults', () => {
+    const ws = makeWs();
+    const { result } = renderHook(() => useOpenSpecAutoDeliver({
+      ws,
+      serverId: 'server-1',
+      sessionName: 'deck_main_brain',
+    }));
+
+    for (const projection of [
+      {
+        runId: 'missing-visibility',
+        projectionVersion: 1,
+        changeName: 'private-change',
+        status: 'implementation_task_loop',
+        stage: 'implementation_task_loop',
+      },
+      {
+        runId: 'bad-stage',
+        visibility: 'full',
+        projectionVersion: 1,
+        changeName: 'private-change',
+        status: 'implementation_task_loop',
+        stage: 'active',
+      },
+      {
+        runId: 'bad-status',
+        visibility: 'full',
+        projectionVersion: 1,
+        changeName: 'private-change',
+        status: {},
+        stage: 'implementation_task_loop',
+      },
+      {
+        runId: 'bad-version',
+        visibility: 'conflict',
+        projectionVersion: Number.POSITIVE_INFINITY,
+        owningMainSessionName: 'deck_main_brain',
+        status: 'implementation_task_loop',
+        stage: 'implementation_task_loop',
+        reason: 'auto_deliver_active',
+      },
+    ]) {
+      act(() => {
+        ws.emit({
+          type: 'openspec_auto_deliver.projection',
+          projection,
+        } as unknown as ServerMessage);
+      });
+    }
+
+    expect(result.current.projection).toBeNull();
+  });
+
+  it('clears stop pending on terminal projection and disconnect', () => {
+    const ws = makeWs();
+    const { result } = renderHook(() => useOpenSpecAutoDeliver({
+      ws,
+      serverId: 'server-1',
+      sessionName: 'deck_main_brain',
+    }));
+
+    act(() => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-run-stop',
+          visibility: 'full',
+          projectionVersion: 1,
+          changeName: 'openspec-auto-delivery',
+          status: 'implementation_task_loop',
+          stage: 'implementation_task_loop',
+          owningMainSessionName: 'deck_main_brain',
+          launchedFromSessionName: 'deck_main_brain',
+          targetImplementationSessionName: 'deck_main_brain',
+          canStop: true,
+        },
+      } as unknown as ServerMessage);
+    });
+
+    act(() => {
+      result.current.stop();
+    });
+
+    expect(result.current.stopPending).toBe(true);
+
+    act(() => {
+      ws.emit({
+        type: 'openspec_auto_deliver.terminal',
+        projection: {
+          runId: 'auto-run-stop',
+          visibility: 'full',
+          projectionVersion: 2,
+          changeName: 'openspec-auto-delivery',
+          status: 'stopped',
+          stage: 'stopped',
+          owningMainSessionName: 'deck_main_brain',
+          terminal: true,
+          canStop: false,
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(result.current.stopPending).toBe(false);
+
+    act(() => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-run-disconnect',
+          visibility: 'full',
+          projectionVersion: 1,
+          changeName: 'openspec-auto-delivery',
+          status: 'implementation_task_loop',
+          stage: 'implementation_task_loop',
+          owningMainSessionName: 'deck_main_brain',
+          canStop: true,
+        },
+      } as unknown as ServerMessage);
+    });
+
+    act(() => {
+      result.current.stop();
+    });
+
+    expect(result.current.stopPending).toBe(true);
+
+    act(() => {
+      ws.emit({
+        type: 'daemon.offline',
+      } as unknown as ServerMessage);
+    });
+
+    expect(result.current.stopPending).toBe(false);
+  });
+
+  it('clears stop pending on timeout with the localized stop timeout key', () => {
+    vi.useFakeTimers();
+    const ws = makeWs();
+    const { result } = renderHook(() => useOpenSpecAutoDeliver({
+      ws,
+      serverId: 'server-1',
+      sessionName: 'deck_main_brain',
+    }));
+
+    act(() => {
+      result.current.stop('auto-run-timeout');
+    });
+    expect(result.current.stopPending).toBe(true);
+
+    act(() => {
+      vi.advanceTimersByTime(15_000);
+    });
+
+    expect(result.current.stopPending).toBe(false);
+    expect(result.current.lastError).toBe('openspec.auto.error.stop_timeout');
+  });
+
+  it('does not leave stop pending when the websocket is not connected', () => {
+    const ws = makeWs();
+    const { result } = renderHook(() => useOpenSpecAutoDeliver({
+      ws,
+      serverId: 'server-1',
+      sessionName: 'deck_main_brain',
+    }));
+    ws.send.mockImplementation(() => {
+      throw new Error('WebSocket not connected');
+    });
+
+    act(() => {
+      expect(result.current.stop('auto-run-offline')).toBeNull();
+    });
+
+    expect(result.current.stopPending).toBe(false);
+    expect(result.current.lastError).toBe('openspec.auto.error.daemon_offline');
   });
 });

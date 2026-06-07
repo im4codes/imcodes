@@ -1216,6 +1216,7 @@
         "invalid_rounds": "El número de rondas está fuera del rango permitido.",
         "daemon_offline": "El daemon está desconectado. Inténtalo de nuevo cuando se reconecte.",
         "launch_timeout": "La entrega automática agotó el tiempo de inicio. Inténtalo de nuevo.",
+        "stop_timeout": "La detención de la entrega automática agotó el tiempo. Inténtalo de nuevo.",
         "custom_combo_unsupported": "La entrega automática todavía no admite combos personalizados de Team.",
         "strict_result_failed": "The audit did not return a valid strict result."
       },

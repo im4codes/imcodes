@@ -13,6 +13,7 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.auto.reason.auto_deliver_active') return 'Auto Deliver is already running for this session.';
       if (key === 'openspec.auto.reason.missing_authoritative_json') return 'The audit did not produce a final authoritative JSON result.';
       if (key === 'openspec.auto.status.active') return 'Active';
+      if (key === 'openspec.auto.status.implementation_task_loop') return 'Active';
       if (key === 'openspec.auto.stage.implementation_task_loop') return 'Implementation';
       if (key === 'openspec.auto.stage.implementation_audit_repair') return 'Implementation audit';
       if (key === 'p2p.mode_audit') return 'Audit';
@@ -476,7 +477,7 @@ describe('DiscussionsPage', () => {
           projectionVersion: 2,
           visibility: 'full',
           changeName: 'openspec-auto-delivery',
-          status: 'active',
+          status: 'implementation_task_loop',
           stage: 'implementation_task_loop',
           owningMainSessionName: 'deck_proj_brain',
           targetImplementationSessionName: 'deck_sub_1',
@@ -516,7 +517,7 @@ describe('DiscussionsPage', () => {
           projectionVersion: 1,
           visibility: 'full',
           changeName: 'direct-auto',
-          status: 'active',
+          status: 'implementation_task_loop',
           stage: 'spec_audit_repair',
           owningMainSessionName: 'deck_proj_brain',
         }],
@@ -543,7 +544,7 @@ describe('DiscussionsPage', () => {
           projectionVersion: 1,
           visibility: 'full',
           changeName: 'visible-auto',
-          status: 'active',
+          status: 'implementation_task_loop',
           stage: 'spec_audit_repair',
           owningMainSessionName: 'deck_proj_brain',
         }],
@@ -571,15 +572,34 @@ describe('DiscussionsPage', () => {
           runId: 'auto-conflict-1',
           projectionVersion: 3,
           visibility: 'conflict',
-          status: 'active',
+          status: 'implementation_task_loop',
           stage: 'implementation_audit_repair',
           owningMainSessionName: 'deck_proj_brain',
           reason: 'auto_deliver_active',
+          changeName: 'private-change-name',
+          latestRepairSummary: 'private repair summary',
+          evidence: [{ summary: 'private evidence' }],
+          uncheckedTaskLabels: ['private unchecked task'],
+          changedFiles: ['/Users/k/private/file.ts'],
+          findings: ['private finding'],
+          validationOutput: 'private validation output',
+          rawPrompt: 'private prompt',
+          rawP2pInternals: { sessionName: 'deck_secret_worker' },
+          apiToken: 'secret-token',
         }],
       } as unknown as ServerMessage);
     });
 
     expect(screen.queryByText('private-change-name')).toBeNull();
+    expect(screen.queryByText('private repair summary')).toBeNull();
+    expect(screen.queryByText('private evidence')).toBeNull();
+    expect(screen.queryByText('private unchecked task')).toBeNull();
+    expect(screen.queryByText('/Users/k/private/file.ts')).toBeNull();
+    expect(screen.queryByText('private finding')).toBeNull();
+    expect(screen.queryByText('private validation output')).toBeNull();
+    expect(screen.queryByText('private prompt')).toBeNull();
+    expect(screen.queryByText('deck_secret_worker')).toBeNull();
+    expect(screen.queryByText('secret-token')).toBeNull();
     const autoRow = container.querySelector('.discussions-list-item') as HTMLElement;
     expect(autoRow.textContent).toContain('deck_proj_brain');
     expect(autoRow.textContent).not.toContain('private-change-name');
@@ -587,6 +607,58 @@ describe('DiscussionsPage', () => {
     fireEvent.click(autoRow);
     expect(screen.getByText('Auto Deliver is already running for this session.')).toBeDefined();
     expect(screen.queryByText('auto_deliver_active')).toBeNull();
+  });
+
+  it('drops malformed Auto Deliver list rows before recovery state can render them', async () => {
+    render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_sub_1' }} initialTab="auto" />);
+
+    await act(async () => {
+      handler?.({ type: 'p2p.list_discussions_response', discussions: [] } as ServerMessage);
+      handler?.({
+        type: 'openspec_auto_deliver.list_response',
+        rows: [
+          {
+            runId: 'missing-visibility',
+            projectionVersion: 1,
+            changeName: 'leaked-missing-visibility',
+            status: 'active',
+            stage: 'implementation_task_loop',
+            owningMainSessionName: 'deck_proj_brain',
+          },
+          {
+            runId: 'missing-stage',
+            projectionVersion: 2,
+            visibility: 'full',
+            changeName: 'leaked-missing-stage',
+            status: 'active',
+            owningMainSessionName: 'deck_proj_brain',
+          },
+          {
+            runId: 'bad-version',
+            projectionVersion: Number.POSITIVE_INFINITY,
+            visibility: 'conflict',
+            status: 'active',
+            stage: 'implementation_task_loop',
+            owningMainSessionName: 'deck_proj_brain',
+            reason: 'auto_deliver_active',
+          },
+          {
+            runId: 'valid-row',
+            projectionVersion: 3,
+            visibility: 'full',
+            changeName: 'visible-valid-row',
+            status: 'implementation_task_loop',
+            stage: 'implementation_task_loop',
+            owningMainSessionName: 'deck_proj_brain',
+          },
+        ],
+      } as unknown as ServerMessage);
+    });
+
+    expect(screen.getAllByText('visible-valid-row').length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText('leaked-missing-visibility')).toBeNull();
+    expect(screen.queryByText('leaked-missing-stage')).toBeNull();
+    expect(screen.queryByText('bad-version')).toBeNull();
   });
 
   it('localizes Auto Deliver terminal reasons in recovery row details', async () => {

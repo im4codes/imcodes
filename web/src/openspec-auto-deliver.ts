@@ -73,5 +73,7 @@ export function materializedPresetLimits(presetId: OpenSpecAutoDeliverPresetId) 
   return {
     specAuditRepairRounds: preset.specAuditRepairRounds,
     implementationAuditRepairRounds: preset.implementationAuditRepairRounds,
+    maxImplementationPrompts: preset.maxImplementationPrompts,
+    maxElapsedMinutes: preset.maxElapsedMinutes,
   };
 }

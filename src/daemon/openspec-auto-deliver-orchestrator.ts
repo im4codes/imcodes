@@ -363,11 +363,7 @@ function buildProjection(run: AutoDeliverRun): OpenSpecAutoDeliverProjection {
     runId: run.runId,
     changeName: run.changeName,
     presetId: run.presetId,
-    materializedLimits: {
-      maxImplementationPrompts: OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
-      maxElapsedMinutes: OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
-      ...run.materializedLimits,
-    },
+    materializedLimits: { ...run.materializedLimits },
     status: run.status,
     stage: run.stage,
     owningMainSessionName: run.owningMainSessionName,
@@ -910,11 +906,50 @@ function latestRunForSession(sessionName: string): AutoDeliverRun | undefined {
   return activeRunForOwner(owner) ?? terminalRunByOwner.get(owner);
 }
 
+function recordP2pCancelFailureDiagnostic(run: AutoDeliverRun, summary: string): void {
+  if (!isOpenSpecAutoDeliverTerminalStage(run.status)) return;
+  run.evidence = mergeEvidence(run.evidence, [{
+    source: 'daemon',
+    summary,
+    stale: false,
+  }]);
+  broadcastProjection(run);
+}
+
+function describeUnknownError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function trackActiveAuditCancellation(run: AutoDeliverRun, active: NonNullable<AutoDeliverRun['activeAudit']>, reason: string): void {
+  void cancelP2pRun(active.p2pRunId, run.serverLink, {
+    source: 'openspec_auto_deliver_terminalize',
+    reason,
+    requestedBySession: run.launchedFromSessionName,
+  })
+    .then((cancelled) => {
+      if (cancelled) return;
+      setTimeout(() => {
+        recordP2pCancelFailureDiagnostic(
+          run,
+          `P2P cancel diagnostic: cancelP2pRun returned false for active Auto Deliver audit run ${active.p2pRunId}.`,
+        );
+      }, 0);
+    })
+    .catch((error) => {
+      setTimeout(() => {
+        recordP2pCancelFailureDiagnostic(
+          run,
+          `P2P cancel diagnostic: cancelP2pRun rejected for active Auto Deliver audit run ${active.p2pRunId}: ${describeUnknownError(error)}.`,
+        );
+      }, 0);
+    });
+}
+
 function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 'passed' | 'needs_human' | 'failed' | 'stopped'>, reason: string): OpenSpecAutoDeliverProjection {
   if (run.activeAudit) {
     const active = run.activeAudit;
     clearAuditPollTimer(run.runId);
-    void cancelP2pRun(active.p2pRunId, run.serverLink).catch(() => undefined);
+    if (active.p2pRunId) trackActiveAuditCancellation(run, active, reason);
     run.activeAudit = undefined;
   }
   run.status = status;

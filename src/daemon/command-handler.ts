@@ -2828,7 +2828,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       if (existingRun && forceNew) {
         // Force: cancel existing run first, then start new
         logger.info({ sessionName, existingRunId: existingRun.id }, 'P2P force: cancelling existing run');
-        cancelP2pRun(existingRun.id, serverLink);
+        cancelP2pRun(existingRun.id, serverLink, {
+          source: 'force_new_p2p',
+          reason: 'existing_run_conflict_force',
+          requestedBySession: sessionName,
+        });
       }
 
       const record = getSession(sessionName);
@@ -6944,7 +6948,16 @@ function isPathAllowed(realPath: string): boolean {
 async function handleP2pCancel(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const runId = cmd.runId as string | undefined;
   if (!runId) return;
-  const ok = await cancelP2pRun(runId, serverLink);
+  const requestedBySession = typeof cmd.sessionName === 'string'
+    ? cmd.sessionName
+    : typeof cmd.session === 'string'
+      ? cmd.session
+      : null;
+  const ok = await cancelP2pRun(runId, serverLink, {
+    source: 'manual_p2p_cancel',
+    reason: 'browser_cancel_request',
+    requestedBySession,
+  });
   try { serverLink.send({ type: P2P_WORKFLOW_MSG.CANCEL_RESPONSE, runId, ok }); } catch { /* ignore */ }
 }
 

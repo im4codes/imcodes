@@ -1,36 +1,29 @@
 import {
   OPENSPEC_AUTO_DELIVER_CHANGE_SLUG_MAX_BYTES,
-  OPENSPEC_AUTO_DELIVER_COMBO_IDS,
-  OPENSPEC_AUTO_DELIVER_COMBO_WRITE_MODES,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
   OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
   OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX,
   OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MIN,
   OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE,
-  OPENSPEC_AUTO_DELIVER_MUTATION_SCOPES,
   OPENSPEC_AUTO_DELIVER_PRESET_IDS,
   OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX,
   OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MIN,
   OPENSPEC_AUTO_DELIVER_REQUEST_ID_MAX_BYTES,
   OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS,
-  OPENSPEC_AUTO_DELIVER_STRICT_RESULT_CHANNELS,
   OPENSPEC_AUTO_DELIVER_VERDICTS,
   OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES,
-  type OpenSpecAutoDeliverComboId,
   type OpenSpecAutoDeliverPresetId,
   type OpenSpecAutoDeliverScoreModuleId,
   materializeOpenSpecAutoDeliverPreset,
 } from './openspec-auto-deliver-constants.js';
 import type {
-  OpenSpecAutoDeliverComboDescriptor,
   OpenSpecAutoDeliverLaunchRequest,
   OpenSpecAutoDeliverTaskStats,
   OpenSpecAutoDeliverValidationIssue,
   OpenSpecAutoDeliverValidationResult,
   OpenSpecAutoDeliverVerdictPayload,
 } from './openspec-auto-deliver-types.js';
-import { P2P_PERMISSION_SCOPES } from './p2p-workflow-constants.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -281,35 +274,4 @@ export function parseOpenSpecAutoDeliverAuthoritativeJsonPayload(text: string): 
   } catch {
     return { ok: false, issues: [issue('malformed_authoritative_json', 'Authoritative JSON is malformed.')] };
   }
-}
-
-export function validateOpenSpecAutoDeliverComboDescriptor(input: unknown): OpenSpecAutoDeliverValidationResult<OpenSpecAutoDeliverComboDescriptor> {
-  if (!isRecord(input)) return { ok: false, issues: [issue('invalid_combo_descriptor', 'Combo descriptor must be an object.')] };
-  const issues: OpenSpecAutoDeliverValidationIssue[] = [];
-  const comboIds = Object.values(OPENSPEC_AUTO_DELIVER_COMBO_IDS) as OpenSpecAutoDeliverComboId[];
-  if (!isOneOf(input.id, comboIds)) issues.push(issue('invalid_combo_id', 'Combo id is not canonical.', 'id'));
-  if (typeof input.title !== 'string' || input.title.trim().length === 0) issues.push(issue('invalid_combo_title', 'Combo title is required.', 'title'));
-  if (!isRecord(input.capability)) {
-    issues.push(issue('invalid_combo_capability', 'Combo capability is required.', 'capability'));
-  } else {
-    if (!isOneOf(input.capability.stage, ['spec_audit_repair', 'implementation_audit_repair'] as const)) issues.push(issue('invalid_combo_stage', 'Combo stage is invalid.', 'capability.stage'));
-    if (!isOneOf(input.capability.requiredPermissionScope, P2P_PERMISSION_SCOPES)) issues.push(issue('invalid_combo_permission_scope', 'Combo permission scope is invalid.', 'capability.requiredPermissionScope'));
-    if (!Array.isArray(input.capability.allowedMutationScopes) || input.capability.allowedMutationScopes.some((scope) => !isOneOf(scope, OPENSPEC_AUTO_DELIVER_MUTATION_SCOPES))) {
-      issues.push(issue('invalid_combo_mutation_scope', 'Combo mutation scopes are invalid.', 'capability.allowedMutationScopes'));
-    }
-    if (!isOneOf(input.capability.writeMode, OPENSPEC_AUTO_DELIVER_COMBO_WRITE_MODES)) issues.push(issue('invalid_combo_write_mode', 'Combo write mode is invalid.', 'capability.writeMode'));
-    if (!isOneOf(input.capability.strictResultChannel, OPENSPEC_AUTO_DELIVER_STRICT_RESULT_CHANNELS)) issues.push(issue('invalid_combo_result_channel', 'Combo strict result channel is invalid.', 'capability.strictResultChannel'));
-    if (typeof input.capability.minTransportParticipants !== 'number' || input.capability.minTransportParticipants < 1) issues.push(issue('invalid_combo_min_participants', 'Combo min participants must be at least one.', 'capability.minTransportParticipants'));
-    if (input.capability.supportsGenerationMetadata !== true) issues.push(issue('combo_missing_generation_metadata', 'Combo must support generation metadata.', 'capability.supportsGenerationMetadata'));
-    if (input.capability.supportsStopCancellation !== true) issues.push(issue('combo_missing_stop_cancellation', 'Combo must support stop/cancel.', 'capability.supportsStopCancellation'));
-    if (input.capability.stage === 'spec_audit_repair' && input.capability.requiredPermissionScope === 'analysis_only') {
-      issues.push(issue('spec_combo_analysis_only', 'Spec audit-repair combo cannot be analysis-only.', 'capability.requiredPermissionScope'));
-    }
-    if (input.capability.stage === 'implementation_audit_repair' && input.capability.requiredPermissionScope === 'analysis_only') {
-      issues.push(issue('implementation_combo_analysis_only', 'Implementation audit-repair combo cannot be analysis-only.', 'capability.requiredPermissionScope'));
-    }
-  }
-  if (!Array.isArray(input.rounds) || input.rounds.length === 0) issues.push(issue('invalid_combo_rounds', 'Combo rounds are required.', 'rounds'));
-  if (issues.length > 0) return { ok: false, issues };
-  return { ok: true, value: input as unknown as OpenSpecAutoDeliverComboDescriptor, issues: [] };
 }

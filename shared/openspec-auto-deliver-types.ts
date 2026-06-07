@@ -1,17 +1,11 @@
-import type { P2pAdvancedRound } from './p2p-advanced.js';
-import type { P2pPermissionScope } from './p2p-workflow-constants.js';
 import type {
-  OpenSpecAutoDeliverComboId,
-  OpenSpecAutoDeliverComboWriteMode,
   OpenSpecAutoDeliverEvidenceProvenance,
-  OpenSpecAutoDeliverMutationScope,
+  OpenSpecAutoDeliverMaterializedLimits,
   OpenSpecAutoDeliverProjectionVisibility,
   OpenSpecAutoDeliverPresetId,
-  OpenSpecAutoDeliverRoundLimits,
   OpenSpecAutoDeliverScoreModuleId,
   OpenSpecAutoDeliverStage,
   OpenSpecAutoDeliverStagePromptId,
-  OpenSpecAutoDeliverStrictResultChannel,
   OpenSpecAutoDeliverViewMode,
   OpenSpecAutoDeliverVerdict,
 } from './openspec-auto-deliver-constants.js';
@@ -23,10 +17,7 @@ export interface OpenSpecAutoDeliverLaunchRequest {
   projectName?: string;
   changeName: string;
   presetId: OpenSpecAutoDeliverPresetId;
-  materializedLimits?: OpenSpecAutoDeliverRoundLimits & {
-    maxImplementationPrompts?: number;
-    maxElapsedMinutes?: number;
-  };
+  materializedLimits?: OpenSpecAutoDeliverMaterializedLimits;
   selectedTeamComboId?: string;
 }
 
@@ -101,34 +92,13 @@ export interface OpenSpecAutoDeliverP2pMetadata {
   generation: number;
 }
 
-export interface OpenSpecAutoDeliverComboCapability {
-  stage: Extract<OpenSpecAutoDeliverStage, 'spec_audit_repair' | 'implementation_audit_repair'>;
-  requiredPermissionScope: P2pPermissionScope;
-  allowedMutationScopes: OpenSpecAutoDeliverMutationScope[];
-  writeMode: OpenSpecAutoDeliverComboWriteMode;
-  strictResultChannel: OpenSpecAutoDeliverStrictResultChannel;
-  minTransportParticipants: number;
-  supportsGenerationMetadata: boolean;
-  supportsStopCancellation: boolean;
-}
-
-export interface OpenSpecAutoDeliverComboDescriptor {
-  id: OpenSpecAutoDeliverComboId;
-  title: string;
-  capability: OpenSpecAutoDeliverComboCapability;
-  rounds: P2pAdvancedRound[];
-}
-
 export interface OpenSpecAutoDeliverProjection {
   visibility?: Extract<OpenSpecAutoDeliverProjectionVisibility, 'full'>;
   projectionVersion: number;
   runId: string;
   changeName: string;
   presetId: OpenSpecAutoDeliverPresetId;
-  materializedLimits: OpenSpecAutoDeliverRoundLimits & {
-    maxImplementationPrompts?: number;
-    maxElapsedMinutes?: number;
-  };
+  materializedLimits: OpenSpecAutoDeliverMaterializedLimits;
   status: OpenSpecAutoDeliverStage;
   stage: OpenSpecAutoDeliverStage;
   owningMainSessionName: string;
@@ -205,10 +175,7 @@ export interface OpenSpecAutoDeliverBrowserFullProjection {
   owningMainSessionName?: string;
   launchedFromSessionName?: string;
   targetImplementationSessionName?: string;
-  materializedLimits?: OpenSpecAutoDeliverRoundLimits & {
-    maxImplementationPrompts?: number;
-    maxElapsedMinutes?: number;
-  };
+  materializedLimits?: OpenSpecAutoDeliverMaterializedLimits;
   specAuditRepairRound?: number;
   implementationAuditRepairRound?: number;
   specAuditRound?: { current: number; total: number };

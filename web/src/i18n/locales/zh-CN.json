@@ -1217,6 +1217,7 @@
         "invalid_rounds": "审计轮数超出允许范围。",
         "daemon_offline": "Daemon 离线，重连后再试。",
         "launch_timeout": "自动交付启动超时，请重试。",
+        "stop_timeout": "自动交付停止超时，请重试。",
         "custom_combo_unsupported": "自动交付暂不支持自定义团队组合流程。",
         "strict_result_failed": "审计没有返回有效的严格结果。"
       },

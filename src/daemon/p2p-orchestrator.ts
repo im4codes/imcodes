@@ -1280,9 +1280,34 @@ export async function startP2pRun(...args:
 
 // ── Cancel ────────────────────────────────────────────────────────────────
 
-export async function cancelP2pRun(runId: string, serverLink: ServerLink | null): Promise<boolean> {
+export interface P2pCancelOptions {
+  source?: string;
+  reason?: string;
+  requestedBySession?: string | null;
+}
+
+export async function cancelP2pRun(runId: string, serverLink: ServerLink | null, options: P2pCancelOptions = {}): Promise<boolean> {
   const run = activeRuns.get(runId);
-  if (!run) return false;
+  const source = options.source ?? 'unknown';
+  if (!run) {
+    logger.warn({
+      runId,
+      source,
+      reason: options.reason,
+      requestedBySession: options.requestedBySession ?? null,
+    }, 'P2P cancel requested for missing run');
+    return false;
+  }
+
+  logger.info({
+    runId,
+    source,
+    reason: options.reason,
+    requestedBySession: options.requestedBySession ?? null,
+    initiatorSession: run.initiatorSession,
+    currentStatus: run.status,
+    currentPhase: run.runPhase,
+  }, 'P2P cancel requested');
 
   run._cancelled = true;
   run.runPhase = 'cancelled';
@@ -1301,6 +1326,7 @@ export async function cancelP2pRun(runId: string, serverLink: ServerLink | null)
     run.activePhase = 'queued';
     transition(run, 'cancelled', serverLink);
     activeRuns.delete(runId);
+    logger.info({ runId, source, reason: options.reason }, 'P2P queued run cancelled');
     return true;
   }
 
@@ -1316,10 +1342,17 @@ export async function cancelP2pRun(runId: string, serverLink: ServerLink | null)
     run.activeTargetSessions = [];
     transition(run, 'cancelled', serverLink);
     activeRuns.delete(runId);
+    logger.info({
+      runId,
+      source,
+      reason: options.reason,
+      targetCount: targets.size,
+    }, 'P2P active run cancelled');
     return true;
   }
 
   activeRuns.delete(runId);
+  logger.info({ runId, source, reason: options.reason, currentStatus: run.status }, 'P2P terminal run removed after cancel request');
   return true;
 }
 

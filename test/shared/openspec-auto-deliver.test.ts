@@ -6,11 +6,11 @@ import {
   OPENSPEC_AUTO_DELIVER_COMBO_IDS,
   materializeOpenSpecAutoDeliverPreset,
 } from '../../shared/openspec-auto-deliver-constants.js';
+import * as openSpecAutoDeliverCombos from '../../shared/openspec-auto-deliver-combos.js';
 import {
+  activeOpenSpecPromptIdForAutoDeliverStage,
   evaluateOpenSpecAutoDeliverComboCompatibility,
-  materializeOpenSpecAutoDeliverStageRound,
 } from '../../shared/openspec-auto-deliver-combos.js';
-import { P2P_PRESET_DEFAULT_SUMMARY_PROMPT } from '../../shared/p2p-workflow-constants.js';
 import { buildOpenSpecAutoDeliverValidationRecommendations } from '../../shared/openspec-auto-deliver-validation-recommendations.js';
 import type {
   OpenSpecAutoDeliverBrowserConflictProjection,
@@ -21,7 +21,6 @@ import {
   parseOpenSpecAutoDeliverAuthoritativeJsonPayload,
   parseOpenSpecTasksMarkdown,
   validateOpenSpecAutoDeliverChangeSlug,
-  validateOpenSpecAutoDeliverComboDescriptor,
   validateOpenSpecAutoDeliverLaunchRequest,
   validateOpenSpecAutoDeliverVerdictPayload,
 } from '../../shared/openspec-auto-deliver-validators.js';
@@ -50,10 +49,14 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
     expect(materializeOpenSpecAutoDeliverPreset('standard')).toEqual({
       specAuditRepairRounds: 1,
       implementationAuditRepairRounds: 2,
+      maxImplementationPrompts: OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
+      maxElapsedMinutes: OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
     });
     expect(materializeOpenSpecAutoDeliverPreset('deep')).toEqual({
       specAuditRepairRounds: 2,
       implementationAuditRepairRounds: 3,
+      maxImplementationPrompts: 24,
+      maxElapsedMinutes: 480,
     });
   });
 
@@ -150,25 +153,9 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
     }).ok).toBe(false);
   });
 
-  it('keeps stage materialization helpers valid but denies legacy ids as selected Team combos', () => {
-    const invalid = validateOpenSpecAutoDeliverComboDescriptor({
-      id: OPENSPEC_AUTO_DELIVER_COMBO_IDS.IMPLEMENTATION_AUDIT_REPAIR,
-      title: 'Invalid',
-      capability: {
-        stage: 'implementation_audit_repair',
-        requiredPermissionScope: 'analysis_only',
-        allowedMutationScopes: ['product_files'],
-        writeMode: 'single_authoritative_writer',
-        strictResultChannel: 'authoritative_summary_json',
-        minTransportParticipants: 1,
-        supportsGenerationMetadata: true,
-        supportsStopCancellation: true,
-      },
-      rounds: [{}],
-    });
-    expect(invalid.ok).toBe(false);
-    expect(invalid.issues.map((entry) => entry.code)).toContain('implementation_combo_analysis_only');
-
+  it('maps active OpenSpec prompt ids while denying legacy ids as selected Team combos', () => {
+    expect(activeOpenSpecPromptIdForAutoDeliverStage('spec_audit_repair')).toBe('proposal_audit');
+    expect(activeOpenSpecPromptIdForAutoDeliverStage('implementation_audit_repair')).toBe('implementation_audit');
     expect(evaluateOpenSpecAutoDeliverComboCompatibility(
       OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
       'spec_audit_repair',
@@ -189,27 +176,7 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
       'implementation_audit_repair',
       'proposal_audit',
     )).toEqual({ ok: false, reason: 'invalid_stage_prompt' });
-
-    const specRound = materializeOpenSpecAutoDeliverStageRound('spec_audit_repair', OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID);
-    expect(specRound).toEqual(expect.objectContaining({
-      activeOpenSpecPromptId: 'proposal_audit',
-      round: expect.objectContaining({ preset: 'proposal_audit', permissionScope: 'artifact_generation' }),
-    }));
-    if ('round' in specRound) {
-      expect(specRound.round.effectiveSummaryPrompt).toContain(P2P_PRESET_DEFAULT_SUMMARY_PROMPT.proposal_audit);
-      expect(specRound.round.effectiveSummaryPrompt).toContain('Proposal Audit Synthesis');
-      expect(specRound.round.effectiveSummaryPrompt).toContain('authoritative result file');
-    }
-    const implementationRound = materializeOpenSpecAutoDeliverStageRound('implementation_audit_repair', OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID);
-    expect(implementationRound).toEqual(expect.objectContaining({
-      activeOpenSpecPromptId: 'implementation_audit',
-      round: expect.objectContaining({ preset: 'implementation_audit', permissionScope: 'implementation' }),
-    }));
-    if ('round' in implementationRound) {
-      expect(implementationRound.round.effectiveSummaryPrompt).toContain(P2P_PRESET_DEFAULT_SUMMARY_PROMPT.implementation_audit);
-      expect(implementationRound.round.effectiveSummaryPrompt).toContain('Implementation Audit Synthesis');
-      expect(implementationRound.round.effectiveSummaryPrompt).toContain('authoritative result file');
-    }
+    expect(openSpecAutoDeliverCombos).not.toHaveProperty('materializeOpenSpecAutoDeliverStageRound');
   });
 
   it('validates strict verdict payloads', () => {

@@ -1216,6 +1216,7 @@
         "invalid_rounds": "Количество раундов вне допустимого диапазона.",
         "daemon_offline": "Daemon не в сети. Повторите попытку после переподключения.",
         "launch_timeout": "Истекло время запуска автодоставки. Повторите попытку.",
+        "stop_timeout": "Истекло время остановки автодоставки. Повторите попытку.",
         "custom_combo_unsupported": "Автодоставка пока не поддерживает пользовательские комбо Team.",
         "strict_result_failed": "The audit did not return a valid strict result."
       },

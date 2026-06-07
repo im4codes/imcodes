@@ -20,14 +20,6 @@ export type OpenSpecAutoDeliverMsgType = (typeof OPENSPEC_AUTO_DELIVER_MSG)[keyo
 export const OPENSPEC_AUTO_DELIVER_PRESET_IDS = ['fast', 'standard', 'strict', 'deep', 'custom'] as const;
 export type OpenSpecAutoDeliverPresetId = (typeof OPENSPEC_AUTO_DELIVER_PRESET_IDS)[number];
 
-export const OPENSPEC_AUTO_DELIVER_PRESET_LIMITS = {
-  fast: { specAuditRepairRounds: 0, implementationAuditRepairRounds: 1 },
-  standard: { specAuditRepairRounds: 1, implementationAuditRepairRounds: 2 },
-  strict: { specAuditRepairRounds: 2, implementationAuditRepairRounds: 2 },
-  deep: { specAuditRepairRounds: 2, implementationAuditRepairRounds: 3 },
-  custom: { specAuditRepairRounds: 1, implementationAuditRepairRounds: 2 },
-} as const satisfies Record<OpenSpecAutoDeliverPresetId, OpenSpecAutoDeliverRoundLimits>;
-
 export const OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET_ID = 'standard' as const satisfies OpenSpecAutoDeliverPresetId;
 
 export interface OpenSpecAutoDeliverRoundLimits {
@@ -35,12 +27,17 @@ export interface OpenSpecAutoDeliverRoundLimits {
   implementationAuditRepairRounds: number;
 }
 
+export interface OpenSpecAutoDeliverMaterializedLimits extends OpenSpecAutoDeliverRoundLimits {
+  maxImplementationPrompts: number;
+  maxElapsedMinutes: number;
+}
+
 export const OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MIN = 0 as const;
 export const OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX = 3 as const;
 export const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MIN = 1 as const;
 export const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX = 5 as const;
 export const OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS = 12 as const;
-export const OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES = 60 as const;
+export const OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES = 240 as const;
 export const OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID = 'audit>review>plan' as const;
 export const OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_PROMPT_ID = 'proposal_audit' as const;
 export const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_PROMPT_ID = 'implementation_audit' as const;
@@ -131,8 +128,41 @@ export const OPENSPEC_AUTO_DELIVER_REQUEST_ID_MAX_BYTES = 128 as const;
 export const OPENSPEC_AUTO_DELIVER_CHANGE_SLUG_MAX_BYTES = 160 as const;
 export const OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES = 64 * 1024;
 
+export const OPENSPEC_AUTO_DELIVER_PRESET_LIMITS = {
+  fast: {
+    specAuditRepairRounds: 0,
+    implementationAuditRepairRounds: 1,
+    maxImplementationPrompts: 6,
+    maxElapsedMinutes: 180,
+  },
+  standard: {
+    specAuditRepairRounds: 1,
+    implementationAuditRepairRounds: 2,
+    maxImplementationPrompts: OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
+    maxElapsedMinutes: OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
+  },
+  strict: {
+    specAuditRepairRounds: 2,
+    implementationAuditRepairRounds: 2,
+    maxImplementationPrompts: 16,
+    maxElapsedMinutes: 360,
+  },
+  deep: {
+    specAuditRepairRounds: 2,
+    implementationAuditRepairRounds: 3,
+    maxImplementationPrompts: 24,
+    maxElapsedMinutes: 480,
+  },
+  custom: {
+    specAuditRepairRounds: 1,
+    implementationAuditRepairRounds: 2,
+    maxImplementationPrompts: OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
+    maxElapsedMinutes: OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
+  },
+} as const satisfies Record<OpenSpecAutoDeliverPresetId, OpenSpecAutoDeliverMaterializedLimits>;
+
 export function materializeOpenSpecAutoDeliverPreset(
   presetId: OpenSpecAutoDeliverPresetId,
-): OpenSpecAutoDeliverRoundLimits {
+): OpenSpecAutoDeliverMaterializedLimits {
   return { ...OPENSPEC_AUTO_DELIVER_PRESET_LIMITS[presetId] };
 }

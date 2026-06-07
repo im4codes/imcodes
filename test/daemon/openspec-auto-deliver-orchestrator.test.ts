@@ -3,10 +3,10 @@ import { mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
-  OPENSPEC_AUTO_DELIVER_COMBO_IDS,
   OPENSPEC_AUTO_DELIVER_MSG,
   OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS,
 } from '../../shared/openspec-auto-deliver-constants.js';
+import { formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
 
 interface MockP2pRun {
   id: string;
@@ -135,6 +135,15 @@ function parseAuditMetadata(run: MockP2pRun): Record<string, unknown> {
     executionSessionName: lineValue('Execution session'),
     generation: Number(lineValue('Generation') || origin.generation),
   };
+}
+
+function expectAuditPromptWithoutVerdictSkeleton(text: string): void {
+  expect(text).not.toContain('```');
+  expect(text).not.toContain('```json');
+  expect(text).not.toContain('"auto_deliver"');
+  expect(text).not.toContain('"verdict"');
+  expect(text).not.toContain('"module_scores"');
+  expect(text).not.toContain('PASS | REWORK | BLOCKED');
 }
 
 async function completeLatestAudit(status = 'completed', payloadOverrides: Record<string, unknown> = {}): Promise<void> {
@@ -338,6 +347,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       modeOverride?: string;
       rounds?: number;
       advanced?: unknown;
+      advancedRounds?: unknown;
       fileContents?: Array<{ path: string; content: string }>;
       targets?: Array<{ session: string; mode: string }>;
       userText?: string;
@@ -345,6 +355,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(implementationLaunch.modeOverride).toBe('audit>review>plan');
     expect(implementationLaunch.rounds).toBe(1);
     expect(implementationLaunch.advanced).toBeUndefined();
+    expect(implementationLaunch.advancedRounds).toBeUndefined();
     expect(implementationLaunch.fileContents).toEqual([]);
     expect(implementationLaunch.targets).toEqual([
       { session: 'deck_sub_peer', mode: 'audit>review>plan' },
@@ -424,6 +435,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       modeOverride?: string;
       rounds?: number;
       advanced?: unknown;
+      advancedRounds?: unknown;
       fileContents?: Array<{ path: string; content: string }>;
       targets?: Array<{ session: string; mode: string }>;
       userText?: string;
@@ -431,6 +443,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(specLaunch.modeOverride).toBe('audit>review>plan');
     expect(specLaunch.rounds).toBe(1);
     expect(specLaunch.advanced).toBeUndefined();
+    expect(specLaunch.advancedRounds).toBeUndefined();
     expect(specLaunch.fileContents).toEqual([]);
     expect(specLaunch.targets).toEqual([
       { session: 'deck_sub_peer', mode: 'audit>review>plan' },
@@ -447,6 +460,53 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       .map((call) => call[0])
       .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
     expect(projection?.projection.activeP2pRunId).toBe('p2p-1');
+  });
+
+  it('builds audit prompts from canonical OpenSpec templates with authoritative result path metadata', async () => {
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-audit-prompt-metadata',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+    }, serverLinkMock as never);
+
+    const reference = '@openspec/changes/demo-change';
+    const specRun = [...p2pRuns.values()].at(-1)!;
+    const specMetadata = parseAuditMetadata(specRun);
+    const specPath = String(specMetadata.authoritativeResultPath);
+    const specOrigin = specRun.launchOrigin as { autoDeliver?: Record<string, unknown> };
+    expect(specRun.userText).toContain(formatOpenSpecPromptTemplate('audit_spec', reference));
+    expect(specRun.userText).toContain(`Authoritative result file: ${specPath}`);
+    expect(specRun.userText).toContain('Required auto_deliver fields:');
+    expect(specRun.userText).toContain('authoritativeResultPath');
+    expect(specOrigin.autoDeliver?.authoritativeResultPath).toBe(specPath);
+    expectAuditPromptWithoutVerdictSkeleton(specRun.userText ?? '');
+
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await completeLatestAudit('completed');
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_task_loop',
+      2500,
+    );
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair',
+      2500,
+    );
+
+    const implementationRun = [...p2pRuns.values()].at(-1)!;
+    const implementationMetadata = parseAuditMetadata(implementationRun);
+    const implementationPath = String(implementationMetadata.authoritativeResultPath);
+    const implementationOrigin = implementationRun.launchOrigin as { autoDeliver?: Record<string, unknown> };
+    expect(implementationRun.userText).toContain(formatOpenSpecPromptTemplate('audit_implementation', reference));
+    expect(implementationRun.userText).toContain(`Authoritative result file: ${implementationPath}`);
+    expect(implementationRun.userText).toContain('Required auto_deliver fields:');
+    expect(implementationRun.userText).toContain('authoritativeResultPath');
+    expect(implementationOrigin.autoDeliver?.authoritativeResultPath).toBe(implementationPath);
+    expectAuditPromptWithoutVerdictSkeleton(implementationRun.userText ?? '');
   });
 
   it('rejects launch while a manual Team run is active for the owning session', async () => {
@@ -542,6 +602,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
 
     const firstAudit = [...p2pRuns.values()].at(-1)!;
+    const origin = parseAuditMetadata(firstAudit);
     firstAudit.status = 'completed';
     firstAudit.resultSummary = null;
     firstAudit.strictAuthoritativeResult = null;
@@ -551,7 +612,8 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       2500,
     );
     expect(repairPrompt).toContain('do not redo the full audit from scratch');
-    expect(repairPrompt).toContain('Authoritative result file:');
+    expect(repairPrompt).toContain(`Authoritative result file: ${origin.authoritativeResultPath}`);
+    expect(repairPrompt).toContain(`"authoritativeResultPath": "${origin.authoritativeResultPath}"`);
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair'
@@ -561,7 +623,6 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     );
 
     expect([...p2pRuns.values()]).toHaveLength(2);
-    const origin = parseAuditMetadata(firstAudit);
     await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({ auto_deliver: origin }), null, 2), 'utf8');
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
@@ -1021,9 +1082,15 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       sessionName: 'deck_demo_brain',
       runId: ack.projection.runId,
     }, serverLinkMock as never);
+    const stopAck = serverLinkMock.send.mock.calls.map((call) => call[0]).find((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.STOP_ACK && msg.requestId === 'req-stop-before-late-audit');
+    expect(stopAck?.ok).toBe(true);
+    expect(stopAck?.projection.status).toBe('stopped');
+    expect(stopAck?.projection.generation).toBe(ack.projection.generation + 1);
     const stopTerminal = serverLinkMock.send.mock.calls.map((call) => call[0]).find((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.terminalReason === 'user_stopped');
     expect(stopTerminal?.projection.status).toBe('stopped');
+    expect(stopTerminal?.projection.generation).toBe(ack.projection.generation + 1);
     expect(getAutoDeliverP2pLock('deck_demo_brain')).toBeUndefined();
 
     const terminalCountAfterStop = serverLinkMock.send.mock.calls.filter((call) =>
@@ -1038,6 +1105,89 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toHaveLength(terminalCountAfterStop);
     expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION)).toHaveLength(projectionCountAfterStop);
     expect(getAutoDeliverP2pLock('deck_demo_brain')).toBeUndefined();
+  });
+
+  it('ignores late implementation idle after stop and does not start audit-repair', async () => {
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-stop-late-implementation',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    const ack = serverLinkMock.send.mock.calls.map((call) => call[0]).find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK);
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_task_loop',
+    );
+    expect(startP2pRunMock).not.toHaveBeenCalled();
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.STOP,
+      requestId: 'req-stop-before-late-implementation',
+      sessionName: 'deck_demo_brain',
+      runId: ack.projection.runId,
+    }, serverLinkMock as never);
+    const stopAck = serverLinkMock.send.mock.calls.map((call) => call[0]).find((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.STOP_ACK && msg.requestId === 'req-stop-before-late-implementation');
+    expect(stopAck?.projection.status).toBe('stopped');
+    expect(stopAck?.projection.generation).toBe(ack.projection.generation + 1);
+    expect(getAutoDeliverP2pLock('deck_demo_brain')).toBeUndefined();
+
+    const terminalCountAfterStop = serverLinkMock.send.mock.calls.filter((call) =>
+      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL,
+    ).length;
+    const projectionCountAfterStop = serverLinkMock.send.mock.calls.filter((call) =>
+      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION,
+    ).length;
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(startP2pRunMock).not.toHaveBeenCalled();
+    expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toHaveLength(terminalCountAfterStop);
+    expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION)).toHaveLength(projectionCountAfterStop);
+    expect(getAutoDeliverP2pLock('deck_demo_brain')).toBeUndefined();
+  });
+
+  it.each<[string, () => void, string]>([
+    ['returns-false', () => cancelP2pRunMock.mockResolvedValueOnce(false), 'cancelP2pRun returned false'],
+    ['rejects', () => cancelP2pRunMock.mockRejectedValueOnce(new Error('cancel transport unavailable')), 'cancelP2pRun rejected'],
+  ])('records P2P cancel failure diagnostically when cancelP2pRun %s', async (_label, setupCancelFailure, expectedDiagnostic) => {
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: `req-stop-cancel-diagnostic-${_label}`,
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+    }, serverLinkMock as never);
+
+    const ack = serverLinkMock.send.mock.calls.map((call) => call[0]).find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK);
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
+    setupCancelFailure();
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.STOP,
+      requestId: `req-stop-cancel-diagnostic-stop-${_label}`,
+      sessionName: 'deck_demo_brain',
+      runId: ack.projection.runId,
+    }, serverLinkMock as never);
+
+    const stopAck = serverLinkMock.send.mock.calls.map((call) => call[0]).find((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.STOP_ACK && msg.requestId === `req-stop-cancel-diagnostic-stop-${_label}`);
+    expect(stopAck?.projection.status).toBe('stopped');
+    expect(stopAck?.projection.terminalReason).toBe('user_stopped');
+
+    const diagnosticProjection = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.status === 'stopped'
+      && msg.projection?.terminalReason === 'user_stopped'
+      && msg.projection?.evidence?.some((entry: { summary?: string }) => entry.summary?.includes(expectedDiagnostic)),
+      2500,
+    );
+    expect(diagnosticProjection.projection.generation).toBe(ack.projection.generation + 1);
+    expect(diagnosticProjection.projection.terminalReason).toBe('user_stopped');
+    expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toHaveLength(1);
   });
 
   it('denies non-participant sibling stop and preserves terminal status on late stop', async () => {

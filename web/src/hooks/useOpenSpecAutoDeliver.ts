@@ -1,16 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { SHARE_DAEMON_MESSAGE_TYPES } from '@shared/tab-sharing.js';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET,
   OPENSPEC_AUTO_DELIVER_MSG,
+  isOpenSpecAutoDeliverTerminalStatus,
   type OpenSpecAutoDeliverLaunchPayload,
   type OpenSpecAutoDeliverPresetId,
   type OpenSpecAutoDeliverProjection,
   type OpenSpecAutoDeliverStatusRequestPayload,
   type OpenSpecAutoDeliverStopPayload,
 } from '../openspec-auto-deliver.js';
+import { normalizeOpenSpecAutoDeliverProjection } from '../openspec-auto-deliver-normalize.js';
 
 const OPEN_SPEC_AUTO_DELIVER_LAUNCH_TIMEOUT_MS = 30_000;
+const OPEN_SPEC_AUTO_DELIVER_STOP_TIMEOUT_MS = 15_000;
 
 interface Options {
   ws: WsClient | null;
@@ -42,48 +48,6 @@ function makeRequestId(prefix: string): string {
   return random ? `${prefix}-${random}` : `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-function normalizeProjection(raw: unknown): OpenSpecAutoDeliverProjection | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const record = raw as Record<string, unknown>;
-  const projection = raw as Partial<OpenSpecAutoDeliverProjection>;
-  const visibility = projection.visibility === 'conflict' ? 'conflict' : 'full';
-  const status = typeof record.status === 'string' && record.status
-    ? record.status
-    : visibility === 'conflict'
-      ? 'active'
-      : undefined;
-  const stage = typeof record.stage === 'string' && record.stage
-    ? record.stage
-    : visibility === 'conflict'
-      ? 'active'
-      : undefined;
-  if (
-    typeof projection.runId !== 'string'
-    || !status
-    || !stage
-  ) {
-    return null;
-  }
-  if (visibility === 'full' && typeof projection.changeName !== 'string') return null;
-  if (visibility === 'conflict' && typeof projection.owningMainSessionName !== 'string') return null;
-  const conflictReason = typeof record.conflictReason === 'string'
-    ? record.conflictReason
-    : typeof record.reason === 'string'
-      ? record.reason
-      : undefined;
-  return {
-    ...projection,
-    visibility,
-    status,
-    stage,
-    ...(conflictReason ? { conflictReason } : {}),
-    projectionVersion: typeof projection.projectionVersion === 'number'
-      && Number.isFinite(projection.projectionVersion)
-      ? projection.projectionVersion
-      : 0,
-  } as OpenSpecAutoDeliverProjection;
-}
-
 function extractProjection(msg: ServerMessage): OpenSpecAutoDeliverProjection | null {
   const raw = msg as Record<string, unknown>;
   if (
@@ -95,7 +59,7 @@ function extractProjection(msg: ServerMessage): OpenSpecAutoDeliverProjection | 
   ) {
     return null;
   }
-  return normalizeProjection(raw.projection ?? raw.run);
+  return normalizeOpenSpecAutoDeliverProjection(raw.projection ?? raw.run);
 }
 
 function normalizeLaunchError(error: unknown): string {
@@ -152,6 +116,34 @@ function normalizeLaunchError(error: unknown): string {
   return trimmed.includes('.') ? trimmed : 'openspec.auto.error.launch_failed';
 }
 
+function normalizeStopError(error: unknown): string {
+  if (typeof error !== 'string') return 'openspec.auto.error.launch_failed';
+  const trimmed = error.trim();
+  if (trimmed === 'openspec.auto.error.stop_timeout') return trimmed;
+  const normalized = trimmed.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  if (
+    normalized === 'daemon_offline'
+    || normalized === 'daemon_unavailable'
+    || normalized === 'daemon_disconnected'
+    || normalized === 'websocket_not_connected'
+    || normalized === 'ws_not_connected'
+  ) {
+    return 'openspec.auto.error.daemon_offline';
+  }
+  if (
+    normalized === 'stop_timeout'
+    || normalized === 'request_timeout'
+    || normalized === 'timeout'
+  ) {
+    return 'openspec.auto.error.stop_timeout';
+  }
+  return normalizeLaunchError(error);
+}
+
+function isTerminalProjection(projection: OpenSpecAutoDeliverProjection): boolean {
+  return projection.terminal === true || isOpenSpecAutoDeliverTerminalStatus(projection.status);
+}
+
 export function useOpenSpecAutoDeliver({
   ws,
   serverId,
@@ -164,7 +156,9 @@ export function useOpenSpecAutoDeliver({
   const [lastError, setLastError] = useState<string | null>(null);
   const latestProjectionRef = useRef<OpenSpecAutoDeliverProjection | null>(null);
   const launchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeLaunchRequestIdRef = useRef<string | null>(null);
+  const activeStopRequestIdRef = useRef<string | null>(null);
 
   const clearLaunchTimeout = useCallback(() => {
     if (launchTimeoutRef.current) {
@@ -172,6 +166,14 @@ export function useOpenSpecAutoDeliver({
       launchTimeoutRef.current = null;
     }
     activeLaunchRequestIdRef.current = null;
+  }, []);
+
+  const clearStopTimeout = useCallback(() => {
+    if (stopTimeoutRef.current) {
+      clearTimeout(stopTimeoutRef.current);
+      stopTimeoutRef.current = null;
+    }
+    activeStopRequestIdRef.current = null;
   }, []);
 
   const applyProjection = useCallback((next: OpenSpecAutoDeliverProjection | null) => {
@@ -188,8 +190,11 @@ export function useOpenSpecAutoDeliver({
     clearLaunchTimeout();
     setProjection(next);
     setLaunchPending(false);
-    setStopPending(false);
-  }, [clearLaunchTimeout]);
+    if (isTerminalProjection(next)) {
+      clearStopTimeout();
+      setStopPending(false);
+    }
+  }, [clearLaunchTimeout, clearStopTimeout]);
 
   const requestStatus = useCallback(() => {
     if (!ws || !sessionName) return null;
@@ -237,11 +242,19 @@ export function useOpenSpecAutoDeliver({
   }, [clearLaunchTimeout, serverId, sessionName, ws]);
 
   const stop = useCallback((runId = projection?.runId) => {
+    if (projection?.visibility === 'conflict') return null;
+    if (projection && isTerminalProjection(projection)) return null;
+    if (projection?.canStop === false) return null;
     const stopSessionName = projection?.targetImplementationSessionName
       || projection?.launchedFromSessionName
       || projection?.owningMainSessionName
       || sessionName;
-    if (!ws || !stopSessionName || !runId) return null;
+    if (!ws || !stopSessionName || !runId) {
+      clearStopTimeout();
+      setStopPending(false);
+      if (runId) setLastError('openspec.auto.error.daemon_offline');
+      return null;
+    }
     const requestId = makeRequestId('openspec-auto-stop');
     const payload: OpenSpecAutoDeliverStopPayload = {
       type: OPENSPEC_AUTO_DELIVER_MSG.STOP,
@@ -250,11 +263,34 @@ export function useOpenSpecAutoDeliver({
       sessionName: stopSessionName,
       runId,
     };
+    try {
+      const sendUrgent = (ws as { sendUrgent?: (msg: object) => void }).sendUrgent;
+      if (sendUrgent) {
+        sendUrgent.call(ws, payload);
+      } else {
+        ws.send(payload);
+      }
+    } catch (error) {
+      clearStopTimeout();
+      setStopPending(false);
+      setLastError(normalizeStopError(error instanceof Error ? error.message : error));
+      return null;
+    }
+    clearStopTimeout();
+    activeStopRequestIdRef.current = requestId;
     setStopPending(true);
     setLastError(null);
-    ws.send(payload);
+    stopTimeoutRef.current = setTimeout(() => {
+      if (activeStopRequestIdRef.current !== requestId) return;
+      activeStopRequestIdRef.current = null;
+      stopTimeoutRef.current = null;
+      setStopPending(false);
+      setLastError('openspec.auto.error.stop_timeout');
+    }, OPEN_SPEC_AUTO_DELIVER_STOP_TIMEOUT_MS);
     return requestId;
   }, [
+    clearStopTimeout,
+    projection,
     projection?.launchedFromSessionName,
     projection?.owningMainSessionName,
     projection?.runId,
@@ -277,39 +313,53 @@ export function useOpenSpecAutoDeliver({
         clearLaunchTimeout();
         setLastError(normalizeLaunchError(raw.error));
         setLaunchPending(false);
-        const conflictProjection = normalizeProjection(raw.projection ?? raw.conflict);
+        const conflictProjection = normalizeOpenSpecAutoDeliverProjection(raw.projection ?? raw.conflict);
         if (conflictProjection) applyProjection(conflictProjection);
         return;
       }
       if (raw.type === OPENSPEC_AUTO_DELIVER_MSG.STOP_ACK) {
+        clearStopTimeout();
         setStopPending(false);
-        const ackProjection = normalizeProjection(raw.projection);
+        const ackProjection = normalizeOpenSpecAutoDeliverProjection(raw.projection);
         if (ackProjection) applyProjection(ackProjection);
         if (raw.ok === false) {
-          setLastError(normalizeLaunchError(raw.error));
+          setLastError(normalizeStopError(raw.error));
         } else {
           setLastError(null);
         }
         return;
       }
+      if (
+        (raw.type === SHARE_DAEMON_MESSAGE_TYPES.SESSION_EVENT && raw.event === 'disconnected')
+        || raw.type === MSG_DAEMON_OFFLINE
+        || raw.type === DAEMON_MSG.DISCONNECTED
+      ) {
+        clearStopTimeout();
+        setStopPending(false);
+        return;
+      }
     });
-  }, [applyProjection, clearLaunchTimeout, ws]);
+  }, [applyProjection, clearLaunchTimeout, clearStopTimeout, ws]);
 
   useEffect(() => {
     latestProjectionRef.current = null;
     clearLaunchTimeout();
+    clearStopTimeout();
     setProjection(null);
     setLastError(null);
     setLaunchPending(false);
     setStopPending(false);
     requestStatus();
-  }, [clearLaunchTimeout, requestStatus, sessionName]);
+  }, [clearLaunchTimeout, clearStopTimeout, requestStatus, sessionName]);
 
   useEffect(() => {
     if (openSpecOpen) requestStatus();
   }, [openSpecOpen, requestStatus]);
 
-  useEffect(() => () => clearLaunchTimeout(), [clearLaunchTimeout]);
+  useEffect(() => () => {
+    clearLaunchTimeout();
+    clearStopTimeout();
+  }, [clearLaunchTimeout, clearStopTimeout]);
 
   return useMemo(() => ({
     projection,

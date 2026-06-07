@@ -530,7 +530,11 @@ class SupervisionAutomation {
   cancelSession(sessionName: string): void {
     const state = this.activeRuns.get(sessionName);
     if (state?.auditRunId) {
-      cancelP2pRun(state.auditRunId, this.serverLink);
+      cancelP2pRun(state.auditRunId, this.serverLink, {
+        source: 'supervision_cancel_session',
+        reason: 'session_supervision_cancelled',
+        requestedBySession: sessionName,
+      });
     }
     this.clearPoller(sessionName);
     this.activeRuns.delete(sessionName);
@@ -659,7 +663,11 @@ class SupervisionAutomation {
     if (snapshot.mode === SUPERVISION_MODE.OFF) return null;
     const existing = this.activeRuns.get(sessionName);
     if (existing?.auditRunId) {
-      cancelP2pRun(existing.auditRunId, this.serverLink);
+      cancelP2pRun(existing.auditRunId, this.serverLink, {
+        source: 'supervision_replace_audit',
+        reason: 'new_task_intent_replaced_existing_audit',
+        requestedBySession: sessionName,
+      });
     }
     this.clearPoller(sessionName);
     const next: ActiveTaskRunState = {

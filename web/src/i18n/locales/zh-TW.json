@@ -1217,6 +1217,7 @@
         "invalid_rounds": "稽核輪數超出允許範圍。",
         "daemon_offline": "Daemon 離線，重新連線後再試。",
         "launch_timeout": "自動交付啟動逾時，請重試。",
+        "stop_timeout": "自動交付停止逾時，請重試。",
         "custom_combo_unsupported": "自動交付暫不支援自訂團隊組合流程。",
         "strict_result_failed": "稽核沒有回傳有效的嚴格結果。"
       },

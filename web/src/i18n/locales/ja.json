@@ -1216,6 +1216,7 @@
         "invalid_rounds": "ラウンド数が許可範囲外です。",
         "daemon_offline": "Daemon がオフラインです。再接続後にもう一度試してください。",
         "launch_timeout": "自動デリバリーの起動がタイムアウトしました。もう一度試してください。",
+        "stop_timeout": "自動デリバリーの停止がタイムアウトしました。もう一度試してください。",
         "custom_combo_unsupported": "自動デリバリーはまだカスタム Team コンボに対応していません。",
         "strict_result_failed": "The audit did not return a valid strict result."
       },

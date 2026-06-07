@@ -9,11 +9,13 @@ import { comboModeLabel } from '../components/p2p-combos.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import {
   OPENSPEC_AUTO_DELIVER_MSG,
-  OPENSPEC_AUTO_DELIVER_PRESETS,
   type OpenSpecAutoDeliverListRow,
-  type OpenSpecAutoDeliverPresetId,
-  type OpenSpecAutoDeliverProjection,
 } from '../openspec-auto-deliver.js';
+import {
+  normalizeOpenSpecAutoDeliverListRow,
+  normalizeOpenSpecAutoDeliverProjection,
+  openSpecAutoDeliverRowFromProjection,
+} from '../openspec-auto-deliver-normalize.js';
 
 interface P2pDiscussion {
   id: string;
@@ -171,42 +173,6 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
     });
   }, []);
 
-  const normalizePresetId = useCallback((presetId: string | undefined): OpenSpecAutoDeliverPresetId | undefined => {
-    return OPENSPEC_AUTO_DELIVER_PRESETS.some((preset) => preset.id === presetId)
-      ? presetId as OpenSpecAutoDeliverPresetId
-      : undefined;
-  }, []);
-
-  const rowFromProjection = useCallback((projection: OpenSpecAutoDeliverProjection): OpenSpecAutoDeliverListRow => {
-    const status = typeof projection.status === 'string' && projection.status ? projection.status : 'active';
-    const stage = typeof projection.stage === 'string' && projection.stage ? projection.stage : 'active';
-    return {
-      projectionVersion: projection.projectionVersion,
-      visibility: projection.visibility,
-      runId: projection.runId,
-      owningMainSessionName: projection.owningMainSessionName ?? '',
-      status,
-      stage,
-      viewMode: projection.visibility === 'conflict'
-        ? 'conflict'
-        : projection.terminal ? 'compactRecovery' : 'fullRunbar',
-      ...(projection.visibility === 'full'
-        ? {
-          ...(typeof projection.generation === 'number' ? { generation: projection.generation } : {}),
-          changeName: projection.changeName,
-          presetId: normalizePresetId(projection.presetId),
-          selectedTeamComboId: projection.selectedTeamComboId ?? undefined,
-          targetImplementationSessionName: projection.targetImplementationSessionName,
-          launchedFromSessionName: projection.launchedFromSessionName,
-          elapsedMs: projection.elapsedMs,
-          terminalReason: projection.terminalReason ?? undefined,
-        }
-        : {
-          reason: projection.conflictReason ?? projection.reason,
-        }),
-    };
-  }, [normalizePresetId]);
-
   // Audit fix (spam-fetch loop) — even though `loadList` itself is
   // stable when `requestScope` has a stable identity, the
   // `RUN_UPDATE` handler below calls `loadList()` on every P2P run
@@ -325,7 +291,9 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
       }
       if (messageType === OPENSPEC_AUTO_DELIVER_MSG.LIST_RESPONSE) {
         const rows = Array.isArray((msg as { rows?: unknown }).rows)
-          ? ((msg as unknown) as { rows: OpenSpecAutoDeliverListRow[] }).rows
+          ? ((msg as unknown as { rows: unknown[] }).rows)
+              .map(normalizeOpenSpecAutoDeliverListRow)
+              .filter((row): row is OpenSpecAutoDeliverListRow => row !== null)
           : [];
         setAutoDeliverRows(rows);
         if (!selectedAutoRunId && rows[0]?.runId) setSelectedAutoRunId(rows[0].runId);
@@ -337,9 +305,9 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
         || messageType === OPENSPEC_AUTO_DELIVER_MSG.CONFLICT_SUMMARY
         || messageType === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
       ) {
-        const projection = (msg as { projection?: OpenSpecAutoDeliverProjection | null }).projection;
-        if (projection?.runId) {
-          upsertAutoDeliverRow(rowFromProjection(projection));
+        const projection = normalizeOpenSpecAutoDeliverProjection((msg as { projection?: unknown }).projection);
+        if (projection) {
+          upsertAutoDeliverRow(openSpecAutoDeliverRowFromProjection(projection));
           if (!selectedAutoRunId) setSelectedAutoRunId(projection.runId);
         }
       }
@@ -386,7 +354,7 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
         }
       }
     });
-  }, [copyText, requestListRefresh, rowFromProjection, selected, selectedAutoRunId, sendReadDiscussion, t, upsertAutoDeliverRow, ws]);
+  }, [copyText, requestListRefresh, selected, selectedAutoRunId, sendReadDiscussion, t, upsertAutoDeliverRow, ws]);
 
   useEffect(() => () => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);

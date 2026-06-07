@@ -1217,6 +1217,7 @@
         "invalid_rounds": "Round counts are outside the allowed range.",
         "daemon_offline": "Daemon is offline. Try again after it reconnects.",
         "launch_timeout": "Auto Deliver launch timed out. Try again.",
+        "stop_timeout": "Auto Deliver stop timed out. Try again.",
         "custom_combo_unsupported": "Custom Team combos are not supported for Auto Deliver yet.",
         "strict_result_failed": "The audit did not return a valid strict result."
       },

@@ -24,7 +24,7 @@ export interface OpenSpecAutoDeliverLauncherProps {
   onClose: () => void;
   onLaunch: (changeName: string, presetId: OpenSpecAutoDeliverPresetId, options: {
     selectedTeamComboId: string;
-    materializedLimits: { specAuditRepairRounds: number; implementationAuditRepairRounds: number };
+    materializedLimits: ReturnType<typeof materializedPresetLimits>;
   }) => void;
   onViewCurrent?: () => void;
 }
@@ -133,8 +133,11 @@ export function OpenSpecAutoDeliverLauncher({
 }: OpenSpecAutoDeliverLauncherProps) {
   const { t } = useTranslation();
   const [presetId, setPresetId] = useState<OpenSpecAutoDeliverPresetId>(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET);
-  const [specRounds, setSpecRounds] = useState<number>(materializedPresetLimits(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET).specAuditRepairRounds);
-  const [implementationRounds, setImplementationRounds] = useState<number>(materializedPresetLimits(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET).implementationAuditRepairRounds);
+  const defaultLimits = materializedPresetLimits(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET);
+  const [specRounds, setSpecRounds] = useState<number>(defaultLimits.specAuditRepairRounds);
+  const [implementationRounds, setImplementationRounds] = useState<number>(defaultLimits.implementationAuditRepairRounds);
+  const [maxImplementationPrompts, setMaxImplementationPrompts] = useState<number>(defaultLimits.maxImplementationPrompts);
+  const [maxElapsedMinutes, setMaxElapsedMinutes] = useState<number>(defaultLimits.maxElapsedMinutes);
   const [selectedTeamComboId, setSelectedTeamComboId] = useState<string>(OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO);
   const { allCombos } = useP2pCustomCombos();
   const hasConflict = isOpenSpecAutoDeliverActiveProjection(conflictProjection);
@@ -160,12 +163,19 @@ export function OpenSpecAutoDeliverLauncher({
     setPresetId(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET);
     setSpecRounds(defaults.specAuditRepairRounds);
     setImplementationRounds(defaults.implementationAuditRepairRounds);
+    setMaxImplementationPrompts(defaults.maxImplementationPrompts);
+    setMaxElapsedMinutes(defaults.maxElapsedMinutes);
     setSelectedTeamComboId(OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO);
   }, [open, changeName]);
 
   if (!open) return null;
 
-  const selectedLimits = { specAuditRepairRounds: specRounds, implementationAuditRepairRounds: implementationRounds };
+  const selectedLimits = {
+    specAuditRepairRounds: specRounds,
+    implementationAuditRepairRounds: implementationRounds,
+    maxImplementationPrompts,
+    maxElapsedMinutes,
+  };
   const invalidRounds = !Number.isInteger(specRounds)
     || specRounds < OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.specMin
     || specRounds > OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.specMax
@@ -223,6 +233,8 @@ export function OpenSpecAutoDeliverLauncher({
                     setPresetId(preset.id);
                     setSpecRounds(preset.specAuditRepairRounds);
                     setImplementationRounds(preset.implementationAuditRepairRounds);
+                    setMaxImplementationPrompts(preset.maxImplementationPrompts);
+                    setMaxElapsedMinutes(preset.maxElapsedMinutes);
                   }}
                 >
                   <span>{t(preset.labelKey)}</span>
@@ -245,7 +257,10 @@ export function OpenSpecAutoDeliverLauncher({
                 max={OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.specMax}
                 value={specRounds}
                 onInput={(event) => {
+                  const customLimits = materializedPresetLimits('custom');
                   setPresetId('custom');
+                  setMaxImplementationPrompts(customLimits.maxImplementationPrompts);
+                  setMaxElapsedMinutes(customLimits.maxElapsedMinutes);
                   setSpecRounds(Number((event.target as HTMLInputElement).value));
                 }}
               />
@@ -258,7 +273,10 @@ export function OpenSpecAutoDeliverLauncher({
                 max={OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.implementationMax}
                 value={implementationRounds}
                 onInput={(event) => {
+                  const customLimits = materializedPresetLimits('custom');
                   setPresetId('custom');
+                  setMaxImplementationPrompts(customLimits.maxImplementationPrompts);
+                  setMaxElapsedMinutes(customLimits.maxElapsedMinutes);
                   setImplementationRounds(Number((event.target as HTMLInputElement).value));
                 }}
               />
