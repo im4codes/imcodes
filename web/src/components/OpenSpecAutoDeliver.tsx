@@ -63,6 +63,18 @@ function statusKey(status: string): string {
   return `openspec.auto.status.${status}`;
 }
 
+function projectionStatus(projection: OpenSpecAutoDeliverProjection): string {
+  return typeof projection.status === 'string' && projection.status ? projection.status : 'active';
+}
+
+function projectionStage(projection: OpenSpecAutoDeliverProjection): string {
+  return typeof projection.stage === 'string' && projection.stage ? projection.stage : 'active';
+}
+
+function projectionTitle(projection: OpenSpecAutoDeliverProjection): string {
+  return projection.visibility === 'conflict' ? projection.owningMainSessionName : projection.changeName;
+}
+
 function taskProgressText(projection: OpenSpecAutoDeliverProjection, t: (key: string, opts?: Record<string, unknown>) => string): string {
   const stats = projection.taskStats;
   if (!stats || stats.total <= 0) return t('openspec.auto.tasks_unknown');
@@ -84,6 +96,7 @@ function formatRoundPair(pair: { current: number; total: number } | undefined, f
 }
 
 function projectionElapsedMs(projection: OpenSpecAutoDeliverProjection, now: number): number {
+  if (projection.visibility !== 'full') return 0;
   if (typeof projection.elapsedMs === 'number' && Number.isFinite(projection.elapsedMs)) return projection.elapsedMs;
   if (typeof projection.startedAt === 'number' && Number.isFinite(projection.startedAt)) return now - projection.startedAt;
   return 0;
@@ -102,9 +115,9 @@ export function OpenSpecAutoDeliverLauncher({
 }: OpenSpecAutoDeliverLauncherProps) {
   const { t } = useTranslation();
   const [presetId, setPresetId] = useState<OpenSpecAutoDeliverPresetId>(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET);
-  const [specRounds, setSpecRounds] = useState(materializedPresetLimits(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET).specAuditRepairRounds);
-  const [implementationRounds, setImplementationRounds] = useState(materializedPresetLimits(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET).implementationAuditRepairRounds);
-  const [selectedTeamComboId, setSelectedTeamComboId] = useState(OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO);
+  const [specRounds, setSpecRounds] = useState<number>(materializedPresetLimits(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET).specAuditRepairRounds);
+  const [implementationRounds, setImplementationRounds] = useState<number>(materializedPresetLimits(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET).implementationAuditRepairRounds);
+  const [selectedTeamComboId, setSelectedTeamComboId] = useState<string>(OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO);
   const { allCombos } = useP2pCustomCombos();
   const hasConflict = isOpenSpecAutoDeliverActiveProjection(conflictProjection);
   const comboOptions = useMemo(() => {
@@ -288,13 +301,16 @@ export function OpenSpecAutoDeliverRunBar({
   onHide,
 }: OpenSpecAutoDeliverRunBarProps) {
   const { t } = useTranslation();
-  const active = !isOpenSpecAutoDeliverTerminalStatus(projection.status);
+  const status = projectionStatus(projection);
+  const stage = projectionStage(projection);
+  const active = !isOpenSpecAutoDeliverTerminalStatus(status);
   const now = useNowTicker(active);
   const elapsed = formatElapsed(projectionElapsedMs(projection, now));
-  const stageLabel = t(stageKey(projection.stage), projection.stage);
+  const stageLabel = t(stageKey(stage), stage);
   const taskText = taskProgressText(projection, t);
   const canStop = projection.canStop !== false && active;
-  const statusLabel = t(statusKey(projection.status), projection.status);
+  const statusLabel = t(statusKey(status), status);
+  const title = projectionTitle(projection);
 
   if (compact) {
     return (
@@ -302,7 +318,7 @@ export function OpenSpecAutoDeliverRunBar({
         <div class="discussions-progress-head openspec-auto-runbar-head">
           <div class="discussions-progress-titlewrap">
             <div class="discussions-progress-kicker">{t('openspec.auto.kicker')}</div>
-            <div class="discussions-progress-title">{projection.changeName}</div>
+            <div class="discussions-progress-title">{title}</div>
           </div>
           <span class="discussions-progress-badge discussions-progress-badge-phase">{stageLabel}</span>
           <button class="discussions-progress-stop openspec-auto-view-btn" type="button" onClick={onView}>
@@ -323,7 +339,7 @@ export function OpenSpecAutoDeliverRunBar({
       <div class="discussions-progress-head openspec-auto-runbar-head">
         <div class="discussions-progress-titlewrap">
           <div class="discussions-progress-kicker">{t('openspec.auto.kicker')}</div>
-          <div class="discussions-progress-title">{projection.changeName}</div>
+          <div class="discussions-progress-title">{title}</div>
         </div>
         <span class="p2p-timer p2p-timer-total">{elapsed}</span>
         <button class="discussions-progress-stop openspec-auto-view-btn" type="button" onClick={onView}>
@@ -395,7 +411,9 @@ export function OpenSpecAutoDeliverDetailsPanel({
   onStop,
 }: OpenSpecAutoDeliverDetailsPanelProps) {
   const { t } = useTranslation();
-  const active = projection ? !isOpenSpecAutoDeliverTerminalStatus(projection.status) : false;
+  const status = projection ? projectionStatus(projection) : 'active';
+  const stage = projection ? projectionStage(projection) : 'active';
+  const active = projection ? !isOpenSpecAutoDeliverTerminalStatus(status) : false;
   const now = useNowTicker(active);
   const elapsed = projection ? formatElapsed(projectionElapsedMs(projection, now)) : '00:00';
   const scoreItems = useMemo(() => projection?.moduleScores ?? [], [projection?.moduleScores]);
@@ -407,15 +425,15 @@ export function OpenSpecAutoDeliverDetailsPanel({
         <div class="openspec-auto-details-head">
           <div>
             <div class="openspec-auto-kicker">{t('openspec.auto.details_title')}</div>
-            <h3>{projection.changeName}</h3>
+            <h3>{projectionTitle(projection)}</h3>
           </div>
           <button class="openspec-auto-icon-btn" type="button" onClick={onClose} aria-label={t('common.close')}>
             ×
           </button>
         </div>
         <div class="openspec-auto-detail-grid">
-          <DetailRow label={t('openspec.auto.status_label')} value={t(statusKey(projection.status), projection.status)} />
-          <DetailRow label={t('openspec.auto.stage_label')} value={t(stageKey(projection.stage), projection.stage)} />
+          <DetailRow label={t('openspec.auto.status_label')} value={t(statusKey(status), status)} />
+          <DetailRow label={t('openspec.auto.stage_label')} value={t(stageKey(stage), stage)} />
           <DetailRow label={t('openspec.auto.elapsed')} value={elapsed} />
           <DetailRow label={t('openspec.auto.preset_label')} value={projection.presetId} />
           <DetailRow label={t('openspec.auto.owning_session')} value={projection.owningMainSessionName} />
@@ -445,13 +463,16 @@ export function OpenSpecAutoDeliverDetailsPanel({
             <div class="openspec-auto-detail-note">{t('openspec.auto.scores_empty')}</div>
           ) : (
             <div class="openspec-auto-score-grid">
-              {scoreItems.map((score) => (
-                <div class="openspec-auto-score" key={score.module}>
-                  <span>{t(`openspec.auto.score_module.${score.module}`, score.module)}</span>
-                  <strong>{score.score}/{score.maxScore ?? 10}</strong>
-                  {score.summary && <small>{score.summary}</small>}
-                </div>
-              ))}
+              {scoreItems.map((score) => {
+                const moduleId = typeof score.module === 'string' && score.module ? score.module : 'unknown';
+                return (
+                  <div class="openspec-auto-score" key={moduleId}>
+                    <span>{t(`openspec.auto.score_module.${moduleId}`, moduleId)}</span>
+                    <strong>{score.score}/{score.maxScore ?? 10}</strong>
+                    {score.summary && <small>{score.summary}</small>}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
@@ -493,6 +514,8 @@ export function OpenSpecAutoDeliverCurrentRunEntry({
 }) {
   const { t } = useTranslation();
   const redacted = projection.visibility === 'conflict';
+  const status = projectionStatus(projection);
+  const stage = projectionStage(projection);
   const route = [
     projection.owningMainSessionName,
     projection.targetImplementationSessionName,
@@ -508,7 +531,7 @@ export function OpenSpecAutoDeliverCurrentRunEntry({
           {redacted ? projection.owningMainSessionName : projection.changeName}
         </div>
         <div class="openspec-auto-current-meta">
-          {t(statusKey(projection.status), projection.status)} · {t(stageKey(projection.stage), projection.stage)}
+          {t(statusKey(status), status)} · {t(stageKey(stage), stage)}
         </div>
         {!redacted && route && (
           <div class="openspec-auto-current-meta">{route}</div>

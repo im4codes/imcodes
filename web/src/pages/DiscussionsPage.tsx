@@ -5,7 +5,13 @@ import { P2pProgressCard } from '../components/P2pProgressCard.js';
 import type { P2pProgressDiscussion } from '../components/P2pProgressCard.js';
 import { FilePreviewPane } from '../components/FilePreviewPane.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
-import { OPENSPEC_AUTO_DELIVER_MSG, type OpenSpecAutoDeliverListRow, type OpenSpecAutoDeliverProjection } from '../openspec-auto-deliver.js';
+import {
+  OPENSPEC_AUTO_DELIVER_MSG,
+  OPENSPEC_AUTO_DELIVER_PRESETS,
+  type OpenSpecAutoDeliverListRow,
+  type OpenSpecAutoDeliverPresetId,
+  type OpenSpecAutoDeliverProjection,
+} from '../openspec-auto-deliver.js';
 
 interface P2pDiscussion {
   id: string;
@@ -154,30 +160,41 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
     });
   }, []);
 
-  const rowFromProjection = useCallback((projection: OpenSpecAutoDeliverProjection): OpenSpecAutoDeliverListRow => ({
-    projectionVersion: projection.projectionVersion,
-    visibility: projection.visibility,
-    runId: projection.runId,
-    owningMainSessionName: projection.owningMainSessionName ?? '',
-    status: projection.status,
-    stage: projection.stage,
-    viewMode: projection.visibility === 'conflict'
-      ? 'conflict'
-      : projection.terminal ? 'compactRecovery' : 'fullRunbar',
-    ...(projection.visibility === 'full'
-      ? {
-        changeName: projection.changeName,
-        presetId: projection.presetId,
-        selectedTeamComboId: projection.selectedTeamComboId ?? undefined,
-        targetImplementationSessionName: projection.targetImplementationSessionName,
-        launchedFromSessionName: projection.launchedFromSessionName,
-        elapsedMs: projection.elapsedMs,
-        terminalReason: projection.terminalReason ?? undefined,
-      }
-      : {
-        reason: projection.conflictReason ?? projection.reason,
-      }),
-  }), []);
+  const normalizePresetId = useCallback((presetId: string | undefined): OpenSpecAutoDeliverPresetId | undefined => {
+    return OPENSPEC_AUTO_DELIVER_PRESETS.some((preset) => preset.id === presetId)
+      ? presetId as OpenSpecAutoDeliverPresetId
+      : undefined;
+  }, []);
+
+  const rowFromProjection = useCallback((projection: OpenSpecAutoDeliverProjection): OpenSpecAutoDeliverListRow => {
+    const status = typeof projection.status === 'string' && projection.status ? projection.status : 'active';
+    const stage = typeof projection.stage === 'string' && projection.stage ? projection.stage : 'active';
+    return {
+      projectionVersion: projection.projectionVersion,
+      visibility: projection.visibility,
+      runId: projection.runId,
+      owningMainSessionName: projection.owningMainSessionName ?? '',
+      status,
+      stage,
+      viewMode: projection.visibility === 'conflict'
+        ? 'conflict'
+        : projection.terminal ? 'compactRecovery' : 'fullRunbar',
+      ...(projection.visibility === 'full'
+        ? {
+          ...(typeof projection.generation === 'number' ? { generation: projection.generation } : {}),
+          changeName: projection.changeName,
+          presetId: normalizePresetId(projection.presetId),
+          selectedTeamComboId: projection.selectedTeamComboId ?? undefined,
+          targetImplementationSessionName: projection.targetImplementationSessionName,
+          launchedFromSessionName: projection.launchedFromSessionName,
+          elapsedMs: projection.elapsedMs,
+          terminalReason: projection.terminalReason ?? undefined,
+        }
+        : {
+          reason: projection.conflictReason ?? projection.reason,
+        }),
+    };
+  }, [normalizePresetId]);
 
   // Audit fix (spam-fetch loop) — even though `loadList` itself is
   // stable when `requestScope` has a stable identity, the
@@ -287,23 +304,27 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
   useEffect(() => {
     if (!ws) return;
     return ws.onMessage((msg: ServerMessage) => {
-      if (msg.type === P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE) {
-        setDiscussions((msg.discussions ?? []) as P2pDiscussion[]);
+      const messageType = typeof (msg as { type?: unknown }).type === 'string'
+        ? (msg as { type: string }).type
+        : '';
+      if (messageType === P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE) {
+        const response = msg as { discussions?: unknown };
+        setDiscussions((Array.isArray(response.discussions) ? response.discussions : []) as P2pDiscussion[]);
         setLoading(false);
       }
-      if (msg.type === OPENSPEC_AUTO_DELIVER_MSG.LIST_RESPONSE) {
+      if (messageType === OPENSPEC_AUTO_DELIVER_MSG.LIST_RESPONSE) {
         const rows = Array.isArray((msg as { rows?: unknown }).rows)
-          ? (msg as { rows: OpenSpecAutoDeliverListRow[] }).rows
+          ? ((msg as unknown) as { rows: OpenSpecAutoDeliverListRow[] }).rows
           : [];
         setAutoDeliverRows(rows);
         if (!selectedAutoRunId && rows[0]?.runId) setSelectedAutoRunId(rows[0].runId);
       }
       if (
-        msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK
-        || msg.type === OPENSPEC_AUTO_DELIVER_MSG.STATUS_PROJECTION
-        || msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
-        || msg.type === OPENSPEC_AUTO_DELIVER_MSG.CONFLICT_SUMMARY
-        || msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+        messageType === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK
+        || messageType === OPENSPEC_AUTO_DELIVER_MSG.STATUS_PROJECTION
+        || messageType === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+        || messageType === OPENSPEC_AUTO_DELIVER_MSG.CONFLICT_SUMMARY
+        || messageType === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
       ) {
         const projection = (msg as { projection?: OpenSpecAutoDeliverProjection | null }).projection;
         if (projection?.runId) {
@@ -311,39 +332,41 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
           if (!selectedAutoRunId) setSelectedAutoRunId(projection.runId);
         }
       }
-      if (msg.type === P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE) {
-        const responseRequestId = msg.requestId;
+      if (messageType === P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE) {
+        const response = msg as { requestId?: string; error?: unknown; content?: unknown; id?: unknown };
+        const responseRequestId = response.requestId;
         const pendingCopy = pendingCopyRef.current;
         if (pendingCopy && responseRequestId === pendingCopy.requestId) {
           pendingCopyRef.current = null;
-          if (!msg.error && typeof msg.content === 'string') {
-            void copyText(pendingCopy.id, msg.content);
+          if (!response.error && typeof response.content === 'string') {
+            void copyText(pendingCopy.id, response.content);
           }
           return;
         }
         if (responseRequestId && pendingReadRequestIdRef.current && responseRequestId !== pendingReadRequestIdRef.current) return;
         // Only accept response matching the most recent request (prevent stale overwrite)
-        const responseId = (msg as any).id as string | undefined;
+        const responseId = typeof response.id === 'string' ? response.id : undefined;
         if (responseId && pendingReadIdRef.current && responseId !== pendingReadIdRef.current) return;
         pendingReadRequestIdRef.current = null;
         pendingReadIdRef.current = null;
-        if (msg.error) {
+        if (response.error) {
           setContent(t('p2p.discussions.load_failed'));
         } else {
-          setContent(msg.content as string);
+          setContent(typeof response.content === 'string' ? response.content : '');
         }
       }
       // Auto-refresh: when a P2P run updates and we're viewing that discussion, reload content
-      if (msg.type === P2P_WORKFLOW_MSG.RUN_UPDATE) {
-        const run = (msg as any).run;
+      if (messageType === P2P_WORKFLOW_MSG.RUN_UPDATE) {
+        const run = (msg as { run?: { id?: string; discussion_id?: unknown } }).run;
         if (!run) return;
         // Refresh list to pick up new/updated discussions — debounced
         // so a burst of run updates doesn't saturate the bridge's
         // per-socket pending cap.
         requestListRefresh();
         // If we're viewing this discussion's file, reload content
-        const runFileId = run.discussion_id ? String(run.discussion_id) : run.id;
-        if (selected && (selected === runFileId || selected.includes(run.id))) {
+        const runId = typeof run.id === 'string' ? run.id : '';
+        const runFileId = run.discussion_id ? String(run.discussion_id) : runId;
+        if (selected && runId && (selected === runFileId || selected.includes(runId))) {
           // Debounce: don't reload if we already have a pending read
           if (!pendingReadIdRef.current) {
             pendingReadIdRef.current = selected;

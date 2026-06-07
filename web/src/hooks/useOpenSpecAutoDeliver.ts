@@ -44,25 +44,39 @@ function makeRequestId(prefix: string): string {
 
 function normalizeProjection(raw: unknown): OpenSpecAutoDeliverProjection | null {
   if (!raw || typeof raw !== 'object') return null;
+  const record = raw as Record<string, unknown>;
   const projection = raw as Partial<OpenSpecAutoDeliverProjection>;
   const visibility = projection.visibility === 'conflict' ? 'conflict' : 'full';
+  const status = typeof record.status === 'string' && record.status
+    ? record.status
+    : visibility === 'conflict'
+      ? 'active'
+      : undefined;
+  const stage = typeof record.stage === 'string' && record.stage
+    ? record.stage
+    : visibility === 'conflict'
+      ? 'active'
+      : undefined;
   if (
     typeof projection.runId !== 'string'
-    || typeof projection.status !== 'string'
-    || typeof projection.stage !== 'string'
+    || !status
+    || !stage
   ) {
     return null;
   }
   if (visibility === 'full' && typeof projection.changeName !== 'string') return null;
   if (visibility === 'conflict' && typeof projection.owningMainSessionName !== 'string') return null;
+  const conflictReason = typeof record.conflictReason === 'string'
+    ? record.conflictReason
+    : typeof record.reason === 'string'
+      ? record.reason
+      : undefined;
   return {
     ...projection,
     visibility,
-    conflictReason: typeof projection.conflictReason === 'string'
-      ? projection.conflictReason
-      : typeof (raw as { reason?: unknown }).reason === 'string'
-        ? (raw as { reason: string }).reason
-        : undefined,
+    status,
+    stage,
+    ...(conflictReason ? { conflictReason } : {}),
     projectionVersion: typeof projection.projectionVersion === 'number'
       && Number.isFinite(projection.projectionVersion)
       ? projection.projectionVersion
