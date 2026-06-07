@@ -416,7 +416,7 @@ function validateAdvancedRounds(rounds: P2pAdvancedRound[]): void {
   const ids = new Set(rounds.map((round) => round.id));
   for (const round of rounds) {
     const verdictPolicy = round.verdictPolicy ?? 'none';
-    const artifactConvention = defaultArtifactConvention(round);
+    const artifactConvention = round.artifactConvention ?? defaultArtifactConvention(round);
     if (round.permissionScope === 'artifact_generation' && artifactConvention === 'explicit' && (!round.artifactOutputs || round.artifactOutputs.length === 0)) {
       throw new Error(`Artifact-generation round "${round.id}" must declare artifact outputs`);
     }

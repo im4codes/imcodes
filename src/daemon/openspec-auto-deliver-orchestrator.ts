@@ -11,7 +11,6 @@ import { timelineEmitter } from './timeline-emitter.js';
 import {
   activeOpenSpecPromptIdForAutoDeliverStage,
   evaluateOpenSpecAutoDeliverComboCompatibility,
-  materializeOpenSpecAutoDeliverStageRound,
 } from '../../shared/openspec-auto-deliver-combos.js';
 import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
@@ -703,13 +702,13 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
       resolvedChangeRootIdentity: metadata.resolvedChangeRootIdentity,
       stage: metadata.stage,
       selectedTeamComboId: metadata.selectedTeamComboId,
-    activeOpenSpecPromptId: metadata.activeOpenSpecPromptId,
-    roundIndex: metadata.roundIndex,
-    attemptId: metadata.attemptId,
-    authoritativeResultPath: metadata.authoritativeResultPath,
-    owningMainSessionName: metadata.owningMainSessionName,
-    executionSessionName: metadata.executionSessionName,
-    generation: metadata.generation,
+      activeOpenSpecPromptId: metadata.activeOpenSpecPromptId,
+      roundIndex: metadata.roundIndex,
+      attemptId: metadata.attemptId,
+      authoritativeResultPath: metadata.authoritativeResultPath,
+      owningMainSessionName: metadata.owningMainSessionName,
+      executionSessionName: metadata.executionSessionName,
+      generation: metadata.generation,
     },
     verdict: 'PASS | REWORK | BLOCKED',
     module_scores: [
@@ -730,6 +729,8 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
     `OpenSpec Auto Deliver audit-repair for openspec/changes/${run.changeName}.`,
     '',
     auditFocus,
+    `This request is launched through the normal Team/P2P combo flow (${metadata.selectedTeamComboId}), not an Auto Deliver custom combo.`,
+    `During the combo audit phase, apply the existing OpenSpec ${metadata.activeOpenSpecPromptId} criteria for this stage.`,
     '',
     `Run id: ${run.runId}`,
     `Stage: ${metadata.stage}`,
@@ -1016,12 +1017,6 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
     return;
   }
   clearAuditPollTimer(runId);
-  if (p2pRun.status !== 'completed') {
-    run.activeAudit = undefined;
-    const projection = terminalize(run, 'needs_human', `audit_p2p_${p2pRun.status}`);
-    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
-    return;
-  }
   const verdict = await consumeAuditResultFile(run, expected);
   if (!verdict) {
     const reason = run.latestMessage ?? 'invalid_audit_result';
@@ -1070,10 +1065,6 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
   const compatibility = evaluateOpenSpecAutoDeliverComboCompatibility(run.selectedTeamComboId, stage, activeOpenSpecPromptId);
   if (!compatibility.ok) {
     return terminalizeAndSend(run, 'failed', compatibility.reason ?? 'selected_combo_unavailable');
-  }
-  const materialized = materializeOpenSpecAutoDeliverStageRound(stage, run.selectedTeamComboId);
-  if ('error' in materialized) {
-    return terminalizeAndSend(run, 'failed', materialized.error ?? 'stage_materialization_failed');
   }
   const roundIndex = incrementAuditRound(run, stage);
   const attemptId = `${run.runId}:${stage}:${run.generation}:${roundIndex}`;
@@ -1141,13 +1132,8 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
     userText: buildAuditRequestText(run, metadata),
     fileContents: await buildAuditFileContents(run),
     serverLink: run.serverLink,
-    modeOverride: 'audit',
-    advanced: {
-      kind: OPENSPEC_AUTO_DELIVER_LAUNCH_ORIGIN,
-      advancedPresetKey: activeOpenSpecPromptId,
-      advancedRounds: [materialized.round],
-      advancedRunTimeoutMs: Math.max(1, materialized.round.timeoutMinutes ?? 10) * 60_000,
-    },
+    modeOverride: run.selectedTeamComboId,
+    rounds: 1,
     launchOrigin: {
       kind: 'openspec_auto_deliver',
       commandId: attemptId,

@@ -2309,10 +2309,14 @@ async function captureArtifactBaseline(run: P2pRun, round: P2pResolvedRound): Pr
       // PR-γ — no legacy baseline; the new helper is the only authority.
       return baseline;
     }
-    const target = join(projectDir, 'openspec', 'changes');
+    const target = 'openspec/changes';
     try {
-      const entries = await readdir(target);
-      baseline.set(target, entries.join('\n'));
+      const capture = await captureP2pArtifactBaseline({
+        rootPath: target,
+        phase: 'baseline',
+        repoRoot: projectDir,
+      });
+      baseline.set(target, JSON.stringify(capture.baseline.files));
     } catch {
       baseline.set(target, null);
     }
@@ -2341,8 +2345,15 @@ async function validateArtifactOutputsForRound(run: P2pRun, round: P2pResolvedRo
     const target = [...baseline.keys()][0];
     const before = baseline.get(target) ?? null;
     try {
-      const afterEntries = (await readdir(target)).join('\n');
-      if (afterEntries === before) throw new Error('openspec_convention artifacts were not observably updated');
+      const record = getSession(run.initiatorSession);
+      const projectDir = record?.projectDir ?? process.cwd();
+      const capture = await captureP2pArtifactBaseline({
+        rootPath: target,
+        phase: 'validate',
+        repoRoot: projectDir,
+      });
+      const after = JSON.stringify(capture.baseline.files);
+      if (after === before) throw new Error('openspec_convention artifacts were not observably updated');
       return;
     } catch (err) {
       throw new Error(err instanceof Error ? err.message : String(err));

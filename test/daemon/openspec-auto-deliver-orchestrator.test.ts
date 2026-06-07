@@ -282,6 +282,17 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     );
     expect(auditProjection.projection.selectedTeamComboId).toBe('audit>review>plan');
     expect(auditProjection.projection.activeOpenSpecPromptId).toBe('implementation_audit');
+    const implementationLaunch = startP2pRunMock.mock.calls.at(-1)?.[0] as {
+      modeOverride?: string;
+      rounds?: number;
+      advanced?: unknown;
+      userText?: string;
+    };
+    expect(implementationLaunch.modeOverride).toBe('audit>review>plan');
+    expect(implementationLaunch.rounds).toBe(1);
+    expect(implementationLaunch.advanced).toBeUndefined();
+    expect(implementationLaunch.userText).toContain('normal Team/P2P combo flow (audit>review>plan)');
+    expect(implementationLaunch.userText).toContain('implementation_audit criteria');
 
     await completeLatestAudit('completed');
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
@@ -327,9 +338,8 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     }, serverLinkMock as never);
 
     expect(startP2pRunMock).toHaveBeenCalledWith(expect.objectContaining({
-      advanced: expect.objectContaining({
-        advancedPresetKey: 'proposal_audit',
-      }),
+      modeOverride: 'audit>review>plan',
+      rounds: 1,
       launchOrigin: expect.objectContaining({
         kind: 'openspec_auto_deliver',
         autoDeliver: expect.objectContaining({
@@ -339,6 +349,17 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
         }),
       }),
     }));
+    const specLaunch = startP2pRunMock.mock.calls.at(-1)?.[0] as {
+      modeOverride?: string;
+      rounds?: number;
+      advanced?: unknown;
+      userText?: string;
+    };
+    expect(specLaunch.modeOverride).toBe('audit>review>plan');
+    expect(specLaunch.rounds).toBe(1);
+    expect(specLaunch.advanced).toBeUndefined();
+    expect(specLaunch.userText).toContain('normal Team/P2P combo flow (audit>review>plan)');
+    expect(specLaunch.userText).toContain('proposal_audit criteria');
     const projection = serverLinkMock.send.mock.calls
       .map((call) => call[0])
       .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
@@ -657,6 +678,25 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
+  });
+
+  it('consumes a valid authoritative result file even when the wrapper P2P run fails', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-failed-p2p-valid-result-file',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
+    await completeLatestAudit('failed');
+
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
 
   it('rejects invalid presets and zero-task changes before acquiring a run', async () => {

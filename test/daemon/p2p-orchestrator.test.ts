@@ -129,7 +129,7 @@ async function waitForStatus(runId: string, expected: P2pRunStatus[], maxMs = 10
   }
   const run = getP2pRun(runId);
   if (!run) throw new Error(`Run ${runId} disappeared before reaching ${expected.join(', ')}`);
-  throw new Error(`Run ${runId} ended in ${run.status}, expected ${expected.join(', ')}`);
+  throw new Error(`Run ${runId} ended in ${run.status}, expected ${expected.join(', ')}${run.error ? `; error=${run.error}` : ''}`);
 }
 
 async function waitForNoRoundHopArtifacts(projectDir: string, runId: string, maxMs = 1000): Promise<void> {
@@ -1053,10 +1053,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
   it('still enters summary when zero hops complete in a round', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
-    if (await writeExecutionMarkerFromPrompt(prompt)) {
-      setTimeout(() => notifySessionIdle(session), 20);
-      return;
-    }
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       if (session === 'deck_proj_brain') {
@@ -2474,6 +2474,48 @@ describe('P2P orchestrator — parallel rounds', () => {
     const done = await waitForStatus(run.id, ['failed'], 15_000);
     expect(done.error).toContain('Expected artifact not observably updated');
     expect(done.error).toContain('docs/plan.md');
+  }, 20_000);
+
+  it('accepts openspec_convention artifact rounds that modify files inside an existing change', async () => {
+    const changeDir = join(tempProjectDir, 'openspec', 'changes', 'existing-change');
+    await mkdir(join(changeDir, 'specs', 'demo'), { recursive: true });
+    await writeFile(join(changeDir, 'proposal.md'), '# Proposal\n\nBefore\n', 'utf8');
+    await writeFile(join(changeDir, 'tasks.md'), '- [ ] update\n', 'utf8');
+    await writeFile(join(changeDir, 'specs', 'demo', 'spec.md'), '# Spec\n', 'utf8');
+
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
+      const filePath = pathFromPrompt(prompt);
+      const heading = headingFromPrompt(prompt);
+      await writeFile(join(changeDir, 'proposal.md'), '# Proposal\n\nAfter\n', 'utf8');
+      await appendFile(filePath, `\n## ${heading}\n\nUpdated existing OpenSpec artifacts from ${session}.\n`, 'utf8');
+      setTimeout(() => notifySessionIdle(session), 20);
+    });
+
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [],
+      userText: 'artifact round updates an existing openspec change',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      advancedRounds: [
+        {
+          id: 'openspec_artifact',
+          title: 'OpenSpec Artifact',
+          preset: 'custom',
+          executionMode: 'single_main',
+          permissionScope: 'artifact_generation',
+          artifactConvention: 'openspec_convention',
+        },
+      ],
+    });
+
+    const done = await waitForStatus(run.id, ['completed'], 15_000);
+    expect(done.error).toBeNull();
+    await expect(readFile(join(changeDir, 'proposal.md'), 'utf8')).resolves.toContain('After');
   }, 20_000);
 
   it('completes the openspec preset after proposal artifacts are created and audit eventually passes', async () => {
