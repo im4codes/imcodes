@@ -1258,6 +1258,59 @@ describe('App shell', () => {
     expect(resetRunbar.getAttribute('data-compact')).toBe('false');
   }, 20_000);
 
+  it('hides the global Auto Deliver runbar after the run reaches a terminal status', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+
+    await act(async () => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-terminal-hidden',
+          projectionVersion: 1,
+          visibility: 'full',
+          changeName: 'finished-change',
+          status: 'active',
+          stage: 'implementation_task_loop',
+          launchedFromSessionName: 'deck_alpha_brain',
+          targetImplementationSessionName: 'deck_alpha_brain',
+          taskStats: { total: 2, checked: 1, unchecked: 1 },
+          canStop: true,
+        },
+      });
+    });
+
+    expect(await screen.findByTestId('app-shell-auto-deliver-runbar')).toBeTruthy();
+
+    await act(async () => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-terminal-hidden',
+          projectionVersion: 2,
+          visibility: 'full',
+          changeName: 'finished-change',
+          status: 'passed',
+          stage: 'passed',
+          terminal: true,
+          launchedFromSessionName: 'deck_alpha_brain',
+          targetImplementationSessionName: 'deck_alpha_brain',
+          taskStats: { total: 2, checked: 2, unchecked: 0 },
+          canStop: false,
+        },
+      });
+    });
+
+    expect(screen.queryByTestId('app-shell-auto-deliver-runbar')).toBeNull();
+  }, 20_000);
+
   it('binds the global Auto Deliver runbar actions to the focused sub-session window', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');

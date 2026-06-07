@@ -42,6 +42,7 @@ import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './component
 import { SubSessionWindow } from './components/SubSessionWindow.js';
 import { OpenSpecAutoDeliverDetailsPanel } from './components/OpenSpecAutoDeliver.js';
 import { useOpenSpecAutoDeliver } from './hooks/useOpenSpecAutoDeliver.js';
+import { isOpenSpecAutoDeliverActiveProjection } from './openspec-auto-deliver.js';
 import { DesktopWindowMaximizeButton } from './components/DesktopWindowMaximizeButton.js';
 import { useSharedGitChanges, requestSharedChanges } from './git-status-store.js';
 import {
@@ -2176,6 +2177,7 @@ export function App() {
   const appOpenSpecAutoRunbarHidden = appOpenSpecAutoRunbarHiddenRunId === appOpenSpecAutoProjection?.runId;
   const appOpenSpecAutoRunbarVisible = !!appOpenSpecAutoProjection
     && appOpenSpecAutoProjection.visibility !== 'conflict'
+    && isOpenSpecAutoDeliverActiveProjection(appOpenSpecAutoProjection)
     && !appOpenSpecAutoRunbarHidden;
   useEffect(() => {
     setAppOpenSpecAutoRunbarHiddenRunId(null);

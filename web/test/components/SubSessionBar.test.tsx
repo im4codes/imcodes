@@ -230,6 +230,54 @@ describe('SubSessionBar', () => {
     expect(view.container.querySelector('.daemon-local-clock')).toBeNull();
   });
 
+  it('shows the Auto Deliver entry in the desktop sub-session toolbar', () => {
+    const onViewAutoDeliver = vi.fn();
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        onViewAutoDeliver={onViewAutoDeliver}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const button = view.getByTestId('subsession-auto-deliver-status');
+    fireEvent.click(button);
+
+    expect(onViewAutoDeliver).toHaveBeenCalledTimes(1);
+  });
+
+  it('hides the Auto Deliver entry in the mobile sub-session toolbar', () => {
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={false}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        onViewAutoDeliver={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(view.queryByTestId('subsession-auto-deliver-status')).toBeNull();
+  });
+
   it('only applies the running pulse to collapsed mini cards while the sub-session is running', () => {
     const idleView = render(
       <SubSessionBar

@@ -527,7 +527,7 @@ describe('DiscussionsPage', () => {
     expect(screen.queryByText('Team row')).toBeNull();
   });
 
-  it('hides the Auto Deliver list category on mobile and falls back to Team discussions', async () => {
+  it('keeps the Auto Deliver list category available on mobile', async () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
     render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_sub_1' }} initialTab="auto" />);
 
@@ -539,10 +539,10 @@ describe('DiscussionsPage', () => {
       handler?.({
         type: 'openspec_auto_deliver.list_response',
         rows: [{
-          runId: 'auto-run-mobile-hidden',
+          runId: 'auto-run-mobile-visible',
           projectionVersion: 1,
           visibility: 'full',
-          changeName: 'hidden-auto',
+          changeName: 'visible-auto',
           status: 'active',
           stage: 'spec_audit_repair',
           owningMainSessionName: 'deck_proj_brain',
@@ -550,12 +550,13 @@ describe('DiscussionsPage', () => {
       } as unknown as ServerMessage);
     });
 
-    expect(screen.queryByRole('button', { name: 'openspec.auto.list_title' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'openspec.auto.list_title' })).toBeDefined();
     expect(screen.getByRole('button', { name: 'p2p.discussions.title' })).toBeDefined();
-    expect(screen.getByText('Team row')).toBeDefined();
-    expect(screen.queryByText('hidden-auto')).toBeNull();
-    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+    expect(screen.getAllByText('visible-auto').length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText('Team row')).toBeNull();
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'openspec_auto_deliver.list_request',
+      sessionName: 'deck_sub_1',
     }));
   });
 

@@ -39,7 +39,6 @@ interface Props {
 export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', requestScope, liveDiscussions = [], onStopDiscussion }: Props) {
   const { t } = useTranslation();
   const [progressHidden, setProgressHidden] = useState(false);
-  const [isMobileListLayout, setIsMobileListLayout] = useState(() => typeof window !== 'undefined' && window.innerWidth < 768);
   const [listTab, setListTab] = useState<'auto' | 'team'>(initialTab);
   const [discussions, setDiscussions] = useState<P2pDiscussion[]>([]);
   const [selected, setSelected] = useState<string | null>(initialSelectedId ?? null);
@@ -58,26 +57,13 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
   const scrollAnimFrameRef = useRef<number | null>(null);
   const detailScrollRef = useRef<HTMLDivElement>(null);
 
-  const autoDeliverListVisible = !isMobileListLayout;
-
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const handleResize = () => setIsMobileListLayout(window.innerWidth < 768);
-    handleResize();
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, []);
-
-  useEffect(() => {
-    const nextTab = initialTab === 'auto' && !autoDeliverListVisible ? 'team' : initialTab;
-    setListTab(nextTab);
-    if (nextTab === 'auto') {
+    setListTab(initialTab);
+    if (initialTab === 'auto') {
       setSelected(null);
       setContent(null);
-    } else {
-      setSelectedAutoRunId(null);
     }
-  }, [autoDeliverListVisible, initialTab]);
+  }, [initialTab]);
 
   const stopDetailScrollAnimation = useCallback(() => {
     if (scrollAnimFrameRef.current !== null) {
@@ -163,13 +149,13 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
   useEffect(() => { loadList(); }, [loadList]);
 
   const loadAutoDeliverRows = useCallback(() => {
-    if (!autoDeliverListVisible || !ws || !stableRequestScope?.sessionName) return;
+    if (!ws || !stableRequestScope?.sessionName) return;
     ws.send({
       type: OPENSPEC_AUTO_DELIVER_MSG.LIST_REQUEST,
       requestId: `openspec-auto-list-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       sessionName: stableRequestScope.sessionName,
     });
-  }, [autoDeliverListVisible, stableRequestScope, ws]);
+  }, [stableRequestScope, ws]);
 
   useEffect(() => { loadAutoDeliverRows(); }, [loadAutoDeliverRows]);
 
@@ -252,12 +238,11 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
   }, [sendReadDiscussion]);
 
   const selectAutoDeliverRun = useCallback((runId: string) => {
-    if (!autoDeliverListVisible) return;
     setListTab('auto');
     setSelected(null);
     setContent(null);
     setSelectedAutoRunId(runId);
-  }, [autoDeliverListVisible]);
+  }, []);
 
   const markCopied = useCallback((id: string) => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
@@ -343,7 +328,7 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
           ? ((msg as unknown) as { rows: OpenSpecAutoDeliverListRow[] }).rows
           : [];
         setAutoDeliverRows(rows);
-        if (autoDeliverListVisible && !selectedAutoRunId && rows[0]?.runId) setSelectedAutoRunId(rows[0].runId);
+        if (!selectedAutoRunId && rows[0]?.runId) setSelectedAutoRunId(rows[0].runId);
       }
       if (
         messageType === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK
@@ -355,7 +340,7 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
         const projection = (msg as { projection?: OpenSpecAutoDeliverProjection | null }).projection;
         if (projection?.runId) {
           upsertAutoDeliverRow(rowFromProjection(projection));
-          if (autoDeliverListVisible && !selectedAutoRunId) setSelectedAutoRunId(projection.runId);
+          if (!selectedAutoRunId) setSelectedAutoRunId(projection.runId);
         }
       }
       if (messageType === P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE) {
@@ -401,7 +386,7 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
         }
       }
     });
-  }, [autoDeliverListVisible, copyText, requestListRefresh, rowFromProjection, selected, selectedAutoRunId, sendReadDiscussion, t, upsertAutoDeliverRow, ws]);
+  }, [copyText, requestListRefresh, rowFromProjection, selected, selectedAutoRunId, sendReadDiscussion, t, upsertAutoDeliverRow, ws]);
 
   useEffect(() => () => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
@@ -444,8 +429,6 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
     () => (selectedAutoRunId ? autoDeliverRows.find((row) => row.runId === selectedAutoRunId) ?? null : null),
     [autoDeliverRows, selectedAutoRunId],
   );
-  const effectiveListTab = autoDeliverListVisible ? listTab : 'team';
-
   return (
     <div class="discussions-page">
       {/* Active P2P progress cards at top */}
@@ -496,24 +479,22 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
       <div class="discussions-layout">
         <div class="discussions-list" style={initialSelectedId && selected ? { display: window.innerWidth < 768 ? 'none' : undefined } : undefined}>
           <div class="discussions-list-tabs">
-            {autoDeliverListVisible && (
-              <button
-                type="button"
-                class={`discussions-list-tab${effectiveListTab === 'auto' ? ' active' : ''}`}
-                onClick={() => setListTab('auto')}
-              >
-                {t('openspec.auto.list_title')}
-              </button>
-            )}
             <button
               type="button"
-              class={`discussions-list-tab${effectiveListTab === 'team' ? ' active' : ''}`}
+              class={`discussions-list-tab${listTab === 'auto' ? ' active' : ''}`}
+              onClick={() => setListTab('auto')}
+            >
+              {t('openspec.auto.list_title')}
+            </button>
+            <button
+              type="button"
+              class={`discussions-list-tab${listTab === 'team' ? ' active' : ''}`}
               onClick={() => setListTab('team')}
             >
               {t('p2p.discussions.title')}
             </button>
           </div>
-          {effectiveListTab === 'auto' ? (
+          {listTab === 'auto' ? (
             <>
               {autoDeliverRows.length === 0 && <div class="discussions-empty">{t('openspec.auto.list_empty')}</div>}
               {autoDeliverRows.map((row) => (

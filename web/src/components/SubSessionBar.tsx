@@ -957,7 +957,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             {desktopLayoutCapable ? t('subsessionBar.add_sub_session_short') : '+'}
           </button>
         )}
-        {onViewAutoDeliver && (
+        {onViewAutoDeliver && !isMobile && (
           <button
             class={`subcard-toolbar-btn${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
             data-testid="subsession-auto-deliver-status"
