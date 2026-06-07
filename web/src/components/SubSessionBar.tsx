@@ -36,6 +36,8 @@ import {
   DEFAULT_SUBSESSION_ACCENT_COLOR,
   getSubSessionAccentColorMap,
 } from '../subsession-accent-colors.js';
+import { OpenSpecAutoDeliverRunBar } from './OpenSpecAutoDeliver.js';
+import type { OpenSpecAutoDeliverProjection } from '../openspec-auto-deliver.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -94,10 +96,18 @@ interface Props {
   onRestoreThenClose?: (id: string) => void;
   onRestart: (id: string) => void;
   onNew?: () => void;
+  onViewAutoDeliver?: () => void;
   onViewDiscussions?: () => void;
   onViewDiscussion?: (fileId: string) => void;
   onViewRepo?: () => void;
   onViewCron?: () => void;
+  openSpecAutoProjection?: OpenSpecAutoDeliverProjection | null;
+  openSpecAutoStopPending?: boolean;
+  openSpecAutoCompact?: boolean;
+  onOpenSpecAutoView?: () => void;
+  onOpenSpecAutoStop?: () => void;
+  onOpenSpecAutoToggleCompact?: () => void;
+  onOpenSpecAutoHide?: () => void;
 
   discussions?: DiscussionSummary[];
   /**
@@ -277,7 +287,7 @@ function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, sharedState
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
@@ -824,6 +834,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   };
 
   const discussionButtonLabel = t('subsessionBar.p2p_discussions');
+  const autoDeliverButtonLabel = t('subsessionBar.auto_deliver');
   const repoButtonLabel = t('repo.info_title', { defaultValue: t('subsessionBar.repository') });
   const cronButtonLabel = t('subsessionBar.scheduled_tasks');
 
@@ -946,6 +957,19 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             {desktopLayoutCapable ? t('subsessionBar.add_sub_session_short') : '+'}
           </button>
         )}
+        {onViewAutoDeliver && (
+          <button
+            class={`subcard-toolbar-btn${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
+            data-testid="subsession-auto-deliver-status"
+            onClick={onViewAutoDeliver}
+            title={autoDeliverButtonLabel}
+            aria-label={autoDeliverButtonLabel}
+            style={{ marginLeft: 4, fontSize: 11 }}
+          >
+            <span aria-hidden="true">⟲</span>
+            {desktopLayoutCapable && <span class="subcard-toolbar-btn-label">{autoDeliverButtonLabel}</span>}
+          </button>
+        )}
         {onViewDiscussions && (
           <button
             class={`subcard-toolbar-btn${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
@@ -1063,6 +1087,20 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           </label>
           <button class="subcard-toolbar-btn" onClick={applySize}>{t('subsessionBar.apply')}</button>
           <button class="subcard-toolbar-btn" onClick={resetSize}>{t('subsessionBar.reset')}</button>
+        </div>
+      )}
+
+      {openSpecAutoProjection && openSpecAutoProjection.visibility !== 'conflict' && (
+        <div class="openspec-auto-subsession-progress">
+          <OpenSpecAutoDeliverRunBar
+            projection={openSpecAutoProjection}
+            stopPending={openSpecAutoStopPending}
+            compact={openSpecAutoCompact}
+            onView={onOpenSpecAutoView ?? onViewAutoDeliver ?? (() => {})}
+            onStop={onOpenSpecAutoStop ?? (() => {})}
+            onToggleCompact={onOpenSpecAutoToggleCompact}
+            onHide={onOpenSpecAutoHide}
+          />
         </div>
       )}
 

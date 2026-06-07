@@ -4,6 +4,7 @@ import type { WsClient, ServerMessage, P2pWorkflowRequestScope } from '../ws-cli
 import { P2pProgressCard } from '../components/P2pProgressCard.js';
 import type { P2pProgressDiscussion } from '../components/P2pProgressCard.js';
 import { FilePreviewPane } from '../components/FilePreviewPane.js';
+import { translateAutoDeliverReason } from '../components/OpenSpecAutoDeliver.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import {
   OPENSPEC_AUTO_DELIVER_MSG,
@@ -25,6 +26,7 @@ interface Props {
   ws: WsClient | null;
   onBack?: () => void;
   initialSelectedId?: string | null;
+  initialTab?: 'auto' | 'team';
   requestScope?: P2pWorkflowRequestScope;
   /** Live discussion state from app (progress, nodes). */
   liveDiscussions?: P2pProgressDiscussion[];
@@ -33,10 +35,10 @@ interface Props {
 
 // Global marked config (breaks, gfm, target=_blank) is set in main.tsx
 
-export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscussions = [], onStopDiscussion }: Props) {
+export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', requestScope, liveDiscussions = [], onStopDiscussion }: Props) {
   const { t } = useTranslation();
   const [progressHidden, setProgressHidden] = useState(false);
-  const [listTab, setListTab] = useState<'auto' | 'team'>('team');
+  const [listTab, setListTab] = useState<'auto' | 'team'>(initialTab);
   const [discussions, setDiscussions] = useState<P2pDiscussion[]>([]);
   const [selected, setSelected] = useState<string | null>(initialSelectedId ?? null);
   const [selectedAutoRunId, setSelectedAutoRunId] = useState<string | null>(null);
@@ -53,6 +55,14 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollAnimFrameRef = useRef<number | null>(null);
   const detailScrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setListTab(initialTab);
+    if (initialTab === 'auto') {
+      setSelected(null);
+      setContent(null);
+    }
+  }, [initialTab]);
 
   const stopDetailScrollAnimation = useCallback(() => {
     if (scrollAnimFrameRef.current !== null) {
@@ -549,10 +559,10 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
                       <div class="openspec-auto-detail-row"><span>{t('openspec.auto.combo_id')}</span><strong>{selectedAutoDeliverRow.selectedTeamComboId}</strong></div>
                     )}
                     {selectedAutoDeliverRow.terminalReason && (
-                      <div class="openspec-auto-detail-row"><span>{t('openspec.auto.terminal_reason')}</span><strong>{selectedAutoDeliverRow.terminalReason}</strong></div>
+                      <div class="openspec-auto-detail-row"><span>{t('openspec.auto.terminal_reason')}</span><strong>{translateAutoDeliverReason(selectedAutoDeliverRow.terminalReason, t)}</strong></div>
                     )}
                     {selectedAutoDeliverRow.reason && (
-                      <div class="openspec-auto-detail-row"><span>{t('openspec.auto.conflict_summary')}</span><strong>{selectedAutoDeliverRow.reason}</strong></div>
+                      <div class="openspec-auto-detail-row"><span>{t('openspec.auto.conflict_summary')}</span><strong>{translateAutoDeliverReason(selectedAutoDeliverRow.reason, t)}</strong></div>
                     )}
                   </div>
                 </div>

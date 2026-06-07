@@ -97,6 +97,7 @@ export interface OpenSpecAutoDeliverP2pMetadata {
   activeOpenSpecPromptId: OpenSpecAutoDeliverStagePromptId;
   roundIndex: number;
   attemptId: string;
+  authoritativeResultPath: string;
   generation: number;
 }
 

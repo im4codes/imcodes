@@ -81,6 +81,19 @@ function taskProgressText(projection: OpenSpecAutoDeliverProjection, t: (key: st
   return t('openspec.auto.tasks_progress', { checked: stats.checked, total: stats.total });
 }
 
+function humanizeAutoDeliverCode(value: string): string {
+  return value
+    .split('_')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+export function translateAutoDeliverReason(value: string | null | undefined, t: (key: string, opts?: Record<string, unknown>) => string): string | undefined {
+  if (!value) return undefined;
+  return t(`openspec.auto.reason.${value}`, { defaultValue: humanizeAutoDeliverCode(value) });
+}
+
 function uncheckedTaskLabels(projection: OpenSpecAutoDeliverProjection): string[] {
   if (projection.taskStats?.uncheckedLabels?.length) return projection.taskStats.uncheckedLabels;
   return projection.taskStats?.items
@@ -93,6 +106,11 @@ function uncheckedTaskLabels(projection: OpenSpecAutoDeliverProjection): string[
 function formatRoundPair(pair: { current: number; total: number } | undefined, fallback?: number): string | number | undefined {
   if (pair) return `${pair.current}/${pair.total}`;
   return fallback;
+}
+
+function formatEvidenceSummary(summary: string | undefined, t: (key: string, opts?: Record<string, unknown>) => string): string | undefined {
+  if (!summary) return undefined;
+  return translateAutoDeliverReason(summary, t);
 }
 
 function projectionElapsedMs(projection: OpenSpecAutoDeliverProjection, now: number): number {
@@ -446,7 +464,7 @@ export function OpenSpecAutoDeliverDetailsPanel({
           <DetailRow label={t('openspec.auto.combo_id')} value={projection.selectedTeamComboId} />
           <DetailRow label={t('openspec.auto.active_prompt')} value={projection.activeOpenSpecPromptId} />
           <DetailRow label={t('openspec.auto.verdict')} value={projection.latestVerdict} />
-          <DetailRow label={t('openspec.auto.terminal_reason')} value={projection.terminalReason} />
+          <DetailRow label={t('openspec.auto.terminal_reason')} value={translateAutoDeliverReason(projection.terminalReason, t)} />
         </div>
         <div class="openspec-auto-detail-section">
           <h4>{t('openspec.auto.task_stats')}</h4>
@@ -480,10 +498,10 @@ export function OpenSpecAutoDeliverDetailsPanel({
           <div class="openspec-auto-detail-section">
             <h4>{t('openspec.auto.evidence')}</h4>
             {projection.latestRepairSummary && <div class="openspec-auto-detail-note">{projection.latestRepairSummary}</div>}
-            {projection.recentFinding && <div class="openspec-auto-detail-note">{projection.recentFinding}</div>}
+            {projection.recentFinding && <div class="openspec-auto-detail-note">{formatEvidenceSummary(projection.recentFinding, t)}</div>}
             {projection.evidence?.map((item) => (
               <div class="openspec-auto-evidence" key={`${item.summary ?? item.label}:${item.source ?? item.provenance ?? ''}`}>
-                <span>{item.summary ?? item.label}</span>
+                <span>{formatEvidenceSummary(item.summary ?? item.label, t)}</span>
                 {(item.source || item.provenance) && <small>{t(`openspec.auto.provenance.${item.source ?? item.provenance}`)}</small>}
                 {item.stale && <small>{t('openspec.auto.evidence_stale')}</small>}
               </div>

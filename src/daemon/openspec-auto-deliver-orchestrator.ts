@@ -1,4 +1,4 @@
-import { readdir, readFile, realpath, stat } from 'node:fs/promises';
+import { mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -19,6 +19,7 @@ import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
   OPENSPEC_AUTO_DELIVER_LAUNCH_ORIGIN,
   OPENSPEC_AUTO_DELIVER_MSG,
+  OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES,
   isOpenSpecAutoDeliverTerminalStage,
   materializeOpenSpecAutoDeliverPreset,
   type OpenSpecAutoDeliverPresetId,
@@ -42,7 +43,6 @@ import {
   buildOpenSpecAutoDeliverValidationRecommendations,
 } from '../../shared/openspec-auto-deliver-validation-recommendations.js';
 import {
-  parseOpenSpecAutoDeliverAuthoritativeJsonPayload,
   parseOpenSpecTasksMarkdown,
   validateOpenSpecAutoDeliverChangeSlug,
   validateOpenSpecAutoDeliverLaunchRequest,
@@ -174,12 +174,15 @@ interface AutoDeliverRun {
     activeOpenSpecPromptId: OpenSpecAutoDeliverStagePromptId;
     stage: AuditRepairStage;
     attemptId: string;
+    authoritativeResultPath: string;
+    resultFileRepairAttempted?: boolean;
     roundIndex: number;
     generation: number;
   };
   latestVerdict?: OpenSpecAutoDeliverVerdict;
   moduleScores?: OpenSpecAutoDeliverModuleScore[];
   latestRepairSummary?: string;
+  lastAuditResultError?: string;
   evidence?: OpenSpecAutoDeliverEvidence[];
   requestIds: Map<string, OpenSpecAutoDeliverProjection>;
   serverLink: ServerLink;
@@ -196,6 +199,10 @@ const requestProjectionByFingerprint = new Map<string, OpenSpecAutoDeliverProjec
 const auditPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let timelineUnsubscribe: (() => void) | null = null;
 const execFileAsync = promisify(execFile);
+
+function byteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
 
 function clearAuditPollTimer(runId: string): void {
   const timer = auditPollTimers.get(runId);
@@ -227,6 +234,62 @@ function broadcastProjection(run: AutoDeliverRun, type = OPENSPEC_AUTO_DELIVER_M
   const projection = bumpProjection(run);
   send(run.serverLink, { type, projection });
   return projection;
+}
+
+function humanInterventionSession(run: AutoDeliverRun): string {
+  return run.targetImplementationSessionName || run.launchedFromSessionName || run.owningMainSessionName;
+}
+
+function humanInterventionMessage(run: AutoDeliverRun, reason: string): string {
+  return [
+    `OpenSpec Auto Deliver needs human input for openspec/changes/${run.changeName}.`,
+    '',
+    `Run: ${run.runId}`,
+    `Status: needs_human`,
+    `Reason: ${reason}`,
+    `Owning session: ${run.owningMainSessionName}`,
+    `Implementation session: ${run.targetImplementationSessionName}`,
+    '',
+    'Reply in this session with the next instruction. The Auto Deliver run has stopped and will not continue until a human takes over.',
+  ].join('\n');
+}
+
+function emitHumanInterventionPrompt(run: AutoDeliverRun, reason: string): void {
+  const sessionName = humanInterventionSession(run);
+  const message = humanInterventionMessage(run, reason);
+  const eventBase = `openspec-auto:${run.runId}:needs-human:${run.generation}`;
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    text: message,
+    streaming: false,
+    assistantKind: 'notification',
+  }, {
+    source: 'daemon',
+    confidence: 'high',
+    eventId: `${eventBase}:message`,
+  });
+  timelineEmitter.emit(sessionName, 'ask.question', {
+    toolUseId: `${run.runId}:needs-human:${run.generation}`,
+    message,
+    waitMs: 5 * 60_000,
+    questions: [{
+      header: 'OpenSpec Auto Deliver',
+      question: `Auto Deliver stopped with reason "${reason}". What should happen next in this session?`,
+      options: [
+        {
+          label: 'Review the failure and continue manually',
+          description: 'Send an instruction to inspect the stopped run, fix the issue, and report back.',
+        },
+        {
+          label: 'Stop here and summarize the current state',
+          description: 'Ask the agent to stop active work and provide a concise handoff.',
+        },
+      ],
+    }],
+  }, {
+    source: 'daemon',
+    confidence: 'high',
+    eventId: `${eventBase}:ask`,
+  });
 }
 
 function mergeEvidence(
@@ -431,6 +494,7 @@ async function buildValidationEvidence(run: AutoDeliverRun): Promise<OpenSpecAut
     readProjectFileIfPresent(run.projectRoot, 'yarn.lock'),
     readProjectFileIfPresent(run.projectRoot, 'server/package.json'),
     readProjectFileIfPresent(run.projectRoot, 'web/package.json'),
+    readProjectFileIfPresent(run.projectRoot, 'pyproject.toml'),
   ])).filter((entry): entry is { path: string; content: string } => !!entry);
   const recommendations = buildOpenSpecAutoDeliverValidationRecommendations(files);
   const recommended = recommendations.filter((entry) => entry.safety === 'recommended');
@@ -439,8 +503,8 @@ async function buildValidationEvidence(run: AutoDeliverRun): Promise<OpenSpecAut
     {
       source: 'daemon',
       summary: recommended.length > 0
-        ? `Recommended validation commands: ${recommended.map((entry) => entry.command).join('; ')}.`
-        : 'No safe validation commands were discovered from project manifests.',
+        ? `Discovered safe validation command candidates from project manifests: ${recommended.map((entry) => entry.command).join('; ')}. These are hints, not a fixed or exhaustive validation plan.`
+        : 'No safe validation command candidates were discovered from project manifests.',
       stale: false,
     },
     ...(unsafe.length > 0
@@ -474,12 +538,12 @@ function buildImplementationPrompt(run: AutoDeliverRun): string {
     '',
     'Implement only this OpenSpec change. Do not commit, push, or stage files. Do not modify unrelated OpenSpec changes or docs.',
     'Work through the remaining tasks below. Mark tasks.md checkboxes only after the work is genuinely complete.',
-    'Run reasonable local validation for touched code when available. Report exact commands and outcomes, or explain why validation could not run.',
+    'Run reasonable local validation for the touched code when available. Treat the discovered commands below as project-specific candidates only; choose the actual validation plan from the changed files and project tooling. Report exact commands and outcomes, or explain why validation could not run.',
     '',
     'Remaining tasks:',
     remainingBlock,
     '',
-    'Validation recommendations:',
+    'Validation command candidates:',
     validationSummary,
   ].join('\n');
 }
@@ -525,6 +589,27 @@ function auditRoundLimit(run: AutoDeliverRun, stage: AuditRepairStage): number {
 
 function auditRoundCount(run: AutoDeliverRun, stage: AuditRepairStage): number {
   return stage === 'spec_audit_repair' ? run.specAuditRepairRound : run.implementationAuditRepairRound;
+}
+
+function isRetryableAuditResultError(reason: string | undefined): boolean {
+  return reason === 'missing_authoritative_json'
+    || reason === 'multiple_authoritative_json'
+    || reason === 'malformed_authoritative_json'
+    || reason === 'authoritative_input_too_large'
+    || reason === 'authoritative_payload_too_large'
+    || reason === 'invalid_authoritative_json'
+    || reason === 'invalid_audit_verdict';
+}
+
+function safeAutoDeliverResultBasename(run: AutoDeliverRun, stage: AuditRepairStage, generation: number, roundIndex: number): string {
+  return `${run.runId}.${stage}.g${generation}.r${roundIndex}.authoritative.json`
+    .replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+async function buildAuthoritativeResultPath(run: AutoDeliverRun, stage: AuditRepairStage, generation: number, roundIndex: number): Promise<string> {
+  const dir = join(run.projectRoot, '.imc', 'discussions');
+  await mkdir(dir, { recursive: true });
+  return join(dir, safeAutoDeliverResultBasename(run, stage, generation, roundIndex));
 }
 
 function incrementAuditRound(run: AutoDeliverRun, stage: AuditRepairStage): number {
@@ -608,12 +693,13 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
       resolvedChangeRootIdentity: metadata.resolvedChangeRootIdentity,
       stage: metadata.stage,
       selectedTeamComboId: metadata.selectedTeamComboId,
-      activeOpenSpecPromptId: metadata.activeOpenSpecPromptId,
-      roundIndex: metadata.roundIndex,
-      attemptId: metadata.attemptId,
-      owningMainSessionName: metadata.owningMainSessionName,
-      executionSessionName: metadata.executionSessionName,
-      generation: metadata.generation,
+    activeOpenSpecPromptId: metadata.activeOpenSpecPromptId,
+    roundIndex: metadata.roundIndex,
+    attemptId: metadata.attemptId,
+    authoritativeResultPath: metadata.authoritativeResultPath,
+    owningMainSessionName: metadata.owningMainSessionName,
+    executionSessionName: metadata.executionSessionName,
+    generation: metadata.generation,
     },
     verdict: 'PASS | REWORK | BLOCKED',
     module_scores: [
@@ -642,6 +728,7 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
     `Selected Team combo id: ${metadata.selectedTeamComboId}`,
     `Active OpenSpec prompt id: ${metadata.activeOpenSpecPromptId}`,
     `Round: ${metadata.roundIndex}/${auditRoundLimit(run, metadata.stage)}`,
+    `Authoritative result file: ${metadata.authoritativeResultPath}`,
     `Owning main session: ${metadata.owningMainSessionName}`,
     `Execution session: ${metadata.executionSessionName}`,
     `Resolved change root identity: ${metadata.resolvedChangeRootIdentity}`,
@@ -649,17 +736,74 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
     `Task stats: ${run.taskStats.checked}/${run.taskStats.total} checked.`,
     unchecked.length > 0 ? `Unchecked tasks:\n${unchecked.map((label) => `- ${label}`).join('\n')}` : 'Unchecked tasks: none.',
     run.latestRepairSummary ? `Prior repair summary: ${run.latestRepairSummary}` : 'Prior repair summary: none.',
+    run.lastAuditResultError
+      ? `Previous audit-repair attempt did not produce a usable authoritative JSON result: ${run.lastAuditResultError}. Retry by writing the final raw JSON object to the authoritative result file path above.`
+      : 'Previous audit-repair strict result error: none.',
     run.evidence?.length ? `Evidence:\n${run.evidence.map((entry) => `- ${entry.source}: ${entry.summary}`).join('\n')}` : 'Evidence: none.',
     metadata.stage === 'implementation_audit_repair' ? changedFiles : '',
     metadata.stage === 'implementation_audit_repair' ? diffStat : '',
     '',
-    'Return exactly one authoritative fenced JSON payload through the runtime-bounded strict result segment. Do not include another JSON fence.',
-    'The JSON must preserve the auto_deliver metadata exactly and must include canonical module scores.',
+    'Write the final authoritative result as raw JSON to the exact Authoritative result file path above. Do not wrap that file in Markdown fences.',
+    'The daemon will read only that file as the authoritative result. Discussion text and summaries are for humans only and are not authoritative.',
+    'The JSON file must preserve the auto_deliver metadata exactly and must include canonical module scores.',
     '',
     `Required top-level fields: ${Object.keys(payloadSkeleton).join(', ')}.`,
     `Required auto_deliver fields: ${Object.keys(payloadSkeleton.auto_deliver).join(', ')}.`,
     'Required module score ids: spec, tasks, implementation, tests, risk.',
   ].join('\n');
+}
+
+function buildAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpecAutoDeliverP2pMetadata, p2pRun: P2pRun, reason: string): string {
+  return [
+    `OpenSpec Auto Deliver needs the authoritative audit result file for openspec/changes/${run.changeName}.`,
+    '',
+    `The audit-repair discussion has already completed; do not redo the full audit from scratch unless you must inspect your prior conclusion.`,
+    `Problem: ${reason}`,
+    `Discussion file: ${p2pRun.contextFilePath}`,
+    `Authoritative result file: ${metadata.authoritativeResultPath}`,
+    '',
+    'Write exactly one raw JSON object to the authoritative result file path above. Do not wrap the file content in Markdown fences. Do not write a second JSON candidate.',
+    'The daemon will read only that file as the authoritative result; chat/discussion text is not authoritative.',
+    '',
+    'The JSON auto_deliver metadata must match exactly:',
+    JSON.stringify({
+      runId: metadata.runId,
+      changeName: metadata.changeName,
+      resolvedChangeRootIdentity: metadata.resolvedChangeRootIdentity,
+      stage: metadata.stage,
+      selectedTeamComboId: metadata.selectedTeamComboId,
+      activeOpenSpecPromptId: metadata.activeOpenSpecPromptId,
+      roundIndex: metadata.roundIndex,
+      attemptId: metadata.attemptId,
+      authoritativeResultPath: metadata.authoritativeResultPath,
+      owningMainSessionName: metadata.owningMainSessionName,
+      executionSessionName: metadata.executionSessionName,
+      generation: metadata.generation,
+    }, null, 2),
+    '',
+    'Required top-level fields: auto_deliver, verdict, module_scores, unchecked_tasks, required_changes, repairs_applied, evidence.',
+    'Required module score ids: spec, tasks, implementation, tests, risk.',
+  ].join('\n');
+}
+
+function dispatchAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpecAutoDeliverP2pMetadata, p2pRun: P2pRun, reason: string): boolean {
+  const runtime = getTransportRuntime(run.targetImplementationSessionName);
+  if (!runtime) return false;
+  const commandId = `${metadata.attemptId}:authoritative-result-file-repair`;
+  const prompt = buildAuditResultFileRepairPrompt(run, metadata, p2pRun, reason);
+  timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
+    text: prompt,
+    allowDuplicate: true,
+    commandId,
+  }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${commandId}` });
+  try {
+    runtime.send(prompt, commandId);
+  } catch {
+    return false;
+  }
+  run.latestMessage = 'authoritative_result_file_repair_prompt_dispatched';
+  broadcastProjection(run);
+  return true;
 }
 
 function validateAuditMetadata(input: unknown, expected: OpenSpecAutoDeliverP2pMetadata): boolean {
@@ -676,6 +820,7 @@ function validateAuditMetadata(input: unknown, expected: OpenSpecAutoDeliverP2pM
     && actual.activeOpenSpecPromptId === expected.activeOpenSpecPromptId
     && actual.roundIndex === expected.roundIndex
     && actual.attemptId === expected.attemptId
+    && actual.authoritativeResultPath === expected.authoritativeResultPath
     && actual.owningMainSessionName === expected.owningMainSessionName
     && actual.executionSessionName === expected.executionSessionName
     && actual.generation === expected.generation;
@@ -698,23 +843,38 @@ function validateFinalPass(run: AutoDeliverRun, verdict: OpenSpecAutoDeliverVerd
   return null;
 }
 
-async function consumeAuditDiscussion(run: AutoDeliverRun, p2pRun: P2pRun, expected: OpenSpecAutoDeliverP2pMetadata): Promise<OpenSpecAutoDeliverVerdictPayload | null> {
-  const strictResult = (p2pRun as P2pRun & { strictAuthoritativeResult?: string | null }).strictAuthoritativeResult;
-  const text = typeof strictResult === 'string' && strictResult.trim() ? strictResult : '';
-  const parsed = parseOpenSpecAutoDeliverAuthoritativeJsonPayload(text);
-  if (!parsed.ok) {
-    run.latestMessage = parsed.issues.map((entry) => entry.code).join(',') || 'invalid_authoritative_json';
+async function consumeAuditResultFile(run: AutoDeliverRun, expected: OpenSpecAutoDeliverP2pMetadata): Promise<OpenSpecAutoDeliverVerdictPayload | null> {
+  const text = await readFile(expected.authoritativeResultPath, 'utf8').catch(() => null);
+  if (typeof text !== 'string' || !text.trim()) {
+    run.latestMessage = 'missing_authoritative_json';
+    run.lastAuditResultError = run.latestMessage;
     return null;
   }
-  if (!validateAuditMetadata(parsed.value, expected)) {
+  if (byteLength(text) > OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES) {
+    run.latestMessage = 'authoritative_input_too_large';
+    run.lastAuditResultError = run.latestMessage;
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    run.latestMessage = 'malformed_authoritative_json';
+    run.lastAuditResultError = run.latestMessage;
+    return null;
+  }
+  if (!validateAuditMetadata(parsed, expected)) {
     run.latestMessage = 'audit_metadata_mismatch';
+    run.lastAuditResultError = run.latestMessage;
     return null;
   }
-  const result = validateOpenSpecAutoDeliverVerdictPayload(parsed.value);
+  const result = validateOpenSpecAutoDeliverVerdictPayload(parsed);
   if (!result.ok) {
     run.latestMessage = result.issues.map((entry) => entry.code).join(',') || 'invalid_audit_verdict';
+    run.lastAuditResultError = run.latestMessage;
     return null;
   }
+  delete run.lastAuditResultError;
   return result.value;
 }
 
@@ -744,6 +904,7 @@ function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 
   terminalRunByOwner.set(run.owningMainSessionName, run);
   releaseAutoDeliverP2pLock(run.owningMainSessionName, run.runId);
   forgetRequestProjectionFingerprints(run);
+  if (status === 'needs_human') emitHumanInterventionPrompt(run, reason);
   return bumpProjection(run);
 }
 
@@ -845,18 +1006,33 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
     return;
   }
   clearAuditPollTimer(runId);
-  run.activeAudit = undefined;
   if (p2pRun.status !== 'completed') {
+    run.activeAudit = undefined;
     const projection = terminalize(run, 'needs_human', `audit_p2p_${p2pRun.status}`);
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
-  const verdict = await consumeAuditDiscussion(run, p2pRun, expected);
+  const verdict = await consumeAuditResultFile(run, expected);
   if (!verdict) {
-    const projection = terminalize(run, 'needs_human', run.latestMessage ?? 'invalid_audit_result');
+    const reason = run.latestMessage ?? 'invalid_audit_result';
+    if (isRetryableAuditResultError(reason) && !active.resultFileRepairAttempted) {
+      active.resultFileRepairAttempted = true;
+      run.activeAudit = active;
+      if (dispatchAuditResultFileRepairPrompt(run, expected, p2pRun, reason)) {
+        auditPollTimers.set(runId, setTimeout(() => { void handleAuditPoll(runId, expected); }, 1000));
+        return;
+      }
+    }
+    run.activeAudit = undefined;
+    if (isRetryableAuditResultError(reason) && auditRoundCount(run, expected.stage) < auditRoundLimit(run, expected.stage)) {
+      await startAuditRepairStageFailClosed(run, expected.stage);
+      return;
+    }
+    const projection = terminalize(run, 'needs_human', reason);
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
+  run.activeAudit = undefined;
   await advanceAfterAuditVerdict(run, expected.stage, verdict).catch((error) => {
     terminalizeAndSend(run, 'failed', error instanceof Error ? error.message : 'audit_advance_failed');
   });
@@ -891,6 +1067,7 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
   }
   const roundIndex = incrementAuditRound(run, stage);
   const attemptId = `${run.runId}:${stage}:${run.generation}:${roundIndex}`;
+  const authoritativeResultPath = await buildAuthoritativeResultPath(run, stage, run.generation, roundIndex);
   const metadata: OpenSpecAutoDeliverP2pMetadata = {
     owner: 'openspec_auto_deliver',
     runId: run.runId,
@@ -903,6 +1080,7 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
     activeOpenSpecPromptId,
     roundIndex,
     attemptId,
+    authoritativeResultPath,
     generation: run.generation,
   };
   run.status = stage;
@@ -934,6 +1112,7 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
     activeOpenSpecPromptId,
     stage,
     attemptId,
+    authoritativeResultPath,
     roundIndex,
     generation: run.generation,
   };
@@ -970,6 +1149,7 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
         stage,
         roundIndex,
         attemptId,
+        authoritativeResultPath,
         selectedTeamComboId: run.selectedTeamComboId,
         activeOpenSpecPromptId,
       },

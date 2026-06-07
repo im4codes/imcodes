@@ -57,6 +57,7 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.auto.tasks_progress') return `${opts?.checked ?? 0}/${opts?.total ?? 0} tasks`;
       if (key === 'openspec.auto.prompt_count') return `${opts?.count ?? 0} prompts`;
       if (key === 'openspec.auto.conflict_active') return `${opts?.change ?? ''} already running`;
+      if (key === 'openspec.auto.reason.missing_authoritative_json') return 'The audit did not produce a final authoritative JSON result.';
       if (key.startsWith('openspec.auto.status.')) return key.split('.').pop() ?? key;
       if (key.startsWith('openspec.auto.stage.')) return key.split('.').pop() ?? key;
       if (key === 'openspec.propose_from_discussion_action') return 'propose_from_discussion_action';
@@ -1650,9 +1651,7 @@ afterEach(() => {
     });
     await flushAsync();
 
-    expect(screen.getByTestId('openspec-auto-runbar')).toBeDefined();
-    expect(screen.getByText('change-a')).toBeDefined();
-    expect(screen.getByText('fresh finding')).toBeDefined();
+    expect(screen.queryByTestId('openspec-auto-runbar')).toBeNull();
     expect(screen.queryByText('old-change')).toBeNull();
 
     const teamButton = screen.getByRole('button', { name: /^team$/i });
@@ -1687,7 +1686,10 @@ afterEach(() => {
     expect(screen.getByRole('textbox').textContent).toBe('');
 
     fireEvent.click(screen.getAllByRole('button', { name: 'View' })[0]);
-    expect(screen.getByTestId('openspec-auto-details')).toBeDefined();
+    const details = screen.getByTestId('openspec-auto-details');
+    expect(details).toBeDefined();
+    expect(within(details).getByText('change-a')).toBeDefined();
+    expect(within(details).getByText('fresh finding')).toBeDefined();
   });
 
   it('renders redacted Auto Deliver conflict entries without details actions', async () => {
@@ -1759,7 +1761,7 @@ afterEach(() => {
     });
     await flushAsync();
 
-    expect(screen.getByTestId('openspec-auto-runbar')).toBeDefined();
+    expect(screen.queryByTestId('openspec-auto-runbar')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
     await flushAsync();
 
@@ -1768,7 +1770,7 @@ afterEach(() => {
     expect(within(entry).getByText('deck_main → deck_sub_worker-alpha')).toBeDefined();
   });
 
-  it('supports compact, hide, recovery, and run-id reset for the Auto Deliver runbar', async () => {
+  it('translates Auto Deliver terminal reasons and evidence codes in details', async () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -1781,57 +1783,29 @@ afterEach(() => {
     ws.emit({
       type: 'openspec_auto_deliver.projection',
       projection: {
-        runId: 'auto-compact-1',
+        runId: 'auto-i18n',
         projectionVersion: 1,
         visibility: 'full',
-        changeName: 'change-a',
+        changeName: 'change-i18n',
         launchedFromSessionName: 'my-session',
         targetImplementationSessionName: 'my-session',
-        status: 'active',
-        stage: 'implementation_task_loop',
-        taskStats: { total: 5, checked: 2, unchecked: 3 },
-        recentFinding: 'compact finding',
-        canStop: true,
+        status: 'needs_human',
+        stage: 'needs_human',
+        terminalReason: 'missing_authoritative_json',
+        recentFinding: 'missing_authoritative_json',
+        evidence: [{ label: 'strict result', summary: 'missing_authoritative_json' }],
+        taskStats: { total: 84, checked: 84, unchecked: 0 },
       },
     });
     await flushAsync();
-
-    const fullRunbar = screen.getByTestId('openspec-auto-runbar');
-    expect(fullRunbar.className).not.toContain('openspec-auto-runbar-compact');
-    fireEvent.click(within(fullRunbar).getByRole('button', { name: 'compact' }));
-    expect(screen.getByTestId('openspec-auto-runbar').className).toContain('openspec-auto-runbar-compact');
-
-    fireEvent.click(within(screen.getByTestId('openspec-auto-runbar')).getByRole('button', { name: 'expand' }));
-    fireEvent.click(within(screen.getByTestId('openspec-auto-runbar')).getByRole('button', { name: 'hide' }));
-    expect(screen.queryByTestId('openspec-auto-runbar')).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
     await flushAsync();
-    const recoveryEntry = screen.getByTestId('openspec-auto-current-entry');
-    expect(within(recoveryEntry).getByText('change-a')).toBeDefined();
-    fireEvent.click(within(recoveryEntry).getByRole('button', { name: 'View' }));
+    fireEvent.click(within(screen.getByTestId('openspec-auto-current-entry')).getByRole('button', { name: 'View' }));
     expect(screen.getByTestId('openspec-auto-details')).toBeDefined();
-
-    ws.emit({
-      type: 'openspec_auto_deliver.projection',
-      projection: {
-        runId: 'auto-compact-2',
-        projectionVersion: 1,
-        visibility: 'full',
-        changeName: 'change-b',
-        launchedFromSessionName: 'my-session',
-        targetImplementationSessionName: 'my-session',
-        status: 'active',
-        stage: 'spec_audit_repair',
-        taskStats: { total: 2, checked: 0, unchecked: 2 },
-        canStop: true,
-      },
-    });
-    await flushAsync();
-
-    const resetRunbar = screen.getByTestId('openspec-auto-runbar');
-    expect(resetRunbar.className).not.toContain('openspec-auto-runbar-compact');
-    expect(within(resetRunbar).getByText('change-b')).toBeDefined();
+    const translated = screen.getAllByText('The audit did not produce a final authoritative JSON result.');
+    expect(translated.length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText('missing_authoritative_json')).toBeNull();
   });
 
   it('opens an openspec change folder in the file browser and can insert files from it', async () => {

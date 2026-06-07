@@ -40,6 +40,8 @@ import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
 import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
 import { SubSessionWindow } from './components/SubSessionWindow.js';
+import { OpenSpecAutoDeliverDetailsPanel } from './components/OpenSpecAutoDeliver.js';
+import { useOpenSpecAutoDeliver } from './hooks/useOpenSpecAutoDeliver.js';
 import { DesktopWindowMaximizeButton } from './components/DesktopWindowMaximizeButton.js';
 import { useSharedGitChanges, requestSharedChanges } from './git-status-store.js';
 import {
@@ -1507,6 +1509,7 @@ export function App() {
   // ── Discussions ─────────────────────────────────────────────────────────────
   const [showDiscussionsPage, setShowDiscussionsPage] = useState(false);
   const [discussionInitialId, setDiscussionInitialId] = useState<string | null>(null);
+  const [discussionInitialTab, setDiscussionInitialTab] = useState<'auto' | 'team'>('team');
   // Swipe back for discussions is handled by FloatingPanel on mobile
   const [showDiscussionDialog, setShowDiscussionDialog] = useState(false);
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -2150,6 +2153,24 @@ export function App() {
     activeSession,
     Boolean(selectedShareTarget),
   );
+  const appOpenSpecAutoSessionName = activeSession ?? visibleMainSessions[0]?.name ?? null;
+  const appOpenSpecAutoDeliver = useOpenSpecAutoDeliver({
+    ws: wsRef.current,
+    serverId: selectedServerId ?? undefined,
+    sessionName: appOpenSpecAutoSessionName,
+  });
+  const [appOpenSpecAutoDetailsOpen, setAppOpenSpecAutoDetailsOpen] = useState(false);
+  const [appOpenSpecAutoRunbarCompact, setAppOpenSpecAutoRunbarCompact] = useState(false);
+  const [appOpenSpecAutoRunbarHiddenRunId, setAppOpenSpecAutoRunbarHiddenRunId] = useState<string | null>(null);
+  const appOpenSpecAutoProjection = appOpenSpecAutoDeliver.projection;
+  const appOpenSpecAutoRunbarHidden = appOpenSpecAutoRunbarHiddenRunId === appOpenSpecAutoProjection?.runId;
+  const appOpenSpecAutoRunbarVisible = !!appOpenSpecAutoProjection
+    && appOpenSpecAutoProjection.visibility !== 'conflict'
+    && !appOpenSpecAutoRunbarHidden;
+  useEffect(() => {
+    setAppOpenSpecAutoRunbarHiddenRunId(null);
+    setAppOpenSpecAutoRunbarCompact(false);
+  }, [appOpenSpecAutoProjection?.runId]);
   const managedSharedSubSessionStateById = useMemo(() => {
     const states = new Map<string, SharedStateSummary>();
     if (!selectedServerId) return states;
@@ -4990,6 +5011,15 @@ export function App() {
               </FloatingPanel>
             )}
 
+            {appOpenSpecAutoDetailsOpen && (
+              <OpenSpecAutoDeliverDetailsPanel
+                projection={appOpenSpecAutoProjection}
+                stopPending={appOpenSpecAutoDeliver.stopPending}
+                onClose={() => setAppOpenSpecAutoDetailsOpen(false)}
+                onStop={() => { appOpenSpecAutoDeliver.stop(); }}
+              />
+            )}
+
             {/* Sub-session bar — hidden on desktop when sidebar is expanded (SessionTree shows sub-sessions there) */}
             {selectedServerId && (
               <SubSessionBar
@@ -5013,8 +5043,18 @@ export function App() {
                 onRestoreThenClose={minimizeSubSessionWindow}
                 onRestart={restartSubSession}
                 onNew={selectedShareTarget ? undefined : () => setShowSubDialog(true)}
-                onViewDiscussions={() => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(null); setShowDiscussionsPage(true); })}
-                onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); })}
+                onViewAutoDeliver={() => runVersionSensitiveAction(trans('openspec.auto.list_title'), () => { setDiscussionInitialId(null); setDiscussionInitialTab('auto'); setShowDiscussionsPage(true); })}
+                openSpecAutoProjection={appOpenSpecAutoRunbarVisible ? appOpenSpecAutoProjection : null}
+                openSpecAutoStopPending={appOpenSpecAutoDeliver.stopPending}
+                openSpecAutoCompact={appOpenSpecAutoRunbarCompact}
+                onOpenSpecAutoView={() => setAppOpenSpecAutoDetailsOpen(true)}
+                onOpenSpecAutoStop={() => { appOpenSpecAutoDeliver.stop(); }}
+                onOpenSpecAutoToggleCompact={() => setAppOpenSpecAutoRunbarCompact((value) => !value)}
+                onOpenSpecAutoHide={() => {
+                  if (appOpenSpecAutoProjection) setAppOpenSpecAutoRunbarHiddenRunId(appOpenSpecAutoProjection.runId);
+                }}
+                onViewDiscussions={() => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(null); setDiscussionInitialTab('team'); setShowDiscussionsPage(true); })}
+                onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setDiscussionInitialTab('team'); setShowDiscussionsPage(true); })}
                 discussions={discussions.filter((d) => isP2pDiscussionVisibleInSubSessionBar(d, {
                   activeSession,
                   activeRootSession,
@@ -5264,7 +5304,7 @@ export function App() {
         <FloatingPanel
           id="discussions"
           title={trans('p2p.discussions.title')}
-          onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
+          onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); setDiscussionInitialTab('team'); }}
           defaultW={800}
           defaultH={600}
           zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.discussions, isMobile ? 6500 : 5040)}
@@ -5273,8 +5313,9 @@ export function App() {
           <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
             <DiscussionsPage
               ws={wsRef.current}
-              onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
+              onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); setDiscussionInitialTab('team'); }}
               initialSelectedId={discussionInitialId}
+              initialTab={discussionInitialTab}
               liveDiscussions={discussions}
               // Audit fix (e940d73f-a8e / M7-A) — wire the active session
               // into requestScope. Without this, multi-project daemons fail

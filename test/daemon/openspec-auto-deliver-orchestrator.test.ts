@@ -78,6 +78,16 @@ async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean,
   throw new Error('Expected websocket send was not observed');
 }
 
+async function waitForTransportSend(predicate: (text: string) => boolean, maxMs = 1000): Promise<string> {
+  const start = Date.now();
+  while (Date.now() - start < maxMs) {
+    const found = transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).find(predicate);
+    if (found) return found;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('Expected transport send was not observed');
+}
+
 function auditPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     verdict: 'PASS',
@@ -111,6 +121,7 @@ function parseAuditMetadata(run: MockP2pRun): Record<string, unknown> {
     activeOpenSpecPromptId: lineValue('Active OpenSpec prompt id') || origin.activeOpenSpecPromptId,
     roundIndex: Number((lineValue('Round') || '0/0').split('/')[0]),
     attemptId: lineValue('Attempt id') || origin.attemptId,
+    authoritativeResultPath: lineValue('Authoritative result file'),
     owningMainSessionName: lineValue('Owning main session') || origin.owningMainSessionName,
     executionSessionName: lineValue('Execution session'),
     generation: Number(lineValue('Generation') || origin.generation),
@@ -122,16 +133,11 @@ async function completeLatestAudit(status = 'completed', payloadOverrides: Recor
   if (!run) throw new Error('No mocked P2P run exists');
   run.status = status;
   const origin = parseAuditMetadata(run);
-  const resultSummary = [
-    '# audit result',
-    '',
-    '```json',
-    JSON.stringify(auditPayload({ auto_deliver: origin, ...payloadOverrides }), null, 2),
-    '```',
-  ].join('\n');
-  run.resultSummary = resultSummary;
-  run.strictAuthoritativeResult = resultSummary;
-  await writeFile(run.contextFilePath, resultSummary, 'utf8');
+  const resultJson = JSON.stringify(auditPayload({ auto_deliver: origin, ...payloadOverrides }), null, 2);
+  run.resultSummary = `# audit result\n\nWrote authoritative result to ${origin.authoritativeResultPath}.`;
+  run.strictAuthoritativeResult = null;
+  await writeFile(run.contextFilePath, run.resultSummary, 'utf8');
+  await writeFile(String(origin.authoritativeResultPath), resultJson, 'utf8');
 }
 
 describe('OpenSpec Auto Deliver daemon orchestrator', () => {
@@ -405,6 +411,89 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(terminal?.projection.terminalReason).toBe('implementation_audit_rework_rounds_exhausted');
   });
 
+  it('requests authoritative result file repair before consuming another audit-repair round', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-missing-json-retry',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
+    await completeLatestAudit('completed');
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_task_loop', 2500);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
+
+    const firstAudit = [...p2pRuns.values()].at(-1)!;
+    firstAudit.status = 'completed';
+    firstAudit.resultSummary = null;
+    firstAudit.strictAuthoritativeResult = null;
+    const repairPrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver needs the authoritative audit result file')
+      && text.includes('Problem: missing_authoritative_json'),
+      2500,
+    );
+    expect(repairPrompt).toContain('do not redo the full audit from scratch');
+    expect(repairPrompt).toContain('Authoritative result file:');
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair'
+      && msg.projection?.implementationAuditRepairRound === 1
+      && msg.projection?.lastMessage === 'authoritative_result_file_repair_prompt_dispatched',
+      2500,
+    );
+
+    expect([...p2pRuns.values()]).toHaveLength(2);
+    const origin = parseAuditMetadata(firstAudit);
+    await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({ auto_deliver: origin }), null, 2), 'utf8');
+
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
+  });
+
+  it('starts another full audit-repair round only after result-file repair also fails', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-missing-json-full-retry',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
+    await completeLatestAudit('completed');
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_task_loop', 2500);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
+
+    const firstAudit = [...p2pRuns.values()].at(-1)!;
+    firstAudit.status = 'completed';
+    firstAudit.resultSummary = null;
+    firstAudit.strictAuthoritativeResult = null;
+    await waitForTransportSend((text) => text.includes('Problem: missing_authoritative_json'), 2500);
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair'
+      && msg.projection?.implementationAuditRepairRound === 2,
+      3000,
+    );
+
+    const retryAudit = [...p2pRuns.values()].at(-1)!;
+    expect(retryAudit.id).not.toBe(firstAudit.id);
+    expect(retryAudit.userText).toContain('Previous audit-repair attempt did not produce a usable authoritative JSON result: missing_authoritative_json');
+    expect(retryAudit.userText).toContain('Retry by writing the final raw JSON object to the authoritative result file path above');
+
+    await completeLatestAudit('completed');
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
+  });
+
   it('falls back to needs_human when the spec audit reports BLOCKED', async () => {
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
@@ -425,7 +514,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(terminal?.projection.terminalReason).toBe('audit_blocked');
   });
 
-  it('rejects stale, malformed, and multiple authoritative audit payloads', async () => {
+  it('rejects stale metadata and malformed or missing authoritative result files', async () => {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
@@ -475,12 +564,29 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     run.status = 'completed';
     run.resultSummary = null;
     run.strictAuthoritativeResult = null;
-    await writeFile(run.contextFilePath, '```json\n{}\n```\n```json\n{}\n```', 'utf8');
     terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.terminalReason).toBe('missing_authoritative_json');
-  });
 
-  it('uses the final P2P result summary instead of incidental JSON in the discussion transcript', async () => {
+    clearOpenSpecAutoDeliverRunsForTests();
+    serverLinkMock.send.mockClear();
+    p2pRuns.clear();
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-malformed-json-file',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
+    const malformedRun = [...p2pRuns.values()].at(-1)!;
+    malformedRun.status = 'completed';
+    await writeFile(String(parseAuditMetadata(malformedRun).authoritativeResultPath), '{not json', 'utf8');
+    terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    expect(terminal?.projection.terminalReason).toBe('malformed_authoritative_json');
+  }, 10_000);
+
+  it('ignores discussion JSON when the authoritative result file is missing', async () => {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
@@ -505,10 +611,11 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     await writeFile(run.contextFilePath, 'participant example\n```json\n{}\n```\n', 'utf8');
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
-    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.status).toBe('needs_human');
+    expect(terminal?.projection.terminalReason).toBe('missing_authoritative_json');
   });
 
-  it('uses a strict authoritative result larger than the generic P2P summary tail', async () => {
+  it('uses an authoritative result file larger than the generic P2P summary tail', async () => {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
@@ -532,10 +639,11 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
         summary: `${module} ${'x'.repeat(700)}`,
       })),
     });
-    const strictResult = `final result\n\`\`\`json\n${JSON.stringify(largePayload, null, 2)}\n\`\`\``;
-    expect(strictResult.length).toBeGreaterThan(2_000);
-    run.strictAuthoritativeResult = strictResult;
-    run.resultSummary = strictResult.slice(-2_000);
+    const resultJson = JSON.stringify(largePayload, null, 2);
+    expect(resultJson.length).toBeGreaterThan(2_000);
+    run.strictAuthoritativeResult = null;
+    run.resultSummary = resultJson.slice(-2_000);
+    await writeFile(String(origin.authoritativeResultPath), resultJson, 'utf8');
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
@@ -669,6 +777,14 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
   });
 
   it('bounds implementation prompts and instructs agents not to commit, push, or stage', async () => {
+    await writeFile(join(projectDir, 'package.json'), JSON.stringify({
+      scripts: {
+        test: 'vitest run',
+        typecheck: 'tsc --noEmit',
+        deploy: 'serverless deploy',
+      },
+    }), 'utf8');
+    await writeFile(join(projectDir, 'pnpm-lock.yaml'), '', 'utf8');
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
       requestId: 'req-prompt-limit',
@@ -678,6 +794,11 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     }, serverLinkMock as never);
 
     expect(transportSendMock.mock.calls[0]?.[0]).toContain('Do not commit, push, or stage files.');
+    expect(transportSendMock.mock.calls[0]?.[0]).toContain('Validation command candidates:');
+    expect(transportSendMock.mock.calls[0]?.[0]).toContain('project-specific candidates only');
+    expect(transportSendMock.mock.calls[0]?.[0]).toContain('Discovered safe validation command candidates from project manifests: pnpm typecheck; pnpm test');
+    expect(transportSendMock.mock.calls[0]?.[0]).toContain('Unsafe validation commands were skipped: pnpm deploy');
+    expect(transportSendMock.mock.calls[0]?.[0]).not.toContain('Recommended validation commands:');
     for (let expectedCount = 2; expectedCount <= 12; expectedCount += 1) {
       timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
       await waitForSend((msg) =>
@@ -851,6 +972,14 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
   });
 
   it('stops as needs_human for out-of-band target-session input during implementation', async () => {
+    const timelineEvents: Array<{ sessionId: string; type: string; payload: Record<string, unknown> }> = [];
+    const unsubscribe = timelineEmitter.on((event) => {
+      timelineEvents.push({
+        sessionId: event.sessionId,
+        type: event.type,
+        payload: event.payload,
+      });
+    });
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
       requestId: 'req-oob',
@@ -864,5 +993,26 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('out_of_band_target_session_input');
+    unsubscribe();
+
+    const manualMessage = timelineEvents.find((event) =>
+      event.sessionId === 'deck_demo_brain'
+      && event.type === 'assistant.text'
+      && String(event.payload.text ?? '').includes('OpenSpec Auto Deliver needs human input')
+    );
+    expect(manualMessage?.payload.text).toContain('Reason: out_of_band_target_session_input');
+
+    const askQuestion = timelineEvents.find((event) =>
+      event.sessionId === 'deck_demo_brain'
+      && event.type === 'ask.question'
+      && String(event.payload.toolUseId ?? '').includes('needs-human')
+    );
+    expect(askQuestion?.payload.message).toContain('Reply in this session with the next instruction');
+    expect(askQuestion?.payload.questions).toEqual([expect.objectContaining({
+      header: 'OpenSpec Auto Deliver',
+      options: expect.arrayContaining([
+        expect.objectContaining({ label: 'Review the failure and continue manually' }),
+      ]),
+    })]);
   });
 });

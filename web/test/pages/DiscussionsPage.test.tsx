@@ -9,7 +9,11 @@ import { DiscussionsPage } from '../../src/pages/DiscussionsPage.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string) => key,
+    t: (key: string, opts?: Record<string, unknown>) => {
+      if (key === 'openspec.auto.reason.auto_deliver_active') return 'Auto Deliver is already running for this session.';
+      if (key === 'openspec.auto.reason.missing_authoritative_json') return 'The audit did not produce a final authoritative JSON result.';
+      return typeof opts?.defaultValue === 'string' ? opts.defaultValue : key;
+    },
   }),
 }));
 
@@ -489,6 +493,86 @@ describe('DiscussionsPage', () => {
     expect(screen.getByText('deck_proj_brain')).toBeDefined();
     expect(screen.getByText('deck_sub_1')).toBeDefined();
     expect(screen.getByText('audit>review>plan')).toBeDefined();
+  });
+
+  it('can open directly on the Auto Deliver list tab', async () => {
+    render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_sub_1' }} initialTab="auto" />);
+
+    await act(async () => {
+      handler?.({ type: 'p2p.list_discussions_response', discussions: [{ id: 'team-1', preview: 'Team row', fileName: 'team-1.md', mtime: 1 }] } as ServerMessage);
+      handler?.({
+        type: 'openspec_auto_deliver.list_response',
+        rows: [{
+          runId: 'auto-run-direct',
+          projectionVersion: 1,
+          visibility: 'full',
+          changeName: 'direct-auto',
+          status: 'active',
+          stage: 'spec_audit_repair',
+          owningMainSessionName: 'deck_proj_brain',
+        }],
+      } as unknown as ServerMessage);
+    });
+
+    expect(screen.getAllByText('direct-auto').length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText('Team row')).toBeNull();
+  });
+
+  it('renders Auto Deliver conflict rows without change names and localizes conflict reasons', async () => {
+    const { container } = render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_sub_1' }} initialTab="auto" />);
+
+    await act(async () => {
+      handler?.({ type: 'p2p.list_discussions_response', discussions: [] } as ServerMessage);
+      handler?.({
+        type: 'openspec_auto_deliver.list_response',
+        rows: [{
+          runId: 'auto-conflict-1',
+          projectionVersion: 3,
+          visibility: 'conflict',
+          status: 'active',
+          stage: 'implementation_audit_repair',
+          owningMainSessionName: 'deck_proj_brain',
+          reason: 'auto_deliver_active',
+        }],
+      } as unknown as ServerMessage);
+    });
+
+    expect(screen.queryByText('private-change-name')).toBeNull();
+    const autoRow = container.querySelector('.discussions-list-item') as HTMLElement;
+    expect(autoRow.textContent).toContain('deck_proj_brain');
+    expect(autoRow.textContent).not.toContain('private-change-name');
+
+    fireEvent.click(autoRow);
+    expect(screen.getByText('Auto Deliver is already running for this session.')).toBeDefined();
+    expect(screen.queryByText('auto_deliver_active')).toBeNull();
+  });
+
+  it('localizes Auto Deliver terminal reasons in recovery row details', async () => {
+    const { container } = render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_sub_1' }} initialTab="auto" />);
+
+    await act(async () => {
+      handler?.({ type: 'p2p.list_discussions_response', discussions: [] } as ServerMessage);
+      handler?.({
+        type: 'openspec_auto_deliver.list_response',
+        rows: [{
+          runId: 'auto-terminal-1',
+          projectionVersion: 4,
+          visibility: 'full',
+          changeName: 'openspec-auto-delivery',
+          status: 'needs_human',
+          stage: 'needs_human',
+          viewMode: 'compactRecovery',
+          owningMainSessionName: 'deck_proj_brain',
+          targetImplementationSessionName: 'deck_sub_1',
+          terminalReason: 'missing_authoritative_json',
+        }],
+      } as unknown as ServerMessage);
+    });
+
+    const autoRow = container.querySelector('.discussions-list-item') as HTMLElement;
+    fireEvent.click(autoRow);
+    expect(screen.getByText('The audit did not produce a final authoritative JSON result.')).toBeDefined();
+    expect(screen.queryByText('missing_authoritative_json')).toBeNull();
   });
 
   it('clicking a live progress card with NO fileId is a no-op (orphan run mid-bind)', async () => {

@@ -323,9 +323,18 @@ function byteLength(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 
-function extractOpenSpecAutoDeliverStrictSegment(content: string): string | null {
-  if (byteLength(content) > OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES) return null;
-  const matches = [...content.matchAll(/```json\s*([\s\S]*?)```/g)];
+function extractFinalSummarySection(content: string): string {
+  let finalSummaryIndex = -1;
+  for (const match of content.matchAll(/^## .*Final Summary.*$/gmi)) {
+    finalSummaryIndex = match.index ?? finalSummaryIndex;
+  }
+  return finalSummaryIndex >= 0 ? content.slice(finalSummaryIndex) : content;
+}
+
+export function extractOpenSpecAutoDeliverStrictSegment(content: string): string | null {
+  const authoritativeSection = extractFinalSummarySection(content);
+  if (byteLength(authoritativeSection) > OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES) return null;
+  const matches = [...authoritativeSection.matchAll(/```json\s*([\s\S]*?)```/g)];
   if (matches.length !== 1) return null;
   const segment = matches[0]?.[0] ?? '';
   return byteLength(segment) <= OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES ? segment : null;
@@ -3701,7 +3710,7 @@ async function dispatchHop(
     let lastSize = sizeBefore;
     let lastGrowthAt = 0;
     let headingFound = false;
-    let headingFoundAt = 0;
+    let executionMarkerFound = false;
     let queueStopSent = false;
 
     while (Date.now() < deadline) {
@@ -3751,7 +3760,6 @@ async function dispatchHop(
           const content = await readFile(watchPath, 'utf8');
           if (normalizeDiscussionSectionHeader(content).includes(normalizeDiscussionSectionHeader(`## ${sectionHeader}`))) {
             headingFound = true;
-            headingFoundAt = Date.now();
             if (!fileGrew) {
               fileGrew = true;
               if (run.status === 'dispatched') transition(run, 'running', serverLink);
@@ -3761,17 +3769,10 @@ async function dispatchHop(
         }
       } catch {}
 
-      if (headingFound && (Date.now() - headingFoundAt) >= 2_000) {
-        logger.info({ runId: run.id, session, sectionHeader }, 'P2P: heading found in file, completing hop');
-        idleWaiter.cancel();
-        await finishHop('completed');
-        pushState(run, serverLink);
-        return true;
-      }
-
       if (options.executionMarkerSpec) {
         const markerState = await readPostSummaryExecutionMarker(options.executionMarkerSpec);
         if (markerState?.ok || markerState?.failedByAgent) {
+          executionMarkerFound = true;
           logger.info(
             {
               runId: run.id,
@@ -3779,12 +3780,8 @@ async function dispatchHop(
               markerPath: options.executionMarkerSpec.markerPath,
               markerStatus: markerState.marker?.status,
             },
-            'P2P: inline execution marker found while waiting for summary hop completion',
+            'P2P: inline execution marker found; waiting for final answer/idle before completing summary hop',
           );
-          idleWaiter.cancel();
-          await finishHop('completed');
-          pushState(run, serverLink);
-          return true;
         }
       }
 
@@ -3792,11 +3789,7 @@ async function dispatchHop(
       if (!headingFound && fileGrew && (lastSize - sizeBefore) > 500 &&
           lastGrowthAt > 0 && (Date.now() - lastGrowthAt) >= settleForGrowth &&
           (Date.now() - dispatchTime) > MIN_PROCESSING_MS) {
-        logger.info({ runId: run.id, session, growth: lastSize - sizeBefore }, 'P2P: content growth fallback — completing hop without heading');
-        idleWaiter.cancel();
-        await finishHop('completed');
-        pushState(run, serverLink);
-        return true;
+        logger.info({ runId: run.id, session, growth: lastSize - sizeBefore }, 'P2P: content growth fallback observed; waiting for final idle before completing hop');
       }
 
       const canCheckIdle = (Date.now() - dispatchTime) > MIN_PROCESSING_MS;
@@ -3817,7 +3810,7 @@ async function dispatchHop(
         });
       }
 
-      if (fileSettled || (pastGrace && !fileGrew)) {
+      if (fileSettled || executionMarkerFound || (pastGrace && !fileGrew)) {
         let idleConfirmed = false;
         const record = getSession(session);
         const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
@@ -3843,6 +3836,13 @@ async function dispatchHop(
               continue;
             }
           } catch {}
+          idleWaiter.cancel();
+          await finishHop('completed');
+          pushState(run, serverLink);
+          return true;
+        }
+
+        if (executionMarkerFound && !fileGrew && idleConfirmed) {
           idleWaiter.cancel();
           await finishHop('completed');
           pushState(run, serverLink);

@@ -10,6 +10,7 @@ export interface P2pAutoDeliverLaunchMetadata {
   stage: string;
   roundIndex?: number;
   attemptId?: string;
+  authoritativeResultPath?: string;
   selectedTeamComboId?: string;
   activeOpenSpecPromptId?: string;
 }
@@ -129,6 +130,7 @@ export function sanitizeP2pLaunchOriginForProjection(origin: P2pLaunchOrigin | u
       stage: origin.autoDeliver.stage,
       ...(origin.autoDeliver.roundIndex != null ? { roundIndex: origin.autoDeliver.roundIndex } : {}),
       ...(origin.autoDeliver.attemptId ? { attemptId: origin.autoDeliver.attemptId } : {}),
+      ...(origin.autoDeliver.authoritativeResultPath ? { authoritativeResultPath: origin.autoDeliver.authoritativeResultPath } : {}),
       ...(origin.autoDeliver.selectedTeamComboId ? { selectedTeamComboId: origin.autoDeliver.selectedTeamComboId } : {}),
       ...(origin.autoDeliver.activeOpenSpecPromptId ? { activeOpenSpecPromptId: origin.autoDeliver.activeOpenSpecPromptId } : {}),
     };

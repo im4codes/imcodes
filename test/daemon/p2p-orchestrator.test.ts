@@ -66,6 +66,7 @@ import {
   listP2pRuns,
   notifySessionIdle,
   serializeP2pRun,
+  extractOpenSpecAutoDeliverStrictSegment,
   _setFileSettleCycles,
   _setGracePeriodMs,
   _setIdlePollMs,
@@ -211,6 +212,54 @@ afterEach(async () => {
 });
 
 describe('P2P orchestrator — parallel rounds', () => {
+
+  it('extracts the generic strict JSON segment from the final summary instead of prior transcript fences', () => {
+    const finalJson = {
+      auto_deliver: { runId: 'auto-1' },
+      verdict: 'PASS',
+      module_scores: [],
+      unchecked_tasks: [],
+      required_changes: [],
+      repairs_applied: [],
+      evidence: [],
+    };
+    const discussion = [
+      '## Earlier Spec Section',
+      '```json',
+      '{"example":true}',
+      '```',
+      '```ts',
+      'const example = 1;',
+      '```',
+      '## brain:codex-sdk:implementation_audit — Final Summary',
+      '```json',
+      JSON.stringify(finalJson, null, 2),
+      '```',
+      '## P2P Original Request Execution Confirmed',
+      'Marker file: .imc/discussions/run.cycle1.execution-marker.json',
+    ].join('\n');
+
+    const segment = extractOpenSpecAutoDeliverStrictSegment(discussion);
+    expect(segment).toContain('"runId": "auto-1"');
+    expect(segment).not.toContain('"example":true');
+  });
+
+  it('fails closed when the final summary contains multiple strict JSON candidates', () => {
+    const discussion = [
+      '```json',
+      '{"earlier":true}',
+      '```',
+      '## brain:codex-sdk:implementation_audit — Final Summary',
+      '```json',
+      '{"verdict":"PASS"}',
+      '```',
+      '```json',
+      '{"verdict":"REWORK"}',
+      '```',
+    ].join('\n');
+
+    expect(extractOpenSpecAutoDeliverStrictSegment(discussion)).toBeNull();
+  });
 
   it('creates round-scoped hop artifact names with run id, round, and hop index', async () => {
     const run = await startP2pRun(
@@ -1305,6 +1354,46 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(payload.summary_phase).toBe('completed');
     expect(payload.hop_counts?.completed).toBeGreaterThanOrEqual(1);
   });
+
+  it('waits for final idle content instead of completing on the first streamed heading', async () => {
+    let pendingFinalWrites = 0;
+    detectStatusAsyncMock.mockImplementation(async () => (pendingFinalWrites === 0 ? 'idle' : 'thinking'));
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (prompt.includes('[P2P Discussion Task')) {
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        pendingFinalWrites += 1;
+        await appendFile(filePath, `\n## ${heading}\n\npartial streaming text\n`, 'utf8');
+        await writeExecutionMarkerFromPrompt(prompt);
+        setTimeout(() => {
+          void appendFile(filePath, 'FINAL ANSWER TEXT\n', 'utf8').then(() => {
+            pendingFinalWrites -= 1;
+            notifySessionIdle(session);
+          });
+        }, 2400);
+        return;
+      }
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 20);
+      }
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'wait for final text',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      5000,
+    );
+
+    const done = await waitForStatus(run.id, ['completed'], 10_000);
+    const content = await readFile(done.contextFilePath, 'utf8');
+    expect(content).toContain('FINAL ANSWER TEXT');
+  }, 12_000);
 
   it('preserves the active run phase when an advanced whole-run timeout fires', async () => {
     let runId = '';

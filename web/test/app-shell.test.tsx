@@ -236,7 +236,14 @@ vi.mock('../src/pages/LoginPage.js', () => ({ LoginPage: textComponent('login-pa
 vi.mock('../src/pages/ServerSetupPage.js', () => ({ ServerSetupPage: textComponent('server-setup-page') }));
 vi.mock('../src/pages/NativeAuthBridge.js', () => ({ NativeAuthBridge: textComponent('native-auth-bridge') }));
 vi.mock('../src/pages/DashboardPage.js', () => ({ DashboardPage: textComponent('dashboard-page') }));
-vi.mock('../src/pages/DiscussionsPage.js', () => ({ DiscussionsPage: textComponent('discussions-page') }));
+vi.mock('../src/pages/DiscussionsPage.js', () => ({
+  DiscussionsPage: ({ initialTab }: any) => (
+    <div>
+      discussions-page
+      <span data-testid="discussions-initial-tab">{initialTab ?? 'team'}</span>
+    </div>
+  ),
+}));
 vi.mock('../src/pages/RepoPage.js', () => ({
   RepoPage: ({ onBack, onCiEvent }: any) => (
     <div>
@@ -361,9 +368,42 @@ vi.mock('../src/components/SessionPane.js', () => ({
 }));
 vi.mock('../src/components/SubSessionBar.js', () => ({
   SUBSESSION_BAR_COLLAPSED_STORAGE_KEY: 'subsession_bar_collapsed',
-  SubSessionBar: ({ onCollapsedChange, onNew, onOpen, onOpenMaximized, onViewCron, onViewDiscussions, onViewDiscussion, onViewRepo, onStopDiscussion, subSessions, discussions = [], totalRunningDiscussions = 0 }: any) => (
+  SubSessionBar: ({
+    onCollapsedChange,
+    onNew,
+    onOpen,
+    onOpenMaximized,
+    onViewAutoDeliver,
+    onViewCron,
+    onViewDiscussions,
+    onViewDiscussion,
+    onViewRepo,
+    onStopDiscussion,
+    subSessions,
+    discussions = [],
+    totalRunningDiscussions = 0,
+    openSpecAutoProjection,
+    openSpecAutoCompact,
+    onOpenSpecAutoView,
+    onOpenSpecAutoStop,
+    onOpenSpecAutoToggleCompact,
+    onOpenSpecAutoHide,
+  }: any) => (
     <div data-testid="app-shell-subsession-bar" data-running-discussions={String(totalRunningDiscussions)}>
       sub-session-bar
+      {openSpecAutoProjection && (
+        <div
+          data-testid="app-shell-auto-deliver-runbar"
+          data-compact={String(openSpecAutoCompact)}
+          data-run-id={openSpecAutoProjection.runId}
+        >
+          {openSpecAutoProjection.changeName}
+          <button onClick={onOpenSpecAutoView}>subbar-auto-deliver-view</button>
+          <button onClick={onOpenSpecAutoStop}>subbar-auto-deliver-stop-run</button>
+          <button onClick={onOpenSpecAutoToggleCompact}>subbar-auto-deliver-compact-run</button>
+          <button onClick={onOpenSpecAutoHide}>subbar-auto-deliver-hide-run</button>
+        </div>
+      )}
       {discussions.map((discussion: any) => (
         <div
           key={discussion.id}
@@ -385,6 +425,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
         <button key={sub.id} onClick={() => onOpen?.(sub.id)}>subbar-open-{sub.id}</button>
       ))}
       <button onClick={() => onOpenMaximized?.(subSessions?.[0]?.id)}>subbar-open-max</button>
+      <button onClick={onViewAutoDeliver}>subbar-auto-deliver</button>
       <button onClick={onViewCron}>subbar-cron</button>
       <button onClick={onViewDiscussions}>subbar-discussions</button>
       <button onClick={() => onViewDiscussion?.('disc-1')}>subbar-discussion</button>
@@ -447,9 +488,18 @@ vi.mock('../src/components/CloneSessionGroupDialog.js', () => ({
 }));
 vi.mock('../src/components/StartDiscussionDialog.js', () => ({ StartDiscussionDialog: textComponent('start-discussion-dialog') }));
 vi.mock('../src/components/AskQuestionDialog.js', () => ({
-  AskQuestionDialog: ({ onDismiss, onSubmit }: any) => (
+  AskQuestionDialog: ({ pending, onDismiss, onSubmit }: any) => (
     <div>
       ask-question-dialog
+      {pending?.questions?.map((question: any, index: number) => (
+        <div key={index}>
+          <span>{question.header}</span>
+          <span>{question.question}</span>
+          {question.options?.map((option: any, optionIndex: number) => (
+            <span key={optionIndex}>{option.label}</span>
+          ))}
+        </div>
+      ))}
       <button onClick={() => onSubmit?.('answer')}>ask-submit</button>
       <button onClick={onDismiss}>ask-dismiss</button>
     </div>
@@ -1113,6 +1163,141 @@ describe('App shell', () => {
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
+  }, 20_000);
+
+  it('opens the Auto Deliver list from the sub-session toolbar status button', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    fireEvent.click(screen.getByText('subbar-auto-deliver'));
+
+    expect(await screen.findByText('discussions-page')).toBeTruthy();
+    expect(screen.getByTestId('discussions-initial-tab').textContent).toBe('auto');
+  }, 20_000);
+
+  it('renders the Auto Deliver runbar in the global sub-session toolbar and resets local presentation per run', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+
+    await act(async () => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-global-1',
+          projectionVersion: 1,
+          visibility: 'full',
+          changeName: 'openspec-auto-delivery',
+          status: 'active',
+          stage: 'implementation_task_loop',
+          launchedFromSessionName: 'deck_alpha_brain',
+          targetImplementationSessionName: 'deck_alpha_brain',
+          taskStats: { total: 84, checked: 80, unchecked: 4 },
+          canStop: true,
+        },
+      });
+    });
+
+    const runbar = await screen.findByTestId('app-shell-auto-deliver-runbar');
+    expect(runbar.textContent).toContain('openspec-auto-delivery');
+    expect(runbar.getAttribute('data-compact')).toBe('false');
+
+    await act(async () => {
+      ws.emit({ type: 'p2p.status_response', runs: [] });
+    });
+    expect(screen.getByTestId('app-shell-auto-deliver-runbar').textContent).toContain('openspec-auto-delivery');
+
+    fireEvent.click(screen.getByText('subbar-auto-deliver-compact-run'));
+    expect(screen.getByTestId('app-shell-auto-deliver-runbar').getAttribute('data-compact')).toBe('true');
+
+    fireEvent.click(screen.getByText('subbar-auto-deliver-view'));
+    expect(await screen.findByTestId('openspec-auto-details')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('subbar-auto-deliver-stop-run'));
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.stop',
+      runId: 'auto-global-1',
+      sessionName: 'deck_alpha_brain',
+    }));
+
+    fireEvent.click(screen.getByText('subbar-auto-deliver-hide-run'));
+    expect(screen.queryByTestId('app-shell-auto-deliver-runbar')).toBeNull();
+
+    await act(async () => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-global-2',
+          projectionVersion: 1,
+          visibility: 'full',
+          changeName: 'second-change',
+          status: 'active',
+          stage: 'spec_audit_repair',
+          launchedFromSessionName: 'deck_alpha_brain',
+          targetImplementationSessionName: 'deck_alpha_brain',
+          taskStats: { total: 4, checked: 1, unchecked: 3 },
+          canStop: true,
+        },
+      });
+    });
+
+    const resetRunbar = await screen.findByTestId('app-shell-auto-deliver-runbar');
+    expect(resetRunbar.textContent).toContain('second-change');
+    expect(resetRunbar.getAttribute('data-compact')).toBe('false');
+  }, 20_000);
+
+  it('reuses the AskQuestion dialog UI for Auto Deliver needs_human handoff questions', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const ws = await getActiveWsClient();
+    await act(async () => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          id: 'evt-auto-ask',
+          ts: Date.now(),
+          sessionId: 'deck_alpha_brain',
+          type: 'ask.question',
+          payload: {
+            toolUseId: 'auto-run-1:needs-human:2',
+            waitMs: 300_000,
+            questions: [{
+              header: 'OpenSpec Auto Deliver',
+              question: 'Auto Deliver stopped with reason "missing_authoritative_json". What should happen next in this session?',
+              options: [
+                { label: 'Review the failure and continue manually' },
+                { label: 'Stop here and summarize the current state' },
+              ],
+            }],
+          },
+        },
+      });
+    });
+
+    expect(await screen.findByText('ask-question-dialog')).toBeTruthy();
+    expect(screen.getByText('OpenSpec Auto Deliver')).toBeTruthy();
+    expect(screen.getByText(/missing_authoritative_json/)).toBeTruthy();
+    expect(screen.getByText('Review the failure and continue manually')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('ask-submit'));
+    expect(ws.askAnswer).toHaveBeenCalledWith('deck_alpha_brain', 'answer');
+    expect(screen.queryByText('ask-question-dialog')).toBeNull();
   }, 20_000);
 
   it('closes all open sub-session windows when clicking the active main session tab', async () => {

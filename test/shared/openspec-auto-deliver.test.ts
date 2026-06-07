@@ -278,11 +278,14 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
         }),
       },
       { path: 'pnpm-lock.yaml', content: '' },
+      { path: 'pyproject.toml', content: '[project]\nname = "demo"\n' },
     ]);
     expect(recommendations).toEqual(expect.arrayContaining([
-      expect.objectContaining({ command: 'pnpm test', safety: 'recommended' }),
-      expect.objectContaining({ command: 'pnpm typecheck', safety: 'recommended' }),
-      expect.objectContaining({ command: 'pnpm deploy', safety: 'unsafe' }),
+      expect.objectContaining({ command: 'pnpm test', safety: 'recommended', sourceFile: 'package.json' }),
+      expect.objectContaining({ command: 'pnpm typecheck', safety: 'recommended', sourceFile: 'package.json' }),
+      expect.objectContaining({ command: 'pnpm deploy', safety: 'unsafe', sourceFile: 'package.json' }),
+      expect.objectContaining({ command: 'pytest', safety: 'unknown', sourceFile: 'pyproject.toml' }),
     ]));
+    expect(recommendations.map((entry) => entry.command)).not.toContain('npm test');
   });
 });
