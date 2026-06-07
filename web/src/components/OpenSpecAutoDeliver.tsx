@@ -459,7 +459,7 @@ export function OpenSpecAutoDeliverDetailsPanel({
           <DetailRow label={t('openspec.auto.impl_round')} value={formatRoundPair(projection.implementationAuditRound, projection.implementationAuditRepairRound)} />
           <DetailRow label={t('openspec.auto.prompt_count_label')} value={projection.implementationPromptCount} />
           <DetailRow label={t('openspec.auto.active_p2p')} value={projection.activeP2pRunId} />
-          <DetailRow label={t('openspec.auto.combo_id')} value={projection.selectedTeamComboId} />
+          <DetailRow label={t('openspec.auto.combo_id')} value={projection.selectedTeamComboId ? comboModeLabel(projection.selectedTeamComboId, t) : undefined} />
           <DetailRow label={t('openspec.auto.active_prompt')} value={projection.activeOpenSpecPromptId} />
           <DetailRow label={t('openspec.auto.verdict')} value={projection.latestVerdict} />
           <DetailRow label={t('openspec.auto.terminal_reason')} value={translateAutoDeliverReason(projection.terminalReason, t)} />

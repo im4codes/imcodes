@@ -1627,6 +1627,7 @@ afterEach(() => {
         targetImplementationSessionName: 'my-session',
         status: 'active',
         stage: 'implementation_task_loop',
+        selectedTeamComboId: 'audit>review>plan',
         startedAt: Date.now() - 1000,
         taskStats: { total: 4, checked: 2, unchecked: 2 },
         implementationPromptCount: 3,
@@ -1689,6 +1690,8 @@ afterEach(() => {
     const details = screen.getByTestId('openspec-auto-details');
     expect(details).toBeDefined();
     expect(within(details).getByText('change-a')).toBeDefined();
+    expect(within(details).getByText('mode_audit→mode_review→mode_plan')).toBeDefined();
+    expect(within(details).queryByText('audit>review>plan')).toBeNull();
     expect(within(details).getByText('fresh finding')).toBeDefined();
   });
 
