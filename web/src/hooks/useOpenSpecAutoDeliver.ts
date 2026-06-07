@@ -237,19 +237,32 @@ export function useOpenSpecAutoDeliver({
   }, [clearLaunchTimeout, serverId, sessionName, ws]);
 
   const stop = useCallback((runId = projection?.runId) => {
-    if (!ws || !sessionName || !runId) return null;
+    const stopSessionName = projection?.targetImplementationSessionName
+      || projection?.launchedFromSessionName
+      || projection?.owningMainSessionName
+      || sessionName;
+    if (!ws || !stopSessionName || !runId) return null;
     const requestId = makeRequestId('openspec-auto-stop');
     const payload: OpenSpecAutoDeliverStopPayload = {
       type: OPENSPEC_AUTO_DELIVER_MSG.STOP,
       requestId,
       serverId,
-      sessionName,
+      sessionName: stopSessionName,
       runId,
     };
     setStopPending(true);
+    setLastError(null);
     ws.send(payload);
     return requestId;
-  }, [projection?.runId, serverId, sessionName, ws]);
+  }, [
+    projection?.launchedFromSessionName,
+    projection?.owningMainSessionName,
+    projection?.runId,
+    projection?.targetImplementationSessionName,
+    serverId,
+    sessionName,
+    ws,
+  ]);
 
   useEffect(() => {
     if (!ws) return;
@@ -272,6 +285,11 @@ export function useOpenSpecAutoDeliver({
         setStopPending(false);
         const ackProjection = normalizeProjection(raw.projection);
         if (ackProjection) applyProjection(ackProjection);
+        if (raw.ok === false) {
+          setLastError(normalizeLaunchError(raw.error));
+        } else {
+          setLastError(null);
+        }
         return;
       }
     });

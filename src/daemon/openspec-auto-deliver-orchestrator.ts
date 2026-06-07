@@ -16,7 +16,6 @@ import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
-  OPENSPEC_AUTO_DELIVER_LAUNCH_ORIGIN,
   OPENSPEC_AUTO_DELIVER_MSG,
   OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES,
   isOpenSpecAutoDeliverTerminalStage,
@@ -48,6 +47,7 @@ import {
   validateOpenSpecAutoDeliverRequestId,
   validateOpenSpecAutoDeliverVerdictPayload,
 } from '../../shared/openspec-auto-deliver-validators.js';
+import { formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
 import {
   hasActiveP2pRunForMainSession,
   registerAutoDeliverP2pLock,
@@ -531,6 +531,7 @@ function uncheckedTaskLabels(stats: OpenSpecAutoDeliverTaskStats): string[] {
 }
 
 function buildImplementationPrompt(run: AutoDeliverRun): string {
+  const reference = openSpecChangeReference(run);
   const remaining = uncheckedTaskLabels(run.taskStats);
   const maxImplementationPrompts = effectiveMaxImplementationPrompts(run);
   const validationSummary = run.evidence?.filter((entry) => entry.source === 'daemon').map((entry) => `- ${entry.summary}`).join('\n')
@@ -539,8 +540,9 @@ function buildImplementationPrompt(run: AutoDeliverRun): string {
     ? remaining.map((label) => `- ${label}`).join('\n')
     : '- Re-read tasks.md and verify every task remains checked.';
   return [
-    `Continue OpenSpec Auto Deliver for openspec/changes/${run.changeName}.`,
+    formatOpenSpecPromptTemplate('implement', reference),
     '',
+    `OpenSpec Auto Deliver context for ${reference}.`,
     `Run id: ${run.runId}`,
     `Generation: ${run.generation}`,
     `Implementation prompt: ${run.implementationPromptCount + 1}/${maxImplementationPrompts}`,
@@ -630,35 +632,6 @@ function incrementAuditRound(run: AutoDeliverRun, stage: AuditRepairStage): numb
   return run.implementationAuditRepairRound;
 }
 
-async function buildAuditFileContents(run: AutoDeliverRun): Promise<Array<{ path: string; content: string }>> {
-  if (!(await refreshChangeRoot(run))) return [];
-  const candidates = [
-    'proposal.md',
-    'design.md',
-    'tasks.md',
-  ];
-  const specsRoot = join(run.changeRoot, 'specs');
-  const specEntries = await readdir(specsRoot, { recursive: true, withFileTypes: true }).catch(() => []);
-  for (const entry of specEntries) {
-    if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
-    const parentPath = 'parentPath' in entry && typeof entry.parentPath === 'string' ? entry.parentPath : specsRoot;
-    const absolute = join(parentPath, entry.name);
-    const rel = absolute.slice(run.changeRoot.length + 1);
-    candidates.push(rel);
-  }
-  const files: Array<{ path: string; content: string }> = [];
-  for (const file of candidates) {
-    const resolved = await realpath(join(run.changeRoot, file)).catch(() => null);
-    if (!resolved || !(resolved === run.changeRoot || resolved.startsWith(`${run.changeRoot}/`))) {
-      run.latestMessage = 'change_artifact_outside_root';
-      continue;
-    }
-    const content = await readFile(resolved, 'utf8').catch(() => null);
-    if (content != null) files.push({ path: `openspec/changes/${run.changeName}/${file}`, content });
-  }
-  return files;
-}
-
 async function collectGitEvidence(run: AutoDeliverRun): Promise<{ changedFiles: string[]; diffStat: string }> {
   const runGit = async (args: string[]): Promise<string> => {
     const result = await execFileAsync('git', ['-C', run.projectRoot, ...args], { timeout: 2000, maxBuffer: 128 * 1024 }).catch(() => null);
@@ -690,9 +663,19 @@ async function collectGitEvidence(run: AutoDeliverRun): Promise<{ changedFiles: 
   return { changedFiles, diffStat };
 }
 
+function openSpecChangeReference(run: AutoDeliverRun): string {
+  return `@openspec/changes/${run.changeName}`;
+}
+
+function buildCanonicalOpenSpecAuditPrompt(run: AutoDeliverRun, stage: AuditRepairStage): string {
+  return stage === 'spec_audit_repair'
+    ? formatOpenSpecPromptTemplate('audit_spec', openSpecChangeReference(run))
+    : formatOpenSpecPromptTemplate('audit_implementation', openSpecChangeReference(run));
+}
+
 function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDeliverP2pMetadata): string {
   const auditFocus = metadata.stage === 'spec_audit_repair'
-    ? 'Audit and repair only the OpenSpec change artifacts for proposal/design/specs/tasks consistency. Do not edit product files.'
+    ? 'Audit and repair only the OpenSpec change artifacts under the referenced change folder. Do not edit product files.'
     : 'Audit and repair product/test/tasks.md implementation against the OpenSpec change. Do not commit, push, stage files, or edit unrelated OpenSpec changes/docs.';
   const unchecked = uncheckedTaskLabels(run.taskStats);
   const payloadSkeleton = {
@@ -727,6 +710,12 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
   const diffStat = run.evidence?.find((entry) => entry.source === 'daemon' && entry.summary.startsWith('Diff stat:'))?.summary ?? 'Diff stat: unavailable.';
   return [
     `OpenSpec Auto Deliver audit-repair for openspec/changes/${run.changeName}.`,
+    '',
+    `Change reference: ${openSpecChangeReference(run)}`,
+    'Read the OpenSpec artifacts from that folder. This discussion intentionally references only the change folder instead of embedding artifact contents.',
+    '',
+    'Canonical OpenSpec dropdown prompt for this stage:',
+    buildCanonicalOpenSpecAuditPrompt(run, metadata.stage),
     '',
     auditFocus,
     `This request is launched through the normal Team/P2P combo flow (${metadata.selectedTeamComboId}), not an Auto Deliver custom combo.`,
@@ -1130,7 +1119,7 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
     initiatorSession: run.targetImplementationSessionName,
     targets: [],
     userText: buildAuditRequestText(run, metadata),
-    fileContents: await buildAuditFileContents(run),
+    fileContents: [],
     serverLink: run.serverLink,
     modeOverride: run.selectedTeamComboId,
     rounds: 1,

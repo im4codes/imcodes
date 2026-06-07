@@ -6698,11 +6698,11 @@ export class WsBridge {
     }
     if (directlySubscribed) return { ok: true };
 
-    // For launcher/list surfaces that may render before the chat/terminal
-    // subscription is established, fall back to the existing server ownership
-    // check. STOP intentionally has no fallback: it is a write operation and
-    // must be bound to a socket that is actively scoped to the target session.
-    if (messageType === OPENSPEC_AUTO_DELIVER_MSG.STOP) return { ok: false };
+    // For launcher/list/runbar surfaces that may render before the
+    // chat/terminal subscription is established, fall back to the existing
+    // server ownership check. Shared viewers are rejected above, so STOP still
+    // remains owner-scoped while avoiding a false "no-op" when the runbar is
+    // mounted outside the actively subscribed chat socket.
     return (await this.verifySessionOwnershipWithSubSessionRetry(sessionName)) ? { ok: true } : { ok: false };
   }
 

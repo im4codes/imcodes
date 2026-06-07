@@ -1,4 +1,5 @@
 import type { P2pAdvancedRound } from './p2p-advanced.js';
+import { P2P_PRESET_DEFAULT_SUMMARY_PROMPT } from './p2p-workflow-constants.js';
 import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
   OPENSPEC_AUTO_DELIVER_COMBO_IDS,
@@ -20,7 +21,7 @@ const SPEC_AUDIT_REPAIR_ROUNDS: P2pAdvancedRound[] = [
     timeoutMinutes: 8,
     verdictPolicy: 'none',
     effectiveSummaryPrompt:
-      'Return the OpenSpec Auto Deliver authoritative JSON only through the runtime-bounded strict result segment.',
+      `${P2P_PRESET_DEFAULT_SUMMARY_PROMPT.proposal_audit}\n\nOpenSpec Auto Deliver result contract: write the authoritative result file as raw JSON only at the requested path; discussion text is not authoritative.`,
   },
 ];
 
@@ -34,7 +35,7 @@ const IMPLEMENTATION_AUDIT_REPAIR_ROUNDS: P2pAdvancedRound[] = [
     timeoutMinutes: 10,
     verdictPolicy: 'none',
     effectiveSummaryPrompt:
-      'Return the OpenSpec Auto Deliver authoritative JSON only through the runtime-bounded strict result segment.',
+      `${P2P_PRESET_DEFAULT_SUMMARY_PROMPT.implementation_audit}\n\nOpenSpec Auto Deliver result contract: write the authoritative result file as raw JSON only at the requested path; discussion text is not authoritative.`,
   },
 ];
 

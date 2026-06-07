@@ -10,6 +10,7 @@ import {
   evaluateOpenSpecAutoDeliverComboCompatibility,
   materializeOpenSpecAutoDeliverStageRound,
 } from '../../shared/openspec-auto-deliver-combos.js';
+import { P2P_PRESET_DEFAULT_SUMMARY_PROMPT } from '../../shared/p2p-workflow-constants.js';
 import { buildOpenSpecAutoDeliverValidationRecommendations } from '../../shared/openspec-auto-deliver-validation-recommendations.js';
 import type {
   OpenSpecAutoDeliverBrowserConflictProjection,
@@ -194,11 +195,21 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
       activeOpenSpecPromptId: 'proposal_audit',
       round: expect.objectContaining({ preset: 'proposal_audit', permissionScope: 'artifact_generation' }),
     }));
+    if ('round' in specRound) {
+      expect(specRound.round.effectiveSummaryPrompt).toContain(P2P_PRESET_DEFAULT_SUMMARY_PROMPT.proposal_audit);
+      expect(specRound.round.effectiveSummaryPrompt).toContain('Proposal Audit Synthesis');
+      expect(specRound.round.effectiveSummaryPrompt).toContain('authoritative result file');
+    }
     const implementationRound = materializeOpenSpecAutoDeliverStageRound('implementation_audit_repair', OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID);
     expect(implementationRound).toEqual(expect.objectContaining({
       activeOpenSpecPromptId: 'implementation_audit',
       round: expect.objectContaining({ preset: 'implementation_audit', permissionScope: 'implementation' }),
     }));
+    if ('round' in implementationRound) {
+      expect(implementationRound.round.effectiveSummaryPrompt).toContain(P2P_PRESET_DEFAULT_SUMMARY_PROMPT.implementation_audit);
+      expect(implementationRound.round.effectiveSummaryPrompt).toContain('Implementation Audit Synthesis');
+      expect(implementationRound.round.effectiveSummaryPrompt).toContain('authoritative result file');
+    }
   });
 
   it('validates strict verdict payloads', () => {

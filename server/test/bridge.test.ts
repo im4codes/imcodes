@@ -114,6 +114,30 @@ function makeDb(tokenHash: string) {
   return db as unknown as import('../src/db/client.js').Database;
 }
 
+function makeOpenSpecAutoDeliverOwnershipDb(allowedSessionNames: string[] = []) {
+  const allowed = new Set(allowedSessionNames);
+  const db = {
+    queryOne: async (sql: string, params?: unknown[]) => {
+      if (sql.includes('token_hash')) return { token_hash: 'valid-hash', user_id: 'test-user' };
+      if (sql.includes('FROM sessions WHERE')) {
+        const sessionName = typeof params?.[1] === 'string' ? params[1] : '';
+        return allowed.has(sessionName) ? { ok: 1 } : null;
+      }
+      if (sql.includes('FROM sub_sessions WHERE')) {
+        const subId = typeof params?.[1] === 'string' ? params[1] : '';
+        return allowed.has(`deck_sub_${subId}`) ? { ok: 1 } : null;
+      }
+      return null;
+    },
+    query: async () => [],
+    execute: async () => ({ changes: 1 }),
+    exec: async () => {},
+    transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => fn(db as unknown as import('../src/db/client.js').Database),
+    close: () => {},
+  };
+  return db as unknown as import('../src/db/client.js').Database;
+}
+
 function makeSubSessionOwnershipRaceDb(options: {
   subId: string;
   allowAfterChecks?: number;
@@ -2890,7 +2914,7 @@ describe('WsBridge', () => {
     });
 
     it('rejects forged OpenSpec Auto Deliver STOP built from conflict metadata before daemon forwarding', async () => {
-      const { daemonWs, browserWs } = await setupAuthBridge();
+      const { daemonWs, browserWs } = await setupAuthBridge(makeOpenSpecAutoDeliverOwnershipDb());
       const bridge = WsBridge.get(serverId);
       daemonWs.sent.length = 0;
       browserWs.sent.length = 0;
@@ -2927,6 +2951,31 @@ describe('WsBridge', () => {
         requestId: 'auto-forged-stop',
         ok: false,
         error: 'unauthorized_session',
+      });
+    });
+
+    it('allows OpenSpec Auto Deliver STOP through owner fallback before chat subscription is ready', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge(makeOpenSpecAutoDeliverOwnershipDb(['deck_proj_brain']));
+      daemonWs.sent.length = 0;
+      browserWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: OPENSPEC_AUTO_DELIVER_MSG.STOP,
+        requestId: 'auto-stop-owner-fallback',
+        sessionName: 'deck_proj_brain',
+        runId: 'auto-stop-run',
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.STOP);
+      expect(forwarded).toMatchObject({
+        type: OPENSPEC_AUTO_DELIVER_MSG.STOP,
+        requestId: 'auto-stop-owner-fallback',
+        serverId,
+        sessionName: 'deck_proj_brain',
+        runId: 'auto-stop-run',
       });
     });
 

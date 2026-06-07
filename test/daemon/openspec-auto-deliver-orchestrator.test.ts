@@ -267,6 +267,13 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       presetId: 'fast',
     }, serverLinkMock as never);
 
+    const firstImplementationPrompt = await waitForTransportSend((text) =>
+      text.includes('Drive the implementation of @openspec/changes/demo-change aggressively.'),
+    );
+    expect(firstImplementationPrompt).toContain('Break the work into concrete sub-tasks');
+    expect(firstImplementationPrompt).toContain('OpenSpec Auto Deliver context for @openspec/changes/demo-change.');
+    expect(firstImplementationPrompt).toContain('Remaining tasks:');
+
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
@@ -286,11 +293,17 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       modeOverride?: string;
       rounds?: number;
       advanced?: unknown;
+      fileContents?: Array<{ path: string; content: string }>;
       userText?: string;
     };
     expect(implementationLaunch.modeOverride).toBe('audit>review>plan');
     expect(implementationLaunch.rounds).toBe(1);
     expect(implementationLaunch.advanced).toBeUndefined();
+    expect(implementationLaunch.fileContents).toEqual([]);
+    expect(implementationLaunch.userText).toContain('Change reference: @openspec/changes/demo-change');
+    expect(implementationLaunch.userText).toContain('This discussion intentionally references only the change folder instead of embedding artifact contents.');
+    expect(implementationLaunch.userText).not.toContain('Resolved change root: ');
+    expect(implementationLaunch.userText).toContain('Perform a strict implementation audit for @openspec/changes/demo-change against its OpenSpec artifacts.');
     expect(implementationLaunch.userText).toContain('normal Team/P2P combo flow (audit>review>plan)');
     expect(implementationLaunch.userText).toContain('implementation_audit criteria');
 
@@ -353,11 +366,18 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       modeOverride?: string;
       rounds?: number;
       advanced?: unknown;
+      fileContents?: Array<{ path: string; content: string }>;
       userText?: string;
     };
     expect(specLaunch.modeOverride).toBe('audit>review>plan');
     expect(specLaunch.rounds).toBe(1);
     expect(specLaunch.advanced).toBeUndefined();
+    expect(specLaunch.fileContents).toEqual([]);
+    expect(specLaunch.userText).toContain('Change reference: @openspec/changes/demo-change');
+    expect(specLaunch.userText).toContain('This discussion intentionally references only the change folder instead of embedding artifact contents.');
+    expect(specLaunch.userText).not.toContain('Resolved change root: ');
+    expect(specLaunch.userText).toContain('Perform a strict specification audit for @openspec/changes/demo-change.');
+    expect(specLaunch.userText).toContain('then directly update the change artifacts under @openspec/changes/demo-change (proposal, design, specs, tasks)');
     expect(specLaunch.userText).toContain('normal Team/P2P combo flow (audit>review>plan)');
     expect(specLaunch.userText).toContain('proposal_audit criteria');
     const projection = serverLinkMock.send.mock.calls
