@@ -2020,7 +2020,7 @@ export function useTimeline(
     });
   }, [clearOptimisticTimer, rememberSettledCommandId, sessionId]);
 
-  const markOptimisticAccepted = useCallback((commandId: string) => {
+  const markOptimisticAccepted = useCallback((commandId: string, options?: { clearPending?: boolean }) => {
     if (!commandId) return;
     // N-R2 fix (audit 0419d1ac-1f4 / O2 选项 D) — `accepted` is a daemon-
     // receipt ack ("I got your command"), NOT a terminal outcome. Two
@@ -2054,7 +2054,7 @@ export function useTimeline(
       const existing = base[idx]!;
       const payload: Record<string, unknown> = {
         ...existing.payload,
-        pending: false,
+        pending: options?.clearPending === true ? false : true,
         failed: false,
         acked: true,
       };
@@ -2182,7 +2182,7 @@ export function useTimeline(
           continue;
         }
       }
-      markOptimisticAccepted(commandId);
+      markOptimisticAccepted(commandId, { clearPending: true });
     }
   }, [clearOptimisticTimer, markOptimisticAccepted, rememberSettledCommandId]);
 

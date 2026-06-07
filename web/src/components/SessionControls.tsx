@@ -131,6 +131,8 @@ interface Props {
   onSubStop?: () => void;
   /** Legacy prop retained for callers that still pass thinking state for labels/timers. */
   activeThinking?: boolean;
+  /** True while transport timeline tail shows an in-flight turn, even if session.state has not caught up. */
+  activeTransportTurn?: boolean;
   /** Mobile: open full-screen file browser overlay. */
   mobileFileBrowserOpen?: boolean;
   onMobileFileBrowserClose?: () => void;
@@ -609,7 +611,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -711,7 +713,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const effectiveRuntimeType = activeSession ? resolveSessionInfoRuntimeType(activeSession) : undefined;
   const transportSendShouldQueue = effectiveRuntimeType === 'transport'
     && !!activeSession
-    && (isRunningSessionState(activeSession.state) || activeThinking);
+    && (isRunningSessionState(activeSession.state) || activeThinking || activeTransportTurn);
   const incomingQueuedTransportEntries = effectiveRuntimeType === 'transport'
     ? normalizeTransportPendingEntries(
         activeSession?.transportPendingMessageEntries,

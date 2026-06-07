@@ -2869,6 +2869,36 @@ afterEach(() => {
     expect(screen.getByText('queue from thinking')).toBeDefined();
   });
 
+  it('uses active timeline turn as a busy signal for transport sends after assistant text starts', () => {
+    const ws = makeWs();
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'idle',
+        })}
+        activeTransportTurn={true}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'queue after assistant text';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expectSendPayload(ws, {
+      sessionName: 'qwen-session',
+      text: 'queue after assistant text',
+    });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.getByText('queue after assistant text')).toBeDefined();
+  });
+
   it('surfaces a normal send as locally failed when the socket write throws', () => {
     const ws = makeWs();
     ws.sendSessionCommand.mockImplementation(() => {

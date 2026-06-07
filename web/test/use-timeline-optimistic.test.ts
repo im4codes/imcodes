@@ -3,6 +3,7 @@
  *
  * Tests for the optimistic-send flow:
  *   addOptimisticUserMessage → spinner
+ *   command.ack accepted      → daemon receipt only; keep spinner
  *   command.ack error         → red "!" (markOptimisticFailed)
  *   echoed user.message       → cleanup (matches by commandId first, text second)
  *   optimistic timeout (90s)  → auto-fail
@@ -379,7 +380,7 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events[0].payload.failureReason).toBe('timeout');
   });
 
-  it('success-ish command.ack marks the local bubble sent and cancels the failure timer', () => {
+  it('success-ish command.ack marks daemon receipt but keeps the local bubble pending', () => {
     const ref = { current: null as HookRef };
     const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
     const { Probe } = captureHookRef(ref, handlerBox);
@@ -402,12 +403,12 @@ describe('useTimeline optimistic send flow', () => {
       vi.advanceTimersByTime(120_000);
     });
 
-    expect(ref.current!.events[0].payload.pending).toBe(false);
+    expect(ref.current!.events[0].payload.pending).toBe(true);
     expect(ref.current!.events[0].payload.acked).toBe(true);
     expect(ref.current!.events[0].payload.failed).toBeFalsy();
   });
 
-  it('settles a pending bubble from command.ack delivered as a timeline event', () => {
+  it('keeps a pending bubble visible when command.ack is delivered as a timeline event', () => {
     const ref = { current: null as HookRef };
     const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
     const { Probe } = captureHookRef(ref, handlerBox);
@@ -439,7 +440,7 @@ describe('useTimeline optimistic send flow', () => {
     });
 
     const optimistic = ref.current!.events.find((event) => event.eventId.includes('cmd-timeline-ack'));
-    expect(optimistic?.payload.pending).toBe(false);
+    expect(optimistic?.payload.pending).toBe(true);
     expect(optimistic?.payload.acked).toBe(true);
     expect(optimistic?.payload.failed).toBeFalsy();
   });
@@ -477,7 +478,7 @@ describe('useTimeline optimistic send flow', () => {
     expect(optimistic?.payload.failureReason).toBe('duplicate_command_id');
   });
 
-  it('settles a pending bubble from command.ack recovered through history', () => {
+  it('keeps a pending bubble visible when command.ack is recovered through history', () => {
     const ref = { current: null as HookRef };
     const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
     const { Probe } = captureHookRef(ref, handlerBox);
@@ -511,7 +512,7 @@ describe('useTimeline optimistic send flow', () => {
     });
 
     const optimistic = ref.current!.events.find((event) => event.eventId.includes('cmd-history-ack'));
-    expect(optimistic?.payload.pending).toBe(false);
+    expect(optimistic?.payload.pending).toBe(true);
     expect(optimistic?.payload.acked).toBe(true);
     expect(optimistic?.payload.failed).toBeFalsy();
   });
@@ -745,7 +746,7 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events[0].payload.pending).toBeFalsy();
   });
 
-  it('persists an acked local send across refresh and replaces it with authoritative history by commandId', async () => {
+  it('persists an acked-but-pending local send across refresh and replaces it with authoritative history by commandId', async () => {
     const ref = { current: null as HookRef };
     const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
     const { Probe } = captureHookRef(ref, handlerBox);
@@ -762,7 +763,7 @@ describe('useTimeline optimistic send flow', () => {
         session: 'deck_opt_refresh_ack',
       } as unknown as ServerMessage);
     });
-    expect(ref.current!.events[0].payload.pending).toBe(false);
+    expect(ref.current!.events[0].payload.pending).toBe(true);
     expect(ref.current!.events[0].payload.acked).toBe(true);
 
     cleanup();
@@ -776,6 +777,7 @@ describe('useTimeline optimistic send flow', () => {
     await waitFor(() => {
       expect(refAfterReload.current!.events).toHaveLength(1);
       expect(refAfterReload.current!.events[0].payload.acked).toBe(true);
+      expect(refAfterReload.current!.events[0].payload.pending).toBe(true);
     });
 
     act(() => {
@@ -1153,7 +1155,7 @@ const CLIENT_RETRY_DELAYS_SUM_PLUS_BUFFER_MS = 7_000;
  *
  * Fixed behaviour:
  *   - `accepted` no longer settles the commandId; bubble becomes
- *     `acked: true` but not terminal.
+ *     `acked: true` but stays pending and not terminal.
  *   - A subsequent `error` / `conflict` ack can flip bubble to `failed`.
  *   - After `failed`, a LATE `accepted` receipt is ignored (guard at top
  *     of `markOptimisticAccepted` checks settled set).
@@ -1193,7 +1195,7 @@ describe('useTimeline dual-ack (audit 0419d1ac-1f4 / N-R2)', () => {
         session: 'deck_dual_ack_a',
       } as unknown as ServerMessage);
     });
-    expect(ref.current!.events[0].payload.pending).toBe(false);
+    expect(ref.current!.events[0].payload.pending).toBe(true);
     expect(ref.current!.events[0].payload.acked).toBe(true);
     expect(ref.current!.events[0].payload.failed).toBeFalsy();
 

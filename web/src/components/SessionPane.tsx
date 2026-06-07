@@ -14,6 +14,7 @@ import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { useTimeline } from '../hooks/useTimeline.js';
 import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
+import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { recordCost } from '../cost-tracker.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { formatLabel } from '../format-label.js';
@@ -224,6 +225,7 @@ export function SessionPane({
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(timelineEvents), [timelineEvents]);
   const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
   const activeToolCall = useMemo(() => hasActiveToolCall(timelineEvents), [timelineEvents]);
+  const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(timelineEvents), [timelineEvents]);
   const liveSessionState = useMemo(
     () => getTailSessionState(timelineEvents) ?? session.state ?? null,
     [timelineEvents, session.state],
@@ -443,6 +445,7 @@ export function SessionPane({
           detectedModel={effectiveDetectedModel}
           hideShortcuts={false}
           activeThinking={!!activeThinkingTs}
+          activeTransportTurn={activeTimelineTurn}
           mobileFileBrowserOpen={mobileFileBrowserOpen}
           onMobileFileBrowserClose={onMobileFileBrowserClose}
           sessions={sessions}
