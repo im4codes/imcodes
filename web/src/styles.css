@@ -1179,6 +1179,13 @@ body {
   .openspec-change-actions-visible { display: grid; }
   .openspec-change-action-wrap { min-width: 0; }
   .openspec-change-action-btn { width: 100%; padding: 5px 6px; font-size: 10px; }
+  .menu-dropdown-openspec-inline .openspec-auto-launcher {
+    flex: 0 1 auto;
+    max-height: min(58vh, calc(var(--vvh, 100dvh) - var(--sat, 0px) - env(safe-area-inset-bottom, 0px) - 156px));
+    margin: 6px 8px;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
   .openspec-auto-preset-grid,
   .openspec-auto-detail-grid,
   .openspec-auto-score-grid { grid-template-columns: 1fr; }

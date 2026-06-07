@@ -232,6 +232,11 @@ describe('styles.css regression contracts', () => {
     expect(mobileRule!).toMatch(/top:\s*var\(--sat,\s*0px\)/);
     expect(mobileRule!).toMatch(/height:\s*calc\(var\(--vvh,\s*100dvh\)/);
     expect(mobileRule!).toMatch(/overflow:\s*hidden/);
+
+    const autoLauncherRule = css.match(/\.menu-dropdown-openspec-inline \.openspec-auto-launcher\s*\{[^}]*\}/);
+    expect(autoLauncherRule).not.toBeNull();
+    expect(autoLauncherRule![0]).toMatch(/max-height:\s*min\(58vh/);
+    expect(autoLauncherRule![0]).toMatch(/overflow-y:\s*auto/);
   });
 
   it('.fb-changes-section must NOT cap height — list must scroll past 10 items', () => {

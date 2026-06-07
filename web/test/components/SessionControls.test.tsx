@@ -2244,6 +2244,50 @@ afterEach(() => {
     }
   });
 
+  it('keeps the OpenSpec Auto Deliver launcher outside the mobile change-list scroller', async () => {
+    const innerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+
+    try {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+      ws.emit({
+        type: 'fs.ls_response',
+        requestId: 'openspec-request',
+        status: 'ok',
+        resolvedPath: '/repo/openspec/changes',
+        entries: [
+          { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+          { name: 'change-b', path: '/repo/openspec/changes/change-b', isDir: true, hidden: false },
+          { name: 'change-c', path: '/repo/openspec/changes/change-c', isDir: true, hidden: false },
+        ],
+      });
+      await flushAsync();
+
+      fireEvent.click(screen.getByRole('button', { name: 'expand change-a' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+
+      const launcher = screen.getByTestId('openspec-auto-launcher');
+      const mobileSheet = document.querySelector('.menu-dropdown-openspec-inline') as HTMLElement;
+      const scrollArea = document.querySelector('.openspec-dropdown-scroll') as HTMLElement;
+      expect(launcher).toBeDefined();
+      expect(mobileSheet).toBeTruthy();
+      expect(scrollArea).toBeTruthy();
+      expect(scrollArea.contains(launcher)).toBe(false);
+      expect(launcher.parentElement).toBe(mobileSheet);
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
+    }
+  });
+
   it('anchors the openspec audit submenu to the audit button on mobile', async () => {
     const innerWidth = window.innerWidth;
     const innerHeight = window.innerHeight;

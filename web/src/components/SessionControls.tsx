@@ -3151,6 +3151,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     )}
                   />
                 ))}
+                </div>
                 <OpenSpecAutoDeliverLauncher
                   open={!!openSpecAutoLauncherChange}
                   changeName={openSpecAutoLauncherChange}
@@ -3165,7 +3166,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   onLaunch={launchOpenSpecAutoDeliver}
                   onViewCurrent={() => setOpenSpecAutoDetailsOpen(true)}
                 />
-                </div>
                 <div class="openspec-dropdown-footer">
                   <div class="openspec-change-action-wrap openspec-footer-action-wrap">
                     <button
