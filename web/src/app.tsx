@@ -3280,6 +3280,8 @@ export function App() {
           ? trans('toast.upgrade_blocked_toolchain_unavailable')
           : msg.reason === 'transport_busy'
             ? trans('toast.upgrade_blocked_transport_busy')
+            : msg.reason === 'auto_deliver_active'
+              ? trans('toast.upgrade_blocked_auto_deliver_active')
             : trans('toast.upgrade_blocked_p2p_active');
         const id = Date.now() + Math.random();
         setToasts((prev) => [...prev, {

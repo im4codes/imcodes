@@ -129,7 +129,10 @@ import { compileP2pWorkflowDraft } from '../../shared/p2p-workflow-compiler.js';
 import { materializeOldAdvancedConfigToWorkflowDraft } from '../../shared/p2p-workflow-materialize.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
-import { handleOpenSpecAutoDeliverCommand } from './openspec-auto-deliver-orchestrator.js';
+import {
+  getActiveOpenSpecAutoDeliverRunsBlockingDaemonUpgrade,
+  handleOpenSpecAutoDeliverCommand,
+} from './openspec-auto-deliver-orchestrator.js';
 import { SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
 import { getP2pConfigStoreScope, handleSessionGroupCloneCancel, handleSessionGroupCloneCommand } from './session-group-clone.js';
 import { buildDefaultP2pStaticPolicy } from '../../shared/p2p-workflow-policy.js';
@@ -5779,13 +5782,11 @@ export function evaluateAutoUpgradeCooldown(
   return { onCooldown: true, remainingMs: cooldownMs - ageMs, lastAt };
 }
 
-/** How long the *session-busy* gate may keep deferring an upgrade before the
- *  daemon forces it through. The per-turn staleness guard
- *  (`TRANSPORT_STALE_TURN_MS`) catches wedged transport turns; this is the
- *  final backstop for everything else (a process-agent CLI stuck in
- *  'running'/'queued', a transport turn the staleness guard hasn't yet aged
- *  out, an unforeseen state) so ONE stuck session can never pin the daemon on
- *  an old version forever. Override for tests via IMCODES_MAX_UPGRADE_DEFER_MS. */
+/** How long the *session-busy* gate reports continuous deferral in logs before
+ *  it marks the wait as capped. It is intentionally advisory only: a daemon
+ *  self-upgrade must never force through an active turn, because restarting the
+ *  daemon would kill or abandon the user's in-flight work. Override for tests
+ *  via IMCODES_MAX_UPGRADE_DEFER_MS. */
 const MAX_UPGRADE_DEFER_MS = (() => {
   const raw = parseInt(process.env.IMCODES_MAX_UPGRADE_DEFER_MS ?? '', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60 * 1000;
@@ -5799,8 +5800,8 @@ let upgradeSessionBusyDeferredSince: number | null = null;
 
 /** Pure decision for the session-busy deferral backstop. Given whether the
  *  session gate is currently blocking and how long it has been blocking,
- *  decide whether to proceed anyway (forced) and what the next "blocked since"
- *  marker should be. Extracted for deterministic unit testing. */
+ *  decide whether to keep blocking and what the next "blocked since" marker
+ *  should be. Extracted for deterministic unit testing. */
 export function evaluateUpgradeDeferralBackstop(args: {
   blocked: boolean;
   deferredSince: number | null;
@@ -5813,10 +5814,9 @@ export function evaluateUpgradeDeferralBackstop(args: {
   }
   const since = deferredSince ?? now;
   const deferredMs = Math.max(0, now - since);
-  if (Number.isFinite(maxDeferMs) && maxDeferMs > 0 && deferredMs >= maxDeferMs) {
-    // Deferred long enough — force the upgrade through and reset the tracker.
-    return { proceed: true, forced: true, nextDeferredSince: null, deferredMs };
-  }
+  // The cap is diagnostic, not a bypass. Keep blocking active work forever
+  // until the turn finishes or the user explicitly stops it.
+  void maxDeferMs;
   return { proceed: false, forced: false, nextDeferredSince: since, deferredMs };
 }
 
@@ -6007,6 +6007,25 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
     return;
   }
 
+  const activeOpenSpecAutoDeliverRuns = getActiveOpenSpecAutoDeliverRunsBlockingDaemonUpgrade();
+  if (activeOpenSpecAutoDeliverRuns.length > 0) {
+    logger.warn({
+      targetVersion,
+      activeRunIds: activeOpenSpecAutoDeliverRuns.map((run) => run.runId),
+      activeRunStatuses: activeOpenSpecAutoDeliverRuns.map((run) => run.status),
+      activeRunStages: activeOpenSpecAutoDeliverRuns.map((run) => run.stage),
+    }, 'daemon.upgrade: blocked because OpenSpec Auto Deliver is active');
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'auto_deliver_active',
+        activeRunIds: activeOpenSpecAutoDeliverRuns.map((run) => run.runId),
+        activeOpenSpecAutoDeliverRuns,
+      });
+    } catch { /* ignore */ }
+    return;
+  }
+
   const activeMasterCompactions = getInflightMasterCompactionCount();
   if (activeMasterCompactions > 0) {
     logger.warn({ targetVersion, activeMasterCompactions }, 'daemon.upgrade: blocked because master compaction is active');
@@ -6063,18 +6082,6 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
       });
     } catch { /* ignore */ }
     return;
-  }
-  if (activeSessions.length > 0 && deferralBackstop.forced) {
-    // Deferred past MAX_UPGRADE_DEFER_MS — the blocking session(s) are almost
-    // certainly wedged. Proceed anyway rather than stay pinned on an old
-    // version forever; a transport SDK session resumes after restart and a
-    // wedged process turn was already lost.
-    logger.warn({
-      targetVersion,
-      blockedSessions: activeSessions,
-      deferredMs: deferralBackstop.deferredMs,
-      maxDeferMs: MAX_UPGRADE_DEFER_MS,
-    }, 'daemon.upgrade: forcing upgrade despite active sessions after prolonged deferral (sessions likely wedged)');
   }
 
   const { spawn } = await import('child_process');

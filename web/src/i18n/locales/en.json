@@ -691,6 +691,7 @@
     "finished": "finished",
     "upgrade_blocked_title": "Upgrade blocked",
     "upgrade_blocked_p2p_active": "Team is still running. Stop it before upgrading the daemon.",
+    "upgrade_blocked_auto_deliver_active": "Auto Deliver is still running. Stop it before upgrading the daemon.",
     "upgrade_blocked_transport_busy": "A transport session is still in a turn. Wait until it goes idle before upgrading the daemon.",
     "upgrade_blocked_toolchain_unavailable": "Node is missing on the daemon host (toolchain removed). Reinstall Node — auto-upgrade is disabled until then."
   },

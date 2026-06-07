@@ -1,12 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { stopProjectMock, stopSubSessionMock, loggerErrorMock, loggerWarnMock, buildSessionListMock, getTransportRuntimeMock } = vi.hoisted(() => ({
+const { stopProjectMock, stopSubSessionMock, loggerErrorMock, loggerWarnMock, buildSessionListMock, getTransportRuntimeMock, activeOpenSpecAutoDeliverRunsMock } = vi.hoisted(() => ({
   stopProjectMock: vi.fn(),
   stopSubSessionMock: vi.fn().mockResolvedValue({ ok: true, closed: ['deck_sub_worker'], failed: [] }),
   loggerErrorMock: vi.fn(),
   loggerWarnMock: vi.fn(),
   buildSessionListMock: vi.fn(async () => []),
   getTransportRuntimeMock: vi.fn(() => undefined),
+  activeOpenSpecAutoDeliverRunsMock: vi.fn(() => []),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -80,6 +81,11 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
   getP2pRun: vi.fn(() => undefined),
   listP2pRuns: vi.fn(() => []),
   serializeP2pRun: vi.fn(),
+}));
+
+vi.mock('../../src/daemon/openspec-auto-deliver-orchestrator.js', () => ({
+  handleOpenSpecAutoDeliverCommand: vi.fn(),
+  getActiveOpenSpecAutoDeliverRunsBlockingDaemonUpgrade: activeOpenSpecAutoDeliverRunsMock,
 }));
 
 vi.mock('../../src/daemon/session-list.js', () => ({
@@ -159,6 +165,7 @@ describe('handleWebCommand shutdown failure paths', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    activeOpenSpecAutoDeliverRunsMock.mockReturnValue([]);
   });
 
   it('reports structured session.stop failures without losing later command handling', async () => {
@@ -230,6 +237,40 @@ describe('handleWebCommand shutdown failure paths', () => {
             pendingCount: 0,
             blockReason: 'status_thinking',
           },
+        },
+      ],
+    });
+  });
+
+  it('blocks daemon.upgrade when OpenSpec Auto Deliver is active', async () => {
+    activeOpenSpecAutoDeliverRunsMock.mockReturnValue([
+      {
+        runId: 'auto-run-1',
+        changeName: 'openspec-auto-delivery',
+        status: 'implementation_task_loop',
+        stage: 'implementation_task_loop',
+        owningMainSessionName: 'deck_proj_brain',
+        launchedFromSessionName: 'deck_sub_worker',
+        targetImplementationSessionName: 'deck_sub_worker',
+      },
+    ]);
+
+    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'daemon.upgrade_blocked',
+      reason: 'auto_deliver_active',
+      activeRunIds: ['auto-run-1'],
+      activeOpenSpecAutoDeliverRuns: [
+        {
+          runId: 'auto-run-1',
+          changeName: 'openspec-auto-delivery',
+          status: 'implementation_task_loop',
+          stage: 'implementation_task_loop',
+          owningMainSessionName: 'deck_proj_brain',
+          launchedFromSessionName: 'deck_sub_worker',
+          targetImplementationSessionName: 'deck_sub_worker',
         },
       ],
     });

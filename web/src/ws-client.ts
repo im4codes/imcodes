@@ -130,6 +130,7 @@ export type ServerMessage =
   | { type: typeof DAEMON_MSG.RECONNECTED }
   | { type: typeof DAEMON_MSG.DISCONNECTED }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'p2p_active'; activeRunIds?: string[] }
+  | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'auto_deliver_active'; activeRunIds?: string[] }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'transport_busy'; activeSessionNames?: string[]; blockedSessions?: TransportUpgradeBlockedSession[] }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'toolchain_unavailable'; nodeBinPresent?: boolean; npmAvailable?: boolean }
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }

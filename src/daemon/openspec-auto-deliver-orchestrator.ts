@@ -200,6 +200,16 @@ const auditPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let timelineUnsubscribe: (() => void) | null = null;
 const execFileAsync = promisify(execFile);
 
+export interface OpenSpecAutoDeliverUpgradeBlockReason {
+  runId: string;
+  changeName: string;
+  status: OpenSpecAutoDeliverStage;
+  stage: OpenSpecAutoDeliverStage;
+  owningMainSessionName: string;
+  launchedFromSessionName: string;
+  targetImplementationSessionName: string;
+}
+
 function byteLength(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
@@ -1451,6 +1461,20 @@ export function handleOpenSpecAutoDeliverDaemonRestartCleanup(serverLink?: Serve
     const link = serverLink ?? run.serverLink;
     send(link, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
   }
+}
+
+export function getActiveOpenSpecAutoDeliverRunsBlockingDaemonUpgrade(): OpenSpecAutoDeliverUpgradeBlockReason[] {
+  return Array.from(runsById.values())
+    .filter((run) => !isOpenSpecAutoDeliverTerminalStage(run.status))
+    .map((run) => ({
+      runId: run.runId,
+      changeName: run.changeName,
+      status: run.status,
+      stage: run.stage,
+      owningMainSessionName: run.owningMainSessionName,
+      launchedFromSessionName: run.launchedFromSessionName,
+      targetImplementationSessionName: run.targetImplementationSessionName,
+    }));
 }
 
 export function clearOpenSpecAutoDeliverRunsForTests(): void {
