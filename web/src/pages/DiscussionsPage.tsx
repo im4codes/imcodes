@@ -5,6 +5,7 @@ import { P2pProgressCard } from '../components/P2pProgressCard.js';
 import type { P2pProgressDiscussion } from '../components/P2pProgressCard.js';
 import { FilePreviewPane } from '../components/FilePreviewPane.js';
 import { translateAutoDeliverReason } from '../components/OpenSpecAutoDeliver.js';
+import { comboModeLabel } from '../components/p2p-combos.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import {
   OPENSPEC_AUTO_DELIVER_MSG,
@@ -426,6 +427,9 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
   }, [selected, content, autoFollow, scrollDetailToBottom]);
 
   const formatTime = (ts: number) => new Date(ts).toLocaleString();
+  const formatAutoStatus = (status: string) => t(`openspec.auto.status.${status}`, status);
+  const formatAutoStage = (stage: string) => t(`openspec.auto.stage.${stage}`, stage);
+  const formatAutoCombo = (comboId: string) => comboModeLabel(comboId, t);
 
   // Find matching live discussion for progress display
   const activeLive = useMemo(
@@ -522,8 +526,8 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
                     {row.visibility === 'conflict' ? row.owningMainSessionName : (row.changeName ?? row.runId)}
                   </div>
                   <div class="discussions-list-meta">
-                    <span style={{ color: '#64748b', fontSize: 11 }}>{row.stage}</span>
-                    <span class="discussions-list-time">{row.status}</span>
+                    <span style={{ color: '#64748b', fontSize: 11 }}>{formatAutoStage(row.stage)}</span>
+                    <span class="discussions-list-time">{formatAutoStatus(row.status)}</span>
                   </div>
                 </div>
               ))}
@@ -567,14 +571,14 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
                   <div class="openspec-auto-kicker">{t('openspec.auto.list_title')}</div>
                   <h3>{selectedAutoDeliverRow.changeName ?? selectedAutoDeliverRow.owningMainSessionName ?? selectedAutoDeliverRow.runId}</h3>
                   <div class="openspec-auto-detail-grid">
-                    <div class="openspec-auto-detail-row"><span>{t('openspec.auto.status_label')}</span><strong>{selectedAutoDeliverRow.status}</strong></div>
-                    <div class="openspec-auto-detail-row"><span>{t('openspec.auto.stage_label')}</span><strong>{selectedAutoDeliverRow.stage}</strong></div>
+                    <div class="openspec-auto-detail-row"><span>{t('openspec.auto.status_label')}</span><strong>{formatAutoStatus(selectedAutoDeliverRow.status)}</strong></div>
+                    <div class="openspec-auto-detail-row"><span>{t('openspec.auto.stage_label')}</span><strong>{formatAutoStage(selectedAutoDeliverRow.stage)}</strong></div>
                     <div class="openspec-auto-detail-row"><span>{t('openspec.auto.owning_session')}</span><strong>{selectedAutoDeliverRow.owningMainSessionName}</strong></div>
                     {selectedAutoDeliverRow.targetImplementationSessionName && (
                       <div class="openspec-auto-detail-row"><span>{t('openspec.auto.execution_session')}</span><strong>{selectedAutoDeliverRow.targetImplementationSessionName}</strong></div>
                     )}
                     {selectedAutoDeliverRow.selectedTeamComboId && (
-                      <div class="openspec-auto-detail-row"><span>{t('openspec.auto.combo_id')}</span><strong>{selectedAutoDeliverRow.selectedTeamComboId}</strong></div>
+                      <div class="openspec-auto-detail-row"><span>{t('openspec.auto.combo_id')}</span><strong>{formatAutoCombo(selectedAutoDeliverRow.selectedTeamComboId)}</strong></div>
                     )}
                     {selectedAutoDeliverRow.terminalReason && (
                       <div class="openspec-auto-detail-row"><span>{t('openspec.auto.terminal_reason')}</span><strong>{translateAutoDeliverReason(selectedAutoDeliverRow.terminalReason, t)}</strong></div>

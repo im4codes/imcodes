@@ -1394,8 +1394,8 @@ afterEach(() => {
 
     const comboSelect = screen.getByRole('combobox') as HTMLSelectElement;
     expect(comboSelect.value).toBe('audit>review>plan');
-    expect(within(comboSelect).getByRole('option', { name: 'Audit-Review-Plan' })).toBeDefined();
-    expect(within(comboSelect).getByRole('option', { name: 'brainstorm > discuss > plan' })).toBeDefined();
+    expect(within(comboSelect).getByRole('option', { name: 'mode_audit→mode_review→mode_plan' })).toBeDefined();
+    expect(within(comboSelect).getByRole('option', { name: 'mode_brainstorm→mode_discuss→mode_plan' })).toBeDefined();
 
     fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
     expect(onLaunch).toHaveBeenCalledWith('change-a', 'standard', {

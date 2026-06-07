@@ -12,7 +12,7 @@ import {
   type OpenSpecAutoDeliverProjection,
 } from '../openspec-auto-deliver.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
-import { useP2pCustomCombos } from './p2p-combos.js';
+import { comboModeLabel, useP2pCustomCombos } from './p2p-combos.js';
 
 export interface OpenSpecAutoDeliverLauncherProps {
   changeName: string | null;
@@ -142,9 +142,7 @@ export function OpenSpecAutoDeliverLauncher({
     const options: Array<{ key: string; label: string; custom?: boolean }> = [
       ...allCombos.presets.map((combo) => ({
         key: combo.key,
-        label: combo.key === OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO
-          ? 'Audit-Review-Plan'
-          : combo.pipeline.join(' > '),
+        label: comboModeLabel(combo.key, t),
       })),
       ...allCombos.custom.map((key) => ({ key, label: key, custom: true })),
     ];

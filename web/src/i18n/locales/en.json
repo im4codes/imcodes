@@ -1189,7 +1189,7 @@
       "spec_round": "Spec audit round",
       "impl_round": "Implementation audit round",
       "active_p2p": "Active Team run",
-      "combo_id": "Combo",
+      "combo_id": "Team combo",
       "active_prompt": "OpenSpec prompt",
       "verdict": "Verdict",
       "terminal_reason": "Terminal reason",

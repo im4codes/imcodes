@@ -12,6 +12,12 @@ vi.mock('react-i18next', () => ({
     t: (key: string, opts?: Record<string, unknown>) => {
       if (key === 'openspec.auto.reason.auto_deliver_active') return 'Auto Deliver is already running for this session.';
       if (key === 'openspec.auto.reason.missing_authoritative_json') return 'The audit did not produce a final authoritative JSON result.';
+      if (key === 'openspec.auto.status.active') return 'Active';
+      if (key === 'openspec.auto.stage.implementation_task_loop') return 'Implementation';
+      if (key === 'openspec.auto.stage.implementation_audit_repair') return 'Implementation audit';
+      if (key === 'p2p.mode_audit') return 'Audit';
+      if (key === 'p2p.mode_review') return 'Review';
+      if (key === 'p2p.mode_plan') return 'Plan';
       return typeof opts?.defaultValue === 'string' ? opts.defaultValue : key;
     },
   }),
@@ -486,14 +492,16 @@ describe('DiscussionsPage', () => {
     expect(screen.getAllByText('openspec-auto-delivery').length).toBeGreaterThanOrEqual(1);
     const autoRow = container.querySelector('.discussions-list-item') as HTMLElement;
     expect(autoRow).toBeTruthy();
-    expect(autoRow.textContent).toContain('implementation_task_loop');
-    expect(autoRow.textContent).toContain('active');
+    expect(autoRow.textContent).toContain('Implementation');
+    expect(autoRow.textContent).toContain('Active');
+    expect(autoRow.textContent).not.toContain('implementation_task_loop');
 
     fireEvent.click(autoRow);
     expect(autoRow.className).toContain('active');
     expect(screen.getByText('deck_proj_brain')).toBeDefined();
     expect(screen.getByText('deck_sub_1')).toBeDefined();
-    expect(screen.getByText('audit>review>plan')).toBeDefined();
+    expect(screen.getByText('Audit→Review→Plan')).toBeDefined();
+    expect(screen.queryByText('audit>review>plan')).toBeNull();
   });
 
   it('can open directly on the Auto Deliver list tab', async () => {
