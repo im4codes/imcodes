@@ -1227,14 +1227,15 @@
         "deep": "深い"
       },
       "status": {
-        "launching": "Launching",
-        "active": "Active",
+        "proposed": "Proposed",
+        "spec_audit_repair": "Spec audit",
+        "implementation_task_loop": "Implementing",
+        "implementation_audit_repair": "Implementation audit",
+        "stopping": "Stopping",
         "passed": "Passed",
         "needs_human": "Needs human",
         "failed": "Failed",
-        "stopped": "Stopped",
-        "proposed": "Proposed",
-        "implementation_task_loop": "Implementing"
+        "stopped": "Stopped"
       },
       "stage": {
         "proposed": "Proposed",

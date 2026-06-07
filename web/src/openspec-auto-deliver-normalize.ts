@@ -53,7 +53,8 @@ function booleanValue(value: unknown): boolean | undefined {
 }
 
 function normalizeStatus(value: unknown): string | null {
-  return nonEmptyString(value) ?? null;
+  const status = nonEmptyString(value);
+  return status && STAGE_VALUES.has(status) ? status : null;
 }
 
 function normalizeStage(value: unknown): string | null {

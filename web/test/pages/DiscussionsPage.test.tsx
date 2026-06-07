@@ -12,7 +12,6 @@ vi.mock('react-i18next', () => ({
     t: (key: string, opts?: Record<string, unknown>) => {
       if (key === 'openspec.auto.reason.auto_deliver_active') return 'Auto Deliver is already running for this session.';
       if (key === 'openspec.auto.reason.missing_authoritative_json') return 'The audit did not produce a final authoritative JSON result.';
-      if (key === 'openspec.auto.status.active') return 'Active';
       if (key === 'openspec.auto.status.implementation_task_loop') return 'Active';
       if (key === 'openspec.auto.stage.implementation_task_loop') return 'Implementation';
       if (key === 'openspec.auto.stage.implementation_audit_repair') return 'Implementation audit';
@@ -643,8 +642,26 @@ describe('DiscussionsPage', () => {
             reason: 'auto_deliver_active',
           },
           {
-            runId: 'valid-row',
+            runId: 'bad-status-active',
             projectionVersion: 3,
+            visibility: 'full',
+            changeName: 'leaked-bad-status-active',
+            status: 'active',
+            stage: 'implementation_task_loop',
+            owningMainSessionName: 'deck_proj_brain',
+          },
+          {
+            runId: 'bad-status-running',
+            projectionVersion: 4,
+            visibility: 'full',
+            changeName: 'leaked-bad-status-running',
+            status: 'running',
+            stage: 'implementation_task_loop',
+            owningMainSessionName: 'deck_proj_brain',
+          },
+          {
+            runId: 'valid-row',
+            projectionVersion: 5,
             visibility: 'full',
             changeName: 'visible-valid-row',
             status: 'implementation_task_loop',
@@ -658,6 +675,8 @@ describe('DiscussionsPage', () => {
     expect(screen.getAllByText('visible-valid-row').length).toBeGreaterThanOrEqual(1);
     expect(screen.queryByText('leaked-missing-visibility')).toBeNull();
     expect(screen.queryByText('leaked-missing-stage')).toBeNull();
+    expect(screen.queryByText('leaked-bad-status-active')).toBeNull();
+    expect(screen.queryByText('leaked-bad-status-running')).toBeNull();
     expect(screen.queryByText('bad-version')).toBeNull();
   });
 

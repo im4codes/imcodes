@@ -66,6 +66,11 @@ export function isOpenSpecAutoDeliverMessageType(value: unknown): value is OpenS
     && (Object.values(OPENSPEC_AUTO_DELIVER_MSG) as string[]).includes(value);
 }
 
+export function isOpenSpecAutoDeliverStage(value: unknown): value is OpenSpecAutoDeliverStage {
+  return typeof value === 'string'
+    && (OPENSPEC_AUTO_DELIVER_STAGES as readonly string[]).includes(value);
+}
+
 export function isOpenSpecAutoDeliverTerminalStage(value: unknown): value is OpenSpecAutoDeliverTerminalStage {
   return typeof value === 'string'
     && (OPENSPEC_AUTO_DELIVER_TERMINAL_STAGES as readonly string[]).includes(value);

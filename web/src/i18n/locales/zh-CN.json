@@ -1228,14 +1228,15 @@
         "deep": "深度"
       },
       "status": {
-        "launching": "启动中",
-        "active": "运行中",
+        "proposed": "已提案",
+        "spec_audit_repair": "Spec 审计",
+        "implementation_task_loop": "实现中",
+        "implementation_audit_repair": "实现审计",
+        "stopping": "停止中",
         "passed": "通过",
         "needs_human": "需要人工",
         "failed": "失败",
-        "stopped": "已停止",
-        "proposed": "已提案",
-        "implementation_task_loop": "实现中"
+        "stopped": "已停止"
       },
       "stage": {
         "proposed": "提案",

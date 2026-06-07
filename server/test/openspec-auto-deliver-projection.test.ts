@@ -14,7 +14,7 @@ describe('OpenSpec Auto Deliver server projection sanitizer', () => {
       targetImplementationSessionName: 'deck_sub_alpha',
       projectionVersion: 3,
       generation: 6,
-      status: 'running',
+      status: 'implementation_task_loop',
       stage: 'implementation_task_loop',
       taskStats: { total: 4, checked: 2, unchecked: 2, uncheckedLabels: ['secret'] },
       moduleScores: [
@@ -40,7 +40,7 @@ describe('OpenSpec Auto Deliver server projection sanitizer', () => {
       targetImplementationSessionName: 'deck_sub_alpha',
       projectionVersion: 3,
       generation: 6,
-      status: 'running',
+      status: 'implementation_task_loop',
       stage: 'implementation_task_loop',
       taskStats: { total: 4, checked: 2, unchecked: 2 },
       validationEvidenceProvenance: ['daemon', 'implementation_reported'],
@@ -71,6 +71,8 @@ describe('OpenSpec Auto Deliver server projection sanitizer', () => {
       owningMainSessionName: 'deck_proj_brain',
       projectionVersion: 9,
       generation: 2,
+      status: 'implementation_audit_repair',
+      stage: 'implementation_audit_repair',
       latestRepairSummary: 'fixed token=abc1234567890abcdef',
       recentFinding: 'blocked by password=hunter2',
       terminalReason: 'validation output had Bearer abcdefghijklmnopqrstuvwxyz',
@@ -135,12 +137,34 @@ describe('OpenSpec Auto Deliver server projection sanitizer', () => {
       owningMainSessionName: 'deck_proj_brain',
       projectionVersion: 1,
       generation: 1,
+      status: 'implementation_task_loop',
+      stage: 'implementation_task_loop',
     })).toBeNull();
     expect(sanitizeOpenSpecAutoDeliverProjection({
       runId: 'run-1',
       changeName: 'change-1',
       owningMainSessionName: 'deck_proj_brain',
       projectionVersion: 1,
+      status: 'implementation_task_loop',
+      stage: 'implementation_task_loop',
+    })).toBeNull();
+    expect(sanitizeOpenSpecAutoDeliverProjection({
+      runId: 'run-1',
+      changeName: 'change-1',
+      owningMainSessionName: 'deck_proj_brain',
+      projectionVersion: 1,
+      generation: 1,
+      status: 'running',
+      stage: 'implementation_task_loop',
+    })).toBeNull();
+    expect(sanitizeOpenSpecAutoDeliverProjection({
+      runId: 'run-1',
+      changeName: 'change-1',
+      owningMainSessionName: 'deck_proj_brain',
+      projectionVersion: 1,
+      generation: 1,
+      status: 'implementation_task_loop',
+      stage: 'active',
     })).toBeNull();
   });
 
@@ -151,6 +175,8 @@ describe('OpenSpec Auto Deliver server projection sanitizer', () => {
       owningMainSessionName: 'deck_proj_brain',
       projectionVersion: 1,
       generation: 1,
+      status: 'implementation_task_loop',
+      stage: 'implementation_task_loop',
       materializedLimits: {
         maxImplementationPrompts: 9,
       },
@@ -160,6 +186,7 @@ describe('OpenSpec Auto Deliver server projection sanitizer', () => {
       specAuditRepairRounds: 1,
       implementationAuditRepairRounds: 2,
       maxImplementationPrompts: 9,
+      maxElapsedMinutes: 240,
     });
   });
 });
@@ -175,7 +202,7 @@ describe('OpenSpec Auto Deliver server projection cache', () => {
       targetImplementationSessionName: 'deck_sub_worker',
       projectionVersion: 1,
       generation: 1,
-      status: 'running',
+      status: 'implementation_task_loop',
       stage: 'spec_audit_repair',
       taskStats: { total: 3, checked: 1, unchecked: 2, uncheckedLabels: ['private task'] },
       evidence: [{ source: 'validation', summary: 'ran private validation output' }],
@@ -193,7 +220,7 @@ describe('OpenSpec Auto Deliver server projection cache', () => {
     expect(conflict).toEqual({
       runId: 'run-1',
       owningMainSessionName: 'deck_proj_brain',
-      status: 'running',
+      status: 'implementation_task_loop',
       stage: 'spec_audit_repair',
       busy: true,
       reason: 'auto_deliver_active',
@@ -235,6 +262,8 @@ describe('OpenSpec Auto Deliver server projection cache', () => {
       targetImplementationSessionName: 'deck_sub_worker_old',
       projectionVersion: 1,
       generation: 1,
+      status: 'implementation_task_loop',
+      stage: 'implementation_task_loop',
     });
     cache.remember({
       runId: 'run-remap',
@@ -244,6 +273,8 @@ describe('OpenSpec Auto Deliver server projection cache', () => {
       targetImplementationSessionName: 'deck_sub_worker_new',
       projectionVersion: 2,
       generation: 2,
+      status: 'implementation_task_loop',
+      stage: 'implementation_task_loop',
     });
 
     expect(cache.getFullProjectionForSession('deck_proj_brain')?.projectionVersion).toBe(2);
@@ -263,6 +294,7 @@ describe('OpenSpec Auto Deliver server projection cache', () => {
       targetImplementationSessionName: 'deck_sub_worker_fresh',
       projectionVersion: 5,
       generation: 5,
+      status: 'implementation_audit_repair',
       stage: 'implementation_audit_repair',
     });
     cache.remember({
@@ -273,6 +305,7 @@ describe('OpenSpec Auto Deliver server projection cache', () => {
       targetImplementationSessionName: 'deck_sub_worker_stale',
       projectionVersion: 4,
       generation: 4,
+      status: 'spec_audit_repair',
       stage: 'spec_audit_repair',
     });
 
@@ -296,6 +329,8 @@ describe('OpenSpec Auto Deliver server projection cache', () => {
       targetImplementationSessionName: 'deck_active_worker',
       projectionVersion: 1,
       generation: 1,
+      status: 'implementation_task_loop',
+      stage: 'implementation_task_loop',
     });
     cache.remember({
       runId: 'terminal-run',
@@ -307,6 +342,7 @@ describe('OpenSpec Auto Deliver server projection cache', () => {
       generation: 1,
       terminal: true,
       status: 'passed',
+      stage: 'passed',
       terminalReason: 'completed',
     });
 
@@ -399,6 +435,8 @@ describe('OpenSpec Auto Deliver server projection cache', () => {
       launchedFromSessionName: 'deck_active_launcher',
       projectionVersion: 1,
       generation: 1,
+      status: 'implementation_task_loop',
+      stage: 'implementation_task_loop',
     });
     cache.remember({
       runId: 'terminal-run',
@@ -408,6 +446,8 @@ describe('OpenSpec Auto Deliver server projection cache', () => {
       projectionVersion: 1,
       generation: 1,
       terminal: true,
+      status: 'stopped',
+      stage: 'stopped',
     });
 
     cache.clear();

@@ -144,6 +144,19 @@ function isTerminalProjection(projection: OpenSpecAutoDeliverProjection): boolea
   return projection.terminal === true || isOpenSpecAutoDeliverTerminalStatus(projection.status);
 }
 
+function projectionMatchesSession(projection: OpenSpecAutoDeliverProjection, sessionName: string | null | undefined): boolean {
+  if (!sessionName) return true;
+  if (projection.visibility === 'conflict') {
+    return projection.owningMainSessionName !== sessionName;
+  }
+  const aliases = [
+    projection.owningMainSessionName,
+    projection.launchedFromSessionName,
+    projection.targetImplementationSessionName,
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+  return aliases.length === 0 || aliases.includes(sessionName);
+}
+
 export function useOpenSpecAutoDeliver({
   ws,
   serverId,
@@ -159,6 +172,7 @@ export function useOpenSpecAutoDeliver({
   const stopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeLaunchRequestIdRef = useRef<string | null>(null);
   const activeStopRequestIdRef = useRef<string | null>(null);
+  const activeStopRunIdRef = useRef<string | null>(null);
 
   const clearLaunchTimeout = useCallback(() => {
     if (launchTimeoutRef.current) {
@@ -174,10 +188,12 @@ export function useOpenSpecAutoDeliver({
       stopTimeoutRef.current = null;
     }
     activeStopRequestIdRef.current = null;
+    activeStopRunIdRef.current = null;
   }, []);
 
   const applyProjection = useCallback((next: OpenSpecAutoDeliverProjection | null) => {
     if (!next) return;
+    if (!projectionMatchesSession(next, sessionName)) return;
     const current = latestProjectionRef.current;
     if (
       current
@@ -191,10 +207,13 @@ export function useOpenSpecAutoDeliver({
     setProjection(next);
     setLaunchPending(false);
     if (isTerminalProjection(next)) {
-      clearStopTimeout();
-      setStopPending(false);
+      const pendingStopRunId = activeStopRunIdRef.current;
+      if (!pendingStopRunId || pendingStopRunId === next.runId) {
+        clearStopTimeout();
+        setStopPending(false);
+      }
     }
-  }, [clearLaunchTimeout, clearStopTimeout]);
+  }, [clearLaunchTimeout, clearStopTimeout, sessionName]);
 
   const requestStatus = useCallback(() => {
     if (!ws || !sessionName) return null;
@@ -263,6 +282,11 @@ export function useOpenSpecAutoDeliver({
       sessionName: stopSessionName,
       runId,
     };
+    clearStopTimeout();
+    activeStopRequestIdRef.current = requestId;
+    activeStopRunIdRef.current = runId;
+    setStopPending(true);
+    setLastError(null);
     try {
       const sendUrgent = (ws as { sendUrgent?: (msg: object) => void }).sendUrgent;
       if (sendUrgent) {
@@ -276,13 +300,10 @@ export function useOpenSpecAutoDeliver({
       setLastError(normalizeStopError(error instanceof Error ? error.message : error));
       return null;
     }
-    clearStopTimeout();
-    activeStopRequestIdRef.current = requestId;
-    setStopPending(true);
-    setLastError(null);
     stopTimeoutRef.current = setTimeout(() => {
       if (activeStopRequestIdRef.current !== requestId) return;
       activeStopRequestIdRef.current = null;
+      activeStopRunIdRef.current = null;
       stopTimeoutRef.current = null;
       setStopPending(false);
       setLastError('openspec.auto.error.stop_timeout');
@@ -318,6 +339,10 @@ export function useOpenSpecAutoDeliver({
         return;
       }
       if (raw.type === OPENSPEC_AUTO_DELIVER_MSG.STOP_ACK) {
+        const ackRequestId = typeof raw.requestId === 'string' ? raw.requestId : null;
+        if (activeStopRequestIdRef.current && ackRequestId !== activeStopRequestIdRef.current) {
+          return;
+        }
         clearStopTimeout();
         setStopPending(false);
         const ackProjection = normalizeOpenSpecAutoDeliverProjection(raw.projection);

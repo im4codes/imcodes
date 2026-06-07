@@ -8,7 +8,11 @@ import type {
   OpenSpecAutoDeliverBrowserFullProjection,
   OpenSpecAutoDeliverListRow,
 } from '../../shared/openspec-auto-deliver-types.js';
-import { materializeOpenSpecAutoDeliverPreset } from '../../shared/openspec-auto-deliver-constants.js';
+import {
+  isOpenSpecAutoDeliverStage,
+  isOpenSpecAutoDeliverTerminalStage,
+  materializeOpenSpecAutoDeliverPreset,
+} from '../../shared/openspec-auto-deliver-constants.js';
 import { redactSensitiveText } from '../../shared/redact-secrets.js';
 
 export type OpenSpecAutoDeliverSanitizedProjection = Omit<
@@ -183,8 +187,13 @@ export function sanitizeOpenSpecAutoDeliverProjection(
   const projectionVersion = sanitizeNonNegativeInteger(raw.projectionVersion);
   const generation = sanitizeNonNegativeInteger(raw.generation);
   if (!runId || !changeName || !owningMainSessionName || projectionVersion === undefined || generation === undefined) return null;
+  const status = sanitizeString(raw.status);
+  const stage = sanitizeString(raw.stage);
+  if (!isOpenSpecAutoDeliverStage(status) || !isOpenSpecAutoDeliverStage(stage)) return null;
 
-  const terminal = raw.terminal === true || ['passed', 'needs_human', 'failed', 'stopped'].includes(String(raw.status ?? ''));
+  const terminal = raw.terminal === true
+    || isOpenSpecAutoDeliverTerminalStage(status)
+    || isOpenSpecAutoDeliverTerminalStage(stage);
   const projection: OpenSpecAutoDeliverSanitizedProjection = {
     runId,
     changeName,
@@ -192,8 +201,8 @@ export function sanitizeOpenSpecAutoDeliverProjection(
     projectionVersion,
     generation,
     visibility: 'full',
-    status: sanitizeString(raw.status) ?? 'active',
-    stage: sanitizeString(raw.stage) ?? sanitizeString(raw.status) ?? 'proposed',
+    status,
+    stage,
     canStop: !terminal,
     canDismiss: true,
   };

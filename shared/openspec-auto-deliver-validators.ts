@@ -261,17 +261,16 @@ export function parseOpenSpecAutoDeliverAuthoritativeJsonPayload(text: string): 
   if (byteLength(text) > OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES) {
     return { ok: false, issues: [issue('authoritative_input_too_large', 'Authoritative result input exceeds byte limit.')] };
   }
-  const matches = [...text.matchAll(/```json\s*([\s\S]*?)```/g)];
-  if (matches.length !== 1) {
-    return { ok: false, issues: [issue(matches.length === 0 ? 'missing_authoritative_json' : 'multiple_authoritative_json', 'Expected exactly one authoritative JSON fence.')] };
+  const payload = text.trim();
+  if (!payload) {
+    return { ok: false, issues: [issue('missing_authoritative_json', 'Expected a raw authoritative JSON payload.')] };
   }
-  const payload = matches[0]?.[1] ?? '';
   if (byteLength(payload) > OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES) {
     return { ok: false, issues: [issue('authoritative_payload_too_large', 'Authoritative result payload exceeds byte limit.')] };
   }
   try {
     return { ok: true, value: JSON.parse(payload), issues: [] };
   } catch {
-    return { ok: false, issues: [issue('malformed_authoritative_json', 'Authoritative JSON is malformed.')] };
+    return { ok: false, issues: [issue('malformed_authoritative_json', 'Raw authoritative JSON is malformed.')] };
   }
 }

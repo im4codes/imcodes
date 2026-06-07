@@ -64,11 +64,11 @@ function statusKey(status: string): string {
 }
 
 function projectionStatus(projection: OpenSpecAutoDeliverProjection): string {
-  return typeof projection.status === 'string' && projection.status ? projection.status : 'active';
+  return typeof projection.status === 'string' && projection.status ? projection.status : 'unknown';
 }
 
 function projectionStage(projection: OpenSpecAutoDeliverProjection): string {
-  return typeof projection.stage === 'string' && projection.stage ? projection.stage : 'active';
+  return typeof projection.stage === 'string' && projection.stage ? projection.stage : 'unknown';
 }
 
 function projectionTitle(projection: OpenSpecAutoDeliverProjection): string {
@@ -445,8 +445,8 @@ export function OpenSpecAutoDeliverDetailsPanel({
   onStop,
 }: OpenSpecAutoDeliverDetailsPanelProps) {
   const { t } = useTranslation();
-  const status = projection ? projectionStatus(projection) : 'active';
-  const stage = projection ? projectionStage(projection) : 'active';
+  const status = projection ? projectionStatus(projection) : 'unknown';
+  const stage = projection ? projectionStage(projection) : 'unknown';
   const active = projection ? !isOpenSpecAutoDeliverTerminalStatus(status) : false;
   const now = useNowTicker(active);
   const elapsed = projection ? formatElapsed(projectionElapsedMs(projection, now)) : '00:00';

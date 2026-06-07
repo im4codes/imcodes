@@ -137,15 +137,17 @@ describe('useOpenSpecAutoDeliver', () => {
       sessionName: 'deck_main_brain',
     }));
 
+    let stopRequestId: string | null = null;
     act(() => {
-      result.current.stop('auto-run-1');
+      stopRequestId = result.current.stop('auto-run-1');
     });
     expect(result.current.stopPending).toBe(true);
+    expect(stopRequestId).toBeTruthy();
 
     act(() => {
       ws.emit({
         type: 'openspec_auto_deliver.stop_ack',
-        requestId: 'stop-1',
+        requestId: stopRequestId,
         ok: false,
         error: 'unauthorized_session',
       } as ServerMessage);
@@ -153,6 +155,60 @@ describe('useOpenSpecAutoDeliver', () => {
 
     expect(result.current.stopPending).toBe(false);
     expect(result.current.lastError).toBe('openspec.auto.error.launch_failed');
+  });
+
+  it('ignores stale Stop ACKs and terminal projections for other runs while stop is pending', () => {
+    const ws = makeWs();
+    const { result } = renderHook(() => useOpenSpecAutoDeliver({
+      ws,
+      serverId: 'server-1',
+      sessionName: 'deck_main_brain',
+    }));
+
+    let stopRequestId: string | null = null;
+    act(() => {
+      stopRequestId = result.current.stop('auto-run-1');
+    });
+    expect(result.current.stopPending).toBe(true);
+
+    act(() => {
+      ws.emit({
+        type: 'openspec_auto_deliver.stop_ack',
+        requestId: 'openspec-auto-stop-stale',
+        ok: false,
+        error: 'unauthorized_session',
+      } as ServerMessage);
+    });
+    expect(result.current.stopPending).toBe(true);
+    expect(result.current.lastError).toBeNull();
+
+    act(() => {
+      ws.emit({
+        type: 'openspec_auto_deliver.terminal',
+        projection: {
+          runId: 'auto-run-other',
+          visibility: 'full',
+          projectionVersion: 2,
+          changeName: 'openspec-auto-delivery',
+          status: 'stopped',
+          stage: 'stopped',
+          owningMainSessionName: 'deck_main_brain',
+          terminal: true,
+          canStop: false,
+        },
+      } as unknown as ServerMessage);
+    });
+    expect(result.current.stopPending).toBe(true);
+
+    act(() => {
+      ws.emit({
+        type: 'openspec_auto_deliver.stop_ack',
+        requestId: stopRequestId,
+        ok: true,
+      } as ServerMessage);
+    });
+    expect(result.current.stopPending).toBe(false);
+    expect(result.current.lastError).toBeNull();
   });
 
   it('constructs conflict projection state from an allowlist and blocks Stop', () => {
@@ -238,11 +294,27 @@ describe('useOpenSpecAutoDeliver', () => {
         stage: 'active',
       },
       {
-        runId: 'bad-status',
+        runId: 'bad-status-object',
         visibility: 'full',
         projectionVersion: 1,
         changeName: 'private-change',
         status: {},
+        stage: 'implementation_task_loop',
+      },
+      {
+        runId: 'bad-status-active',
+        visibility: 'full',
+        projectionVersion: 1,
+        changeName: 'private-change',
+        status: 'active',
+        stage: 'implementation_task_loop',
+      },
+      {
+        runId: 'bad-status-running',
+        visibility: 'full',
+        projectionVersion: 1,
+        changeName: 'private-change',
+        status: 'running',
         stage: 'implementation_task_loop',
       },
       {

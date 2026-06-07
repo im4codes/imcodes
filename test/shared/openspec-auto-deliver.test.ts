@@ -4,6 +4,7 @@ import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
   OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
   OPENSPEC_AUTO_DELIVER_COMBO_IDS,
+  isOpenSpecAutoDeliverStage,
   materializeOpenSpecAutoDeliverPreset,
 } from '../../shared/openspec-auto-deliver-constants.js';
 import * as openSpecAutoDeliverCombos from '../../shared/openspec-auto-deliver-combos.js';
@@ -58,6 +59,13 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
       maxImplementationPrompts: 24,
       maxElapsedMinutes: 480,
     });
+  });
+
+  it('keeps Auto Deliver lifecycle values canonical', () => {
+    expect(isOpenSpecAutoDeliverStage('implementation_task_loop')).toBe(true);
+    expect(isOpenSpecAutoDeliverStage('stopping')).toBe(true);
+    expect(isOpenSpecAutoDeliverStage('running')).toBe(false);
+    expect(isOpenSpecAutoDeliverStage('active')).toBe(false);
   });
 
   it('validates custom materialized launch limits and fills implementation defaults', () => {
@@ -191,12 +199,13 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
     expect(validateOpenSpecAutoDeliverVerdictPayload(contradictory).ok).toBe(false);
   });
 
-  it('extracts exactly one authoritative JSON payload', () => {
-    expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload(`Before\n\`\`\`json\n${JSON.stringify(validVerdictPayload())}\n\`\`\``).ok).toBe(true);
-    expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload(`${'x'.repeat(70 * 1024)}\n\`\`\`json\n${JSON.stringify(validVerdictPayload())}\n\`\`\``).ok).toBe(false);
+  it('parses only raw authoritative JSON payloads', () => {
+    expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload(JSON.stringify(validVerdictPayload())).ok).toBe(true);
+    expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload(`Before\n\`\`\`json\n${JSON.stringify(validVerdictPayload())}\n\`\`\``).ok).toBe(false);
+    expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload(`${'x'.repeat(70 * 1024)}\n${JSON.stringify(validVerdictPayload())}`).ok).toBe(false);
     expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload('no json here').ok).toBe(false);
     expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload('```json\n{}\n```\n```json\n{}\n```').ok).toBe(false);
-    expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload('```json\n{ nope }\n```').ok).toBe(false);
+    expect(parseOpenSpecAutoDeliverAuthoritativeJsonPayload('{ nope }').ok).toBe(false);
   });
 
   it('keeps browser projection and list row contracts redaction-safe', () => {
