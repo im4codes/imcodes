@@ -19,8 +19,9 @@ interface MockP2pRun {
   strictAuthoritativeResult?: string | null;
 }
 
-const { getSessionMock, serverLinkMock, transportSendMock, p2pRuns, startP2pRunMock, getP2pRunMock, listP2pRunsMock, cancelP2pRunMock } = vi.hoisted(() => ({
+const { getSessionMock, getTransportRuntimeMock, serverLinkMock, transportSendMock, p2pRuns, startP2pRunMock, getP2pRunMock, listP2pRunsMock, cancelP2pRunMock } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
+  getTransportRuntimeMock: vi.fn(),
   serverLinkMock: { send: vi.fn() },
   transportSendMock: vi.fn(() => 'sent'),
   p2pRuns: new Map<string, MockP2pRun>(),
@@ -39,7 +40,7 @@ vi.mock('../../src/store/session-store.js', () => ({
 }));
 
 vi.mock('../../src/agent/session-manager.js', () => ({
-  getTransportRuntime: vi.fn(() => ({ send: transportSendMock })),
+  getTransportRuntime: getTransportRuntimeMock,
 }));
 
 vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
@@ -160,6 +161,8 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       p2pRuns.set(id, run);
       return run;
     });
+    getTransportRuntimeMock.mockReset();
+    getTransportRuntimeMock.mockImplementation(() => ({ send: transportSendMock }));
     clearOpenSpecAutoDeliverRunsForTests();
     getSessionMock.mockImplementation((name: string) => ({
       name,
@@ -195,9 +198,16 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(acks).toHaveLength(2);
     expect(acks[0].projection.runId).toBe(acks[1].projection.runId);
     expect(acks[0].projection.owningMainSessionName).toBe('deck_demo_brain');
+    expect(acks[0].projection.launchedFromSessionName).toBe('deck_sub_worker');
     expect(acks[0].projection.targetImplementationSessionName).toBe('deck_sub_worker');
     expect(acks[0].projection.taskStats).toMatchObject({ total: 2, checked: 1, unchecked: 1 });
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
+    expect(startP2pRunMock).toHaveBeenCalledWith(expect.objectContaining({
+      initiatorSession: 'deck_sub_worker',
+    }));
+    expect(startP2pRunMock).not.toHaveBeenCalledWith(expect.objectContaining({
+      initiatorSession: 'deck_demo_brain',
+    }));
   });
 
   it('keeps the fixed state transition table fail-closed for unlisted transitions', () => {

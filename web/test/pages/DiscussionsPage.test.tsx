@@ -46,6 +46,7 @@ describe('DiscussionsPage', () => {
   beforeEach(() => {
     clipboardWriteText = vi.fn().mockResolvedValue(undefined);
     nextP2pRequestIndex = 0;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
     const nextP2pRequestId = () => `p2p-test-${++nextP2pRequestIndex}`;
     const send = vi.fn();
     let rafTime = 0;
@@ -516,6 +517,38 @@ describe('DiscussionsPage', () => {
 
     expect(screen.getAllByText('direct-auto').length).toBeGreaterThanOrEqual(1);
     expect(screen.queryByText('Team row')).toBeNull();
+  });
+
+  it('hides the Auto Deliver list category on mobile and falls back to Team discussions', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_sub_1' }} initialTab="auto" />);
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.list_discussions_response',
+        discussions: [{ id: 'team-1', preview: 'Team row', fileName: 'team-1.md', mtime: 1 }],
+      } as ServerMessage);
+      handler?.({
+        type: 'openspec_auto_deliver.list_response',
+        rows: [{
+          runId: 'auto-run-mobile-hidden',
+          projectionVersion: 1,
+          visibility: 'full',
+          changeName: 'hidden-auto',
+          status: 'active',
+          stage: 'spec_audit_repair',
+          owningMainSessionName: 'deck_proj_brain',
+        }],
+      } as unknown as ServerMessage);
+    });
+
+    expect(screen.queryByRole('button', { name: 'openspec.auto.list_title' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'p2p.discussions.title' })).toBeDefined();
+    expect(screen.getByText('Team row')).toBeDefined();
+    expect(screen.queryByText('hidden-auto')).toBeNull();
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.list_request',
+    }));
   });
 
   it('renders Auto Deliver conflict rows without change names and localizes conflict reasons', async () => {

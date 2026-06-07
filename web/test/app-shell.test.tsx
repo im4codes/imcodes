@@ -1258,6 +1258,141 @@ describe('App shell', () => {
     expect(resetRunbar.getAttribute('data-compact')).toBe('false');
   }, 20_000);
 
+  it('binds the global Auto Deliver runbar actions to the focused sub-session window', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+
+    fireEvent.click(screen.getByText('subbar-open-sub-1'));
+    expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+
+    await waitFor(() => {
+      expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'openspec_auto_deliver.status_request',
+        sessionName: 'deck_sub_alpha_helper',
+      }));
+    });
+
+    await act(async () => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-sub-focused',
+          projectionVersion: 1,
+          visibility: 'full',
+          changeName: 'openspec-auto-delivery',
+          status: 'active',
+          stage: 'implementation_task_loop',
+          owningMainSessionName: 'deck_alpha_brain',
+          launchedFromSessionName: 'deck_sub_alpha_helper',
+          targetImplementationSessionName: 'deck_sub_alpha_helper',
+          taskStats: { total: 4, checked: 2, unchecked: 2 },
+          canStop: true,
+        },
+      });
+    });
+
+    expect(await screen.findByTestId('app-shell-auto-deliver-runbar')).toBeTruthy();
+    fireEvent.click(screen.getByText('subbar-auto-deliver-stop-run'));
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.stop',
+      runId: 'auto-sub-focused',
+      sessionName: 'deck_sub_alpha_helper',
+    }));
+  }, 20_000);
+
+  it('binds the global Auto Deliver runbar to the open sub-session UI scope on mobile', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Android' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      useSubSessionsState.subSessions = [
+        {
+          id: 'sub-1',
+          sessionName: 'deck_sub_alpha_helper',
+          parentSession: 'deck_alpha_brain',
+          label: 'Helper',
+          description: 'Helper session',
+          cwd: '/work/alpha',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'idle',
+          serverId: 'srv-1',
+        },
+      ];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+      const { App } = await importApp();
+      render(<App />);
+
+      expect(await screen.findByText('session-tabs')).toBeTruthy();
+      const ws = await getActiveWsClient();
+
+      fireEvent.click(screen.getByText('subbar-open-sub-1'));
+      expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+
+      await waitFor(() => {
+        expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'openspec_auto_deliver.status_request',
+          sessionName: 'deck_sub_alpha_helper',
+        }));
+      });
+
+      await act(async () => {
+        ws.emit({
+          type: 'openspec_auto_deliver.projection',
+          projection: {
+            runId: 'auto-sub-mobile',
+            projectionVersion: 1,
+            visibility: 'full',
+            changeName: 'openspec-auto-delivery',
+            status: 'active',
+            stage: 'implementation_task_loop',
+            owningMainSessionName: 'deck_alpha_brain',
+            launchedFromSessionName: 'deck_sub_alpha_helper',
+            targetImplementationSessionName: 'deck_sub_alpha_helper',
+            taskStats: { total: 4, checked: 2, unchecked: 2 },
+            canStop: true,
+          },
+        });
+      });
+
+      expect(await screen.findByTestId('app-shell-auto-deliver-runbar')).toBeTruthy();
+      fireEvent.click(screen.getByText('subbar-auto-deliver-stop-run'));
+      expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'openspec_auto_deliver.stop',
+        runId: 'auto-sub-mobile',
+        sessionName: 'deck_sub_alpha_helper',
+      }));
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
   it('reuses the AskQuestion dialog UI for Auto Deliver needs_human handoff questions', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');

@@ -2153,7 +2153,17 @@ export function App() {
     activeSession,
     Boolean(selectedShareTarget),
   );
-  const appOpenSpecAutoSessionName = activeSession ?? visibleMainSessions[0]?.name ?? null;
+  const appOpenSpecAutoScopedSubSessionName = useMemo(() => {
+    const visibleById = new Map(visibleSubSessions.map((sub) => [sub.id, sub]));
+    const focusedSub = focusedSubId ? (visibleById.get(focusedSubId) ?? subSessions.find((sub) => sub.id === focusedSubId) ?? null) : null;
+    if (focusedSub?.sessionName) return focusedSub.sessionName;
+    if (!isMobileRef.current) return null;
+    const openIds = Array.from(openSubIds);
+    const activeOpenSubId = openIds.length > 0 ? openIds[openIds.length - 1] : null;
+    if (!activeOpenSubId) return null;
+    return (visibleById.get(activeOpenSubId) ?? subSessions.find((sub) => sub.id === activeOpenSubId))?.sessionName ?? null;
+  }, [focusedSubId, openSubIds, subSessions, visibleSubSessions]);
+  const appOpenSpecAutoSessionName = appOpenSpecAutoScopedSubSessionName ?? activeSession ?? visibleMainSessions[0]?.name ?? null;
   const appOpenSpecAutoDeliver = useOpenSpecAutoDeliver({
     ws: wsRef.current,
     serverId: selectedServerId ?? undefined,
