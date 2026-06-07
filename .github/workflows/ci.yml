@@ -321,8 +321,36 @@ jobs:
           cache: 'npm'
           cache-dependency-path: server/package-lock.json
       - run: ./scripts/ci-npm-ci.sh server
+      - name: Warm DB test container image
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if docker pull pgvector/pgvector:pg18; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::Docker image pull failed on attempt ${attempt}; retrying..."
+              sleep $((attempt * 10))
+            fi
+          done
+          echo "Docker image pull failed after 3 attempts."
+          exit 1
       - name: Run DB integration tests
-        run: npm run test:integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2; do
+            if npm run test:integration; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 2 ]; then
+              echo "::warning::DB integration tests failed on attempt ${attempt}; retrying..."
+              sleep 15
+            fi
+          done
+          echo "DB integration tests failed after 2 attempts."
+          exit 1
         working-directory: server
         env:
           TESTCONTAINERS_RYUK_DISABLED: 'true'
