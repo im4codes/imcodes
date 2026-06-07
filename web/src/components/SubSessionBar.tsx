@@ -959,12 +959,11 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         )}
         {onViewAutoDeliver && !isMobile && (
           <button
-            class={`subcard-toolbar-btn${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
+            class={`subcard-toolbar-btn subcard-toolbar-btn-auto${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
             data-testid="subsession-auto-deliver-status"
             onClick={onViewAutoDeliver}
             title={autoDeliverButtonLabel}
             aria-label={autoDeliverButtonLabel}
-            style={{ marginLeft: 4, fontSize: 11 }}
           >
             <span aria-hidden="true">⟲</span>
             {desktopLayoutCapable && <span class="subcard-toolbar-btn-label">{autoDeliverButtonLabel}</span>}
@@ -972,7 +971,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         )}
         {onViewDiscussions && (
           <button
-            class={`subcard-toolbar-btn${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
+            class={`subcard-toolbar-btn subcard-toolbar-btn-discussions${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
             data-onboarding="discussion-history"
             data-running-discussions={totalRunningDiscussions}
             onClick={onViewDiscussions}
@@ -991,7 +990,6 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                   )
                 : t('subsessionBar.p2p_discussions')
             }
-            style={{ marginLeft: 4, fontSize: 11, position: 'relative' }}
           >
             <span aria-hidden="true">👥</span>
             {desktopLayoutCapable && <span class="subcard-toolbar-btn-label">{discussionButtonLabel}</span>}
