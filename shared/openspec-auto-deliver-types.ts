@@ -271,6 +271,7 @@ export type OpenSpecAutoDeliverBrowserProjection =
 
 export interface OpenSpecAutoDeliverListRow {
   projectionVersion: number;
+  generation?: number;
   visibility: OpenSpecAutoDeliverProjectionVisibility;
   runId: string;
   owningMainSessionName: string;

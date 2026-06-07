@@ -143,6 +143,25 @@ describe('OpenSpec Auto Deliver server projection sanitizer', () => {
       projectionVersion: 1,
     })).toBeNull();
   });
+
+  it('fills required materialized limit defaults when a raw projection only provides optional limits', () => {
+    const projection = sanitizeOpenSpecAutoDeliverProjection({
+      runId: 'run-limits',
+      changeName: 'change-limits',
+      owningMainSessionName: 'deck_proj_brain',
+      projectionVersion: 1,
+      generation: 1,
+      materializedLimits: {
+        maxImplementationPrompts: 9,
+      },
+    });
+
+    expect(projection?.materializedLimits).toEqual({
+      specAuditRepairRounds: 1,
+      implementationAuditRepairRounds: 2,
+      maxImplementationPrompts: 9,
+    });
+  });
 });
 
 describe('OpenSpec Auto Deliver server projection cache', () => {
@@ -356,6 +375,7 @@ describe('OpenSpec Auto Deliver server projection cache', () => {
       }),
       expect.objectContaining({
         projectionVersion: 3,
+        generation: 3,
         visibility: 'full',
         viewMode: 'fullRunbar',
         runId: 'own-run',

@@ -11,7 +11,12 @@ import type {
 import { materializeOpenSpecAutoDeliverPreset } from '../../shared/openspec-auto-deliver-constants.js';
 import { redactSensitiveText } from '../../shared/redact-secrets.js';
 
-export type OpenSpecAutoDeliverSanitizedProjection = OpenSpecAutoDeliverBrowserFullProjection;
+export type OpenSpecAutoDeliverSanitizedProjection = Omit<
+  OpenSpecAutoDeliverBrowserFullProjection,
+  'owningMainSessionName'
+> & {
+  owningMainSessionName: string;
+};
 export type OpenSpecAutoDeliverConflictSummary = OpenSpecAutoDeliverBrowserConflictProjection;
 
 type CacheEntry = {
@@ -130,12 +135,16 @@ function sanitizeEvidence(value: unknown): OpenSpecAutoDeliverSanitizedProjectio
 
 function sanitizeMaterializedLimits(value: unknown): OpenSpecAutoDeliverSanitizedProjection['materializedLimits'] | undefined {
   if (!isRecord(value)) return undefined;
-  const limits: NonNullable<OpenSpecAutoDeliverSanitizedProjection['materializedLimits']> = {};
+  const limits: NonNullable<OpenSpecAutoDeliverSanitizedProjection['materializedLimits']> = materializeOpenSpecAutoDeliverPreset('standard');
+  let hasSanitizedValue = false;
   for (const field of ['specAuditRepairRounds', 'implementationAuditRepairRounds', 'maxImplementationPrompts', 'maxElapsedMinutes'] as const) {
     const sanitized = sanitizeNonNegativeInteger(value[field]);
-    if (sanitized !== undefined) limits[field] = sanitized;
+    if (sanitized !== undefined) {
+      limits[field] = sanitized;
+      hasSanitizedValue = true;
+    }
   }
-  return Object.keys(limits).length > 0 ? limits : undefined;
+  return hasSanitizedValue ? limits : undefined;
 }
 
 function hasForbiddenField(value: unknown): boolean {
