@@ -1457,7 +1457,8 @@ afterEach(() => {
     });
 
     const comboSelect = screen.getByRole('combobox') as HTMLSelectElement;
-    await waitFor(() => expect(within(comboSelect).getByRole('option', { name: 'audit>plan (Custom)' })).toBeDefined());
+    await waitFor(() => expect(within(comboSelect).getByRole('option', { name: 'mode_audit→mode_plan (Custom)' })).toBeDefined());
+    expect(within(comboSelect).queryByRole('option', { name: 'audit>plan (Custom)' })).toBeNull();
     fireEvent.change(comboSelect, { target: { value: 'audit>plan' } });
 
     expect(screen.getByTestId('openspec-auto-combo-warning').textContent).toBe('Custom Team combos are not supported for Auto Deliver yet');

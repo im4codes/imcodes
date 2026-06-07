@@ -144,7 +144,7 @@ export function OpenSpecAutoDeliverLauncher({
         key: combo.key,
         label: comboModeLabel(combo.key, t),
       })),
-      ...allCombos.custom.map((key) => ({ key, label: key, custom: true })),
+      ...allCombos.custom.map((key) => ({ key, label: comboModeLabel(key, t), custom: true })),
     ];
     const seen = new Set<string>();
     return options.filter((option) => {
