@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { TransportSessionRuntime, type PendingTransportMessage } from '../../src/agent/transport-session-runtime.js';
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
-import type { TransportProvider, ProviderError, SessionConfig } from '../../src/agent/transport-provider.js';
+import type { TransportProvider, ProviderError, SessionConfig, ProviderStatusUpdate, ProviderUsageUpdate } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
@@ -56,6 +56,8 @@ function makeMockProvider() {
   let completeCb: ((sid: string, m: AgentMessage) => void) | null = null;
   let errorCb: ((sid: string, e: ProviderError) => void) | null = null;
   let approvalCb: ((sid: string, req: { id: string; description: string; tool?: string }) => void) | null = null;
+  let statusCb: ((sid: string, status: ProviderStatusUpdate) => void) | null = null;
+  let usageCb: ((sid: string, update: ProviderUsageUpdate) => void) | null = null;
 
   const fireDelta = (sid: string) =>
     deltaCb?.(sid, { messageId: 'msg', type: 'text', delta: 'x', role: 'assistant' });
@@ -74,6 +76,10 @@ function makeMockProvider() {
     errorCb?.(sid, err ?? { code: 'PROVIDER_ERROR', message: 'err', recoverable: false });
   const fireApproval = (sid: string, req: { id: string; description: string; tool?: string }) =>
     approvalCb?.(sid, req);
+  const fireStatus = (sid: string, status: ProviderStatusUpdate) =>
+    statusCb?.(sid, status);
+  const fireUsage = (sid: string, update: ProviderUsageUpdate) =>
+    usageCb?.(sid, update);
 
   return {
     provider: {
@@ -85,9 +91,11 @@ function makeMockProvider() {
       onComplete: (cb: (sid: string, m: AgentMessage) => void) => { completeCb = cb; return () => { completeCb = null; }; },
       onError: (cb: (sid: string, e: ProviderError) => void) => { errorCb = cb; return () => { errorCb = null; }; },
       onApprovalRequest: (cb: (sid: string, req: { id: string; description: string; tool?: string }) => void) => { approvalCb = cb; },
+      onStatus: (cb: (sid: string, status: ProviderStatusUpdate) => void) => { statusCb = cb; return () => { statusCb = null; }; },
+      onUsage: (cb: (sid: string, update: ProviderUsageUpdate) => void) => { usageCb = cb; return () => { usageCb = null; }; },
       respondApproval: vi.fn().mockResolvedValue(undefined),
     } as unknown as TransportProvider,
-    fireDelta, fireComplete, fireError, fireApproval,
+    fireDelta, fireComplete, fireError, fireApproval, fireStatus, fireUsage,
   };
 }
 
@@ -223,6 +231,36 @@ describe('TransportSessionRuntime', () => {
       lastActivityAgeMs: 250,
     });
     expect(snapshot.pendingVersion).toBeGreaterThanOrEqual(1);
+  });
+
+  it('treats provider status, usage, and approval callbacks as turn liveness evidence', async () => {
+    const internal = runtime as unknown as {
+      _lastActivityAt: number;
+    };
+
+    internal._lastActivityAt = 1_000;
+    mock.fireStatus('sess-1', { status: 'thinking', label: 'Thinking...' });
+    expect(runtime.lastActivityAt).toBeGreaterThan(1_000);
+
+    internal._lastActivityAt = 1_000;
+    mock.fireUsage('sess-1', { usage: { input_tokens: 10 }, model: 'test-model' });
+    expect(runtime.lastActivityAt).toBeGreaterThan(1_000);
+
+    const approvals: Array<Record<string, unknown>> = [];
+    runtime.onApprovalRequest = (request) => approvals.push(request as unknown as Record<string, unknown>);
+    internal._lastActivityAt = 1_000;
+    mock.fireApproval('sess-1', { id: 'approval-1', description: 'Allow tool?', tool: 'shell' });
+    expect(runtime.lastActivityAt).toBeGreaterThan(1_000);
+    expect(approvals).toEqual([
+      { id: 'approval-1', description: 'Allow tool?', tool: 'shell' },
+    ]);
+
+    internal._lastActivityAt = 1_000;
+    mock.fireStatus('other-session', { status: 'thinking', label: 'Wrong session' });
+    mock.fireUsage('other-session', { usage: { input_tokens: 99 } });
+    mock.fireApproval('other-session', { id: 'approval-other', description: 'Wrong session' });
+    expect(runtime.lastActivityAt).toBe(1_000);
+    expect(approvals).toHaveLength(1);
   });
 
   it('bumps pendingVersion monotonically on every queue mutation (desync guard)', async () => {

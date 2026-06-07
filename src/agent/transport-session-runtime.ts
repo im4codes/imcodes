@@ -3,7 +3,7 @@ import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
-import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate } from './transport-provider.js';
+import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate } from './transport-provider.js';
 import { PROVIDER_ERROR_CODES } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
@@ -361,6 +361,14 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._lastActivityAt = Date.now();
         this._onSessionInfoChange?.(info);
       })] : []),
+      ...(this.provider.onStatus ? [this.provider.onStatus((sid: string, _status: ProviderStatusUpdate) => {
+        if (sid !== this._providerSessionId) return;
+        this._lastActivityAt = Date.now();
+      })] : []),
+      ...(this.provider.onUsage ? [this.provider.onUsage((sid: string, _update: ProviderUsageUpdate) => {
+        if (sid !== this._providerSessionId) return;
+        this._lastActivityAt = Date.now();
+      })] : []),
     );
     const unsubscribeToolCall = this.provider.onToolCall?.((sid: string) => {
       if (sid !== this._providerSessionId) return;
@@ -379,6 +387,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (this.provider.onApprovalRequest) {
       this.provider.onApprovalRequest((sid: string, req: ApprovalRequest) => {
         if (sid !== this._providerSessionId) return;
+        this._lastActivityAt = Date.now();
         this._onApprovalRequest?.(req);
       });
     }
