@@ -7,6 +7,7 @@ import {
   OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MIN,
   OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX,
   OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MIN,
+  type OpenSpecAutoDeliverMaterializedLimits,
   type OpenSpecAutoDeliverPresetId,
 } from '@shared/openspec-auto-deliver-constants.js';
 import type {
@@ -38,6 +39,8 @@ export type {
   OpenSpecAutoDeliverListRow,
 } from '@shared/openspec-auto-deliver-types.js';
 
+export type { OpenSpecAutoDeliverMaterializedLimits };
+
 export const OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET: OpenSpecAutoDeliverPresetId = OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET_ID;
 export const OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO = OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID;
 export const OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS = {
@@ -67,7 +70,7 @@ export function isOpenSpecAutoDeliverActiveProjection(projection: OpenSpecAutoDe
   return !!projection && !isOpenSpecAutoDeliverTerminalStatus(projection.status);
 }
 
-export function materializedPresetLimits(presetId: OpenSpecAutoDeliverPresetId) {
+export function materializedPresetLimits(presetId: OpenSpecAutoDeliverPresetId): OpenSpecAutoDeliverMaterializedLimits {
   const preset = OPENSPEC_AUTO_DELIVER_PRESETS.find((entry) => entry.id === presetId)
     ?? OPENSPEC_AUTO_DELIVER_PRESETS.find((entry) => entry.id === OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET)!;
   return {

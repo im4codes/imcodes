@@ -24,7 +24,7 @@ import {
 import { OpenSpecChangeRow } from './OpenSpecChangeRow.js';
 import { useOpenSpecAutoDeliver } from '../hooks/useOpenSpecAutoDeliver.js';
 import { isOpenSpecAutoDeliverActiveProjection } from '../openspec-auto-deliver.js';
-import type { OpenSpecAutoDeliverPresetId } from '../openspec-auto-deliver.js';
+import type { OpenSpecAutoDeliverMaterializedLimits, OpenSpecAutoDeliverPresetId } from '../openspec-auto-deliver.js';
 import { isFutureWorkflowSchema } from '@shared/p2p-workflow-validators.js';
 import {
   P2P_CAPABILITY_FRESHNESS_TTL_MS,
@@ -1561,7 +1561,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const launchOpenSpecAutoDeliver = useCallback((changeName: string, presetId: OpenSpecAutoDeliverPresetId, options?: {
     selectedTeamComboId: string;
-    materializedLimits: { specAuditRepairRounds: number; implementationAuditRepairRounds: number };
+    materializedLimits: OpenSpecAutoDeliverMaterializedLimits;
   }) => {
     const requestId = openSpecAutoDeliver.launch({ changeName, presetId, ...options });
     if (!requestId) return;
