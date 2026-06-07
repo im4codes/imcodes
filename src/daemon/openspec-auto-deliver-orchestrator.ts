@@ -695,6 +695,19 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
   const auditFocus = metadata.stage === 'spec_audit_repair'
     ? 'Audit and repair only the OpenSpec change artifacts under the referenced change folder. Do not edit product files.'
     : 'Audit and repair product/test/tasks.md implementation against the OpenSpec change. Do not commit, push, stage files, or edit unrelated OpenSpec changes/docs.';
+  const stageVerdictScope = metadata.stage === 'spec_audit_repair'
+    ? [
+        'Spec-stage verdict scope:',
+        '- Return PASS when proposal.md, design.md, specs/**/spec.md, and tasks.md are internally consistent, acceptance-ready, and implementation-ready.',
+        '- Do not return REWORK merely because product implementation or product tests remain unfinished; those belong to the implementation stage.',
+        '- If you add or preserve implementation/test follow-up tasks in tasks.md, treat that as successful spec repair once the artifacts are clear. In that case leave unchecked_tasks and required_changes empty and describe the task additions in repairs_applied/evidence.',
+        '- Return REWORK only when the OpenSpec artifacts themselves still need another spec-audit repair attempt.',
+      ].join('\n')
+    : [
+        'Implementation-stage verdict scope:',
+        '- Return PASS only when implementation, tests, and tasks.md completion satisfy the OpenSpec change.',
+        '- Return REWORK when product code, tests, or tasks.md still need another implementation audit-repair attempt.',
+      ].join('\n');
   const unchecked = uncheckedTaskLabels(run.taskStats);
   const payloadSkeleton = {
     auto_deliver: {
@@ -736,6 +749,7 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
     buildCanonicalOpenSpecAuditPrompt(run, metadata.stage),
     '',
     auditFocus,
+    stageVerdictScope,
     `This request is launched through the normal Team/P2P combo flow (${metadata.selectedTeamComboId}), not an Auto Deliver custom combo.`,
     `During the combo audit phase, apply the existing OpenSpec ${metadata.activeOpenSpecPromptId} criteria for this stage.`,
     '',
@@ -772,6 +786,18 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
 }
 
 function buildAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpecAutoDeliverP2pMetadata, p2pRun: P2pRun, reason: string): string {
+  const stageVerdictScope = metadata.stage === 'spec_audit_repair'
+    ? [
+        'Spec-stage verdict scope:',
+        '- PASS means the OpenSpec artifacts are implementation-ready, even if implementation/test tasks in tasks.md remain unchecked for the next stage.',
+        '- Do not put implementation-stage follow-up tasks in unchecked_tasks or required_changes for a spec-stage PASS; record them in repairs_applied/evidence instead.',
+        '- REWORK means the OpenSpec artifacts themselves still require another spec-audit repair attempt.',
+      ].join('\n')
+    : [
+        'Implementation-stage verdict scope:',
+        '- PASS means implementation, tests, and tasks.md completion satisfy the OpenSpec change.',
+        '- REWORK means product/test/task completion still needs another implementation audit-repair attempt.',
+      ].join('\n');
   return [
     `OpenSpec Auto Deliver needs the authoritative audit result file for openspec/changes/${run.changeName}.`,
     '',
@@ -801,6 +827,8 @@ function buildAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpe
     '',
     'Required top-level fields: auto_deliver, verdict, module_scores, unchecked_tasks, required_changes, repairs_applied, evidence.',
     'Required module score ids: spec, tasks, implementation, tests, risk.',
+    '',
+    stageVerdictScope,
   ].join('\n');
 }
 

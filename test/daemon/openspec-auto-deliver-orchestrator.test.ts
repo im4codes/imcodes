@@ -244,6 +244,23 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     }));
   });
 
+  it('scopes spec-audit verdicts to artifact readiness rather than unfinished implementation tasks', async () => {
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-spec-verdict-scope',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+    }, serverLinkMock as never);
+
+    const audit = [...p2pRuns.values()].at(-1)!;
+    expect(audit.userText).toContain('Spec-stage verdict scope:');
+    expect(audit.userText).toContain('Return PASS when proposal.md, design.md, specs/**/spec.md, and tasks.md are internally consistent');
+    expect(audit.userText).toContain('Do not return REWORK merely because product implementation or product tests remain unfinished');
+    expect(audit.userText).toContain('leave unchecked_tasks and required_changes empty');
+    expect(audit.userText).toContain('Return REWORK only when the OpenSpec artifacts themselves still need another spec-audit repair attempt');
+  });
+
   it('rejects launch before lock when no Team member configuration is saved', async () => {
     getSavedP2pConfigMock.mockResolvedValue(undefined);
 
@@ -628,6 +645,32 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
+  });
+
+  it('keeps result-file repair prompts stage-scoped for spec audit repair', async () => {
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-spec-missing-json-repair',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
+    const firstAudit = [...p2pRuns.values()].at(-1)!;
+    firstAudit.status = 'completed';
+    firstAudit.resultSummary = null;
+    firstAudit.strictAuthoritativeResult = null;
+
+    const repairPrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver needs the authoritative audit result file')
+      && text.includes('Spec-stage verdict scope:'),
+      2500,
+    );
+    expect(repairPrompt).toContain('PASS means the OpenSpec artifacts are implementation-ready');
+    expect(repairPrompt).toContain('implementation/test tasks in tasks.md remain unchecked for the next stage');
+    expect(repairPrompt).toContain('Do not put implementation-stage follow-up tasks in unchecked_tasks or required_changes');
+    expect(repairPrompt).toContain('REWORK means the OpenSpec artifacts themselves still require another spec-audit repair attempt');
   });
 
   it('starts another full audit-repair round only after result-file repair also fails', async () => {
