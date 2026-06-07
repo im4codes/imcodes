@@ -81,6 +81,7 @@ vi.mock('../src/api.js', () => {
     clearApiKey: vi.fn(),
     configure: vi.fn(),
     configureApiKey: vi.fn(),
+    discoverSharedEntries: vi.fn(async () => []),
     fetchMe: (...args: unknown[]) => fetchMeMock(...args),
     getApiKey: vi.fn(() => 'api-key-1'),
     listP2pRuns: (...args: unknown[]) => listP2pRunsMock(...args),
@@ -1265,6 +1266,7 @@ describe('App shell', () => {
     const { App } = await importApp();
     render(<App />);
 
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
     const ws = await getActiveWsClient();
     await act(async () => {
       ws.emit({
