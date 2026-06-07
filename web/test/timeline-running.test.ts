@@ -20,6 +20,33 @@ describe('isRunningTimelineEvent', () => {
     ] as any)).toBe(true);
   });
 
+  it('keeps an active turn visible through pending optimistic user messages', () => {
+    expect(hasActiveTimelineTurn([
+      { type: 'session.state', payload: { state: 'idle' } },
+      { type: 'assistant.text', payload: { text: 'still working', streaming: true } },
+      { type: 'user.message', payload: { text: 'queued first', pending: true, commandId: 'cmd-1' } },
+      { type: 'command.ack', payload: { ok: true, commandId: 'cmd-1' } },
+    ] as any)).toBe(true);
+  });
+
+  it('keeps a running transport turn visible through the confirmed user message echo', () => {
+    expect(hasActiveTimelineTurn([
+      { type: 'session.state', payload: { state: 'idle' } },
+      { type: 'session.state', payload: { state: 'running' } },
+      { type: 'user.message', payload: { text: 'sent first', pending: false, commandId: 'cmd-1' } },
+      { type: 'command.ack', payload: { ok: true, commandId: 'cmd-1' } },
+    ] as any)).toBe(true);
+  });
+
+  it('lets a confirmed user message end active-turn inference when no newer running signal exists', () => {
+    expect(hasActiveTimelineTurn([
+      { type: 'session.state', payload: { state: 'idle' } },
+      { type: 'assistant.text', payload: { text: 'old assistant text', streaming: false } },
+      { type: 'user.message', payload: { text: 'already confirmed', pending: false, commandId: 'cmd-1' } },
+      { type: 'command.ack', payload: { ok: true, commandId: 'cmd-1' } },
+    ] as any)).toBe(false);
+  });
+
   it('stops active turn detection at the latest idle state', () => {
     expect(hasActiveTimelineTurn([
       { type: 'assistant.text', payload: { text: 'done', streaming: false } },

@@ -648,6 +648,12 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ clientMessageId: 'cmd-queued', pending: true }),
       expect.anything(),
     );
+    const queuedUserMessages = emitMock.mock.calls.filter(([session, type, payload]) => (
+      session === 'deck_transport_brain'
+      && type === 'user.message'
+      && (payload as { commandId?: string; clientMessageId?: string } | undefined)?.commandId === 'cmd-queued'
+    ));
+    expect(queuedUserMessages).toHaveLength(0);
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-queued', status: 'accepted' });
   });
 

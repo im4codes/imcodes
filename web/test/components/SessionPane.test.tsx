@@ -277,6 +277,78 @@ describe('SessionPane', () => {
     expect(screen.getByRole('button', { name: 'send' }).getAttribute('data-active-transport-turn')).toBe('true');
   });
 
+  it('keeps active transport turn through a pending optimistic user message tail', () => {
+    timelineEventsMock = [
+      { eventId: 'idle', sessionId: 'deck_test_brain', ts: 1, type: 'session.state', payload: { state: 'idle' } },
+      { eventId: 'text', sessionId: 'deck_test_brain', ts: 2, type: 'assistant.text', payload: { text: 'still streaming', streaming: true } },
+      { eventId: 'pending-user', sessionId: 'deck_test_brain', ts: 3, type: 'user.message', payload: { text: 'queued first', pending: true, commandId: 'cmd-1' } },
+      { eventId: 'ack', sessionId: 'deck_test_brain', ts: 4, type: 'command.ack', payload: { ok: true, commandId: 'cmd-1' } },
+    ];
+
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'claude-code-sdk',
+          state: 'idle',
+          runtimeType: 'transport',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(sessionControlsSpy).toHaveBeenCalledWith(expect.objectContaining({
+      activeTransportTurn: true,
+    }));
+    expect(screen.getByRole('button', { name: 'send' }).getAttribute('data-active-transport-turn')).toBe('true');
+  });
+
+  it('keeps active transport turn through a confirmed user message after running state', () => {
+    timelineEventsMock = [
+      { eventId: 'idle', sessionId: 'deck_test_brain', ts: 1, type: 'session.state', payload: { state: 'idle' } },
+      { eventId: 'running', sessionId: 'deck_test_brain', ts: 2, type: 'session.state', payload: { state: 'running' } },
+      { eventId: 'user', sessionId: 'deck_test_brain', ts: 3, type: 'user.message', payload: { text: 'sent first', pending: false, commandId: 'cmd-1' } },
+      { eventId: 'ack', sessionId: 'deck_test_brain', ts: 4, type: 'command.ack', payload: { ok: true, commandId: 'cmd-1' } },
+    ];
+
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'claude-code-sdk',
+          state: 'idle',
+          runtimeType: 'transport',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(sessionControlsSpy).toHaveBeenCalledWith(expect.objectContaining({
+      activeTransportTurn: true,
+    }));
+    expect(screen.getByRole('button', { name: 'send' }).getAttribute('data-active-transport-turn')).toBe('true');
+  });
+
   it('forces copilot-sdk sessions into chat mode when runtimeType is omitted', () => {
     render(
       <SessionPane
