@@ -126,6 +126,15 @@
     "reload": "再読み込み",
     "retry": "再試行"
   },
+  "askQuestion": {
+    "waiting": "回答を待っています。モデルは {{seconds}} 秒後に自動で続行します。",
+    "retained": "モデルはすでに続行しました。あと {{seconds}} 秒はこの回答で割り込めます。",
+    "customPlaceholder": "カスタム / 補足（任意）",
+    "answerPlaceholder": "回答を入力",
+    "dismiss": "閉じる",
+    "answer": "回答",
+    "interrupt": "この回答で割り込む"
+  },
   "chat": {
     "dpad": {
       "title": "矢印キー — ドラッグで移動"
@@ -1249,6 +1258,14 @@
         "implementation_reported": "Implementation reported",
         "audit_reported": "Audit reported",
         "none": "None"
+      },
+      "ask": {
+        "header": "OpenSpec Auto Deliver",
+        "needs_human_question": "Auto Deliver には人の対応が必要です: {{reason}} このセッションで次にどうしますか？",
+        "review_continue": "失敗を確認して手動で続行",
+        "review_continue_desc": "停止した実行を調べ、問題を修正し、結果を報告するよう指示します。",
+        "stop_summarize": "ここで停止して現在の状態を要約",
+        "stop_summarize_desc": "進行中の作業を止め、短い引き継ぎを出すよう依頼します。"
       },
       "reason": {
         "auto_deliver_active": "このセッションでは Auto Deliver がすでに実行中です。",

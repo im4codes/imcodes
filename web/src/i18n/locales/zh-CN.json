@@ -126,6 +126,15 @@
     "reload": "重新加载",
     "retry": "重试"
   },
+  "askQuestion": {
+    "waiting": "正在等待你的回答，模型会在 {{seconds}} 秒后自行继续。",
+    "retained": "模型已经继续运行；你仍可在 {{seconds}} 秒内用这个回答打断它。",
+    "customPlaceholder": "自定义/补充（可选）",
+    "answerPlaceholder": "输入你的回答",
+    "dismiss": "关闭",
+    "answer": "回答",
+    "interrupt": "用此回答打断"
+  },
   "chat": {
     "dpad": {
       "title": "方向键 — 拖动发送方向键"
@@ -1250,6 +1259,14 @@
         "implementation_reported": "实现侧报告",
         "audit_reported": "审计侧报告",
         "none": "无"
+      },
+      "ask": {
+        "header": "OpenSpec 自动交付",
+        "needs_human_question": "自动交付需要人工处理：{{reason}} 这个会话接下来要怎么做？",
+        "review_continue": "查看失败原因并手动继续",
+        "review_continue_desc": "发送指令，让代理检查已停止的自动交付、修复问题并回报结果。",
+        "stop_summarize": "停在这里并总结当前状态",
+        "stop_summarize_desc": "让代理停止当前工作，并给出简短交接说明。"
       },
       "reason": {
         "auto_deliver_active": "此会话已经有 Auto Deliver 正在运行。",

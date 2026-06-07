@@ -65,6 +65,11 @@ import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 const execFileAsync = promisify(execFileCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget, type SharedP2pRunScope } from './p2p-orchestrator.js';
+import {
+  expandP2pTargets as expandP2pTargetsShared,
+  resolveP2pConfigScopeSession as resolveP2pConfigScopeSessionShared,
+  resolveStructuredP2pSessionConfig as resolveStructuredP2pSessionConfigShared,
+} from './p2p-target-selection.js';
 import { buildSessionList } from './session-list.js';
 import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
@@ -164,7 +169,7 @@ import {
   isTransportEffortLevel,
   type TransportEffortLevel,
 } from '../../shared/effort-levels.js';
-import { getSavedP2pConfig, upsertSavedP2pConfig } from '../store/p2p-config-store.js';
+import { upsertSavedP2pConfig } from '../store/p2p-config-store.js';
 import {
   deleteContextObservation,
   ensureContextNamespace,
@@ -920,61 +925,11 @@ export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promis
  * - Always skip: initiator itself, stopped sessions
  */
 function expandAllTargets(initiatorName: string, mode: string, excludeSameType = false, sessionConfig?: P2pSessionConfig): P2pTarget[] {
-  const initiator = getSession(initiatorName);
-  const all = listSessions();
-  const targets: P2pTarget[] = [];
-
-  const NON_DISCUSSABLE = new Set(['shell', 'script']);
-
-  for (const s of all) {
-    if (s.name === initiatorName) continue;
-    if (s.state === 'stopped') continue;
-    if (NON_DISCUSSABLE.has(s.agentType ?? '')) continue;
-    if (excludeSameType && initiator?.agentType && s.agentType === initiator.agentType) continue;
-
-    let inDomain = false;
-    if (initiatorName.startsWith('deck_sub_')) {
-      const isSibling = s.parentSession && s.parentSession === initiator?.parentSession;
-      const isParent = s.name === initiator?.parentSession;
-      inDomain = !!(isSibling || isParent);
-    } else {
-      const isChild = s.parentSession === initiatorName;
-      const isSameProject = !s.name.startsWith('deck_sub_') && initiator?.projectName && s.projectName === initiator.projectName;
-      inDomain = !!(isChild || isSameProject);
-    }
-
-    if (!inDomain) continue;
-
-    if (sessionConfig) {
-      // Strict allowlist semantics: a saved P2P config is an INCLUSION list.
-      // ONLY sessions with `enabled: true` and a non-`skip` mode are eligible.
-      // Missing entries are EXCLUDED.
-      //
-      // Earlier "missing = include" semantics caused every new sub-session
-      // (created after the user's last save) to silently join the run, so
-      // selecting 3 members produced "all members" once any new sub-session
-      // was spawned. The Gate 1 / Gate 2 / cap=5 checks at command-handler
-      // entry now reject the empty-config case explicitly with a clear error
-      // (`NO_SAVED_CONFIG` / `NO_ENABLED_PARTICIPANTS`), so the strict
-      // allowlist never silently fails — it always either runs the picked
-      // set or surfaces a visible error.
-      const entry = sessionConfig[s.name];
-      if (!entry || entry.enabled !== true || entry.mode === 'skip') continue;
-      const effectiveMode = (mode === P2P_CONFIG_MODE) ? entry.mode : mode;
-      targets.push({ session: s.name, mode: effectiveMode });
-    } else {
-      targets.push({ session: s.name, mode });
-    }
-  }
-  // Sort deterministically by session name for predictable ordering
-  targets.sort((a, b) => a.session.localeCompare(b.session));
-  return targets;
+  return expandP2pTargetsShared(initiatorName, mode, excludeSameType, sessionConfig);
 }
 
 function resolveP2pConfigScopeSession(sessionName: string): string {
-  if (!sessionName.startsWith('deck_sub_')) return sessionName;
-  const record = getSession(sessionName);
-  return record?.parentSession ?? sessionName;
+  return resolveP2pConfigScopeSessionShared(sessionName);
 }
 
 async function resolveStructuredP2pSessionConfig(
@@ -982,15 +937,7 @@ async function resolveStructuredP2pSessionConfig(
   serverLink: ServerLink,
   clientConfig?: P2pSessionConfig,
 ): Promise<P2pSessionConfig | undefined> {
-  const scopeSession = resolveP2pConfigScopeSession(sessionName);
-  const storeScope = getP2pConfigStoreScope(serverLink, scopeSession);
-  const saved = await getSavedP2pConfig(storeScope);
-  if (saved?.sessions && typeof saved.sessions === 'object') return saved.sessions;
-  if (storeScope !== scopeSession) {
-    const legacySaved = await getSavedP2pConfig(scopeSession);
-    if (legacySaved?.sessions && typeof legacySaved.sessions === 'object') return legacySaved.sessions;
-  }
-  return clientConfig;
+  return resolveStructuredP2pSessionConfigShared(sessionName, serverLink, clientConfig);
 }
 
 function sendP2pTargetError(

@@ -60,6 +60,7 @@ import {
   startP2pRun,
   type P2pRun,
 } from './p2p-orchestrator.js';
+import { resolveConfiguredP2pTargets } from './p2p-target-selection.js';
 
 type AutoDeliverRunStatus = Extract<OpenSpecAutoDeliverStage,
   'proposed' | 'spec_audit_repair' | 'implementation_task_loop' | 'implementation_audit_repair' | 'passed' | 'needs_human' | 'failed' | 'stopped'>;
@@ -78,7 +79,6 @@ export type OpenSpecAutoDeliverTransitionEvent =
   | 'implementation_audit_pass'
   | 'implementation_audit_rework'
   | 'implementation_audit_blocked'
-  | 'out_of_band_input'
   | 'stop'
   | 'restart_cleanup'
   | 'runtime_error';
@@ -107,7 +107,6 @@ const OPENSPEC_AUTO_DELIVER_TRANSITIONS: Record<OpenSpecAutoDeliverStage, Partia
     implementation_idle_incomplete: 'implementation_task_loop',
     implementation_idle_all_checked: 'implementation_audit_repair',
     implementation_audit_started: 'implementation_audit_repair',
-    out_of_band_input: 'needs_human',
     stop: 'stopped',
     restart_cleanup: 'failed',
     runtime_error: 'failed',
@@ -1055,6 +1054,14 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
   if (!compatibility.ok) {
     return terminalizeAndSend(run, 'failed', compatibility.reason ?? 'selected_combo_unavailable');
   }
+  const targetSelection = await resolveConfiguredP2pTargets({
+    initiatorSession: run.targetImplementationSessionName,
+    mode: run.selectedTeamComboId,
+    serverLink: run.serverLink,
+  });
+  if (!targetSelection.ok) {
+    return terminalizeAndSend(run, 'needs_human', targetSelection.error);
+  }
   const roundIndex = incrementAuditRound(run, stage);
   const attemptId = `${run.runId}:${stage}:${run.generation}:${roundIndex}`;
   const authoritativeResultPath = await buildAuthoritativeResultPath(run, stage, run.generation, roundIndex);
@@ -1117,7 +1124,7 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
   });
   const p2pRun = await startP2pRun({
     initiatorSession: run.targetImplementationSessionName,
-    targets: [],
+    targets: targetSelection.targets,
     userText: buildAuditRequestText(run, metadata),
     fileContents: [],
     serverLink: run.serverLink,
@@ -1212,20 +1219,7 @@ function ensureTimelineListener(): void {
       }
       return;
     }
-    if (event.type === 'user.message') {
-      const run = [...runsById.values()].find((candidate) =>
-        candidate.targetImplementationSessionName === event.sessionId
-        && candidate.status === 'implementation_task_loop'
-        && !!candidate.activeCommandId
-      );
-      const eventId = event.eventId;
-      if (run && (typeof eventId !== 'string' || !eventId.startsWith(`openspec-auto:${run.activeCommandId}`))) {
-        if (!transitionAllowed(run, 'out_of_band_input')) return;
-        const projection = terminalize(run, 'needs_human', 'out_of_band_target_session_input');
-        send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
-      }
-      return;
-    }
+    if (event.type === 'user.message') return;
     if (event.type !== 'session.state') return;
     if ((event.payload as Record<string, unknown>).state !== 'idle') return;
     const run = [...runsById.values()].find((candidate) =>
@@ -1289,6 +1283,12 @@ async function launch(request: OpenSpecAutoDeliverLaunchRequest, serverLink: Ser
     activeOpenSpecPromptIdForAutoDeliverStage(firstAuditStage),
   );
   if (!compatibility.ok) return { ok: false, error: compatibility.reason ?? 'selected_combo_unavailable' };
+  const targetSelection = await resolveConfiguredP2pTargets({
+    initiatorSession: sessionName,
+    mode: selectedTeamComboId,
+    serverLink,
+  });
+  if (!targetSelection.ok) return { ok: false, error: targetSelection.error };
 
   registerAutoDeliverP2pLock({
     runId: `launch:${owner}`,

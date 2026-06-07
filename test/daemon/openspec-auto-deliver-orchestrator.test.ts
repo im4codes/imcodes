@@ -19,8 +19,10 @@ interface MockP2pRun {
   strictAuthoritativeResult?: string | null;
 }
 
-const { getSessionMock, getTransportRuntimeMock, serverLinkMock, transportSendMock, p2pRuns, startP2pRunMock, getP2pRunMock, listP2pRunsMock, cancelP2pRunMock } = vi.hoisted(() => ({
+const { getSessionMock, listSessionsMock, getSavedP2pConfigMock, getTransportRuntimeMock, serverLinkMock, transportSendMock, p2pRuns, startP2pRunMock, getP2pRunMock, listP2pRunsMock, cancelP2pRunMock } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
+  listSessionsMock: vi.fn(),
+  getSavedP2pConfigMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
   serverLinkMock: { send: vi.fn() },
   transportSendMock: vi.fn(() => 'sent'),
@@ -37,6 +39,11 @@ const { getSessionMock, getTransportRuntimeMock, serverLinkMock, transportSendMo
 
 vi.mock('../../src/store/session-store.js', () => ({
   getSession: getSessionMock,
+  listSessions: listSessionsMock,
+}));
+
+vi.mock('../../src/store/p2p-config-store.js', () => ({
+  getSavedP2pConfig: getSavedP2pConfigMock,
 }));
 
 vi.mock('../../src/agent/session-manager.js', () => ({
@@ -174,6 +181,19 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       state: 'idle',
       parentSession: name.startsWith('deck_sub_') ? 'deck_demo_brain' : undefined,
     }));
+    listSessionsMock.mockImplementation(() => [
+      getSessionMock('deck_demo_brain'),
+      getSessionMock('deck_sub_worker'),
+      getSessionMock('deck_sub_peer'),
+    ]);
+    getSavedP2pConfigMock.mockResolvedValue({
+      sessions: {
+        deck_demo_brain: { enabled: true, mode: 'audit' },
+        deck_sub_worker: { enabled: true, mode: 'review' },
+        deck_sub_peer: { enabled: true, mode: 'plan' },
+      },
+      rounds: 1,
+    });
   });
 
   afterEach(async () => {
@@ -204,10 +224,34 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
     expect(startP2pRunMock).toHaveBeenCalledWith(expect.objectContaining({
       initiatorSession: 'deck_sub_worker',
+      targets: [
+        { session: 'deck_demo_brain', mode: 'audit>review>plan' },
+        { session: 'deck_sub_peer', mode: 'audit>review>plan' },
+      ],
     }));
     expect(startP2pRunMock).not.toHaveBeenCalledWith(expect.objectContaining({
       initiatorSession: 'deck_demo_brain',
     }));
+  });
+
+  it('rejects launch before lock when no Team member configuration is saved', async () => {
+    getSavedP2pConfigMock.mockResolvedValue(undefined);
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-no-team-config',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+    }, serverLinkMock as never);
+
+    const error = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ERROR
+      && msg.error === 'no_saved_config',
+    );
+    expect(error.error).toBe('no_saved_config');
+    expect(startP2pRunMock).not.toHaveBeenCalled();
+    expect(getAutoDeliverP2pLock('deck_demo_brain')).toBeUndefined();
   });
 
   it('keeps the fixed state transition table fail-closed for unlisted transitions', () => {
@@ -218,7 +262,6 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(getOpenSpecAutoDeliverTransitionTarget('spec_audit_repair', 'spec_audit_blocked')).toBe('needs_human');
     expect(getOpenSpecAutoDeliverTransitionTarget('implementation_task_loop', 'implementation_idle_incomplete')).toBe('implementation_task_loop');
     expect(getOpenSpecAutoDeliverTransitionTarget('implementation_task_loop', 'implementation_idle_all_checked')).toBe('implementation_audit_repair');
-    expect(getOpenSpecAutoDeliverTransitionTarget('implementation_task_loop', 'out_of_band_input')).toBe('needs_human');
     expect(getOpenSpecAutoDeliverTransitionTarget('implementation_audit_repair', 'implementation_audit_pass')).toBe('passed');
     expect(getOpenSpecAutoDeliverTransitionTarget('implementation_audit_repair', 'implementation_audit_rework')).toBe('implementation_audit_repair');
     expect(getOpenSpecAutoDeliverTransitionTarget('implementation_audit_repair', 'implementation_audit_blocked')).toBe('needs_human');
@@ -294,12 +337,17 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       rounds?: number;
       advanced?: unknown;
       fileContents?: Array<{ path: string; content: string }>;
+      targets?: Array<{ session: string; mode: string }>;
       userText?: string;
     };
     expect(implementationLaunch.modeOverride).toBe('audit>review>plan');
     expect(implementationLaunch.rounds).toBe(1);
     expect(implementationLaunch.advanced).toBeUndefined();
     expect(implementationLaunch.fileContents).toEqual([]);
+    expect(implementationLaunch.targets).toEqual([
+      { session: 'deck_sub_peer', mode: 'audit>review>plan' },
+      { session: 'deck_sub_worker', mode: 'audit>review>plan' },
+    ]);
     expect(implementationLaunch.userText).toContain('Change reference: @openspec/changes/demo-change');
     expect(implementationLaunch.userText).toContain('This discussion intentionally references only the change folder instead of embedding artifact contents.');
     expect(implementationLaunch.userText).not.toContain('Resolved change root: ');
@@ -353,6 +401,10 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(startP2pRunMock).toHaveBeenCalledWith(expect.objectContaining({
       modeOverride: 'audit>review>plan',
       rounds: 1,
+      targets: [
+        { session: 'deck_sub_peer', mode: 'audit>review>plan' },
+        { session: 'deck_sub_worker', mode: 'audit>review>plan' },
+      ],
       launchOrigin: expect.objectContaining({
         kind: 'openspec_auto_deliver',
         autoDeliver: expect.objectContaining({
@@ -367,12 +419,17 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       rounds?: number;
       advanced?: unknown;
       fileContents?: Array<{ path: string; content: string }>;
+      targets?: Array<{ session: string; mode: string }>;
       userText?: string;
     };
     expect(specLaunch.modeOverride).toBe('audit>review>plan');
     expect(specLaunch.rounds).toBe(1);
     expect(specLaunch.advanced).toBeUndefined();
     expect(specLaunch.fileContents).toEqual([]);
+    expect(specLaunch.targets).toEqual([
+      { session: 'deck_sub_peer', mode: 'audit>review>plan' },
+      { session: 'deck_sub_worker', mode: 'audit>review>plan' },
+    ]);
     expect(specLaunch.userText).toContain('Change reference: @openspec/changes/demo-change');
     expect(specLaunch.userText).toContain('This discussion intentionally references only the change folder instead of embedding artifact contents.');
     expect(specLaunch.userText).not.toContain('Resolved change root: ');
@@ -1041,48 +1098,37 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(ack?.projection.status).toBe('proposed');
   });
 
-  it('stops as needs_human for out-of-band target-session input during implementation', async () => {
-    const timelineEvents: Array<{ sessionId: string; type: string; payload: Record<string, unknown> }> = [];
-    const unsubscribe = timelineEmitter.on((event) => {
-      timelineEvents.push({
-        sessionId: event.sessionId,
-        type: event.type,
-        payload: event.payload,
-      });
-    });
+  it('allows supplemental user input in the target implementation session during implementation', async () => {
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
-      requestId: 'req-oob',
+      requestId: 'req-supplemental-input',
       sessionName: 'deck_demo_brain',
       changeName: 'demo-change',
       presetId: 'fast',
     }, serverLinkMock as never);
 
-    timelineEmitter.emit('deck_demo_brain', 'user.message', { text: 'manual prompt' }, { source: 'daemon', confidence: 'high', eventId: 'manual' });
+    serverLinkMock.send.mockClear();
+    timelineEmitter.emit('deck_demo_brain', 'user.message', { text: 'manual prompt', commandId: 'manual-command-1' }, { source: 'daemon', confidence: 'high', eventId: 'manual' });
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL);
-    expect(terminal?.projection.status).toBe('needs_human');
-    expect(terminal?.projection.terminalReason).toBe('out_of_band_target_session_input');
-    unsubscribe();
+    expect(serverLinkMock.send.mock.calls.some((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toBe(false);
+  });
 
-    const manualMessage = timelineEvents.find((event) =>
-      event.sessionId === 'deck_demo_brain'
-      && event.type === 'assistant.text'
-      && String(event.payload.text ?? '').includes('OpenSpec Auto Deliver needs human input')
-    );
-    expect(manualMessage?.payload.text).toContain('Reason: out_of_band_target_session_input');
+  it('does not treat daemon-internal target-session messages without commandId as out-of-band user input', async () => {
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-oob-internal',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
 
-    const askQuestion = timelineEvents.find((event) =>
-      event.sessionId === 'deck_demo_brain'
-      && event.type === 'ask.question'
-      && String(event.payload.toolUseId ?? '').includes('needs-human')
-    );
-    expect(askQuestion?.payload.message).toContain('Reply in this session with the next instruction');
-    expect(askQuestion?.payload.questions).toEqual([expect.objectContaining({
-      header: 'OpenSpec Auto Deliver',
-      options: expect.arrayContaining([
-        expect.objectContaining({ label: 'Review the failure and continue manually' }),
-      ]),
-    })]);
+    serverLinkMock.send.mockClear();
+    timelineEmitter.emit('deck_demo_brain', 'user.message', { text: 'internal p2p-style prompt' }, {
+      source: 'daemon',
+      confidence: 'high',
+      eventId: 'p2p-internal-message',
+    });
+
+    expect(serverLinkMock.send.mock.calls.some((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toBe(false);
   });
 });

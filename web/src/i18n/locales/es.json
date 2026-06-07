@@ -126,6 +126,15 @@
     "reload": "Recargar",
     "retry": "Reintentar"
   },
+  "askQuestion": {
+    "waiting": "Esperando tu respuesta. El modelo continuará por sí solo en {{seconds}}s.",
+    "retained": "El modelo ya continuó. Aún puedes interrumpirlo durante {{seconds}}s.",
+    "customPlaceholder": "Personalizado / extra (opcional)",
+    "answerPlaceholder": "Tu respuesta",
+    "dismiss": "Cerrar",
+    "answer": "Responder",
+    "interrupt": "Interrumpir con esto"
+  },
   "chat": {
     "dpad": {
       "title": "Teclas de flecha: arrastra para mover"
@@ -1249,6 +1258,14 @@
         "implementation_reported": "Implementation reported",
         "audit_reported": "Audit reported",
         "none": "None"
+      },
+      "ask": {
+        "header": "Auto Deliver de OpenSpec",
+        "needs_human_question": "Auto Deliver necesita intervención humana: {{reason}} ¿Qué debe pasar ahora en esta sesión?",
+        "review_continue": "Revisar el fallo y continuar manualmente",
+        "review_continue_desc": "Envía una instrucción para inspeccionar la ejecución detenida, corregir el problema e informar el resultado.",
+        "stop_summarize": "Detener aquí y resumir el estado actual",
+        "stop_summarize_desc": "Pide al agente que detenga el trabajo activo y entregue un resumen breve."
       },
       "reason": {
         "auto_deliver_active": "Auto Deliver ya se está ejecutando para esta sesión.",

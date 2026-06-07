@@ -126,6 +126,15 @@
     "reload": "Перезагрузить",
     "retry": "Повторить"
   },
+  "askQuestion": {
+    "waiting": "Ожидается ваш ответ. Модель продолжит сама через {{seconds}} с.",
+    "retained": "Модель уже продолжила работу. Вы еще можете прервать ее в течение {{seconds}} с.",
+    "customPlaceholder": "Дополнение / свой ответ (необязательно)",
+    "answerPlaceholder": "Ваш ответ",
+    "dismiss": "Закрыть",
+    "answer": "Ответить",
+    "interrupt": "Прервать этим ответом"
+  },
   "chat": {
     "dpad": {
       "title": "Клавиши-стрелки — тяните, чтобы двигать"
@@ -1249,6 +1258,14 @@
         "implementation_reported": "Implementation reported",
         "audit_reported": "Audit reported",
         "none": "None"
+      },
+      "ask": {
+        "header": "OpenSpec Auto Deliver",
+        "needs_human_question": "Auto Deliver требует участия человека: {{reason}} Что сделать дальше в этой сессии?",
+        "review_continue": "Разобрать сбой и продолжить вручную",
+        "review_continue_desc": "Отправить инструкцию: проверить остановленный запуск, исправить проблему и отчитаться.",
+        "stop_summarize": "Остановиться здесь и кратко описать состояние",
+        "stop_summarize_desc": "Попросить агента остановить активную работу и дать краткий handoff."
       },
       "reason": {
         "auto_deliver_active": "Auto Deliver уже выполняется для этой сессии.",

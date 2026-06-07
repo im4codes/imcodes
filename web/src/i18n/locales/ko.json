@@ -126,6 +126,15 @@
     "reload": "다시 로드",
     "retry": "다시 시도"
   },
+  "askQuestion": {
+    "waiting": "답변을 기다리는 중입니다. 모델은 {{seconds}}초 후 자동으로 계속합니다.",
+    "retained": "모델은 이미 계속 진행했습니다. {{seconds}}초 동안 이 답변으로 중단시킬 수 있습니다.",
+    "customPlaceholder": "사용자 지정 / 추가 입력(선택 사항)",
+    "answerPlaceholder": "답변 입력",
+    "dismiss": "닫기",
+    "answer": "답변",
+    "interrupt": "이 답변으로 중단"
+  },
   "chat": {
     "dpad": {
       "title": "방향키 — 드래그하여 이동"
@@ -1249,6 +1258,14 @@
         "implementation_reported": "Implementation reported",
         "audit_reported": "Audit reported",
         "none": "None"
+      },
+      "ask": {
+        "header": "OpenSpec Auto Deliver",
+        "needs_human_question": "Auto Deliver에 사람의 처리가 필요합니다: {{reason}} 이 세션에서 다음에 무엇을 할까요?",
+        "review_continue": "실패를 검토하고 수동으로 계속",
+        "review_continue_desc": "중단된 실행을 점검하고 문제를 수정한 뒤 결과를 보고하도록 지시합니다.",
+        "stop_summarize": "여기서 멈추고 현재 상태 요약",
+        "stop_summarize_desc": "에이전트에게 진행 중인 작업을 멈추고 간단한 인계 요약을 제공하도록 요청합니다."
       },
       "reason": {
         "auto_deliver_active": "이 세션에서 Auto Deliver가 이미 실행 중입니다.",

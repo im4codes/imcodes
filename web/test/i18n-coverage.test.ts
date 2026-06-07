@@ -94,6 +94,12 @@ const OPENSPEC_AUTO_DELIVER_KEYS = [
   'openspec.auto.provenance.implementation_reported',
   'openspec.auto.provenance.audit_reported',
   'openspec.auto.provenance.none',
+  'openspec.auto.ask.header',
+  'openspec.auto.ask.needs_human_question',
+  'openspec.auto.ask.review_continue',
+  'openspec.auto.ask.review_continue_desc',
+  'openspec.auto.ask.stop_summarize',
+  'openspec.auto.ask.stop_summarize_desc',
   'openspec.auto.reason.missing_authoritative_json',
   'openspec.auto.reason.auto_deliver_active',
   'openspec.auto.reason.invalid_authoritative_json',
@@ -114,6 +120,15 @@ const OPENSPEC_AUTO_DELIVER_KEYS = [
   'openspec.auto.reason.audit_pass_with_changed_files_without_repairs',
   'openspec.auto.reason.audit_pass_with_uncovered_changes',
   'openspec.auto.reason.final_audit_passed',
+] as const;
+const ASK_QUESTION_KEYS = [
+  'askQuestion.waiting',
+  'askQuestion.retained',
+  'askQuestion.customPlaceholder',
+  'askQuestion.answerPlaceholder',
+  'askQuestion.dismiss',
+  'askQuestion.answer',
+  'askQuestion.interrupt',
 ] as const;
 const CLONE_UI_KEYS = [
   'menu',
@@ -277,6 +292,17 @@ describe('generic i18n coverage guard', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
       for (const key of OPENSPEC_AUTO_DELIVER_KEYS) {
+        const value = readPath(messages, key);
+        expect(value, `${locale}:${key}`).toEqual(expect.any(String));
+        expect((value as string | undefined)?.trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('keeps AskQuestion translation keys present in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      for (const key of ASK_QUESTION_KEYS) {
         const value = readPath(messages, key);
         expect(value, `${locale}:${key}`).toEqual(expect.any(String));
         expect((value as string | undefined)?.trim().length, `${locale}:${key}`).toBeGreaterThan(0);
