@@ -40,7 +40,7 @@ import {
   subSessionName,
   type SubSessionRecord,
 } from './subsession-manager.js';
-import { sendSubSessionSync } from './subsession-sync.js';
+import { sendSubSessionSync, type SubSessionSyncOptions } from './subsession-sync.js';
 import logger from '../util/logger.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
@@ -621,7 +621,7 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
   invalidateTransportListModelsCache('subsession_transport_config_update');
   const id = sessionName.replace(/^deck_sub_/, '');
   try {
-    await sendSubSessionSync(serverLink, id, { transportConfig: nextTransportConfig });
+    await sendSubSessionSync(serverLink, id, { transportConfig: nextTransportConfig }, getSubSessionSyncOptions(sessionName));
   } catch {
     // not connected
   }
@@ -748,7 +748,19 @@ function getDefaultThinkingLevel(agentType: string | undefined): TransportEffort
 async function syncSubSessionIfNeeded(sessionName: string, serverLink: ServerLink): Promise<void> {
   if (!sessionName.startsWith('deck_sub_')) return;
   const subId = sessionName.slice('deck_sub_'.length);
-  try { await sendSubSessionSync(serverLink, subId); } catch { /* ignore */ }
+  try { await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(sessionName)); } catch { /* ignore */ }
+}
+
+function getSubSessionSyncOptions(sessionName: string): SubSessionSyncOptions | undefined {
+  const runtime = getTransportRuntime(sessionName);
+  if (!runtime) return undefined;
+  return {
+    transportQueue: {
+      pendingMessages: runtime.pendingMessages,
+      pendingEntries: runtime.pendingEntries,
+      pendingVersion: runtime.pendingVersion,
+    },
+  };
 }
 
 /**
@@ -883,7 +895,7 @@ function refreshQwenQuotaUsageLabels(serverLink?: ServerLink): void {
     // Re-sync sub-sessions so their quota usage labels update in the browser
     if (session.name.startsWith('deck_sub_')) {
       const subId = session.name.replace(/^deck_sub_/, '');
-      if (serverLink) void sendSubSessionSync(serverLink, subId).catch(() => { /* not connected */ });
+      if (serverLink) void sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name)).catch(() => { /* not connected */ });
     }
   }
   if (serverLink) void handleGetSessions(serverLink);
@@ -905,7 +917,7 @@ export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promis
     if (!session.name.startsWith('deck_sub_')) continue;
     const subId = session.name.replace(/^deck_sub_/, '');
     try {
-      await sendSubSessionSync(serverLink, subId);
+      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
     } catch {
       // not connected
     }
@@ -1355,7 +1367,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
           upsertSession({ ...record, label: nextLabel, updatedAt: Date.now() });
           logger.info({ sessionName: sName, label }, 'subsession.rename: label updated');
           const id = sName.replace(/^deck_sub_/, '');
-          void sendSubSessionSync(serverLink, id, { label: nextLabel }).catch(() => {
+          void sendSubSessionSync(serverLink, id, { label: nextLabel }, getSubSessionSyncOptions(sName)).catch(() => {
             // not connected
           });
         }
@@ -4903,7 +4915,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       });
       // Sync to server DB
       try {
-        await sendSubSessionSync(serverLink, id);
+        await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sessionName));
       } catch { /* not connected */ }
     } catch (e: unknown) {
       logger.error({ err: e, id, type }, 'subsession.start failed (transport)');
@@ -4967,7 +4979,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     });
     // Sync to server DB so frontend can see the sub-session
     try {
-      await sendSubSessionSync(serverLink, id);
+      await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sessionName));
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, id }, 'subsession.start failed');
@@ -5014,7 +5026,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
           transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
         });
         try {
-          await sendSubSessionSync(serverLink, id);
+          await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sName));
         } catch { /* not connected */ }
       } catch (e: unknown) {
         logger.error({ err: e, sessionName: sName }, 'subsession.restart failed');
@@ -5032,7 +5044,7 @@ async function handleSubSessionRebuildAll(cmd: Record<string, unknown>, serverLi
   await rebuildSubSessions(subSessions).catch((e: unknown) => logger.error({ err: e }, 'subsession.rebuild_all failed'));
   for (const sub of subSessions) {
     try {
-      await sendSubSessionSync(serverLink, sub.id);
+      await sendSubSessionSync(serverLink, sub.id, undefined, getSubSessionSyncOptions(`deck_sub_${sub.id}`));
     } catch (e) {
       logger.warn({ err: e, id: sub.id }, 'Failed to sync rebuilt sub-session');
     }
@@ -5070,7 +5082,7 @@ async function handleSubSessionSetModel(cmd: Record<string, unknown>, serverLink
     await startSubSession({ id, type: 'codex', cwd: cwd ?? null, codexModel: model });
     // Sync restarted sub-session to server DB
     try {
-      await sendSubSessionSync(serverLink, id);
+      await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sessionName));
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, sessionName, model }, 'subsession.set_model restart failed');
