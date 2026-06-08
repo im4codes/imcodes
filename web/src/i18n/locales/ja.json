@@ -1228,7 +1228,8 @@
         "launch_timeout": "自動デリバリーの起動がタイムアウトしました。もう一度試してください。",
         "stop_timeout": "自動デリバリーの停止がタイムアウトしました。もう一度試してください。",
         "custom_combo_unsupported": "自動デリバリーはまだカスタム Team コンボに対応していません。",
-        "strict_result_failed": "The audit did not return a valid strict result."
+        "strict_result_failed": "The audit did not return a valid strict result.",
+        "continue_timeout": "Auto Deliver の続行がタイムアウトしました。もう一度試してください。"
       },
       "preset": {
         "fast": "高速",
@@ -1317,7 +1318,11 @@
         "auto_commit_push_not_pushed": "{{count}} 件の commit がまだ upstream より先行しているため、人の確認が必要です。",
         "auto_commit_push_no_commit": "新しい commit が作成されなかったため、人の確認が必要です。",
         "auto_commit_push_forbidden_paths": "ローカル計画ファイルが commit されたため、人の確認が必要です: {{files}}",
-        "auto_commit_push_unexpected_files": "commit に今回の Auto Deliver 変更外のファイルが含まれているため、人の確認が必要です: {{files}}"
+        "auto_commit_push_unexpected_files": "commit に今回の Auto Deliver 変更外のファイルが含まれているため、人の確認が必要です: {{files}}",
+        "spec_audit_blocked": "Spec 監査がブロックされています。結果を確認して修正後に続行してください。",
+        "implementation_audit_blocked": "実装監査がブロックされています。結果を確認して修正後に続行してください。",
+        "spec_audit_rework_requires_repair": "Spec 監査で修正が必要と報告されました。Auto Deliver は監査修復ラウンドを追加します。",
+        "implementation_audit_rework_requires_repair": "実装監査で修正が必要と報告されました。Auto Deliver は監査修復ラウンドを追加します。"
       },
       "lifecycle": {
         "spec_audit_repair_started": "仕様監査修復を開始しました。",
@@ -1331,13 +1336,16 @@
         "authoritative_result_file_repair_prompt_dispatched": "結果ファイル修復プロンプトを送信しました。",
         "spec_audit_passed": "仕様監査に合格しました。",
         "spec_audit_rework_scored": "仕様監査が完了し、追加作業のスコアが記録されました。",
-        "spec_audit_blocked_scored": "仕様監査が完了し、ブロック判定のスコアが記録されました。"
+        "spec_audit_blocked_scored": "仕様監査が完了し、ブロック判定のスコアが記録されました。",
+        "continue_requested": "続行が要求されました。"
       },
       "spec_rounds": "仕様監査ラウンド",
       "impl_rounds": "実装監査ラウンド",
       "team_combo": "Team コンボ",
       "auto_commit_push": "監査通過後に自動で commit & push",
-      "auto_commit_push_help": "ユーザー設定として保存されます。監査通過後、agent に commit&push を実行させます。"
+      "auto_commit_push_help": "ユーザー設定として保存されます。監査通過後、agent に commit&push を実行させます。",
+      "continue": "続行",
+      "continuing": "続行中..."
     },
     "propose_from_discussion_action": "直近の議論から生成",
     "propose_from_description_action": "下の説明から生成",

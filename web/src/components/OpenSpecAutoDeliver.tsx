@@ -46,8 +46,10 @@ export interface OpenSpecAutoDeliverRunBarProps {
 export interface OpenSpecAutoDeliverDetailsPanelProps {
   projection: OpenSpecAutoDeliverProjection | null;
   stopPending?: boolean;
+  continuePending?: boolean;
   onClose: () => void;
   onStop: () => void;
+  onContinue: () => void;
 }
 
 type TranslationFn = (key: string, opts?: Record<string, unknown>) => string;
@@ -688,13 +690,16 @@ function DetailRow({ label, value }: { label: string; value?: string | number | 
 export function OpenSpecAutoDeliverDetailsPanel({
   projection,
   stopPending = false,
+  continuePending = false,
   onClose,
   onStop,
+  onContinue,
 }: OpenSpecAutoDeliverDetailsPanelProps) {
   const { t } = useTranslation();
   const status = projection ? projectionStatus(projection) : 'unknown';
   const stage = projection ? projectionStage(projection) : 'unknown';
   const active = projection ? !isOpenSpecAutoDeliverTerminalStatus(status) : false;
+  const canContinue = projection?.visibility === 'full' && projection.canContinue === true && !active;
   const now = useNowTicker(active);
   const elapsed = projection ? formatElapsed(projectionElapsedMs(projection, now)) : '00:00';
   const scoreItems = useMemo(() => projection?.moduleScores ?? [], [projection?.moduleScores]);
@@ -810,6 +815,11 @@ export function OpenSpecAutoDeliverDetailsPanel({
           </div>
         )}
         <div class="openspec-auto-details-actions">
+          {canContinue && (
+            <button class="btn btn-secondary" type="button" disabled={continuePending} onClick={onContinue}>
+              {continuePending ? t('openspec.auto.continuing') : t('openspec.auto.continue')}
+            </button>
+          )}
           {active && projection.canStop !== false && (
             <button class="btn btn-secondary" type="button" disabled={stopPending} onClick={onStop}>
               {stopPending ? t('openspec.auto.stopping') : t('openspec.auto.stop')}

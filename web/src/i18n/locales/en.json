@@ -1229,7 +1229,8 @@
         "launch_timeout": "Auto Deliver launch timed out. Try again.",
         "stop_timeout": "Auto Deliver stop timed out. Try again.",
         "custom_combo_unsupported": "Custom Team combos are not supported for Auto Deliver yet.",
-        "strict_result_failed": "The audit did not return a valid strict result."
+        "strict_result_failed": "The audit did not return a valid strict result.",
+        "continue_timeout": "Auto Deliver continue timed out. Try again."
       },
       "preset": {
         "fast": "Fast",
@@ -1318,7 +1319,11 @@
         "auto_commit_push_not_pushed": "Auto commit/push needs human review because {{count}} commit(s) are still ahead of upstream.",
         "auto_commit_push_no_commit": "Auto commit/push needs human review because no new commit was created.",
         "auto_commit_push_forbidden_paths": "Auto commit/push needs human review because local planning files were committed: {{files}}",
-        "auto_commit_push_unexpected_files": "Auto commit/push needs human review because the commit included files outside the current Auto Deliver change: {{files}}"
+        "auto_commit_push_unexpected_files": "Auto commit/push needs human review because the commit included files outside the current Auto Deliver change: {{files}}",
+        "spec_audit_blocked": "Spec audit is blocked. Review the result, fix the issue, then continue.",
+        "implementation_audit_blocked": "Implementation audit is blocked. Review the result, fix the issue, then continue.",
+        "spec_audit_rework_requires_repair": "Spec audit reported required repairs. Auto Deliver will add another audit-repair round.",
+        "implementation_audit_rework_requires_repair": "Implementation audit reported required repairs. Auto Deliver will add another audit-repair round."
       },
       "lifecycle": {
         "spec_audit_repair_started": "Spec audit-repair started.",
@@ -1332,13 +1337,16 @@
         "authoritative_result_file_repair_prompt_dispatched": "Result-file repair prompt sent.",
         "spec_audit_passed": "Spec audit passed.",
         "spec_audit_rework_scored": "Spec audit completed with follow-up work scored.",
-        "spec_audit_blocked_scored": "Spec audit completed with a blocked verdict scored."
+        "spec_audit_blocked_scored": "Spec audit completed with a blocked verdict scored.",
+        "continue_requested": "Continue requested."
       },
       "spec_rounds": "Spec audit rounds",
       "impl_rounds": "Implementation audit rounds",
       "team_combo": "Team combo",
       "auto_commit_push": "Commit and push automatically after audit passes",
-      "auto_commit_push_help": "Saved as your preference. After the audit passes, the agent receives commit&push."
+      "auto_commit_push_help": "Saved as your preference. After the audit passes, the agent receives commit&push.",
+      "continue": "Continue",
+      "continuing": "Continuing..."
     },
     "propose_from_discussion_action": "From Recent Discussion",
     "propose_from_description_action": "From Description Below",

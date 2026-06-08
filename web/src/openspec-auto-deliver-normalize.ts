@@ -306,6 +306,7 @@ export function normalizeOpenSpecAutoDeliverProjection(raw: unknown): OpenSpecAu
     'owningMainSessionName',
     'launchedFromSessionName',
     'targetImplementationSessionName',
+    'resumeStage',
     'activeP2pRunId',
     'selectedTeamComboId',
     'latestRepairSummary',
@@ -330,7 +331,7 @@ export function normalizeOpenSpecAutoDeliverProjection(raw: unknown): OpenSpecAu
     const value = optionalNumber(raw, key);
     if (value !== undefined) projection[key] = value;
   }
-  for (const key of ['canStop', 'canDismiss', 'terminal']) {
+  for (const key of ['canStop', 'canContinue', 'canDismiss', 'terminal']) {
     const value = booleanValue(raw[key]);
     if (value !== undefined) projection[key] = value;
   }

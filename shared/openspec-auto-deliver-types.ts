@@ -30,6 +30,13 @@ export interface OpenSpecAutoDeliverStopRequest {
   runId: string;
 }
 
+export interface OpenSpecAutoDeliverContinueRequest {
+  requestId: string;
+  serverId?: string;
+  sessionName: string;
+  runId: string;
+}
+
 export interface OpenSpecAutoDeliverStatusRequest {
   requestId: string;
   serverId?: string;
@@ -117,6 +124,7 @@ export interface OpenSpecAutoDeliverProjection {
   materializedLimits: OpenSpecAutoDeliverMaterializedLimits;
   status: OpenSpecAutoDeliverStage;
   stage: OpenSpecAutoDeliverStage;
+  resumeStage?: OpenSpecAutoDeliverStage;
   owningMainSessionName: string;
   launchedFromSessionName: string;
   targetImplementationSessionName: string;
@@ -132,6 +140,7 @@ export interface OpenSpecAutoDeliverProjection {
   selectedTeamComboId?: string;
   activeOpenSpecPromptId?: OpenSpecAutoDeliverStagePromptId;
   canStop?: boolean;
+  canContinue?: boolean;
   latestVerdict?: OpenSpecAutoDeliverVerdict;
   moduleScores?: OpenSpecAutoDeliverModuleScore[];
   auditResults?: OpenSpecAutoDeliverAuditResult[];
@@ -187,6 +196,7 @@ export interface OpenSpecAutoDeliverBrowserFullProjection {
   presetId?: OpenSpecAutoDeliverPresetId | string;
   status: OpenSpecAutoDeliverStage | string;
   stage: OpenSpecAutoDeliverStage | string;
+  resumeStage?: OpenSpecAutoDeliverStage | string;
   startedAt?: number;
   elapsedMs?: number;
   owningMainSessionName?: string;
@@ -213,6 +223,7 @@ export interface OpenSpecAutoDeliverBrowserFullProjection {
   terminal?: boolean;
   updatedAt?: string;
   canStop?: boolean;
+  canContinue?: boolean;
   canDismiss?: boolean;
 }
 

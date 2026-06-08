@@ -1229,7 +1229,8 @@
         "launch_timeout": "自动交付启动超时，请重试。",
         "stop_timeout": "自动交付停止超时，请重试。",
         "custom_combo_unsupported": "自动交付暂不支持自定义团队组合流程。",
-        "strict_result_failed": "审计没有返回有效的严格结果。"
+        "strict_result_failed": "审计没有返回有效的严格结果。",
+        "continue_timeout": "自动交付继续超时，请重试。"
       },
       "preset": {
         "fast": "快速",
@@ -1318,7 +1319,11 @@
         "auto_commit_push_not_pushed": "仍有 {{count}} 个 commit 领先 upstream，需要人工检查推送。",
         "auto_commit_push_no_commit": "没有产生新的 commit，需要人工检查。",
         "auto_commit_push_forbidden_paths": "本地规划文件被提交了，需要人工检查：{{files}}",
-        "auto_commit_push_unexpected_files": "commit 包含了本次 Auto Deliver 变更之外的文件，需要人工检查：{{files}}"
+        "auto_commit_push_unexpected_files": "commit 包含了本次 Auto Deliver 变更之外的文件，需要人工检查：{{files}}",
+        "spec_audit_blocked": "规格审计被阻塞。请查看结果、修复问题后继续。",
+        "implementation_audit_blocked": "实现审计被阻塞。请查看结果、修复问题后继续。",
+        "spec_audit_rework_requires_repair": "规格审计报告仍需修复。自动交付会追加一轮审计修复。",
+        "implementation_audit_rework_requires_repair": "实现审计报告仍需修复。自动交付会追加一轮审计修复。"
       },
       "lifecycle": {
         "spec_audit_repair_started": "Spec 审计修复已开始。",
@@ -1332,13 +1337,16 @@
         "authoritative_result_file_repair_prompt_dispatched": "结果文件修复提示已发送。",
         "spec_audit_passed": "Spec 审计已通过。",
         "spec_audit_rework_scored": "Spec 审计已完成，并记录了后续工作评分。",
-        "spec_audit_blocked_scored": "Spec 审计已完成，并记录了阻塞 verdict 评分。"
+        "spec_audit_blocked_scored": "Spec 审计已完成，并记录了阻塞 verdict 评分。",
+        "continue_requested": "已请求继续。"
       },
       "spec_rounds": "Spec 审计轮次",
       "impl_rounds": "实现审计轮次",
       "team_combo": "团队组合流程",
       "auto_commit_push": "审计通过后自动提交并推送",
-      "auto_commit_push_help": "会保存为你的偏好。审计通过后会让 agent 执行 commit&push。"
+      "auto_commit_push_help": "会保存为你的偏好。审计通过后会让 agent 执行 commit&push。",
+      "continue": "继续",
+      "continuing": "继续中..."
     },
     "propose_from_discussion_action": "根据最近讨论生成",
     "propose_from_description_action": "根据下面的描述生成",

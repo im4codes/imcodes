@@ -4,6 +4,8 @@ export const OPENSPEC_AUTO_DELIVER_MSG = {
   LAUNCH: 'openspec_auto_deliver.launch',
   LAUNCH_ACK: 'openspec_auto_deliver.launch_ack',
   LAUNCH_ERROR: 'openspec_auto_deliver.launch_error',
+  CONTINUE: 'openspec_auto_deliver.continue',
+  CONTINUE_ACK: 'openspec_auto_deliver.continue_ack',
   STOP: 'openspec_auto_deliver.stop',
   STOP_ACK: 'openspec_auto_deliver.stop_ack',
   STATUS_REQUEST: 'openspec_auto_deliver.status_request',

@@ -12,6 +12,7 @@ import {
 } from '@shared/openspec-auto-deliver-constants.js';
 import type {
   OpenSpecAutoDeliverBrowserProjection,
+  OpenSpecAutoDeliverContinueRequest,
   OpenSpecAutoDeliverLaunchRequest,
   OpenSpecAutoDeliverStatusRequest,
   OpenSpecAutoDeliverStopRequest,
@@ -57,6 +58,10 @@ export interface OpenSpecAutoDeliverLaunchPayload extends OpenSpecAutoDeliverLau
 
 export interface OpenSpecAutoDeliverStopPayload extends OpenSpecAutoDeliverStopRequest {
   type: typeof OPENSPEC_AUTO_DELIVER_MSG.STOP;
+}
+
+export interface OpenSpecAutoDeliverContinuePayload extends OpenSpecAutoDeliverContinueRequest {
+  type: typeof OPENSPEC_AUTO_DELIVER_MSG.CONTINUE;
 }
 
 export interface OpenSpecAutoDeliverStatusRequestPayload extends OpenSpecAutoDeliverStatusRequest {

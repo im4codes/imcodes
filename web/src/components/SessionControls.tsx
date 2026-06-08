@@ -2922,8 +2922,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         <OpenSpecAutoDeliverDetailsPanel
           projection={openSpecAutoProjection}
           stopPending={openSpecAutoDeliver.stopPending}
+          continuePending={openSpecAutoDeliver.continuePending}
           onClose={() => setOpenSpecAutoDetailsOpen(false)}
           onStop={() => { openSpecAutoDeliver.stop(); }}
+          onContinue={() => { openSpecAutoDeliver.continueRun(); }}
         />
       )}
       {/* Header control row — compact mode keeps meta controls but still hides terminal shortcuts */}

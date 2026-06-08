@@ -1228,7 +1228,8 @@
         "launch_timeout": "La entrega automática agotó el tiempo de inicio. Inténtalo de nuevo.",
         "stop_timeout": "La detención de la entrega automática agotó el tiempo. Inténtalo de nuevo.",
         "custom_combo_unsupported": "La entrega automática todavía no admite combos personalizados de Team.",
-        "strict_result_failed": "The audit did not return a valid strict result."
+        "strict_result_failed": "The audit did not return a valid strict result.",
+        "continue_timeout": "La continuación de Auto Deliver agotó el tiempo. Inténtalo de nuevo."
       },
       "preset": {
         "fast": "Rápido",
@@ -1317,7 +1318,11 @@
         "auto_commit_push_not_pushed": "La confirmación/envío automático necesita revisión humana porque {{count}} commit(s) siguen por delante del upstream.",
         "auto_commit_push_no_commit": "La confirmación/envío automático necesita revisión humana porque no se creó ningún commit nuevo.",
         "auto_commit_push_forbidden_paths": "La confirmación/envío automático necesita revisión humana porque se confirmaron archivos locales de planificación: {{files}}",
-        "auto_commit_push_unexpected_files": "La confirmación/envío automático necesita revisión humana porque el commit incluyó archivos fuera de este cambio de Auto Deliver: {{files}}"
+        "auto_commit_push_unexpected_files": "La confirmación/envío automático necesita revisión humana porque el commit incluyó archivos fuera de este cambio de Auto Deliver: {{files}}",
+        "spec_audit_blocked": "La auditoría de especificación está bloqueada. Revisa el resultado, corrige el problema y continúa.",
+        "implementation_audit_blocked": "La auditoría de implementación está bloqueada. Revisa el resultado, corrige el problema y continúa.",
+        "spec_audit_rework_requires_repair": "La auditoría de especificación informó reparaciones pendientes. Auto Deliver agregará otra ronda de auditoría-reparación.",
+        "implementation_audit_rework_requires_repair": "La auditoría de implementación informó reparaciones pendientes. Auto Deliver agregará otra ronda de auditoría-reparación."
       },
       "lifecycle": {
         "spec_audit_repair_started": "La auditoría-reparación de especificación empezó.",
@@ -1331,13 +1336,16 @@
         "authoritative_result_file_repair_prompt_dispatched": "Se envió el prompt de reparación del archivo de resultado.",
         "spec_audit_passed": "La auditoría de especificación pasó.",
         "spec_audit_rework_scored": "La auditoría de especificación terminó con trabajo pendiente puntuado.",
-        "spec_audit_blocked_scored": "La auditoría de especificación terminó con un veredicto bloqueado puntuado."
+        "spec_audit_blocked_scored": "La auditoría de especificación terminó con un veredicto bloqueado puntuado.",
+        "continue_requested": "Continuación solicitada."
       },
       "spec_rounds": "Rondas de auditoría de especificación",
       "impl_rounds": "Rondas de auditoría de implementación",
       "team_combo": "Combo de Team",
       "auto_commit_push": "Confirmar y enviar automáticamente tras aprobar la auditoría",
-      "auto_commit_push_help": "Se guarda como tu preferencia. Tras aprobar la auditoría, el agente recibe commit&push."
+      "auto_commit_push_help": "Se guarda como tu preferencia. Tras aprobar la auditoría, el agente recibe commit&push.",
+      "continue": "Continuar",
+      "continuing": "Continuando..."
     },
     "propose_from_discussion_action": "Desde la discusión reciente",
     "propose_from_description_action": "Desde la descripción de abajo",

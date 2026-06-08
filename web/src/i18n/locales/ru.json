@@ -1228,7 +1228,8 @@
         "launch_timeout": "Истекло время запуска автодоставки. Повторите попытку.",
         "stop_timeout": "Истекло время остановки автодоставки. Повторите попытку.",
         "custom_combo_unsupported": "Автодоставка пока не поддерживает пользовательские комбо Team.",
-        "strict_result_failed": "The audit did not return a valid strict result."
+        "strict_result_failed": "The audit did not return a valid strict result.",
+        "continue_timeout": "Продолжение Auto Deliver истекло по времени. Попробуйте снова."
       },
       "preset": {
         "fast": "Быстро",
@@ -1317,7 +1318,11 @@
         "auto_commit_push_not_pushed": "Автоматический commit/push требует проверки человеком: {{count}} commit(s) все еще впереди upstream.",
         "auto_commit_push_no_commit": "Автоматический commit/push требует проверки человеком: новый commit не был создан.",
         "auto_commit_push_forbidden_paths": "Автоматический commit/push требует проверки человеком: были закоммичены локальные planning-файлы: {{files}}",
-        "auto_commit_push_unexpected_files": "Автоматический commit/push требует проверки человеком: commit включил файлы вне текущего изменения Auto Deliver: {{files}}"
+        "auto_commit_push_unexpected_files": "Автоматический commit/push требует проверки человеком: commit включил файлы вне текущего изменения Auto Deliver: {{files}}",
+        "spec_audit_blocked": "Аудит спецификации заблокирован. Проверьте результат, исправьте проблему и продолжите.",
+        "implementation_audit_blocked": "Аудит реализации заблокирован. Проверьте результат, исправьте проблему и продолжите.",
+        "spec_audit_rework_requires_repair": "Аудит спецификации сообщил о необходимых исправлениях. Auto Deliver добавит ещё один раунд audit-repair.",
+        "implementation_audit_rework_requires_repair": "Аудит реализации сообщил о необходимых исправлениях. Auto Deliver добавит ещё один раунд audit-repair."
       },
       "lifecycle": {
         "spec_audit_repair_started": "Аудит-исправление спецификации начался.",
@@ -1331,13 +1336,16 @@
         "authoritative_result_file_repair_prompt_dispatched": "Prompt исправления файла результата отправлен.",
         "spec_audit_passed": "Аудит спецификации пройден.",
         "spec_audit_rework_scored": "Аудит спецификации завершен с оценкой оставшейся работы.",
-        "spec_audit_blocked_scored": "Аудит спецификации завершен с оценкой блокирующего вердикта."
+        "spec_audit_blocked_scored": "Аудит спецификации завершен с оценкой блокирующего вердикта.",
+        "continue_requested": "Запрошено продолжение."
       },
       "spec_rounds": "Раунды аудита спецификации",
       "impl_rounds": "Раунды аудита реализации",
       "team_combo": "Комбо Team",
       "auto_commit_push": "Автоматически коммитить и отправлять после успешного аудита",
-      "auto_commit_push_help": "Сохраняется как ваша настройка. После успешного аудита agent получает commit&push."
+      "auto_commit_push_help": "Сохраняется как ваша настройка. После успешного аудита agent получает commit&push.",
+      "continue": "Продолжить",
+      "continuing": "Продолжается..."
     },
     "propose_from_discussion_action": "Из недавнего обсуждения",
     "propose_from_description_action": "Из описания ниже",

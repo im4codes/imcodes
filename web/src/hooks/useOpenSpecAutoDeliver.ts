@@ -7,6 +7,7 @@ import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET,
   OPENSPEC_AUTO_DELIVER_MSG,
   isOpenSpecAutoDeliverTerminalStatus,
+  type OpenSpecAutoDeliverContinuePayload,
   type OpenSpecAutoDeliverLaunchPayload,
   type OpenSpecAutoDeliverPresetId,
   type OpenSpecAutoDeliverProjection,
@@ -17,6 +18,7 @@ import { normalizeOpenSpecAutoDeliverProjection } from '../openspec-auto-deliver
 
 const OPEN_SPEC_AUTO_DELIVER_LAUNCH_TIMEOUT_MS = 30_000;
 const OPEN_SPEC_AUTO_DELIVER_STOP_TIMEOUT_MS = 15_000;
+const OPEN_SPEC_AUTO_DELIVER_CONTINUE_TIMEOUT_MS = 30_000;
 
 interface Options {
   ws: WsClient | null;
@@ -38,9 +40,11 @@ interface State {
   projection: OpenSpecAutoDeliverProjection | null;
   launchPending: boolean;
   stopPending: boolean;
+  continuePending: boolean;
   lastError: string | null;
   launch: (options: LaunchOptions) => string | null;
   stop: (runId?: string) => string | null;
+  continueRun: (runId?: string) => string | null;
   requestStatus: () => string | null;
   clearError: () => void;
 }
@@ -168,13 +172,17 @@ export function useOpenSpecAutoDeliver({
   const [projection, setProjection] = useState<OpenSpecAutoDeliverProjection | null>(null);
   const [launchPending, setLaunchPending] = useState(false);
   const [stopPending, setStopPending] = useState(false);
+  const [continuePending, setContinuePending] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
   const latestProjectionRef = useRef<OpenSpecAutoDeliverProjection | null>(null);
   const launchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const continueTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeLaunchRequestIdRef = useRef<string | null>(null);
   const activeStopRequestIdRef = useRef<string | null>(null);
   const activeStopRunIdRef = useRef<string | null>(null);
+  const activeContinueRequestIdRef = useRef<string | null>(null);
+  const activeContinueRunIdRef = useRef<string | null>(null);
 
   const clearLaunchTimeout = useCallback(() => {
     if (launchTimeoutRef.current) {
@@ -191,6 +199,15 @@ export function useOpenSpecAutoDeliver({
     }
     activeStopRequestIdRef.current = null;
     activeStopRunIdRef.current = null;
+  }, []);
+
+  const clearContinueTimeout = useCallback(() => {
+    if (continueTimeoutRef.current) {
+      clearTimeout(continueTimeoutRef.current);
+      continueTimeoutRef.current = null;
+    }
+    activeContinueRequestIdRef.current = null;
+    activeContinueRunIdRef.current = null;
   }, []);
 
   const applyProjection = useCallback((next: OpenSpecAutoDeliverProjection | null) => {
@@ -214,8 +231,14 @@ export function useOpenSpecAutoDeliver({
         clearStopTimeout();
         setStopPending(false);
       }
+    } else {
+      const pendingContinueRunId = activeContinueRunIdRef.current;
+      if (!pendingContinueRunId || pendingContinueRunId === next.runId) {
+        clearContinueTimeout();
+        setContinuePending(false);
+      }
     }
-  }, [clearLaunchTimeout, clearStopTimeout, sessionName]);
+  }, [clearContinueTimeout, clearLaunchTimeout, clearStopTimeout, sessionName]);
 
   const requestStatus = useCallback(() => {
     if (!ws || !sessionName) return null;
@@ -325,6 +348,61 @@ export function useOpenSpecAutoDeliver({
     ws,
   ]);
 
+  const continueRun = useCallback((runId = projection?.runId) => {
+    if (projection?.visibility === 'conflict') return null;
+    if (!projection || projection.status === 'passed' || projection.canContinue === false) return null;
+    const continueSessionName = projection.targetImplementationSessionName
+      || projection.launchedFromSessionName
+      || projection.owningMainSessionName
+      || sessionName;
+    if (!ws || !continueSessionName || !runId) {
+      clearContinueTimeout();
+      setContinuePending(false);
+      if (runId) setLastError('openspec.auto.error.daemon_offline');
+      return null;
+    }
+    const requestId = makeRequestId('openspec-auto-continue');
+    const payload: OpenSpecAutoDeliverContinuePayload = {
+      type: OPENSPEC_AUTO_DELIVER_MSG.CONTINUE,
+      requestId,
+      serverId,
+      sessionName: continueSessionName,
+      runId,
+    };
+    clearContinueTimeout();
+    activeContinueRequestIdRef.current = requestId;
+    activeContinueRunIdRef.current = runId;
+    setContinuePending(true);
+    setLastError(null);
+    try {
+      ws.send(payload);
+    } catch (error) {
+      clearContinueTimeout();
+      setContinuePending(false);
+      setLastError(normalizeLaunchError(error instanceof Error ? error.message : error));
+      return null;
+    }
+    continueTimeoutRef.current = setTimeout(() => {
+      if (activeContinueRequestIdRef.current !== requestId) return;
+      activeContinueRequestIdRef.current = null;
+      activeContinueRunIdRef.current = null;
+      continueTimeoutRef.current = null;
+      setContinuePending(false);
+      setLastError('openspec.auto.error.continue_timeout');
+    }, OPEN_SPEC_AUTO_DELIVER_CONTINUE_TIMEOUT_MS);
+    return requestId;
+  }, [
+    clearContinueTimeout,
+    projection,
+    projection?.launchedFromSessionName,
+    projection?.owningMainSessionName,
+    projection?.runId,
+    projection?.targetImplementationSessionName,
+    serverId,
+    sessionName,
+    ws,
+  ]);
+
   useEffect(() => {
     if (!ws) return;
     return ws.onMessage((msg: ServerMessage) => {
@@ -358,28 +436,48 @@ export function useOpenSpecAutoDeliver({
         }
         return;
       }
+      if (raw.type === OPENSPEC_AUTO_DELIVER_MSG.CONTINUE_ACK) {
+        const ackRequestId = typeof raw.requestId === 'string' ? raw.requestId : null;
+        if (activeContinueRequestIdRef.current && ackRequestId !== activeContinueRequestIdRef.current) {
+          return;
+        }
+        clearContinueTimeout();
+        setContinuePending(false);
+        const ackProjection = normalizeOpenSpecAutoDeliverProjection(raw.projection);
+        if (ackProjection) applyProjection(ackProjection);
+        if (raw.ok === false) {
+          setLastError(normalizeLaunchError(raw.error));
+        } else {
+          setLastError(null);
+        }
+        return;
+      }
       if (
         (raw.type === SHARE_DAEMON_MESSAGE_TYPES.SESSION_EVENT && raw.event === 'disconnected')
         || raw.type === MSG_DAEMON_OFFLINE
         || raw.type === DAEMON_MSG.DISCONNECTED
       ) {
         clearStopTimeout();
+        clearContinueTimeout();
         setStopPending(false);
+        setContinuePending(false);
         return;
       }
     });
-  }, [applyProjection, clearLaunchTimeout, clearStopTimeout, ws]);
+  }, [applyProjection, clearContinueTimeout, clearLaunchTimeout, clearStopTimeout, ws]);
 
   useEffect(() => {
     latestProjectionRef.current = null;
     clearLaunchTimeout();
     clearStopTimeout();
+    clearContinueTimeout();
     setProjection(null);
     setLastError(null);
     setLaunchPending(false);
     setStopPending(false);
+    setContinuePending(false);
     requestStatus();
-  }, [clearLaunchTimeout, clearStopTimeout, requestStatus, sessionName]);
+  }, [clearContinueTimeout, clearLaunchTimeout, clearStopTimeout, requestStatus, sessionName]);
 
   useEffect(() => {
     if (openSpecOpen) requestStatus();
@@ -388,16 +486,19 @@ export function useOpenSpecAutoDeliver({
   useEffect(() => () => {
     clearLaunchTimeout();
     clearStopTimeout();
-  }, [clearLaunchTimeout, clearStopTimeout]);
+    clearContinueTimeout();
+  }, [clearContinueTimeout, clearLaunchTimeout, clearStopTimeout]);
 
   return useMemo(() => ({
     projection,
     launchPending,
     stopPending,
+    continuePending,
     lastError,
     launch,
     stop,
+    continueRun,
     requestStatus,
     clearError: () => setLastError(null),
-  }), [launch, launchPending, lastError, projection, requestStatus, stop, stopPending]);
+  }), [continuePending, continueRun, launch, launchPending, lastError, projection, requestStatus, stop, stopPending]);
 }

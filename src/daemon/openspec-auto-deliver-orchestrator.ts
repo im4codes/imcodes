@@ -37,6 +37,7 @@ import {
 import type {
   OpenSpecAutoDeliverEvidence,
   OpenSpecAutoDeliverAuditResult,
+  OpenSpecAutoDeliverContinueRequest,
   OpenSpecAutoDeliverLaunchRequest,
   OpenSpecAutoDeliverModuleScore,
   OpenSpecAutoDeliverRepairSummary,
@@ -107,8 +108,8 @@ const OPENSPEC_AUTO_DELIVER_TRANSITIONS: Record<OpenSpecAutoDeliverStage, Partia
   spec_audit_repair: {
     spec_audit_started: 'spec_audit_repair',
     spec_audit_pass: 'implementation_task_loop',
-    spec_audit_rework: 'implementation_task_loop',
-    spec_audit_blocked: 'implementation_task_loop',
+    spec_audit_rework: 'spec_audit_repair',
+    spec_audit_blocked: 'needs_human',
     implementation_prompt_dispatched: 'implementation_task_loop',
     stop: 'stopped',
     restart_cleanup: 'failed',
@@ -126,8 +127,8 @@ const OPENSPEC_AUTO_DELIVER_TRANSITIONS: Record<OpenSpecAutoDeliverStage, Partia
   implementation_audit_repair: {
     implementation_audit_started: 'implementation_audit_repair',
     implementation_audit_pass: 'passed',
-    implementation_audit_rework: 'passed',
-    implementation_audit_blocked: 'passed',
+    implementation_audit_rework: 'implementation_audit_repair',
+    implementation_audit_blocked: 'needs_human',
     auto_commit_push_dispatched: 'commit_push',
     stop: 'stopped',
     restart_cleanup: 'failed',
@@ -184,6 +185,7 @@ interface AutoDeliverRun {
   implementationAuditRepairRound: number;
   taskStats: OpenSpecAutoDeliverTaskStats;
   terminalReason?: string;
+  resumeStage?: OpenSpecAutoDeliverStage;
   latestMessage?: string;
   activeCommandId?: string;
   activeAudit?: {
@@ -410,6 +412,10 @@ function completedAuditRoundCount(run: AutoDeliverRun, stage: AuditRepairStage):
   return Math.max(0, startedCount - activeInStage);
 }
 
+function canContinueRun(run: AutoDeliverRun): boolean {
+  return isOpenSpecAutoDeliverTerminalStage(run.status) && run.status !== 'passed';
+}
+
 function buildProjection(run: AutoDeliverRun): OpenSpecAutoDeliverProjection {
   const specAuditRound = {
     current: completedAuditRoundCount(run, 'spec_audit_repair'),
@@ -428,6 +434,7 @@ function buildProjection(run: AutoDeliverRun): OpenSpecAutoDeliverProjection {
     materializedLimits: { ...run.materializedLimits },
     status: run.status,
     stage: run.stage,
+    resumeStage: run.resumeStage,
     owningMainSessionName: run.owningMainSessionName,
     launchedFromSessionName: run.launchedFromSessionName,
     targetImplementationSessionName: run.targetImplementationSessionName,
@@ -443,6 +450,7 @@ function buildProjection(run: AutoDeliverRun): OpenSpecAutoDeliverProjection {
     selectedTeamComboId: run.selectedTeamComboId,
     activeOpenSpecPromptId: run.activeAudit?.activeOpenSpecPromptId,
     canStop: !isOpenSpecAutoDeliverTerminalStage(run.status),
+    canContinue: canContinueRun(run),
     latestRepairSummary: run.latestRepairSummary,
     latestVerdict: run.latestVerdict,
     moduleScores: run.moduleScores ? run.moduleScores.map((score) => ({ ...score })) : undefined,
@@ -629,11 +637,15 @@ function buildImplementationPrompt(run: AutoDeliverRun): string {
     formatOpenSpecPromptTemplate('implement', reference),
     '',
     `OpenSpec Auto Deliver context for ${reference}.`,
+    `Project root: ${run.projectRoot}`,
+    `Change root: ${run.changeRootIdentity}`,
     `Run id: ${run.runId}`,
     `Generation: ${run.generation}`,
     `Implementation prompt: ${run.implementationPromptCount + 1}/${maxImplementationPrompts}`,
     '',
     'Implement only this OpenSpec change. Do not commit, push, or stage files. Do not modify unrelated OpenSpec changes or docs.',
+    'Before inspecting, editing, validating, or committing anything, work from the project root above. Do not rely on the execution session current directory if it differs.',
+    'All relative file paths in this prompt are relative to that project root.',
     'Work through the remaining tasks below. Mark tasks.md checkboxes only after the work is genuinely complete.',
     'Run reasonable local validation for the touched code when available. Treat the discovered commands below as project-specific candidates only; choose the actual validation plan from the changed files and project tooling. Report exact commands and outcomes, or explain why validation could not run.',
     '',
@@ -1119,10 +1131,12 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
     `Selected Team combo id: ${metadata.selectedTeamComboId}`,
     `Active OpenSpec prompt id: ${metadata.activeOpenSpecPromptId}`,
     `Round: ${metadata.roundIndex}/${auditRoundLimit(run, metadata.stage)}`,
+    `Project root: ${run.projectRoot}`,
     `Authoritative result file: ${metadata.authoritativeResultPath}`,
     `Owning main session: ${metadata.owningMainSessionName}`,
     `Execution session: ${metadata.executionSessionName}`,
     `Resolved change root identity: ${metadata.resolvedChangeRootIdentity}`,
+    'All referenced relative paths are relative to the project root above; do not use the execution session current directory if it differs.',
     '',
     `Task stats: ${run.taskStats.checked}/${run.taskStats.total} checked.`,
     unchecked.length > 0 ? `Unchecked tasks:\n${unchecked.map((label) => `- ${label}`).join('\n')}` : 'Unchecked tasks: none.',
@@ -1162,7 +1176,10 @@ function buildAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpe
     `The audit-repair discussion has already completed; do not redo the full audit from scratch unless you must inspect your prior conclusion.`,
     `Problem: ${reason}`,
     `Discussion file: ${p2pRun.contextFilePath}`,
+    `Project root: ${run.projectRoot}`,
     `Authoritative result file: ${metadata.authoritativeResultPath}`,
+    `Resolved change root identity: ${metadata.resolvedChangeRootIdentity}`,
+    'All referenced relative paths are relative to the project root above; do not use the execution session current directory if it differs.',
     '',
     'Write exactly one raw JSON object to the authoritative result file path above. Do not wrap the file content in Markdown fences. Do not write a second JSON candidate.',
     'The daemon will read only that file as the authoritative result; chat/discussion text is not authoritative.',
@@ -1337,6 +1354,7 @@ function trackActiveAuditCancellation(run: AutoDeliverRun, active: NonNullable<A
 }
 
 function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 'passed' | 'needs_human' | 'failed' | 'stopped'>, reason: string): OpenSpecAutoDeliverProjection {
+  const previousStage = run.stage;
   if (run.activeAudit) {
     const active = run.activeAudit;
     clearAuditPollTimer(run.runId);
@@ -1345,6 +1363,7 @@ function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 
   }
   clearAuditFixRetryTimer(run.runId);
   delete run.activeCommandId;
+  run.resumeStage = status === 'passed' ? undefined : previousStage;
   run.status = status;
   run.stage = status;
   run.terminalReason = reason;
@@ -1453,11 +1472,24 @@ async function advanceAfterAuditVerdict(
   }
 
   if (stage === 'spec_audit_repair') {
+    if (verdict.verdict === 'BLOCKED') {
+      const projection = terminalize(run, 'needs_human', 'spec_audit_blocked');
+      send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+      return;
+    }
+    if (verdict.verdict === 'REWORK') {
+      if (shouldRunAnotherConfiguredAuditRound(run, stage)) {
+        await startAuditRepairStageFailClosed(run, stage);
+        return;
+      }
+      scheduleAuditFixRetry(run, stage, 'spec_audit_rework_requires_repair');
+      return;
+    }
     if (shouldRunAnotherConfiguredAuditRound(run, stage)) {
       await startAuditRepairStageFailClosed(run, stage);
       return;
     }
-    run.latestMessage = verdict.verdict === 'PASS' ? 'spec_audit_passed' : `spec_audit_${verdict.verdict.toLowerCase()}_scored`;
+    run.latestMessage = 'spec_audit_passed';
     run.evidence = mergeEvidence(run.evidence, await buildValidationEvidence(run));
     dispatchImplementationPrompt(run);
     return;
@@ -1468,7 +1500,18 @@ async function advanceAfterAuditVerdict(
     return;
   }
 
-    if (verdict.verdict === 'PASS') {
+  if (verdict.verdict === 'BLOCKED') {
+    const projection = terminalize(run, 'needs_human', 'implementation_audit_blocked');
+    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+    return;
+  }
+
+  if (verdict.verdict === 'REWORK') {
+    scheduleAuditFixRetry(run, stage, 'implementation_audit_rework_requires_repair');
+    return;
+  }
+
+  if (verdict.verdict === 'PASS') {
     const gitEvidence = await collectGitEvidence(run);
     const currentRunChangedFiles = await currentRunProductFiles(run, gitEvidence.changedFiles);
     run.evidence = mergeEvidence(run.evidence, [
@@ -1502,9 +1545,6 @@ async function advanceAfterAuditVerdict(
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
-
-  const projection = terminalize(run, 'passed', verdict.verdict === 'BLOCKED' ? 'final_audit_blocked_scored' : 'final_audit_rework_scored');
-  send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
 }
 
 async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMetadata): Promise<void> {
@@ -1913,6 +1953,81 @@ async function stop(request: OpenSpecAutoDeliverStopRequest): Promise<{ ok: bool
   return { ok: true, projection, terminal: true };
 }
 
+function inferResumeStage(run: AutoDeliverRun): Extract<OpenSpecAutoDeliverStage, 'proposed' | 'spec_audit_repair' | 'implementation_task_loop' | 'implementation_audit_repair' | 'commit_push'> {
+  if (
+    run.resumeStage === 'proposed'
+    || run.resumeStage === 'spec_audit_repair'
+    || run.resumeStage === 'implementation_task_loop'
+    || run.resumeStage === 'implementation_audit_repair'
+    || run.resumeStage === 'commit_push'
+  ) {
+    return run.resumeStage;
+  }
+  if (run.terminalReason?.startsWith('spec_audit_')) return 'spec_audit_repair';
+  if (run.terminalReason?.startsWith('implementation_audit_')) return 'implementation_audit_repair';
+  return run.taskStats.unchecked > 0 ? 'implementation_task_loop' : 'implementation_audit_repair';
+}
+
+async function continueRun(request: OpenSpecAutoDeliverContinueRequest): Promise<{ ok: boolean; projection?: OpenSpecAutoDeliverProjection; error?: string; terminal?: boolean }> {
+  const run = runsById.get(request.runId);
+  if (!run) return { ok: false, error: 'run_not_found' };
+  if (request.sessionName !== run.owningMainSessionName && request.sessionName !== run.launchedFromSessionName && request.sessionName !== run.targetImplementationSessionName) {
+    return { ok: false, error: 'forbidden' };
+  }
+  if (!canContinueRun(run)) return { ok: false, error: 'run_not_continuable', projection: buildProjection(run), terminal: false };
+  const active = activeRunByOwner.get(run.owningMainSessionName);
+  if (active && active !== run.runId) return { ok: false, error: 'auto_deliver_active', projection: buildProjection(run), terminal: false };
+  try {
+    run.taskStats = await readTaskStatsForRun(run);
+  } catch {
+    run.latestMessage = 'tasks_unreadable';
+    return { ok: false, error: 'tasks_unreadable', projection: buildProjection(run), terminal: false };
+  }
+
+  const resumeStage = inferResumeStage(run);
+  delete run.terminalReason;
+  run.resumeStage = undefined;
+  run.status = resumeStage;
+  run.stage = resumeStage;
+  run.latestMessage = 'continue_requested';
+  activeRunByOwner.set(run.owningMainSessionName, run.runId);
+  terminalRunByOwner.delete(run.owningMainSessionName);
+  registerAutoDeliverP2pLock({
+    runId: run.runId,
+    owningMainSessionName: run.owningMainSessionName,
+    generation: run.generation,
+    selectedTeamComboId: run.selectedTeamComboId,
+  });
+
+  if (resumeStage === 'spec_audit_repair') {
+    if (auditRoundCount(run, 'spec_audit_repair') >= auditRoundLimit(run, 'spec_audit_repair')) extendAuditRoundLimit(run, 'spec_audit_repair');
+    const projection = await startAuditRepairStageFailClosed(run, 'spec_audit_repair');
+    return { ok: true, projection };
+  }
+  if (resumeStage === 'implementation_audit_repair') {
+    if (auditRoundCount(run, 'implementation_audit_repair') >= auditRoundLimit(run, 'implementation_audit_repair')) extendAuditRoundLimit(run, 'implementation_audit_repair');
+    const projection = await startAuditRepairStageFailClosed(run, 'implementation_audit_repair');
+    return { ok: true, projection };
+  }
+  if (resumeStage === 'commit_push') {
+    await dispatchAutoCommitPushPrompt(run);
+    return { ok: true, projection: buildProjection(run) };
+  }
+  if (resumeStage === 'proposed' && run.materializedLimits.specAuditRepairRounds > 0) {
+    const projection = await startAuditRepairStageFailClosed(run, 'spec_audit_repair');
+    return { ok: true, projection };
+  }
+  if (run.taskStats.unchecked <= 0) {
+    if (auditRoundCount(run, 'implementation_audit_repair') >= auditRoundLimit(run, 'implementation_audit_repair')) extendAuditRoundLimit(run, 'implementation_audit_repair');
+    const projection = await startAuditRepairStageFailClosed(run, 'implementation_audit_repair');
+    return { ok: true, projection };
+  }
+  if (run.implementationPromptCount >= effectiveMaxImplementationPrompts(run)) {
+    run.materializedLimits.maxImplementationPrompts = run.implementationPromptCount + 1;
+  }
+  return { ok: true, projection: dispatchImplementationPrompt(run) };
+}
+
 async function status(request: OpenSpecAutoDeliverStatusRequest): Promise<OpenSpecAutoDeliverProjection | null> {
   const run = latestRunForSession(request.sessionName);
   if (!run) return null;
@@ -1950,6 +2065,20 @@ export async function handleOpenSpecAutoDeliverCommand(cmd: Record<string, unkno
         error: result.error,
         ...(result.projection ? { projection: result.projection } : {}),
       });
+    }
+    return;
+  }
+  if (type === OPENSPEC_AUTO_DELIVER_MSG.CONTINUE) {
+    const result = await continueRun(cmd as unknown as OpenSpecAutoDeliverContinueRequest);
+    send(serverLink, {
+      type: OPENSPEC_AUTO_DELIVER_MSG.CONTINUE_ACK,
+      requestId: cmd.requestId,
+      ok: result.ok,
+      ...(result.error ? { error: result.error } : {}),
+      ...(result.projection ? { projection: result.projection } : {}),
+    });
+    if (result.projection && result.terminal !== false) {
+      send(serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.PROJECTION, projection: result.projection });
     }
     return;
   }

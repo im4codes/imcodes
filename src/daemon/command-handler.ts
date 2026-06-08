@@ -1504,6 +1504,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void traceCommandAsync(cmd, 'web_command.p2p_status', () => handleP2pStatus(cmd, serverLink));
       break;
     case OPENSPEC_AUTO_DELIVER_MSG.LAUNCH:
+    case OPENSPEC_AUTO_DELIVER_MSG.CONTINUE:
     case OPENSPEC_AUTO_DELIVER_MSG.STOP:
     case OPENSPEC_AUTO_DELIVER_MSG.STATUS_REQUEST:
       void traceCommandAsync(cmd, 'web_command.openspec_auto_deliver', () => handleOpenSpecAutoDeliverCommand(cmd, serverLink));

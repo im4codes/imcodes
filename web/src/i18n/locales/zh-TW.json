@@ -1229,7 +1229,8 @@
         "launch_timeout": "自動交付啟動逾時，請重試。",
         "stop_timeout": "自動交付停止逾時，請重試。",
         "custom_combo_unsupported": "自動交付暫不支援自訂團隊組合流程。",
-        "strict_result_failed": "稽核沒有回傳有效的嚴格結果。"
+        "strict_result_failed": "稽核沒有回傳有效的嚴格結果。",
+        "continue_timeout": "自動交付繼續逾時，請重試。"
       },
       "preset": {
         "fast": "快速",
@@ -1318,7 +1319,11 @@
         "auto_commit_push_not_pushed": "仍有 {{count}} 個 commit 領先 upstream，需要人工檢查推送。",
         "auto_commit_push_no_commit": "沒有產生新的 commit，需要人工檢查。",
         "auto_commit_push_forbidden_paths": "本機規劃檔案被提交了，需要人工檢查：{{files}}",
-        "auto_commit_push_unexpected_files": "commit 包含了本次 Auto Deliver 變更之外的檔案，需要人工檢查：{{files}}"
+        "auto_commit_push_unexpected_files": "commit 包含了本次 Auto Deliver 變更之外的檔案，需要人工檢查：{{files}}",
+        "spec_audit_blocked": "規格稽核被阻塞。請查看結果、修復問題後繼續。",
+        "implementation_audit_blocked": "實作稽核被阻塞。請查看結果、修復問題後繼續。",
+        "spec_audit_rework_requires_repair": "規格稽核回報仍需修復。自動交付會追加一輪稽核修復。",
+        "implementation_audit_rework_requires_repair": "實作稽核回報仍需修復。自動交付會追加一輪稽核修復。"
       },
       "lifecycle": {
         "spec_audit_repair_started": "Spec 審計修復已開始。",
@@ -1332,13 +1337,16 @@
         "authoritative_result_file_repair_prompt_dispatched": "結果檔案修復提示已送出。",
         "spec_audit_passed": "Spec 審計已通過。",
         "spec_audit_rework_scored": "Spec 審計已完成，並記錄了後續工作評分。",
-        "spec_audit_blocked_scored": "Spec 審計已完成，並記錄了阻塞 verdict 評分。"
+        "spec_audit_blocked_scored": "Spec 審計已完成，並記錄了阻塞 verdict 評分。",
+        "continue_requested": "已要求繼續。"
       },
       "spec_rounds": "Spec 審計輪次",
       "impl_rounds": "實作審計輪次",
       "team_combo": "團隊組合流程",
       "auto_commit_push": "審計通過後自動提交並推送",
-      "auto_commit_push_help": "會儲存為你的偏好。審計通過後會讓 agent 執行 commit&push。"
+      "auto_commit_push_help": "會儲存為你的偏好。審計通過後會讓 agent 執行 commit&push。",
+      "continue": "繼續",
+      "continuing": "繼續中..."
     },
     "propose_from_discussion_action": "根據最近討論生成",
     "propose_from_description_action": "根據下面的描述生成",
