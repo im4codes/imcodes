@@ -159,6 +159,7 @@ import {
 } from './transport-queue.js';
 import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
+import { shouldUseIosMacTextScale } from './native-platform.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from './codex-model-preference.js';
@@ -602,6 +603,11 @@ export function App() {
 
   // Keep layout height within visual viewport on mobile (keyboard-aware)
   useEffect(() => {
+    if (shouldUseIosMacTextScale()) {
+      document.documentElement.style.removeProperty('--vvh');
+      document.documentElement.classList.remove('kb-open', 'input-focused');
+      return;
+    }
     const vv = window.visualViewport;
     if (!vv) return;
     let inputFocused = false;

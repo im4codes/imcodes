@@ -1,6 +1,7 @@
 import UIKit
 import Capacitor
 import UserNotifications
+import WebKit
 
 @UIApplicationMain
 class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterDelegate {
@@ -104,7 +105,15 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
         bridge.registerPluginInstance(AuthSessionPlugin())
         bridge.registerPluginInstance(WatchBridgePlugin())
+        configureInputChromeForMacIfNeeded(bridge.webView)
         didRegisterLocalPlugins = true
+    }
+
+    private func configureInputChromeForMacIfNeeded(_ webView: WKWebView?) {
+        guard #available(iOS 14.0, *), ProcessInfo.processInfo.isiOSAppOnMac else { return }
+        webView?.inputAssistantItem.leadingBarButtonGroups = []
+        webView?.inputAssistantItem.trailingBarButtonGroups = []
+        webView?.scrollView.keyboardDismissMode = .interactive
     }
 
 }
