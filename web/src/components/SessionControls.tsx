@@ -1579,6 +1579,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const launchOpenSpecAutoDeliver = useCallback((changeName: string, presetId: OpenSpecAutoDeliverPresetId, options?: {
     selectedTeamComboId: string;
     materializedLimits: OpenSpecAutoDeliverMaterializedLimits;
+    locale?: string;
+    autoCommitPush: boolean;
   }) => {
     const requestId = openSpecAutoDeliver.launch({ changeName, presetId, ...options });
     if (!requestId) return;

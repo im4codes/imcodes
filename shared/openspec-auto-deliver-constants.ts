@@ -50,6 +50,7 @@ export const OPENSPEC_AUTO_DELIVER_STAGES = [
   'spec_audit_repair',
   'implementation_task_loop',
   'implementation_audit_repair',
+  'commit_push',
   'stopping',
   'passed',
   'needs_human',
@@ -131,6 +132,32 @@ export const OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_METADATA_FIELDS = [
 ] as const;
 export type OpenSpecAutoDeliverAuthoritativeMetadataField = (typeof OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_METADATA_FIELDS)[number];
 
+export const OPENSPEC_AUTO_DELIVER_MODULE_SCORE_FIELDS = [
+  'module',
+  'score',
+  'max_score',
+  'summary',
+] as const;
+export type OpenSpecAutoDeliverModuleScoreField = (typeof OPENSPEC_AUTO_DELIVER_MODULE_SCORE_FIELDS)[number];
+
+export const OPENSPEC_AUTO_DELIVER_REPAIR_SUMMARY_FIELDS = [
+  'files',
+  'reason',
+] as const;
+export type OpenSpecAutoDeliverRepairSummaryField = (typeof OPENSPEC_AUTO_DELIVER_REPAIR_SUMMARY_FIELDS)[number];
+
+export const OPENSPEC_AUTO_DELIVER_EVIDENCE_REQUIRED_FIELDS = [
+  'source',
+  'summary',
+] as const;
+export type OpenSpecAutoDeliverEvidenceRequiredField = (typeof OPENSPEC_AUTO_DELIVER_EVIDENCE_REQUIRED_FIELDS)[number];
+
+export const OPENSPEC_AUTO_DELIVER_EVIDENCE_OPTIONAL_FIELDS = [
+  'command',
+  'exitCode',
+] as const;
+export type OpenSpecAutoDeliverEvidenceOptionalField = (typeof OPENSPEC_AUTO_DELIVER_EVIDENCE_OPTIONAL_FIELDS)[number];
+
 export const OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE = [
   'daemon',
   'implementation_reported',
@@ -150,12 +177,6 @@ export const OPENSPEC_AUTO_DELIVER_COMBO_WRITE_MODES = [
   'serialized_patch_apply',
 ] as const;
 export type OpenSpecAutoDeliverComboWriteMode = (typeof OPENSPEC_AUTO_DELIVER_COMBO_WRITE_MODES)[number];
-
-export const OPENSPEC_AUTO_DELIVER_STRICT_RESULT_CHANNELS = [
-  'authoritative_summary_json',
-  'structured_p2p_result',
-] as const;
-export type OpenSpecAutoDeliverStrictResultChannel = (typeof OPENSPEC_AUTO_DELIVER_STRICT_RESULT_CHANNELS)[number];
 
 export const OPENSPEC_AUTO_DELIVER_MUTATION_SCOPES = [
   'openspec_change_artifacts',

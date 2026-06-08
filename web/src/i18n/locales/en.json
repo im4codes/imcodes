@@ -1242,6 +1242,7 @@
         "spec_audit_repair": "Spec audit",
         "implementation_task_loop": "Implementing",
         "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Commit & push",
         "stopping": "Stopping",
         "passed": "Passed",
         "needs_human": "Needs human",
@@ -1253,6 +1254,7 @@
         "spec_audit_repair": "Spec audit",
         "implementation_task_loop": "Implementation",
         "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Commit & push",
         "passed": "Passed",
         "needs_human": "Needs human",
         "failed": "Failed",
@@ -1307,7 +1309,16 @@
         "quality_gate_low_score": "A quality gate paused for low module score: {{modules}}. Auto Deliver will add one audit-fix round if no one intervenes.",
         "final_audit_passed": "Final audit passed.",
         "final_audit_rework_scored": "Final audit completed with follow-up work scored. Review the module scores to decide whether to run Auto Deliver again.",
-        "final_audit_blocked_scored": "Final audit completed with a blocked verdict scored. Review the module scores to decide whether to run Auto Deliver again."
+        "final_audit_blocked_scored": "Final audit completed with a blocked verdict scored. Review the module scores to decide whether to run Auto Deliver again.",
+        "auto_commit_push_failed": "Auto commit/push failed: {{detail}}",
+        "auto_commit_push_git_status_failed": "Auto commit/push could not read git status: {{detail}}",
+        "auto_commit_push_preexisting_changes": "Auto commit/push skipped because product files were already dirty before launch: {{files}}",
+        "auto_commit_push_incomplete": "Auto commit/push needs human review because product files are still dirty after the commit/push step: {{files}}",
+        "auto_commit_push_no_upstream": "Auto commit/push needs human review because this branch has no upstream.",
+        "auto_commit_push_not_pushed": "Auto commit/push needs human review because {{count}} commit(s) are still ahead of upstream.",
+        "auto_commit_push_no_commit": "Auto commit/push needs human review because no new commit was created.",
+        "auto_commit_push_forbidden_paths": "Auto commit/push needs human review because local planning files were committed: {{files}}",
+        "auto_commit_push_unexpected_files": "Auto commit/push needs human review because the commit included files outside the current Auto Deliver change: {{files}}"
       },
       "lifecycle": {
         "spec_audit_repair_started": "Spec audit-repair started.",
@@ -1317,6 +1328,7 @@
         "implementation_idle_all_checked": "All implementation tasks are checked.",
         "implementation_audit_repair_started": "Implementation audit-repair started.",
         "implementation_audit_repair_p2p_started": "Implementation audit Team run started.",
+        "auto_commit_push_prompt_dispatched": "Commit/push prompt sent.",
         "authoritative_result_file_repair_prompt_dispatched": "Result-file repair prompt sent.",
         "spec_audit_passed": "Spec audit passed.",
         "spec_audit_rework_scored": "Spec audit completed with follow-up work scored.",
@@ -1324,7 +1336,9 @@
       },
       "spec_rounds": "Spec audit rounds",
       "impl_rounds": "Implementation audit rounds",
-      "team_combo": "Team combo"
+      "team_combo": "Team combo",
+      "auto_commit_push": "Commit and push automatically after audit passes",
+      "auto_commit_push_help": "Saved as your preference. Product changes only; OpenSpec and docs stay local."
     },
     "propose_from_discussion_action": "From Recent Discussion",
     "propose_from_description_action": "From Description Below",

@@ -8,6 +8,7 @@ export {
 } from '@shared/p2p-config-scope.js';
 export const PREF_KEY_P2P_COMBO_CONFIRM_SKIP = 'p2p_combo_direct_send_skip_confirm';
 export const PREF_KEY_P2P_CUSTOM_COMBOS = 'p2p_custom_combos';
+export const PREF_KEY_OPENSPEC_AUTO_DELIVER_AUTO_COMMIT_PUSH = 'openspec_auto_deliver_auto_commit_push';
 /**
  * Last-selected tab in the P2P quick-pick dropdown shown above the chat
  * input. Two tabs: `'combos'` (the original combo presets list) and

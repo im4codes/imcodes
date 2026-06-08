@@ -666,6 +666,37 @@ body {
   font-size: 11px;
   line-height: 1.35;
 }
+.openspec-auto-checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid rgba(71, 85, 105, 0.8);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, 0.54);
+  color: #dbe7f5;
+  cursor: pointer;
+}
+.openspec-auto-checkbox input {
+  flex: 0 0 auto;
+  margin: 2px 0 0;
+}
+.openspec-auto-checkbox span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+.openspec-auto-checkbox strong {
+  font-size: 12px;
+  line-height: 1.25;
+}
+.openspec-auto-checkbox small {
+  color: #94a3b8;
+  font-size: 10px;
+  line-height: 1.35;
+}
 .openspec-auto-launcher-head,
 .openspec-auto-details-head {
   display: flex;

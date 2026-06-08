@@ -19,6 +19,8 @@ export interface OpenSpecAutoDeliverLaunchRequest {
   presetId: OpenSpecAutoDeliverPresetId;
   materializedLimits?: OpenSpecAutoDeliverMaterializedLimits;
   selectedTeamComboId?: string;
+  locale?: string;
+  autoCommitPush?: boolean;
 }
 
 export interface OpenSpecAutoDeliverStopRequest {

@@ -34,6 +34,8 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.auto.current_run') return 'Current Auto Deliver';
       if (key === 'openspec.auto.kicker') return 'Auto Deliver';
       if (key === 'openspec.auto.start') return 'Start Auto Deliver';
+      if (key === 'openspec.auto.auto_commit_push') return 'Commit and push automatically after audit passes';
+      if (key === 'openspec.auto.auto_commit_push_help') return 'Saved as your preference. Product changes only; OpenSpec and docs stay local.';
       if (key === 'openspec.auto.view') return 'View';
       if (key === 'openspec.auto.stop') return 'Stop Auto Deliver';
       if (key === 'openspec.auto.lock_manual_actions') return 'Auto Deliver owns Team lane';
@@ -261,6 +263,7 @@ vi.mock('../../src/api.js', () => ({
 
 import { OpenSpecAutoDeliverLauncher } from '../../src/components/OpenSpecAutoDeliver.js';
 import { OPENSPEC_LIST_REQUEST_TIMEOUT_MS, SessionControls } from '../../src/components/SessionControls.js';
+import { __resetPrefCacheForTests } from '../../src/hooks/usePref.js';
 import type { SessionInfo } from '../../src/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
@@ -442,6 +445,7 @@ const subSession = (name: string, label: string): SessionInfo =>
 describe('SessionControls', () => {
 afterEach(() => {
   cleanup();
+  __resetPrefCacheForTests();
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: DEFAULT_INNER_WIDTH });
 });
 
@@ -1402,6 +1406,7 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
     expect(onLaunch).toHaveBeenCalledWith('change-a', 'standard', {
       selectedTeamComboId: 'audit>review>plan',
+      autoCommitPush: false,
       materializedLimits: {
         specAuditRepairRounds: 1,
         implementationAuditRepairRounds: 2,
@@ -1409,6 +1414,26 @@ afterEach(() => {
         maxElapsedMinutes: 240,
       },
     });
+  });
+
+  it('sends the persisted auto commit/push preference when the launcher checkbox is enabled', () => {
+    const onLaunch = vi.fn();
+    render(
+      <OpenSpecAutoDeliverLauncher
+        open
+        changeName="change-a"
+        onClose={vi.fn()}
+        onLaunch={onLaunch}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Commit and push automatically after audit passes' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+
+    expect(onLaunch).toHaveBeenCalledWith('change-a', 'standard', expect.objectContaining({
+      selectedTeamComboId: 'audit>review>plan',
+      autoCommitPush: true,
+    }));
   });
 
   it('keeps numeric controls editable after preset quick setters and launches custom exact limits', () => {
@@ -1436,6 +1461,7 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
     expect(onLaunch).toHaveBeenCalledWith('change-a', 'custom', {
       selectedTeamComboId: 'audit>review>plan',
+      autoCommitPush: false,
       materializedLimits: {
         specAuditRepairRounds: 3,
         implementationAuditRepairRounds: 5,

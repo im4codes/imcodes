@@ -1241,6 +1241,7 @@
         "spec_audit_repair": "Spec audit",
         "implementation_task_loop": "Implementing",
         "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Commit & push",
         "stopping": "Stopping",
         "passed": "Passed",
         "needs_human": "Needs human",
@@ -1252,6 +1253,7 @@
         "spec_audit_repair": "Spec audit",
         "implementation_task_loop": "Implementation",
         "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Commit & push",
         "passed": "Passed",
         "needs_human": "Needs human",
         "failed": "Failed",
@@ -1306,7 +1308,16 @@
         "quality_gate_low_score": "Контроль качества приостановлен из-за низкой оценки модуля: {{modules}}. Если никто не вмешается, Auto Deliver добавит один раунд audit-fix.",
         "final_audit_passed": "Финальный аудит пройден.",
         "final_audit_rework_scored": "Финальный аудит завершен с оценкой оставшейся работы. Проверьте оценки модулей и решите, запускать ли Auto Deliver снова.",
-        "final_audit_blocked_scored": "Финальный аудит завершен с оценкой блокирующего вердикта. Проверьте оценки модулей и решите, запускать ли Auto Deliver снова."
+        "final_audit_blocked_scored": "Финальный аудит завершен с оценкой блокирующего вердикта. Проверьте оценки модулей и решите, запускать ли Auto Deliver снова.",
+        "auto_commit_push_failed": "Автоматический commit/push не выполнен: {{detail}}",
+        "auto_commit_push_git_status_failed": "Не удалось прочитать статус git для автоматического commit/push: {{detail}}",
+        "auto_commit_push_preexisting_changes": "Автоматический commit/push пропущен: до запуска уже были изменены файлы продукта: {{files}}",
+        "auto_commit_push_incomplete": "Автоматический commit/push требует проверки человеком: после шага commit/push файлы продукта все еще изменены: {{files}}",
+        "auto_commit_push_no_upstream": "Автоматический commit/push требует проверки человеком: у этой ветки нет upstream.",
+        "auto_commit_push_not_pushed": "Автоматический commit/push требует проверки человеком: {{count}} commit(s) все еще впереди upstream.",
+        "auto_commit_push_no_commit": "Автоматический commit/push требует проверки человеком: новый commit не был создан.",
+        "auto_commit_push_forbidden_paths": "Автоматический commit/push требует проверки человеком: были закоммичены локальные planning-файлы: {{files}}",
+        "auto_commit_push_unexpected_files": "Автоматический commit/push требует проверки человеком: commit включил файлы вне текущего изменения Auto Deliver: {{files}}"
       },
       "lifecycle": {
         "spec_audit_repair_started": "Аудит-исправление спецификации начался.",
@@ -1316,6 +1327,7 @@
         "implementation_idle_all_checked": "Все задачи реализации отмечены.",
         "implementation_audit_repair_started": "Аудит-исправление реализации начался.",
         "implementation_audit_repair_p2p_started": "Team-запуск аудита реализации начался.",
+        "auto_commit_push_prompt_dispatched": "Prompt commit/push отправлен.",
         "authoritative_result_file_repair_prompt_dispatched": "Prompt исправления файла результата отправлен.",
         "spec_audit_passed": "Аудит спецификации пройден.",
         "spec_audit_rework_scored": "Аудит спецификации завершен с оценкой оставшейся работы.",
@@ -1323,7 +1335,9 @@
       },
       "spec_rounds": "Spec audit rounds",
       "impl_rounds": "Implementation audit rounds",
-      "team_combo": "Комбо Team"
+      "team_combo": "Комбо Team",
+      "auto_commit_push": "Автоматически коммитить и отправлять после успешного аудита",
+      "auto_commit_push_help": "Сохраняется как ваша настройка. Только изменения продукта; OpenSpec и docs остаются локальными."
     },
     "propose_from_discussion_action": "Из недавнего обсуждения",
     "propose_from_description_action": "Из описания ниже",

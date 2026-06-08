@@ -128,6 +128,8 @@ export function validateOpenSpecAutoDeliverLaunchRequest(input: unknown): OpenSp
   if (typeof input.sessionName !== 'string' || input.sessionName.length === 0) issues.push(issue('invalid_session_name', 'sessionName is required.', 'sessionName'));
   if (!isOneOf(input.presetId, OPENSPEC_AUTO_DELIVER_PRESET_IDS)) issues.push(issue('invalid_preset_id', 'presetId is invalid.', 'presetId'));
   if (input.projectName !== undefined && typeof input.projectName !== 'string') issues.push(issue('invalid_project_name', 'projectName must be a string.', 'projectName'));
+  if (input.locale !== undefined && (typeof input.locale !== 'string' || input.locale.trim().length === 0)) issues.push(issue('invalid_locale', 'locale must be a non-empty string when provided.', 'locale'));
+  if (input.autoCommitPush !== undefined && typeof input.autoCommitPush !== 'boolean') issues.push(issue('invalid_auto_commit_push', 'autoCommitPush must be a boolean when provided.', 'autoCommitPush'));
   const selectedTeamComboId = typeof input.selectedTeamComboId === 'string' && input.selectedTeamComboId.trim()
     ? input.selectedTeamComboId.trim()
     : OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID;
@@ -170,6 +172,8 @@ export function validateOpenSpecAutoDeliverLaunchRequest(input: unknown): OpenSp
         maxElapsedMinutes: maxMinutes as number,
       },
       ...(typeof input.projectName === 'string' ? { projectName: input.projectName } : {}),
+      ...(typeof input.locale === 'string' ? { locale: input.locale.trim() } : {}),
+      autoCommitPush: input.autoCommitPush === true,
     },
     issues: [],
   };

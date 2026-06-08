@@ -1241,6 +1241,7 @@
         "spec_audit_repair": "Spec audit",
         "implementation_task_loop": "Implementing",
         "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Commit & push",
         "stopping": "Stopping",
         "passed": "Passed",
         "needs_human": "Needs human",
@@ -1252,6 +1253,7 @@
         "spec_audit_repair": "Spec audit",
         "implementation_task_loop": "Implementation",
         "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Commit & push",
         "passed": "Passed",
         "needs_human": "Needs human",
         "failed": "Failed",
@@ -1306,7 +1308,16 @@
         "quality_gate_low_score": "品質ゲートが低いモジュールスコアで一時停止しました: {{modules}}。介入がなければ Auto Deliver は audit-fix ラウンドを 1 回追加します。",
         "final_audit_passed": "最終監査に合格しました。",
         "final_audit_rework_scored": "最終監査が完了し、追加作業のスコアが記録されました。モジュールスコアを確認して Auto Deliver を再実行するか判断してください。",
-        "final_audit_blocked_scored": "最終監査が完了し、ブロック判定のスコアが記録されました。モジュールスコアを確認して Auto Deliver を再実行するか判断してください。"
+        "final_audit_blocked_scored": "最終監査が完了し、ブロック判定のスコアが記録されました。モジュールスコアを確認して Auto Deliver を再実行するか判断してください。",
+        "auto_commit_push_failed": "自動 commit/push に失敗しました: {{detail}}",
+        "auto_commit_push_git_status_failed": "自動 commit/push のための git status を読み取れませんでした: {{detail}}",
+        "auto_commit_push_preexisting_changes": "起動前から製品ファイルに変更があったため、自動 commit/push をスキップしました: {{files}}",
+        "auto_commit_push_incomplete": "commit/push ステップ後も製品ファイルが dirty のため、人の確認が必要です: {{files}}",
+        "auto_commit_push_no_upstream": "このブランチに upstream がないため、人の確認が必要です。",
+        "auto_commit_push_not_pushed": "{{count}} 件の commit がまだ upstream より先行しているため、人の確認が必要です。",
+        "auto_commit_push_no_commit": "新しい commit が作成されなかったため、人の確認が必要です。",
+        "auto_commit_push_forbidden_paths": "ローカル計画ファイルが commit されたため、人の確認が必要です: {{files}}",
+        "auto_commit_push_unexpected_files": "commit に今回の Auto Deliver 変更外のファイルが含まれているため、人の確認が必要です: {{files}}"
       },
       "lifecycle": {
         "spec_audit_repair_started": "仕様監査修復を開始しました。",
@@ -1316,6 +1327,7 @@
         "implementation_idle_all_checked": "すべての実装タスクがチェック済みです。",
         "implementation_audit_repair_started": "実装監査修復を開始しました。",
         "implementation_audit_repair_p2p_started": "実装監査の Team 実行を開始しました。",
+        "auto_commit_push_prompt_dispatched": "Commit/push プロンプトを送信しました。",
         "authoritative_result_file_repair_prompt_dispatched": "結果ファイル修復プロンプトを送信しました。",
         "spec_audit_passed": "仕様監査に合格しました。",
         "spec_audit_rework_scored": "仕様監査が完了し、追加作業のスコアが記録されました。",
@@ -1323,7 +1335,9 @@
       },
       "spec_rounds": "Spec audit rounds",
       "impl_rounds": "Implementation audit rounds",
-      "team_combo": "Team コンボ"
+      "team_combo": "Team コンボ",
+      "auto_commit_push": "監査通過後に自動で commit & push",
+      "auto_commit_push_help": "ユーザー設定として保存されます。製品変更のみ対象で、OpenSpec と docs はローカルのままです。"
     },
     "propose_from_discussion_action": "直近の議論から生成",
     "propose_from_description_action": "下の説明から生成",

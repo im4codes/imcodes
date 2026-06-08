@@ -1,6 +1,6 @@
 import { lstat, mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
@@ -18,10 +18,15 @@ import {
   OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
+  OPENSPEC_AUTO_DELIVER_EVIDENCE_OPTIONAL_FIELDS,
+  OPENSPEC_AUTO_DELIVER_EVIDENCE_REQUIRED_FIELDS,
   OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE,
   OPENSPEC_AUTO_DELIVER_MSG,
+  OPENSPEC_AUTO_DELIVER_MODULE_SCORE_FIELDS,
+  OPENSPEC_AUTO_DELIVER_REPAIR_SUMMARY_FIELDS,
   OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS,
   OPENSPEC_AUTO_DELIVER_TERMINAL_REASONS,
+  OPENSPEC_AUTO_DELIVER_VERDICTS,
   isOpenSpecAutoDeliverTerminalStage,
   materializeOpenSpecAutoDeliverPreset,
   type OpenSpecAutoDeliverPresetId,
@@ -69,7 +74,7 @@ import {
 import { resolveConfiguredP2pTargets } from './p2p-target-selection.js';
 
 type AutoDeliverRunStatus = Extract<OpenSpecAutoDeliverStage,
-  'proposed' | 'spec_audit_repair' | 'implementation_task_loop' | 'implementation_audit_repair' | 'passed' | 'needs_human' | 'failed' | 'stopped'>;
+  'proposed' | 'spec_audit_repair' | 'implementation_task_loop' | 'implementation_audit_repair' | 'commit_push' | 'passed' | 'needs_human' | 'failed' | 'stopped'>;
 
 type AuditRepairStage = Extract<OpenSpecAutoDeliverStage, 'spec_audit_repair' | 'implementation_audit_repair'>;
 export type OpenSpecAutoDeliverTransitionEvent =
@@ -85,6 +90,7 @@ export type OpenSpecAutoDeliverTransitionEvent =
   | 'implementation_audit_pass'
   | 'implementation_audit_rework'
   | 'implementation_audit_blocked'
+  | 'auto_commit_push_dispatched'
   | 'stop'
   | 'restart_cleanup'
   | 'runtime_error';
@@ -122,6 +128,12 @@ const OPENSPEC_AUTO_DELIVER_TRANSITIONS: Record<OpenSpecAutoDeliverStage, Partia
     implementation_audit_pass: 'passed',
     implementation_audit_rework: 'passed',
     implementation_audit_blocked: 'passed',
+    auto_commit_push_dispatched: 'commit_push',
+    stop: 'stopped',
+    restart_cleanup: 'failed',
+    runtime_error: 'failed',
+  },
+  commit_push: {
     stop: 'stopped',
     restart_cleanup: 'failed',
     runtime_error: 'failed',
@@ -158,6 +170,8 @@ interface AutoDeliverRun {
   targetImplementationSessionName: string;
   presetId: OpenSpecAutoDeliverPresetId;
   selectedTeamComboId: string;
+  locale?: string;
+  autoCommitPush: boolean;
   materializedLimits: OpenSpecAutoDeliverProjection['materializedLimits'];
   status: AutoDeliverRunStatus;
   stage: OpenSpecAutoDeliverStage;
@@ -189,6 +203,11 @@ interface AutoDeliverRun {
   latestRepairSummary?: string;
   lastAuditResultError?: string;
   evidence?: OpenSpecAutoDeliverEvidence[];
+  baselineProductChangedFiles?: string[];
+  baselineProductFileFingerprints?: Record<string, string>;
+  autoCommitPushBaselineHead?: string;
+  autoCommitPushBaselineAhead?: number;
+  autoCommitPushCandidateFiles?: string[];
   requestIds: Map<string, OpenSpecAutoDeliverProjection>;
   serverLink: ServerLink;
 }
@@ -461,6 +480,8 @@ function openSpecAutoDeliverLaunchFingerprint(input: {
   changeName: string;
   presetId: string;
   selectedTeamComboId: string;
+  locale?: string;
+  autoCommitPush: boolean;
   materializedLimits: unknown;
 }): string {
   return JSON.stringify(input);
@@ -744,7 +765,7 @@ async function collectGitEvidence(run: AutoDeliverRun): Promise<{ changedFiles: 
     const result = await execFileAsync('git', ['-C', run.projectRoot, ...args], { timeout: 2000, maxBuffer: 128 * 1024 }).catch(() => null);
     return result?.stdout?.toString?.() ?? '';
   };
-  const statusFiles = (await runGit(['status', '--porcelain=v1']))
+  const statusFiles = (await runGit(['status', '--porcelain=v1', '--untracked-files=all']))
     .split(/\r?\n/)
     .map((line) => line.slice(3).trim())
     .map((line) => line.includes(' -> ') ? line.split(' -> ').at(-1)?.trim() ?? line : line)
@@ -770,6 +791,242 @@ async function collectGitEvidence(run: AutoDeliverRun): Promise<{ changedFiles: 
   return { changedFiles, diffStat };
 }
 
+function isLocalPlanningPath(path: string): boolean {
+  const normalized = path.replace(/\\/g, '/').replace(/^\/+/, '');
+  return normalized === 'openspec'
+    || normalized.startsWith('openspec/')
+    || normalized === 'docs'
+    || normalized.startsWith('docs/')
+    || normalized === '.imc'
+    || normalized.startsWith('.imc/');
+}
+
+function productChangedFiles(files: string[]): string[] {
+  return files
+    .map((file) => file.replace(/\\/g, '/').replace(/^\/+/, '').trim())
+    .filter((file) => file.length > 0 && !isLocalPlanningPath(file));
+}
+
+async function productFileFingerprint(projectRoot: string, file: string): Promise<string> {
+  const projectRootResolved = resolve(projectRoot);
+  const candidate = resolve(projectRoot, file);
+  if (!isPathWithin(projectRootResolved, candidate)) return 'outside-project';
+  const fileStat = await lstat(candidate).catch(() => null);
+  if (!fileStat) return 'missing';
+  const resolved = await realpath(candidate).catch(() => null);
+  if (!resolved || !isPathWithin(projectRootResolved, resolved)) return 'outside-project';
+  if (!fileStat.isFile() && !fileStat.isSymbolicLink()) return `${fileStat.isDirectory() ? 'directory' : 'special'}:${fileStat.size}:${fileStat.mtimeMs}`;
+  const content = await readFile(resolved).catch(() => null);
+  if (!content) return 'unreadable';
+  return createHash('sha256').update(content).digest('hex');
+}
+
+async function productFileFingerprints(projectRoot: string, files: string[]): Promise<Record<string, string>> {
+  const output: Record<string, string> = {};
+  for (const file of productChangedFiles(files)) {
+    output[file] = await productFileFingerprint(projectRoot, file);
+  }
+  return output;
+}
+
+async function currentRunProductFiles(run: AutoDeliverRun, files: string[]): Promise<string[]> {
+  const baseline = run.baselineProductFileFingerprints ?? {};
+  const candidates: string[] = [];
+  for (const file of productChangedFiles(files)) {
+    const before = baseline[file];
+    if (!before) {
+      candidates.push(file);
+      continue;
+    }
+    const after = await productFileFingerprint(run.projectRoot, file);
+    if (after !== before) candidates.push(file);
+  }
+  return [...new Set(candidates)];
+}
+
+function parseGitStatusPorcelainZ(stdout: string): string[] {
+  const parts = stdout.split('\0').filter(Boolean);
+  const files: string[] = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    const entry = parts[index];
+    if (!entry || entry.length < 4) continue;
+    const status = entry.slice(0, 2);
+    const path = entry.slice(3).trim();
+    if (path) files.push(path);
+    if ((status.includes('R') || status.includes('C')) && index + 1 < parts.length) index += 1;
+  }
+  return [...new Set(files)];
+}
+
+async function gitOutput(projectRoot: string, args: string[], timeout = 10_000): Promise<string> {
+  const result = await execFileAsync('git', ['-C', projectRoot, ...args], {
+    timeout,
+    maxBuffer: 1024 * 1024,
+  });
+  return result.stdout?.toString?.() ?? '';
+}
+
+async function collectAutoCommitProductFiles(projectRoot: string): Promise<string[]> {
+  const stdout = await gitOutput(projectRoot, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+  return productChangedFiles(parseGitStatusPorcelainZ(stdout));
+}
+
+async function currentUpstreamAheadCount(projectRoot: string): Promise<number | null> {
+  const upstream = (await gitOutput(projectRoot, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])
+    .catch(() => '')).trim();
+  if (!upstream) return null;
+  const aheadBehind = (await gitOutput(projectRoot, ['rev-list', '--left-right', '--count', '@{u}...HEAD'])).trim();
+  const [, aheadRaw] = aheadBehind.split(/\s+/);
+  const ahead = Number(aheadRaw);
+  if (!Number.isFinite(ahead)) throw new Error(`invalid ahead/behind output "${aheadBehind}"`);
+  return ahead;
+}
+
+function buildAutoCommitPushPrompt(run: AutoDeliverRun, files: string[]): string {
+  void run;
+  void files;
+  return 'commit&push';
+}
+
+async function dispatchAutoCommitPushPrompt(run: AutoDeliverRun): Promise<OpenSpecAutoDeliverProjection> {
+  const elapsedProjection = enforceElapsedLimit(run);
+  if (elapsedProjection) return elapsedProjection;
+  if (!transitionAllowed(run, 'auto_commit_push_dispatched')) {
+    return terminalizeAndSend(run, 'failed', 'invalid_transition_auto_commit_push');
+  }
+  let files: string[];
+  try {
+    files = await collectAutoCommitProductFiles(run.projectRoot);
+  } catch (error) {
+    return terminalizeAndSend(run, 'needs_human', `auto_commit_push_git_status_failed:${describeUnknownError(error)}`);
+  }
+  const candidateFiles = await currentRunProductFiles(run, files);
+  if (candidateFiles.length === 0) {
+    run.evidence = mergeEvidence(run.evidence, [{
+      source: 'daemon',
+      summary: files.length > 0
+        ? `Auto commit/push enabled: no new product file changes beyond launch baseline. Baseline dirty files remain: ${files.join(', ')}.`
+        : 'Auto commit/push enabled: no product file changes to commit.',
+      stale: false,
+    }]);
+    return terminalizeAndSend(run, 'passed', 'final_audit_passed');
+  }
+  const runtime = getTransportRuntime(run.targetImplementationSessionName);
+  if (!runtime) {
+    return terminalizeAndSend(run, 'failed', 'missing_transport_runtime');
+  }
+  try {
+    run.autoCommitPushBaselineHead = (await gitOutput(run.projectRoot, ['rev-parse', 'HEAD'])).trim();
+    run.autoCommitPushBaselineAhead = await currentUpstreamAheadCount(run.projectRoot) ?? 0;
+  } catch (error) {
+    return terminalizeAndSend(run, 'needs_human', `auto_commit_push_git_status_failed:${describeUnknownError(error)}`);
+  }
+  run.autoCommitPushCandidateFiles = candidateFiles;
+  run.status = 'commit_push';
+  run.stage = 'commit_push';
+  run.activeCommandId = `${run.runId}:auto-commit-push:${run.generation}`;
+  const prompt = buildAutoCommitPushPrompt(run, files);
+  timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
+    text: prompt,
+    allowDuplicate: true,
+    commandId: run.activeCommandId,
+  }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${run.activeCommandId}` });
+  try {
+    runtime.send(prompt, run.activeCommandId);
+  } catch (error) {
+    delete run.activeCommandId;
+    return terminalizeAndSend(run, 'failed', error instanceof Error ? `auto_commit_push_send_failed:${error.message}` : 'auto_commit_push_send_failed');
+  }
+  run.latestMessage = 'auto_commit_push_prompt_dispatched';
+  run.evidence = mergeEvidence(run.evidence, [{
+    source: 'daemon',
+    summary: `Auto commit/push prompt dispatched to implementation LLM for current-run product files: ${candidateFiles.join(', ')}.`,
+    stale: false,
+  }]);
+  return broadcastProjection(run);
+}
+
+async function verifyAutoCommitPushCompleted(run: AutoDeliverRun): Promise<{ ok: true; summary: string } | { ok: false; error: string }> {
+  let files: string[];
+  try {
+    files = await collectAutoCommitProductFiles(run.projectRoot);
+  } catch (error) {
+    return { ok: false, error: `auto_commit_push_git_status_failed:${describeUnknownError(error)}` };
+  }
+  if (files.length > 0) {
+    const candidates = new Set(run.autoCommitPushCandidateFiles ?? []);
+    const remainingCurrentRunFiles = (await currentRunProductFiles(run, files)).filter((file) => candidates.has(file));
+    if (remainingCurrentRunFiles.length > 0) {
+      return { ok: false, error: `auto_commit_push_incomplete:${remainingCurrentRunFiles.slice(0, 30).join(',')}` };
+    }
+  }
+  const head = (await gitOutput(run.projectRoot, ['rev-parse', 'HEAD']).catch(() => '')).trim();
+  if (run.autoCommitPushBaselineHead && head === run.autoCommitPushBaselineHead) {
+    return { ok: false, error: 'auto_commit_push_no_commit' };
+  }
+  if (run.autoCommitPushBaselineHead && head) {
+    const committedFiles = (await gitOutput(run.projectRoot, ['diff', '--name-only', `${run.autoCommitPushBaselineHead}..HEAD`]).catch(() => ''))
+      .split(/\r?\n/)
+      .map((file) => file.trim())
+      .filter(Boolean);
+    const forbidden = committedFiles.filter(isLocalPlanningPath);
+    if (forbidden.length > 0) {
+      return { ok: false, error: `auto_commit_push_forbidden_paths:${forbidden.slice(0, 30).join(',')}` };
+    }
+    const candidates = new Set(run.autoCommitPushCandidateFiles ?? []);
+    const unexpected = productChangedFiles(committedFiles).filter((file) => !candidates.has(file));
+    if (unexpected.length > 0) {
+      return { ok: false, error: `auto_commit_push_unexpected_files:${unexpected.slice(0, 30).join(',')}` };
+    }
+  }
+  const upstream = (await gitOutput(run.projectRoot, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])
+    .catch(() => '')).trim();
+  if (!upstream) {
+    return { ok: false, error: 'auto_commit_push_no_upstream' };
+  }
+  let ahead = 0;
+  let behind = 0;
+  try {
+    const aheadBehind = (await gitOutput(run.projectRoot, ['rev-list', '--left-right', '--count', '@{u}...HEAD'])).trim();
+    const [behindRaw, aheadRaw] = aheadBehind.split(/\s+/);
+    ahead = Number(aheadRaw);
+    behind = Number(behindRaw);
+    if (!Number.isFinite(ahead) || !Number.isFinite(behind)) {
+      return { ok: false, error: `auto_commit_push_git_status_failed:invalid ahead/behind output "${aheadBehind}"` };
+    }
+  } catch (error) {
+    return { ok: false, error: `auto_commit_push_git_status_failed:${describeUnknownError(error)}` };
+  }
+  const allowedAhead = run.autoCommitPushBaselineAhead ?? 0;
+  if (ahead > allowedAhead) {
+    return { ok: false, error: `auto_commit_push_not_pushed:${ahead - allowedAhead}` };
+  }
+  const commit = (await gitOutput(run.projectRoot, ['log', '-1', '--pretty=%h %s']).catch(() => '')).trim();
+  const behindText = Number.isFinite(behind) && behind > 0 ? `; local branch is ${behind} commit(s) behind upstream` : '';
+  const allowedAheadText = allowedAhead > 0 ? `; preserving ${allowedAhead} pre-existing ahead commit(s)` : '';
+  return {
+    ok: true,
+    summary: `Auto commit/push verified by daemon${commit ? `: ${commit}` : ''}; upstream=${upstream}${behindText}${allowedAheadText}.`,
+  };
+}
+
+async function advanceAfterAutoCommitPushIdle(run: AutoDeliverRun): Promise<void> {
+  if (run.status !== 'commit_push' || !run.activeCommandId) return;
+  if (enforceElapsedLimit(run)) return;
+  delete run.activeCommandId;
+  const verification = await verifyAutoCommitPushCompleted(run);
+  run.evidence = mergeEvidence(run.evidence, [{
+    source: 'daemon',
+    summary: verification.ok ? verification.summary : verification.error,
+    stale: false,
+  }]);
+  if (!verification.ok) {
+    terminalizeAndSend(run, 'needs_human', verification.error);
+    return;
+  }
+  terminalizeAndSend(run, 'passed', 'final_audit_passed');
+}
+
 function openSpecChangeReference(run: AutoDeliverRun): string {
   return `@openspec/changes/${run.changeName}`;
 }
@@ -778,6 +1035,20 @@ function buildCanonicalOpenSpecAuditPrompt(run: AutoDeliverRun, stage: AuditRepa
   return stage === 'spec_audit_repair'
     ? formatOpenSpecPromptTemplate('audit_spec', openSpecChangeReference(run))
     : formatOpenSpecPromptTemplate('audit_implementation', openSpecChangeReference(run));
+}
+
+function buildAuthoritativeResultSchemaHints(includeAutoDeliverNesting: boolean): string[] {
+  return [
+    includeAutoDeliverNesting
+      ? 'The top-level auto_deliver object must exactly equal the metadata object below.'
+      : `Required auto_deliver fields: ${OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_METADATA_FIELDS.join(', ')}.`,
+    `Allowed verdict values: ${OPENSPEC_AUTO_DELIVER_VERDICTS.join(', ')}.`,
+    `module_scores must contain exactly one entry for each module: ${OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.join(', ')}.`,
+    `Each module_scores entry uses fields: ${OPENSPEC_AUTO_DELIVER_MODULE_SCORE_FIELDS.join(', ')}; max_score must be 10.`,
+    `Each repairs_applied entry uses fields: ${OPENSPEC_AUTO_DELIVER_REPAIR_SUMMARY_FIELDS.join(', ')}.`,
+    `Each evidence entry requires fields: ${OPENSPEC_AUTO_DELIVER_EVIDENCE_REQUIRED_FIELDS.join(', ')}; optional fields: ${OPENSPEC_AUTO_DELIVER_EVIDENCE_OPTIONAL_FIELDS.join(', ')}.`,
+    'PASS must leave unchecked_tasks and required_changes empty.',
+  ];
 }
 
 function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDeliverP2pMetadata): string {
@@ -841,8 +1112,7 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
     'The JSON file must preserve the auto_deliver metadata exactly and must include canonical module scores.',
     '',
     `Required top-level fields: ${OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS.join(', ')}.`,
-    `Required auto_deliver fields: ${OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_METADATA_FIELDS.join(', ')}.`,
-    `Required module score ids: ${OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.join(', ')}.`,
+    ...buildAuthoritativeResultSchemaHints(false),
   ].join('\n');
 }
 
@@ -870,7 +1140,7 @@ function buildAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpe
     'Write exactly one raw JSON object to the authoritative result file path above. Do not wrap the file content in Markdown fences. Do not write a second JSON candidate.',
     'The daemon will read only that file as the authoritative result; chat/discussion text is not authoritative.',
     '',
-    'The JSON auto_deliver metadata must match exactly:',
+    'The top-level auto_deliver object must exactly equal this metadata object:',
     JSON.stringify({
       runId: metadata.runId,
       changeName: metadata.changeName,
@@ -887,7 +1157,7 @@ function buildAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpe
     }, null, 2),
     '',
     `Required top-level fields: ${OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS.join(', ')}.`,
-    `Required module score ids: ${OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.join(', ')}.`,
+    ...buildAuthoritativeResultSchemaHints(true),
     '',
     stageVerdictScope,
   ].join('\n');
@@ -1047,6 +1317,7 @@ function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 
     run.activeAudit = undefined;
   }
   clearAuditFixRetryTimer(run.runId);
+  delete run.activeCommandId;
   run.status = status;
   run.stage = status;
   run.terminalReason = reason;
@@ -1170,8 +1441,9 @@ async function advanceAfterAuditVerdict(
     return;
   }
 
-  if (verdict.verdict === 'PASS') {
+    if (verdict.verdict === 'PASS') {
     const gitEvidence = await collectGitEvidence(run);
+    const currentRunChangedFiles = await currentRunProductFiles(run, gitEvidence.changedFiles);
     run.evidence = mergeEvidence(run.evidence, [
       {
         source: 'daemon',
@@ -1186,13 +1458,17 @@ async function advanceAfterAuditVerdict(
         stale: false,
       },
     ]);
-    if (gitEvidence.changedFiles.length > 0 && verdict.repairs_applied.length === 0) {
+    if (currentRunChangedFiles.length > 0 && verdict.repairs_applied.length === 0) {
       scheduleAuditFixRetry(run, stage, 'audit_pass_with_changed_files_without_repairs');
       return;
     }
-    const finalFailure = validateFinalPass(run, verdict, gitEvidence.changedFiles);
+    const finalFailure = validateFinalPass(run, verdict, currentRunChangedFiles);
     if (finalFailure) {
       scheduleAuditFixRetry(run, stage, finalFailure);
+      return;
+    }
+    if (run.autoCommitPush) {
+      await dispatchAutoCommitPushPrompt(run);
       return;
     }
     const projection = terminalize(run, 'passed', 'final_audit_passed');
@@ -1362,6 +1638,7 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
     serverLink: run.serverLink,
     modeOverride: run.selectedTeamComboId,
     rounds: 1,
+    locale: run.locale,
     launchOrigin: {
       kind: 'openspec_auto_deliver',
       commandId: attemptId,
@@ -1432,7 +1709,7 @@ function ensureTimelineListener(): void {
   if (event.type === 'assistant.text') {
       const run = [...runsById.values()].find((candidate) =>
         candidate.targetImplementationSessionName === event.sessionId
-        && candidate.status === 'implementation_task_loop'
+        && (candidate.status === 'implementation_task_loop' || candidate.status === 'commit_push')
         && !!candidate.activeCommandId
       );
       const text = typeof event.payload.text === 'string' ? event.payload.text.trim() : '';
@@ -1449,6 +1726,17 @@ function ensureTimelineListener(): void {
     if (event.type === 'user.message') return;
     if (event.type !== 'session.state') return;
     if ((event.payload as Record<string, unknown>).state !== 'idle') return;
+    const commitPushRun = [...runsById.values()].find((candidate) =>
+      candidate.targetImplementationSessionName === event.sessionId
+      && candidate.status === 'commit_push'
+      && !!candidate.activeCommandId
+    );
+    if (commitPushRun) {
+      void advanceAfterAutoCommitPushIdle(commitPushRun).catch((error) => {
+        terminalizeAndSend(commitPushRun, 'failed', error instanceof Error ? error.message : 'auto_commit_push_idle_advance_failed');
+      });
+      return;
+    }
     const run = [...runsById.values()].find((candidate) =>
       candidate.targetImplementationSessionName === event.sessionId
       && candidate.status === 'implementation_task_loop'
@@ -1484,12 +1772,16 @@ async function launch(request: OpenSpecAutoDeliverLaunchRequest, serverLink: Ser
   const presetId = launchValidation.value.presetId;
   const materializedLimits = launchValidation.value.materializedLimits ?? materializeOpenSpecAutoDeliverPreset(presetId);
   const selectedTeamComboId = launchValidation.value.selectedTeamComboId ?? OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID;
+  const locale = launchValidation.value.locale;
+  const autoCommitPush = launchValidation.value.autoCommitPush === true;
   const launchFingerprint = openSpecAutoDeliverLaunchFingerprint({
     requestId: requestId.value,
     sessionName,
     changeName: change.value,
     presetId,
     selectedTeamComboId,
+    locale,
+    autoCommitPush,
     materializedLimits,
   });
   const cached = requestProjectionByFingerprint.get(launchFingerprint);
@@ -1533,6 +1825,8 @@ async function launch(request: OpenSpecAutoDeliverLaunchRequest, serverLink: Ser
     releaseAutoDeliverP2pLock(owner, `launch:${owner}`);
     return { ok: false, error: 'tasks_missing_checkboxes' };
   }
+  const baselineProductChangedFiles = await collectAutoCommitProductFiles(resolved.projectRoot).catch(() => []);
+  const baselineProductFileFingerprints = await productFileFingerprints(resolved.projectRoot, baselineProductChangedFiles).catch(() => ({}));
   const now = Date.now();
   const run: AutoDeliverRun = {
     runId: `auto_${randomUUID().slice(0, 12)}`,
@@ -1545,6 +1839,8 @@ async function launch(request: OpenSpecAutoDeliverLaunchRequest, serverLink: Ser
     targetImplementationSessionName: sessionName,
     presetId,
     selectedTeamComboId,
+    ...(locale ? { locale } : {}),
+    autoCommitPush,
     materializedLimits,
     status: 'proposed',
     stage: 'proposed',
@@ -1558,6 +1854,8 @@ async function launch(request: OpenSpecAutoDeliverLaunchRequest, serverLink: Ser
     taskStats,
     latestMessage: taskStats.total === 0 ? 'tasks_missing_checkboxes' : 'ready',
     evidence: [],
+    baselineProductChangedFiles,
+    baselineProductFileFingerprints,
     requestIds: new Map(),
     serverLink,
   };

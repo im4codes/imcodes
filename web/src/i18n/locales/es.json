@@ -1241,6 +1241,7 @@
         "spec_audit_repair": "Spec audit",
         "implementation_task_loop": "Implementing",
         "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Confirmar y enviar",
         "stopping": "Stopping",
         "passed": "Passed",
         "needs_human": "Needs human",
@@ -1252,6 +1253,7 @@
         "spec_audit_repair": "Spec audit",
         "implementation_task_loop": "Implementation",
         "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Confirmar y enviar",
         "passed": "Passed",
         "needs_human": "Needs human",
         "failed": "Failed",
@@ -1306,7 +1308,16 @@
         "quality_gate_low_score": "La puerta de calidad se pausó por una puntuación baja de módulo: {{modules}}. Si nadie interviene, Auto Deliver añadirá una ronda audit-fix.",
         "final_audit_passed": "La auditoría final pasó.",
         "final_audit_rework_scored": "La auditoría final terminó con trabajo pendiente puntuado. Revisa las puntuaciones por módulo para decidir si ejecutas Auto Deliver otra vez.",
-        "final_audit_blocked_scored": "La auditoría final terminó con un veredicto bloqueado puntuado. Revisa las puntuaciones por módulo para decidir si ejecutas Auto Deliver otra vez."
+        "final_audit_blocked_scored": "La auditoría final terminó con un veredicto bloqueado puntuado. Revisa las puntuaciones por módulo para decidir si ejecutas Auto Deliver otra vez.",
+        "auto_commit_push_failed": "La confirmación/envío automático falló: {{detail}}",
+        "auto_commit_push_git_status_failed": "No se pudo leer el estado de git para confirmar/enviar automáticamente: {{detail}}",
+        "auto_commit_push_preexisting_changes": "Se omitió la confirmación/envío automático porque ya había archivos de producto modificados antes del inicio: {{files}}",
+        "auto_commit_push_incomplete": "La confirmación/envío automático necesita revisión humana porque aún hay archivos de producto modificados tras el paso de commit/push: {{files}}",
+        "auto_commit_push_no_upstream": "La confirmación/envío automático necesita revisión humana porque esta rama no tiene upstream.",
+        "auto_commit_push_not_pushed": "La confirmación/envío automático necesita revisión humana porque {{count}} commit(s) siguen por delante del upstream.",
+        "auto_commit_push_no_commit": "La confirmación/envío automático necesita revisión humana porque no se creó ningún commit nuevo.",
+        "auto_commit_push_forbidden_paths": "La confirmación/envío automático necesita revisión humana porque se confirmaron archivos locales de planificación: {{files}}",
+        "auto_commit_push_unexpected_files": "La confirmación/envío automático necesita revisión humana porque el commit incluyó archivos fuera de este cambio de Auto Deliver: {{files}}"
       },
       "lifecycle": {
         "spec_audit_repair_started": "La auditoría-reparación de especificación empezó.",
@@ -1316,6 +1327,7 @@
         "implementation_idle_all_checked": "Todas las tareas de implementación están marcadas.",
         "implementation_audit_repair_started": "La auditoría-reparación de implementación empezó.",
         "implementation_audit_repair_p2p_started": "La ejecución Team de auditoría de implementación empezó.",
+        "auto_commit_push_prompt_dispatched": "Se envió el prompt de commit/push.",
         "authoritative_result_file_repair_prompt_dispatched": "Se envió el prompt de reparación del archivo de resultado.",
         "spec_audit_passed": "La auditoría de especificación pasó.",
         "spec_audit_rework_scored": "La auditoría de especificación terminó con trabajo pendiente puntuado.",
@@ -1323,7 +1335,9 @@
       },
       "spec_rounds": "Spec audit rounds",
       "impl_rounds": "Implementation audit rounds",
-      "team_combo": "Combo de Team"
+      "team_combo": "Combo de Team",
+      "auto_commit_push": "Confirmar y enviar automáticamente tras aprobar la auditoría",
+      "auto_commit_push_help": "Se guarda como tu preferencia. Solo cambios de producto; OpenSpec y docs quedan locales."
     },
     "propose_from_discussion_action": "Desde la discusión reciente",
     "propose_from_description_action": "Desde la descripción de abajo",

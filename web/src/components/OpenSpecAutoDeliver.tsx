@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { PREF_KEY_OPENSPEC_AUTO_DELIVER_AUTO_COMMIT_PUSH } from '../constants/prefs.js';
+import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET,
   OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO,
@@ -25,6 +27,8 @@ export interface OpenSpecAutoDeliverLauncherProps {
   onLaunch: (changeName: string, presetId: OpenSpecAutoDeliverPresetId, options: {
     selectedTeamComboId: string;
     materializedLimits: ReturnType<typeof materializedPresetLimits>;
+    locale?: string;
+    autoCommitPush: boolean;
   }) => void;
   onViewCurrent?: () => void;
 }
@@ -67,6 +71,7 @@ const OVERALL_PROGRESS_PHASES = [
   'spec_audit_repair',
   'implementation_task_loop',
   'implementation_audit_repair',
+  'commit_push',
 ] as const;
 const OVERALL_PROGRESS_TOTAL = OVERALL_PROGRESS_PHASES.length + 1;
 
@@ -149,6 +154,8 @@ export function computeOpenSpecAutoDeliverProgress(projection: OpenSpecAutoDeliv
     } else if (projection.materializedLimits?.maxImplementationPrompts && projection.materializedLimits.maxImplementationPrompts > 0) {
       currentStage = progressMetric(projection.implementationPromptCount ?? 0, projection.materializedLimits.maxImplementationPrompts, 'prompts');
     }
+  } else if (stage === 'commit_push') {
+    currentStage = progressMetric(0, 1, 'stage');
   }
 
   return {
@@ -174,6 +181,76 @@ export function translateAutoDeliverReason(value: string | null | undefined, t: 
     const fallback = `Quality gate stopped for low module score: ${modules}`;
     const translated = t(key, {
       modules,
+      defaultValue: fallback,
+    });
+    return translated === key ? fallback : translated;
+  }
+  if (value.startsWith('auto_commit_push_failed:')) {
+    const detail = value.slice('auto_commit_push_failed:'.length);
+    const key = 'openspec.auto.reason.auto_commit_push_failed';
+    const fallback = `Auto commit/push failed: ${detail}`;
+    const translated = t(key, {
+      detail,
+      defaultValue: fallback,
+    });
+    return translated === key ? fallback : translated;
+  }
+  if (value.startsWith('auto_commit_push_git_status_failed:')) {
+    const detail = value.slice('auto_commit_push_git_status_failed:'.length);
+    const key = 'openspec.auto.reason.auto_commit_push_git_status_failed';
+    const fallback = `Auto commit/push could not read git status: ${detail}`;
+    const translated = t(key, {
+      detail,
+      defaultValue: fallback,
+    });
+    return translated === key ? fallback : translated;
+  }
+  if (value.startsWith('auto_commit_push_preexisting_changes:')) {
+    const files = value.slice('auto_commit_push_preexisting_changes:'.length).replace(/,/g, ', ');
+    const key = 'openspec.auto.reason.auto_commit_push_preexisting_changes';
+    const fallback = `Auto commit/push skipped because product files were already dirty before launch: ${files}`;
+    const translated = t(key, {
+      files,
+      defaultValue: fallback,
+    });
+    return translated === key ? fallback : translated;
+  }
+  if (value.startsWith('auto_commit_push_incomplete:')) {
+    const files = value.slice('auto_commit_push_incomplete:'.length).replace(/,/g, ', ');
+    const key = 'openspec.auto.reason.auto_commit_push_incomplete';
+    const fallback = `Auto commit/push needs human review because product files are still dirty after the commit/push step: ${files}`;
+    const translated = t(key, {
+      files,
+      defaultValue: fallback,
+    });
+    return translated === key ? fallback : translated;
+  }
+  if (value.startsWith('auto_commit_push_not_pushed:')) {
+    const count = value.slice('auto_commit_push_not_pushed:'.length);
+    const key = 'openspec.auto.reason.auto_commit_push_not_pushed';
+    const fallback = `Auto commit/push needs human review because ${count} commit(s) are still ahead of upstream.`;
+    const translated = t(key, {
+      count,
+      defaultValue: fallback,
+    });
+    return translated === key ? fallback : translated;
+  }
+  if (value.startsWith('auto_commit_push_forbidden_paths:')) {
+    const files = value.slice('auto_commit_push_forbidden_paths:'.length).replace(/,/g, ', ');
+    const key = 'openspec.auto.reason.auto_commit_push_forbidden_paths';
+    const fallback = `Auto commit/push needs human review because local planning files were committed: ${files}`;
+    const translated = t(key, {
+      files,
+      defaultValue: fallback,
+    });
+    return translated === key ? fallback : translated;
+  }
+  if (value.startsWith('auto_commit_push_unexpected_files:')) {
+    const files = value.slice('auto_commit_push_unexpected_files:'.length).replace(/,/g, ', ');
+    const key = 'openspec.auto.reason.auto_commit_push_unexpected_files';
+    const fallback = `Auto commit/push needs human review because the commit included files outside the current Auto Deliver change: ${files}`;
+    const translated = t(key, {
+      files,
       defaultValue: fallback,
     });
     return translated === key ? fallback : translated;
@@ -269,7 +346,9 @@ export function OpenSpecAutoDeliverLauncher({
   onLaunch,
   onViewCurrent,
 }: OpenSpecAutoDeliverLauncherProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const autoCommitPushPref = usePref<boolean>(PREF_KEY_OPENSPEC_AUTO_DELIVER_AUTO_COMMIT_PUSH, { parse: parseBooleanish });
+  const autoCommitPush = autoCommitPushPref.value === true;
   const [presetId, setPresetId] = useState<OpenSpecAutoDeliverPresetId>(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET);
   const defaultLimits = materializedPresetLimits(OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET);
   const [specRounds, setSpecRounds] = useState<number>(defaultLimits.specAuditRepairRounds);
@@ -305,6 +384,11 @@ export function OpenSpecAutoDeliverLauncher({
     setMaxElapsedMinutes(defaults.maxElapsedMinutes);
     setSelectedTeamComboId(OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO);
   }, [open, changeName]);
+  const handleAutoCommitPushChange = useCallback((event: Event) => {
+    const checked = (event.target as HTMLInputElement).checked;
+    autoCommitPushPref.set(checked);
+    void autoCommitPushPref.save(checked).catch(() => {});
+  }, [autoCommitPushPref]);
 
   if (!open) return null;
 
@@ -435,6 +519,18 @@ export function OpenSpecAutoDeliverLauncher({
               {t('openspec.auto.error.custom_combo_unsupported')}
             </div>
           )}
+          <label class="openspec-auto-checkbox">
+            <input
+              type="checkbox"
+              checked={autoCommitPush}
+              onChange={handleAutoCommitPushChange}
+              aria-label={t('openspec.auto.auto_commit_push')}
+            />
+            <span>
+              <strong>{t('openspec.auto.auto_commit_push')}</strong>
+              <small>{t('openspec.auto.auto_commit_push_help')}</small>
+            </span>
+          </label>
           <div class="openspec-auto-launcher-meta">
             {t('openspec.auto.materialized_limits', {
               spec: selectedLimits.specAuditRepairRounds,
@@ -452,7 +548,13 @@ export function OpenSpecAutoDeliverLauncher({
             disabled={disabled || !changeName || launchPending || invalidRounds || incompatibleCombo}
             onClick={() => {
               if (disabled || !changeName || launchPending || invalidRounds || incompatibleCombo) return;
-              onLaunch(changeName, presetId, { selectedTeamComboId, materializedLimits: selectedLimits });
+              const locale = i18n?.language;
+              onLaunch(changeName, presetId, {
+                selectedTeamComboId,
+                materializedLimits: selectedLimits,
+                ...(locale ? { locale } : {}),
+                autoCommitPush,
+              });
             }}
           >
             {launchPending ? t('common.starting') : t('openspec.auto.start')}

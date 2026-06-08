@@ -1242,6 +1242,7 @@
         "spec_audit_repair": "Spec 审计",
         "implementation_task_loop": "实现中",
         "implementation_audit_repair": "实现审计",
+        "commit_push": "提交并推送",
         "stopping": "停止中",
         "passed": "通过",
         "needs_human": "需要人工",
@@ -1253,6 +1254,7 @@
         "spec_audit_repair": "Spec 审计",
         "implementation_task_loop": "实现",
         "implementation_audit_repair": "实现审计",
+        "commit_push": "提交并推送",
         "passed": "通过",
         "needs_human": "需要人工",
         "failed": "失败",
@@ -1307,7 +1309,16 @@
         "quality_gate_low_score": "质量门控因模块低分暂停：{{modules}}。如果无人介入，Auto Deliver 会自动追加一轮 audit-fix。",
         "final_audit_passed": "最终审计已通过。",
         "final_audit_rework_scored": "最终审计已完成并给出后续工作评分。请查看模块分数决定是否再运行 Auto Deliver。",
-        "final_audit_blocked_scored": "最终审计已完成并给出阻塞判定评分。请查看模块分数决定是否再运行 Auto Deliver。"
+        "final_audit_blocked_scored": "最终审计已完成并给出阻塞判定评分。请查看模块分数决定是否再运行 Auto Deliver。",
+        "auto_commit_push_failed": "自动提交/推送失败：{{detail}}",
+        "auto_commit_push_git_status_failed": "自动提交/推送无法读取 git 状态：{{detail}}",
+        "auto_commit_push_preexisting_changes": "启动前已有产品文件改动，已跳过自动提交/推送：{{files}}",
+        "auto_commit_push_incomplete": "提交/推送步骤后仍有产品文件未提交，需要人工检查：{{files}}",
+        "auto_commit_push_no_upstream": "当前分支没有 upstream，需要人工检查后推送。",
+        "auto_commit_push_not_pushed": "仍有 {{count}} 个 commit 领先 upstream，需要人工检查推送。",
+        "auto_commit_push_no_commit": "没有产生新的 commit，需要人工检查。",
+        "auto_commit_push_forbidden_paths": "本地规划文件被提交了，需要人工检查：{{files}}",
+        "auto_commit_push_unexpected_files": "commit 包含了本次 Auto Deliver 变更之外的文件，需要人工检查：{{files}}"
       },
       "lifecycle": {
         "spec_audit_repair_started": "Spec 审计修复已开始。",
@@ -1317,6 +1328,7 @@
         "implementation_idle_all_checked": "所有实现任务已勾选。",
         "implementation_audit_repair_started": "实现审计修复已开始。",
         "implementation_audit_repair_p2p_started": "实现审计 Team 运行已开始。",
+        "auto_commit_push_prompt_dispatched": "提交/推送提示已发送。",
         "authoritative_result_file_repair_prompt_dispatched": "结果文件修复提示已发送。",
         "spec_audit_passed": "Spec 审计已通过。",
         "spec_audit_rework_scored": "Spec 审计已完成，并记录了后续工作评分。",
@@ -1324,7 +1336,9 @@
       },
       "spec_rounds": "Spec audit rounds",
       "impl_rounds": "Implementation audit rounds",
-      "team_combo": "团队组合流程"
+      "team_combo": "团队组合流程",
+      "auto_commit_push": "审计通过后自动提交并推送",
+      "auto_commit_push_help": "会保存为你的偏好。只提交产品改动，OpenSpec 和 docs 保持本地。"
     },
     "propose_from_discussion_action": "根据最近讨论生成",
     "propose_from_description_action": "根据下面的描述生成",

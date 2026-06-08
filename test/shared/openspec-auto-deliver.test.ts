@@ -78,6 +78,8 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
       changeName: 'openspec-auto-delivery',
       presetId: 'custom',
       selectedTeamComboId: OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
+      locale: 'zh-CN',
+      autoCommitPush: true,
       materializedLimits: {
         specAuditRepairRounds: 3,
         implementationAuditRepairRounds: 5,
@@ -93,6 +95,8 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
         changeName: 'openspec-auto-delivery',
         presetId: 'custom',
         selectedTeamComboId: OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
+        locale: 'zh-CN',
+        autoCommitPush: true,
         materializedLimits: {
           specAuditRepairRounds: 3,
           implementationAuditRepairRounds: 5,
@@ -153,7 +157,10 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
       sessionName: 'deck_proj_brain',
       changeName: 'openspec-auto-delivery',
       presetId: 'standard',
-    }).ok).toBe(true);
+    })).toEqual(expect.objectContaining({
+      ok: true,
+      value: expect.objectContaining({ autoCommitPush: false }),
+    }));
     expect(validateOpenSpecAutoDeliverLaunchRequest({
       requestId: 'req-1',
       serverId: 'srv-1',

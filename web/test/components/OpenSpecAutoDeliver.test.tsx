@@ -87,8 +87,8 @@ describe('OpenSpecAutoDeliver components', () => {
 
     expect(progress.overall).toMatchObject({
       current: 2,
-      total: 5,
-      percent: 40,
+      total: 6,
+      percent: 33,
       kind: 'overall',
     });
     expect(progress.currentStage).toMatchObject({
@@ -126,7 +126,7 @@ describe('OpenSpecAutoDeliver components', () => {
 
     const runbar = screen.getByTestId('openspec-auto-runbar');
     expect(runbar.textContent).toContain('Overall');
-    expect(runbar.textContent).toContain('2/5 · 40%');
+    expect(runbar.textContent).toContain('2/6 · 33%');
     expect(runbar.textContent).toContain('Current stage');
     expect(runbar.textContent).toContain('0/1 · 0%');
     expect(runbar.textContent).toContain('Spec audit Team run started.');
@@ -142,7 +142,7 @@ describe('OpenSpecAutoDeliver components', () => {
     );
 
     const compactRunbar = screen.getByTestId('openspec-auto-runbar');
-    expect(compactRunbar.textContent).toContain('2/5 · 40%');
+    expect(compactRunbar.textContent).toContain('2/6 · 33%');
     expect(compactRunbar.textContent).toContain('Spec audit Team run started.');
     expect(compactRunbar.textContent).not.toContain('spec_audit_repair_p2p_started');
   });

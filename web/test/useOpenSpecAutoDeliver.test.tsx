@@ -49,6 +49,8 @@ describe('useOpenSpecAutoDeliver', () => {
           maxImplementationPrompts: 12,
           maxElapsedMinutes: 240,
         },
+        locale: 'zh-CN',
+        autoCommitPush: true,
       });
       expect(requestId).toBeTruthy();
     });
@@ -58,6 +60,8 @@ describe('useOpenSpecAutoDeliver', () => {
       type: 'openspec_auto_deliver.launch',
       changeName: 'openspec-auto-delivery',
       selectedTeamComboId: 'audit>review>plan',
+      locale: 'zh-CN',
+      autoCommitPush: true,
       materializedLimits: {
         specAuditRepairRounds: 1,
         implementationAuditRepairRounds: 2,

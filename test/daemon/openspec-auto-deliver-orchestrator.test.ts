@@ -2,6 +2,8 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import {
   OPENSPEC_AUTO_DELIVER_MSG,
   OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS,
@@ -15,6 +17,7 @@ interface MockP2pRun {
   mainSession?: string;
   launchOrigin?: unknown;
   userText?: string;
+  locale?: string;
   resultSummary?: string | null;
   strictAuthoritativeResult?: string | null;
   error?: string | null;
@@ -69,6 +72,7 @@ import { getAutoDeliverP2pLock } from '../../src/daemon/p2p-launch-admission.js'
 
 let projectDir: string;
 let extraTempDirs: string[];
+const execFileAsync = promisify(execFile);
 
 async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): Promise<void> {
   const root = join(projectDir, 'openspec', 'changes', name);
@@ -96,6 +100,29 @@ async function waitForTransportSend(predicate: (text: string) => boolean, maxMs 
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error('Expected transport send was not observed');
+}
+
+async function git(args: string[], cwd = projectDir): Promise<string> {
+  const result = await execFileAsync('git', ['-C', cwd, ...args], {
+    timeout: 30_000,
+    maxBuffer: 1024 * 1024,
+  });
+  return result.stdout?.toString?.() ?? '';
+}
+
+async function initializeGitWithRemote(): Promise<string> {
+  const remoteDir = await mkdtemp(join(tmpdir(), `imcodes-auto-deliver-remote-${Date.now()}-`));
+  extraTempDirs.push(remoteDir);
+  await execFileAsync('git', ['init', '--bare', remoteDir], { timeout: 30_000 });
+  await execFileAsync('git', ['init', projectDir], { timeout: 30_000 });
+  await git(['config', 'user.email', 'auto-deliver@example.test']);
+  await git(['config', 'user.name', 'Auto Deliver Test']);
+  await git(['checkout', '-B', 'main']);
+  await git(['add', '--', '.']);
+  await git(['commit', '-m', 'Initial project']);
+  await git(['remote', 'add', 'origin', remoteDir]);
+  await git(['push', '-u', 'origin', 'main']);
+  return remoteDir;
 }
 
 function auditPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -147,6 +174,15 @@ function expectAuditPromptWithoutVerdictSkeleton(text: string): void {
   expect(text).not.toContain('PASS | REWORK | BLOCKED');
 }
 
+function expectAuthoritativeResultSchemaHints(text: string): void {
+  expect(text).toContain('Allowed verdict values: PASS, REWORK, BLOCKED');
+  expect(text).toContain('module_scores must contain exactly one entry for each module');
+  expect(text).toContain('Each module_scores entry uses fields: module, score, max_score, summary; max_score must be 10');
+  expect(text).toContain('Each repairs_applied entry uses fields: files, reason');
+  expect(text).toContain('Each evidence entry requires fields: source, summary; optional fields: command, exitCode');
+  expect(text).toContain('PASS must leave unchecked_tasks and required_changes empty');
+}
+
 async function completeLatestAudit(status = 'completed', payloadOverrides: Record<string, unknown> = {}): Promise<void> {
   const run = [...p2pRuns.values()].at(-1);
   if (!run) throw new Error('No mocked P2P run exists');
@@ -189,12 +225,12 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     getP2pRunMock.mockClear();
     listP2pRunsMock.mockImplementation(() => [...p2pRuns.values()]);
     cancelP2pRunMock.mockClear();
-    startP2pRunMock.mockImplementation(async (opts: { launchOrigin?: unknown; userText?: string; initiatorSession?: string }) => {
+    startP2pRunMock.mockImplementation(async (opts: { launchOrigin?: unknown; userText?: string; initiatorSession?: string; locale?: string }) => {
       const id = `p2p-${p2pRuns.size + 1}`;
       const contextFilePath = join(projectDir, '.imc', 'discussions', `${id}.md`);
       await mkdir(join(projectDir, '.imc', 'discussions'), { recursive: true });
       await writeFile(contextFilePath, '# mocked p2p\n', 'utf8');
-      const run = { id, status: 'queued', contextFilePath, mainSession: opts.initiatorSession, launchOrigin: opts.launchOrigin, userText: opts.userText };
+      const run = { id, status: 'queued', contextFilePath, mainSession: opts.initiatorSession, launchOrigin: opts.launchOrigin, userText: opts.userText, locale: opts.locale };
       p2pRuns.set(id, run);
       return run;
     });
@@ -263,6 +299,23 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(startP2pRunMock).not.toHaveBeenCalledWith(expect.objectContaining({
       initiatorSession: 'deck_demo_brain',
     }));
+  });
+
+  it('passes the selected UI locale through Auto Deliver Team/P2P audit launches', async () => {
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-locale',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+      locale: 'zh-CN',
+    }, serverLinkMock as never);
+
+    expect(startP2pRunMock).toHaveBeenCalledWith(expect.objectContaining({
+      locale: 'zh-CN',
+    }));
+    const audit = [...p2pRuns.values()].at(-1)!;
+    expect(audit.locale).toBe('zh-CN');
   });
 
   it('scopes spec-audit verdicts to artifact readiness rather than unfinished implementation tasks', async () => {
@@ -375,6 +428,8 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(getOpenSpecAutoDeliverTransitionTarget('implementation_audit_repair', 'implementation_audit_pass')).toBe('passed');
     expect(getOpenSpecAutoDeliverTransitionTarget('implementation_audit_repair', 'implementation_audit_rework')).toBe('passed');
     expect(getOpenSpecAutoDeliverTransitionTarget('implementation_audit_repair', 'implementation_audit_blocked')).toBe('passed');
+    expect(getOpenSpecAutoDeliverTransitionTarget('implementation_audit_repair', 'auto_commit_push_dispatched')).toBe('commit_push');
+    expect(getOpenSpecAutoDeliverTransitionTarget('commit_push', 'implementation_audit_pass')).toBeNull();
     expect(getOpenSpecAutoDeliverTransitionTarget('passed', 'implementation_prompt_dispatched')).toBeNull();
     expect(getOpenSpecAutoDeliverTransitionTarget('needs_human', 'implementation_audit_pass')).toBeNull();
     expect(getOpenSpecAutoDeliverTransitionTarget('stopped', 'spec_audit_started')).toBeNull();
@@ -469,10 +524,58 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(implementationLaunch.userText).toContain('implementation_audit criteria');
 
     await completeLatestAudit('completed');
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 8000);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
+
+  it('asks the implementation LLM to commit&push, then verifies product changes after final implementation audit PASS when opted in', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await writeFile(join(projectDir, '.gitignore'), '.imc/\n', 'utf8');
+    const remoteDir = await initializeGitWithRemote();
+    await mkdir(join(projectDir, 'src'), { recursive: true });
+    await writeFile(join(projectDir, 'src', 'preexisting.ts'), 'export const preexisting = true;\n', 'utf8');
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-auto-commit',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+      autoCommitPush: true,
+    }, serverLinkMock as never);
+
+    await writeFile(join(projectDir, 'src', 'feature.ts'), 'export const delivered = true;\n', 'utf8');
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair',
+      2500,
+    );
+
+    await completeLatestAudit('completed', {
+      repairs_applied: [{ files: ['src/feature.ts'], reason: 'Implemented the product change.' }],
+    });
+    const prompt = await waitForTransportSend((text) => text === 'commit&push', 2500);
+    expect(prompt).toBe('commit&push');
+    const commitMessage = 'Implement delivered feature';
+    await git(['add', '--', 'src/feature.ts']);
+    await git(['commit', '-m', commitMessage]);
+    await git(['push']);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 8000);
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.evidence?.map((entry: { summary?: string }) => entry.summary).join('\n')).toContain('Auto commit/push verified by daemon');
+
+    expect(await git(['status', '--porcelain', '--', 'src/feature.ts'])).toBe('');
+    expect(await git(['status', '--porcelain', '--', 'src/preexisting.ts'])).toContain('src/preexisting.ts');
+    expect(await git(['log', '--oneline', '-1'])).toContain(commitMessage);
+    const remoteLog = await execFileAsync('git', ['--git-dir', remoteDir, 'log', '--oneline', 'main', '-1'], {
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+    });
+    expect(remoteLog.stdout?.toString?.() ?? '').toContain(commitMessage);
+  }, 15_000);
 
   it('runs the Standard preset from spec audit through implementation audit PASS', async () => {
     await handleOpenSpecAutoDeliverCommand({
@@ -588,6 +691,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(specRun.userText).toContain(`Authoritative result file: ${specPath}`);
     expect(specRun.userText).toContain('Required auto_deliver fields:');
     expect(specRun.userText).toContain('authoritativeResultPath');
+    expectAuthoritativeResultSchemaHints(specRun.userText ?? '');
     expect(specOrigin.autoDeliver?.authoritativeResultPath).toBe(specPath);
     expectAuditPromptWithoutVerdictSkeleton(specRun.userText ?? '');
 
@@ -613,6 +717,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(implementationRun.userText).toContain(`Authoritative result file: ${implementationPath}`);
     expect(implementationRun.userText).toContain('Required auto_deliver fields:');
     expect(implementationRun.userText).toContain('authoritativeResultPath');
+    expectAuthoritativeResultSchemaHints(implementationRun.userText ?? '');
     expect(implementationOrigin.autoDeliver?.authoritativeResultPath).toBe(implementationPath);
     expectAuditPromptWithoutVerdictSkeleton(implementationRun.userText ?? '');
   });
@@ -844,6 +949,10 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(repairPrompt).toContain('implementation/test tasks in tasks.md remain unchecked for the next stage');
     expect(repairPrompt).toContain('Do not put implementation-stage follow-up tasks in unchecked_tasks or required_changes');
     expect(repairPrompt).toContain('REWORK means the OpenSpec artifacts themselves still require another spec-audit repair attempt');
+    expect(repairPrompt).toContain('The top-level auto_deliver object must exactly equal this metadata object');
+    expectAuthoritativeResultSchemaHints(repairPrompt);
+    expect(repairPrompt).not.toContain('```');
+    expect(repairPrompt).not.toContain('"module_scores"');
   });
 
   it('starts another full audit-repair round only after result-file repair also fails', async () => {

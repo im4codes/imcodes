@@ -30,6 +30,8 @@ interface LaunchOptions {
   presetId?: OpenSpecAutoDeliverPresetId;
   selectedTeamComboId?: string;
   materializedLimits?: OpenSpecAutoDeliverLaunchPayload['materializedLimits'];
+  locale?: string;
+  autoCommitPush?: boolean;
 }
 
 interface State {
@@ -228,7 +230,7 @@ export function useOpenSpecAutoDeliver({
     return requestId;
   }, [serverId, sessionName, ws]);
 
-  const launch = useCallback(({ changeName, presetId = OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET, selectedTeamComboId, materializedLimits }: LaunchOptions) => {
+  const launch = useCallback(({ changeName, presetId = OPENSPEC_AUTO_DELIVER_DEFAULT_PRESET, selectedTeamComboId, materializedLimits, locale, autoCommitPush }: LaunchOptions) => {
     const trimmedChangeName = changeName.trim();
     if (!ws || !sessionName || !trimmedChangeName) {
       setLastError('openspec.auto.error.missing_change');
@@ -244,6 +246,8 @@ export function useOpenSpecAutoDeliver({
       presetId,
       ...(selectedTeamComboId ? { selectedTeamComboId } : {}),
       ...(materializedLimits ? { materializedLimits } : {}),
+      ...(locale ? { locale } : {}),
+      autoCommitPush: autoCommitPush === true,
     };
     clearLaunchTimeout();
     activeLaunchRequestIdRef.current = requestId;

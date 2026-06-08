@@ -1241,6 +1241,7 @@
         "spec_audit_repair": "Spec audit",
         "implementation_task_loop": "Implementing",
         "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Commit & push",
         "stopping": "Stopping",
         "passed": "Passed",
         "needs_human": "Needs human",
@@ -1252,6 +1253,7 @@
         "spec_audit_repair": "Spec audit",
         "implementation_task_loop": "Implementation",
         "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Commit & push",
         "passed": "Passed",
         "needs_human": "Needs human",
         "failed": "Failed",
@@ -1306,7 +1308,16 @@
         "quality_gate_low_score": "품질 게이트가 낮은 모듈 점수로 일시 중지되었습니다: {{modules}}. 개입이 없으면 Auto Deliver가 audit-fix 라운드 1회를 추가합니다.",
         "final_audit_passed": "최종 감사가 통과되었습니다.",
         "final_audit_rework_scored": "최종 감사가 완료되었고 후속 작업 점수가 기록되었습니다. 모듈 점수를 확인해 Auto Deliver를 다시 실행할지 결정하세요.",
-        "final_audit_blocked_scored": "최종 감사가 완료되었고 차단 판정 점수가 기록되었습니다. 모듈 점수를 확인해 Auto Deliver를 다시 실행할지 결정하세요."
+        "final_audit_blocked_scored": "최종 감사가 완료되었고 차단 판정 점수가 기록되었습니다. 모듈 점수를 확인해 Auto Deliver를 다시 실행할지 결정하세요.",
+        "auto_commit_push_failed": "자동 commit/push 실패: {{detail}}",
+        "auto_commit_push_git_status_failed": "자동 commit/push를 위해 git 상태를 읽을 수 없습니다: {{detail}}",
+        "auto_commit_push_preexisting_changes": "시작 전에 이미 제품 파일 변경이 있어 자동 commit/push를 건너뛰었습니다: {{files}}",
+        "auto_commit_push_incomplete": "commit/push 단계 이후에도 제품 파일이 dirty 상태라서 사람의 검토가 필요합니다: {{files}}",
+        "auto_commit_push_no_upstream": "이 브랜치에 upstream이 없어 사람의 검토가 필요합니다.",
+        "auto_commit_push_not_pushed": "{{count}}개의 commit이 아직 upstream보다 앞서 있어 사람의 검토가 필요합니다.",
+        "auto_commit_push_no_commit": "새 commit이 생성되지 않아 사람의 검토가 필요합니다.",
+        "auto_commit_push_forbidden_paths": "로컬 계획 파일이 commit되어 사람의 검토가 필요합니다: {{files}}",
+        "auto_commit_push_unexpected_files": "commit에 이번 Auto Deliver 변경 범위 밖의 파일이 포함되어 사람의 검토가 필요합니다: {{files}}"
       },
       "lifecycle": {
         "spec_audit_repair_started": "명세 감사-수정을 시작했습니다.",
@@ -1316,6 +1327,7 @@
         "implementation_idle_all_checked": "모든 구현 작업이 체크되었습니다.",
         "implementation_audit_repair_started": "구현 감사-수정을 시작했습니다.",
         "implementation_audit_repair_p2p_started": "구현 감사 Team 실행을 시작했습니다.",
+        "auto_commit_push_prompt_dispatched": "Commit/push 프롬프트를 보냈습니다.",
         "authoritative_result_file_repair_prompt_dispatched": "결과 파일 수정 프롬프트를 보냈습니다.",
         "spec_audit_passed": "명세 감사가 통과되었습니다.",
         "spec_audit_rework_scored": "명세 감사가 완료되었고 후속 작업 점수가 기록되었습니다.",
@@ -1323,7 +1335,9 @@
       },
       "spec_rounds": "Spec audit rounds",
       "impl_rounds": "Implementation audit rounds",
-      "team_combo": "Team 콤보"
+      "team_combo": "Team 콤보",
+      "auto_commit_push": "감사 통과 후 자동 commit & push",
+      "auto_commit_push_help": "사용자 기본값으로 저장됩니다. 제품 변경만 커밋하며 OpenSpec과 docs는 로컬에 남깁니다."
     },
     "propose_from_discussion_action": "최근 논의에서 생성",
     "propose_from_description_action": "아래 설명에서 생성",
