@@ -8,7 +8,7 @@
 > But minds in concert don't answer fate, they author it.<br>
 > — IM.codes
 
-IM.codes даёт coding agents единый слой памяти и управляемую MCP-поверхность поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает или вспоминает нужную историю в будущие session. Поддерживаются Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, OpenCode, OpenClaw и Qwen, а также терминал, файлы, Git, localhost preview, уведомления, multi-agent workflows и нативный стриминг для transport-агентов. Совместный доступ к session превращает активную вкладку или весь source server в scoped workspace: один человек может наблюдать, другой — участвовать и отправлять prompts. OpenSpec Auto Deliver может провести change от proposal/spec audit через implementation, validation hints, Team audit/rework, автоматическую оценку модулей и финальные quality gates. Встроенный Auto supervision умеет оценивать завершённые ходы, продолжать работу автономно и при необходимости запускать цикл audit/rework перед возвратом контроля. Встроенное Team-обсуждение — несколько моделей взаимно проверяют и аудируют планы и реализации друг друга, эффективно уменьшая пропуски, «слепые зоны» и смещения одной модели.
+IM.codes даёт coding agents единый слой памяти и управляемую MCP-поверхность поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает или вспоминает нужную историю в будущие session. Поддерживаются Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, OpenCode, OpenClaw и Qwen, а также терминал, файлы, Git, localhost preview, уведомления, multi-agent workflows и нативный стриминг для transport-агентов. OpenSpec Auto Deliver может провести change от proposal/spec audit через implementation, validation hints, Team audit/rework, автоматическую оценку модулей и финальные quality gates. Совместный доступ также поддерживает pair или multi-person collaborative coding вокруг live agent sessions. Встроенный Auto supervision умеет оценивать завершённые ходы, продолжать работу автономно и при необходимости запускать цикл audit/rework перед возвратом контроля. Встроенное Team-обсуждение — несколько моделей взаимно проверяют и аудируют планы и реализации друг друга, эффективно уменьшая пропуски, «слепые зоны» и смещения одной модели.
 
 > Это перевод. **Каноническая версия — английский README (`../README.md`).** Если есть расхождения, ориентируйтесь на английский вариант.
 
@@ -72,16 +72,6 @@ IM.codes даёт coding agents единый слой памяти и управ
 
 Это не ещё один AI IDE и не просто удалённый терминал. Это слой сообщений, памяти и review вокруг терминальных coding agents.
 
-## Совместное программирование
-
-IM.codes также поддерживает human-to-human collaboration вокруг одного agent workspace. Можно поделиться текущей вкладкой, sub-session или всем source server с другим пользователем и выбрать роль `viewer` или `participant`.
-
-- **Pair или mob programming для агентов.** Два человека могут смотреть одну live coding session; большая группа может подключиться к одному server, когда задаче нужно больше контекста или review.
-- **Scoped sharing.** Делитесь только текущей вкладкой/sub-session для точечной передачи или всем source server, когда collaborator должен переходить между связанными sessions.
-- **Роли viewer и participant.** Viewer видит scoped state и может участвовать в discussions, но не управляет agent. Participant может отправлять prompts в покрытые конкретные tabs.
-- **Видимые shared actors.** Сообщения через shared access помечаются human actor и role, поэтому timeline показывает, кто дал инструкцию.
-- **Отзываемый доступ.** Shared users управляются из UI, их можно понизить или отозвать; participant access показывает явное trust warning, потому что prompts могут влиять на несандбоксированных agents.
-
 ## OpenSpec Auto Deliver
 
 Для OpenSpec-based changes Auto Deliver превращает change folder в end-to-end supervised delivery run: proposal/spec review, implementation, validation, Team audit, автоматическая оценка модулей, rework gates и видимый final handoff.
@@ -92,6 +82,10 @@ IM.codes также поддерживает human-to-human collaboration вок
 - **Автоматическая оценка модулей.** Каждый audit выдаёт structured scores для `spec`, `tasks`, `implementation`, `tests` и `risk`; evidence и summaries видны в run details, а не спрятаны в chat text.
 - **Implementation audit и rework gates.** Финальный scored verdict — `PASS`, `REWORK` или `BLOCKED` — решает, пройдет ли run, будет ли repair в пределах лимитов или нужна human decision.
 - **Fail-closed и контроль человека.** Auto Deliver просит human input при invalid audit output, исчерпанных time/prompt limits, manual interference, несовместимом Team state или unreadable tasks. Он не делает stage, commit или push кода.
+
+## Совместное программирование
+
+Поделитесь текущей вкладкой, sub-session или всем source server с другим пользователем. `viewer` подходит для read-only review, `participant` — когда teammate должен отправлять prompts в покрытые sessions. Shared messages несут actor labels, а доступ можно понизить или отозвать из UI.
 
 ## Shared Agent Context и память
 
@@ -140,11 +134,11 @@ IM.codes может вести поддерживаемые agent session ход
 ### Мобильные устройства, часы и уведомления
 Есть биометрическая аутентификация, push‑уведомления, ввод для shell‑сессий и быстрые ответы на Apple Watch.
 
-### Совместное программирование
-Поделитесь live session с другим человеком для pair programming или пригласите нескольких людей в scoped server workspace для mob-style agent supervision. Role-based access отделяет read-only viewers от participants, которые могут отправлять prompts; shared messages несут actor labels, поэтому collaboration остаётся auditable.
-
 ### OpenSpec Auto Deliver
 Проведите spec-driven change через structured pipeline: proposal/spec audit, implementation prompts, manifest-aware validation hints, Team audit/rework, автоматическая оценка spec/tasks/implementation/tests/risk и fail-closed handoff.
+
+### Совместное программирование
+Поделитесь live session для pair programming или пригласите нескольких людей в scoped server workspace с ролями viewer/participant.
 
 ### Кросс-модельный аудит и Team обсуждения
 Выходу одной модели нельзя доверять слепо. Team обсуждения позволяют нескольким агентам — от разных провайдеров и с разными стилями мышления — совместно анализировать одну кодовую базу ещё до написания кода. Каждый раунд следует настраиваемому многоэтапному пайплайну, где каждый агент читает все предыдущие вклады. Разные модели находят разные типы проблем. Такая перекрёстная проверка ещё до реализации выявляет проблемы, которые одна модель часто пропускает, и сокращает переделки.

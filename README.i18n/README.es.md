@@ -9,7 +9,7 @@
 > But minds in concert don't answer fate, they author it.<br>
 > — IM.codes
 
-IM.codes ofrece a los coding agents una capa de memoria compartida entre proveedores y una superficie MCP gestionada. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent), además de terminal, archivos, vistas Git, localhost preview, notificaciones, flujos multiagente y streaming nativo para agentes transport. El uso compartido de sesión convierte una pestaña activa o todo un source server en un espacio de colaboración con alcance, para que una persona observe mientras otra participa y envía prompts. OpenSpec Auto Deliver puede llevar un cambio desde auditoría de propuesta/spec hasta implementación, sugerencias de validación, auditoría/retrabajo Team, scoring automático por módulo y quality gates finales. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión Team integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.
+IM.codes ofrece a los coding agents una capa de memoria compartida entre proveedores y una superficie MCP gestionada. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent), además de terminal, archivos, vistas Git, localhost preview, notificaciones, flujos multiagente y streaming nativo para agentes transport. OpenSpec Auto Deliver puede llevar un cambio desde auditoría de propuesta/spec hasta implementación, sugerencias de validación, auditoría/retrabajo Team, scoring automático por módulo y quality gates finales. El uso compartido de sesión también permite programación colaborativa pair o multi-persona alrededor de sesiones agent en vivo. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión Team integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.
 
 > **Nota:** Este archivo es una traducción. **El README en inglés (`../README.md`) es la versión canónica.** Si hay alguna diferencia, prevalece la versión en inglés.
 
@@ -76,16 +76,6 @@ No es otro IDE de IA ni un cliente genérico de terminal remota. Es la capa de m
 
 Este es un proyecto personal. Yo prácticamente no escribí código: fue construido casi por completo por [Claude Code](https://github.com/anthropics/claude-code), con contribuciones importantes de [Codex](https://github.com/openai/codex) y [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
-## Programación colaborativa
-
-IM.codes también permite colaboración humana alrededor del mismo workspace de agentes. Comparte la pestaña actual, una sub-sesión o todo el source server con otro usuario, y elige si será `viewer` o `participant`.
-
-- **Pair o mob programming con agentes.** Dos personas pueden mirar la misma sesión de coding en vivo; grupos más grandes pueden reunirse alrededor del mismo servidor cuando la tarea necesita más contexto o revisión.
-- **Uso compartido con alcance.** Comparte solo la pestaña/sub-sesión actual para un handoff enfocado, o todo el source server cuando los colaboradores necesiten moverse entre sesiones relacionadas.
-- **Roles viewer y participant.** Viewers pueden inspeccionar el estado con alcance y unirse a discusiones sin conducir el agente. Participants pueden enviar prompts a las pestañas concretas cubiertas.
-- **Actores visibles.** Los mensajes enviados mediante shared access llevan etiqueta de actor humano y rol, de modo que la timeline muestra quién dio cada instrucción.
-- **Acceso revocable.** Los usuarios compartidos se gestionan desde la UI y pueden degradarse o revocarse; participant muestra una advertencia explícita porque un prompt puede influir en agentes no sandboxed.
-
 ## OpenSpec Auto Deliver
 
 Para cambios basados en OpenSpec, Auto Deliver convierte un change folder en una ejecución de entrega supervisada de extremo a extremo: revisión proposal/spec, implementación, validación, auditoría Team, scoring automático por módulo, gates de retrabajo y handoff final visible.
@@ -96,6 +86,10 @@ Para cambios basados en OpenSpec, Auto Deliver convierte un change folder en una
 - **Scoring automático por módulo.** Cada auditoría produce puntuaciones estructuradas para `spec`, `tasks`, `implementation`, `tests` y `risk`, con evidencia y resumen visibles en los detalles de ejecución.
 - **Auditoría de implementación y gates de retrabajo.** El veredicto final con puntuación — `PASS`, `REWORK` o `BLOCKED` — decide si la ejecución pasa, repara mientras haya límites o requiere decisión humana.
 - **Fail-closed y control humano.** Auto Deliver pide intervención humana ante salida de auditoría inválida, límites agotados, interferencia manual, estado Team incompatible o tareas ilegibles. No hace stage, commit ni push de código.
+
+## Programación colaborativa
+
+Comparte una pestaña, sub-sesión o source server completo con otro usuario. Usa `viewer` para review de solo lectura o `participant` cuando un teammate deba enviar prompts a las sesiones cubiertas. Los mensajes compartidos llevan actor label y el acceso puede degradarse o revocarse desde la UI.
 
 ## Shared Agent Context y memoria
 
@@ -144,11 +138,11 @@ Previsualiza tu servidor de desarrollo local desde cualquier dispositivo sin des
 ### Móvil, reloj y notificaciones
 Soporte completo para móvil, autenticación biométrica, notificaciones push, entrada interactiva para sesiones shell y respuestas rápidas desde Apple Watch.
 
-### Programación colaborativa
-Comparte una sesión viva con otra persona para pair programming, o invita a varias personas a un workspace de servidor con alcance para supervisión estilo mob. Los roles separan viewers de solo lectura y participants que pueden enviar prompts; los mensajes compartidos incluyen etiqueta de actor para que la colaboración sea auditable.
-
 ### OpenSpec Auto Deliver
 Ejecuta un cambio guiado por spec mediante un pipeline estructurado: auditoría proposal/spec, prompts de implementación, sugerencias de validación basadas en manifests, auditoría/retrabajo Team, scoring automático de spec/tasks/implementation/tests/risk y handoff fail-closed visible.
+
+### Programación colaborativa
+Comparte una sesión viva para pair programming, o invita a más personas a un workspace de servidor con alcance mediante roles viewer/participant.
 
 ### Auditoría cross-modelo y discusiones Team
 La salida de un solo modelo no debería confiarse ciegamente. Las discusiones Team permiten que múltiples agentes — de distintos proveedores y estilos de pensamiento — colaboren en el análisis del mismo código antes de escribir una sola línea. Cada ronda sigue un pipeline multifase personalizable, donde cada agente lee todas las contribuciones anteriores. Diferentes modelos detectan diferentes tipos de problemas. Esta revisión cruzada entre proveedores encuentra problemas que un solo modelo suele pasar por alto antes de la implementación, reduciendo el retrabajo.

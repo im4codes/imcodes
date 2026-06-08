@@ -9,7 +9,7 @@
 > されど三人の孔明、談笑のうちに天下を定む。<br>
 > — IM.codes
 
-IM.codes は coding agent のための、プロバイダーをまたぐ共有メモリレイヤーと管理対象 MCP tool surface です。完了した作業を再利用可能なコンテキストとして蓄積し、適切な履歴を後続 session に注入または recall します。対応先は Claude Code、Codex、Gemini CLI、GitHub Copilot、Cursor、OpenCode、OpenClaw、Qwen などで、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携、transport 系 agent のネイティブストリーミングも備えています。セッション共有により、実行中のタブや source server 全体をスコープ付きの協調ワークスペースにでき、1 人が見守り、別の人が参加して prompt を送れます。OpenSpec Auto Deliver は変更を proposal/spec 監査から実装、検証ヒント、Team 監査/手戻り、自動モジュール採点、最終 quality gate まで進められます。内蔵の Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。Team ディスカッションを内蔵——複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。
+IM.codes は coding agent のための、プロバイダーをまたぐ共有メモリレイヤーと管理対象 MCP tool surface です。完了した作業を再利用可能なコンテキストとして蓄積し、適切な履歴を後続 session に注入または recall します。対応先は Claude Code、Codex、Gemini CLI、GitHub Copilot、Cursor、OpenCode、OpenClaw、Qwen などで、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携、transport 系 agent のネイティブストリーミングも備えています。OpenSpec Auto Deliver は変更を proposal/spec 監査から実装、検証ヒント、Team 監査/手戻り、自動モジュール採点、最終 quality gate まで進められます。セッション共有も live agent session を中心に pair / multi-person 協調プログラミングを支えます。内蔵の Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。Team ディスカッションを内蔵——複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。
 
 > これは翻訳版です。**正式な内容は英語版 README（`../README.md`）です。** 差異がある場合は英語版を優先してください。
 
@@ -73,16 +73,6 @@ iPhone、iPad、Apple Watch に対応しています。[Web App](https://app.im.
 
 これは別の AI IDE ではなく、単なる遠隔ターミナルでもありません。端末ベースの coding agents を取り巻くメッセージング、メモリ、レビューのレイヤーです。
 
-## 協調プログラミング
-
-IM.codes は同じ agent ワークスペースを中心に、人間同士の協調もサポートします。現在のタブ、サブセッション、または source server 全体を他のユーザーに共有し、`viewer` または `participant` のロールを選べます。
-
-- **ペア/モブ programming for agents。** 2 人で同じ live coding session を見ながら進められます。より多くの文脈やレビューが必要なときは、複数人で同じ server に参加できます。
-- **スコープ付き共有。** 集中的な引き継ぎには現在のタブ/サブセッションだけを共有し、関連 session を横断する必要がある場合は source server 全体を共有できます。
-- **Viewer と participant の分離。** Viewer はスコープ内の状態確認と discussion 参加ができますが agent は操作しません。Participant は対象タブへ prompt を送信できます。
-- **見える shared actor。** shared access 経由のメッセージには人間の actor と role が表示され、timeline で誰が指示したか分かります。
-- **取り消し可能なアクセス。** 共有ユーザーは UI で管理・降格・取り消しできます。participant には、prompt が sandbox されていない agent に影響し得るため明示的な trust warning が出ます。
-
 ## OpenSpec Auto Deliver
 
 OpenSpec ベースの変更では、Auto Deliver が change folder を end-to-end の監督付き delivery run に変えます: proposal/spec review、実装、検証、Team audit、自動モジュール採点、rework gate、見える最終 handoff まで扱います。
@@ -93,6 +83,10 @@ OpenSpec ベースの変更では、Auto Deliver が change folder を end-to-en
 - **自動モジュール採点。** 各 audit は `spec`、`tasks`、`implementation`、`tests`、`risk` の structured scores を出し、evidence と summary は run details に表示されます。
 - **実装 audit と rework gate。** 採点付き final verdict — `PASS`、`REWORK`、`BLOCKED` — により、pass するか、limit 内で repair するか、人間判断に戻すかを決めます。
 - **Fail-closed と人間の最終制御。** audit output 不正、limit 到達、manual interference、Team state 不整合、tasks unreadable では human input を求めます。code の stage、commit、push は行いません。
+
+## 協調プログラミング
+
+現在のタブ、サブセッション、または source server 全体を他のユーザーに共有できます。`viewer` は read-only review、`participant` は対象 session への prompt 送信に使います。Shared message には actor label が付き、access は UI で降格または取り消しできます。
 
 ## Shared Agent Context とメモリ
 
@@ -141,11 +135,11 @@ SSH、VPN、ポート開放なしで、任意のブラウザから agent session
 ### モバイル、Watch、通知
 生体認証、push 通知、shell session の入力、Apple Watch での素早い確認と返信に対応します。
 
-### 協調プログラミング
-live session を他の人に共有して pair programming できます。複数人を scoped server workspace に招待して mob-style に agent を監督することもできます。ロールにより read-only viewer と prompt を送れる participant を分離し、shared message には actor label が付くため協調作業を audit できます。
-
 ### OpenSpec Auto Deliver
 spec-driven change を structured pipeline で進めます: proposal/spec audit、implementation prompts、manifest-aware validation hints、Team audit/rework、spec/tasks/implementation/tests/risk の自動採点、fail-closed handoff。
+
+### 協調プログラミング
+live session を他の人に共有して pair programming したり、viewer/participant roles で scoped server workspace に複数人を招待できます。
 
 ### クロスモデル監査と Team ディスカッション
 単一モデルの出力を盲信すべきではありません。Team ディスカッションでは、異なるプロバイダーや思考スタイルを持つ複数の agent が、コードを書く前に同じコードベースで協調分析を行います。各ラウンドはカスタマイズ可能なマルチフェーズパイプラインに従い、各 agent は前の貢献をすべて読んだ上で出力します。異なるモデルは異なる種類の問題を発見します。このクロスプロバイダー相互審査により、実装前に単一モデルが見落としがちな問題を発見し、手戻りを減らせます。
