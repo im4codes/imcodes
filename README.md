@@ -8,7 +8,7 @@
 > But minds in concert don't answer fate, they author it.<br>
 > — IM.codes
 
-IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and native streaming output for transport-backed agents. For spec-driven work, OpenSpec Auto Deliver can take a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.
+IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and native streaming output for transport-backed agents. Session sharing turns a running tab or whole source server into a scoped collaborative workspace, so one teammate can watch while another participates and sends prompts. For spec-driven work, OpenSpec Auto Deliver can take a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.
 
 > **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
 
@@ -75,9 +75,19 @@ When you leave your desk, most coding-agent workflows fall apart. The agent is s
 
 That reach problem is only one half of it. Complex coding-agent work also needs steadier judgment: a single model can fall into familiar patterns, miss issues, or produce unstable answers on hard tasks. Switching providers can help, but without shared context it can also lose the thread.
 
-[IM.codes](https://im.codes) is built around both needs. It keeps sessions within reach from mobile or web: open the terminal, inspect files and git changes, preview localhost from another device, get notified when work finishes, and keep multiple agents moving on your own infrastructure. It also pairs [Shared Agent Context & Memory](#shared-agent-context--memory) with [Multi-Agent Discussions & Cross-Provider Audit](#multi-agent-discussions--cross-provider-audit): durable recall comes from summarized completed work, while Team discussion is structured cross-model review before code lands. It does not make output perfect, but it reduces single-model blind spots and helps complex work converge with more review.
+[IM.codes](https://im.codes) is built around both needs. It keeps sessions within reach from mobile or web: open the terminal, inspect files and git changes, preview localhost from another device, get notified when work finishes, invite another person into the same session or server, and keep multiple agents moving on your own infrastructure. It also pairs [Shared Agent Context & Memory](#shared-agent-context--memory) with [Multi-Agent Discussions & Cross-Provider Audit](#multi-agent-discussions--cross-provider-audit): durable recall comes from summarized completed work, while Team discussion is structured cross-model review before code lands. It does not make output perfect, but it reduces single-model blind spots and helps complex work converge with more review.
 
 It is not another AI IDE or a generic remote terminal. It is the messaging, memory, and review layer around terminal-based coding agents.
+
+## Collaborative Coding
+
+IM.codes also supports human-to-human collaboration around the same agent workspace. Share the current tab, a sub-session, or the whole source server with another user, then choose whether they are a `viewer` or a `participant`.
+
+- **Pair or mob programming for agents.** Two people can watch the same live coding session, and larger groups can join around the same server when a task needs more context or review.
+- **Scoped sharing.** Share just the current tab/sub-session for a focused handoff, or share the whole source server when collaborators need to move across related sessions.
+- **Viewer vs participant roles.** Viewers can inspect scoped state and join discussions without driving the agent. Participants can send prompts to covered concrete tabs.
+- **Visible shared actors.** Messages sent through shared access are labeled with the human actor and role, so the timeline shows who actually gave an instruction.
+- **Revocable access.** Shared users are managed from the UI and can be downgraded or revoked; participant access includes an explicit trust warning because prompts can influence unsandboxed agents.
 
 ## OpenSpec Auto Deliver
 
@@ -144,6 +154,10 @@ Preview your local dev server from any device — phone, tablet, or remote brows
 ### Mobile, Watch & Notifications
 
 Full mobile support with biometric auth and push notifications. Shell sessions allow interactive keyboard input on mobile (SSH-like). Sub-session preview cards always show latest messages. Toast notifications navigate directly to the relevant session. Apple Watch support adds quick session monitoring, unread counts, and quick replies from the wrist.
+
+### Collaborative Coding
+
+Share a live session with another person for pair programming, or invite multiple people into a scoped server workspace for mob-style agent supervision. Role-based access separates read-only viewers from participants who can send prompts, and shared messages carry actor labels so collaboration stays auditable.
 
 ### OpenSpec Auto Deliver
 

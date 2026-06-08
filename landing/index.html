@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IM.codes — The IM for agents. Shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit.</title>
-<meta name="description" content="The IM for agents. Shared memory, OpenSpec Auto Deliver with automatic module scoring, managed MCP tools, supervised execution, and cross-agent audit — recall solved work, message sibling agents, schedule cron sends, supervise task completion, and run audit/rework loops across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, and OpenClaw.">
+<title>IM.codes — The IM for agents. Shared memory, collaborative coding, OpenSpec Auto Deliver, managed MCP tools, and cross-agent audit.</title>
+<meta name="description" content="The IM for agents. Shared memory, collaborative coding, OpenSpec Auto Deliver with automatic module scoring, managed MCP tools, supervised execution, and cross-agent audit — recall solved work, message sibling agents, schedule cron sends, supervise task completion, and run audit/rework loops across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, and OpenClaw.">
 <style>
 :root {
   --bg: #0a0a0a;
@@ -230,7 +230,7 @@ footer {
 <header>
   <div class="header-left">
     <h1>IM<span>.</span>codes</h1>
-    <div class="tagline" data-i18n="tagline">The IM for agents. Shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit.</div>
+    <div class="tagline" data-i18n="tagline">The IM for agents. Shared memory, collaborative coding, OpenSpec Auto Deliver, managed MCP tools, and cross-agent audit.</div>
   </div>
   <div class="lang-switch">
     <button onclick="setLang('en')" data-lang="en" class="active">EN</button>
@@ -249,7 +249,7 @@ footer {
     <span data-i18n="couplet_l2">But minds in concert don't answer fate, they author it.</span><br>
     <cite>— IM.codes</cite>
   </blockquote>
-  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. OpenSpec Auto Deliver can drive a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.</p>
+  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Session sharing lets a teammate join the same live tab or source server as a viewer or participant, enabling pair or multi-person collaborative coding around agents. OpenSpec Auto Deliver can drive a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.</p>
   <div class="prompt">imcodes bind https://app.im.codes/bind/&lt;key&gt;<span class="cursor"></span></div>
   <div class="output" data-i18n="hero_output">bound to app.im.codes &middot; daemon started &middot; registered as system service</div>
 </section>
@@ -323,6 +323,18 @@ footer {
   </ul>
 </section>
 
+<section>
+  <h2 data-i18n="h_collab">collaborative coding</h2>
+  <p style="color:var(--fg); margin-bottom:12px;" data-i18n="collab_intro">Share a live tab, sub-session, or whole source server with another person. Use viewer access for review, or participant access when a teammate should send prompts into the covered sessions.</p>
+  <ul class="reqs">
+    <li data-i18n="collab_1">Pair programming: one person watches while another drives the agent, with both seeing the same live terminal/chat state.</li>
+    <li data-i18n="collab_2">Multi-person collaboration: invite several people into the same scoped server workspace for mob-style agent supervision.</li>
+    <li data-i18n="collab_3">Scoped sharing keeps access narrow: current tab, sub-session, or whole source server.</li>
+    <li data-i18n="collab_4">Viewer and participant roles separate read-only review from prompt-sending access.</li>
+    <li data-i18n="collab_5">Shared messages carry human actor labels, and access can be downgraded or revoked from the UI.</li>
+  </ul>
+</section>
+
 <section class="spotlight">
   <h2 data-i18n="h_autodeliver">OpenSpec Auto Deliver</h2>
   <p style="color:var(--fg); margin-bottom:12px;" data-i18n="autodeliver_intro">Turn an OpenSpec change folder into a supervised delivery run: proposal/spec audit, implementation, validation hints, Team audit/rework, automatic scoring, and a visible final handoff.</p>
@@ -366,6 +378,7 @@ footer {
   <div class="features">
     <div class="feat"><div class="feat-name" data-i18n="f_memory_name">shared agent context</div><div class="feat-desc" data-i18n="f_memory_desc">problem→solution memory, multilingual recall, automatic per-message and startup injection with visible timeline cards</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_mcp_name">managed MCP tools</div><div class="feat-desc" data-i18n="f_mcp_desc">ten runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_collab_name">collaborative coding</div><div class="feat-desc" data-i18n="f_collab_desc">share tabs, sub-sessions, or whole source servers with viewer/participant roles for pair or multi-person agent programming</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_autodeliver_name">OpenSpec Auto Deliver</div><div class="feat-desc" data-i18n="f_autodeliver_desc">proposal/spec audit → implementation → Team audit/rework, with automatic module scoring for spec/tasks/implementation/tests/risk</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_auto_name">supervised execution</div><div class="feat-desc" data-i18n="f_auto_desc">turn-level completion checks, auto-continue, and optional audit→rework loops for transport-backed agents</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_remote_name">remote terminal</div><div class="feat-desc" data-i18n="f_remote_desc">browser & mobile, no SSH/VPN, real-time PTY streaming at 12fps</div></div>
@@ -532,8 +545,8 @@ docker compose up -d</div>
 const I18N = {
   en: {
     watch_intro: 'Watch support covers quick session monitoring, unread counts, OTA update visibility, push notifications, and quick replies from the wrist.',
-    tagline: 'The IM for agents. Shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit.',
-    hero_intro: "IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. OpenSpec Auto Deliver can drive a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.",
+    tagline: 'The IM for agents. Shared memory, collaborative coding, OpenSpec Auto Deliver, managed MCP tools, and cross-agent audit.',
+    hero_intro: "IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Session sharing lets a teammate join the same live tab or source server as a viewer or participant, enabling pair or multi-person collaborative coding around agents. OpenSpec Auto Deliver can drive a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.",
     watch_badge: 'iPhone · iPad · Apple Watch',
     watch_download: 'Watch app includes session list, unread counts, and quick replies.',
     agents_intro: 'Multiple agents support both CLI and SDK integrations.',
@@ -551,6 +564,13 @@ const I18N = {
     mcp_4: '<code>send_list_targets</code> and <code>send_message</code> let agents discover sibling sessions and send scoped text, file references, replies, or broadcasts.',
     mcp_5: '<code>cron_create</code>, <code>cron_list</code>, <code>cron_update</code>, and <code>cron_delete</code> manage future structured sends for reminders, recurring checks, delegated reviews, and follow-ups.',
     mcp_6: 'Runtime-bound identity prevents forged namespace, user, server, token, or routing fields; provider-level ready/degraded status and redacted recent calls stay visible in the UI.',
+    h_collab: 'collaborative coding',
+    collab_intro: 'Share a live tab, sub-session, or whole source server with another person. Use viewer access for review, or participant access when a teammate should send prompts into the covered sessions.',
+    collab_1: 'Pair programming: one person watches while another drives the agent, with both seeing the same live terminal/chat state.',
+    collab_2: 'Multi-person collaboration: invite several people into the same scoped server workspace for mob-style agent supervision.',
+    collab_3: 'Scoped sharing keeps access narrow: current tab, sub-session, or whole source server.',
+    collab_4: 'Viewer and participant roles separate read-only review from prompt-sending access.',
+    collab_5: 'Shared messages carry human actor labels, and access can be downgraded or revoked from the UI.',
     h_autodeliver: 'OpenSpec Auto Deliver',
     autodeliver_intro: 'Turn an OpenSpec change folder into a supervised delivery run: proposal/spec audit, implementation, validation hints, Team audit/rework, automatic scoring, and a visible final handoff.',
     autodeliver_1: 'One-click launch resolves the owning session, reads <code>tasks.md</code>, locks the Team lane, and keeps live progress in the UI.',
@@ -569,6 +589,8 @@ const I18N = {
     f_memory_desc: 'problem→solution memory, multilingual recall, automatic per-message and startup injection with visible timeline cards',
     f_mcp_name: 'managed MCP tools',
     f_mcp_desc: 'ten runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling',
+    f_collab_name: 'collaborative coding',
+    f_collab_desc: 'share tabs, sub-sessions, or whole source servers with viewer/participant roles for pair or multi-person agent programming',
     f_autodeliver_name: 'OpenSpec Auto Deliver',
     f_autodeliver_desc: 'proposal/spec audit → implementation → Team audit/rework, with automatic module scoring for spec/tasks/implementation/tests/risk',
     f_auto_name: 'supervised execution',
@@ -584,8 +606,8 @@ const I18N = {
     sh_manual_pgvector: 'Generated docker-compose.yml uses pgvector/pgvector:pg18 for PostgreSQL.',
   },
   'zh-CN': {
-    tagline: '给 AI agent 的 IM。共享记忆、OpenSpec 自动交付、托管 MCP 工具、受监督执行，以及跨模型审计。',
-    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层，以及一套托管 MCP 工具面。它会把已完成的工作沉淀成可复用上下文，再在后续 session 中注入或召回合适的历史，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。OpenSpec 自动交付可以把一个变更从提案/规格审计一路推进到实现、验证建议、团队审计/返工、自动模块打分和最终质量门控。内置 Auto supervision 可在每轮完成后判断任务是否完成、是否继续自动执行，并可选进入审计/返工闭环后再把控制权交还给你。团队讨论功能让多个模型相互审阅对方的方案和实现——能有效减少单模型的遗漏、盲点和偏差。',
+    tagline: '给 AI agent 的 IM。共享记忆、协作编程、OpenSpec 自动交付、托管 MCP 工具，以及跨模型审计。',
+    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层，以及一套托管 MCP 工具面。它会把已完成的工作沉淀成可复用上下文，再在后续 session 中注入或召回合适的历史，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。会话共享让队友以 viewer 或 participant 身份加入同一个实时标签页或 source server，支持围绕 agent 的双人甚至多人协作编程。OpenSpec 自动交付可以把一个变更从提案/规格审计一路推进到实现、验证建议、团队审计/返工、自动模块打分和最终质量门控。内置 Auto supervision 可在每轮完成后判断任务是否完成、是否继续自动执行，并可选进入审计/返工闭环后再把控制权交还给你。团队讨论功能让多个模型相互审阅对方的方案和实现——能有效减少单模型的遗漏、盲点和偏差。',
     couplet_l1: '三个臭皮匠，顶个诸葛亮。',
     couplet_l2: '三个诸葛亮，谈笑定阴阳。',
     hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
@@ -605,6 +627,13 @@ const I18N = {
     mcp_4: '<code>send_list_targets</code> 和 <code>send_message</code> 让 agent 发现兄弟会话，并发送有作用域的文本、文件引用、回复请求或广播。',
     mcp_5: '<code>cron_create</code>、<code>cron_list</code>、<code>cron_update</code> 和 <code>cron_delete</code> 管理未来结构化发送任务，用于提醒、周期检查、委托 review 和 follow-up。',
     mcp_6: '运行时绑定身份可防止伪造 namespace、user、server、token 或路由字段；UI 会显示 provider 级 ready/degraded 状态和脱敏后的最近调用。',
+    h_collab: '协作编程',
+    collab_intro: '把实时标签页、子会话或整台 source server 分享给另一个人。Viewer 适合旁观 review；participant 适合让队友向覆盖范围内的 session 发送 prompt。',
+    collab_1: '双人编程：一个人旁观，一个人驱动 agent，双方看到同一份实时终端/聊天状态。',
+    collab_2: '多人协作：邀请多个人进入同一个有作用域的 server 工作区，做 mob-style agent supervision。',
+    collab_3: '有作用域的分享让权限保持收敛：当前标签页、子会话，或整台 source server。',
+    collab_4: 'Viewer 和 participant 角色把只读 review 与可发送 prompt 的权限分开。',
+    collab_5: 'Shared message 会带真人 actor 标识，访问权限也可以在 UI 中降级或撤销。',
     h_autodeliver: 'OpenSpec 自动交付',
     autodeliver_intro: '把一个 OpenSpec 变更目录变成可监督的交付运行：提案/规格审计、实现、验证建议、团队审计/返工、自动打分，以及可见的最终交接。',
     autodeliver_1: '一键启动会解析所属会话、读取 <code>tasks.md</code>、锁定 Team 通道，并在 UI 中持续显示实时进度。',
@@ -623,6 +652,8 @@ const I18N = {
     f_memory_desc: '问题→解决方案记忆、多语言召回、按消息/启动自动注入，并在时间线中可见',
     f_mcp_name: '托管 MCP 工具',
     f_mcp_desc: '十个运行时作用域工具：记忆搜索/来源、偏好、Scoped Send 和 Cron 调度',
+    f_collab_name: '协作编程',
+    f_collab_desc: '把标签页、子会话或整台 source server 分享给 viewer/participant，支持双人或多人 agent 编程',
     f_autodeliver_name: 'OpenSpec 自动交付',
     f_autodeliver_desc: '提案/规格审计 → 实现 → 团队审计/返工，并自动给 spec/tasks/implementation/tests/risk 模块打分',
     f_auto_name: '受监督执行',
@@ -679,8 +710,8 @@ const I18N = {
     disclaimer: 'IM.codes 是一个独立的开源项目，与 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司无任何关联、认可或赞助关系。所有产品名称和商标均为其各自所有者的财产。',
   },
   'zh-TW': {
-    tagline: '給 AI agent 的 IM。共享記憶、OpenSpec 自動交付、託管 MCP 工具、受監督執行，以及跨模型審計。',
-    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層，以及一套託管 MCP 工具面。它會把已完成的工作沉澱成可重用上下文，再在後續 session 中注入或召回合適的歷史，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。OpenSpec 自動交付可以把一個變更從提案/規格審計一路推進到實作、驗證建議、團隊審計/返工、自動模組打分和最終品質門控。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。團隊討論功能讓多個模型互相審閱對方的方案和實作——能有效減少單模型的遺漏、盲點和偏差。',
+    tagline: '給 AI agent 的 IM。共享記憶、協作編程、OpenSpec 自動交付、託管 MCP 工具，以及跨模型審計。',
+    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層，以及一套託管 MCP 工具面。它會把已完成的工作沉澱成可重用上下文，再在後續 session 中注入或召回合適的歷史，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。Session 分享讓隊友以 viewer 或 participant 身份加入同一個即時標籤頁或 source server，支援圍繞 agent 的雙人甚至多人協作編程。OpenSpec 自動交付可以把一個變更從提案/規格審計一路推進到實作、驗證建議、團隊審計/返工、自動模組打分和最終品質門控。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。團隊討論功能讓多個模型互相審閱對方的方案和實作——能有效減少單模型的遺漏、盲點和偏差。',
     couplet_l1: '三個臭皮匠，頂個諸葛亮。',
     couplet_l2: '三個諸葛亮，談笑定陰陽。',
     hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
@@ -700,6 +731,13 @@ const I18N = {
     mcp_4: '<code>send_list_targets</code> 和 <code>send_message</code> 讓 agent 發現兄弟 session，並發送有作用域的文字、檔案引用、回覆請求或廣播。',
     mcp_5: '<code>cron_create</code>、<code>cron_list</code>、<code>cron_update</code> 和 <code>cron_delete</code> 管理未來結構化發送任務，用於提醒、週期檢查、委託 review 和 follow-up。',
     mcp_6: '執行時綁定身份可防止偽造 namespace、user、server、token 或路由欄位；UI 會顯示 provider 級 ready/degraded 狀態和脫敏後的最近呼叫。',
+    h_collab: '協作編程',
+    collab_intro: '把即時標籤頁、子 session 或整台 source server 分享給另一個人。Viewer 適合旁觀 review；participant 適合讓隊友向覆蓋範圍內的 session 送出 prompt。',
+    collab_1: '雙人編程：一個人旁觀，一個人驅動 agent，雙方看到同一份即時終端/聊天狀態。',
+    collab_2: '多人協作：邀請多個人進入同一個有作用域的 server 工作區，做 mob-style agent supervision。',
+    collab_3: '有作用域的分享讓權限保持收斂：目前標籤頁、子 session，或整台 source server。',
+    collab_4: 'Viewer 和 participant 角色把唯讀 review 與可送出 prompt 的權限分開。',
+    collab_5: 'Shared message 會帶真人 actor 標識，存取權限也可以在 UI 中降級或撤銷。',
     h_autodeliver: 'OpenSpec 自動交付',
     autodeliver_intro: '把一個 OpenSpec 變更目錄變成可監督的交付執行：提案/規格審計、實作、驗證建議、團隊審計/返工、自動打分，以及可見的最終交接。',
     autodeliver_1: '一鍵啟動會解析所屬 session、讀取 <code>tasks.md</code>、鎖定 Team 通道，並在 UI 中持續顯示即時進度。',
@@ -718,6 +756,8 @@ const I18N = {
     f_memory_desc: '問題→解決方案記憶、多語言召回、按訊息/啟動自動注入，並在時間線中可見',
     f_mcp_name: '託管 MCP 工具',
     f_mcp_desc: '十個執行時作用域工具：記憶搜尋/來源、偏好、Scoped Send 和 Cron 調度',
+    f_collab_name: '協作編程',
+    f_collab_desc: '把標籤頁、子 session 或整台 source server 分享給 viewer/participant，支援雙人或多人 agent 編程',
     f_autodeliver_name: 'OpenSpec 自動交付',
     f_autodeliver_desc: '提案/規格審計 → 實作 → 團隊審計/返工，並自動給 spec/tasks/implementation/tests/risk 模組打分',
     f_auto_name: '受監督執行',
@@ -774,8 +814,8 @@ const I18N = {
     disclaimer: 'IM.codes 是一個獨立的開源專案，與 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司無任何關聯、認可或贊助關係。所有產品名稱和商標均為其各自擁有者的財產。',
   },
   ja: {
-    tagline: 'エージェントのための IM。共有メモリ、managed MCP tools、監督付き実行、そして AI プロバイダー横断の監査。',
-    hero_intro: 'IM.codes は coding agent に、プロバイダーをまたぐ共有メモリレイヤーと managed MCP tool surface を提供します。完了した作業を再利用可能なコンテキストとして蓄積し、Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw などの後続 session に適切な履歴を注入またはリコールします。Built-in Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。Team ディスカッションを内蔵 — 複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。',
+    tagline: 'エージェントのための IM。共有メモリ、協調プログラミング、OpenSpec Auto Deliver、managed MCP tools、そしてクロスモデル監査。',
+    hero_intro: 'IM.codes は coding agent に、プロバイダーをまたぐ共有メモリレイヤーと managed MCP tool surface を提供します。完了した作業を再利用可能なコンテキストとして蓄積し、Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw などの後続 session に適切な履歴を注入またはリコールします。Session 共有により、チームメイトが viewer または participant として同じ live tab や source server に参加でき、agent を中心に pair または multi-person collaborative coding ができます。OpenSpec Auto Deliver は変更を proposal/spec 監査から実装、検証ヒント、Team 監査/手戻り、自動モジュール採点、最終 quality gate まで進められます。Built-in Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。Team ディスカッションを内蔵 — 複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。',
     // TODO(native-review): JA hero couplet — 默认「天下」(可换「乾坤」);「三人の孔明」措辞待母语者确认
     couplet_l1: '三人寄れば文殊の知恵。',
     couplet_l2: 'されど三人の孔明、談笑のうちに天下を定む。',
@@ -796,6 +836,20 @@ const I18N = {
     mcp_4: '<code>send_list_targets</code> と <code>send_message</code> は sibling sessions を見つけ、scoped text、file references、replies、broadcasts を送信します。',
     mcp_5: '<code>cron_create</code>、<code>cron_list</code>、<code>cron_update</code>、<code>cron_delete</code> は reminders、recurring checks、delegated reviews、follow-ups の future structured sends を管理します。',
     mcp_6: 'Runtime-bound identity は namespace、user、server、token、routing fields の偽造を防ぎます。provider-level ready/degraded status と redacted recent calls は UI で確認できます。',
+    h_collab: '協調プログラミング',
+    collab_intro: 'live tab、sub-session、または source server 全体を他の人に共有できます。レビューには viewer、対象 session に prompt を送る場合は participant を使います。',
+    collab_1: 'ペア programming: 片方が見守り、もう片方が agent を操作し、両者が同じ live terminal/chat state を見ます。',
+    collab_2: '複数人 collaboration: 複数人を同じ scoped server workspace に招待し、mob-style に agent を監督できます。',
+    collab_3: 'Scoped sharing により access は current tab、sub-session、source server 全体のいずれかに限定されます。',
+    collab_4: 'Viewer と participant roles は read-only review と prompt-sending access を分離します。',
+    collab_5: 'Shared messages には human actor labels が付き、access は UI から降格または取り消しできます。',
+    h_autodeliver: 'OpenSpec Auto Deliver',
+    autodeliver_intro: 'OpenSpec change folder を supervised delivery run に変えます: proposal/spec audit、実装、検証ヒント、Team audit/rework、自動採点、見える final handoff。',
+    autodeliver_1: 'ワンクリック起動で owning session を解決し、<code>tasks.md</code> を読み、Team lane をロックし、UI に live progress を表示します。',
+    autodeliver_2: '実装前に通常の Team/P2P combo flow で spec audit を実行でき、chat summary ではなく authoritative JSON を使います。',
+    autodeliver_3: 'Implementation prompts は選択した OpenSpec change に集中し、project manifests から安全な validation command 候補を提示します。',
+    autodeliver_4: '自動モジュール採点は <code>spec</code>、<code>tasks</code>、<code>implementation</code>、<code>tests</code>、<code>risk</code> を評価し、evidence は run details に表示されます。',
+    autodeliver_5: 'Fail-closed gates は不正な audit output、limit 到達、manual interference、tasks unreadable で human input を求めます。Auto Deliver は code を stage、commit、push しません。',
     h_auto: '監督付き実行',
     auto_intro: 'IM.codes は blind auto-continue に頼らず、対応する transport session をターンごとに監督できます。Auto は直近のターンが完了か、継続か、あなたに制御を返すべきかを判断します。',
     auto_1: 'セッション単位の Auto モード: Off / Supervised / Supervised + audit。',
@@ -807,6 +861,10 @@ const I18N = {
     f_memory_desc: '問題→解決の記憶、多言語リコール、メッセージ時/起動時の自動注入をタイムラインで可視化',
     f_mcp_name: 'managed MCP tools',
     f_mcp_desc: '10 runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling',
+    f_collab_name: '協調プログラミング',
+    f_collab_desc: 'tabs、sub-sessions、source servers を viewer/participant roles で共有し、pair または multi-person agent programming を実現',
+    f_autodeliver_name: 'OpenSpec Auto Deliver',
+    f_autodeliver_desc: 'proposal/spec audit → implementation → Team audit/rework、自動採点 spec/tasks/implementation/tests/risk',
     f_auto_name: '監督付き実行',
     f_auto_desc: 'transport 系エージェント向けのターン単位完了判定、自動継続、任意の audit→rework ループ',
     why_text: 'デスクを離れると、多くの coding agent ワークフローは途切れます。エージェントはまだターミナルで動いていても、作業を続けるには SSH、tmux attach、リモートデスクトップ、あるいはラップトップに戻るまで待つしかありません。それは問題の半分にすぎません。難しい agent 作業には、より安定した判断も必要です。単一モデルは型にはまった判断に寄り、問題を見落としたり、provider を切り替えた時に文脈を失ったりします。IM.codes は、常に手元から届く session、完了作業の共有メモリ要約、構造化 Team クロスモデルレビューを組み合わせ、コードが入る前に複数の agent が計画を検証できるようにします。出力を完璧にはしませんが、単一モデルの盲点を減らし、作業の連続性を保ちます。',
@@ -861,8 +919,8 @@ const I18N = {
     disclaimer: 'IM.codes は独立したオープンソースプロジェクトであり、Anthropic、OpenAI、Google、Alibaba、OpenClaw、またはその他の言及された企業との提携、承認、スポンサーシップはありません。すべての製品名および商標は各所有者に帰属します。',
   },
   ko: {
-    tagline: '에이전트를 위한 IM. 공유 메모리, managed MCP tools, 감독된 실행, 그리고 AI 제공자 전반의 교차 감사.',
-    hero_intro: 'IM.codes는 coding agent를 위한 provider 간 공유 메모리 레이어와 managed MCP tool surface를 제공합니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw 등 이후 session에 적절한 기록을 주입하거나 다시 recall합니다. 내장된 Auto supervision은 완료된 턴을 판정하고, 자동 계속과 감사/재작업 루프까지 수행한 뒤 제어를 돌려줄 수 있습니다. Team 토론 기능 내장 — 여러 모델이 서로의 계획과 구현을 리뷰하고 감사하여, 단일 모델의 누락·맹점·편향을 효과적으로 줄입니다.',
+    tagline: '에이전트를 위한 IM. 공유 메모리, 협업 코딩, OpenSpec Auto Deliver, managed MCP tools, 그리고 교차 감사.',
+    hero_intro: 'IM.codes는 coding agent를 위한 provider 간 공유 메모리 레이어와 managed MCP tool surface를 제공합니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw 등 이후 session에 적절한 기록을 주입하거나 다시 recall합니다. 세션 공유로 팀원이 viewer 또는 participant로 같은 live tab이나 source server에 참여할 수 있어, agent를 중심으로 pair 또는 multi-person collaborative coding을 할 수 있습니다. OpenSpec Auto Deliver는 변경을 proposal/spec 감사부터 구현, 검증 힌트, Team 감사/재작업, 자동 모듈 채점, 최종 quality gate까지 진행할 수 있습니다. 내장된 Auto supervision은 완료된 턴을 판정하고, 자동 계속과 감사/재작업 루프까지 수행한 뒤 제어를 돌려줄 수 있습니다. Team 토론 기능 내장 — 여러 모델이 서로의 계획과 구현을 리뷰하고 감사하여, 단일 모델의 누락·맹점·편향을 효과적으로 줄입니다.',
     // TODO(native-review): KO hero couplet — 第一句「백지장도 맞들면 낫다」承接弱,待母语者重写;默认「천하」
     couplet_l1: '백지장도 맞들면 낫다.',
     couplet_l2: '허나 세 명의 제갈량, 담소 속에 천하를 정한다.',
@@ -883,6 +941,20 @@ const I18N = {
     mcp_4: '<code>send_list_targets</code>와 <code>send_message</code>는 sibling sessions를 찾고 scoped text, file references, replies, broadcasts를 보냅니다.',
     mcp_5: '<code>cron_create</code>, <code>cron_list</code>, <code>cron_update</code>, <code>cron_delete</code>는 reminders, recurring checks, delegated reviews, follow-ups용 future structured sends를 관리합니다.',
     mcp_6: 'Runtime-bound identity는 namespace, user, server, token, routing fields 위조를 막습니다. provider-level ready/degraded status와 redacted recent calls는 UI에서 계속 보입니다.',
+    h_collab: '협업 코딩',
+    collab_intro: 'Live tab, sub-session, 또는 전체 source server를 다른 사람에게 공유할 수 있습니다. Review에는 viewer를, 팀원이 covered session에 prompt를 보내야 할 때는 participant를 사용합니다.',
+    collab_1: 'Pair programming: 한 사람은 지켜보고 다른 사람은 agent를 구동하며, 둘 다 같은 live terminal/chat state를 봅니다.',
+    collab_2: 'Multi-person collaboration: 여러 사람을 같은 scoped server workspace에 초대해 mob-style agent supervision을 할 수 있습니다.',
+    collab_3: 'Scoped sharing은 current tab, sub-session, 또는 전체 source server로 access를 좁게 유지합니다.',
+    collab_4: 'Viewer와 participant roles는 read-only review와 prompt-sending access를 분리합니다.',
+    collab_5: 'Shared messages에는 human actor labels가 붙고, access는 UI에서 낮추거나 회수할 수 있습니다.',
+    h_autodeliver: 'OpenSpec Auto Deliver',
+    autodeliver_intro: 'OpenSpec change folder를 supervised delivery run으로 바꿉니다: proposal/spec audit, 구현, 검증 힌트, Team audit/rework, 자동 채점, 보이는 final handoff.',
+    autodeliver_1: '원클릭 launch는 owning session을 해석하고, <code>tasks.md</code>를 읽고, Team lane을 잠그며, UI에 live progress를 유지합니다.',
+    autodeliver_2: '구현 전 spec audit은 일반 Team/P2P combo flow로 실행할 수 있고, chat summary가 아니라 authoritative JSON을 사용합니다.',
+    autodeliver_3: 'Implementation prompts는 선택한 OpenSpec change에 집중하고 project manifests에서 안전한 validation command 후보를 보여줍니다.',
+    autodeliver_4: '자동 모듈 채점은 <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code>, <code>risk</code>를 평가하며 evidence는 run details에 표시됩니다.',
+    autodeliver_5: 'Fail-closed gates는 잘못된 audit output, exhausted limits, manual interference, unreadable tasks에서 human input을 요청합니다. Auto Deliver는 code를 stage, commit, push하지 않습니다.',
     h_auto: '감독된 실행',
     auto_intro: 'IM.codes는 blind auto-continue에 의존하지 않고 지원되는 transport session을 턴 단위로 감독할 수 있습니다. Auto는 최근 턴이 끝났는지, 더 진행해야 하는지, 아니면 제어를 사용자에게 돌려줘야 하는지 판단합니다.',
     auto_1: '세션별 Auto 모드: Off, Supervised, Supervised + audit.',
@@ -894,6 +966,10 @@ const I18N = {
     f_memory_desc: '문제→해결 메모리, 다국어 리콜, 메시지/시작 시 자동 주입을 타임라인에서 가시화',
     f_mcp_name: 'managed MCP tools',
     f_mcp_desc: '10 runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling',
+    f_collab_name: '협업 코딩',
+    f_collab_desc: 'tabs, sub-sessions, source servers를 viewer/participant roles로 공유해 pair 또는 multi-person agent programming 지원',
+    f_autodeliver_name: 'OpenSpec Auto Deliver',
+    f_autodeliver_desc: 'proposal/spec audit → implementation → Team audit/rework, spec/tasks/implementation/tests/risk 자동 채점',
     f_auto_name: '감독된 실행',
     f_auto_desc: 'transport 에이전트를 위한 턴 단위 완료 판정, 자동 계속, 선택적 audit→rework 루프',
     why_text: '책상을 떠나면 대부분의 coding agent 워크플로우는 끊깁니다. 에이전트는 여전히 터미널에서 돌아가지만, 작업을 이어가려면 보통 SSH, tmux attach, 원격 데스크톱을 쓰거나 노트북 앞으로 돌아갈 때까지 기다려야 합니다. 그것은 문제의 절반일 뿐입니다. 어려운 agent 작업에는 더 안정적인 판단도 필요합니다. 단일 모델은 익숙한 패턴에 갇히거나 문제를 놓치고, provider를 바꿀 때 컨텍스트가 끊길 수 있습니다. IM.codes는 언제든 닿을 수 있는 session, 완료된 작업의 공유 메모리 요약, 구조화된 Team 크로스 모델 리뷰를 함께 제공해 코드가 반영되기 전 여러 agent가 계획을 검토하게 합니다. 출력을 완벽하게 만들지는 않지만 단일 모델의 맹점을 줄이고 작업의 연속성을 지킵니다.',
@@ -948,8 +1024,8 @@ const I18N = {
     disclaimer: 'IM.codes는 독립적인 오픈소스 프로젝트로, Anthropic, OpenAI, Google, Alibaba, OpenClaw 또는 언급된 다른 회사와 제휴, 보증 또는 후원 관계가 없습니다. 모든 제품 이름과 상표는 각 소유자의 자산입니다.',
   },
   es: {
-    tagline: 'El IM para agentes. Memoria compartida, herramientas MCP gestionadas, ejecución supervisada y auditoría cruzada entre proveedores de IA.',
-    hero_intro: 'IM.codes da a los coding agents una capa de memoria compartida y una superficie de herramientas MCP gestionadas entre proveedores. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras de Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw y más. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión Team integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.',
+    tagline: 'El IM para agentes. Memoria compartida, programación colaborativa, OpenSpec Auto Deliver, herramientas MCP gestionadas y auditoría cruzada.',
+    hero_intro: 'IM.codes da a los coding agents una capa de memoria compartida y una superficie de herramientas MCP gestionadas entre proveedores. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras de Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw y más. El uso compartido de sesión permite que un teammate entre en la misma pestaña viva o source server como viewer o participant, habilitando pair o multi-person collaborative coding alrededor de agentes. OpenSpec Auto Deliver puede llevar un cambio desde auditoría proposal/spec hasta implementación, sugerencias de validación, auditoría/retrabajo Team, scoring automático por módulo y quality gates finales. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión Team integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.',
     hero_output: 'vinculado a app.im.codes · daemon iniciado · registrado como servicio del sistema',
     self_host_warning: '<strong>Se recomienda encarecidamente el autoalojamiento.</strong> <code>app.im.codes</code> es una instancia de prueba compartida sin garantías de disponibilidad — puede tener límites, ser objetivo de ataques o no estar disponible. Este es un proyecto personal sin soporte comercial. Para uso más allá de la evaluación, despliega en tu propia infraestructura.',
     h_screenshots: 'capturas', h_why: 'por qué', h_memory: 'contexto compartido para agentes', h_mcp: 'herramientas MCP gestionadas', h_not: 'qué no es', h_features: 'características', h_arch: 'arquitectura', h_download: 'descargar', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
@@ -967,6 +1043,20 @@ const I18N = {
     mcp_4: '<code>send_list_targets</code> y <code>send_message</code> permiten descubrir sesiones hermanas y enviar texto con alcance, referencias de archivos, respuestas o broadcasts.',
     mcp_5: '<code>cron_create</code>, <code>cron_list</code>, <code>cron_update</code> y <code>cron_delete</code> gestionan envíos estructurados futuros para recordatorios, comprobaciones recurrentes, reviews delegadas y follow-ups.',
     mcp_6: 'La identidad de runtime impide falsificar namespace, user, server, token o routing fields; el estado ready/degraded por provider y las llamadas recientes redactadas quedan visibles en la UI.',
+    h_collab: 'programación colaborativa',
+    collab_intro: 'Comparte una pestaña viva, sub-sesión o source server completo con otra persona. Usa viewer para review, o participant cuando un teammate deba enviar prompts a las sesiones cubiertas.',
+    collab_1: 'Pair programming: una persona observa mientras otra conduce el agente, ambas viendo el mismo estado de terminal/chat en vivo.',
+    collab_2: 'Colaboración multi-persona: invita a varias personas al mismo workspace de servidor con alcance para supervisión tipo mob.',
+    collab_3: 'Scoped sharing mantiene el acceso acotado: pestaña actual, sub-sesión o source server completo.',
+    collab_4: 'Los roles viewer y participant separan review solo lectura de acceso para enviar prompts.',
+    collab_5: 'Los mensajes compartidos llevan etiquetas de actor humano, y el acceso puede degradarse o revocarse desde la UI.',
+    h_autodeliver: 'OpenSpec Auto Deliver',
+    autodeliver_intro: 'Convierte un OpenSpec change folder en una entrega supervisada: auditoría proposal/spec, implementación, sugerencias de validación, auditoría/retrabajo Team, scoring automático y handoff final visible.',
+    autodeliver_1: 'El lanzamiento con un clic resuelve la sesión propietaria, lee <code>tasks.md</code>, bloquea el carril Team y mantiene progreso vivo en la UI.',
+    autodeliver_2: 'La auditoría spec puede ejecutarse antes de implementar mediante el flujo Team/P2P normal, usando JSON autoritativo en vez de confiar en resúmenes de chat.',
+    autodeliver_3: 'Los prompts de implementación se enfocan en el cambio OpenSpec seleccionado y muestran candidatos seguros de validación desde manifests del proyecto.',
+    autodeliver_4: 'El scoring automático evalúa <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code> y <code>risk</code>, con evidencia visible en los detalles.',
+    autodeliver_5: 'Los gates fail-closed piden intervención humana ante audit output inválido, límites agotados, interferencia manual o tareas ilegibles. Auto Deliver nunca hace stage, commit ni push.',
     h_auto: 'ejecución supervisada',
     auto_intro: 'IM.codes puede supervisar sesión por sesión los transport sessions compatibles en lugar de depender de un auto-continue ciego. Auto comprueba si el último turno ya terminó, debe continuar o debe devolverte el control.',
     auto_1: 'Modos Auto por sesión: Off, Supervised y Supervised + audit.',
@@ -978,6 +1068,10 @@ const I18N = {
     f_memory_desc: 'memoria problema→solución, recuperación multilingüe e inyección automática por mensaje y al iniciar, visible en la línea de tiempo',
     f_mcp_name: 'herramientas MCP gestionadas',
     f_mcp_desc: 'diez herramientas con alcance de runtime para búsqueda/fuentes de memoria, preferencias, Send con alcance y programación Cron',
+    f_collab_name: 'programación colaborativa',
+    f_collab_desc: 'comparte tabs, sub-sesiones o source servers con roles viewer/participant para programación agent pair o multi-persona',
+    f_autodeliver_name: 'OpenSpec Auto Deliver',
+    f_autodeliver_desc: 'auditoría proposal/spec → implementación → auditoría/retrabajo Team, con scoring automático spec/tasks/implementation/tests/risk',
     f_auto_name: 'ejecución supervisada',
     f_auto_desc: 'comprobaciones de finalización por turno, auto-continue y bucles opcionales audit→rework para agentes transport',
     why_text: 'Cuando te alejas del escritorio, la mayoría de los flujos con coding agents se rompen. El agente sigue ejecutándose en una terminal, pero continuar suele significar usar SSH, tmux attach, escritorio remoto o esperar a volver al portátil. Esa es solo la mitad del problema. El trabajo difícil con agents también necesita mejor criterio: un solo modelo puede caer en patrones, pasar por alto problemas o perder contexto al cambiar de provider. IM.codes combina sesiones siempre accesibles, memoria compartida de trabajo completado resumido y revisión Team estructurada entre modelos para que varios agentes cuestionen los planes antes de que el código aterrice. No vuelve perfecto el resultado, pero reduce puntos ciegos de un solo modelo y mantiene la continuidad.',
@@ -1032,8 +1126,8 @@ const I18N = {
     disclaimer: 'IM.codes es un proyecto de código abierto independiente y no está afiliado, respaldado ni patrocinado por Anthropic, OpenAI, Google, Alibaba, OpenClaw ni ninguna otra empresa mencionada. Todos los nombres de productos y marcas son propiedad de sus respectivos dueños.',
   },
   ru: {
-    tagline: 'IM для агентов. Общая память, управляемые MCP tools, контролируемое выполнение и кросс-модельный аудит поверх AI-провайдеров.',
-    hero_intro: 'IM.codes даёт coding agents единый слой памяти и управляемую поверхность MCP tools поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает или recall нужную историю в будущие session для Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw и других. Встроенный Auto supervision умеет оценивать завершённые ходы, продолжать работу автономно и при необходимости запускать цикл audit/rework перед возвратом контроля. Team-обсуждение — несколько моделей взаимно проверяют и аудируют планы и реализации друг друга, эффективно уменьшая пропуски, «слепые зоны» и смещения одной модели.',
+    tagline: 'IM для агентов. Общая память, совместное программирование, OpenSpec Auto Deliver, управляемые MCP tools и кросс-модельный аудит.',
+    hero_intro: 'IM.codes даёт coding agents единый слой памяти и управляемую поверхность MCP tools поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает или recall нужную историю в будущие session для Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw и других. Session sharing позволяет teammate зайти в тот же live tab или source server как viewer или participant, включая pair или multi-person collaborative coding вокруг agents. OpenSpec Auto Deliver может провести change от proposal/spec audit через implementation, validation hints, Team audit/rework, автоматическую оценку модулей и финальные quality gates. Встроенный Auto supervision умеет оценивать завершённые ходы, продолжать работу автономно и при необходимости запускать цикл audit/rework перед возвратом контроля. Team-обсуждение — несколько моделей взаимно проверяют и аудируют планы и реализации друг друга, эффективно уменьшая пропуски, «слепые зоны» и смещения одной модели.',
     hero_output: 'привязан к app.im.codes · демон запущен · зарегистрирован как системная служба',
     self_host_warning: '<strong>Настоятельно рекомендуется самостоятельный хостинг.</strong> <code>app.im.codes</code> — общий тестовый экземпляр без гарантий доступности. Может быть ограничен, атакован или недоступен. Это личный проект без коммерческой поддержки. Для использования помимо тестирования разверните на собственной инфраструктуре.',
     h_screenshots: 'скриншоты', h_why: 'зачем', h_memory: 'общий контекст агентов', h_mcp: 'управляемые MCP tools', h_not: 'чем это не является', h_features: 'возможности', h_arch: 'архитектура', h_download: 'скачать', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
@@ -1051,6 +1145,20 @@ const I18N = {
     mcp_4: '<code>send_list_targets</code> и <code>send_message</code> помогают найти sibling sessions и отправить scoped text, file references, replies или broadcasts.',
     mcp_5: '<code>cron_create</code>, <code>cron_list</code>, <code>cron_update</code> и <code>cron_delete</code> управляют future structured sends для reminders, recurring checks, delegated reviews и follow-ups.',
     mcp_6: 'Runtime-bound identity не даёт подделывать namespace, user, server, token или routing fields; provider-level ready/degraded status и redacted recent calls видны в UI.',
+    h_collab: 'совместное программирование',
+    collab_intro: 'Поделитесь live tab, sub-session или всем source server с другим человеком. Viewer подходит для review, participant — когда teammate должен отправлять prompts в покрытые sessions.',
+    collab_1: 'Pair programming: один человек наблюдает, другой управляет agent, оба видят один live terminal/chat state.',
+    collab_2: 'Multi-person collaboration: пригласите нескольких людей в один scoped server workspace для mob-style agent supervision.',
+    collab_3: 'Scoped sharing держит доступ узким: current tab, sub-session или весь source server.',
+    collab_4: 'Роли viewer и participant отделяют read-only review от доступа к отправке prompts.',
+    collab_5: 'Shared messages несут human actor labels, а access можно понизить или отозвать из UI.',
+    h_autodeliver: 'OpenSpec Auto Deliver',
+    autodeliver_intro: 'Превратите OpenSpec change folder в supervised delivery run: proposal/spec audit, implementation, validation hints, Team audit/rework, automatic scoring и видимый final handoff.',
+    autodeliver_1: 'One-click launch определяет owning session, читает <code>tasks.md</code>, блокирует Team lane и показывает live progress в UI.',
+    autodeliver_2: 'Spec audit можно запустить до implementation через обычный Team/P2P combo flow, используя authoritative JSON вместо chat summaries.',
+    autodeliver_3: 'Implementation prompts фокусируются на выбранном OpenSpec change и показывают безопасные validation command candidates из project manifests.',
+    autodeliver_4: 'Automatic module scoring оценивает <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code> и <code>risk</code>, evidence виден в run details.',
+    autodeliver_5: 'Fail-closed gates требуют human input при bad audit output, exhausted limits, manual interference или unreadable tasks. Auto Deliver никогда не делает stage, commit или push code.',
     h_auto: 'контролируемое выполнение',
     auto_intro: 'IM.codes может контролировать поддерживаемые transport session ход за ходом вместо слепого auto-continue. Auto определяет, завершён ли последний ход, нужно ли продолжать, или пора вернуть управление вам.',
     auto_1: 'Режимы Auto на уровне session: Off, Supervised и Supervised + audit.',
@@ -1062,6 +1170,10 @@ const I18N = {
     f_memory_desc: 'память проблема→решение, многоязычный recall и автоматическая инъекция при сообщении и старте сессии с видимостью в таймлайне',
     f_mcp_name: 'управляемые MCP tools',
     f_mcp_desc: 'десять runtime-scoped tools для memory search/sources, preferences, scoped Send и Cron scheduling',
+    f_collab_name: 'совместное программирование',
+    f_collab_desc: 'делитесь tabs, sub-sessions или source servers с viewer/participant roles для pair или multi-person agent programming',
+    f_autodeliver_name: 'OpenSpec Auto Deliver',
+    f_autodeliver_desc: 'proposal/spec audit → implementation → Team audit/rework, automatic scoring spec/tasks/implementation/tests/risk',
     f_auto_name: 'контролируемое выполнение',
     f_auto_desc: 'проверка завершения по ходам, auto-continue и необязательные циклы audit→rework для transport-агентов',
     why_text: 'Когда вы отходите от рабочего стола, большинство workflows с coding agents ломается. Агент всё ещё работает в терминале, но продолжение обычно означает SSH, tmux attach, удалённый рабочий стол или ожидание, пока вы вернётесь к ноутбуку. Это только половина проблемы. Сложная работа с agents требует более устойчивого суждения: одна модель может застрять в шаблонах, пропустить проблемы или потерять контекст при смене provider. IM.codes объединяет всегда доступные session, общую память с резюме завершённой работы и структурированный Team кросс-модельный review, чтобы несколько agents проверяли планы до попадания кода. Это не делает вывод идеальным, но уменьшает слепые зоны одной модели и сохраняет непрерывность работы.',
