@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IM.codes — The IM for agents. Shared memory, managed MCP tools, supervised execution, and cross-agent audit across AI providers.</title>
-<meta name="description" content="The IM for agents. Shared memory, managed MCP tools, supervised execution, and cross-agent audit across AI providers — recall solved work, message sibling agents, schedule cron sends, supervise task completion, and run audit/rework loops across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, and OpenClaw.">
+<title>IM.codes — The IM for agents. Shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit.</title>
+<meta name="description" content="The IM for agents. Shared memory, OpenSpec Auto Deliver with automatic module scoring, managed MCP tools, supervised execution, and cross-agent audit — recall solved work, message sibling agents, schedule cron sends, supervise task completion, and run audit/rework loops across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, and OpenClaw.">
 <style>
 :root {
   --bg: #0a0a0a;
@@ -50,6 +50,10 @@ h1 span { color: var(--accent); }
 .lead { color: var(--fg); max-width: 660px; margin-bottom: 18px; }
 
 .warning { background: #1a1000; border: 1px solid #4a3000; border-radius: 4px; padding: 10px 14px; margin-bottom: 20px; font-size: 12px; color: #fbbf24; }
+.spotlight { background: linear-gradient(135deg, rgba(34,197,94,0.10), rgba(59,130,246,0.08)); border: 1px solid rgba(34,197,94,0.28); border-radius: 6px; padding: 18px 20px; }
+.spotlight h2 { color: #d7ffe5; border-bottom-color: rgba(34,197,94,0.22); }
+.score-tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 12px; }
+.score-tags span { border: 1px solid rgba(34,197,94,0.30); border-radius: 999px; padding: 2px 8px; color: #d7ffe5; background: rgba(0,0,0,0.18); font-size: 11px; }
 
 section { margin-bottom: 40px; }
 h2 {
@@ -226,7 +230,7 @@ footer {
 <header>
   <div class="header-left">
     <h1>IM<span>.</span>codes</h1>
-    <div class="tagline" data-i18n="tagline">The IM for agents. Shared memory, managed MCP tools, supervised execution, and cross-agent audit across AI providers.</div>
+    <div class="tagline" data-i18n="tagline">The IM for agents. Shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit.</div>
   </div>
   <div class="lang-switch">
     <button onclick="setLang('en')" data-lang="en" class="active">EN</button>
@@ -245,7 +249,7 @@ footer {
     <span data-i18n="couplet_l2">But minds in concert don't answer fate, they author it.</span><br>
     <cite>— IM.codes</cite>
   </blockquote>
-  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.</p>
+  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. OpenSpec Auto Deliver can drive a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.</p>
   <div class="prompt">imcodes bind https://app.im.codes/bind/&lt;key&gt;<span class="cursor"></span></div>
   <div class="output" data-i18n="hero_output">bound to app.im.codes &middot; daemon started &middot; registered as system service</div>
 </section>
@@ -319,6 +323,21 @@ footer {
   </ul>
 </section>
 
+<section class="spotlight">
+  <h2 data-i18n="h_autodeliver">OpenSpec Auto Deliver</h2>
+  <p style="color:var(--fg); margin-bottom:12px;" data-i18n="autodeliver_intro">Turn an OpenSpec change folder into a supervised delivery run: proposal/spec audit, implementation, validation hints, Team audit/rework, automatic scoring, and a visible final handoff.</p>
+  <div class="score-tags" aria-label="Auto scoring modules">
+    <span>spec</span><span>tasks</span><span>implementation</span><span>tests</span><span>risk</span>
+  </div>
+  <ul class="reqs">
+    <li data-i18n="autodeliver_1">One-click launch resolves the owning session, reads <code>tasks.md</code>, locks the Team lane, and keeps live progress in the UI.</li>
+    <li data-i18n="autodeliver_2">Spec audit can run before implementation through the normal Team/P2P combo flow, using authoritative JSON instead of trusting chat summaries.</li>
+    <li data-i18n="autodeliver_3">Implementation prompts stay focused on the selected OpenSpec change and surface safe validation command candidates from project manifests.</li>
+    <li data-i18n="autodeliver_4">Automatic module scoring rates <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code>, and <code>risk</code> with evidence visible in run details.</li>
+    <li data-i18n="autodeliver_5">Fail-closed gates ask for human input on bad audit output, exhausted limits, manual interference, or unreadable tasks. Auto Deliver never stages, commits, or pushes code.</li>
+  </ul>
+</section>
+
 <section>
   <h2 data-i18n="h_auto">supervised execution</h2>
   <p style="color:var(--fg); margin-bottom:12px;" data-i18n="auto_intro">IM.codes can supervise supported transport sessions turn by turn instead of relying on blind auto-continue. Auto checks whether the latest turn is done, should continue, or should return control to you.</p>
@@ -347,6 +366,7 @@ footer {
   <div class="features">
     <div class="feat"><div class="feat-name" data-i18n="f_memory_name">shared agent context</div><div class="feat-desc" data-i18n="f_memory_desc">problem→solution memory, multilingual recall, automatic per-message and startup injection with visible timeline cards</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_mcp_name">managed MCP tools</div><div class="feat-desc" data-i18n="f_mcp_desc">ten runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_autodeliver_name">OpenSpec Auto Deliver</div><div class="feat-desc" data-i18n="f_autodeliver_desc">proposal/spec audit → implementation → Team audit/rework, with automatic module scoring for spec/tasks/implementation/tests/risk</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_auto_name">supervised execution</div><div class="feat-desc" data-i18n="f_auto_desc">turn-level completion checks, auto-continue, and optional audit→rework loops for transport-backed agents</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_remote_name">remote terminal</div><div class="feat-desc" data-i18n="f_remote_desc">browser & mobile, no SSH/VPN, real-time PTY streaming at 12fps</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser & git</div><div class="feat-desc" data-i18n="f_file_desc">tree view, upload/download, +/- stats, safe HTML quick preview, inline image previews with lightbox zoom</div></div>
@@ -512,8 +532,8 @@ docker compose up -d</div>
 const I18N = {
   en: {
     watch_intro: 'Watch support covers quick session monitoring, unread counts, OTA update visibility, push notifications, and quick replies from the wrist.',
-    tagline: 'The IM for agents. Shared memory, managed MCP tools, supervised execution, and cross-agent audit across AI providers.',
-    hero_intro: "IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.",
+    tagline: 'The IM for agents. Shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit.',
+    hero_intro: "IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. OpenSpec Auto Deliver can drive a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.",
     watch_badge: 'iPhone · iPad · Apple Watch',
     watch_download: 'Watch app includes session list, unread counts, and quick replies.',
     agents_intro: 'Multiple agents support both CLI and SDK integrations.',
@@ -531,6 +551,13 @@ const I18N = {
     mcp_4: '<code>send_list_targets</code> and <code>send_message</code> let agents discover sibling sessions and send scoped text, file references, replies, or broadcasts.',
     mcp_5: '<code>cron_create</code>, <code>cron_list</code>, <code>cron_update</code>, and <code>cron_delete</code> manage future structured sends for reminders, recurring checks, delegated reviews, and follow-ups.',
     mcp_6: 'Runtime-bound identity prevents forged namespace, user, server, token, or routing fields; provider-level ready/degraded status and redacted recent calls stay visible in the UI.',
+    h_autodeliver: 'OpenSpec Auto Deliver',
+    autodeliver_intro: 'Turn an OpenSpec change folder into a supervised delivery run: proposal/spec audit, implementation, validation hints, Team audit/rework, automatic scoring, and a visible final handoff.',
+    autodeliver_1: 'One-click launch resolves the owning session, reads <code>tasks.md</code>, locks the Team lane, and keeps live progress in the UI.',
+    autodeliver_2: 'Spec audit can run before implementation through the normal Team/P2P combo flow, using authoritative JSON instead of trusting chat summaries.',
+    autodeliver_3: 'Implementation prompts stay focused on the selected OpenSpec change and surface safe validation command candidates from project manifests.',
+    autodeliver_4: 'Automatic module scoring rates <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code>, and <code>risk</code> with evidence visible in run details.',
+    autodeliver_5: 'Fail-closed gates ask for human input on bad audit output, exhausted limits, manual interference, or unreadable tasks. Auto Deliver never stages, commits, or pushes code.',
     h_auto: 'supervised execution',
     auto_intro: 'IM.codes can supervise supported transport sessions turn by turn instead of relying on blind auto-continue. Auto checks whether the latest turn is done, should continue, or should return control to you.',
     auto_1: 'Per-session Auto modes: Off, Supervised, and Supervised + audit.',
@@ -542,6 +569,8 @@ const I18N = {
     f_memory_desc: 'problem→solution memory, multilingual recall, automatic per-message and startup injection with visible timeline cards',
     f_mcp_name: 'managed MCP tools',
     f_mcp_desc: 'ten runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling',
+    f_autodeliver_name: 'OpenSpec Auto Deliver',
+    f_autodeliver_desc: 'proposal/spec audit → implementation → Team audit/rework, with automatic module scoring for spec/tasks/implementation/tests/risk',
     f_auto_name: 'supervised execution',
     f_auto_desc: 'turn-level completion checks, auto-continue, and optional audit→rework loops for transport-backed agents',
     h_openclaw: 'openclaw connect',
@@ -555,8 +584,8 @@ const I18N = {
     sh_manual_pgvector: 'Generated docker-compose.yml uses pgvector/pgvector:pg18 for PostgreSQL.',
   },
   'zh-CN': {
-    tagline: '给 AI agent 的 IM。共享记忆、托管 MCP 工具、受监督执行，以及跨模型审计。',
-    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层，以及一套托管 MCP 工具面。它会把已完成的工作沉淀成可复用上下文，再在后续 session 中注入或召回合适的历史，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。内置 Auto supervision 可在每轮完成后判断任务是否完成、是否继续自动执行，并可选进入审计/返工闭环后再把控制权交还给你。团队讨论功能让多个模型相互审阅对方的方案和实现——能有效减少单模型的遗漏、盲点和偏差。',
+    tagline: '给 AI agent 的 IM。共享记忆、OpenSpec 自动交付、托管 MCP 工具、受监督执行，以及跨模型审计。',
+    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层，以及一套托管 MCP 工具面。它会把已完成的工作沉淀成可复用上下文，再在后续 session 中注入或召回合适的历史，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。OpenSpec 自动交付可以把一个变更从提案/规格审计一路推进到实现、验证建议、团队审计/返工、自动模块打分和最终质量门控。内置 Auto supervision 可在每轮完成后判断任务是否完成、是否继续自动执行，并可选进入审计/返工闭环后再把控制权交还给你。团队讨论功能让多个模型相互审阅对方的方案和实现——能有效减少单模型的遗漏、盲点和偏差。',
     couplet_l1: '三个臭皮匠，顶个诸葛亮。',
     couplet_l2: '三个诸葛亮，谈笑定阴阳。',
     hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
@@ -576,6 +605,13 @@ const I18N = {
     mcp_4: '<code>send_list_targets</code> 和 <code>send_message</code> 让 agent 发现兄弟会话，并发送有作用域的文本、文件引用、回复请求或广播。',
     mcp_5: '<code>cron_create</code>、<code>cron_list</code>、<code>cron_update</code> 和 <code>cron_delete</code> 管理未来结构化发送任务，用于提醒、周期检查、委托 review 和 follow-up。',
     mcp_6: '运行时绑定身份可防止伪造 namespace、user、server、token 或路由字段；UI 会显示 provider 级 ready/degraded 状态和脱敏后的最近调用。',
+    h_autodeliver: 'OpenSpec 自动交付',
+    autodeliver_intro: '把一个 OpenSpec 变更目录变成可监督的交付运行：提案/规格审计、实现、验证建议、团队审计/返工、自动打分，以及可见的最终交接。',
+    autodeliver_1: '一键启动会解析所属会话、读取 <code>tasks.md</code>、锁定 Team 通道，并在 UI 中持续显示实时进度。',
+    autodeliver_2: '实现前可先跑规格审计，复用常规 Team/P2P 组合流程，并读取权威 JSON，而不是盲信聊天摘要。',
+    autodeliver_3: '实现 prompt 会聚焦选中的 OpenSpec 变更，并从项目 manifest 中提示安全的验证命令候选。',
+    autodeliver_4: '自动模块打分会对 <code>spec</code>、<code>tasks</code>、<code>implementation</code>、<code>tests</code>、<code>risk</code> 评分，证据会显示在运行详情里。',
+    autodeliver_5: '失败即回退：审计输出异常、达到上限、人工干预或 tasks 不可读时都会要求人工处理。自动交付不会 stage、commit 或 push 代码。',
     h_auto: '受监督执行',
     auto_intro: 'IM.codes 可对支持的 transport session 做逐轮监督，而不是盲目自动继续。Auto 会判断最近一轮是已经完成、应该继续自动执行，还是该把控制权交还给你。',
     auto_1: '按 session 配置 Auto 模式：Off、Supervised、Supervised + audit。',
@@ -587,6 +623,8 @@ const I18N = {
     f_memory_desc: '问题→解决方案记忆、多语言召回、按消息/启动自动注入，并在时间线中可见',
     f_mcp_name: '托管 MCP 工具',
     f_mcp_desc: '十个运行时作用域工具：记忆搜索/来源、偏好、Scoped Send 和 Cron 调度',
+    f_autodeliver_name: 'OpenSpec 自动交付',
+    f_autodeliver_desc: '提案/规格审计 → 实现 → 团队审计/返工，并自动给 spec/tasks/implementation/tests/risk 模块打分',
     f_auto_name: '受监督执行',
     f_auto_desc: '逐轮完成判定、自动继续，以及可选的审计→返工闭环，适用于 transport agent',
     why_text: '离开桌面后，大多数 coding agent 工作流就断了。代理还在终端里运行，但你通常只能靠 SSH、tmux attach、远程桌面，或者等回到电脑前。这只是问题的一半。复杂 agent 工作还需要更稳的判断：单个模型可能陷入定式、漏掉问题，切换 provider 时也可能丢上下文。IM.codes 把始终可达的会话、已完成工作的共享记忆摘要，以及结构化团队跨模型审阅放在一起，让多个 agent 在代码落地前互相挑战方案。它不能让输出完美，但能减少单模型盲点，并让工作保持连续。',
@@ -641,8 +679,8 @@ const I18N = {
     disclaimer: 'IM.codes 是一个独立的开源项目，与 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司无任何关联、认可或赞助关系。所有产品名称和商标均为其各自所有者的财产。',
   },
   'zh-TW': {
-    tagline: '給 AI agent 的 IM。共享記憶、託管 MCP 工具、受監督執行，以及跨模型審計。',
-    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層，以及一套託管 MCP 工具面。它會把已完成的工作沉澱成可重用上下文，再在後續 session 中注入或召回合適的歷史，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。團隊討論功能讓多個模型互相審閱對方的方案和實作——能有效減少單模型的遺漏、盲點和偏差。',
+    tagline: '給 AI agent 的 IM。共享記憶、OpenSpec 自動交付、託管 MCP 工具、受監督執行，以及跨模型審計。',
+    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層，以及一套託管 MCP 工具面。它會把已完成的工作沉澱成可重用上下文，再在後續 session 中注入或召回合適的歷史，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。OpenSpec 自動交付可以把一個變更從提案/規格審計一路推進到實作、驗證建議、團隊審計/返工、自動模組打分和最終品質門控。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。團隊討論功能讓多個模型互相審閱對方的方案和實作——能有效減少單模型的遺漏、盲點和偏差。',
     couplet_l1: '三個臭皮匠，頂個諸葛亮。',
     couplet_l2: '三個諸葛亮，談笑定陰陽。',
     hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
@@ -662,6 +700,13 @@ const I18N = {
     mcp_4: '<code>send_list_targets</code> 和 <code>send_message</code> 讓 agent 發現兄弟 session，並發送有作用域的文字、檔案引用、回覆請求或廣播。',
     mcp_5: '<code>cron_create</code>、<code>cron_list</code>、<code>cron_update</code> 和 <code>cron_delete</code> 管理未來結構化發送任務，用於提醒、週期檢查、委託 review 和 follow-up。',
     mcp_6: '執行時綁定身份可防止偽造 namespace、user、server、token 或路由欄位；UI 會顯示 provider 級 ready/degraded 狀態和脫敏後的最近呼叫。',
+    h_autodeliver: 'OpenSpec 自動交付',
+    autodeliver_intro: '把一個 OpenSpec 變更目錄變成可監督的交付執行：提案/規格審計、實作、驗證建議、團隊審計/返工、自動打分，以及可見的最終交接。',
+    autodeliver_1: '一鍵啟動會解析所屬 session、讀取 <code>tasks.md</code>、鎖定 Team 通道，並在 UI 中持續顯示即時進度。',
+    autodeliver_2: '實作前可先跑規格審計，重用常規 Team/P2P 組合流程，並讀取權威 JSON，而不是盲信聊天摘要。',
+    autodeliver_3: '實作 prompt 會聚焦選中的 OpenSpec 變更，並從專案 manifest 中提示安全的驗證命令候選。',
+    autodeliver_4: '自動模組打分會對 <code>spec</code>、<code>tasks</code>、<code>implementation</code>、<code>tests</code>、<code>risk</code> 評分，證據會顯示在執行詳情裡。',
+    autodeliver_5: '失敗即回退：審計輸出異常、達到上限、人工干預或 tasks 不可讀時都會要求人工處理。自動交付不會 stage、commit 或 push 程式碼。',
     h_auto: '受監督執行',
     auto_intro: 'IM.codes 可對支援的 transport session 做逐輪監督，而不是盲目自動繼續。Auto 會判斷最近一輪是已完成、應該繼續自動執行，還是該把控制權交還給你。',
     auto_1: '按 session 設定 Auto 模式：Off、Supervised、Supervised + audit。',
@@ -673,6 +718,8 @@ const I18N = {
     f_memory_desc: '問題→解決方案記憶、多語言召回、按訊息/啟動自動注入，並在時間線中可見',
     f_mcp_name: '託管 MCP 工具',
     f_mcp_desc: '十個執行時作用域工具：記憶搜尋/來源、偏好、Scoped Send 和 Cron 調度',
+    f_autodeliver_name: 'OpenSpec 自動交付',
+    f_autodeliver_desc: '提案/規格審計 → 實作 → 團隊審計/返工，並自動給 spec/tasks/implementation/tests/risk 模組打分',
     f_auto_name: '受監督執行',
     f_auto_desc: '逐輪完成判定、自動繼續，以及可選的審計→返工閉環，適用於 transport agent',
     why_text: '離開桌面後，大多數 coding agent 工作流就斷了。代理還在終端機裡運行，但你通常只能靠 SSH、tmux attach、遠端桌面，或者等回到電腦前。這只是問題的一半。複雜 agent 工作還需要更穩的判斷：單一模型可能陷入固定模式、漏掉問題，切換 provider 時也可能遺失上下文。IM.codes 把始終可達的 session、已完成工作的共享記憶摘要，以及結構化團隊跨模型審閱放在一起，讓多個 agent 在程式碼落地前互相檢視方案。它不能讓輸出完美，但能減少單一模型盲點，並讓工作保持連續。',

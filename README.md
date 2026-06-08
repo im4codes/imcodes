@@ -2,13 +2,13 @@
 
 [English](README.md) | [简体中文](README.i18n/README.zh-CN.md) | [繁體中文](README.i18n/README.zh-TW.md) | [Español](README.i18n/README.es.md) | [Русский](README.i18n/README.ru.md) | [日本語](README.i18n/README.ja.md) | [한국어](README.i18n/README.ko.md)
 
-**The IM for agents. Shared memory, managed MCP tools, supervised execution, and cross-agent audit across AI providers.**
+**The IM for agents. Shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit across AI providers.**
 
 > Two heads are better than one.<br>
 > But minds in concert don't answer fate, they author it.<br>
 > — IM.codes
 
-IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and native streaming output for transport-backed agents. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.
+IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and native streaming output for transport-backed agents. For spec-driven work, OpenSpec Auto Deliver can take a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.
 
 > **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
 
@@ -79,6 +79,18 @@ That reach problem is only one half of it. Complex coding-agent work also needs 
 
 It is not another AI IDE or a generic remote terminal. It is the messaging, memory, and review layer around terminal-based coding agents.
 
+## OpenSpec Auto Deliver
+
+For OpenSpec-based changes, Auto Deliver turns a change folder into an end-to-end supervised delivery run: proposal/spec review, implementation, validation, Team audit, automatic module scoring, rework gates, and a visible final handoff.
+
+- **One-click change pipeline.** Launch from an OpenSpec change on a transport-backed coding session. IM.codes resolves the owning session, locks the Team lane to prevent conflicting runs, reads `tasks.md`, and keeps a live run projection in the UI.
+- **Spec audit before implementation.** Optional proposal/spec audit-repair uses the normal Team/P2P combo flow (default `audit>review>plan`) and reads an authoritative JSON result instead of trusting chat summaries.
+- **Task-driven implementation loop.** The daemon sends focused implementation prompts back into the same session, works only on that OpenSpec change, tracks checked/unchecked tasks, and surfaces safe validation command candidates discovered from project manifests.
+- **Automatic module scoring.** Every audit produces structured scores for `spec`, `tasks`, `implementation`, `tests`, and `risk`, with evidence and summaries visible in the run details instead of buried in chat text.
+- **Implementation audit and rework gates.** The final scored verdict — `PASS`, `REWORK`, or `BLOCKED` — decides whether the run can pass, should repair while limits allow, or needs a human decision.
+- **Presets for delivery depth.** `fast`, `standard`, `strict`, and `deep` tune spec-audit rounds, implementation-audit rounds, max implementation prompts, and elapsed-time limits.
+- **Fail-closed and human-owned.** Auto Deliver asks for human input on invalid audit output, time/prompt limits, manual interference, incompatible Team state, or unreadable tasks. It does **not** stage, commit, or push code; the user stays the final release owner.
+
 This is a personal project. I haven't written any code myself — it was built almost entirely by [Claude Code](https://github.com/anthropics/claude-code), with significant contributions from [Codex](https://github.com/openai/codex) and [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
 ## Shared Agent Context & Memory
@@ -132,6 +144,10 @@ Preview your local dev server from any device — phone, tablet, or remote brows
 ### Mobile, Watch & Notifications
 
 Full mobile support with biometric auth and push notifications. Shell sessions allow interactive keyboard input on mobile (SSH-like). Sub-session preview cards always show latest messages. Toast notifications navigate directly to the relevant session. Apple Watch support adds quick session monitoring, unread counts, and quick replies from the wrist.
+
+### OpenSpec Auto Deliver
+
+Run a spec-driven change through a structured delivery pipeline: proposal/spec audit, implementation prompts, manifest-aware validation hints, Team audit/rework, automatic module scores for spec/tasks/implementation/tests/risk, and a fail-closed handoff. The run bar shows progress across stages, task counts, audit rounds, evidence, and terminal reasons so the automation remains inspectable instead of becoming another hidden background agent.
 
 ### Supervised Task Automation
 
