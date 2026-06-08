@@ -1356,4 +1356,47 @@ describe('QwenProvider', () => {
       { status: null, label: null },
     ]);
   });
+
+  describe('cross-message streaming accumulator', () => {
+    it('resets the streaming accumulator at each message_start so a second message is not prefixed with the first', async () => {
+      // REGRESSION LOCK: Qwen streams cumulative text in state.currentText and
+      // emits it as a MessageDelta { messageId, delta } that the relay renders by
+      // replacing the bubble for that messageId. When a NEW assistant message
+      // (new message.id) begins mid-turn, state.currentText MUST reset to '' on
+      // the message_start event — otherwise message 2's deltas render prefixed
+      // with message 1's full text (visible cross-message bleed).
+      const provider = new QwenProvider();
+      await provider.connect({});
+      await provider.createSession({ sessionKey: 'sess-bleed', cwd: '/tmp/project' });
+
+      const deltas: Array<{ id: string; text: string }> = [];
+      provider.onDelta((_sid, delta) => deltas.push({ id: delta.messageId, text: delta.delta }));
+
+      await provider.send('sess-bleed', 'hello');
+      const run = lastSpawn();
+
+      // ── Message 1 ──
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'm1' } } })}\n`);
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Let me check.' } } })}\n`);
+      // ── A new assistant message begins mid-turn (e.g. after a tool round) ──
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'm2' } } })}\n`);
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'The answer' } } })}\n`);
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' is 42.' } } })}\n`);
+      run.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'The answer is 42.' })}\n`);
+      run.child.emit('close', 0, null);
+      await flushIO();
+
+      // Message 1 accumulated only its own text.
+      const m1Deltas = deltas.filter((d) => d.id === 'm1').map((d) => d.text);
+      expect(m1Deltas).toEqual(['Let me check.']);
+
+      // Message 2's deltas must be its OWN cumulative text only — never prefixed
+      // with message 1's text. This is the lock.
+      const m2Deltas = deltas.filter((d) => d.id === 'm2').map((d) => d.text);
+      expect(m2Deltas).toEqual(['The answer', 'The answer is 42.']);
+
+      // Guard: no emitted delta may ever concatenate the two messages.
+      expect(deltas.every((d) => !d.text.includes('Let me check.The answer'))).toBe(true);
+    });
+  });
 });
