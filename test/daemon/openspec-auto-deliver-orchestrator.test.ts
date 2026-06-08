@@ -925,6 +925,31 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
 
+  it('requests authoritative result file repair for verdict payload format errors', async () => {
+    const firstAudit = await startFastImplementationAudit('req-invalid-verdict-payload-repair');
+    const origin = parseAuditMetadata(firstAudit);
+    firstAudit.status = 'completed';
+    await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({
+      auto_deliver: origin,
+      evidence: [{ source: 'OpenSpec CLI', summary: 'free-form source should be regenerated' }],
+    }), null, 2), 'utf8');
+
+    const repairPrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver needs the authoritative audit result file')
+      && text.includes('Problem: invalid_evidence_source'),
+      2500,
+    );
+    expect(repairPrompt).toContain(`Authoritative result file: ${origin.authoritativeResultPath}`);
+    expect(repairPrompt).toContain('Allowed verdict values: PASS, REWORK, BLOCKED');
+    expect(repairPrompt).toContain('module_scores must contain exactly one entry for each module');
+    expect([...p2pRuns.values()]).toHaveLength(1);
+
+    await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({ auto_deliver: origin }), null, 2), 'utf8');
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
+  });
+
   it('keeps result-file repair prompts stage-scoped for spec audit repair', async () => {
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,

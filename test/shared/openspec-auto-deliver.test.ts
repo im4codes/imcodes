@@ -199,13 +199,37 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
   it('validates strict verdict payloads', () => {
     expect(validateOpenSpecAutoDeliverVerdictPayload(validVerdictPayload()).ok).toBe(true);
 
+    const invalidVerdict = validVerdictPayload();
+    invalidVerdict.verdict = 'DONE';
+    expect(validateOpenSpecAutoDeliverVerdictPayload(invalidVerdict).ok).toBe(false);
+
     const missingModule = validVerdictPayload();
     missingModule.module_scores = missingModule.module_scores.filter((score) => score.module !== 'risk');
     expect(validateOpenSpecAutoDeliverVerdictPayload(missingModule).ok).toBe(false);
 
+    const duplicateModule = validVerdictPayload();
+    duplicateModule.module_scores[0] = { ...duplicateModule.module_scores[1]! };
+    expect(validateOpenSpecAutoDeliverVerdictPayload(duplicateModule).ok).toBe(false);
+
+    const invalidScore = validVerdictPayload();
+    invalidScore.module_scores[0] = { ...invalidScore.module_scores[0]!, score: 11 };
+    expect(validateOpenSpecAutoDeliverVerdictPayload(invalidScore).ok).toBe(false);
+
+    const invalidMaxScore = validVerdictPayload();
+    invalidMaxScore.module_scores[0] = { ...invalidMaxScore.module_scores[0]!, max_score: 100 };
+    expect(validateOpenSpecAutoDeliverVerdictPayload(invalidMaxScore).ok).toBe(false);
+
     const contradictory = validVerdictPayload();
     contradictory.unchecked_tasks = ['Task still open'];
     expect(validateOpenSpecAutoDeliverVerdictPayload(contradictory).ok).toBe(false);
+  });
+
+  it('rejects free-form authoritative evidence sources', () => {
+    for (const source of ['OpenSpec CLI', 'openspec/changes/platform-foundation']) {
+      const payload = validVerdictPayload();
+      payload.evidence = [{ source, summary: 'free-form provenance should be rejected' }];
+      expect(validateOpenSpecAutoDeliverVerdictPayload(payload), source).toEqual(expect.objectContaining({ ok: false }));
+    }
   });
 
   it('centralizes strict authoritative result field contracts', () => {

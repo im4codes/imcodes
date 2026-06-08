@@ -688,14 +688,41 @@ function auditRoundCount(run: AutoDeliverRun, stage: AuditRepairStage): number {
   return stage === 'spec_audit_repair' ? run.specAuditRepairRound : run.implementationAuditRepairRound;
 }
 
+const RETRYABLE_AUTHORITATIVE_RESULT_ERROR_CODES = new Set([
+  'missing_authoritative_json',
+  'multiple_authoritative_json',
+  'malformed_authoritative_json',
+  'authoritative_input_too_large',
+  'authoritative_payload_too_large',
+  'invalid_authoritative_json',
+  'invalid_audit_verdict',
+  'invalid_verdict_payload',
+  'invalid_verdict',
+  'invalid_module_scores',
+  'invalid_module_score',
+  'invalid_score_module',
+  'invalid_score_value',
+  'invalid_max_score',
+  'invalid_score_summary',
+  'duplicate_score_module',
+  'missing_score_module',
+  'invalid_string_array',
+  'invalid_string_array_item',
+  'invalid_repairs_applied',
+  'invalid_repair_summary',
+  'invalid_repair_reason',
+  'invalid_evidence',
+  'invalid_evidence_entry',
+  'invalid_evidence_source',
+  'invalid_evidence_summary',
+  'invalid_evidence_command',
+  'invalid_evidence_exit_code',
+  'contradictory_pass_payload',
+]);
+
 function isRetryableAuditResultError(reason: string | undefined): boolean {
-  return reason === 'missing_authoritative_json'
-    || reason === 'multiple_authoritative_json'
-    || reason === 'malformed_authoritative_json'
-    || reason === 'authoritative_input_too_large'
-    || reason === 'authoritative_payload_too_large'
-    || reason === 'invalid_authoritative_json'
-    || reason === 'invalid_audit_verdict';
+  const codes = reason?.split(',').map((code) => code.trim()).filter(Boolean) ?? [];
+  return codes.length > 0 && codes.every((code) => RETRYABLE_AUTHORITATIVE_RESULT_ERROR_CODES.has(code));
 }
 
 function p2pAuditFailureSummary(p2pRun: P2pRun): string {
