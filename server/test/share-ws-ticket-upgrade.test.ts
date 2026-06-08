@@ -180,18 +180,62 @@ describe('share websocket ticket upgrade semantics', () => {
   let serverId: string;
   let env: Env;
 
+  async function startHttpServer(nextEnv: Env): Promise<void> {
+    const nextServer = createServer();
+    setupWebSocketUpgrade(nextServer, nextEnv);
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => reject(error);
+      nextServer.once('error', onError);
+      nextServer.listen(0, '127.0.0.1', () => {
+        nextServer.off('error', onError);
+        resolve();
+      });
+    });
+    httpServer = nextServer;
+    port = (httpServer.address() as { port: number }).port;
+  }
+
+  async function closeHttpServer(): Promise<void> {
+    if (!httpServer.listening) return;
+    await new Promise<void>((resolve, reject) => {
+      httpServer.close((error?: Error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+
+  async function closeWs(ws: WebSocket): Promise<void> {
+    if (ws.readyState === WebSocket.CLOSED) return;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const timeout = setTimeout(done, 500);
+      timeout.unref?.();
+
+      function done() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        ws.off('close', done);
+        ws.off('error', done);
+        resolve();
+      }
+
+      ws.once('close', done);
+      ws.once('error', done);
+      ws.close();
+    });
+  }
+
   beforeEach(async () => {
     serverId = `srv-share-ticket-${Math.random().toString(36).slice(2)}`;
     env = makeEnv(makeDb(serverId));
-    httpServer = createServer();
-    setupWebSocketUpgrade(httpServer, env);
-    await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', () => resolve()));
-    port = (httpServer.address() as { port: number }).port;
+    await startHttpServer(env);
   });
 
   afterEach(async () => {
     WsBridge.getAll().clear();
-    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    await closeHttpServer();
   });
 
   it('allows the same unexpired share ticket to reconnect while member tickets remain single-use', async () => {
@@ -212,15 +256,15 @@ describe('share websocket ticket upgrade semantics', () => {
     const shareUrl = wsUrl(port, serverId, reusableShareTicket);
     const shareFirst = await connect(shareUrl);
     expect(shareFirst.opened).toBe(true);
-    if (shareFirst.opened) shareFirst.ws.close();
+    if (shareFirst.opened) await closeWs(shareFirst.ws);
     const shareSecond = await connect(shareUrl);
     expect(shareSecond.opened).toBe(true);
-    if (shareSecond.opened) shareSecond.ws.close();
+    if (shareSecond.opened) await closeWs(shareSecond.ws);
 
     const memberUrl = `ws://127.0.0.1:${port}/api/server/${serverId}/ws?ticket=${encodeURIComponent(memberTicket)}`;
     const memberFirst = await connect(memberUrl);
     expect(memberFirst.opened).toBe(true);
-    if (memberFirst.opened) memberFirst.ws.close();
+    if (memberFirst.opened) await closeWs(memberFirst.ws);
     const memberSecond = await connect(memberUrl);
     expect(memberSecond.opened).toBe(false);
     if (!memberSecond.opened) expect(memberSecond.statusCode).toBe(401);
@@ -235,11 +279,8 @@ describe('share websocket ticket upgrade semantics', () => {
       memberUserIds: ['member-user'],
       existingSessions: ['deck_proj_brain'],
     }));
-    httpServer.close();
-    await new Promise<void>((resolve) => httpServer.once('close', resolve));
-    httpServer = createServer();
-    setupWebSocketUpgrade(httpServer, env);
-    await new Promise<void>((resolve) => httpServer.listen(port, '127.0.0.1', () => resolve()));
+    await closeHttpServer();
+    await startHttpServer(env);
 
     const mainConnect = await connect(wsUrl(port, serverId, shareTicket(env, {
       serverId,
@@ -247,9 +288,9 @@ describe('share websocket ticket upgrade semantics', () => {
       snapshot: snapshotFor(mainTarget, { effectiveRole: 'participant', coveringShareIds: ['main-share'], primaryShareId: 'main-share' }),
     })));
     expect(mainConnect.opened).toBe(true);
-    if (mainConnect.opened) mainConnect.ws.close();
+    if (mainConnect.opened) await closeWs(mainConnect.ws);
 
-    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    await closeHttpServer();
     const subTarget: ShareTarget = { kind: 'subsession', serverId, subSessionId: 'sub-1' };
     env = makeEnv(makeDb(serverId, {
       shares: [
@@ -258,9 +299,7 @@ describe('share websocket ticket upgrade semantics', () => {
       memberUserIds: ['member-user'],
       existingSubSessions: ['sub-1'],
     }));
-    httpServer = createServer();
-    setupWebSocketUpgrade(httpServer, env);
-    await new Promise<void>((resolve) => httpServer.listen(port, '127.0.0.1', () => resolve()));
+    await startHttpServer(env);
 
     const subConnect = await connect(wsUrl(port, serverId, shareTicket(env, {
       serverId,
@@ -268,7 +307,7 @@ describe('share websocket ticket upgrade semantics', () => {
       snapshot: snapshotFor(subTarget, { coveringShareIds: ['sub-share'], primaryShareId: 'sub-share' }),
     })));
     expect(subConnect.opened).toBe(true);
-    if (subConnect.opened) subConnect.ws.close();
+    if (subConnect.opened) await closeWs(subConnect.ws);
   });
 
   it('rejects malformed, target-mismatched, expired, revoked, and target-unavailable share tickets before upgrade', async () => {
@@ -324,15 +363,13 @@ describe('share websocket ticket upgrade semantics', () => {
 
   it('rejects stale share tickets after the next coverage recheck even when the bearer token has not expired', async () => {
     const target: ShareTarget = { kind: 'server', serverId };
-    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    await closeHttpServer();
     env = makeEnv(makeDb(serverId, {
       shares: [
         { id: 'expired-coverage', target, targetUserId: 'share-user', role: 'viewer', createdAt: 1_000, expiresAt: Date.now() - 1 },
       ],
     }));
-    httpServer = createServer();
-    setupWebSocketUpgrade(httpServer, env);
-    await new Promise<void>((resolve) => httpServer.listen(port, '127.0.0.1', () => resolve()));
+    await startHttpServer(env);
 
     const result = await connect(wsUrl(port, serverId, shareTicket(env, {
       serverId,
@@ -347,16 +384,14 @@ describe('share websocket ticket upgrade semantics', () => {
 
   it('re-resolves overlapping live coverage when an older grant reached its recheck boundary', async () => {
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
-    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    await closeHttpServer();
     env = makeEnv(makeDb(serverId, {
       shares: [
         { id: 'remaining-share', target, targetUserId: 'share-user', role: 'viewer', createdAt: 2_000, expiresAt: Date.now() + 60_000 },
       ],
       existingSessions: ['deck_proj_brain'],
     }));
-    httpServer = createServer();
-    setupWebSocketUpgrade(httpServer, env);
-    await new Promise<void>((resolve) => httpServer.listen(port, '127.0.0.1', () => resolve()));
+    await startHttpServer(env);
 
     const result = await connect(wsUrl(port, serverId, shareTicket(env, {
       serverId,
@@ -371,7 +406,7 @@ describe('share websocket ticket upgrade semantics', () => {
     })));
 
     expect(result.opened).toBe(true);
-    if (result.opened) result.ws.close();
+    if (result.opened) await closeWs(result.ws);
   });
 
   it('enforces serverId sticky routing invariants before creating a bridge owner', async () => {
@@ -394,6 +429,6 @@ describe('share websocket ticket upgrade semantics', () => {
     expect(validRoute.opened).toBe(true);
     expect(WsBridge.getAll().has(ticketServerId)).toBe(true);
     expect(WsBridge.getAll().has(wrongRouteServerId)).toBe(false);
-    if (validRoute.opened) validRoute.ws.close();
+    if (validRoute.opened) await closeWs(validRoute.ws);
   });
 });
