@@ -5035,8 +5035,10 @@ export function App() {
               <OpenSpecAutoDeliverDetailsPanel
                 projection={appOpenSpecAutoProjection}
                 stopPending={appOpenSpecAutoDeliver.stopPending}
+                continuePending={appOpenSpecAutoDeliver.continuePending}
                 onClose={() => setAppOpenSpecAutoDetailsOpen(false)}
                 onStop={() => { appOpenSpecAutoDeliver.stop(); }}
+                onContinue={() => { appOpenSpecAutoDeliver.continueRun(); }}
               />
             )}
 

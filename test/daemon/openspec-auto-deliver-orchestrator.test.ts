@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
@@ -218,6 +218,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     projectDir = join(tmpdir(), `imcodes-auto-deliver-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     extraTempDirs = [];
     await makeChange('demo-change');
+    projectDir = await realpath(projectDir);
     serverLinkMock.send.mockClear();
     transportSendMock.mockClear();
     p2pRuns.clear();
