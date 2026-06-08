@@ -2151,6 +2151,9 @@ describe('WsBridge', () => {
         activeModel: 'sonnet',
         effort: 'high',
         transportConfig: { provider: { mode: 'safe' } },
+        transportPendingMessages: [],
+        transportPendingMessageEntries: [],
+        transportPendingMessageVersion: 7,
       }));
       await flushAsync();
 
@@ -2168,6 +2171,9 @@ describe('WsBridge', () => {
       expect(msg.activeModel).toBe('sonnet');
       expect(msg.effort).toBe('high');
       expect(msg.transportConfig).toEqual({ provider: { mode: 'safe' } });
+      expect(msg.transportPendingMessages).toEqual([]);
+      expect(msg.transportPendingMessageEntries).toEqual([]);
+      expect(msg.transportPendingMessageVersion).toBe(7);
       expect(msg.state).toBe('idle');
     });
 

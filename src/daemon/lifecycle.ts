@@ -643,6 +643,7 @@ export async function startup(): Promise<DaemonContext> {
           continue;
         }
         const id = session.name.slice('deck_sub_'.length);
+        const transportRuntime = getTransportRuntime(session.name);
         try {
           serverLink.send({
             type: 'subsession.sync',
@@ -675,6 +676,11 @@ export async function startup(): Promise<DaemonContext> {
             quotaMeta: session.quotaMeta ?? null,
             effort: session.effort ?? null,
             transportConfig: session.transportConfig ?? null,
+            ...(transportRuntime ? {
+              transportPendingMessages: transportRuntime.pendingMessages,
+              transportPendingMessageEntries: transportRuntime.pendingEntries,
+              transportPendingMessageVersion: transportRuntime.pendingVersion,
+            } : {}),
           });
         } catch { /* ignore */ }
       }

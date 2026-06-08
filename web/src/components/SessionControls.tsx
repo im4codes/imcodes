@@ -710,6 +710,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         activeSession?.name ?? '',
       )
     : [];
+  const incomingQueuedTransportVersion = typeof activeSession?.transportPendingMessageVersion === 'number'
+    ? activeSession.transportPendingMessageVersion
+    : undefined;
   const queuedTransportEntries = useMemo<LocalQueuedTransportEntry[]>(() => {
     if (optimisticQueuedEntries === null) return incomingQueuedTransportEntries;
     if (optimisticQueuedEntries.length === 0) return [];
@@ -1174,17 +1177,29 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const lastIncomingQueuedTransportEntriesKeyRef = useRef(incomingQueuedTransportEntriesKey);
   const lastIncomingQueuedTransportEntriesCountRef = useRef(incomingQueuedTransportEntries.length);
   const lastIncomingQueuedTransportEntryIdsRef = useRef(new Set(incomingQueuedTransportEntries.map((entry) => entry.clientMessageId)));
+  const lastIncomingQueuedTransportVersionRef = useRef(incomingQueuedTransportVersion);
   useEffect(() => {
     if (effectiveRuntimeType !== 'transport') {
       setOptimisticQueuedEntries(null);
       lastIncomingQueuedTransportEntriesKeyRef.current = incomingQueuedTransportEntriesKey;
       lastIncomingQueuedTransportEntriesCountRef.current = incomingQueuedTransportEntries.length;
       lastIncomingQueuedTransportEntryIdsRef.current = new Set(incomingQueuedTransportEntries.map((entry) => entry.clientMessageId));
+      lastIncomingQueuedTransportVersionRef.current = incomingQueuedTransportVersion;
       return;
     }
     const previousIds = lastIncomingQueuedTransportEntryIdsRef.current;
     const previousCount = lastIncomingQueuedTransportEntriesCountRef.current;
+    const previousVersion = lastIncomingQueuedTransportVersionRef.current;
     const incomingChanged = lastIncomingQueuedTransportEntriesKeyRef.current !== incomingQueuedTransportEntriesKey;
+    const versionChanged = previousVersion !== incomingQueuedTransportVersion;
+    const emptySnapshotAdvanced = incomingQueuedTransportEntries.length === 0
+      && incomingQueuedTransportVersion !== undefined
+      && versionChanged
+      && (
+        previousVersion === undefined
+          ? incomingQueuedTransportVersion > 0
+          : incomingQueuedTransportVersion === 0 || incomingQueuedTransportVersion >= previousVersion
+      );
     if (incomingChanged && incomingQueuedTransportEntries.length > 0) {
       const incomingIds = new Set(incomingQueuedTransportEntries.map((entry) => entry.clientMessageId));
       setOptimisticQueuedEntries((prev) => {
@@ -1192,9 +1207,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         const remaining = prev.filter((entry) => !incomingIds.has(entry.clientMessageId));
         return remaining.length > 0 ? remaining : null;
       });
-    } else if (incomingChanged && previousCount > 0 && incomingQueuedTransportEntries.length === 0) {
+    } else if ((incomingChanged && previousCount > 0 && incomingQueuedTransportEntries.length === 0) || emptySnapshotAdvanced) {
       setOptimisticQueuedEntries((prev) => {
         if (!prev) return null;
+        if (emptySnapshotAdvanced) return null;
         const remaining = prev.filter((entry) => !previousIds.has(entry.clientMessageId));
         return remaining.length > 0 ? remaining : null;
       });
@@ -1202,7 +1218,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     lastIncomingQueuedTransportEntriesKeyRef.current = incomingQueuedTransportEntriesKey;
     lastIncomingQueuedTransportEntriesCountRef.current = incomingQueuedTransportEntries.length;
     lastIncomingQueuedTransportEntryIdsRef.current = new Set(incomingQueuedTransportEntries.map((entry) => entry.clientMessageId));
-  }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntries.length, incomingQueuedTransportEntriesKey]);
+    lastIncomingQueuedTransportVersionRef.current = incomingQueuedTransportVersion;
+  }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntries.length, incomingQueuedTransportEntriesKey, incomingQueuedTransportVersion]);
 
   useEffect(() => {
     if (!ws || !activeSession) return;

@@ -5,6 +5,7 @@ import { getQwenOAuthQuotaUsageLabel } from '../agent/provider-quota.js';
 import { getClaudeSdkRuntimeConfig } from '../agent/sdk-runtime-config.js';
 import { getClaudeUsageQuota } from '../agent/claude-usage-quota.js';
 import { getSession, type SessionRecord } from '../store/session-store.js';
+import { getTransportRuntime } from '../agent/session-manager.js';
 import type { ServerLink } from './server-link.js';
 import logger from '../util/logger.js';
 
@@ -53,6 +54,7 @@ export async function buildSubSessionSyncPayload(
   // Option B (best-effort, ≤1 fetch / 30min): proactive 5h+weekly quota for a
   // claude-code-sdk sub-session. null → fall back to the rate_limit_event quota.
   const usageQuota = isClaudeSdkSession(r.agentType) ? await getClaudeUsageQuota().catch(() => null) : null;
+  const transportRuntime = getTransportRuntime(sessionName);
 
   return {
     type: 'subsession.sync',
@@ -90,6 +92,11 @@ export async function buildSubSessionSyncPayload(
     quotaUsageLabel: freshDisplay.quotaUsageLabel ?? r.quotaUsageLabel ?? null,
     quotaMeta: usageQuota?.quotaMeta ?? freshDisplay.quotaMeta ?? r.quotaMeta ?? null,
     effort: r.effort ?? null,
+    ...(transportRuntime ? {
+      transportPendingMessages: transportRuntime.pendingMessages,
+      transportPendingMessageEntries: transportRuntime.pendingEntries,
+      transportPendingMessageVersion: transportRuntime.pendingVersion,
+    } : {}),
   };
 }
 

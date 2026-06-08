@@ -4227,6 +4227,9 @@ export class WsBridge {
           (msg.transportConfig as Record<string, unknown>) || null,
         );
         // Notify browsers so sub-session appears immediately without page refresh
+        const hasTransportPendingMessages = Object.prototype.hasOwnProperty.call(msg, 'transportPendingMessages');
+        const hasTransportPendingMessageEntries = Object.prototype.hasOwnProperty.call(msg, 'transportPendingMessageEntries');
+        const hasTransportPendingMessageVersion = Object.prototype.hasOwnProperty.call(msg, 'transportPendingMessageVersion');
         this.broadcastToBrowsers(JSON.stringify({
           type: 'subsession.created',
           id: msg.id,
@@ -4243,6 +4246,9 @@ export class WsBridge {
           activeModel: msg.activeModel || msg.modelDisplay || null,
           effort: msg.effort || null,
           transportConfig: msg.transportConfig || null,
+          ...(hasTransportPendingMessages ? { transportPendingMessages: msg.transportPendingMessages } : {}),
+          ...(hasTransportPendingMessageEntries ? { transportPendingMessageEntries: msg.transportPendingMessageEntries } : {}),
+          ...(hasTransportPendingMessageVersion ? { transportPendingMessageVersion: msg.transportPendingMessageVersion } : {}),
           qwenModel: msg.qwenModel || null,
           qwenAuthType: msg.qwenAuthType || null,
           qwenAvailableModels: msg.qwenAvailableModels || null,

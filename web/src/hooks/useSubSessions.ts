@@ -45,6 +45,45 @@ function toSessionName(id: string): string {
   return `deck_sub_${id}`;
 }
 
+function hasTransportPendingSyncSnapshot(value: Record<string, unknown>): boolean {
+  return Object.prototype.hasOwnProperty.call(value, 'transportPendingMessages')
+    || Object.prototype.hasOwnProperty.call(value, 'transportPendingMessageEntries')
+    || Object.prototype.hasOwnProperty.call(value, 'transportPendingMessageVersion');
+}
+
+function buildTransportPendingSyncPatch(
+  existing: Pick<SubSession, 'transportPendingMessages' | 'transportPendingMessageEntries' | 'transportPendingMessageVersion'>,
+  value: Record<string, unknown>,
+  scopeKey: string,
+): Partial<SubSession> {
+  if (!hasTransportPendingSyncSnapshot(value)) return {};
+  const incomingVersion = extractTransportPendingVersion(value.transportPendingMessageVersion);
+  if (!shouldApplyTransportQueueSnapshot(existing.transportPendingMessageVersion ?? undefined, incomingVersion)) {
+    return {};
+  }
+  const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(value, 'transportPendingMessages');
+  const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(value, 'transportPendingMessageEntries');
+  const pendingMessages = extractTransportPendingMessages(value.transportPendingMessages);
+  return {
+    ...(hasPendingMessagesField
+      ? { transportPendingMessages: pendingMessages }
+      : {}),
+    ...(hasPendingMessagesField || hasPendingEntriesField
+      ? {
+          transportPendingMessageEntries: normalizeTransportPendingEntries(
+            value.transportPendingMessageEntries,
+            pendingMessages,
+            scopeKey,
+          ),
+        }
+      : {}),
+    transportPendingMessageVersion: nextTransportQueueVersion(
+      existing.transportPendingMessageVersion ?? undefined,
+      incomingVersion,
+    ),
+  };
+}
+
 function mergeLoadedSubSession(s: SubSessionData, existing?: SubSession): SubSession {
   const base: SubSession = {
     ...s,
@@ -236,6 +275,11 @@ export function useSubSessions(
               const updated = [...prev];
               const existing = updated[existingIdx];
               const preserveQuota = isCodexFamily(existing.type);
+              const transportPendingPatch = buildTransportPendingSyncPatch(
+                existing,
+                m,
+                existing.sessionName,
+              );
               updated[existingIdx] = { ...updated[existingIdx],
                 ...(m.state != null && { state: m.state as SubSession['state'] }),
                 ...(m.cwd != null && { cwd: m.cwd }),
@@ -256,18 +300,7 @@ export function useSubSessions(
                     updated[existingIdx].transportConfig,
                   ),
                 }),
-                ...(m.transportPendingMessages !== undefined && { transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages) }),
-                ...((m.transportPendingMessages !== undefined || m.transportPendingMessageEntries !== undefined) && {
-                  transportPendingMessageEntries: normalizeTransportPendingEntries(
-                    m.transportPendingMessageEntries,
-                    extractTransportPendingMessages(m.transportPendingMessages),
-                    updated[existingIdx].sessionName,
-                  ),
-                  transportPendingMessageVersion: nextTransportQueueVersion(
-                    updated[existingIdx].transportPendingMessageVersion ?? undefined,
-                    extractTransportPendingVersion(m.transportPendingMessageVersion),
-                  ),
-                }),
+                ...transportPendingPatch,
                 ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
                 ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
                 ...(m.qwenAvailableModels != null && { qwenAvailableModels: m.qwenAvailableModels }),
@@ -335,6 +368,7 @@ export function useSubSessions(
           setSubSessions((prev) => prev.map((s) => {
             if (s.id !== m.id) return s;
             const preserveQuota = isCodexFamily(s.type);
+            const transportPendingPatch = buildTransportPendingSyncPatch(s, m, s.sessionName);
             return { ...s,
               ...(m.state ? { state: m.state as SubSession['state'] } : {}),
               ...(m.cwd !== undefined ? { cwd: m.cwd } : {}),
@@ -357,18 +391,7 @@ export function useSubSessions(
                   s.transportConfig,
                 ),
               } : {}),
-              ...(m.transportPendingMessages !== undefined ? { transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages) } : {}),
-              ...((m.transportPendingMessages !== undefined || m.transportPendingMessageEntries !== undefined) ? {
-                transportPendingMessageEntries: normalizeTransportPendingEntries(
-                  m.transportPendingMessageEntries,
-                  extractTransportPendingMessages(m.transportPendingMessages),
-                  s.sessionName,
-                ),
-                transportPendingMessageVersion: nextTransportQueueVersion(
-                  s.transportPendingMessageVersion ?? undefined,
-                  extractTransportPendingVersion(m.transportPendingMessageVersion),
-                ),
-              } : {}),
+              ...transportPendingPatch,
             };
           }));
         }

@@ -3134,6 +3134,47 @@ afterEach(() => {
     expect(screen.queryByText('queued then drained')).toBeNull();
   });
 
+  it('clears a local queued entry when reconnect snapshot advances to an empty queue', () => {
+    const ws = makeWs();
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessages: [],
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 0,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'sent while browser was offline';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    expect(screen.getByText('sent while browser was offline')).toBeDefined();
+
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessages: [],
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 2,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.queryByText('sent while browser was offline')).toBeNull();
+  });
+
   it('clears an optimistic queue entry by text when the authoritative user.message lacks ids', () => {
     const ws = makeWs();
     render(
