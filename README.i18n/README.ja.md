@@ -338,6 +338,10 @@ setx PATH "<npm-prefix-path>;%PATH%"
 - Linux / macOS では tmux
 - Claude Code、Codex、Gemini CLI、OpenClaw、Qwen のいずれか
 
+## このプロジェクトについて
+
+個人プロジェクトです。私はほとんどコードを書いていません。ほぼ全てを [Claude Code](https://github.com/anthropics/claude-code) が構築し、[Codex](https://github.com/openai/codex) と [Gemini CLI](https://github.com/google-gemini/gemini-cli) も重要な貢献をしています。
+
 ## 免責事項
 
 IM.codes は独立したオープンソースプロジェクトであり、Anthropic、OpenAI、Google、Alibaba、OpenClaw などとは提携・承認・支援関係にありません。

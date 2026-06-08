@@ -337,6 +337,10 @@ setx PATH "<npm-prefix-path>;%PATH%"
 - tmux на Linux/macOS
 - как минимум один AI coding agent: Claude Code, Codex, Gemini CLI, OpenClaw или Qwen
 
+## О проекте
+
+Это личный проект. Я почти не писал код сам: он почти полностью создан [Claude Code](https://github.com/anthropics/claude-code), со значительным вкладом [Codex](https://github.com/openai/codex) и [Gemini CLI](https://github.com/google-gemini/gemini-cli).
+
 ## Дисклеймер
 
 IM.codes — независимый open-source проект и не аффилирован с Anthropic, OpenAI, Google, Alibaba, OpenClaw или другими упомянутыми компаниями.

@@ -74,8 +74,6 @@ Ese problema de acceso es solo la mitad. El trabajo complejo con coding agents t
 
 No es otro IDE de IA ni un cliente genérico de terminal remota. Es la capa de mensajería, memoria y revisión alrededor de coding agents basados en terminal.
 
-Este es un proyecto personal. Yo prácticamente no escribí código: fue construido casi por completo por [Claude Code](https://github.com/anthropics/claude-code), con contribuciones importantes de [Codex](https://github.com/openai/codex) y [Gemini CLI](https://github.com/google-gemini/gemini-cli).
-
 ## OpenSpec Auto Deliver
 
 Para cambios basados en OpenSpec, Auto Deliver convierte un change folder en una ejecución de entrega supervisada de extremo a extremo: revisión proposal/spec, implementación, validación, auditoría Team, scoring automático por módulo, gates de retrabajo y handoff final visible.
@@ -345,6 +343,10 @@ setx PATH "<npm-prefix-path>;%PATH%"
 - Node.js >= 22
 - tmux en Linux/macOS
 - Al menos un coding agent: Claude Code, Codex, Gemini CLI, OpenClaw o Qwen
+
+## Acerca de
+
+Este es un proyecto personal. Yo prácticamente no escribí código: fue construido casi por completo por [Claude Code](https://github.com/anthropics/claude-code), con contribuciones importantes de [Codex](https://github.com/openai/codex) y [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
 ## Descargo de responsabilidad
 

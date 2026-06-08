@@ -10,16 +10,7 @@
 
 IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and native streaming output for transport-backed agents. For spec-driven work, OpenSpec Auto Deliver can take a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Session sharing also supports pair or multi-person collaborative coding around live agent sessions. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.
 
-> **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
-
-### Breaking Changes
-
-- **PostgreSQL default image changed to `pgvector/pgvector:pg18`** (instead of `postgres:16-alpine`). New self-hosted deployments generated from the current templates use this image for multilingual vector search in shared agent memory:
-  ```yaml
-  postgres:
-    image: pgvector/pgvector:pg18   # was: postgres:16-alpine
-  ```
-  The pgvector extension is enabled automatically by the server migration on first startup.
+> **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk.
 
 ## Screenshots
 
@@ -94,8 +85,6 @@ For OpenSpec-based changes, Auto Deliver turns a change folder into an end-to-en
 ## Collaborative Coding
 
 Share a tab, sub-session, or whole source server with another user. Use `viewer` for read-only review or `participant` when a teammate should send prompts into the covered sessions. Shared messages carry actor labels, and access can be downgraded or revoked from the UI.
-
-This is a personal project. I haven't written any code myself — it was built almost entirely by [Claude Code](https://github.com/anthropics/claude-code), with significant contributions from [Codex](https://github.com/openai/codex) and [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
 ## Shared Agent Context & Memory
 
@@ -418,6 +407,10 @@ Check the daemon watchdog log for errors:
 - Node.js >= 22
 - Terminal multiplexer: [tmux](https://github.com/tmux/tmux) (Linux/macOS). Windows uses ConPTY (auto-detected, built-in).
 - At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code) (CLI or SDK), [Codex](https://github.com/openai/codex) (CLI or SDK), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), or [Qwen](https://github.com/QwenLM/qwen-agent)
+
+## About
+
+This is a personal project. I haven't written any code myself — it was built almost entirely by [Claude Code](https://github.com/anthropics/claude-code), with significant contributions from [Codex](https://github.com/openai/codex) and [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
 ## Disclaimer
 

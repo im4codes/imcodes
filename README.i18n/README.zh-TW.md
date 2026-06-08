@@ -89,8 +89,6 @@ IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層和託管 M
 
 把目前標籤頁、子 session 或整台 source server 分享給其他使用者。`viewer` 適合唯讀 review；`participant` 可以向覆蓋範圍內的 session 送出 prompt。Shared message 會標註真人 actor，權限可在 UI 中降級或撤銷。
 
-這是一個個人專案。我自己幾乎沒寫程式碼——它基本由 [Claude Code](https://github.com/anthropics/claude-code) 建構完成，[Codex](https://github.com/openai/codex) 和 [Gemini CLI](https://github.com/google-gemini/gemini-cli) 也提供了大量貢獻。
-
 ## 共享代理上下文與記憶
 
 IM.codes 會持續把已完成的代理工作沉澱成可重用記憶，並在後續工作階段中自動回灌這些上下文。
@@ -407,6 +405,10 @@ setx PATH "<npm-prefix-path>;%PATH%"
 - Node.js >= 22
 - 终端复用器：[tmux](https://github.com/tmux/tmux)（Linux/macOS）。Windows 使用 ConPTY（自动检测，系统内置）。
 - 至少安裝一个 AI coding agent：[Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、[OpenClaw](https://openclaw.com) 或 [Qwen](https://github.com/QwenLM/qwen-agent)
+
+## 關於
+
+這是一個個人專案。我自己幾乎沒寫程式碼——它基本由 [Claude Code](https://github.com/anthropics/claude-code) 建構完成，[Codex](https://github.com/openai/codex) 和 [Gemini CLI](https://github.com/google-gemini/gemini-cli) 也提供了大量貢獻。
 
 ## 免责声明
 
