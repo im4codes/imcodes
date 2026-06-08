@@ -641,8 +641,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
     if (msg.type === 'stream_event') {
       const event = msg.event;
-      if (event.type === 'message_start' && event.message?.id) {
-        state.currentMessageId = String(event.message.id);
+      if (event.type === 'message_start') {
+        // New assistant message within the turn (the model's continuation after
+        // a tool result starts a fresh message_start with a new id). Reset the
+        // streaming accumulator so this message's deltas don't render prefixed
+        // with the previous message's full text. Without this, the new bubble
+        // briefly shows "<prev message text><new delta>" and only snaps to the
+        // correct text when the message completes — visible flicker/bleed.
+        state.currentText = '';
+        state.currentMessageId = event.message?.id ? String(event.message.id) : null;
         return;
       }
       if (event.type === 'content_block_start' && this.isToolBlock(event.content_block)) {

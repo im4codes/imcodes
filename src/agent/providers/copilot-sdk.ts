@@ -804,7 +804,15 @@ export class CopilotSdkProvider implements TransportProvider {
       case 'assistant.message_delta': {
         const chunk = String(event.data?.deltaContent ?? '');
         if (!chunk) return;
-        state.currentMessageId = String(event.data?.messageId ?? state.currentMessageId ?? randomUUID());
+        const incomingMessageId = String(event.data?.messageId ?? state.currentMessageId ?? randomUUID());
+        // Reset the accumulator at a new-message boundary so message 2's deltas
+        // don't render prefixed with message 1's full text (multi-message turns
+        // occur after every tool round). Without this the new bubble flickers,
+        // showing the prior message's text until this one completes.
+        if (incomingMessageId !== state.currentMessageId) {
+          state.currentText = '';
+        }
+        state.currentMessageId = incomingMessageId;
         state.currentText += chunk;
         const delta: MessageDelta = {
           messageId: state.currentMessageId,

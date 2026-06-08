@@ -2432,6 +2432,13 @@ export class CodexSdkProvider implements TransportProvider {
       if (!sessionId || !state) return;
       if (state.cancelled) return;
       this.clearStatus(sessionId, state);
+      // Reset the streaming accumulator when a new agentMessage item starts so
+      // its deltas don't render prefixed with the previous message's full text
+      // (multi-message turns occur after every tool round). Guards the case
+      // where item/started was not observed before the first delta.
+      if (state.currentMessageId !== params.itemId) {
+        state.currentText = '';
+      }
       state.currentMessageId = params.itemId;
       state.currentText += String(params.delta ?? '');
       const delta: MessageDelta = {
@@ -2487,6 +2494,14 @@ export class CodexSdkProvider implements TransportProvider {
       }
 
       if (item.type === 'agentMessage') {
+        // A new agentMessage item begins: clear the accumulator so its stream
+        // starts fresh (prevents the previous message's text from bleeding into
+        // this message's bubble during streaming). item/completed for the SAME
+        // id must NOT clear (currentMessageId already matches), so the final
+        // text overwrite below is preserved.
+        if (state.currentMessageId !== item.id) {
+          state.currentText = '';
+        }
         state.currentMessageId = item.id;
         if (method === 'item/completed' && typeof item.text === 'string') {
           const prior = state.currentText;

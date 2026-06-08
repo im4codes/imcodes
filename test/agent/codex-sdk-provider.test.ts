@@ -1511,6 +1511,36 @@ describe('CodexSdkProvider', () => {
     expect(sessionInfo).toContainEqual({ resumeId: 'thread-1' });
   });
 
+  it('resets the streaming accumulator across agentMessages so a second message is not prefixed with the first', async () => {
+    // A turn with a tool round produces TWO agentMessage items. The second
+    // message's deltas must start fresh, not carry the first message's text.
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-multi', cwd: '/tmp/project' });
+
+    const deltas: Array<{ id: string; text: string }> = [];
+    provider.onDelta((_sid, delta) => deltas.push({ id: delta.messageId, text: delta.delta }));
+
+    await provider.send('route-multi', 'hello');
+    const child = childProcessMock.children[0];
+
+    child.emits({ method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: '' } } });
+    child.emits({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg-1', delta: 'First.' } });
+    child.emits({ method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'First.' } } });
+    // ── tool round, then the model continues in a NEW agentMessage ──
+    child.emits({ method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-2', type: 'agentMessage', text: '' } } });
+    child.emits({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg-2', delta: 'Second' } });
+    child.emits({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg-2', delta: ' part.' } });
+    child.emits({ method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-2', type: 'agentMessage', text: 'Second part.' } } });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+
+    await waitForCondition(() => deltas.filter((d) => d.id === 'msg-2').length >= 2);
+
+    const msg2Deltas = deltas.filter((d) => d.id === 'msg-2').map((d) => d.text);
+    expect(msg2Deltas).toEqual(['Second', 'Second part.']);
+    expect(deltas.every((d) => !d.text.includes('First.Second'))).toBe(true);
+  });
+
   it('completes a normal turn from idle thread status when turn/completed is missing', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });

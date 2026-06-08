@@ -185,6 +185,40 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(sessionInfo.some((info) => info.model === 'claude-sonnet-4-6')).toBe(true);
   });
 
+  it('resets the streaming accumulator across messages so a second message is not prefixed with the first', async () => {
+    // A single turn with a tool round produces TWO assistant messages, each
+    // with its own message_start id. The second message's streaming deltas must
+    // start fresh — not carry the first message's full text as a prefix.
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-multi', model: 'claude-sonnet-4-6' },
+      { type: 'stream_event', session_id: 'session-multi', event: { type: 'message_start', message: { id: 'msg-1' } } },
+      { type: 'stream_event', session_id: 'session-multi', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Let me check.' } } },
+      { type: 'assistant', session_id: 'session-multi', message: { content: [{ type: 'text', text: 'Let me check.' }] } },
+      // ── tool round happens here; the model then continues in a NEW message ──
+      { type: 'stream_event', session_id: 'session-multi', event: { type: 'message_start', message: { id: 'msg-2' } } },
+      { type: 'stream_event', session_id: 'session-multi', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'The answer' } } },
+      { type: 'stream_event', session_id: 'session-multi', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' is 42.' } } },
+      { type: 'assistant', session_id: 'session-multi', message: { content: [{ type: 'text', text: 'The answer is 42.' }] } },
+      { type: 'result', session_id: 'session-multi', subtype: 'success', is_error: false, result: 'The answer is 42.', usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-multi', cwd: '/tmp/project', resumeId: 'session-multi' });
+
+    const deltas: Array<{ id: string; text: string }> = [];
+    provider.onDelta((_sid, delta) => deltas.push({ id: delta.messageId, text: delta.delta }));
+
+    await provider.send('route-multi', 'hello');
+    await flush();
+
+    // Message 2's deltas must be its OWN text only, never prefixed with msg-1.
+    const msg2Deltas = deltas.filter((d) => d.id === 'msg-2').map((d) => d.text);
+    expect(msg2Deltas).toEqual(['The answer', 'The answer is 42.']);
+    // Guard: no delta should ever contain both messages concatenated.
+    expect(deltas.every((d) => !d.text.includes('Let me check.The answer'))).toBe(true);
+  });
+
   it('uses the last assistant usage for completion metadata instead of cumulative result usage', async () => {
     sdkMock.setNextMessages([
       {

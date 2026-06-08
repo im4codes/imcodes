@@ -479,6 +479,16 @@ export class CursorHeadlessProvider implements TransportProvider {
       }
 
       if (event.kind === 'assistant.delta') {
+        // Adopt a new message id and reset the accumulator BEFORE accumulating,
+        // so a new message's deltas start clean and emit under the right id.
+        // Otherwise the first delta of message 2 fails the startsWith guard
+        // (it doesn't start with message 1's text), gets concatenated onto the
+        // previous message's full text, and is emitted under the stale id —
+        // visible cross-message bleed until the message completes.
+        if (event.messageId && event.messageId !== state.currentMessageId) {
+          state.currentMessageId = event.messageId;
+          state.currentText = '';
+        }
         const chunk = event.text;
         if (chunk) {
           const nextText = chunk.startsWith(state.currentText)
@@ -487,9 +497,6 @@ export class CursorHeadlessProvider implements TransportProvider {
           if (nextText !== state.currentText) {
             emitDelta(nextText);
           }
-        }
-        if (event.messageId) {
-          state.currentMessageId = event.messageId;
         }
         return;
       }
