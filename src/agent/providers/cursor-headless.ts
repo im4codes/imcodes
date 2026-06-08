@@ -428,12 +428,23 @@ export class CursorHeadlessProvider implements TransportProvider {
     let stderrBuf = '';
 
     const sessionKey = this.findSessionIdForState(state) ?? sessionId;
+    let statusCleared = false;
+    const clearStatus = (): void => {
+      if (statusCleared) return;
+      statusCleared = true;
+      this.emitStatus(sessionKey, null, null);
+    };
+    // cursor-agent spends several seconds connecting to its backend before any
+    // output. Show "Connecting…" immediately so the turn doesn't read as hung.
+    this.emitStatus(sessionKey, 'connecting', 'Connecting…');
     const emitError = (error: ProviderError): void => {
       if (sawError || completed) return;
       sawError = true;
+      clearStatus();
       for (const cb of this.errorCallbacks) cb(sessionKey, error);
     };
     const emitDelta = (text: string): void => {
+      clearStatus();
       const messageId = state.currentMessageId ??= randomUUID();
       state.currentText = text;
       const delta: MessageDelta = {
@@ -475,6 +486,8 @@ export class CursorHeadlessProvider implements TransportProvider {
           resumeId: state.resumeId,
           ...(state.model ? { model: state.model } : {}),
         });
+        // Connected — model is now working. Switch the label until tokens stream.
+        this.emitStatus(sessionKey, 'thinking', 'Thinking…');
         return;
       }
 
@@ -548,6 +561,7 @@ export class CursorHeadlessProvider implements TransportProvider {
         completed = true;
         state.completed = true;
         state.child = null;
+        clearStatus();
         if (includeSessionSystemText) state.sessionSystemTextInjected = sessionSystemText;
         state.currentMessageId ??= randomUUID();
         const message: AgentMessage = {
@@ -584,6 +598,7 @@ export class CursorHeadlessProvider implements TransportProvider {
     child.once('close', (code, signal) => {
       rl.close();
       state.child = null;
+      clearStatus();
       if (completed || sawError) return;
       if (state.cancelled) {
         emitError(this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Cursor turn cancelled', true, { code, signal }));
@@ -799,6 +814,18 @@ export class CursorHeadlessProvider implements TransportProvider {
 
   private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {
     for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
+  }
+
+  /**
+   * Surface a transient execution status (footer "working" label). cursor-agent
+   * spawns a fresh process per turn and spends ~8-15s connecting/authenticating
+   * to its backend BEFORE emitting any output — dead silence that reads as a
+   * hang. We emit "Connecting…" the moment we spawn, switch to "Thinking…" once
+   * the session initializes, and clear it (status:null) as soon as the first
+   * assistant token streams. `status: null` clears any active label.
+   */
+  private emitStatus(sessionId: string, status: string | null, label: string | null): void {
+    for (const cb of this.statusCallbacks) cb(sessionId, { status, ...(label !== undefined ? { label } : {}) });
   }
 
   private async runExecFile(

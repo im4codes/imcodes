@@ -134,4 +134,41 @@ describe('CursorHeadlessProvider streaming accumulator', () => {
     // Completion still resolves to the full text.
     expect(completed).toEqual(['Hello there friend.']);
   });
+
+  it('surfaces a connecting/thinking status during the pre-output gap and clears it once streaming starts', async () => {
+    // cursor-agent spawns a fresh process per turn and spends ~8-15s connecting
+    // to its backend before emitting anything — dead silence that reads as a
+    // hang. The provider must emit "Connecting…" the moment it spawns, switch
+    // to "Thinking…" on init, and clear the status (null) when tokens stream.
+    const provider = new CursorHeadlessProvider();
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    const sessionId = await provider.createSession({
+      sessionKey: 'route-cursor-status',
+      cwd: '/tmp/project',
+      resumeId: 'cursor-chat-status',
+    });
+
+    const statuses: Array<string | null> = [];
+    provider.onStatus?.((_sid, s) => statuses.push(s.status));
+
+    await provider.send(sessionId, 'hello');
+    // "Connecting…" must already be emitted synchronously on spawn — before any
+    // stdout arrives from cursor.
+    expect(statuses[0]).toBe('connecting');
+
+    const spawned = harness.lastSpawn();
+    const write = (record: Record<string, unknown>) => {
+      spawned.child.stdout.write(`${JSON.stringify(record)}\n`);
+    };
+    write({ type: 'system', subtype: 'init', session_id: 'cursor-chat-status', model: 'Auto' });
+    write({ type: 'assistant', session_id: 'cursor-chat-status', message: { role: 'assistant', content: [{ type: 'text', text: 'Hi.' }] }, timestamp_ms: 1 });
+    write({ type: 'result', subtype: 'success', is_error: false, result: 'Hi.', session_id: 'cursor-chat-status' });
+    spawned.child.emit('close', 0, null);
+    await harness.flush();
+
+    // Sequence: connecting (spawn) → thinking (init) → null (first token clears).
+    expect(statuses).toContain('thinking');
+    expect(statuses.indexOf('connecting')).toBeLessThan(statuses.indexOf('thinking'));
+    expect(statuses[statuses.length - 1]).toBeNull();
+  });
 });
