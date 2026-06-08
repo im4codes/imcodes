@@ -331,7 +331,7 @@ footer {
   </div>
   <ul class="reqs">
     <li data-i18n="autodeliver_1">One-click launch resolves the owning session, reads <code>tasks.md</code>, locks the Team lane, and keeps live progress in the UI.</li>
-    <li data-i18n="autodeliver_2">Spec audit can run before implementation through the normal Team/P2P combo flow, using authoritative JSON instead of trusting chat summaries.</li>
+    <li data-i18n="autodeliver_2">Spec audit can run before implementation through the normal Team flow, using authoritative JSON instead of trusting chat summaries.</li>
     <li data-i18n="autodeliver_3">Implementation prompts stay focused on the selected OpenSpec change and surface safe validation command candidates from project manifests.</li>
     <li data-i18n="autodeliver_4">Automatic module scoring rates <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code>, and <code>risk</code> with evidence visible in run details.</li>
     <li data-i18n="autodeliver_5">Fail-closed gates ask for human input on bad audit output, exhausted limits, manual interference, or unreadable tasks. Auto Deliver never stages, commits, or pushes code.</li>
@@ -568,7 +568,7 @@ const I18N = {
     h_autodeliver: 'OpenSpec Auto Deliver',
     autodeliver_intro: 'Turn an OpenSpec change folder into a supervised delivery run: proposal/spec audit, implementation, validation hints, Team audit/rework, automatic scoring, and a visible final handoff.',
     autodeliver_1: 'One-click launch resolves the owning session, reads <code>tasks.md</code>, locks the Team lane, and keeps live progress in the UI.',
-    autodeliver_2: 'Spec audit can run before implementation through the normal Team/P2P combo flow, using authoritative JSON instead of trusting chat summaries.',
+    autodeliver_2: 'Spec audit can run before implementation through the normal Team flow, using authoritative JSON instead of trusting chat summaries.',
     autodeliver_3: 'Implementation prompts stay focused on the selected OpenSpec change and surface safe validation command candidates from project manifests.',
     autodeliver_4: 'Automatic module scoring rates <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code>, and <code>risk</code> with evidence visible in run details.',
     autodeliver_5: 'Fail-closed gates ask for human input on bad audit output, exhausted limits, manual interference, or unreadable tasks. Auto Deliver never stages, commits, or pushes code.',
@@ -628,7 +628,7 @@ const I18N = {
     h_autodeliver: 'OpenSpec 自动交付',
     autodeliver_intro: '把一个 OpenSpec 变更目录变成可监督的交付运行：提案/规格审计、实现、验证建议、团队审计/返工、自动打分，以及可见的最终交接。',
     autodeliver_1: '一键启动会解析所属会话、读取 <code>tasks.md</code>、锁定 Team 通道，并在 UI 中持续显示实时进度。',
-    autodeliver_2: '实现前可先跑规格审计，复用常规 Team/P2P 组合流程，并读取权威 JSON，而不是盲信聊天摘要。',
+    autodeliver_2: '实现前可先跑规格审计，复用常规 Team 流程，并读取权威 JSON，而不是盲信聊天摘要。',
     autodeliver_3: '实现 prompt 会聚焦选中的 OpenSpec 变更，并从项目 manifest 中提示安全的验证命令候选。',
     autodeliver_4: '自动模块打分会对 <code>spec</code>、<code>tasks</code>、<code>implementation</code>、<code>tests</code>、<code>risk</code> 评分，证据会显示在运行详情里。',
     autodeliver_5: '失败即回退：审计输出异常、达到上限、人工干预或 tasks 不可读时都会要求人工处理。自动交付不会 stage、commit 或 push 代码。',
@@ -729,7 +729,7 @@ const I18N = {
     h_autodeliver: 'OpenSpec 自動交付',
     autodeliver_intro: '把一個 OpenSpec 變更目錄變成可監督的交付執行：提案/規格審計、實作、驗證建議、團隊審計/返工、自動打分，以及可見的最終交接。',
     autodeliver_1: '一鍵啟動會解析所屬 session、讀取 <code>tasks.md</code>、鎖定 Team 通道，並在 UI 中持續顯示即時進度。',
-    autodeliver_2: '實作前可先跑規格審計，重用常規 Team/P2P 組合流程，並讀取權威 JSON，而不是盲信聊天摘要。',
+    autodeliver_2: '實作前可先跑規格審計，重用常規 Team 流程，並讀取權威 JSON，而不是盲信聊天摘要。',
     autodeliver_3: '實作 prompt 會聚焦選中的 OpenSpec 變更，並從專案 manifest 中提示安全的驗證命令候選。',
     autodeliver_4: '自動模組打分會對 <code>spec</code>、<code>tasks</code>、<code>implementation</code>、<code>tests</code>、<code>risk</code> 評分，證據會顯示在執行詳情裡。',
     autodeliver_5: '失敗即回退：審計輸出異常、達到上限、人工干預或 tasks 不可讀時都會要求人工處理。自動交付不會 stage、commit 或 push 程式碼。',
@@ -831,7 +831,7 @@ const I18N = {
     h_autodeliver: 'OpenSpec Auto Deliver',
     autodeliver_intro: 'OpenSpec change folder を supervised delivery run に変えます: proposal/spec audit、実装、検証ヒント、Team audit/rework、自動採点、見える final handoff。',
     autodeliver_1: 'ワンクリック起動で owning session を解決し、<code>tasks.md</code> を読み、Team lane をロックし、UI に live progress を表示します。',
-    autodeliver_2: '実装前に通常の Team/P2P combo flow で spec audit を実行でき、chat summary ではなく authoritative JSON を使います。',
+    autodeliver_2: '実装前に通常の Team flow で spec audit を実行でき、chat summary ではなく authoritative JSON を使います。',
     autodeliver_3: 'Implementation prompts は選択した OpenSpec change に集中し、project manifests から安全な validation command 候補を提示します。',
     autodeliver_4: '自動モジュール採点は <code>spec</code>、<code>tasks</code>、<code>implementation</code>、<code>tests</code>、<code>risk</code> を評価し、evidence は run details に表示されます。',
     autodeliver_5: 'Fail-closed gates は不正な audit output、limit 到達、manual interference、tasks unreadable で human input を求めます。Auto Deliver は code を stage、commit、push しません。',
@@ -933,7 +933,7 @@ const I18N = {
     h_autodeliver: 'OpenSpec Auto Deliver',
     autodeliver_intro: 'OpenSpec change folder를 supervised delivery run으로 바꿉니다: proposal/spec audit, 구현, 검증 힌트, Team audit/rework, 자동 채점, 보이는 final handoff.',
     autodeliver_1: '원클릭 launch는 owning session을 해석하고, <code>tasks.md</code>를 읽고, Team lane을 잠그며, UI에 live progress를 유지합니다.',
-    autodeliver_2: '구현 전 spec audit은 일반 Team/P2P combo flow로 실행할 수 있고, chat summary가 아니라 authoritative JSON을 사용합니다.',
+    autodeliver_2: '구현 전 spec audit은 일반 Team flow로 실행할 수 있고, chat summary가 아니라 authoritative JSON을 사용합니다.',
     autodeliver_3: 'Implementation prompts는 선택한 OpenSpec change에 집중하고 project manifests에서 안전한 validation command 후보를 보여줍니다.',
     autodeliver_4: '자동 모듈 채점은 <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code>, <code>risk</code>를 평가하며 evidence는 run details에 표시됩니다.',
     autodeliver_5: 'Fail-closed gates는 잘못된 audit output, exhausted limits, manual interference, unreadable tasks에서 human input을 요청합니다. Auto Deliver는 code를 stage, commit, push하지 않습니다.',
@@ -1032,7 +1032,7 @@ const I18N = {
     h_autodeliver: 'OpenSpec Auto Deliver',
     autodeliver_intro: 'Convierte un OpenSpec change folder en una entrega supervisada: auditoría proposal/spec, implementación, sugerencias de validación, auditoría/retrabajo Team, scoring automático y handoff final visible.',
     autodeliver_1: 'El lanzamiento con un clic resuelve la sesión propietaria, lee <code>tasks.md</code>, bloquea el carril Team y mantiene progreso vivo en la UI.',
-    autodeliver_2: 'La auditoría spec puede ejecutarse antes de implementar mediante el flujo Team/P2P normal, usando JSON autoritativo en vez de confiar en resúmenes de chat.',
+    autodeliver_2: 'La auditoría spec puede ejecutarse antes de implementar mediante el flujo Team normal, usando JSON autoritativo en vez de confiar en resúmenes de chat.',
     autodeliver_3: 'Los prompts de implementación se enfocan en el cambio OpenSpec seleccionado y muestran candidatos seguros de validación desde manifests del proyecto.',
     autodeliver_4: 'El scoring automático evalúa <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code> y <code>risk</code>, con evidencia visible en los detalles.',
     autodeliver_5: 'Los gates fail-closed piden intervención humana ante audit output inválido, límites agotados, interferencia manual o tareas ilegibles. Auto Deliver nunca hace stage, commit ni push.',
@@ -1131,7 +1131,7 @@ const I18N = {
     h_autodeliver: 'OpenSpec Auto Deliver',
     autodeliver_intro: 'Превратите OpenSpec change folder в supervised delivery run: proposal/spec audit, implementation, validation hints, Team audit/rework, automatic scoring и видимый final handoff.',
     autodeliver_1: 'One-click launch определяет owning session, читает <code>tasks.md</code>, блокирует Team lane и показывает live progress в UI.',
-    autodeliver_2: 'Spec audit можно запустить до implementation через обычный Team/P2P combo flow, используя authoritative JSON вместо chat summaries.',
+    autodeliver_2: 'Spec audit можно запустить до implementation через обычный Team flow, используя authoritative JSON вместо chat summaries.',
     autodeliver_3: 'Implementation prompts фокусируются на выбранном OpenSpec change и показывают безопасные validation command candidates из project manifests.',
     autodeliver_4: 'Automatic module scoring оценивает <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code> и <code>risk</code>, evidence виден в run details.',
     autodeliver_5: 'Fail-closed gates требуют human input при bad audit output, exhausted limits, manual interference или unreadable tasks. Auto Deliver никогда не делает stage, commit или push code.',

@@ -84,7 +84,7 @@ It is not another AI IDE or a generic remote terminal. It is the messaging, memo
 For OpenSpec-based changes, Auto Deliver turns a change folder into an end-to-end supervised delivery run: proposal/spec review, implementation, validation, Team audit, automatic module scoring, rework gates, and a visible final handoff.
 
 - **One-click change pipeline.** Launch from an OpenSpec change on a transport-backed coding session. IM.codes resolves the owning session, locks the Team lane to prevent conflicting runs, reads `tasks.md`, and keeps a live run projection in the UI.
-- **Spec audit before implementation.** Optional proposal/spec audit-repair uses the normal Team/P2P combo flow (default `audit>review>plan`) and reads an authoritative JSON result instead of trusting chat summaries.
+- **Spec audit before implementation.** Optional proposal/spec audit-repair uses the normal Team flow (default `audit>review>plan`) and reads an authoritative JSON result instead of trusting chat summaries.
 - **Task-driven implementation loop.** The daemon sends focused implementation prompts back into the same session, works only on that OpenSpec change, tracks checked/unchecked tasks, and surfaces safe validation command candidates discovered from project manifests.
 - **Automatic module scoring.** Every audit produces structured scores for `spec`, `tasks`, `implementation`, `tests`, and `risk`, with evidence and summaries visible in the run details instead of buried in chat text.
 - **Implementation audit and rework gates.** The final scored verdict — `PASS`, `REWORK`, or `BLOCKED` — decides whether the run can pass, should repair while limits allow, or needs a human decision.

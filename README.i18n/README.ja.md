@@ -78,7 +78,7 @@ iPhone、iPad、Apple Watch に対応しています。[Web App](https://app.im.
 OpenSpec ベースの変更では、Auto Deliver が change folder を end-to-end の監督付き delivery run に変えます: proposal/spec review、実装、検証、Team audit、自動モジュール採点、rework gate、見える最終 handoff まで扱います。
 
 - **ワンクリックの change pipeline。** transport-backed coding session から起動します。IM.codes は owner session を解決し、衝突を避けるため Team lane をロックし、`tasks.md` を読み、UI に live run projection を表示します。
-- **実装前の spec audit。** 任意の proposal/spec audit-repair は通常の Team/P2P combo flow（既定 `audit>review>plan`）を使い、chat summary ではなく authoritative JSON を読みます。
+- **実装前の spec audit。** 任意の proposal/spec audit-repair は通常の Team flow（既定 `audit>review>plan`）を使い、chat summary ではなく authoritative JSON を読みます。
 - **タスク駆動の実装ループ。** daemon は同じ session に focused implementation prompt を送り、その OpenSpec change だけを扱い、checked/unchecked tasks を追跡し、project manifests から見つけた安全な validation command 候補を表示します。
 - **自動モジュール採点。** 各 audit は `spec`、`tasks`、`implementation`、`tests`、`risk` の structured scores を出し、evidence と summary は run details に表示されます。
 - **実装 audit と rework gate。** 採点付き final verdict — `PASS`、`REWORK`、`BLOCKED` — により、pass するか、limit 内で repair するか、人間判断に戻すかを決めます。

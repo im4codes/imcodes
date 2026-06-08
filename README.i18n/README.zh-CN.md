@@ -79,7 +79,7 @@ IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层和托管 M
 对于基于 OpenSpec 的变更，Auto Deliver 会把一个 change 目录变成端到端的受监督交付运行：提案/规格审计、实现、验证、团队审计、自动模块打分、返工门控和可见的最终交接。
 
 - **一键启动变更流水线。** 从 transport 型 coding session 上启动，IM.codes 会解析所属主会话、锁定 Team 通道防止冲突运行、读取 `tasks.md`，并在 UI 中保持实时运行状态。
-- **实现前先做规格审计。** 可选的提案/规格 audit-repair 使用常规 Team/P2P 组合流程（默认 `audit>review>plan`），并读取权威 JSON，而不是盲信聊天摘要。
+- **实现前先做规格审计。** 可选的提案/规格 audit-repair 使用常规 Team 流程（默认 `audit>review>plan`），并读取权威 JSON，而不是盲信聊天摘要。
 - **按任务驱动实现循环。** daemon 会把聚焦的实现 prompt 发回同一 session，只处理该 OpenSpec 变更，跟踪 checked/unchecked 任务，并展示从项目 manifest 中发现的安全验证命令候选。
 - **自动模块打分。** 每轮审计都会对 `spec`、`tasks`、`implementation`、`tests`、`risk` 给出结构化评分，证据和摘要显示在运行详情里，而不是埋在聊天文本中。
 - **实现审计与返工门控。** 最终带评分的 `PASS`、`REWORK` 或 `BLOCKED` 判定会决定运行是通过、在限制内继续修复，还是需要人工决策。

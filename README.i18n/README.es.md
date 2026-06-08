@@ -81,7 +81,7 @@ Este es un proyecto personal. Yo prácticamente no escribí código: fue constru
 Para cambios basados en OpenSpec, Auto Deliver convierte un change folder en una ejecución de entrega supervisada de extremo a extremo: revisión proposal/spec, implementación, validación, auditoría Team, scoring automático por módulo, gates de retrabajo y handoff final visible.
 
 - **Pipeline de cambio con un clic.** Se lanza desde una sesión de coding transport-backed. IM.codes resuelve la sesión propietaria, bloquea el carril Team para evitar ejecuciones en conflicto, lee `tasks.md` y mantiene una proyección viva en la UI.
-- **Auditoría spec antes de implementar.** El audit-repair opcional de propuesta/spec usa el flujo Team/P2P normal (por defecto `audit>review>plan`) y lee un JSON autoritativo en vez de confiar en resúmenes de chat.
+- **Auditoría spec antes de implementar.** El audit-repair opcional de propuesta/spec usa el flujo Team normal (por defecto `audit>review>plan`) y lee un JSON autoritativo en vez de confiar en resúmenes de chat.
 - **Bucle de implementación guiado por tareas.** El daemon envía prompts de implementación enfocados a la misma sesión, trabaja solo en ese cambio OpenSpec, sigue tareas checked/unchecked y muestra candidatos seguros de comandos de validación descubiertos en manifests del proyecto.
 - **Scoring automático por módulo.** Cada auditoría produce puntuaciones estructuradas para `spec`, `tasks`, `implementation`, `tests` y `risk`, con evidencia y resumen visibles en los detalles de ejecución.
 - **Auditoría de implementación y gates de retrabajo.** El veredicto final con puntuación — `PASS`, `REWORK` o `BLOCKED` — decide si la ejecución pasa, repara mientras haya límites o requiere decisión humana.

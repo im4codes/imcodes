@@ -77,7 +77,7 @@ IM.codes даёт coding agents единый слой памяти и управ
 Для OpenSpec-based changes Auto Deliver превращает change folder в end-to-end supervised delivery run: proposal/spec review, implementation, validation, Team audit, автоматическая оценка модулей, rework gates и видимый final handoff.
 
 - **One-click change pipeline.** Запускается из transport-backed coding session. IM.codes определяет owning session, блокирует Team lane от конфликтующих runs, читает `tasks.md` и показывает live run projection в UI.
-- **Spec audit до implementation.** Опциональный proposal/spec audit-repair использует обычный Team/P2P combo flow (по умолчанию `audit>review>plan`) и читает authoritative JSON вместо доверия chat summaries.
+- **Spec audit до implementation.** Опциональный proposal/spec audit-repair использует обычный Team flow (по умолчанию `audit>review>plan`) и читает authoritative JSON вместо доверия chat summaries.
 - **Task-driven implementation loop.** Daemon отправляет focused implementation prompts в ту же session, работает только с этим OpenSpec change, отслеживает checked/unchecked tasks и показывает безопасные validation command candidates из project manifests.
 - **Автоматическая оценка модулей.** Каждый audit выдаёт structured scores для `spec`, `tasks`, `implementation`, `tests` и `risk`; evidence и summaries видны в run details, а не спрятаны в chat text.
 - **Implementation audit и rework gates.** Финальный scored verdict — `PASS`, `REWORK` или `BLOCKED` — решает, пройдет ли run, будет ли repair в пределах лимитов или нужна human decision.
