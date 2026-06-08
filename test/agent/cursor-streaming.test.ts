@@ -79,4 +79,59 @@ describe('CursorHeadlessProvider streaming accumulator', () => {
     // No m2 delta should be prefixed with message 1's text.
     expect(msg2Deltas.every((text) => !text.includes('Let me check.'))).toBe(true);
   });
+
+  it('streams cursor-agent --stream-partial-output incremental fragments live instead of dumping the full text at the end', async () => {
+    // Real cursor-agent wire format (verified against cursor-agent 2026.06):
+    // the response arrives as a series of INCREMENTAL `type:"assistant"`
+    // fragments, each tagged with `timestamp_ms`, then ONE consolidated
+    // full-text `type:"assistant"` message WITHOUT `timestamp_ms`, then a
+    // `result`. Before the fix the parser treated every `type:"assistant"` as
+    // `assistant.final`, so nothing streamed and the whole answer appeared at
+    // once only when `result` arrived ("等半天直接输出全文"). This test locks
+    // that the timestamped fragments stream as incremental deltas and the
+    // untimestamped consolidated message does NOT produce a duplicate delta.
+    const provider = new CursorHeadlessProvider();
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    const sessionId = await provider.createSession({
+      sessionKey: 'route-cursor-partial',
+      cwd: '/tmp/project',
+      resumeId: 'cursor-chat-partial',
+    });
+
+    const deltas: string[] = [];
+    const completed: string[] = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send(sessionId, 'say hello in 3 words');
+    const spawned = harness.lastSpawn();
+    const assistant = (text: string, timestamp?: number) =>
+      spawned.child.stdout.write(`${JSON.stringify({
+        type: 'assistant',
+        session_id: 'cursor-chat-partial',
+        message: { role: 'assistant', content: [{ type: 'text', text }] },
+        ...(timestamp !== undefined ? { timestamp_ms: timestamp } : {}),
+      })}\n`);
+
+    spawned.child.stdout.write(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'cursor-chat-partial', model: 'Auto' })}\n`);
+    // Incremental fragments (each carries timestamp_ms) — these MUST stream.
+    assistant('Hello', 1);
+    assistant(' there', 2);
+    assistant(' friend', 3);
+    assistant('.', 4);
+    // Consolidated full-text message (NO timestamp_ms) — closes the segment,
+    // must NOT emit a duplicate delta (text already fully streamed).
+    assistant('Hello there friend.');
+    spawned.child.stdout.write(`${JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Hello there friend.', session_id: 'cursor-chat-partial' })}\n`);
+    spawned.child.emit('close', 0, null);
+    await harness.flush();
+
+    // Proof of LIVE streaming: more than one incremental delta was emitted as
+    // the cumulative text grew — not a single end-of-turn dump.
+    expect(deltas).toEqual(['Hello', 'Hello there', 'Hello there friend', 'Hello there friend.']);
+    // The untimestamped consolidated message did not double the final text.
+    expect(deltas.filter((t) => t === 'Hello there friend.')).toHaveLength(1);
+    // Completion still resolves to the full text.
+    expect(completed).toEqual(['Hello there friend.']);
+  });
 });
