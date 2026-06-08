@@ -1333,11 +1333,11 @@
         "spec_audit_rework_scored": "La auditoría de especificación terminó con trabajo pendiente puntuado.",
         "spec_audit_blocked_scored": "La auditoría de especificación terminó con un veredicto bloqueado puntuado."
       },
-      "spec_rounds": "Spec audit rounds",
-      "impl_rounds": "Implementation audit rounds",
+      "spec_rounds": "Rondas de auditoría de especificación",
+      "impl_rounds": "Rondas de auditoría de implementación",
       "team_combo": "Combo de Team",
       "auto_commit_push": "Confirmar y enviar automáticamente tras aprobar la auditoría",
-      "auto_commit_push_help": "Se guarda como tu preferencia. Solo cambios de producto; OpenSpec y docs quedan locales."
+      "auto_commit_push_help": "Se guarda como tu preferencia. Tras aprobar la auditoría, el agente recibe commit&push."
     },
     "propose_from_discussion_action": "Desde la discusión reciente",
     "propose_from_description_action": "Desde la descripción de abajo",

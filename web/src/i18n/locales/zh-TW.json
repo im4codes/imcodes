@@ -1334,11 +1334,11 @@
         "spec_audit_rework_scored": "Spec 審計已完成，並記錄了後續工作評分。",
         "spec_audit_blocked_scored": "Spec 審計已完成，並記錄了阻塞 verdict 評分。"
       },
-      "spec_rounds": "Spec audit rounds",
-      "impl_rounds": "Implementation audit rounds",
+      "spec_rounds": "Spec 審計輪次",
+      "impl_rounds": "實作審計輪次",
       "team_combo": "團隊組合流程",
       "auto_commit_push": "審計通過後自動提交並推送",
-      "auto_commit_push_help": "會儲存為你的偏好。只提交產品改動，OpenSpec 和 docs 保持本機。"
+      "auto_commit_push_help": "會儲存為你的偏好。審計通過後會讓 agent 執行 commit&push。"
     },
     "propose_from_discussion_action": "根據最近討論生成",
     "propose_from_description_action": "根據下面的描述生成",

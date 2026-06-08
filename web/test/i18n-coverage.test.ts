@@ -334,6 +334,17 @@ describe('generic i18n coverage guard', () => {
     }
   });
 
+  it('keeps visible Auto Deliver round labels localized outside English', () => {
+    const english = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as unknown;
+    const keys = ['openspec.auto.spec_rounds', 'openspec.auto.impl_rounds'] as const;
+    for (const locale of SUPPORTED_LOCALES.filter((item) => item !== 'en')) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      for (const key of keys) {
+        expect(readPath(messages, key), `${locale}:${key}`).not.toBe(readPath(english, key));
+      }
+    }
+  });
+
   it('keeps AskQuestion translation keys present in every locale', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;

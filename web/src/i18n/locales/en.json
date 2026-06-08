@@ -1338,7 +1338,7 @@
       "impl_rounds": "Implementation audit rounds",
       "team_combo": "Team combo",
       "auto_commit_push": "Commit and push automatically after audit passes",
-      "auto_commit_push_help": "Saved as your preference. Product changes only; OpenSpec and docs stay local."
+      "auto_commit_push_help": "Saved as your preference. After the audit passes, the agent receives commit&push."
     },
     "propose_from_discussion_action": "From Recent Discussion",
     "propose_from_description_action": "From Description Below",

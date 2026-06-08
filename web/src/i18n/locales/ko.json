@@ -1333,11 +1333,11 @@
         "spec_audit_rework_scored": "명세 감사가 완료되었고 후속 작업 점수가 기록되었습니다.",
         "spec_audit_blocked_scored": "명세 감사가 완료되었고 차단 판정 점수가 기록되었습니다."
       },
-      "spec_rounds": "Spec audit rounds",
-      "impl_rounds": "Implementation audit rounds",
+      "spec_rounds": "명세 감사 라운드",
+      "impl_rounds": "구현 감사 라운드",
       "team_combo": "Team 콤보",
       "auto_commit_push": "감사 통과 후 자동 commit & push",
-      "auto_commit_push_help": "사용자 기본값으로 저장됩니다. 제품 변경만 커밋하며 OpenSpec과 docs는 로컬에 남깁니다."
+      "auto_commit_push_help": "사용자 기본값으로 저장됩니다. 감사 통과 후 agent에게 commit&push를 실행하게 합니다."
     },
     "propose_from_discussion_action": "최근 논의에서 생성",
     "propose_from_description_action": "아래 설명에서 생성",

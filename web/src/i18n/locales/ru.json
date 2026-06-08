@@ -1333,11 +1333,11 @@
         "spec_audit_rework_scored": "Аудит спецификации завершен с оценкой оставшейся работы.",
         "spec_audit_blocked_scored": "Аудит спецификации завершен с оценкой блокирующего вердикта."
       },
-      "spec_rounds": "Spec audit rounds",
-      "impl_rounds": "Implementation audit rounds",
+      "spec_rounds": "Раунды аудита спецификации",
+      "impl_rounds": "Раунды аудита реализации",
       "team_combo": "Комбо Team",
       "auto_commit_push": "Автоматически коммитить и отправлять после успешного аудита",
-      "auto_commit_push_help": "Сохраняется как ваша настройка. Только изменения продукта; OpenSpec и docs остаются локальными."
+      "auto_commit_push_help": "Сохраняется как ваша настройка. После успешного аудита agent получает commit&push."
     },
     "propose_from_discussion_action": "Из недавнего обсуждения",
     "propose_from_description_action": "Из описания ниже",

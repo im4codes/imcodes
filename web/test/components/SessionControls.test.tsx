@@ -35,7 +35,7 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.auto.kicker') return 'Auto Deliver';
       if (key === 'openspec.auto.start') return 'Start Auto Deliver';
       if (key === 'openspec.auto.auto_commit_push') return 'Commit and push automatically after audit passes';
-      if (key === 'openspec.auto.auto_commit_push_help') return 'Saved as your preference. Product changes only; OpenSpec and docs stay local.';
+      if (key === 'openspec.auto.auto_commit_push_help') return 'Saved as your preference. After the audit passes, the agent receives commit&push.';
       if (key === 'openspec.auto.view') return 'View';
       if (key === 'openspec.auto.stop') return 'Stop Auto Deliver';
       if (key === 'openspec.auto.lock_manual_actions') return 'Auto Deliver owns Team lane';

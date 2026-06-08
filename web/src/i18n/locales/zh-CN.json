@@ -1334,11 +1334,11 @@
         "spec_audit_rework_scored": "Spec 审计已完成，并记录了后续工作评分。",
         "spec_audit_blocked_scored": "Spec 审计已完成，并记录了阻塞 verdict 评分。"
       },
-      "spec_rounds": "Spec audit rounds",
-      "impl_rounds": "Implementation audit rounds",
+      "spec_rounds": "Spec 审计轮次",
+      "impl_rounds": "实现审计轮次",
       "team_combo": "团队组合流程",
       "auto_commit_push": "审计通过后自动提交并推送",
-      "auto_commit_push_help": "会保存为你的偏好。只提交产品改动，OpenSpec 和 docs 保持本地。"
+      "auto_commit_push_help": "会保存为你的偏好。审计通过后会让 agent 执行 commit&push。"
     },
     "propose_from_discussion_action": "根据最近讨论生成",
     "propose_from_description_action": "根据下面的描述生成",

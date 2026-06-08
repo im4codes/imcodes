@@ -1333,11 +1333,11 @@
         "spec_audit_rework_scored": "仕様監査が完了し、追加作業のスコアが記録されました。",
         "spec_audit_blocked_scored": "仕様監査が完了し、ブロック判定のスコアが記録されました。"
       },
-      "spec_rounds": "Spec audit rounds",
-      "impl_rounds": "Implementation audit rounds",
+      "spec_rounds": "仕様監査ラウンド",
+      "impl_rounds": "実装監査ラウンド",
       "team_combo": "Team コンボ",
       "auto_commit_push": "監査通過後に自動で commit & push",
-      "auto_commit_push_help": "ユーザー設定として保存されます。製品変更のみ対象で、OpenSpec と docs はローカルのままです。"
+      "auto_commit_push_help": "ユーザー設定として保存されます。監査通過後、agent に commit&push を実行させます。"
     },
     "propose_from_discussion_action": "直近の議論から生成",
     "propose_from_description_action": "下の説明から生成",
