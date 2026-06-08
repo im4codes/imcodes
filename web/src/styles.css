@@ -29,6 +29,97 @@ body {
   overflow: hidden;
 }
 
+html.native-ios-mac {
+  -webkit-text-size-adjust: 115%;
+  text-size-adjust: 115%;
+}
+html.native-ios-mac body { font-size: 16px; }
+html.native-ios-mac .sidebar-header,
+html.native-ios-mac .sidebar-stats,
+html.native-ios-mac .shared-entries-header,
+html.native-ios-mac .share-dialog-subtitle,
+html.native-ios-mac .share-field-label,
+html.native-ios-mac .share-help,
+html.native-ios-mac .share-error,
+html.native-ios-mac .share-list-title,
+html.native-ios-mac .share-list-empty,
+html.native-ios-mac .share-list-name,
+html.native-ios-mac .mobile-server-menu-shared-title,
+html.native-ios-mac .chat-tool-chooser-title,
+html.native-ios-mac .chat-tool-chooser-btn-label,
+html.native-ios-mac .chat-thinking-bar,
+html.native-ios-mac .chat-thinking-toggle,
+html.native-ios-mac .chat-thinking-label,
+html.native-ios-mac .chat-memory-context-title,
+html.native-ios-mac .chat-memory-context-item-summary,
+html.native-ios-mac .chat-memory-context-status-title,
+html.native-ios-mac .chat-memory-context-status-summary,
+html.native-ios-mac .chat-table,
+html.native-ios-mac .toast,
+html.native-ios-mac .toast-body {
+  font-size: 14px;
+}
+html.native-ios-mac .server-item,
+html.native-ios-mac .server-ctx-item,
+html.native-ios-mac .tab,
+html.native-ios-mac .tab-rename-input,
+html.native-ios-mac .tab-empty,
+html.native-ios-mac .menu-item,
+html.native-ios-mac .btn,
+html.native-ios-mac .controls-input,
+html.native-ios-mac .controls-queued-item,
+html.native-ios-mac .share-choice,
+html.native-ios-mac .share-input,
+html.native-ios-mac .share-role-select,
+html.native-ios-mac .share-revoke-btn,
+html.native-ios-mac .shared-entry-title,
+html.native-ios-mac .chat-attachment-dl,
+html.native-ios-mac .chat-sel-btn {
+  font-size: 13.5px;
+}
+html.native-ios-mac .chat-user,
+html.native-ios-mac .chat-assistant,
+html.native-ios-mac .chat-rich-text,
+html.native-ios-mac .chat-bubble-content {
+  font-size: 16px;
+}
+html.native-ios-mac .chat-tool,
+html.native-ios-mac .chat-tool-name,
+html.native-ios-mac .chat-tool-input {
+  font-size: 15px;
+}
+html.native-ios-mac .chat-code-block pre,
+html.native-ios-mac .chat-tool-result-preview,
+html.native-ios-mac .chat-file-change-title,
+html.native-ios-mac .chat-file-change-path,
+html.native-ios-mac .chat-file-change-diff-pre,
+html.native-ios-mac .chat-snapshot-content {
+  font-size: 13px;
+}
+html.native-ios-mac .chat-tool-chooser-subtitle,
+html.native-ios-mac .chat-tool-chooser-btn-hint,
+html.native-ios-mac .shared-entry-subtitle,
+html.native-ios-mac .shared-entry-meta,
+html.native-ios-mac .chat-shared-actor-label,
+html.native-ios-mac .controls-queued-item-actor,
+html.native-ios-mac .chat-pinned-last-sent-label,
+html.native-ios-mac .chat-pinned-last-sent-actor,
+html.native-ios-mac .chat-pinned-last-sent-time,
+html.native-ios-mac .chat-bubble-time,
+html.native-ios-mac .chat-system,
+html.native-ios-mac .chat-history-overlay-label,
+html.native-ios-mac .chat-history-step,
+html.native-ios-mac .chat-memory-context-summary,
+html.native-ios-mac .chat-memory-context-query,
+html.native-ios-mac .chat-memory-context-section-title,
+html.native-ios-mac .chat-memory-context-chip,
+html.native-ios-mac .chat-memory-context-status-detail,
+html.native-ios-mac .chat-mode,
+html.native-ios-mac .chat-snapshot-toggle,
+html.native-ios-mac .chat-dl-btn {
+  font-size: 12px;
+}
+
 /* Layout — accounts for iOS safe area (status bar/notch) and mobile keyboard (--vvh) */
 /* Layout — accounts for iOS safe area (status bar/notch) and mobile keyboard (--vvh) */
 .layout { display: flex; height: calc(100vh - env(safe-area-inset-top, 0px)); height: calc(var(--vvh, 100dvh) - env(safe-area-inset-top, 0px)); margin-top: env(safe-area-inset-top); }

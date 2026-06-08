@@ -4,6 +4,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import 'xterm/css/xterm.css';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
+import { IOS_MAC_TERMINAL_FONT_SIZE, shouldUseIosMacTextScale } from '../native-platform.js';
 
 interface Props {
   sessionName: string;
@@ -86,6 +87,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   const [scrollProgress, setScrollProgress] = useState(1); // 0..1, 1 = bottom
   const scrollHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showScrollbar, setShowScrollbar] = useState(false);
+  const useIosMacTextScale = shouldUseIosMacTextScale();
 
   const clearRawFlushTimer = useCallback(() => {
     if (rawFlushTimerRef.current) {
@@ -149,8 +151,8 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         selectionBackground: '#1d4ed860',
       },
       fontFamily: "'Cascadia Code', 'Fira Code', 'SF Mono', monospace",
-      fontSize: 13,
-      lineHeight: 1.4,
+      fontSize: useIosMacTextScale ? IOS_MAC_TERMINAL_FONT_SIZE : 13,
+      lineHeight: useIosMacTextScale ? 1.45 : 1.4,
       convertEol: true,
       scrollback: preview ? 2000 : 5000,
       allowTransparency: false,
@@ -333,7 +335,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       termRef.current = null;
       fitRef.current = null;
     };
-  }, [sessionName]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sessionName, useIosMacTextScale]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // When WS reconnects (connected → true), re-send terminal dimensions so tmux
   // always matches xterm — prevents garbled/corrupted display (花屏).
