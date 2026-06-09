@@ -21,7 +21,7 @@ describe('OpenSpec Auto Deliver server projection sanitizer', () => {
         { module: 'tests', score: 7, max_score: 10, summary: 'ran with Bearer abcdefghijklmnopqrstuvwxyz' },
       ],
       evidence: [
-        { source: 'daemon', summary: 'changed /Users/k/project/file.ts', command: 'npm test', exitCode: 0 },
+        { source: 'openspec/changes/demo/spec.md', summary: 'changed /Users/k/project/file.ts', command: 'npm test', exitCode: 0 },
       ],
       validationEvidenceProvenance: ['daemon', 'implementation_reported'],
       lastMessage: 'implementation_prompt_dispatched',
@@ -47,7 +47,7 @@ describe('OpenSpec Auto Deliver server projection sanitizer', () => {
       recentFinding: 'implementation_prompt_dispatched',
     });
     expect(projection?.evidence?.[0]).toMatchObject({
-      source: 'daemon',
+      source: 'openspec/changes/demo/spec.md',
       summary: 'changed [REDACTED:path]',
       command: 'npm test',
       exitCode: 0,

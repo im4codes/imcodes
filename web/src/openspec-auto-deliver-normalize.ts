@@ -1,5 +1,4 @@
 import {
-  OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE,
   OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_PROMPT_ID,
   OPENSPEC_AUTO_DELIVER_PRESET_IDS,
   OPENSPEC_AUTO_DELIVER_PROJECTION_VISIBILITIES,
@@ -30,7 +29,6 @@ const PROMPT_ID_VALUES = new Set<string>([
 ]);
 const VERDICT_VALUES = new Set<string>(OPENSPEC_AUTO_DELIVER_VERDICTS);
 const MODULE_VALUES = new Set<string>(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS);
-const PROVENANCE_VALUES = new Set<string>(OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -158,10 +156,8 @@ function normalizeEvidence(value: unknown): OpenSpecAutoDeliverEvidence[] | unde
     .filter(isRecord)
     .map((item) => {
       const label = nonEmptyString(item.label);
-      const rawProvenance = nonEmptyString(item.provenance);
-      const rawSource = nonEmptyString(item.source);
-      const provenance = rawProvenance && PROVENANCE_VALUES.has(rawProvenance) ? rawProvenance : undefined;
-      const source = rawSource && PROVENANCE_VALUES.has(rawSource) ? rawSource : undefined;
+      const provenance = nonEmptyString(item.provenance);
+      const source = nonEmptyString(item.source);
       const summary = nonEmptyString(item.summary);
       if (!label && !summary) return null;
       const command = nonEmptyString(item.command);

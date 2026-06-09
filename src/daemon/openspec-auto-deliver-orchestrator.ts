@@ -1337,7 +1337,6 @@ const RETRYABLE_AUTHORITATIVE_RESULT_ERROR_CODES = new Set([
   'invalid_repair_reason',
   'invalid_evidence',
   'invalid_evidence_entry',
-  'invalid_evidence_source',
   'invalid_evidence_summary',
   'invalid_evidence_command',
   'invalid_evidence_exit_code',
@@ -1734,6 +1733,7 @@ function buildAuthoritativeResultSchemaHints(includeAutoDeliverNesting: boolean)
     `Each module_scores entry uses fields: ${OPENSPEC_AUTO_DELIVER_MODULE_SCORE_FIELDS.join(', ')}; max_score must be 10.`,
     `Each repairs_applied entry uses fields: ${OPENSPEC_AUTO_DELIVER_REPAIR_SUMMARY_FIELDS.join(', ')}.`,
     `Each evidence entry requires fields: ${OPENSPEC_AUTO_DELIVER_EVIDENCE_REQUIRED_FIELDS.join(', ')}; optional fields: ${OPENSPEC_AUTO_DELIVER_EVIDENCE_OPTIONAL_FIELDS.join(', ')}.`,
+    'evidence.source is informational only; use any useful label, or "none" when no label is available.',
     'PASS must leave unchecked_tasks and required_changes empty.',
   ];
 }

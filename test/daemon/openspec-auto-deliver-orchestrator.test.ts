@@ -215,6 +215,7 @@ function expectAuthoritativeResultSchemaHints(text: string): void {
   expect(text).toContain('Each module_scores entry uses fields: module, score, max_score, summary; max_score must be 10');
   expect(text).toContain('Each repairs_applied entry uses fields: files, reason');
   expect(text).toContain('Each evidence entry requires fields: source, summary; optional fields: command, exitCode');
+  expect(text).toContain('evidence.source is informational only');
   expect(text).toContain('PASS must leave unchecked_tasks and required_changes empty');
 }
 
@@ -1514,18 +1515,19 @@ exec "${realGit}" "$@"
     const origin = parseAutoDeliverMetadataBlock(acceptancePrompt);
     await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({
       auto_deliver: origin,
-      evidence: [{ source: 'OpenSpec CLI', summary: 'free-form source should be regenerated' }],
+      evidence: [{ source: 'OpenSpec CLI', summary: '' }],
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
 
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
-      && text.includes('Problem: invalid_evidence_source'),
+      && text.includes('Problem: invalid_evidence_summary'),
       2500,
     );
     expect(repairPrompt).toContain(`Authoritative result file: ${origin.authoritativeResultPath}`);
     expect(repairPrompt).toContain('Allowed verdict values: PASS, REWORK, BLOCKED');
     expect(repairPrompt).toContain('module_scores must contain exactly one entry for each module');
+    expectAuthoritativeResultSchemaHints(repairPrompt);
     expect([...p2pRuns.values()]).toHaveLength(1);
 
     await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({ auto_deliver: origin }), null, 2), 'utf8');

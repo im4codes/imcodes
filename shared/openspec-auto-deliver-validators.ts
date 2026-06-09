@@ -5,7 +5,6 @@ import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
   OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX,
   OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MIN,
-  OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE,
   OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_VERDICT_FIELDS,
   OPENSPEC_AUTO_DELIVER_PRESET_IDS,
   OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX,
@@ -244,9 +243,6 @@ export function validateOpenSpecAutoDeliverVerdictPayload(input: unknown): OpenS
         issues.push(issue('invalid_evidence_entry', 'Evidence entry must be an object.', `evidence[${index}]`));
         return;
       }
-      if (!isOneOf(entry.source, OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE)) {
-        issues.push(issue('invalid_evidence_source', 'Evidence source is invalid.', `evidence[${index}].source`));
-      }
       if (typeof entry.summary !== 'string' || entry.summary.trim().length === 0) {
         issues.push(issue('invalid_evidence_summary', 'Evidence summary is required.', `evidence[${index}].summary`));
       }
@@ -264,7 +260,19 @@ export function validateOpenSpecAutoDeliverVerdictPayload(input: unknown): OpenS
     issues.push(issue('contradictory_pass_payload', 'PASS cannot include unchecked tasks or required changes.'));
   }
   if (issues.length > 0) return { ok: false, issues };
-  return { ok: true, value: input as unknown as OpenSpecAutoDeliverVerdictPayload, issues: [] };
+  const normalized = {
+    ...input,
+    evidence: Array.isArray(input.evidence)
+      ? input.evidence.map((entry) => {
+          const record = entry as Record<string, unknown>;
+          const source = typeof record.source === 'string' && record.source.trim().length > 0
+            ? record.source.trim()
+            : 'none';
+          return { ...record, source };
+        })
+      : [],
+  };
+  return { ok: true, value: normalized as unknown as OpenSpecAutoDeliverVerdictPayload, issues: [] };
 }
 
 export function parseOpenSpecAutoDeliverAuthoritativeJsonPayload(text: string): OpenSpecAutoDeliverValidationResult<unknown> {

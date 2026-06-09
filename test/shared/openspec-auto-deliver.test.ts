@@ -224,12 +224,20 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
     expect(validateOpenSpecAutoDeliverVerdictPayload(contradictory).ok).toBe(false);
   });
 
-  it('rejects free-form authoritative evidence sources', () => {
+  it('accepts free-form authoritative evidence source labels', () => {
     for (const source of ['OpenSpec CLI', 'openspec/changes/platform-foundation']) {
       const payload = validVerdictPayload();
-      payload.evidence = [{ source, summary: 'free-form provenance should be rejected' }];
-      expect(validateOpenSpecAutoDeliverVerdictPayload(payload), source).toEqual(expect.objectContaining({ ok: false }));
+      payload.evidence = [{ source, summary: 'free-form provenance should be preserved' }];
+      expect(validateOpenSpecAutoDeliverVerdictPayload(payload), source).toEqual(expect.objectContaining({ ok: true }));
     }
+  });
+
+  it('defaults missing evidence source labels to none', () => {
+    const payload = validVerdictPayload();
+    payload.evidence = [{ summary: 'source label has no gate value' } as typeof payload.evidence[number]];
+    const result = validateOpenSpecAutoDeliverVerdictPayload(payload);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.evidence[0]?.source).toBe('none');
   });
 
   it('centralizes strict authoritative result field contracts', () => {

@@ -1,5 +1,4 @@
 import type {
-  OpenSpecAutoDeliverEvidenceProvenance,
   OpenSpecAutoDeliverMaterializedLimits,
   OpenSpecAutoDeliverProjectionVisibility,
   OpenSpecAutoDeliverPresetId,
@@ -69,7 +68,7 @@ export interface OpenSpecAutoDeliverRepairSummary {
 }
 
 export interface OpenSpecAutoDeliverEvidence {
-  source: OpenSpecAutoDeliverEvidenceProvenance;
+  source: string;
   summary: string;
   command?: string;
   exitCode?: number;
@@ -208,8 +207,8 @@ export interface OpenSpecAutoDeliverBrowserScoreSnapshot {
 
 export interface OpenSpecAutoDeliverBrowserEvidence {
   label?: string;
-  provenance?: OpenSpecAutoDeliverEvidenceProvenance | string;
-  source?: OpenSpecAutoDeliverEvidenceProvenance | string;
+  provenance?: string;
+  source?: string;
   summary?: string;
   command?: string;
   exitCode?: number;

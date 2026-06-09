@@ -9,13 +9,11 @@ import type {
   OpenSpecAutoDeliverListRow,
 } from '../../shared/openspec-auto-deliver-types.js';
 import {
-  OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE,
   OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS,
   OPENSPEC_AUTO_DELIVER_VERDICTS,
   isOpenSpecAutoDeliverStage,
   isOpenSpecAutoDeliverTerminalStage,
   materializeOpenSpecAutoDeliverPreset,
-  type OpenSpecAutoDeliverEvidenceProvenance,
   type OpenSpecAutoDeliverScoreModuleId,
   type OpenSpecAutoDeliverVerdict,
 } from '../../shared/openspec-auto-deliver-constants.js';
@@ -38,7 +36,6 @@ type CacheEntry = {
 const FORBIDDEN_FIELD_NAMES = new Set<string>(P2P_FORBIDDEN_ENVELOPE_FIELD_NAMES);
 const SCORE_MODULES = new Set<string>(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS);
 const VERDICTS = new Set<string>(OPENSPEC_AUTO_DELIVER_VERDICTS);
-const EVIDENCE_PROVENANCE = new Set<string>(OPENSPEC_AUTO_DELIVER_EVIDENCE_PROVENANCE);
 const SENSITIVE_FIELD_NAME_PATTERN = /(?:^|[_-])(token|secret|key|password|credential|env|environment|prompt|provider|raw)(?:$|[_-])/i;
 const SECRET_KEY_VALUE_PATTERN = /\b(token|secret|api[_-]?key|access[_-]?token|credential)\s*[:=]\s*['"]?[^\s'"]+['"]?/gi;
 const ABSOLUTE_PATH_PATTERN = /(?:\/Users\/[^\s'")]+|\/home\/[^\s'")]+|\/tmp\/[^\s'")]+|[A-Za-z]:\\[^\s'")]+)/g;
@@ -149,13 +146,13 @@ function sanitizeEvidence(value: unknown): OpenSpecAutoDeliverSanitizedProjectio
   const output: NonNullable<OpenSpecAutoDeliverSanitizedProjection['evidence']> = [];
   for (const item of value.slice(0, P2P_SANITIZE_MAX_ARRAY_ITEMS)) {
     if (!isRecord(item)) continue;
-    const source = sanitizeString(item.source);
+    const source = sanitizeString(item.source) ?? sanitizeString(item.provenance) ?? 'none';
     const summary = sanitizeString(item.summary);
-    if (!source || !EVIDENCE_PROVENANCE.has(source) || !summary) continue;
+    if (!summary) continue;
     const command = sanitizeString(item.command);
     const exitCode = sanitizeNumber(item.exitCode);
     output.push({
-      source: source as OpenSpecAutoDeliverEvidenceProvenance,
+      source,
       summary,
       ...(command ? { command } : {}),
       ...(exitCode !== undefined ? { exitCode } : {}),
@@ -216,7 +213,7 @@ function sanitizeAuditResults(value: unknown): OpenSpecAutoDeliverSanitizedProje
       requiredChanges: sanitizeStringArray(item.requiredChanges) ?? [],
       repairSummaries: sanitizeRepairSummaries(item.repairSummaries) ?? [],
       evidence: (sanitizeEvidence(item.evidence) ?? []).map((entry) => ({
-        source: (entry.source ?? 'audit_reported') as OpenSpecAutoDeliverEvidenceProvenance,
+        source: entry.source ?? 'none',
         summary: entry.summary ?? '',
         ...(entry.command ? { command: entry.command } : {}),
         ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),

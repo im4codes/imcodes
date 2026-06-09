@@ -33,7 +33,7 @@ describe('normalizeOpenSpecAutoDeliverProjection', () => {
         uncheckedTasks: [],
         requiredChanges: ['tighten validation'],
         repairSummaries: [{ files: ['src/demo.ts'], reason: 'Updated validation.' }],
-        evidence: [{ source: 'audit_reported', summary: 'Audit completed.' }],
+        evidence: [{ source: 'openspec/changes/demo/spec.md', summary: 'Audit completed.' }],
         completedAt: 123,
       }],
     });
@@ -44,6 +44,7 @@ describe('normalizeOpenSpecAutoDeliverProjection', () => {
     expect(projection?.auditResults?.[0]?.discussionFilePath).toBe('/repo/.imc/discussions/audit.md');
     expect(projection?.auditResults?.[0]?.moduleScores).toHaveLength(5);
     expect(projection?.auditResults?.[0]?.requiredChanges).toEqual(['tighten validation']);
+    expect(projection?.auditResults?.[0]?.evidence[0]?.source).toBe('openspec/changes/demo/spec.md');
   });
 
   it('preserves lifecycle latest-message fields for recovery/list rows', () => {
