@@ -544,6 +544,7 @@ export function FileBrowser({
   const pendingCreateFileRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
   const pendingRenameRef = useRef(new Map<string, { parentPath: string; sourcePath: string; targetPath: string }>());
   const pendingDeleteRef = useRef(new Map<string, { parentPath: string | null; targetPath: string }>());
+  const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const previewContentRef = useRef<HTMLDivElement | null>(null);
   const previewScrollSnapshotRef = useRef<PreviewScrollSnapshot | null>(null);
   const mountedRef = useRef(true);
@@ -584,14 +585,22 @@ export function FileBrowser({
   useEffect(() => {
     if (!contextMenu) return;
     const close = () => setContextMenu(null);
+    const closeWhenOutsideMenu = (event: Event) => {
+      const menu = contextMenuRef.current;
+      const target = event.target instanceof Node ? event.target : null;
+      if (menu && target && menu.contains(target)) return;
+      close();
+    };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') close();
     };
-    window.addEventListener('click', close);
+    document.addEventListener('pointerdown', closeWhenOutsideMenu, true);
+    document.addEventListener('contextmenu', closeWhenOutsideMenu, true);
     window.addEventListener('blur', close);
     window.addEventListener('keydown', onKeyDown);
     return () => {
-      window.removeEventListener('click', close);
+      document.removeEventListener('pointerdown', closeWhenOutsideMenu, true);
+      document.removeEventListener('contextmenu', closeWhenOutsideMenu, true);
       window.removeEventListener('blur', close);
       window.removeEventListener('keydown', onKeyDown);
     };
@@ -1453,6 +1462,7 @@ export function FileBrowser({
 
   const contextMenuView = contextMenu ? (
     <div
+      ref={contextMenuRef}
       class="fb-context-menu"
       style={{ left: contextMenu.x, top: contextMenu.y }}
       onClick={(event) => event.stopPropagation()}

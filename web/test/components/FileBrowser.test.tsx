@@ -835,6 +835,20 @@ describe('FileBrowser', () => {
     }
   });
 
+  it('closes the right-click menu when clicking outside it', async () => {
+    const { ws, respond } = makeWsFactory();
+    render(<FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
+    await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+
+    const row = screen.getByText('foo.ts').closest('.fb-node');
+    expect(row).not.toBeNull();
+    fireEvent.contextMenu(row!);
+    expect(screen.getByText('Rename')).toBeTruthy();
+
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByText('Rename')).toBeNull();
+  });
+
   it('does not delete from the right-click menu until the confirmation is accepted', async () => {
     const { ws, respond, fsDelete } = makeWsFactory();
     const originalConfirm = window.confirm;
