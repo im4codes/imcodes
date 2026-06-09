@@ -64,6 +64,14 @@ import {
 } from '../../shared/openspec-auto-deliver-validators.js';
 import { formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
 import {
+  buildP2pExecutionMarker,
+  stringifyP2pExecutionMarker,
+  validateP2pExecutionMarkerContent,
+  type P2pExecutionMarker,
+  type P2pExecutionMarkerSpec,
+  type P2pExecutionMarkerValidation,
+} from '../../shared/p2p-execution-marker.js';
+import {
   hasActiveP2pRunForMainSession,
   registerAutoDeliverP2pLock,
   releaseAutoDeliverP2pLock,
@@ -192,6 +200,11 @@ interface AutoDeliverRun {
   resumeStage?: OpenSpecAutoDeliverStage;
   latestMessage?: string;
   activeCommandId?: string;
+  activeImplementationMarker?: {
+    markerPath: string;
+    spec: P2pExecutionMarkerSpec;
+    retryCount: number;
+  };
   activeAudit?: {
     p2pRunId: string;
     selectedTeamComboId: string;
@@ -404,6 +417,22 @@ function recordImplementationReportedEvidence(run: AutoDeliverRun, text: string)
     source: 'implementation_reported',
     summary,
     ...(command ? { command } : {}),
+    stale: false,
+  }]);
+}
+
+function recordImplementationMarkerEvidence(run: AutoDeliverRun, marker: P2pExecutionMarker): void {
+  const details = [
+    marker.summary,
+    marker.changedFiles?.length ? `changedFiles=${marker.changedFiles.join(',')}` : undefined,
+    marker.tests?.length ? `tests=${marker.tests.join(',')}` : undefined,
+  ].filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+  run.evidence = mergeEvidence(run.evidence, [{
+    source: 'implementation_reported',
+    summary: details.length > 0
+      ? `Implementation completion marker accepted: ${details.join('; ')}`
+      : 'Implementation completion marker accepted.',
+    ...(run.activeCommandId ? { command: run.activeCommandId } : {}),
     stale: false,
   }]);
 }
@@ -786,6 +815,35 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
     '',
     'Validation candidates:',
     validationSummary,
+    '',
+    buildImplementationCompletionMarkerBlock(run),
+  ].join('\n');
+}
+
+function buildImplementationCompletionMarkerBlock(run: AutoDeliverRun): string {
+  const active = run.activeImplementationMarker;
+  if (!active) return 'Implementation completion marker: unavailable.';
+  const completedMarker = stringifyP2pExecutionMarker(buildP2pExecutionMarker(active.spec, 'completed')).trimEnd();
+  const failedMarker = stringifyP2pExecutionMarker({
+    ...buildP2pExecutionMarker(active.spec, 'failed'),
+    error: 'short reason',
+  }).trimEnd();
+  return [
+    'Implementation completion marker (required):',
+    `- After you have completed implementation, tasks.md updates, and reasonable validation, write this exact JSON marker to: ${active.markerPath}`,
+    '- Keep runId, cycleIndex, cycleTotal, nonce, and status exactly as shown. Do not write the marker before doing the work.',
+    '- If you cannot complete the implementation, write the failed marker instead and include a short error field.',
+    '- Idling without this marker does not count as implementation completion; Auto Deliver will keep the run in implementation until the marker is present and valid.',
+    '',
+    'Completed marker:',
+    '```json',
+    completedMarker,
+    '```',
+    '',
+    'Failed marker:',
+    '```json',
+    failedMarker,
+    '```',
   ].join('\n');
 }
 
@@ -829,6 +887,16 @@ async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: 
   run.stage = 'implementation_task_loop';
   run.implementationPromptCount += 1;
   run.activeCommandId = `${run.runId}:implementation:${run.generation}:${run.implementationPromptCount}`;
+  run.activeImplementationMarker = {
+    markerPath: await buildImplementationMarkerPath(run, run.generation, run.implementationPromptCount),
+    spec: {
+      runId: run.runId,
+      cycleIndex: run.implementationPromptCount,
+      cycleTotal: effectiveMaxImplementationPrompts(run),
+      nonce: randomUUID(),
+    },
+    retryCount: 0,
+  };
   const prompt = buildImplementationPrompt(run, repairReason);
   timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
     text: prompt,
@@ -844,6 +912,64 @@ async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: 
   run.latestMessage = repairReason
     ? `implementation_repair_prompt_dispatched:${repairReason}`
     : 'implementation_prompt_dispatched';
+  return broadcastProjection(run);
+}
+
+async function readImplementationCompletionMarker(run: AutoDeliverRun): Promise<P2pExecutionMarkerValidation> {
+  const active = run.activeImplementationMarker;
+  if (!active) return { ok: false, reason: 'implementation_marker_contract_missing' };
+  const content = await readFile(active.markerPath, 'utf8').catch(() => null);
+  if (content === null) return { ok: false, reason: 'implementation_marker_missing' };
+  return validateP2pExecutionMarkerContent(content, active.spec);
+}
+
+function buildImplementationMarkerReminderPrompt(run: AutoDeliverRun, reason: string): string {
+  return [
+    `OpenSpec Auto Deliver implementation is not complete yet for ${openSpecChangeReference(run)}.`,
+    '',
+    `Project root: ${run.projectRoot}`,
+    `Change root: ${run.changeRootIdentity}`,
+    `Run id: ${run.runId}`,
+    `Generation: ${run.generation}`,
+    `Reason: ${reason}`,
+    '',
+    'Do not start an audit report. Continue from the current implementation state and finish the required code, test, and tasks.md work.',
+    'Run the appropriate validation for the files you touched. If validation fails, fix the failure and validate again.',
+    'Write the completed marker only after the implementation is genuinely finished and validated. If you are blocked, write the failed marker with a short reason.',
+    'A false idle without this marker is not completion; Auto Deliver will keep the run in implementation.',
+    '',
+    buildImplementationCompletionMarkerBlock(run),
+  ].join('\n');
+}
+
+async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason: string): Promise<OpenSpecAutoDeliverProjection> {
+  const elapsedProjection = enforceElapsedLimit(run);
+  if (elapsedProjection) return elapsedProjection;
+  const runtime = getTransportRuntime(run.targetImplementationSessionName);
+  if (!runtime) return terminalize(run, 'failed', 'missing_transport_runtime');
+  if (!run.activeImplementationMarker) {
+    return dispatchImplementationPrompt(run, `implementation_marker_missing:${reason}`);
+  }
+  run.activeImplementationMarker.retryCount += 1;
+  run.activeCommandId = `${run.runId}:implementation-marker:${run.generation}:${run.implementationPromptCount}:${run.activeImplementationMarker.retryCount}`;
+  const prompt = buildImplementationMarkerReminderPrompt(run, reason);
+  timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
+    text: prompt,
+    allowDuplicate: true,
+    commandId: run.activeCommandId,
+  }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${run.activeCommandId}` });
+  try {
+    runtime.send(prompt, run.activeCommandId);
+  } catch (error) {
+    delete run.activeCommandId;
+    return terminalize(run, 'failed', error instanceof Error ? `implementation_marker_reminder_send_failed:${error.message}` : 'implementation_marker_reminder_send_failed');
+  }
+  run.latestMessage = `implementation_marker_missing:${reason}`;
+  run.evidence = mergeEvidence(run.evidence, [{
+    source: 'daemon',
+    summary: `Implementation idle ignored because the completion marker was missing or invalid: ${reason}.`,
+    stale: false,
+  }]);
   return broadcastProjection(run);
 }
 
@@ -1196,6 +1322,17 @@ function p2pAuditFailureSummary(p2pRun: P2pRun): string {
 function safeAutoDeliverResultBasename(run: AutoDeliverRun, stage: AuditRepairStage, generation: number, roundIndex: number): string {
   return `${run.runId}.${stage}.g${generation}.r${roundIndex}.authoritative.json`
     .replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+function safeImplementationMarkerBasename(run: AutoDeliverRun, generation: number, promptIndex: number): string {
+  return `${run.runId}.implementation.g${generation}.p${promptIndex}.marker.json`
+    .replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+async function buildImplementationMarkerPath(run: AutoDeliverRun, generation: number, promptIndex: number): Promise<string> {
+  const dir = join(run.projectRoot, '.imc', 'discussions');
+  await mkdir(dir, { recursive: true });
+  return join(dir, safeImplementationMarkerBasename(run, generation, promptIndex));
 }
 
 async function buildAuthoritativeResultPath(run: AutoDeliverRun, stage: AuditRepairStage, generation: number, roundIndex: number): Promise<string> {
@@ -1852,6 +1989,7 @@ function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 
   run.activeAcceptanceAudit = undefined;
   clearAuditFixRetryTimer(run.runId);
   delete run.activeCommandId;
+  delete run.activeImplementationMarker;
   run.resumeStage = status === 'passed' ? undefined : previousStage;
   run.status = status;
   run.stage = status;
@@ -2331,19 +2469,41 @@ async function startAuditRepairStageFailClosed(run: AutoDeliverRun, stage: Audit
 async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void> {
   if (run.status !== 'implementation_task_loop' || !run.activeCommandId) return;
   if (enforceElapsedLimit(run)) return;
-  delete run.activeCommandId;
   try {
     run.taskStats = await readTaskStatsForRun(run);
   } catch {
+    delete run.activeCommandId;
     terminalizeAndSend(run, 'needs_human', 'tasks_unreadable');
     return;
   }
   if (run.taskStats.total <= 0) {
+    delete run.activeCommandId;
     const projection = terminalize(run, 'needs_human', 'tasks_missing_checkboxes');
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
   if (run.taskStats.unchecked <= 0) {
+    const markerState = await readImplementationCompletionMarker(run);
+    if (!markerState.ok) {
+      if (markerState.failedByAgent) {
+        run.evidence = mergeEvidence(run.evidence, [{
+          source: 'implementation_reported',
+          summary: `Implementation completion marker reported failure: ${markerState.reason}`,
+          command: run.activeCommandId,
+          stale: false,
+        }]);
+        await dispatchImplementationPrompt(run, `implementation_marker_failed:${markerState.reason}`);
+        return;
+      }
+      const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);
+      if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
+        send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+      }
+      return;
+    }
+    recordImplementationMarkerEvidence(run, markerState.marker);
+    delete run.activeCommandId;
+    delete run.activeImplementationMarker;
     if (run.needsPostRepairAcceptanceAudit || run.auditBeforeRepair || run.implementationAuditDiscussionFilePath) {
       await dispatchPostRepairAcceptanceAuditPrompt(run);
       return;
@@ -2356,6 +2516,8 @@ async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void
     await startAuditRepairStageFailClosed(run, 'implementation_audit_repair');
     return;
   }
+  delete run.activeCommandId;
+  delete run.activeImplementationMarker;
   const projection = await dispatchImplementationPrompt(run);
   if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });

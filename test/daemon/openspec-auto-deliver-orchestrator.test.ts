@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -100,6 +100,31 @@ async function waitForTransportSend(predicate: (text: string) => boolean, maxMs 
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error('Expected transport send was not observed');
+}
+
+async function writeLatestImplementationMarker(overrides: Record<string, unknown> = {}): Promise<boolean> {
+  const prompt = [...transportSendMock.mock.calls]
+    .map((call) => String(call[0] ?? ''))
+    .reverse()
+    .find((text) => text.includes('Implementation completion marker (required):'));
+  if (!prompt) return false;
+  const markerPath = prompt.match(/write this exact JSON marker to: ([^\n]+)/)?.[1]?.trim();
+  const markerBody = prompt.match(/Completed marker:\n```json\n([\s\S]*?)\n```/)?.[1];
+  if (!markerPath || !markerBody) return false;
+  const marker = { ...(JSON.parse(markerBody) as Record<string, unknown>), ...overrides };
+  await mkdir(dirname(markerPath), { recursive: true });
+  await writeFile(markerPath, `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
+  return true;
+}
+
+async function emitDeckDemoIdle(): Promise<void> {
+  await writeLatestImplementationMarker();
+  timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+}
+
+async function emitSessionIdle(sessionName: string): Promise<void> {
+  await writeLatestImplementationMarker();
+  timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' });
 }
 
 async function git(args: string[], cwd = projectDir): Promise<string> {
@@ -230,7 +255,7 @@ async function startFinalAcceptanceAuditPrompt(requestId: string): Promise<strin
     && text.includes('Reason: implementation_audit_followup_repair'),
     2500,
   );
-  timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+  await emitDeckDemoIdle();
   return waitForTransportSend((text) =>
     text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
     2500,
@@ -243,13 +268,13 @@ async function completeSpecAuditDiscussionToImplementation(): Promise<void> {
     text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
     2500,
   );
-  timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+  await emitDeckDemoIdle();
   const specAcceptancePrompt = await waitForTransportSend((text) =>
     text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
     2500,
   );
   await completeAcceptanceAuditFromPrompt(specAcceptancePrompt);
-  timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+  await emitDeckDemoIdle();
 }
 
 async function startFastImplementationAudit(requestId: string): Promise<MockP2pRun> {
@@ -261,7 +286,7 @@ async function startFastImplementationAudit(requestId: string): Promise<MockP2pR
     changeName: 'demo-change',
     presetId: 'fast',
   }, serverLinkMock as never);
-  timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+  await emitDeckDemoIdle();
   await waitForSend((msg) =>
     msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
     && msg.projection?.stage === 'implementation_audit_repair',
@@ -434,7 +459,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
         maxElapsedMinutes: 480,
       },
     }, serverLinkMock as never);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const audit = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
@@ -513,7 +538,7 @@ exec "${realGit}" "$@"
     });
 
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair',
@@ -672,14 +697,14 @@ exec "${realGit}" "$@"
     expect(firstImplementationPrompt).toContain('Before inspecting, editing, validating, or committing anything, work from the project root above.');
     expect(firstImplementationPrompt).toContain('Remaining tasks:');
 
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && (msg.projection as { implementationPromptCount?: number } | undefined)?.implementationPromptCount === 2,
     );
 
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const auditProjection = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
@@ -728,7 +753,7 @@ exec "${realGit}" "$@"
     expect(repairPrompt).not.toContain(formatOpenSpecPromptTemplate('audit_implementation', '@openspec/changes/demo-change'));
     expect(repairPrompt).not.toContain('Changed files:');
     expect(repairPrompt).not.toContain('Diff stat:');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const acceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change')
       && text.includes(`Previous audit discussion file: ${discussion.contextFilePath}`)
@@ -738,10 +763,50 @@ exec "${realGit}" "$@"
     expect(acceptancePrompt).not.toContain('Changed files:');
     expect(acceptancePrompt).not.toContain('Diff stat:');
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 8000);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
+  });
+
+  it('keeps implementation active when idle arrives without a completion marker', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-missing-implementation-marker',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    const implementationPrompt = await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      2500,
+    );
+    expect(implementationPrompt).toContain('After you have completed implementation, tasks.md updates, and reasonable validation');
+
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    const reminderPrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver implementation is not complete yet for @openspec/changes/demo-change.')
+      && text.includes('Reason: implementation_marker_missing')
+      && text.includes('finish the required code, test, and tasks.md work')
+      && text.includes('Write the completed marker only after the implementation is genuinely finished and validated'),
+      2500,
+    );
+    expect(reminderPrompt).toContain('Run the appropriate validation for the files you touched.');
+    expect(startP2pRunMock).not.toHaveBeenCalled();
+
+    expect(await writeLatestImplementationMarker()).toBe(true);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair',
+      2500,
+    );
+    expect(startP2pRunMock).toHaveBeenCalledTimes(1);
   });
 
   it('asks the implementation LLM to commit&push, then verifies product changes after final implementation audit PASS when opted in', async () => {
@@ -761,7 +826,7 @@ exec "${realGit}" "$@"
     }, serverLinkMock as never);
 
     await writeFile(join(projectDir, 'src', 'feature.ts'), 'export const delivered = true;\n', 'utf8');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair',
@@ -774,7 +839,7 @@ exec "${realGit}" "$@"
       && text.includes('Reason: implementation_audit_followup_repair'),
       2500,
     );
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const acceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
       2500,
@@ -782,14 +847,14 @@ exec "${realGit}" "$@"
     await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
       repairs_applied: [{ files: ['src/feature.ts'], reason: 'Implemented the product change.' }],
     });
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const prompt = await waitForTransportSend((text) => text === 'commit&push', 2500);
     expect(prompt).toBe('commit&push');
     const commitMessage = 'Implement delivered feature';
     await git(['add', '--', 'src/feature.ts']);
     await git(['commit', '-m', commitMessage]);
     await git(['push']);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 8000);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.evidence?.map((entry: { summary?: string }) => entry.summary).join('\n')).toContain('Auto commit/push verified by daemon');
@@ -822,13 +887,13 @@ exec "${realGit}" "$@"
       2500,
     );
     expect(specRepairPrompt).toContain(formatOpenSpecPromptTemplate('audit_spec', '@openspec/changes/demo-change'));
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const specAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
       2500,
     );
     await completeAcceptanceAuditFromPrompt(specAcceptancePrompt);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const implementationPromptProjection = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && (msg.projection as { stage?: string; implementationPromptCount?: number }).stage === 'implementation_task_loop'
@@ -838,7 +903,7 @@ exec "${realGit}" "$@"
     expect(implementationPromptProjection.projection.specAuditRound).toEqual({ current: 1, total: 1 });
 
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const implementationAuditProjection = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
     expect(implementationAuditProjection.projection.implementationAuditRound).toEqual({ current: 0, total: 2 });
     const discussion = await completeLatestDiscussion();
@@ -851,13 +916,13 @@ exec "${realGit}" "$@"
     expect(repairPrompt).toContain('OpenSpec Auto Deliver implementation repair for @openspec/changes/demo-change');
     expect(repairPrompt).not.toContain(formatOpenSpecPromptTemplate('audit_implementation', '@openspec/changes/demo-change'));
     expect([...p2pRuns.values()]).toHaveLength(2);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const acceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
       2500,
     );
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
@@ -961,7 +1026,7 @@ exec "${realGit}" "$@"
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
       2500,
     );
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const specAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
       2500,
@@ -970,13 +1035,13 @@ exec "${realGit}" "$@"
     expect(specAcceptancePrompt).toContain('Required top-level fields:');
     expectAuthoritativeResultSchemaHints(specAcceptancePrompt);
     await completeAcceptanceAuditFromPrompt(specAcceptancePrompt);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_task_loop',
       2500,
     );
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair',
@@ -1027,7 +1092,7 @@ exec "${realGit}" "$@"
       presetId: 'fast',
     }, serverLinkMock as never);
 
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
     await completeLatestDiscussion('completed', '# implementation audit discussion\n\nCheck task truthfulness before final acceptance.');
 
@@ -1036,14 +1101,14 @@ exec "${realGit}" "$@"
       && text.includes('Reason: implementation_audit_followup_repair'),
       2500,
     );
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const failingAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
       2500,
     );
     await makeChange('demo-change', '- [ ] first\n- [x] second\n');
     await completeAcceptanceAuditFromPrompt(failingAcceptancePrompt);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('Audit findings to repair now:')
@@ -1063,7 +1128,7 @@ exec "${realGit}" "$@"
 
     expect([...p2pRuns.values()]).toHaveLength(1);
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const acceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change')
@@ -1074,7 +1139,7 @@ exec "${realGit}" "$@"
     );
     expect([...p2pRuns.values()]).toHaveLength(1);
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
@@ -1101,7 +1166,7 @@ exec "${realGit}" "$@"
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
       2500,
     );
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const specAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
       2500,
@@ -1110,7 +1175,7 @@ exec "${realGit}" "$@"
       verdict: 'REWORK',
       required_changes: ['clarify acceptance criteria'],
     });
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const gate = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
@@ -1146,7 +1211,7 @@ exec "${realGit}" "$@"
         summary: `${module} perfect`,
       })),
     });
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
@@ -1177,7 +1242,7 @@ exec "${realGit}" "$@"
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
       2500,
     );
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const specAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
       2500,
@@ -1190,7 +1255,7 @@ exec "${realGit}" "$@"
         summary: `${module} acceptable`,
       })),
     });
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const implementationProjection = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
@@ -1221,7 +1286,7 @@ exec "${realGit}" "$@"
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
       2500,
     );
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const specAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
       2500,
@@ -1230,7 +1295,7 @@ exec "${realGit}" "$@"
       verdict: 'BLOCKED',
       required_changes: ['scope is unclear'],
     });
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('needs_human');
@@ -1249,7 +1314,7 @@ exec "${realGit}" "$@"
       presetId: 'fast',
     }, serverLinkMock as never);
 
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
     const firstAuditRun = [...p2pRuns.values()].at(-1)!;
 
@@ -1281,7 +1346,7 @@ exec "${realGit}" "$@"
 
     expect([...p2pRuns.values()]).toHaveLength(1);
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const acceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change')
@@ -1294,7 +1359,7 @@ exec "${realGit}" "$@"
     await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
       repairs_applied: [{ files: ['test/demo.test.ts'], reason: 'tighten tests' }],
     });
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
@@ -1319,7 +1384,7 @@ exec "${realGit}" "$@"
       presetId: 'fast',
     }, serverLinkMock as never);
 
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
     await completeLatestDiscussion('completed', '# implementation audit discussion\n\nTests need a targeted regression case.\n');
 
@@ -1344,7 +1409,7 @@ exec "${realGit}" "$@"
     expect(gate.projection.auditResults).toBeUndefined();
 
     expect([...p2pRuns.values()]).toHaveLength(1);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const acceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change')
@@ -1354,7 +1419,7 @@ exec "${realGit}" "$@"
     );
     expect([...p2pRuns.values()]).toHaveLength(1);
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
@@ -1369,7 +1434,7 @@ exec "${realGit}" "$@"
   it('keeps valid missing authoritative result files classified as missing JSON', async () => {
     const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-valid-missing-result-file');
     const origin = parseAutoDeliverMetadataBlock(acceptancePrompt);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
@@ -1383,7 +1448,7 @@ exec "${realGit}" "$@"
   it('requests authoritative result file repair before consuming another audit-repair round', async () => {
     const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-missing-json-retry');
     const origin = parseAutoDeliverMetadataBlock(acceptancePrompt);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
       && text.includes('Problem: missing_authoritative_json'),
@@ -1402,7 +1467,7 @@ exec "${realGit}" "$@"
 
     expect([...p2pRuns.values()]).toHaveLength(1);
     await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({ auto_deliver: origin }), null, 2), 'utf8');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
@@ -1416,7 +1481,7 @@ exec "${realGit}" "$@"
       auto_deliver: origin,
       evidence: [{ source: 'OpenSpec CLI', summary: 'free-form source should be regenerated' }],
     }), null, 2), 'utf8');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
@@ -1429,7 +1494,7 @@ exec "${realGit}" "$@"
     expect([...p2pRuns.values()]).toHaveLength(1);
 
     await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({ auto_deliver: origin }), null, 2), 'utf8');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
@@ -1450,12 +1515,12 @@ exec "${realGit}" "$@"
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
       2500,
     );
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
       2500,
     );
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final specification acceptance audit authoritative result file')
@@ -1481,7 +1546,7 @@ exec "${realGit}" "$@"
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
     await completeSpecAuditDiscussionToImplementation();
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_task_loop', 2500);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
 
     await completeLatestDiscussion('completed', '# implementation audit discussion\n\nRepair before final scoring.');
@@ -1490,14 +1555,14 @@ exec "${realGit}" "$@"
       && text.includes('Reason: implementation_audit_followup_repair'),
       2500,
     );
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
       2500,
     );
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForTransportSend((text) => text.includes('Problem: missing_authoritative_json'), 2500);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('missing_authoritative_json');
@@ -1509,7 +1574,7 @@ exec "${realGit}" "$@"
       verdict: 'BLOCKED',
       required_changes: ['external dependency is unavailable'],
     });
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('needs_human');
@@ -1527,7 +1592,7 @@ exec "${realGit}" "$@"
         generation: 999,
       },
     });
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     let terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('audit_metadata_mismatch');
@@ -1540,7 +1605,7 @@ exec "${realGit}" "$@"
       call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION,
     ).length;
     await completeAcceptanceAuditFromPrompt(stalePrompt);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await new Promise((resolve) => setTimeout(resolve, 1100));
     expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toHaveLength(terminalCountAfterStale);
     expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION)).toHaveLength(projectionCountAfterStale);
@@ -1550,9 +1615,9 @@ exec "${realGit}" "$@"
     transportSendMock.mockClear();
     p2pRuns.clear();
     await startFinalAcceptanceAuditPrompt('req-multiple-json');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForTransportSend((text) => text.includes('Problem: missing_authoritative_json'), 2500);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.terminalReason).toBe('missing_authoritative_json');
 
@@ -1562,9 +1627,9 @@ exec "${realGit}" "$@"
     p2pRuns.clear();
     const malformedPrompt = await startFinalAcceptanceAuditPrompt('req-malformed-json-file');
     await writeFile(String(parseAutoDeliverMetadataBlock(malformedPrompt).authoritativeResultPath), '{not json', 'utf8');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForTransportSend((text) => text.includes('Problem: malformed_authoritative_json'), 2500);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.terminalReason).toBe('malformed_authoritative_json');
   }, 10_000);
@@ -1577,7 +1642,7 @@ exec "${realGit}" "$@"
     const outsideResult = join(outsideDir, 'authoritative.json');
     await writeFile(outsideResult, JSON.stringify(auditPayload({ auto_deliver: origin }), null, 2), 'utf8');
     await symlink(outsideResult, String(origin.authoritativeResultPath), 'file');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('needs_human');
@@ -1601,7 +1666,7 @@ exec "${realGit}" "$@"
       presetId: 'fast',
     }, serverLinkMock as never);
 
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
     await completeLatestDiscussion('completed', '# implementation audit discussion\n\nResult path must stay inside project discussions.');
     await waitForTransportSend((text) =>
@@ -1609,12 +1674,12 @@ exec "${realGit}" "$@"
       && text.includes('Reason: implementation_audit_followup_repair'),
       2500,
     );
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
       2500,
     );
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('needs_human');
@@ -1632,13 +1697,13 @@ exec "${realGit}" "$@"
       '```',
     ].join('\n');
     expect(summaryWithJson).toContain('"verdict"');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
       && text.includes('Problem: missing_authoritative_json'),
       2500,
     );
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('missing_authoritative_json');
@@ -1659,7 +1724,7 @@ exec "${realGit}" "$@"
     const resultJson = JSON.stringify(largePayload, null, 2);
     expect(resultJson.length).toBeGreaterThan(2_000);
     await writeFile(String(origin.authoritativeResultPath), resultJson, 'utf8');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
@@ -1675,7 +1740,7 @@ exec "${realGit}" "$@"
       presetId: 'fast',
     }, serverLinkMock as never);
 
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
     const p2pRun = [...p2pRuns.values()].at(-1)!;
     p2pRun.error = 'dispatch_failed: tmux send-keys failed: can\'t find pane: deck_demo_brain';
@@ -1839,14 +1904,14 @@ exec "${realGit}" "$@"
     expect(transportSendMock.mock.calls[0]?.[0]).toContain('Unsafe validation commands were skipped: pnpm deploy');
     expect(transportSendMock.mock.calls[0]?.[0]).not.toContain('Recommended validation commands:');
     for (let expectedCount = 2; expectedCount <= 6; expectedCount += 1) {
-      timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+      await emitDeckDemoIdle();
       await waitForSend((msg) =>
         msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
         && msg.projection?.implementationPromptCount === expectedCount,
         1000,
       );
     }
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const terminal = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
@@ -1867,7 +1932,7 @@ exec "${realGit}" "$@"
     }, serverLinkMock as never);
 
     timelineEmitter.emit('deck_demo_brain', 'assistant.text', { text: 'Ran npm test: passed' });
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
 
     const projection = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
@@ -1987,7 +2052,7 @@ exec "${realGit}" "$@"
       call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION,
     ).length;
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await emitDeckDemoIdle();
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(startP2pRunMock).not.toHaveBeenCalled();
@@ -2057,7 +2122,7 @@ exec "${realGit}" "$@"
     expect(forbidden?.ok).toBe(false);
     expect(forbidden?.error).toBe('forbidden');
 
-    timelineEmitter.emit('deck_sub_worker', 'session.state', { state: 'idle' });
+    await emitSessionIdle('deck_sub_worker');
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
     await completeLatestDiscussion('completed', '# implementation audit discussion\n\nNo remaining issues.');
     await waitForTransportSend((text) =>
@@ -2065,13 +2130,13 @@ exec "${realGit}" "$@"
       && text.includes('Reason: implementation_audit_followup_repair'),
       2500,
     );
-    timelineEmitter.emit('deck_sub_worker', 'session.state', { state: 'idle' });
+    await emitSessionIdle('deck_sub_worker');
     const acceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
       2500,
     );
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
-    timelineEmitter.emit('deck_sub_worker', 'session.state', { state: 'idle' });
+    await emitSessionIdle('deck_sub_worker');
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed', 2500);
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
 
