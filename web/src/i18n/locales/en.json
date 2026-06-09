@@ -694,7 +694,12 @@
     "tab_files": "Files",
     "tab_changes": "Changes",
     "changes_title": "Changes ({{count}})",
-    "no_changes": "No changes"
+    "no_changes": "No changes",
+    "rename_prompt": "Rename {{name}}",
+    "rename_failed": "Failed to rename item",
+    "delete_confirm": "Delete {{name}}? This cannot be undone.",
+    "delete_failed": "Failed to delete item",
+    "invalid_name": "Name cannot contain path separators"
   },
   "toast": {
     "finished": "finished",

@@ -15,6 +15,7 @@ import {
   type ShareTarget,
 } from '../src/ws/share-policy.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { getShareScopedCommandPolicy } from '../../shared/tab-sharing.js';
 import { REPO_MSG } from '../../shared/repo-types.js';
@@ -495,6 +496,7 @@ describe('WsBridge share-scoped sockets', () => {
       { type: 'fs.ls', requestId: 'fs-ls-1', session: 'deck_proj_brain' },
       { type: 'fs.read', requestId: 'fs-read-1', session: 'deck_proj_brain' },
       { type: 'fs.write', requestId: 'fs-write-1', session: 'deck_proj_brain' },
+      { type: FS_TRANSPORT_MSG.RENAME, requestId: 'fs-rename-1', session: 'deck_proj_brain' },
       { type: 'fs.edit', requestId: 'fs-edit-1', session: 'deck_proj_brain' },
       { type: 'fs.delete', requestId: 'fs-delete-1', session: 'deck_proj_brain' },
       { type: 'fs.patch', requestId: 'fs-patch-1', session: 'deck_proj_brain' },
@@ -519,6 +521,7 @@ describe('WsBridge share-scoped sockets', () => {
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.ls' }),
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.read' }),
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.write' }),
+      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: FS_TRANSPORT_MSG.RENAME }),
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.edit' }),
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.delete' }),
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.patch' }),
@@ -539,6 +542,7 @@ describe('WsBridge share-scoped sockets', () => {
       'fs.ls',
       'fs.read',
       'fs.write',
+      FS_TRANSPORT_MSG.RENAME,
       'fs.edit',
       'fs.delete',
       'fs.patch',

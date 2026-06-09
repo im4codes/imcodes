@@ -694,7 +694,12 @@
     "tab_files": "ファイル",
     "tab_changes": "変更",
     "changes_title": "変更 ({{count}})",
-    "no_changes": "変更なし"
+    "no_changes": "変更なし",
+    "rename_prompt": "{{name}} の名前を変更",
+    "rename_failed": "項目の名前変更に失敗しました",
+    "delete_confirm": "{{name}} を削除しますか？この操作は元に戻せません。",
+    "delete_failed": "項目の削除に失敗しました",
+    "invalid_name": "名前にパス区切り文字は使用できません"
   },
   "toast": {
     "finished": "完了",

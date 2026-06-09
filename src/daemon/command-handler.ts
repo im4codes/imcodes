@@ -58,7 +58,7 @@ import {
   type TimelineResponseStatus,
 } from '../../shared/timeline-protocol.js';
 import { homedir } from 'os';
-import { lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
+import { lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, rename as fsRename, rm as fsRm, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
 import { exec as execCb, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -833,6 +833,7 @@ import { getDefaultPreviewReadCoordinator, __resetPreviewReadCoordinatorForTests
 import { isFilePreviewPathAllowed, resolveCanonical } from './file-preview-path-policy.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { FS_READ_ERROR_CODES } from '../../shared/fs-read-error-codes.js';
+import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';
@@ -1496,6 +1497,12 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case 'fs.write':
       void handleFsWrite(cmd, serverLink);
+      break;
+    case FS_TRANSPORT_MSG.RENAME:
+      void handleFsRename(cmd, serverLink);
+      break;
+    case FS_TRANSPORT_MSG.DELETE:
+      void handleFsDelete(cmd, serverLink);
       break;
     case P2P_WORKFLOW_MSG.CANCEL:
       void handleP2pCancel(cmd, serverLink);
@@ -7929,6 +7936,10 @@ function normalizeRepoRelativePath(repoRoot: string, relativePath: string): stri
   return nodePath.join(repoRoot, decodeGitPath(relativePath));
 }
 
+function toGitPath(relativePath: string): string {
+  return relativePath.split(nodePath.sep).join('/');
+}
+
 async function loadRepoGitStatusSnapshot(repoRoot: string, repoSignature: string): Promise<GitStatusSnapshot> {
   const { stdout } = await execAsync('git status --porcelain=v1 -z -u', { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
   const files: GitStatusFile[] = [];
@@ -7948,6 +7959,36 @@ async function loadRepoGitStatusSnapshot(repoRoot: string, repoSignature: string
     files.push({ path: normalizeRepoRelativePath(repoRoot, logicalPath), code });
   }
   return { repoRoot, repoSignature, files };
+}
+
+async function loadRepoDirectIgnoredChildren(repoRoot: string, requestedPath: string): Promise<GitStatusFile[]> {
+  if (!isPathInside(repoRoot, requestedPath)) return [];
+  let entries: Array<{ name: string }>;
+  try {
+    entries = await fsReaddir(requestedPath, { withFileTypes: true }) as Array<{ name: string }>;
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(entries)) return [];
+  const relativeChildren = entries
+    .map((entry) => toGitPath(nodePath.relative(repoRoot, nodePath.join(requestedPath, entry.name))))
+    .filter((relativePath) => relativePath && !relativePath.startsWith('..') && !nodePath.isAbsolute(relativePath));
+  if (relativeChildren.length === 0) return [];
+  let stdout = '';
+  try {
+    ({ stdout } = await execFileAsync('git', ['check-ignore', '-z', '--', ...relativeChildren], {
+      cwd: repoRoot,
+      timeout: 5000,
+      encoding: 'utf8',
+      maxBuffer: 1024 * 1024,
+    }));
+  } catch {
+    return [];
+  }
+  return parseZRecords(stdout).map((relativePath) => ({
+    path: normalizeRepoRelativePath(repoRoot, relativePath),
+    code: '!!',
+  }));
 }
 
 async function getRepoGitStatusSnapshot(startPath: string): Promise<GitStatusSnapshot | null> {
@@ -8106,16 +8147,24 @@ async function loadRepoGitStatusResponseSnapshot(
     loadRepoGitStatusSnapshot(context.repoRoot, context.repoSignature),
     includeStats ? loadRepoGitNumstatSnapshot(context.repoRoot, context.repoSignature) : Promise.resolve(null),
   ]);
-  const files = filterRepoFilesForPath(snapshot.files, requestedPath).map((file) => {
+  const filesByPath = new Map<string, GitStatusFile>();
+  for (const file of filterRepoFilesForPath(snapshot.files, requestedPath).map((file) => {
     const stats = numstat?.stats.get(file.path);
     return stats ? { ...file, ...stats } : file;
-  });
+  })) {
+    filesByPath.set(file.path, file);
+  }
+  if (!includeStats) {
+    for (const file of await loadRepoDirectIgnoredChildren(context.repoRoot, requestedPath)) {
+      if (!filesByPath.has(file.path)) filesByPath.set(file.path, file);
+    }
+  }
   return {
     repoRoot: context.repoRoot,
     repoSignature: context.repoSignature,
     requestedPath,
     includeStats,
-    files,
+    files: [...filesByPath.values()],
   };
 }
 
@@ -8235,7 +8284,7 @@ async function getRepoGitStatusResponseSnapshot(startPath: string, includeStats:
 
 async function loadFileGitDiffSnapshot(logicalPath: string, repoRoot: string, repoSignature: string, fileSignature: string): Promise<GitDiffSnapshot> {
   let diff = '';
-  const repoRelativePath = nodePath.relative(repoRoot, logicalPath).split(nodePath.sep).join('/');
+  const repoRelativePath = toGitPath(nodePath.relative(repoRoot, logicalPath));
   try {
     const { stdout } = await execFileAsync('git', ['diff', 'HEAD', '--', repoRelativePath], { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
     diff = stdout;
@@ -8622,6 +8671,127 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       logger.warn({ requestId, errorCode }, 'fs.write failed');
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: errorCode }); } catch { /* ignore */ }
     }
+  }
+}
+
+async function resolveExistingFsMutationTarget(rawPath: string): Promise<
+  | { ok: true; resolved: string; real: string }
+  | { ok: false; error: string; resolved?: string }
+> {
+  const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
+  const resolved = nodePath.resolve(expanded);
+  try {
+    const linkStats = await fsLstat(resolved);
+    if (linkStats.isSymbolicLink()) {
+      return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+    }
+  } catch (err) {
+    const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
+    return { ok: false, error: code === 'ENOENT' || code === 'ENOTDIR' ? FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND : FS_GENERIC_ERROR_CODES.INTERNAL_ERROR, resolved };
+  }
+  try {
+    const real = await fsRealpath(resolved);
+    if (!isPathAllowed(real)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: real };
+    return { ok: true, resolved, real };
+  } catch {
+    return { ok: false, error: FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND, resolved };
+  }
+}
+
+async function resolveFsMutationDestination(rawPath: string): Promise<
+  | { ok: true; resolved: string; realParent: string }
+  | { ok: false; error: string; resolved?: string }
+> {
+  const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
+  const resolved = nodePath.resolve(expanded);
+  const parent = nodePath.dirname(resolved);
+  try {
+    const realParent = await fsRealpath(parent);
+    if (!isPathAllowed(realParent)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+    try {
+      await fsLstat(resolved);
+      return { ok: false, error: FS_WRITE_ERROR.FILE_EXISTS, resolved };
+    } catch (err) {
+      const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
+      if (code !== 'ENOENT') return { ok: false, error: FS_GENERIC_ERROR_CODES.INTERNAL_ERROR, resolved };
+    }
+    return { ok: true, resolved, realParent };
+  } catch {
+    return { ok: false, error: FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND, resolved };
+  }
+}
+
+async function handleFsRename(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const rawPath = cmd.path as string | undefined;
+  const rawNewPath = cmd.newPath as string | undefined;
+  const requestId = cmd.requestId as string | undefined;
+  if (!rawPath || !rawNewPath || !requestId) {
+    if (requestId) {
+      try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath ?? '', newPath: rawNewPath, status: 'error', error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }); } catch { /* ignore */ }
+    }
+    return;
+  }
+
+  const source = await resolveExistingFsMutationTarget(rawPath);
+  if (!source.ok) {
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, resolvedPath: source.resolved, status: 'error', error: source.error }); } catch { /* ignore */ }
+    return;
+  }
+  const destination = await resolveFsMutationDestination(rawNewPath);
+  if (!destination.ok) {
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, resolvedPath: destination.resolved, status: 'error', error: destination.error }); } catch { /* ignore */ }
+    return;
+  }
+
+  try {
+    await fsRename(source.resolved, destination.resolved);
+    invalidateFsListCachesForPath(source.real);
+    invalidateFsListCachesForPath(destination.resolved);
+    invalidateFileSearchCachesForPath(source.real);
+    invalidateFileSearchCachesForPath(destination.resolved);
+    invalidateGitCachesForPath(source.real);
+    invalidateGitCachesForPath(destination.resolved);
+    try {
+      serverLink.send({
+        type: FS_TRANSPORT_MSG.RENAME_RESPONSE,
+        requestId,
+        path: rawPath,
+        newPath: rawNewPath,
+        resolvedPath: source.real,
+        status: 'ok',
+      });
+    } catch { /* ignore */ }
+  } catch (err) {
+    logger.warn({ requestId, errorCode: getFsWriteErrorCode(err) }, 'fs.rename failed');
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, status: 'error', error: getFsWriteErrorCode(err) }); } catch { /* ignore */ }
+  }
+}
+
+async function handleFsDelete(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const rawPath = cmd.path as string | undefined;
+  const requestId = cmd.requestId as string | undefined;
+  if (!rawPath || !requestId) {
+    if (requestId) {
+      try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath ?? '', status: 'error', error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }); } catch { /* ignore */ }
+    }
+    return;
+  }
+
+  const target = await resolveExistingFsMutationTarget(rawPath);
+  if (!target.ok) {
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, resolvedPath: target.resolved, status: 'error', error: target.error }); } catch { /* ignore */ }
+    return;
+  }
+
+  try {
+    await fsRm(target.real, { recursive: true, force: false });
+    invalidateFsListCachesForPath(target.real);
+    invalidateFileSearchCachesForPath(target.real);
+    invalidateGitCachesForPath(target.real);
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, resolvedPath: target.real, status: 'ok' }); } catch { /* ignore */ }
+  } catch (err) {
+    logger.warn({ requestId, errorCode: getFsWriteErrorCode(err) }, 'fs.delete failed');
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, status: 'error', error: getFsWriteErrorCode(err) }); } catch { /* ignore */ }
   }
 }
 

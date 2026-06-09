@@ -3,6 +3,7 @@ import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
 import { evaluateP2pSendTargetScope } from '../share/p2p-send-scope.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { TRANSPORT_MSG } from '../../../shared/transport-events.js';
+import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 import { P2P_WORKFLOW_MSG } from '../../../shared/p2p-workflow-messages.js';
 import {
   SHARE_BROWSER_COMMANDS,
@@ -123,6 +124,7 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: 'fs.ls', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_BROWSE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_BROWSE) },
   { bridgeCommand: 'fs.read', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_READ) },
   { bridgeCommand: 'fs.write', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_WRITE) },
+  { bridgeCommand: FS_TRANSPORT_MSG.RENAME, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_EDIT, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_EDIT) },
   { bridgeCommand: 'fs.edit', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_EDIT, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_EDIT) },
   { bridgeCommand: 'fs.delete', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_DELETE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_DELETE) },
   { bridgeCommand: 'fs.patch', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_PATCH, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_PATCH) },

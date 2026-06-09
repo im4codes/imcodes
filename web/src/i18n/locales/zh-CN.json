@@ -694,7 +694,12 @@
     "tab_files": "文件",
     "tab_changes": "变更",
     "changes_title": "变更 ({{count}})",
-    "no_changes": "无变更"
+    "no_changes": "无变更",
+    "rename_prompt": "重命名 {{name}}",
+    "rename_failed": "重命名失败",
+    "delete_confirm": "删除 {{name}}？此操作无法撤销。",
+    "delete_failed": "删除失败",
+    "invalid_name": "名称不能包含路径分隔符"
   },
   "toast": {
     "finished": "完成了",

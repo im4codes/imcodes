@@ -694,7 +694,12 @@
     "tab_files": "파일",
     "tab_changes": "변경",
     "changes_title": "변경 ({{count}})",
-    "no_changes": "변경 없음"
+    "no_changes": "변경 없음",
+    "rename_prompt": "{{name}} 이름 변경",
+    "rename_failed": "항목 이름을 변경하지 못했습니다",
+    "delete_confirm": "{{name}}을(를) 삭제할까요? 이 작업은 되돌릴 수 없습니다.",
+    "delete_failed": "항목을 삭제하지 못했습니다",
+    "invalid_name": "이름에는 경로 구분자를 포함할 수 없습니다"
   },
   "toast": {
     "finished": "완료됨",

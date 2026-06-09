@@ -15,6 +15,7 @@ import { TRANSPORT_EVENT } from '@shared/transport-events.js';
 import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
+import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import type { ShareTarget } from './tab-sharing-ui.js';
@@ -60,6 +61,8 @@ import type {
   FsWriteResponse,
   FsWriteOptions,
   FsMkdirResponse,
+  FsRenameResponse,
+  FsDeleteResponse,
 } from '../../src/shared/transport/fs.js';
 import type { DaemonBuildInfo } from '@shared/build-manifest-types.js';
 
@@ -179,6 +182,8 @@ export type ServerMessage =
   | FsGitDiffResponse
   | FsWriteResponse
   | FsMkdirResponse
+  | FsRenameResponse
+  | FsDeleteResponse
   | { type: 'repo.detect_response'; requestId: string; projectDir: string; context: any }
   | { type: 'repo.issues_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.prs_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
@@ -1242,6 +1247,20 @@ export class WsClient {
   fsMkdir(path: string): string {
     const requestId = crypto.randomUUID();
     this.send({ type: 'fs.mkdir', path, requestId });
+    return requestId;
+  }
+
+  /** Rename a file or directory on the daemon. Returns requestId. */
+  fsRename(path: string, newPath: string): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: FS_TRANSPORT_MSG.RENAME, path, newPath, requestId });
+    return requestId;
+  }
+
+  /** Delete a file or directory on the daemon. Returns requestId. */
+  fsDelete(path: string): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: FS_TRANSPORT_MSG.DELETE, path, requestId });
     return requestId;
   }
 

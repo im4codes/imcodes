@@ -694,7 +694,12 @@
     "tab_files": "Файлы",
     "tab_changes": "Изменения",
     "changes_title": "Изменения ({{count}})",
-    "no_changes": "Нет изменений"
+    "no_changes": "Нет изменений",
+    "rename_prompt": "Переименовать {{name}}",
+    "rename_failed": "Не удалось переименовать элемент",
+    "delete_confirm": "Удалить {{name}}? Это действие нельзя отменить.",
+    "delete_failed": "Не удалось удалить элемент",
+    "invalid_name": "Имя не может содержать разделители пути"
   },
   "toast": {
     "finished": "завершено",

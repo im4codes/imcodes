@@ -22,18 +22,23 @@ vi.mock('node:fs/promises', () => ({
   readdir: vi.fn(),
   realpath: vi.fn(),
   readFile: vi.fn(),
+  rename: vi.fn(),
+  rm: vi.fn(),
   stat: vi.fn(),
   writeFile: vi.fn(),
 }));
 
 const mockLstat = vi.mocked(fsp.lstat);
 const mockRealpath = vi.mocked(fsp.realpath);
+const mockRename = vi.mocked(fsp.rename);
+const mockRm = vi.mocked(fsp.rm);
 const mockStat = vi.mocked(fsp.stat);
 const mockReadFile = vi.mocked(fsp.readFile);
 const mockWriteFile = vi.mocked(fsp.writeFile);
 
 import { handleWebCommand, __resetFsGitCachesForTests } from '../../src/daemon/command-handler.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { FS_WRITE_ERROR } from '../../src/shared/transport/fs.js';
 
 /** Flush the microtask + macrotask queue so async handlers complete. */
@@ -45,6 +50,8 @@ describe('fs.write handler', () => {
     sent.length = 0;
     mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
     mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    mockRename.mockResolvedValue(undefined);
+    mockRm.mockResolvedValue(undefined);
     __resetFsGitCachesForTests();
   });
 
@@ -317,6 +324,94 @@ describe('fs.write handler', () => {
       error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
     });
     expect(JSON.stringify(sent[0])).not.toContain('.ssh');
+  });
+});
+
+describe('fs.rename and fs.delete handlers', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sent.length = 0;
+    mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
+    mockRename.mockResolvedValue(undefined);
+    mockRm.mockResolvedValue(undefined);
+    __resetFsGitCachesForTests();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('renames an allowed file when the destination does not exist', async () => {
+    const oldPath = path.join(homedir(), 'project', 'old.txt');
+    const newPath = path.join(homedir(), 'project', 'new.txt');
+    mockLstat.mockImplementation(async (target) => {
+      if (String(target) === oldPath) return { isSymbolicLink: () => false } as fsp.Stats;
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({ type: FS_TRANSPORT_MSG.RENAME, path: oldPath, newPath, requestId: 'rename-ok' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockRename).toHaveBeenCalledWith(oldPath, newPath);
+    expect(sent[0]).toMatchObject({
+      type: FS_TRANSPORT_MSG.RENAME_RESPONSE,
+      requestId: 'rename-ok',
+      status: 'ok',
+      path: oldPath,
+      newPath,
+    });
+  });
+
+  it('does not overwrite an existing destination while renaming', async () => {
+    const oldPath = path.join(homedir(), 'project', 'old.txt');
+    const newPath = path.join(homedir(), 'project', 'new.txt');
+    mockLstat.mockResolvedValue({ isSymbolicLink: () => false } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({ type: FS_TRANSPORT_MSG.RENAME, path: oldPath, newPath, requestId: 'rename-exists' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockRename).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: FS_TRANSPORT_MSG.RENAME_RESPONSE,
+      requestId: 'rename-exists',
+      status: 'error',
+      error: 'file_exists',
+    });
+  });
+
+  it('deletes an allowed file or directory recursively after the browser has confirmed', async () => {
+    const targetPath = path.join(homedir(), 'project', 'old.txt');
+    mockLstat.mockResolvedValue({ isSymbolicLink: () => false } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({ type: FS_TRANSPORT_MSG.DELETE, path: targetPath, requestId: 'delete-ok' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockRm).toHaveBeenCalledWith(targetPath, { recursive: true, force: false });
+    expect(sent[0]).toMatchObject({
+      type: FS_TRANSPORT_MSG.DELETE_RESPONSE,
+      requestId: 'delete-ok',
+      status: 'ok',
+      path: targetPath,
+    });
+  });
+
+  it('refuses to delete symbolic links', async () => {
+    const targetPath = path.join(homedir(), 'project', 'link.txt');
+    mockLstat.mockResolvedValue({ isSymbolicLink: () => true } as fsp.Stats);
+
+    handleWebCommand({ type: FS_TRANSPORT_MSG.DELETE, path: targetPath, requestId: 'delete-link' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockRm).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: FS_TRANSPORT_MSG.DELETE_RESPONSE,
+      requestId: 'delete-link',
+      status: 'error',
+      error: 'forbidden_path',
+    });
   });
 });
 

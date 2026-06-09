@@ -1,4 +1,5 @@
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 /**
  * FileBrowser — universal reusable file/directory browser.
  *
@@ -390,12 +391,27 @@ export const __resetFileBrowserSharedChangesForTests = __resetSharedChangesForTe
 const DEFAULT_SHOW_HIDDEN_FILES = true;
 
 type NewEntryKind = 'file' | 'folder';
+type FileContextMenuState = { node: FsNode; x: number; y: number };
 
 function shortenPathSegment(segment: string, maxLength: number): string {
   if (segment.length <= maxLength) return segment;
   const head = Math.max(6, Math.floor((maxLength - 1) * 0.55));
   const tail = Math.max(4, maxLength - 1 - head);
   return `${segment.slice(0, head)}…${segment.slice(-tail)}`;
+}
+
+function gitStatusClass(code: string): 'ignored' | 'untracked' | 'deleted' | 'added' | 'modified' {
+  if (code === '!!') return 'ignored';
+  if (code === '??') return 'untracked';
+  if (code === 'D') return 'deleted';
+  if (code === 'A') return 'added';
+  return 'modified';
+}
+
+function gitStatusBadge(code: string): string {
+  if (code === '!!') return 'I';
+  if (code === '??') return 'U';
+  return code;
 }
 
 export function FileBrowser({
@@ -488,6 +504,7 @@ export function FileBrowser({
 
   const [newEntry, setNewEntry] = useState<{ kind: NewEntryKind; parentPath: string } | null>(null);
   const [newEntryName, setNewEntryName] = useState('');
+  const [contextMenu, setContextMenu] = useState<FileContextMenuState | null>(null);
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
   // Restore last active tab from localStorage
@@ -525,6 +542,8 @@ export function FileBrowser({
   const pendingPreviewDiffRef = useRef(new Map<string, PendingPreviewDiff>());
   const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
   const pendingCreateFileRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
+  const pendingRenameRef = useRef(new Map<string, { parentPath: string; sourcePath: string; targetPath: string }>());
+  const pendingDeleteRef = useRef(new Map<string, { parentPath: string | null; targetPath: string }>());
   const previewContentRef = useRef<HTMLDivElement | null>(null);
   const previewScrollSnapshotRef = useRef<PreviewScrollSnapshot | null>(null);
   const mountedRef = useRef(true);
@@ -553,12 +572,30 @@ export function FileBrowser({
       pendingPreviewDiffRef.current.clear();
       pendingMkdirRef.current.clear();
       pendingCreateFileRef.current.clear();
+      pendingRenameRef.current.clear();
+      pendingDeleteRef.current.clear();
       editorMsgHandlers.current.clear();
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
       for (const timer of timersRef.current.values()) clearTimeout(timer);
       timersRef.current.clear();
     };
   }, []);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close();
+    };
+    window.addEventListener('click', close);
+    window.addEventListener('blur', close);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('blur', close);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [contextMenu]);
 
   useEffect(() => {
     const root = data[0];
@@ -674,6 +711,8 @@ export function FileBrowser({
         pendingRef.current.clear();
         clearAllPendingPreviewRequests();
         pendingCreateFileRef.current.clear();
+        pendingRenameRef.current.clear();
+        pendingDeleteRef.current.clear();
         const loadingPath = previewRef.current.status === 'loading' ? previewRef.current.path : null;
         activePreviewCycleRef.current = null;
         if (loadingPath) {
@@ -868,6 +907,51 @@ export function FileBrowser({
         return;
       }
 
+      if (msg.type === FS_TRANSPORT_MSG.RENAME_RESPONSE) {
+        const pendingRename = pendingRenameRef.current.get(msg.requestId);
+        if (!pendingRename) return;
+        pendingRenameRef.current.delete(msg.requestId);
+        if (!mountedRef.current) return;
+        if (msg.status === 'error') {
+          setError(msg.error === FS_WRITE_ERROR.FILE_EXISTS ? t('file_browser.file_exists') : (msg.error ?? t('file_browser.rename_failed')));
+          return;
+        }
+        loadedRef.current.delete(pendingRename.parentPath);
+        setError(null);
+        setSelectedPaths(new Set([pendingRename.targetPath]));
+        if (previewRef.current.status !== 'idle' && (previewRef.current as { path: string }).path === pendingRename.sourcePath) {
+          setPreview({ status: 'idle' });
+        }
+        fetchDir(pendingRename.parentPath);
+        return;
+      }
+
+      if (msg.type === FS_TRANSPORT_MSG.DELETE_RESPONSE) {
+        const pendingDelete = pendingDeleteRef.current.get(msg.requestId);
+        if (!pendingDelete) return;
+        pendingDeleteRef.current.delete(msg.requestId);
+        if (!mountedRef.current) return;
+        if (msg.status === 'error') {
+          setError(msg.error ?? t('file_browser.delete_failed'));
+          return;
+        }
+        if (pendingDelete.parentPath) {
+          loadedRef.current.delete(pendingDelete.parentPath);
+          fetchDir(pendingDelete.parentPath);
+        }
+        setError(null);
+        setSelectedPaths((prev) => {
+          if (!prev.has(pendingDelete.targetPath)) return prev;
+          const next = new Set(prev);
+          next.delete(pendingDelete.targetPath);
+          return next;
+        });
+        if (previewRef.current.status !== 'idle' && (previewRef.current as { path: string }).path === pendingDelete.targetPath) {
+          setPreview({ status: 'idle' });
+        }
+        return;
+      }
+
       if (msg.type === 'fs.git_status_response') {
         // Shared-cache path (changesRootPath, badges, etc.) is routed
         // into `git-status-store` by its per-ws bridge, so we only handle
@@ -1038,6 +1122,30 @@ export function FileBrowser({
     setNewEntry(null);
     setNewEntryName('');
   }, [buildChildPath, ws]);
+
+  const requestRename = useCallback((node: FsNode) => {
+    const parentPath = getParentDir(node.id);
+    if (!parentPath) return;
+    const nextName = window.prompt(t('file_browser.rename_prompt', { name: node.name }), node.name);
+    const trimmed = nextName?.trim();
+    if (!trimmed || trimmed === node.name) return;
+    if (trimmed.includes('/') || trimmed.includes('\\')) {
+      setError(t('file_browser.invalid_name'));
+      return;
+    }
+    const targetPath = buildChildPath(parentPath, trimmed);
+    const requestId = ws.fsRename(node.id, targetPath);
+    pendingRenameRef.current.set(requestId, { parentPath, sourcePath: node.id, targetPath });
+    setContextMenu(null);
+  }, [buildChildPath, t, ws]);
+
+  const requestDelete = useCallback((node: FsNode) => {
+    const confirmed = window.confirm(t('file_browser.delete_confirm', { name: node.name }));
+    if (!confirmed) return;
+    const requestId = ws.fsDelete(node.id);
+    pendingDeleteRef.current.set(requestId, { parentPath: getParentDir(node.id), targetPath: node.id });
+    setContextMenu(null);
+  }, [t, ws]);
 
   const requestNewEntry = useCallback(() => {
     if (!newEntry) return;
@@ -1311,6 +1419,16 @@ export function FileBrowser({
     }
   }, [fetchPreview, preview]);
 
+  const handleNodeContextMenu = useCallback((node: FsNode, event: MouseEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({
+      node,
+      x: Math.min(event.clientX, Math.max(0, window.innerWidth - 176)),
+      y: Math.min(event.clientY, Math.max(0, window.innerHeight - 96)),
+    });
+  }, []);
+
   const handleConfirm = () => {
     if (selectedPaths.size === 0) {
       if (mode === 'dir-only') onConfirm([currentLabel]);
@@ -1333,6 +1451,21 @@ export function FileBrowser({
 
   const previewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
 
+  const contextMenuView = contextMenu ? (
+    <div
+      class="fb-context-menu"
+      style={{ left: contextMenu.x, top: contextMenu.y }}
+      onClick={(event) => event.stopPropagation()}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      }}
+    >
+      <button type="button" onClick={() => requestRename(contextMenu.node)}>{t('common.rename')}</button>
+      <button type="button" class="danger" onClick={() => requestDelete(contextMenu.node)}>{t('common.delete')}</button>
+    </div>
+  ) : null;
+
   const tree = (
     <div class={`fb-tree${layout !== 'panel' && hasInlinePreview ? ' fb-tree-split' : ''}`}>
       {data.map((root) => (
@@ -1348,6 +1481,7 @@ export function FileBrowser({
           onToggleExpand={toggleExpand}
           onSelect={handleSelect}
           onPreview={handlePreview}
+          onContextMenu={handleNodeContextMenu}
           previewPath={previewPath}
         />
       ))}
@@ -1871,6 +2005,7 @@ export function FileBrowser({
       return (
         <>
           {lightboxOverlay}
+          {contextMenuView}
           <div class="fb-panel">
             {tabs}
             {previewPane ? (
@@ -1889,6 +2024,7 @@ export function FileBrowser({
     return (
       <>
         {lightboxOverlay}
+        {contextMenuView}
         <div class="fb-panel">
           {tabs}
           {breadcrumb}
@@ -1922,6 +2058,7 @@ export function FileBrowser({
   return (
     <>
       {lightboxOverlay}
+      {contextMenuView}
       <div class="fb-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose?.(); }}>
         <div class={`fb-modal${hasPreview ? ' fb-modal-wide' : ''}`} onClick={(e) => e.stopPropagation()}>
           <div class="fb-header">
@@ -1954,6 +2091,7 @@ function FsTreeNode({
   onToggleExpand,
   onSelect,
   onPreview,
+  onContextMenu,
   previewPath,
   depth = 0,
 }: {
@@ -1967,6 +2105,7 @@ function FsTreeNode({
   onToggleExpand: (id: string) => void;
   onSelect: (id: string, isDir: boolean) => void;
   onPreview: (id: string) => void;
+  onContextMenu: (node: FsNode, event: MouseEvent) => void;
   previewPath: string | null;
   depth?: number;
 }) {
@@ -1977,18 +2116,23 @@ function FsTreeNode({
   const isDisabled = mode === 'dir-only' && !node.isDir;
   const isPreviewing = previewPath === node.id;
   const gitCode = modifiedFiles.get(node.id);
+  const gitClass = gitCode ? gitStatusClass(gitCode) : null;
 
   if (!showHidden && node.hidden) return null;
 
   return (
     <div>
       <div
-        class={`fb-node${isSelected ? ' selected' : ''}${isAlready ? ' already' : ''}${isDisabled ? ' disabled' : ''}${isPreviewing ? ' previewing' : ''}${gitCode ? ` git-${gitCode === '??' ? 'untracked' : gitCode === 'D' ? 'deleted' : gitCode === 'A' ? 'added' : 'modified'}` : ''}`}
+        class={`fb-node${isSelected ? ' selected' : ''}${isAlready ? ' already' : ''}${isDisabled ? ' disabled' : ''}${isPreviewing ? ' previewing' : ''}${gitClass ? ` git-${gitClass}` : ''}`}
         style={{ paddingLeft: 8 + depth * 16 }}
         onClick={() => {
           if (!isMulti && !isDisabled) onSelect(node.id, node.isDir);
           if (node.isDir) onToggleExpand(node.id);
           if (!node.isDir && mode !== 'dir-only') onPreview(node.id);
+        }}
+        onContextMenu={(event) => {
+          if (depth === 0) return;
+          onContextMenu(node, event);
         }}
       >
         {isMulti && (
@@ -2010,7 +2154,7 @@ function FsTreeNode({
             : '📄'}
         </span>
         <span class="fb-node-name">{node.name}</span>
-        {gitCode && <span class={`fb-node-git-badge git-badge-${gitCode === '??' ? 'untracked' : gitCode === 'D' ? 'deleted' : gitCode === 'A' ? 'added' : 'modified'}`} title={`git: ${gitCode}`}>{gitCode === '??' ? 'U' : gitCode}</span>}
+        {gitCode && gitClass && <span class={`fb-node-git-badge git-badge-${gitClass}`} title={`git: ${gitCode}`}>{gitStatusBadge(gitCode)}</span>}
         {isAlready && <span class="fb-node-badge">↑</span>}
       </div>
       {node.isDir && isExpanded && node.children && (
@@ -2031,6 +2175,7 @@ function FsTreeNode({
               onToggleExpand={onToggleExpand}
               onSelect={onSelect}
               onPreview={onPreview}
+              onContextMenu={onContextMenu}
               previewPath={previewPath}
               depth={depth + 1}
             />

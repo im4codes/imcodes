@@ -21,6 +21,7 @@ import {
   P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
 } from '../../shared/p2p-workflow-constants.js';
 import { REPO_MSG } from '../../shared/repo-types.js';
+import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import {
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_CAPABILITY,
@@ -4495,6 +4496,86 @@ describe('WsBridge', () => {
 
       // Should not be broadcast to any browser
       expect(browserWs.sentStrings.filter(s => s.includes('fs.write_response'))).toHaveLength(0);
+    });
+
+    it('relays fs.rename from browser to daemon and single-casts response', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs1 = new MockWs();
+      bridge.handleBrowserConnection(browserWs1 as never, 'user-1', makeDb('valid-hash'));
+      const browserWs2 = new MockWs();
+      bridge.handleBrowserConnection(browserWs2 as never, 'user-2', makeDb('valid-hash'));
+
+      browserWs1.emit('message', JSON.stringify({
+        type: FS_TRANSPORT_MSG.RENAME,
+        requestId: 'rename-req-single',
+        path: '/home/user/old.txt',
+        newPath: '/home/user/new.txt',
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings.find((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === FS_TRANSPORT_MSG.RENAME; } catch { return false; }
+      });
+      expect(forwarded).toBeDefined();
+      browserWs1.sent.length = 0;
+      browserWs2.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: FS_TRANSPORT_MSG.RENAME_RESPONSE,
+        requestId: 'rename-req-single',
+        path: '/home/user/old.txt',
+        newPath: '/home/user/new.txt',
+        status: 'ok',
+      }));
+      await flushAsync();
+
+      expect(browserWs1.sentStrings).toHaveLength(1);
+      expect(browserWs2.sentStrings).toHaveLength(0);
+      expect(JSON.parse(browserWs1.sentStrings[0]).type).toBe(FS_TRANSPORT_MSG.RENAME_RESPONSE);
+    });
+
+    it('relays fs.delete from browser to daemon and single-casts response', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs1 = new MockWs();
+      bridge.handleBrowserConnection(browserWs1 as never, 'user-1', makeDb('valid-hash'));
+      const browserWs2 = new MockWs();
+      bridge.handleBrowserConnection(browserWs2 as never, 'user-2', makeDb('valid-hash'));
+
+      browserWs1.emit('message', JSON.stringify({
+        type: FS_TRANSPORT_MSG.DELETE,
+        requestId: 'delete-req-single',
+        path: '/home/user/old.txt',
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings.find((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === FS_TRANSPORT_MSG.DELETE; } catch { return false; }
+      });
+      expect(forwarded).toBeDefined();
+      browserWs1.sent.length = 0;
+      browserWs2.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: FS_TRANSPORT_MSG.DELETE_RESPONSE,
+        requestId: 'delete-req-single',
+        path: '/home/user/old.txt',
+        status: 'ok',
+      }));
+      await flushAsync();
+
+      expect(browserWs1.sentStrings).toHaveLength(1);
+      expect(browserWs2.sentStrings).toHaveLength(0);
+      expect(JSON.parse(browserWs1.sentStrings[0]).type).toBe(FS_TRANSPORT_MSG.DELETE_RESPONSE);
     });
   });
 

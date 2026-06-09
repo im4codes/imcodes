@@ -694,7 +694,12 @@
     "tab_files": "Archivos",
     "tab_changes": "Cambios",
     "changes_title": "Cambios ({{count}})",
-    "no_changes": "Sin cambios"
+    "no_changes": "Sin cambios",
+    "rename_prompt": "Renombrar {{name}}",
+    "rename_failed": "No se pudo renombrar el elemento",
+    "delete_confirm": "¿Eliminar {{name}}? Esta acción no se puede deshacer.",
+    "delete_failed": "No se pudo eliminar el elemento",
+    "invalid_name": "El nombre no puede contener separadores de ruta"
   },
   "toast": {
     "finished": "terminó",

@@ -22,6 +22,7 @@ import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { RESOURCE_EVENT_MSG, type ResourceTopic } from '../../../shared/resource-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
+import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import {
@@ -941,7 +942,9 @@ type FsPendingRouteKind =
   | 'fs.git_status'
   | 'fs.git_diff'
   | 'file.search'
-  | 'fs.write';
+  | 'fs.write'
+  | typeof FS_TRANSPORT_MSG.RENAME
+  | typeof FS_TRANSPORT_MSG.DELETE;
 
 interface PendingFsRoute {
   socket: WebSocket;
@@ -1041,6 +1044,8 @@ export class WsBridge {
   private pendingFsGitDiffRequests: PendingFsRouteMap = new Map();
   private pendingFileSearchRequests: PendingFsRouteMap = new Map();
   private pendingFsWriteRequests: PendingFsRouteMap = new Map();
+  private pendingFsRenameRequests: PendingFsRouteMap = new Map();
+  private pendingFsDeleteRequests: PendingFsRouteMap = new Map();
 
   /** Per-request timeline pending map — routes responses via requestId unicast. */
   private pendingTimelineRequests = new Map<string, PendingTimelineRequest>();
@@ -1220,6 +1225,10 @@ export class WsBridge {
         return this.pendingFileSearchRequests;
       case 'fs.write':
         return this.pendingFsWriteRequests;
+      case FS_TRANSPORT_MSG.RENAME:
+        return this.pendingFsRenameRequests;
+      case FS_TRANSPORT_MSG.DELETE:
+        return this.pendingFsDeleteRequests;
     }
   }
 
@@ -1262,6 +1271,10 @@ export class WsBridge {
         return { type: 'file.search_response', requestId: pending.requestId, results: [], error };
       case 'fs.write':
         return { type: 'fs.write_response', requestId: pending.requestId, path: pending.path, status: 'error', error };
+      case FS_TRANSPORT_MSG.RENAME:
+        return { type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId: pending.requestId, path: pending.path, status: 'error', error };
+      case FS_TRANSPORT_MSG.DELETE:
+        return { type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId: pending.requestId, path: pending.path, status: 'error', error };
     }
   }
 
@@ -1287,6 +1300,8 @@ export class WsBridge {
       this.pendingFsGitDiffRequests,
       this.pendingFileSearchRequests,
       this.pendingFsWriteRequests,
+      this.pendingFsRenameRequests,
+      this.pendingFsDeleteRequests,
     ];
     for (const map of maps) {
       for (const [requestId, pending] of map) {
@@ -2937,6 +2952,16 @@ export class WsBridge {
         this.registerPendingFsRoute('fs.write', ws, msg);
       }
 
+      // Track fs.rename requests for single-cast response routing
+      if (msg.type === FS_TRANSPORT_MSG.RENAME && typeof msg.requestId === 'string') {
+        this.registerPendingFsRoute(FS_TRANSPORT_MSG.RENAME, ws, msg);
+      }
+
+      // Track fs.delete requests for single-cast response routing
+      if (msg.type === FS_TRANSPORT_MSG.DELETE && typeof msg.requestId === 'string') {
+        this.registerPendingFsRoute(FS_TRANSPORT_MSG.DELETE, ws, msg);
+      }
+
       // Validate and track timeline request ids for single-cast response routing.
       // This eliminates the race where terminal.subscribe's async ownership check hasn't completed
       // before the daemon responds with timeline data - without this, the response is silently dropped.
@@ -4031,6 +4056,18 @@ export class WsBridge {
     // ── fs.write_response: single-cast back to requesting browser ────────────
     if (type === 'fs.write_response') {
       this.forwardPendingFsRoute('fs.write', msg.requestId as string | undefined, msg);
+      return;
+    }
+
+    // ── fs.rename_response: single-cast back to requesting browser ───────────
+    if (type === FS_TRANSPORT_MSG.RENAME_RESPONSE) {
+      this.forwardPendingFsRoute(FS_TRANSPORT_MSG.RENAME, msg.requestId as string | undefined, msg);
+      return;
+    }
+
+    // ── fs.delete_response: single-cast back to requesting browser ───────────
+    if (type === FS_TRANSPORT_MSG.DELETE_RESPONSE) {
+      this.forwardPendingFsRoute(FS_TRANSPORT_MSG.DELETE, msg.requestId as string | undefined, msg);
       return;
     }
 

@@ -1,5 +1,6 @@
 import { parentPort } from 'node:worker_threads';
 import * as nodePath from 'node:path';
+import { readdir as fsReaddir } from 'node:fs/promises';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import type {
@@ -39,6 +40,10 @@ function normalizeRepoRelativePath(repoRoot: string, relativePath: string): stri
   return nodePath.join(repoRoot, decodeGitPath(relativePath));
 }
 
+function toGitPath(relativePath: string): string {
+  return relativePath.split(nodePath.sep).join('/');
+}
+
 function isPathInside(root: string, candidate: string): boolean {
   const normalizedRoot = nodePath.resolve(root);
   const normalizedCandidate = nodePath.resolve(candidate);
@@ -74,6 +79,32 @@ async function loadRepoStatusFiles(repoRoot: string): Promise<FsGitStatusWorkerF
     files.push({ path: normalizeRepoRelativePath(repoRoot, logicalPath), code });
   }
   return files;
+}
+
+async function loadDirectIgnoredChildren(repoRoot: string, requestedPath: string): Promise<FsGitStatusWorkerFile[]> {
+  if (!isPathInside(repoRoot, requestedPath)) return [];
+  let entries: Array<{ name: string }>;
+  try {
+    entries = await fsReaddir(requestedPath, { withFileTypes: true }) as Array<{ name: string }>;
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(entries)) return [];
+  const relativeChildren = entries
+    .map((entry) => toGitPath(nodePath.relative(repoRoot, nodePath.join(requestedPath, entry.name))))
+    .filter((relativePath) => relativePath && !relativePath.startsWith('..') && !nodePath.isAbsolute(relativePath));
+  if (relativeChildren.length === 0) return [];
+
+  let stdout = '';
+  try {
+    stdout = await execGit(repoRoot, ['check-ignore', '-z', '--', ...relativeChildren]);
+  } catch {
+    return [];
+  }
+  return parseZRecords(stdout).map((relativePath) => ({
+    path: normalizeRepoRelativePath(repoRoot, relativePath),
+    code: '!!',
+  }));
 }
 
 async function loadRepoNumstat(repoRoot: string): Promise<Map<string, { additions?: number; deletions?: number }>> {
@@ -119,19 +150,26 @@ export async function scanFsGitStatusSnapshot(input: FsGitStatusBuildJobInput): 
   files: FsGitStatusWorkerFile[];
 }> {
   const statusFiles = await loadRepoStatusFiles(input.repoRoot);
+  const directIgnored = input.includeStats ? [] : await loadDirectIgnoredChildren(input.repoRoot, input.requestedPath);
   const stats = input.includeStats ? await loadRepoNumstat(input.repoRoot) : null;
-  const files = statusFiles
+  const filesByPath = new Map<string, FsGitStatusWorkerFile>();
+  for (const file of statusFiles
     .filter((file) => isPathInside(input.requestedPath, file.path))
     .map((file) => {
       const fileStats = stats?.get(file.path);
       return fileStats ? { ...file, ...fileStats } : file;
-    });
+    })) {
+    filesByPath.set(file.path, file);
+  }
+  for (const file of directIgnored) {
+    if (!filesByPath.has(file.path)) filesByPath.set(file.path, file);
+  }
   return {
     repoRoot: input.repoRoot,
     repoSignature: input.repoSignature,
     requestedPath: input.requestedPath,
     includeStats: input.includeStats,
-    files,
+    files: [...filesByPath.values()],
   };
 }
 

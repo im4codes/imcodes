@@ -1,4 +1,5 @@
 import type { FsReadErrorCode, FsReadPreviewReason } from '../../../shared/fs-read-error-codes.js';
+import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 
 export interface FsEntry {
   name: string;
@@ -96,4 +97,26 @@ export interface FsGitDiffResponse extends FsBaseResponse {
 
 export interface FsMkdirResponse extends FsBaseResponse {
   type: 'fs.mkdir_response';
+}
+
+export interface FsRenameRequest {
+  type: typeof FS_TRANSPORT_MSG.RENAME;
+  requestId: string;
+  path: string;
+  newPath: string;
+}
+
+export interface FsRenameResponse extends FsBaseResponse {
+  type: typeof FS_TRANSPORT_MSG.RENAME_RESPONSE;
+  newPath?: string;
+}
+
+export interface FsDeleteRequest {
+  type: typeof FS_TRANSPORT_MSG.DELETE;
+  requestId: string;
+  path: string;
+}
+
+export interface FsDeleteResponse extends FsBaseResponse {
+  type: typeof FS_TRANSPORT_MSG.DELETE_RESPONSE;
 }

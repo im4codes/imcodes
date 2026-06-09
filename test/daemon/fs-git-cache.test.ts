@@ -51,6 +51,7 @@ import { FsGitStatusWorkerPool, __setDefaultFsGitStatusWorkerPoolForTests, type 
 import type { FsGitStatusWorkerRequest, FsGitStatusWorkerResult } from '../../src/daemon/fs-git-status-worker-types.js';
 
 const mockRealpath = vi.mocked(fsp.realpath);
+const mockReaddir = vi.mocked(fsp.readdir);
 const mockReadFile = vi.mocked(fsp.readFile);
 const mockStat = vi.mocked(fsp.stat);
 const mockWriteFile = vi.mocked(fsp.writeFile);
@@ -201,6 +202,7 @@ function setupRepoMocks(repoRoot: string, filePath?: string) {
 describe('fs git cache handlers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockReaddir.mockReset();
     sent.length = 0;
     mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
     __resetFsGitCachesForTests();
@@ -557,6 +559,44 @@ describe('fs git cache handlers', () => {
     expect((sent[0] as any).files).toEqual([
       { path: '/home/k/project/dir with spaces/file\t"quoted".ts', code: 'M', additions: 4, deletions: 1 },
     ]);
+  });
+
+  it('includes gitignored files with ignored status', async () => {
+    const repoRoot = '/home/k/project';
+    setupRepoMocks(repoRoot);
+    mockReaddir.mockResolvedValue([{ name: 'dist' }, { name: 'src' }] as any);
+    mockExec.mockImplementation((command: any, options: any, callback: any) => {
+      if (typeof options === 'function') callback = options;
+      if (command === 'git status --porcelain=v1 -z -u') {
+        callback(null, '', '');
+        return {} as any;
+      }
+      callback(null, '', '');
+      return {} as any;
+    });
+    mockExecFile.mockImplementation((file: any, args: any, options: any, callback: any) => {
+      if (typeof options === 'function') callback = options;
+      if (file === 'git' && Array.isArray(args) && args.join(' ') === 'check-ignore -z -- dist src') {
+        callback(null, 'dist\0', '');
+        return {} as any;
+      }
+      callback(new Error(`unexpected command: ${file} ${Array.isArray(args) ? args.join(' ') : ''}`), '', '');
+      return {} as any;
+    });
+
+    handleWebCommand({ type: 'fs.git_status', path: repoRoot, requestId: 'status-ignored' }, mockServerLink as any);
+    await flushAsync();
+
+    expect((sent[0] as any).files).toEqual([
+      { path: '/home/k/project/dist', code: '!!' },
+    ]);
+    expect(mockExec.mock.calls[0]?.[0]).toBe('git status --porcelain=v1 -z -u');
+    expect(mockExecFile).toHaveBeenCalledWith(
+      'git',
+      ['check-ignore', '-z', '--', 'dist', 'src'],
+      expect.objectContaining({ cwd: repoRoot }),
+      expect.any(Function),
+    );
   });
 
   it('returns an empty ok response outside a git repo', async () => {

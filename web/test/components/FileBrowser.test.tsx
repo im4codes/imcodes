@@ -55,6 +55,13 @@ vi.mock('react-i18next', () => {
     'file_browser.mkdir_failed': 'Failed to create folder',
     'file_browser.create_file_failed': 'Failed to create file',
     'file_browser.file_exists': 'File already exists',
+    'file_browser.rename_prompt': 'Rename file',
+    'file_browser.rename_failed': 'Failed to rename item',
+    'file_browser.delete_confirm': 'Delete this item?',
+    'file_browser.delete_failed': 'Failed to delete item',
+    'file_browser.invalid_name': 'Invalid name',
+    'common.rename': 'Rename',
+    'common.delete': 'Delete',
     'fileBrowser.copyPath': 'Copy path',
     'fileBrowser.copied': 'Copied!',
     'common.cancel': 'Cancel',
@@ -95,6 +102,16 @@ function makeWsFactory() {
     lastRequestId = 'mock-write-id';
     return lastRequestId;
   });
+  const fsRename = vi.fn((path: string) => {
+    lastSentPath = path;
+    lastRequestId = 'mock-rename-id';
+    return lastRequestId;
+  });
+  const fsDelete = vi.fn((path: string) => {
+    lastSentPath = path;
+    lastRequestId = 'mock-delete-id';
+    return lastRequestId;
+  });
 
   const ws: WsClient = {
     onMessage: (handler: (msg: ServerMessage) => void) => {
@@ -104,6 +121,8 @@ function makeWsFactory() {
     fsListDir,
     fsMkdir,
     fsWriteFile,
+    fsRename,
+    fsDelete,
     fsReadFile: vi.fn(() => 'mock-read-id'),
     fsGitStatus: vi.fn(() => 'mock-git-status-id'),
     fsGitDiff: vi.fn(() => 'mock-git-diff-id'),
@@ -134,7 +153,7 @@ function makeWsFactory() {
     for (const messageHandler of messageHandlers) messageHandler(msg);
   };
 
-  return { ws, fsListDir, fsMkdir, fsWriteFile, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles };
+  return { ws, fsListDir, fsMkdir, fsWriteFile, fsRename, fsDelete, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles };
 }
 
 describe('FileBrowser', () => {
@@ -774,6 +793,72 @@ describe('FileBrowser', () => {
       });
     });
     expect(document.querySelector('.fb-node-git-badge')).not.toBeNull();
+  });
+
+  it('renders gitignored files as muted ignored nodes', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(<FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
+    await act(async () => { respond([{ name: 'cache.log', isDir: false }], '/home/user'); });
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/cache.log', code: '!!' }],
+      });
+    });
+
+    const row = screen.getByText('cache.log').closest('.fb-node');
+    expect(row?.classList.contains('git-ignored')).toBe(true);
+    expect(document.querySelector('.git-badge-ignored')?.textContent).toBe('I');
+  });
+
+  it('renames a file from the right-click menu', async () => {
+    const { ws, respond, fsRename } = makeWsFactory();
+    const originalPrompt = window.prompt;
+    window.prompt = vi.fn(() => 'renamed.ts');
+    try {
+      render(<FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
+      await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+
+      const row = screen.getByText('foo.ts').closest('.fb-node');
+      expect(row).not.toBeNull();
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByText('Rename'));
+
+      expect(fsRename).toHaveBeenCalledWith('/home/user/foo.ts', '/home/user/renamed.ts');
+    } finally {
+      window.prompt = originalPrompt;
+    }
+  });
+
+  it('does not delete from the right-click menu until the confirmation is accepted', async () => {
+    const { ws, respond, fsDelete } = makeWsFactory();
+    const originalConfirm = window.confirm;
+    window.confirm = vi.fn(() => false);
+    try {
+      render(<FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
+      await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+
+      const row = screen.getByText('foo.ts').closest('.fb-node');
+      expect(row).not.toBeNull();
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByText('Delete'));
+
+      expect(window.confirm).toHaveBeenCalled();
+      expect(fsDelete).not.toHaveBeenCalled();
+
+      window.confirm = vi.fn(() => true);
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByText('Delete'));
+
+      expect(fsDelete).toHaveBeenCalledWith('/home/user/foo.ts');
+    } finally {
+      window.confirm = originalConfirm;
+    }
   });
 
   it('requests stats only for shared changes queries, not tree git badges', async () => {
