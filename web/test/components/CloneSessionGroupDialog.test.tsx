@@ -214,8 +214,9 @@ describe('CloneSessionGroupDialog', () => {
     });
   });
 
-  it('refreshes and switches to the cloned main session on success', () => {
-    const ws = renderDialog();
+  it('refreshes, switches to the cloned main session, and closes on success', () => {
+    const onClose = vi.fn();
+    const ws = renderDialog(makeWs(), { onClose });
     const navigations: unknown[] = [];
     const onNavigate = (event: Event) => {
       navigations.push((event as CustomEvent).detail);
@@ -250,6 +251,7 @@ describe('CloneSessionGroupDialog', () => {
       expect(ws.p2pStatus).toHaveBeenCalledWith({ sessionName: 'deck_cd_1_brain' });
       expect(ws.p2pListDiscussions).toHaveBeenCalledWith({ sessionName: 'deck_cd_1_brain' });
       expect(navigations).toContainEqual({ serverId: 'server-1', session: 'deck_cd_1_brain' });
+      expect(onClose).toHaveBeenCalledOnce();
       expect(screen.getByText('Copied group created as deck_cd_1_brain. Switching to it now.')).toBeDefined();
     } finally {
       window.removeEventListener('deck:navigate', onNavigate);

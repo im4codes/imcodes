@@ -444,10 +444,19 @@ async function copyDaemonLocalP2pConfig(
   spec: CloneableSessionGroupSpec,
   resources: CreatedResources,
 ): Promise<SessionGroupCloneWarning[]> {
-  const sourceScope = getP2pConfigStoreScope(serverLink, spec.main.sourceSessionName);
+  const sourceSessionCandidates = [
+    spec.main.sourceSessionName,
+    ...spec.subSessions.map((sub) => sub.sourceSessionName),
+    ...spec.skippedMembers.map((member) => member.sessionName),
+  ];
   const targetScope = getP2pConfigStoreScope(serverLink, spec.main.targetMainSessionName);
-    const sourceConfig = await getSavedP2pConfig(sourceScope)
-    ?? (sourceScope === spec.main.sourceSessionName ? undefined : await getSavedP2pConfig(spec.main.sourceSessionName));
+  let sourceConfig: import('../../shared/p2p-modes.js').P2pSavedConfig | undefined;
+  for (const sourceSessionName of sourceSessionCandidates) {
+    const sourceScope = getP2pConfigStoreScope(serverLink, sourceSessionName);
+    sourceConfig = await getSavedP2pConfig(sourceScope)
+      ?? (sourceScope === sourceSessionName ? undefined : await getSavedP2pConfig(sourceSessionName));
+    if (sourceConfig) break;
+  }
   if (!sourceConfig) return [{ code: 'p2p_config_missing' }];
   const remapped = cloneP2pConfigWithSessionRemap(sourceConfig, spec.sessionNameMap, Date.now(), {
     sourceGroupSessionNames: [

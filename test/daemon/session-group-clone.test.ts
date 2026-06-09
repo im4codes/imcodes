@@ -354,6 +354,54 @@ describe('daemon session group clone', () => {
     expect(eventText).not.toContain('transportConfig');
   });
 
+  it('copies daemon-local Team config saved under a source member scope', async () => {
+    const dir = await makeDir('member-p2p-config');
+    sessions.set('deck_cd_brain', makeSession({
+      name: 'deck_cd_brain',
+      projectName: 'cd',
+      role: 'brain',
+      projectDir: dir,
+    }));
+    sessions.set('deck_sub_active', makeSession({
+      name: 'deck_sub_active',
+      projectName: 'deck_sub_active',
+      role: 'w1',
+      projectDir: dir,
+      parentSession: 'deck_cd_brain',
+      label: 'Worker A',
+    }));
+    p2pConfigs.set('server-1:deck_sub_active', {
+      sessions: {
+        deck_sub_active: { enabled: true, mode: 'audit' },
+      },
+      rounds: 2,
+      contextReducer: {
+        mode: 'reuse_existing_session',
+        sessionName: 'deck_sub_active',
+      },
+    });
+    const { link, sent } = makeServerLink();
+
+    await handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: `idem-member-p2p-${unique++}`,
+    }, link as never);
+
+    const clonedSub = [...sessions.values()].find((record) => record.parentSession === 'deck_cd_1_brain');
+    expect(clonedSub?.name).toBeDefined();
+    expect(p2pConfigs.get('server-1:deck_cd_1_brain')).toMatchObject({
+      sessions: {
+        [clonedSub!.name]: { enabled: true, mode: 'audit' },
+      },
+      rounds: 2,
+      contextReducer: {
+        sessionName: clonedSub!.name,
+      },
+    });
+    expect(sent.at(-1)).toMatchObject({ state: 'succeeded' });
+  });
+
   it('preserves a non-English target project name as the cloned main display label', async () => {
     const dir = await makeDir('non-english-label');
     sessions.set('deck_cd_brain', makeSession({

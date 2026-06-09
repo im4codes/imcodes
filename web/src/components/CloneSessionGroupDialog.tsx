@@ -272,10 +272,11 @@ export function CloneSessionGroupDialog({
           } catch {
             // CustomEvent can be unavailable in very old embedded webviews.
           }
+          onClose();
         }
       }
     });
-  }, [idempotencyKey, serverId, ws]);
+  }, [idempotencyKey, onClose, serverId, ws]);
 
   const submit = () => {
     if (busy) return;

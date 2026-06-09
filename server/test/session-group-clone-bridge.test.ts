@@ -402,6 +402,85 @@ describe('WsBridge session group clone routing', () => {
     expect(JSON.stringify(auditRows)).toContain('session_group_clone.p2p_config_copied');
   });
 
+  it('copies server-synced P2P preference saved under a source Team member scope', async () => {
+    const { serverId, daemon, browserA, userPrefs } = await setup();
+    const sourceMemberKey = p2pSessionConfigPrefKey('deck_sub_a', serverId);
+    userPrefs.set(`user-owner:${sourceMemberKey}`, JSON.stringify({
+      sessions: {
+        deck_sub_a: { enabled: true, mode: 'audit' },
+        deck_sub_reviewer: { enabled: true, mode: 'review' },
+      },
+      rounds: 3,
+      contextReducer: {
+        mode: 'reuse_existing_session',
+        sessionName: 'deck_sub_reviewer',
+      },
+    }));
+
+    browserA.emit('message', JSON.stringify({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      serverId,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: 'idem-p2p-member-pref',
+      targetProjectName: 'cd_1',
+    }));
+    await flush();
+    daemon.clearSent();
+
+    daemon.emit('message', JSON.stringify({
+      type: SESSION_GROUP_CLONE_MSG.EVENT,
+      operationId: 'op-p2p-member-pref',
+      idempotencyKey: 'idem-p2p-member-pref',
+      state: 'succeeded',
+      sourceMainSessionName: 'deck_cd_brain',
+      clonedMainSessionName: 'deck_cd_1_brain',
+      result: {
+        operationId: 'op-p2p-member-pref',
+        idempotencyKey: 'idem-p2p-member-pref',
+        sourceMainSession: 'deck_cd_brain',
+        clonedMainSession: 'deck_cd_1_brain',
+        targetProjectName: 'cd_1',
+        targetProjectSlug: 'cd_1',
+        sessionNameMap: {
+          deck_cd_brain: 'deck_cd_1_brain',
+          deck_sub_a: 'deck_sub_b',
+          deck_sub_reviewer: 'deck_sub_reviewer_clone',
+        },
+        copiedSubSessionIds: [
+          { sourceId: 'a', clonedId: 'b' },
+          { sourceId: 'reviewer', clonedId: 'reviewer_clone' },
+        ],
+        skippedMembers: [],
+        skippedCronJobs: 0,
+        skippedOrchestrationRuns: 0,
+        warnings: [],
+      },
+    }));
+    await flush();
+
+    const targetKey = p2pSessionConfigPrefKey('deck_cd_1_brain', serverId);
+    expect(JSON.parse(userPrefs.get(`user-owner:${targetKey}`) ?? 'null')).toMatchObject({
+      sessions: {
+        deck_sub_b: { enabled: true, mode: 'audit' },
+        deck_sub_reviewer_clone: { enabled: true, mode: 'review' },
+      },
+      rounds: 3,
+      contextReducer: {
+        sessionName: 'deck_sub_reviewer_clone',
+      },
+    });
+    expect(daemon.sentJson()).toContainEqual(expect.objectContaining({
+      type: P2P_CONFIG_MSG.SAVE,
+      scopeSession: 'deck_cd_1_brain',
+      config: expect.objectContaining({
+        sessions: {
+          deck_sub_b: { enabled: true, mode: 'audit' },
+          deck_sub_reviewer_clone: { enabled: true, mode: 'review' },
+        },
+      }),
+    }));
+  });
+
   it('converts server-synced P2P preference write failure into cleanup_required instead of success', async () => {
     const { serverId, daemon, browserA, userPrefs, auditRows } = await setup(
       [SESSION_GROUP_CLONE_CAPABILITY_V1],

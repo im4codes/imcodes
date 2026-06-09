@@ -819,17 +819,20 @@ function parseStoredP2pConfig(raw: string | null): P2pSavedConfig | null {
   }
 }
 
-async function getUserP2pConfigForRoot(
+async function getUserP2pConfigForCloneSource(
   db: Database,
   userId: string,
   serverId: string,
-  rootSessionName: string,
+  sourceSessionNames: readonly string[],
 ): Promise<{ key: string; config: P2pSavedConfig } | null> {
-  const keys = [
-    p2pSessionConfigPrefKey(rootSessionName, serverId),
-    ...p2pSessionConfigLegacyPrefKeys(rootSessionName),
-  ];
-  for (const key of keys) {
+  const keys = new Set<string>();
+  for (const sourceSessionName of sourceSessionNames) {
+    const trimmed = sourceSessionName.trim();
+    if (!trimmed) continue;
+    keys.add(p2pSessionConfigPrefKey(trimmed, serverId));
+    for (const key of p2pSessionConfigLegacyPrefKeys(trimmed)) keys.add(key);
+  }
+  for (const key of keys.values()) {
     const config = parseStoredP2pConfig(await getUserPref(db, userId, key));
     if (config) return { key, config };
   }
@@ -3702,7 +3705,12 @@ export class WsBridge {
     if (!context) return;
 
     const sourceMainSessionName = result.sourceMainSession || event.sourceMainSessionName || context.sourceMainSessionName;
-    const source = await getUserP2pConfigForRoot(db, context.userId, this.serverId, sourceMainSessionName);
+    const sourceSessionNames = Array.from(new Set([
+      sourceMainSessionName,
+      ...Object.keys(result.sessionNameMap),
+      ...result.skippedMembers.map((member) => member.sessionName),
+    ].filter((name): name is string => typeof name === 'string' && name.trim().length > 0)));
+    const source = await getUserP2pConfigForCloneSource(db, context.userId, this.serverId, sourceSessionNames);
     if (!source) return;
 
     const targetKey = p2pSessionConfigPrefKey(result.clonedMainSession, this.serverId);
