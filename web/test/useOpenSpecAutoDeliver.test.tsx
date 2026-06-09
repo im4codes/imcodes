@@ -342,6 +342,195 @@ describe('useOpenSpecAutoDeliver', () => {
     expect(result.current.projection).toBeNull();
   });
 
+  it('continues a failed run through the projected target session and clears pending on ACK', () => {
+    const ws = makeWs();
+    const { result } = renderHook(() => useOpenSpecAutoDeliver({
+      ws,
+      serverId: 'server-1',
+      sessionName: 'deck_main_brain',
+    }));
+
+    act(() => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-run-continue',
+          visibility: 'full',
+          projectionVersion: 1,
+          changeName: 'openspec-auto-delivery',
+          status: 'needs_human',
+          stage: 'needs_human',
+          owningMainSessionName: 'deck_main_brain',
+          launchedFromSessionName: 'deck_sub_launcher',
+          targetImplementationSessionName: 'deck_sub_worker',
+          terminal: true,
+          canContinue: true,
+          canStop: false,
+        },
+      } as unknown as ServerMessage);
+    });
+
+    let continueRequestId: string | null = null;
+    act(() => {
+      continueRequestId = result.current.continueRun();
+    });
+
+    expect(continueRequestId).toBeTruthy();
+    expect(result.current.continuePending).toBe(true);
+    expect(result.current.lastError).toBeNull();
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.continue',
+      requestId: continueRequestId,
+      serverId: 'server-1',
+      sessionName: 'deck_sub_worker',
+      runId: 'auto-run-continue',
+    }));
+
+    act(() => {
+      ws.emit({
+        type: 'openspec_auto_deliver.continue_ack',
+        requestId: continueRequestId,
+        ok: true,
+        projection: {
+          runId: 'auto-run-continue',
+          visibility: 'full',
+          projectionVersion: 2,
+          changeName: 'openspec-auto-delivery',
+          status: 'spec_audit_repair',
+          stage: 'spec_audit_repair',
+          owningMainSessionName: 'deck_main_brain',
+          launchedFromSessionName: 'deck_sub_launcher',
+          targetImplementationSessionName: 'deck_sub_worker',
+          canContinue: false,
+          canStop: true,
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(result.current.continuePending).toBe(false);
+    expect(result.current.lastError).toBeNull();
+    expect(result.current.projection).toMatchObject({
+      runId: 'auto-run-continue',
+      status: 'spec_audit_repair',
+      canContinue: false,
+      canStop: true,
+    });
+  });
+
+  it('does not continue conflicts, passed runs, or non-recoverable projections', () => {
+    const ws = makeWs();
+    const { result } = renderHook(() => useOpenSpecAutoDeliver({
+      ws,
+      serverId: 'server-1',
+      sessionName: 'deck_sibling',
+    }));
+
+    act(() => {
+      ws.emit({
+        type: 'openspec_auto_deliver.conflict_summary',
+        projection: {
+          runId: 'auto-conflict',
+          visibility: 'conflict',
+          projectionVersion: 1,
+          owningMainSessionName: 'deck_main_brain',
+          status: 'needs_human',
+          stage: 'needs_human',
+          reason: 'auto_deliver_active',
+          canContinue: true,
+        },
+      } as unknown as ServerMessage);
+    });
+    act(() => {
+      expect(result.current.continueRun()).toBeNull();
+    });
+
+    act(() => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-passed',
+          visibility: 'full',
+          projectionVersion: 1,
+          changeName: 'openspec-auto-delivery',
+          status: 'passed',
+          stage: 'passed',
+          owningMainSessionName: 'deck_sibling',
+          terminal: true,
+          canContinue: true,
+        },
+      } as unknown as ServerMessage);
+    });
+    act(() => {
+      expect(result.current.continueRun()).toBeNull();
+    });
+
+    act(() => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-not-recoverable',
+          visibility: 'full',
+          projectionVersion: 2,
+          changeName: 'openspec-auto-delivery',
+          status: 'failed',
+          stage: 'failed',
+          owningMainSessionName: 'deck_sibling',
+          terminal: true,
+          canContinue: false,
+        },
+      } as unknown as ServerMessage);
+    });
+    act(() => {
+      expect(result.current.continueRun()).toBeNull();
+    });
+
+    expect(ws.send.mock.calls.some(([payload]) => (
+      (payload as { type?: string }).type === 'openspec_auto_deliver.continue'
+    ))).toBe(false);
+    expect(result.current.continuePending).toBe(false);
+  });
+
+  it('clears continue pending on timeout with the localized continue timeout key', () => {
+    vi.useFakeTimers();
+    const ws = makeWs();
+    const { result } = renderHook(() => useOpenSpecAutoDeliver({
+      ws,
+      serverId: 'server-1',
+      sessionName: 'deck_main_brain',
+    }));
+
+    act(() => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-run-continue-timeout',
+          visibility: 'full',
+          projectionVersion: 1,
+          changeName: 'openspec-auto-delivery',
+          status: 'needs_human',
+          stage: 'needs_human',
+          owningMainSessionName: 'deck_main_brain',
+          targetImplementationSessionName: 'deck_sub_worker',
+          terminal: true,
+          canContinue: true,
+          canStop: false,
+        },
+      } as unknown as ServerMessage);
+    });
+
+    act(() => {
+      result.current.continueRun();
+    });
+    expect(result.current.continuePending).toBe(true);
+
+    act(() => {
+      vi.advanceTimersByTime(30_000);
+    });
+
+    expect(result.current.continuePending).toBe(false);
+    expect(result.current.lastError).toBe('openspec.auto.error.continue_timeout');
+  });
+
   it('clears stop pending on terminal projection and disconnect', () => {
     const ws = makeWs();
     const { result } = renderHook(() => useOpenSpecAutoDeliver({

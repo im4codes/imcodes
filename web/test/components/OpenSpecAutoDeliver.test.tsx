@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { h } from 'preact';
-import { cleanup, render, screen } from '@testing-library/preact';
+import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   OpenSpecAutoDeliverCurrentRunEntry,
@@ -21,6 +21,8 @@ vi.mock('react-i18next', () => ({
         'openspec.auto.kicker': 'Auto Deliver',
         'openspec.auto.view': 'View',
         'openspec.auto.stop': 'Stop',
+        'openspec.auto.continue': 'Continue',
+        'openspec.auto.continuing': 'Continuing...',
         'openspec.auto.compact': 'Compact',
         'openspec.auto.expand': 'Expand',
         'openspec.auto.latest_message': 'Latest',
@@ -46,6 +48,8 @@ vi.mock('react-i18next', () => ({
         'openspec.auto.stage.spec_audit_repair': 'Spec audit',
         'openspec.auto.status.implementation_task_loop': 'Implementation',
         'openspec.auto.stage.implementation_task_loop': 'Implementation',
+        'openspec.auto.status.needs_human': 'Needs human',
+        'openspec.auto.stage.needs_human': 'Needs human',
         'openspec.auto.score_module.implementation': 'Implementation',
       };
       if (key === 'openspec.auto.progress_count') return `${opts?.current ?? 0}/${opts?.total ?? 0}`;
@@ -223,5 +227,90 @@ describe('OpenSpecAutoDeliver components', () => {
     expect(document.body.textContent).toContain('Repairing from audit findings. Final score will refresh after implementation and validation.');
     expect(document.body.textContent).toContain('No scores');
     expect(document.body.textContent).not.toContain('Stale audit score.');
+  });
+
+  it('renders explicit Continue recovery action without conflating Close or Stop', () => {
+    const projection: OpenSpecAutoDeliverProjection = {
+      visibility: 'full',
+      projectionVersion: 8,
+      generation: 3,
+      runId: 'auto-needs-human',
+      changeName: 'openspec-auto-delivery',
+      status: 'needs_human',
+      stage: 'needs_human',
+      owningMainSessionName: 'deck_brain',
+      launchedFromSessionName: 'deck_brain',
+      targetImplementationSessionName: 'deck_worker',
+      terminal: true,
+      canContinue: true,
+      canStop: false,
+      terminalReason: 'missing_authoritative_json',
+    };
+    const onContinue = vi.fn();
+    const onClose = vi.fn();
+    const onStop = vi.fn();
+
+    const { rerender } = render(
+      <OpenSpecAutoDeliverDetailsPanel
+        projection={projection}
+        continuePending={false}
+        onClose={onClose}
+        onStop={onStop}
+        onContinue={onContinue}
+      />,
+    );
+
+    const continueButton = screen.getByRole('button', { name: 'Continue' });
+    expect(continueButton).toBeDefined();
+    expect((continueButton as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull();
+
+    const [, footerCloseButton] = screen.getAllByRole('button', { name: 'Close' });
+    fireEvent.click(footerCloseButton);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onContinue).not.toHaveBeenCalled();
+    expect(onStop).not.toHaveBeenCalled();
+
+    fireEvent.click(continueButton);
+    expect(onContinue).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onStop).not.toHaveBeenCalled();
+
+    rerender(
+      <OpenSpecAutoDeliverDetailsPanel
+        projection={projection}
+        continuePending
+        onClose={onClose}
+        onStop={onStop}
+        onContinue={onContinue}
+      />,
+    );
+
+    const pendingButton = screen.getByRole('button', { name: 'Continuing...' });
+    expect((pendingButton as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('hides Continue when the terminal projection is not recoverable', () => {
+    render(
+      <OpenSpecAutoDeliverDetailsPanel
+        projection={{
+          visibility: 'full',
+          projectionVersion: 9,
+          generation: 3,
+          runId: 'auto-passed',
+          changeName: 'openspec-auto-delivery',
+          status: 'passed',
+          stage: 'passed',
+          owningMainSessionName: 'deck_brain',
+          terminal: true,
+          canContinue: false,
+        }}
+        onClose={vi.fn()}
+        onStop={vi.fn()}
+        onContinue={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: 'Continue' })).toBeNull();
   });
 });
