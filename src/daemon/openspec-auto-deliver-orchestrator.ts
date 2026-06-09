@@ -667,12 +667,58 @@ function bullets(items: string[], limit = 12): string {
   return remaining > 0 ? [...visible, `- ...and ${remaining} more`].join('\n') : visible.join('\n');
 }
 
+const PROMPT_NOISY_EVIDENCE_PREFIXES = [
+  'Changed files:',
+  'Diff stat:',
+  'Fresh changed files:',
+  'Fresh diff stat:',
+];
+
+function isPromptNoisyEvidenceSummary(summary: string): boolean {
+  return PROMPT_NOISY_EVIDENCE_PREFIXES.some((prefix) => summary.startsWith(prefix));
+}
+
+function runEvidenceForPrompt(run: AutoDeliverRun): string {
+  const entries = (run.evidence ?? []).filter((entry) => !isPromptNoisyEvidenceSummary(entry.summary));
+  if (entries.length === 0) return 'Evidence: none.';
+  const visible = entries.slice(0, 8).map((entry) => `- ${entry.source}: ${entry.summary}`);
+  const remaining = entries.length - visible.length;
+  return `Evidence:\n${remaining > 0 ? [...visible, `- ...and ${remaining} more`].join('\n') : visible.join('\n')}`;
+}
+
+function validationCommandEvidence(run: AutoDeliverRun): string {
+  const validationPrefixes = [
+    'Discovered safe validation command candidates',
+    'No safe validation command candidates',
+    'Unsafe validation commands were skipped',
+  ];
+  const summaries = [...new Set((run.evidence ?? [])
+    .filter((entry) => entry.source === 'daemon' && validationPrefixes.some((prefix) => entry.summary.startsWith(prefix)))
+    .map((entry) => entry.summary))];
+  return bullets(summaries, 3);
+}
+
+function auditGuidanceEvidence(audit: OpenSpecAutoDeliverAuditResult | undefined): string {
+  const noisyPrefixes = [
+    'Discovered safe validation command candidates',
+    'No safe validation command candidates',
+    'Unsafe validation commands were skipped',
+    'Spec audit discussion completed:',
+    'Implementation audit discussion completed:',
+    'Dispatching ',
+  ];
+  const summaries = (audit?.evidence ?? [])
+    .map((entry) => entry.summary)
+    .filter((summary) => !isPromptNoisyEvidenceSummary(summary))
+    .filter((summary) => !noisyPrefixes.some((prefix) => summary.startsWith(prefix)));
+  return bullets([...new Set(summaries)], 5);
+}
+
 function buildImplementationRepairBlock(run: AutoDeliverRun, repairReason?: string): string | null {
   const audit = latestAuditResultForStage(run, 'implementation_audit_repair');
   const auditDiscussionFilePath = audit?.discussionFilePath ?? run.implementationAuditDiscussionFilePath;
   if (!audit && !repairReason && !auditDiscussionFilePath) return null;
   const lowScores = (audit?.moduleScores ?? []).filter((score) => score.score < OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE);
-  const evidence = (audit?.evidence ?? []).map((entry) => entry.summary);
   const requiredFollowupRepair = repairReason === OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON
     ? [
         '',
@@ -696,8 +742,8 @@ function buildImplementationRepairBlock(run: AutoDeliverRun, repairReason?: stri
     'Unchecked or falsely-complete tasks reported by the audit:',
     bullets(audit?.uncheckedTasks ?? []),
     '',
-    'Audit evidence to use as implementation guidance:',
-    bullets(evidence, 8),
+    'Concise audit guidance:',
+    auditGuidanceEvidence(audit),
     ...requiredFollowupRepair,
     '',
     auditDiscussionFilePath ? 'Before editing, read the audit discussion file above for the full review/plan context; use the discussion findings as the repair source of truth.' : undefined,
@@ -711,10 +757,9 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
   const remaining = uncheckedTaskLabels(run.taskStats);
   const maxImplementationPrompts = effectiveMaxImplementationPrompts(run);
   const basePrompt = repairReason
-    ? formatOpenSpecPromptTemplate('audit_implementation', reference)
+    ? `OpenSpec Auto Deliver implementation repair for ${reference}.`
     : formatOpenSpecPromptTemplate('implement', reference);
-  const validationSummary = run.evidence?.filter((entry) => entry.source === 'daemon').map((entry) => `- ${entry.summary}`).join('\n')
-    || '- No daemon validation recommendations are available.';
+  const validationSummary = validationCommandEvidence(run);
   const remainingBlock = remaining.length > 0
     ? remaining.map((label) => `- ${label}`).join('\n')
     : '- Re-read tasks.md and verify every task remains checked.';
@@ -732,14 +777,14 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
     'Before inspecting, editing, validating, or committing anything, work from the project root above. Do not rely on the execution session current directory if it differs.',
     'All relative file paths in this prompt are relative to that project root.',
     'Work through the remaining tasks below. Mark tasks.md checkboxes only after the work is genuinely complete.',
-    'Run reasonable local validation for the touched code when available. Treat the discovered commands below as project-specific candidates only; choose the actual validation plan from the changed files and project tooling. Report exact commands and outcomes, or explain why validation could not run.',
+    'Run reasonable local validation for the touched code when available. Treat the validation candidates below as project-specific hints only; choose the actual validation plan from the changed files and project tooling. Report exact commands and outcomes, or explain why validation could not run.',
     '',
     'Remaining tasks:',
     remainingBlock,
     '',
     buildImplementationRepairBlock(run, repairReason) ?? 'No prior implementation-audit findings are pending. Implement the remaining OpenSpec tasks directly.',
     '',
-    'Validation command candidates:',
+    'Validation candidates:',
     validationSummary,
   ].join('\n');
 }
@@ -879,11 +924,6 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
   const lowScores = (previousAudit?.moduleScores ?? [])
     .filter((score) => score.score < OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE)
     .map((score) => `${score.module}=${score.score}/10 (${score.summary})`);
-  const evidence = (previousAudit?.evidence ?? []).map((entry) => entry.summary);
-  const changedFiles = run.evidence?.find((entry) => entry.source === 'daemon' && entry.summary.startsWith('Changed files:'))?.summary
-    ?? 'Changed files: unavailable.';
-  const diffStat = run.evidence?.find((entry) => entry.source === 'daemon' && entry.summary.startsWith('Diff stat:'))?.summary
-    ?? 'Diff stat: unavailable.';
   const title = specStage
     ? `OpenSpec Auto Deliver final specification acceptance audit for ${reference}.`
     : `OpenSpec Auto Deliver final implementation acceptance audit for ${reference}.`;
@@ -932,11 +972,8 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     'Previous audit unchecked or falsely-complete tasks to verify:',
     bullets(previousAudit?.uncheckedTasks ?? []),
     '',
-    'Previous audit evidence:',
-    bullets(evidence, 8),
-    '',
-    changedFiles,
-    diffStat,
+    'Previous audit guidance:',
+    auditGuidanceEvidence(previousAudit),
     '',
     'Write exactly one raw JSON object to the authoritative result file path above. Do not wrap the file content in Markdown fences.',
     'The daemon will read only that file as the authoritative result.',
@@ -981,7 +1018,8 @@ function buildPostRepairAcceptanceAuditResultRepairPrompt(
     `Authoritative result file: ${metadata.authoritativeResultPath}`,
     `Resolved change root identity: ${metadata.resolvedChangeRootIdentity}`,
     '',
-    'Do not redo the audit unless needed to correct the JSON. Write exactly one raw JSON object to the authoritative result file path above.',
+    'Do not perform a new audit. Only correct the authoritative JSON file so it satisfies the schema below.',
+    'Write exactly one raw JSON object to the authoritative result file path above.',
     'The top-level auto_deliver object must exactly equal this metadata object:',
     JSON.stringify({
       runId: metadata.runId,
@@ -1529,8 +1567,6 @@ function buildAuthoritativeResultSchemaHints(includeAutoDeliverNesting: boolean)
 function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDeliverP2pMetadata): string {
   if (metadata.stage === 'implementation_audit_repair') {
     const unchecked = uncheckedTaskLabels(run.taskStats);
-    const changedFiles = run.evidence?.find((entry) => entry.source === 'daemon' && entry.summary.startsWith('Changed files:'))?.summary ?? 'Changed files: unavailable.';
-    const diffStat = run.evidence?.find((entry) => entry.source === 'daemon' && entry.summary.startsWith('Diff stat:'))?.summary ?? 'Diff stat: unavailable.';
     return [
       `OpenSpec Auto Deliver implementation audit discussion for openspec/changes/${run.changeName}.`,
       '',
@@ -1566,9 +1602,7 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
       `Task stats: ${run.taskStats.checked}/${run.taskStats.total} checked.`,
       unchecked.length > 0 ? `Unchecked tasks:\n${unchecked.map((label) => `- ${label}`).join('\n')}` : 'Unchecked tasks: none.',
       run.latestRepairSummary ? `Prior repair summary: ${run.latestRepairSummary}` : 'Prior repair summary: none.',
-      run.evidence?.length ? `Evidence:\n${run.evidence.map((entry) => `- ${entry.source}: ${entry.summary}`).join('\n')}` : 'Evidence: none.',
-      changedFiles,
-      diffStat,
+      runEvidenceForPrompt(run),
     ].join('\n');
   }
   const unchecked = uncheckedTaskLabels(run.taskStats);
@@ -1607,7 +1641,7 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
     `Task stats: ${run.taskStats.checked}/${run.taskStats.total} checked.`,
     unchecked.length > 0 ? `Unchecked tasks:\n${unchecked.map((label) => `- ${label}`).join('\n')}` : 'Unchecked tasks: none.',
     run.latestRepairSummary ? `Prior repair summary: ${run.latestRepairSummary}` : 'Prior repair summary: none.',
-    run.evidence?.length ? `Evidence:\n${run.evidence.map((entry) => `- ${entry.source}: ${entry.summary}`).join('\n')}` : 'Evidence: none.',
+    runEvidenceForPrompt(run),
   ].join('\n');
 }
 

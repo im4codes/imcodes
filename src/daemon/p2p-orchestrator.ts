@@ -443,7 +443,7 @@ function buildPostSummaryExecutionConfirmationPrompt(
     `Execution marker file: ${executionSpec.markerPath}`,
     `Execution marker status: ${executionMarker.status}`,
     executionMarker.summary ? `Execution summary: ${executionMarker.summary}` : null,
-    executionMarker.changedFiles?.length ? `Changed files: ${executionMarker.changedFiles.join(', ')}` : null,
+    executionMarker.changedFiles?.length ? 'Execution marker reported file changes; inspect the workspace if file-level detail is needed.' : null,
     executionMarker.tests?.length ? `Tests: ${executionMarker.tests.join(', ')}` : null,
   ].filter((line): line is string => line !== null).join('\n');
 
@@ -1574,7 +1574,7 @@ async function appendPostSummaryExecutionAudit(
     `Status: ${marker.status}`,
     `Attempts: ${attempts}`,
     marker.summary ? `Summary: ${marker.summary}` : null,
-    marker.changedFiles?.length ? `Changed files: ${marker.changedFiles.join(', ')}` : null,
+    marker.changedFiles?.length ? 'File changes were reported by the execution marker; inspect the workspace for details.' : null,
     marker.tests?.length ? `Tests: ${marker.tests.join(', ')}` : null,
     marker.completedAt ? `Completed at: ${marker.completedAt}` : null,
     '',

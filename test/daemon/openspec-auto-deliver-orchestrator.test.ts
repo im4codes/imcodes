@@ -718,13 +718,16 @@ exec "${realGit}" "$@"
 
     const discussion = await completeLatestDiscussion();
     const repairPrompt = await waitForTransportSend((text) =>
-      text.includes(formatOpenSpecPromptTemplate('audit_implementation', '@openspec/changes/demo-change'))
+      text.includes('OpenSpec Auto Deliver implementation repair for @openspec/changes/demo-change')
       && text.includes(`Audit discussion file: ${discussion.contextFilePath}`)
       && text.includes('Reason: implementation_audit_followup_repair')
       && text.includes('This repair pass is required even when the implementation audit passed'),
       2500,
     );
     expect(repairPrompt).toContain('Do not write another audit report. Edit the product code, tests, and tasks.md now');
+    expect(repairPrompt).not.toContain(formatOpenSpecPromptTemplate('audit_implementation', '@openspec/changes/demo-change'));
+    expect(repairPrompt).not.toContain('Changed files:');
+    expect(repairPrompt).not.toContain('Diff stat:');
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
     const acceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change')
@@ -732,6 +735,8 @@ exec "${realGit}" "$@"
       && !text.includes('quick verification'),
       2500,
     );
+    expect(acceptancePrompt).not.toContain('Changed files:');
+    expect(acceptancePrompt).not.toContain('Diff stat:');
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 8000);
@@ -843,7 +848,8 @@ exec "${realGit}" "$@"
       && text.includes('Reason: implementation_audit_followup_repair'),
       2500,
     );
-    expect(repairPrompt).toContain(formatOpenSpecPromptTemplate('audit_implementation', '@openspec/changes/demo-change'));
+    expect(repairPrompt).toContain('OpenSpec Auto Deliver implementation repair for @openspec/changes/demo-change');
+    expect(repairPrompt).not.toContain(formatOpenSpecPromptTemplate('audit_implementation', '@openspec/changes/demo-change'));
     expect([...p2pRuns.values()]).toHaveLength(2);
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
     const acceptancePrompt = await waitForTransportSend((text) =>
@@ -1364,7 +1370,7 @@ exec "${realGit}" "$@"
       && text.includes('Problem: missing_authoritative_json'),
       2500,
     );
-    expect(repairPrompt).toContain('Do not redo the audit unless needed to correct the JSON');
+    expect(repairPrompt).toContain('Do not perform a new audit. Only correct the authoritative JSON file');
     expect(repairPrompt).toContain(`Authoritative result file: ${origin.authoritativeResultPath}`);
     expect(repairPrompt).toContain(`"authoritativeResultPath": "${origin.authoritativeResultPath}"`);
     await waitForSend((msg) =>
@@ -1808,8 +1814,8 @@ exec "${realGit}" "$@"
     }, serverLinkMock as never);
 
     expect(transportSendMock.mock.calls[0]?.[0]).toContain('Do not commit, push, or stage files.');
-    expect(transportSendMock.mock.calls[0]?.[0]).toContain('Validation command candidates:');
-    expect(transportSendMock.mock.calls[0]?.[0]).toContain('project-specific candidates only');
+    expect(transportSendMock.mock.calls[0]?.[0]).toContain('Validation candidates:');
+    expect(transportSendMock.mock.calls[0]?.[0]).toContain('project-specific hints only');
     expect(transportSendMock.mock.calls[0]?.[0]).toContain('Discovered safe validation command candidates from project manifests: pnpm typecheck; pnpm test');
     expect(transportSendMock.mock.calls[0]?.[0]).toContain('Unsafe validation commands were skipped: pnpm deploy');
     expect(transportSendMock.mock.calls[0]?.[0]).not.toContain('Recommended validation commands:');

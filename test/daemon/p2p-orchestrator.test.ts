@@ -811,7 +811,8 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(nextCycleHopPrompts[0]).toContain('Treat cycle 1/2 outputs as the primary audit scope');
     expect(nextCycleHopPrompts[0]).toContain('P2P Original Request Execution Confirmed (cycle 1/2)');
     expect(nextCycleHopPrompts[0]).toContain('Summary: Cycle 1 execution result');
-    expect(nextCycleHopPrompts[0]).toContain('Changed files: src/cycle-1.ts');
+    expect(nextCycleHopPrompts[0]).toContain('File changes were reported by the execution marker; inspect the workspace for details.');
+    expect(nextCycleHopPrompts[0]).not.toContain('Changed files: src/cycle-1.ts');
     expect(nextCycleHopPrompts[0]).toContain('Tests: vitest cycle 1');
   });
 
