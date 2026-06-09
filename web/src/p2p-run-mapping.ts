@@ -333,17 +333,8 @@ export function mergeP2pStatusResponseDiscussions<T extends {
   const explicitMissingRunId = options.runId && options.runFound === false
     ? `p2p_${options.runId}`
     : null;
-  const incomingIds = new Set(incoming.map((entry) => entry.id));
   const merged = existing.filter((d) => {
     if (explicitMissingRunId && d.id === explicitMissingRunId) return false;
-    if (
-      options.fullList === true
-      && d.id.startsWith('p2p_')
-      && !incomingIds.has(d.id)
-      && !isTerminalDiscussionState(d.state)
-    ) {
-      return false;
-    }
     return true;
   });
 

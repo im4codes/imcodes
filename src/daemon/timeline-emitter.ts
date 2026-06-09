@@ -312,6 +312,12 @@ export class TimelineEmitter {
     return () => { this.handlers.delete(handler); };
   }
 
+  /** Return a copy of the live in-memory buffer for readers that need the
+   * just-emitted event before the async timeline projection catches up. */
+  getBufferedEvents(sessionId: string): TimelineEvent[] {
+    return [...(this.buffer.get(sessionId) ?? [])];
+  }
+
   /**
    * Replay events after a given seq for a session.
    *

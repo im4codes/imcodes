@@ -3636,6 +3636,35 @@ describe('WsBridge', () => {
       expect(payload?.title).not.toContain('deck_sub_timeline-worker');
     });
 
+    it('pushes ask.question timeline events with the actual question text', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 'deck_cd_brain',
+          eventId: 'evt-ask-question',
+          ts: Date.now(),
+          type: 'ask.question',
+          payload: {
+            toolUseId: 'tool-ask-1',
+            questions: [{ question: 'Should I continue with the risky migration?' }],
+          },
+        },
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.title).toBe('my-server · codedeck · claude-code');
+      expect(payload?.body).toBe('Should I continue with the risky migration?');
+      expect(payload?.data).toMatchObject({
+        serverId,
+        session: 'deck_cd_brain',
+        type: 'ask.question',
+      });
+    });
+
     it('does not push stale timeline idle events replayed on daemon restart', async () => {
       const { dispatchPush } = await import('../src/routes/push.js');
       const { daemonWs } = await setupPushBridge();

@@ -1173,6 +1173,7 @@
       "no_change": "Ningún cambio seleccionado",
       "start": "Iniciar entrega automática",
       "stop": "Detener",
+      "confirm_stop": "¿Detener esta entrega automática? El trabajo activo de Team/auditoría se cancelará.",
       "stopping": "Deteniendo...",
       "view": "Ver",
       "compact": "Compactar",

@@ -756,7 +756,7 @@ describe('App shell', () => {
     expect(ws.subscribeTransportSession).not.toHaveBeenCalledWith('deck_sub_alpha_process', expect.anything());
   }, 20_000);
 
-  it('clears stale P2P progress from the session bar when a full status response has no active runs', async () => {
+  it('keeps cached P2P progress until an explicit status lookup confirms the run is missing', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -797,6 +797,20 @@ describe('App shell', () => {
         type: P2P_WORKFLOW_MSG.STATUS_RESPONSE,
         requestId: 'p2p-status-empty',
         runs: [],
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('app-shell-p2p-discussion-p2p_run-status-bar')).toBeTruthy();
+      expect(screen.getByTestId('app-shell-subsession-bar').getAttribute('data-running-discussions')).toBe('1');
+    });
+
+    await act(async () => {
+      ws.emit({
+        type: P2P_WORKFLOW_MSG.STATUS_RESPONSE,
+        requestId: 'p2p-status-missing',
+        runId: 'run-status-bar',
+        run: null,
       });
     });
 
@@ -1261,6 +1275,7 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('subbar-auto-deliver-view'));
     expect(await screen.findByTestId('openspec-auto-details')).toBeTruthy();
 
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
     fireEvent.click(screen.getByText('subbar-auto-deliver-stop-run'));
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'openspec_auto_deliver.stop',
@@ -1403,6 +1418,7 @@ describe('App shell', () => {
     });
 
     expect(await screen.findByTestId('app-shell-auto-deliver-runbar')).toBeTruthy();
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
     fireEvent.click(screen.getByText('subbar-auto-deliver-stop-run'));
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'openspec_auto_deliver.stop',
@@ -1471,6 +1487,7 @@ describe('App shell', () => {
       });
 
       expect(await screen.findByTestId('app-shell-auto-deliver-runbar')).toBeTruthy();
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
       fireEvent.click(screen.getByText('subbar-auto-deliver-stop-run'));
       expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'openspec_auto_deliver.stop',
@@ -1488,6 +1505,7 @@ describe('App shell', () => {
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
 
     const { App } = await importApp();
+    const { watchProjectionStore } = await import('../src/watch-projection.js');
     render(<App />);
 
     expect(await screen.findByText('session-tabs')).toBeTruthy();
@@ -1520,6 +1538,14 @@ describe('App shell', () => {
     expect(screen.getByText('OpenSpec Auto Deliver')).toBeTruthy();
     expect(screen.getByText(/missing_authoritative_json/)).toBeTruthy();
     expect(screen.getByText('Review the failure and continue manually')).toBeTruthy();
+    await waitFor(() => {
+      expect(vi.mocked(watchProjectionStore.pushDurableEvent)).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'ask.question',
+        session: 'deck_alpha_brain',
+        serverId: 'srv-1',
+        message: 'Auto Deliver stopped with reason "missing_authoritative_json". What should happen next in this session?',
+      }));
+    });
 
     fireEvent.click(screen.getByText('ask-submit'));
     expect(ws.askAnswer).toHaveBeenCalledWith('deck_alpha_brain', 'answer');

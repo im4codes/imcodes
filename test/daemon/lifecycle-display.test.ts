@@ -4,6 +4,7 @@ import type { SessionRecord } from '../../src/store/session-store.js';
 vi.mock('../../src/daemon/timeline-store.js', () => ({
   timelineStore: {
     readByTypesPreferred: vi.fn(),
+    append: vi.fn(),
     cleanup: vi.fn(),
     truncateAll: vi.fn(),
     readPreferred: vi.fn(),
@@ -11,6 +12,7 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
 }));
 
 const { timelineStore } = await import('../../src/daemon/timeline-store.js');
+const { timelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
 const { getLastAssistantText, resolvePushDisplayContext } = await import('../../src/daemon/lifecycle.js');
 
 const readByTypesPreferred = vi.mocked(timelineStore.readByTypesPreferred);
@@ -31,6 +33,7 @@ function session(overrides: Partial<SessionRecord> & { name: string }): SessionR
 describe('daemon lifecycle push display helpers', () => {
   afterEach(() => {
     vi.clearAllMocks();
+    timelineEmitter.forgetSession('deck_alpha_brain');
   });
 
   it('uses readable child and parent labels for sub-session push context', () => {
@@ -75,6 +78,16 @@ describe('daemon lifecycle push display helpers', () => {
 
     await expect(getLastAssistantText('deck_alpha_brain')).resolves.toBe('x'.repeat(200));
     expect(readByTypesPreferred).toHaveBeenCalledWith('deck_alpha_brain', ['assistant.text'], { limit: 100 });
+  });
+
+  it('prefers live buffered assistant text over lagging projected timeline text', async () => {
+    timelineEmitter.emit('deck_alpha_brain', 'assistant.text', {
+      text: 'new answer that has not reached projection yet',
+      streaming: false,
+    });
+
+    await expect(getLastAssistantText('deck_alpha_brain')).resolves.toBe('new answer that has not reached projection yet');
+    expect(readByTypesPreferred).not.toHaveBeenCalled();
   });
 
   it('treats timeline read failures as missing push context', async () => {

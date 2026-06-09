@@ -175,6 +175,7 @@ export function useOpenSpecAutoDeliver({
   const [continuePending, setContinuePending] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
   const latestProjectionRef = useRef<OpenSpecAutoDeliverProjection | null>(null);
+  const projectionCacheRef = useRef<Map<string, OpenSpecAutoDeliverProjection>>(new Map());
   const launchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const continueTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -222,6 +223,15 @@ export function useOpenSpecAutoDeliver({
       return;
     }
     latestProjectionRef.current = next;
+    const cacheKeys = [
+      next.owningMainSessionName,
+      next.launchedFromSessionName,
+      next.targetImplementationSessionName,
+      sessionName ?? undefined,
+    ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+    for (const key of cacheKeys) {
+      projectionCacheRef.current.set(key, next);
+    }
     clearLaunchTimeout();
     setProjection(next);
     setLaunchPending(false);
@@ -467,11 +477,12 @@ export function useOpenSpecAutoDeliver({
   }, [applyProjection, clearContinueTimeout, clearLaunchTimeout, clearStopTimeout, ws]);
 
   useEffect(() => {
-    latestProjectionRef.current = null;
+    const cached = sessionName ? projectionCacheRef.current.get(sessionName) ?? null : null;
+    latestProjectionRef.current = cached;
     clearLaunchTimeout();
     clearStopTimeout();
     clearContinueTimeout();
-    setProjection(null);
+    setProjection(cached);
     setLastError(null);
     setLaunchPending(false);
     setStopPending(false);

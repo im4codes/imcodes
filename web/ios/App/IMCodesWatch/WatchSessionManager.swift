@@ -473,7 +473,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
         switch type {
         case "session.idle":
             WKInterfaceDevice.current().play(.success)
-        case "session.notification":
+        case "session.notification", "ask.question":
             WKInterfaceDevice.current().play(.notification)
         case "session.error":
             WKInterfaceDevice.current().play(.failure)

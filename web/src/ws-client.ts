@@ -161,6 +161,7 @@ export type ServerMessage =
   | { type: 'file.search_response'; requestId: string; results: string[]; error?: string }
   | { type: typeof P2P_WORKFLOW_MSG.DAEMON_HELLO; daemonId: string; capabilities: string[]; helloEpoch: number; sentAt: number; timelineProtocolRevision?: number; timelineProtocolCapability?: string; buildInfo?: DaemonBuildInfo }
   | { type: typeof P2P_WORKFLOW_MSG.RUN_UPDATE; run: any }
+  | { type: typeof P2P_WORKFLOW_MSG.RUN_SAVE; run: any }
   | { type: typeof P2P_CONFIG_MSG.SAVE_RESPONSE; requestId: string; scopeSession: string; ok: boolean; error?: string }
   | { type: typeof P2P_WORKFLOW_MSG.CONFLICT; existingRunId: string; initiatorSession: string; commandId: string }
   | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
@@ -168,7 +169,7 @@ export type ServerMessage =
   | { type: 'subsession.removed'; id: string; sessionName: string }
   | { type: typeof P2P_WORKFLOW_MSG.RUN_STARTED; runId: string; session: string }
   | { type: typeof P2P_WORKFLOW_MSG.CANCEL_RESPONSE; runId: string; ok: boolean }
-  | { type: typeof P2P_WORKFLOW_MSG.STATUS_RESPONSE; requestId: string; runId?: string; run?: any; runs?: any[] }
+  | { type: typeof P2P_WORKFLOW_MSG.STATUS_RESPONSE; requestId: string; runId?: string; run?: any; runs?: any[]; error?: string }
   | { type: typeof P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE; requestId: string; discussions: Array<{ id: string; fileName: string; path?: string; preview: string; mtime: number }> }
   | { type: typeof P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE; id?: string; requestId: string; content?: string; error?: string }
   | { type: typeof CC_PRESET_MSG.LIST_RESPONSE; presets: CcPreset[] }
@@ -1090,6 +1091,7 @@ export class WsClient {
   private static readonly DAEMON_ORIGIN_MESSAGE_TYPES: ReadonlySet<string> = new Set<string>([
     P2P_WORKFLOW_MSG.DAEMON_HELLO,
     P2P_WORKFLOW_MSG.RUN_UPDATE,
+    P2P_WORKFLOW_MSG.RUN_SAVE,
     P2P_WORKFLOW_MSG.STATUS_RESPONSE,
     P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
     P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,

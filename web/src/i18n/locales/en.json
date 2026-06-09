@@ -1174,6 +1174,7 @@
       "no_change": "No change selected",
       "start": "Start Auto Deliver",
       "stop": "Stop",
+      "confirm_stop": "Stop this Auto Deliver run? Active Team/audit work will be cancelled.",
       "stopping": "Stopping...",
       "view": "View",
       "compact": "Compact",

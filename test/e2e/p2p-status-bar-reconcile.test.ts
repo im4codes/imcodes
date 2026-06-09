@@ -86,7 +86,7 @@ describe('p2p status bar reconcile e2e', () => {
     return sent.at(-1) as { type: string; requestId: string; runs?: Array<Record<string, unknown>> };
   }
 
-  it('daemon full-list empty status clears stale running P2P bar state in the web reducer', async () => {
+  it('daemon full-list empty status preserves cached active P2P bar state as a resync fallback', async () => {
     const contextFilePath = join(imcSubDir(projectDir, 'discussions'), 'run-status-e2e.md');
     mockListP2pRuns.mockReturnValue([
       {
@@ -131,6 +131,31 @@ describe('p2p status bar reconcile e2e', () => {
       { fullList: Array.isArray(drainedResponse.runs) },
     );
 
-    expect(reconciled.map((discussion) => discussion.id)).toEqual(['p2p_run-already-done', 'classic-discussion']);
+    expect(reconciled.map((discussion) => discussion.id)).toEqual([
+      'p2p_run-status-e2e',
+      'p2p_run-already-done',
+      'classic-discussion',
+    ]);
+  });
+
+  it('explicit missing run status removes only that P2P bar entry', async () => {
+    const activeDiscussion = mapP2pRunToDiscussion({
+      id: 'run-explicit-missing',
+      status: 'running',
+      active_phase: 'hop',
+    });
+    const otherDiscussion = mapP2pRunToDiscussion({
+      id: 'run-still-cached',
+      status: 'running',
+      active_phase: 'hop',
+    });
+
+    const reconciled = mergeP2pStatusResponseDiscussions(
+      [activeDiscussion, otherDiscussion],
+      [],
+      { runId: 'run-explicit-missing', runFound: false },
+    );
+
+    expect(reconciled.map((discussion) => discussion.id)).toEqual(['p2p_run-still-cached']);
   });
 });

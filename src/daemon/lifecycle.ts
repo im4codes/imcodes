@@ -51,16 +51,24 @@ import {
 } from '../../shared/worker-session-snapshot.js';
 import { buildWorkerSessionSyncPlan, type WorkerSessionSyncPlanInput } from './worker-session-sync-plan.js';
 
+function latestAssistantTextFromEvents(events: Array<{ type?: unknown; payload?: unknown }>): string | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event?.type !== 'assistant.text') continue;
+    const text = (event.payload as Record<string, unknown> | undefined)?.text;
+    if (typeof text === 'string' && text.trim()) return text.slice(0, 200);
+  }
+  return undefined;
+}
+
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 export async function getLastAssistantText(sessionName: string): Promise<string | undefined> {
+  const buffered = latestAssistantTextFromEvents(timelineEmitter.getBufferedEvents(sessionName));
+  if (buffered) return buffered;
+
   try {
     const events = await timelineStore.readByTypesPreferred(sessionName, ['assistant.text'], { limit: 100 });
-    for (let i = events.length - 1; i >= 0; i--) {
-      if (events[i].type === 'assistant.text') {
-        const text = (events[i].payload as Record<string, unknown>)?.text;
-        if (typeof text === 'string' && text.trim()) return text.slice(0, 200);
-      }
-    }
+    return latestAssistantTextFromEvents(events);
   } catch { /* ignore */ }
   return undefined;
 }

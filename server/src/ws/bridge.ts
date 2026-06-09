@@ -6616,7 +6616,7 @@ export class WsBridge {
         break;
       case 'ask.question':
         title = titleParts.join(' · ');
-        body = lastText || 'Waiting for your answer';
+        body = this.extractAskQuestionBody(msg) || lastText || 'Waiting for your answer';
         break;
       default:
         return;
@@ -6628,6 +6628,20 @@ export class WsBridge {
       body,
       data: { serverId: this.serverId, session: sessionName, type: eventType },
     }, env);
+  }
+
+  private extractAskQuestionBody(msg: Record<string, unknown>): string {
+    const directQuestion = typeof msg.question === 'string' ? msg.question.trim() : '';
+    if (directQuestion) return directQuestion.slice(0, 200);
+
+    const questions = Array.isArray(msg.questions) ? msg.questions : [];
+    for (const item of questions) {
+      if (!item || typeof item !== 'object') continue;
+      const question = (item as Record<string, unknown>).question;
+      if (typeof question === 'string' && question.trim()) return question.trim().slice(0, 200);
+    }
+
+    return '';
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────

@@ -40,6 +40,7 @@ export interface WatchApplicationContext {
 export type WatchDurableEvent =
   | { type: 'session.idle'; session: string; serverId?: string | null; title?: string; message?: string; agentType?: string; label?: string; parentLabel?: string }
   | { type: 'session.notification'; session: string; serverId?: string | null; title: string; message: string; agentType?: string; label?: string; parentLabel?: string }
+  | { type: 'ask.question'; session: string; serverId?: string | null; title: string; message: string; agentType?: string; label?: string; parentLabel?: string }
   | { type: 'session.error'; project: string; message: string };
 
 export interface WatchProjectionStoreDeps {

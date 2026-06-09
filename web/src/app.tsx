@@ -123,7 +123,7 @@ import {
   type TeamDiscussionGuidePref,
 } from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
-import { WsClient } from './ws-client.js';
+import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
 import { configure as configureApi, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
@@ -1590,6 +1590,8 @@ export function App() {
     /** Server-authored actor metadata for share-originated discussions/P2P. */
     sharedActor?: SharedActorEnvelope;
   }>>([]);
+  const discussionsRef = useRef(discussions);
+  discussionsRef.current = discussions;
 
   /** Set of session names enabled in the P2P config for the active root session. */
   const [p2pSessionNames, setP2pSessionNames] = useState<Set<string>>(new Set());
@@ -2176,6 +2178,23 @@ export function App() {
     serverId: selectedServerId ?? undefined,
     sessionName: appOpenSpecAutoSessionName,
   });
+  const appOpenSpecAutoRequestStatusRef = useRef<() => string | null>(() => null);
+  appOpenSpecAutoRequestStatusRef.current = appOpenSpecAutoDeliver.requestStatus;
+  const confirmOpenSpecAutoStop = useCallback(() => {
+    if (typeof window !== 'undefined' && !window.confirm(transRef.current('openspec.auto.confirm_stop'))) return;
+    appOpenSpecAutoDeliver.stop();
+  }, [appOpenSpecAutoDeliver.stop]);
+  const requestP2pStatusWithCachedRunConfirmation = useCallback((ws: WsClient, scope?: P2pWorkflowRequestScope) => {
+    ws.p2pStatus(scope);
+    const seen = new Set<string>();
+    for (const discussion of discussionsRef.current) {
+      if (!discussion.id.startsWith('p2p_') || !isBarActiveDiscussion(discussion)) continue;
+      const runId = discussion.id.slice('p2p_'.length);
+      if (!runId || seen.has(runId)) continue;
+      seen.add(runId);
+      ws.p2pStatus(runId, scope);
+    }
+  }, []);
   const [appOpenSpecAutoDetailsOpen, setAppOpenSpecAutoDetailsOpen] = useState(false);
   const [appOpenSpecAutoRunbarCompact, setAppOpenSpecAutoRunbarCompact] = useState(false);
   const [appOpenSpecAutoRunbarHiddenRunId, setAppOpenSpecAutoRunbarHiddenRunId] = useState<string | null>(null);
@@ -2658,7 +2677,8 @@ export function App() {
             const initialActive = activeSessionRef.current;
             const initialScope = initialActive ? { sessionName: initialActive } : undefined;
             ws.p2pListDiscussions(initialScope);
-            ws.p2pStatus(initialScope);
+            requestP2pStatusWithCachedRunConfirmation(ws, initialScope);
+            appOpenSpecAutoRequestStatusRef.current();
             // Re-sync classic discussions too (not just the P2P path) so a run
             // that finished while backgrounded is reconciled out of the bar.
             ws.discussionList();
@@ -2824,6 +2844,35 @@ export function App() {
             toolUseId: String(event.payload.toolUseId ?? ''),
             questions: (event.payload.questions as PendingQuestion['questions']) ?? [],
             ...(typeof event.payload.waitMs === 'number' ? { waitMs: event.payload.waitMs } : {}),
+          });
+          const questions = Array.isArray(event.payload.questions)
+            ? event.payload.questions as Array<Record<string, unknown>>
+            : [];
+          const firstQuestion = questions
+            .map((item) => typeof item.question === 'string' ? item.question.trim() : '')
+            .find(Boolean) ?? '';
+          const localSub = subSessions.find(s => s.sessionName === event.sessionId);
+          const localMain = sessionsRef.current.find((s) => s.name === event.sessionId);
+          const label = localSub?.label || localMain?.label || undefined;
+          const parentLabel = localSub?.parentSession
+            ? sessionsRef.current.find((s) => s.name === localSub.parentSession)?.label
+            : undefined;
+          const agentType = localSub?.type || localMain?.agentType || undefined;
+          const displayProject = buildSessionToastLabel(event.sessionId, {
+            label,
+            parentLabel,
+            project: localMain?.project ?? localSub?.parentSession ?? event.sessionId,
+            agentType,
+          });
+          void watchProjectionStore.pushDurableEvent({
+            type: 'ask.question',
+            session: event.sessionId,
+            serverId: selectedServerId,
+            title: displayProject,
+            message: firstQuestion || 'Waiting for your answer',
+            ...(agentType ? { agentType } : {}),
+            ...(label ? { label } : {}),
+            ...(parentLabel ? { parentLabel } : {}),
           });
         }
         // Auto-dismiss a stale question card only once the model's turn is
@@ -3201,7 +3250,7 @@ export function App() {
           );
         }
       }
-      if (msg.type === P2P_WORKFLOW_MSG.RUN_UPDATE && msg.run) {
+      if ((msg.type === P2P_WORKFLOW_MSG.RUN_UPDATE || msg.type === P2P_WORKFLOW_MSG.RUN_SAVE) && msg.run) {
         const entry = mapP2pRunToDiscussion(msg.run as Record<string, any>);
         setDiscussions((prev) => {
           const existing = prev.find((d) => d.id === entry.id);
@@ -3230,7 +3279,7 @@ export function App() {
         setDiscussions((prev) => mergeP2pStatusResponseDiscussions(prev, mapped, {
           runId: typeof msg.runId === 'string' ? msg.runId : undefined,
           runFound: !!msg.run,
-          fullList: Array.isArray(msg.runs),
+          fullList: Array.isArray(msg.runs) && typeof (msg as Record<string, unknown>).error !== 'string',
         }));
       }
       if (msg.type === REPO_MSG.DETECTED || msg.type === REPO_MSG.DETECT_RESPONSE) {
@@ -3435,6 +3484,8 @@ export function App() {
           const reconnectActive = activeSessionRef.current;
           const reconnectScope = reconnectActive ? { sessionName: reconnectActive } : undefined;
           ws.p2pListDiscussions(reconnectScope);
+          requestP2pStatusWithCachedRunConfirmation(ws, reconnectScope);
+          appOpenSpecAutoRequestStatusRef.current();
         }
       }
     });
@@ -3487,7 +3538,11 @@ export function App() {
       // backgrounded disappears from the bar without a reload (absorbs alt-tab churn).
       if (now - lastDiscussionResyncAt > DISCUSSION_RECONCILE_HIDDEN_MS) {
         lastDiscussionResyncAt = now;
+        const session = activeSessionRef.current;
+        const scope = session ? { sessionName: session } : undefined;
         ws.discussionList();
+        requestP2pStatusWithCachedRunConfirmation(ws, scope);
+        appOpenSpecAutoRequestStatusRef.current();
       }
       if (refreshTimeline) requestActiveTimelineRefresh({ resetCooldowns: true });
     };
@@ -3562,7 +3617,7 @@ export function App() {
       for (const timer of resubscribeTimersRef.current) clearTimeout(timer);
       resubscribeTimersRef.current.clear();
     };
-  }, [auth, selectedServerId, selectedShareTarget]);
+  }, [auth, selectedServerId, selectedShareTarget, requestP2pStatusWithCachedRunConfirmation]);
 
   // Subscribe to terminal for ALL sessions when connected.
   // SDK/transport sessions must remain passively subscribed so shared timeline
@@ -5037,7 +5092,7 @@ export function App() {
                 stopPending={appOpenSpecAutoDeliver.stopPending}
                 continuePending={appOpenSpecAutoDeliver.continuePending}
                 onClose={() => setAppOpenSpecAutoDetailsOpen(false)}
-                onStop={() => { appOpenSpecAutoDeliver.stop(); }}
+                onStop={confirmOpenSpecAutoStop}
                 onContinue={() => { appOpenSpecAutoDeliver.continueRun(); }}
               />
             )}
@@ -5070,7 +5125,7 @@ export function App() {
                 openSpecAutoStopPending={appOpenSpecAutoDeliver.stopPending}
                 openSpecAutoCompact={appOpenSpecAutoRunbarCompact}
                 onOpenSpecAutoView={() => setAppOpenSpecAutoDetailsOpen(true)}
-                onOpenSpecAutoStop={() => { appOpenSpecAutoDeliver.stop(); }}
+                onOpenSpecAutoStop={confirmOpenSpecAutoStop}
                 onOpenSpecAutoToggleCompact={() => setAppOpenSpecAutoRunbarCompact((value) => !value)}
                 onOpenSpecAutoHide={() => {
                   if (appOpenSpecAutoProjection) setAppOpenSpecAutoRunbarHiddenRunId(appOpenSpecAutoProjection.runId);

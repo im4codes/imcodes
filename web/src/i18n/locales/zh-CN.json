@@ -1174,6 +1174,7 @@
       "no_change": "未选择变更",
       "start": "启动自动交付",
       "stop": "停止",
+      "confirm_stop": "停止这个自动交付运行？正在进行的 Team/审计任务会被取消。",
       "stopping": "停止中...",
       "view": "查看",
       "compact": "紧凑",
