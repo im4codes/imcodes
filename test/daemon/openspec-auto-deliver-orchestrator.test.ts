@@ -376,6 +376,30 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(audit.locale).toBe('zh-CN');
   });
 
+  it('passes the saved Team hop timeout through Auto Deliver Team/P2P audit launches', async () => {
+    getSavedP2pConfigMock.mockResolvedValue({
+      sessions: {
+        deck_demo_brain: { enabled: true, mode: 'audit' },
+        deck_sub_worker: { enabled: true, mode: 'review' },
+        deck_sub_peer: { enabled: true, mode: 'plan' },
+      },
+      rounds: 1,
+      hopTimeoutMinutes: 7,
+    });
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-hop-timeout',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+    }, serverLinkMock as never);
+
+    expect(startP2pRunMock).toHaveBeenCalledWith(expect.objectContaining({
+      hopTimeoutMs: 420_000,
+    }));
+  });
+
   it('scopes spec Team audit discussions to artifact repair guidance before final scoring', async () => {
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
@@ -1104,6 +1128,57 @@ exec "${realGit}" "$@"
       String(call[0] ?? '').includes('Drive the implementation of @openspec/changes/demo-change aggressively.'),
     )).toBe(false);
     expect([...p2pRuns.values()]).toHaveLength(2);
+  });
+
+  it('does not start another spec Team round after final spec acceptance PASS with acceptable scores', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-spec-pass-does-not-fill-budget',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'deep',
+      materializedLimits: {
+        specAuditRepairRounds: 3,
+        implementationAuditRepairRounds: 1,
+        maxImplementationPrompts: 24,
+        maxElapsedMinutes: 480,
+      },
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
+    await completeLatestDiscussion('completed', '# spec audit discussion\n\nRepair artifacts before final scoring.');
+    await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
+      2500,
+    );
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    const specAcceptancePrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
+      2500,
+    );
+    await completeAcceptanceAuditFromPrompt(specAcceptancePrompt, {
+      module_scores: OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.map((module) => ({
+        module,
+        score: module === 'risk' ? 7 : 8,
+        max_score: 10,
+        summary: `${module} acceptable`,
+      })),
+    });
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    const implementationProjection = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_task_loop',
+      2500,
+    );
+    expect(implementationProjection.projection.finalAfterRepair).toMatchObject({
+      phase: 'final_after_repair',
+      verdict: 'PASS',
+      summary: 'spec_audit_passed',
+    });
+    expect(implementationProjection.projection.moduleScores?.some((score: { score?: number }) => score.score === 7)).toBe(true);
+    expect([...p2pRuns.values()]).toHaveLength(1);
   });
 
   it('stops for human input when spec audit reports BLOCKED', async () => {

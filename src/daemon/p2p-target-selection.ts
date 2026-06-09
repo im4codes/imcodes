@@ -1,5 +1,5 @@
 import { MAX_P2P_PARTICIPANTS, P2P_CONFIG_ERROR, type P2pConfigErrorType } from '../../shared/p2p-config-events.js';
-import { P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
+import { P2P_CONFIG_MODE, type P2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import { getSession, listSessions } from '../store/session-store.js';
 import { getSavedP2pConfig } from '../store/p2p-config-store.js';
 import { getP2pConfigStoreScope } from './session-group-clone.js';
@@ -10,6 +10,7 @@ export interface P2pTargetSelectionResult {
   ok: true;
   targets: P2pTarget[];
   sessionConfig?: P2pSessionConfig;
+  savedConfig?: P2pSavedConfig;
 }
 
 export interface P2pTargetSelectionFailure {
@@ -27,19 +28,28 @@ export function resolveP2pConfigScopeSession(sessionName: string): string {
   return record?.parentSession ?? sessionName;
 }
 
+export async function resolveSavedP2pConfig(
+  sessionName: string,
+  serverLink: ServerLink,
+): Promise<P2pSavedConfig | undefined> {
+  const scopeSession = resolveP2pConfigScopeSession(sessionName);
+  const storeScope = getP2pConfigStoreScope(serverLink, scopeSession);
+  const saved = await getSavedP2pConfig(storeScope);
+  if (saved?.sessions && typeof saved.sessions === 'object') return saved;
+  if (storeScope !== scopeSession) {
+    const legacySaved = await getSavedP2pConfig(scopeSession);
+    if (legacySaved?.sessions && typeof legacySaved.sessions === 'object') return legacySaved;
+  }
+  return undefined;
+}
+
 export async function resolveStructuredP2pSessionConfig(
   sessionName: string,
   serverLink: ServerLink,
   clientConfig?: P2pSessionConfig,
 ): Promise<P2pSessionConfig | undefined> {
-  const scopeSession = resolveP2pConfigScopeSession(sessionName);
-  const storeScope = getP2pConfigStoreScope(serverLink, scopeSession);
-  const saved = await getSavedP2pConfig(storeScope);
+  const saved = await resolveSavedP2pConfig(sessionName, serverLink);
   if (saved?.sessions && typeof saved.sessions === 'object') return saved.sessions;
-  if (storeScope !== scopeSession) {
-    const legacySaved = await getSavedP2pConfig(scopeSession);
-    if (legacySaved?.sessions && typeof legacySaved.sessions === 'object') return legacySaved.sessions;
-  }
   return clientConfig;
 }
 
@@ -95,11 +105,11 @@ export async function resolveConfiguredP2pTargets(
     excludeSameType?: boolean;
   },
 ): Promise<P2pTargetSelection> {
-  const sessionConfig = await resolveStructuredP2pSessionConfig(
+  const savedConfig = await resolveSavedP2pConfig(
     input.initiatorSession,
     input.serverLink,
-    input.clientConfig,
   );
+  const sessionConfig = savedConfig?.sessions ?? input.clientConfig;
   if (!sessionConfig || typeof sessionConfig !== 'object') {
     return { ok: false, error: P2P_CONFIG_ERROR.NO_SAVED_CONFIG };
   }
@@ -128,5 +138,5 @@ export async function resolveConfiguredP2pTargets(
     };
   }
 
-  return { ok: true, targets, sessionConfig };
+  return { ok: true, targets, sessionConfig, savedConfig };
 }

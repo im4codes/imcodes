@@ -25,6 +25,8 @@ import {
   OPENSPEC_AUTO_DELIVER_MODULE_SCORE_FIELDS,
   OPENSPEC_AUTO_DELIVER_REPAIR_SUMMARY_FIELDS,
   OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS,
+  OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX,
+  OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX,
   OPENSPEC_AUTO_DELIVER_TERMINAL_REASONS,
   OPENSPEC_AUTO_DELIVER_VERDICTS,
   isOpenSpecAutoDeliverTerminalStage,
@@ -1884,8 +1886,17 @@ function lowScoringModules(verdict: OpenSpecAutoDeliverVerdictPayload): OpenSpec
   return verdict.module_scores.filter((score) => score.score < OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE);
 }
 
+function maxRuntimeAuditRoundLimit(stage: AuditRepairStage): number {
+  // One extra slot is reserved for the single-model final acceptance audit that
+  // follows a Team repair discussion. Do not let dynamic repair retries grow
+  // the displayed/active budget without bound.
+  return stage === 'spec_audit_repair'
+    ? OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX + 1
+    : OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX + 1;
+}
+
 function extendAuditRoundLimit(run: AutoDeliverRun, stage: AuditRepairStage): void {
-  const nextLimit = auditRoundCount(run, stage) + 1;
+  const nextLimit = Math.min(auditRoundCount(run, stage) + 1, maxRuntimeAuditRoundLimit(stage));
   if (stage === 'spec_audit_repair') {
     run.materializedLimits.specAuditRepairRounds = Math.max(run.materializedLimits.specAuditRepairRounds, nextLimit);
     return;
@@ -1979,15 +1990,14 @@ async function advanceAfterAuditVerdict(
       scheduleAuditFixRetry(run, stage, 'spec_audit_rework_requires_repair');
       return;
     }
-    if (shouldRunAnotherConfiguredAuditRound(run, stage)) {
-      await startAuditRepairStageFailClosed(run, stage);
-      return;
-    }
     if (postRepairVerification) {
       run.finalAfterRepair = scoreSnapshotFromAuditResult(auditResult, 'final_after_repair', 'spec_audit_passed');
       run.moduleScores = run.finalAfterRepair.moduleScores.map((score) => ({ ...score }));
       run.needsPostRepairAcceptanceAudit = false;
       run.postRepairAcceptanceStage = undefined;
+    } else if (shouldRunAnotherConfiguredAuditRound(run, stage)) {
+      await startAuditRepairStageFailClosed(run, stage);
+      return;
     }
     run.latestMessage = 'spec_audit_passed';
     run.evidence = mergeEvidence(run.evidence, await buildValidationEvidence(run));
@@ -2172,6 +2182,9 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
   if (!targetSelection.ok) {
     return terminalizeAndSend(run, 'needs_human', targetSelection.error);
   }
+  const hopTimeoutMs = targetSelection.savedConfig?.hopTimeoutMinutes != null
+    ? Math.min(targetSelection.savedConfig.hopTimeoutMinutes * 60_000, 600_000)
+    : undefined;
   const roundIndex = incrementAuditRound(run, stage);
   const attemptId = `${run.runId}:${stage}:${run.generation}:${roundIndex}`;
   const authoritativeResultPath = await buildAuthoritativeResultPath(run, stage, run.generation, roundIndex);
@@ -2240,6 +2253,7 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
     serverLink: run.serverLink,
     modeOverride: run.selectedTeamComboId,
     rounds: 1,
+    hopTimeoutMs,
     locale: run.locale,
     launchOrigin: {
       kind: 'openspec_auto_deliver',
