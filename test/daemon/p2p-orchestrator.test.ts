@@ -73,6 +73,7 @@ import {
   _setMarkerPromptRetryAfterMs,
   _setMinProcessingMs,
   _setPostSummaryConfirmationDelayMs,
+  _setQueueStuckStopAfterMs,
   _setQueuedPromptStopAfterMs,
   _setRoundHopCleanupDelayMs,
   type P2pRun,
@@ -187,6 +188,7 @@ beforeEach(async () => {
   _setMinProcessingMs(0);
   _setFileSettleCycles(1);
   _setPostSummaryConfirmationDelayMs(0);
+  _setQueueStuckStopAfterMs(40);
   _setQueuedPromptStopAfterMs(40);
   _setRoundHopCleanupDelayMs(0);
   vi.mocked(getTransportRuntime).mockReset();
@@ -237,6 +239,7 @@ afterEach(async () => {
   _setMinProcessingMs(8000);
   _setFileSettleCycles(2);
   _setPostSummaryConfirmationDelayMs(3000);
+  _setQueueStuckStopAfterMs(120000);
   _setQueuedPromptStopAfterMs(20000);
   _setRoundHopCleanupDelayMs(0);
   await rm(tempProjectDir, { recursive: true, force: true }).catch(() => {});
@@ -398,6 +401,53 @@ describe('P2P orchestrator — parallel rounds', () => {
       reason: 'p2p-discussion_section_missing',
       staleMs: 40,
     }));
+    expect(fakeRuntime.cancel).not.toHaveBeenCalled();
+  });
+
+  it('does not cancel an active P2P transport turn just because discussion output has not appeared yet', async () => {
+    const cancelStaleActiveTurnWithPending = vi.fn().mockReturnValue(false);
+    const fakeRuntime = {
+      send: vi.fn().mockReturnValue('sent'),
+      pendingCount: 0,
+      pendingVersion: 3,
+      pendingMessages: [],
+      pendingEntries: [],
+      drainPendingIfIdle: vi.fn().mockReturnValue(false),
+      getDiagnosticSnapshot: vi.fn().mockReturnValue({
+        status: 'thinking',
+        sending: true,
+        pendingCount: 0,
+        pendingVersion: 3,
+        activeDispatchCount: 1,
+        stalePendingRecoveryActive: false,
+        providerSessionBound: true,
+        lastActivityAt: Date.now() - 1_000,
+        lastActivityAgeMs: 1_000,
+      }),
+      cancelStaleActiveTurnWithPending,
+      cancel: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) =>
+      session === 'deck_proj_w1' ? fakeRuntime as any : undefined,
+    );
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'slow active transport p2p prompt',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      180,
+    );
+
+    await waitForStatus(run.id, ['completed', 'timed_out'], 3_000);
+
+    expect(fakeRuntime.send).toHaveBeenCalled();
+    expect(fakeRuntime.drainPendingIfIdle).toHaveBeenCalled();
+    expect(cancelStaleActiveTurnWithPending).not.toHaveBeenCalled();
     expect(fakeRuntime.cancel).not.toHaveBeenCalled();
   });
 

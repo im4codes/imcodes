@@ -2729,8 +2729,9 @@ describe('p2p-workflow reverse-regression', () => {
     ).toBe(true);
     expect(
       /async\s+function\s+maybeStopStaleP2pTransportQueue\s*\(/.test(orchestrator.text)
-        && /runtime\.cancel\(\)/.test(orchestrator.text),
-      'P2P must stop a stale active transport turn once so queued work can drain',
+        && /runtime\.cancelStaleActiveTurnWithPending\(/.test(orchestrator.text)
+        && !/await\s+runtime\.cancel\(\)/.test(orchestrator.text),
+      'P2P stale recovery must use pending-aware runtime recovery instead of raw cancelling active turns',
     ).toBe(true);
     expect(
       /async\s+function\s+isPostSummaryMarkerRetryReady\s*\(/.test(orchestrator.text)

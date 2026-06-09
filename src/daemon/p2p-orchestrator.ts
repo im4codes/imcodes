@@ -798,6 +798,25 @@ async function maybeStopStaleP2pTransportQueue(args: {
     return false;
   }
 
+  if (snapshot.pendingCount <= 0) {
+    logger.debug(
+      {
+        runId: args.run.id,
+        session: args.session,
+        reason: args.reason,
+        dispatchAgeMs,
+        queueStuckStopAfterMs: staleAfterMs,
+        status: snapshot.status,
+        sending: snapshot.sending,
+        pendingCount: snapshot.pendingCount,
+        activeDispatchCount: snapshot.activeDispatchCount,
+        lastActivityAgeMs: snapshot.lastActivityAgeMs,
+      },
+      'P2P: active transport turn has no queued prompt; leaving it to normal hop timeout',
+    );
+    return false;
+  }
+
   const cancelStarted = runtime.cancelStaleActiveTurnWithPending({
     reason: `p2p-${args.reason}`,
     nowMs: now,
@@ -822,7 +841,7 @@ async function maybeStopStaleP2pTransportQueue(args: {
     return true;
   }
 
-  logger.warn(
+  logger.debug(
     {
       runId: args.run.id,
       session: args.session,
@@ -835,16 +854,9 @@ async function maybeStopStaleP2pTransportQueue(args: {
       activeDispatchCount: snapshot.activeDispatchCount,
       lastActivityAgeMs: snapshot.lastActivityAgeMs,
     },
-    'P2P: transport queue appears stale — stopping active turn once to allow queued work to drain',
+    'P2P: stale queue recovery skipped because runtime did not confirm queued pending work',
   );
-
-  try {
-    await runtime.cancel();
-    return true;
-  } catch (err) {
-    logger.warn({ runId: args.run.id, session: args.session, err }, 'P2P: stale transport queue stop failed');
-    return true;
-  }
+  return false;
 }
 
 async function dispatchP2pPromptToSession(args: {

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { performance } from 'node:perf_hooks';
-import { WsBridge, __setTimelineDataPlaneQueueConfigForTests } from '../src/ws/bridge.js';
+import { WsBridge, __setIdlePushSettleMsForTests, __setTimelineDataPlaneQueueConfigForTests } from '../src/ws/bridge.js';
 import { getCounter, resetMetricsForTests } from '../src/util/metrics.js';
 import {
   markDaemonUpgradeTargetVersionPublishedForTest,
@@ -3714,6 +3714,118 @@ describe('WsBridge', () => {
 
       const payload = vi.mocked(dispatchPush).mock.calls[0][0];
       expect(payload.body).toBe('All tests passing.');
+    });
+
+    it('prefers current assistant timeline text over stale idle lastText', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'user-current-turn',
+          sessionId: 'deck_cd_brain',
+          ts: 10,
+          type: 'user.message',
+          payload: { text: 'please run the checks' },
+        },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'assistant-current-turn',
+          sessionId: 'deck_cd_brain',
+          ts: 20,
+          type: 'assistant.text',
+          payload: { text: 'Current turn result: all checks passed.', streaming: false },
+        },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle', session: 'deck_cd_brain', lastText: 'Previous turn text.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.body).toBe('Current turn result: all checks passed.');
+    });
+
+    it('does not reuse stale idle lastText after a newer user message without an assistant response', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'assistant-previous-turn',
+          sessionId: 'deck_cd_brain',
+          ts: 10,
+          type: 'assistant.text',
+          payload: { text: 'Previous turn text.', streaming: false },
+        },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'user-new-turn',
+          sessionId: 'deck_cd_brain',
+          ts: 20,
+          type: 'user.message',
+          payload: { text: 'new request' },
+        },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle', session: 'deck_cd_brain', lastText: 'Previous turn text.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.body).toContain('ready for input');
+      expect(payload?.body).not.toBe('Previous turn text.');
+    });
+
+    it('settles idle push briefly so final assistant text can arrive after idle', async () => {
+      vi.useFakeTimers();
+      const restoreIdlePushSettle = __setIdlePushSettleMsForTests(300);
+      try {
+        const { dispatchPush } = await import('../src/routes/push.js');
+        const { daemonWs } = await setupPushBridge();
+
+        daemonWs.emit('message', JSON.stringify({
+          type: 'timeline.event',
+          event: {
+            eventId: 'user-race-turn',
+            sessionId: 'deck_cd_brain',
+            ts: Date.now(),
+            type: 'user.message',
+            payload: { text: 'current request' },
+          },
+        }));
+        daemonWs.emit('message', JSON.stringify({
+          type: 'session.idle', session: 'deck_cd_brain', lastText: 'Previous turn text.',
+        }));
+        await flushAsync();
+        expect(dispatchPush).not.toHaveBeenCalled();
+
+        daemonWs.emit('message', JSON.stringify({
+          type: 'timeline.event',
+          event: {
+            eventId: 'assistant-race-turn',
+            sessionId: 'deck_cd_brain',
+            ts: Date.now() + 1,
+            type: 'assistant.text',
+            payload: { text: 'Current response arrived after idle.', streaming: false },
+          },
+        }));
+
+        await vi.advanceTimersByTimeAsync(300);
+        await flushAsync();
+
+        const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+        expect(payload?.body).toBe('Current response arrived after idle.');
+      } finally {
+        restoreIdlePushSettle();
+        vi.useRealTimers();
+      }
     });
 
     it('falls back to default body when no lastText', async () => {

@@ -483,6 +483,7 @@ type TimelineDataPlaneJob = {
 
 const WATCH_RECENT_TEXT_CAP = 5;
 const WATCH_RECENT_TEXT_MAX_CHARS = 160;
+let idlePushSettleMs = process.env.NODE_ENV === 'test' ? 0 : 300;
 const HTTP_TIMELINE_TIMEOUT_MS = 15_000;
 const TIMELINE_PENDING_UNICAST_TIMEOUT_MS = 30_000;
 // Bumped from 128 → 4096 and 15s → 60s as part of the commit-42dfabec
@@ -540,6 +541,12 @@ export function __setTimelineDataPlaneQueueConfigForTests(config: {
     timelineDataPlaneQueueCap = previous.queueCap;
     timelineDataPlaneJobDeadlineMs = previous.deadlineMs;
   };
+}
+
+export function __setIdlePushSettleMsForTests(ms: number): () => void {
+  const previous = idlePushSettleMs;
+  idlePushSettleMs = Number.isFinite(ms) && ms >= 0 ? Math.trunc(ms) : previous;
+  return () => { idlePushSettleMs = previous; };
 }
 
 function normalizeRecentText(text: unknown): string | null {
@@ -1051,6 +1058,12 @@ export class WsBridge {
 
   /** Lightweight per-session hot cache for Watch first-paint text. */
   private recentTextBySession = new Map<string, WatchRecentTextRow[]>();
+  private pendingIdlePushes = new Map<string, {
+    timer: ReturnType<typeof setTimeout> | null;
+    db: Database;
+    env: Env;
+    msg: Record<string, unknown>;
+  }>();
 
   /** Latest daemon-owned active main-session snapshot for watch list responses. */
   private activeMainSessions = new Map<string, WatchActiveMainSessionRow>();
@@ -2302,6 +2315,7 @@ export class WsBridge {
         this.authenticated = true;
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
         this.recentTextBySession.clear();
+        this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
         this.hasActiveMainSessionSnapshot = false;
         logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion }, 'Daemon authenticated');
@@ -2449,7 +2463,9 @@ export class WsBridge {
       // Push notifications for key events
       if (env) {
         const pushType = msg.type as string;
-        if (pushType === 'session.idle' || pushType === 'session.notification' || pushType === 'session.error') {
+        if (pushType === 'session.idle') {
+          this.scheduleIdleEventPush(db, env, msg);
+        } else if (pushType === 'session.notification' || pushType === 'session.error') {
           this.dispatchEventPush(db, env, msg).catch((err) =>
             logger.error({ err }, 'Push dispatch failed'),
           );
@@ -2470,11 +2486,11 @@ export class WsBridge {
             const eventTs = typeof event.ts === 'number' ? event.ts : undefined;
             if (payload[TIMELINE_SUPPRESS_PUSH_FIELD] === true) return;
             if (eventTs && Date.now() - eventTs > PUSH_TIMELINE_EVENT_MAX_AGE_MS) return;
-            this.dispatchEventPush(db, env, {
+            this.scheduleIdleEventPush(db, env, {
               type: 'session.idle',
               session: event.sessionId ?? '',
               lastText: (msg as Record<string, unknown>).lastText ?? '',
-            }).catch((err) => logger.error({ err }, 'Push dispatch failed'));
+            });
           }
         }
       }
@@ -2491,6 +2507,7 @@ export class WsBridge {
         // `this.daemonWs !== ws` and bail out.
         this.authPromise = null;
         this.recentTextBySession.clear();
+        this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
         this.activeSubSessions.clear();
         this.hasActiveMainSessionSnapshot = false;
@@ -6563,6 +6580,70 @@ export class WsBridge {
     };
   }
 
+  private clearPendingIdlePushes(): void {
+    for (const pending of this.pendingIdlePushes.values()) {
+      if (pending.timer) clearTimeout(pending.timer);
+    }
+    this.pendingIdlePushes.clear();
+  }
+
+  private mergeIdlePushMessage(previous: Record<string, unknown>, next: Record<string, unknown>): Record<string, unknown> {
+    const merged = { ...previous, ...next };
+    if (typeof next.lastText !== 'string' || !next.lastText.trim()) {
+      if (typeof previous.lastText === 'string' && previous.lastText.trim()) merged.lastText = previous.lastText;
+    }
+    if (typeof next.label !== 'string' || !next.label.trim()) {
+      if (typeof previous.label === 'string' && previous.label.trim()) merged.label = previous.label;
+    }
+    if (typeof next.parentLabel !== 'string' || !next.parentLabel.trim()) {
+      if (typeof previous.parentLabel === 'string' && previous.parentLabel.trim()) merged.parentLabel = previous.parentLabel;
+    }
+    if (typeof next.project !== 'string' || !next.project.trim()) {
+      if (typeof previous.project === 'string' && previous.project.trim()) merged.project = previous.project;
+    }
+    if (typeof next.agentType !== 'string' || !next.agentType.trim()) {
+      if (typeof previous.agentType === 'string' && previous.agentType.trim()) merged.agentType = previous.agentType;
+    }
+    return merged;
+  }
+
+  private scheduleIdleEventPush(db: Database, env: Env, msg: Record<string, unknown>): void {
+    const sessionName = String(msg.session ?? msg.sessionId ?? '');
+    if (!sessionName) return;
+    const key = `session.idle:${sessionName}`;
+    const existing = this.pendingIdlePushes.get(key);
+    if (existing?.timer) clearTimeout(existing.timer);
+    const mergedMsg = existing ? this.mergeIdlePushMessage(existing.msg, msg) : msg;
+
+    const flush = () => {
+      const pending = this.pendingIdlePushes.get(key);
+      if (!pending) return;
+      this.pendingIdlePushes.delete(key);
+      this.dispatchEventPush(pending.db, pending.env, pending.msg).catch((err) =>
+        logger.error({ err }, 'Push dispatch failed'),
+      );
+    };
+
+    if (idlePushSettleMs <= 0) {
+      this.pendingIdlePushes.set(key, { timer: null, db, env, msg: mergedMsg });
+      queueMicrotask(flush);
+      return;
+    }
+
+    const timer = setTimeout(flush, idlePushSettleMs);
+    this.pendingIdlePushes.set(key, { timer, db, env, msg: mergedMsg });
+  }
+
+  private resolveLatestAssistantTextForPush(sessionName: string, daemonLastText: string): string {
+    const rows = this.recentTextBySession.get(sessionName) ?? [];
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      const row = rows[i];
+      if (row.type === 'assistant.text') return row.text.slice(0, 200);
+      if (row.type === 'user.message') return '';
+    }
+    return daemonLastText;
+  }
+
   private async dispatchEventPush(db: Database, env: Env, msg: Record<string, unknown>): Promise<void> {
     // Dedup: same session idle/error can fire from both hook and timeline paths
     const sessionKey = `${msg.type}:${msg.session ?? msg.sessionId ?? ''}`;
@@ -6596,18 +6677,19 @@ export class WsBridge {
     const agentType = resolved.agentType || String(msg.agentType ?? '');
     const titleParts = [server.name, displayName];
     if (agentType) titleParts.push(agentType);
-    const lastText = String(msg.lastText ?? msg.message ?? '').slice(0, 200);
+    const daemonLastText = String(msg.lastText ?? '').slice(0, 200);
+    const messageText = String(msg.message ?? '').slice(0, 200);
 
     let title: string;
     let body: string;
     switch (eventType) {
       case 'session.idle':
         title = titleParts.join(' · ');
-        body = lastText || 'Task complete — ready for input';
+        body = this.resolveLatestAssistantTextForPush(sessionName, daemonLastText) || 'Task complete — ready for input';
         break;
       case 'session.notification': {
         title = titleParts.join(' · ');
-        body = String(msg.message ?? 'Notification');
+        body = messageText || 'Notification';
         break;
       }
       case 'session.error':
@@ -6616,7 +6698,7 @@ export class WsBridge {
         break;
       case 'ask.question':
         title = titleParts.join(' · ');
-        body = this.extractAskQuestionBody(msg) || lastText || 'Waiting for your answer';
+        body = this.extractAskQuestionBody(msg) || 'Waiting for your answer';
         break;
       default:
         return;
