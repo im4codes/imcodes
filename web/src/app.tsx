@@ -2163,10 +2163,10 @@ export function App() {
     Boolean(selectedShareTarget),
   );
   const appOpenSpecAutoScopedSubSessionName = useMemo(() => {
+    if (!isMobileRef.current) return null;
     const visibleById = new Map(visibleSubSessions.map((sub) => [sub.id, sub]));
     const focusedSub = focusedSubId ? (visibleById.get(focusedSubId) ?? subSessions.find((sub) => sub.id === focusedSubId) ?? null) : null;
     if (focusedSub?.sessionName) return focusedSub.sessionName;
-    if (!isMobileRef.current) return null;
     const openIds = Array.from(openSubIds);
     const activeOpenSubId = openIds.length > 0 ? openIds[openIds.length - 1] : null;
     if (!activeOpenSubId) return null;

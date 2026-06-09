@@ -1362,7 +1362,7 @@ describe('App shell', () => {
     expect(screen.queryByTestId('app-shell-auto-deliver-runbar')).toBeNull();
   }, 20_000);
 
-  it('binds the global Auto Deliver runbar actions to the focused sub-session window', async () => {
+  it('keeps the Auto Deliver runbar scoped to the main session when a desktop sub-session window is focused', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -1394,23 +1394,27 @@ describe('App shell', () => {
     await waitFor(() => {
       expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'openspec_auto_deliver.status_request',
-        sessionName: 'deck_sub_alpha_helper',
+        sessionName: 'deck_alpha_brain',
       }));
     });
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.status_request',
+      sessionName: 'deck_sub_alpha_helper',
+    }));
 
     await act(async () => {
       ws.emit({
         type: 'openspec_auto_deliver.projection',
         projection: {
-          runId: 'auto-sub-focused',
+          runId: 'auto-main-while-sub-focused',
           projectionVersion: 1,
           visibility: 'full',
           changeName: 'openspec-auto-delivery',
           status: 'implementation_task_loop',
           stage: 'implementation_task_loop',
           owningMainSessionName: 'deck_alpha_brain',
-          launchedFromSessionName: 'deck_sub_alpha_helper',
-          targetImplementationSessionName: 'deck_sub_alpha_helper',
+          launchedFromSessionName: 'deck_alpha_brain',
+          targetImplementationSessionName: 'deck_alpha_brain',
           taskStats: { total: 4, checked: 2, unchecked: 2 },
           canStop: true,
         },
@@ -1422,8 +1426,8 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('subbar-auto-deliver-stop-run'));
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'openspec_auto_deliver.stop',
-      runId: 'auto-sub-focused',
-      sessionName: 'deck_sub_alpha_helper',
+      runId: 'auto-main-while-sub-focused',
+      sessionName: 'deck_alpha_brain',
     }));
   }, 20_000);
 
