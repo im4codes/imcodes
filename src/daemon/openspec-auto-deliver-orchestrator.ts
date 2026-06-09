@@ -1125,6 +1125,17 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     '- BLOCKED only for external blockers that cannot be repaired in this repository.',
     scoreScope,
     '',
+    'Scoring discipline:',
+    '- Score from 10 downward based on current repaired evidence; do not start from PASS or assume high scores because a repair prompt completed.',
+    '- Treat the repair turn, checked tasks.md, and discussion summaries as claims to verify, not proof. Re-read the repaired files and compare them against every previous required_change, unchecked/falsely-complete task, low-score concern, validation requirement, and Team repair scorecard item.',
+    '- Apply the Team repair scorecard as a recovery table: start from the baseline scores, restore points only for deduction items that are actually fixed and evidenced, and do not restore points for unverified claims.',
+    '- Award 9 or 10 only when fresh post-repair evidence shows the relevant module is complete, edge cases are covered, and appropriate validation ran after repair. If validation could not run, the evidence must explain the concrete blocker and the affected module must not receive 9 or 10.',
+    specStage
+      ? '- For spec-stage scoring, tests means testability of requirements, scenarios, and acceptance criteria. If OpenSpec validation was not run after repair, cap spec, tasks, tests, and risk at 7 even if the text looks clean.'
+      : '- For implementation-stage scoring, tests means actual test coverage plus executed validation. If product validation was not run after repair, cap implementation and risk at 7 and cap tests at 6 even if the code looks plausible.',
+    '- If any previous finding remains unresolved or only unverified, verdict must be REWORK and the affected module score must be 5 or lower.',
+    '- Evidence that only restates the prompt, promises future work, or cites the Team discussion without inspecting repaired files is insufficient for PASS.',
+    '',
     'The top-level auto_deliver object must exactly equal this metadata object:',
     JSON.stringify({
       runId: metadata.runId,
@@ -1144,6 +1155,17 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     `Required top-level fields: ${OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS.join(', ')}.`,
     ...buildAuthoritativeResultSchemaHints(false),
   ].join('\n');
+}
+
+function buildTeamRepairScorecardInstructions(stage: AuditRepairStage): string[] {
+  const target = stage === 'spec_audit_repair' ? 'artifact' : 'implementation';
+  return [
+    'Repair scorecard for final acceptance:',
+    `- Include a non-authoritative repair scorecard in the final Team summary for ${target} repair planning. This is not the final authoritative module_scores JSON.`,
+    '- For each module (spec, tasks, implementation, tests, risk), provide: baseline score before repair, deduction reasons, concrete recovery conditions, and full-score conditions.',
+    '- Phrase recovery conditions as evidence gates, not bonus points. Example: "tests may recover from 6 to 8 only after X test is added and Y validation passes."',
+    '- The later single-model final acceptance audit will use this scorecard as a checklist and may restore points only for conditions proven by post-repair evidence.',
+  ];
 }
 
 function buildPostRepairAcceptanceAuditResultRepairPrompt(
@@ -1750,6 +1772,7 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
       '- Produce concrete repair guidance that the execution model can apply directly.',
       '- In the final Team summary, separate critical fixes, small follow-up fixes, validation requirements, and any blockers.',
       '- Treat high apparent quality as still requiring a repair pass; do not conclude that no implementation repair should run merely because scores would be high.',
+      ...buildTeamRepairScorecardInstructions(metadata.stage),
       '',
       `Task stats: ${run.taskStats.checked}/${run.taskStats.total} checked.`,
       unchecked.length > 0 ? `Unchecked tasks:\n${unchecked.map((label) => `- ${label}`).join('\n')}` : 'Unchecked tasks: none.',
@@ -1789,6 +1812,7 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
     '- Produce concrete artifact repair guidance that the execution model can apply directly.',
     '- In the final Team summary, separate critical artifact fixes, small follow-up fixes, validation requirements, and any blockers.',
     '- Treat high apparent quality as still requiring a repair pass; do not conclude that no spec repair should run merely because scores would be high.',
+    ...buildTeamRepairScorecardInstructions(metadata.stage),
     '',
     `Task stats: ${run.taskStats.checked}/${run.taskStats.total} checked.`,
     unchecked.length > 0 ? `Unchecked tasks:\n${unchecked.map((label) => `- ${label}`).join('\n')}` : 'Unchecked tasks: none.',

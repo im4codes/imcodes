@@ -218,6 +218,27 @@ function expectAuthoritativeResultSchemaHints(text: string): void {
   expect(text).toContain('PASS must leave unchecked_tasks and required_changes empty');
 }
 
+function expectFinalAcceptanceScoringDiscipline(text: string): void {
+  expect(text).toContain('Scoring discipline:');
+  expect(text).toContain('Score from 10 downward based on current repaired evidence');
+  expect(text).toContain('do not start from PASS or assume high scores because a repair prompt completed');
+  expect(text).toContain('Treat the repair turn, checked tasks.md, and discussion summaries as claims to verify, not proof');
+  expect(text).toContain('Team repair scorecard item');
+  expect(text).toContain('Apply the Team repair scorecard as a recovery table');
+  expect(text).toContain('restore points only for deduction items that are actually fixed and evidenced');
+  expect(text).toContain('Award 9 or 10 only when fresh post-repair evidence shows the relevant module is complete');
+  expect(text).toContain('If any previous finding remains unresolved or only unverified, verdict must be REWORK');
+  expect(text).toContain('Evidence that only restates the prompt, promises future work, or cites the Team discussion without inspecting repaired files is insufficient for PASS');
+}
+
+function expectTeamRepairScorecardInstructions(text: string): void {
+  expect(text).toContain('Repair scorecard for final acceptance:');
+  expect(text).toContain('This is not the final authoritative module_scores JSON');
+  expect(text).toContain('baseline score before repair, deduction reasons, concrete recovery conditions, and full-score conditions');
+  expect(text).toContain('Phrase recovery conditions as evidence gates, not bonus points');
+  expect(text).toContain('will use this scorecard as a checklist and may restore points only for conditions proven by post-repair evidence');
+}
+
 async function completeLatestAudit(status = 'completed', payloadOverrides: Record<string, unknown> = {}): Promise<void> {
   const run = [...p2pRuns.values()].at(-1);
   if (!run) throw new Error('No mocked P2P run exists');
@@ -744,6 +765,7 @@ exec "${realGit}" "$@"
     expect(implementationLaunch.userText).toContain('Do not write authoritative JSON. Do not assign final module scores.');
     expect(implementationLaunch.userText).toContain('The execution model will use this discussion file to repair code/tests/tasks');
     expect(implementationLaunch.userText).toContain('Treat high apparent quality as still requiring a repair pass');
+    expectTeamRepairScorecardInstructions(implementationLaunch.userText ?? '');
 
     const discussion = await completeLatestDiscussion();
     const repairPrompt = await waitForTransportSend((text) =>
@@ -766,6 +788,9 @@ exec "${realGit}" "$@"
     );
     expect(acceptancePrompt).not.toContain('Changed files:');
     expect(acceptancePrompt).not.toContain('Diff stat:');
+    expectFinalAcceptanceScoringDiscipline(acceptancePrompt);
+    expect(acceptancePrompt).toContain('For implementation-stage scoring, tests means actual test coverage plus executed validation');
+    expect(acceptancePrompt).toContain('cap implementation and risk at 7 and cap tests at 6');
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitDeckDemoIdle();
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 8000);
@@ -995,6 +1020,7 @@ exec "${realGit}" "$@"
     expect(specLaunch.userText).toContain('Use the OpenSpec specification audit prompt above as the audit-and-repair standard; preserve concrete artifact repair instructions in the discussion output.');
     expect(specLaunch.userText).toContain('Do not write authoritative JSON. Do not assign final module scores.');
     expect(specLaunch.userText).toContain('The execution model will use this discussion file to repair the artifacts');
+    expectTeamRepairScorecardInstructions(specLaunch.userText ?? '');
     const projection = serverLinkMock.send.mock.calls
       .map((call) => call[0])
       .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
@@ -1019,6 +1045,7 @@ exec "${realGit}" "$@"
     expect(specRun.userText).toContain('Use the OpenSpec specification audit prompt above as the audit-and-repair standard; preserve concrete artifact repair instructions in the discussion output.');
     expect(specRun.userText).toContain('Do not write authoritative JSON. Do not assign final module scores.');
     expect(specRun.userText).toContain('The execution model will use this discussion file to repair the artifacts');
+    expectTeamRepairScorecardInstructions(specRun.userText ?? '');
     expect(specRun.userText).not.toContain('Authoritative result file:');
     expect(specRun.userText).not.toContain('Required top-level fields:');
     expect(specOrigin.autoDeliver?.authoritativeResultPath).toBe(specPath);
@@ -1038,6 +1065,9 @@ exec "${realGit}" "$@"
     expect(specAcceptancePrompt).toContain(`Authoritative result file:`);
     expect(specAcceptancePrompt).toContain('Required top-level fields:');
     expectAuthoritativeResultSchemaHints(specAcceptancePrompt);
+    expectFinalAcceptanceScoringDiscipline(specAcceptancePrompt);
+    expect(specAcceptancePrompt).toContain('For spec-stage scoring, tests means testability of requirements, scenarios, and acceptance criteria');
+    expect(specAcceptancePrompt).toContain('cap spec, tasks, tests, and risk at 7');
     await completeAcceptanceAuditFromPrompt(specAcceptancePrompt);
     await emitDeckDemoIdle();
     await waitForSend((msg) =>
@@ -1059,6 +1089,7 @@ exec "${realGit}" "$@"
     expect(implementationRun.userText).toContain('Use the OpenSpec implementation audit prompt above as the audit-and-repair standard; preserve concrete repair instructions in the discussion output.');
     expect(implementationRun.userText).toContain('Do not write authoritative JSON. Do not assign final module scores.');
     expect(implementationRun.userText).toContain('The execution model will use this discussion file to repair code/tests/tasks');
+    expectTeamRepairScorecardInstructions(implementationRun.userText ?? '');
     expect(implementationRun.userText).not.toContain('Authoritative result file:');
     expect(implementationRun.userText).not.toContain('Required top-level fields:');
     expect(implementationOrigin.autoDeliver?.stage).toBe('implementation_audit_repair');
