@@ -595,11 +595,13 @@ export function FileBrowser({
       if (event.key === 'Escape') close();
     };
     document.addEventListener('pointerdown', closeWhenOutsideMenu, true);
+    document.addEventListener('mousedown', closeWhenOutsideMenu, true);
     document.addEventListener('contextmenu', closeWhenOutsideMenu, true);
     window.addEventListener('blur', close);
     window.addEventListener('keydown', onKeyDown);
     return () => {
       document.removeEventListener('pointerdown', closeWhenOutsideMenu, true);
+      document.removeEventListener('mousedown', closeWhenOutsideMenu, true);
       document.removeEventListener('contextmenu', closeWhenOutsideMenu, true);
       window.removeEventListener('blur', close);
       window.removeEventListener('keydown', onKeyDown);

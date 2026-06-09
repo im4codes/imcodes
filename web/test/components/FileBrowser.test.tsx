@@ -845,7 +845,7 @@ describe('FileBrowser', () => {
     fireEvent.contextMenu(row!);
     expect(screen.getByText('Rename')).toBeTruthy();
 
-    fireEvent.pointerDown(document.body);
+    fireEvent.mouseDown(document.body);
     expect(screen.queryByText('Rename')).toBeNull();
   });
 
