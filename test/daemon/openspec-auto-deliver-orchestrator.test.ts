@@ -678,7 +678,7 @@ exec "${realGit}" "$@"
     expect([...p2pRuns.values()]).toHaveLength(2);
   });
 
-  it('continues implementation prompts until tasks.md is fully checked', async () => {
+  it('keeps one implementation prompt active until tasks.md is fully checked', async () => {
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
       requestId: 'req-loop',
@@ -698,10 +698,14 @@ exec "${realGit}" "$@"
     expect(firstImplementationPrompt).toContain('Remaining tasks:');
 
     await emitDeckDemoIdle();
-    await waitForSend((msg) =>
-      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
-      && (msg.projection as { implementationPromptCount?: number } | undefined)?.implementationPromptCount === 2,
+    await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver implementation is not complete yet for @openspec/changes/demo-change.')
+      && text.includes('Reason: implementation_tasks_still_unchecked'),
     );
+    expect(serverLinkMock.send.mock.calls.some((call) =>
+      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && (call[0]?.projection as { implementationPromptCount?: number } | undefined)?.implementationPromptCount === 2,
+    )).toBe(false);
 
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     await emitDeckDemoIdle();
@@ -1880,7 +1884,7 @@ exec "${realGit}" "$@"
     expect(startP2pRunMock).not.toHaveBeenCalled();
   });
 
-  it('bounds implementation prompts and instructs agents not to commit, push, or stage', async () => {
+  it('does not resend the full implementation prompt when tasks remain unchecked after idle', async () => {
     await writeFile(join(projectDir, 'package.json'), JSON.stringify({
       scripts: {
         test: 'vitest run',
@@ -1903,22 +1907,23 @@ exec "${realGit}" "$@"
     expect(transportSendMock.mock.calls[0]?.[0]).toContain('Discovered safe validation command candidates from project manifests: pnpm typecheck; pnpm test');
     expect(transportSendMock.mock.calls[0]?.[0]).toContain('Unsafe validation commands were skipped: pnpm deploy');
     expect(transportSendMock.mock.calls[0]?.[0]).not.toContain('Recommended validation commands:');
-    for (let expectedCount = 2; expectedCount <= 6; expectedCount += 1) {
-      await emitDeckDemoIdle();
-      await waitForSend((msg) =>
-        msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
-        && msg.projection?.implementationPromptCount === expectedCount,
-        1000,
-      );
-    }
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) =>
-      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
-      && msg.projection?.terminalReason === 'implementation_prompt_limit_reached',
+    const reminderPrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver implementation is not complete yet for @openspec/changes/demo-change.')
+      && text.includes('Reason: implementation_tasks_still_unchecked'),
       2500,
     );
-    expect(terminal?.projection.status).toBe('needs_human');
+    expect(reminderPrompt).toContain('Continue from the current implementation state');
+    const fullImplementationPrompts = transportSendMock.mock.calls
+      .map((call) => String(call[0] ?? ''))
+      .filter((text) => text.includes('Implementation prompt:'));
+    expect(fullImplementationPrompts).toHaveLength(1);
+    expect(fullImplementationPrompts[0]).toContain('Implementation prompt: 1/6');
+    expect(serverLinkMock.send.mock.calls.some((call) =>
+      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && call[0]?.projection?.implementationPromptCount > 1,
+    )).toBe(false);
   });
 
   it('captures implementation-reported validation evidence before final audit', async () => {

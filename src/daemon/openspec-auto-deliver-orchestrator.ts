@@ -235,6 +235,7 @@ interface AutoDeliverRun {
   implementationAuditDiscussionFilePath?: string;
   needsPostRepairAcceptanceAudit?: boolean;
   postRepairAcceptanceStage?: AuditRepairStage;
+  lastImplementationRepairPromptKey?: string;
   latestRepairSummary?: string;
   lastAuditResultError?: string;
   evidence?: OpenSpecAutoDeliverEvidence[];
@@ -800,7 +801,7 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
     `Change root: ${run.changeRootIdentity}`,
     `Run id: ${run.runId}`,
     `Generation: ${run.generation}`,
-    `Implementation prompt: ${run.implementationPromptCount + 1}/${maxImplementationPrompts}`,
+    `Implementation prompt: ${run.implementationPromptCount}/${maxImplementationPrompts}`,
     '',
     'Implement only this OpenSpec change. Do not commit, push, or stage files. Do not modify unrelated OpenSpec changes or docs.',
     'Before inspecting, editing, validating, or committing anything, work from the project root above. Do not rely on the execution session current directory if it differs.',
@@ -948,7 +949,7 @@ async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason:
   const runtime = getTransportRuntime(run.targetImplementationSessionName);
   if (!runtime) return terminalize(run, 'failed', 'missing_transport_runtime');
   if (!run.activeImplementationMarker) {
-    return dispatchImplementationPrompt(run, `implementation_marker_missing:${reason}`);
+    return terminalize(run, 'needs_human', `implementation_marker_contract_missing:${reason}`);
   }
   run.activeImplementationMarker.retryCount += 1;
   run.activeCommandId = `${run.runId}:implementation-marker:${run.generation}:${run.implementationPromptCount}:${run.activeImplementationMarker.retryCount}`;
@@ -973,12 +974,26 @@ async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason:
   return broadcastProjection(run);
 }
 
+function implementationRepairPromptKey(run: AutoDeliverRun, reason: string): string {
+  const audit = latestAuditResultForStage(run, 'implementation_audit_repair');
+  return audit
+    ? `${audit.generation}:${audit.attemptId}:${reason}`
+    : `${run.generation}:no-audit:${reason}`;
+}
+
 async function dispatchImplementationRepairPrompt(run: AutoDeliverRun, reason: string): Promise<OpenSpecAutoDeliverProjection> {
-  if (run.implementationPromptCount >= effectiveMaxImplementationPrompts(run)) {
-    run.materializedLimits.maxImplementationPrompts = run.implementationPromptCount + 1;
-  }
   run.needsPostRepairAcceptanceAudit = true;
   run.postRepairAcceptanceStage = 'implementation_audit_repair';
+  const repairKey = implementationRepairPromptKey(run, reason);
+  if (run.lastImplementationRepairPromptKey === repairKey) {
+    run.evidence = mergeEvidence(run.evidence, [{
+      source: 'daemon',
+      summary: `Implementation repair prompt was already dispatched for this audit finding; sending a marker reminder instead: ${reason}.`,
+      stale: false,
+    }]);
+    return dispatchImplementationMarkerReminder(run, `implementation_repair_already_dispatched:${reason}`);
+  }
+  run.lastImplementationRepairPromptKey = repairKey;
   run.evidence = mergeEvidence(run.evidence, [{
     source: 'daemon',
     summary: `Dispatching implementation repair prompt from audit findings: ${reason}.`,
@@ -2492,7 +2507,8 @@ async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void
           command: run.activeCommandId,
           stale: false,
         }]);
-        await dispatchImplementationPrompt(run, `implementation_marker_failed:${markerState.reason}`);
+        const projection = terminalize(run, 'needs_human', `implementation_marker_failed:${markerState.reason}`);
+        send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
         return;
       }
       const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);
@@ -2516,9 +2532,7 @@ async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void
     await startAuditRepairStageFailClosed(run, 'implementation_audit_repair');
     return;
   }
-  delete run.activeCommandId;
-  delete run.activeImplementationMarker;
-  const projection = await dispatchImplementationPrompt(run);
+  const projection = await dispatchImplementationMarkerReminder(run, 'implementation_tasks_still_unchecked');
   if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
   }
@@ -2841,9 +2855,6 @@ async function continueRun(request: OpenSpecAutoDeliverContinueRequest): Promise
     if (auditRoundCount(run, 'implementation_audit_repair') >= auditRoundLimit(run, 'implementation_audit_repair')) extendAuditRoundLimit(run, 'implementation_audit_repair');
     const projection = await startAuditRepairStageFailClosed(run, 'implementation_audit_repair');
     return { ok: true, projection };
-  }
-  if (run.implementationPromptCount >= effectiveMaxImplementationPrompts(run)) {
-    run.materializedLimits.maxImplementationPrompts = run.implementationPromptCount + 1;
   }
   return { ok: true, projection: await dispatchImplementationPrompt(run) };
 }
