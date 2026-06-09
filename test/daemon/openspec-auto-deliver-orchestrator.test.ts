@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
@@ -424,6 +424,52 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       rounds: 1,
       modeOverride: 'audit>review>plan',
     }));
+  });
+
+  it('sends launch ack before collecting the implementation product baseline', async () => {
+    await makeChange('demo-change', '- [ ] first\n');
+    await initializeGitWithRemote();
+    const binDir = await mkdtemp(join(tmpdir(), `imcodes-auto-deliver-git-${Date.now()}-`));
+    extraTempDirs.push(binDir);
+    const oldPath = process.env.PATH;
+    const realGit = (await execFileAsync('which', ['git'])).stdout.toString().trim();
+    await writeFile(join(binDir, 'git'), `#!/bin/bash
+if [ "$3" = "status" ] && [ "$4" = "--porcelain=v1" ]; then
+  sleep 1
+fi
+exec "${realGit}" "$@"
+`, 'utf8');
+    await chmod(join(binDir, 'git'), 0o755);
+    process.env.PATH = `${binDir}:${oldPath ?? ''}`;
+    try {
+      const pending = handleOpenSpecAutoDeliverCommand({
+        type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+        requestId: 'req-launch-ack-before-baseline',
+        sessionName: 'deck_demo_brain',
+        changeName: 'demo-change',
+        presetId: 'deep',
+        materializedLimits: {
+          specAuditRepairRounds: 0,
+          implementationAuditRepairRounds: 1,
+          maxImplementationPrompts: 24,
+          maxElapsedMinutes: 480,
+        },
+      }, serverLinkMock as never);
+
+      const ack = await waitForSend((msg) =>
+        msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK
+        && msg.requestId === 'req-launch-ack-before-baseline',
+        300,
+      );
+      expect(ack.projection?.stage).toBe('proposed');
+      await pending;
+      expect(transportSendMock).toHaveBeenCalledWith(
+        expect.stringContaining('OpenSpec Auto Deliver context for @openspec/changes/demo-change'),
+        expect.stringContaining(':implementation:'),
+      );
+    } finally {
+      process.env.PATH = oldPath;
+    }
   });
 
   it('records only final implementation assistant text as evidence before the audit prompt', async () => {

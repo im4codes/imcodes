@@ -225,6 +225,7 @@ interface AutoDeliverRun {
   evidence?: OpenSpecAutoDeliverEvidence[];
   baselineProductChangedFiles?: string[];
   baselineProductFileFingerprints?: Record<string, string>;
+  productBaselineUnavailableReason?: string;
   autoCommitPushBaselineHead?: string;
   autoCommitPushBaselineAhead?: number;
   autoCommitPushCandidateFiles?: string[];
@@ -762,9 +763,11 @@ function buildSpecRepairPrompt(run: AutoDeliverRun, repairReason: string): strin
   ].join('\n');
 }
 
-function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: string): OpenSpecAutoDeliverProjection {
+async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: string): Promise<OpenSpecAutoDeliverProjection> {
   const elapsedProjection = enforceElapsedLimit(run);
   if (elapsedProjection) return elapsedProjection;
+  const baselineFailure = await ensureProductBaseline(run);
+  if (baselineFailure) return baselineFailure;
   if (!transitionAllowed(run, 'implementation_prompt_dispatched')) {
     return terminalize(run, 'failed', 'invalid_transition_implementation_prompt');
   }
@@ -797,7 +800,7 @@ function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: string
   return broadcastProjection(run);
 }
 
-function dispatchImplementationRepairPrompt(run: AutoDeliverRun, reason: string): OpenSpecAutoDeliverProjection {
+async function dispatchImplementationRepairPrompt(run: AutoDeliverRun, reason: string): Promise<OpenSpecAutoDeliverProjection> {
   if (run.implementationPromptCount >= effectiveMaxImplementationPrompts(run)) {
     run.materializedLimits.maxImplementationPrompts = run.implementationPromptCount + 1;
   }
@@ -1321,6 +1324,28 @@ async function collectAutoCommitProductFiles(projectRoot: string): Promise<strin
   return productChangedFiles(parseGitStatusPorcelainZ(stdout));
 }
 
+async function ensureProductBaseline(run: AutoDeliverRun): Promise<OpenSpecAutoDeliverProjection | null> {
+  if (run.baselineProductChangedFiles && run.baselineProductFileFingerprints) return null;
+  try {
+    const baselineProductChangedFiles = await collectAutoCommitProductFiles(run.projectRoot);
+    run.baselineProductChangedFiles = baselineProductChangedFiles;
+    run.baselineProductFileFingerprints = await productFileFingerprints(run.projectRoot, baselineProductChangedFiles);
+    delete run.productBaselineUnavailableReason;
+    return null;
+  } catch (error) {
+    const reason = describeUnknownError(error);
+    run.baselineProductChangedFiles = [];
+    run.baselineProductFileFingerprints = {};
+    run.productBaselineUnavailableReason = reason;
+    run.evidence = mergeEvidence(run.evidence, [{
+      source: 'daemon',
+      summary: `Product baseline unavailable before implementation; continuing without launch dirty-file filtering: ${reason}.`,
+      stale: false,
+    }]);
+    return null;
+  }
+}
+
 async function currentUpstreamAheadCount(projectRoot: string): Promise<number | null> {
   const upstream = (await gitOutput(projectRoot, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'])
     .catch(() => '')).trim();
@@ -1341,6 +1366,9 @@ function buildAutoCommitPushPrompt(run: AutoDeliverRun, files: string[]): string
 async function dispatchAutoCommitPushPrompt(run: AutoDeliverRun): Promise<OpenSpecAutoDeliverProjection> {
   const elapsedProjection = enforceElapsedLimit(run);
   if (elapsedProjection) return elapsedProjection;
+  if (run.productBaselineUnavailableReason) {
+    return terminalizeAndSend(run, 'needs_human', `auto_commit_push_baseline_failed:${run.productBaselineUnavailableReason}`);
+  }
   if (!transitionAllowed(run, 'auto_commit_push_dispatched')) {
     return terminalizeAndSend(run, 'failed', 'invalid_transition_auto_commit_push');
   }
@@ -1925,7 +1953,7 @@ async function advanceAfterAuditVerdict(
     }
     if (stage === 'implementation_audit_repair') {
       run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', reason);
-      dispatchImplementationRepairPrompt(run, reason);
+      await dispatchImplementationRepairPrompt(run, reason);
       return;
     }
     scheduleAuditFixRetry(run, stage, reason);
@@ -1963,7 +1991,7 @@ async function advanceAfterAuditVerdict(
     }
     run.latestMessage = 'spec_audit_passed';
     run.evidence = mergeEvidence(run.evidence, await buildValidationEvidence(run));
-    dispatchImplementationPrompt(run);
+    await dispatchImplementationPrompt(run);
     return;
   }
 
@@ -1981,7 +2009,7 @@ async function advanceAfterAuditVerdict(
       return;
     }
     run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', 'implementation_audit_rework_requires_repair');
-    dispatchImplementationRepairPrompt(run, 'implementation_audit_rework_requires_repair');
+    await dispatchImplementationRepairPrompt(run, 'implementation_audit_rework_requires_repair');
     return;
   }
 
@@ -2004,18 +2032,18 @@ async function advanceAfterAuditVerdict(
     ]);
     if (currentRunChangedFiles.length > 0 && verdict.repairs_applied.length === 0) {
       run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', 'audit_pass_with_changed_files_without_repairs');
-      dispatchImplementationRepairPrompt(run, 'audit_pass_with_changed_files_without_repairs');
+      await dispatchImplementationRepairPrompt(run, 'audit_pass_with_changed_files_without_repairs');
       return;
     }
     const finalFailure = validateFinalPass(run, verdict, currentRunChangedFiles);
     if (finalFailure) {
       run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', finalFailure);
-      dispatchImplementationRepairPrompt(run, finalFailure);
+      await dispatchImplementationRepairPrompt(run, finalFailure);
       return;
     }
     if (!postRepairVerification) {
       run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON);
-      dispatchImplementationRepairPrompt(run, OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON);
+      await dispatchImplementationRepairPrompt(run, OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON);
       return;
     }
     run.finalAfterRepair = scoreSnapshotFromAuditResult(auditResult, 'final_after_repair', 'final_audit_passed');
@@ -2080,7 +2108,7 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
     }]);
     const projection = expected.stage === 'spec_audit_repair'
       ? dispatchSpecRepairPrompt(run, 'spec_audit_followup_repair')
-      : dispatchImplementationRepairPrompt(run, OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON);
+      : await dispatchImplementationRepairPrompt(run, OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON);
     if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
       send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     }
@@ -2275,7 +2303,7 @@ async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void
     await startAuditRepairStageFailClosed(run, 'implementation_audit_repair');
     return;
   }
-  const projection = dispatchImplementationPrompt(run);
+  const projection = await dispatchImplementationPrompt(run);
   if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
   }
@@ -2329,9 +2357,10 @@ async function advanceAfterPostRepairAcceptanceAuditIdle(run: AutoDeliverRun): P
 function ensureTimelineListener(): void {
   if (timelineUnsubscribe) return;
   timelineUnsubscribe = timelineEmitter.on((event) => {
-  if (event.type === 'assistant.text') {
-      const run = [...runsById.values()].find((candidate) =>
-        candidate.targetImplementationSessionName === event.sessionId
+    if (event.type === 'assistant.text') {
+      const run = Array.from(runsById.values()).find((candidate) =>
+        !isOpenSpecAutoDeliverTerminalStage(candidate.status)
+        && candidate.targetImplementationSessionName === event.sessionId
         && (candidate.status === 'implementation_task_loop' || candidate.status === 'commit_push')
         && !!candidate.activeCommandId
       );
@@ -2349,9 +2378,12 @@ function ensureTimelineListener(): void {
     if (event.type === 'user.message') return;
     if (event.type !== 'session.state') return;
     if ((event.payload as Record<string, unknown>).state !== 'idle') return;
-    const commitPushRun = [...runsById.values()].find((candidate) =>
-      candidate.targetImplementationSessionName === event.sessionId
-      && candidate.status === 'commit_push'
+    const activeCandidates = Array.from(runsById.values()).filter((candidate) =>
+      !isOpenSpecAutoDeliverTerminalStage(candidate.status)
+      && candidate.targetImplementationSessionName === event.sessionId
+    );
+    const commitPushRun = activeCandidates.find((candidate) =>
+      candidate.status === 'commit_push'
       && !!candidate.activeCommandId
     );
     if (commitPushRun) {
@@ -2360,9 +2392,8 @@ function ensureTimelineListener(): void {
       });
       return;
     }
-    const acceptanceAuditRun = [...runsById.values()].find((candidate) =>
-      candidate.targetImplementationSessionName === event.sessionId
-      && candidate.status === candidate.activeAcceptanceAudit?.stage
+    const acceptanceAuditRun = activeCandidates.find((candidate) =>
+      candidate.status === candidate.activeAcceptanceAudit?.stage
       && !!candidate.activeCommandId
       && !!candidate.activeAcceptanceAudit
     );
@@ -2372,9 +2403,8 @@ function ensureTimelineListener(): void {
       });
       return;
     }
-    const specRepairRun = [...runsById.values()].find((candidate) =>
-      candidate.targetImplementationSessionName === event.sessionId
-      && candidate.status === 'spec_audit_repair'
+    const specRepairRun = activeCandidates.find((candidate) =>
+      candidate.status === 'spec_audit_repair'
       && !!candidate.activeCommandId
       && !candidate.activeAcceptanceAudit
     );
@@ -2384,9 +2414,8 @@ function ensureTimelineListener(): void {
       });
       return;
     }
-    const run = [...runsById.values()].find((candidate) =>
-      candidate.targetImplementationSessionName === event.sessionId
-      && candidate.status === 'implementation_task_loop'
+    const run = activeCandidates.find((candidate) =>
+      candidate.status === 'implementation_task_loop'
       && !!candidate.activeCommandId
     );
     if (!run) return;
@@ -2472,8 +2501,6 @@ async function launch(request: OpenSpecAutoDeliverLaunchRequest, serverLink: Ser
     releaseAutoDeliverP2pLock(owner, `launch:${owner}`);
     return { ok: false, error: 'tasks_missing_checkboxes' };
   }
-  const baselineProductChangedFiles = await collectAutoCommitProductFiles(resolved.projectRoot).catch(() => []);
-  const baselineProductFileFingerprints = await productFileFingerprints(resolved.projectRoot, baselineProductChangedFiles).catch(() => ({}));
   const now = Date.now();
   const run: AutoDeliverRun = {
     runId: `auto_${randomUUID().slice(0, 12)}`,
@@ -2501,8 +2528,6 @@ async function launch(request: OpenSpecAutoDeliverLaunchRequest, serverLink: Ser
     taskStats,
     latestMessage: taskStats.total === 0 ? 'tasks_missing_checkboxes' : 'ready',
     evidence: [],
-    baselineProductChangedFiles,
-    baselineProductFileFingerprints,
     requestIds: new Map(),
     serverLink,
   };
@@ -2605,7 +2630,7 @@ async function continueRun(request: OpenSpecAutoDeliverContinueRequest): Promise
   if (run.implementationPromptCount >= effectiveMaxImplementationPrompts(run)) {
     run.materializedLimits.maxImplementationPrompts = run.implementationPromptCount + 1;
   }
-  return { ok: true, projection: dispatchImplementationPrompt(run) };
+  return { ok: true, projection: await dispatchImplementationPrompt(run) };
 }
 
 async function status(request: OpenSpecAutoDeliverStatusRequest): Promise<OpenSpecAutoDeliverProjection | null> {
@@ -2635,7 +2660,7 @@ export async function handleOpenSpecAutoDeliverCommand(cmd: Record<string, unkno
           await startAuditRepairStageFailClosed(run, 'spec_audit_repair');
         } else {
           run.evidence = await buildValidationEvidence(run);
-          dispatchImplementationPrompt(run);
+          await dispatchImplementationPrompt(run);
         }
       }
     } else {

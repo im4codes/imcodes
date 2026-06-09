@@ -10,6 +10,7 @@ const execFileAsync = promisify(execFile);
 
 const GH_MIN_VERSION = '2.0.0';
 const GLAB_MIN_VERSION = '1.22.0';
+const DETECT_REPO_DIRECT_CACHE_TTL_MS = 10_000;
 
 // Known hosts — checked before CLI probe
 const KNOWN_HOSTS: Record<string, RepoPlatform> = {
@@ -24,6 +25,14 @@ interface ParsedRemote {
   owner: string;
   repo: string;
 }
+
+interface DetectRepoCacheEntry {
+  ctx: RepoContext;
+  expiresAt: number;
+}
+
+const detectRepoDirectCache = new Map<string, DetectRepoCacheEntry>();
+const detectRepoDirectInflight = new Map<string, Promise<RepoContext>>();
 
 function stripGitSuffix(value: string): string {
   return value.endsWith('.git') ? value.slice(0, -4) : value;
@@ -197,8 +206,8 @@ async function getDefaultBranch(cwd: string): Promise<string | undefined> {
   }
 }
 
-/** Main detection entry point. */
-export async function detectRepo(projectDir: string): Promise<RepoContext> {
+/** Main detection entry point, uncached. */
+async function detectRepoUncached(projectDir: string): Promise<RepoContext> {
   const freshness = getRepoGenerationSnapshot(projectDir);
   const finish = (ctx: RepoContext): RepoContext => ({
     ...ctx,
@@ -292,6 +301,36 @@ export async function detectRepo(projectDir: string): Promise<RepoContext> {
     cliVersion: cliCheck.cliVersion,
     cliAuth: true,
   });
+}
+
+/** Main detection entry point. */
+export async function detectRepo(projectDir: string): Promise<RepoContext> {
+  const freshness = getRepoGenerationSnapshot(projectDir);
+  const cacheKey = projectDir;
+  const cached = detectRepoDirectCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now() && cached.ctx.repoGeneration === freshness.repoGeneration) {
+    return cached.ctx;
+  }
+
+  const inflight = detectRepoDirectInflight.get(cacheKey);
+  if (inflight) return inflight;
+
+  const promise = detectRepoUncached(projectDir).then((ctx) => {
+    detectRepoDirectCache.set(cacheKey, {
+      ctx,
+      expiresAt: Date.now() + DETECT_REPO_DIRECT_CACHE_TTL_MS,
+    });
+    return ctx;
+  }).finally(() => {
+    detectRepoDirectInflight.delete(cacheKey);
+  });
+  detectRepoDirectInflight.set(cacheKey, promise);
+  return promise;
+}
+
+export function __clearDetectRepoCacheForTests(): void {
+  detectRepoDirectCache.clear();
+  detectRepoDirectInflight.clear();
 }
 
 // Re-export helpers for testing

@@ -1,12 +1,18 @@
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { describe, it, expect } from 'vitest';
-import { detectRepo, parseRemoteUrl, parseRemotes, compareSemver, extractVersion } from '../../src/repo/detector.js';
+import { beforeEach, describe, it, expect } from 'vitest';
+import { detectRepo, parseRemoteUrl, parseRemotes, compareSemver, extractVersion, __clearDetectRepoCacheForTests } from '../../src/repo/detector.js';
+import { __resetRepoGenerationsForTests } from '../../src/repo/generation.js';
 
 const execFileAsync = promisify(execFile);
+
+beforeEach(() => {
+  __clearDetectRepoCacheForTests();
+  __resetRepoGenerationsForTests();
+});
 
 describe('parseRemoteUrl', () => {
   it('parses HTTPS github URL', () => {
@@ -174,6 +180,77 @@ describe('detectRepo local branch context', () => {
       expect(result.info?.currentBranch).toBe('feature/local');
       expect(result.info?.owner).toBe('acme');
       expect(result.info?.repo).toBe('widgets');
+    } finally {
+      process.env.PATH = oldPath;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('deduplicates concurrent detection for the same project directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-detect-cache-'));
+    const repoDir = join(root, 'repo');
+    const binDir = join(root, 'bin');
+    const countFile = join(root, 'gh-count');
+    const oldPath = process.env.PATH;
+    try {
+      await mkdir(repoDir, { recursive: true });
+      await mkdir(binDir, { recursive: true });
+      await writeFile(countFile, '0\n');
+
+      const gitScript = `#!/bin/bash
+set -e
+cmd="$*"
+if [ "$cmd" = "remote -v" ]; then
+  printf 'origin\\thttps://github.com/acme/widgets.git (fetch)\\n'
+elif [ "$cmd" = "symbolic-ref refs/remotes/origin/HEAD --short" ]; then
+  printf 'origin/main\\n'
+elif [ "$cmd" = "symbolic-ref --quiet --short HEAD" ]; then
+  printf 'main\\n'
+else
+  echo "unexpected git command: $cmd" >&2
+  exit 1
+fi
+`;
+      const ghScript = `#!/bin/bash
+set -e
+count="$(<"${countFile}")"
+printf '%s\\n' "$((count + 1))" > "${countFile}"
+if [ "$1" = "--version" ]; then
+  printf 'gh version 2.45.0 (2024-03-01)\\n'
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  exit 0
+fi
+echo "unexpected gh command: $*" >&2
+exit 1
+`;
+      const whichScript = `#!/bin/bash
+set -e
+if [ "$1" = "gh" ]; then
+  printf '${join(binDir, 'gh')}\\n'
+  exit 0
+fi
+exit 1
+`;
+      await writeFile(join(binDir, 'git'), gitScript);
+      await writeFile(join(binDir, 'gh'), ghScript);
+      await writeFile(join(binDir, 'which'), whichScript);
+      await chmod(join(binDir, 'git'), 0o755);
+      await chmod(join(binDir, 'gh'), 0o755);
+      await chmod(join(binDir, 'which'), 0o755);
+
+      process.env.PATH = binDir;
+      const [first, second] = await Promise.all([
+        detectRepo(repoDir),
+        detectRepo(repoDir),
+      ]);
+
+      expect(first.status).toBe('ok');
+      expect(second.status).toBe('ok');
+      expect(first.info?.repo).toBe('widgets');
+      expect(second.info?.repo).toBe('widgets');
+      expect((await readFile(countFile, 'utf8')).trim()).toBe('2');
     } finally {
       process.env.PATH = oldPath;
       await rm(root, { recursive: true, force: true });
