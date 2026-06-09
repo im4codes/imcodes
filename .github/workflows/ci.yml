@@ -754,6 +754,11 @@ jobs:
           java-version: '21'
 
       - uses: android-actions/setup-android@v3
+        with:
+          # The action defaults to "tools platform-tools"; the legacy "tools"
+          # package now resolves to the deprecated sdk-tools archive and can
+          # fail before our explicit modern SDK install step below runs.
+          packages: ''
 
       - name: Install Android SDK packages
         run: |
