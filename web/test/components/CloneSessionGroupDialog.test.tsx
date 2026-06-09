@@ -7,6 +7,7 @@ import { render, screen, fireEvent, cleanup, act } from '@testing-library/preact
 import { CloneSessionGroupDialog } from '../../src/components/CloneSessionGroupDialog.js';
 import type { SessionInfo } from '../../src/types.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1, SESSION_GROUP_CLONE_MSG } from '../../../shared/session-group-clone.js';
+import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -24,6 +25,10 @@ vi.mock('react-i18next', () => ({
         'session.clone.overrideDirectories': 'Use a new working directory for cloned sessions',
         'session.clone.cwdOverride': 'Replacement working directory',
         'session.clone.cwdOverridePlaceholder': '/work/new-checkout',
+        'session.clone.gitRemoteUrl': 'Git remote URL (optional)',
+        'session.clone.gitRemoteUrlPlaceholder': 'https://github.com/org/repo.git',
+        'session.clone.gitRemoteUrlHelp': 'Clone this remote before copying.',
+        'session.clone.gitRemoteCapabilityMissing': 'The daemon does not support remote clone.',
         'session.clone.browseCwd': 'Browse working directory',
         'session.clone.daemonHostValidation': 'Working directories are validated on the daemon host before anything is created.',
         'session.clone.runningWarning': 'The copied group starts fresh.',
@@ -93,7 +98,7 @@ function makeWs() {
     p2pListDiscussions: vi.fn(),
     getDaemonCapabilitySnapshot: vi.fn(() => ({
       daemonId: 'daemon-test',
-      capabilities: [SESSION_GROUP_CLONE_CAPABILITY_V1],
+      capabilities: [SESSION_GROUP_CLONE_CAPABILITY_V1, GIT_REMOTE_CLONE_CAPABILITY_V1],
       helloEpoch: 1,
       sentAt: Date.now(),
       observedAt: Date.now(),
@@ -210,6 +215,29 @@ describe('CloneSessionGroupDialog', () => {
       sourceMainSessionName: 'deck_cd_brain',
       targetProjectName: 'cd_1',
       cwdOverride: null,
+      gitRemoteUrl: null,
+      idempotencyKey: expect.any(String),
+    });
+  });
+
+  it('sends an optional git remote URL with a replacement working directory', () => {
+    const ws = renderDialog();
+
+    fireEvent.click(screen.getByLabelText(/working director/i));
+    fireEvent.input(screen.getByPlaceholderText('/work/new-checkout'), {
+      target: { value: '/work/new-checkout' },
+    });
+    fireEvent.input(screen.getByPlaceholderText('https://github.com/org/repo.git'), {
+      target: { value: 'https://github.com/acme/copied.git' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Copy group' }));
+
+    expect(ws.cloneSessionGroup).toHaveBeenCalledWith({
+      serverId: 'server-1',
+      sourceMainSessionName: 'deck_cd_brain',
+      targetProjectName: 'cd_1',
+      cwdOverride: '/work/new-checkout',
+      gitRemoteUrl: 'https://github.com/acme/copied.git',
       idempotencyKey: expect.any(String),
     });
   });

@@ -17,6 +17,7 @@ import {
 } from '../../shared/p2p-workflow-constants.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
+import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
 import { TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
 import { FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../shared/transport/file-transfer.js';
 import {
@@ -131,6 +132,7 @@ const WATCHDOG_MS = 15_000;           // check connection health every 15s
 const PONG_TIMEOUT_MS = 10_000;       // if no pong within 10s, connection is dead
 const DAEMON_STATIC_CAPABILITIES = [
   SESSION_GROUP_CLONE_CAPABILITY_V1,
+  GIT_REMOTE_CLONE_CAPABILITY_V1,
   TIMELINE_PROTOCOL_CAPABILITY,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 ] as const;

@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact';
+import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -50,6 +51,14 @@ const makeWs = () => {
       handlers.forEach((handler) => handler(msg));
     },
     subSessionDetectShells: vi.fn(),
+    getDaemonCapabilitySnapshot: vi.fn(() => ({
+      daemonId: 'daemon-test',
+      capabilities: [GIT_REMOTE_CLONE_CAPABILITY_V1],
+      helloEpoch: 1,
+      sentAt: Date.now(),
+      observedAt: Date.now(),
+    })),
+    isDaemonCapabilityStale: vi.fn(() => false),
   };
 };
 
@@ -149,6 +158,29 @@ describe('NewSessionDialog', () => {
       agentType: 'claude-code-sdk',
       thinking: 'high',
     });
+  });
+
+  it('includes optional git remote URL for main-session starts', () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), {
+      target: { value: 'my-app' },
+    });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), {
+      target: { value: '/work/my-app' },
+    });
+    fireEvent.input(screen.getByPlaceholderText('git_remote_url_placeholder'), {
+      target: { value: 'https://github.com/acme/my-app.git' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      project: 'my-app',
+      dir: '/work/my-app',
+      gitRemoteUrl: 'https://github.com/acme/my-app.git',
+    }));
   });
 
   it('shows error when submitting with empty project name', () => {

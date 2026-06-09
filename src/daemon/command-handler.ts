@@ -42,6 +42,7 @@ import {
 } from './subsession-manager.js';
 import { sendSubSessionSync, type SubSessionSyncOptions } from './subsession-sync.js';
 import logger from '../util/logger.js';
+import { maybeCloneGitRemoteToDirectory } from './git-remote-clone.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
@@ -1715,7 +1716,7 @@ async function handleInbound(cmd: Record<string, unknown>): Promise<void> {
 async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawProject = cmd.project as string | undefined;
   const agentType = (cmd.agentType as string) || 'claude-code';
-  const dir = expandTilde((cmd.dir as string) || '~');
+  const requestedDir = expandTilde((cmd.dir as string) || '~');
   const ccPresetName = cmd.ccPreset as string | undefined;
   const ccInitPrompt = cmd.ccInitPrompt as string | undefined;
   const requestedModel = (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined);
@@ -1734,7 +1735,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   const label = project !== rawProject.trim().toLowerCase() ? rawProject.trim() : undefined;
   if (isKnownTestSessionName(sessionName) || isKnownTestProjectName(rawProject)) {
     const message = `Refusing to start known test session pattern: ${sessionName}`;
-    logger.warn({ rawProject, project, dir, agentType }, 'session.start rejected by test-session guard');
+    logger.warn({ rawProject, project, dir: requestedDir, agentType }, 'session.start rejected by test-session guard');
     try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
     return;
   }
@@ -1751,10 +1752,16 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     const existingByProject = listSessions(project).filter((s) => s.role === 'brain' && s.state !== 'stopped');
     if (existingByProject.length > 0) {
       const message = `Session already exists for project ${project}. Stop or restart it instead of starting a duplicate.`;
-      logger.warn({ project, dir, agentType, existing: existingByProject.map((s) => s.name) }, 'session.start rejected because project already has an active main session');
+      logger.warn({ project, dir: requestedDir, agentType, existing: existingByProject.map((s) => s.name) }, 'session.start rejected because project already has an active main session');
       try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
       return;
     }
+
+    const dir = await maybeCloneGitRemoteToDirectory({
+      gitRemoteUrl: cmd.gitRemoteUrl,
+      targetDir: requestedDir,
+    });
+
     if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
       removeSession(`deck_${project}_brain`);

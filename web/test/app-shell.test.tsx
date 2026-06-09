@@ -1195,7 +1195,7 @@ describe('App shell', () => {
     expect(screen.getByTestId('discussions-initial-tab').textContent).toBe('auto');
   }, 20_000);
 
-  it('renders the Auto Deliver runbar in the global sub-session toolbar and resets local presentation per run', async () => {
+  it('renders the Auto Deliver runbar in the global sub-session toolbar and persists compact presentation locally', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -1271,6 +1271,26 @@ describe('App shell', () => {
 
     fireEvent.click(screen.getByText('subbar-auto-deliver-compact-run'));
     expect(screen.getByTestId('app-shell-auto-deliver-runbar').getAttribute('data-compact')).toBe('true');
+    expect(localStorage.getItem('rcc_openspec_auto_runbar_compact')).toBe('1');
+
+    await act(async () => {
+      ws.emit({
+        type: 'openspec_auto_deliver.status_projection',
+        projection: {
+          runId: 'auto-global-1',
+          projectionVersion: 4,
+          visibility: 'full',
+          changeName: 'openspec-auto-delivery',
+          status: 'implementation_audit_repair',
+          stage: 'implementation_audit_repair',
+          launchedFromSessionName: 'deck_alpha_brain',
+          targetImplementationSessionName: 'deck_alpha_brain',
+          taskStats: { total: 84, checked: 82, unchecked: 2 },
+          canStop: true,
+        },
+      });
+    });
+    expect(screen.getByTestId('app-shell-auto-deliver-runbar').getAttribute('data-compact')).toBe('true');
 
     fireEvent.click(screen.getByText('subbar-auto-deliver-view'));
     expect(await screen.findByTestId('openspec-auto-details')).toBeTruthy();
@@ -1306,7 +1326,7 @@ describe('App shell', () => {
 
     const resetRunbar = await screen.findByTestId('app-shell-auto-deliver-runbar');
     expect(resetRunbar.textContent).toContain('second-change');
-    expect(resetRunbar.getAttribute('data-compact')).toBe('false');
+    expect(resetRunbar.getAttribute('data-compact')).toBe('true');
   }, 20_000);
 
   it('hides the global Auto Deliver runbar after the run reaches a terminal status', async () => {

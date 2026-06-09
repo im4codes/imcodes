@@ -4,6 +4,7 @@ import {
   SESSION_GROUP_CLONE_CAPABILITY_V1,
   SESSION_GROUP_CLONE_MSG,
 } from '../../shared/session-group-clone.js';
+import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
 
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
 const mockSendToDaemon = vi.fn();
@@ -119,6 +120,33 @@ describe('session group clone routes', () => {
     expect(JSON.stringify(mockLogAudit.mock.calls)).not.toContain('/safe/not-audit-path');
   });
 
+  it('forwards optional git remote clone requests without writing the remote to audit details', async () => {
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_cd_brain/group-clone', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        idempotencyKey: 'idem-git-remote',
+        targetProjectName: 'cd_1',
+        cwdOverride: '/work/copied',
+        gitRemoteUrl: 'https://token@example.com/acme/copied.git',
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(JSON.parse(String(mockSendToDaemon.mock.calls[0]?.[0]))).toEqual({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      serverId: 'srv-1',
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: 'idem-git-remote',
+      targetProjectName: 'cd_1',
+      cwdOverride: '/work/copied',
+      gitRemoteUrl: 'https://token@example.com/acme/copied.git',
+    });
+    expect(JSON.stringify(mockLogAudit.mock.calls)).not.toContain('token@example.com');
+    expect(JSON.stringify(mockLogAudit.mock.calls)).not.toContain('/work/copied');
+  });
+
   it('forwards server-visible session names so daemon default naming can avoid DB-visible conflicts', async () => {
     mockGetDbSessionsByServer.mockResolvedValueOnce([
       { name: 'deck_cd_1_brain' },
@@ -193,6 +221,35 @@ describe('session group clone routes', () => {
       details: expect.objectContaining({
         errorCode: 'unsupported_command',
         missingCapability: SESSION_GROUP_CLONE_CAPABILITY_V1,
+      }),
+    }), {});
+  });
+
+  it('rejects git remote clone requests when the daemon lacks the git clone capability', async () => {
+    mockHasDaemonCapability.mockImplementation((capability) => capability !== GIT_REMOTE_CLONE_CAPABILITY_V1);
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_cd_brain/group-clone', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        idempotencyKey: 'idem-git-capability',
+        targetProjectName: 'cd_1',
+        cwdOverride: '/work/copied',
+        gitRemoteUrl: 'https://github.com/acme/copied.git',
+      }),
+    });
+
+    expect(res.status).toBe(409);
+    await expect(res.json()).resolves.toEqual({
+      error: 'unsupported_command',
+      missingCapability: GIT_REMOTE_CLONE_CAPABILITY_V1,
+    });
+    expect(mockSendToDaemon).not.toHaveBeenCalled();
+    expect(mockLogAudit).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'session_group_clone.failed',
+      details: expect.objectContaining({
+        errorCode: 'unsupported_command',
+        missingCapability: GIT_REMOTE_CLONE_CAPABILITY_V1,
       }),
     }), {});
   });

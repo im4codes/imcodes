@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { PREF_KEY_OPENSPEC_AUTO_DELIVER_AUTO_COMMIT_PUSH } from '../constants/prefs.js';
 import { parseBooleanish, usePref } from '../hooks/usePref.js';
@@ -76,6 +76,51 @@ const OVERALL_PROGRESS_PHASES = [
   'commit_push',
 ] as const;
 const OVERALL_PROGRESS_TOTAL = OVERALL_PROGRESS_PHASES.length + 1;
+const DETAILS_SIZE_STORAGE_KEY = 'rcc_openspec_auto_deliver_details_size';
+const DETAILS_DEFAULT_SIZE = { width: 720, height: 760 };
+const DETAILS_MIN_SIZE = { width: 420, height: 360 };
+
+function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(numeric)));
+}
+
+function desktopDetailsMaxSize(): { width: number; height: number } {
+  if (typeof window === 'undefined') return { width: 1200, height: 900 };
+  return {
+    width: Math.max(DETAILS_MIN_SIZE.width, window.innerWidth - 32),
+    height: Math.max(DETAILS_MIN_SIZE.height, window.innerHeight - 32),
+  };
+}
+
+function readDetailsSizePreference(): { width: number; height: number } {
+  const maxSize = desktopDetailsMaxSize();
+  try {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(DETAILS_SIZE_STORAGE_KEY) : null;
+    const parsed = raw ? JSON.parse(raw) as { width?: unknown; height?: unknown } : null;
+    return {
+      width: clampNumber(parsed?.width, DETAILS_MIN_SIZE.width, maxSize.width, DETAILS_DEFAULT_SIZE.width),
+      height: clampNumber(parsed?.height, DETAILS_MIN_SIZE.height, maxSize.height, DETAILS_DEFAULT_SIZE.height),
+    };
+  } catch {
+    return {
+      width: Math.min(DETAILS_DEFAULT_SIZE.width, maxSize.width),
+      height: Math.min(DETAILS_DEFAULT_SIZE.height, maxSize.height),
+    };
+  }
+}
+
+function isDesktopDetailsViewport(): boolean {
+  if (typeof window === 'undefined') return false;
+  return !window.matchMedia?.('(max-width: 768px)').matches;
+}
+
+function writeDetailsSizePreference(size: { width: number; height: number }): void {
+  try {
+    localStorage.setItem(DETAILS_SIZE_STORAGE_KEY, JSON.stringify(size));
+  } catch { /* ignore */ }
+}
 
 function formatElapsed(ms: number): string {
   const safe = Math.max(0, Math.floor(ms / 1000));
@@ -752,11 +797,39 @@ export function OpenSpecAutoDeliverDetailsPanel({
   const latestMessage = translateAutoDeliverMessage(projection?.recentFinding, t);
   const repairingFromAudit = stage === 'implementation_task_loop'
     && projection?.recentFinding?.startsWith('implementation_repair_prompt_dispatched:');
+  const [detailsSize] = useState(readDetailsSizePreference);
+  const detailsPanelRef = useRef<HTMLDivElement | null>(null);
+  const detailsPanelStyle = useMemo(
+    () => `--openspec-auto-details-width:${detailsSize.width}px;--openspec-auto-details-height:${detailsSize.height}px;`,
+    [detailsSize.height, detailsSize.width],
+  );
+  useEffect(() => {
+    const node = detailsPanelRef.current;
+    if (!node || typeof ResizeObserver === 'undefined') return undefined;
+    let saveTimer: ReturnType<typeof setTimeout> | null = null;
+    const observer = new ResizeObserver((entries) => {
+      if (!isDesktopDetailsViewport()) return;
+      const rect = entries[0]?.contentRect;
+      if (!rect) return;
+      const maxSize = desktopDetailsMaxSize();
+      const next = {
+        width: clampNumber(rect.width, DETAILS_MIN_SIZE.width, maxSize.width, DETAILS_DEFAULT_SIZE.width),
+        height: clampNumber(rect.height, DETAILS_MIN_SIZE.height, maxSize.height, DETAILS_DEFAULT_SIZE.height),
+      };
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => writeDetailsSizePreference(next), 120);
+    });
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+      if (saveTimer) clearTimeout(saveTimer);
+    };
+  }, []);
   if (!projection) return null;
 
   return (
     <div class="openspec-auto-details-backdrop" data-testid="openspec-auto-details">
-      <div class="openspec-auto-details-panel">
+      <div ref={detailsPanelRef} class="openspec-auto-details-panel" style={detailsPanelStyle}>
         <div class="openspec-auto-details-head">
           <div>
             <div class="openspec-auto-kicker">{t('openspec.auto.details_title')}</div>

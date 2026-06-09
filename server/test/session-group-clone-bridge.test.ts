@@ -9,6 +9,7 @@ import {
   SESSION_GROUP_CLONE_CAPABILITY_V1,
   SESSION_GROUP_CLONE_MSG,
 } from '../../shared/session-group-clone.js';
+import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -694,6 +695,27 @@ describe('WsBridge session group clone routing', () => {
       code: 'unsupported_command',
       originalType: SESSION_GROUP_CLONE_MSG.START,
       missingCapability: SESSION_GROUP_CLONE_CAPABILITY_V1,
+    }));
+  });
+
+  it('rejects browser git remote clone commands when daemon git clone capability is missing', async () => {
+    const { serverId, daemon, browserA } = await setup([SESSION_GROUP_CLONE_CAPABILITY_V1]);
+    browserA.emit('message', JSON.stringify({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      serverId,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: 'idem-missing-git-capability',
+      cwdOverride: '/work/copied',
+      gitRemoteUrl: 'https://github.com/acme/copied.git',
+    }));
+    await flush();
+
+    expect(daemon.sentJson().some((msg) => msg.type === SESSION_GROUP_CLONE_MSG.START)).toBe(false);
+    expect(browserA.sentJson()).toContainEqual(expect.objectContaining({
+      type: 'error',
+      code: 'unsupported_command',
+      originalType: SESSION_GROUP_CLONE_MSG.START,
+      missingCapability: GIT_REMOTE_CLONE_CAPABILITY_V1,
     }));
   });
 

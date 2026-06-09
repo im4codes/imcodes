@@ -35,6 +35,8 @@ import type { ServerLink } from './server-link.js';
 import { startSubSession, stopSubSession } from './subsession-manager.js';
 import { sendSubSessionSync } from './subsession-sync.js';
 import { getPaneCwd } from '../agent/tmux.js';
+import { GitRemoteCloneError, cloneGitRemoteToDirectory } from './git-remote-clone.js';
+import { normalizeOptionalGitRemoteUrl } from '../../shared/git-remote-url.js';
 
 const OPERATION_RETENTION_MS = 10 * 60 * 1000;
 
@@ -179,7 +181,7 @@ function assertNotCancelled(operation: CloneOperationSnapshot): void {
   throw new SessionGroupCloneValidationError('cancelled', 'Session group clone cancelled');
 }
 
-function requestFingerprint(request: Pick<SessionGroupCloneRequest, 'sourceMainSessionName' | 'targetProjectName' | 'cwdOverride' | 'serverId'>): string {
+function requestFingerprint(request: Pick<SessionGroupCloneRequest, 'sourceMainSessionName' | 'targetProjectName' | 'cwdOverride' | 'gitRemoteUrl' | 'serverId'>): string {
   return JSON.stringify({
     serverId: request.serverId ?? null,
     sourceMainSessionName: request.sourceMainSessionName.trim(),
@@ -189,6 +191,9 @@ function requestFingerprint(request: Pick<SessionGroupCloneRequest, 'sourceMainS
     cwdOverride: typeof request.cwdOverride === 'string'
       ? request.cwdOverride.trim()
       : request.cwdOverride ?? null,
+    gitRemoteUrl: typeof request.gitRemoteUrl === 'string'
+      ? request.gitRemoteUrl.trim()
+      : request.gitRemoteUrl ?? null,
   });
 }
 
@@ -349,8 +354,14 @@ async function buildCloneSpec(
   activeTargetReservations.add(target.targetMainSessionName);
   operation.reservedTargetName = target.targetMainSessionName;
 
+  const gitRemoteUrl = normalizeOptionalGitRemoteUrl(cmd.gitRemoteUrl);
+  if (gitRemoteUrl && !cmd.cwdOverride?.trim()) {
+    throw new SessionGroupCloneValidationError('invalid_cwd', 'gitRemoteUrl requires cwdOverride');
+  }
   const cwdOverride = cmd.cwdOverride?.trim()
-    ? await resolveUsableDirectory(cmd.cwdOverride, 'cwdOverride')
+    ? gitRemoteUrl
+      ? await cloneGitRemoteToDirectory({ gitRemoteUrl, targetDir: cmd.cwdOverride.trim() })
+      : await resolveUsableDirectory(cmd.cwdOverride, 'cwdOverride')
     : null;
   const mainProjectDir = cwdOverride ?? await resolveUsableDirectory(source.projectDir, `${source.name}.projectDir`);
   assertNotCancelled(operation);
@@ -746,6 +757,7 @@ async function rollbackClone(serverLink: ServerLink, resources: CreatedResources
 }
 
 function errorCodeFromUnknown(err: unknown): SessionGroupCloneErrorCode {
+  if (err instanceof GitRemoteCloneError) return err.code;
   if (err instanceof SessionGroupCloneValidationError) return err.code;
   return 'internal_error';
 }
@@ -769,6 +781,9 @@ export async function handleSessionGroupCloneCommand(cmd: Record<string, unknown
       : undefined,
     cwdOverride: typeof cmd.cwdOverride === 'string' || cmd.cwdOverride === null
       ? cmd.cwdOverride
+      : undefined,
+    gitRemoteUrl: typeof cmd.gitRemoteUrl === 'string' || cmd.gitRemoteUrl === null
+      ? cmd.gitRemoteUrl
       : undefined,
     unavailableSessionNames: Array.isArray(cmd.unavailableSessionNames)
       ? cmd.unavailableSessionNames.filter((name): name is string => typeof name === 'string')

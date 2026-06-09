@@ -22,6 +22,7 @@ const {
   getClaudeSdkRuntimeConfigMock,
   getQwenDisplayMetadataMock,
   getQwenOAuthQuotaUsageLabelMock,
+  cloneGitRemoteToDirectoryMock,
 } = vi.hoisted(() => {
   const sessions = new Map<string, SessionRecord>();
   const p2pConfigs = new Map<string, import('../../shared/p2p-modes.js').P2pSavedConfig>();
@@ -48,6 +49,7 @@ const {
     getClaudeSdkRuntimeConfigMock: vi.fn(async () => ({})),
     getQwenDisplayMetadataMock: vi.fn(() => ({})),
     getQwenOAuthQuotaUsageLabelMock: vi.fn(() => undefined),
+    cloneGitRemoteToDirectoryMock: vi.fn(),
   };
 });
 
@@ -98,6 +100,18 @@ vi.mock('../../src/store/p2p-config-store.js', () => ({
   getSavedP2pConfig: getSavedP2pConfigMock,
   upsertSavedP2pConfig: upsertSavedP2pConfigMock,
   removeSavedP2pConfig: removeSavedP2pConfigMock,
+}));
+
+vi.mock('../../src/daemon/git-remote-clone.js', () => ({
+  GitRemoteCloneError: class GitRemoteCloneError extends Error {
+    readonly code: string;
+    constructor(code: string, message: string) {
+      super(message);
+      this.name = 'GitRemoteCloneError';
+      this.code = code;
+    }
+  },
+  cloneGitRemoteToDirectory: cloneGitRemoteToDirectoryMock,
 }));
 
 vi.mock('../../src/util/logger.js', () => ({
@@ -229,6 +243,7 @@ beforeEach(() => {
   });
   installDefaultLaunchMocks();
   getPaneCwdMock.mockRejectedValue(new Error('tmux unavailable'));
+  cloneGitRemoteToDirectoryMock.mockImplementation(async ({ targetDir }: { targetDir: string }) => targetDir);
   persistSessionRecordAwaitedMock.mockResolvedValue(undefined);
 });
 
@@ -974,6 +989,44 @@ describe('daemon session group clone', () => {
     expect(sessions.get('deck_cd_1_brain')?.projectDir).toBe(resolvedTargetDir);
     const clonedSub = [...sessions.values()].find((record) => record.parentSession === 'deck_cd_1_brain');
     expect(clonedSub?.projectDir).toBe(resolvedTargetDir);
+  });
+
+  it('clones an optional git remote into the cwd override before copying the group', async () => {
+    const sourceDir = await makeDir('remote-source');
+    const requestedTargetDir = join(await makeDir('remote-parent'), 'checkout');
+    const clonedTargetDir = await makeDir('remote-cloned');
+    cloneGitRemoteToDirectoryMock.mockResolvedValueOnce(clonedTargetDir);
+    sessions.set('deck_cd_brain', makeSession({
+      name: 'deck_cd_brain',
+      projectName: 'cd',
+      role: 'brain',
+      projectDir: sourceDir,
+    }));
+    sessions.set('deck_sub_active', makeSession({
+      name: 'deck_sub_active',
+      projectName: 'deck_sub_active',
+      role: 'w1',
+      projectDir: '',
+      parentSession: 'deck_cd_brain',
+    }));
+    const { link, sent } = makeServerLink();
+
+    await handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: `idem-remote-cwd-${unique++}`,
+      cwdOverride: requestedTargetDir,
+      gitRemoteUrl: 'https://github.com/acme/copied.git',
+    }, link as never);
+
+    expect(cloneGitRemoteToDirectoryMock).toHaveBeenCalledWith({
+      gitRemoteUrl: 'https://github.com/acme/copied.git',
+      targetDir: requestedTargetDir,
+    });
+    expect(sent.at(-1)?.state).toBe('succeeded');
+    expect(sessions.get('deck_cd_1_brain')?.projectDir).toBe(clonedTargetDir);
+    const clonedSub = [...sessions.values()].find((record) => record.parentSession === 'deck_cd_1_brain');
+    expect(clonedSub?.projectDir).toBe(clonedTargetDir);
   });
 
   it('uses the live process pane cwd when an active sub-session has no persisted cwd', async () => {

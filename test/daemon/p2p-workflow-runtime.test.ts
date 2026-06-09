@@ -8,6 +8,7 @@ import {
 } from '../../shared/p2p-workflow-constants.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
+import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
 import { TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
 import { FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../shared/transport/file-transfer.js';
 import type {
@@ -193,6 +194,7 @@ describe('ServerLink P2P workflow hello', () => {
       P2P_WORKFLOW_OPENSPEC_ARTIFACTS_CAPABILITY_V1,
       P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
       SESSION_GROUP_CLONE_CAPABILITY_V1,
+      GIT_REMOTE_CLONE_CAPABILITY_V1,
       TIMELINE_PROTOCOL_CAPABILITY,
       FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
     ]);
@@ -212,6 +214,7 @@ describe('ServerLink P2P workflow hello', () => {
       P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
     ].sort().concat([
       SESSION_GROUP_CLONE_CAPABILITY_V1,
+      GIT_REMOTE_CLONE_CAPABILITY_V1,
       TIMELINE_PROTOCOL_CAPABILITY,
       FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
     ]));
@@ -275,6 +278,7 @@ describe('ServerLink P2P workflow hello', () => {
         P2P_WORKFLOW_OPENSPEC_ARTIFACTS_CAPABILITY_V1,
         P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
         SESSION_GROUP_CLONE_CAPABILITY_V1,
+        GIT_REMOTE_CLONE_CAPABILITY_V1,
         TIMELINE_PROTOCOL_CAPABILITY,
         FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
       ],
@@ -348,6 +352,7 @@ describe('ServerLink P2P workflow hello', () => {
         P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
       ].sort().concat([
         SESSION_GROUP_CLONE_CAPABILITY_V1,
+        GIT_REMOTE_CLONE_CAPABILITY_V1,
         TIMELINE_PROTOCOL_CAPABILITY,
         FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
       ]),

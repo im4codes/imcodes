@@ -916,6 +916,7 @@ export class WsClient {
           idempotencyKey: payload.idempotencyKey,
           ...(payload.targetProjectName !== undefined ? { targetProjectName: payload.targetProjectName } : {}),
           ...(payload.cwdOverride !== undefined ? { cwdOverride: payload.cwdOverride } : {}),
+          ...(payload.gitRemoteUrl !== undefined ? { gitRemoteUrl: payload.gitRemoteUrl } : {}),
         }),
       });
       return;

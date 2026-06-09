@@ -796,14 +796,16 @@ html.native-ios-mac .chat-dl-btn {
   gap: 10px;
 }
 .openspec-auto-icon-btn {
-  width: 26px;
-  height: 26px;
+  width: 32px;
+  height: 32px;
   flex: 0 0 auto;
   border: 1px solid rgba(148, 163, 184, 0.28);
   border-radius: 7px;
   background: rgba(15, 23, 42, 0.78);
   color: #cbd5e1;
   cursor: pointer;
+  line-height: 1;
+  touch-action: manipulation;
 }
 .openspec-auto-icon-btn:hover { color: #fff; border-color: rgba(125, 211, 252, 0.55); }
 .openspec-auto-preset-grid {
@@ -895,8 +897,13 @@ html.native-ios-mac .chat-dl-btn {
   background: rgba(2, 6, 23, 0.62);
 }
 .openspec-auto-details-panel {
-  width: min(720px, calc(100vw - 32px));
-  max-height: min(760px, calc(var(--vvh, 100dvh) - 32px));
+  box-sizing: border-box;
+  width: min(var(--openspec-auto-details-width, 720px), calc(100vw - 32px));
+  height: min(var(--openspec-auto-details-height, 760px), calc(var(--vvh, 100dvh) - 32px));
+  min-width: min(420px, calc(100vw - 32px));
+  min-height: min(360px, calc(var(--vvh, 100dvh) - 32px));
+  max-height: min(900px, calc(var(--vvh, 100dvh) - 32px));
+  resize: both;
   overflow: auto;
   padding: 16px;
   border: 1px solid rgba(56, 189, 248, 0.26);
@@ -904,6 +911,15 @@ html.native-ios-mac .chat-dl-btn {
   background: linear-gradient(145deg, rgba(2, 6, 23, 0.98), rgba(15, 23, 42, 0.96));
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5), inset 0 0 0 1px rgba(148, 163, 184, 0.08);
   color: #dbe7f5;
+}
+.openspec-auto-details-panel .openspec-auto-details-head {
+  position: sticky;
+  top: -16px;
+  z-index: 2;
+  margin: -16px -16px 0;
+  padding: 16px 16px 10px;
+  background: linear-gradient(145deg, rgba(2, 6, 23, 0.98), rgba(15, 23, 42, 0.96));
+  border-bottom: 1px solid rgba(71, 85, 105, 0.36);
 }
 .openspec-auto-details-head h3 { margin: 2px 0 0; color: #f8fafc; font-size: 18px; }
 .openspec-auto-detail-grid {
@@ -1343,11 +1359,28 @@ html.native-ios-mac .chat-dl-btn {
   .openspec-auto-preset-grid,
   .openspec-auto-detail-grid,
   .openspec-auto-score-grid { grid-template-columns: 1fr; }
-  .openspec-auto-details-backdrop { align-items: flex-end; padding: 8px; }
+  .openspec-auto-details-backdrop {
+    align-items: flex-end;
+    padding: calc(max(var(--sat, 0px), env(safe-area-inset-top, 0px)) + 8px) 8px calc(env(safe-area-inset-bottom, 0px) + 8px);
+  }
   .openspec-auto-details-panel {
     width: 100%;
-    max-height: calc(var(--vvh, 100dvh) - 16px);
+    height: auto;
+    min-width: 0;
+    min-height: 0;
+    max-height: calc(var(--vvh, 100dvh) - max(var(--sat, 0px), env(safe-area-inset-top, 0px)) - env(safe-area-inset-bottom, 0px) - 16px);
+    resize: none;
     border-radius: 12px 12px 0 0;
+  }
+  .openspec-auto-details-panel .openspec-auto-details-head {
+    top: -16px;
+    align-items: center;
+  }
+  .openspec-auto-details-panel .openspec-auto-icon-btn {
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    font-size: 22px;
   }
   .openspec-folder-modal {
     width: 100vw;

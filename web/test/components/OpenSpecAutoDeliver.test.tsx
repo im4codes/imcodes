@@ -91,6 +91,7 @@ function specAuditProjection(): OpenSpecAutoDeliverProjection {
 describe('OpenSpecAutoDeliver components', () => {
   afterEach(() => {
     cleanup();
+    localStorage.clear();
     vi.restoreAllMocks();
   });
 
@@ -178,6 +179,22 @@ describe('OpenSpecAutoDeliver components', () => {
 
     expect(screen.getAllByText('Spec audit Team run started.').length).toBeGreaterThanOrEqual(2);
     expect(document.body.textContent).not.toContain('spec_audit_repair_p2p_started');
+  });
+
+  it('applies the saved desktop details panel size', () => {
+    localStorage.setItem('rcc_openspec_auto_deliver_details_size', JSON.stringify({ width: 880, height: 640 }));
+
+    render(
+      <OpenSpecAutoDeliverDetailsPanel
+        projection={specAuditProjection()}
+        onClose={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    );
+
+    const panel = screen.getByTestId('openspec-auto-details').querySelector('.openspec-auto-details-panel') as HTMLElement | null;
+    expect(panel?.style.getPropertyValue('--openspec-auto-details-width')).toBe('880px');
+    expect(panel?.style.getPropertyValue('--openspec-auto-details-height')).toBe('640px');
   });
 
   it('separates pre-repair audit scores from pending final acceptance scores', () => {

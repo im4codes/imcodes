@@ -40,6 +40,8 @@ export type SessionGroupCloneErrorCode =
   | 'blank_target_project'
   | 'name_taken'
   | 'invalid_cwd'
+  | 'invalid_git_remote'
+  | 'git_clone_failed'
   | 'incomplete_clone_spec'
   | 'unsupported_session_type'
   | 'p2p_config_invalid'
@@ -101,6 +103,7 @@ export interface SessionGroupCloneRequest {
   idempotencyKey: string;
   targetProjectName?: string | null;
   cwdOverride?: string | null;
+  gitRemoteUrl?: string | null;
   /** Server-supplied, internal-only names unavailable for target allocation. */
   unavailableSessionNames?: string[];
 }
@@ -116,6 +119,7 @@ export interface SessionGroupCloneOptions {
   idempotencyKey: string;
   targetProjectName?: string | null;
   cwdOverride?: string | null;
+  gitRemoteUrl?: string | null;
 }
 
 export interface CloneableMainSessionSpec {

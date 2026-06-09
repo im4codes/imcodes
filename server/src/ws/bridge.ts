@@ -160,6 +160,7 @@ import {
   type SessionGroupCloneSkippedMember,
   type SessionGroupCloneWarning,
 } from '../../../shared/session-group-clone.js';
+import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import { P2P_CONFIG_MSG } from '../../../shared/p2p-config-events.js';
 import { p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../../../shared/p2p-config-scope.js';
 import { isP2pSavedConfig, type P2pSavedConfig } from '../../../shared/p2p-modes.js';
@@ -3566,12 +3567,18 @@ export class WsBridge {
     const idempotencyKey = typeof msg.idempotencyKey === 'string' ? msg.idempotencyKey.trim() : '';
     const targetProjectName = readCloneOptionalString(msg, 'targetProjectName');
     const cwdOverride = readCloneOptionalString(msg, 'cwdOverride');
-    if (!sourceMainSessionName || !idempotencyKey || !targetProjectName.ok || !cwdOverride.ok) {
+    const gitRemoteUrl = readCloneOptionalString(msg, 'gitRemoteUrl');
+    if (!sourceMainSessionName || !idempotencyKey || !targetProjectName.ok || !cwdOverride.ok || !gitRemoteUrl.ok) {
       sendError('invalid_request');
       return;
     }
     if (typeof targetProjectName.value === 'string' && targetProjectName.value.trim() === '') {
       sendError('blank_target_project');
+      return;
+    }
+    if (typeof gitRemoteUrl.value === 'string' && gitRemoteUrl.value.trim()
+      && !this.hasDaemonCapability(GIT_REMOTE_CLONE_CAPABILITY_V1)) {
+      sendError('unsupported_command', { missingCapability: GIT_REMOTE_CLONE_CAPABILITY_V1 });
       return;
     }
     const targetMainSessionName = await this.findExplicitSessionGroupCloneTargetConflict(targetProjectName.value);
@@ -3602,6 +3609,7 @@ export class WsBridge {
     };
     if (targetProjectName.value !== undefined) payload.targetProjectName = targetProjectName.value;
     if (cwdOverride.value !== undefined) payload.cwdOverride = cwdOverride.value;
+    if (gitRemoteUrl.value !== undefined) payload.gitRemoteUrl = gitRemoteUrl.value;
     const unavailableSessionNames = await this.getServerVisibleSessionNames();
     if (unavailableSessionNames.length > 0) payload.unavailableSessionNames = unavailableSessionNames;
     this.registerSessionGroupCloneOperationContext({ idempotencyKey, userId, sourceMainSessionName });

@@ -227,6 +227,15 @@ type AppUpdateNotice = {
 const FAST_SERVER_SWITCH_SPLASH_KEY = 'imcodes:fast-server-switch-splash';
 const DAEMON_ONLINE_WS_RECOVERY_INITIAL_MS = 5_000;
 const DAEMON_ONLINE_WS_RECOVERY_INTERVAL_MS = 5_000;
+const OPENSPEC_AUTO_RUNBAR_COMPACT_STORAGE_KEY = 'rcc_openspec_auto_runbar_compact';
+
+function readOpenSpecAutoRunbarCompactPreference(): boolean {
+  try {
+    return localStorage.getItem(OPENSPEC_AUTO_RUNBAR_COMPACT_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
 
 function markFastServerSwitchSplash(): void {
   try {
@@ -2196,7 +2205,7 @@ export function App() {
     }
   }, []);
   const [appOpenSpecAutoDetailsOpen, setAppOpenSpecAutoDetailsOpen] = useState(false);
-  const [appOpenSpecAutoRunbarCompact, setAppOpenSpecAutoRunbarCompact] = useState(false);
+  const [appOpenSpecAutoRunbarCompact, setAppOpenSpecAutoRunbarCompact] = useState(readOpenSpecAutoRunbarCompactPreference);
   const [appOpenSpecAutoRunbarHiddenRunId, setAppOpenSpecAutoRunbarHiddenRunId] = useState<string | null>(null);
   const appOpenSpecAutoProjection = appOpenSpecAutoDeliver.projection;
   const appOpenSpecAutoRunbarHidden = appOpenSpecAutoRunbarHiddenRunId === appOpenSpecAutoProjection?.runId;
@@ -2206,8 +2215,12 @@ export function App() {
     && !appOpenSpecAutoRunbarHidden;
   useEffect(() => {
     setAppOpenSpecAutoRunbarHiddenRunId(null);
-    setAppOpenSpecAutoRunbarCompact(false);
   }, [appOpenSpecAutoProjection?.runId]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(OPENSPEC_AUTO_RUNBAR_COMPACT_STORAGE_KEY, appOpenSpecAutoRunbarCompact ? '1' : '0');
+    } catch { /* ignore */ }
+  }, [appOpenSpecAutoRunbarCompact]);
   const managedSharedSubSessionStateById = useMemo(() => {
     const states = new Map<string, SharedStateSummary>();
     if (!selectedServerId) return states;

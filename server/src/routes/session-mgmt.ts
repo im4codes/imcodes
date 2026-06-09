@@ -41,6 +41,7 @@ import {
   mainSessionNameForProjectSlug,
   type SessionGroupCloneErrorCode,
 } from '../../../shared/session-group-clone.js';
+import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import type { SharedActorEnvelope } from '../../../shared/tab-sharing.js';
 
 export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -411,6 +412,7 @@ sessionMgmtRoutes.post('/:id/sessions/:rootSession/group-clone', async (c) => {
   const idempotencyKey = typeof body.idempotencyKey === 'string' ? body.idempotencyKey.trim() : '';
   const targetProjectNameResult = readOptionalStringField(body, 'targetProjectName');
   const cwdOverrideResult = readOptionalStringField(body, 'cwdOverride');
+  const gitRemoteUrlResult = readOptionalStringField(body, 'gitRemoteUrl');
   const auditBase = {
     role,
     sourceMainSessionName,
@@ -436,7 +438,7 @@ sessionMgmtRoutes.post('/:id/sessions/:rootSession/group-clone', async (c) => {
     return c.json({ error: 'invalid_request', reason: 'idempotencyKey_required' }, 400);
   }
 
-  if (!targetProjectNameResult.ok || !cwdOverrideResult.ok) {
+  if (!targetProjectNameResult.ok || !cwdOverrideResult.ok || !gitRemoteUrlResult.ok) {
     await auditSessionGroupClone(c, {
       ...auditBase,
       outcome: 'failed',
@@ -487,6 +489,19 @@ sessionMgmtRoutes.post('/:id/sessions/:rootSession/group-clone', async (c) => {
       missingCapability: SESSION_GROUP_CLONE_CAPABILITY_V1,
     }, 409);
   }
+  if (typeof gitRemoteUrlResult.value === 'string' && gitRemoteUrlResult.value.trim()
+    && !bridge.hasDaemonCapability(GIT_REMOTE_CLONE_CAPABILITY_V1)) {
+    await auditSessionGroupClone(c, {
+      ...auditBase,
+      outcome: 'failed',
+      errorCode: 'unsupported_command',
+      missingCapability: GIT_REMOTE_CLONE_CAPABILITY_V1,
+    });
+    return c.json({
+      error: 'unsupported_command',
+      missingCapability: GIT_REMOTE_CLONE_CAPABILITY_V1,
+    }, 409);
+  }
 
   const payload: Record<string, unknown> = {
     type: SESSION_GROUP_CLONE_MSG.START,
@@ -499,6 +514,9 @@ sessionMgmtRoutes.post('/:id/sessions/:rootSession/group-clone', async (c) => {
   }
   if (cwdOverrideResult.value !== undefined) {
     payload.cwdOverride = cwdOverrideResult.value;
+  }
+  if (gitRemoteUrlResult.value !== undefined) {
+    payload.gitRemoteUrl = gitRemoteUrlResult.value;
   }
   const unavailableSessionNames = dbSessions
     .map((session) => session.name)
