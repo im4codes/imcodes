@@ -1915,6 +1915,13 @@ function lowScoringModules(verdict: OpenSpecAutoDeliverVerdictPayload): OpenSpec
   return verdict.module_scores.filter((score) => score.score < OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE);
 }
 
+function isPerfectPass(verdict: OpenSpecAutoDeliverVerdictPayload): boolean {
+  return verdict.verdict === 'PASS'
+    && verdict.unchecked_tasks.length === 0
+    && verdict.required_changes.length === 0
+    && verdict.module_scores.every((score) => score.score === score.max_score);
+}
+
 function maxRuntimeAuditRoundLimit(stage: AuditRepairStage): number {
   return stage === 'spec_audit_repair'
     ? OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX
@@ -1932,7 +1939,6 @@ function extendAuditRoundLimit(run: AutoDeliverRun, stage: AuditRepairStage): vo
 
 function scheduleAuditFixRetry(run: AutoDeliverRun, stage: AuditRepairStage, reason: string): void {
   clearAuditFixRetryTimer(run.runId);
-  extendAuditRoundLimit(run, stage);
   run.status = stage;
   run.stage = stage;
   run.latestMessage = reason;
@@ -1947,11 +1953,22 @@ function scheduleAuditFixRetry(run: AutoDeliverRun, stage: AuditRepairStage, rea
     const current = runsById.get(run.runId);
     if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
     if (current.activeAudit) return;
+    if (auditRoundCount(current, stage) >= auditRoundLimit(current, stage)) {
+      terminalizeAndSend(current, 'needs_human', stage === 'spec_audit_repair'
+        ? 'spec_audit_rounds_exhausted'
+        : 'implementation_audit_rounds_exhausted');
+      return;
+    }
     void startAuditRepairStageFailClosed(current, stage);
   }, OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS));
 }
 
-function shouldRunAnotherConfiguredAuditRound(run: AutoDeliverRun, stage: AuditRepairStage): boolean {
+function shouldRunAnotherConfiguredAuditRound(
+  run: AutoDeliverRun,
+  stage: AuditRepairStage,
+  verdict?: OpenSpecAutoDeliverVerdictPayload,
+): boolean {
+  if (verdict && isPerfectPass(verdict)) return false;
   return auditRoundCount(run, stage) < auditRoundLimit(run, stage);
 }
 
@@ -2021,7 +2038,7 @@ async function advanceAfterAuditVerdict(
       run.moduleScores = run.finalAfterRepair.moduleScores.map((score) => ({ ...score }));
       run.needsPostRepairAcceptanceAudit = false;
       run.postRepairAcceptanceStage = undefined;
-    } else if (shouldRunAnotherConfiguredAuditRound(run, stage)) {
+    } else if (shouldRunAnotherConfiguredAuditRound(run, stage, verdict)) {
       await startAuditRepairStageFailClosed(run, stage);
       return;
     }
@@ -2162,10 +2179,6 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
       }
     }
     run.activeAudit = undefined;
-    if (isRetryableAuditResultError(reason) && auditRoundCount(run, expected.stage) < auditRoundLimit(run, expected.stage)) {
-      await startAuditRepairStageFailClosed(run, expected.stage);
-      return;
-    }
     const projection = terminalize(run, 'needs_human', reason);
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;

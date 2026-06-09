@@ -1122,18 +1122,37 @@ exec "${realGit}" "$@"
     expect(gate.projection.moduleScores).toHaveLength(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.length);
     expect(gate.projection.auditResults).toHaveLength(1);
     expect(gate.projection.auditResults?.[0]?.requiredChanges).toEqual(['clarify acceptance criteria']);
-    expect(gate.projection.specAuditRound).toEqual({ current: 1, total: 2 });
+    expect(gate.projection.specAuditRound).toEqual({ current: 1, total: 1 });
 
-    await waitForSend((msg) =>
-      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
-      && msg.projection?.stage === 'spec_audit_repair'
-      && msg.projection?.activeP2pRunId === 'p2p-2',
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.terminalReason === 'spec_audit_rounds_exhausted',
       2500,
     );
+    expect(terminal.projection.status).toBe('needs_human');
+    expect([...p2pRuns.values()]).toHaveLength(1);
     expect(transportSendMock.mock.calls.some((call) =>
       String(call[0] ?? '').includes('Drive the implementation of @openspec/changes/demo-change aggressively.'),
     )).toBe(false);
-    expect([...p2pRuns.values()]).toHaveLength(2);
+  });
+
+  it('does not start another Team audit after final implementation acceptance PASS with perfect scores', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-perfect-final-pass');
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
+      module_scores: OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.map((module) => ({
+        module,
+        score: 10,
+        max_score: 10,
+        summary: `${module} perfect`,
+      })),
+    });
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
+    expect(terminal?.projection.implementationAuditRound).toEqual({ current: 1, total: 1 });
+    expect([...p2pRuns.values()]).toHaveLength(1);
   });
 
   it('does not start another spec Team round after final spec acceptance PASS with acceptable scores', async () => {
