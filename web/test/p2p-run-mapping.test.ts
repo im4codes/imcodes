@@ -573,7 +573,7 @@ describe('mapP2pRunToDiscussion', () => {
     expect(merged.map((d) => d.id)).toEqual(['p2p_run_alpha', 'p2p_run_beta']);
   });
 
-  it('removes stale active P2P entries that are absent from a full status response', () => {
+  it('keeps cached active P2P entries that are absent from a full status response', () => {
     const existing = [
       {
         id: 'p2p_run_alpha',
@@ -604,10 +604,10 @@ describe('mapP2pRunToDiscussion', () => {
 
     const merged = mergeP2pStatusResponseDiscussions(existing, [], { fullList: true });
 
-    expect(merged.map((d) => d.id)).toEqual(['p2p_run_done', 'local_manual_discussion']);
+    expect(merged.map((d) => d.id)).toEqual(['p2p_run_alpha', 'p2p_run_done', 'local_manual_discussion']);
   });
 
-  it('keeps active P2P entries present in a full status response and removes absent ones', () => {
+  it('updates active P2P entries present in a full status response without removing absent cached entries', () => {
     const existing = [
       {
         id: 'p2p_run_alpha',
@@ -636,7 +636,7 @@ describe('mapP2pRunToDiscussion', () => {
         state: 'running',
         currentRound: 1,
         maxRounds: 1,
-        completedHops: 0,
+        completedHops: 1,
         totalHops: 1,
         startedAt: undefined,
       },
@@ -644,7 +644,8 @@ describe('mapP2pRunToDiscussion', () => {
 
     const merged = mergeP2pStatusResponseDiscussions(existing, incoming, { fullList: true });
 
-    expect(merged.map((d) => d.id)).toEqual(['p2p_run_beta']);
+    expect(merged.map((d) => d.id)).toEqual(['p2p_run_alpha', 'p2p_run_beta']);
+    expect(merged.find((d) => d.id === 'p2p_run_beta')?.completedHops).toBe(1);
   });
 
   it('removes only an explicitly missing status run', () => {
