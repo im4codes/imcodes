@@ -224,16 +224,27 @@ function expectFinalAcceptanceScoringDiscipline(text: string): void {
   expect(text).toContain('Score from 10 downward based on current repaired evidence');
   expect(text).toContain('do not start from PASS or assume high scores because a repair prompt completed');
   expect(text).toContain('Treat the repair turn, checked tasks.md, and discussion summaries as claims to verify, not proof');
-  expect(text).toContain('Team repair scorecard item');
-  expect(text).toContain('Apply the Team repair scorecard as a recovery table');
+  expect(text).toContain('repair scorecard item');
+  expect(text).toContain('Strictly follow the repair scorecard');
+  expect(text).toContain('Do not assign module_scores that exceed the repair scorecard recovery/full-score conditions');
   expect(text).toContain('restore points only for deduction items that are actually fixed and evidenced');
   expect(text).toContain('Award 9 or 10 only when fresh post-repair evidence shows the relevant module is complete');
   expect(text).toContain('If any previous finding remains unresolved or only unverified, verdict must be REWORK');
   expect(text).toContain('Evidence that only restates the prompt, promises future work, or cites the Team discussion without inspecting repaired files is insufficient for PASS');
 }
 
+function expectTeamRepairScorecardLocation(text: string, discussionPath: string): void {
+  expect(text).toContain('Team repair scorecard location:');
+  expect(text).toContain(`- File: ${discussionPath}`);
+  expect(text).toContain('- Heading to find: "repair scorecard".');
+  expect(text).toContain('- You MUST locate the latest matching section before assigning module_scores.');
+  expect(text).toContain('- Treat that section as the binding deduction/recovery table for module_scores.');
+  expect(text).toContain('- If the heading is absent, state that in evidence, set verdict to REWORK, and cap every module score at 6.');
+}
+
 function expectTeamRepairScorecardInstructions(text: string): void {
-  expect(text).toContain('Repair scorecard for final acceptance:');
+  expect(text).toContain('repair scorecard');
+  expect(text).toContain('include the exact heading "repair scorecard"');
   expect(text).toContain('This is not the final authoritative module_scores JSON');
   expect(text).toContain('baseline score before repair, deduction reasons, concrete recovery conditions, and full-score conditions');
   expect(text).toContain('Phrase recovery conditions as evidence gates, not bonus points');
@@ -1067,6 +1078,7 @@ exec "${realGit}" "$@"
     expect(specAcceptancePrompt).toContain('Required top-level fields:');
     expectAuthoritativeResultSchemaHints(specAcceptancePrompt);
     expectFinalAcceptanceScoringDiscipline(specAcceptancePrompt);
+    expectTeamRepairScorecardLocation(specAcceptancePrompt, specRun.contextFilePath);
     expect(specAcceptancePrompt).toContain('For spec-stage scoring, tests means testability of requirements, scenarios, and acceptance criteria');
     expect(specAcceptancePrompt).toContain('cap spec, tasks, tests, and risk at 7');
     await completeAcceptanceAuditFromPrompt(specAcceptancePrompt);
@@ -1096,6 +1108,20 @@ exec "${realGit}" "$@"
     expect(implementationOrigin.autoDeliver?.stage).toBe('implementation_audit_repair');
     expect(implementationOrigin.autoDeliver?.authoritativeResultPath).toBeTruthy();
     expectAuditPromptWithoutVerdictSkeleton(implementationRun.userText ?? '');
+
+    await completeLatestDiscussion('completed', '# implementation audit discussion\n\nRepair implementation before final scoring.');
+    await waitForTransportSend((text) =>
+      text.includes('Audit findings to repair now:')
+      && text.includes('Reason: implementation_audit_followup_repair'),
+      2500,
+    );
+    await emitDeckDemoIdle();
+    const implementationAcceptancePrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
+      2500,
+    );
+    expectFinalAcceptanceScoringDiscipline(implementationAcceptancePrompt);
+    expectTeamRepairScorecardLocation(implementationAcceptancePrompt, implementationRun.contextFilePath);
   });
 
   it('rejects launch while a manual Team run is active for the owning session', async () => {

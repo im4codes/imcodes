@@ -1102,6 +1102,13 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     `Authoritative result file: ${metadata.authoritativeResultPath}`,
     '',
     auditDiscussionFilePath ? `Previous audit discussion file: ${auditDiscussionFilePath}` : 'Previous audit discussion file: unavailable.',
+    'Team repair scorecard location:',
+    auditDiscussionFilePath ? `- File: ${auditDiscussionFilePath}` : '- File: unavailable.',
+    '- Heading to find: "repair scorecard".',
+    '- You MUST locate the latest matching section before assigning module_scores.',
+    '- Treat that section as the binding deduction/recovery table for module_scores.',
+    '- If the heading is absent, state that in evidence, set verdict to REWORK, and cap every module score at 6.',
+    '',
     previousAudit ? `Previous audit verdict: ${previousAudit.verdict}` : 'Previous audit verdict: unavailable.',
     '',
     'Previous audit required_changes to verify:',
@@ -1127,8 +1134,9 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     '',
     'Scoring discipline:',
     '- Score from 10 downward based on current repaired evidence; do not start from PASS or assume high scores because a repair prompt completed.',
-    '- Treat the repair turn, checked tasks.md, and discussion summaries as claims to verify, not proof. Re-read the repaired files and compare them against every previous required_change, unchecked/falsely-complete task, low-score concern, validation requirement, and Team repair scorecard item.',
-    '- Apply the Team repair scorecard as a recovery table: start from the baseline scores, restore points only for deduction items that are actually fixed and evidenced, and do not restore points for unverified claims.',
+    '- Treat the repair turn, checked tasks.md, and discussion summaries as claims to verify, not proof. Re-read the repaired files and compare them against every previous required_change, unchecked/falsely-complete task, low-score concern, validation requirement, and repair scorecard item.',
+    '- Strictly follow the repair scorecard: start from its baseline scores, restore points only for deduction items that are actually fixed and evidenced, and do not restore points for unverified claims.',
+    '- Do not assign module_scores that exceed the repair scorecard recovery/full-score conditions.',
     '- Award 9 or 10 only when fresh post-repair evidence shows the relevant module is complete, edge cases are covered, and appropriate validation ran after repair. If validation could not run, the evidence must explain the concrete blocker and the affected module must not receive 9 or 10.',
     specStage
       ? '- For spec-stage scoring, tests means testability of requirements, scenarios, and acceptance criteria. If OpenSpec validation was not run after repair, cap spec, tasks, tests, and risk at 7 even if the text looks clean.'
@@ -1160,8 +1168,8 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
 function buildTeamRepairScorecardInstructions(stage: AuditRepairStage): string[] {
   const target = stage === 'spec_audit_repair' ? 'artifact' : 'implementation';
   return [
-    'Repair scorecard for final acceptance:',
-    `- Include a non-authoritative repair scorecard in the final Team summary for ${target} repair planning. This is not the final authoritative module_scores JSON.`,
+    'repair scorecard',
+    `- In the final Team summary, include the exact heading "repair scorecard" for ${target} repair planning. This is not the final authoritative module_scores JSON.`,
     '- For each module (spec, tasks, implementation, tests, risk), provide: baseline score before repair, deduction reasons, concrete recovery conditions, and full-score conditions.',
     '- Phrase recovery conditions as evidence gates, not bonus points. Example: "tests may recover from 6 to 8 only after X test is added and Y validation passes."',
     '- The later single-model final acceptance audit will use this scorecard as a checklist and may restore points only for conditions proven by post-repair evidence.',
