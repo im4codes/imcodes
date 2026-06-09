@@ -1331,6 +1331,44 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(content).toContain('SUCCESS-deck_proj_w1');
   });
 
+  it('does not double the configured timeout for required initiator hops', async () => {
+    _setIdlePollMs(10);
+    _setGracePeriodMs(20);
+    _setMinProcessingMs(0);
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 5);
+        return;
+      }
+      const filePath = pathFromPrompt(prompt);
+      const heading = headingFromPrompt(prompt);
+      if (session === 'deck_proj_brain' && heading.includes('Initial Analysis')) {
+        setTimeout(() => notifySessionIdle(session), 5);
+        return;
+      }
+      await appendFile(filePath, `\n## ${heading}\n\nSUCCESS-${session}\n`, 'utf8');
+      setTimeout(() => notifySessionIdle(session), 5);
+    });
+
+    const startedAt = Date.now();
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'initiator timeout should not be multiplied',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      220,
+    );
+
+    const done = await waitForStatus(run.id, ['completed'], 3000);
+    const elapsedMs = Date.now() - startedAt;
+    expect(done.skippedHops).toContain('deck_proj_brain');
+    expect(elapsedMs).toBeLessThan(420);
+  });
+
   it('uses isolated cross-project hop copies and copies completed artifacts back to the main project hop file', async () => {
     await mkdir(join(tempProjectDir, 'other'), { recursive: true });
     getSessionMock.mockImplementation((name: string) => {
@@ -1521,6 +1559,31 @@ describe('P2P orchestrator — parallel rounds', () => {
     const content = await readFile(done.contextFilePath, 'utf8');
     expect(content).toContain('FINAL ANSWER TEXT');
   }, 12_000);
+
+  it('uses SDK transport runtime state instead of tmux detection when completing P2P hops', async () => {
+    detectStatusAsyncMock.mockResolvedValue('thinking');
+    const runtimes = new Map<string, Record<string, unknown>>([
+      ['deck_proj_brain', makeFakeTransportRuntime('deck_proj_brain')],
+      ['deck_proj_w1', makeFakeTransportRuntime('deck_proj_w1')],
+    ]);
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) => runtimes.get(session) as any);
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'transport runtime idle should settle p2p',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      500,
+    );
+
+    const done = await waitForStatus(run.id, ['completed'], 3000);
+    expect(done.status).toBe('completed');
+    expect(detectStatusAsyncMock).not.toHaveBeenCalled();
+  });
 
   it('preserves the active run phase when an advanced whole-run timeout fires', async () => {
     let runId = '';

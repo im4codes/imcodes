@@ -1005,6 +1005,34 @@ function waitForIdleEvent(session: string, timeoutMs: number): IdleWaiterHandle 
   return { promise, cancel: cancelFn };
 }
 
+async function isP2pCompletionIdle(
+  run: P2pRun,
+  session: string,
+  idleEventReceived: boolean,
+): Promise<boolean> {
+  const transportRuntime = getTransportRuntime(session);
+  if (transportRuntime) {
+    const snapshot = transportRuntime.getDiagnosticSnapshot(Date.now());
+    if (snapshot.sending || snapshot.pendingCount > 0 || snapshot.activeDispatchCount > 0) {
+      return false;
+    }
+    return snapshot.status === 'idle' || snapshot.status === 'error';
+  }
+
+  const record = getSession(session);
+  const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
+  const useStoreState = agentType === 'gemini';
+
+  try {
+    return useStoreState
+      ? record?.state === 'idle'
+      : await detectStatusAsync(session, agentType) === 'idle';
+  } catch (err) {
+    logger.debug({ runId: run.id, session, err }, 'P2P: idle detection failed while completing hop');
+    return idleEventReceived;
+  }
+}
+
 // ── Start a P2P run ───────────────────────────────────────────────────────
 
 function buildHelperEligibleSnapshot(initiatorSession: string, targets: P2pTarget[]): P2pParticipantSnapshotEntry[] {
@@ -3712,16 +3740,10 @@ async function dispatchHop(
   const watchPath = localCopyPath ?? sourcePath;
   if (hop) hop.working_path = watchPath;
   const MAX_RETRIES = 0;
-  // Required legacy hops (initiator initial-analysis + round summaries) get a
-  // doubled wait window because they are more important than ordinary
-  // participant hops. If they still produce no output, mark that legacy hop
-  // skipped and continue with the evidence we have instead of re-sending the
-  // same prompt after a successful dispatch. Advanced workflow rounds keep
-  // their strict per-round timeout semantics.
-  const REQUIRED_HOP_TIMEOUT_MULTIPLIER = 2;
-  const effectiveTimeoutMs = required
-    ? run.timeoutMs * REQUIRED_HOP_TIMEOUT_MULTIPLIER
-    : run.timeoutMs;
+  // All hops respect the user-configured per-hop timeout. Required legacy hops
+  // still get special failure handling below, but they must not silently double
+  // the configured Team timeout and stall the next phase.
+  const effectiveTimeoutMs = run.timeoutMs;
 
   const finishHop = async (status: P2pHopStatus, error: string | null = null) => {
     if (localCopyPath && status === 'completed') {
@@ -3908,20 +3930,7 @@ async function dispatchHop(
       }
 
       if (fileSettled || executionMarkerFound || (pastGrace && !fileGrew)) {
-        let idleConfirmed = false;
-        const record = getSession(session);
-        const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-        const useStoreState = agentType === 'gemini';
-
-        try {
-          if (useStoreState) {
-            idleConfirmed = record?.state === 'idle';
-          } else {
-            idleConfirmed = await detectStatusAsync(session, agentType) === 'idle';
-          }
-        } catch {
-          idleConfirmed = idleEventReceived;
-        }
+        const idleConfirmed = await isP2pCompletionIdle(run, session, idleEventReceived);
 
         if (fileSettled && idleConfirmed) {
           try {
