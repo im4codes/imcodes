@@ -265,6 +265,22 @@ export function translateAutoDeliverReason(value: string | null | undefined, t: 
 
 export function translateAutoDeliverMessage(value: string | null | undefined, t: TranslationFn): string | undefined {
   if (!value) return undefined;
+  if (value.startsWith('spec_repair_prompt_dispatched:')) {
+    const reason = value.slice('spec_repair_prompt_dispatched:'.length);
+    const reasonText = translateAutoDeliverReason(reason, t) ?? humanizeAutoDeliverCode(reason);
+    const key = 'openspec.auto.lifecycle.spec_repair_prompt_dispatched';
+    const fallback = `Spec repair prompt sent from audit findings: ${reasonText}`;
+    const translated = t(key, { reason: reasonText, defaultValue: fallback });
+    return translated === key ? fallback : translated;
+  }
+  if (value.startsWith('implementation_repair_prompt_dispatched:')) {
+    const reason = value.slice('implementation_repair_prompt_dispatched:'.length);
+    const reasonText = translateAutoDeliverReason(reason, t) ?? humanizeAutoDeliverCode(reason);
+    const key = 'openspec.auto.lifecycle.implementation_repair_prompt_dispatched';
+    const fallback = `Implementation repair prompt sent from audit findings: ${reasonText}`;
+    const translated = t(key, { reason: reasonText, defaultValue: fallback });
+    return translated === key ? fallback : translated;
+  }
   const key = `openspec.auto.lifecycle.${value}`;
   const fallback = `__missing_${key}__`;
   const translated = t(key, { defaultValue: fallback });
@@ -687,6 +703,31 @@ function DetailRow({ label, value }: { label: string; value?: string | number | 
   );
 }
 
+function ScoreGrid({
+  scores,
+  t,
+  keyPrefix,
+}: {
+  scores: Array<{ module?: string; score: number; maxScore?: number; max_score?: number; summary?: string }>;
+  t: TranslationFn;
+  keyPrefix: string;
+}) {
+  return (
+    <div class="openspec-auto-score-grid">
+      {scores.map((score) => {
+        const moduleId = typeof score.module === 'string' && score.module ? score.module : 'unknown';
+        return (
+          <div class="openspec-auto-score" key={`${keyPrefix}:${moduleId}`}>
+            <span>{t(`openspec.auto.score_module.${moduleId}`, { defaultValue: moduleId })}</span>
+            <strong>{score.score}/{score.maxScore ?? score.max_score ?? 10}</strong>
+            {score.summary && <small>{score.summary}</small>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export function OpenSpecAutoDeliverDetailsPanel({
   projection,
   stopPending = false,
@@ -702,9 +743,15 @@ export function OpenSpecAutoDeliverDetailsPanel({
   const canContinue = projection?.visibility === 'full' && projection.canContinue === true && !active;
   const now = useNowTicker(active);
   const elapsed = projection ? formatElapsed(projectionElapsedMs(projection, now)) : '00:00';
-  const scoreItems = useMemo(() => projection?.moduleScores ?? [], [projection?.moduleScores]);
+  const finalScoreItems = useMemo(() => (
+    projection?.finalAfterRepair?.moduleScores
+    ?? (!projection?.auditBeforeRepair ? projection?.moduleScores ?? [] : [])
+  ), [projection?.auditBeforeRepair, projection?.finalAfterRepair, projection?.moduleScores]);
+  const preRepairScoreItems = useMemo(() => projection?.auditBeforeRepair?.moduleScores ?? [], [projection?.auditBeforeRepair]);
   const auditResults = useMemo(() => projection?.auditResults ?? [], [projection?.auditResults]);
   const latestMessage = translateAutoDeliverMessage(projection?.recentFinding, t);
+  const repairingFromAudit = stage === 'implementation_task_loop'
+    && projection?.recentFinding?.startsWith('implementation_repair_prompt_dispatched:');
   if (!projection) return null;
 
   return (
@@ -760,18 +807,7 @@ export function OpenSpecAutoDeliverDetailsPanel({
                     </span>
                     <strong>{result.verdict}</strong>
                   </div>
-                  <div class="openspec-auto-score-grid">
-                    {result.moduleScores.map((score) => {
-                      const moduleId = typeof score.module === 'string' && score.module ? score.module : 'unknown';
-                      return (
-                        <div class="openspec-auto-score" key={`${result.attemptId}:${moduleId}`}>
-                          <span>{t(`openspec.auto.score_module.${moduleId}`, moduleId)}</span>
-                          <strong>{score.score}/{score.max_score ?? 10}</strong>
-                          {score.summary && <small>{score.summary}</small>}
-                        </div>
-                      );
-                    })}
-                  </div>
+                  <ScoreGrid scores={result.moduleScores} t={t} keyPrefix={result.attemptId} />
                   {result.requiredChanges.length > 0 && (
                     <div class="openspec-auto-detail-note">
                       {t('openspec.auto.required_changes')}: {result.requiredChanges.slice(0, 3).join('; ')}
@@ -782,23 +818,27 @@ export function OpenSpecAutoDeliverDetailsPanel({
             </div>
           )}
         </div>
-        <div class="openspec-auto-detail-section">
-          <h4>{t('openspec.auto.scores')}</h4>
-          {scoreItems.length === 0 ? (
-            <div class="openspec-auto-detail-note">{t('openspec.auto.scores_empty')}</div>
-          ) : (
-            <div class="openspec-auto-score-grid">
-              {scoreItems.map((score) => {
-                const moduleId = typeof score.module === 'string' && score.module ? score.module : 'unknown';
-                return (
-                  <div class="openspec-auto-score" key={moduleId}>
-                    <span>{t(`openspec.auto.score_module.${moduleId}`, moduleId)}</span>
-                    <strong>{score.score}/{score.maxScore ?? 10}</strong>
-                    {score.summary && <small>{score.summary}</small>}
-                  </div>
-                );
+        {preRepairScoreItems.length > 0 && (
+          <div class="openspec-auto-detail-section">
+            <h4>{t('openspec.auto.pre_repair_scores')}</h4>
+            <div class="openspec-auto-detail-note">
+              {t('openspec.auto.score_snapshot_meta', {
+                round: projection.auditBeforeRepair?.roundIndex,
+                reason: translateAutoDeliverReason(projection.auditBeforeRepair?.summary, t) ?? projection.auditBeforeRepair?.summary,
               })}
             </div>
+            <ScoreGrid scores={preRepairScoreItems} t={t} keyPrefix="audit-before-repair" />
+          </div>
+        )}
+        <div class="openspec-auto-detail-section">
+          <h4>{t('openspec.auto.final_scores')}</h4>
+          {repairingFromAudit && preRepairScoreItems.length > 0 && (
+            <div class="openspec-auto-detail-note">{t('openspec.auto.scores_pending_repair_rescore')}</div>
+          )}
+          {finalScoreItems.length === 0 ? (
+            <div class="openspec-auto-detail-note">{t('openspec.auto.scores_empty')}</div>
+          ) : (
+            <ScoreGrid scores={finalScoreItems} t={t} keyPrefix="final-after-repair" />
           )}
         </div>
         {(projection.latestRepairSummary || projection.evidence?.length) && (

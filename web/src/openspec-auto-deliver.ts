@@ -36,6 +36,7 @@ export type {
   OpenSpecAutoDeliverBrowserEvidence as OpenSpecAutoDeliverEvidence,
   OpenSpecAutoDeliverBrowserFullProjection,
   OpenSpecAutoDeliverBrowserModuleScore as OpenSpecAutoDeliverModuleScore,
+  OpenSpecAutoDeliverBrowserScoreSnapshot,
   OpenSpecAutoDeliverBrowserProjection as OpenSpecAutoDeliverProjection,
   OpenSpecAutoDeliverBrowserTaskStats as OpenSpecAutoDeliverTaskStats,
   OpenSpecAutoDeliverListRow,

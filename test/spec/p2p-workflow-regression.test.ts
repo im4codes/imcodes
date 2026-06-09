@@ -2716,15 +2716,15 @@ describe('p2p-workflow reverse-regression', () => {
     const orchestrator = read('src/daemon/p2p-orchestrator.ts');
 
     expect(
-      orchestrator.text.includes('QUEUE_STUCK_STOP_AFTER_MS = 300_000'),
-      'P2P stale queue watchdog must default to 5 minutes',
+      orchestrator.text.includes('QUEUE_STUCK_STOP_AFTER_MS = 120_000'),
+      'P2P stale queue watchdog must default to a bounded short recovery window',
     ).toBe(true);
     expect(
-      orchestrator.text.includes('MARKER_PROMPT_RETRY_AFTER_MS = 60_000'),
+      orchestrator.text.includes('MARKER_PROMPT_RETRY_AFTER_MS = 30_000'),
       'marker-missing retries must be throttled',
     ).toBe(true);
     expect(
-      orchestrator.text.includes('POST_SUMMARY_CONFIRMATION_DELAY_MS = 10_000'),
+      orchestrator.text.includes('POST_SUMMARY_CONFIRMATION_DELAY_MS = 3_000'),
       'execution follow-up confirmation must wait briefly after the execution marker is observed',
     ).toBe(true);
     expect(
@@ -2797,7 +2797,7 @@ describe('p2p-workflow reverse-regression', () => {
     const orchestrator = read('src/daemon/p2p-orchestrator.ts');
 
     expect(
-      orchestrator.text.includes('QUEUED_PROMPT_STOP_AFTER_MS = 60_000'),
+      orchestrator.text.includes('QUEUED_PROMPT_STOP_AFTER_MS = 20_000'),
       'P2P queued prompt watchdog must use a shorter threshold than generic stale queue recovery',
     ).toBe(true);
     expect(

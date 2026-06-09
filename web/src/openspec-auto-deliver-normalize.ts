@@ -16,6 +16,7 @@ import type {
   OpenSpecAutoDeliverListRow,
   OpenSpecAutoDeliverModuleScore,
   OpenSpecAutoDeliverProjection,
+  OpenSpecAutoDeliverBrowserScoreSnapshot,
   OpenSpecAutoDeliverTaskStats,
 } from './openspec-auto-deliver.js';
 
@@ -215,6 +216,7 @@ function normalizeAuditResults(value: unknown): OpenSpecAutoDeliverAuditResult[]
         roundIndex,
         attemptId,
         generation,
+        ...(optionalString(item, 'discussionFilePath') ? { discussionFilePath: optionalString(item, 'discussionFilePath') } : {}),
         verdict: verdict as OpenSpecAutoDeliverAuditResult['verdict'],
         moduleScores: moduleScores.map((score) => ({
           module: score.module as OpenSpecAutoDeliverAuditResult['moduleScores'][number]['module'],
@@ -237,6 +239,43 @@ function normalizeAuditResults(value: unknown): OpenSpecAutoDeliverAuditResult[]
     })
     .filter((item): item is NonNullable<typeof item> => item !== null);
   return output.length > 0 ? output : undefined;
+}
+
+function normalizeScoreSnapshot(value: unknown): OpenSpecAutoDeliverBrowserScoreSnapshot | undefined {
+  if (!isRecord(value)) return undefined;
+  const phase = nonEmptyString(value.phase);
+  const stage = normalizeStage(value.stage);
+  const roundIndex = nonNegativeInteger(value.roundIndex);
+  const attemptId = nonEmptyString(value.attemptId);
+  const generation = nonNegativeInteger(value.generation);
+  const verdict = normalizeVerdict(value.verdict);
+  const moduleScores = normalizeModuleScores(value.moduleScores);
+  const summary = nonEmptyString(value.summary);
+  const completedAt = nonNegativeInteger(value.completedAt);
+  if (
+    (phase !== 'audit_before_repair' && phase !== 'final_after_repair')
+    || stage !== 'implementation_audit_repair'
+    || roundIndex === undefined
+    || !attemptId
+    || generation === undefined
+    || !verdict
+    || !moduleScores
+    || !summary
+    || completedAt === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    phase,
+    stage,
+    roundIndex,
+    attemptId,
+    generation,
+    verdict,
+    moduleScores,
+    summary,
+    completedAt,
+  };
 }
 
 function normalizePresetId(value: unknown): OpenSpecAutoDeliverPresetId | undefined {
@@ -346,6 +385,10 @@ export function normalizeOpenSpecAutoDeliverProjection(raw: unknown): OpenSpecAu
   if (implementationAuditRound) projection.implementationAuditRound = implementationAuditRound;
   const moduleScores = normalizeModuleScores(raw.moduleScores);
   if (moduleScores) projection.moduleScores = moduleScores;
+  const auditBeforeRepair = normalizeScoreSnapshot(raw.auditBeforeRepair);
+  if (auditBeforeRepair) projection.auditBeforeRepair = auditBeforeRepair;
+  const finalAfterRepair = normalizeScoreSnapshot(raw.finalAfterRepair);
+  if (finalAfterRepair) projection.finalAfterRepair = finalAfterRepair;
   const auditResults = normalizeAuditResults(raw.auditResults);
   if (auditResults) projection.auditResults = auditResults;
   const evidence = normalizeEvidence(raw.evidence);

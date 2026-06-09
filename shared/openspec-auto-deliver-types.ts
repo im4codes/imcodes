@@ -90,12 +90,27 @@ export interface OpenSpecAutoDeliverAuditResult {
   roundIndex: number;
   attemptId: string;
   generation: number;
+  discussionFilePath?: string;
   verdict: OpenSpecAutoDeliverVerdict;
   moduleScores: OpenSpecAutoDeliverModuleScore[];
   uncheckedTasks: string[];
   requiredChanges: string[];
   repairSummaries: OpenSpecAutoDeliverRepairSummary[];
   evidence: OpenSpecAutoDeliverEvidence[];
+  completedAt: number;
+}
+
+export type OpenSpecAutoDeliverScoreSnapshotPhase = 'audit_before_repair' | 'final_after_repair';
+
+export interface OpenSpecAutoDeliverScoreSnapshot {
+  phase: OpenSpecAutoDeliverScoreSnapshotPhase;
+  stage: Extract<OpenSpecAutoDeliverStage, 'spec_audit_repair' | 'implementation_audit_repair'>;
+  roundIndex: number;
+  attemptId: string;
+  generation: number;
+  verdict: OpenSpecAutoDeliverVerdict;
+  moduleScores: OpenSpecAutoDeliverModuleScore[];
+  summary: string;
   completedAt: number;
 }
 
@@ -143,6 +158,8 @@ export interface OpenSpecAutoDeliverProjection {
   canContinue?: boolean;
   latestVerdict?: OpenSpecAutoDeliverVerdict;
   moduleScores?: OpenSpecAutoDeliverModuleScore[];
+  auditBeforeRepair?: OpenSpecAutoDeliverScoreSnapshot;
+  finalAfterRepair?: OpenSpecAutoDeliverScoreSnapshot;
   auditResults?: OpenSpecAutoDeliverAuditResult[];
   latestRepairSummary?: string;
   evidence?: OpenSpecAutoDeliverEvidence[];
@@ -175,6 +192,18 @@ export interface OpenSpecAutoDeliverBrowserModuleScore {
   maxScore?: number;
   max_score?: number;
   summary?: string;
+}
+
+export interface OpenSpecAutoDeliverBrowserScoreSnapshot {
+  phase: OpenSpecAutoDeliverScoreSnapshotPhase | string;
+  stage: Extract<OpenSpecAutoDeliverStage, 'spec_audit_repair' | 'implementation_audit_repair'> | string;
+  roundIndex: number;
+  attemptId: string;
+  generation: number;
+  verdict: OpenSpecAutoDeliverVerdict | string;
+  moduleScores: OpenSpecAutoDeliverBrowserModuleScore[];
+  summary: string;
+  completedAt: number;
 }
 
 export interface OpenSpecAutoDeliverBrowserEvidence {
@@ -214,6 +243,8 @@ export interface OpenSpecAutoDeliverBrowserFullProjection {
   activeOpenSpecPromptId?: OpenSpecAutoDeliverStagePromptId | string | null;
   latestVerdict?: OpenSpecAutoDeliverVerdict | string | null;
   moduleScores?: OpenSpecAutoDeliverBrowserModuleScore[];
+  auditBeforeRepair?: OpenSpecAutoDeliverBrowserScoreSnapshot;
+  finalAfterRepair?: OpenSpecAutoDeliverBrowserScoreSnapshot;
   auditResults?: OpenSpecAutoDeliverAuditResult[];
   latestRepairSummary?: string | null;
   evidence?: OpenSpecAutoDeliverBrowserEvidence[];
@@ -254,6 +285,8 @@ export interface OpenSpecAutoDeliverBrowserConflictProjection {
   activeOpenSpecPromptId?: never;
   latestVerdict?: never;
   moduleScores?: never;
+  auditBeforeRepair?: never;
+  finalAfterRepair?: never;
   auditResults?: never;
   latestRepairSummary?: never;
   evidence?: never;

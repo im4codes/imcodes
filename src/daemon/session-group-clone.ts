@@ -409,7 +409,7 @@ async function buildCloneSpec(
     runtimeType: source.runtimeType ?? null,
     providerId: source.providerId ?? null,
     projectDir: mainProjectDir,
-    label: source.label ?? null,
+    label: target.rawTargetProjectName,
     description: source.description ?? null,
     requestedModel: source.requestedModel ?? null,
     activeModel: source.activeModel ?? null,

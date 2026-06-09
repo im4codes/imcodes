@@ -738,14 +738,14 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
-let IDLE_POLL_MS = 3_000;
-let GRACE_PERIOD_DEFAULT_MS = 180_000; // 3 min — complex analysis (subagent research + write) takes time
-let MIN_PROCESSING_MS = 30_000; // Don't trust idle detection until 30s after dispatch
-let FILE_SETTLE_CYCLES = 3; // File must stop growing for 3 poll cycles (9s) to be "settled"
-let MARKER_PROMPT_RETRY_AFTER_MS = 60_000; // Marker prompts may be retried, but only after queue-aware idle.
-let POST_SUMMARY_CONFIRMATION_DELAY_MS = 10_000; // Let the execution marker/status settle before the follow-up check.
-let QUEUE_STUCK_STOP_AFTER_MS = 300_000; // 5 min — stop only when transport queue/turn is stale
-let QUEUED_PROMPT_STOP_AFTER_MS = 60_000; // 1 min — P2P-owned prompt is visibly queued behind stale work
+let IDLE_POLL_MS = 1_000;
+let GRACE_PERIOD_DEFAULT_MS = 45_000; // Complex analysis can be slow, but blank/idle hops should not stall for minutes.
+let MIN_PROCESSING_MS = 8_000; // Give the agent a short startup window before trusting idle detection.
+let FILE_SETTLE_CYCLES = 2; // File must stop growing for 2 poll cycles (2s) to be "settled".
+let MARKER_PROMPT_RETRY_AFTER_MS = 30_000; // Marker prompts may be retried, but only after queue-aware idle.
+let POST_SUMMARY_CONFIRMATION_DELAY_MS = 3_000; // Let the execution marker/status settle before the follow-up check.
+let QUEUE_STUCK_STOP_AFTER_MS = 120_000; // Generic stale queue recovery stays conservative.
+let QUEUED_PROMPT_STOP_AFTER_MS = 20_000; // P2P-owned queued prompt should be recovered quickly.
 let ROUND_HOP_CLEANUP_DELAY_MS = 0;
 
 /** Override poll interval for tests. */

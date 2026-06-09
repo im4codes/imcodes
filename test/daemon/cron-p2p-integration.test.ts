@@ -164,12 +164,12 @@ beforeEach(async () => {
 
 afterEach(async () => {
   vi.restoreAllMocks();
-  _setIdlePollMs(3_000);
-  _setGracePeriodMs(180_000);
-  _setMinProcessingMs(30_000);
-  _setMarkerPromptRetryAfterMs(60_000);
-  _setFileSettleCycles(3);
-  _setPostSummaryConfirmationDelayMs(10_000);
+  _setIdlePollMs(1_000);
+  _setGracePeriodMs(45_000);
+  _setMinProcessingMs(8_000);
+  _setMarkerPromptRetryAfterMs(30_000);
+  _setFileSettleCycles(2);
+  _setPostSummaryConfirmationDelayMs(3_000);
   await rm(tempProjectDir, { recursive: true, force: true }).catch(() => {});
 });
 

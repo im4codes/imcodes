@@ -307,7 +307,7 @@ describe('daemon session group clone', () => {
 
     const main = sessions.get('deck_cd_1_brain');
     expect(main).toMatchObject({
-      label: 'CD Brain',
+      label: 'cd_1',
       description: 'main persona',
       requestedModel: 'opus',
       activeModel: 'opus-active',
@@ -352,6 +352,33 @@ describe('daemon session group clone', () => {
     expect(eventText).not.toContain('SECRET_SUB_KEY');
     expect(eventText).not.toContain('authorization');
     expect(eventText).not.toContain('transportConfig');
+  });
+
+  it('preserves a non-English target project name as the cloned main display label', async () => {
+    const dir = await makeDir('non-english-label');
+    sessions.set('deck_cd_brain', makeSession({
+      name: 'deck_cd_brain',
+      projectName: 'cd',
+      role: 'brain',
+      projectDir: dir,
+      label: 'Source Label',
+    }));
+    const { link } = makeServerLink();
+
+    await handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: 'deck_cd_brain',
+      targetProjectName: '客户项目',
+      idempotencyKey: `idem-non-english-label-${unique++}`,
+    }, link as never);
+
+    const main = [...sessions.values()].find((record) => record.role === 'brain' && record.name !== 'deck_cd_brain');
+    expect(main).toMatchObject({
+      name: 'deck_u5ba2_u6237_u9879_u76ee_brain',
+      projectName: 'u5ba2_u6237_u9879_u76ee',
+      label: '客户项目',
+      userCreated: true,
+    });
   });
 
   it('syncs every cloned active direct child through the sub-session DB path', async () => {

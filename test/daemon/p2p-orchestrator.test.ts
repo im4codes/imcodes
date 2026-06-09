@@ -231,13 +231,13 @@ afterEach(async () => {
   // Brief settle so in-flight promises flush before filesystem cleanup.
   await new Promise((r) => setTimeout(r, 50));
 
-  _setIdlePollMs(3000);
-  _setGracePeriodMs(180000);
-  _setMarkerPromptRetryAfterMs(60000);
-  _setMinProcessingMs(30000);
-  _setFileSettleCycles(3);
-  _setPostSummaryConfirmationDelayMs(10000);
-  _setQueuedPromptStopAfterMs(60000);
+  _setIdlePollMs(1000);
+  _setGracePeriodMs(45000);
+  _setMarkerPromptRetryAfterMs(30000);
+  _setMinProcessingMs(8000);
+  _setFileSettleCycles(2);
+  _setPostSummaryConfirmationDelayMs(3000);
+  _setQueuedPromptStopAfterMs(20000);
   _setRoundHopCleanupDelayMs(0);
   await rm(tempProjectDir, { recursive: true, force: true }).catch(() => {});
   clearAutoDeliverP2pLocksForTests();

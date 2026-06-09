@@ -21,6 +21,7 @@ describe('normalizeOpenSpecAutoDeliverProjection', () => {
         roundIndex: 1,
         attemptId: 'attempt-1',
         generation: 1,
+        discussionFilePath: '/repo/.imc/discussions/audit.md',
         verdict: 'REWORK',
         moduleScores: [
           { module: 'spec', score: 8, max_score: 10, summary: 'Spec is clear.' },
@@ -40,6 +41,7 @@ describe('normalizeOpenSpecAutoDeliverProjection', () => {
     expect(projection?.visibility).toBe('full');
     expect(projection?.auditResults).toHaveLength(1);
     expect(projection?.auditResults?.[0]?.verdict).toBe('REWORK');
+    expect(projection?.auditResults?.[0]?.discussionFilePath).toBe('/repo/.imc/discussions/audit.md');
     expect(projection?.auditResults?.[0]?.moduleScores).toHaveLength(5);
     expect(projection?.auditResults?.[0]?.requiredChanges).toEqual(['tighten validation']);
   });
@@ -74,5 +76,61 @@ describe('normalizeOpenSpecAutoDeliverProjection', () => {
     });
 
     expect(row?.recentFinding).toBe('implementation_audit_repair_p2p_started');
+  });
+
+  it('preserves pre-repair and final score snapshots for details UI', () => {
+    const projection = normalizeOpenSpecAutoDeliverProjection({
+      visibility: 'full',
+      projectionVersion: 6,
+      generation: 3,
+      runId: 'run-scores',
+      changeName: 'openspec-auto-delivery',
+      status: 'passed',
+      stage: 'passed',
+      owningMainSessionName: 'deck_brain',
+      auditBeforeRepair: {
+        phase: 'audit_before_repair',
+        stage: 'implementation_audit_repair',
+        roundIndex: 1,
+        attemptId: 'attempt-before',
+        generation: 2,
+        verdict: 'REWORK',
+        summary: 'implementation_audit_rework_requires_repair',
+        completedAt: 123,
+        moduleScores: [
+          { module: 'implementation', score: 5, max_score: 10, summary: 'Needs repair.' },
+        ],
+      },
+      finalAfterRepair: {
+        phase: 'final_after_repair',
+        stage: 'implementation_audit_repair',
+        roundIndex: 2,
+        attemptId: 'attempt-final',
+        generation: 2,
+        verdict: 'PASS',
+        summary: 'final_audit_passed',
+        completedAt: 456,
+        moduleScores: [
+          { module: 'implementation', score: 9, max_score: 10, summary: 'Repaired.' },
+        ],
+      },
+    });
+
+    expect(projection?.auditBeforeRepair).toMatchObject({
+      phase: 'audit_before_repair',
+      verdict: 'REWORK',
+      roundIndex: 1,
+    });
+    expect(projection?.auditBeforeRepair?.moduleScores).toEqual([
+      { module: 'implementation', score: 5, max_score: 10, summary: 'Needs repair.' },
+    ]);
+    expect(projection?.finalAfterRepair).toMatchObject({
+      phase: 'final_after_repair',
+      verdict: 'PASS',
+      roundIndex: 2,
+    });
+    expect(projection?.finalAfterRepair?.moduleScores).toEqual([
+      { module: 'implementation', score: 9, max_score: 10, summary: 'Repaired.' },
+    ]);
   });
 });

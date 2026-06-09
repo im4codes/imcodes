@@ -43,6 +43,7 @@ import type {
   OpenSpecAutoDeliverRepairSummary,
   OpenSpecAutoDeliverP2pMetadata,
   OpenSpecAutoDeliverProjection,
+  OpenSpecAutoDeliverScoreSnapshot,
   OpenSpecAutoDeliverStatusRequest,
   OpenSpecAutoDeliverStopRequest,
   OpenSpecAutoDeliverTaskStats,
@@ -125,6 +126,7 @@ const OPENSPEC_AUTO_DELIVER_TRANSITIONS: Record<OpenSpecAutoDeliverStage, Partia
     runtime_error: 'failed',
   },
   implementation_audit_repair: {
+    implementation_prompt_dispatched: 'implementation_task_loop',
     implementation_audit_started: 'implementation_audit_repair',
     implementation_audit_pass: 'passed',
     implementation_audit_rework: 'implementation_audit_repair',
@@ -199,9 +201,25 @@ interface AutoDeliverRun {
     roundIndex: number;
     generation: number;
   };
+  activeAcceptanceAudit?: {
+    selectedTeamComboId: string;
+    activeOpenSpecPromptId: OpenSpecAutoDeliverStagePromptId;
+    stage: AuditRepairStage;
+    attemptId: string;
+    authoritativeResultPath: string;
+    resultFileRepairAttempted?: boolean;
+    roundIndex: number;
+    generation: number;
+  };
   latestVerdict?: OpenSpecAutoDeliverVerdict;
   moduleScores?: OpenSpecAutoDeliverModuleScore[];
+  auditBeforeRepair?: OpenSpecAutoDeliverScoreSnapshot;
+  finalAfterRepair?: OpenSpecAutoDeliverScoreSnapshot;
   auditResults?: OpenSpecAutoDeliverAuditResult[];
+  specAuditDiscussionFilePath?: string;
+  implementationAuditDiscussionFilePath?: string;
+  needsPostRepairAcceptanceAudit?: boolean;
+  postRepairAcceptanceStage?: AuditRepairStage;
   latestRepairSummary?: string;
   lastAuditResultError?: string;
   evidence?: OpenSpecAutoDeliverEvidence[];
@@ -226,7 +244,8 @@ const auditPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const auditFixRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let timelineUnsubscribe: (() => void) | null = null;
 const execFileAsync = promisify(execFile);
-const OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS = process.env.NODE_ENV === 'test' ? 50 : 5 * 60_000;
+const OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS = process.env.NODE_ENV === 'test' ? 50 : 15_000;
+const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON = 'implementation_audit_followup_repair';
 
 export interface OpenSpecAutoDeliverUpgradeBlockReason {
   runId: string;
@@ -448,12 +467,14 @@ function buildProjection(run: AutoDeliverRun): OpenSpecAutoDeliverProjection {
     implementationAuditRound,
     activeP2pRunId: run.activeAudit?.p2pRunId,
     selectedTeamComboId: run.selectedTeamComboId,
-    activeOpenSpecPromptId: run.activeAudit?.activeOpenSpecPromptId,
+    activeOpenSpecPromptId: run.activeAudit?.activeOpenSpecPromptId ?? run.activeAcceptanceAudit?.activeOpenSpecPromptId,
     canStop: !isOpenSpecAutoDeliverTerminalStage(run.status),
     canContinue: canContinueRun(run),
     latestRepairSummary: run.latestRepairSummary,
     latestVerdict: run.latestVerdict,
     moduleScores: run.moduleScores ? run.moduleScores.map((score) => ({ ...score })) : undefined,
+    auditBeforeRepair: cloneScoreSnapshot(run.auditBeforeRepair),
+    finalAfterRepair: cloneScoreSnapshot(run.finalAfterRepair),
     auditResults: run.auditResults ? run.auditResults.map((result) => ({
       ...result,
       moduleScores: result.moduleScores.map((score) => ({ ...score })),
@@ -468,6 +489,14 @@ function buildProjection(run: AutoDeliverRun): OpenSpecAutoDeliverProjection {
     evidence: run.evidence ? run.evidence.map((entry) => ({ ...entry })) : undefined,
     lastMessage: run.latestMessage,
     terminalReason: run.terminalReason,
+  };
+}
+
+function cloneScoreSnapshot(snapshot: OpenSpecAutoDeliverScoreSnapshot | undefined): OpenSpecAutoDeliverScoreSnapshot | undefined {
+  if (!snapshot) return undefined;
+  return {
+    ...snapshot,
+    moduleScores: snapshot.moduleScores.map((score) => ({ ...score })),
   };
 }
 
@@ -624,17 +653,70 @@ function uncheckedTaskLabels(stats: OpenSpecAutoDeliverTaskStats): string[] {
   return stats.items.filter((item) => !item.checked).map((item) => item.label);
 }
 
-function buildImplementationPrompt(run: AutoDeliverRun): string {
+function latestAuditResultForStage(run: AutoDeliverRun, stage: AuditRepairStage): OpenSpecAutoDeliverAuditResult | undefined {
+  return [...(run.auditResults ?? [])].reverse().find((result) => result.stage === stage);
+}
+
+function bullets(items: string[], limit = 12): string {
+  if (items.length === 0) return '- none';
+  const visible = items.slice(0, limit).map((item) => `- ${item}`);
+  const remaining = items.length - visible.length;
+  return remaining > 0 ? [...visible, `- ...and ${remaining} more`].join('\n') : visible.join('\n');
+}
+
+function buildImplementationRepairBlock(run: AutoDeliverRun, repairReason?: string): string | null {
+  const audit = latestAuditResultForStage(run, 'implementation_audit_repair');
+  const auditDiscussionFilePath = audit?.discussionFilePath ?? run.implementationAuditDiscussionFilePath;
+  if (!audit && !repairReason && !auditDiscussionFilePath) return null;
+  const lowScores = (audit?.moduleScores ?? []).filter((score) => score.score < OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE);
+  const evidence = (audit?.evidence ?? []).map((entry) => entry.summary);
+  const requiredFollowupRepair = repairReason === OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON
+    ? [
+        '',
+        'This repair pass is required even when the implementation audit passed and scores are acceptable.',
+        'Do a serious final implementation repair pass: read the audit discussion, fix any small gaps or polish issues, tighten tests/tasks where appropriate, run validation, and report exact outcomes.',
+        'If no code change is appropriate after inspection, say so explicitly with the validation commands and outcomes.',
+      ]
+    : [];
+  return [
+    'Audit findings to repair now:',
+    repairReason ? `Reason: ${repairReason}` : undefined,
+    audit ? `Previous implementation audit verdict: ${audit.verdict}` : undefined,
+    auditDiscussionFilePath ? `Audit discussion file: ${auditDiscussionFilePath}` : undefined,
+    lowScores.length > 0
+      ? `Low module scores: ${lowScores.map((score) => `${score.module}=${score.score}/10 (${score.summary})`).join('; ')}`
+      : undefined,
+    '',
+    'Required code/test/task changes from the audit:',
+    bullets(audit?.requiredChanges ?? []),
+    '',
+    'Unchecked or falsely-complete tasks reported by the audit:',
+    bullets(audit?.uncheckedTasks ?? []),
+    '',
+    'Audit evidence to use as implementation guidance:',
+    bullets(evidence, 8),
+    ...requiredFollowupRepair,
+    '',
+    auditDiscussionFilePath ? 'Before editing, read the audit discussion file above for the full review/plan context; use the discussion findings as the repair source of truth.' : undefined,
+    auditDiscussionFilePath ? '' : undefined,
+    'Do not write another audit report. Edit the product code, tests, and tasks.md now, then run validation.',
+  ].filter((line): line is string => line !== undefined).join('\n');
+}
+
+function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): string {
   const reference = openSpecChangeReference(run);
   const remaining = uncheckedTaskLabels(run.taskStats);
   const maxImplementationPrompts = effectiveMaxImplementationPrompts(run);
+  const basePrompt = repairReason
+    ? formatOpenSpecPromptTemplate('audit_implementation', reference)
+    : formatOpenSpecPromptTemplate('implement', reference);
   const validationSummary = run.evidence?.filter((entry) => entry.source === 'daemon').map((entry) => `- ${entry.summary}`).join('\n')
     || '- No daemon validation recommendations are available.';
   const remainingBlock = remaining.length > 0
     ? remaining.map((label) => `- ${label}`).join('\n')
     : '- Re-read tasks.md and verify every task remains checked.';
   return [
-    formatOpenSpecPromptTemplate('implement', reference),
+    basePrompt,
     '',
     `OpenSpec Auto Deliver context for ${reference}.`,
     `Project root: ${run.projectRoot}`,
@@ -652,12 +734,35 @@ function buildImplementationPrompt(run: AutoDeliverRun): string {
     'Remaining tasks:',
     remainingBlock,
     '',
+    buildImplementationRepairBlock(run, repairReason) ?? 'No prior implementation-audit findings are pending. Implement the remaining OpenSpec tasks directly.',
+    '',
     'Validation command candidates:',
     validationSummary,
   ].join('\n');
 }
 
-function dispatchImplementationPrompt(run: AutoDeliverRun): OpenSpecAutoDeliverProjection {
+function buildSpecRepairPrompt(run: AutoDeliverRun, repairReason: string): string {
+  const reference = openSpecChangeReference(run);
+  return [
+    formatOpenSpecPromptTemplate('audit_spec', reference),
+    '',
+    `OpenSpec Auto Deliver spec-artifact repair context for ${reference}.`,
+    `Project root: ${run.projectRoot}`,
+    `Change root: ${run.changeRootIdentity}`,
+    `Run id: ${run.runId}`,
+    `Generation: ${run.generation}`,
+    `Reason: ${repairReason}`,
+    run.specAuditDiscussionFilePath ? `Spec audit discussion file: ${run.specAuditDiscussionFilePath}` : 'Spec audit discussion file: unavailable.',
+    '',
+    'Repair only the OpenSpec artifacts under this change: proposal.md, design.md, specs/**/spec.md, and tasks.md.',
+    'Before editing, read the spec audit discussion file above for the full review/plan context.',
+    'Do not edit product implementation files. Do not write authoritative JSON. Do not assign final module scores in this turn.',
+    'After repairing the artifacts, run OpenSpec validation when available and report exact commands/outcomes.',
+    'The final spec acceptance score and authoritative JSON will be produced by a separate single-model acceptance audit after this repair turn.',
+  ].join('\n');
+}
+
+function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: string): OpenSpecAutoDeliverProjection {
   const elapsedProjection = enforceElapsedLimit(run);
   if (elapsedProjection) return elapsedProjection;
   if (!transitionAllowed(run, 'implementation_prompt_dispatched')) {
@@ -674,7 +779,7 @@ function dispatchImplementationPrompt(run: AutoDeliverRun): OpenSpecAutoDeliverP
   run.stage = 'implementation_task_loop';
   run.implementationPromptCount += 1;
   run.activeCommandId = `${run.runId}:implementation:${run.generation}:${run.implementationPromptCount}`;
-  const prompt = buildImplementationPrompt(run);
+  const prompt = buildImplementationPrompt(run, repairReason);
   timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
     text: prompt,
     allowDuplicate: true,
@@ -686,7 +791,313 @@ function dispatchImplementationPrompt(run: AutoDeliverRun): OpenSpecAutoDeliverP
     delete run.activeCommandId;
     return terminalize(run, 'failed', error instanceof Error ? `implementation_send_failed:${error.message}` : 'implementation_send_failed');
   }
-  run.latestMessage = 'implementation_prompt_dispatched';
+  run.latestMessage = repairReason
+    ? `implementation_repair_prompt_dispatched:${repairReason}`
+    : 'implementation_prompt_dispatched';
+  return broadcastProjection(run);
+}
+
+function dispatchImplementationRepairPrompt(run: AutoDeliverRun, reason: string): OpenSpecAutoDeliverProjection {
+  if (run.implementationPromptCount >= effectiveMaxImplementationPrompts(run)) {
+    run.materializedLimits.maxImplementationPrompts = run.implementationPromptCount + 1;
+  }
+  extendAuditRoundLimit(run, 'implementation_audit_repair');
+  run.needsPostRepairAcceptanceAudit = true;
+  run.postRepairAcceptanceStage = 'implementation_audit_repair';
+  run.evidence = mergeEvidence(run.evidence, [{
+    source: 'daemon',
+    summary: `Dispatching implementation repair prompt from audit findings: ${reason}.`,
+    stale: false,
+  }]);
+  return dispatchImplementationPrompt(run, reason);
+}
+
+function dispatchSpecRepairPrompt(run: AutoDeliverRun, reason: string): OpenSpecAutoDeliverProjection {
+  const elapsedProjection = enforceElapsedLimit(run);
+  if (elapsedProjection) return elapsedProjection;
+  const runtime = getTransportRuntime(run.targetImplementationSessionName);
+  if (!runtime) {
+    return terminalize(run, 'failed', 'missing_transport_runtime');
+  }
+  extendAuditRoundLimit(run, 'spec_audit_repair');
+  run.status = 'spec_audit_repair';
+  run.stage = 'spec_audit_repair';
+  run.needsPostRepairAcceptanceAudit = true;
+  run.postRepairAcceptanceStage = 'spec_audit_repair';
+  run.activeCommandId = `${run.runId}:spec-repair:${run.generation}:${run.specAuditRepairRound}`;
+  run.evidence = mergeEvidence(run.evidence, [{
+    source: 'daemon',
+    summary: `Dispatching spec artifact repair prompt from audit discussion: ${reason}.`,
+    stale: false,
+  }]);
+  const prompt = buildSpecRepairPrompt(run, reason);
+  timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
+    text: prompt,
+    allowDuplicate: true,
+    commandId: run.activeCommandId,
+  }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${run.activeCommandId}` });
+  try {
+    runtime.send(prompt, run.activeCommandId);
+  } catch (error) {
+    delete run.activeCommandId;
+    return terminalize(run, 'failed', error instanceof Error ? `spec_repair_prompt_send_failed:${error.message}` : 'spec_repair_prompt_send_failed');
+  }
+  run.latestMessage = `spec_repair_prompt_dispatched:${reason}`;
+  return broadcastProjection(run);
+}
+
+function acceptanceAuditMetadataFromActive(
+  run: AutoDeliverRun,
+  active: NonNullable<AutoDeliverRun['activeAcceptanceAudit']>,
+): OpenSpecAutoDeliverP2pMetadata {
+  return {
+    owner: 'openspec_auto_deliver',
+    runId: run.runId,
+    owningMainSessionName: run.owningMainSessionName,
+    executionSessionName: run.targetImplementationSessionName,
+    changeName: run.changeName,
+    resolvedChangeRootIdentity: run.changeRootIdentity,
+    stage: active.stage,
+    selectedTeamComboId: active.selectedTeamComboId,
+    activeOpenSpecPromptId: active.activeOpenSpecPromptId,
+    roundIndex: active.roundIndex,
+    attemptId: active.attemptId,
+    authoritativeResultPath: active.authoritativeResultPath,
+    generation: active.generation,
+  };
+}
+
+function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: OpenSpecAutoDeliverP2pMetadata): string {
+  const reference = openSpecChangeReference(run);
+  const stage = metadata.stage;
+  const specStage = stage === 'spec_audit_repair';
+  const previousAudit = latestAuditResultForStage(run, stage);
+  const auditDiscussionFilePath = previousAudit?.discussionFilePath ?? (specStage ? run.specAuditDiscussionFilePath : run.implementationAuditDiscussionFilePath);
+  const lowScores = (previousAudit?.moduleScores ?? [])
+    .filter((score) => score.score < OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE)
+    .map((score) => `${score.module}=${score.score}/10 (${score.summary})`);
+  const evidence = (previousAudit?.evidence ?? []).map((entry) => entry.summary);
+  const changedFiles = run.evidence?.find((entry) => entry.source === 'daemon' && entry.summary.startsWith('Changed files:'))?.summary
+    ?? 'Changed files: unavailable.';
+  const diffStat = run.evidence?.find((entry) => entry.source === 'daemon' && entry.summary.startsWith('Diff stat:'))?.summary
+    ?? 'Diff stat: unavailable.';
+  const title = specStage
+    ? `OpenSpec Auto Deliver final specification acceptance audit for ${reference}.`
+    : `OpenSpec Auto Deliver final implementation acceptance audit for ${reference}.`;
+  const basePrompt = specStage
+    ? formatOpenSpecPromptTemplate('audit_spec', reference)
+    : formatOpenSpecPromptTemplate('audit_implementation', reference);
+  const auditTarget = specStage
+    ? 'the repaired OpenSpec artifacts'
+    : 'the repaired product code, tests, and tasks.md';
+  const passScope = specStage
+    ? '- PASS only if the repaired proposal.md, design.md, specs/**/spec.md, and tasks.md are internally consistent, acceptance-ready, and implementation-ready.'
+    : '- PASS only if the repaired code/tests/tasks now satisfy the OpenSpec change and the previous audit findings are resolved.';
+  const reworkScope = specStage
+    ? '- REWORK if any artifact ambiguity, inconsistency, missing acceptance criteria, untestable requirement, or spec-stage repair gap remains.'
+    : '- REWORK if any previous finding remains unresolved, new regressions are found, tasks are falsely checked, tests are missing, or validation is insufficient.';
+  const scoreScope = specStage
+    ? '- module_scores must score the repaired OpenSpec artifact state, not product implementation completeness.'
+    : '- module_scores must score the repaired product implementation state, not the previous audit state.';
+  return [
+    title,
+    '',
+    'OpenSpec audit prompt:',
+    basePrompt,
+    '',
+    'This is a focused final acceptance audit pass, not a Team/P2P discussion and not a planning round.',
+    `Seriously audit ${auditTarget} against the previous Team audit discussion and the OpenSpec change.`,
+    'Do not implement fixes in this turn. If anything remains unfixed, return REWORK with concrete required_changes.',
+    '',
+    `Project root: ${run.projectRoot}`,
+    `Resolved change root identity: ${metadata.resolvedChangeRootIdentity}`,
+    `Run id: ${metadata.runId}`,
+    `Stage: ${metadata.stage}`,
+    `Round: ${metadata.roundIndex}/${auditRoundLimit(run, stage)}`,
+    `Attempt id: ${metadata.attemptId}`,
+    `Authoritative result file: ${metadata.authoritativeResultPath}`,
+    '',
+    auditDiscussionFilePath ? `Previous audit discussion file: ${auditDiscussionFilePath}` : 'Previous audit discussion file: unavailable.',
+    previousAudit ? `Previous audit verdict: ${previousAudit.verdict}` : 'Previous audit verdict: unavailable.',
+    '',
+    'Previous audit required_changes to verify:',
+    bullets(previousAudit?.requiredChanges ?? []),
+    '',
+    'Previous low module scores to verify:',
+    bullets(lowScores),
+    '',
+    'Previous audit unchecked or falsely-complete tasks to verify:',
+    bullets(previousAudit?.uncheckedTasks ?? []),
+    '',
+    'Previous audit evidence:',
+    bullets(evidence, 8),
+    '',
+    changedFiles,
+    diffStat,
+    '',
+    'Write exactly one raw JSON object to the authoritative result file path above. Do not wrap the file content in Markdown fences.',
+    'The daemon will read only that file as the authoritative result.',
+    '',
+    `Verdict scope for this final ${specStage ? 'specification' : 'implementation'} acceptance audit:`,
+    passScope,
+    reworkScope,
+    '- BLOCKED only for external blockers that cannot be repaired in this repository.',
+    scoreScope,
+    '',
+    'The top-level auto_deliver object must exactly equal this metadata object:',
+    JSON.stringify({
+      runId: metadata.runId,
+      changeName: metadata.changeName,
+      resolvedChangeRootIdentity: metadata.resolvedChangeRootIdentity,
+      stage: metadata.stage,
+      selectedTeamComboId: metadata.selectedTeamComboId,
+      activeOpenSpecPromptId: metadata.activeOpenSpecPromptId,
+      roundIndex: metadata.roundIndex,
+      attemptId: metadata.attemptId,
+      authoritativeResultPath: metadata.authoritativeResultPath,
+      owningMainSessionName: metadata.owningMainSessionName,
+      executionSessionName: metadata.executionSessionName,
+      generation: metadata.generation,
+    }, null, 2),
+    '',
+    `Required top-level fields: ${OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS.join(', ')}.`,
+    ...buildAuthoritativeResultSchemaHints(false),
+  ].join('\n');
+}
+
+function buildPostRepairAcceptanceAuditResultRepairPrompt(
+  run: AutoDeliverRun,
+  metadata: OpenSpecAutoDeliverP2pMetadata,
+  reason: string,
+): string {
+  const specStage = metadata.stage === 'spec_audit_repair';
+  return [
+    `OpenSpec Auto Deliver needs the final ${specStage ? 'specification' : 'implementation'} acceptance audit authoritative result file for openspec/changes/${run.changeName}.`,
+    '',
+    `Problem: ${reason}`,
+    `Authoritative result file: ${metadata.authoritativeResultPath}`,
+    `Resolved change root identity: ${metadata.resolvedChangeRootIdentity}`,
+    '',
+    'Do not redo the audit unless needed to correct the JSON. Write exactly one raw JSON object to the authoritative result file path above.',
+    'The top-level auto_deliver object must exactly equal this metadata object:',
+    JSON.stringify({
+      runId: metadata.runId,
+      changeName: metadata.changeName,
+      resolvedChangeRootIdentity: metadata.resolvedChangeRootIdentity,
+      stage: metadata.stage,
+      selectedTeamComboId: metadata.selectedTeamComboId,
+      activeOpenSpecPromptId: metadata.activeOpenSpecPromptId,
+      roundIndex: metadata.roundIndex,
+      attemptId: metadata.attemptId,
+      authoritativeResultPath: metadata.authoritativeResultPath,
+      owningMainSessionName: metadata.owningMainSessionName,
+      executionSessionName: metadata.executionSessionName,
+      generation: metadata.generation,
+    }, null, 2),
+    '',
+    `Required top-level fields: ${OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS.join(', ')}.`,
+    ...buildAuthoritativeResultSchemaHints(false),
+  ].join('\n');
+}
+
+async function dispatchPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun): Promise<OpenSpecAutoDeliverProjection> {
+  const elapsedProjection = enforceElapsedLimit(run);
+  if (elapsedProjection) return elapsedProjection;
+  const stage: AuditRepairStage = run.postRepairAcceptanceStage ?? 'implementation_audit_repair';
+  const transitionEvent: OpenSpecAutoDeliverTransitionEvent = stage === 'spec_audit_repair'
+    ? 'spec_audit_started'
+    : 'implementation_audit_started';
+  if (!transitionAllowed(run, transitionEvent)) {
+    return terminalizeAndSend(run, 'failed', 'invalid_transition_post_repair_acceptance_audit');
+  }
+  if (auditRoundCount(run, stage) >= auditRoundLimit(run, stage)) {
+    extendAuditRoundLimit(run, stage);
+  }
+  if (!(await refreshChangeRoot(run))) {
+    return terminalizeAndSend(run, 'failed', run.latestMessage ?? 'change_root_invalid');
+  }
+  const runtime = getTransportRuntime(run.targetImplementationSessionName);
+  if (!runtime) {
+    return terminalizeAndSend(run, 'failed', 'missing_transport_runtime');
+  }
+  const gitEvidence = await collectGitEvidence(run);
+  run.evidence = mergeEvidence(run.evidence, [
+    {
+      source: 'daemon',
+      summary: gitEvidence.changedFiles.length > 0
+        ? `Changed files: ${gitEvidence.changedFiles.join(', ')}.`
+        : 'Changed files: none reported by git diff.',
+      stale: false,
+    },
+    {
+      source: 'daemon',
+      summary: gitEvidence.diffStat
+        ? `Diff stat: ${gitEvidence.diffStat}`
+        : 'Diff stat: none reported by git diff.',
+      stale: false,
+    },
+  ]);
+  const activeOpenSpecPromptId = activeOpenSpecPromptIdForAutoDeliverStage(stage);
+  const roundIndex = incrementAuditRound(run, stage);
+  const attemptId = `${run.runId}:post_repair_acceptance_audit:${run.generation}:${roundIndex}`;
+  const authoritativeResultPath = await buildAuthoritativeResultPath(run, stage, run.generation, roundIndex);
+  const active: NonNullable<AutoDeliverRun['activeAcceptanceAudit']> = {
+    selectedTeamComboId: run.selectedTeamComboId,
+    activeOpenSpecPromptId,
+    stage,
+    attemptId,
+    authoritativeResultPath,
+    roundIndex,
+    generation: run.generation,
+  };
+  const metadata = acceptanceAuditMetadataFromActive(run, active);
+  run.status = stage;
+  run.stage = stage;
+  run.activeAcceptanceAudit = active;
+  run.activeCommandId = `${attemptId}:prompt`;
+  const prompt = buildPostRepairAcceptanceAuditPrompt(run, metadata);
+  timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
+    text: prompt,
+    allowDuplicate: true,
+    commandId: run.activeCommandId,
+  }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${run.activeCommandId}` });
+  try {
+    runtime.send(prompt, run.activeCommandId);
+  } catch (error) {
+    delete run.activeCommandId;
+    run.activeAcceptanceAudit = undefined;
+    return terminalize(run, 'failed', error instanceof Error ? `post_repair_acceptance_audit_send_failed:${error.message}` : 'post_repair_acceptance_audit_send_failed');
+  }
+  run.latestMessage = 'post_repair_acceptance_audit_dispatched';
+  return broadcastProjection(run);
+}
+
+function dispatchPostRepairAcceptanceAuditResultRepairPrompt(
+  run: AutoDeliverRun,
+  active: NonNullable<AutoDeliverRun['activeAcceptanceAudit']>,
+  reason: string,
+): OpenSpecAutoDeliverProjection {
+  const runtime = getTransportRuntime(run.targetImplementationSessionName);
+  if (!runtime) {
+    return terminalize(run, 'failed', 'missing_transport_runtime');
+  }
+  active.resultFileRepairAttempted = true;
+  run.activeAcceptanceAudit = active;
+  run.activeCommandId = `${active.attemptId}:result-file-repair`;
+  const metadata = acceptanceAuditMetadataFromActive(run, active);
+  const prompt = buildPostRepairAcceptanceAuditResultRepairPrompt(run, metadata, reason);
+  timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
+    text: prompt,
+    allowDuplicate: true,
+    commandId: run.activeCommandId,
+  }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${run.activeCommandId}` });
+  try {
+    runtime.send(prompt, run.activeCommandId);
+  } catch (error) {
+    delete run.activeCommandId;
+    return terminalize(run, 'failed', error instanceof Error ? `post_repair_result_repair_send_failed:${error.message}` : 'post_repair_result_repair_send_failed');
+  }
+  run.latestMessage = 'post_repair_result_file_repair_prompt_dispatched';
   return broadcastProjection(run);
 }
 
@@ -1091,39 +1502,61 @@ function buildAuthoritativeResultSchemaHints(includeAutoDeliverNesting: boolean)
 }
 
 function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDeliverP2pMetadata): string {
-  const auditFocus = metadata.stage === 'spec_audit_repair'
-    ? 'Audit and repair only the OpenSpec change artifacts under the referenced change folder. Do not edit product files.'
-    : 'Audit and repair product/test/tasks.md implementation against the OpenSpec change. Do not commit, push, stage files, or edit unrelated OpenSpec changes/docs.';
-  const stageVerdictScope = metadata.stage === 'spec_audit_repair'
-    ? [
-        'Spec-stage verdict scope:',
-        '- Return PASS when proposal.md, design.md, specs/**/spec.md, and tasks.md are internally consistent, acceptance-ready, and implementation-ready.',
-        '- Do not return REWORK merely because product implementation or product tests remain unfinished; those belong to the implementation stage.',
-        '- If you add or preserve implementation/test follow-up tasks in tasks.md, treat that as successful spec repair once the artifacts are clear. In that case leave unchecked_tasks and required_changes empty and describe the task additions in repairs_applied/evidence.',
-        '- Return REWORK only when the OpenSpec artifacts themselves still need another spec-audit repair attempt.',
-      ].join('\n')
-    : [
-        'Implementation-stage verdict scope:',
-        '- Return PASS only when implementation, tests, and tasks.md completion satisfy the OpenSpec change.',
-        '- Return REWORK when product code, tests, or tasks.md still need another implementation audit-repair attempt.',
-      ].join('\n');
+  if (metadata.stage === 'implementation_audit_repair') {
+    const unchecked = uncheckedTaskLabels(run.taskStats);
+    const changedFiles = run.evidence?.find((entry) => entry.source === 'daemon' && entry.summary.startsWith('Changed files:'))?.summary ?? 'Changed files: unavailable.';
+    const diffStat = run.evidence?.find((entry) => entry.source === 'daemon' && entry.summary.startsWith('Diff stat:'))?.summary ?? 'Diff stat: unavailable.';
+    return [
+      `OpenSpec Auto Deliver implementation audit discussion for openspec/changes/${run.changeName}.`,
+      '',
+      `Change reference: ${openSpecChangeReference(run)}`,
+      '',
+      'OpenSpec implementation audit prompt:',
+      formatOpenSpecPromptTemplate('audit_implementation', openSpecChangeReference(run)),
+      '',
+      `Project root: ${run.projectRoot}`,
+      `Resolved change root identity: ${metadata.resolvedChangeRootIdentity}`,
+      `Run id: ${run.runId}`,
+      `Stage: ${metadata.stage}`,
+      `Generation: ${metadata.generation}`,
+      `Attempt id: ${metadata.attemptId}`,
+      `Selected Team combo id: ${metadata.selectedTeamComboId}`,
+      `Active OpenSpec prompt id: ${metadata.activeOpenSpecPromptId}`,
+      `Round: ${metadata.roundIndex}/${auditRoundLimit(run, metadata.stage)}`,
+      `Owning main session: ${metadata.owningMainSessionName}`,
+      `Execution session: ${metadata.executionSessionName}`,
+      'All referenced relative paths are relative to the project root above; do not use the execution session current directory if it differs.',
+      '',
+      'Read the OpenSpec artifacts from the referenced change folder and audit the current product code, tests, and tasks.md against them.',
+      'Use the OpenSpec implementation audit prompt above as the audit-and-repair standard; preserve concrete repair instructions in the discussion output.',
+      'Do not write authoritative JSON. Do not assign final module scores.',
+      'The execution model will use this discussion file to repair code/tests/tasks, then a separate single-model final implementation acceptance audit will score the repaired state and write the authoritative JSON.',
+      '',
+      'Audit focus:',
+      '- Identify every mismatch, omission, regression risk, edge-case gap, missing test, and falsely checked task.',
+      '- Produce concrete repair guidance that the execution model can apply directly.',
+      '- In the final Team summary, separate critical fixes, small follow-up fixes, validation requirements, and any blockers.',
+      '- Treat high apparent quality as still requiring a repair pass; do not conclude that no implementation repair should run merely because scores would be high.',
+      '',
+      `Task stats: ${run.taskStats.checked}/${run.taskStats.total} checked.`,
+      unchecked.length > 0 ? `Unchecked tasks:\n${unchecked.map((label) => `- ${label}`).join('\n')}` : 'Unchecked tasks: none.',
+      run.latestRepairSummary ? `Prior repair summary: ${run.latestRepairSummary}` : 'Prior repair summary: none.',
+      run.evidence?.length ? `Evidence:\n${run.evidence.map((entry) => `- ${entry.source}: ${entry.summary}`).join('\n')}` : 'Evidence: none.',
+      changedFiles,
+      diffStat,
+    ].join('\n');
+  }
   const unchecked = uncheckedTaskLabels(run.taskStats);
-  const changedFiles = run.evidence?.find((entry) => entry.source === 'daemon' && entry.summary.startsWith('Changed files:'))?.summary ?? 'Changed files: unavailable.';
-  const diffStat = run.evidence?.find((entry) => entry.source === 'daemon' && entry.summary.startsWith('Diff stat:'))?.summary ?? 'Diff stat: unavailable.';
   return [
-    `OpenSpec Auto Deliver audit-repair for openspec/changes/${run.changeName}.`,
+    `OpenSpec Auto Deliver specification audit discussion for openspec/changes/${run.changeName}.`,
     '',
     `Change reference: ${openSpecChangeReference(run)}`,
-    'Read the OpenSpec artifacts from that folder. This discussion intentionally references only the change folder instead of embedding artifact contents.',
     '',
-    'Canonical OpenSpec dropdown prompt for this stage:',
-    buildCanonicalOpenSpecAuditPrompt(run, metadata.stage),
+    'OpenSpec specification audit prompt:',
+    formatOpenSpecPromptTemplate('audit_spec', openSpecChangeReference(run)),
     '',
-    auditFocus,
-    stageVerdictScope,
-    `This request is launched through the normal Team/P2P combo flow (${metadata.selectedTeamComboId}), not an Auto Deliver custom combo.`,
-    `During the combo audit phase, apply the existing OpenSpec ${metadata.activeOpenSpecPromptId} criteria for this stage.`,
-    '',
+    `Project root: ${run.projectRoot}`,
+    `Resolved change root identity: ${metadata.resolvedChangeRootIdentity}`,
     `Run id: ${run.runId}`,
     `Stage: ${metadata.stage}`,
     `Generation: ${metadata.generation}`,
@@ -1131,29 +1564,25 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
     `Selected Team combo id: ${metadata.selectedTeamComboId}`,
     `Active OpenSpec prompt id: ${metadata.activeOpenSpecPromptId}`,
     `Round: ${metadata.roundIndex}/${auditRoundLimit(run, metadata.stage)}`,
-    `Project root: ${run.projectRoot}`,
-    `Authoritative result file: ${metadata.authoritativeResultPath}`,
     `Owning main session: ${metadata.owningMainSessionName}`,
     `Execution session: ${metadata.executionSessionName}`,
-    `Resolved change root identity: ${metadata.resolvedChangeRootIdentity}`,
     'All referenced relative paths are relative to the project root above; do not use the execution session current directory if it differs.',
+    '',
+    'Audit only the OpenSpec artifacts under this change: proposal.md, design.md, specs/**/spec.md, and tasks.md.',
+    'Use the OpenSpec specification audit prompt above as the audit-and-repair standard; preserve concrete artifact repair instructions in the discussion output.',
+    'Do not write authoritative JSON. Do not assign final module scores.',
+    'The execution model will use this discussion file to repair the artifacts, then a separate single-model final specification acceptance audit will score the repaired state and write the authoritative JSON.',
+    '',
+    'Audit focus:',
+    '- Identify ambiguous scope, inconsistent requirements, weak acceptance criteria, untestable scenarios, missing edge cases, failure modes, dependencies, and task gaps.',
+    '- Produce concrete artifact repair guidance that the execution model can apply directly.',
+    '- In the final Team summary, separate critical artifact fixes, small follow-up fixes, validation requirements, and any blockers.',
+    '- Treat high apparent quality as still requiring a repair pass; do not conclude that no spec repair should run merely because scores would be high.',
     '',
     `Task stats: ${run.taskStats.checked}/${run.taskStats.total} checked.`,
     unchecked.length > 0 ? `Unchecked tasks:\n${unchecked.map((label) => `- ${label}`).join('\n')}` : 'Unchecked tasks: none.',
     run.latestRepairSummary ? `Prior repair summary: ${run.latestRepairSummary}` : 'Prior repair summary: none.',
-    run.lastAuditResultError
-      ? `Previous audit-repair attempt did not produce a usable authoritative JSON result: ${run.lastAuditResultError}. Retry by writing the final raw JSON object to the authoritative result file path above.`
-      : 'Previous audit-repair strict result error: none.',
     run.evidence?.length ? `Evidence:\n${run.evidence.map((entry) => `- ${entry.source}: ${entry.summary}`).join('\n')}` : 'Evidence: none.',
-    metadata.stage === 'implementation_audit_repair' ? changedFiles : '',
-    metadata.stage === 'implementation_audit_repair' ? diffStat : '',
-    '',
-    'Write the final authoritative result as raw JSON to the exact Authoritative result file path above. Do not wrap that file in Markdown fences.',
-    'The daemon will read only that file as the authoritative result. Discussion text and summaries are for humans only and are not authoritative.',
-    'The JSON file must preserve the auto_deliver metadata exactly and must include canonical module scores.',
-    '',
-    `Required top-level fields: ${OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS.join(', ')}.`,
-    ...buildAuthoritativeResultSchemaHints(false),
   ].join('\n');
 }
 
@@ -1168,7 +1597,7 @@ function buildAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpe
     : [
         'Implementation-stage verdict scope:',
         '- PASS means implementation, tests, and tasks.md completion satisfy the OpenSpec change.',
-        '- REWORK means product/test/task completion still needs another implementation audit-repair attempt.',
+        '- REWORK means product/test/task completion still needs implementation repair and a follow-up audit.',
       ].join('\n');
   return [
     `OpenSpec Auto Deliver needs the authoritative audit result file for openspec/changes/${run.changeName}.`,
@@ -1361,6 +1790,7 @@ function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 
     if (active.p2pRunId) trackActiveAuditCancellation(run, active, reason);
     run.activeAudit = undefined;
   }
+  run.activeAcceptanceAudit = undefined;
   clearAuditFixRetryTimer(run.runId);
   delete run.activeCommandId;
   run.resumeStage = status === 'passed' ? undefined : previousStage;
@@ -1381,13 +1811,14 @@ function recordAuditResult(
   run: AutoDeliverRun,
   stage: AuditRepairStage,
   verdict: OpenSpecAutoDeliverVerdictPayload,
-  active: Pick<NonNullable<AutoDeliverRun['activeAudit']>, 'roundIndex' | 'attemptId' | 'generation'>,
-): void {
+  active: Pick<NonNullable<AutoDeliverRun['activeAudit']>, 'roundIndex' | 'attemptId' | 'generation'> & { discussionFilePath?: string },
+): OpenSpecAutoDeliverAuditResult {
   const result: OpenSpecAutoDeliverAuditResult = {
     stage,
     roundIndex: active.roundIndex,
     attemptId: active.attemptId,
     generation: active.generation,
+    ...(active.discussionFilePath ? { discussionFilePath: active.discussionFilePath } : {}),
     verdict: verdict.verdict,
     moduleScores: verdict.module_scores.map((score) => ({ ...score })),
     uncheckedTasks: [...verdict.unchecked_tasks],
@@ -1400,6 +1831,25 @@ function recordAuditResult(
     completedAt: Date.now(),
   };
   run.auditResults = [...(run.auditResults ?? []), result].slice(-20);
+  return result;
+}
+
+function scoreSnapshotFromAuditResult(
+  result: OpenSpecAutoDeliverAuditResult,
+  phase: OpenSpecAutoDeliverScoreSnapshot['phase'],
+  summary: string,
+): OpenSpecAutoDeliverScoreSnapshot {
+  return {
+    phase,
+    stage: result.stage,
+    roundIndex: result.roundIndex,
+    attemptId: result.attemptId,
+    generation: result.generation,
+    verdict: result.verdict,
+    moduleScores: result.moduleScores.map((score) => ({ ...score })),
+    summary,
+    completedAt: result.completedAt,
+  };
 }
 
 function lowScoringModules(verdict: OpenSpecAutoDeliverVerdictPayload): OpenSpecAutoDeliverModuleScore[] {
@@ -1444,12 +1894,15 @@ async function advanceAfterAuditVerdict(
   run: AutoDeliverRun,
   stage: AuditRepairStage,
   verdict: OpenSpecAutoDeliverVerdictPayload,
-  active: Pick<NonNullable<AutoDeliverRun['activeAudit']>, 'roundIndex' | 'attemptId' | 'generation'>,
+  active: Pick<NonNullable<AutoDeliverRun['activeAudit']>, 'roundIndex' | 'attemptId' | 'generation'> & {
+    discussionFilePath?: string;
+    postRepairVerification?: boolean;
+  },
 ): Promise<void> {
   if (enforceElapsedLimit(run)) return;
   run.latestVerdict = verdict.verdict;
   run.moduleScores = verdict.module_scores.map((score) => ({ ...score }));
-  recordAuditResult(run, stage, verdict, active);
+  const auditResult = recordAuditResult(run, stage, verdict, active);
   run.evidence = mergeEvidence(run.evidence, verdict.evidence.map((entry) => ({ ...entry })), {
     staleExisting: verdict.repairs_applied.length > 0,
   });
@@ -1461,13 +1914,21 @@ async function advanceAfterAuditVerdict(
     return;
   }
 
+  const postRepairVerification = active.postRepairVerification === true;
   const lowScores = lowScoringModules(verdict);
   if (lowScores.length > 0) {
-    scheduleAuditFixRetry(
-      run,
-      stage,
-      `quality_gate_low_score:${lowScores.map((score) => `${score.module}=${score.score}`).join(',')}`,
-    );
+    const reason = `quality_gate_low_score:${lowScores.map((score) => `${score.module}=${score.score}`).join(',')}`;
+    if (postRepairVerification) {
+      run.finalAfterRepair = scoreSnapshotFromAuditResult(auditResult, 'final_after_repair', reason);
+      scheduleAuditFixRetry(run, stage, reason);
+      return;
+    }
+    if (stage === 'implementation_audit_repair') {
+      run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', reason);
+      dispatchImplementationRepairPrompt(run, reason);
+      return;
+    }
+    scheduleAuditFixRetry(run, stage, reason);
     return;
   }
 
@@ -1478,6 +1939,11 @@ async function advanceAfterAuditVerdict(
       return;
     }
     if (verdict.verdict === 'REWORK') {
+      if (postRepairVerification) {
+        run.finalAfterRepair = scoreSnapshotFromAuditResult(auditResult, 'final_after_repair', 'spec_audit_rework_requires_repair');
+        scheduleAuditFixRetry(run, stage, 'spec_audit_rework_requires_repair');
+        return;
+      }
       if (shouldRunAnotherConfiguredAuditRound(run, stage)) {
         await startAuditRepairStageFailClosed(run, stage);
         return;
@@ -1489,25 +1955,33 @@ async function advanceAfterAuditVerdict(
       await startAuditRepairStageFailClosed(run, stage);
       return;
     }
+    if (postRepairVerification) {
+      run.finalAfterRepair = scoreSnapshotFromAuditResult(auditResult, 'final_after_repair', 'spec_audit_passed');
+      run.moduleScores = run.finalAfterRepair.moduleScores.map((score) => ({ ...score }));
+      run.needsPostRepairAcceptanceAudit = false;
+      run.postRepairAcceptanceStage = undefined;
+    }
     run.latestMessage = 'spec_audit_passed';
     run.evidence = mergeEvidence(run.evidence, await buildValidationEvidence(run));
     dispatchImplementationPrompt(run);
     return;
   }
 
-  if (shouldRunAnotherConfiguredAuditRound(run, stage)) {
-    await startAuditRepairStageFailClosed(run, stage);
-    return;
-  }
-
   if (verdict.verdict === 'BLOCKED') {
+    run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', 'implementation_audit_blocked');
     const projection = terminalize(run, 'needs_human', 'implementation_audit_blocked');
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
 
   if (verdict.verdict === 'REWORK') {
-    scheduleAuditFixRetry(run, stage, 'implementation_audit_rework_requires_repair');
+    if (postRepairVerification) {
+      run.finalAfterRepair = scoreSnapshotFromAuditResult(auditResult, 'final_after_repair', 'implementation_audit_rework_requires_repair');
+      scheduleAuditFixRetry(run, stage, 'implementation_audit_rework_requires_repair');
+      return;
+    }
+    run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', 'implementation_audit_rework_requires_repair');
+    dispatchImplementationRepairPrompt(run, 'implementation_audit_rework_requires_repair');
     return;
   }
 
@@ -1529,14 +2003,25 @@ async function advanceAfterAuditVerdict(
       },
     ]);
     if (currentRunChangedFiles.length > 0 && verdict.repairs_applied.length === 0) {
-      scheduleAuditFixRetry(run, stage, 'audit_pass_with_changed_files_without_repairs');
+      run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', 'audit_pass_with_changed_files_without_repairs');
+      dispatchImplementationRepairPrompt(run, 'audit_pass_with_changed_files_without_repairs');
       return;
     }
     const finalFailure = validateFinalPass(run, verdict, currentRunChangedFiles);
     if (finalFailure) {
-      scheduleAuditFixRetry(run, stage, finalFailure);
+      run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', finalFailure);
+      dispatchImplementationRepairPrompt(run, finalFailure);
       return;
     }
+    if (!postRepairVerification) {
+      run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON);
+      dispatchImplementationRepairPrompt(run, OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON);
+      return;
+    }
+    run.finalAfterRepair = scoreSnapshotFromAuditResult(auditResult, 'final_after_repair', 'final_audit_passed');
+    run.moduleScores = run.finalAfterRepair.moduleScores.map((score) => ({ ...score }));
+    run.needsPostRepairAcceptanceAudit = false;
+    run.postRepairAcceptanceStage = undefined;
     if (run.autoCommitPush) {
       await dispatchAutoCommitPushPrompt(run);
       return;
@@ -1579,6 +2064,28 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
+  if (expected.stage === 'spec_audit_repair' || expected.stage === 'implementation_audit_repair') {
+    run.activeAudit = undefined;
+    if (expected.stage === 'spec_audit_repair') {
+      run.specAuditDiscussionFilePath = p2pRun.contextFilePath;
+    } else {
+      run.implementationAuditDiscussionFilePath = p2pRun.contextFilePath;
+    }
+    run.evidence = mergeEvidence(run.evidence, [{
+      source: 'daemon',
+      summary: expected.stage === 'spec_audit_repair'
+        ? `Spec audit discussion completed: ${p2pRun.contextFilePath}. Artifact repair will use this discussion before final acceptance scoring.`
+        : `Implementation audit discussion completed: ${p2pRun.contextFilePath}. Execution repair will use this discussion before final acceptance scoring.`,
+      stale: false,
+    }]);
+    const projection = expected.stage === 'spec_audit_repair'
+      ? dispatchSpecRepairPrompt(run, 'spec_audit_followup_repair')
+      : dispatchImplementationRepairPrompt(run, OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON);
+    if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
+      send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+    }
+    return;
+  }
   const verdict = await consumeAuditResultFile(run, expected);
   if (!verdict) {
     const reason = run.latestMessage ?? 'invalid_audit_result';
@@ -1599,7 +2106,7 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
-  const completedAudit = active;
+  const completedAudit = { ...active, discussionFilePath: p2pRun.contextFilePath };
   run.activeAudit = undefined;
   await advanceAfterAuditVerdict(run, expected.stage, verdict, completedAudit).catch((error) => {
     terminalizeAndSend(run, 'failed', error instanceof Error ? error.message : 'audit_advance_failed');
@@ -1756,6 +2263,10 @@ async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void
     return;
   }
   if (run.taskStats.unchecked <= 0) {
+    if (run.needsPostRepairAcceptanceAudit || run.auditBeforeRepair || run.implementationAuditDiscussionFilePath) {
+      await dispatchPostRepairAcceptanceAuditPrompt(run);
+      return;
+    }
     if (run.materializedLimits.implementationAuditRepairRounds <= 0) {
       const projection = terminalize(run, 'needs_human', 'implementation_audit_required');
       send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
@@ -1768,6 +2279,51 @@ async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void
   if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
   }
+}
+
+async function advanceAfterSpecRepairIdle(run: AutoDeliverRun): Promise<void> {
+  if (run.status !== 'spec_audit_repair' || !run.activeCommandId || run.activeAcceptanceAudit) return;
+  if (enforceElapsedLimit(run)) return;
+  delete run.activeCommandId;
+  try {
+    run.taskStats = await readTaskStatsForRun(run);
+  } catch {
+    terminalizeAndSend(run, 'needs_human', 'tasks_unreadable');
+    return;
+  }
+  await dispatchPostRepairAcceptanceAuditPrompt(run);
+}
+
+async function advanceAfterPostRepairAcceptanceAuditIdle(run: AutoDeliverRun): Promise<void> {
+  if (!run.activeAcceptanceAudit || run.status !== run.activeAcceptanceAudit.stage || !run.activeCommandId) return;
+  if (enforceElapsedLimit(run)) return;
+  delete run.activeCommandId;
+  const active = run.activeAcceptanceAudit;
+  const metadata = acceptanceAuditMetadataFromActive(run, active);
+  const verdict = await consumeAuditResultFile(run, metadata);
+  if (!verdict) {
+    const reason = run.latestMessage ?? 'invalid_audit_result';
+    if (isRetryableAuditResultError(reason) && !active.resultFileRepairAttempted) {
+      const projection = dispatchPostRepairAcceptanceAuditResultRepairPrompt(run, active, reason);
+      if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
+        send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+      }
+      return;
+    }
+    run.activeAcceptanceAudit = undefined;
+    const projection = terminalize(run, 'needs_human', reason);
+    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+    return;
+  }
+  run.activeAcceptanceAudit = undefined;
+  await advanceAfterAuditVerdict(run, active.stage, verdict, {
+    roundIndex: active.roundIndex,
+    attemptId: active.attemptId,
+    generation: active.generation,
+    postRepairVerification: true,
+  }).catch((error) => {
+    terminalizeAndSend(run, 'failed', error instanceof Error ? error.message : 'post_repair_acceptance_audit_advance_failed');
+  });
 }
 
 function ensureTimelineListener(): void {
@@ -1801,6 +2357,30 @@ function ensureTimelineListener(): void {
     if (commitPushRun) {
       void advanceAfterAutoCommitPushIdle(commitPushRun).catch((error) => {
         terminalizeAndSend(commitPushRun, 'failed', error instanceof Error ? error.message : 'auto_commit_push_idle_advance_failed');
+      });
+      return;
+    }
+    const acceptanceAuditRun = [...runsById.values()].find((candidate) =>
+      candidate.targetImplementationSessionName === event.sessionId
+      && candidate.status === candidate.activeAcceptanceAudit?.stage
+      && !!candidate.activeCommandId
+      && !!candidate.activeAcceptanceAudit
+    );
+    if (acceptanceAuditRun) {
+      void advanceAfterPostRepairAcceptanceAuditIdle(acceptanceAuditRun).catch((error) => {
+        terminalizeAndSend(acceptanceAuditRun, 'failed', error instanceof Error ? error.message : 'post_repair_acceptance_audit_idle_advance_failed');
+      });
+      return;
+    }
+    const specRepairRun = [...runsById.values()].find((candidate) =>
+      candidate.targetImplementationSessionName === event.sessionId
+      && candidate.status === 'spec_audit_repair'
+      && !!candidate.activeCommandId
+      && !candidate.activeAcceptanceAudit
+    );
+    if (specRepairRun) {
+      void advanceAfterSpecRepairIdle(specRepairRun).catch((error) => {
+        terminalizeAndSend(specRepairRun, 'failed', error instanceof Error ? error.message : 'spec_repair_idle_advance_failed');
       });
       return;
     }

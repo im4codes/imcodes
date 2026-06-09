@@ -156,7 +156,7 @@ describe('daemon session group clone engine', () => {
       projectDir: resolvedTempDir,
       fresh: true,
       userCreated: true,
-      label: 'Source Label',
+      label: 'P2P Design Review',
       ccPreset: 'MiniMax',
       qwenModel: 'minimax-m2',
     }));
@@ -169,6 +169,53 @@ describe('daemon session group clone engine', () => {
     expect(serializedEvents).not.toContain('runtime-cc-session');
     expect(serializedEvents).not.toContain('runtime-codex-session');
     expect(serializedEvents).not.toContain('%42');
+  });
+
+  it('uses a non-English target project name as the cloned main tab label', async () => {
+    const source = makeMain({ projectDir: tempDir, state: 'idle', label: 'Source Label' });
+    const resolvedTempDir = await realpath(tempDir);
+    getSessionMock.mockImplementation((name: string) => name === source.name ? source : undefined);
+    listSessionsMock.mockReturnValue([source]);
+    launchSessionMock.mockImplementationOnce(async (opts) => {
+      getSessionMock.mockImplementation((name: string) => {
+        if (name === source.name) return source;
+        if (name === opts.name) {
+          return {
+            ...source,
+            name: opts.name,
+            projectName: opts.projectName,
+            role: opts.role,
+            projectDir: opts.projectDir,
+            label: opts.label,
+            providerSessionId: 'fresh-provider-session',
+            providerResumeId: undefined,
+            ccSessionId: 'fresh-cc-session',
+            codexSessionId: undefined,
+            paneId: undefined,
+            userCreated: true,
+          };
+        }
+        return undefined;
+      });
+    });
+
+    const { handleSessionGroupCloneCommand } = await import('../../src/daemon/session-group-clone.js');
+    const link = makeLink();
+
+    await handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: source.name,
+      targetProjectName: '客户项目',
+      idempotencyKey: 'idem-non-english',
+    }, link as never);
+
+    expect(launchSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_u5ba2_u6237_u9879_u76ee_brain',
+      projectName: 'u5ba2_u6237_u9879_u76ee',
+      projectDir: resolvedTempDir,
+      label: '客户项目',
+    }));
+    expect(JSON.stringify(link.send.mock.calls.map((call) => call[0]))).toContain('客户项目');
   });
 
   it('rejects blank target names before sanitizer fallback can create proj', async () => {
