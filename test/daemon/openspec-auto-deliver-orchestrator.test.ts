@@ -830,7 +830,7 @@ exec "${realGit}" "$@"
       && (msg.projection as { implementationPromptCount?: number }).implementationPromptCount === 1,
       2500,
     );
-    expect(implementationPromptProjection.projection.specAuditRound).toEqual({ current: 2, total: 2 });
+    expect(implementationPromptProjection.projection.specAuditRound).toEqual({ current: 1, total: 1 });
 
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
@@ -861,10 +861,10 @@ exec "${realGit}" "$@"
       phase: 'final_after_repair',
       stage: 'implementation_audit_repair',
       verdict: 'PASS',
-      roundIndex: 2,
+      roundIndex: 1,
     });
     expect(terminal?.projection.finalAfterRepair?.moduleScores).toHaveLength(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.length);
-    expect(terminal?.projection.implementationAuditRound).toEqual({ current: 2, total: 2 });
+    expect(terminal?.projection.implementationAuditRound).toEqual({ current: 1, total: 2 });
     expect(terminal?.projection.auditResults).toHaveLength(2);
   });
 
@@ -1053,7 +1053,7 @@ exec "${realGit}" "$@"
     );
     expect(gate.projection.status).toBe('implementation_task_loop');
     expect(gate.projection.implementationPromptCount).toBe(3);
-    expect(gate.projection.implementationAuditRound).toEqual({ current: 2, total: 3 });
+    expect(gate.projection.implementationAuditRound).toEqual({ current: 1, total: 1 });
 
     expect([...p2pRuns.values()]).toHaveLength(1);
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
@@ -1075,7 +1075,7 @@ exec "${realGit}" "$@"
     expect(terminal?.projection.finalAfterRepair).toMatchObject({
       phase: 'final_after_repair',
       verdict: 'PASS',
-      roundIndex: 3,
+      roundIndex: 1,
     });
   });
 
@@ -1116,7 +1116,7 @@ exec "${realGit}" "$@"
     expect(gate.projection.moduleScores).toHaveLength(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.length);
     expect(gate.projection.auditResults).toHaveLength(1);
     expect(gate.projection.auditResults?.[0]?.requiredChanges).toEqual(['clarify acceptance criteria']);
-    expect(gate.projection.specAuditRound).toEqual({ current: 2, total: 3 });
+    expect(gate.projection.specAuditRound).toEqual({ current: 1, total: 2 });
 
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
@@ -1252,7 +1252,7 @@ exec "${realGit}" "$@"
     expect(gate.projection.auditBeforeRepair).toBeUndefined();
     expect(gate.projection.finalAfterRepair).toBeUndefined();
     expect(gate.projection.auditResults).toBeUndefined();
-    expect(gate.projection.implementationAuditRound).toEqual({ current: 1, total: 2 });
+    expect(gate.projection.implementationAuditRound).toEqual({ current: 1, total: 1 });
 
     expect([...p2pRuns.values()]).toHaveLength(1);
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
@@ -1279,7 +1279,7 @@ exec "${realGit}" "$@"
       phase: 'final_after_repair',
       verdict: 'PASS',
       summary: 'final_audit_passed',
-      roundIndex: 2,
+      roundIndex: 1,
     });
     expect(terminal?.projection.auditResults).toHaveLength(1);
   });
@@ -1313,7 +1313,7 @@ exec "${realGit}" "$@"
     );
     expect(gate.projection.status).toBe('implementation_task_loop');
     expect(gate.projection.implementationPromptCount).toBe(2);
-    expect(gate.projection.implementationAuditRound).toEqual({ current: 1, total: 2 });
+    expect(gate.projection.implementationAuditRound).toEqual({ current: 1, total: 1 });
     expect(gate.projection.auditBeforeRepair).toBeUndefined();
     expect(gate.projection.finalAfterRepair).toBeUndefined();
     expect(gate.projection.auditResults).toBeUndefined();
@@ -1337,7 +1337,7 @@ exec "${realGit}" "$@"
       phase: 'final_after_repair',
       verdict: 'PASS',
       summary: 'final_audit_passed',
-      roundIndex: 2,
+      roundIndex: 1,
     });
   });
 
@@ -1370,7 +1370,7 @@ exec "${realGit}" "$@"
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_audit_repair'
-      && msg.projection?.implementationAuditRepairRound === 2
+      && msg.projection?.implementationAuditRepairRound === 1
       && msg.projection?.lastMessage === 'post_repair_result_file_repair_prompt_dispatched',
       2500,
     );

@@ -806,7 +806,6 @@ async function dispatchImplementationRepairPrompt(run: AutoDeliverRun, reason: s
   if (run.implementationPromptCount >= effectiveMaxImplementationPrompts(run)) {
     run.materializedLimits.maxImplementationPrompts = run.implementationPromptCount + 1;
   }
-  extendAuditRoundLimit(run, 'implementation_audit_repair');
   run.needsPostRepairAcceptanceAudit = true;
   run.postRepairAcceptanceStage = 'implementation_audit_repair';
   run.evidence = mergeEvidence(run.evidence, [{
@@ -824,7 +823,6 @@ function dispatchSpecRepairPrompt(run: AutoDeliverRun, reason: string): OpenSpec
   if (!runtime) {
     return terminalize(run, 'failed', 'missing_transport_runtime');
   }
-  extendAuditRoundLimit(run, 'spec_audit_repair');
   run.status = 'spec_audit_repair';
   run.stage = 'spec_audit_repair';
   run.needsPostRepairAcceptanceAudit = true;
@@ -1015,9 +1013,6 @@ async function dispatchPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun): Pro
   if (!transitionAllowed(run, transitionEvent)) {
     return terminalizeAndSend(run, 'failed', 'invalid_transition_post_repair_acceptance_audit');
   }
-  if (auditRoundCount(run, stage) >= auditRoundLimit(run, stage)) {
-    extendAuditRoundLimit(run, stage);
-  }
   if (!(await refreshChangeRoot(run))) {
     return terminalizeAndSend(run, 'failed', run.latestMessage ?? 'change_root_invalid');
   }
@@ -1043,7 +1038,7 @@ async function dispatchPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun): Pro
     },
   ]);
   const activeOpenSpecPromptId = activeOpenSpecPromptIdForAutoDeliverStage(stage);
-  const roundIndex = incrementAuditRound(run, stage);
+  const roundIndex = Math.max(1, auditRoundCount(run, stage));
   const attemptId = `${run.runId}:post_repair_acceptance_audit:${run.generation}:${roundIndex}`;
   const authoritativeResultPath = await buildAuthoritativeResultPath(run, stage, run.generation, roundIndex);
   const active: NonNullable<AutoDeliverRun['activeAcceptanceAudit']> = {
@@ -1887,12 +1882,9 @@ function lowScoringModules(verdict: OpenSpecAutoDeliverVerdictPayload): OpenSpec
 }
 
 function maxRuntimeAuditRoundLimit(stage: AuditRepairStage): number {
-  // One extra slot is reserved for the single-model final acceptance audit that
-  // follows a Team repair discussion. Do not let dynamic repair retries grow
-  // the displayed/active budget without bound.
   return stage === 'spec_audit_repair'
-    ? OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX + 1
-    : OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX + 1;
+    ? OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX
+    : OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX;
 }
 
 function extendAuditRoundLimit(run: AutoDeliverRun, stage: AuditRepairStage): void {
