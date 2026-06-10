@@ -926,6 +926,33 @@ export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promis
   }
 }
 
+/**
+ * Periodic Option-B (5h + weekly) quota refresh for claude-code-sdk SUB-sessions.
+ *
+ * Why this is needed separately from main sessions: buildSessionList carries the
+ * proactive /api/oauth/usage override (the 5h+7d picture) for MAIN sessions but
+ * EXPLICITLY EXCLUDES sub-sessions (session-list.ts), and the real-time
+ * rate_limit_event only refreshes sub-sessions that are actively taking turns. So
+ * an idle claude-code-sdk sub keeps a stale 5h-only quota and its footer never
+ * shows the 7d line. Pushing a periodic subsession.sync — which prefers the
+ * Option-B snapshot (see subsession-sync.ts) — keeps the 7d line current, exactly
+ * mirroring refreshCodexQuotaMetadata's sub-session handling above.
+ */
+export async function refreshClaudeSdkSubQuotaMetadata(serverLink?: ServerLink): Promise<void> {
+  if (!serverLink) return;
+  for (const session of listSessions()) {
+    if (session.agentType !== 'claude-code-sdk') continue;
+    if (!session.name.startsWith('deck_sub_')) continue;
+    if (session.state === 'stopped' || session.state === 'error') continue;
+    const subId = session.name.replace(/^deck_sub_/, '');
+    try {
+      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
+    } catch {
+      // not connected
+    }
+  }
+}
+
 // ── @@ token parsing ─────────────────────────────────────────────────────────
 
 /**

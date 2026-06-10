@@ -4,7 +4,7 @@ import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink } from './server-link.js';
-import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata } from './command-handler.js';
+import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
 import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
@@ -1331,6 +1331,12 @@ function startCodexQuotaPoller(serverLink: ServerLink | null): void {
   codexQuotaTimer = setInterval(() => {
     void refreshCodexQuotaMetadata(serverLink).catch((err) => {
       logger.warn({ err }, 'Codex quota refresh failed');
+    });
+    // claude-code-sdk sub-sessions are excluded from session_list (which carries
+    // the Option-B 5h+weekly override for main sessions), so push a periodic
+    // subsession.sync to keep their 7d quota line fresh — mirrors the codex subs.
+    void refreshClaudeSdkSubQuotaMetadata(serverLink).catch((err) => {
+      logger.warn({ err }, 'Claude SDK sub-session quota refresh failed');
     });
   }, CODEX_QUOTA_REFRESH_MS);
 }
