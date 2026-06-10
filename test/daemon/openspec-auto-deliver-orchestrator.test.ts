@@ -793,6 +793,7 @@ exec "${realGit}" "$@"
       fileContents?: Array<{ path: string; content: string }>;
       targets?: Array<{ session: string; mode: string }>;
       userText?: string;
+      finalSummaryExtraInstruction?: string;
     };
     expect(implementationLaunch.modeOverride).toBe('audit>review>plan');
     expect(implementationLaunch.rounds).toBe(1);
@@ -818,6 +819,10 @@ exec "${realGit}" "$@"
     expect(implementationLaunch.userText).toContain('The execution model will use this discussion file to repair code/tests/tasks');
     expect(implementationLaunch.userText).toContain('Treat high apparent quality as still requiring a repair pass');
     expectTeamScorecardHopGuidanceOnly(implementationLaunch.userText ?? '');
+    // Implementation-stage scorecard keeps code semantics — the spec-stage
+    // artifact reinterpretation must NOT leak into this stage.
+    expectTeamRepairScorecardInstructions(implementationLaunch.finalSummaryExtraInstruction ?? '');
+    expect(implementationLaunch.finalSummaryExtraInstruction ?? '').not.toContain('Spec-stage module semantics');
 
     const discussion = await completeLatestDiscussion();
     const repairPrompt = await waitForTransportSend((text) =>
@@ -1154,6 +1159,11 @@ exec "${realGit}" "$@"
     // final summary via finalSummaryExtraInstruction — the acceptance audit
     // hard-depends on the "repair scorecard" heading being present.
     expectTeamRepairScorecardInstructions(specLaunch.finalSummaryExtraInstruction ?? '');
+    // Spec-stage semantics: without these, teams gate implementation/tests/risk
+    // recovery on product code that this stage never produces → modules parked
+    // at baseline forever → spec stage loops on the <6 quality gate.
+    expect(specLaunch.finalSummaryExtraInstruction ?? '').toContain('Spec-stage module semantics');
+    expect(specLaunch.finalSummaryExtraInstruction ?? '').toContain('MUST NOT be gated on product code or product tests');
     const projection = serverLinkMock.send.mock.calls
       .map((call) => call[0])
       .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
@@ -1212,6 +1222,11 @@ exec "${realGit}" "$@"
     expectTeamRepairScorecardLocation(specAcceptancePrompt, specRun.contextFilePath);
     expect(specAcceptancePrompt).toContain('For spec-stage scoring, tests means testability of requirements, scenarios, and acceptance criteria');
     expect(specAcceptancePrompt).toContain('cap spec, tasks, tests, and risk at 7');
+    // Spec-stage module semantics + the out-of-stage precedence rule: a team
+    // scorecard that gates implementation/tests/risk on product code at spec
+    // stage must not park those modules at the baseline forever.
+    expect(specAcceptancePrompt).toContain('Spec-stage module semantics: implementation = implementation-readiness of the artifacts');
+    expect(specAcceptancePrompt).toContain('that condition is OUT OF STAGE');
     await completeAcceptanceAuditFromPrompt(specAcceptancePrompt);
     await emitDeckDemoIdle();
     await waitForSend((msg) =>

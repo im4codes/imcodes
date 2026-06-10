@@ -1198,7 +1198,10 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     ? '- REWORK if any artifact ambiguity, inconsistency, missing acceptance criteria, untestable requirement, or spec-stage repair gap remains.'
     : '- REWORK if any previous finding remains unresolved, new regressions are found, tasks are falsely checked, tests are missing, or validation is insufficient.';
   const scoreScope = specStage
-    ? '- module_scores must score the repaired OpenSpec artifact state, not product implementation completeness.'
+    ? [
+        '- module_scores must score the repaired OpenSpec artifact state, not product implementation completeness. Spec-stage module semantics: implementation = implementation-readiness of the artifacts; tests = testability of requirements/scenarios/acceptance criteria; risk = remaining artifact ambiguity/inconsistency risk.',
+        '- If the repair scorecard gates a module on product code or product tests at this stage, that condition is OUT OF STAGE: do not park the module at its baseline because of it — re-evaluate the module against the artifact-stage semantics above and score the repaired artifact evidence.',
+      ].join('\n')
     : '- module_scores must score the repaired product implementation state, not the previous audit state.';
   return [
     title,
@@ -1284,11 +1287,23 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
 }
 
 function buildTeamRepairScorecardInstructions(stage: AuditRepairStage): string[] {
-  const target = stage === 'spec_audit_repair' ? 'artifact' : 'implementation';
+  const specStage = stage === 'spec_audit_repair';
+  const target = specStage ? 'artifact' : 'implementation';
   return [
     'repair scorecard',
     `- In the final Team summary, include the exact heading "repair scorecard" for ${target} repair planning. This is not the final authoritative module_scores JSON.`,
     '- For each module (spec, tasks, implementation, tests, risk), provide: baseline score before repair, deduction reasons, concrete recovery conditions, and full-score conditions.',
+    // The score schema is the same five modules at every stage, but the SPEC
+    // stage produces no product code — without stage semantics, teams write
+    // code-gated recovery conditions ("recovery requires code+tests") that can
+    // NEVER be satisfied at this stage, parking implementation/tests/risk at
+    // the baseline forever and looping the spec stage on the <6 quality gate.
+    ...(specStage
+      ? [
+          '- Spec-stage module semantics: score the ARTIFACT state only. implementation = implementation-readiness of the artifacts (design completeness, decided open questions, task actionability); tests = testability of requirements, scenarios, and acceptance criteria; risk = remaining ambiguity/inconsistency/dependency risk in the artifacts.',
+          '- At this stage recovery and full-score conditions MUST be artifact-stage evidence gates (artifact edits, resolved decisions, openspec validation passing). They MUST NOT be gated on product code or product tests — this stage does not produce them, and such a condition can never be satisfied here.',
+        ]
+      : []),
     '- Phrase recovery conditions as evidence gates, not bonus points. Example: "tests may recover from 6 to 8 only after X test is added and Y validation passes."',
     '- The later single-model final acceptance audit will use this scorecard as a checklist and may restore points only for conditions proven by post-repair evidence.',
   ];
