@@ -1110,6 +1110,7 @@ exec "${realGit}" "$@"
       fileContents?: Array<{ path: string; content: string }>;
       targets?: Array<{ session: string; mode: string }>;
       userText?: string;
+      finalSummaryExtraInstruction?: string;
     };
     expect(specLaunch.modeOverride).toBe('audit>review>plan');
     expect(specLaunch.rounds).toBe(1);
@@ -1133,6 +1134,11 @@ exec "${realGit}" "$@"
     expect(specLaunch.userText).toContain('Do not write authoritative JSON. Do not assign final module scores.');
     expect(specLaunch.userText).toContain('The execution model will use this discussion file to repair the artifacts');
     expectTeamRepairScorecardInstructions(specLaunch.userText ?? '');
+    // With the post-summary execution gate skipped (no full request restatement
+    // on the final summary turn), the scorecard output contract must reach the
+    // final summary via finalSummaryExtraInstruction — the acceptance audit
+    // hard-depends on the "repair scorecard" heading being present.
+    expectTeamRepairScorecardInstructions(specLaunch.finalSummaryExtraInstruction ?? '');
     const projection = serverLinkMock.send.mock.calls
       .map((call) => call[0])
       .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');

@@ -2644,6 +2644,13 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
     rounds: 1,
     hopTimeoutMs,
     locale: run.locale,
+    // Hop prompts never embed the request text, and the post-summary execution
+    // gate (whose full request restatement used to smuggle these requirements
+    // into the final summary turn) is skipped for Auto Deliver runs — so the
+    // scorecard output contract must be restated on the final summary
+    // explicitly, or the discussion ships without the "repair scorecard"
+    // section the acceptance audit hard-depends on.
+    finalSummaryExtraInstruction: buildTeamRepairScorecardInstructions(stage).join('\n'),
     launchOrigin: {
       kind: 'openspec_auto_deliver',
       commandId: attemptId,

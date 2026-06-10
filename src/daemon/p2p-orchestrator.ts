@@ -160,6 +160,16 @@ export interface StartP2pRunOptions {
   sharedActor?: SharedActorEnvelope;
   shareScope?: SharedP2pRunScope;
   launchOrigin?: P2pLaunchOrigin;
+  /**
+   * Extra instruction appended verbatim to the FINAL summary hop instruction.
+   * Hop prompts never embed `userText`, so output requirements stated only in
+   * the original request (e.g. Auto Deliver's "repair scorecard" section that
+   * the acceptance audit hard-depends on) can get lost by the final round —
+   * previously they leaked in via the post-summary execution block's full
+   * request restatement; with that gate skipped for Auto Deliver runs the
+   * caller must restate them here explicitly.
+   */
+  finalSummaryExtraInstruction?: string;
 }
 
 export interface SharedP2pRunScope {
@@ -276,6 +286,8 @@ export interface P2pRun {
    * uses an allowlist sanitizer so raw prompts/provider internals never leak.
    */
   launchOrigin?: P2pLaunchOrigin;
+  /** See StartP2pRunOptions.finalSummaryExtraInstruction. */
+  finalSummaryExtraInstruction?: string;
   deadlineAt?: number | null;
   currentRoundId?: string | null;
   currentExecutionStep: number;
@@ -1306,6 +1318,7 @@ export async function startP2pRun(...args:
       : undefined,
     advancedSourceKind: advancedSource?.kind,
     launchOrigin: opts.launchOrigin,
+    finalSummaryExtraInstruction: opts.finalSummaryExtraInstruction,
   };
 
   activeRuns.set(runId, run);
@@ -2082,8 +2095,11 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       const nonFinalSummaryGuard = inlineExecutionSpec
         ? 'For the summary/kickoff portion, write analysis only into the discussion file first. After that section is written, follow the execution block below in the same turn.'
         : 'IMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.';
+      const finalSummaryExtra = isLastRound && run.finalSummaryExtraInstruction?.trim()
+        ? `\n${run.finalSummaryExtraInstruction.trim()}`
+        : '';
       const roundSummaryInstruction = isLastRound
-        ? `${summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.${inlineExecutionInstruction}`
+        ? `${summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.${finalSummaryExtra}${inlineExecutionInstruction}`
         : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). This summary prepares the next round, but the orchestrator will still dispatch a separate next-round initiator initial-analysis prompt before participant hops. Append to the file.\n${nonFinalSummaryGuard}${inlineExecutionInstruction}`;
       const roundSummaryPrompt = buildHopPrompt(run, summaryModeConfig, {
         session: run.initiatorSession,
@@ -3648,7 +3664,10 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
       cycleIndex: 1,
       cycleTotal: 1,
     });
-  const finalInstructionBase = `${resolvedFinalSummaryPrompt}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.`;
+  const workflowFinalSummaryExtra = run.finalSummaryExtraInstruction?.trim()
+    ? `\n${run.finalSummaryExtraInstruction.trim()}`
+    : '';
+  const finalInstructionBase = `${resolvedFinalSummaryPrompt}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.${workflowFinalSummaryExtra}`;
   const finalPrompt = buildHopPrompt(run, getP2pMode(finalRound?.modeKey ?? run.mode), {
     session: run.initiatorSession,
     sectionHeader: `${discussionParticipantNameWithMode(run.initiatorSession, finalRound?.modeKey ?? run.mode)} — Final Summary`,

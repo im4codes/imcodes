@@ -1156,6 +1156,10 @@ describe('P2P orchestrator — parallel rounds', () => {
       userText: 'auto deliver audit discussion — analysis only',
       fileContents: [],
       serverLink: serverLinkMock as any,
+      // With the gate gone there is no full request restatement on the final
+      // summary turn — output contracts (e.g. the repair scorecard section)
+      // must be restated here and MUST land in the final summary prompt.
+      finalSummaryExtraInstruction: 'include the exact heading "repair scorecard" with per-module baselines',
       launchOrigin: {
         kind: 'openspec_auto_deliver',
         commandId: 'auto-command-gate-skip',
@@ -1183,6 +1187,8 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(finalSummaryPrompt?.prompt).not.toContain('directly execute the user');
     // …and no follow-up verification turn at all.
     expect(prompts.some((entry) => entry.prompt.includes('Team execution follow-up verification'))).toBe(false);
+    // The caller-supplied output contract IS restated on the final summary.
+    expect(finalSummaryPrompt?.prompt).toContain('include the exact heading "repair scorecard" with per-module baselines');
   });
 
   it('retains completed hop evidence with best-effort fallback when exact baseline slicing is not possible', async () => {
