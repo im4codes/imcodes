@@ -1906,50 +1906,42 @@ exec "${realGit}" "$@"
     expect(transportSendMock.mock.calls.some((call) => String(call[0] ?? '').includes('Problem: missing_authoritative_json'))).toBe(false);
   });
 
-  it('recovers a post-summary execution-gate failure via an audit-fix round instead of audit_p2p_failed', async () => {
+  it('proceeds to repair + scoring on a post-summary execution-gate failure instead of audit_p2p_failed', async () => {
     // Regression: the Team audit discussion's by-design post-summary execution
-    // gate may end with a `failed` marker when the agent could not finish the
-    // repair in one turn. That used to terminalize the whole delivery as
-    // audit_p2p_failed even though the audit itself was fine. It must instead
-    // route through the recoverable audit-fix retry path (contrast the
-    // dispatch_failed infrastructure case above, which still hard-fails).
+    // gate may end with a `failed` marker when the agent could not finish ALL the
+    // repair in one hop — but the discussion analysis is complete. The run must
+    // PROCEED to the separate repair + acceptance scoring (which produces the
+    // score), NOT terminalize as audit_p2p_failed and NOT re-run the discussion
+    // (which would loop, incrementing rounds without ever producing a score).
+    // Contrast the dispatch_failed infrastructure case above, which still hard-fails.
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
-    const emitSpy = vi.spyOn(timelineEmitter, 'emit');
-    try {
-      await handleOpenSpecAutoDeliverCommand({
-        type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
-        requestId: 'req-post-summary-exec-recoverable',
-        sessionName: 'deck_demo_brain',
-        changeName: 'demo-change',
-        presetId: 'fast',
-      }, serverLinkMock as never);
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-post-summary-exec-proceed',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
 
-      await emitDeckDemoIdle();
-      await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && (msg.projection as { stage?: string })?.stage === 'implementation_audit_repair');
-      const p2pRun = [...p2pRuns.values()].at(-1)!;
-      p2pRun.error = 'post_summary_execution_failed: implementation repair scope not completed in this turn';
-      await completeLatestAudit('failed');
+    await emitDeckDemoIdle();
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && (msg.projection as { stage?: string })?.stage === 'implementation_audit_repair');
+    const p2pRun = [...p2pRuns.values()].at(-1)!;
+    p2pRun.error = 'post_summary_execution_failed: implementation repair scope not completed in this turn';
+    await completeLatestAudit('failed');
 
-      // The daemon emits a *recoverable* audit-fix gate, not a hard terminal.
-      let recoverableAsk: unknown;
-      const start = Date.now();
-      while (Date.now() - start < 2500) {
-        recoverableAsk = emitSpy.mock.calls.find(([, event, payload]) =>
-          event === 'ask.question'
-          && Array.isArray((payload as { questions?: unknown[] })?.questions)
-          && String((payload as { questions: { question?: string }[] }).questions[0]?.question ?? '').includes('recoverable gate'));
-        if (recoverableAsk) break;
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      expect(recoverableAsk).toBeTruthy();
+    // The run proceeds to the implementation repair dispatch (which leads to the
+    // acceptance audit that produces the score) rather than re-running the audit.
+    await waitForTransportSend((text) =>
+      text.includes('Audit findings to repair now:')
+      && text.includes('Reason: implementation_audit_followup_repair'),
+      2500,
+    );
 
-      const auditP2pFailedTerminal = serverLinkMock.send.mock.calls
-        .map((call) => call[0] as { type?: string; projection?: { terminalReason?: string } })
-        .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.terminalReason === 'audit_p2p_failed');
-      expect(auditP2pFailedTerminal).toBeUndefined();
-    } finally {
-      emitSpy.mockRestore();
-    }
+    // And it does NOT hard-fail the delivery as audit_p2p_failed.
+    const auditP2pFailedTerminal = serverLinkMock.send.mock.calls
+      .map((call) => call[0] as { type?: string; projection?: { terminalReason?: string } })
+      .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.terminalReason === 'audit_p2p_failed');
+    expect(auditP2pFailedTerminal).toBeUndefined();
   });
 
   it('classifies post-summary execution gate failures as recoverable and infra failures as terminal', () => {

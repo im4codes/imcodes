@@ -2394,31 +2394,36 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
     return;
   }
   clearAuditPollTimer(runId);
-  if (p2pRun.status !== 'completed') {
+  // The Team audit discussion's by-design post-summary execution gate may end
+  // with a `failed` marker (or a gate timeout) when the agent could not finish
+  // ALL the repair in a single hop — even though it produced the full audit
+  // analysis and repair guidance in the discussion file. The auto-deliver flow
+  // does NOT depend on that gate: the repair is a SEPARATE dispatch and the
+  // SCORE comes from the acceptance audit. So treat a post-summary gate failure
+  // as "discussion usable" and proceed to repair + scoring below. Re-running the
+  // discussion instead would loop forever — incrementing rounds without ever
+  // producing a score. Genuine failures (dispatch_failed, the discussion itself
+  // timing out, cancellation, etc.) still escalate to needs_human.
+  const usableGateFailure = p2pRun.status !== 'completed'
+    && (expected.stage === 'spec_audit_repair' || expected.stage === 'implementation_audit_repair')
+    && isPostSummaryExecutionGateFailure(p2pRun.error);
+  if (p2pRun.status !== 'completed' && !usableGateFailure) {
     run.evidence = mergeEvidence(run.evidence, [{
       source: 'daemon',
       summary: p2pAuditFailureSummary(p2pRun),
       stale: false,
     }]);
     run.activeAudit = undefined;
-    // The Team audit discussion's by-design post-summary execution gate may end
-    // with a `failed` marker or a gate timeout when the agent could not finish
-    // the repair in a single turn. That is recoverable: route it through the
-    // audit-fix retry path, which adds one more audit round (work accumulates in
-    // the artifacts across rounds) or escalates to `*_rounds_exhausted`
-    // needs_human once the round budget is spent — instead of hard-failing the
-    // whole delivery on a transient "ran out of turn" signal. Infrastructure
-    // failures (e.g. dispatch_failed) still escalate to needs_human immediately.
-    if (
-      (expected.stage === 'spec_audit_repair' || expected.stage === 'implementation_audit_repair')
-      && isPostSummaryExecutionGateFailure(p2pRun.error)
-    ) {
-      scheduleAuditFixRetry(run, expected.stage, 'audit_p2p_failed');
-      return;
-    }
     const projection = terminalize(run, 'needs_human', 'audit_p2p_failed');
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
+  }
+  if (usableGateFailure) {
+    run.evidence = mergeEvidence(run.evidence, [{
+      source: 'daemon',
+      summary: `Audit discussion analysis is usable; its post-summary execution gate did not complete (${p2pRun.error ?? 'no completion marker'}). Proceeding to repair + acceptance scoring instead of re-running the discussion.`,
+      stale: false,
+    }]);
   }
   if (expected.stage === 'spec_audit_repair' || expected.stage === 'implementation_audit_repair') {
     run.activeAudit = undefined;
