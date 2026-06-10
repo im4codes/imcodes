@@ -43,7 +43,11 @@ export default defineWorkspace([
       globals: false,
       fileParallelism: false,
       hookTimeout: 30000,
-      testTimeout: 60000, // E2E tests spawn real tmux + agent processes and are unstable under file-level parallelism
+      testTimeout: 90000, // E2E tests spawn real tmux + agent processes and are unstable under file-level parallelism
+      // A cold embedding-model load plus tmux/agent spawn can push a single
+      // attempt just past the timeout (observed 60008ms on a 60s limit). Retry
+      // so a transient e2e timeout re-runs warm instead of failing CI.
+      retry: 2,
     },
   },
 ]);
