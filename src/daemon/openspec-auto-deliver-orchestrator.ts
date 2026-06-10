@@ -781,7 +781,7 @@ function buildImplementationRepairBlock(run: AutoDeliverRun, repairReason?: stri
     audit ? `Previous implementation audit verdict: ${audit.verdict}` : undefined,
     auditDiscussionFilePath ? `Audit discussion file: ${auditDiscussionFilePath}` : undefined,
     lowScores.length > 0
-      ? `Low module scores: ${lowScores.map((score) => `${score.module}=${score.score}/10 (${score.summary})`).join('; ')}`
+      ? `Low module scores: ${lowScores.map((score) => `${score.module}=${score.score}/10`).join(', ')}`
       : undefined,
     '',
     'Required code/test/task changes from the audit:',
@@ -868,6 +868,19 @@ function buildImplementationCompletionMarkerBlock(run: AutoDeliverRun): string {
 
 function buildSpecRepairPrompt(run: AutoDeliverRun, repairReason: string): string {
   const reference = openSpecChangeReference(run);
+  // The previous spec audit (team discussion or acceptance audit) already
+  // produced concrete, one-line required_changes (each is "file:line — directive")
+  // plus per-module scores. The earlier repair turn missed these because the
+  // prompt only carried a generic reason + "read the discussion file", so the
+  // model rewrote elsewhere and left the flagged items open → the next
+  // acceptance audit penalized the unresolved findings and the score DROPPED.
+  // Inline a concise must-fix checklist (no evidence dump, no long summaries):
+  // just the requiredChanges lines and a bare module=score list.
+  const previousAudit = latestAuditResultForStage(run, 'spec_audit_repair');
+  const mustFix = previousAudit?.requiredChanges ?? [];
+  const lowScores = (previousAudit?.moduleScores ?? [])
+    .filter((score) => score.score < OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE)
+    .map((score) => `${score.module}=${score.score}/10`);
   return [
     formatOpenSpecPromptTemplate('audit_spec', reference),
     '',
@@ -877,14 +890,23 @@ function buildSpecRepairPrompt(run: AutoDeliverRun, repairReason: string): strin
     `Run id: ${run.runId}`,
     `Generation: ${run.generation}`,
     `Reason: ${repairReason}`,
+    previousAudit ? `Previous spec audit verdict: ${previousAudit.verdict}.` : undefined,
     run.specAuditDiscussionFilePath ? `Spec audit discussion file: ${run.specAuditDiscussionFilePath}` : 'Spec audit discussion file: unavailable.',
+    ...(mustFix.length > 0
+      ? [
+          '',
+          'Must-fix items flagged by the previous spec audit — resolve EACH at the cited file:line/heading. Do not rewrite elsewhere and leave these open; the next acceptance audit caps the module at 5 for any unresolved item:',
+          bullets(mustFix),
+        ]
+      : []),
+    ...(lowScores.length > 0 ? [`Modules still below bar: ${lowScores.join(', ')}.`] : []),
     '',
     'Repair only the OpenSpec artifacts under this change: proposal.md, design.md, specs/**/spec.md, and tasks.md.',
-    'Before editing, read the spec audit discussion file above for the full review/plan context.',
+    'Read the spec audit discussion file above for full context, but treat the must-fix list as the binding checklist: make the concrete edit for each item and record it in repairs_applied with the file path.',
     'Do not edit product implementation files. Do not write authoritative JSON. Do not assign final module scores in this turn.',
     'After repairing the artifacts, run OpenSpec validation when available and report exact commands/outcomes.',
     'The final spec acceptance score and authoritative JSON will be produced by a separate single-model acceptance audit after this repair turn.',
-  ].join('\n');
+  ].filter((line): line is string => line !== undefined).join('\n');
 }
 
 async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: string): Promise<OpenSpecAutoDeliverProjection> {
@@ -1195,8 +1217,9 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     'Scoring discipline:',
     '- Score from 10 downward based on current repaired evidence; do not start from PASS or assume high scores because a repair prompt completed.',
     '- Treat the repair turn, checked tasks.md, and discussion summaries as claims to verify, not proof. Re-read the repaired files and compare them against every previous required_change, unchecked/falsely-complete task, low-score concern, validation requirement, and repair scorecard item.',
-    '- Strictly follow the repair scorecard: start from its baseline scores, restore points only for deduction items that are actually fixed and evidenced, and do not restore points for unverified claims.',
-    '- Do not assign module_scores that exceed the repair scorecard recovery/full-score conditions.',
+    '- Use the repair scorecard baseline as the STARTING point, not a ceiling. When a deduction item is confirmed fixed by fresh post-repair evidence (you read the changed files / ran or saw validation), you MUST raise that module above its baseline in proportion to what was actually resolved. Withhold the increase only for items still unfixed or unverifiable.',
+    '- A module score identical to its pre-repair baseline is correct ONLY when that module had no real repair, or its findings remain genuinely unresolved. If repairs_applied resolved this module\'s deduction items and you verified them, an unchanged (flat) score is WRONG — reflect the improvement; do not park everything at the baseline out of caution.',
+    '- Do not inflate beyond the evidence either: do not exceed the repair scorecard full-score conditions, and do not restore points for claims you could not verify.',
     '- Award 9 or 10 only when fresh post-repair evidence shows the relevant module is complete, edge cases are covered, and appropriate validation ran after repair. If validation could not run, the evidence must explain the concrete blocker and the affected module must not receive 9 or 10.',
     specStage
       ? '- For spec-stage scoring, tests means testability of requirements, scenarios, and acceptance criteria. If OpenSpec validation was not run after repair, cap spec, tasks, tests, and risk at 7 even if the text looks clean.'
@@ -1309,7 +1332,11 @@ async function dispatchPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun): Pro
   const activeOpenSpecPromptId = activeOpenSpecPromptIdForAutoDeliverStage(stage);
   const roundIndex = Math.max(1, auditRoundCount(run, stage));
   const attemptId = `${run.runId}:post_repair_acceptance_audit:${run.generation}:${roundIndex}`;
-  const authoritativeResultPath = await buildAuthoritativeResultPath(run, stage, run.generation, roundIndex);
+  // 'acceptance' phase → distinct path from the team discussion's audit file at
+  // the same (stage, round), so this audit always writes onto an empty path
+  // (fresh scores, never re-stamps the discussion's stale verdict) and the team
+  // scorecard JSON is preserved for inspection.
+  const authoritativeResultPath = await buildAuthoritativeResultPath(run, stage, run.generation, roundIndex, 'acceptance');
   const active: NonNullable<AutoDeliverRun['activeAcceptanceAudit']> = {
     selectedTeamComboId: run.selectedTeamComboId,
     activeOpenSpecPromptId,
@@ -1423,8 +1450,25 @@ function p2pAuditFailureSummary(p2pRun: P2pRun): string {
     : `Team/P2P audit run failed before producing an authoritative result. status=${p2pRun.status}`;
 }
 
-function safeAutoDeliverResultBasename(run: AutoDeliverRun, stage: AuditRepairStage, generation: number, roundIndex: number): string {
-  return `${run.runId}.${stage}.g${generation}.r${roundIndex}.authoritative.json`
+/**
+ * Which phase owns an authoritative result file. The team/P2P discussion audit
+ * and the post-repair single-model acceptance audit MUST NOT share a path: they
+ * run at the same (stage, round), so a shared path lets the acceptance audit
+ * read/re-stamp the discussion's stale scores (→ scores never move after a fix)
+ * and clobbers the team scorecard JSON. 'audit' keeps the original basename for
+ * backward compatibility; 'acceptance' gets a distinct `.acceptance` segment.
+ */
+type AutoDeliverResultPhase = 'audit' | 'acceptance';
+
+function safeAutoDeliverResultBasename(
+  run: AutoDeliverRun,
+  stage: AuditRepairStage,
+  generation: number,
+  roundIndex: number,
+  phase: AutoDeliverResultPhase = 'audit',
+): string {
+  const phaseSegment = phase === 'acceptance' ? '.acceptance' : '';
+  return `${run.runId}.${stage}.g${generation}.r${roundIndex}${phaseSegment}.authoritative.json`
     .replace(/[^a-zA-Z0-9._-]/g, '_');
 }
 
@@ -1439,10 +1483,16 @@ async function buildImplementationMarkerPath(run: AutoDeliverRun, generation: nu
   return join(dir, safeImplementationMarkerBasename(run, generation, promptIndex));
 }
 
-async function buildAuthoritativeResultPath(run: AutoDeliverRun, stage: AuditRepairStage, generation: number, roundIndex: number): Promise<string> {
+async function buildAuthoritativeResultPath(
+  run: AutoDeliverRun,
+  stage: AuditRepairStage,
+  generation: number,
+  roundIndex: number,
+  phase: AutoDeliverResultPhase = 'audit',
+): Promise<string> {
   const dir = join(run.projectRoot, '.imc', 'discussions');
   await mkdir(dir, { recursive: true });
-  return join(dir, safeAutoDeliverResultBasename(run, stage, generation, roundIndex));
+  return join(dir, safeAutoDeliverResultBasename(run, stage, generation, roundIndex, phase));
 }
 
 function isPathWithin(parent: string, child: string): boolean {

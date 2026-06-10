@@ -242,9 +242,12 @@ function expectFinalAcceptanceScoringDiscipline(text: string): void {
   expect(text).toContain('do not start from PASS or assume high scores because a repair prompt completed');
   expect(text).toContain('Treat the repair turn, checked tasks.md, and discussion summaries as claims to verify, not proof');
   expect(text).toContain('repair scorecard item');
-  expect(text).toContain('Strictly follow the repair scorecard');
-  expect(text).toContain('Do not assign module_scores that exceed the repair scorecard recovery/full-score conditions');
-  expect(text).toContain('restore points only for deduction items that are actually fixed and evidenced');
+  // Baseline is a starting point, not a ceiling: a verified fix MUST raise the score.
+  expect(text).toContain('Use the repair scorecard baseline as the STARTING point, not a ceiling');
+  expect(text).toContain('you MUST raise that module above its baseline in proportion to what was actually resolved');
+  expect(text).toContain('an unchanged (flat) score is WRONG');
+  // Anti-gaming guards retained on the other side.
+  expect(text).toContain('do not exceed the repair scorecard full-score conditions, and do not restore points for claims you could not verify');
   expect(text).toContain('Award 9 or 10 only when fresh post-repair evidence shows the relevant module is complete');
   expect(text).toContain('If any previous finding remains unresolved or only unverified, verdict must be REWORK');
   expect(text).toContain('Evidence that only restates the prompt, promises future work, or cites the Team discussion without inspecting repaired files is insufficient for PASS');
@@ -1165,6 +1168,15 @@ exec "${realGit}" "$@"
     );
     expect(specAcceptancePrompt).toContain(`Authoritative result file:`);
     expect(specAcceptancePrompt).toContain('Required top-level fields:');
+    // The acceptance audit MUST write to a path distinct from the team
+    // discussion's authoritative file at the same (stage, round) — otherwise it
+    // re-stamps the discussion's stale scores and clobbers the team scorecard.
+    const specAcceptancePath = (specAcceptancePrompt.split(/\r?\n/)
+      .find((line) => line.startsWith('Authoritative result file:')) ?? '')
+      .replace('Authoritative result file:', '').trim();
+    expect(specAcceptancePath).toBeTruthy();
+    expect(specAcceptancePath).not.toBe(specPath);
+    expect(specAcceptancePath).toContain('.acceptance.');
     expectAuthoritativeResultSchemaHints(specAcceptancePrompt);
     expectFinalAcceptanceScoringDiscipline(specAcceptancePrompt);
     expectTeamRepairScorecardLocation(specAcceptancePrompt, specRun.contextFilePath);
@@ -1351,6 +1363,58 @@ exec "${realGit}" "$@"
     expect(transportSendMock.mock.calls.some((call) =>
       String(call[0] ?? '').includes('Drive the implementation of @openspec/changes/demo-change aggressively.'),
     )).toBe(false);
+  });
+
+  it('inlines the previous spec acceptance audit required_changes into the next spec repair prompt', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-spec-repair-requirements',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
+    await completeLatestDiscussion('completed', '# spec audit discussion\n\nClarify acceptance criteria before final scoring.');
+    // The first repair prompt has no prior acceptance audit result yet → no must-fix list.
+    const firstRepairPrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
+      2500,
+    );
+    expect(firstRepairPrompt).not.toContain('Must-fix items flagged by the previous spec audit');
+    await emitDeckDemoIdle();
+    const specAcceptancePrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
+      2500,
+    );
+    const flaggedChange = 'design.md:281 — remove the BigInt-vs-cap either/or and the owner-decision marker';
+    await completeAcceptanceAuditFromPrompt(specAcceptancePrompt, {
+      verdict: 'REWORK',
+      required_changes: [flaggedChange],
+    });
+    await emitDeckDemoIdle();
+
+    // Round 2 launches a fresh spec audit discussion; complete it and capture the
+    // next repair prompt — it MUST carry the flagged required_changes verbatim so
+    // the repair model targets the exact item instead of rewriting elsewhere.
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'spec_audit_repair'
+      && msg.projection?.lastMessage === 'spec_audit_rework_requires_repair',
+      2500,
+    );
+    const start = Date.now();
+    while (Date.now() - start < 2500 && [...p2pRuns.values()].length < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await completeLatestDiscussion('completed', '# spec audit discussion round 2\n\nResolve the open fork.');
+    const secondRepairPrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change')
+      && text.includes('Must-fix items flagged by the previous spec audit'),
+      2500,
+    );
+    expect(secondRepairPrompt).toContain(`- ${flaggedChange}`);
   });
 
   it('does not start another Team audit after final implementation acceptance PASS with perfect scores', async () => {
