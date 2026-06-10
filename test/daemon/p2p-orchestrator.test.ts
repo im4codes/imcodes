@@ -1191,6 +1191,86 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(finalSummaryPrompt?.prompt).toContain('include the exact heading "repair scorecard" with per-module baselines');
   });
 
+  it('appends finalSummaryExtraInstruction to the legacy final summary alongside the inline execution block', async () => {
+    // Manual runs keep the execution gate; the extra instruction must coexist
+    // with (not replace) the inline execution block.
+    const prompts: Array<{ session: string; prompt: string }> = [];
+
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      prompts.push({ session, prompt });
+      if (prompt.includes('[P2P Discussion Task')) {
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+        await writeExecutionMarkerFromPrompt(prompt);
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 20);
+      }
+    });
+
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'manual run with a final summary output contract',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      finalSummaryExtraInstruction: 'final summary MUST include the section "output contract lock"',
+    });
+
+    const done = await waitForStatus(run.id, ['completed']);
+    expect(done.status).toBe('completed');
+
+    const finalSummaryPrompt = prompts.find((entry) => entry.session === 'deck_proj_brain' && entry.prompt.includes('Final Summary'));
+    expect(finalSummaryPrompt?.prompt).toContain('final summary MUST include the section "output contract lock"');
+    expect(finalSummaryPrompt?.prompt).toContain('Execution proof required');
+  });
+
+  it('appends finalSummaryExtraInstruction to the workflow-path final summary', async () => {
+    // The advanced/workflow flow builds its final summary through a different
+    // code path than the legacy combo loop — lock the restatement there too.
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_proj_brain') return { agentType: 'claude-code-sdk', projectDir: tempProjectDir, parentSession: undefined, label: 'brain' };
+      return null;
+    });
+    const prompts: Array<{ session: string; prompt: string }> = [];
+
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      prompts.push({ session, prompt });
+      const filePath = pathFromPrompt(prompt);
+      const heading = headingFromPrompt(prompt);
+      await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+      await writeExecutionMarkerFromPrompt(prompt);
+      setTimeout(() => notifySessionIdle(session), 20);
+    });
+
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [],
+      userText: 'workflow run with a final summary output contract',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      finalSummaryExtraInstruction: 'final summary MUST include the section "output contract lock"',
+      advancedRounds: [
+        {
+          id: 'implementation',
+          title: 'Implementation',
+          preset: 'implementation',
+          executionMode: 'single_main',
+          permissionScope: 'implementation',
+        },
+      ],
+    });
+
+    const done = await waitForStatus(run.id, ['completed'], 15_000);
+    expect(done.status).toBe('completed');
+
+    const finalSummaryPrompt = prompts.find((entry) => entry.session === 'deck_proj_brain' && entry.prompt.includes('Final Summary'));
+    expect(finalSummaryPrompt?.prompt).toContain('final summary MUST include the section "output contract lock"');
+  });
+
   it('retains completed hop evidence with best-effort fallback when exact baseline slicing is not possible', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
       const filePath = pathFromPrompt(prompt);
