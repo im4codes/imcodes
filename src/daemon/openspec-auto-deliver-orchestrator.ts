@@ -63,7 +63,7 @@ import {
   validateOpenSpecAutoDeliverVerdictPayload,
   parseOpenSpecAutoDeliverAuthoritativeJsonPayload,
 } from '../../shared/openspec-auto-deliver-validators.js';
-import { formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
+import { formatOpenSpecAuditStandardTemplate, formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
 import {
   buildP2pExecutionMarker,
   isPostSummaryExecutionGateFailure,
@@ -1166,9 +1166,12 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
   const title = specStage
     ? `OpenSpec Auto Deliver final specification acceptance audit for ${reference}.`
     : `OpenSpec Auto Deliver final implementation acceptance audit for ${reference}.`;
+  // Audit-standard variant only: this is a scoring pass ("Do not implement
+  // fixes in this turn"), so the canonical template's trailing repair
+  // directive must not be embedded here.
   const basePrompt = specStage
-    ? formatOpenSpecPromptTemplate('audit_spec', reference)
-    : formatOpenSpecPromptTemplate('audit_implementation', reference);
+    ? formatOpenSpecAuditStandardTemplate('audit_spec', reference)
+    : formatOpenSpecAuditStandardTemplate('audit_implementation', reference);
   const auditTarget = specStage
     ? 'the repaired OpenSpec artifacts'
     : 'the repaired product code, tests, and tasks.md';
@@ -1851,12 +1854,6 @@ function openSpecChangeReference(run: AutoDeliverRun): string {
   return `@openspec/changes/${run.changeName}`;
 }
 
-function buildCanonicalOpenSpecAuditPrompt(run: AutoDeliverRun, stage: AuditRepairStage): string {
-  return stage === 'spec_audit_repair'
-    ? formatOpenSpecPromptTemplate('audit_spec', openSpecChangeReference(run))
-    : formatOpenSpecPromptTemplate('audit_implementation', openSpecChangeReference(run));
-}
-
 function buildAuthoritativeResultSchemaHints(includeAutoDeliverNesting: boolean): string[] {
   return [
     includeAutoDeliverNesting
@@ -1881,7 +1878,11 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
       `Change reference: ${openSpecChangeReference(run)}`,
       '',
       'OpenSpec implementation audit prompt:',
-      formatOpenSpecPromptTemplate('audit_implementation', openSpecChangeReference(run)),
+      // Discussion turns are audit-only ("Do not write authoritative JSON",
+      // repair happens in the execution model's turn) — embed the audit
+      // standard without the template's "then fix the code … Do not stop at a
+      // report" repair directive, which contradicted the audit-only contract.
+      formatOpenSpecAuditStandardTemplate('audit_implementation', openSpecChangeReference(run)),
       '',
       `Project root: ${run.projectRoot}`,
       `Resolved change root identity: ${metadata.resolvedChangeRootIdentity}`,
@@ -1921,7 +1922,10 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
     `Change reference: ${openSpecChangeReference(run)}`,
     '',
     'OpenSpec specification audit prompt:',
-    formatOpenSpecPromptTemplate('audit_spec', openSpecChangeReference(run)),
+    // Audit-only turn — same rationale as the implementation branch above: do
+    // not embed "then directly update the change artifacts … Do not stop at
+    // review notes" into a turn whose contract is review-only.
+    formatOpenSpecAuditStandardTemplate('audit_spec', openSpecChangeReference(run)),
     '',
     `Project root: ${run.projectRoot}`,
     `Resolved change root identity: ${metadata.resolvedChangeRootIdentity}`,

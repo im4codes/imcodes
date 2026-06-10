@@ -9,7 +9,7 @@ import {
   OPENSPEC_AUTO_DELIVER_MSG,
   OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS,
 } from '../../shared/openspec-auto-deliver-constants.js';
-import { formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
+import { formatOpenSpecAuditStandardTemplate, formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
 import { isPostSummaryExecutionGateFailure } from '../../shared/p2p-execution-marker.js';
 
 interface MockP2pRun {
@@ -792,7 +792,12 @@ exec "${realGit}" "$@"
     expect(implementationLaunch.userText).toContain(`Project root: ${projectDir}`);
     expect(implementationLaunch.userText).toContain(`Resolved change root identity: ${join(projectDir, 'openspec', 'changes', 'demo-change')}`);
     expect(implementationLaunch.userText).toContain('All referenced relative paths are relative to the project root above');
-    expect(implementationLaunch.userText).toContain(formatOpenSpecPromptTemplate('audit_implementation', '@openspec/changes/demo-change'));
+    // Audit-only discussion embeds the audit STANDARD without the canonical
+    // template's "then fix the code … Do not stop at a report" repair
+    // directive, which contradicted the "do not repair in this turn" contract.
+    expect(implementationLaunch.userText).toContain(formatOpenSpecAuditStandardTemplate('audit_implementation', '@openspec/changes/demo-change'));
+    expect(implementationLaunch.userText).not.toContain('then fix the code');
+    expect(implementationLaunch.userText).not.toContain('Do not stop at a report');
     expect(implementationLaunch.userText).toContain('Use the OpenSpec implementation audit prompt above as the audit-and-repair standard; preserve concrete repair instructions in the discussion output.');
     expect(implementationLaunch.userText).toContain('Do not write authoritative JSON. Do not assign final module scores.');
     expect(implementationLaunch.userText).toContain('The execution model will use this discussion file to repair code/tests/tasks');
@@ -1120,7 +1125,10 @@ exec "${realGit}" "$@"
     expect(specLaunch.userText).toContain(`Resolved change root identity: ${join(projectDir, 'openspec', 'changes', 'demo-change')}`);
     expect(specLaunch.userText).toContain('All referenced relative paths are relative to the project root above');
     expect(specLaunch.userText).toContain('Perform a strict specification audit for @openspec/changes/demo-change.');
-    expect(specLaunch.userText).toContain('then directly update the change artifacts under @openspec/changes/demo-change (proposal, design, specs, tasks)');
+    // The repair directive must NOT leak into the audit-only discussion turn —
+    // it told the team to edit artifacts in a turn whose contract is review-only.
+    expect(specLaunch.userText).not.toContain('then directly update the change artifacts');
+    expect(specLaunch.userText).not.toContain('Do not stop at review notes');
     expect(specLaunch.userText).toContain('Use the OpenSpec specification audit prompt above as the audit-and-repair standard; preserve concrete artifact repair instructions in the discussion output.');
     expect(specLaunch.userText).toContain('Do not write authoritative JSON. Do not assign final module scores.');
     expect(specLaunch.userText).toContain('The execution model will use this discussion file to repair the artifacts');
@@ -1145,7 +1153,8 @@ exec "${realGit}" "$@"
     const specOrigin = specRun.launchOrigin as { autoDeliver?: Record<string, unknown> };
     const specPath = String(specOrigin.autoDeliver?.authoritativeResultPath);
     expect(specPath).toBeTruthy();
-    expect(specRun.userText).toContain(formatOpenSpecPromptTemplate('audit_spec', reference));
+    expect(specRun.userText).toContain(formatOpenSpecAuditStandardTemplate('audit_spec', reference));
+    expect(specRun.userText).not.toContain('then directly update the change artifacts');
     expect(specRun.userText).toContain('Use the OpenSpec specification audit prompt above as the audit-and-repair standard; preserve concrete artifact repair instructions in the discussion output.');
     expect(specRun.userText).toContain('Do not write authoritative JSON. Do not assign final module scores.');
     expect(specRun.userText).toContain('The execution model will use this discussion file to repair the artifacts');
@@ -1199,7 +1208,8 @@ exec "${realGit}" "$@"
     const implementationRun = [...p2pRuns.values()].at(-1)!;
     const implementationOrigin = implementationRun.launchOrigin as { autoDeliver?: Record<string, unknown> };
     expect(implementationRun.userText).toContain('OpenSpec Auto Deliver implementation audit discussion');
-    expect(implementationRun.userText).toContain(formatOpenSpecPromptTemplate('audit_implementation', reference));
+    expect(implementationRun.userText).toContain(formatOpenSpecAuditStandardTemplate('audit_implementation', reference));
+    expect(implementationRun.userText).not.toContain('then fix the code');
     expect(implementationRun.userText).toContain('Use the OpenSpec implementation audit prompt above as the audit-and-repair standard; preserve concrete repair instructions in the discussion output.');
     expect(implementationRun.userText).toContain('Do not write authoritative JSON. Do not assign final module scores.');
     expect(implementationRun.userText).toContain('The execution model will use this discussion file to repair code/tests/tasks');
