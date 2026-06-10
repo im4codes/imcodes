@@ -814,11 +814,24 @@ function sanitizeSessionGroupCloneEvent(msg: Record<string, unknown>): SessionGr
 function parseStoredP2pConfig(raw: string | null): P2pSavedConfig | null {
   if (raw === null) return null;
   try {
-    const parsed = JSON.parse(raw) as unknown;
+    let parsed = JSON.parse(raw) as unknown;
+    // The web client serializes this preference to a JSON string before
+    // calling PUT /api/preferences/:key, and that route JSON.stringifies the
+    // body value again — so the canonical stored form is double-encoded.
+    // Older server-side writes stored the object single-encoded; accept both.
+    if (typeof parsed === 'string') parsed = JSON.parse(parsed) as unknown;
     return isP2pSavedConfig(parsed) ? parsed : null;
   } catch {
     return null;
   }
+}
+
+/**
+ * Serialize a P2P config the same way the web client + preferences PUT route
+ * do (double-encoded), so every reader sees one canonical stored form.
+ */
+function serializeStoredP2pConfig(config: P2pSavedConfig): string {
+  return JSON.stringify(JSON.stringify(config));
 }
 
 async function getUserP2pConfigForCloneSource(
@@ -3668,7 +3681,19 @@ export class WsBridge {
     }
 
     try {
-      await this.copyServerSyncedP2pConfigForClone(finalEvent);
+      const copyWarnings = await this.copyServerSyncedP2pConfigForClone(finalEvent);
+      if (copyWarnings.length) {
+        finalEvent = {
+          ...finalEvent,
+          warnings: [...(finalEvent.warnings ?? []), ...copyWarnings],
+          ...(finalEvent.result ? {
+            result: {
+              ...finalEvent.result,
+              warnings: [...finalEvent.result.warnings, ...copyWarnings],
+            },
+          } : {}),
+        };
+      }
     } catch (err) {
       const cleanupResources = err instanceof SessionGroupCloneServerP2pError ? err.cleanupResources : [];
       logger.warn({ err, serverId: this.serverId, operationId: event.operationId }, 'session-group clone server-synced P2P preference copy failed');
@@ -3728,14 +3753,17 @@ export class WsBridge {
     };
   }
 
-  private async copyServerSyncedP2pConfigForClone(event: SessionGroupCloneEvent): Promise<void> {
+  private async copyServerSyncedP2pConfigForClone(event: SessionGroupCloneEvent): Promise<SessionGroupCloneWarning[]> {
     const db = this.db;
     const result = event.result;
-    if (!db || event.state !== 'succeeded' || !result) return;
+    if (!db || event.state !== 'succeeded' || !result) return [];
 
     this.pruneSessionGroupCloneContexts();
     const context = this.sessionGroupCloneContexts.get(event.idempotencyKey);
-    if (!context) return;
+    if (!context) {
+      logger.warn({ serverId: this.serverId, operationId: event.operationId }, 'session-group clone P2P preference copy skipped — operation context missing');
+      return [{ code: 'p2p_config_missing', fieldPath: 'server_pref_context' }];
+    }
 
     const sourceMainSessionName = result.sourceMainSession || event.sourceMainSessionName || context.sourceMainSessionName;
     const sourceSessionNames = Array.from(new Set([
@@ -3744,7 +3772,10 @@ export class WsBridge {
       ...result.skippedMembers.map((member) => member.sessionName),
     ].filter((name): name is string => typeof name === 'string' && name.trim().length > 0)));
     const source = await getUserP2pConfigForCloneSource(db, context.userId, this.serverId, sourceSessionNames);
-    if (!source) return;
+    if (!source) {
+      logger.warn({ serverId: this.serverId, operationId: event.operationId, sourceMainSessionName }, 'session-group clone P2P preference copy skipped — no source preference found');
+      return [{ code: 'p2p_config_missing', fieldPath: 'server_pref' }];
+    }
 
     const targetKey = p2pSessionConfigPrefKey(result.clonedMainSession, this.serverId);
     const previousTargetValue = await getUserPref(db, context.userId, targetKey);
@@ -3756,7 +3787,7 @@ export class WsBridge {
     });
 
     try {
-      await setUserPref(db, context.userId, targetKey, JSON.stringify(remapped.config));
+      await setUserPref(db, context.userId, targetKey, serializeStoredP2pConfig(remapped.config));
       this.sendToDaemon(JSON.stringify({
         type: P2P_CONFIG_MSG.SAVE,
         requestId: `session-group-clone:${event.operationId}`,
@@ -3777,6 +3808,7 @@ export class WsBridge {
           warningCount: remapped.warnings.length,
         },
       });
+      return [];
     } catch (err) {
       try {
         if (previousTargetValue === null) {

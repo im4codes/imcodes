@@ -539,8 +539,13 @@ async function launchCloneMembers(
     totalSubSessions: spec.subSessions.length,
     subSessionsCreated: 0,
   });
+  // Launch all cloned sub-sessions concurrently — each launch can take seconds
+  // (provider connect, CLI startup, tmux bootstrap), so sequential awaits make
+  // clones with several members painfully slow. Total wall-clock becomes the
+  // slowest single member instead of the sum of all members.
   let subSessionsCreated = 0;
-  for (const sub of spec.subSessions) {
+  const clonedSubRecords: Array<SessionRecord | null> = new Array(spec.subSessions.length).fill(null);
+  const subLaunchResults = await Promise.allSettled(spec.subSessions.map(async (sub, index) => {
     assertNotCancelled(operation);
     assertAgentType(sub.agentType);
     await startSubSession({
@@ -559,7 +564,7 @@ async function launchCloneMembers(
     });
     resources.clonedSubSessionNames.push(sub.clonedSessionName);
     const clonedSubRecord = patchClonedSubSessionRecord(sub, spec.main.targetMainSessionName);
-    recordsToPersist.push(clonedSubRecord);
+    clonedSubRecords[index] = clonedSubRecord;
     pushProviderSessionResource(resources, clonedSubRecord);
     await sendSubSessionSync(serverLink, sub.clonedId, clonedSubRecord);
     subSessionsCreated += 1;
@@ -568,6 +573,15 @@ async function launchCloneMembers(
       totalSubSessions: spec.subSessions.length,
       subSessionsCreated,
     });
+  }));
+  // Wait for every launch to settle before deciding the outcome so rollback
+  // never races an in-flight startSubSession.
+  const firstSubLaunchFailure = subLaunchResults.find(
+    (entry): entry is PromiseRejectedResult => entry.status === 'rejected',
+  );
+  if (firstSubLaunchFailure) throw firstSubLaunchFailure.reason;
+  for (const record of clonedSubRecords) {
+    if (record) recordsToPersist.push(record);
   }
   assertNotCancelled(operation);
 

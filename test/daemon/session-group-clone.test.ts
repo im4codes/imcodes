@@ -819,6 +819,59 @@ describe('daemon session group clone', () => {
     ]);
   });
 
+  it('launches cloned sub-sessions concurrently instead of awaiting each one sequentially', async () => {
+    const dir = await makeDir('sub-parallel');
+    sessions.set('deck_cd_brain', makeSession({
+      name: 'deck_cd_brain',
+      projectName: 'cd',
+      role: 'brain',
+      projectDir: dir,
+    }));
+    for (const label of ['Reviewer', 'Implementer', 'Summarizer'] as const) {
+      const name = `deck_sub_${label.toLowerCase()}`;
+      sessions.set(name, makeSession({
+        name,
+        projectName: name,
+        role: 'w1',
+        projectDir: dir,
+        parentSession: 'deck_cd_brain',
+        label,
+      }));
+    }
+    const { link } = makeServerLink();
+
+    // Each launch parks on a manually released promise. If launches were
+    // sequential, the second startSubSession would never be invoked while the
+    // first is still pending and peak in-flight would stay at 1.
+    let inFlight = 0;
+    let peakInFlight = 0;
+    const defaultImpl = startSubSessionMock.getMockImplementation()!;
+    const releases: Array<() => void> = [];
+    startSubSessionMock.mockImplementation(async (sub: Parameters<typeof defaultImpl>[0]) => {
+      inFlight += 1;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      await new Promise<void>((resolve) => { releases.push(resolve); });
+      inFlight -= 1;
+      await defaultImpl(sub);
+    });
+
+    const clonePromise = handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: `idem-sub-parallel-${unique++}`,
+    }, link as never);
+
+    await vi.waitFor(() => {
+      expect(releases.length).toBe(3);
+    });
+    expect(peakInFlight).toBe(3);
+    for (const release of releases) release();
+    await clonePromise;
+
+    expect(startSubSessionMock).toHaveBeenCalledTimes(3);
+    expect([...sessions.values()].filter((record) => record.parentSession === 'deck_cd_1_brain')).toHaveLength(3);
+  });
+
   it('persists Qwen preset fields for main and sub-session clones and retargets cloned-root P2P config', async () => {
     const dir = await makeDir('qwen-preset-persist');
     sessions.set('deck_cd_brain', makeSession({
