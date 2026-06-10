@@ -1118,6 +1118,73 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(confirmationPrompts[0].prompt).toContain('Do not just say it is done');
   });
 
+  it('skips the post-summary execution gate for Auto Deliver-launched audit discussions', async () => {
+    // Auto Deliver audit discussions are analysis-only: the repair turn (with
+    // the must-fix checklist) and the acceptance scoring are dispatched by the
+    // auto-deliver orchestrator AFTER this run completes. The generic
+    // "execute the original request" gate would burn an extra execution turn
+    // plus a follow-up confirmation turn on an audit-only request.
+    const prompts: Array<{ session: string; prompt: string }> = [];
+
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      prompts.push({ session, prompt });
+      if (prompt.includes('[P2P Discussion Task')) {
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+        await writeExecutionMarkerFromPrompt(prompt);
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 20);
+      }
+    });
+
+    registerAutoDeliverP2pLock({
+      runId: 'auto-run-gate-skip',
+      owningMainSessionName: 'deck_proj',
+      generation: 1,
+      stage: 'spec_audit_repair',
+      roundIndex: 1,
+      selectedTeamComboId: 'audit',
+      activeOpenSpecPromptId: 'proposal_audit',
+    });
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'auto deliver audit discussion — analysis only',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      launchOrigin: {
+        kind: 'openspec_auto_deliver',
+        commandId: 'auto-command-gate-skip',
+        autoDeliver: {
+          runId: 'auto-run-gate-skip',
+          changeName: 'demo-change',
+          owningMainSessionName: 'deck_proj',
+          generation: 1,
+          stage: 'spec_audit_repair',
+          roundIndex: 1,
+          attemptId: 'attempt-gate-skip',
+          selectedTeamComboId: 'audit',
+          activeOpenSpecPromptId: 'proposal_audit',
+        },
+      },
+    });
+
+    const done = await waitForStatus(run.id, ['completed']);
+    expect(done.status).toBe('completed');
+
+    const finalSummaryPrompt = prompts.find((entry) => entry.session === 'deck_proj_brain' && entry.prompt.includes('Final Summary'));
+    expect(finalSummaryPrompt).toBeDefined();
+    // No inline execution block in the final summary…
+    expect(finalSummaryPrompt?.prompt).not.toContain('Execution proof required');
+    expect(finalSummaryPrompt?.prompt).not.toContain('directly execute the user');
+    // …and no follow-up verification turn at all.
+    expect(prompts.some((entry) => entry.prompt.includes('Team execution follow-up verification'))).toBe(false);
+  });
+
   it('retains completed hop evidence with best-effort fallback when exact baseline slicing is not possible', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
       const filePath = pathFromPrompt(prompt);

@@ -2054,7 +2054,16 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       run.activePhase = 'summary';
       const isLastRound = run.currentRound === run.rounds;
       const isFlowCycleEnd = (run.currentRound % pipelineLength) === 0;
-      const shouldRunExecutionGate = isFlowCycleEnd || isLastRound;
+      // OpenSpec Auto Deliver audit discussions are analysis-only by contract:
+      // the repair is a SEPARATE dedicated dispatch (with the must-fix
+      // checklist) and the score comes from the acceptance audit. Running the
+      // generic "execute the original request" gate here just burns an extra
+      // execution turn + a follow-up confirmation turn on an audit-only
+      // request — and its single-hop marker deadline routinely failed on large
+      // repairs (handleAuditPoll tolerates that failure for exactly this
+      // reason). Skip the gate entirely for these runs.
+      const skipExecutionGate = run.launchOrigin?.kind === 'openspec_auto_deliver';
+      const shouldRunExecutionGate = (isFlowCycleEnd || isLastRound) && !skipExecutionGate;
       const inlineExecutionSpec = shouldRunExecutionGate
         ? createPostSummaryExecutionSpec(run, {
           cycleIndex: Math.ceil(run.currentRound / pipelineLength),
@@ -3630,16 +3639,24 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   const resolvedFinalSummaryPrompt = finalRoundSummaryPrompt
     ?? legacyModeSummaryPrompt
     ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.';
-  const inlineExecutionSpec = createPostSummaryExecutionSpec(run, {
-    cycleIndex: 1,
-    cycleTotal: 1,
-  });
+  // Same Auto Deliver exemption as the legacy combo path above: audit
+  // discussions are analysis-only; the repair + scoring turns are dispatched
+  // by the auto-deliver orchestrator after this run completes.
+  const inlineExecutionSpec = run.launchOrigin?.kind === 'openspec_auto_deliver'
+    ? null
+    : createPostSummaryExecutionSpec(run, {
+      cycleIndex: 1,
+      cycleTotal: 1,
+    });
+  const finalInstructionBase = `${resolvedFinalSummaryPrompt}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.`;
   const finalPrompt = buildHopPrompt(run, getP2pMode(finalRound?.modeKey ?? run.mode), {
     session: run.initiatorSession,
     sectionHeader: `${discussionParticipantNameWithMode(run.initiatorSession, finalRound?.modeKey ?? run.mode)} — Final Summary`,
-    instruction: `${resolvedFinalSummaryPrompt}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.\n\n${buildInlinePostSummaryExecutionInstruction(run, inlineExecutionSpec)}`,
+    instruction: inlineExecutionSpec
+      ? `${finalInstructionBase}\n\n${buildInlinePostSummaryExecutionInstruction(run, inlineExecutionSpec)}`
+      : finalInstructionBase,
     isInitial: false,
-    allowsExecution: true,
+    allowsExecution: inlineExecutionSpec !== null,
   });
   const summaryOk = await dispatchHop(run, run.initiatorSession, finalPrompt, serverLink, {
     sectionHeader: `${discussionParticipantNameWithMode(run.initiatorSession, finalRound?.modeKey ?? run.mode)} — Final Summary`,
@@ -3650,14 +3667,16 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   run.summaryPhase = summaryOk ? 'completed' : 'failed';
   if (run._cancelled || isTerminal(run.status)) return;
 
-  const executionOk = await runPostSummaryExecutionGate(run, serverLink, {
-    cycleIndex: inlineExecutionSpec.cycleIndex,
-    cycleTotal: inlineExecutionSpec.cycleTotal,
-    timeoutMs: run.timeoutMs * 3,
-    spec: inlineExecutionSpec,
-    initialPromptAlreadyDispatched: true,
-  });
-  if (!executionOk || run._cancelled || isTerminal(run.status)) return;
+  if (inlineExecutionSpec) {
+    const executionOk = await runPostSummaryExecutionGate(run, serverLink, {
+      cycleIndex: inlineExecutionSpec.cycleIndex,
+      cycleTotal: inlineExecutionSpec.cycleTotal,
+      timeoutMs: run.timeoutMs * 3,
+      spec: inlineExecutionSpec,
+      initialPromptAlreadyDispatched: true,
+    });
+    if (!executionOk || run._cancelled || isTerminal(run.status)) return;
+  }
 
   // R3 v1b (W2) — flush the discussion write queue before reading so the
   // result summary captures every queued segment instead of an
