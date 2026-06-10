@@ -136,6 +136,8 @@
     "interrupt": "用此回答打斷"
   },
   "chat": {
+    "delete_message": "刪除訊息",
+    "delete_message_confirm": "為所有人刪除此訊息?此操作無法復原。",
     "dpad": {
       "title": "方向鍵 — 拖曳發送方向鍵"
     },

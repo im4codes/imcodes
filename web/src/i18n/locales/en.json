@@ -136,6 +136,8 @@
     "interrupt": "Interrupt with this"
   },
   "chat": {
+    "delete_message": "Delete message",
+    "delete_message_confirm": "Delete this message for everyone? This can't be undone.",
     "dpad": {
       "title": "Arrow keys — drag to move"
     },

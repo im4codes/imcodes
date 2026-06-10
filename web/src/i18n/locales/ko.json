@@ -136,6 +136,8 @@
     "interrupt": "이 답변으로 중단"
   },
   "chat": {
+    "delete_message": "메시지 삭제",
+    "delete_message_confirm": "이 메시지를 모두에게서 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.",
     "dpad": {
       "title": "방향키 — 드래그하여 이동"
     },

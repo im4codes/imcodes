@@ -864,6 +864,8 @@ interface SelectionMenu {
   anchorClientX: number;
   anchorClientY: number;
   text: string;
+  /** eventId of the message the menu was opened on, if any — enables "Delete message". */
+  eventId?: string;
 }
 
 const FILE_PANEL_MIN = 220;
@@ -2250,11 +2252,17 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     if (!mainRect) return;
     const position = positionChatActionMenu(clientX, clientY, mainRect);
     menuOpenedAtRef.current = Date.now();
+    // Resolve the message this menu was opened on so we can offer "Delete message".
+    // The id lives on the `.chat-event` wrapper (user msgs) or a descendant (assistant block).
+    const eventId = target.getAttribute('data-event-id')
+      ?? target.querySelector('[data-event-id]')?.getAttribute('data-event-id')
+      ?? undefined;
     setCtxMenu({
       ...position,
       anchorClientX: clientX,
       anchorClientY: clientY,
       text,
+      eventId,
     });
   }, [getActionMenuContainerRect]);
 
@@ -2777,6 +2785,23 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                 {t('common.quote_block', 'Quote All')}
               </button>
               </>
+            )}
+            {ctxMenu.eventId && ws && sessionId && (
+              <button
+                class="chat-sel-btn"
+                style={{ color: '#e5484d' }}
+                onClick={() => {
+                  const eid = ctxMenu.eventId;
+                  if (!eid || !sessionId || !ws) return;
+                  // Destructive + global → keep an explicit confirmation (no click-to-delete).
+                  if (!window.confirm(t('chat.delete_message_confirm'))) return;
+                  ws.deleteTimelineMessage(sessionId, eid);
+                  setCtxMenu(null);
+                  if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
+                }}
+              >
+                {t('chat.delete_message')}
+              </button>
             )}
           </div>
         )}

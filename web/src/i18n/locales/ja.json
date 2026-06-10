@@ -136,6 +136,8 @@
     "interrupt": "この回答で割り込む"
   },
   "chat": {
+    "delete_message": "メッセージを削除",
+    "delete_message_confirm": "このメッセージを全員から削除しますか?この操作は取り消せません。",
     "dpad": {
       "title": "矢印キー — ドラッグで移動"
     },

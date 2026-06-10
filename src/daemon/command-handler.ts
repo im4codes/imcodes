@@ -1285,6 +1285,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case 'session.undo_queued_message':
       void handleUndoQueuedTransportMessage(cmd, serverLink);
       break;
+    case TIMELINE_MESSAGES.DELETE:
+      void handleDeleteTimelineMessage(cmd, serverLink);
+      break;
     case 'session.input':
       void handleInput(cmd);
       break;
@@ -3888,6 +3891,72 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
   } finally {
     release();
   }
+}
+
+/**
+ * Globally delete (hide) one timeline message. Initiated by a right-click in the
+ * web UI; the deletion is durable and propagates to every viewer.
+ *
+ * Mechanism: re-emit the exact target event with `hidden: true`. The stable-eventId
+ * path in `timelineEmitter.emit` replaces it in the ring buffer and re-broadcasts to
+ * all viewers; the re-emit's fresh (higher) `seq` wins the same-eventId merge
+ * (`preferTimelineEvent`) on BOTH the daemon and every web client; the renderer drops
+ * `hidden` events (ChatView filters them); and the JSONL append + SQLite `hidden`
+ * column make it durable across refresh/restart. The agent's already-processed
+ * conversation context is intentionally untouched — this removes the message from the
+ * timeline view, it does not rewrite history the model already saw.
+ *
+ * Double-insurance write path: the server pod-routes the command by serverId, and the
+ * daemon independently re-checks that it actually owns `sessionName` before mutating.
+ */
+async function handleDeleteTimelineMessage(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName : '';
+  const eventId = typeof cmd.eventId === 'string' ? cmd.eventId.trim() : '';
+  const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim()
+    ? cmd.commandId.trim()
+    : `delete-msg-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  if (!sessionName || !eventId) return;
+
+  const ackError = (error: string): void => {
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error });
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error });
+  };
+  const ackAccepted = (): void => {
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
+  };
+
+  // Authorize: this daemon must actually own the session before touching its timeline.
+  if (!getSession(sessionName)) {
+    ackError('Session not found');
+    return;
+  }
+
+  // Locate the target event: in-memory ring buffer first (covers recently-visible
+  // messages), then a bounded tail read of the persisted JSONL for older ones.
+  let target = timelineEmitter.getBufferedEvents(sessionName).find((e) => e.eventId === eventId);
+  if (!target) {
+    try {
+      target = timelineStore.read(sessionName, { limit: 5000 }).find((e) => e.eventId === eventId);
+    } catch { /* fall through to not-found */ }
+  }
+  if (!target) {
+    ackError('Message not found');
+    return;
+  }
+  if (target.hidden) {
+    ackAccepted(); // Idempotent — already deleted.
+    return;
+  }
+
+  // Re-emit verbatim with hidden:true (see function doc for why this is the delete).
+  timelineEmitter.emit(sessionName, target.type, target.payload, {
+    eventId: target.eventId,
+    hidden: true,
+    source: target.source,
+    confidence: target.confidence,
+  });
+  ackAccepted();
 }
 
 async function handleInput(cmd: Record<string, unknown>): Promise<void> {

@@ -136,6 +136,8 @@
     "interrupt": "Interrumpir con esto"
   },
   "chat": {
+    "delete_message": "Eliminar mensaje",
+    "delete_message_confirm": "¿Eliminar este mensaje para todos? Esta acción no se puede deshacer.",
     "dpad": {
       "title": "Teclas de flecha: arrastra para mover"
     },

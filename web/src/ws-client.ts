@@ -876,6 +876,23 @@ export class WsClient {
   }
 
   /**
+   * Globally delete (hide) one timeline message for every viewer of this session.
+   * The daemon re-emits the event with hidden:true — persisted (JSONL + SQLite) and
+   * broadcast — so it disappears for everyone and stays gone across refresh/restart.
+   * Acked via the normal command.ack path. Pod-routing is implicit: this WS is already
+   * connected to the session's owning server.
+   */
+  deleteTimelineMessage(sessionName: string, eventId: string): void {
+    if (!sessionName || !eventId) return;
+    this.send({
+      type: TIMELINE_MESSAGES.DELETE,
+      sessionName,
+      eventId,
+      commandId: crypto.randomUUID(),
+    });
+  }
+
+  /**
    * Send session.send command with an auto-generated commandId for dedup/ack.
    * Only session.send injects commandId — session.input does not.
    */
