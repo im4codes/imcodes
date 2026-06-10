@@ -274,6 +274,22 @@ const OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS = process.env.NODE_ENV === '
 // implementation just made task progress, a reminder is throttled to at least
 // this interval so a fast-flapping idle cannot spam the agent.
 const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_REMINDER_MIN_INTERVAL_MS = process.env.NODE_ENV === 'test' ? 40 : 30_000;
+// A transport runtime can be briefly absent while a session reconnects or its SDK
+// transport is restored (e.g. a relaunch) — it comes back on its own. Wait this
+// long for it to reappear before treating it as genuinely gone, so a healthy
+// in-flight delivery is not hard-failed on a momentary miss.
+const OPENSPEC_AUTO_DELIVER_TRANSPORT_RUNTIME_WAIT_MS = process.env.NODE_ENV === 'test' ? 200 : 15_000;
+
+async function awaitTransportRuntime(sessionName: string): Promise<ReturnType<typeof getTransportRuntime>> {
+  let runtime = getTransportRuntime(sessionName);
+  if (runtime) return runtime;
+  const deadline = Date.now() + OPENSPEC_AUTO_DELIVER_TRANSPORT_RUNTIME_WAIT_MS;
+  while (!runtime && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    runtime = getTransportRuntime(sessionName);
+  }
+  return runtime;
+}
 const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON = 'implementation_audit_followup_repair';
 
 export interface OpenSpecAutoDeliverUpgradeBlockReason {
@@ -936,7 +952,7 @@ async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: 
   if (run.implementationPromptCount >= effectiveMaxImplementationPrompts(run)) {
     return terminalize(run, 'needs_human', 'implementation_prompt_limit_reached');
   }
-  const runtime = getTransportRuntime(run.targetImplementationSessionName);
+  const runtime = await awaitTransportRuntime(run.targetImplementationSessionName);
   if (!runtime) {
     return terminalize(run, 'failed', 'missing_transport_runtime');
   }
@@ -1002,7 +1018,7 @@ function buildImplementationMarkerReminderPrompt(run: AutoDeliverRun, reason: st
 async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason: string): Promise<OpenSpecAutoDeliverProjection> {
   const elapsedProjection = enforceElapsedLimit(run);
   if (elapsedProjection) return elapsedProjection;
-  const runtime = getTransportRuntime(run.targetImplementationSessionName);
+  const runtime = await awaitTransportRuntime(run.targetImplementationSessionName);
   if (!runtime) return terminalize(run, 'failed', 'missing_transport_runtime');
   if (!run.activeImplementationMarker) {
     return terminalize(run, 'needs_human', `implementation_marker_contract_missing:${reason}`);
@@ -1327,7 +1343,7 @@ async function dispatchPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun): Pro
   if (!(await refreshChangeRoot(run))) {
     return terminalizeAndSend(run, 'failed', run.latestMessage ?? 'change_root_invalid');
   }
-  const runtime = getTransportRuntime(run.targetImplementationSessionName);
+  const runtime = await awaitTransportRuntime(run.targetImplementationSessionName);
   if (!runtime) {
     return terminalizeAndSend(run, 'failed', 'missing_transport_runtime');
   }
@@ -1734,7 +1750,7 @@ async function dispatchAutoCommitPushPrompt(run: AutoDeliverRun): Promise<OpenSp
     }]);
     return terminalizeAndSend(run, 'passed', 'final_audit_passed');
   }
-  const runtime = getTransportRuntime(run.targetImplementationSessionName);
+  const runtime = await awaitTransportRuntime(run.targetImplementationSessionName);
   if (!runtime) {
     return terminalizeAndSend(run, 'failed', 'missing_transport_runtime');
   }
