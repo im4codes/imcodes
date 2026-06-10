@@ -3345,6 +3345,12 @@ html.native-ios-mac .chat-dl-btn {
 
 /* ── Session Tree (task 2.1–2.5) ─────────────────────────────────────────── */
 .session-tree { display: flex; flex-direction: column; padding: 6px 0; }
+.session-tree-scroll { display: flex; flex-direction: column; }
+/* Resizable popup variant (mobile session list): header stays pinned, the list
+   scrolls, and a bottom drag handle resizes height — matching the sidebar
+   pinned panels. Height is applied inline via useVerticalResize. */
+.session-tree.is-resizable { position: relative; overflow: hidden; flex-shrink: 0; padding-bottom: 0; }
+.session-tree.is-resizable .session-tree-scroll { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 6px; scrollbar-width: thin; scrollbar-color: rgba(34,211,238,0.38) transparent; }
 .session-tree-empty { padding: 12px 16px; color: #5f7087; font-size: 12px; }
 .session-tree-header { display: flex; align-items: center; justify-content: space-between; padding: 0 4px 0 0; }
 .session-tree-collapse-all { background: none; border: none; color: #5f7087; font-size: 10px; cursor: pointer; padding: 2px 10px; text-align: left; transition: color 0.15s; }

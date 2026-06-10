@@ -4590,6 +4590,14 @@ export function App() {
               >
                 {trans('sharedContext.diagnostics.title')}
               </button>
+              {/* Session-list show/hide toggle — same as the mobile sidebar ⊞ button */}
+              <button
+                class="btn"
+                style={{ background: '#334155', color: mobileHideTabBar ? '#64748b' : 'var(--chrome-accent)', fontSize: 12, marginLeft: 'auto' }}
+                onClick={() => setMobileHideTabBar((p) => { const v = !p; localStorage.setItem('mobile_hide_tab_bar', v ? '1' : ''); return v; })}
+                title={trans('sidebar.sessionTree', 'Session tree')}
+                aria-pressed={!mobileHideTabBar}
+              >⊞</button>
             </div>
             <SharedEntriesPanel
               entries={sharedEntries}
@@ -4599,8 +4607,8 @@ export function App() {
               onOpen={(entry) => void handleOpenSharedEntry(entry)}
               onRefresh={() => void refreshSharedEntries()}
             />
-            {/* Session tree */}
-            <SessionTree
+            {/* Session tree — hidden via the ⊞ list toggle above */}
+            {!mobileHideTabBar && <SessionTree
               serverId={selectedServerId}
               sessions={visibleMainSessions}
               subSessions={subSessions}
@@ -4618,7 +4626,7 @@ export function App() {
               }}
               onNewSession={selectedShareTarget ? undefined : () => setShowNewSession(true)}
               onNewSubSession={selectedShareTarget ? undefined : () => setShowSubDialog(true)}
-            />
+            />}
 
             {/* P2P ring progress — show active P2P runs */}
             {discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (

@@ -25,6 +25,7 @@ import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
+import { useVerticalResize } from '../hooks/useVerticalResize.js';
 
 interface Props {
   serverId?: string | null;
@@ -44,6 +45,11 @@ interface Props {
   onNewSession?: () => void;
   /** Open new sub-session dialog. */
   onNewSubSession?: () => void;
+  /** When set (together with onResizeHeight), the tree renders as a fixed-height,
+   *  bottom-resizable popup — the same drag-to-resize as the sidebar pinned panels. */
+  height?: number;
+  /** Persist a new height after a resize drag completes. */
+  onResizeHeight?: (height: number) => void;
 }
 
 // ── Helper: compute label for a main session ─────────────────────────────────
@@ -181,9 +187,17 @@ function SessionTreeInner({
   onSelectSubSession,
   onNewSession,
   onNewSubSession,
+  height,
+  onResizeHeight,
 }: Props) {
   const { t } = useTranslation();
   const [collapsed, setCollapsed] = useState<Set<string>>(() => loadCollapsed(serverId));
+  const resizable = typeof height === 'number' && !!onResizeHeight;
+  const { height: liveHeight, onMouseDown: onResizeMouseDown, onTouchStart: onResizeTouchStart } = useVerticalResize({
+    height: height ?? 0,
+    minHeight: 140,
+    onResize: onResizeHeight,
+  });
 
   useEffect(() => {
     setCollapsed(loadCollapsed(serverId));
@@ -246,7 +260,12 @@ function SessionTreeInner({
   }
 
   return (
-    <div class="session-tree" role="tree" aria-label={t('sidebar.sessionTree', 'Session tree')}>
+    <div
+      class={resizable ? 'session-tree is-resizable' : 'session-tree'}
+      role="tree"
+      aria-label={t('sidebar.sessionTree', 'Session tree')}
+      style={resizable ? { height: liveHeight } : undefined}
+    >
       {/* Header: collapse toggle + new session button */}
       <div class="session-tree-header">
         {hasSubs && (
@@ -263,6 +282,7 @@ function SessionTreeInner({
         )}
       </div>
 
+      <div class="session-tree-scroll">
       {sessions.map((session) => {
         const sessionLabel = getSessionLabel(session);
         const isActive = session.name === activeSession;
@@ -340,6 +360,15 @@ function SessionTreeInner({
           </div>
         );
       })}
+      </div>
+      {resizable && (
+        <div
+          class="sidebar-pinned-resize-handle"
+          onMouseDown={onResizeMouseDown}
+          onTouchStart={onResizeTouchStart}
+          aria-hidden="true"
+        />
+      )}
     </div>
   );
 }
