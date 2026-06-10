@@ -2183,6 +2183,20 @@ function extendAuditRoundLimit(run: AutoDeliverRun, stage: AuditRepairStage): vo
   run.materializedLimits.implementationAuditRepairRounds = Math.max(run.materializedLimits.implementationAuditRepairRounds, nextLimit);
 }
 
+/**
+ * Ensure there is budget for another audit-repair round. The preset round count
+ * is the BASE, not a hard ceiling: when the audit score is still below standard
+ * the budget auto-increments toward the runtime MAX (implementation 5, spec 3)
+ * so the run keeps converging to a quality delivery instead of giving up after
+ * the preset base. Returns false only when even the runtime MAX is spent — that
+ * is the genuine escalation point.
+ */
+function ensureAuditRoundBudget(run: AutoDeliverRun, stage: AuditRepairStage): boolean {
+  if (auditRoundCount(run, stage) < auditRoundLimit(run, stage)) return true;
+  extendAuditRoundLimit(run, stage);
+  return auditRoundCount(run, stage) < auditRoundLimit(run, stage);
+}
+
 function scheduleAuditFixRetry(run: AutoDeliverRun, stage: AuditRepairStage, reason: string): void {
   clearAuditFixRetryTimer(run.runId);
   run.status = stage;
@@ -2199,7 +2213,7 @@ function scheduleAuditFixRetry(run: AutoDeliverRun, stage: AuditRepairStage, rea
     const current = runsById.get(run.runId);
     if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
     if (current.activeAudit) return;
-    if (auditRoundCount(current, stage) >= auditRoundLimit(current, stage)) {
+    if (!ensureAuditRoundBudget(current, stage)) {
       terminalizeAndSend(current, 'needs_human', stage === 'spec_audit_repair'
         ? 'spec_audit_rounds_exhausted'
         : 'implementation_audit_rounds_exhausted');
@@ -2460,7 +2474,7 @@ async function startAuditRepairStage(run: AutoDeliverRun, stage: AuditRepairStag
   if (!transitionAllowed(run, event)) {
     return terminalizeAndSend(run, 'failed', `invalid_transition_${stage}`);
   }
-  if (auditRoundCount(run, stage) >= auditRoundLimit(run, stage)) {
+  if (!ensureAuditRoundBudget(run, stage)) {
     const reason = stage === 'spec_audit_repair'
       ? 'spec_audit_rounds_exhausted'
       : 'implementation_audit_rounds_exhausted';

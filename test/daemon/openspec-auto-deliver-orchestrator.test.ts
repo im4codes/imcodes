@@ -1340,13 +1340,14 @@ exec "${realGit}" "$@"
     expect(gate.projection.auditResults?.[0]?.requiredChanges).toEqual(['clarify acceptance criteria']);
     expect(gate.projection.specAuditRound).toEqual({ current: 1, total: 1 });
 
-    const terminal = await waitForSend((msg) =>
-      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
-      && msg.projection?.terminalReason === 'spec_audit_rounds_exhausted',
-      2500,
-    );
-    expect(terminal.projection.status).toBe('needs_human');
-    expect([...p2pRuns.values()]).toHaveLength(1);
+    // A below-standard score auto-increments the round budget toward the runtime
+    // MAX instead of giving up: the run launches another spec audit round and
+    // does NOT advance to implementation or terminalize after the preset base.
+    const start = Date.now();
+    while (Date.now() - start < 2500 && [...p2pRuns.values()].length < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect([...p2pRuns.values()]).toHaveLength(2);
     expect(transportSendMock.mock.calls.some((call) =>
       String(call[0] ?? '').includes('Drive the implementation of @openspec/changes/demo-change aggressively.'),
     )).toBe(false);
