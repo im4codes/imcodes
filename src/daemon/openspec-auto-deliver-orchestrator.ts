@@ -715,6 +715,37 @@ function bullets(items: string[], limit = 12): string {
   return remaining > 0 ? [...visible, `- ...and ${remaining} more`].join('\n') : visible.join('\n');
 }
 
+/**
+ * Concise "must-fix" block shared by the spec AND implementation repair prompts
+ * so both stages drive the next repair turn identically. Lists the prior audit's
+ * one-line required_changes (each already "file:line — directive") plus a bare
+ * `module=score` list — NO evidence dump, no long per-module summaries. The
+ * framing ("resolve EACH at the cited file:line; do not rewrite elsewhere and
+ * leave these open; the next acceptance audit caps the module at 5") is the same
+ * on both stages: this is what stops a repair turn from editing around the
+ * flagged items and getting penalized (score drop) on the next acceptance audit.
+ * Returns [] when the audit produced no required_changes and no low scores.
+ */
+function buildPriorAuditMustFixLines(
+  audit: OpenSpecAutoDeliverAuditResult | undefined,
+  auditNoun: string,
+): string[] {
+  const mustFix = audit?.requiredChanges ?? [];
+  const lowScores = (audit?.moduleScores ?? [])
+    .filter((score) => score.score < OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE)
+    .map((score) => `${score.module}=${score.score}/10`);
+  if (mustFix.length === 0 && lowScores.length === 0) return [];
+  return [
+    ...(mustFix.length > 0
+      ? [
+          `Must-fix items flagged by the previous ${auditNoun} — resolve EACH at the cited file:line/heading. Do not rewrite elsewhere and leave these open; the next acceptance audit caps the module at 5 for any unresolved item:`,
+          bullets(mustFix),
+        ]
+      : []),
+    ...(lowScores.length > 0 ? [`Modules still below bar: ${lowScores.join(', ')}.`] : []),
+  ];
+}
+
 const PROMPT_NOISY_EVIDENCE_PREFIXES = [
   'Changed files:',
   'Diff stat:',
@@ -766,7 +797,8 @@ function buildImplementationRepairBlock(run: AutoDeliverRun, repairReason?: stri
   const audit = latestAuditResultForStage(run, 'implementation_audit_repair');
   const auditDiscussionFilePath = audit?.discussionFilePath ?? run.implementationAuditDiscussionFilePath;
   if (!audit && !repairReason && !auditDiscussionFilePath) return null;
-  const lowScores = (audit?.moduleScores ?? []).filter((score) => score.score < OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE);
+  // Same must-fix checklist + framing as the spec repair prompt (shared helper).
+  const mustFixLines = buildPriorAuditMustFixLines(audit, 'implementation audit');
   const requiredFollowupRepair = repairReason === OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON
     ? [
         '',
@@ -780,12 +812,7 @@ function buildImplementationRepairBlock(run: AutoDeliverRun, repairReason?: stri
     repairReason ? `Reason: ${repairReason}` : undefined,
     audit ? `Previous implementation audit verdict: ${audit.verdict}` : undefined,
     auditDiscussionFilePath ? `Audit discussion file: ${auditDiscussionFilePath}` : undefined,
-    lowScores.length > 0
-      ? `Low module scores: ${lowScores.map((score) => `${score.module}=${score.score}/10`).join(', ')}`
-      : undefined,
-    '',
-    'Required code/test/task changes from the audit:',
-    bullets(audit?.requiredChanges ?? []),
+    ...(mustFixLines.length > 0 ? ['', ...mustFixLines] : []),
     '',
     'Unchecked or falsely-complete tasks reported by the audit:',
     bullets(audit?.uncheckedTasks ?? []),
@@ -869,18 +896,14 @@ function buildImplementationCompletionMarkerBlock(run: AutoDeliverRun): string {
 function buildSpecRepairPrompt(run: AutoDeliverRun, repairReason: string): string {
   const reference = openSpecChangeReference(run);
   // The previous spec audit (team discussion or acceptance audit) already
-  // produced concrete, one-line required_changes (each is "file:line — directive")
-  // plus per-module scores. The earlier repair turn missed these because the
-  // prompt only carried a generic reason + "read the discussion file", so the
-  // model rewrote elsewhere and left the flagged items open → the next
-  // acceptance audit penalized the unresolved findings and the score DROPPED.
-  // Inline a concise must-fix checklist (no evidence dump, no long summaries):
-  // just the requiredChanges lines and a bare module=score list.
+  // produced concrete, one-line required_changes plus per-module scores. The
+  // earlier repair turn missed these because the prompt only carried a generic
+  // reason + "read the discussion file", so the model rewrote elsewhere and left
+  // the flagged items open → the next acceptance audit penalized the unresolved
+  // findings and the score DROPPED. Inline the SAME concise must-fix checklist
+  // the implementation repair path uses (shared helper).
   const previousAudit = latestAuditResultForStage(run, 'spec_audit_repair');
-  const mustFix = previousAudit?.requiredChanges ?? [];
-  const lowScores = (previousAudit?.moduleScores ?? [])
-    .filter((score) => score.score < OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE)
-    .map((score) => `${score.module}=${score.score}/10`);
+  const mustFixLines = buildPriorAuditMustFixLines(previousAudit, 'spec audit');
   return [
     formatOpenSpecPromptTemplate('audit_spec', reference),
     '',
@@ -892,14 +915,7 @@ function buildSpecRepairPrompt(run: AutoDeliverRun, repairReason: string): strin
     `Reason: ${repairReason}`,
     previousAudit ? `Previous spec audit verdict: ${previousAudit.verdict}.` : undefined,
     run.specAuditDiscussionFilePath ? `Spec audit discussion file: ${run.specAuditDiscussionFilePath}` : 'Spec audit discussion file: unavailable.',
-    ...(mustFix.length > 0
-      ? [
-          '',
-          'Must-fix items flagged by the previous spec audit — resolve EACH at the cited file:line/heading. Do not rewrite elsewhere and leave these open; the next acceptance audit caps the module at 5 for any unresolved item:',
-          bullets(mustFix),
-        ]
-      : []),
-    ...(lowScores.length > 0 ? [`Modules still below bar: ${lowScores.join(', ')}.`] : []),
+    ...(mustFixLines.length > 0 ? ['', ...mustFixLines] : []),
     '',
     'Repair only the OpenSpec artifacts under this change: proposal.md, design.md, specs/**/spec.md, and tasks.md.',
     'Read the spec audit discussion file above for full context, but treat the must-fix list as the binding checklist: make the concrete edit for each item and record it in repairs_applied with the file path.',
