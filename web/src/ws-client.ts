@@ -1252,16 +1252,16 @@ export class WsClient {
   }
 
   /** Rename a file or directory on the daemon. Returns requestId. */
-  fsRename(path: string, newPath: string): string {
+  fsRename(path: string, newPath: string, sessionName?: string): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: FS_TRANSPORT_MSG.RENAME, path, newPath, requestId });
+    this.send({ type: FS_TRANSPORT_MSG.RENAME, path, newPath, requestId, ...(sessionName ? { sessionName } : {}) });
     return requestId;
   }
 
   /** Delete a file or directory on the daemon. Returns requestId. */
-  fsDelete(path: string): string {
+  fsDelete(path: string, sessionName?: string): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: FS_TRANSPORT_MSG.DELETE, path, requestId });
+    this.send({ type: FS_TRANSPORT_MSG.DELETE, path, requestId, ...(sessionName ? { sessionName } : {}) });
     return requestId;
   }
 

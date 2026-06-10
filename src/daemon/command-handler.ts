@@ -6970,6 +6970,32 @@ function isPathAllowed(realPath: string): boolean {
   return isFilePreviewPathAllowed(realPath);
 }
 
+function isSameOrInsidePath(root: string, candidate: string): boolean {
+  const relative = nodePath.relative(root, candidate);
+  return relative === '' || (!!relative && !relative.startsWith('..') && !nodePath.isAbsolute(relative));
+}
+
+async function resolveFsMutationSessionRoot(cmd: Record<string, unknown>): Promise<
+  | { ok: true; realRoot?: string }
+  | { ok: false; error: string }
+> {
+  const sessionName = typeof cmd.sessionName === 'string'
+    ? cmd.sessionName
+    : typeof cmd.session === 'string'
+      ? cmd.session
+      : '';
+  if (!sessionName) return { ok: true };
+  const record = getSession(sessionName);
+  if (!record?.projectDir) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+  try {
+    const realRoot = await fsRealpath(record.projectDir);
+    if (!isPathAllowed(realRoot)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+    return { ok: true, realRoot };
+  } catch {
+    return { ok: false, error: FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND };
+  }
+}
+
 // ── P2P cancel/status handlers ────────────────────────────────────────────
 
 async function handleP2pCancel(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -8681,7 +8707,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   }
 }
 
-async function resolveExistingFsMutationTarget(rawPath: string): Promise<
+async function resolveExistingFsMutationTarget(rawPath: string, sessionRealRoot?: string): Promise<
   | { ok: true; resolved: string; real: string }
   | { ok: false; error: string; resolved?: string }
 > {
@@ -8699,13 +8725,16 @@ async function resolveExistingFsMutationTarget(rawPath: string): Promise<
   try {
     const real = await fsRealpath(resolved);
     if (!isPathAllowed(real)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: real };
+    if (sessionRealRoot && !isSameOrInsidePath(sessionRealRoot, real)) {
+      return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: real };
+    }
     return { ok: true, resolved, real };
   } catch {
     return { ok: false, error: FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND, resolved };
   }
 }
 
-async function resolveFsMutationDestination(rawPath: string): Promise<
+async function resolveFsMutationDestination(rawPath: string, sessionRealRoot?: string): Promise<
   | { ok: true; resolved: string; realParent: string }
   | { ok: false; error: string; resolved?: string }
 > {
@@ -8715,6 +8744,9 @@ async function resolveFsMutationDestination(rawPath: string): Promise<
   try {
     const realParent = await fsRealpath(parent);
     if (!isPathAllowed(realParent)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+    if (sessionRealRoot && !isSameOrInsidePath(sessionRealRoot, realParent)) {
+      return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+    }
     try {
       await fsLstat(resolved);
       return { ok: false, error: FS_WRITE_ERROR.FILE_EXISTS, resolved };
@@ -8739,12 +8771,18 @@ async function handleFsRename(cmd: Record<string, unknown>, serverLink: ServerLi
     return;
   }
 
-  const source = await resolveExistingFsMutationTarget(rawPath);
+  const sessionRoot = await resolveFsMutationSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+
+  const source = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
   if (!source.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, resolvedPath: source.resolved, status: 'error', error: source.error }); } catch { /* ignore */ }
     return;
   }
-  const destination = await resolveFsMutationDestination(rawNewPath);
+  const destination = await resolveFsMutationDestination(rawNewPath, sessionRoot.realRoot);
   if (!destination.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, resolvedPath: destination.resolved, status: 'error', error: destination.error }); } catch { /* ignore */ }
     return;
@@ -8784,7 +8822,13 @@ async function handleFsDelete(cmd: Record<string, unknown>, serverLink: ServerLi
     return;
   }
 
-  const target = await resolveExistingFsMutationTarget(rawPath);
+  const sessionRoot = await resolveFsMutationSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+
+  const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
   if (!target.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, resolvedPath: target.resolved, status: 'error', error: target.error }); } catch { /* ignore */ }
     return;

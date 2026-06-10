@@ -2862,10 +2862,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           <span style={{ fontSize: 13, fontWeight: 600 }}>📁 Files</span>
           <button class="fb-close" onClick={onMobileFileBrowserClose}>✕</button>
         </div>
-        <FileBrowser
-          ws={ws}
-          serverId={serverId}
-          mode="file-multi"
+          <FileBrowser
+            ws={ws}
+            serverId={serverId}
+            sessionName={activeSession.name}
+            mode="file-multi"
           layout="panel"
           initialPath={activeSession.projectDir ?? '~'}
           changesRootPath={activeSession.projectDir ?? undefined}
@@ -2893,6 +2894,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             key={`${serverId ?? 'local'}:${openSpecFolderPath}`}
             ws={ws}
             serverId={serverId}
+            sessionName={activeSession.name}
             mode="file-multi"
             layout="panel"
             initialPath={openSpecFolderPath}

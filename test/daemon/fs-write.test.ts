@@ -37,6 +37,7 @@ const mockReadFile = vi.mocked(fsp.readFile);
 const mockWriteFile = vi.mocked(fsp.writeFile);
 
 import { handleWebCommand, __resetFsGitCachesForTests } from '../../src/daemon/command-handler.js';
+import * as sessionStore from '../../src/store/session-store.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { FS_WRITE_ERROR } from '../../src/shared/transport/fs.js';
@@ -363,6 +364,51 @@ describe('fs.rename and fs.delete handlers', () => {
     });
   });
 
+  it('renames a file inside the owning session project directory', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const oldPath = path.join(projectDir, 'old.txt');
+    const newPath = path.join(projectDir, 'new.txt');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_proj_brain', projectDir } as never);
+    mockLstat.mockImplementation(async (target) => {
+      if (String(target) === oldPath) return { isSymbolicLink: () => false } as fsp.Stats;
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({ type: FS_TRANSPORT_MSG.RENAME, path: oldPath, newPath, requestId: 'rename-session-ok', sessionName: 'deck_proj_brain' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockRename).toHaveBeenCalledWith(oldPath, newPath);
+    expect(sent[0]).toMatchObject({
+      type: FS_TRANSPORT_MSG.RENAME_RESPONSE,
+      requestId: 'rename-session-ok',
+      status: 'ok',
+    });
+  });
+
+  it('refuses to rename a file outside the owning session project directory', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const oldPath = path.join(homedir(), 'other', 'old.txt');
+    const newPath = path.join(projectDir, 'new.txt');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_proj_brain', projectDir } as never);
+    mockLstat.mockImplementation(async (target) => {
+      if (String(target) === oldPath) return { isSymbolicLink: () => false } as fsp.Stats;
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({ type: FS_TRANSPORT_MSG.RENAME, path: oldPath, newPath, requestId: 'rename-session-outside', sessionName: 'deck_proj_brain' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockRename).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: FS_TRANSPORT_MSG.RENAME_RESPONSE,
+      requestId: 'rename-session-outside',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
   it('does not overwrite an existing destination while renaming', async () => {
     const oldPath = path.join(homedir(), 'project', 'old.txt');
     const newPath = path.join(homedir(), 'project', 'new.txt');
@@ -395,6 +441,25 @@ describe('fs.rename and fs.delete handlers', () => {
       requestId: 'delete-ok',
       status: 'ok',
       path: targetPath,
+    });
+  });
+
+  it('refuses to delete a file outside the owning session project directory', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const targetPath = path.join(homedir(), 'other', 'old.txt');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_proj_brain', projectDir } as never);
+    mockLstat.mockResolvedValue({ isSymbolicLink: () => false } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({ type: FS_TRANSPORT_MSG.DELETE, path: targetPath, requestId: 'delete-session-outside', sessionName: 'deck_proj_brain' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockRm).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: FS_TRANSPORT_MSG.DELETE_RESPONSE,
+      requestId: 'delete-session-outside',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
     });
   });
 

@@ -835,6 +835,34 @@ describe('FileBrowser', () => {
     }
   });
 
+  it('passes the owning session when renaming from the right-click menu', async () => {
+    const { ws, respond, fsRename } = makeWsFactory();
+    const originalPrompt = window.prompt;
+    window.prompt = vi.fn(() => 'renamed.ts');
+    try {
+      render(
+        <FileBrowser
+          ws={ws}
+          mode="file-single"
+          layout="panel"
+          initialPath="/home/user"
+          sessionName="deck_proj_brain"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+
+      const row = screen.getByText('foo.ts').closest('.fb-node');
+      expect(row).not.toBeNull();
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByText('Rename'));
+
+      expect(fsRename).toHaveBeenCalledWith('/home/user/foo.ts', '/home/user/renamed.ts', 'deck_proj_brain');
+    } finally {
+      window.prompt = originalPrompt;
+    }
+  });
+
   it('closes the right-click menu when clicking outside it', async () => {
     const { ws, respond } = makeWsFactory();
     render(<FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
@@ -870,6 +898,34 @@ describe('FileBrowser', () => {
       fireEvent.click(screen.getByText('Delete'));
 
       expect(fsDelete).toHaveBeenCalledWith('/home/user/foo.ts');
+    } finally {
+      window.confirm = originalConfirm;
+    }
+  });
+
+  it('passes the owning session when deleting from the right-click menu', async () => {
+    const { ws, respond, fsDelete } = makeWsFactory();
+    const originalConfirm = window.confirm;
+    window.confirm = vi.fn(() => true);
+    try {
+      render(
+        <FileBrowser
+          ws={ws}
+          mode="file-single"
+          layout="panel"
+          initialPath="/home/user"
+          sessionName="deck_proj_brain"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+
+      const row = screen.getByText('foo.ts').closest('.fb-node');
+      expect(row).not.toBeNull();
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByText('Delete'));
+
+      expect(fsDelete).toHaveBeenCalledWith('/home/user/foo.ts', 'deck_proj_brain');
     } finally {
       window.confirm = originalConfirm;
     }

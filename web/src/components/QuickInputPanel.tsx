@@ -602,6 +602,7 @@ export function QuickInputPanel({
         {activeTab === 'files' && ws && (
           <FileBrowser
             ws={ws}
+            sessionName={sessionName}
             mode="file-multi"
             layout="panel"
             initialPath={sessionCwd ?? '~'}

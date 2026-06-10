@@ -5068,6 +5068,7 @@ export function App() {
                 <FileBrowser
                   ws={wsRef.current}
                   serverId={selectedServerId}
+                  sessionName={activeSession ?? undefined}
                   mode="file-multi"
                   layout="panel"
                   initialPath={activeSessionInfo.projectDir ?? '~'}
@@ -5524,6 +5525,7 @@ export function App() {
             key={previewFileRequest.rootPath ?? getFilePreviewInitialPath(previewFileRequest)}
             ws={wsRef.current}
             serverId={selectedServerId ?? undefined}
+            sessionName={previewFileRequest.sessionName ?? activeSession ?? undefined}
             mode="file-single"
             layout="panel"
             initialPath={getFilePreviewInitialPath(previewFileRequest)}

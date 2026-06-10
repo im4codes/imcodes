@@ -144,6 +144,7 @@ registerPanelType('filebrowser', {
         key={`${ctx.serverId}:${projectDir}`}
         ws={ctx.ws}
         serverId={ctx.serverId}
+        sessionName={activeSession}
         mode="file-multi"
         layout="panel"
         initialPath={projectDir}

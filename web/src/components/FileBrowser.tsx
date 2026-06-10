@@ -124,6 +124,8 @@ export interface FileBrowserProps {
   refreshTrigger?: number;
   /** Server ID for file transfer download API. If provided, enables download buttons. */
   serverId?: string;
+  /** Session whose project directory scopes rename/delete requests. */
+  sessionName?: string;
   onConfirm: (paths: string[]) => void;
   onClose?: () => void;
   /** Called after a new directory is successfully created. */
@@ -251,6 +253,8 @@ export type FileBrowserPreviewState =
 
 export interface FileBrowserPreviewRequest {
   path: string;
+  /** Session whose project directory should scope writes from the preview host. */
+  sessionName?: string;
   preferDiff?: boolean;
   previewViewMode?: HtmlPreviewViewMode;
   preview?: FileBrowserPreviewState;
@@ -437,6 +441,7 @@ export function FileBrowser({
   onPreviewFile,
   defaultTab = 'files',
   onInsertPath,
+  sessionName,
 }: FileBrowserProps) {
   const { t } = useTranslation();
   const includeFiles = mode !== 'dir-only';
@@ -1067,6 +1072,7 @@ export function FileBrowser({
     if (onPreviewFile) {
       onPreviewFile({
         path: filePath,
+        sessionName,
         preferDiff,
         previewViewMode: nextViewMode,
         preview: { status: 'loading', path: filePath },
@@ -1145,18 +1151,20 @@ export function FileBrowser({
       return;
     }
     const targetPath = buildChildPath(parentPath, trimmed);
-    const requestId = ws.fsRename(node.id, targetPath);
+    const requestId = sessionName
+      ? ws.fsRename(node.id, targetPath, sessionName)
+      : ws.fsRename(node.id, targetPath);
     pendingRenameRef.current.set(requestId, { parentPath, sourcePath: node.id, targetPath });
     setContextMenu(null);
-  }, [buildChildPath, t, ws]);
+  }, [buildChildPath, sessionName, t, ws]);
 
   const requestDelete = useCallback((node: FsNode) => {
     const confirmed = window.confirm(t('file_browser.delete_confirm', { name: node.name }));
     if (!confirmed) return;
-    const requestId = ws.fsDelete(node.id);
+    const requestId = sessionName ? ws.fsDelete(node.id, sessionName) : ws.fsDelete(node.id);
     pendingDeleteRef.current.set(requestId, { parentPath: getParentDir(node.id), targetPath: node.id });
     setContextMenu(null);
-  }, [t, ws]);
+  }, [sessionName, t, ws]);
 
   const requestNewEntry = useCallback(() => {
     if (!newEntry) return;

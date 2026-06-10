@@ -5,6 +5,7 @@ import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-m
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { TIMELINE_MESSAGES } from '@shared/timeline-protocol.js';
+import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 import type { MessageHandler } from '../src/ws-client.js';
 
 // Mock WebSocket implementation
@@ -1429,6 +1430,37 @@ describe('WsClient', () => {
       };
       lastWs!.emit('message', { data: JSON.stringify(responseMsg) });
       expect(handler).toHaveBeenCalledWith(expect.objectContaining({ type: 'fs.ls_response', requestId }));
+      client.disconnect();
+    });
+  });
+
+  describe('fs rename/delete', () => {
+    it('includes the owning session when renaming', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      const requestId = client.fsRename('/home/user/project/a.txt', '/home/user/project/b.txt', 'deck_proj_brain');
+      const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
+      expect(msg).toMatchObject({
+        type: FS_TRANSPORT_MSG.RENAME,
+        requestId,
+        path: '/home/user/project/a.txt',
+        newPath: '/home/user/project/b.txt',
+        sessionName: 'deck_proj_brain',
+      });
+      client.disconnect();
+    });
+
+    it('includes the owning session when deleting', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      const requestId = client.fsDelete('/home/user/project/a.txt', 'deck_proj_brain');
+      const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
+      expect(msg).toMatchObject({
+        type: FS_TRANSPORT_MSG.DELETE,
+        requestId,
+        path: '/home/user/project/a.txt',
+        sessionName: 'deck_proj_brain',
+      });
       client.disconnect();
     });
   });

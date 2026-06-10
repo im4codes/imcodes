@@ -1471,6 +1471,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     const viewMode = previewViewMode ?? (preferDiff ? 'diff' : 'source');
     onPreviewFile({
       path: resolvedPath,
+      sessionName: sessionId ?? undefined,
       preferDiff: viewMode === 'diff' && preferDiff,
       previewViewMode: viewMode,
       preview: { status: 'loading', path: resolvedPath },
@@ -2800,6 +2801,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             <FileBrowser
               ws={ws}
               serverId={serverId}
+              sessionName={sessionId ?? undefined}
               mode="file-single"
               layout="panel"
               initialPath={workdir ?? '~'}

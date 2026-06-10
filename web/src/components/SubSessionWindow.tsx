@@ -945,6 +945,7 @@ export function SubSessionWindow({
             <FileBrowser
               ws={ws}
               serverId={serverId}
+              sessionName={sub.sessionName}
               mode="file-multi"
               layout="panel"
               initialPath={sub.cwd ?? '~'}
@@ -979,6 +980,7 @@ export function SubSessionWindow({
             <FileBrowser
               ws={ws}
               serverId={serverId}
+              sessionName={sub.sessionName}
               mode="file-multi"
               layout="panel"
               initialPath={sub.cwd ?? '~'}

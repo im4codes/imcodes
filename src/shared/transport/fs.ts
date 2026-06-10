@@ -104,6 +104,8 @@ export interface FsRenameRequest {
   requestId: string;
   path: string;
   newPath: string;
+  /** Session whose project directory scopes this write, when available. */
+  sessionName?: string;
 }
 
 export interface FsRenameResponse extends FsBaseResponse {
@@ -115,6 +117,8 @@ export interface FsDeleteRequest {
   type: typeof FS_TRANSPORT_MSG.DELETE;
   requestId: string;
   path: string;
+  /** Session whose project directory scopes this write, when available. */
+  sessionName?: string;
 }
 
 export interface FsDeleteResponse extends FsBaseResponse {
