@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { usageEndpointToQuotaMeta, getClaudeUsageQuota, setClaudeUsageQuotaOptIn, __resetClaudeUsageQuotaCache } from './claude-usage-quota.js';
+import { usageEndpointToQuotaMeta, getClaudeUsageQuota, setClaudeUsageQuotaOptIn, peekClaudeUsageQuotaCached, __resetClaudeUsageQuotaCache } from './claude-usage-quota.js';
 import { formatProviderQuotaLabel } from '../../shared/provider-quota.js';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -68,6 +68,30 @@ describe('getClaudeUsageQuota opt-in gate', () => {
     // force=true bypasses the cache; the gate must still short-circuit to null
     // before any token read or fetch.
     expect(await getClaudeUsageQuota(true)).toBeNull();
+  });
+});
+
+describe('peekClaudeUsageQuotaCached (sync source-of-truth for the real-time path)', () => {
+  const cachePath = join(tmpdir(), '.imcodes', 'claude-usage-quota.json');
+  afterEach(() => { setClaudeUsageQuotaOptIn(false); __resetClaudeUsageQuotaCache(); vi.restoreAllMocks(); });
+
+  it('returns the persisted 5h+7d snapshot synchronously, without a fetch', () => {
+    // This is what stops the rate_limit_event (5h-only) session-info update from
+    // clobbering the 7d line: the real-time path prefers this cached 7d picture.
+    mkdirSync(join(tmpdir(), '.imcodes'), { recursive: true });
+    const value = { quotaMeta: usageEndpointToQuotaMeta(REAL)!, quotaLabel: '5h 26% · 7d 30%' };
+    writeFileSync(cachePath, JSON.stringify({ at: Date.now(), value }));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const peeked = peekClaudeUsageQuotaCached();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(peeked?.quotaMeta.secondary?.usedPercent).toBe(30); // the 7d the real-time path must preserve
+    expect(peeked?.quotaLabel).toBe('5h 26% · 7d 30%');
+  });
+
+  it('returns null when nothing is cached', () => {
+    expect(peekClaudeUsageQuotaCached()).toBeNull();
   });
 });
 

@@ -35,6 +35,7 @@ import { getQwenRuntimeConfig } from './qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from './provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from './provider-quota.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from './sdk-runtime-config.js';
+import { peekClaudeUsageQuotaCached } from './claude-usage-quota.js';
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
@@ -1365,8 +1366,25 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
       changed = true;
     }
 
-    if (typeof info.quotaLabel === 'string' && info.quotaLabel && next.quotaLabel !== info.quotaLabel) {
-      next.quotaLabel = info.quotaLabel;
+    // For claude-code-sdk the proactive /api/oauth/usage quota (5h + weekly) is the
+    // source of truth when available; the rate_limit_event quota carried in `info`
+    // is 5h-only while healthy and must NOT clobber the richer 7d picture (mirrors
+    // the Option-B override in buildSessionList). This handler's emitSessionPersist
+    // broadcasts to the web in real time, so without this the 7d line flickers away
+    // on every rate_limit_event. Fall back to `info` (Option A) only when no
+    // proactive snapshot with a weekly window exists.
+    let effQuotaLabel = info.quotaLabel;
+    let effQuotaMeta = info.quotaMeta;
+    if (agentType === 'claude-code-sdk') {
+      const proactive = peekClaudeUsageQuotaCached();
+      if (proactive?.quotaMeta?.secondary) {
+        effQuotaLabel = proactive.quotaLabel;
+        effQuotaMeta = proactive.quotaMeta;
+      }
+    }
+
+    if (typeof effQuotaLabel === 'string' && effQuotaLabel && next.quotaLabel !== effQuotaLabel) {
+      next.quotaLabel = effQuotaLabel;
       changed = true;
     }
 
@@ -1375,8 +1393,8 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
       changed = true;
     }
 
-    if (info.quotaMeta !== undefined && !providerQuotaMetaEquals(next.quotaMeta, info.quotaMeta)) {
-      next.quotaMeta = info.quotaMeta;
+    if (effQuotaMeta !== undefined && !providerQuotaMetaEquals(next.quotaMeta, effQuotaMeta)) {
+      next.quotaMeta = effQuotaMeta;
       changed = true;
     }
 

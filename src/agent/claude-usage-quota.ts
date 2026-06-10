@@ -275,6 +275,18 @@ export async function getClaudeUsageQuota(force = false): Promise<ClaudeUsageQuo
   return inflight;
 }
 
+/**
+ * Synchronous peek at the current cached Option-B quota (5h + weekly), WITHOUT
+ * fetching. Returns null when nothing is cached. Used by the real-time
+ * session-info (rate_limit_event) path so the 5h-only Option-A quota never
+ * clobbers the richer 7d picture in the web footer — the proactive snapshot is
+ * the source of truth for claude-code-sdk whenever it carries a weekly window.
+ */
+export function peekClaudeUsageQuotaCached(): ClaudeUsageQuota | null {
+  loadPersistedCacheOnce();
+  return cache?.value ?? null;
+}
+
 /** Test seam — clear the throttle cache. */
 export function __resetClaudeUsageQuotaCache(): void {
   cache = null;
