@@ -271,6 +271,21 @@ function expectTeamRepairScorecardInstructions(text: string): void {
   expect(text).toContain('will use this scorecard as a checklist and may restore points only for conditions proven by post-repair evidence');
 }
 
+/**
+ * The discussion REQUEST must carry only the hop-level guidance: feed
+ * per-module ingredients, and explicitly do NOT write a scorecard section —
+ * the full scorecard format goes exclusively to the final-summary turn via
+ * finalSummaryExtraInstruction. When the full instructions sat in the request
+ * text, every hop wrote its own scorecard each round, corrupting the
+ * acceptance audit's latest-scorecard lookup.
+ */
+function expectTeamScorecardHopGuidanceOnly(text: string): void {
+  expect(text).toContain('so the final Team summary can assemble the repair scorecard');
+  expect(text).toContain('Do NOT write a "repair scorecard" section in individual hop outputs');
+  expect(text).not.toContain('include the exact heading "repair scorecard"');
+  expect(text).not.toContain('baseline score before repair, deduction reasons, concrete recovery conditions, and full-score conditions');
+}
+
 async function completeLatestAudit(status = 'completed', payloadOverrides: Record<string, unknown> = {}): Promise<void> {
   const run = [...p2pRuns.values()].at(-1);
   if (!run) throw new Error('No mocked P2P run exists');
@@ -802,7 +817,7 @@ exec "${realGit}" "$@"
     expect(implementationLaunch.userText).toContain('Do not write authoritative JSON. Do not assign final module scores.');
     expect(implementationLaunch.userText).toContain('The execution model will use this discussion file to repair code/tests/tasks');
     expect(implementationLaunch.userText).toContain('Treat high apparent quality as still requiring a repair pass');
-    expectTeamRepairScorecardInstructions(implementationLaunch.userText ?? '');
+    expectTeamScorecardHopGuidanceOnly(implementationLaunch.userText ?? '');
 
     const discussion = await completeLatestDiscussion();
     const repairPrompt = await waitForTransportSend((text) =>
@@ -1133,7 +1148,7 @@ exec "${realGit}" "$@"
     expect(specLaunch.userText).toContain('Use the OpenSpec specification audit prompt above as the audit-and-repair standard; preserve concrete artifact repair instructions in the discussion output.');
     expect(specLaunch.userText).toContain('Do not write authoritative JSON. Do not assign final module scores.');
     expect(specLaunch.userText).toContain('The execution model will use this discussion file to repair the artifacts');
-    expectTeamRepairScorecardInstructions(specLaunch.userText ?? '');
+    expectTeamScorecardHopGuidanceOnly(specLaunch.userText ?? '');
     // With the post-summary execution gate skipped (no full request restatement
     // on the final summary turn), the scorecard output contract must reach the
     // final summary via finalSummaryExtraInstruction — the acceptance audit
@@ -1164,7 +1179,7 @@ exec "${realGit}" "$@"
     expect(specRun.userText).toContain('Use the OpenSpec specification audit prompt above as the audit-and-repair standard; preserve concrete artifact repair instructions in the discussion output.');
     expect(specRun.userText).toContain('Do not write authoritative JSON. Do not assign final module scores.');
     expect(specRun.userText).toContain('The execution model will use this discussion file to repair the artifacts');
-    expectTeamRepairScorecardInstructions(specRun.userText ?? '');
+    expectTeamScorecardHopGuidanceOnly(specRun.userText ?? '');
     expect(specRun.userText).not.toContain('Authoritative result file:');
     expect(specRun.userText).not.toContain('Required top-level fields:');
     expect(specOrigin.autoDeliver?.authoritativeResultPath).toBe(specPath);
@@ -1219,7 +1234,7 @@ exec "${realGit}" "$@"
     expect(implementationRun.userText).toContain('Use the OpenSpec implementation audit prompt above as the audit-and-repair standard; preserve concrete repair instructions in the discussion output.');
     expect(implementationRun.userText).toContain('Do not write authoritative JSON. Do not assign final module scores.');
     expect(implementationRun.userText).toContain('The execution model will use this discussion file to repair code/tests/tasks');
-    expectTeamRepairScorecardInstructions(implementationRun.userText ?? '');
+    expectTeamScorecardHopGuidanceOnly(implementationRun.userText ?? '');
     expect(implementationRun.userText).not.toContain('Authoritative result file:');
     expect(implementationRun.userText).not.toContain('Required top-level fields:');
     expect(implementationOrigin.autoDeliver?.stage).toBe('implementation_audit_repair');

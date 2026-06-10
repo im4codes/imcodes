@@ -1294,6 +1294,22 @@ function buildTeamRepairScorecardInstructions(stage: AuditRepairStage): string[]
   ];
 }
 
+/**
+ * Hop-level guidance that goes into the DISCUSSION REQUEST text instead of the
+ * full scorecard instructions. The full instructions are delivered ONLY to the
+ * final-summary turn (via finalSummaryExtraInstruction): when they sat in the
+ * request text, every participant hop saw them and wrote its own "repair
+ * scorecard" section each round — burning tokens and, worse, corrupting the
+ * acceptance audit's binding lookup, which takes the LATEST matching heading
+ * in the discussion file.
+ */
+function buildTeamScorecardHopGuidance(): string[] {
+  return [
+    'Per-module findings (spec, tasks, implementation, tests, risk) with concrete evidence must be present in the hop outputs so the final Team summary can assemble the repair scorecard.',
+    'Do NOT write a "repair scorecard" section in individual hop outputs or intermediate round summaries — ONLY the final Team summary includes it (that turn receives the scorecard format separately). Duplicate scorecard sections corrupt the acceptance audit\'s latest-scorecard lookup.',
+  ];
+}
+
 function buildPostRepairAcceptanceAuditResultRepairPrompt(
   run: AutoDeliverRun,
   metadata: OpenSpecAutoDeliverP2pMetadata,
@@ -1923,7 +1939,7 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
       '- Produce concrete repair guidance that the execution model can apply directly.',
       '- In the final Team summary, separate critical fixes, small follow-up fixes, validation requirements, and any blockers.',
       '- Treat high apparent quality as still requiring a repair pass; do not conclude that no implementation repair should run merely because scores would be high.',
-      ...buildTeamRepairScorecardInstructions(metadata.stage),
+      ...buildTeamScorecardHopGuidance(),
       '',
       `Task stats: ${run.taskStats.checked}/${run.taskStats.total} checked.`,
       unchecked.length > 0 ? `Unchecked tasks:\n${unchecked.map((label) => `- ${label}`).join('\n')}` : 'Unchecked tasks: none.',
@@ -1966,7 +1982,7 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
     '- Produce concrete artifact repair guidance that the execution model can apply directly.',
     '- In the final Team summary, separate critical artifact fixes, small follow-up fixes, validation requirements, and any blockers.',
     '- Treat high apparent quality as still requiring a repair pass; do not conclude that no spec repair should run merely because scores would be high.',
-    ...buildTeamRepairScorecardInstructions(metadata.stage),
+    ...buildTeamScorecardHopGuidance(),
     '',
     `Task stats: ${run.taskStats.checked}/${run.taskStats.total} checked.`,
     unchecked.length > 0 ? `Unchecked tasks:\n${unchecked.map((label) => `- ${label}`).join('\n')}` : 'Unchecked tasks: none.',
