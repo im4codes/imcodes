@@ -256,4 +256,69 @@ exit 1
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('detects self-hosted GitLab even when `glab auth status` exits non-zero from an unrelated failing host', async () => {
+    // Regression: the self-hosted instance (172.16.253.211, custom SSH port 2224) is
+    // logged in, but an expired gitlab.com token makes `glab auth status` exit
+    // non-zero. The old code ran it in a try/catch and discarded the output on the
+    // throw — so the good host (still present in stderr) was masked → UNKNOWN.
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-detect-glab-'));
+    const repoDir = join(root, 'repo');
+    const binDir = join(root, 'bin');
+    const oldPath = process.env.PATH;
+    try {
+      await mkdir(repoDir, { recursive: true });
+      await mkdir(binDir, { recursive: true });
+
+      const gitScript = `#!/bin/bash
+cmd="$*"
+if [ "$cmd" = "remote -v" ]; then
+  printf 'origin\\tssh://git@172.16.253.211:2224/root/dj_platform.git (fetch)\\n'
+  printf 'origin\\tssh://git@172.16.253.211:2224/root/dj_platform.git (push)\\n'
+elif [ "$cmd" = "symbolic-ref refs/remotes/origin/HEAD --short" ]; then
+  printf 'origin/main\\n'
+elif [ "$cmd" = "symbolic-ref --quiet --short HEAD" ]; then
+  printf 'main\\n'
+elif [ "$cmd" = "branch --show-current" ]; then
+  printf 'main\\n'
+else
+  exit 0
+fi
+`;
+      // glab: self-hosted host IS logged in, but glab exits non-zero because the
+      // configured gitlab.com token is expired. The host still appears in stderr.
+      const glabScript = `#!/bin/bash
+if [ "$1" = "--version" ]; then printf 'glab 1.89.0 (test)\\n'; exit 0; fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf 'gitlab.com: API call failed: 401 invalid_token\\n' >&2
+  printf '172.16.253.211: logged in as root\\n' >&2
+  printf 'could not authenticate to one or more of the configured GitLab instances.\\n' >&2
+  exit 1
+fi
+exit 1
+`;
+      const whichScript = `#!/bin/bash
+if [ "$1" = "glab" ]; then printf '${join(binDir, 'glab')}\\n'; exit 0; fi
+exit 1
+`;
+      await writeFile(join(binDir, 'git'), gitScript);
+      await writeFile(join(binDir, 'glab'), glabScript);
+      await writeFile(join(binDir, 'which'), whichScript);
+      await chmod(join(binDir, 'git'), 0o755);
+      await chmod(join(binDir, 'glab'), 0o755);
+      await chmod(join(binDir, 'which'), 0o755);
+
+      process.env.PATH = binDir;
+      const result = await detectRepo(repoDir);
+
+      expect(result.info?.platform).toBe('gitlab');
+      expect(result.status).toBe('ok');
+      expect(result.info?.owner).toBe('root');
+      expect(result.info?.repo).toBe('dj_platform');
+      expect(result.cliAuth).toBe(true);
+    } finally {
+      process.env.PATH = oldPath;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

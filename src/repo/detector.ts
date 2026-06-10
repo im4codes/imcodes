@@ -98,6 +98,29 @@ async function resolveSSHHost(alias: string): Promise<string> {
   }
 }
 
+/**
+ * Run `glab auth status` and return its combined stdout+stderr (lowercased),
+ * even when glab exits non-zero.
+ *
+ * Why the error path matters: glab returns a non-zero exit code if ANY configured
+ * host fails authentication (e.g. an expired gitlab.com token) — but the output
+ * still lists every configured host, including the ones that authed fine. The
+ * previous `try { ... } catch {}` discarded that output on the throw, so a single
+ * broken host (gitlab.com) masked a perfectly-good self-hosted instance and the
+ * repo showed up as UNKNOWN. Recovering stdout/stderr from the error object keeps
+ * self-hosted detection working regardless of other hosts' state. Returns '' when
+ * glab is missing or produced nothing.
+ */
+async function glabAuthStatusOutput(): Promise<string> {
+  try {
+    const { stdout, stderr } = await execFileAsync('glab', ['auth', 'status'], { timeout: 5000 });
+    return `${stdout}\n${stderr}`.toLowerCase();
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string };
+    return `${e.stdout ?? ''}\n${e.stderr ?? ''}`.toLowerCase();
+  }
+}
+
 /** Determine platform for a host — known hosts first, SSH alias, then CLI probe. */
 async function detectPlatform(host: string): Promise<RepoPlatform> {
   // 1. Known hosts (direct match)
@@ -116,15 +139,14 @@ async function detectPlatform(host: string): Promise<RepoPlatform> {
     } catch { /* not a gh host or gh not installed */ }
   }
 
-  // 4. glab: parse `glab auth status` output for all authenticated hosts (supports self-hosted GitLab)
-  try {
-    const { stderr, stdout } = await execFileAsync('glab', ['auth', 'status'], { timeout: 5000 });
-    // glab outputs host lines to both stdout and stderr depending on version
-    const output = (stdout + '\n' + stderr).toLowerCase();
-    for (const h of hostsToTry) {
-      if (output.includes(h.toLowerCase())) return 'gitlab';
-    }
-  } catch { /* glab not installed or not authenticated */ }
+  // 4. glab: parse `glab auth status` output for all authenticated hosts (supports
+  //    self-hosted GitLab). Uses the resilient reader so glab's non-zero exit when an
+  //    unrelated host (e.g. an expired gitlab.com token) fails does NOT hide a
+  //    perfectly-good self-hosted host that's present in the same output.
+  const glabOutput = await glabAuthStatusOutput();
+  for (const h of hostsToTry) {
+    if (glabOutput.includes(h.toLowerCase())) return 'gitlab';
+  }
 
   return 'unknown';
 }
@@ -183,9 +205,10 @@ async function checkAuth(platform: RepoPlatform, host: string): Promise<boolean>
     if (platform === 'github') {
       await execFileAsync('gh', ['auth', 'status', '--hostname', host], { timeout: 5000 });
     } else {
-      // glab: verify the specific host is authenticated (supports self-hosted)
-      const { stdout, stderr } = await execFileAsync('glab', ['auth', 'status'], { timeout: 5000 });
-      const output = (stdout + '\n' + stderr).toLowerCase();
+      // glab: verify the specific host appears in `glab auth status` (supports
+      // self-hosted). Resilient reader so an unrelated failing host (non-zero exit,
+      // e.g. expired gitlab.com) can't hide a target host that authed fine.
+      const output = await glabAuthStatusOutput();
       if (!output.includes(host.toLowerCase())) return false;
     }
     return true;

@@ -121,7 +121,7 @@ describe('GitLabProvider contracts', () => {
     expect(() => new GitLabProvider('group', 'bad repo', '/tmp/project')).toThrow('Invalid owner/repo');
   });
 
-  it('normalizes GitLab list, detail, and stubbed CI results', async () => {
+  it('normalizes GitLab list, detail, and CI results', async () => {
     const provider = new GitLabProvider('group', 'repo', '/tmp/project');
     const created = '2026-05-11T00:00:00.000Z';
     const updated = '2026-05-11T00:01:00.000Z';
@@ -157,8 +157,22 @@ describe('GitLabProvider contracts', () => {
       items: [{ shortSha: 'abcdef1', author: 'cat' }],
     });
 
-    await expect(provider.listActions()).resolves.toEqual({ items: [], page: 1, hasMore: false, projectDir: '/tmp/project' });
-    await expect(provider.getActionDetail(123)).resolves.toEqual({ runId: 123, jobs: [] });
+    // CI/CD pipelines → RepoWorkflowRun (status normalized; `name` from best-effort
+    // commit-title enrichment, which issues one extra glab call per pipeline).
+    complete([{ id: 50, iid: 5, sha: 'f00dcafef00dcafe', ref: 'main', status: 'failed', source: 'push', created_at: created, updated_at: updated, web_url: 'https://gitlab.com/group/repo/-/pipelines/50' }]);
+    complete({ title: 'fix: thing' });
+    await expect(provider.listActions({ perPage: 1 })).resolves.toMatchObject({
+      page: 1,
+      hasMore: true,
+      items: [{ id: 50, name: 'fix: thing', status: 'failure', branch: 'main', commitSha: 'f00dcafe', runNumber: 5, event: 'push' }],
+    });
+
+    // Pipeline jobs → RepoActionJob, labelled "stage / name".
+    complete([{ id: 8350, name: 'unit', stage: 'test', status: 'success', started_at: created, finished_at: updated, web_url: 'https://gitlab.com/job/8350' }]);
+    await expect(provider.getActionDetail(123)).resolves.toMatchObject({
+      runId: 123,
+      jobs: [{ id: 8350, name: 'test / unit', status: 'success', steps: [] }],
+    });
 
     complete({ id: 'abcdef1234567890', short_id: 'abcdef1', message: 'subject\n\nbody', author_name: 'cat', committed_date: created, web_url: 'https://gitlab.com/commit', stats: { additions: 4, deletions: 2, total: 6 } });
     complete([
