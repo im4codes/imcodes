@@ -39,6 +39,10 @@ export const OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_ROUNDS_MAX = 3 as const;
 export const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MIN = 1 as const;
 export const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_ROUNDS_MAX = 5 as const;
 export const OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS = 12 as const;
+/** Max consecutive idle reminders (no task progress and no completion marker)
+ *  before the implementation phase escalates to needs_human instead of
+ *  re-prompting the agent forever. */
+export const OPENSPEC_AUTO_DELIVER_MAX_IMPLEMENTATION_MARKER_REMINDERS = 6 as const;
 export const OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES = 240 as const;
 export const OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID = 'audit>review>plan' as const;
 export const OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_PROMPT_ID = 'proposal_audit' as const;

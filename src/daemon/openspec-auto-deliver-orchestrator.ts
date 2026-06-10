@@ -18,6 +18,7 @@ import {
   OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_RESULT_FIELDS,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
+  OPENSPEC_AUTO_DELIVER_MAX_IMPLEMENTATION_MARKER_REMINDERS,
   OPENSPEC_AUTO_DELIVER_EVIDENCE_OPTIONAL_FIELDS,
   OPENSPEC_AUTO_DELIVER_EVIDENCE_REQUIRED_FIELDS,
   OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE,
@@ -205,6 +206,11 @@ interface AutoDeliverRun {
     markerPath: string;
     spec: P2pExecutionMarkerSpec;
     retryCount: number;
+    /** Unchecked-task count at the previous reminder; lets the reminder loop
+     *  reset retryCount when the implementation makes progress between idles. */
+    lastUncheckedCount?: number;
+    /** Epoch ms of the last reminder actually sent; used to throttle the rate. */
+    lastReminderAt?: number;
   };
   activeAudit?: {
     p2pRunId: string;
@@ -260,9 +266,14 @@ const terminalRunByOwner = new Map<string, AutoDeliverRun>();
 const requestProjectionByFingerprint = new Map<string, OpenSpecAutoDeliverProjection>();
 const auditPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const auditFixRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const implementationReminderTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let timelineUnsubscribe: (() => void) | null = null;
 const execFileAsync = promisify(execFile);
 const OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS = process.env.NODE_ENV === 'test' ? 50 : 15_000;
+// Minimum spacing between implementation "marker missing" reminders. Unless the
+// implementation just made task progress, a reminder is throttled to at least
+// this interval so a fast-flapping idle cannot spam the agent.
+const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_REMINDER_MIN_INTERVAL_MS = process.env.NODE_ENV === 'test' ? 40 : 30_000;
 const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON = 'implementation_audit_followup_repair';
 
 export interface OpenSpecAutoDeliverUpgradeBlockReason {
@@ -285,6 +296,12 @@ function clearAuditFixRetryTimer(runId: string): void {
   const timer = auditFixRetryTimers.get(runId);
   if (timer) clearTimeout(timer);
   auditFixRetryTimers.delete(runId);
+}
+
+function clearImplementationReminderTimer(runId: string): void {
+  const timer = implementationReminderTimers.get(runId);
+  if (timer) clearTimeout(timer);
+  implementationReminderTimers.delete(runId);
 }
 
 function cloneTaskStats(stats: OpenSpecAutoDeliverTaskStats): OpenSpecAutoDeliverTaskStats {
@@ -952,8 +969,50 @@ async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason:
   if (!run.activeImplementationMarker) {
     return terminalize(run, 'needs_human', `implementation_marker_contract_missing:${reason}`);
   }
-  run.activeImplementationMarker.retryCount += 1;
-  run.activeCommandId = `${run.runId}:implementation-marker:${run.generation}:${run.implementationPromptCount}:${run.activeImplementationMarker.retryCount}`;
+  const marker = run.activeImplementationMarker;
+  // Bound AND pace the idle -> "marker missing" -> reminder -> idle loop so it
+  // cannot re-prompt the agent forever or spam it (previously a reminder fired
+  // on every idle, with no count or rate limit; only the hours-long elapsed
+  // limit ever stopped it).
+  const unchecked = run.taskStats?.unchecked ?? null;
+  const progressed = unchecked !== null
+    && marker.lastUncheckedCount !== undefined
+    && unchecked < marker.lastUncheckedCount;
+  // Reset the count whenever the implementation makes task progress between
+  // idles, so a genuinely advancing run is never aborted or throttled.
+  if (progressed) marker.retryCount = 0;
+  if (unchecked !== null) marker.lastUncheckedCount = unchecked;
+  // Count cap: escalate to needs_human once the agent stalls without writing
+  // the marker for too many consecutive idles, instead of nudging forever.
+  if (marker.retryCount >= OPENSPEC_AUTO_DELIVER_MAX_IMPLEMENTATION_MARKER_REMINDERS) {
+    clearImplementationReminderTimer(run.runId);
+    return terminalize(run, 'needs_human', `implementation_marker_reminders_exhausted:${reason}`);
+  }
+  // Rate throttle: unless progress was just made, keep at least MIN_INTERVAL
+  // between reminders. Defer via a single timer (rather than skipping) so one
+  // late idle cannot stall the loop, and dedupe so a burst of idles schedules
+  // only one pending reminder.
+  if (!progressed) {
+    const sinceLast = Date.now() - (marker.lastReminderAt ?? 0);
+    if (sinceLast < OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_REMINDER_MIN_INTERVAL_MS) {
+      if (!implementationReminderTimers.has(run.runId)) {
+        const waitMs = OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_REMINDER_MIN_INTERVAL_MS - sinceLast;
+        implementationReminderTimers.set(run.runId, setTimeout(() => {
+          implementationReminderTimers.delete(run.runId);
+          const current = runsById.get(run.runId);
+          if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
+          void advanceAfterImplementationIdle(current).catch((error) => {
+            terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'implementation_idle_advance_failed');
+          });
+        }, waitMs));
+      }
+      return broadcastProjection(run);
+    }
+  }
+  clearImplementationReminderTimer(run.runId);
+  marker.retryCount += 1;
+  marker.lastReminderAt = Date.now();
+  run.activeCommandId = `${run.runId}:implementation-marker:${run.generation}:${run.implementationPromptCount}:${marker.retryCount}`;
   const prompt = buildImplementationMarkerReminderPrompt(run, reason);
   timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
     text: prompt,
@@ -2036,6 +2095,7 @@ function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 
   }
   run.activeAcceptanceAudit = undefined;
   clearAuditFixRetryTimer(run.runId);
+  clearImplementationReminderTimer(run.runId);
   delete run.activeCommandId;
   delete run.activeImplementationMarker;
   run.resumeStage = status === 'passed' ? undefined : previousStage;
@@ -2566,6 +2626,7 @@ async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void
       return;
     }
     recordImplementationMarkerEvidence(run, markerState.marker);
+    clearImplementationReminderTimer(run.runId);
     delete run.activeCommandId;
     delete run.activeImplementationMarker;
     if (run.needsPostRepairAcceptanceAudit || run.auditBeforeRepair || run.implementationAuditDiscussionFilePath) {
@@ -3017,6 +3078,8 @@ export function clearOpenSpecAutoDeliverRunsForTests(): void {
   auditPollTimers.clear();
   for (const timer of auditFixRetryTimers.values()) clearTimeout(timer);
   auditFixRetryTimers.clear();
+  for (const timer of implementationReminderTimers.values()) clearTimeout(timer);
+  implementationReminderTimers.clear();
   for (const run of runsById.values()) {
     releaseAutoDeliverP2pLock(run.owningMainSessionName, run.runId);
   }

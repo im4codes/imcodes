@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
+  OPENSPEC_AUTO_DELIVER_MAX_IMPLEMENTATION_MARKER_REMINDERS,
   OPENSPEC_AUTO_DELIVER_MSG,
   OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS,
 } from '../../shared/openspec-auto-deliver-constants.js';
@@ -101,6 +102,21 @@ async function waitForTransportSend(predicate: (text: string) => boolean, maxMs 
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error('Expected transport send was not observed');
+}
+
+function implementationReminderCount(): number {
+  return transportSendMock.mock.calls
+    .filter((call) => String(call[0] ?? '').includes('OpenSpec Auto Deliver implementation is not complete yet'))
+    .length;
+}
+
+async function waitForImplementationReminderCount(n: number, maxMs = 2500): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < maxMs) {
+    if (implementationReminderCount() >= n) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`expected >= ${n} implementation reminders, saw ${implementationReminderCount()}`);
 }
 
 async function writeLatestImplementationMarker(overrides: Record<string, unknown> = {}): Promise<boolean> {
@@ -849,6 +865,78 @@ exec "${realGit}" "$@"
       2500,
     );
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('escalates to needs_human after too many idle reminders without a completion marker', async () => {
+    // Regression: a session that kept going idle without writing the completion
+    // marker re-sent the "implementation is not complete yet" reminder forever
+    // (only the hours-long elapsed limit stopped it). The reminder loop is now
+    // bounded.
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-implementation-marker-reminder-cap',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      2500,
+    );
+
+    // Each idle without a marker (and without task progress) sends one reminder,
+    // up to the cap; the next idle escalates instead of re-prompting forever.
+    for (let i = 1; i <= OPENSPEC_AUTO_DELIVER_MAX_IMPLEMENTATION_MARKER_REMINDERS; i++) {
+      timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+      await waitForImplementationReminderCount(i);
+    }
+
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    expect(terminal?.projection.status).toBe('needs_human');
+    expect(String((terminal?.projection as { terminalReason?: string })?.terminalReason ?? ''))
+      .toContain('implementation_marker_reminders_exhausted');
+    // No extra reminder beyond the cap was sent.
+    expect(implementationReminderCount()).toBe(OPENSPEC_AUTO_DELIVER_MAX_IMPLEMENTATION_MARKER_REMINDERS);
+  });
+
+  it('throttles bursty idle reminders to the minimum interval', async () => {
+    // Regression: reminders used to fire on every idle. A burst of idles within
+    // the cooldown window must collapse to a single (deferred) reminder.
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-implementation-marker-reminder-throttle',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      2500,
+    );
+
+    // First idle -> first reminder (no prior reminder, nothing to throttle).
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await waitForImplementationReminderCount(1);
+
+    // Burst of idles inside the cooldown -> collapses to one deferred reminder.
+    for (let k = 0; k < 5; k++) {
+      timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    }
+    // Settle well under the test min-interval (40ms): the deferred reminder has
+    // not fired yet, so the burst produced no extra reminder.
+    await new Promise((resolve) => setTimeout(resolve, 12));
+    expect(implementationReminderCount()).toBe(1);
+
+    // Exactly one throttled reminder is delivered after the interval (not five).
+    await waitForImplementationReminderCount(2);
+    expect(implementationReminderCount()).toBe(2);
   });
 
   it('asks the implementation LLM to commit&push, then verifies product changes after final implementation audit PASS when opted in', async () => {
