@@ -34,7 +34,7 @@ import { resolveStructuredSessionBootstrap } from './structured-session-bootstra
 import { getQwenRuntimeConfig } from './qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from './provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from './provider-quota.js';
-import { getClaudeSdkRuntimeConfig } from './sdk-runtime-config.js';
+import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from './sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
@@ -1500,6 +1500,12 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       let requestedTransportModel = s.requestedModel ?? s.qwenModel;
       if (s.providerId === 'codex-sdk') {
         requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
+      } else if (s.providerId === 'claude-code-sdk' && requestedTransportModel) {
+        // Resolve the picker alias (e.g. "fable") to the documented API id before the
+        // SDK sees it — symmetric with the model-change path (command-handler) and the
+        // codex branch above. Without this, a restored session passed the raw alias and
+        // the SDK rejected it ("model (fable) may not exist"). Idempotent for ids.
+        requestedTransportModel = normalizeClaudeSdkModelForProvider(requestedTransportModel);
       }
       const runtime = new TransportSessionRuntime(provider, s.name);
       wireTransportCallbacks(runtime, s.name);
@@ -1802,6 +1808,10 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
   if (agentType === 'codex-sdk') {
     requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
+  } else if (agentType === 'claude-code-sdk' && requestedTransportModel) {
+    // Resolve the picker alias (e.g. "fable") to the documented API id at launch —
+    // symmetric with the restore path and command-handler's model-change path.
+    requestedTransportModel = normalizeClaudeSdkModelForProvider(requestedTransportModel);
   }
   // Preserve existing transportConfig (including supervision) when opts doesn't override.
   // Only fall through to `undefined` if nothing is set — never force `{}`, which would

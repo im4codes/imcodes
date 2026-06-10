@@ -135,7 +135,13 @@ vi.mock('../../src/daemon/gemini-watcher.js', () => ({ startWatching: vi.fn().mo
 vi.mock('../../src/daemon/opencode-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
 vi.mock('../../src/agent/structured-session-bootstrap.js', () => ({ resolveStructuredSessionBootstrap: vi.fn(async (x) => x) }));
 vi.mock('../../src/agent/qwen-runtime-config.js', () => ({ getQwenRuntimeConfig: vi.fn(async () => null) }));
-vi.mock('../../src/agent/sdk-runtime-config.js', () => ({ getClaudeSdkRuntimeConfig: vi.fn(async () => ({})) }));
+// Keep the REAL exports (notably normalizeClaudeSdkModelForProvider, used by the
+// restore/launch model resolution); only stub getClaudeSdkRuntimeConfig so the
+// test doesn't read ~/.claude credentials.
+vi.mock('../../src/agent/sdk-runtime-config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/agent/sdk-runtime-config.js')>()),
+  getClaudeSdkRuntimeConfig: vi.fn(async () => ({})),
+}));
 vi.mock('../../src/agent/codex-runtime-config.js', () => ({ getCodexRuntimeConfig: vi.fn(async () => ({})) }));
 vi.mock('../../src/agent/provider-display.js', () => ({ getQwenDisplayMetadata: vi.fn(() => ({})) }));
 vi.mock('../../src/agent/provider-quota.js', () => ({ getQwenOAuthQuotaUsageLabel: vi.fn(() => '') }));
@@ -235,6 +241,47 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_cc_brain')?.effort).toBe('high');
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-cc-restore' });
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
+  });
+
+  it('normalizes the `fable` picker alias to the API id (claude-fable-5) on restore (regression)', async () => {
+    // A claude-code-sdk session whose persisted model is the picker alias "fable".
+    // Restore does NOT take the model-change command path (which normalizes), so
+    // without normalization at the SDK boundary the raw "fable" reached the SDK and
+    // failed: "There's an issue with the selected model (fable). It may not exist."
+    mocks.store.set('deck_sdk_cc_fable', {
+      name: 'deck_sdk_cc_fable',
+      projectName: 'sdkcc',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/sdk-cc-fable',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'route-cc-fable',
+      ccSessionId: 'cc-session-fable',
+      requestedModel: 'fable',
+      activeModel: 'fable',
+      modelDisplay: 'fable',
+      effort: 'high',
+      transportConfig: { provider: { mode: 'safe' }, sharedContextNamespace: { scope: 'personal', projectId: 'sdk-cc-fable' } },
+    });
+
+    await connectProvider('claude-code-sdk', {});
+    await restoreTransportSessions('claude-code-sdk');
+
+    const runtime = getTransportRuntime('deck_sdk_cc_fable');
+    expect(runtime).toBeDefined();
+
+    runtime!.send('hello after restart');
+    await flush();
+
+    expect(mocks.claudeRuns).toHaveLength(1);
+    // The picker alias must be resolved to the documented API id before the SDK sees it.
+    expect(mocks.claudeRuns[0].options.model).toBe('claude-fable-5');
   });
 
   it('restoreTransportSessions awaits drainResend — pre-populated resend queue is fully transferred to runtime before resolve (audit cae1de69-826)', async () => {
