@@ -2938,6 +2938,10 @@ function ToolCallGroup({
   const last = events.length > 1 ? events[events.length - 1] : null;
   const middle = events.slice(1, last ? -1 : undefined);
 
+  // Defensive: an empty consolidated group would crash ChatEvent on
+  // `event.type` and take the whole session pane down with it.
+  if (!first) return null;
+
   return (
     <div class="chat-tool-group">
       <ChatEvent event={first} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} serverId={serverId} />
