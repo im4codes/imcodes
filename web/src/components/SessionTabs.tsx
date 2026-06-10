@@ -197,6 +197,35 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     return () => cancelAnimationFrame(frame);
   }, [activeSession, orderedSessions]);
 
+  // Mouse-wheel → horizontal scroll for the tab bar. On Windows/Linux a plain
+  // mouse wheel only emits vertical `deltaY`, and the browser will NOT translate
+  // that into horizontal scroll for an `overflow-x` container — so when tabs
+  // overflow the bar they're unreachable without a horizontal scroll device.
+  // Translate vertical wheel intent into `scrollLeft` here. Registered as a
+  // NON-passive listener so `preventDefault()` actually suppresses the page
+  // from scrolling vertically instead. Trackpads (which already emit `deltaX`)
+  // keep working — we pick whichever axis has the larger magnitude.
+  useEffect(() => {
+    const tabBar = tabBarRef.current;
+    if (!tabBar) return;
+    const onWheel = (event: WheelEvent) => {
+      // Respect an explicit horizontal gesture (trackpad / shift+wheel) by
+      // using whichever axis the user actually moved more.
+      const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+      if (delta === 0) return;
+      const maxScroll = tabBar.scrollWidth - tabBar.clientWidth;
+      if (maxScroll <= 0) return; // nothing overflowing — let the page scroll
+      const atStart = tabBar.scrollLeft <= 0;
+      const atEnd = tabBar.scrollLeft >= maxScroll - 0.5;
+      // Don't trap the wheel at the edges — let the page scroll past the bar.
+      if ((delta < 0 && atStart) || (delta > 0 && atEnd)) return;
+      event.preventDefault();
+      tabBar.scrollLeft += delta;
+    };
+    tabBar.addEventListener('wheel', onWheel, { passive: false });
+    return () => tabBar.removeEventListener('wheel', onWheel);
+  }, []);
+
   // External rename trigger (from ⋯ menu in SessionControls)
   useEffect(() => {
     if (!renameRequest) return;
