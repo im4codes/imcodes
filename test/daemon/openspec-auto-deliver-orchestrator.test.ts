@@ -9,6 +9,7 @@ import {
   OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS,
 } from '../../shared/openspec-auto-deliver-constants.js';
 import { formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
+import { isPostSummaryExecutionGateFailure } from '../../shared/p2p-execution-marker.js';
 
 interface MockP2pRun {
   id: string;
@@ -1814,6 +1815,62 @@ exec "${realGit}" "$@"
     expect(terminal?.projection.terminalReason).toBe('audit_p2p_failed');
     expect(terminal?.projection.evidence?.some((entry: { summary?: string }) => entry.summary?.includes('dispatch_failed'))).toBe(true);
     expect(transportSendMock.mock.calls.some((call) => String(call[0] ?? '').includes('Problem: missing_authoritative_json'))).toBe(false);
+  });
+
+  it('recovers a post-summary execution-gate failure via an audit-fix round instead of audit_p2p_failed', async () => {
+    // Regression: the Team audit discussion's by-design post-summary execution
+    // gate may end with a `failed` marker when the agent could not finish the
+    // repair in one turn. That used to terminalize the whole delivery as
+    // audit_p2p_failed even though the audit itself was fine. It must instead
+    // route through the recoverable audit-fix retry path (contrast the
+    // dispatch_failed infrastructure case above, which still hard-fails).
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    const emitSpy = vi.spyOn(timelineEmitter, 'emit');
+    try {
+      await handleOpenSpecAutoDeliverCommand({
+        type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+        requestId: 'req-post-summary-exec-recoverable',
+        sessionName: 'deck_demo_brain',
+        changeName: 'demo-change',
+        presetId: 'fast',
+      }, serverLinkMock as never);
+
+      await emitDeckDemoIdle();
+      await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && (msg.projection as { stage?: string })?.stage === 'implementation_audit_repair');
+      const p2pRun = [...p2pRuns.values()].at(-1)!;
+      p2pRun.error = 'post_summary_execution_failed: implementation repair scope not completed in this turn';
+      await completeLatestAudit('failed');
+
+      // The daemon emits a *recoverable* audit-fix gate, not a hard terminal.
+      let recoverableAsk: unknown;
+      const start = Date.now();
+      while (Date.now() - start < 2500) {
+        recoverableAsk = emitSpy.mock.calls.find(([, event, payload]) =>
+          event === 'ask.question'
+          && Array.isArray((payload as { questions?: unknown[] })?.questions)
+          && String((payload as { questions: { question?: string }[] }).questions[0]?.question ?? '').includes('recoverable gate'));
+        if (recoverableAsk) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(recoverableAsk).toBeTruthy();
+
+      const auditP2pFailedTerminal = serverLinkMock.send.mock.calls
+        .map((call) => call[0] as { type?: string; projection?: { terminalReason?: string } })
+        .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.terminalReason === 'audit_p2p_failed');
+      expect(auditP2pFailedTerminal).toBeUndefined();
+    } finally {
+      emitSpy.mockRestore();
+    }
+  });
+
+  it('classifies post-summary execution gate failures as recoverable and infra failures as terminal', () => {
+    expect(isPostSummaryExecutionGateFailure('post_summary_execution_failed: implementation repair scope not completed in this turn')).toBe(true);
+    expect(isPostSummaryExecutionGateFailure('timed_out: post_summary_execution_timeout')).toBe(true);
+    expect(isPostSummaryExecutionGateFailure('dispatch_failed: tmux send-keys failed: can\'t find pane')).toBe(false);
+    expect(isPostSummaryExecutionGateFailure('timed_out: hop_timeout')).toBe(false);
+    expect(isPostSummaryExecutionGateFailure(null)).toBe(false);
+    expect(isPostSummaryExecutionGateFailure(undefined)).toBe(false);
+    expect(isPostSummaryExecutionGateFailure('')).toBe(false);
   });
 
   it('rejects invalid presets and zero-task changes before acquiring a run', async () => {

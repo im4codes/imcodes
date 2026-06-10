@@ -65,6 +65,7 @@ import {
 import { formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
 import {
   buildP2pExecutionMarker,
+  isPostSummaryExecutionGateFailure,
   stringifyP2pExecutionMarker,
   validateP2pExecutionMarkerContent,
   type P2pExecutionMarker,
@@ -2326,6 +2327,21 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
       stale: false,
     }]);
     run.activeAudit = undefined;
+    // The Team audit discussion's by-design post-summary execution gate may end
+    // with a `failed` marker or a gate timeout when the agent could not finish
+    // the repair in a single turn. That is recoverable: route it through the
+    // audit-fix retry path, which adds one more audit round (work accumulates in
+    // the artifacts across rounds) or escalates to `*_rounds_exhausted`
+    // needs_human once the round budget is spent — instead of hard-failing the
+    // whole delivery on a transient "ran out of turn" signal. Infrastructure
+    // failures (e.g. dispatch_failed) still escalate to needs_human immediately.
+    if (
+      (expected.stage === 'spec_audit_repair' || expected.stage === 'implementation_audit_repair')
+      && isPostSummaryExecutionGateFailure(p2pRun.error)
+    ) {
+      scheduleAuditFixRetry(run, expected.stage, 'audit_p2p_failed');
+      return;
+    }
     const projection = terminalize(run, 'needs_human', 'audit_p2p_failed');
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;

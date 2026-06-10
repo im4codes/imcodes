@@ -94,6 +94,8 @@ import {
 } from '../../shared/p2p-status.js';
 import {
   buildP2pExecutionMarker,
+  POST_SUMMARY_EXECUTION_FAILED_ERROR_TYPE,
+  POST_SUMMARY_EXECUTION_TIMEOUT_REASON,
   stringifyP2pExecutionMarker,
   validateP2pExecutionMarkerContent,
   type P2pExecutionMarker,
@@ -1894,7 +1896,7 @@ async function runPostSummaryExecutionGate(
     }
     if (markerState && !markerState.ok) {
       if (markerState.failedByAgent) {
-        failRun(run, 'post_summary_execution_failed', markerState.reason, serverLink);
+        failRun(run, POST_SUMMARY_EXECUTION_FAILED_ERROR_TYPE, markerState.reason, serverLink);
         return false;
       }
     }
@@ -1917,7 +1919,7 @@ async function runPostSummaryExecutionGate(
   }
 
   logger.warn({ runId: run.id, session, timeoutMs, markerPath: spec.markerPath }, 'P2P: post-summary execution marker timed out');
-  failRun(run, 'timed_out', 'post_summary_execution_timeout', serverLink);
+  failRun(run, 'timed_out', POST_SUMMARY_EXECUTION_TIMEOUT_REASON, serverLink);
   return false;
 }
 
