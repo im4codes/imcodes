@@ -104,4 +104,48 @@ describe('quota persistence + idle gate', () => {
     expect(fetchSpy).not.toHaveBeenCalled();        // idle gate suppressed the fetch
     expect(q).toBeNull();                           // nothing cached yet → null, but no network
   });
+
+  it('keeps serving a stale (>30min) persisted snapshot after a restart instead of blanking the 7d line', async () => {
+    // Daemon restarts often (auto-upgrade); a 2h-old snapshot must still seed
+    // the cache so the footer never collapses to the 5h-only rate_limit view.
+    mkdirSync(join(tmpdir(), '.imcodes'), { recursive: true });
+    const value = { quotaMeta: usageEndpointToQuotaMeta(REAL)!, quotaLabel: 'stale-but-served' };
+    writeFileSync(cachePath, JSON.stringify({ at: Date.now() - 2 * 60 * 60 * 1000, value }));
+    // The expired TTL triggers a refetch attempt; make it fail — the stale
+    // snapshot must survive a failed refresh rather than blank the footer.
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('offline'));
+
+    setClaudeUsageQuotaOptIn(true); // opt in (also marks activity)
+    const q = await getClaudeUsageQuota();
+
+    expect(q?.quotaLabel).toBe('stale-but-served');
+  });
+
+  it('serves the persisted snapshot BEFORE the opt-in toggle arrives after a restart (no token read, no fetch)', async () => {
+    // After a restart optedIn defaults to false until the web (re)connects and
+    // re-delivers the pref. The snapshot only ever exists while opted in
+    // (revoking deletes it), so serving it leaks nothing — and must not touch
+    // the token or the network.
+    mkdirSync(join(tmpdir(), '.imcodes'), { recursive: true });
+    const value = { quotaMeta: usageEndpointToQuotaMeta(REAL)!, quotaLabel: 'pre-optin-label' };
+    writeFileSync(cachePath, JSON.stringify({ at: Date.now() - 2 * 60 * 60 * 1000, value }));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const q = await getClaudeUsageQuota(); // optedIn is false (restart default)
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(q?.quotaLabel).toBe('pre-optin-label');
+  });
+
+  it('drops persisted snapshots older than 24h instead of showing misleading data', async () => {
+    mkdirSync(join(tmpdir(), '.imcodes'), { recursive: true });
+    const value = { quotaMeta: usageEndpointToQuotaMeta(REAL)!, quotaLabel: 'too-old' };
+    writeFileSync(cachePath, JSON.stringify({ at: Date.now() - 25 * 60 * 60 * 1000, value }));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const q = await getClaudeUsageQuota(); // optedIn is false (restart default)
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(q).toBeNull();
+  });
 });

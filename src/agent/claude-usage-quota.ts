@@ -19,6 +19,11 @@ const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 // Account-wide quota — throttle the call to AT MOST once per 30 minutes
 // regardless of how many sessions or how often buildSessionList runs.
 const CACHE_TTL_MS = 30 * 60 * 1000;
+// A persisted snapshot older than the fetch TTL is still worth SHOWING after a
+// daemon restart — the weekly window moves slowly, and a stale 7d line beats a
+// blank one (the TTL check still triggers a refetch as soon as it can). Only
+// drop snapshots old enough to be misleading.
+const MAX_PERSISTED_AGE_MS = 24 * 60 * 60 * 1000;
 // When no claude-code-sdk session has been used for this long, stop hitting the
 // network: serve the last cached snapshot (incl. the disk-persisted one) instead
 // of calling /api/oauth/usage. A send to a claude-code-sdk session resumes it.
@@ -167,7 +172,12 @@ function loadPersistedCacheOnce(): void {
   try {
     if (!existsSync(CACHE_PATH)) return;
     const parsed = JSON.parse(readFileSync(CACHE_PATH, 'utf8')) as { at?: number; value?: ClaudeUsageQuota | null };
-    if (parsed && typeof parsed.at === 'number' && parsed.value && Date.now() - parsed.at < CACHE_TTL_MS) {
+    // Seed even when older than the fetch TTL (but not absurdly old): after a
+    // daemon restart the footer keeps the last known 5h+7d picture instead of
+    // collapsing to the rate_limit_event 5h-only fallback for up to 30+ min.
+    // The `at` timestamp is preserved, so an expired-TTL snapshot still
+    // triggers a refetch on the next non-idle call.
+    if (parsed && typeof parsed.at === 'number' && parsed.value && Date.now() - parsed.at < MAX_PERSISTED_AGE_MS) {
       cache = { at: parsed.at, value: parsed.value };
     }
   } catch { /* missing / unreadable / bad json — treat as no cache */ }
@@ -233,7 +243,14 @@ async function fetchUsageQuota(): Promise<ClaudeUsageQuota | null> {
  */
 export async function getClaudeUsageQuota(force = false): Promise<ClaudeUsageQuota | null> {
   // Off by default — no token read, no network — until the user authorizes it.
-  if (!optedIn) return null;
+  // A persisted snapshot only ever exists while opted in (revoking deletes it),
+  // so serving it BEFORE the web (re)delivers the opt-in toggle after a daemon
+  // restart leaks nothing new and keeps the 7d line from blanking. No fetch
+  // happens in this state.
+  if (!optedIn) {
+    loadPersistedCacheOnce();
+    return cache?.value ?? null;
+  }
   loadPersistedCacheOnce();
   const now = Date.now();
   // Fresh cache (incl. one seeded from disk after a restart) → serve, no network.
