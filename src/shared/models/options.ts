@@ -1,4 +1,7 @@
-export const CLAUDE_CODE_MODEL_IDS = ['opus[1M]', 'sonnet', 'haiku'] as const;
+// `fable` = Claude Fable 5 (Mythos-class, GA 2026-06-09) — Anthropic's most
+// capable widely released model, the new top tier above Opus. Listed first so
+// the picker surfaces the strongest model at the top.
+export const CLAUDE_CODE_MODEL_IDS = ['fable', 'opus[1M]', 'sonnet', 'haiku'] as const;
 export type ClaudeCodeModelId = typeof CLAUDE_CODE_MODEL_IDS[number];
 
 export function normalizeClaudeCodeModelId(value: string | null | undefined): ClaudeCodeModelId | undefined {
@@ -12,6 +15,9 @@ export function normalizeClaudeCodeModelId(value: string | null | undefined): Cl
   // correctly even when the detected/stored model preserves its version for the
   // ctx-bar label.
   const lower = trimmed.toLowerCase();
+  // Mythos-class maps to the `fable` picker option (claude-fable-5 /
+  // claude-mythos-5 both resolve here).
+  if (lower.includes('fable') || lower.includes('mythos')) return 'fable';
   if (lower.includes('opus')) return 'opus[1M]';
   if (lower.includes('sonnet')) return 'sonnet';
   if (lower.includes('haiku')) return 'haiku';

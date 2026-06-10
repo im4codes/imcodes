@@ -26,6 +26,13 @@ describe('shortModelLabel', () => {
     expect(shortModelLabel('gemini-3-flash-preview')).toBe('flash');
   });
 
+  it('labels Claude Fable 5 / Mythos 5 (Mythos-class) with their version', () => {
+    expect(shortModelLabel('claude-fable-5')).toBe('fable-5');
+    expect(shortModelLabel('claude-fable-5-20260609')).toBe('fable-5');
+    expect(shortModelLabel('claude-mythos-5')).toBe('mythos-5');
+    expect(shortModelLabel('fable')).toBe('fable');
+  });
+
   it('preserves Qwen and compatible provider model labels', () => {
     expect(shortModelLabel('coder-model')).toBe('coder-model');
     expect(shortModelLabel('qwen3-coder-next')).toBe('qwen3-coder-next');

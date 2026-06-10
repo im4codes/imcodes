@@ -199,7 +199,7 @@ function writeTransportQueueHidden(storageKey: string | null, hidden: boolean): 
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
-type ModelChoice = 'opus[1M]' | 'sonnet' | 'haiku';
+type ModelChoice = 'fable' | 'opus[1M]' | 'sonnet' | 'haiku';
 
 const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
 

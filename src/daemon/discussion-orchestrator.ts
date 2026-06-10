@@ -18,6 +18,9 @@ const IDLE_POLL_INTERVAL = 3_000;
 
 // Model strength ranking (for auto-selecting the verdict participant)
 const MODEL_STRENGTH: Record<string, number> = {
+  // Mythos-class (Claude Fable 5) sits above Opus — strongest verdict pick.
+  fable: 120,
+  'claude-fable-5': 120,
   'opus[1M]': 100,
   opus: 100,
   sonnet: 80,

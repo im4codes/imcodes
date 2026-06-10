@@ -29,6 +29,14 @@ describe('model context inference', () => {
     expect(inferContextWindow('gpt-4.1-mini')).toBe(1_000_000);
   });
 
+  it('maps Claude Fable 5 / Mythos 5 (Mythos-class) to 1M context', () => {
+    expect(inferContextWindow('fable')).toBe(1_000_000);
+    expect(inferContextWindow('mythos')).toBe(1_000_000);
+    expect(inferContextWindow('claude-fable-5')).toBe(1_000_000);
+    expect(inferContextWindow('claude-fable-5-20260609')).toBe(1_000_000);
+    expect(inferContextWindow('claude-mythos-5')).toBe(1_000_000);
+  });
+
   it('maps claude opus family to 1M context', () => {
     expect(inferContextWindow('opus[1M]')).toBe(1_000_000);
     expect(inferContextWindow('claude-opus-4-1')).toBe(1_000_000);

@@ -1337,6 +1337,21 @@ export function App() {
     return {};
   });
 
+  // Resizable session-tree popup height (device-local, not synced) — same
+  // bottom drag-to-resize behavior as the pinned panels.
+  const [sessionTreeHeight, setSessionTreeHeight] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem('session_tree_height');
+      const n = raw ? parseInt(raw, 10) : NaN;
+      if (Number.isFinite(n) && n >= 140) return n;
+    } catch { /* ignore */ }
+    return 300;
+  });
+  const saveSessionTreeHeight = useCallback((h: number) => {
+    setSessionTreeHeight(h);
+    try { localStorage.setItem('session_tree_height', String(h)); } catch { /* ignore */ }
+  }, []);
+
   // ── Desktop floating window stack ────────────────────────────────────────────
   // Single shared ordering authority for all desktop, non-modal floating
   // workspace windows (sub-sessions, file preview, file browser, repo, cron,
@@ -2823,6 +2838,7 @@ export function App() {
         const stripped = msg.diff.lines.map(([, l]: [unknown, string]) => l.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')).join(' ').toLowerCase();
         // Detect models from terminal output
         const claudeModel: string | null =
+          stripped.includes('fable') ? 'fable' :
           stripped.includes('opus') ? 'opus[1M]' :
           stripped.includes('sonnet') ? 'sonnet' :
           stripped.includes('haiku') ? 'haiku' : null;
@@ -5294,6 +5310,8 @@ export function App() {
                 }}
                 onNewSession={selectedShareTarget ? undefined : () => { setShowNewSession(true); closeSidebar(); }}
                 onNewSubSession={selectedShareTarget ? undefined : () => { setShowSubDialog(true); closeSidebar(); }}
+                height={sessionTreeHeight}
+                onResizeHeight={saveSessionTreeHeight}
               />}
               {/* P2P ring progress */}
               {discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
