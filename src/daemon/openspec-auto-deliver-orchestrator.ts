@@ -675,7 +675,19 @@ async function refreshChangeRoot(run: AutoDeliverRun): Promise<boolean> {
 
 async function readTaskStatsForRun(run: AutoDeliverRun): Promise<OpenSpecAutoDeliverTaskStats> {
   if (!(await refreshChangeRoot(run))) throw new Error(run.latestMessage ?? 'change_root_invalid');
-  return readTaskStats(run.changeRoot);
+  // tasks.md can be transiently unreadable/half-written while the agent is
+  // checking tasks off; retry a few times before treating it as unreadable so a
+  // momentary read race does not hard-fail the run.
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await readTaskStats(run.changeRoot);
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('tasks_unreadable');
 }
 
 async function readProjectFileIfPresent(projectRoot: string, path: string): Promise<{ path: string; content: string } | null> {
@@ -2519,12 +2531,15 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
   // SCORE comes from the acceptance audit. So treat a post-summary gate failure
   // as "discussion usable" and proceed to repair + scoring below. Re-running the
   // discussion instead would loop forever — incrementing rounds without ever
-  // producing a score. Genuine failures (dispatch_failed, the discussion itself
-  // timing out, cancellation, etc.) still escalate to needs_human.
-  const usableGateFailure = p2pRun.status !== 'completed'
+  // producing a score. A hop/discussion timeout is also treated as usable — the
+  // completed hops' analysis is already in the discussion file, so the agent
+  // "running out of the time-boxed hop" must not hard-fail the delivery either.
+  // Only genuine infra failures (dispatch_failed) and user cancellation still
+  // escalate to needs_human.
+  const usableDespiteFailure = p2pRun.status !== 'completed'
     && (expected.stage === 'spec_audit_repair' || expected.stage === 'implementation_audit_repair')
-    && isPostSummaryExecutionGateFailure(p2pRun.error);
-  if (p2pRun.status !== 'completed' && !usableGateFailure) {
+    && (isPostSummaryExecutionGateFailure(p2pRun.error) || p2pRun.status === 'timed_out');
+  if (p2pRun.status !== 'completed' && !usableDespiteFailure) {
     run.evidence = mergeEvidence(run.evidence, [{
       source: 'daemon',
       summary: p2pAuditFailureSummary(p2pRun),
@@ -2535,10 +2550,10 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
-  if (usableGateFailure) {
+  if (usableDespiteFailure) {
     run.evidence = mergeEvidence(run.evidence, [{
       source: 'daemon',
-      summary: `Audit discussion analysis is usable; its post-summary execution gate did not complete (${p2pRun.error ?? 'no completion marker'}). Proceeding to repair + acceptance scoring instead of re-running the discussion.`,
+      summary: `Audit discussion did not fully complete (${p2pRun.error ?? p2pRun.status}); its analysis is usable — proceeding to repair + acceptance scoring instead of re-running the discussion.`,
       stale: false,
     }]);
   }

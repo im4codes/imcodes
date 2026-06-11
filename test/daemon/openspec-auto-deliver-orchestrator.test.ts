@@ -2054,6 +2054,38 @@ exec "${realGit}" "$@"
     expect(auditP2pFailedTerminal).toBeUndefined();
   });
 
+  it('proceeds to repair + scoring when the audit discussion times out (a hop ran out of its time box)', async () => {
+    // Regression: a hop/discussion timeout leaves partial-but-usable analysis in
+    // the file, but the run used to hard-fail as audit_p2p_failed. It must PROCEED
+    // to repair + scoring like the gate-failure case. This path is keyed on the
+    // P2P run status being `timed_out` (not on the post-summary error string).
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-audit-hop-timeout-proceed',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await emitDeckDemoIdle();
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && (msg.projection as { stage?: string })?.stage === 'implementation_audit_repair');
+    const p2pRun = [...p2pRuns.values()].at(-1)!;
+    p2pRun.error = 'timed_out: hop_timeout';
+    await completeLatestAudit('timed_out');
+
+    await waitForTransportSend((text) =>
+      text.includes('Audit findings to repair now:')
+      && text.includes('Reason: implementation_audit_followup_repair'),
+      2500,
+    );
+
+    const auditP2pFailedTerminal = serverLinkMock.send.mock.calls
+      .map((call) => call[0] as { type?: string; projection?: { terminalReason?: string } })
+      .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.terminalReason === 'audit_p2p_failed');
+    expect(auditP2pFailedTerminal).toBeUndefined();
+  });
+
   it('classifies post-summary execution gate failures as recoverable and infra failures as terminal', () => {
     expect(isPostSummaryExecutionGateFailure('post_summary_execution_failed: implementation repair scope not completed in this turn')).toBe(true);
     expect(isPostSummaryExecutionGateFailure('timed_out: post_summary_execution_timeout')).toBe(true);
