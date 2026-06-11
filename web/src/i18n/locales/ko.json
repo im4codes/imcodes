@@ -1345,7 +1345,7 @@
         "auto_commit_push_unexpected_files": "commit에 이번 Auto Deliver 변경 범위 밖의 파일이 포함되어 사람의 검토가 필요합니다: {{files}}",
         "spec_audit_blocked": "스펙 감사가 차단되었습니다. 결과를 확인하고 문제를 수정한 뒤 계속하세요.",
         "implementation_audit_blocked": "구현 감사가 차단되었습니다. 결과를 확인하고 문제를 수정한 뒤 계속하세요.",
-        "spec_audit_rework_requires_repair": "스펙 감사에서 추가 수정이 필요하다고 보고했습니다. Auto Deliver가 감사-수정 라운드를 추가합니다.",
+        "spec_audit_rework_requires_repair": "스펙 감사에서 추가 수정이 필요하다고 보고했습니다. Auto Deliver가 다음 감사-수정 사이클을 계속합니다.",
         "implementation_audit_rework_requires_repair": "Implementation audit reported required repairs. Auto Deliver will run implementation repair, then audit and score again.",
         "spec_audit_followup_repair": "Spec audit discussion completed. Auto Deliver will repair the artifacts before final acceptance scoring.",
         "implementation_audit_followup_repair": "Implementation audit discussion completed. Auto Deliver will run a final repair pass before acceptance scoring."

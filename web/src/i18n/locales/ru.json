@@ -1345,7 +1345,7 @@
         "auto_commit_push_unexpected_files": "Автоматический commit/push требует проверки человеком: commit включил файлы вне текущего изменения Auto Deliver: {{files}}",
         "spec_audit_blocked": "Аудит спецификации заблокирован. Проверьте результат, исправьте проблему и продолжите.",
         "implementation_audit_blocked": "Аудит реализации заблокирован. Проверьте результат, исправьте проблему и продолжите.",
-        "spec_audit_rework_requires_repair": "Аудит спецификации сообщил о необходимых исправлениях. Auto Deliver добавит ещё один раунд audit-repair.",
+        "spec_audit_rework_requires_repair": "Аудит спецификации сообщил о необходимых исправлениях. Auto Deliver продолжит следующий цикл audit-repair.",
         "implementation_audit_rework_requires_repair": "Implementation audit reported required repairs. Auto Deliver will run implementation repair, then audit and score again.",
         "spec_audit_followup_repair": "Spec audit discussion completed. Auto Deliver will repair the artifacts before final acceptance scoring.",
         "implementation_audit_followup_repair": "Implementation audit discussion completed. Auto Deliver will run a final repair pass before acceptance scoring."

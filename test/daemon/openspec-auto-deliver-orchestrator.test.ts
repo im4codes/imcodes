@@ -242,6 +242,7 @@ function expectFinalAcceptanceScoringDiscipline(text: string): void {
   expect(text).toContain('do not start from PASS or assume high scores because a repair prompt completed');
   expect(text).toContain('Treat the repair turn, checked tasks.md, and discussion summaries as claims to verify, not proof');
   expect(text).toContain('repair scorecard item');
+  expect(text).toContain('repair task checklist item');
   // Baseline is a starting point, not a ceiling: a verified fix MUST raise the score.
   expect(text).toContain('Use the repair scorecard baseline as the STARTING point, not a ceiling');
   expect(text).toContain('you MUST raise that module above its baseline in proportion to what was actually resolved');
@@ -260,6 +261,11 @@ function expectTeamRepairScorecardLocation(text: string, discussionPath: string)
   expect(text).toContain('- You MUST locate the latest matching section before assigning module_scores.');
   expect(text).toContain('- Treat that section as the binding deduction/recovery table for module_scores.');
   expect(text).toContain('- If the heading is absent, state that in evidence, set verdict to REWORK, and cap every module score at 6.');
+  expect(text).toContain('Team repair task checklist location:');
+  expect(text).toContain(`- File: ${discussionPath}`);
+  expect(text).toContain('- Heading to find: "repair task checklist".');
+  expect(text).toContain('- You MUST locate the latest matching section and verify each checklist item against repaired files and validation evidence.');
+  expect(text).toContain('- If the heading is absent, state that in evidence and score conservatively.');
 }
 
 function expectTeamRepairScorecardInstructions(text: string): void {
@@ -269,6 +275,10 @@ function expectTeamRepairScorecardInstructions(text: string): void {
   expect(text).toContain('baseline score before repair, deduction reasons, concrete recovery conditions, and full-score conditions');
   expect(text).toContain('Phrase recovery conditions as evidence gates, not bonus points');
   expect(text).toContain('will use this scorecard as a checklist and may restore points only for conditions proven by post-repair evidence');
+  expect(text).toContain('repair task checklist');
+  expect(text).toContain('include the exact heading "repair task checklist"');
+  expect(text).toContain('ordered executable repair plan');
+  expect(text).toContain('will read this checklist and complete it item by item before final acceptance scoring');
 }
 
 /**
@@ -1437,6 +1447,7 @@ exec "${realGit}" "$@"
       2500,
     );
     expect(firstRepairPrompt).not.toContain('Must-fix items flagged by the previous spec audit');
+    expect(firstRepairPrompt).toContain('Locate the latest "repair task checklist" section and complete it item by item');
     await emitDeckDemoIdle();
     const specAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
@@ -1469,6 +1480,7 @@ exec "${realGit}" "$@"
       2500,
     );
     expect(secondRepairPrompt).toContain(`- ${flaggedChange}`);
+    expect(secondRepairPrompt).toContain('Locate the latest "repair task checklist" section and complete it item by item');
   });
 
   it('does not start another Team audit after final implementation acceptance PASS with perfect scores', async () => {
@@ -1600,6 +1612,7 @@ exec "${realGit}" "$@"
     expect(repairPrompt).toContain('This repair pass is required even when the implementation audit passed');
     expect(repairPrompt).toContain(`Audit discussion file: ${firstAuditRun.contextFilePath}`);
     expect(repairPrompt).toContain('Before editing, read the audit discussion file above for the full review/plan context');
+    expect(repairPrompt).toContain('Locate the latest "repair task checklist" section and complete it item by item');
     const gate = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_task_loop'

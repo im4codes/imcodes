@@ -1347,7 +1347,7 @@
         "auto_commit_push_unexpected_files": "commit 包含了本次 Auto Deliver 变更之外的文件，需要人工检查：{{files}}",
         "spec_audit_blocked": "规格审计被阻塞。请查看结果、修复问题后继续。",
         "implementation_audit_blocked": "实现审计被阻塞。请查看结果、修复问题后继续。",
-        "spec_audit_rework_requires_repair": "规格审计报告仍需修复。自动交付会追加一轮审计修复。",
+        "spec_audit_rework_requires_repair": "规格审计报告仍需修复。自动交付会继续下一次审计修复流程。",
         "implementation_audit_rework_requires_repair": "实现审计报告仍需修复。自动交付会先执行实现修复，然后重新审计并打分。",
         "spec_audit_followup_repair": "规格审计讨论已完成。自动交付会先修复变更文档，再进行最终验收评分。",
         "implementation_audit_followup_repair": "实现审计讨论已完成。自动交付会先执行最终修复，再进行验收评分。"

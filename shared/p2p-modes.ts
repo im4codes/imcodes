@@ -248,6 +248,7 @@ export const BUILT_IN_MODES: P2pMode[] = [
       '5. **Acceptance and Validation** — explicit acceptance criteria plus concrete verification steps and tests for each major behavior\n' +
       '6. **Risk Assessment** — identified risks with mitigation strategies\n' +
       '7. **Open Questions** — unresolved decisions that need stakeholder input\n' +
+      'End with the exact heading "repair task checklist" and an ordered, executable checklist that the follow-up execution stage can complete item by item. Each checklist item must name the file/component area, intended change, dependencies, and validation evidence. ' +
       'Be precise: name files, functions, types, data structures, and test coverage. The final plan must be detailed enough for direct implementation and QA handoff.',
   },
   {

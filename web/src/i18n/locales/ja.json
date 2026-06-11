@@ -1345,7 +1345,7 @@
         "auto_commit_push_unexpected_files": "commit に今回の Auto Deliver 変更外のファイルが含まれているため、人の確認が必要です: {{files}}",
         "spec_audit_blocked": "Spec 監査がブロックされています。結果を確認して修正後に続行してください。",
         "implementation_audit_blocked": "実装監査がブロックされています。結果を確認して修正後に続行してください。",
-        "spec_audit_rework_requires_repair": "Spec 監査で修正が必要と報告されました。Auto Deliver は監査修復ラウンドを追加します。",
+        "spec_audit_rework_requires_repair": "Spec 監査で修正が必要と報告されました。Auto Deliver は次の監査修復サイクルを続行します。",
         "implementation_audit_rework_requires_repair": "Implementation audit reported required repairs. Auto Deliver will run implementation repair, then audit and score again.",
         "spec_audit_followup_repair": "Spec audit discussion completed. Auto Deliver will repair the artifacts before final acceptance scoring.",
         "implementation_audit_followup_repair": "Implementation audit discussion completed. Auto Deliver will run a final repair pass before acceptance scoring."

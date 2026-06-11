@@ -1346,7 +1346,7 @@
         "auto_commit_push_unexpected_files": "La confirmación/envío automático necesita revisión humana porque el commit incluyó archivos fuera de este cambio de Auto Deliver: {{files}}",
         "spec_audit_blocked": "La auditoría de especificación está bloqueada. Revisa el resultado, corrige el problema y continúa.",
         "implementation_audit_blocked": "La auditoría de implementación está bloqueada. Revisa el resultado, corrige el problema y continúa.",
-        "spec_audit_rework_requires_repair": "La auditoría de especificación informó reparaciones pendientes. Auto Deliver agregará otra ronda de auditoría-reparación.",
+        "spec_audit_rework_requires_repair": "La auditoría de especificación informó reparaciones pendientes. Auto Deliver continuará con el siguiente ciclo de auditoría-reparación.",
         "implementation_audit_rework_requires_repair": "Implementation audit reported required repairs. Auto Deliver will run implementation repair, then audit and score again.",
         "spec_audit_followup_repair": "Spec audit discussion completed. Auto Deliver will repair the artifacts before final acceptance scoring.",
         "implementation_audit_followup_repair": "Implementation audit discussion completed. Auto Deliver will run a final repair pass before acceptance scoring."

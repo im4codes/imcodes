@@ -1347,7 +1347,7 @@
         "auto_commit_push_unexpected_files": "commit 包含了本次 Auto Deliver 變更之外的檔案，需要人工檢查：{{files}}",
         "spec_audit_blocked": "規格稽核被阻塞。請查看結果、修復問題後繼續。",
         "implementation_audit_blocked": "實作稽核被阻塞。請查看結果、修復問題後繼續。",
-        "spec_audit_rework_requires_repair": "規格稽核回報仍需修復。自動交付會追加一輪稽核修復。",
+        "spec_audit_rework_requires_repair": "規格稽核回報仍需修復。自動交付會繼續下一次稽核修復流程。",
         "implementation_audit_rework_requires_repair": "實作稽核回報仍需修復。自動交付會先執行實作修復，然後重新審計並評分。",
         "spec_audit_followup_repair": "規格稽核討論已完成。自動交付會先修復變更文件，再進行最終驗收評分。",
         "implementation_audit_followup_repair": "實作稽核討論已完成。自動交付會先執行最終修復，再進行驗收評分。"

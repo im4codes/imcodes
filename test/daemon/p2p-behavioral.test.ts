@@ -138,6 +138,7 @@ describe('buildHopPrompt — production function', () => {
     expect(prompt).toContain('Discussion file: /tmp/test-discussion.md');
     expect(prompt).toContain('Final summary instructions:');
     expect(prompt).toContain('Acceptance and Validation');
+    expect(prompt).toContain('repair task checklist');
     expect(prompt).toContain('Infer whether the user context specifies a concrete destination file for the final plan');
     expect(prompt).toContain('If a concrete destination file is clear from the user context, write the complete plan there.');
     expect(prompt).toContain('If you wrote the plan to another file, still append a short note under "## brain — Final Summary" in the discussion file');

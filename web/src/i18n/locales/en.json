@@ -1347,7 +1347,7 @@
         "auto_commit_push_unexpected_files": "Auto commit/push needs human review because the commit included files outside the current Auto Deliver change: {{files}}",
         "spec_audit_blocked": "Spec audit is blocked. Review the result, fix the issue, then continue.",
         "implementation_audit_blocked": "Implementation audit is blocked. Review the result, fix the issue, then continue.",
-        "spec_audit_rework_requires_repair": "Spec audit reported required repairs. Auto Deliver will add another audit-repair round.",
+        "spec_audit_rework_requires_repair": "Spec audit reported required repairs. Auto Deliver will continue with the next audit-repair cycle.",
         "implementation_audit_rework_requires_repair": "Implementation audit reported required repairs. Auto Deliver will run implementation repair, then audit and score again.",
         "spec_audit_followup_repair": "Spec audit discussion completed. Auto Deliver will repair the artifacts before final acceptance scoring.",
         "implementation_audit_followup_repair": "Implementation audit discussion completed. Auto Deliver will run a final repair pass before acceptance scoring."

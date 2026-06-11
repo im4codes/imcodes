@@ -287,7 +287,8 @@ export const P2P_PRESET_DEFAULT_SUMMARY_PROMPT: Record<P2pPresetKey, string> = {
     + '4. **Implementation Phases** — ordered tasks with file paths, function/type changes, dependencies, sequencing, edge cases, rollout notes.\n'
     + '5. **Acceptance and Validation** — explicit acceptance criteria + concrete verification steps and tests.\n'
     + '6. **Risk Assessment** — risks with mitigation strategies.\n'
-    + '7. **Open Questions** — unresolved decisions needing stakeholder input.',
+    + '7. **Open Questions** — unresolved decisions needing stakeholder input.\n'
+    + 'End with the exact heading "repair task checklist" and an ordered, executable checklist that the follow-up execution stage can complete item by item. Each checklist item must name the file/component area, intended change, dependencies, and validation evidence.',
   openspec_propose:
     'Write a complete **OpenSpec Proposal Synthesis** for this round. Structure it as:\n'
     + '1. **Proposal Statement** — what the change is and why.\n'
