@@ -3,6 +3,7 @@ import {
   OpenSpecAutoDeliverProjectionCache,
   sanitizeOpenSpecAutoDeliverProjection,
 } from '../src/openspec-auto-deliver-projection.js';
+import { OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES } from '../../shared/openspec-auto-deliver-constants.js';
 
 describe('OpenSpec Auto Deliver server projection sanitizer', () => {
   it('constructs a narrow allowlisted projection and redacts sensitive text', () => {
@@ -186,7 +187,7 @@ describe('OpenSpec Auto Deliver server projection sanitizer', () => {
       specAuditRepairRounds: 1,
       implementationAuditRepairRounds: 2,
       maxImplementationPrompts: 9,
-      maxElapsedMinutes: 240,
+      maxElapsedMinutes: OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
     });
   });
 

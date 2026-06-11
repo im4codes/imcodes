@@ -265,7 +265,8 @@ function expectTeamRepairScorecardLocation(text: string, discussionPath: string)
   expect(text).toContain(`- File: ${discussionPath}`);
   expect(text).toContain('- Heading to find: "repair task checklist".');
   expect(text).toContain('- You MUST locate the latest matching section and verify each checklist item against repaired files and validation evidence.');
-  expect(text).toContain('- If the heading is absent, state that in evidence and score conservatively.');
+  expect(text).toContain('- If the heading is absent, fall back to the latest final summary / Implementation Plan in the same discussion file');
+  expect(text).toContain('Do not fail or cap scores solely because this optional heading is absent.');
 }
 
 function expectTeamRepairScorecardInstructions(text: string): void {
@@ -1448,6 +1449,7 @@ exec "${realGit}" "$@"
     );
     expect(firstRepairPrompt).not.toContain('Must-fix items flagged by the previous spec audit');
     expect(firstRepairPrompt).toContain('Locate the latest "repair task checklist" section and complete it item by item');
+    expect(firstRepairPrompt).toContain('if that heading is absent, use the latest final summary / Implementation Plan');
     await emitDeckDemoIdle();
     const specAcceptancePrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
@@ -1481,6 +1483,7 @@ exec "${realGit}" "$@"
     );
     expect(secondRepairPrompt).toContain(`- ${flaggedChange}`);
     expect(secondRepairPrompt).toContain('Locate the latest "repair task checklist" section and complete it item by item');
+    expect(secondRepairPrompt).toContain('if that heading is absent, use the latest final summary / Implementation Plan');
   });
 
   it('does not start another Team audit after final implementation acceptance PASS with perfect scores', async () => {
@@ -1613,6 +1616,7 @@ exec "${realGit}" "$@"
     expect(repairPrompt).toContain(`Audit discussion file: ${firstAuditRun.contextFilePath}`);
     expect(repairPrompt).toContain('Before editing, read the audit discussion file above for the full review/plan context');
     expect(repairPrompt).toContain('Locate the latest "repair task checklist" section and complete it item by item');
+    expect(repairPrompt).toContain('if that heading is absent, use the latest final summary / Implementation Plan');
     const gate = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'implementation_task_loop'
