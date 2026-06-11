@@ -449,6 +449,12 @@ export class OpenSpecAutoDeliverProjectionCache {
     return rows.sort((a, b) => b.projectionVersion - a.projectionVersion);
   }
 
+  getAllListRows(): OpenSpecAutoDeliverListRow[] {
+    return [...this.byOwningMainSession.values()]
+      .map((entry) => this.toFullListRow(entry.projection))
+      .sort((a, b) => b.projectionVersion - a.projectionVersion);
+  }
+
   clearActive(): void {
     for (const [owningMainSessionName, entry] of [...this.byOwningMainSession]) {
       if (entry.terminal) continue;

@@ -151,13 +151,12 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
   useEffect(() => { loadList(); }, [loadList]);
 
   const loadAutoDeliverRows = useCallback(() => {
-    if (!ws || !stableRequestScope?.sessionName) return;
+    if (!ws) return;
     ws.send({
       type: OPENSPEC_AUTO_DELIVER_MSG.LIST_REQUEST,
       requestId: `openspec-auto-list-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      sessionName: stableRequestScope.sessionName,
     });
-  }, [stableRequestScope, ws]);
+  }, [ws]);
 
   useEffect(() => { loadAutoDeliverRows(); }, [loadAutoDeliverRows]);
 
@@ -479,9 +478,32 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
                     <span style={{ color: '#64748b', fontSize: 11 }}>{formatAutoStage(row.stage)}</span>
                     <span class="discussions-list-time">{formatAutoStatus(row.status)}</span>
                   </div>
+                  <div class="discussions-list-meta">
+                    <span>{t('openspec.auto.owning_session')}: {row.owningMainSessionName}</span>
+                  </div>
+                  {row.visibility !== 'conflict' && row.targetImplementationSessionName && (
+                    <div class="discussions-list-meta">
+                      <span>{t('openspec.auto.execution_session')}: {row.targetImplementationSessionName}</span>
+                    </div>
+                  )}
+                  {row.visibility !== 'conflict' && row.selectedTeamComboId && (
+                    <div class="discussions-list-meta">
+                      <span>{t('openspec.auto.combo_id')}: {formatAutoCombo(row.selectedTeamComboId)}</span>
+                    </div>
+                  )}
+                  {row.visibility !== 'conflict' && row.terminalReason && (
+                    <div class="discussions-list-meta">
+                      <span>{t('openspec.auto.terminal_reason')}: {translateAutoDeliverReason(row.terminalReason, t)}</span>
+                    </div>
+                  )}
                   {row.recentFinding && (
                     <div class="discussions-list-meta">
-                      <span style={{ color: '#64748b', fontSize: 11 }}>{formatAutoMessage(row.recentFinding)}</span>
+                      <span>{t('openspec.auto.latest_message')}: {formatAutoMessage(row.recentFinding)}</span>
+                    </div>
+                  )}
+                  {row.visibility === 'conflict' && row.reason && (
+                    <div class="discussions-list-meta">
+                      <span>{t('openspec.auto.conflict_summary')}: {translateAutoDeliverReason(row.reason, t)}</span>
                     </div>
                   )}
                 </div>

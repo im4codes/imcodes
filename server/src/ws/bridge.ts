@@ -2837,7 +2837,9 @@ export class WsBridge {
           safeSend(ws, JSON.stringify({
             type: OPENSPEC_AUTO_DELIVER_MSG.LIST_RESPONSE,
             requestId: msg.requestId,
-            rows: sessionName ? this.openspecAutoDeliverProjectionCache.getListRowsForSession(sessionName) : [],
+            rows: sessionName
+              ? this.openspecAutoDeliverProjectionCache.getListRowsForSession(sessionName)
+              : this.openspecAutoDeliverProjectionCache.getAllListRows(),
           }));
           return;
         }
@@ -6868,7 +6870,12 @@ export class WsBridge {
     sessionName: string,
     messageType: string,
   ): Promise<{ ok: true } | { ok: false }> {
-    if (!sessionName) return { ok: false };
+    if (!sessionName) {
+      return messageType === OPENSPEC_AUTO_DELIVER_MSG.LIST_REQUEST
+        && !this.browserShareStates.has(ws)
+        ? { ok: true }
+        : { ok: false };
+    }
 
     const terminalSessions = this.browserSubscriptions.get(ws);
     const transportSessions = this.transportSubscriptions.get(ws);

@@ -3059,6 +3059,67 @@ describe('WsBridge', () => {
       });
     });
 
+    it('returns all OpenSpec Auto Deliver rows for the global list page without requiring a sessionName', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      const bridge = WsBridge.get(serverId);
+      daemonWs.sent.length = 0;
+      browserWs.sent.length = 0;
+
+      bridge.rememberOpenSpecAutoDeliverProjectionForTests({
+        runId: 'auto-list-main',
+        changeName: 'main-change',
+        owningMainSessionName: 'deck_main_brain',
+        targetImplementationSessionName: 'deck_main_worker',
+        projectionVersion: 21,
+        generation: 1,
+        status: 'implementation_task_loop',
+        stage: 'implementation_task_loop',
+        selectedTeamComboId: 'audit>review>plan',
+      });
+      bridge.rememberOpenSpecAutoDeliverProjectionForTests({
+        runId: 'auto-list-other',
+        changeName: 'other-change',
+        owningMainSessionName: 'deck_other_brain',
+        targetImplementationSessionName: 'deck_other_worker',
+        projectionVersion: 22,
+        generation: 1,
+        status: 'needs_human',
+        stage: 'needs_human',
+        terminal: true,
+        terminalReason: 'missing_authoritative_json',
+      });
+
+      browserWs.emit('message', JSON.stringify({
+        type: OPENSPEC_AUTO_DELIVER_MSG.LIST_REQUEST,
+        requestId: 'auto-list-global',
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((raw) => raw.includes(OPENSPEC_AUTO_DELIVER_MSG.LIST_REQUEST))).toBe(false);
+      const listResponse = browserWs.sentStrings
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.LIST_RESPONSE);
+      expect(listResponse).toMatchObject({
+        requestId: 'auto-list-global',
+        rows: [
+          {
+            runId: 'auto-list-other',
+            visibility: 'full',
+            changeName: 'other-change',
+            targetImplementationSessionName: 'deck_other_worker',
+            terminalReason: 'missing_authoritative_json',
+          },
+          {
+            runId: 'auto-list-main',
+            visibility: 'full',
+            changeName: 'main-change',
+            selectedTeamComboId: 'audit>review>plan',
+            targetImplementationSessionName: 'deck_main_worker',
+          },
+        ],
+      });
+    });
+
     it('does not overwrite OpenSpec Auto Deliver pending requests when sockets reuse the same requestId', async () => {
       const bridge = WsBridge.get(serverId);
       const daemonWs = new MockWs();

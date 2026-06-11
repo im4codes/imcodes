@@ -14,6 +14,11 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.auto.reason.missing_authoritative_json') return 'The audit did not produce a final authoritative JSON result.';
       if (key === 'openspec.auto.lifecycle.spec_audit_repair_p2p_started') return 'Spec audit Team run started.';
       if (key === 'openspec.auto.latest_message') return 'Latest';
+      if (key === 'openspec.auto.owning_session') return 'Owner';
+      if (key === 'openspec.auto.execution_session') return 'Execution';
+      if (key === 'openspec.auto.combo_id') return 'Team flow';
+      if (key === 'openspec.auto.terminal_reason') return 'Terminal reason';
+      if (key === 'openspec.auto.conflict_summary') return 'Conflict';
       if (key === 'openspec.auto.status.implementation_task_loop') return 'Active';
       if (key === 'openspec.auto.stage.implementation_task_loop') return 'Implementation';
       if (key === 'openspec.auto.stage.implementation_audit_repair') return 'Implementation audit';
@@ -466,8 +471,12 @@ describe('DiscussionsPage', () => {
     const { container } = render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_sub_1' }} />);
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'openspec_auto_deliver.list_request',
-      sessionName: 'deck_sub_1',
     }));
+    const autoListRequest = vi.mocked(ws.send).mock.calls
+      .map((call) => call[0] as { type?: string; sessionName?: string })
+      .find((msg) => msg.type === 'openspec_auto_deliver.list_request');
+    expect(autoListRequest).toBeDefined();
+    expect(autoListRequest).not.toHaveProperty('sessionName');
 
     await act(async () => {
       handler?.({ type: 'p2p.list_discussions_response', discussions: [] } as ServerMessage);
@@ -497,6 +506,10 @@ describe('DiscussionsPage', () => {
     expect(autoRow).toBeTruthy();
     expect(autoRow.textContent).toContain('Implementation');
     expect(autoRow.textContent).toContain('Active');
+    expect(autoRow.textContent).toContain('Owner: deck_proj_brain');
+    expect(autoRow.textContent).toContain('Execution: deck_sub_1');
+    expect(autoRow.textContent).toContain('Team flow: Audit→Review→Plan');
+    expect(autoRow.textContent).toContain('Latest: Spec audit Team run started.');
     expect(autoRow.textContent).toContain('Spec audit Team run started.');
     expect(autoRow.textContent).not.toContain('implementation_task_loop');
     expect(autoRow.textContent).not.toContain('spec_audit_repair_p2p_started');
@@ -564,8 +577,12 @@ describe('DiscussionsPage', () => {
     expect(screen.queryByText('Team row')).toBeNull();
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'openspec_auto_deliver.list_request',
-      sessionName: 'deck_sub_1',
     }));
+    const autoListRequest = vi.mocked(ws.send).mock.calls
+      .map((call) => call[0] as { type?: string; sessionName?: string })
+      .find((msg) => msg.type === 'openspec_auto_deliver.list_request');
+    expect(autoListRequest).toBeDefined();
+    expect(autoListRequest).not.toHaveProperty('sessionName');
   });
 
   it('renders Auto Deliver conflict rows without change names and localizes conflict reasons', async () => {
@@ -610,6 +627,8 @@ describe('DiscussionsPage', () => {
     const autoRow = container.querySelector('.discussions-list-item') as HTMLElement;
     expect(autoRow.textContent).toContain('deck_proj_brain');
     expect(autoRow.textContent).not.toContain('private-change-name');
+    expect(autoRow.textContent).toContain('Conflict: Auto Deliver is already running for this session.');
+    expect(autoRow.textContent).not.toContain('auto_deliver_active');
 
     fireEvent.click(autoRow);
     expect(screen.getByText('Auto Deliver is already running for this session.')).toBeDefined();
@@ -711,6 +730,8 @@ describe('DiscussionsPage', () => {
     });
 
     const autoRow = container.querySelector('.discussions-list-item') as HTMLElement;
+    expect(autoRow.textContent).toContain('Terminal reason: The audit did not produce a final authoritative JSON result.');
+    expect(autoRow.textContent).not.toContain('missing_authoritative_json');
     fireEvent.click(autoRow);
     expect(screen.getByText('The audit did not produce a final authoritative JSON result.')).toBeDefined();
     expect(screen.queryByText('missing_authoritative_json')).toBeNull();
