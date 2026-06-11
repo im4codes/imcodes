@@ -415,6 +415,39 @@ describe('ChatView', () => {
     expect(container.querySelector('.chat-html-preview-btn')).toBeNull();
   });
 
+  it('keeps ChatView mounted when HTML preview dispatch fails because the websocket is disconnected', () => {
+    const ws = {
+      fsReadFile: vi.fn(() => {
+        throw new Error('WebSocket not connected');
+      }),
+      onMessage: vi.fn(() => () => undefined),
+    };
+    const events = [{
+      eventId: 'user-html-path-offline',
+      type: 'user.message',
+      ts: Date.now(),
+      payload: { text: 'Open ./dist/offline.HTML' },
+    }];
+
+    const { container } = render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        sessionId="deck_main_brain"
+        ws={ws as any}
+        workdir="/repo"
+      />,
+    );
+
+    const htmlButton = container.querySelector('.chat-html-preview-btn') as HTMLButtonElement | null;
+    expect(htmlButton).not.toBeNull();
+    expect(() => fireEvent.click(htmlButton!)).not.toThrow();
+    expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./dist/offline.HTML');
+    expect(container.textContent).toContain('Open ./dist/offline.HTML');
+    expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
+    expect(document.body.textContent).toContain('upload.daemon_offline');
+  });
+
   it('opens the fullscreen HTML preview in a new window and closes the overlay', () => {
     vi.useFakeTimers();
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, 'createObjectURL');

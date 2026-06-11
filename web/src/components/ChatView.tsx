@@ -1490,12 +1490,35 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     openFilePreview(path, preferDiff);
   }, [openFilePreview]);
 
+  const mapPreviewDispatchError = useCallback((err: unknown): string => {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('WebSocket not connected') || msg.includes('daemon_offline') || msg.includes('503')) {
+      return t('upload.daemon_offline');
+    }
+    return t('file_browser.preview_error');
+  }, [t]);
+
   const handleHtmlPreview = useCallback((path: string) => {
-    if (!ws || typeof ws.fsReadFile !== 'function') return;
     const resolvedPath = resolvePreviewPath(path, workdir);
-    const requestId = ws.fsReadFile(resolvedPath);
-    setHtmlFullscreenPreview({ status: 'loading', path: resolvedPath, requestId });
-  }, [workdir, ws]);
+    if (!ws || typeof ws.fsReadFile !== 'function') {
+      setHtmlFullscreenPreview({
+        status: 'error',
+        path: resolvedPath,
+        error: t('file_browser.preview_error'),
+      });
+      return;
+    }
+    try {
+      const requestId = ws.fsReadFile(resolvedPath);
+      setHtmlFullscreenPreview({ status: 'loading', path: resolvedPath, requestId });
+    } catch (err) {
+      setHtmlFullscreenPreview({
+        status: 'error',
+        path: resolvedPath,
+        error: mapPreviewDispatchError(err),
+      });
+    }
+  }, [mapPreviewDispatchError, t, workdir, ws]);
 
   const closeHtmlFullscreenPreview = useCallback(() => {
     setHtmlFullscreenPreview(null);
@@ -2795,7 +2818,11 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                   if (!eid || !sessionId || !ws) return;
                   // Destructive + global → keep an explicit confirmation (no click-to-delete).
                   if (!window.confirm(t('chat.delete_message_confirm'))) return;
-                  ws.deleteTimelineMessage(sessionId, eid);
+                  try {
+                    ws.deleteTimelineMessage(sessionId, eid);
+                  } catch (err) {
+                    console.warn('delete timeline message failed', err);
+                  }
                   setCtxMenu(null);
                   if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
                 }}
