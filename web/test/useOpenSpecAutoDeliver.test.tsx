@@ -47,7 +47,7 @@ describe('useOpenSpecAutoDeliver', () => {
           specAuditRepairRounds: 1,
           implementationAuditRepairRounds: 2,
           maxImplementationPrompts: 12,
-          maxElapsedMinutes: 240,
+          maxElapsedMinutes: 480,
         },
         locale: 'zh-CN',
         autoCommitPush: true,
@@ -66,7 +66,7 @@ describe('useOpenSpecAutoDeliver', () => {
         specAuditRepairRounds: 1,
         implementationAuditRepairRounds: 2,
         maxImplementationPrompts: 12,
-        maxElapsedMinutes: 240,
+        maxElapsedMinutes: 480,
       },
     }));
 
@@ -85,7 +85,7 @@ describe('useOpenSpecAutoDeliver', () => {
           specAuditRepairRounds: 1,
           implementationAuditRepairRounds: 2,
           maxImplementationPrompts: 12,
-          maxElapsedMinutes: 240,
+          maxElapsedMinutes: 480,
         },
       });
     });

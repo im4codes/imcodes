@@ -1377,7 +1377,7 @@ afterEach(() => {
         specAuditRepairRounds: 1,
         implementationAuditRepairRounds: 2,
         maxImplementationPrompts: 12,
-        maxElapsedMinutes: 240,
+        maxElapsedMinutes: 480,
       },
       requestId: expect.any(String),
     }));
@@ -1411,7 +1411,7 @@ afterEach(() => {
         specAuditRepairRounds: 1,
         implementationAuditRepairRounds: 2,
         maxImplementationPrompts: 12,
-        maxElapsedMinutes: 240,
+        maxElapsedMinutes: 480,
       },
     });
   });
@@ -1466,7 +1466,7 @@ afterEach(() => {
         specAuditRepairRounds: 3,
         implementationAuditRepairRounds: 5,
         maxImplementationPrompts: 12,
-        maxElapsedMinutes: 240,
+        maxElapsedMinutes: 480,
       },
     });
   });

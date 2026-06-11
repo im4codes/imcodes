@@ -59,7 +59,7 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
       specAuditRepairRounds: 2,
       implementationAuditRepairRounds: 3,
       maxImplementationPrompts: 24,
-      maxElapsedMinutes: 480,
+      maxElapsedMinutes: 960,
     });
   });
 
