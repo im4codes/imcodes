@@ -859,9 +859,10 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
   const reference = openSpecChangeReference(run);
   const remaining = uncheckedTaskLabels(run.taskStats);
   const maxImplementationPrompts = effectiveMaxImplementationPrompts(run);
-  const basePrompt = repairReason
+  const basePrompt = formatOpenSpecPromptTemplate('implement', reference);
+  const repairPreamble = repairReason
     ? `OpenSpec Auto Deliver implementation repair for ${reference}.`
-    : formatOpenSpecPromptTemplate('implement', reference);
+    : null;
   const validationSummary = validationCommandEvidence(run);
   const remainingBlock = remaining.length > 0
     ? remaining.map((label) => `- ${label}`).join('\n')
@@ -869,6 +870,8 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
   return [
     basePrompt,
     '',
+    repairPreamble,
+    repairPreamble ? '' : null,
     `OpenSpec Auto Deliver context for ${reference}.`,
     `Project root: ${run.projectRoot}`,
     `Change root: ${run.changeRootIdentity}`,
@@ -891,7 +894,7 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
     validationSummary,
     '',
     buildImplementationCompletionMarkerBlock(run),
-  ].join('\n');
+  ].filter((line): line is string => line !== null).join('\n');
 }
 
 function buildImplementationCompletionMarkerBlock(run: AutoDeliverRun): string {
@@ -1009,8 +1012,11 @@ async function readImplementationCompletionMarker(run: AutoDeliverRun): Promise<
 }
 
 function buildImplementationMarkerReminderPrompt(run: AutoDeliverRun, reason: string): string {
+  const reference = openSpecChangeReference(run);
   return [
-    `OpenSpec Auto Deliver implementation is not complete yet for ${openSpecChangeReference(run)}.`,
+    formatOpenSpecPromptTemplate('implement', reference),
+    '',
+    `OpenSpec Auto Deliver implementation is not complete yet for ${reference}.`,
     '',
     `Project root: ${run.projectRoot}`,
     `Change root: ${run.changeRootIdentity}`,

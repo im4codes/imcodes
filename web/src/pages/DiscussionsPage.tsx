@@ -4,12 +4,14 @@ import type { WsClient, ServerMessage, P2pWorkflowRequestScope } from '../ws-cli
 import { P2pProgressCard } from '../components/P2pProgressCard.js';
 import type { P2pProgressDiscussion } from '../components/P2pProgressCard.js';
 import { FilePreviewPane } from '../components/FilePreviewPane.js';
-import { translateAutoDeliverMessage, translateAutoDeliverReason } from '../components/OpenSpecAutoDeliver.js';
-import { comboModeLabel } from '../components/p2p-combos.js';
+import {
+  OpenSpecAutoDeliverDetailsPanel,
+} from '../components/OpenSpecAutoDeliver.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import {
   OPENSPEC_AUTO_DELIVER_MSG,
   type OpenSpecAutoDeliverListRow,
+  type OpenSpecAutoDeliverProjection,
 } from '../openspec-auto-deliver.js';
 import {
   normalizeOpenSpecAutoDeliverListRow,
@@ -46,6 +48,7 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
   const [selected, setSelected] = useState<string | null>(initialSelectedId ?? null);
   const [selectedAutoRunId, setSelectedAutoRunId] = useState<string | null>(null);
   const [autoDeliverRows, setAutoDeliverRows] = useState<OpenSpecAutoDeliverListRow[]>([]);
+  const [autoDeliverProjections, setAutoDeliverProjections] = useState<Record<string, OpenSpecAutoDeliverProjection>>({});
   const [content, setContent] = useState<string | null>(null);
   const [autoFollow, setAutoFollow] = useState(true);
   const [copyMenuId, setCopyMenuId] = useState<string | null>(null);
@@ -172,6 +175,65 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
     });
   }, []);
 
+  const upsertAutoDeliverProjection = useCallback((projection: OpenSpecAutoDeliverProjection) => {
+    if (!projection.runId) return;
+    setAutoDeliverProjections((current) => {
+      const existing = current[projection.runId];
+      if (existing && existing.projectionVersion > projection.projectionVersion) return current;
+      return { ...current, [projection.runId]: projection };
+    });
+  }, []);
+
+  const projectionFromAutoDeliverRow = useCallback((row: OpenSpecAutoDeliverListRow): OpenSpecAutoDeliverProjection => {
+    if (row.visibility === 'conflict') {
+      const reason = row.reason ?? 'auto_deliver_active';
+      return {
+        visibility: 'conflict',
+        projectionVersion: row.projectionVersion,
+        runId: row.runId,
+        owningMainSessionName: row.owningMainSessionName,
+        status: row.status,
+        stage: row.stage,
+        busy: true,
+        reason,
+        conflictReason: reason,
+        canStop: false,
+      };
+    }
+    return {
+      visibility: 'full',
+      projectionVersion: row.projectionVersion,
+      generation: row.generation ?? 0,
+      runId: row.runId,
+      changeName: row.changeName ?? row.runId,
+      presetId: row.presetId,
+      status: row.status,
+      stage: row.stage,
+      owningMainSessionName: row.owningMainSessionName,
+      launchedFromSessionName: row.launchedFromSessionName,
+      targetImplementationSessionName: row.targetImplementationSessionName,
+      elapsedMs: row.elapsedMs,
+      selectedTeamComboId: row.selectedTeamComboId ?? null,
+      recentFinding: row.recentFinding ?? null,
+      terminalReason: row.terminalReason ?? null,
+      terminal: row.viewMode === 'compactRecovery',
+      canStop: row.viewMode !== 'compactRecovery',
+    };
+  }, []);
+
+  const requestAutoDeliverDetails = useCallback((row: OpenSpecAutoDeliverListRow | null | undefined) => {
+    if (!ws || !row || row.visibility === 'conflict') return;
+    const sessionName = row.targetImplementationSessionName
+      ?? row.launchedFromSessionName
+      ?? row.owningMainSessionName;
+    if (!sessionName) return;
+    ws.send({
+      type: OPENSPEC_AUTO_DELIVER_MSG.STATUS_REQUEST,
+      requestId: `openspec-auto-detail-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      sessionName,
+    });
+  }, [ws]);
+
   // Audit fix (spam-fetch loop) — even though `loadList` itself is
   // stable when `requestScope` has a stable identity, the
   // `RUN_UPDATE` handler below calls `loadList()` on every P2P run
@@ -207,7 +269,8 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
     setSelected(null);
     setContent(null);
     setSelectedAutoRunId(runId);
-  }, []);
+    requestAutoDeliverDetails(autoDeliverRows.find((row) => row.runId === runId));
+  }, [autoDeliverRows, requestAutoDeliverDetails]);
 
   const markCopied = useCallback((id: string) => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
@@ -289,13 +352,17 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
         setLoading(false);
       }
       if (messageType === OPENSPEC_AUTO_DELIVER_MSG.LIST_RESPONSE) {
-        const rows = Array.isArray((msg as { rows?: unknown }).rows)
+        const rawRows = Array.isArray((msg as { rows?: unknown }).rows)
           ? ((msg as unknown as { rows: unknown[] }).rows)
-              .map(normalizeOpenSpecAutoDeliverListRow)
-              .filter((row): row is OpenSpecAutoDeliverListRow => row !== null)
           : [];
+        const rows = rawRows
+          .map(normalizeOpenSpecAutoDeliverListRow)
+          .filter((row): row is OpenSpecAutoDeliverListRow => row !== null);
         setAutoDeliverRows(rows);
-        if (!selectedAutoRunId && rows[0]?.runId) setSelectedAutoRunId(rows[0].runId);
+        if (!selectedAutoRunId && rows[0]?.runId) {
+          setSelectedAutoRunId(rows[0].runId);
+          requestAutoDeliverDetails(rows[0]);
+        }
       }
       if (
         messageType === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK
@@ -306,6 +373,7 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
       ) {
         const projection = normalizeOpenSpecAutoDeliverProjection((msg as { projection?: unknown }).projection);
         if (projection) {
+          upsertAutoDeliverProjection(projection);
           upsertAutoDeliverRow(openSpecAutoDeliverRowFromProjection(projection));
           if (!selectedAutoRunId) setSelectedAutoRunId(projection.runId);
         }
@@ -353,7 +421,7 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
         }
       }
     });
-  }, [copyText, requestListRefresh, selected, selectedAutoRunId, sendReadDiscussion, t, upsertAutoDeliverRow, ws]);
+  }, [copyText, requestAutoDeliverDetails, requestListRefresh, selected, selectedAutoRunId, sendReadDiscussion, t, upsertAutoDeliverProjection, upsertAutoDeliverRow, ws]);
 
   useEffect(() => () => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
@@ -381,8 +449,6 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
   const formatTime = (ts: number) => new Date(ts).toLocaleString();
   const formatAutoStatus = (status: string) => t(`openspec.auto.status.${status}`, status);
   const formatAutoStage = (stage: string) => t(`openspec.auto.stage.${stage}`, stage);
-  const formatAutoCombo = (comboId: string) => comboModeLabel(comboId, t);
-  const formatAutoMessage = (message: string | undefined) => translateAutoDeliverMessage(message, t);
 
   // Find matching live discussion for progress display
   const activeLive = useMemo(
@@ -397,6 +463,12 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
     () => (selectedAutoRunId ? autoDeliverRows.find((row) => row.runId === selectedAutoRunId) ?? null : null),
     [autoDeliverRows, selectedAutoRunId],
   );
+  const selectedAutoDeliverProjection = useMemo(() => {
+    if (!selectedAutoDeliverRow) return null;
+    return autoDeliverProjections[selectedAutoDeliverRow.runId]
+      ?? projectionFromAutoDeliverRow(selectedAutoDeliverRow);
+  }, [autoDeliverProjections, projectionFromAutoDeliverRow, selectedAutoDeliverRow]);
+
   return (
     <div class="discussions-page">
       {/* Active P2P progress cards at top */}
@@ -478,34 +550,6 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
                     <span style={{ color: '#64748b', fontSize: 11 }}>{formatAutoStage(row.stage)}</span>
                     <span class="discussions-list-time">{formatAutoStatus(row.status)}</span>
                   </div>
-                  <div class="discussions-list-meta">
-                    <span>{t('openspec.auto.owning_session')}: {row.owningMainSessionName}</span>
-                  </div>
-                  {row.visibility !== 'conflict' && row.targetImplementationSessionName && (
-                    <div class="discussions-list-meta">
-                      <span>{t('openspec.auto.execution_session')}: {row.targetImplementationSessionName}</span>
-                    </div>
-                  )}
-                  {row.visibility !== 'conflict' && row.selectedTeamComboId && (
-                    <div class="discussions-list-meta">
-                      <span>{t('openspec.auto.combo_id')}: {formatAutoCombo(row.selectedTeamComboId)}</span>
-                    </div>
-                  )}
-                  {row.visibility !== 'conflict' && row.terminalReason && (
-                    <div class="discussions-list-meta">
-                      <span>{t('openspec.auto.terminal_reason')}: {translateAutoDeliverReason(row.terminalReason, t)}</span>
-                    </div>
-                  )}
-                  {row.recentFinding && (
-                    <div class="discussions-list-meta">
-                      <span>{t('openspec.auto.latest_message')}: {formatAutoMessage(row.recentFinding)}</span>
-                    </div>
-                  )}
-                  {row.visibility === 'conflict' && row.reason && (
-                    <div class="discussions-list-meta">
-                      <span>{t('openspec.auto.conflict_summary')}: {translateAutoDeliverReason(row.reason, t)}</span>
-                    </div>
-                  )}
                 </div>
               ))}
             </>
@@ -531,7 +575,7 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
         </div>
 
         <div class={`discussions-detail${selected || selectedAutoRunId ? ' discussions-detail-fullscreen' : ''}`}>
-          {selectedAutoDeliverRow && listTab === 'auto' && (
+          {selectedAutoDeliverProjection && listTab === 'auto' && (
             <div class="discussions-nav-row">
               <button
                 class="discussions-back-btn"
@@ -541,33 +585,17 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
               </button>
             </div>
           )}
-          {selectedAutoDeliverRow && listTab === 'auto' && (
+          {selectedAutoDeliverProjection && listTab === 'auto' && (
             <div class="discussions-detail-scroll">
               <div class="discussions-file-preview">
-                <div class="openspec-auto-list-detail">
-                  <div class="openspec-auto-kicker">{t('openspec.auto.list_title')}</div>
-                  <h3>{selectedAutoDeliverRow.changeName ?? selectedAutoDeliverRow.owningMainSessionName ?? selectedAutoDeliverRow.runId}</h3>
-                  <div class="openspec-auto-detail-grid">
-                    <div class="openspec-auto-detail-row"><span>{t('openspec.auto.status_label')}</span><strong>{formatAutoStatus(selectedAutoDeliverRow.status)}</strong></div>
-                    <div class="openspec-auto-detail-row"><span>{t('openspec.auto.stage_label')}</span><strong>{formatAutoStage(selectedAutoDeliverRow.stage)}</strong></div>
-                    <div class="openspec-auto-detail-row"><span>{t('openspec.auto.owning_session')}</span><strong>{selectedAutoDeliverRow.owningMainSessionName}</strong></div>
-                    {selectedAutoDeliverRow.targetImplementationSessionName && (
-                      <div class="openspec-auto-detail-row"><span>{t('openspec.auto.execution_session')}</span><strong>{selectedAutoDeliverRow.targetImplementationSessionName}</strong></div>
-                    )}
-                    {selectedAutoDeliverRow.selectedTeamComboId && (
-                      <div class="openspec-auto-detail-row"><span>{t('openspec.auto.combo_id')}</span><strong>{formatAutoCombo(selectedAutoDeliverRow.selectedTeamComboId)}</strong></div>
-                    )}
-                    {selectedAutoDeliverRow.terminalReason && (
-                      <div class="openspec-auto-detail-row"><span>{t('openspec.auto.terminal_reason')}</span><strong>{translateAutoDeliverReason(selectedAutoDeliverRow.terminalReason, t)}</strong></div>
-                    )}
-                    {selectedAutoDeliverRow.recentFinding && (
-                      <div class="openspec-auto-detail-row"><span>{t('openspec.auto.latest_message')}</span><strong>{formatAutoMessage(selectedAutoDeliverRow.recentFinding)}</strong></div>
-                    )}
-                    {selectedAutoDeliverRow.reason && (
-                      <div class="openspec-auto-detail-row"><span>{t('openspec.auto.conflict_summary')}</span><strong>{translateAutoDeliverReason(selectedAutoDeliverRow.reason, t)}</strong></div>
-                    )}
-                  </div>
-                </div>
+                <OpenSpecAutoDeliverDetailsPanel
+                  projection={selectedAutoDeliverProjection}
+                  embedded
+                  showActions={false}
+                  onClose={() => setSelectedAutoRunId(null)}
+                  onStop={() => {}}
+                  onContinue={() => {}}
+                />
               </div>
             </div>
           )}

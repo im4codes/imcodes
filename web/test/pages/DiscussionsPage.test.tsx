@@ -19,9 +19,16 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.auto.combo_id') return 'Team flow';
       if (key === 'openspec.auto.terminal_reason') return 'Terminal reason';
       if (key === 'openspec.auto.conflict_summary') return 'Conflict';
+      if (key === 'openspec.auto.details_title') return 'Auto Deliver details';
+      if (key === 'openspec.auto.task_stats') return 'Task status';
+      if (key === 'openspec.auto.audit_results') return 'Audit results';
+      if (key === 'openspec.auto.final_scores') return 'Final acceptance scores';
+      if (key === 'openspec.auto.evidence') return 'Evidence';
+      if (key === 'openspec.auto.score_module.implementation') return 'Implementation score';
       if (key === 'openspec.auto.status.implementation_task_loop') return 'Active';
       if (key === 'openspec.auto.stage.implementation_task_loop') return 'Implementation';
       if (key === 'openspec.auto.stage.implementation_audit_repair') return 'Implementation audit';
+      if (key === 'openspec.auto.tasks_progress') return `${opts?.checked}/${opts?.total} tasks`;
       if (key === 'p2p.mode_audit') return 'Audit';
       if (key === 'p2p.mode_review') return 'Review';
       if (key === 'p2p.mode_plan') return 'Plan';
@@ -506,21 +513,73 @@ describe('DiscussionsPage', () => {
     expect(autoRow).toBeTruthy();
     expect(autoRow.textContent).toContain('Implementation');
     expect(autoRow.textContent).toContain('Active');
-    expect(autoRow.textContent).toContain('Owner: deck_proj_brain');
-    expect(autoRow.textContent).toContain('Execution: deck_sub_1');
-    expect(autoRow.textContent).toContain('Team flow: Audit→Review→Plan');
-    expect(autoRow.textContent).toContain('Latest: Spec audit Team run started.');
-    expect(autoRow.textContent).toContain('Spec audit Team run started.');
+    expect(autoRow.textContent).not.toContain('Owner: deck_proj_brain');
+    expect(autoRow.textContent).not.toContain('Execution: deck_sub_1');
+    expect(autoRow.textContent).not.toContain('Team flow: Audit→Review→Plan');
+    expect(autoRow.textContent).not.toContain('Latest: Spec audit Team run started.');
+    expect(autoRow.textContent).not.toContain('Spec audit Team run started.');
     expect(autoRow.textContent).not.toContain('implementation_task_loop');
     expect(autoRow.textContent).not.toContain('spec_audit_repair_p2p_started');
 
     fireEvent.click(autoRow);
     expect(autoRow.className).toContain('active');
+    await waitFor(() => {
+      expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'openspec_auto_deliver.status_request',
+        sessionName: 'deck_sub_1',
+      }));
+    });
+    await act(async () => {
+      handler?.({
+        type: 'openspec_auto_deliver.status_projection',
+        projection: {
+          runId: 'auto-run-1',
+          projectionVersion: 3,
+          generation: 1,
+          visibility: 'full',
+          changeName: 'openspec-auto-delivery',
+          status: 'implementation_task_loop',
+          stage: 'implementation_task_loop',
+          owningMainSessionName: 'deck_proj_brain',
+          targetImplementationSessionName: 'deck_sub_1',
+          selectedTeamComboId: 'audit>review>plan',
+          recentFinding: 'spec_audit_repair_p2p_started',
+          taskStats: { total: 5, checked: 3, unchecked: 2 },
+          auditResults: [{
+            stage: 'implementation_audit_repair',
+            roundIndex: 1,
+            attemptId: 'attempt-1',
+            generation: 1,
+            verdict: 'REWORK',
+            moduleScores: [{ module: 'implementation', score: 6, max_score: 10, summary: 'Needs repair.' }],
+            requiredChanges: ['Fix missing UI detail parity.'],
+            evidence: [],
+          }],
+          finalAfterRepair: {
+            phase: 'final_after_repair',
+            stage: 'implementation_audit_repair',
+            roundIndex: 1,
+            attemptId: 'attempt-final',
+            generation: 1,
+            verdict: 'PASS',
+            moduleScores: [{ module: 'implementation', score: 10, max_score: 10, summary: 'Aligned.' }],
+            completedAt: 100,
+          },
+          evidence: [{ source: 'daemon', summary: 'Validation passed.' }],
+        },
+      } as unknown as ServerMessage);
+    });
+
     expect(screen.getByText('deck_proj_brain')).toBeDefined();
     expect(screen.getByText('deck_sub_1')).toBeDefined();
     expect(screen.getByText('Audit→Review→Plan')).toBeDefined();
     expect(screen.getAllByText('Spec audit Team run started.').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('Latest')).toBeDefined();
+    expect(screen.getByText('Task status')).toBeDefined();
+    expect(screen.getByText('3/5 tasks')).toBeDefined();
+    expect(screen.getByText('Audit results')).toBeDefined();
+    expect(screen.getByText('Final acceptance scores')).toBeDefined();
+    expect(screen.getByText('Validation passed.')).toBeDefined();
     expect(screen.queryByText('audit>review>plan')).toBeNull();
     expect(screen.queryByText('spec_audit_repair_p2p_started')).toBeNull();
   });
@@ -627,7 +686,7 @@ describe('DiscussionsPage', () => {
     const autoRow = container.querySelector('.discussions-list-item') as HTMLElement;
     expect(autoRow.textContent).toContain('deck_proj_brain');
     expect(autoRow.textContent).not.toContain('private-change-name');
-    expect(autoRow.textContent).toContain('Conflict: Auto Deliver is already running for this session.');
+    expect(autoRow.textContent).not.toContain('Conflict: Auto Deliver is already running for this session.');
     expect(autoRow.textContent).not.toContain('auto_deliver_active');
 
     fireEvent.click(autoRow);
@@ -730,7 +789,7 @@ describe('DiscussionsPage', () => {
     });
 
     const autoRow = container.querySelector('.discussions-list-item') as HTMLElement;
-    expect(autoRow.textContent).toContain('Terminal reason: The audit did not produce a final authoritative JSON result.');
+    expect(autoRow.textContent).not.toContain('Terminal reason: The audit did not produce a final authoritative JSON result.');
     expect(autoRow.textContent).not.toContain('missing_authoritative_json');
     fireEvent.click(autoRow);
     expect(screen.getByText('The audit did not produce a final authoritative JSON result.')).toBeDefined();

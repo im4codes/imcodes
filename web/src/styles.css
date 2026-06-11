@@ -912,6 +912,21 @@ html.native-ios-mac .chat-dl-btn {
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5), inset 0 0 0 1px rgba(148, 163, 184, 0.08);
   color: #dbe7f5;
 }
+.openspec-auto-details-embedded {
+  width: 100%;
+  min-width: 0;
+}
+.openspec-auto-details-panel-embedded {
+  width: 100%;
+  height: auto;
+  min-width: 0;
+  min-height: 0;
+  max-height: none;
+  resize: none;
+  overflow: visible;
+  border-radius: 0;
+  box-shadow: none;
+}
 .openspec-auto-details-panel .openspec-auto-details-head {
   position: sticky;
   top: -16px;

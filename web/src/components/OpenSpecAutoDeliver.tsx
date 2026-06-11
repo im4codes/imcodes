@@ -47,6 +47,8 @@ export interface OpenSpecAutoDeliverDetailsPanelProps {
   projection: OpenSpecAutoDeliverProjection | null;
   stopPending?: boolean;
   continuePending?: boolean;
+  embedded?: boolean;
+  showActions?: boolean;
   onClose: () => void;
   onStop: () => void;
   onContinue: () => void;
@@ -777,6 +779,8 @@ export function OpenSpecAutoDeliverDetailsPanel({
   projection,
   stopPending = false,
   continuePending = false,
+  embedded = false,
+  showActions = true,
   onClose,
   onStop,
   onContinue,
@@ -804,6 +808,7 @@ export function OpenSpecAutoDeliverDetailsPanel({
     [detailsSize.height, detailsSize.width],
   );
   useEffect(() => {
+    if (embedded) return undefined;
     const node = detailsPanelRef.current;
     if (!node || typeof ResizeObserver === 'undefined') return undefined;
     let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -824,20 +829,25 @@ export function OpenSpecAutoDeliverDetailsPanel({
       observer.disconnect();
       if (saveTimer) clearTimeout(saveTimer);
     };
-  }, []);
+  }, [embedded]);
   if (!projection) return null;
 
-  return (
-    <div class="openspec-auto-details-backdrop" data-testid="openspec-auto-details">
-      <div ref={detailsPanelRef} class="openspec-auto-details-panel" style={detailsPanelStyle}>
+  const panel = (
+      <div
+        ref={detailsPanelRef}
+        class={`openspec-auto-details-panel${embedded ? ' openspec-auto-details-panel-embedded' : ''}`}
+        style={embedded ? undefined : detailsPanelStyle}
+      >
         <div class="openspec-auto-details-head">
           <div>
             <div class="openspec-auto-kicker">{t('openspec.auto.details_title')}</div>
             <h3>{projectionTitle(projection)}</h3>
           </div>
-          <button class="openspec-auto-icon-btn" type="button" onClick={onClose} aria-label={t('common.close')}>
-            ×
-          </button>
+          {!embedded && (
+            <button class="openspec-auto-icon-btn" type="button" onClick={onClose} aria-label={t('common.close')}>
+              ×
+            </button>
+          )}
         </div>
         <div class="openspec-auto-detail-grid">
           <DetailRow label={t('openspec.auto.status_label')} value={t(statusKey(status), status)} />
@@ -855,6 +865,9 @@ export function OpenSpecAutoDeliverDetailsPanel({
           <DetailRow label={t('openspec.auto.active_prompt')} value={projection.activeOpenSpecPromptId} />
           <DetailRow label={t('openspec.auto.verdict')} value={projection.latestVerdict} />
           <DetailRow label={t('openspec.auto.latest_message')} value={latestMessage} />
+          {projection.visibility === 'conflict' && (
+            <DetailRow label={t('openspec.auto.conflict_summary')} value={translateAutoDeliverReason(projection.conflictReason, t)} />
+          )}
           <DetailRow label={t('openspec.auto.terminal_reason')} value={translateAutoDeliverReason(projection.terminalReason, t)} />
         </div>
         <div class="openspec-auto-detail-section">
@@ -927,7 +940,8 @@ export function OpenSpecAutoDeliverDetailsPanel({
             ))}
           </div>
         )}
-        <div class="openspec-auto-details-actions">
+        {showActions && (
+          <div class="openspec-auto-details-actions">
           {canContinue && (
             <button class="btn btn-secondary" type="button" disabled={continuePending} onClick={onContinue}>
               {continuePending ? t('openspec.auto.continuing') : t('openspec.auto.continue')}
@@ -941,8 +955,22 @@ export function OpenSpecAutoDeliverDetailsPanel({
           <button class="btn btn-primary" type="button" onClick={onClose}>
             {t('common.close')}
           </button>
-        </div>
+          </div>
+        )}
       </div>
+  );
+
+  if (embedded) {
+    return (
+      <div class="openspec-auto-details-embedded" data-testid="openspec-auto-details">
+        {panel}
+      </div>
+    );
+  }
+
+  return (
+    <div class="openspec-auto-details-backdrop" data-testid="openspec-auto-details">
+      {panel}
     </div>
   );
 }

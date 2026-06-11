@@ -766,10 +766,12 @@ exec "${realGit}" "$@"
     expect(firstImplementationPrompt).toContain('Remaining tasks:');
 
     await emitDeckDemoIdle();
-    await waitForTransportSend((text) =>
+    const reminderPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver implementation is not complete yet for @openspec/changes/demo-change.')
       && text.includes('Reason: implementation_tasks_still_unchecked'),
     );
+    expect(reminderPrompt).toContain('Drive the implementation of @openspec/changes/demo-change aggressively.');
+    expect(reminderPrompt).toContain('dispatch sub-agents with clear ownership');
     expect(serverLinkMock.send.mock.calls.some((call) =>
       call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && (call[0]?.projection as { implementationPromptCount?: number } | undefined)?.implementationPromptCount === 2,
@@ -832,6 +834,8 @@ exec "${realGit}" "$@"
       && text.includes('This repair pass is required even when the implementation audit passed'),
       2500,
     );
+    expect(repairPrompt).toContain('Drive the implementation of @openspec/changes/demo-change aggressively.');
+    expect(repairPrompt).toContain('dispatch sub-agents with clear ownership');
     expect(repairPrompt).toContain('Do not write another audit report. Edit the product code, tests, and tasks.md now');
     expect(repairPrompt).not.toContain(formatOpenSpecPromptTemplate('audit_implementation', '@openspec/changes/demo-change'));
     expect(repairPrompt).not.toContain('Changed files:');
@@ -881,6 +885,8 @@ exec "${realGit}" "$@"
       && text.includes('Write the completed marker only after the implementation is genuinely finished and validated'),
       2500,
     );
+    expect(reminderPrompt).toContain('Drive the implementation of @openspec/changes/demo-change aggressively.');
+    expect(reminderPrompt).toContain('dispatch sub-agents with clear ownership');
     expect(reminderPrompt).toContain('Run the appropriate validation for the files you touched.');
     expect(startP2pRunMock).not.toHaveBeenCalled();
 
@@ -1071,6 +1077,8 @@ exec "${realGit}" "$@"
       && text.includes('Reason: implementation_audit_followup_repair'),
       2500,
     );
+    expect(repairPrompt).toContain('Drive the implementation of @openspec/changes/demo-change aggressively.');
+    expect(repairPrompt).toContain('dispatch sub-agents with clear ownership');
     expect(repairPrompt).toContain('OpenSpec Auto Deliver implementation repair for @openspec/changes/demo-change');
     expect(repairPrompt).not.toContain(formatOpenSpecPromptTemplate('audit_implementation', '@openspec/changes/demo-change'));
     expect([...p2pRuns.values()]).toHaveLength(2);
@@ -2253,6 +2261,8 @@ exec "${realGit}" "$@"
       && text.includes('Reason: implementation_tasks_still_unchecked'),
       2500,
     );
+    expect(reminderPrompt).toContain('Drive the implementation of @openspec/changes/demo-change aggressively.');
+    expect(reminderPrompt).toContain('dispatch sub-agents with clear ownership');
     expect(reminderPrompt).toContain('Continue from the current implementation state');
     const fullImplementationPrompts = transportSendMock.mock.calls
       .map((call) => String(call[0] ?? ''))
