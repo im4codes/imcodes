@@ -195,6 +195,25 @@ function validateStringArray(value: unknown, path: string): OpenSpecAutoDeliverV
   return value.flatMap((entry, index) => typeof entry === 'string' ? [] : [issue('invalid_string_array_item', 'Expected a string.', `${path}[${index}]`)]);
 }
 
+function validateRepairCompletion(input: unknown): OpenSpecAutoDeliverValidationIssue[] {
+  if (input === undefined) return [];
+  const issues: OpenSpecAutoDeliverValidationIssue[] = [];
+  if (!isRecord(input)) return [issue('invalid_repair_completion', 'repair_completion must be an object.', 'repair_completion')];
+  if (!isOneOf(input.status, ['complete', 'incomplete', 'blocked'] as const)) {
+    issues.push(issue('invalid_repair_completion_status', 'repair_completion.status must be complete, incomplete, or blocked.', 'repair_completion.status'));
+  }
+  if (typeof input.previous_items_complete !== 'boolean') {
+    issues.push(issue('invalid_repair_completion_previous_items_complete', 'repair_completion.previous_items_complete must be a boolean.', 'repair_completion.previous_items_complete'));
+  }
+  for (const field of ['completed_items', 'incomplete_items', 'blocked_items'] as const) {
+    issues.push(...validateStringArray(input[field], `repair_completion.${field}`));
+  }
+  if (typeof input.summary !== 'string' || input.summary.trim().length === 0) {
+    issues.push(issue('invalid_repair_completion_summary', 'repair_completion.summary is required.', 'repair_completion.summary'));
+  }
+  return issues;
+}
+
 const OPENSPEC_AUTO_DELIVER_STRING_ARRAY_VERDICT_FIELDS = OPENSPEC_AUTO_DELIVER_AUTHORITATIVE_VERDICT_FIELDS.filter((
   field,
 ): field is 'unchecked_tasks' | 'required_changes' => field === 'unchecked_tasks' || field === 'required_changes');
@@ -250,6 +269,7 @@ export function validateOpenSpecAutoDeliverVerdictPayload(input: unknown): OpenS
       if (entry.exitCode !== undefined && (typeof entry.exitCode !== 'number' || !Number.isFinite(entry.exitCode))) issues.push(issue('invalid_evidence_exit_code', 'Evidence exitCode must be a number.', `evidence[${index}].exitCode`));
     });
   }
+  issues.push(...validateRepairCompletion(input.repair_completion));
   if (
     input.verdict === 'PASS'
     && (

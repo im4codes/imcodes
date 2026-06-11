@@ -1108,8 +1108,13 @@ async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason:
 
 function implementationRepairPromptKey(run: AutoDeliverRun, reason: string): string {
   const audit = latestAuditResultForStage(run, 'implementation_audit_repair');
+  const resultIndex = audit
+    ? (run.auditResults ?? [])
+        .filter((result) => result.stage === 'implementation_audit_repair' && result.generation === audit.generation)
+        .length
+    : 0;
   return audit
-    ? `${audit.generation}:${audit.attemptId}:${reason}`
+    ? `${audit.generation}:${audit.attemptId}:${resultIndex}:${reason}`
     : `${run.generation}:no-audit:${reason}`;
 }
 
@@ -1265,6 +1270,15 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     '',
     'Previous audit guidance:',
     auditGuidanceEvidence(previousAudit),
+    '',
+    'Repair completion decision (required for this final acceptance audit):',
+    '- Include a top-level repair_completion object in the JSON.',
+    '- repair_completion.status must be one of: complete, incomplete, blocked.',
+    '- repair_completion.previous_items_complete must answer whether ALL previous required_changes, unchecked/falsely-complete tasks, repair scorecard gates, and repair task checklist/fallback plan items are now completed.',
+    '- Use status="incomplete" and previous_items_complete=false when the prior repair checklist was not fully completed; list exact unfinished prior items in incomplete_items.',
+    '- Use status="complete" and previous_items_complete=true only when the prior repair checklist is complete. If the checklist is complete but new or deeper issues still make the score low, put those new issues in required_changes.',
+    '- Use status="blocked" only for external blockers that cannot be repaired in this repository; list blockers in blocked_items.',
+    '- Fields: status, previous_items_complete, completed_items, incomplete_items, blocked_items, summary.',
     '',
     'Write exactly one raw JSON object to the authoritative result file path above. Do not wrap the file content in Markdown fences.',
     'The daemon will read only that file as the authoritative result.',
@@ -1529,6 +1543,11 @@ const RETRYABLE_AUTHORITATIVE_RESULT_ERROR_CODES = new Set([
   'invalid_evidence_summary',
   'invalid_evidence_command',
   'invalid_evidence_exit_code',
+  'missing_repair_completion',
+  'invalid_repair_completion',
+  'invalid_repair_completion_status',
+  'invalid_repair_completion_previous_items_complete',
+  'invalid_repair_completion_summary',
   'contradictory_pass_payload',
 ]);
 
@@ -1939,6 +1958,7 @@ function buildAuthoritativeResultSchemaHints(includeAutoDeliverNesting: boolean)
     `Each module_scores entry uses fields: ${OPENSPEC_AUTO_DELIVER_MODULE_SCORE_FIELDS.join(', ')}; max_score must be 10.`,
     `Each repairs_applied entry uses fields: ${OPENSPEC_AUTO_DELIVER_REPAIR_SUMMARY_FIELDS.join(', ')}.`,
     `Each evidence entry requires fields: ${OPENSPEC_AUTO_DELIVER_EVIDENCE_REQUIRED_FIELDS.join(', ')}; optional fields: ${OPENSPEC_AUTO_DELIVER_EVIDENCE_OPTIONAL_FIELDS.join(', ')}.`,
+    'Final acceptance audits must include repair_completion with fields: status, previous_items_complete, completed_items, incomplete_items, blocked_items, summary.',
     'evidence.source is informational only; use any useful label, or "none" when no label is available.',
     'PASS must leave unchecked_tasks and required_changes empty.',
   ];
@@ -2147,7 +2167,11 @@ function validateFinalPass(run: AutoDeliverRun, verdict: OpenSpecAutoDeliverVerd
   return null;
 }
 
-async function consumeAuditResultFile(run: AutoDeliverRun, expected: OpenSpecAutoDeliverP2pMetadata): Promise<OpenSpecAutoDeliverVerdictPayload | null> {
+async function consumeAuditResultFile(
+  run: AutoDeliverRun,
+  expected: OpenSpecAutoDeliverP2pMetadata,
+  options: { requireRepairCompletion?: boolean } = {},
+): Promise<OpenSpecAutoDeliverVerdictPayload | null> {
   if (!(await validateAuthoritativeResultPath(run, expected.authoritativeResultPath))) {
     run.latestMessage = OPENSPEC_AUTO_DELIVER_TERMINAL_REASONS.INVALID_AUTHORITATIVE_RESULT_PATH;
     run.lastAuditResultError = run.latestMessage;
@@ -2174,6 +2198,11 @@ async function consumeAuditResultFile(run: AutoDeliverRun, expected: OpenSpecAut
   const result = validateOpenSpecAutoDeliverVerdictPayload(parsed);
   if (!result.ok) {
     run.latestMessage = result.issues.map((entry) => entry.code).join(',') || 'invalid_audit_verdict';
+    run.lastAuditResultError = run.latestMessage;
+    return null;
+  }
+  if (options.requireRepairCompletion && !result.value.repair_completion) {
+    run.latestMessage = 'missing_repair_completion';
     run.lastAuditResultError = run.latestMessage;
     return null;
   }
@@ -2306,6 +2335,29 @@ function lowScoringModules(verdict: OpenSpecAutoDeliverVerdictPayload): OpenSpec
   return verdict.module_scores.filter((score) => score.score < OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE);
 }
 
+function hasPendingRepairWork(verdict: OpenSpecAutoDeliverVerdictPayload): boolean {
+  return verdict.verdict === 'REWORK'
+    || verdict.unchecked_tasks.length > 0
+    || verdict.required_changes.length > 0;
+}
+
+type RepairCompletionDecision = 'complete' | 'incomplete' | 'blocked' | 'unknown';
+
+function repairCompletionDecision(verdict: OpenSpecAutoDeliverVerdictPayload): RepairCompletionDecision {
+  const completion = verdict.repair_completion;
+  if (!completion) return 'unknown';
+  if (completion.status === 'blocked' || completion.blocked_items.length > 0) return 'blocked';
+  if (
+    completion.status === 'incomplete'
+    || completion.previous_items_complete === false
+    || completion.incomplete_items.length > 0
+  ) {
+    return 'incomplete';
+  }
+  if (completion.status === 'complete' && completion.previous_items_complete === true) return 'complete';
+  return 'unknown';
+}
+
 function isPerfectPass(verdict: OpenSpecAutoDeliverVerdictPayload): boolean {
   return verdict.verdict === 'PASS'
     && verdict.unchecked_tasks.length === 0
@@ -2330,11 +2382,10 @@ function extendAuditRoundLimit(run: AutoDeliverRun, stage: AuditRepairStage): vo
 
 /**
  * Ensure there is budget for another audit-repair round. The preset round count
- * is the BASE, not a hard ceiling: when the audit score is still below standard
- * the budget auto-increments toward the runtime MAX (implementation 5, spec 3)
- * so the run keeps converging to a quality delivery instead of giving up after
- * the preset base. Returns false only when even the runtime MAX is spent — that
- * is the genuine escalation point.
+ * is the BASE, not a hard ceiling. The budget is extended only when a new Team
+ * audit round is genuinely needed; concrete post-repair findings first go back
+ * to the corresponding repair prompt so repair/acceptance loops do not inflate
+ * the Team round counters. Returns false only when even the runtime MAX is spent.
  */
 function ensureAuditRoundBudget(run: AutoDeliverRun, stage: AuditRepairStage): boolean {
   if (auditRoundCount(run, stage) < auditRoundLimit(run, stage)) return true;
@@ -2366,6 +2417,29 @@ function scheduleAuditFixRetry(run: AutoDeliverRun, stage: AuditRepairStage, rea
     }
     void startAuditRepairStageFailClosed(current, stage);
   }, OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS));
+}
+
+async function dispatchPostRepairAcceptanceFollowup(
+  run: AutoDeliverRun,
+  stage: AuditRepairStage,
+  verdict: OpenSpecAutoDeliverVerdictPayload,
+  reason: string,
+): Promise<boolean> {
+  const completion = repairCompletionDecision(verdict);
+  if (completion === 'blocked') {
+    terminalizeAndSend(run, 'needs_human', `${reason}:repair_completion_blocked`);
+    return true;
+  }
+  const shouldContinueRepair = completion === 'incomplete'
+    || (completion === 'unknown' && hasPendingRepairWork(verdict));
+  if (!shouldContinueRepair) return false;
+  const projection = stage === 'spec_audit_repair'
+    ? dispatchSpecRepairPrompt(run, reason)
+    : await dispatchImplementationRepairPrompt(run, reason);
+  if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
+    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+  }
+  return true;
 }
 
 function shouldRunAnotherConfiguredAuditRound(
@@ -2407,6 +2481,9 @@ async function advanceAfterAuditVerdict(
     const reason = `quality_gate_low_score:${lowScores.map((score) => `${score.module}=${score.score}`).join(',')}`;
     if (postRepairVerification) {
       run.finalAfterRepair = scoreSnapshotFromAuditResult(auditResult, 'final_after_repair', reason);
+      if (await dispatchPostRepairAcceptanceFollowup(run, stage, verdict, reason)) {
+        return;
+      }
       scheduleAuditFixRetry(run, stage, reason);
       return;
     }
@@ -2428,6 +2505,9 @@ async function advanceAfterAuditVerdict(
     if (verdict.verdict === 'REWORK') {
       if (postRepairVerification) {
         run.finalAfterRepair = scoreSnapshotFromAuditResult(auditResult, 'final_after_repair', 'spec_audit_rework_requires_repair');
+        if (await dispatchPostRepairAcceptanceFollowup(run, stage, verdict, 'spec_audit_rework_requires_repair')) {
+          return;
+        }
         scheduleAuditFixRetry(run, stage, 'spec_audit_rework_requires_repair');
         return;
       }
@@ -2463,6 +2543,9 @@ async function advanceAfterAuditVerdict(
   if (verdict.verdict === 'REWORK') {
     if (postRepairVerification) {
       run.finalAfterRepair = scoreSnapshotFromAuditResult(auditResult, 'final_after_repair', 'implementation_audit_rework_requires_repair');
+      if (await dispatchPostRepairAcceptanceFollowup(run, stage, verdict, 'implementation_audit_rework_requires_repair')) {
+        return;
+      }
       scheduleAuditFixRetry(run, stage, 'implementation_audit_rework_requires_repair');
       return;
     }
@@ -2840,7 +2923,7 @@ async function advanceAfterPostRepairAcceptanceAuditIdle(run: AutoDeliverRun): P
   delete run.activeCommandId;
   const active = run.activeAcceptanceAudit;
   const metadata = acceptanceAuditMetadataFromActive(run, active);
-  const verdict = await consumeAuditResultFile(run, metadata);
+  const verdict = await consumeAuditResultFile(run, metadata, { requireRepairCompletion: true });
   if (!verdict) {
     const reason = run.latestMessage ?? 'invalid_audit_result';
     if (isRetryableAuditResultError(reason) && !active.resultFileRepairAttempted) {

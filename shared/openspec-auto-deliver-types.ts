@@ -75,6 +75,15 @@ export interface OpenSpecAutoDeliverEvidence {
   stale?: boolean;
 }
 
+export interface OpenSpecAutoDeliverRepairCompletion {
+  status: 'complete' | 'incomplete' | 'blocked';
+  previous_items_complete: boolean;
+  completed_items: string[];
+  incomplete_items: string[];
+  blocked_items: string[];
+  summary: string;
+}
+
 export interface OpenSpecAutoDeliverVerdictPayload {
   verdict: OpenSpecAutoDeliverVerdict;
   module_scores: OpenSpecAutoDeliverModuleScore[];
@@ -82,6 +91,7 @@ export interface OpenSpecAutoDeliverVerdictPayload {
   required_changes: string[];
   repairs_applied: OpenSpecAutoDeliverRepairSummary[];
   evidence: OpenSpecAutoDeliverEvidence[];
+  repair_completion?: OpenSpecAutoDeliverRepairCompletion;
 }
 
 export interface OpenSpecAutoDeliverAuditResult {

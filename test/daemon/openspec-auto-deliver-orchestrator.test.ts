@@ -184,6 +184,18 @@ function auditPayload(overrides: Record<string, unknown> = {}): Record<string, u
   };
 }
 
+function repairCompletion(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    status: 'complete',
+    previous_items_complete: true,
+    completed_items: ['all previous repair items verified'],
+    incomplete_items: [],
+    blocked_items: [],
+    summary: 'Previous repair checklist is complete.',
+    ...overrides,
+  };
+}
+
 function parseAuditMetadata(run: MockP2pRun): Record<string, unknown> {
   const text = run.userText ?? '';
   const lineValue = (label: string): string => {
@@ -232,11 +244,16 @@ function expectAuthoritativeResultSchemaHints(text: string): void {
   expect(text).toContain('Each module_scores entry uses fields: module, score, max_score, summary; max_score must be 10');
   expect(text).toContain('Each repairs_applied entry uses fields: files, reason');
   expect(text).toContain('Each evidence entry requires fields: source, summary; optional fields: command, exitCode');
+  expect(text).toContain('Final acceptance audits must include repair_completion with fields');
   expect(text).toContain('evidence.source is informational only');
   expect(text).toContain('PASS must leave unchecked_tasks and required_changes empty');
 }
 
 function expectFinalAcceptanceScoringDiscipline(text: string): void {
+  expect(text).toContain('Repair completion decision (required for this final acceptance audit):');
+  expect(text).toContain('Include a top-level repair_completion object in the JSON.');
+  expect(text).toContain('repair_completion.previous_items_complete must answer whether ALL previous required_changes');
+  expect(text).toContain('Use status="complete" and previous_items_complete=true only when the prior repair checklist is complete');
   expect(text).toContain('Scoring discipline:');
   expect(text).toContain('Score from 10 downward based on current repaired evidence');
   expect(text).toContain('do not start from PASS or assume high scores because a repair prompt completed');
@@ -321,7 +338,11 @@ async function completeLatestDiscussion(status = 'completed', summary = '# imple
 
 async function completeAcceptanceAuditFromPrompt(text: string, payloadOverrides: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
   const origin = parseAutoDeliverMetadataBlock(text);
-  const resultJson = JSON.stringify(auditPayload({ auto_deliver: origin, ...payloadOverrides }), null, 2);
+  const resultJson = JSON.stringify(auditPayload({
+    auto_deliver: origin,
+    repair_completion: repairCompletion(),
+    ...payloadOverrides,
+  }), null, 2);
   await writeFile(String(origin.authoritativeResultPath), resultJson, 'utf8');
   return origin;
 }
@@ -1402,13 +1423,27 @@ exec "${realGit}" "$@"
     await completeAcceptanceAuditFromPrompt(specAcceptancePrompt, {
       verdict: 'REWORK',
       required_changes: ['clarify acceptance criteria'],
+      repair_completion: repairCompletion({
+        status: 'incomplete',
+        previous_items_complete: false,
+        completed_items: [],
+        incomplete_items: ['clarify acceptance criteria'],
+        summary: 'The previous spec repair checklist is still incomplete.',
+      }),
     });
     await emitDeckDemoIdle();
 
+    const repairPrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change')
+      && text.includes('Reason: spec_audit_rework_requires_repair')
+      && text.includes('clarify acceptance criteria'),
+      2500,
+    );
+    expect(repairPrompt).toContain('Must-fix items flagged by the previous spec audit');
     const gate = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'spec_audit_repair'
-      && msg.projection?.lastMessage === 'spec_audit_rework_requires_repair',
+      && String(msg.projection?.lastMessage ?? '').includes('spec_audit_rework_requires_repair'),
       2500,
     );
     expect(gate.projection.latestVerdict).toBe('REWORK');
@@ -1416,15 +1451,7 @@ exec "${realGit}" "$@"
     expect(gate.projection.auditResults).toHaveLength(1);
     expect(gate.projection.auditResults?.[0]?.requiredChanges).toEqual(['clarify acceptance criteria']);
     expect(gate.projection.specAuditRound).toEqual({ current: 1, total: 1 });
-
-    // A below-standard score auto-increments the round budget toward the runtime
-    // MAX instead of giving up: the run launches another spec audit round and
-    // does NOT advance to implementation or terminalize after the preset base.
-    const start = Date.now();
-    while (Date.now() - start < 2500 && [...p2pRuns.values()].length < 2) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    expect([...p2pRuns.values()]).toHaveLength(2);
+    expect([...p2pRuns.values()]).toHaveLength(1);
     expect(transportSendMock.mock.calls.some((call) =>
       String(call[0] ?? '').includes('Drive the implementation of @openspec/changes/demo-change aggressively.'),
     )).toBe(false);
@@ -1459,23 +1486,24 @@ exec "${realGit}" "$@"
     await completeAcceptanceAuditFromPrompt(specAcceptancePrompt, {
       verdict: 'REWORK',
       required_changes: [flaggedChange],
+      repair_completion: repairCompletion({
+        status: 'incomplete',
+        previous_items_complete: false,
+        completed_items: [],
+        incomplete_items: [flaggedChange],
+        summary: 'The flagged acceptance repair item is still incomplete.',
+      }),
     });
     await emitDeckDemoIdle();
 
-    // Round 2 launches a fresh spec audit discussion; complete it and capture the
-    // next repair prompt — it MUST carry the flagged required_changes verbatim so
-    // the repair model targets the exact item instead of rewriting elsewhere.
+    // The acceptance audit's required_changes go straight back into the next
+    // spec repair prompt; they do not consume or inflate another Team audit round.
     await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && msg.projection?.stage === 'spec_audit_repair'
-      && msg.projection?.lastMessage === 'spec_audit_rework_requires_repair',
+      && String(msg.projection?.lastMessage ?? '').includes('spec_audit_rework_requires_repair'),
       2500,
     );
-    const start = Date.now();
-    while (Date.now() - start < 2500 && [...p2pRuns.values()].length < 2) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    await completeLatestDiscussion('completed', '# spec audit discussion round 2\n\nResolve the open fork.');
     const secondRepairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change')
       && text.includes('Must-fix items flagged by the previous spec audit'),
@@ -1484,6 +1512,56 @@ exec "${realGit}" "$@"
     expect(secondRepairPrompt).toContain(`- ${flaggedChange}`);
     expect(secondRepairPrompt).toContain('Locate the latest "repair task checklist" section and complete it item by item');
     expect(secondRepairPrompt).toContain('if that heading is absent, use the latest final summary / Implementation Plan');
+    expect([...p2pRuns.values()]).toHaveLength(1);
+  });
+
+  it('starts another Team audit only after final acceptance says previous spec repairs are complete but still insufficient', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-spec-rework-complete-new-round',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
+    await completeLatestDiscussion('completed', '# spec audit discussion\n\nRepair the artifact checklist before final scoring.');
+    await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change'),
+      2500,
+    );
+    await emitDeckDemoIdle();
+    const specAcceptancePrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
+      2500,
+    );
+    await completeAcceptanceAuditFromPrompt(specAcceptancePrompt, {
+      verdict: 'REWORK',
+      required_changes: ['new cross-spec ambiguity remains'],
+      repair_completion: repairCompletion({
+        completed_items: ['previous artifact checklist completed'],
+        summary: 'Previous repair checklist is complete; a newly found ambiguity remains.',
+      }),
+    });
+    await emitDeckDemoIdle();
+
+    const start = Date.now();
+    while (Date.now() - start < 2500 && [...p2pRuns.values()].length < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect([...p2pRuns.values()]).toHaveLength(2);
+    const projection = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'spec_audit_repair'
+      && msg.projection?.specAuditRepairRound === 2,
+      2500,
+    );
+    expect(projection.projection.specAuditRepairRound).toBe(2);
+    expect(projection.projection.specAuditRound).toEqual({ current: 1, total: 2 });
+    expect(transportSendMock.mock.calls.some((call) =>
+      String(call[0] ?? '').includes('Reason: spec_audit_rework_requires_repair'),
+    )).toBe(false);
   });
 
   it('does not start another Team audit after final implementation acceptance PASS with perfect scores', async () => {
@@ -1718,6 +1796,94 @@ exec "${realGit}" "$@"
     });
   });
 
+  it('feeds final acceptance REWORK back into implementation repair before extending audit rounds', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-final-rework-followup-repair');
+    const unresolved = 'test/postgres-review.test.ts:77 — add Postgres failure-injection coverage for rollback';
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
+      verdict: 'REWORK',
+      required_changes: [unresolved],
+      repair_completion: repairCompletion({
+        status: 'incomplete',
+        previous_items_complete: false,
+        completed_items: [],
+        incomplete_items: [unresolved],
+        summary: 'The Postgres rollback evidence requested by the previous audit is still missing.',
+      }),
+      module_scores: OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.map((module) => ({
+        module,
+        score: module === 'tasks' || module === 'tests' || module === 'risk' ? 5 : 8,
+        max_score: 10,
+        summary: `${module} final acceptance`,
+      })),
+    });
+    await emitDeckDemoIdle();
+
+    const repairPrompt = await waitForTransportSend((text) =>
+      text.includes('Audit findings to repair now:')
+      && text.includes('Reason: quality_gate_low_score:tasks=5,tests=5,risk=5')
+      && text.includes(unresolved)
+      && text.includes('Do not write another audit report. Edit the product code, tests, and tasks.md now'),
+      2500,
+    );
+    expect(repairPrompt).toContain('Previous implementation audit verdict: REWORK');
+    expect(repairPrompt).toContain('Must-fix items flagged by the previous implementation audit');
+    const gate = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && String(msg.projection?.lastMessage ?? '').includes('quality_gate_low_score:tasks=5,tests=5,risk=5'),
+      2500,
+    );
+    expect(gate.projection.status).toBe('implementation_task_loop');
+    expect(gate.projection.implementationPromptCount).toBe(3);
+    expect(gate.projection.implementationAuditRound).toEqual({ current: 1, total: 1 });
+    expect([...p2pRuns.values()]).toHaveLength(1);
+
+    await emitDeckDemoIdle();
+    const nextAcceptancePrompt = await waitForTransportSend((text) =>
+      text !== acceptancePrompt
+      && text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change')
+      && text.includes(unresolved),
+      2500,
+    );
+    expect(nextAcceptancePrompt).toContain('Previous audit verdict: REWORK');
+    expect([...p2pRuns.values()]).toHaveLength(1);
+  });
+
+  it('starts another Team implementation audit only after final acceptance says previous repairs are complete but still low scoring', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-final-complete-low-score-new-round');
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
+      verdict: 'REWORK',
+      required_changes: ['new transaction edge case remains after previous repairs'],
+      repair_completion: repairCompletion({
+        completed_items: ['previous implementation checklist completed'],
+        summary: 'Previous implementation repair checklist is complete; a newly found transaction edge case remains.',
+      }),
+      module_scores: OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.map((module) => ({
+        module,
+        score: module === 'risk' ? 5 : 8,
+        max_score: 10,
+        summary: `${module} final acceptance`,
+      })),
+    });
+    await emitDeckDemoIdle();
+
+    const start = Date.now();
+    while (Date.now() - start < 2500 && [...p2pRuns.values()].length < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect([...p2pRuns.values()]).toHaveLength(2);
+    const projection = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair'
+      && msg.projection?.implementationAuditRepairRound === 2,
+      2500,
+    );
+    expect(projection.projection.implementationAuditRepairRound).toBe(2);
+    expect(projection.projection.implementationAuditRound).toEqual({ current: 1, total: 2 });
+    expect(transportSendMock.mock.calls.filter((call) =>
+      String(call[0] ?? '').includes('Reason: quality_gate_low_score:risk=5'),
+    )).toHaveLength(0);
+  });
+
   it('keeps valid missing authoritative result files classified as missing JSON', async () => {
     const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-valid-missing-result-file');
     const origin = parseAutoDeliverMetadataBlock(acceptancePrompt);
@@ -1753,7 +1919,10 @@ exec "${realGit}" "$@"
     );
 
     expect([...p2pRuns.values()]).toHaveLength(1);
-    await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({ auto_deliver: origin }), null, 2), 'utf8');
+    await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({
+      auto_deliver: origin,
+      repair_completion: repairCompletion(),
+    }), null, 2), 'utf8');
     await emitDeckDemoIdle();
 
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
@@ -1781,7 +1950,37 @@ exec "${realGit}" "$@"
     expectAuthoritativeResultSchemaHints(repairPrompt);
     expect([...p2pRuns.values()]).toHaveLength(1);
 
-    await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({ auto_deliver: origin }), null, 2), 'utf8');
+    await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({
+      auto_deliver: origin,
+      repair_completion: repairCompletion(),
+    }), null, 2), 'utf8');
+    await emitDeckDemoIdle();
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
+  });
+
+  it('requires repair_completion before consuming a final acceptance result', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-missing-repair-completion');
+    const origin = parseAutoDeliverMetadataBlock(acceptancePrompt);
+    await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({
+      auto_deliver: origin,
+    }), null, 2), 'utf8');
+    await emitDeckDemoIdle();
+
+    const repairPrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
+      && text.includes('Problem: missing_repair_completion'),
+      2500,
+    );
+    expect(repairPrompt).toContain(`Authoritative result file: ${origin.authoritativeResultPath}`);
+    expect(repairPrompt).toContain('Final acceptance audits must include repair_completion with fields');
+    expect([...p2pRuns.values()]).toHaveLength(1);
+
+    await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({
+      auto_deliver: origin,
+      repair_completion: repairCompletion(),
+    }), null, 2), 'utf8');
     await emitDeckDemoIdle();
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
@@ -2002,6 +2201,7 @@ exec "${realGit}" "$@"
     const origin = parseAutoDeliverMetadataBlock(acceptancePrompt);
     const largePayload = auditPayload({
       auto_deliver: origin,
+      repair_completion: repairCompletion(),
       module_scores: OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.map((module) => ({
         module,
         score: 9,

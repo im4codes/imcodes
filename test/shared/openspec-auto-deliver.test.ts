@@ -224,6 +224,38 @@ describe('OpenSpec Auto Deliver shared contracts', () => {
     expect(validateOpenSpecAutoDeliverVerdictPayload(contradictory).ok).toBe(false);
   });
 
+  it('validates optional repair completion status for final acceptance payloads', () => {
+    const payload = validVerdictPayload() as ReturnType<typeof validVerdictPayload> & { repair_completion?: Record<string, unknown> };
+    payload.repair_completion = {
+      status: 'complete',
+      previous_items_complete: true,
+      completed_items: ['previous repair checklist completed'],
+      incomplete_items: [],
+      blocked_items: [],
+      summary: 'All previous repair items were verified.',
+    };
+    expect(validateOpenSpecAutoDeliverVerdictPayload(payload).ok).toBe(true);
+
+    const invalid = validVerdictPayload() as ReturnType<typeof validVerdictPayload> & { repair_completion?: Record<string, unknown> };
+    invalid.repair_completion = {
+      status: 'maybe',
+      previous_items_complete: 'yes',
+      completed_items: ['done'],
+      incomplete_items: [],
+      blocked_items: [],
+      summary: '',
+    };
+    const result = validateOpenSpecAutoDeliverVerdictPayload(invalid);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues.map((entry) => entry.code)).toEqual(expect.arrayContaining([
+        'invalid_repair_completion_status',
+        'invalid_repair_completion_previous_items_complete',
+        'invalid_repair_completion_summary',
+      ]));
+    }
+  });
+
   it('accepts free-form authoritative evidence source labels', () => {
     for (const source of ['OpenSpec CLI', 'openspec/changes/platform-foundation']) {
       const payload = validVerdictPayload();
