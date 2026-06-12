@@ -629,6 +629,116 @@ exec "${realGit}" "$@"
     }
   });
 
+  it('does not send a marker reminder when idle fires during implementation prompt dispatch', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    let emittedIdleDuringDispatch = false;
+    const sendDuringIdleMock = vi.fn((text: string) => {
+      if (!emittedIdleDuringDispatch && text.includes('OpenSpec Auto Deliver context for @openspec/changes/demo-change')) {
+        emittedIdleDuringDispatch = true;
+        timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+      }
+      return 'sent' as const;
+    });
+    getTransportRuntimeMock.mockImplementation(() => ({
+      send: sendDuringIdleMock,
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+    }));
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-implementation-send-idle-race',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_task_loop',
+      2500,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(sendDuringIdleMock).toHaveBeenCalledTimes(1);
+    expect(String(sendDuringIdleMock.mock.calls[0]?.[0] ?? '')).toContain('Implementation prompt: 1/');
+  });
+
+  it('keeps queued Auto Deliver prompts out of the committed timeline until transport drain', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    let queuedRuntime: {
+      providerSessionId: string;
+      pendingEntries: Array<{ clientMessageId: string; text: string }>;
+      pendingVersion: number;
+      send: ReturnType<typeof vi.fn>;
+      settleActiveDispatchFromExternalCompletion: ReturnType<typeof vi.fn>;
+    };
+    queuedRuntime = {
+      providerSessionId: 'provider-demo',
+      pendingEntries: [],
+      pendingVersion: 0,
+      send: vi.fn((text: string, commandId?: string) => {
+        const clientMessageId = commandId ?? `queued-${queuedRuntime.pendingVersion + 1}`;
+        queuedRuntime.pendingVersion += 1;
+        queuedRuntime.pendingEntries = [{ clientMessageId, text }];
+        return 'queued' as const;
+      }),
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+    };
+    getTransportRuntimeMock.mockImplementation(() => queuedRuntime);
+    const timelineSpy = vi.spyOn(timelineEmitter, 'emit');
+
+    try {
+      await handleOpenSpecAutoDeliverCommand({
+        type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+        requestId: 'req-queued-implementation-not-committed',
+        sessionName: 'deck_demo_brain',
+        changeName: 'demo-change',
+        presetId: 'fast',
+      }, serverLinkMock as never);
+
+      await waitForSend((msg) =>
+        msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+        && msg.projection?.stage === 'implementation_task_loop',
+        2500,
+      );
+      expect(queuedRuntime.send).toHaveBeenCalledTimes(1);
+      const commandId = String(queuedRuntime.send.mock.calls[0]?.[1] ?? '');
+      expect(commandId).toContain(':implementation:');
+      expect(timelineSpy.mock.calls.some(([session, type, payload]) =>
+        session === 'deck_demo_brain'
+        && type === 'user.message'
+        && (
+          (payload as Record<string, unknown>).commandId === commandId
+          || (payload as Record<string, unknown>).clientMessageId === commandId
+        )
+      )).toBe(false);
+      expect(timelineSpy.mock.calls.some(([session, type, payload]) =>
+        session === 'deck_demo_brain'
+        && type === 'session.state'
+        && (payload as Record<string, unknown>).state === 'queued'
+        && (payload as Record<string, unknown>).pendingMessageVersion === 1
+        && Array.isArray((payload as Record<string, unknown>).pendingMessageEntries)
+      )).toBe(true);
+
+      timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(queuedRuntime.send).toHaveBeenCalledTimes(1);
+
+      timelineEmitter.emit('deck_demo_brain', 'user.message', {
+        text: queuedRuntime.pendingEntries[0]?.text ?? '',
+        clientMessageId: commandId,
+      });
+      timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+      const start = Date.now();
+      while (queuedRuntime.send.mock.calls.length < 2 && Date.now() - start < 1000) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(queuedRuntime.send).toHaveBeenCalledTimes(2);
+      expect(String(queuedRuntime.send.mock.calls[1]?.[0] ?? '')).toContain('Reason: implementation_marker_missing');
+    } finally {
+      timelineSpy.mockRestore();
+    }
+  });
+
   it('records only final implementation assistant text as evidence before the audit prompt', async () => {
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,

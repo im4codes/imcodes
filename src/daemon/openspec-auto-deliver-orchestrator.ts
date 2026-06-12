@@ -203,6 +203,7 @@ interface AutoDeliverRun {
   resumeStage?: OpenSpecAutoDeliverStage;
   latestMessage?: string;
   activeCommandId?: string;
+  activeImplementationPromptAwaitingDispatch?: boolean;
   activeImplementationMarker?: {
     markerPath: string;
     spec: P2pExecutionMarkerSpec;
@@ -306,6 +307,7 @@ function runtimeProviderSessionId(runtime: NonNullable<ReturnType<typeof getTran
 function emitAutoDeliverQueuedState(
   sessionName: string,
   entries: Array<{ commandId: string; text: string }>,
+  pendingMessageVersion?: number,
 ): void {
   timelineEmitter.emit(sessionName, 'session.state', {
     state: 'queued',
@@ -315,6 +317,7 @@ function emitAutoDeliverQueuedState(
       clientMessageId: entry.commandId,
       text: entry.text,
     })),
+    ...(typeof pendingMessageVersion === 'number' ? { pendingMessageVersion } : {}),
   }, { source: 'daemon', confidence: 'high' });
 }
 
@@ -361,11 +364,13 @@ async function sendAutoDeliverPromptToImplementationSession(
   }
   try {
     const result = runtime.send(prompt, commandId);
-    timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
-      text: prompt,
-      allowDuplicate: true,
-      commandId,
-    }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${commandId}` });
+    if (result === 'sent') {
+      timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
+        text: prompt,
+        allowDuplicate: true,
+        commandId,
+      }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${commandId}` });
+    }
     if (result === 'queued') {
       const pendingEntries = Array.isArray(runtime.pendingEntries) ? runtime.pendingEntries : [];
       emitAutoDeliverQueuedState(
@@ -374,6 +379,7 @@ async function sendAutoDeliverPromptToImplementationSession(
           commandId: entry.clientMessageId,
           text: entry.text,
         })),
+        typeof runtime.pendingVersion === 'number' ? runtime.pendingVersion : undefined,
       );
     }
     return result;
@@ -1103,10 +1109,14 @@ async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: 
   run.stage = 'implementation_task_loop';
   run.implementationPromptCount += 1;
   run.activeCommandId = `${run.runId}:implementation:${run.generation}:${run.implementationPromptCount}`;
+  run.activeImplementationPromptAwaitingDispatch = true;
   run.activeImplementationMarker = await buildImplementationMarkerContract(run, run.implementationPromptCount);
   const prompt = buildImplementationPrompt(run, repairReason);
   const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
-  if (sendMode !== 'resend_queued') scheduleImplementationMarkerPoll(run);
+  if (sendMode === 'sent') {
+    run.activeImplementationPromptAwaitingDispatch = false;
+    scheduleImplementationMarkerPoll(run);
+  }
   run.latestMessage = repairReason
     ? `implementation_repair_prompt_dispatched:${repairReason}`
     : 'implementation_prompt_dispatched';
@@ -1138,6 +1148,7 @@ async function advanceAfterCompletedImplementationMarker(
   clearImplementationMarkerPollTimer(run.runId);
   settleImplementationRuntimeFromMarker(run, 'openspec-auto-deliver-implementation-marker-completed');
   delete run.activeCommandId;
+  delete run.activeImplementationPromptAwaitingDispatch;
   delete run.activeImplementationMarker;
   if (run.needsPostRepairAcceptanceAudit || run.auditBeforeRepair || run.implementationAuditDiscussionFilePath) {
     await dispatchPostRepairAcceptanceAuditPrompt(run);
@@ -1177,6 +1188,7 @@ async function advanceAfterImplementationMarkerPoll(run: AutoDeliverRun): Promis
   }
   if (run.taskStats.total <= 0) {
     delete run.activeCommandId;
+    delete run.activeImplementationPromptAwaitingDispatch;
     const projection = terminalize(run, 'needs_human', 'tasks_missing_checkboxes');
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
@@ -1286,9 +1298,13 @@ async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason:
   marker.retryCount += 1;
   marker.lastReminderAt = Date.now();
   run.activeCommandId = `${run.runId}:implementation-marker:${run.generation}:${run.implementationPromptCount}:${marker.retryCount}`;
+  run.activeImplementationPromptAwaitingDispatch = true;
   const prompt = buildImplementationMarkerReminderPrompt(run, reason);
   const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
-  if (sendMode !== 'resend_queued') scheduleImplementationMarkerPoll(run);
+  if (sendMode === 'sent') {
+    run.activeImplementationPromptAwaitingDispatch = false;
+    scheduleImplementationMarkerPoll(run);
+  }
   run.latestMessage = recovered
     ? `implementation_marker_contract_recreated:${reason}`
     : `implementation_marker_missing:${reason}`;
@@ -2398,6 +2414,7 @@ function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 
   clearImplementationReminderTimer(run.runId);
   clearImplementationMarkerPollTimer(run.runId);
   delete run.activeCommandId;
+  delete run.activeImplementationPromptAwaitingDispatch;
   delete run.activeImplementationMarker;
   run.resumeStage = status === 'passed' ? undefined : previousStage;
   run.status = status;
@@ -2975,16 +2992,19 @@ async function startAuditRepairStageFailClosed(run: AutoDeliverRun, stage: Audit
 
 async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void> {
   if (run.status !== 'implementation_task_loop' || !run.activeCommandId) return;
+  if (run.activeImplementationPromptAwaitingDispatch) return;
   if (enforceElapsedLimit(run)) return;
   try {
     run.taskStats = await readTaskStatsForRun(run);
   } catch {
     delete run.activeCommandId;
+    delete run.activeImplementationPromptAwaitingDispatch;
     terminalizeAndSend(run, 'needs_human', 'tasks_unreadable');
     return;
   }
   if (run.taskStats.total <= 0) {
     delete run.activeCommandId;
+    delete run.activeImplementationPromptAwaitingDispatch;
     const projection = terminalize(run, 'needs_human', 'tasks_missing_checkboxes');
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
@@ -3077,7 +3097,24 @@ function ensureTimelineListener(): void {
       }
       return;
     }
-    if (event.type === 'user.message') return;
+    if (event.type === 'user.message') {
+      const eventCommandId =
+        typeof (event.payload as Record<string, unknown>).commandId === 'string'
+          ? (event.payload as Record<string, unknown>).commandId
+          : typeof (event.payload as Record<string, unknown>).clientMessageId === 'string'
+            ? (event.payload as Record<string, unknown>).clientMessageId
+            : undefined;
+      if (eventCommandId) {
+        const dispatchedRun = Array.from(runsById.values()).find((candidate) =>
+          !isOpenSpecAutoDeliverTerminalStage(candidate.status)
+          && candidate.targetImplementationSessionName === event.sessionId
+          && candidate.status === 'implementation_task_loop'
+          && candidate.activeCommandId === eventCommandId
+        );
+        if (dispatchedRun) dispatchedRun.activeImplementationPromptAwaitingDispatch = false;
+      }
+      return;
+    }
     if (event.type !== 'session.state') return;
     if ((event.payload as Record<string, unknown>).state !== 'idle') return;
     const activeCandidates = Array.from(runsById.values()).filter((candidate) =>
@@ -3119,6 +3156,7 @@ function ensureTimelineListener(): void {
     const run = activeCandidates.find((candidate) =>
       candidate.status === 'implementation_task_loop'
       && !!candidate.activeCommandId
+      && !candidate.activeImplementationPromptAwaitingDispatch
     );
     if (!run) return;
     void advanceAfterImplementationIdle(run).catch((error) => {

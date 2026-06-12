@@ -779,6 +779,10 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._sending = false;
       this._activeTurn = null;
       this._activeDispatchEntries = [];
+      this._activeDispatchProviderStarted = false;
+      this._activeDispatchCancelled = false;
+      this._activeDispatchId = null;
+      this._activeDispatchStaleRecoveryStarted = false;
       throw err;
     }
     return 'sent';
@@ -918,18 +922,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     dispatchedEntries?: PendingTransportMessage[],
   ): void {
     const dispatchId = ++this._nextDispatchId;
-    this._history.push({
-      id: randomUUID(),
-      sessionId: this._providerSessionId!,
-      kind: 'text',
-      role: 'user',
-      content: message,
-      timestamp: Date.now(),
-      status: 'complete',
-    });
-
     this._lastActivityAt = Date.now();
-    this.setStatus('thinking');
     this._sending = true;
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
@@ -949,6 +942,18 @@ export class TransportSessionRuntime implements SessionRuntime {
     });
     void promise.catch(() => {}); // prevent unhandled rejection
     this._activeTurn = { promise, resolve, reject };
+
+    this._history.push({
+      id: randomUUID(),
+      sessionId: this._providerSessionId!,
+      kind: 'text',
+      role: 'user',
+      content: message,
+      timestamp: Date.now(),
+      status: 'complete',
+    });
+
+    this.setStatus('thinking');
 
     if (shouldResetTransportPreferenceContextForSessionControl(message)) {
       this._lastInjectedPreferenceContextSignature = null;

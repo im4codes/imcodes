@@ -51,7 +51,7 @@ vi.mock('../../src/context/memory-search.js', () => ({
 
 // ── Mock provider factory ──────────────────────────────────────────────────────
 
-function makeMockProvider() {
+function makeMockProvider(id = 'mock') {
   let deltaCb: ((sid: string, d: MessageDelta) => void) | null = null;
   let completeCb: ((sid: string, m: AgentMessage) => void) | null = null;
   let errorCb: ((sid: string, e: ProviderError) => void) | null = null;
@@ -83,7 +83,7 @@ function makeMockProvider() {
 
   return {
     provider: {
-      id: 'mock', connectionMode: 'persistent', sessionOwnership: 'provider',
+      id, connectionMode: 'persistent', sessionOwnership: 'provider',
       capabilities: { streaming: true, toolCalling: false, approval: false, sessionRestore: false, multiTurn: true, attachments: false, contextSupport: 'full-normalized-context-injection' },
       connect: vi.fn(), disconnect: vi.fn(), send: vi.fn(), cancel: vi.fn(),
       createSession: vi.fn().mockResolvedValue('sess-1'), endSession: vi.fn(),
@@ -197,6 +197,119 @@ describe('TransportSessionRuntime', () => {
     ]);
     // provider.send called only once (for first message)
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('queues re-entrant sends from onStatusChange while a dispatch is starting', async () => {
+    let reentrantResult: 'sent' | 'queued' | null = null;
+    let triggered = false;
+
+    runtime.onStatusChange = (status) => {
+      if (status === 'thinking' && !triggered) {
+        triggered = true;
+        reentrantResult = runtime.send('second', 'msg-status-reentrant');
+      }
+    };
+
+    expect(runtime.send('first', 'msg-first')).toBe('sent');
+    expect(reentrantResult).toBe('queued');
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-status-reentrant', text: 'second' },
+    ]);
+
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('direct codex-sdk long-turn probe keeps file-analysis follow-up sends queued until completion', async () => {
+    const sdkMock = makeMockProvider('codex-sdk');
+    const sessionName = 'deck_sdk_probe_codex_sdk_brain';
+    const sdkRuntime = new TransportSessionRuntime(sdkMock.provider, sessionName);
+    await sdkRuntime.initialize({
+      ...defaultConfig,
+      sessionKey: sessionName,
+      sessionName,
+      projectName: 'sdk_probe',
+      cwd: process.cwd(),
+      fresh: true,
+    });
+
+    let startOfTurnResult: 'sent' | 'queued' | null = null;
+    let drainedEntries: PendingTransportMessage[] = [];
+    let triggered = false;
+    sdkRuntime.onStatusChange = (status) => {
+      if (status === 'thinking' && !triggered) {
+        triggered = true;
+        startOfTurnResult = sdkRuntime.send('queued while thinking begins', 'msg-codex-start-reentrant');
+      }
+    };
+    sdkRuntime.onDrain = (entries) => {
+      drainedEntries = entries.map((entry) => ({ ...entry }));
+    };
+
+    const longAnalysisPrompt = [
+      'Read these files, analyze the idle/queue behavior, and explain your reasoning while you work:',
+      '- src/agent/transport-session-runtime.ts',
+      '- src/agent/session-manager.ts',
+      '- src/daemon/openspec-auto-deliver-orchestrator.ts',
+      '- test/daemon/transport-session-runtime.test.ts',
+      '',
+      'Focus on whether a second user message can bypass the queue while this turn is still running.',
+    ].join('\n');
+
+    expect(sdkRuntime.send(longAnalysisPrompt, 'msg-codex-first')).toBe('sent');
+    expect(startOfTurnResult).toBe('queued');
+    expect(sdkRuntime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-codex-start-reentrant', text: 'queued while thinking begins' },
+    ]);
+
+    await flushDispatch();
+    expect(sdkMock.provider.send).toHaveBeenCalledTimes(1);
+    expect(sdkMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      userMessage: longAnalysisPrompt,
+    }));
+
+    sdkMock.fireStatus('sess-1', { status: 'reading-files', label: 'Reading src/agent/transport-session-runtime.ts' });
+    sdkMock.fireDelta('sess-1');
+    expect(sdkRuntime.getStatus()).toBe('streaming');
+    expect(sdkRuntime.send('queued while codex is reading transport runtime', 'msg-codex-reading-runtime')).toBe('queued');
+
+    sdkMock.fireStatus('sess-1', { status: 'analyzing', label: 'Analyzing session-manager callbacks' });
+    sdkMock.fireDelta('sess-1');
+    expect(sdkRuntime.send('queued while codex is analyzing session manager', 'msg-codex-analyzing-session-manager')).toBe('queued');
+
+    sdkMock.fireStatus('sess-1', { status: 'explaining', label: 'Explaining queue behavior' });
+    sdkMock.fireDelta('sess-1');
+    expect(sdkRuntime.send('queued while codex is explaining findings', 'msg-codex-explaining')).toBe('queued');
+
+    expect(sdkRuntime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-codex-start-reentrant', text: 'queued while thinking begins' },
+      { clientMessageId: 'msg-codex-reading-runtime', text: 'queued while codex is reading transport runtime' },
+      { clientMessageId: 'msg-codex-analyzing-session-manager', text: 'queued while codex is analyzing session manager' },
+      { clientMessageId: 'msg-codex-explaining', text: 'queued while codex is explaining findings' },
+    ]);
+    expect(sdkMock.provider.send).toHaveBeenCalledTimes(1);
+
+    sdkMock.fireComplete('sess-1');
+    await flushDispatch();
+
+    expect(drainedEntries).toEqual([
+      { clientMessageId: 'msg-codex-start-reentrant', text: 'queued while thinking begins' },
+      { clientMessageId: 'msg-codex-reading-runtime', text: 'queued while codex is reading transport runtime' },
+      { clientMessageId: 'msg-codex-analyzing-session-manager', text: 'queued while codex is analyzing session manager' },
+      { clientMessageId: 'msg-codex-explaining', text: 'queued while codex is explaining findings' },
+    ]);
+    expect(sdkRuntime.pendingCount).toBe(0);
+    expect(sdkMock.provider.send).toHaveBeenCalledTimes(2);
+    expect(sdkMock.provider.send).toHaveBeenLastCalledWith('sess-1', expect.objectContaining({
+      userMessage: [
+        'queued while thinking begins',
+        'queued while codex is reading transport runtime',
+        'queued while codex is analyzing session manager',
+        'queued while codex is explaining findings',
+      ].join('\n\n'),
+    }));
+
+    await sdkRuntime.kill();
   });
 
   it('send() queues when any active-turn marker is present, even if the sending flag is stale', async () => {
