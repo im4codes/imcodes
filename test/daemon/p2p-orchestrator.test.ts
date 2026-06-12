@@ -72,7 +72,6 @@ import {
   _setIdlePollMs,
   _setMarkerPromptRetryAfterMs,
   _setMinProcessingMs,
-  _setPostSummaryConfirmationDelayMs,
   _setQueueStuckStopAfterMs,
   _setQueuedPromptStopAfterMs,
   _setRoundHopCleanupDelayMs,
@@ -87,6 +86,55 @@ import {
 
 let tempProjectDir: string;
 let autoWriteExecutionMarkers = true;
+const TEST_CLEANUP_SETTLE_MS = 50;
+const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
+let trackedTestTimers = new Set<ReturnType<typeof setTimeout>>();
+let pendingTestTasks = new Set<Promise<unknown>>();
+
+function installTestTimerTracking(): void {
+  trackedTestTimers = new Set();
+  pendingTestTasks = new Set();
+  globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+    let handle: ReturnType<typeof setTimeout>;
+    const wrapped = (...callbackArgs: unknown[]) => {
+      trackedTestTimers.delete(handle);
+      if (typeof handler === 'function') {
+        return (handler as (...innerArgs: unknown[]) => unknown)(...callbackArgs);
+      }
+      return undefined;
+    };
+    handle = realSetTimeout(wrapped, timeout, ...args);
+    trackedTestTimers.add(handle);
+    return handle;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((handle?: ReturnType<typeof setTimeout>) => {
+    if (handle) trackedTestTimers.delete(handle);
+    return realClearTimeout(handle);
+  }) as typeof clearTimeout;
+}
+
+function trackTestTask(task: Promise<unknown>): void {
+  const tracked = task.finally(() => {
+    pendingTestTasks.delete(tracked);
+  });
+  pendingTestTasks.add(tracked);
+}
+
+async function settleAndClearTestBackgroundWork(): Promise<void> {
+  await new Promise((r) => realSetTimeout(r, TEST_CLEANUP_SETTLE_MS));
+  if (pendingTestTasks.size > 0) {
+    const results = await Promise.allSettled([...pendingTestTasks]);
+    const rejected = results.find((result) => result.status === 'rejected');
+    if (rejected?.status === 'rejected') throw rejected.reason;
+  }
+  for (const timer of trackedTestTimers) {
+    realClearTimeout(timer);
+  }
+  trackedTestTimers.clear();
+  globalThis.setTimeout = realSetTimeout;
+  globalThis.clearTimeout = realClearTimeout;
+}
 
 function pathFromPrompt(prompt: string): string {
   const match = prompt.match(/\/\S+?\.md/);
@@ -145,9 +193,9 @@ function makeFakeTransportRuntime(sessionName: string): Record<string, unknown> 
     send: vi.fn((prompt: string) => {
       const filePath = [...prompt.matchAll(/\/\S+?\.md/g)].at(-1)?.[0] ?? pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
-      void appendFile(filePath, `\n## ${heading}\n\nTransport output from ${sessionName}.\n`, 'utf8')
+      trackTestTask(appendFile(filePath, `\n## ${heading}\n\nTransport output from ${sessionName}.\n`, 'utf8')
         .then(() => writeExecutionMarkerFromPrompt(prompt))
-        .then(() => setTimeout(() => notifySessionIdle(sessionName), 20));
+        .then(() => setTimeout(() => notifySessionIdle(sessionName), 20)));
       return 'sent';
     }),
   };
@@ -180,6 +228,7 @@ async function waitForNoRoundHopArtifacts(projectDir: string, runId: string, max
 }
 
 beforeEach(async () => {
+  installTestTimerTracking();
   vi.clearAllMocks();
   clearAutoDeliverP2pLocksForTests();
   _setIdlePollMs(20);
@@ -187,7 +236,6 @@ beforeEach(async () => {
   _setMarkerPromptRetryAfterMs(0);
   _setMinProcessingMs(0);
   _setFileSettleCycles(1);
-  _setPostSummaryConfirmationDelayMs(0);
   _setQueueStuckStopAfterMs(40);
   _setQueuedPromptStopAfterMs(40);
   _setRoundHopCleanupDelayMs(0);
@@ -230,15 +278,13 @@ afterEach(async () => {
   // Cancel all active runs BEFORE deleting the temp dir to prevent background
   // async ops (file reads, idle polls) from throwing ENOENT on deleted files.
   await Promise.allSettled(listP2pRuns().map((r) => cancelP2pRun(r.id, serverLinkMock as any)));
-  // Brief settle so in-flight promises flush before filesystem cleanup.
-  await new Promise((r) => setTimeout(r, 50));
+  await settleAndClearTestBackgroundWork();
 
   _setIdlePollMs(1000);
   _setGracePeriodMs(45000);
   _setMarkerPromptRetryAfterMs(30000);
   _setMinProcessingMs(8000);
   _setFileSettleCycles(2);
-  _setPostSummaryConfirmationDelayMs(3000);
   _setQueueStuckStopAfterMs(120000);
   _setQueuedPromptStopAfterMs(20000);
   _setRoundHopCleanupDelayMs(0);

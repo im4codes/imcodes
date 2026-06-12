@@ -2712,7 +2712,7 @@ describe('p2p-workflow reverse-regression', () => {
     ).toBe(true);
   });
 
-  it('#81 P2P marker gates MUST watchdog stale queues without blind prompt retry (R3 v2 PR-ρ)', () => {
+  it('#81 P2P marker gates MUST settle marker-proven turns without blind prompt retry (R3 v2 PR-ρ)', () => {
     const orchestrator = read('src/daemon/p2p-orchestrator.ts');
 
     expect(
@@ -2724,9 +2724,9 @@ describe('p2p-workflow reverse-regression', () => {
       'marker-missing retries must be throttled',
     ).toBe(true);
     expect(
-      orchestrator.text.includes('POST_SUMMARY_CONFIRMATION_DELAY_MS = 3_000'),
-      'execution follow-up confirmation must wait briefly after the execution marker is observed',
-    ).toBe(true);
+      orchestrator.text.includes('POST_SUMMARY_CONFIRMATION_DELAY_MS'),
+      'execution marker proof must not keep a stale delay hook that stalls the confirmation follow-up',
+    ).toBe(false);
     expect(
       /async\s+function\s+maybeStopStaleP2pTransportQueue\s*\(/.test(orchestrator.text)
         && /runtime\.cancelStaleActiveTurnWithPending\(/.test(orchestrator.text)
@@ -2743,8 +2743,8 @@ describe('p2p-workflow reverse-regression', () => {
     expect(executionGateAnchor, 'runPostSummaryExecutionGate must exist').toBeGreaterThan(0);
     const executionGateWindow = orchestrator.text.slice(executionGateAnchor, executionGateAnchor + 5200);
     expect(
-      /POST_SUMMARY_CONFIRMATION_DELAY_MS[\s\S]{0,360}runPostSummaryExecutionConfirmationGate/.test(executionGateWindow),
-      'execution gate must delay the follow-up prompt after observing the execution marker',
+      /markerState\?\.ok[\s\S]{0,360}settlePostSummaryRuntimeFromMarker\([\s\S]{0,360}runPostSummaryExecutionConfirmationGate/.test(executionGateWindow),
+      'execution marker proof must settle the active runtime and advance directly to confirmation',
     ).toBe(true);
     expect(
       /maybeStopStaleP2pTransportQueue\([\s\S]{0,260}reason:\s*'execution_marker_missing'/.test(executionGateWindow),

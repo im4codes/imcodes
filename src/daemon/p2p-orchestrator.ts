@@ -757,7 +757,6 @@ let GRACE_PERIOD_DEFAULT_MS = 45_000; // Complex analysis can be slow, but blank
 let MIN_PROCESSING_MS = 8_000; // Give the agent a short startup window before trusting idle detection.
 let FILE_SETTLE_CYCLES = 2; // File must stop growing for 2 poll cycles (2s) to be "settled".
 let MARKER_PROMPT_RETRY_AFTER_MS = 30_000; // Marker prompts may be retried, but only after queue-aware idle.
-let POST_SUMMARY_CONFIRMATION_DELAY_MS = 3_000; // Let the execution marker/status settle before the follow-up check.
 let QUEUE_STUCK_STOP_AFTER_MS = 120_000; // Generic stale queue recovery stays conservative.
 let QUEUED_PROMPT_STOP_AFTER_MS = 20_000; // P2P-owned queued prompt should be recovered quickly.
 let ROUND_HOP_CLEANUP_DELAY_MS = 0;
@@ -772,8 +771,6 @@ export function _setMinProcessingMs(ms: number): void { MIN_PROCESSING_MS = ms; 
 export function _setFileSettleCycles(n: number): void { FILE_SETTLE_CYCLES = n; }
 /** Override marker retry delay for tests. */
 export function _setMarkerPromptRetryAfterMs(ms: number): void { MARKER_PROMPT_RETRY_AFTER_MS = ms; }
-/** Override follow-up confirmation delay for tests. */
-export function _setPostSummaryConfirmationDelayMs(ms: number): void { POST_SUMMARY_CONFIRMATION_DELAY_MS = ms; }
 /** Override stale queue watchdog threshold for tests. */
 export function _setQueueStuckStopAfterMs(ms: number): void { QUEUE_STUCK_STOP_AFTER_MS = ms; }
 /** Override queued P2P prompt watchdog threshold for tests. */
