@@ -198,6 +198,11 @@ function writeTransportQueueHidden(storageKey: string | null, hidden: boolean): 
   }
 }
 
+function isModalKeyboardOwnerOpen(): boolean {
+  if (typeof document === 'undefined') return false;
+  return !!document.querySelector('[role="dialog"][aria-modal="true"], .fb-lightbox, .html-fullscreen-preview');
+}
+
 type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'fable' | 'opus[1M]' | 'sonnet' | 'haiku';
 
@@ -277,17 +282,23 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
   }
 }
 
-function appendStoredComposerAttachment(storageKey: string, attachment: ComposerAttachment): ComposerAttachment[] {
+function appendStoredComposerAttachments(storageKey: string, attachments: readonly ComposerAttachment[]): ComposerAttachment[] {
   const current = parseStoredComposerAttachments(window.sessionStorage.getItem(storageKey));
-  const next = renumberAttachments([...current, attachment]);
+  const next = renumberAttachments([...current, ...attachments]);
   window.sessionStorage.setItem(storageKey, JSON.stringify(next));
   return next;
 }
 
 type ComposerUploadSnapshot = {
-  uploading: boolean;
-  progress: number;
+  uploads: ComposerUploadItem[];
   error: string | null;
+};
+
+type ComposerUploadItem = {
+  id: string;
+  name: string;
+  progress: number;
+  status: 'uploading' | 'done' | 'error';
 };
 
 type ComposerUploadEntry = {
@@ -296,11 +307,16 @@ type ComposerUploadEntry = {
 };
 
 const DEFAULT_COMPOSER_UPLOAD_STATE: ComposerUploadSnapshot = {
-  uploading: false,
-  progress: 0,
+  uploads: [],
   error: null,
 };
 const composerUploadStore = new Map<string, ComposerUploadEntry>();
+let composerUploadIdCounter = 0;
+
+function createComposerUploadId(): string {
+  composerUploadIdCounter += 1;
+  return `upload-${composerUploadIdCounter}`;
+}
 
 function getComposerUploadEntry(key: string): ComposerUploadEntry {
   let entry = composerUploadStore.get(key);
@@ -312,23 +328,54 @@ function getComposerUploadEntry(key: string): ComposerUploadEntry {
 }
 
 function getComposerUploadSnapshot(key: string): ComposerUploadSnapshot {
-  return { ...getComposerUploadEntry(key).snapshot };
+  const snapshot = getComposerUploadEntry(key).snapshot;
+  return { ...snapshot, uploads: snapshot.uploads.map((item) => ({ ...item })) };
 }
 
 function updateComposerUploadSnapshot(key: string, patch: Partial<ComposerUploadSnapshot>): void {
   const entry = getComposerUploadEntry(key);
-  entry.snapshot = { ...entry.snapshot, ...patch };
-  const next = { ...entry.snapshot };
+  entry.snapshot = {
+    ...entry.snapshot,
+    ...patch,
+    uploads: patch.uploads ? patch.uploads.map((item) => ({ ...item })) : entry.snapshot.uploads,
+  };
+  const next = getComposerUploadSnapshot(key);
   for (const listener of entry.listeners) listener(next);
+}
+
+function addComposerUploadItems(key: string, items: ComposerUploadItem[]): void {
+  const entry = getComposerUploadEntry(key);
+  updateComposerUploadSnapshot(key, {
+    error: null,
+    uploads: [...entry.snapshot.uploads, ...items],
+  });
+}
+
+function updateComposerUploadItem(key: string, id: string, patch: Partial<ComposerUploadItem>): void {
+  const entry = getComposerUploadEntry(key);
+  updateComposerUploadSnapshot(key, {
+    uploads: entry.snapshot.uploads.map((item) => (
+      item.id === id ? { ...item, ...patch } : item
+    )),
+  });
+}
+
+function removeComposerUploadItems(key: string, ids: readonly string[]): void {
+  if (ids.length === 0) return;
+  const idSet = new Set(ids);
+  const entry = getComposerUploadEntry(key);
+  updateComposerUploadSnapshot(key, {
+    uploads: entry.snapshot.uploads.filter((item) => !idSet.has(item.id)),
+  });
 }
 
 function subscribeComposerUploadSnapshot(key: string, listener: (snapshot: ComposerUploadSnapshot) => void): () => void {
   const entry = getComposerUploadEntry(key);
   entry.listeners.add(listener);
-  listener({ ...entry.snapshot });
+  listener(getComposerUploadSnapshot(key));
   return () => {
     entry.listeners.delete(listener);
-    if (entry.listeners.size === 0 && !entry.snapshot.uploading && !entry.snapshot.error) {
+    if (entry.listeners.size === 0 && entry.snapshot.uploads.length === 0 && !entry.snapshot.error) {
       composerUploadStore.delete(key);
     }
   };
@@ -770,8 +817,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   // File upload state
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadSnapshot, setUploadSnapshot] = useState(() => getComposerUploadSnapshot(composerUploadKey));
-  const uploading = uploadSnapshot.uploading;
-  const uploadProgress = uploadSnapshot.progress;
+  const uploadRows = uploadSnapshot.uploads;
+  const uploading = uploadRows.some((item) => item.status === 'uploading');
   const uploadError = uploadSnapshot.error;
   const [sendWarning, setSendWarning] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
@@ -2503,7 +2550,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleKeyDown = (e: KeyboardEvent) => {
     if (imeComposingRef.current || isImeComposingKeyEvent(e)) return;
 
-    if (e.key === 'Escape' && effectiveRuntimeType === 'transport' && isRunningSessionState(activeSession?.state)) {
+    if (
+      e.key === 'Escape'
+      && effectiveRuntimeType === 'transport'
+      && isRunningSessionState(activeSession?.state)
+      && !isModalKeyboardOwnerOpen()
+    ) {
       e.preventDefault();
       handleStopPress();
       return;
@@ -2584,23 +2636,25 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (files.length === 0 || !serverId) return false;
     const uploadKey = composerUploadKey;
     const uploadAttachmentDraftKey = attachmentDraftKey;
-    updateComposerUploadSnapshot(uploadKey, { uploading: true, progress: 0, error: null });
-    let uploadedAny = false;
-    for (const file of files) {
+    const uploadItems = files.map((file) => ({
+      id: createComposerUploadId(),
+      name: file.name || 'file',
+      progress: 0,
+      status: 'uploading' as const,
+    }));
+    addComposerUploadItems(uploadKey, uploadItems);
+
+    const uploadedAttachments = await Promise.all(files.map(async (file, index) => {
+      const uploadItem = uploadItems[index];
       try {
-        const result = await uploadFile(serverId, file, (pct) => updateComposerUploadSnapshot(uploadKey, { progress: pct }));
+        const result = await uploadFile(serverId, file, (pct) => {
+          updateComposerUploadItem(uploadKey, uploadItem.id, { progress: pct });
+        });
+        updateComposerUploadItem(uploadKey, uploadItem.id, { progress: 100, status: 'done' });
         if (result.attachment?.daemonPath) {
-          uploadedAny = true;
-          const attachment = { path: result.attachment.daemonPath, name: file.name, seq: 0 };
-          if (uploadAttachmentDraftKey) {
-            const next = appendStoredComposerAttachment(uploadAttachmentDraftKey, attachment);
-            if (mountedRef.current && attachmentDraftKeyRef.current === uploadAttachmentDraftKey) {
-              setAttachments(next);
-            }
-          } else {
-            setAttachments((prev) => renumberAttachments([...prev, attachment]));
-          }
+          return { path: result.attachment.daemonPath, name: file.name, seq: 0 };
         }
+        return null;
       } catch (err) {
         console.error('[upload] failed:', err);
         const body = err instanceof Error ? err.message : String(err);
@@ -2612,12 +2666,26 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         } else {
           errorMessage = t('upload.upload_failed');
         }
+        updateComposerUploadItem(uploadKey, uploadItem.id, { status: 'error' });
         updateComposerUploadSnapshot(uploadKey, { error: errorMessage });
         setTimeout(() => updateComposerUploadSnapshot(uploadKey, { error: null }), 5000);
+        return null;
+      }
+    }));
+
+    const successfulAttachments = uploadedAttachments.filter((entry): entry is ComposerAttachment => !!entry);
+    if (successfulAttachments.length > 0) {
+      if (uploadAttachmentDraftKey) {
+        const next = appendStoredComposerAttachments(uploadAttachmentDraftKey, successfulAttachments);
+        if (mountedRef.current && attachmentDraftKeyRef.current === uploadAttachmentDraftKey) {
+          setAttachments(next);
+        }
+      } else {
+        setAttachments((prev) => renumberAttachments([...prev, ...successfulAttachments]));
       }
     }
-    updateComposerUploadSnapshot(uploadKey, { uploading: false, progress: uploadedAny ? 100 : 0 });
-    return uploadedAny;
+    removeComposerUploadItems(uploadKey, uploadItems.map((item) => item.id));
+    return successfulAttachments.length > 0;
   }, [attachmentDraftKey, composerUploadKey, serverId, t]);
 
   const handleFileUpload = useCallback(async (files: FileList | null) => {
@@ -3650,13 +3718,42 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
       )}
 
-      {/* Upload progress bar */}
-      {uploading && (
-        <div style={{ margin: '0 8px 4px', height: 18, display: 'flex', alignItems: 'center', gap: 8 }}>
-          <div style={{ flex: 1, height: 4, background: 'rgba(255,255,255,0.1)', borderRadius: 2, overflow: 'hidden' }}>
-            <div style={{ width: `${uploadProgress}%`, height: '100%', background: '#3b82f6', borderRadius: 2, transition: 'width 0.2s ease' }} />
-          </div>
-          <span style={{ fontSize: 11, color: '#94a3b8', minWidth: 32 }}>{uploadProgress}%</span>
+      {/* Upload progress bars */}
+      {uploadRows.length > 0 && (
+        <div style={{ margin: '0 8px 4px', display: 'grid', gap: 4 }}>
+          {uploadRows.map((item) => (
+            <div
+              key={item.id}
+              data-testid="composer-upload-row"
+              style={{ minHeight: 18, display: 'grid', gridTemplateColumns: 'minmax(72px, 0.9fr) minmax(80px, 1fr) 38px', alignItems: 'center', gap: 8 }}
+            >
+              <span
+                title={item.name}
+                style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: '#94a3b8' }}
+              >
+                {item.name}
+              </span>
+              <div
+                role="progressbar"
+                aria-label={`${item.name} upload progress`}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={item.progress}
+                style={{ height: 4, background: 'rgba(255,255,255,0.1)', borderRadius: 2, overflow: 'hidden' }}
+              >
+                <div
+                  style={{
+                    width: `${item.progress}%`,
+                    height: '100%',
+                    background: item.status === 'error' ? '#ef4444' : '#3b82f6',
+                    borderRadius: 2,
+                    transition: 'width 0.2s ease',
+                  }}
+                />
+              </div>
+              <span data-testid="composer-upload-progress" style={{ fontSize: 11, color: '#94a3b8', textAlign: 'right' }}>{item.progress}%</span>
+            </div>
+          ))}
         </div>
       )}
 

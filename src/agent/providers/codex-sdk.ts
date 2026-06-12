@@ -60,6 +60,7 @@ const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
 const COMPACT_START_ACCEPT_TIMEOUT_MS = 15_000;
 const COMPACT_NO_SIGNAL_SETTLE_MS = 5_000;
 const COMPACT_HARD_TIMEOUT_MS = 120_000;
+const CODEX_IDLE_STATUS_COMPLETION_FALLBACK_MS = 30_000;
 const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
@@ -387,6 +388,9 @@ interface CodexSdkSessionState {
   currentMessageId: string | null;
   currentText: string;
   pendingComplete?: AgentMessage;
+  idleStatusCompletionTimer: ReturnType<typeof setTimeout> | null;
+  idleStatusCompletionTurnId?: string;
+  activeItemIds: Set<string>;
   cancelled: boolean;
   cancelTimer: ReturnType<typeof setTimeout> | null;
   compactSettleTimer: ReturnType<typeof setTimeout> | null;
@@ -1445,6 +1449,9 @@ export class CodexSdkProvider implements TransportProvider {
       currentMessageId: null,
       currentText: '',
       pendingComplete: undefined,
+      idleStatusCompletionTimer: null,
+      idleStatusCompletionTurnId: undefined,
+      activeItemIds: new Set(),
       cancelled: false,
       cancelTimer: null,
       compactSettleTimer: null,
@@ -1568,6 +1575,8 @@ export class CodexSdkProvider implements TransportProvider {
     state.currentText = '';
     state.currentMessageId = null;
     state.pendingComplete = undefined;
+    this.clearIdleStatusCompletionFallback(state);
+    state.activeItemIds.clear();
     state.cancelled = false;
     this.clearCancelTimer(state);
     state.lastUsage = undefined;
@@ -1629,6 +1638,8 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearStatus(sessionId, state);
       state.runningTurnId = undefined;
       state.pendingComplete = undefined;
+      this.clearIdleStatusCompletionFallback(state);
+      state.activeItemIds.clear();
       this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
       this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
@@ -1647,6 +1658,7 @@ export class CodexSdkProvider implements TransportProvider {
     for (const [sessionId, state] of this.sessions) {
       this.clearCancelTimer(state);
       this.clearCompactTimers(state);
+      this.clearIdleStatusCompletionFallback(state);
       this.clearRawChecklistPollTimer(state);
       if (!options.clearSessions) {
         this.clearStatus(sessionId, state);
@@ -1657,6 +1669,7 @@ export class CodexSdkProvider implements TransportProvider {
         state.currentMessageId = null;
         state.currentText = '';
         state.pendingComplete = undefined;
+        state.activeItemIds.clear();
         state.cancelled = false;
         state.lastStatusSignature = null;
         this.clearPendingSessionSystemTextUpdate(state);
@@ -1816,6 +1829,8 @@ export class CodexSdkProvider implements TransportProvider {
       if (state.runningTurnId) this.armRawChecklistPolling(sessionId, state);
     } catch (err) {
       state.runningTurnId = undefined;
+      this.clearIdleStatusCompletionFallback(state);
+      state.activeItemIds.clear();
       this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
       const error = this.normalizeError(err);
@@ -1868,6 +1883,7 @@ export class CodexSdkProvider implements TransportProvider {
       }
     } catch (err) {
       this.clearCompactTimers(state);
+      this.clearIdleStatusCompletionFallback(state);
       this.clearStatus(sessionId, state);
       state.runningCompact = false;
       state.runningTurnId = undefined;
@@ -2215,6 +2231,7 @@ export class CodexSdkProvider implements TransportProvider {
     const item = isRecord(params.item) ? params.item : undefined;
     if (!sessionId || !state || !item) return false;
     if (state.cancelled) return true;
+    this.deferIdleStatusCompletionFallback(sessionId, state);
 
     if (item.type === 'function_call') {
       const name = meaningfulString(item.name);
@@ -2366,6 +2383,7 @@ export class CodexSdkProvider implements TransportProvider {
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
+      this.deferIdleStatusCompletionFallback(sessionId, state);
       const normalizedUsage = normalizeCodexTokenUsage(params);
       if (!normalizedUsage) return;
       state.lastUsage = normalizedUsage;
@@ -2394,6 +2412,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (!sessionId || !state) return;
       const status = readThreadStatus(params);
       if (isThreadActiveStatus(status)) {
+        this.clearIdleStatusCompletionFallback(state);
         if (!state.runningCompact) return;
         state.compactObserved = true;
         this.clearCompactSettleTimer(state);
@@ -2409,7 +2428,7 @@ export class CodexSdkProvider implements TransportProvider {
           return;
         }
         if (state.runningTurnId) {
-          await this.completeTurn(sessionId, state, readParamTurnId(params) ?? state.runningTurnId);
+          this.armIdleStatusCompletionFallback(sessionId, state, readParamTurnId(params));
         }
       }
       return;
@@ -2431,6 +2450,7 @@ export class CodexSdkProvider implements TransportProvider {
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       if (state.cancelled) return;
+      this.deferIdleStatusCompletionFallback(sessionId, state);
       this.clearStatus(sessionId, state);
       // Reset the streaming accumulator when a new agentMessage item starts so
       // its deltas don't render prefixed with the previous message's full text
@@ -2459,6 +2479,7 @@ export class CodexSdkProvider implements TransportProvider {
 
       const item = params.item as Record<string, any> | undefined;
       if (!item) return;
+      this.trackCodexTurnItemActivity(sessionId, state, method, item);
 
       if (item.type === 'contextCompaction') {
         state.runningCompact = true;
@@ -2526,6 +2547,7 @@ export class CodexSdkProvider implements TransportProvider {
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
+      this.clearIdleStatusCompletionFallback(state);
       const turn = params.turn ?? {};
       const status = turn.status;
       const turnId = readParamTurnId(params);
@@ -2545,6 +2567,7 @@ export class CodexSdkProvider implements TransportProvider {
         state.runningCompact = false;
         state.compactObserved = false;
         state.runningTurnId = undefined;
+        state.activeItemIds.clear();
         this.clearPendingSessionSystemTextUpdate(state);
         const error = this.normalizeError(turn.error?.message ?? 'Codex turn failed', turn.error);
         if (this.isCodexAuthError(error)) {
@@ -2563,11 +2586,13 @@ export class CodexSdkProvider implements TransportProvider {
         state.compactObserved = false;
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
+          state.activeItemIds.clear();
           this.clearPendingSessionSystemTextUpdate(state);
           return;
         }
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
+        state.activeItemIds.clear();
         this.clearPendingSessionSystemTextUpdate(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
@@ -2586,6 +2611,7 @@ export class CodexSdkProvider implements TransportProvider {
         state.pendingComplete = undefined;
         state.currentMessageId = null;
         state.currentText = '';
+        state.activeItemIds.clear();
         state.cancelled = false;
         this.clearPendingSessionSystemTextUpdate(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
@@ -2599,6 +2625,7 @@ export class CodexSdkProvider implements TransportProvider {
 
   private async completeTurn(sessionId: string, state: CodexSdkSessionState, turnId?: string): Promise<void> {
     this.clearCancelTimer(state);
+    this.clearIdleStatusCompletionFallback(state);
     this.clearStatus(sessionId, state);
     this.queueRawChecklistHistoryScan(sessionId, state);
     this.clearRawChecklistPollTimer(state);
@@ -2612,6 +2639,7 @@ export class CodexSdkProvider implements TransportProvider {
     const generatedImageTracking = state.generatedImageTracking;
     const alreadyDetectedImagePaths = [...state.generatedImagePaths];
     state.runningTurnId = undefined;
+    state.activeItemIds.clear();
     state.generatedImageTracking = null;
     const newlyDetectedImagePaths = await this.detectNewGeneratedImagePaths(generatedImageTracking);
     const generatedImagePaths = [
@@ -2860,6 +2888,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
     this.clearRawChecklistPollTimer(state);
+    this.clearIdleStatusCompletionFallback(state);
     this.clearStatus(sessionId, state);
     state.runningCompact = false;
     state.runningTurnId = undefined;
@@ -2868,6 +2897,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.currentMessageId = null;
     state.currentText = '';
     state.pendingComplete = undefined;
+    state.activeItemIds.clear();
     this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex compact cancelled', true));
   }
 
@@ -2907,6 +2937,72 @@ export class CodexSdkProvider implements TransportProvider {
     state.cancelTimer = null;
   }
 
+  private clearIdleStatusCompletionTimer(state: CodexSdkSessionState): void {
+    if (!state.idleStatusCompletionTimer) return;
+    clearTimeout(state.idleStatusCompletionTimer);
+    state.idleStatusCompletionTimer = null;
+  }
+
+  private clearIdleStatusCompletionFallback(state: CodexSdkSessionState): void {
+    this.clearIdleStatusCompletionTimer(state);
+    state.idleStatusCompletionTurnId = undefined;
+  }
+
+  private armIdleStatusCompletionFallback(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
+    const candidateTurnId = turnId ?? state.runningTurnId;
+    if (!candidateTurnId || !state.runningTurnId) return;
+    if (turnId && turnId !== state.runningTurnId) return;
+    state.idleStatusCompletionTurnId = candidateTurnId;
+    this.deferIdleStatusCompletionFallback(sessionId, state);
+  }
+
+  private deferIdleStatusCompletionFallback(sessionId: string, state: CodexSdkSessionState): void {
+    const candidateTurnId = state.idleStatusCompletionTurnId;
+    if (!candidateTurnId) return;
+    this.clearIdleStatusCompletionTimer(state);
+    if (!state.runningTurnId || candidateTurnId !== state.runningTurnId) {
+      state.idleStatusCompletionTurnId = undefined;
+      return;
+    }
+    if (state.activeItemIds.size > 0) return;
+
+    state.idleStatusCompletionTimer = setTimeout(() => {
+      state.idleStatusCompletionTimer = null;
+      if (!this.sessions.has(sessionId)) return;
+      const currentCandidateTurnId = state.idleStatusCompletionTurnId;
+      if (!currentCandidateTurnId || !state.runningTurnId) return;
+      if (state.runningCompact || state.cancelled) return;
+      if (currentCandidateTurnId !== state.runningTurnId) {
+        state.idleStatusCompletionTurnId = undefined;
+        return;
+      }
+      if (state.activeItemIds.size > 0) {
+        this.deferIdleStatusCompletionFallback(sessionId, state);
+        return;
+      }
+      state.idleStatusCompletionTurnId = undefined;
+      void this.completeTurn(sessionId, state, currentCandidateTurnId);
+    }, CODEX_IDLE_STATUS_COMPLETION_FALLBACK_MS);
+    state.idleStatusCompletionTimer.unref?.();
+  }
+
+  private trackCodexTurnItemActivity(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    method: 'item/started' | 'item/completed',
+    item: Record<string, any>,
+  ): void {
+    const itemId = meaningfulString(item.id);
+    if (itemId) {
+      if (method === 'item/started') {
+        state.activeItemIds.add(itemId);
+      } else {
+        state.activeItemIds.delete(itemId);
+      }
+    }
+    this.deferIdleStatusCompletionFallback(sessionId, state);
+  }
+
   private armCompactNoSignalSettle(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
     this.clearCompactSettleTimer(state);
     state.compactSettleTimer = setTimeout(() => {
@@ -2923,6 +3019,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (!this.sessions.has(sessionId)) return;
       if (!state.runningCompact) return;
       this.clearCompactTimers(state);
+      this.clearIdleStatusCompletionFallback(state);
       this.clearStatus(sessionId, state);
       state.runningCompact = false;
       state.runningTurnId = undefined;
@@ -2930,6 +3027,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearPendingSessionSystemTextUpdate(state);
       state.currentMessageId = null;
       state.currentText = '';
+      state.activeItemIds.clear();
       this.emitError(sessionId, this.makeError(
         PROVIDER_ERROR_CODES.PROVIDER_ERROR,
         `Codex SDK compact did not complete within ${Math.round(COMPACT_HARD_TIMEOUT_MS)}ms`,

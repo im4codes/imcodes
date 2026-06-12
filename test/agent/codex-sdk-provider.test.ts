@@ -1541,7 +1541,8 @@ describe('CodexSdkProvider', () => {
     expect(deltas.every((d) => !d.text.includes('First.Second'))).toBe(true);
   });
 
-  it('completes a normal turn from idle thread status when turn/completed is missing', async () => {
+  it('falls back to completing a quiet normal turn from idle thread status when turn/completed is missing', async () => {
+    vi.useFakeTimers();
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-idle-status-complete', cwd: '/tmp/project' });
@@ -1556,7 +1557,13 @@ describe('CodexSdkProvider', () => {
       params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
     });
     child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
-    await waitForCondition(() => completed.length === 1);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(completed).toEqual([]);
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(completed).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(0);
 
     expect(completed).toEqual(['Done']);
     await provider.send('route-idle-status-complete', 'next');
@@ -1564,6 +1571,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('does not duplicate a normal completion after idle status fallback', async () => {
+    vi.useFakeTimers();
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-idle-status-no-duplicate', cwd: '/tmp/project' });
@@ -1578,12 +1586,52 @@ describe('CodexSdkProvider', () => {
       params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
     });
     child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
-    await waitForCondition(() => completed.length === 1);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(0);
 
     child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
-    await flush();
+    await vi.advanceTimersByTimeAsync(0);
 
     expect(completed).toEqual(['Done']);
+  });
+
+  it('does not complete from idle thread status while a turn item is still active', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-idle-active-item', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('route-idle-active-item', 'hello');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: '' } },
+    });
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
+
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(completed).toEqual([]);
+    await expect(provider.send('route-idle-active-item', 'next')).rejects.toMatchObject({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+    });
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
+
+    vi.useRealTimers();
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done after active item' } },
+    });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await waitForCondition(() => completed.length === 1);
+
+    expect(completed).toEqual(['Done after active item']);
   });
 
   it('resumes with stored thread id on existing session', async () => {

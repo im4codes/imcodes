@@ -3629,6 +3629,36 @@ afterEach(() => {
     expect(ws.sendInput).not.toHaveBeenCalled();
   });
 
+  it('does not send direct cancel on Escape while a modal preview owns the keyboard', () => {
+    const ws = makeWs();
+    const dialog = document.createElement('div');
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    document.body.appendChild(dialog);
+    try {
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({
+            name: 'qwen-session',
+            agentType: 'qwen',
+            runtimeType: 'transport',
+            state: 'running',
+          })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+      fireEvent.keyDown(input, { key: 'Escape' });
+
+      expect(gatherSendCalls(ws)).toEqual([]);
+      expect(ws.sendInput).not.toHaveBeenCalled();
+    } finally {
+      dialog.remove();
+    }
+  });
+
   it('pressing Escape in a running transport sub-session uses the same Stop feedback', () => {
     const ws = makeWs();
     render(
@@ -4582,6 +4612,75 @@ afterEach(() => {
     await waitFor(() => {
       expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1');
     });
+  });
+
+  it('renders independent progress rows for a concurrent multi-file upload batch', async () => {
+    type UploadResolver = (value: { attachment: { daemonPath: string } }) => void;
+    const pendingUploads: Array<{
+      file: File;
+      onProgress?: (pct: number) => void;
+      resolve: UploadResolver;
+    }> = [];
+    uploadFileMock.mockImplementation((_serverId: string, file: File, onProgress?: (pct: number) => void) => (
+      new Promise<{ attachment: { daemonPath: string } }>((resolve) => {
+        pendingUploads.push({ file, onProgress, resolve });
+      })
+    ));
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const alpha = new File(['aaa'], 'alpha.txt', { type: 'text/plain' });
+    const beta = new File(['bbb'], 'beta.txt', { type: 'text/plain' });
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [alpha, beta],
+        getData: () => '',
+      },
+    });
+
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(2));
+    expect(pendingUploads.map((entry) => entry.file.name)).toEqual(['alpha.txt', 'beta.txt']);
+
+    await act(async () => {
+      pendingUploads[0].onProgress?.(24);
+      pendingUploads[1].onProgress?.(68);
+    });
+
+    const rows = screen.getAllByTestId('composer-upload-row');
+    expect(rows).toHaveLength(2);
+    expect(within(rows[0]).getByText('alpha.txt')).toBeDefined();
+    expect(within(rows[1]).getByText('beta.txt')).toBeDefined();
+    expect(screen.getAllByRole('progressbar').map((bar) => bar.getAttribute('aria-valuenow'))).toEqual(['24', '68']);
+
+    await act(async () => {
+      pendingUploads[1].resolve({ attachment: { daemonPath: '/tmp/beta.txt' } });
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(screen.getAllByRole('progressbar').map((bar) => bar.getAttribute('aria-valuenow'))).toEqual(['24', '100']);
+    });
+
+    await act(async () => {
+      pendingUploads[0].resolve({ attachment: { daemonPath: '/tmp/alpha.txt' } });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(screen.queryAllByTestId('composer-upload-row')).toHaveLength(0);
+      expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1');
+      expect(screen.getByTestId('attachment-tag-2').textContent).toBe('#2');
+    });
+    const badges = document.querySelectorAll('.attachment-badge');
+    expect(badges[0].querySelector('.attachment-badge-name')?.textContent).toBe('alpha.txt');
+    expect(badges[1].querySelector('.attachment-badge-name')?.textContent).toBe('beta.txt');
   });
 
   it('R3 v2 PR-ρ — removing a middle attachment renumbers the remaining tags consecutively', async () => {
