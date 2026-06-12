@@ -282,9 +282,9 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
   }
 }
 
-function appendStoredComposerAttachments(storageKey: string, attachments: readonly ComposerAttachment[]): ComposerAttachment[] {
+function appendStoredComposerAttachment(storageKey: string, attachment: ComposerAttachment): ComposerAttachment[] {
   const current = parseStoredComposerAttachments(window.sessionStorage.getItem(storageKey));
-  const next = renumberAttachments([...current, ...attachments]);
+  const next = renumberAttachments([...current, attachment]);
   window.sessionStorage.setItem(storageKey, JSON.stringify(next));
   return next;
 }
@@ -2676,7 +2676,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const successfulAttachments = uploadedAttachments.filter((entry): entry is ComposerAttachment => !!entry);
     if (successfulAttachments.length > 0) {
       if (uploadAttachmentDraftKey) {
-        const next = appendStoredComposerAttachments(uploadAttachmentDraftKey, successfulAttachments);
+        let next: ComposerAttachment[] = [];
+        for (const attachment of successfulAttachments) {
+          next = appendStoredComposerAttachment(uploadAttachmentDraftKey, attachment);
+        }
         if (mountedRef.current && attachmentDraftKeyRef.current === uploadAttachmentDraftKey) {
           setAttachments(next);
         }
