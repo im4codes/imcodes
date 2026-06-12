@@ -2641,7 +2641,9 @@ export class CodexSdkProvider implements TransportProvider {
     state.runningTurnId = undefined;
     state.activeItemIds.clear();
     state.generatedImageTracking = null;
-    const newlyDetectedImagePaths = await this.detectNewGeneratedImagePaths(generatedImageTracking);
+    const newlyDetectedImagePaths = generatedImageTracking
+      ? await this.detectNewGeneratedImagePaths(generatedImageTracking)
+      : [];
     const generatedImagePaths = [
       ...alreadyDetectedImagePaths,
       ...newlyDetectedImagePaths.filter((path) => !alreadyDetectedImagePaths.includes(path)),
