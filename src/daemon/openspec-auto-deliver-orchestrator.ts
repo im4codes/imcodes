@@ -256,6 +256,8 @@ interface AutoDeliverRun {
   serverLink: ServerLink;
 }
 
+type ImplementationMarkerContract = NonNullable<AutoDeliverRun['activeImplementationMarker']>;
+
 type LaunchResult =
   | { ok: true; projection: OpenSpecAutoDeliverProjection }
   | { ok: false; error: string; projection?: OpenSpecAutoDeliverProjection };
@@ -621,6 +623,23 @@ function forgetRequestProjectionFingerprints(run: AutoDeliverRun): void {
 
 function effectiveMaxImplementationPrompts(run: AutoDeliverRun): number {
   return run.materializedLimits.maxImplementationPrompts ?? OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS;
+}
+
+async function buildImplementationMarkerContract(
+  run: AutoDeliverRun,
+  promptCount: number,
+): Promise<ImplementationMarkerContract> {
+  const cycleIndex = Math.max(1, promptCount);
+  return {
+    markerPath: await buildImplementationMarkerPath(run, run.generation, cycleIndex),
+    spec: {
+      runId: run.runId,
+      cycleIndex,
+      cycleTotal: Math.max(effectiveMaxImplementationPrompts(run), cycleIndex),
+      nonce: randomUUID(),
+    },
+    retryCount: 0,
+  };
 }
 
 async function resolveChangeRoot(sessionName: string, changeName: string): Promise<{ ok: true; projectRoot: string; root: string } | { ok: false; error: string }> {
@@ -996,16 +1015,7 @@ async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: 
   run.stage = 'implementation_task_loop';
   run.implementationPromptCount += 1;
   run.activeCommandId = `${run.runId}:implementation:${run.generation}:${run.implementationPromptCount}`;
-  run.activeImplementationMarker = {
-    markerPath: await buildImplementationMarkerPath(run, run.generation, run.implementationPromptCount),
-    spec: {
-      runId: run.runId,
-      cycleIndex: run.implementationPromptCount,
-      cycleTotal: effectiveMaxImplementationPrompts(run),
-      nonce: randomUUID(),
-    },
-    retryCount: 0,
-  };
+  run.activeImplementationMarker = await buildImplementationMarkerContract(run, run.implementationPromptCount);
   const prompt = buildImplementationPrompt(run, repairReason);
   timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
     text: prompt,
@@ -1133,15 +1143,31 @@ function buildImplementationMarkerReminderPrompt(run: AutoDeliverRun, reason: st
   ].join('\n');
 }
 
+async function ensureImplementationMarkerContractForReminder(
+  run: AutoDeliverRun,
+  reason: string,
+): Promise<{ marker: ImplementationMarkerContract; recovered: boolean }> {
+  if (run.activeImplementationMarker) {
+    return { marker: run.activeImplementationMarker, recovered: false };
+  }
+
+  const promptCount = Math.max(1, run.implementationPromptCount);
+  if (run.implementationPromptCount <= 0) run.implementationPromptCount = promptCount;
+  run.activeImplementationMarker = await buildImplementationMarkerContract(run, promptCount);
+  run.evidence = mergeEvidence(run.evidence, [{
+    source: 'daemon',
+    summary: `Implementation marker contract was missing (${reason}); Auto Deliver recreated it and re-sent the marker prompt automatically.`,
+    stale: false,
+  }]);
+  return { marker: run.activeImplementationMarker, recovered: true };
+}
+
 async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason: string): Promise<OpenSpecAutoDeliverProjection> {
   const elapsedProjection = enforceElapsedLimit(run);
   if (elapsedProjection) return elapsedProjection;
   const runtime = await awaitTransportRuntime(run.targetImplementationSessionName);
   if (!runtime) return terminalize(run, 'failed', 'missing_transport_runtime');
-  if (!run.activeImplementationMarker) {
-    return terminalize(run, 'needs_human', `implementation_marker_contract_missing:${reason}`);
-  }
-  const marker = run.activeImplementationMarker;
+  const { marker, recovered } = await ensureImplementationMarkerContractForReminder(run, reason);
   // Bound AND pace the idle -> "marker missing" -> reminder -> idle loop so it
   // cannot re-prompt the agent forever or spam it (previously a reminder fired
   // on every idle, with no count or rate limit; only the hours-long elapsed
@@ -1198,7 +1224,9 @@ async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason:
     return terminalize(run, 'failed', error instanceof Error ? `implementation_marker_reminder_send_failed:${error.message}` : 'implementation_marker_reminder_send_failed');
   }
   scheduleImplementationMarkerPoll(run);
-  run.latestMessage = `implementation_marker_missing:${reason}`;
+  run.latestMessage = recovered
+    ? `implementation_marker_contract_recreated:${reason}`
+    : `implementation_marker_missing:${reason}`;
   run.evidence = mergeEvidence(run.evidence, [{
     source: 'daemon',
     summary: `Implementation idle ignored because the completion marker was missing or invalid: ${reason}.`,
@@ -3426,4 +3454,11 @@ export function clearOpenSpecAutoDeliverRunsForTests(): void {
   activeRunByOwner.clear();
   terminalRunByOwner.clear();
   requestProjectionByFingerprint.clear();
+}
+
+export function dropOpenSpecAutoDeliverImplementationMarkerForTests(runId: string): boolean {
+  const run = runsById.get(runId);
+  if (!run) return false;
+  delete run.activeImplementationMarker;
+  return true;
 }

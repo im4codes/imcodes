@@ -66,6 +66,7 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
 
 import {
   clearOpenSpecAutoDeliverRunsForTests,
+  dropOpenSpecAutoDeliverImplementationMarkerForTests,
   getOpenSpecAutoDeliverTransitionTarget,
   handleOpenSpecAutoDeliverDaemonRestartCleanup,
   handleOpenSpecAutoDeliverCommand,
@@ -995,6 +996,55 @@ exec "${realGit}" "$@"
     expect(serverLinkMock.send.mock.calls.some((call) =>
       call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
       && call[0]?.projection?.terminalReason === 'implementation_marker_failed:remaining repair checklist gaps',
+    )).toBe(false);
+
+    expect(await writeLatestImplementationMarker()).toBe(true);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair',
+      2500,
+    );
+    expect(startP2pRunMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('recreates a missing implementation marker contract instead of asking the user', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-missing-implementation-marker-contract',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    const launchAck = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK
+      && msg.requestId === 'req-missing-implementation-marker-contract',
+      2500,
+    );
+    const runId = String(launchAck.projection.runId);
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      2500,
+    );
+
+    expect(dropOpenSpecAutoDeliverImplementationMarkerForTests(runId)).toBe(true);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    const reminderPrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver implementation is not complete yet for @openspec/changes/demo-change.')
+      && text.includes('Reason: implementation_marker_contract_missing')
+      && text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      2500,
+    );
+    expect(reminderPrompt).not.toContain('Implementation completion marker: unavailable.');
+    expect(serverLinkMock.send.mock.calls.some((call) =>
+      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && String(call[0]?.projection?.terminalReason ?? '').includes('implementation_marker_contract_missing'),
     )).toBe(false);
 
     expect(await writeLatestImplementationMarker()).toBe(true);
