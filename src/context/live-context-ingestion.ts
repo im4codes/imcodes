@@ -30,6 +30,7 @@ export function isLiveContextMaterializationAdmissionOpen(): boolean {
 export interface LiveContextIngestionOptions extends MaterializationCoordinatorOptions {
   sessionLookup: (sessionName: string) => SessionRecord | undefined;
   resolveBootstrap: (record: SessionRecord) => Promise<TransportContextBootstrap>;
+  shouldIngestTimelineEvent?: (event: TimelineEvent, session: SessionRecord) => boolean;
   onError?: (error: unknown, event: TimelineEvent) => void;
 }
 
@@ -44,6 +45,7 @@ export class LiveContextIngestion {
 
   private readonly sessionLookup: LiveContextIngestionOptions['sessionLookup'];
   private readonly resolveBootstrap: LiveContextIngestionOptions['resolveBootstrap'];
+  private readonly shouldIngestTimelineEvent?: LiveContextIngestionOptions['shouldIngestTimelineEvent'];
   private readonly onError?: LiveContextIngestionOptions['onError'];
   private readonly sessionWork = new Map<string, Promise<void>>();
   private readonly bootstrapCache = new Map<string, BootstrapCacheEntry>();
@@ -63,6 +65,7 @@ export class LiveContextIngestion {
     });
     this.sessionLookup = options.sessionLookup;
     this.resolveBootstrap = options.resolveBootstrap;
+    this.shouldIngestTimelineEvent = options.shouldIngestTimelineEvent;
     this.onError = options.onError;
     this.unsubscribeCacheInvalidation = subscribeRuntimeMemoryCacheInvalidation(() => {
       this.bootstrapCache.clear();
@@ -105,6 +108,7 @@ export class LiveContextIngestion {
     let lastTs = Date.now();
     let staged = 0;
     for (const event of events) {
+      if (this.shouldIngestTimelineEvent && !this.shouldIngestTimelineEvent(event, session)) continue;
       const mapped = mapTimelineEvent(event);
       if (!mapped) continue;
       staged += 1;
@@ -127,6 +131,7 @@ export class LiveContextIngestion {
   private async processTimelineEvent(event: TimelineEvent): Promise<void> {
     const session = this.sessionLookup(event.sessionId);
     if (!session) return;
+    if (this.shouldIngestTimelineEvent && !this.shouldIngestTimelineEvent(event, session)) return;
     const bootstrap = await this.getBootstrap(session);
     const target = toSessionTarget(session.name, bootstrap);
 
@@ -215,6 +220,7 @@ function toSessionTarget(sessionName: string, bootstrap: TransportContextBootstr
 function mapTimelineEvent(event: TimelineEvent): Pick<LocalContextEvent, 'eventType' | 'content' | 'metadata'> | null {
   switch (event.type) {
     case 'user.message':
+      if (event.payload.memoryExcluded === true) return null;
       return {
         eventType: 'user.turn',
         content: stringifyContent(event.payload.text),

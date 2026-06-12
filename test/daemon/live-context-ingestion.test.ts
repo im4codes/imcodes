@@ -21,6 +21,16 @@ async function successfulCompressor(input: CompressionInput): Promise<Compressio
   };
 }
 
+async function echoCompressor(input: CompressionInput): Promise<CompressionResult> {
+  return {
+    summary: input.events.map((event) => event.content).join('\n'),
+    model: 'test-model',
+    backend: 'test',
+    usedBackup: false,
+    fromSdk: true,
+  };
+}
+
 describe('LiveContextIngestion', () => {
   let tempDir: string;
   const namespace: ContextNamespace = { scope: 'personal', projectId: 'github.com/acme/repo' };
@@ -284,6 +294,53 @@ describe('LiveContextIngestion', () => {
     expect(enqueued).toHaveLength(1);
   });
 
+  it('lets callers suppress team participant timeline events before they enter memory staging', async () => {
+    const enqueued: MaterializationSkillReviewJob[] = [];
+    const workerSession = { ...session, name: 'deck_repo_w1', role: 'w1' as const };
+    const ingestion = new LiveContextIngestion({
+      compressor: echoCompressor,
+      thresholds: { eventCount: 99, idleMs: 1, scheduleMs: 1, minIntervalMs: 0 },
+      sessionLookup: (sessionName) => sessionName === workerSession.name ? workerSession : session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+      shouldIngestTimelineEvent: (event) => event.sessionId !== workerSession.name,
+      skillReviewScheduler: {
+        featureEnabled: true,
+        getState: () => ({
+          pendingKeys: new Set(),
+          lastRunByScope: new Map(),
+          dailyCountByScope: new Map(),
+        }),
+        policy: { toolIterationThreshold: 1, minIntervalMs: 0 },
+        enqueue: (job) => { enqueued.push(job); },
+      },
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 100, { text: 'P2P worker kickoff prompt' }, workerSession.name));
+    await ingestion.handleTimelineEvent(makeEvent('tool.result', 110, { output: 'worker tool evidence' }, workerSession.name));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 120, { text: 'P2P worker analysis', streaming: false }, workerSession.name));
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 130, { state: 'idle' }, workerSession.name));
+
+    expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({
+      totalRecords: 0,
+      stagedEventCount: 0,
+      dirtyTargetCount: 0,
+    });
+    expect(enqueued).toEqual([]);
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 200, {
+      text: 'Main internal summary prompt',
+      memoryExcluded: true,
+    }));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 210, { text: 'Main session summary', streaming: false }));
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 220, { state: 'idle' }));
+
+    const [summary] = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 });
+    expect(summary?.summary).toContain('Main session summary');
+    expect(summary?.summary).not.toContain('Main internal summary prompt');
+    expect(summary?.summary).not.toContain('P2P worker');
+    expect(summary?.summary).not.toContain('worker tool evidence');
+  });
+
   it('backfills recent timeline history for sessions that have no existing context activity', async () => {
     const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
       sessionLookup: () => session,
@@ -334,10 +391,15 @@ describe('LiveContextIngestion', () => {
   });
 });
 
-function makeEvent(type: TimelineEvent['type'], ts: number, payload: Record<string, unknown>): TimelineEvent {
+function makeEvent(
+  type: TimelineEvent['type'],
+  ts: number,
+  payload: Record<string, unknown>,
+  sessionId = 'deck_repo_brain',
+): TimelineEvent {
   return {
     eventId: `${type}-${ts}`,
-    sessionId: 'deck_repo_brain',
+    sessionId,
     ts,
     seq: ts,
     epoch: 1,

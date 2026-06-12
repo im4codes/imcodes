@@ -7,6 +7,7 @@ import { ServerLink } from './server-link.js';
 import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
 import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
+import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -591,6 +592,7 @@ export async function startup(): Promise<DaemonContext> {
   const liveContextIngestion = new LiveContextIngestion({
     sessionLookup: getSession,
     skillReviewScheduler: skillReviewWorker,
+    shouldIngestTimelineEvent: (event, session) => !isP2pParticipantMemoryNoise(event, session, listP2pRuns()),
     resolveBootstrap: (session) => resolveTransportContextBootstrap({
       projectDir: session.projectDir,
       transportConfig: getSession(session.name)?.transportConfig ?? session.transportConfig ?? {},

@@ -885,6 +885,10 @@ async function dispatchP2pPromptToSession(args: {
     timelineEmitter.emit(args.session, 'user.message', {
       text: args.prompt,
       ...(args.allowDuplicate ? { allowDuplicate: true } : {}),
+      memoryExcluded: true,
+      p2pRunId: args.run.id,
+      p2pDiscussionId: args.run.discussionId,
+      p2pPhase: args.run.activePhase,
     });
     const result = transportRuntime.send(args.prompt);
     if (result === 'queued') {
