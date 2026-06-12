@@ -1565,6 +1565,8 @@ describe('CodexSdkProvider', () => {
     await vi.advanceTimersByTimeAsync(1);
     await vi.advanceTimersByTimeAsync(0);
 
+    vi.useRealTimers();
+    await waitForCondition(() => completed.length === 1);
     expect(completed).toEqual(['Done']);
     await provider.send('route-idle-status-complete', 'next');
     expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
@@ -1617,8 +1619,9 @@ describe('CodexSdkProvider', () => {
     await vi.advanceTimersByTimeAsync(30_000);
     await vi.advanceTimersByTimeAsync(0);
 
+    vi.useRealTimers();
+    await waitForCondition(() => completed.length === 1);
     child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
-    await vi.advanceTimersByTimeAsync(0);
 
     expect(completed).toEqual(['Done']);
   });
