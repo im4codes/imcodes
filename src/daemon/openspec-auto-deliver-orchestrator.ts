@@ -19,6 +19,7 @@ import {
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES,
   OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS,
   OPENSPEC_AUTO_DELIVER_MAX_IMPLEMENTATION_MARKER_REMINDERS,
+  OPENSPEC_AUTO_DELIVER_MAX_RESULT_FILE_REPAIR_PROMPTS,
   OPENSPEC_AUTO_DELIVER_EVIDENCE_OPTIONAL_FIELDS,
   OPENSPEC_AUTO_DELIVER_EVIDENCE_REQUIRED_FIELDS,
   OPENSPEC_AUTO_DELIVER_MIN_ACCEPTABLE_MODULE_SCORE,
@@ -222,6 +223,7 @@ interface AutoDeliverRun {
     attemptId: string;
     authoritativeResultPath: string;
     resultFileRepairAttempted?: boolean;
+    resultFileRepairAttemptCount?: number;
     roundIndex: number;
     generation: number;
   };
@@ -232,6 +234,7 @@ interface AutoDeliverRun {
     attemptId: string;
     authoritativeResultPath: string;
     resultFileRepairAttempted?: boolean;
+    resultFileRepairAttemptCount?: number;
     roundIndex: number;
     generation: number;
   };
@@ -606,6 +609,23 @@ function terminalizeAndSend(
   const projection = terminalize(run, status, reason);
   send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
   return projection;
+}
+
+function isTransportRuntimeBusyForIdleAdvance(run: AutoDeliverRun): boolean {
+  const runtime = getTransportRuntime(run.targetImplementationSessionName);
+  if (!runtime) return false;
+  const snapshot = runtime as {
+    getStatus?: () => string;
+    sending?: boolean;
+    activeDispatchEntries?: unknown[];
+  };
+  const status = typeof snapshot.getStatus === 'function' ? snapshot.getStatus() : undefined;
+  return status === 'streaming'
+    || status === 'thinking'
+    || status === 'tool_running'
+    || status === 'permission'
+    || snapshot.sending === true
+    || (Array.isArray(snapshot.activeDispatchEntries) && snapshot.activeDispatchEntries.length > 0);
 }
 
 function enforceElapsedLimit(run: AutoDeliverRun): OpenSpecAutoDeliverProjection | null {
@@ -1567,12 +1587,14 @@ function buildPostRepairAcceptanceAuditResultRepairPrompt(
   run: AutoDeliverRun,
   metadata: OpenSpecAutoDeliverP2pMetadata,
   reason: string,
+  repairAttemptNumber: number,
 ): string {
   const specStage = metadata.stage === 'spec_audit_repair';
   return [
     `OpenSpec Auto Deliver needs the final ${specStage ? 'specification' : 'implementation'} acceptance audit authoritative result file for openspec/changes/${run.changeName}.`,
     '',
     `Problem: ${reason}`,
+    `Repair prompt attempt: ${repairAttemptNumber}/${OPENSPEC_AUTO_DELIVER_MAX_RESULT_FILE_REPAIR_PROMPTS}`,
     `Authoritative result file: ${metadata.authoritativeResultPath}`,
     `Resolved change root identity: ${metadata.resolvedChangeRootIdentity}`,
     '',
@@ -1662,11 +1684,11 @@ async function dispatchPostRepairAcceptanceAuditResultRepairPrompt(
   active: NonNullable<AutoDeliverRun['activeAcceptanceAudit']>,
   reason: string,
 ): Promise<OpenSpecAutoDeliverProjection> {
-  active.resultFileRepairAttempted = true;
+  const repairAttemptNumber = markResultFileRepairPromptDispatched(active);
   run.activeAcceptanceAudit = active;
-  run.activeCommandId = `${active.attemptId}:result-file-repair`;
+  run.activeCommandId = `${active.attemptId}:result-file-repair:${repairAttemptNumber}`;
   const metadata = acceptanceAuditMetadataFromActive(run, active);
-  const prompt = buildPostRepairAcceptanceAuditResultRepairPrompt(run, metadata, reason);
+  const prompt = buildPostRepairAcceptanceAuditResultRepairPrompt(run, metadata, reason, repairAttemptNumber);
   await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
   run.latestMessage = 'post_repair_result_file_repair_prompt_dispatched';
   return broadcastProjection(run);
@@ -1721,6 +1743,30 @@ const RETRYABLE_AUTHORITATIVE_RESULT_ERROR_CODES = new Set([
 function isRetryableAuditResultError(reason: string | undefined): boolean {
   const codes = reason?.split(',').map((code) => code.trim()).filter(Boolean) ?? [];
   return codes.length > 0 && codes.every((code) => RETRYABLE_AUTHORITATIVE_RESULT_ERROR_CODES.has(code));
+}
+
+type ResultFileRepairState = {
+  resultFileRepairAttempted?: boolean;
+  resultFileRepairAttemptCount?: number;
+};
+
+function resultFileRepairAttemptCount(active: ResultFileRepairState): number {
+  return active.resultFileRepairAttemptCount ?? (active.resultFileRepairAttempted ? 1 : 0);
+}
+
+function canDispatchResultFileRepairPrompt(active: ResultFileRepairState): boolean {
+  return resultFileRepairAttemptCount(active) < OPENSPEC_AUTO_DELIVER_MAX_RESULT_FILE_REPAIR_PROMPTS;
+}
+
+function markResultFileRepairPromptDispatched(active: ResultFileRepairState): number {
+  const next = resultFileRepairAttemptCount(active) + 1;
+  active.resultFileRepairAttempted = true;
+  active.resultFileRepairAttemptCount = next;
+  return next;
+}
+
+function exhaustedResultFileRepairReason(reason: string): string {
+  return `result_file_repair_prompts_exhausted:${reason}`;
 }
 
 function p2pAuditFailureSummary(p2pRun: P2pRun): string {
@@ -2207,7 +2253,13 @@ function buildAuditRequestText(run: AutoDeliverRun, metadata: OpenSpecAutoDelive
   ].join('\n');
 }
 
-function buildAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpecAutoDeliverP2pMetadata, p2pRun: P2pRun, reason: string): string {
+function buildAuditResultFileRepairPrompt(
+  run: AutoDeliverRun,
+  metadata: OpenSpecAutoDeliverP2pMetadata,
+  p2pRun: P2pRun,
+  reason: string,
+  repairAttemptNumber: number,
+): string {
   const stageVerdictScope = metadata.stage === 'spec_audit_repair'
     ? [
         'Spec-stage verdict scope:',
@@ -2225,6 +2277,7 @@ function buildAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpe
     '',
     `The audit-repair discussion has already completed; do not redo the full audit from scratch unless you must inspect your prior conclusion.`,
     `Problem: ${reason}`,
+    `Repair prompt attempt: ${repairAttemptNumber}/${OPENSPEC_AUTO_DELIVER_MAX_RESULT_FILE_REPAIR_PROMPTS}`,
     `Discussion file: ${p2pRun.contextFilePath}`,
     `Project root: ${run.projectRoot}`,
     `Authoritative result file: ${metadata.authoritativeResultPath}`,
@@ -2257,9 +2310,15 @@ function buildAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpe
   ].join('\n');
 }
 
-async function dispatchAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpecAutoDeliverP2pMetadata, p2pRun: P2pRun, reason: string): Promise<boolean> {
-  const commandId = `${metadata.attemptId}:authoritative-result-file-repair`;
-  const prompt = buildAuditResultFileRepairPrompt(run, metadata, p2pRun, reason);
+async function dispatchAuditResultFileRepairPrompt(
+  run: AutoDeliverRun,
+  metadata: OpenSpecAutoDeliverP2pMetadata,
+  p2pRun: P2pRun,
+  reason: string,
+  repairAttemptNumber: number,
+): Promise<boolean> {
+  const commandId = `${metadata.attemptId}:authoritative-result-file-repair:${repairAttemptNumber}`;
+  const prompt = buildAuditResultFileRepairPrompt(run, metadata, p2pRun, reason, repairAttemptNumber);
   await sendAutoDeliverPromptToImplementationSession(run, prompt, commandId);
   run.latestMessage = 'authoritative_result_file_repair_prompt_dispatched';
   broadcastProjection(run);
@@ -2825,10 +2884,16 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
   const verdict = await consumeAuditResultFile(run, expected);
   if (!verdict) {
     const reason = run.latestMessage ?? 'invalid_audit_result';
-    if (isRetryableAuditResultError(reason) && !active.resultFileRepairAttempted) {
-      active.resultFileRepairAttempted = true;
+    if (isRetryableAuditResultError(reason)) {
+      if (!canDispatchResultFileRepairPrompt(active)) {
+        run.activeAudit = undefined;
+        const projection = terminalize(run, 'failed', exhaustedResultFileRepairReason(reason));
+        send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+        return;
+      }
+      const repairAttemptNumber = markResultFileRepairPromptDispatched(active);
       run.activeAudit = active;
-      if (await dispatchAuditResultFileRepairPrompt(run, expected, p2pRun, reason)) {
+      if (await dispatchAuditResultFileRepairPrompt(run, expected, p2pRun, reason, repairAttemptNumber)) {
         auditPollTimers.set(runId, setTimeout(() => { void handleAuditPoll(runId, expected); }, 1000));
         return;
       }
@@ -3053,7 +3118,13 @@ async function advanceAfterPostRepairAcceptanceAuditIdle(run: AutoDeliverRun): P
   const verdict = await consumeAuditResultFile(run, metadata, { requireRepairCompletion: true });
   if (!verdict) {
     const reason = run.latestMessage ?? 'invalid_audit_result';
-    if (isRetryableAuditResultError(reason) && !active.resultFileRepairAttempted) {
+    if (isRetryableAuditResultError(reason)) {
+      if (!canDispatchResultFileRepairPrompt(active)) {
+        run.activeAcceptanceAudit = undefined;
+        const projection = terminalize(run, 'failed', exhaustedResultFileRepairReason(reason));
+        send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+        return;
+      }
       const projection = await dispatchPostRepairAcceptanceAuditResultRepairPrompt(run, active, reason);
       if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
         send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
@@ -3126,6 +3197,7 @@ function ensureTimelineListener(): void {
       && !!candidate.activeCommandId
     );
     if (commitPushRun) {
+      if (isTransportRuntimeBusyForIdleAdvance(commitPushRun)) return;
       void advanceAfterAutoCommitPushIdle(commitPushRun).catch((error) => {
         terminalizeAndSend(commitPushRun, 'failed', error instanceof Error ? error.message : 'auto_commit_push_idle_advance_failed');
       });
@@ -3137,6 +3209,7 @@ function ensureTimelineListener(): void {
       && !!candidate.activeAcceptanceAudit
     );
     if (acceptanceAuditRun) {
+      if (isTransportRuntimeBusyForIdleAdvance(acceptanceAuditRun)) return;
       void advanceAfterPostRepairAcceptanceAuditIdle(acceptanceAuditRun).catch((error) => {
         terminalizeAndSend(acceptanceAuditRun, 'failed', error instanceof Error ? error.message : 'post_repair_acceptance_audit_idle_advance_failed');
       });
@@ -3148,6 +3221,7 @@ function ensureTimelineListener(): void {
       && !candidate.activeAcceptanceAudit
     );
     if (specRepairRun) {
+      if (isTransportRuntimeBusyForIdleAdvance(specRepairRun)) return;
       void advanceAfterSpecRepairIdle(specRepairRun).catch((error) => {
         terminalizeAndSend(specRepairRun, 'failed', error instanceof Error ? error.message : 'spec_repair_idle_advance_failed');
       });
@@ -3159,6 +3233,7 @@ function ensureTimelineListener(): void {
       && !candidate.activeImplementationPromptAwaitingDispatch
     );
     if (!run) return;
+    if (isTransportRuntimeBusyForIdleAdvance(run)) return;
     void advanceAfterImplementationIdle(run).catch((error) => {
       terminalizeAndSend(run, 'failed', error instanceof Error ? error.message : 'implementation_idle_advance_failed');
     });

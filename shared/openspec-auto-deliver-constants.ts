@@ -43,6 +43,9 @@ export const OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS = 12 as co
  *  before the implementation phase escalates to needs_human instead of
  *  re-prompting the agent forever. */
 export const OPENSPEC_AUTO_DELIVER_MAX_IMPLEMENTATION_MARKER_REMINDERS = 6 as const;
+/** Max authoritative-result repair prompts before the run fails closed. These
+ *  prompts are automatic recovery, so exhaustion must not open a human popup. */
+export const OPENSPEC_AUTO_DELIVER_MAX_RESULT_FILE_REPAIR_PROMPTS = 6 as const;
 export const OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_ELAPSED_MINUTES = 480 as const;
 export const OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID = 'audit>review>plan' as const;
 export const OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_PROMPT_ID = 'proposal_audit' as const;

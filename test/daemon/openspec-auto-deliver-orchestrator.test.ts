@@ -107,6 +107,19 @@ async function waitForTransportSend(predicate: (text: string) => boolean, maxMs 
   throw new Error('Expected transport send was not observed');
 }
 
+function transportSendCount(predicate: (text: string) => boolean): number {
+  return transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).filter(predicate).length;
+}
+
+async function waitForTransportSendCount(predicate: (text: string) => boolean, count: number, maxMs = 1000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < maxMs) {
+    if (transportSendCount(predicate) >= count) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('Expected transport send count was not observed');
+}
+
 function implementationReminderCount(): number {
   return transportSendMock.mock.calls
     .filter((call) => String(call[0] ?? '').includes('OpenSpec Auto Deliver implementation is not complete yet'))
@@ -2299,7 +2312,7 @@ exec "${realGit}" "$@"
     expect(repairPrompt).not.toContain('"module_scores"');
   });
 
-  it('stops for human input when final acceptance result-file repair also fails', async () => {
+  it('keeps retrying final acceptance result-file repair instead of prompting for human input', async () => {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
@@ -2327,11 +2340,90 @@ exec "${realGit}" "$@"
       2500,
     );
     await emitDeckDemoIdle();
-    await waitForTransportSend((text) => text.includes('Problem: missing_authoritative_json'), 2500);
+    const firstRepairPrompt = await waitForTransportSend((text) => text.includes('Problem: missing_authoritative_json'), 2500);
+    const origin = parseAutoDeliverMetadataBlock(firstRepairPrompt);
+    expect(firstRepairPrompt).toContain('Repair prompt attempt: 1/');
+    await emitDeckDemoIdle();
+    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, 2500);
+    const secondRepairPrompt = transportSendMock.mock.calls
+      .map((call) => String(call[0] ?? ''))
+      .filter((text) => text.includes('Problem: missing_authoritative_json'))
+      .at(-1);
+    expect(secondRepairPrompt).toContain('Repair prompt attempt: 2/');
+    expect(serverLinkMock.send.mock.calls.some((call) =>
+      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && call[0]?.projection?.status === 'needs_human',
+    )).toBe(false);
+
+    await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({
+      auto_deliver: origin,
+      repair_completion: repairCompletion(),
+    }), null, 2), 'utf8');
     await emitDeckDemoIdle();
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
-    expect(terminal?.projection.status).toBe('needs_human');
-    expect(terminal?.projection.terminalReason).toBe('missing_authoritative_json');
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
+  });
+
+  it('ignores stale idle events while final acceptance result-file prompts are still running', async () => {
+    let runtimeStatus = 'idle';
+    const runtime = {
+      providerSessionId: 'provider-demo',
+      getStatus: () => runtimeStatus,
+      get sending() { return runtimeStatus !== 'idle'; },
+      get activeDispatchEntries() {
+        return runtimeStatus === 'idle' ? [] : [{ clientMessageId: 'active', text: 'active turn' }];
+      },
+      send: transportSendMock,
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+    };
+    getTransportRuntimeMock.mockImplementation(() => runtime);
+
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-final-acceptance-stale-idle');
+    const origin = parseAutoDeliverMetadataBlock(acceptancePrompt);
+    const missingPrompt = (text: string) => text.includes('Problem: missing_authoritative_json');
+
+    runtimeStatus = 'thinking';
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(transportSendCount(missingPrompt)).toBe(0);
+    expect(serverLinkMock.send.mock.calls.some((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toBe(false);
+
+    runtimeStatus = 'idle';
+    timelineEmitter.emit('deck_demo_brain', 'session.state', {
+      state: 'idle',
+      pendingCount: 0,
+      pendingMessages: [],
+      pendingMessageEntries: [],
+      pendingMessageVersion: 1,
+    });
+    const repairPrompt = await waitForTransportSend(missingPrompt, 2500);
+    expect(repairPrompt).toContain('Repair prompt attempt: 1/');
+
+    runtimeStatus = 'thinking';
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(transportSendCount(missingPrompt)).toBe(1);
+    expect(serverLinkMock.send.mock.calls.some((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toBe(false);
+
+    await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({
+      auto_deliver: origin,
+      repair_completion: repairCompletion(),
+    }), null, 2), 'utf8');
+    runtimeStatus = 'idle';
+    timelineEmitter.emit('deck_demo_brain', 'session.state', {
+      state: 'idle',
+      pendingCount: 0,
+      pendingMessages: [],
+      pendingMessageEntries: [],
+      pendingMessageVersion: 2,
+    });
+
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
 
   it('stops for human input when implementation audit reports BLOCKED', async () => {
@@ -2380,24 +2472,40 @@ exec "${realGit}" "$@"
     serverLinkMock.send.mockClear();
     transportSendMock.mockClear();
     p2pRuns.clear();
-    await startFinalAcceptanceAuditPrompt('req-multiple-json');
+    const missingPrompt = await startFinalAcceptanceAuditPrompt('req-multiple-json');
+    const missingOrigin = parseAutoDeliverMetadataBlock(missingPrompt);
     await emitDeckDemoIdle();
     await waitForTransportSend((text) => text.includes('Problem: missing_authoritative_json'), 2500);
     await emitDeckDemoIdle();
+    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, 2500);
+    expect(serverLinkMock.send.mock.calls.some((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toBe(false);
+    await writeFile(String(missingOrigin.authoritativeResultPath), JSON.stringify(auditPayload({
+      auto_deliver: missingOrigin,
+      repair_completion: repairCompletion(),
+    }), null, 2), 'utf8');
+    await emitDeckDemoIdle();
     terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
-    expect(terminal?.projection.terminalReason).toBe('missing_authoritative_json');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
 
     clearOpenSpecAutoDeliverRunsForTests();
     serverLinkMock.send.mockClear();
     transportSendMock.mockClear();
     p2pRuns.clear();
     const malformedPrompt = await startFinalAcceptanceAuditPrompt('req-malformed-json-file');
-    await writeFile(String(parseAutoDeliverMetadataBlock(malformedPrompt).authoritativeResultPath), '{not json', 'utf8');
+    const malformedOrigin = parseAutoDeliverMetadataBlock(malformedPrompt);
+    await writeFile(String(malformedOrigin.authoritativeResultPath), '{not json', 'utf8');
     await emitDeckDemoIdle();
     await waitForTransportSend((text) => text.includes('Problem: malformed_authoritative_json'), 2500);
     await emitDeckDemoIdle();
+    await waitForTransportSendCount((text) => text.includes('Problem: malformed_authoritative_json'), 2, 2500);
+    expect(serverLinkMock.send.mock.calls.some((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toBe(false);
+    await writeFile(String(malformedOrigin.authoritativeResultPath), JSON.stringify(auditPayload({
+      auto_deliver: malformedOrigin,
+      repair_completion: repairCompletion(),
+    }), null, 2), 'utf8');
+    await emitDeckDemoIdle();
     terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
-    expect(terminal?.projection.terminalReason).toBe('malformed_authoritative_json');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   }, 10_000);
 
   it('rejects authoritative result files that symlink outside .imc/discussions', async () => {
@@ -2473,9 +2581,19 @@ exec "${realGit}" "$@"
       2500,
     );
     await emitDeckDemoIdle();
+    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, 2500);
+    expect(serverLinkMock.send.mock.calls.some((call) =>
+      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && call[0]?.projection?.status === 'needs_human',
+    )).toBe(false);
+    await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({
+      auto_deliver: origin,
+      repair_completion: repairCompletion(),
+    }), null, 2), 'utf8');
+    await emitDeckDemoIdle();
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
-    expect(terminal?.projection.status).toBe('needs_human');
-    expect(terminal?.projection.terminalReason).toBe('missing_authoritative_json');
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
 
   it('uses an authoritative result file larger than the generic P2P summary tail', async () => {
