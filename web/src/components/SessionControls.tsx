@@ -49,7 +49,9 @@ import {
   buildP2pConfigSelection,
   P2P_CONFIG_MODE,
   COMBO_SEPARATOR,
+  getEnabledP2pMemberNames,
   isComboMode,
+  sanitizeP2pSavedConfig,
 } from '@shared/p2p-modes.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
@@ -1830,8 +1832,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const rootSession = activeSub?.parentSession || activeSession?.name || '';
   const hasConfiguredP2pParticipants = useMemo(() => {
     if (!p2pSavedConfig?.sessions) return false;
-    return Object.values(p2pSavedConfig.sessions).some((entry) => entry?.enabled && entry.mode !== 'skip');
-  }, [p2pSavedConfig]);
+    return getEnabledP2pMemberNames(p2pSavedConfig.sessions, { scopeSession: rootSession }).length > 0;
+  }, [p2pSavedConfig, rootSession]);
 
   // A session that is itself an enabled P2P participant ("member") must not
   // start its own Team discussion from its Team dropdown — discussions spawn
@@ -1842,7 +1844,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isCurrentSessionP2pMember = useMemo(() => {
     const name = activeSession?.name;
     if (!name || name === rootSession) return false;
-    const entry = p2pSavedConfig?.sessions?.[name];
+    const entry = sanitizeP2pSavedConfig(p2pSavedConfig ?? { sessions: {}, rounds: 1 }, { scopeSession: rootSession }).sessions[name];
     return !!entry?.enabled && entry.mode !== 'skip';
   }, [activeSession?.name, rootSession, p2pSavedConfig]);
 
@@ -1899,11 +1901,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [resolvePendingP2pConfigSave, ws]);
 
   const handleP2pDropdownRoundsChange = useCallback((nextRounds: number) => {
-    const cfg: P2pSavedConfig = {
+    const cfg: P2pSavedConfig = sanitizeP2pSavedConfig({
       ...(p2pSavedConfig ?? { sessions: {}, rounds: 1 }),
       rounds: nextRounds,
       updatedAt: Date.now(),
-    };
+    }, { scopeSession: rootSession });
     setP2pSavedConfig(cfg);
     void p2pSavedConfigPref.save(cfg).catch(() => {});
     if (rootSession) {
@@ -1912,8 +1914,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [p2pSavedConfig, p2pSavedConfigPref, persistP2pConfigToDaemon, rootSession]);
 
   useEffect(() => {
-    setP2pSavedConfig(p2pSavedConfigPref.value);
-  }, [p2pSavedConfigPref.value]);
+    setP2pSavedConfig(p2pSavedConfigPref.value
+      ? sanitizeP2pSavedConfig(p2pSavedConfigPref.value, { scopeSession: rootSession })
+      : null);
+  }, [p2pSavedConfigPref.value, rootSession]);
 
   useEffect(() => {
     if (!ws || !rootSession || !p2pSavedConfig) return;
@@ -2042,7 +2046,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const applySavedP2pConfigSelection = useCallback((extra: Record<string, unknown>, mode: string, userText?: string) => {
     if (!p2pSavedConfig || (mode !== P2P_CONFIG_MODE && !isComboMode(mode))) return;
-    const selection = buildP2pConfigSelection(p2pSavedConfig, mode);
+    const selection = buildP2pConfigSelection(sanitizeP2pSavedConfig(p2pSavedConfig, { scopeSession: rootSession }), mode);
     extra.p2pSessionConfig = selection.config.sessions;
     extra.p2pRounds = selection.rounds;
     if (selection.config.extraPrompt) extra.p2pExtraPrompt = selection.config.extraPrompt;
@@ -2053,7 +2057,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       userText,
       locale: i18n?.language ?? 'en',
     }, computeAdvancedLaunchCapabilityGate(ws, selection.config));
-  }, [activeSession?.name, activeSession?.projectDir, i18n?.language, p2pSavedConfig, ws]);
+  }, [activeSession?.name, activeSession?.projectDir, i18n?.language, p2pSavedConfig, rootSession, ws]);
 
   const buildSendPayload = useCallback((options?: string | BuildSendPayloadOptions): PendingSendPayload | null => {
     const normalizedOptions: BuildSendPayloadOptions =
@@ -2088,7 +2092,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       const hasConfigTarget = orderedTargets.some(t => t.mode === 'config');
       if (extra.p2pAtTargets && hasConfigTarget) {
         const override = normalizedOptions.syntheticConfigOverride ?? pendingConfigOverrideRef.current;
-        const cfg = override?.config ?? p2pSavedConfig;
+        const cfg = override?.config
+          ? sanitizeP2pSavedConfig(override.config, { scopeSession: rootSession })
+          : (p2pSavedConfig ? sanitizeP2pSavedConfig(p2pSavedConfig, { scopeSession: rootSession }) : null);
         if (cfg) {
           extra.p2pSessionConfig = cfg.sessions;
           extra.p2pRounds = override?.rounds ?? cfg.rounds ?? 1;
@@ -2142,7 +2148,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       text = text ? `${refs} ${text}` : refs;
     }
     return { text, extra };
-  }, [activeSession, applySavedP2pConfigSelection, attachments, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions]);
+  }, [activeSession, applySavedP2pConfigSelection, attachments, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, rootSession, sessions, subSessions]);
 
   const buildModeOnlySendPayload = useCallback((rawText: string, modeOverride?: string): PendingSendPayload | null => {
     const text = rawText.trim();
@@ -2473,7 +2479,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return;
     }
     const selection = p2pSavedConfig
-      ? buildP2pConfigSelection(p2pSavedConfig, mode, roundsOverride ?? p2pSavedConfig.rounds ?? 1)
+      ? buildP2pConfigSelection(sanitizeP2pSavedConfig(p2pSavedConfig, { scopeSession: rootSession }), mode, roundsOverride ?? p2pSavedConfig.rounds ?? 1)
       : null;
     const payloadOptions: BuildSendPayloadOptions = selection
       ? {
@@ -2487,7 +2493,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         }
       : { modeOverride: mode };
     requestSend(buildSendPayload(payloadOptions), { clearComposer: true });
-  }, [buildSendPayload, isCurrentSessionP2pMember, p2pSavedConfig, requestSend, showSendWarning, t]);
+  }, [buildSendPayload, isCurrentSessionP2pMember, p2pSavedConfig, requestSend, rootSession, showSendWarning, t]);
 
   /*
    * R3 v2 PR-κ — Click-to-launch a saved workflow from the P2P dropdown.
@@ -2508,7 +2514,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!p2pSavedConfig || workflowLibraryItems.length === 0) return;
     const target = workflowLibraryItems.find((entry) => entry.id === workflowId);
     if (!target) return;
-    const chosenConfig: P2pSavedConfig = { ...p2pSavedConfig, activeWorkflowId: workflowId };
+    const chosenConfig: P2pSavedConfig = sanitizeP2pSavedConfig({ ...p2pSavedConfig, activeWorkflowId: workflowId }, { scopeSession: rootSession });
     const selection = buildP2pConfigSelection(chosenConfig, P2P_CONFIG_MODE);
     const titleLabel = (target.title?.trim() || workflowId).slice(0, 40);
     const payloadOptions: BuildSendPayloadOptions = {
@@ -2521,7 +2527,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       syntheticConfigOverride: selection,
     };
     requestSend(buildSendPayload(payloadOptions), { clearComposer: true });
-  }, [buildSendPayload, isCurrentSessionP2pMember, p2pSavedConfig, requestSend, showSendWarning, t, workflowLibraryItems]);
+  }, [buildSendPayload, isCurrentSessionP2pMember, p2pSavedConfig, requestSend, rootSession, showSendWarning, t, workflowLibraryItems]);
 
   const handleComboSendCancel = useCallback(() => {
     maybePersistComboSendSkip();
@@ -3879,6 +3885,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 name: s.name,
                 agentType: s.agentType,
                 state: s.state,
+                role: s.role,
                 label: s.label ?? null,
                 parentSession: null,
                 isSelf: s.name === activeSession.name,
@@ -4386,7 +4393,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     <VoiceOverlay open={voiceOpen} onClose={() => setVoiceOpen(false)} onSend={handleVoiceSend} initialText={divRef.current?.textContent ?? ''} />
     {p2pConfigOpen && (
       <P2pConfigPanel
-        sessions={(sessions ?? []).map(s => ({ name: s.name, agentType: s.agentType, state: s.state }))}
+        sessions={(sessions ?? []).map(s => ({ name: s.name, agentType: s.agentType, state: s.state, role: s.role }))}
         subSessions={subSessions ?? []}
         activeSession={activeSession?.name}
         serverId={serverId}
@@ -4394,7 +4401,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         onClose={() => setP2pConfigOpen(false)}
         onPersistDaemonConfig={(scopeSession, cfg) => persistP2pConfigToDaemon(scopeSession, cfg)}
         onSave={(cfg) => {
-          setP2pSavedConfig(cfg);
+          setP2pSavedConfig(sanitizeP2pSavedConfig(cfg, { scopeSession: rootSession }));
         }}
         daemonCapabilitySource={ws ? {
           getSnapshot: () => ws.getDaemonCapabilitySnapshot(),

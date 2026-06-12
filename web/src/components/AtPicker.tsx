@@ -8,6 +8,7 @@ import type { ServerMessage } from '../ws-client.js';
 import {
   buildP2pConfigSelection,
   COMBO_PRESETS,
+  isP2pMemberEligibleSession,
   isComboMode,
   parseModePipeline,
   type P2pSavedConfig,
@@ -20,6 +21,7 @@ interface SessionEntry {
   name: string;
   agentType: string;
   state: string;
+  role?: string | null;
   label?: string | null;
   parentSession?: string | null;
   isSelf?: boolean;
@@ -238,6 +240,7 @@ export function AtPicker({
     for (const s of sessions) {
       if (s.agentType === 'shell' || s.agentType === 'script') continue;
       if (rootSession && s.name !== rootSession && s.parentSession !== rootSession) continue;
+      if (!isP2pMemberEligibleSession(s.name, { scopeSession: rootSession, role: s.role })) continue;
       const existing = seen.get(s.name);
       if (!existing) {
         seen.set(s.name, s);

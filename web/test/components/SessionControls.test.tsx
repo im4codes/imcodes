@@ -469,10 +469,9 @@ afterEach(() => {
     patchSubSessionMock.mockResolvedValue(undefined);
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
-        const sessionKey = key.split(':').pop() ?? key.slice('p2p_session_config:'.length);
         return JSON.stringify({
           sessions: {
-            [sessionKey]: { enabled: true, mode: 'audit' },
+            deck_sub_abc: { enabled: true, mode: 'audit' },
           },
           rounds: 3,
         });
@@ -854,10 +853,8 @@ afterEach(() => {
     const ws = makeWs();
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
-        const sessionKey = key.slice('p2p_session_config:'.length);
         return JSON.stringify({
           sessions: {
-            [sessionKey]: { enabled: true, mode: 'audit' },
             'deck_sub_abc': { enabled: true, mode: 'review' },
           },
           rounds: 3,
@@ -866,7 +863,7 @@ afterEach(() => {
           advancedRunTimeoutMinutes: 45,
           contextReducer: {
             mode: 'clone_sdk_session',
-            templateSession: sessionKey,
+            templateSession: 'deck_sub_abc',
           },
         });
       }
@@ -898,7 +895,6 @@ afterEach(() => {
         { session: '__all__', mode: 'config' },
       ],
       p2pSessionConfig: {
-        'my-session': { enabled: true, mode: 'audit' },
         'deck_sub_abc': { enabled: true, mode: 'review' },
       },
       p2pRounds: 3,
@@ -975,7 +971,7 @@ afterEach(() => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
         return JSON.stringify({
           sessions: {
-            'my-session': { enabled: false, mode: 'audit' },
+            'deck_sub_abc': { enabled: false, mode: 'audit' },
           },
           rounds: 3,
         });
@@ -997,7 +993,7 @@ afterEach(() => {
   it('applies P2P config preference events without refetching', async () => {
     let prefValue = JSON.stringify({
       sessions: {
-        'my-session': { enabled: false, mode: 'audit' },
+        'deck_sub_abc': { enabled: false, mode: 'audit' },
       },
       rounds: 3,
     });
@@ -1014,7 +1010,6 @@ afterEach(() => {
 
     prefValue = JSON.stringify({
       sessions: {
-        'my-session': { enabled: true, mode: 'audit' },
         'deck_sub_abc': { enabled: true, mode: 'review' },
       },
       rounds: 3,
@@ -1055,7 +1050,7 @@ afterEach(() => {
         scopeSession: 'my-session',
         config: {
           sessions: {
-            'my-session': { enabled: true, mode: 'audit' },
+            deck_sub_abc: { enabled: true, mode: 'audit' },
           },
           rounds: 3,
         },
@@ -1079,7 +1074,7 @@ afterEach(() => {
       scopeSession: 'my-session',
       config: {
         sessions: {
-          'my-session': { enabled: true, mode: 'audit' },
+          deck_sub_abc: { enabled: true, mode: 'audit' },
         },
         rounds: 3,
       },
@@ -1175,7 +1170,7 @@ afterEach(() => {
       ],
       p2pMode: 'audit>review>plan',
       p2pSessionConfig: {
-        'my-session': { enabled: true, mode: 'audit' },
+        deck_sub_abc: { enabled: true, mode: 'audit' },
       },
       p2pRounds: 3,
       p2pLocale: 'en',
@@ -1196,7 +1191,7 @@ afterEach(() => {
       ],
       p2pMode: 'audit>review>plan',
       p2pSessionConfig: {
-        'my-session': { enabled: true, mode: 'audit' },
+        deck_sub_abc: { enabled: true, mode: 'audit' },
       },
       p2pRounds: 3,
       p2pLocale: 'en',
@@ -1226,7 +1221,7 @@ afterEach(() => {
       ],
       p2pMode: 'audit>review>plan',
       p2pSessionConfig: {
-        'my-session': { enabled: true, mode: 'audit' },
+        deck_sub_abc: { enabled: true, mode: 'audit' },
       },
       p2pRounds: 3,
       p2pLocale: 'en',

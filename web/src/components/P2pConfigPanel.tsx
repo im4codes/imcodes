@@ -10,7 +10,13 @@ import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p
 import { P2pComboManager } from './P2pComboManager.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import { AdvancedWorkflowCanvasEditor } from './AdvancedWorkflowCanvasEditor.js';
-import type { P2pSavedConfig, P2pSessionConfig } from '@shared/p2p-modes.js';
+import {
+  isP2pMemberEligibleSession,
+  sanitizeP2pSavedConfig,
+  sanitizeP2pSessionConfig,
+  type P2pSavedConfig,
+  type P2pSessionConfig,
+} from '@shared/p2p-modes.js';
 import { BUILT_IN_ADVANCED_PRESETS } from '@shared/p2p-advanced.js';
 import { MAX_P2P_PARTICIPANTS } from '@shared/p2p-config-events.js';
 import { materializeOldAdvancedConfigToWorkflowDraft } from '@shared/p2p-workflow-materialize.js';
@@ -48,6 +54,7 @@ interface SessionRow {
   name: string;
   agentType: string;
   state: string;
+  role?: string | null;
 }
 
 interface SubSessionRow {
@@ -471,6 +478,7 @@ export function P2pConfigPanel({
   for (const s of sessions) {
     if (EXCLUDED_TYPES.has(s.agentType)) continue;
     if (scopeSession && s.name !== scopeSession) continue;
+    if (!isP2pMemberEligibleSession(s.name, { scopeSession, role: s.role })) continue;
     if (seen.has(s.name)) continue;
     seen.add(s.name);
     const shortName = s.name.split('_').pop() || s.name;
@@ -480,6 +488,7 @@ export function P2pConfigPanel({
   for (const s of subSessions) {
     if (EXCLUDED_TYPES.has(s.type)) continue;
     if (scopeSession && s.parentSession && s.parentSession !== scopeSession) continue;
+    if (!isP2pMemberEligibleSession(s.sessionName, { scopeSession })) continue;
     if (seen.has(s.sessionName)) continue;
     seen.add(s.sessionName);
     const shortName = s.label || s.sessionName;
@@ -705,20 +714,21 @@ export function P2pConfigPanel({
     const parsed = p2pConfigPref.value;
     if (!parsed) return;
     if (formDirtyRef.current && seededConfigKeyRef.current === configKey) return;
+    const sanitized = sanitizeP2pSavedConfig(parsed, { scopeSession });
     seededConfigKeyRef.current = configKey;
     formDirtyRef.current = false;
-    setSessionCfg(parsed.sessions ?? {});
-    setRounds(parsed.rounds ?? DEFAULT_P2P_ROUNDS);
-    setHopTimeoutMinutes(parsed.hopTimeoutMinutes ?? 8);
-    setExtraPrompt(parsed.extraPrompt ?? '');
-    setAdvancedPresetKey(parsed.advancedPresetKey ?? '');
-    setAdvancedRounds(parsed.advancedRounds);
-    setAdvancedRunTimeoutMinutes(parsed.advancedRunTimeoutMinutes ?? 30);
-    setContextReducerMode(parsed.contextReducer?.mode ?? '');
-    setContextReducerSession(parsed.contextReducer?.sessionName ?? '');
-    setContextReducerTemplate(parsed.contextReducer?.templateSession ?? '');
-    setAllowedExecutables(Array.isArray(parsed.allowedExecutables)
-      ? parsed.allowedExecutables.filter((entry): entry is string => typeof entry === 'string')
+    setSessionCfg(sanitized.sessions ?? {});
+    setRounds(sanitized.rounds ?? DEFAULT_P2P_ROUNDS);
+    setHopTimeoutMinutes(sanitized.hopTimeoutMinutes ?? 8);
+    setExtraPrompt(sanitized.extraPrompt ?? '');
+    setAdvancedPresetKey(sanitized.advancedPresetKey ?? '');
+    setAdvancedRounds(sanitized.advancedRounds);
+    setAdvancedRunTimeoutMinutes(sanitized.advancedRunTimeoutMinutes ?? 30);
+    setContextReducerMode(sanitized.contextReducer?.mode ?? '');
+    setContextReducerSession(sanitized.contextReducer?.sessionName ?? '');
+    setContextReducerTemplate(sanitized.contextReducer?.templateSession ?? '');
+    setAllowedExecutables(Array.isArray(sanitized.allowedExecutables)
+      ? sanitized.allowedExecutables.filter((entry): entry is string => typeof entry === 'string')
       : []);
     setAllowedExecutableDraft('');
     // R3 v2 PR-ι — Lift any legacy single `workflowDraft` into the
@@ -726,7 +736,7 @@ export function P2pConfigPanel({
     // idempotent + non-destructive, so users with mixed-shape configs
     // (saved by older clients still on the rolling-deploy window) load
     // cleanly into the library editor.
-    const migrated = migrateLegacyWorkflowDraft(parsed);
+    const migrated = migrateLegacyWorkflowDraft(sanitized);
     const materializedEnvelope = buildP2pWorkflowLaunchEnvelopeFromConfig(migrated, {
       sessionName: scopeSession ?? undefined,
     });
@@ -736,11 +746,11 @@ export function P2pConfigPanel({
     );
     setWorkflowLibrary(initialLibrary);
     const desiredActive = migrated.activeWorkflowId
-      ?? initialLibrary.find((entry) => entry.id === parsed.activeWorkflowId)?.id
+      ?? initialLibrary.find((entry) => entry.id === sanitized.activeWorkflowId)?.id
       ?? initialLibrary[0]?.id;
     setActiveWorkflowId(desiredActive);
-    setWorkflowLaunchEnvelope(parsed.workflowLaunchEnvelope ?? materializedEnvelope ?? undefined);
-    const needsMigration = hasOldAdvancedConfig(parsed) && !parsed.workflowDraft && !parsed.workflowLaunchEnvelope && initialLibrary.length === 0;
+    setWorkflowLaunchEnvelope(sanitized.workflowLaunchEnvelope ?? materializedEnvelope ?? undefined);
+    const needsMigration = hasOldAdvancedConfig(sanitized) && !sanitized.workflowDraft && !sanitized.workflowLaunchEnvelope && initialLibrary.length === 0;
     setAdvancedMigrationNeeded(needsMigration);
   }, [configKey, p2pConfigPref.value, scopeSession]);
 
@@ -798,6 +808,7 @@ export function P2pConfigPanel({
     markFormDirty();
     const eligibleKeys = new Set(allEligible.map((entry) => entry.key));
     setSessionCfg((prev) => {
+      const sanitizedPrev = sanitizeP2pSessionConfig(prev, { scopeSession });
       const cur = prev[key] ?? { enabled: false, mode: 'audit' };
       const willEnable = !cur.enabled;
       const willCountAsParticipant = willEnable && cur.mode !== 'skip';
@@ -807,7 +818,7 @@ export function P2pConfigPanel({
         // sessions: old saved configs can contain stale/closed/other-scope
         // entries, and those are pruned on save, so they must not block a
         // user from selecting the visible in-scope participants.
-        const currentlyEnabledCount = Object.entries(prev).filter(
+        const currentlyEnabledCount = Object.entries(sanitizedPrev).filter(
           ([k, e]) => k !== key && eligibleKeys.has(k) && e?.enabled === true && e.mode !== 'skip',
         ).length;
         if (currentlyEnabledCount >= MAX_P2P_PARTICIPANTS) {
@@ -820,7 +831,7 @@ export function P2pConfigPanel({
         }
         setSaveError(null);
       }
-      return { ...prev, [key]: { ...cur, enabled: willEnable } };
+      return { ...sanitizedPrev, [key]: { ...cur, enabled: willEnable } };
     });
   };
 
@@ -828,11 +839,12 @@ export function P2pConfigPanel({
     markFormDirty();
     const eligibleKeys = new Set(allEligible.map((entry) => entry.key));
     setSessionCfg((prev) => {
+      const sanitizedPrev = sanitizeP2pSessionConfig(prev, { scopeSession });
       const cur = prev[key] ?? { enabled: false, mode: 'audit' };
       const willCountAsParticipant = cur.enabled && mode !== 'skip';
       const didCountAsParticipant = cur.enabled && cur.mode !== 'skip';
       if (willCountAsParticipant && !didCountAsParticipant) {
-        const currentlyEnabledCount = Object.entries(prev).filter(
+        const currentlyEnabledCount = Object.entries(sanitizedPrev).filter(
           ([k, e]) => k !== key && eligibleKeys.has(k) && e?.enabled === true && e.mode !== 'skip',
         ).length;
         if (currentlyEnabledCount >= MAX_P2P_PARTICIPANTS) {
@@ -845,7 +857,7 @@ export function P2pConfigPanel({
         }
       }
       setSaveError(null);
-      return { ...prev, [key]: { ...cur, mode } };
+      return { ...sanitizedPrev, [key]: { ...cur, mode } };
     });
   };
 

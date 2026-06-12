@@ -12,6 +12,9 @@ import {
   getLegacyModeKeyForExecutionRound,
   getComboRoundCount,
   COMBO_PRESETS,
+  getEnabledP2pMemberNames,
+  isP2pMemberEligibleSession,
+  sanitizeP2pSavedConfig,
 } from '../../shared/p2p-modes.js';
 import type { P2pSavedConfig, P2pSessionConfig, P2pSessionEntry } from '../../shared/p2p-modes.js';
 
@@ -106,6 +109,37 @@ describe('P2pSavedConfig shape', () => {
   it('rounds can be 1', () => {
     const config: P2pSavedConfig = { sessions: {}, rounds: 1 };
     expect(config.rounds).toBe(1);
+  });
+});
+
+describe('P2P Team member eligibility', () => {
+  it('treats main brain sessions as hosts, not Team members', () => {
+    expect(isP2pMemberEligibleSession('deck_proj_brain')).toBe(false);
+    expect(isP2pMemberEligibleSession('deck_proj_brain', { scopeSession: 'deck_proj_brain' })).toBe(false);
+    expect(isP2pMemberEligibleSession('deck_proj_w1', { scopeSession: 'deck_proj_brain' })).toBe(true);
+    expect(isP2pMemberEligibleSession('deck_sub_worker', { scopeSession: 'deck_proj_brain' })).toBe(true);
+    expect(isP2pMemberEligibleSession('custom_session', { role: 'brain' })).toBe(false);
+  });
+
+  it('sanitizes saved Team configs by removing brain entries before counting enabled members', () => {
+    const config: P2pSavedConfig = {
+      sessions: {
+        deck_proj_brain: { enabled: true, mode: 'audit' },
+        deck_proj_w1: { enabled: true, mode: 'review' },
+        deck_sub_worker: { enabled: false, mode: 'skip' },
+      },
+      rounds: 2,
+      extraPrompt: 'keep this',
+    };
+
+    const sanitized = sanitizeP2pSavedConfig(config, { scopeSession: 'deck_proj_brain' });
+    expect(sanitized.sessions).toEqual({
+      deck_proj_w1: { enabled: true, mode: 'review' },
+      deck_sub_worker: { enabled: false, mode: 'skip' },
+    });
+    expect(sanitized.rounds).toBe(2);
+    expect(sanitized.extraPrompt).toBe('keep this');
+    expect(getEnabledP2pMemberNames(sanitized.sessions, { scopeSession: 'deck_proj_brain' })).toEqual(['deck_proj_w1']);
   });
 });
 

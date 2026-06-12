@@ -75,7 +75,15 @@ import { buildSessionList } from './session-list.js';
 import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { supervisionAutomation } from './supervision-automation.js';
-import { parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
+import {
+  getEnabledP2pMemberNames,
+  isP2pMemberEligibleSession,
+  parseModePipeline,
+  P2P_CONFIG_MODE,
+  isP2pSavedConfig,
+  sanitizeP2pSavedConfig,
+  type P2pSessionConfig,
+} from '../../shared/p2p-modes.js';
 import type { P2pAdvancedRound, P2pContextReducerConfig, P2pRoundPreset } from '../../shared/p2p-advanced.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { getLoadedConfig } from '../config.js';
@@ -1701,7 +1709,8 @@ async function handleP2pConfigSave(cmd: Record<string, unknown>, serverLink: Ser
     return;
   }
   try {
-    await upsertSavedP2pConfig(getP2pConfigStoreScope(serverLink, scopeSession), config);
+    const sanitizedConfig = sanitizeP2pSavedConfig(config, { scopeSession });
+    await upsertSavedP2pConfig(getP2pConfigStoreScope(serverLink, scopeSession), sanitizedConfig);
     if (requestId) {
       serverLink?.send({
         type: P2P_CONFIG_MSG.SAVE_RESPONSE,
@@ -2619,6 +2628,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
 // ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
   const clientP2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
+  const p2pScopeSession = resolveP2pConfigScopeSession(sessionName);
   let receiptAcked = false;
   const emitAcceptedReceiptAck = (): void => {
     if (receiptAcked) return;
@@ -2730,9 +2740,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         );
         return;
       }
-      const enabledNames = Object.entries(p2pSessionConfig)
-        .filter(([, entry]) => entry && entry.enabled === true && entry.mode !== 'skip')
-        .map(([name]) => name);
+      const enabledNames = getEnabledP2pMemberNames(p2pSessionConfig, {
+        scopeSession: p2pScopeSession,
+      });
       if (enabledNames.length === 0) {
         logger.warn({ sessionName }, 'P2P start blocked: saved config has no enabled members');
         sendP2pTargetError(
@@ -2780,8 +2790,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     for (const t of explicitTargets) {
       if (t.session === '__all__') {
         agents.push(...expandAllTargets(sessionName, t.mode, false, p2pSessionConfig));
-      } else if (getSession(t.session)) {
-        agents.push({ session: t.session, mode: t.mode });
+      } else {
+        const targetRecord = getSession(t.session);
+        if (targetRecord && isP2pMemberEligibleSession(t.session, {
+          scopeSession: p2pScopeSession,
+          role: targetRecord.role,
+        })) {
+          agents.push({ session: t.session, mode: t.mode });
+        }
       }
     }
     // Extract @file references from text

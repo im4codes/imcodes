@@ -102,7 +102,7 @@ describe('AtPicker', () => {
 
     fireEvent.click(screen.getByText('agents'));
 
-    expect(screen.getByText('brain')).toBeDefined();
+    expect(screen.queryByText('brain')).toBeNull();
     expect(screen.getByText('worker1')).toBeDefined();
     expect(screen.getByText('worker2')).toBeDefined();
     expect(screen.queryByText('other9')).toBeNull();
@@ -112,7 +112,7 @@ describe('AtPicker', () => {
     renderPicker();
 
     fireEvent.click(screen.getByText('agents'));
-    expect(screen.getByText('brain')).toBeDefined();
+    expect(screen.queryByText('brain')).toBeNull();
 
     fireEvent.keyDown(document, { key: 'Escape' });
 

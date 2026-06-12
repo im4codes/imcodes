@@ -103,6 +103,7 @@ import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { parseString, parseBooleanish, usePref } from './hooks/usePref.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
+import { isP2pMemberEligibleSession } from '@shared/p2p-modes.js';
 import { PREF_KEY_DEFAULT_SHELL, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from './constants/prefs.js';
 import {
   p2pSubSessionParentSignature,
@@ -2390,6 +2391,7 @@ export function App() {
     if (!activeRootSession || !p2pConfigPref.value?.sessions) { setP2pSessionNames(new Set()); return; }
     const names = new Set<string>();
     for (const [name, entry] of Object.entries(p2pConfigPref.value.sessions)) {
+      if (!isP2pMemberEligibleSession(name, { scopeSession: activeRootSession })) continue;
       if (entry.enabled && entry.mode !== 'skip') names.add(name);
     }
     setP2pSessionNames(names);

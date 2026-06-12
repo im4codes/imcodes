@@ -153,14 +153,17 @@ describe('P2pConfigPanel', () => {
         { name: 'deck_proj_w1', agentType: 'shell', state: 'idle' },
         { name: 'deck_proj_w2', agentType: 'script', state: 'idle' },
       ],
-      subSessions: [],
+      subSessions: [
+        { sessionName: 'deck_sub_worker', type: 'qwen', label: 'worker', state: 'running', parentSession: 'deck_proj_brain' },
+      ],
     });
 
     // Wait for loading to complete
     await flush();
 
-    // claude-code session should appear by its short name
-    expect(screen.getByText('brain')).toBeDefined();
+    // Main/brain session is the Team host and must not be listed as a member.
+    expect(screen.queryByText('brain')).toBeNull();
+    expect(screen.getByText('worker')).toBeDefined();
 
     // shell and script sessions should not appear
     expect(screen.queryByText('w1')).toBeNull();
@@ -183,7 +186,8 @@ describe('P2pConfigPanel', () => {
       await primary.promise;
     });
     await flush();
-    expect(screen.getByText('brain')).toBeDefined();
+    expect(screen.queryByText('brain')).toBeNull();
+    expect(screen.getByText('worker')).toBeDefined();
   });
 
   it('excludes shell type from subSessions', async () => {
@@ -265,8 +269,8 @@ describe('P2pConfigPanel', () => {
     expect(onSave).toHaveBeenCalledOnce();
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
 
-    // Active session + eligible sub-sessions should be in config
-    expect(cfg.sessions['deck_proj_brain']).toBeDefined();
+    // Active/main session is the host, not a Team member.
+    expect(cfg.sessions['deck_proj_brain']).toBeUndefined();
     expect(cfg.sessions['deck_sub_abc']).toBeDefined();
     // shell sub-session should not be included
     expect(cfg.sessions['deck_sub_def']).toBeUndefined();
@@ -279,7 +283,7 @@ describe('P2pConfigPanel', () => {
 
     getUserPrefMock.mockImplementation(async (key: string) => {
       if (key === 'p2p_session_config:srv-main:deck_proj_brain') {
-        return JSON.stringify({ sessions: { deck_proj_brain: { enabled: true, mode: 'audit' } }, rounds: 3 });
+        return JSON.stringify({ sessions: { deck_sub_abc: { enabled: true, mode: 'audit' } }, rounds: 3 });
       }
       return null;
     });
@@ -296,7 +300,8 @@ describe('P2pConfigPanel', () => {
     await flush();
 
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
-    expect(cfg.sessions.deck_proj_brain).toMatchObject({ enabled: true, mode: 'audit' });
+    expect(cfg.sessions.deck_proj_brain).toBeUndefined();
+    expect(cfg.sessions.deck_sub_abc).toMatchObject({ enabled: true, mode: 'audit' });
   }, 15_000);
 
   it('calls onClose when the close button (✕) is clicked', async () => {
@@ -659,7 +664,14 @@ describe('P2pConfigPanel', () => {
       return null;
     });
 
-    renderPanel({ onSave });
+    renderPanel({
+      onSave,
+      subSessions: [
+        { sessionName: 'deck_sub_abc', type: 'qwen', label: 'worker', state: 'running', parentSession: 'deck_proj_brain' },
+        { sessionName: 'deck_sub_ghi', type: 'claude-code-sdk', label: 'analyst', state: 'running', parentSession: 'deck_proj_brain' },
+        { sessionName: 'deck_sub_cli', type: 'codex', label: 'reviewer', state: 'running', parentSession: 'deck_proj_brain' },
+      ],
+    });
     await flush();
 
     const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
@@ -681,8 +693,9 @@ describe('P2pConfigPanel', () => {
 
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
     expect(Object.keys(cfg.sessions).some((key) => key.startsWith('deck_old_stale_'))).toBe(false);
-    expect(cfg.sessions.deck_proj_brain.enabled).toBe(true);
+    expect(cfg.sessions.deck_proj_brain).toBeUndefined();
     expect(cfg.sessions.deck_sub_abc.enabled).toBe(true);
+    expect(cfg.sessions.deck_sub_ghi.enabled).toBe(true);
   }, 15_000);
 
   it('changing rounds updates the config passed to onSave', async () => {
@@ -786,7 +799,7 @@ describe('P2pConfigPanel', () => {
   it('reloads panel state when the session P2P preference changes externally', async () => {
     let prefValue = JSON.stringify({
       sessions: {
-        'deck_proj_brain': { enabled: false, mode: 'audit' },
+        'deck_sub_abc': { enabled: false, mode: 'audit' },
       },
       rounds: 1,
     });
@@ -803,7 +816,7 @@ describe('P2pConfigPanel', () => {
 
     prefValue = JSON.stringify({
       sessions: {
-        'deck_proj_brain': { enabled: true, mode: 'audit' },
+        'deck_sub_abc': { enabled: true, mode: 'audit' },
       },
       rounds: 1,
     });
@@ -963,7 +976,7 @@ describe('P2pConfigPanel', () => {
     renderPanel();
     await flush();
 
-    expect(screen.getByText('brain')).toBeDefined();
+    expect(screen.queryByText('brain')).toBeNull();
     expect(screen.getByText('worker')).toBeDefined();
     expect(screen.queryByText('reviewer')).toBeNull();
 
@@ -988,11 +1001,11 @@ describe('P2pConfigPanel', () => {
     await flush();
 
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
-    expect(cfg.sessions['deck_proj_brain']).toBeDefined();
-    expect(cfg.sessions['deck_proj_brain'].enabled).toBe(true);
+    expect(cfg.sessions['deck_proj_brain']).toBeUndefined();
     expect(cfg.sessions['deck_sub_cli']).toBeDefined();
     expect(cfg.sessions['deck_sub_cli'].enabled).toBe(true);
     expect(cfg.sessions['deck_sub_abc']).toBeDefined();
+    expect(cfg.sessions['deck_sub_abc'].enabled).toBe(true);
   }, 15_000);
 
   it('manages shared custom combos from the combo tab', async () => {
@@ -1062,7 +1075,7 @@ describe('P2pConfigPanel', () => {
   it('applies primary P2P preference events without refetching', async () => {
     getUserPrefMock.mockImplementation(async (key: string) => {
       if (key === 'p2p_session_config:srv-main:deck_proj_brain') {
-        return JSON.stringify({ sessions: { deck_proj_brain: { enabled: false, mode: 'audit' } }, rounds: 1 });
+        return JSON.stringify({ sessions: { deck_sub_abc: { enabled: false, mode: 'audit' } }, rounds: 1 });
       }
       return null;
     });
@@ -1074,7 +1087,7 @@ describe('P2pConfigPanel', () => {
     window.dispatchEvent(new CustomEvent('imcodes:user-pref-changed', {
       detail: {
         key: 'p2p_session_config:srv-main:deck_proj_brain',
-        value: JSON.stringify({ sessions: { deck_proj_brain: { enabled: true, mode: 'audit' } }, rounds: 1 }),
+        value: JSON.stringify({ sessions: { deck_sub_abc: { enabled: true, mode: 'audit' } }, rounds: 1 }),
       },
     }));
     await flush();
