@@ -86,6 +86,7 @@ import {
   type P2pRun,
 } from './p2p-orchestrator.js';
 import { resolveConfiguredP2pTargets } from './p2p-target-selection.js';
+import { enqueueResend, getResendEntries } from './transport-resend-queue.js';
 
 type AutoDeliverRunStatus = Extract<OpenSpecAutoDeliverStage,
   'proposed' | 'spec_audit_repair' | 'implementation_task_loop' | 'implementation_audit_repair' | 'commit_push' | 'passed' | 'needs_human' | 'failed' | 'stopped'>;
@@ -293,6 +294,97 @@ async function awaitTransportRuntime(sessionName: string): Promise<ReturnType<ty
     runtime = getTransportRuntime(sessionName);
   }
   return runtime;
+}
+
+type AutoDeliverPromptSendMode = 'sent' | 'queued' | 'resend_queued';
+
+function runtimeProviderSessionId(runtime: NonNullable<ReturnType<typeof getTransportRuntime>>): string | null | undefined {
+  if (!('providerSessionId' in runtime)) return undefined;
+  return runtime.providerSessionId ?? null;
+}
+
+function emitAutoDeliverQueuedState(
+  sessionName: string,
+  entries: Array<{ commandId: string; text: string }>,
+): void {
+  timelineEmitter.emit(sessionName, 'session.state', {
+    state: 'queued',
+    pendingCount: entries.length,
+    pendingMessages: entries.map((entry) => entry.text),
+    pendingMessageEntries: entries.map((entry) => ({
+      clientMessageId: entry.commandId,
+      text: entry.text,
+    })),
+  }, { source: 'daemon', confidence: 'high' });
+}
+
+function queueAutoDeliverPromptForTransportResend(
+  run: AutoDeliverRun,
+  prompt: string,
+  commandId: string,
+  reason: string,
+): AutoDeliverPromptSendMode {
+  const enqueueResult = enqueueResend(run.targetImplementationSessionName, {
+    text: prompt,
+    commandId,
+    queuedAt: Date.now(),
+  });
+  const queued = getResendEntries(run.targetImplementationSessionName);
+  emitAutoDeliverQueuedState(run.targetImplementationSessionName, queued);
+  run.evidence = mergeEvidence(run.evidence, [{
+    source: 'daemon',
+    summary: `Auto Deliver prompt queued for transport resend after send was not immediately available: ${reason}.`,
+    stale: false,
+  }]);
+  if (enqueueResult.droppedOldest) {
+    run.evidence = mergeEvidence(run.evidence, [{
+      source: 'daemon',
+      summary: 'Transport resend queue was full while queueing an Auto Deliver prompt; the oldest queued transport message was dropped.',
+      stale: false,
+    }]);
+  }
+  return 'resend_queued';
+}
+
+async function sendAutoDeliverPromptToImplementationSession(
+  run: AutoDeliverRun,
+  prompt: string,
+  commandId: string,
+): Promise<AutoDeliverPromptSendMode> {
+  const runtime = await awaitTransportRuntime(run.targetImplementationSessionName);
+  if (!runtime) {
+    return queueAutoDeliverPromptForTransportResend(run, prompt, commandId, 'missing_transport_runtime');
+  }
+  const providerSessionId = runtimeProviderSessionId(runtime);
+  if (providerSessionId === null) {
+    return queueAutoDeliverPromptForTransportResend(run, prompt, commandId, 'transport_runtime_not_initialized');
+  }
+  try {
+    const result = runtime.send(prompt, commandId);
+    timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
+      text: prompt,
+      allowDuplicate: true,
+      commandId,
+    }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${commandId}` });
+    if (result === 'queued') {
+      const pendingEntries = Array.isArray(runtime.pendingEntries) ? runtime.pendingEntries : [];
+      emitAutoDeliverQueuedState(
+        run.targetImplementationSessionName,
+        pendingEntries.map((entry) => ({
+          commandId: entry.clientMessageId,
+          text: entry.text,
+        })),
+      );
+    }
+    return result;
+  } catch (error) {
+    return queueAutoDeliverPromptForTransportResend(
+      run,
+      prompt,
+      commandId,
+      error instanceof Error ? error.message : 'transport_send_failed',
+    );
+  }
 }
 const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON = 'implementation_audit_followup_repair';
 
@@ -1007,29 +1099,14 @@ async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: 
   if (run.implementationPromptCount >= effectiveMaxImplementationPrompts(run)) {
     return terminalize(run, 'needs_human', 'implementation_prompt_limit_reached');
   }
-  const runtime = await awaitTransportRuntime(run.targetImplementationSessionName);
-  if (!runtime) {
-    return terminalize(run, 'failed', 'missing_transport_runtime');
-  }
   run.status = 'implementation_task_loop';
   run.stage = 'implementation_task_loop';
   run.implementationPromptCount += 1;
   run.activeCommandId = `${run.runId}:implementation:${run.generation}:${run.implementationPromptCount}`;
   run.activeImplementationMarker = await buildImplementationMarkerContract(run, run.implementationPromptCount);
   const prompt = buildImplementationPrompt(run, repairReason);
-  timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
-    text: prompt,
-    allowDuplicate: true,
-    commandId: run.activeCommandId,
-  }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${run.activeCommandId}` });
-  try {
-    runtime.send(prompt, run.activeCommandId);
-  } catch (error) {
-    clearImplementationMarkerPollTimer(run.runId);
-    delete run.activeCommandId;
-    return terminalize(run, 'failed', error instanceof Error ? `implementation_send_failed:${error.message}` : 'implementation_send_failed');
-  }
-  scheduleImplementationMarkerPoll(run);
+  const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
+  if (sendMode !== 'resend_queued') scheduleImplementationMarkerPoll(run);
   run.latestMessage = repairReason
     ? `implementation_repair_prompt_dispatched:${repairReason}`
     : 'implementation_prompt_dispatched';
@@ -1165,8 +1242,6 @@ async function ensureImplementationMarkerContractForReminder(
 async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason: string): Promise<OpenSpecAutoDeliverProjection> {
   const elapsedProjection = enforceElapsedLimit(run);
   if (elapsedProjection) return elapsedProjection;
-  const runtime = await awaitTransportRuntime(run.targetImplementationSessionName);
-  if (!runtime) return terminalize(run, 'failed', 'missing_transport_runtime');
   const { marker, recovered } = await ensureImplementationMarkerContractForReminder(run, reason);
   // Bound AND pace the idle -> "marker missing" -> reminder -> idle loop so it
   // cannot re-prompt the agent forever or spam it (previously a reminder fired
@@ -1212,18 +1287,8 @@ async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason:
   marker.lastReminderAt = Date.now();
   run.activeCommandId = `${run.runId}:implementation-marker:${run.generation}:${run.implementationPromptCount}:${marker.retryCount}`;
   const prompt = buildImplementationMarkerReminderPrompt(run, reason);
-  timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
-    text: prompt,
-    allowDuplicate: true,
-    commandId: run.activeCommandId,
-  }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${run.activeCommandId}` });
-  try {
-    runtime.send(prompt, run.activeCommandId);
-  } catch (error) {
-    delete run.activeCommandId;
-    return terminalize(run, 'failed', error instanceof Error ? `implementation_marker_reminder_send_failed:${error.message}` : 'implementation_marker_reminder_send_failed');
-  }
-  scheduleImplementationMarkerPoll(run);
+  const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
+  if (sendMode !== 'resend_queued') scheduleImplementationMarkerPoll(run);
   run.latestMessage = recovered
     ? `implementation_marker_contract_recreated:${reason}`
     : `implementation_marker_missing:${reason}`;
@@ -1268,13 +1333,9 @@ async function dispatchImplementationRepairPrompt(run: AutoDeliverRun, reason: s
   return dispatchImplementationPrompt(run, reason);
 }
 
-function dispatchSpecRepairPrompt(run: AutoDeliverRun, reason: string): OpenSpecAutoDeliverProjection {
+async function dispatchSpecRepairPrompt(run: AutoDeliverRun, reason: string): Promise<OpenSpecAutoDeliverProjection> {
   const elapsedProjection = enforceElapsedLimit(run);
   if (elapsedProjection) return elapsedProjection;
-  const runtime = getTransportRuntime(run.targetImplementationSessionName);
-  if (!runtime) {
-    return terminalize(run, 'failed', 'missing_transport_runtime');
-  }
   run.status = 'spec_audit_repair';
   run.stage = 'spec_audit_repair';
   run.needsPostRepairAcceptanceAudit = true;
@@ -1286,17 +1347,7 @@ function dispatchSpecRepairPrompt(run: AutoDeliverRun, reason: string): OpenSpec
     stale: false,
   }]);
   const prompt = buildSpecRepairPrompt(run, reason);
-  timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
-    text: prompt,
-    allowDuplicate: true,
-    commandId: run.activeCommandId,
-  }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${run.activeCommandId}` });
-  try {
-    runtime.send(prompt, run.activeCommandId);
-  } catch (error) {
-    delete run.activeCommandId;
-    return terminalize(run, 'failed', error instanceof Error ? `spec_repair_prompt_send_failed:${error.message}` : 'spec_repair_prompt_send_failed');
-  }
+  await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
   run.latestMessage = `spec_repair_prompt_dispatched:${reason}`;
   return broadcastProjection(run);
 }
@@ -1545,10 +1596,6 @@ async function dispatchPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun): Pro
   if (!(await refreshChangeRoot(run))) {
     return terminalizeAndSend(run, 'failed', run.latestMessage ?? 'change_root_invalid');
   }
-  const runtime = await awaitTransportRuntime(run.targetImplementationSessionName);
-  if (!runtime) {
-    return terminalizeAndSend(run, 'failed', 'missing_transport_runtime');
-  }
   const gitEvidence = await collectGitEvidence(run);
   run.evidence = mergeEvidence(run.evidence, [
     {
@@ -1589,47 +1636,22 @@ async function dispatchPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun): Pro
   run.activeAcceptanceAudit = active;
   run.activeCommandId = `${attemptId}:prompt`;
   const prompt = buildPostRepairAcceptanceAuditPrompt(run, metadata);
-  timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
-    text: prompt,
-    allowDuplicate: true,
-    commandId: run.activeCommandId,
-  }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${run.activeCommandId}` });
-  try {
-    runtime.send(prompt, run.activeCommandId);
-  } catch (error) {
-    delete run.activeCommandId;
-    run.activeAcceptanceAudit = undefined;
-    return terminalize(run, 'failed', error instanceof Error ? `post_repair_acceptance_audit_send_failed:${error.message}` : 'post_repair_acceptance_audit_send_failed');
-  }
+  await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
   run.latestMessage = 'post_repair_acceptance_audit_dispatched';
   return broadcastProjection(run);
 }
 
-function dispatchPostRepairAcceptanceAuditResultRepairPrompt(
+async function dispatchPostRepairAcceptanceAuditResultRepairPrompt(
   run: AutoDeliverRun,
   active: NonNullable<AutoDeliverRun['activeAcceptanceAudit']>,
   reason: string,
-): OpenSpecAutoDeliverProjection {
-  const runtime = getTransportRuntime(run.targetImplementationSessionName);
-  if (!runtime) {
-    return terminalize(run, 'failed', 'missing_transport_runtime');
-  }
+): Promise<OpenSpecAutoDeliverProjection> {
   active.resultFileRepairAttempted = true;
   run.activeAcceptanceAudit = active;
   run.activeCommandId = `${active.attemptId}:result-file-repair`;
   const metadata = acceptanceAuditMetadataFromActive(run, active);
   const prompt = buildPostRepairAcceptanceAuditResultRepairPrompt(run, metadata, reason);
-  timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
-    text: prompt,
-    allowDuplicate: true,
-    commandId: run.activeCommandId,
-  }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${run.activeCommandId}` });
-  try {
-    runtime.send(prompt, run.activeCommandId);
-  } catch (error) {
-    delete run.activeCommandId;
-    return terminalize(run, 'failed', error instanceof Error ? `post_repair_result_repair_send_failed:${error.message}` : 'post_repair_result_repair_send_failed');
-  }
+  await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
   run.latestMessage = 'post_repair_result_file_repair_prompt_dispatched';
   return broadcastProjection(run);
 }
@@ -1957,10 +1979,6 @@ async function dispatchAutoCommitPushPrompt(run: AutoDeliverRun): Promise<OpenSp
     }]);
     return terminalizeAndSend(run, 'passed', 'final_audit_passed');
   }
-  const runtime = await awaitTransportRuntime(run.targetImplementationSessionName);
-  if (!runtime) {
-    return terminalizeAndSend(run, 'failed', 'missing_transport_runtime');
-  }
   try {
     run.autoCommitPushBaselineHead = (await gitOutput(run.projectRoot, ['rev-parse', 'HEAD'])).trim();
     run.autoCommitPushBaselineAhead = await currentUpstreamAheadCount(run.projectRoot) ?? 0;
@@ -1972,17 +1990,7 @@ async function dispatchAutoCommitPushPrompt(run: AutoDeliverRun): Promise<OpenSp
   run.stage = 'commit_push';
   run.activeCommandId = `${run.runId}:auto-commit-push:${run.generation}`;
   const prompt = buildAutoCommitPushPrompt(run, files);
-  timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
-    text: prompt,
-    allowDuplicate: true,
-    commandId: run.activeCommandId,
-  }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${run.activeCommandId}` });
-  try {
-    runtime.send(prompt, run.activeCommandId);
-  } catch (error) {
-    delete run.activeCommandId;
-    return terminalizeAndSend(run, 'failed', error instanceof Error ? `auto_commit_push_send_failed:${error.message}` : 'auto_commit_push_send_failed');
-  }
+  await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
   run.latestMessage = 'auto_commit_push_prompt_dispatched';
   run.evidence = mergeEvidence(run.evidence, [{
     source: 'daemon',
@@ -2233,21 +2241,10 @@ function buildAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpe
   ].join('\n');
 }
 
-function dispatchAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpecAutoDeliverP2pMetadata, p2pRun: P2pRun, reason: string): boolean {
-  const runtime = getTransportRuntime(run.targetImplementationSessionName);
-  if (!runtime) return false;
+async function dispatchAuditResultFileRepairPrompt(run: AutoDeliverRun, metadata: OpenSpecAutoDeliverP2pMetadata, p2pRun: P2pRun, reason: string): Promise<boolean> {
   const commandId = `${metadata.attemptId}:authoritative-result-file-repair`;
   const prompt = buildAuditResultFileRepairPrompt(run, metadata, p2pRun, reason);
-  timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
-    text: prompt,
-    allowDuplicate: true,
-    commandId,
-  }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${commandId}` });
-  try {
-    runtime.send(prompt, commandId);
-  } catch {
-    return false;
-  }
+  await sendAutoDeliverPromptToImplementationSession(run, prompt, commandId);
   run.latestMessage = 'authoritative_result_file_repair_prompt_dispatched';
   broadcastProjection(run);
   return true;
@@ -2564,7 +2561,7 @@ async function dispatchPostRepairAcceptanceFollowup(
     || (completion === 'unknown' && hasPendingRepairWork(verdict));
   if (!shouldContinueRepair) return false;
   const projection = stage === 'spec_audit_repair'
-    ? dispatchSpecRepairPrompt(run, reason)
+    ? await dispatchSpecRepairPrompt(run, reason)
     : await dispatchImplementationRepairPrompt(run, reason);
   if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
@@ -2801,7 +2798,7 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
       stale: false,
     }]);
     const projection = expected.stage === 'spec_audit_repair'
-      ? dispatchSpecRepairPrompt(run, 'spec_audit_followup_repair')
+      ? await dispatchSpecRepairPrompt(run, 'spec_audit_followup_repair')
       : await dispatchImplementationRepairPrompt(run, OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON);
     if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
       send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
@@ -2814,7 +2811,7 @@ async function handleAuditPoll(runId: string, expected: OpenSpecAutoDeliverP2pMe
     if (isRetryableAuditResultError(reason) && !active.resultFileRepairAttempted) {
       active.resultFileRepairAttempted = true;
       run.activeAudit = active;
-      if (dispatchAuditResultFileRepairPrompt(run, expected, p2pRun, reason)) {
+      if (await dispatchAuditResultFileRepairPrompt(run, expected, p2pRun, reason)) {
         auditPollTimers.set(runId, setTimeout(() => { void handleAuditPoll(runId, expected); }, 1000));
         return;
       }
@@ -3037,7 +3034,7 @@ async function advanceAfterPostRepairAcceptanceAuditIdle(run: AutoDeliverRun): P
   if (!verdict) {
     const reason = run.latestMessage ?? 'invalid_audit_result';
     if (isRetryableAuditResultError(reason) && !active.resultFileRepairAttempted) {
-      const projection = dispatchPostRepairAcceptanceAuditResultRepairPrompt(run, active, reason);
+      const projection = await dispatchPostRepairAcceptanceAuditResultRepairPrompt(run, active, reason);
       if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
         send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
       }

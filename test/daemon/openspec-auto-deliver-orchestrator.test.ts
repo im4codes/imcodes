@@ -71,6 +71,7 @@ import {
   handleOpenSpecAutoDeliverDaemonRestartCleanup,
   handleOpenSpecAutoDeliverCommand,
 } from '../../src/daemon/openspec-auto-deliver-orchestrator.js';
+import { clearAllResend, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { getAutoDeliverP2pLock } from '../../src/daemon/p2p-launch-admission.js';
 
@@ -425,6 +426,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       send: transportSendMock,
       settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
     }));
+    clearAllResend();
     clearOpenSpecAutoDeliverRunsForTests();
     getSessionMock.mockImplementation((name: string) => ({
       name,
@@ -453,6 +455,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
 
   afterEach(async () => {
     clearOpenSpecAutoDeliverRunsForTests();
+    clearAllResend();
     await rm(projectDir, { recursive: true, force: true });
     await Promise.all(extraTempDirs.map((dir) => rm(dir, { recursive: true, force: true })));
   });
@@ -1919,6 +1922,47 @@ exec "${realGit}" "$@"
       summary: 'final_audit_passed',
       roundIndex: 1,
     });
+  });
+
+  it('queues final acceptance audit prompts for resend when transport runtime is not initialized', async () => {
+    await startFastImplementationAudit('req-final-acceptance-uninitialized-runtime');
+    const discussion = await completeLatestDiscussion();
+    await waitForTransportSend((text) =>
+      text.includes('Audit findings to repair now:')
+      && text.includes('Reason: implementation_audit_followup_repair'),
+      2500,
+    );
+    expect(await writeLatestImplementationMarker()).toBe(true);
+    transportSendMock.mockClear();
+    getTransportRuntimeMock.mockImplementation(() => ({
+      providerSessionId: null,
+      send: transportSendMock,
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+    }));
+
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    const projection = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair'
+      && msg.projection?.lastMessage === 'post_repair_acceptance_audit_dispatched',
+      2500,
+    );
+    expect(projection.projection.status).toBe('implementation_audit_repair');
+    expect(projection.projection.terminal).not.toBe(true);
+    expect(serverLinkMock.send.mock.calls.some((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toBe(false);
+    expect(transportSendMock).not.toHaveBeenCalled();
+
+    const queued = getResendEntries('deck_demo_brain');
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.commandId).toContain(':post_repair_acceptance_audit:');
+    expect(queued[0]?.text).toContain('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change');
+    expect(queued[0]?.text).toContain(`Previous audit discussion file: ${discussion.contextFilePath}`);
+    expect(serverLinkMock.send.mock.calls.some((call) =>
+      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && String(call[0]?.projection?.evidence?.map((entry: { summary?: string }) => entry.summary).join('\n') ?? '')
+        .includes('Auto Deliver prompt queued for transport resend'),
+    )).toBe(true);
   });
 
   it('feeds final acceptance REWORK back into implementation repair before extending audit rounds', async () => {
