@@ -433,15 +433,19 @@ export function SubSessionWindow({
   // TerminalView would start empty (no snapshot, only incremental data).
   useEffect(() => {
     if (!ws || !connected || isTransport) return;
+    if (isShell && !active) return;
     const raw = active;
     try { ws.subscribeTerminal(sub.sessionName, raw); } catch { /* ignore */ }
     if (!raw) {
       return;
     }
     return () => {
-      try { ws.subscribeTerminal(sub.sessionName, false); } catch { /* ignore */ }
+      try {
+        if (isShell) ws.unsubscribeTerminal(sub.sessionName);
+        else ws.subscribeTerminal(sub.sessionName, false);
+      } catch { /* ignore */ }
     };
-  }, [ws, connected, sub.sessionName, active, isTransport]);
+  }, [ws, connected, sub.sessionName, active, isTransport, isShell]);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => {

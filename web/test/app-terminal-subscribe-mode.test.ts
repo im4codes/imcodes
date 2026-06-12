@@ -23,15 +23,19 @@ describe('shouldSubscribeTerminalRaw', () => {
     expect(shouldSubscribeTerminalRaw(true, 'terminal')).toBe(true);
   });
 
-  it('REGRESSION GUARD: transport/sdk sessions must remain in passive global subscriptions and this test must not be deleted', () => {
+  it('REGRESSION GUARD: shell/script sessions must not enter passive terminal subscriptions and this test must not be deleted', () => {
     expect(listPassiveTerminalSubscriptionNames([
       { name: 'deck_proc_brain', runtimeType: 'process' as const },
       { name: 'deck_sdk_brain', runtimeType: 'transport' as const },
+      { name: 'deck_shell_brain', runtimeType: 'process' as const, agentType: 'shell' },
+      { name: 'deck_script_brain', runtimeType: 'process' as const, agentType: 'script' },
     ])).toEqual(['deck_proc_brain', 'deck_sdk_brain']);
 
     expect(listPassiveTerminalSubSessionNames([
       { id: 'sub-proc', sessionName: 'deck_sub_proc', runtimeType: 'process' as const },
       { id: 'sub-sdk', sessionName: 'deck_sub_sdk', runtimeType: 'transport' as const },
+      { id: 'sub-shell', sessionName: 'deck_sub_shell', runtimeType: 'process' as const, type: 'shell' },
+      { id: 'sub-script', sessionName: 'deck_sub_script', runtimeType: 'process' as const, type: 'script' },
     ])).toEqual(['deck_sub_proc', 'deck_sub_sdk']);
   });
 
@@ -73,10 +77,12 @@ describe('shouldSubscribeTerminalRaw', () => {
       sessions: [
         { name: 'deck_sdk_brain', runtimeType: 'transport' as const },
         { name: 'deck_proc_brain', runtimeType: 'process' as const },
+        { name: 'deck_shell_brain', runtimeType: 'process' as const, agentType: 'shell' },
       ],
       subSessions: [
         { id: 'sub-sdk', sessionName: 'deck_sub_sdk', runtimeType: 'transport' as const },
         { id: 'sub-proc', sessionName: 'deck_sub_proc', runtimeType: 'process' as const },
+        { id: 'sub-shell', sessionName: 'deck_sub_shell', runtimeType: 'process' as const, type: 'shell' },
       ],
     })).toEqual([
       { name: 'deck_sdk_brain', mode: 'chat' },

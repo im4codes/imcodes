@@ -397,6 +397,30 @@ describe('SubSessionCard', () => {
     expect(releaseRaw).toHaveBeenCalledOnce();
   });
 
+  it('fallback shell card cleanup unsubscribes instead of entering passive mode', async () => {
+    const ws = { subscribeTerminal: vi.fn(), unsubscribeTerminal: vi.fn() } as any;
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession({ type: 'shell', shellBin: '/bin/bash' })}
+        ws={ws}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(ws.subscribeTerminal).toHaveBeenCalledWith('deck_sub_sub-card-1', true);
+    });
+
+    view.unmount();
+
+    expect(ws.unsubscribeTerminal).toHaveBeenCalledWith('deck_sub_sub-card-1');
+    expect(ws.subscribeTerminal).not.toHaveBeenCalledWith('deck_sub_sub-card-1', false);
+  });
+
   it('renders the stop button in transport fallback input mode and sends direct cancel via the urgent path', async () => {
     // Stop is highest-priority — it must use sendSessionCommandUrgent so a
     // visibility/focus probe-flip (`_connected = false`) can't silently

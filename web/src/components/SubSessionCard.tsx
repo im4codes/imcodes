@@ -162,10 +162,9 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const [quickPanelOpen, setQuickPanelOpen] = useState(false);
   const [overlayOpen, setOverlayOpen] = useState(false);
 
-  // Shell/script cards render a live xterm preview. Keep them in raw mode so
-  // command output is delivered immediately instead of waiting for passive
-  // terminal snapshots; cleanup downgrades back to passive because App owns the
-  // global sub-session subscription.
+  // Shell/script cards render a live xterm preview. Keep them in raw mode only
+  // while the card is mounted; cleanup releases the stream entirely because
+  // shell/script sessions have no passive terminal history to replay.
   useEffect(() => {
     if (!isShell || !ws || !connected) return;
     if (typeof ws.holdTerminalRaw === 'function') {
@@ -173,7 +172,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     }
     try { ws.subscribeTerminal(sub.sessionName, true); } catch { /* ignore */ }
     return () => {
-      try { ws.subscribeTerminal(sub.sessionName, false); } catch { /* ignore */ }
+      try { ws.unsubscribeTerminal(sub.sessionName); } catch { /* ignore */ }
     };
   }, [connected, isShell, sub.sessionName, ws]);
 

@@ -4088,10 +4088,21 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
     logger.debug({ session, agentType: record?.agentType }, 'Terminal subscribe skipped for transport session');
     return;
   }
+  const raw = cmd.raw === true;
+  const isShellLike = record?.agentType === 'shell' || record?.agentType === 'script';
+  if (isShellLike && !raw) {
+    const existing = activeSubscriptions.get(session);
+    if (existing) {
+      existing.unsubscribe();
+      activeSubscriptions.delete(session);
+    }
+    logger.debug({ session, agentType: record?.agentType }, 'Terminal subscribe skipped for passive shell/script session');
+    return;
+  }
 
-  // The bridge may include a `raw` flag on terminal.subscribe for its own forwarding-mode
-  // bookkeeping, but daemon-side terminal streaming remains transport-stable in this phase:
-  // once subscribed for a session, we continue emitting both text diffs and raw PTY bytes.
+  // Non-shell process sessions still keep a daemon-side stream for terminal
+  // state and legacy parser updates; shell/script sessions are live surfaces
+  // only, so raw:false is handled above as "no terminal subscription".
   // Per-session raw PTY batching: accumulate small chunks and flush on timer or size threshold.
   let rawBatch: Buffer[] = [];
   let rawBatchBytes = 0;

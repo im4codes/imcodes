@@ -48,12 +48,21 @@ function isTransportTarget(target: RuntimeAwareTarget): boolean {
   return resolveTargetRuntimeType(target) === 'transport';
 }
 
+function isShellLikeTarget(target: RuntimeAwareTarget): boolean {
+  const agentType = target.agentType ?? target.type;
+  return agentType === 'shell' || agentType === 'script';
+}
+
 export function listPassiveTerminalSubscriptionNames<T extends NamedSessionTarget>(targets: readonly T[]): string[] {
-  return targets.map((target) => target.name);
+  return targets
+    .filter((target) => !isShellLikeTarget(target))
+    .map((target) => target.name);
 }
 
 export function listPassiveTerminalSubSessionNames<T extends NamedSubSessionTarget>(targets: readonly T[]): string[] {
-  return targets.map((target) => target.sessionName);
+  return targets
+    .filter((target) => !isShellLikeTarget(target))
+    .map((target) => target.sessionName);
 }
 
 export function listGlobalTransportSubscriptionNames<T extends TransportNamedSessionTarget>(targets: readonly T[]): string[] {
@@ -96,8 +105,10 @@ export function buildTerminalResubscribePlan(params: {
         })()
       : []),
     ...sessions
-      .filter((session) => session.name !== activeName)
+      .filter((session) => session.name !== activeName && !isShellLikeTarget(session))
       .map((session) => ({ name: session.name, mode: 'chat' as const })),
-    ...subSessions.map((sub) => ({ name: sub.sessionName, mode: 'chat' as const })),
+    ...subSessions
+      .filter((sub) => !isShellLikeTarget(sub))
+      .map((sub) => ({ name: sub.sessionName, mode: 'chat' as const })),
   ];
 }

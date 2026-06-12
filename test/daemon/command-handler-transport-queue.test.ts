@@ -3095,6 +3095,49 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(terminalRequestSnapshotMock).not.toHaveBeenCalled();
   });
 
+  it('skips passive shell/script terminal subscriptions and releases any live shell stream', async () => {
+    const unsubscribeShell = vi.fn();
+    terminalSubscribeMock.mockReturnValueOnce(unsubscribeShell);
+    getSessionMock.mockReturnValue({
+      name: 'deck_shell_brain',
+      projectName: 'transport',
+      role: 'worker',
+      agentType: 'shell',
+      runtimeType: 'process',
+      state: 'running',
+    });
+
+    handleWebCommand({ type: 'terminal.subscribe', session: 'deck_shell_brain', raw: false }, serverLink as any);
+    await flushAsync();
+
+    expect(terminalSubscribeMock).not.toHaveBeenCalled();
+
+    handleWebCommand({ type: 'terminal.subscribe', session: 'deck_shell_brain', raw: true }, serverLink as any);
+    await flushAsync();
+
+    expect(terminalSubscribeMock).toHaveBeenCalledTimes(1);
+
+    handleWebCommand({ type: 'terminal.subscribe', session: 'deck_shell_brain', raw: false }, serverLink as any);
+    await flushAsync();
+
+    expect(unsubscribeShell).toHaveBeenCalledTimes(1);
+    expect(terminalSubscribeMock).toHaveBeenCalledTimes(1);
+
+    getSessionMock.mockReturnValue({
+      name: 'deck_script_brain',
+      projectName: 'transport',
+      role: 'worker',
+      agentType: 'script',
+      runtimeType: 'process',
+      state: 'running',
+    });
+
+    handleWebCommand({ type: 'terminal.subscribe', session: 'deck_script_brain', raw: false }, serverLink as any);
+    await flushAsync();
+
+    expect(terminalSubscribeMock).toHaveBeenCalledTimes(1);
+  });
+
   it('skips tmux resize for transport sessions', async () => {
     handleWebCommand({ type: 'session.resize', sessionName: 'deck_transport_brain', cols: 200, rows: 50 }, serverLink as any);
     await flushAsync();
