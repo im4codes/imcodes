@@ -475,7 +475,6 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     expect(startP2pRunMock).toHaveBeenCalledWith(expect.objectContaining({
       initiatorSession: 'deck_sub_worker',
       targets: [
-        { session: 'deck_demo_brain', mode: 'audit>review>plan' },
         { session: 'deck_sub_peer', mode: 'audit>review>plan' },
       ],
     }));
