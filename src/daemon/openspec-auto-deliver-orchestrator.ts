@@ -909,7 +909,7 @@ function buildImplementationCompletionMarkerBlock(run: AutoDeliverRun): string {
     'Implementation completion marker (required):',
     `- After you have completed implementation, tasks.md updates, and reasonable validation, write this exact JSON marker to: ${active.markerPath}`,
     '- Keep runId, cycleIndex, cycleTotal, nonce, and status exactly as shown. Do not write the marker before doing the work.',
-    '- If you cannot complete the implementation, write the failed marker instead and include a short error field.',
+    '- Use the failed marker only when external input or an unrecoverable blocker prevents further implementation. If work is merely incomplete, keep working and overwrite any old failed marker with the completed marker after finishing.',
     '- Idling without this marker does not count as implementation completion; Auto Deliver will keep the run in implementation until the marker is present and valid.',
     '',
     'Completed marker:',
@@ -1026,7 +1026,7 @@ function buildImplementationMarkerReminderPrompt(run: AutoDeliverRun, reason: st
     '',
     'Do not start an audit report. Continue from the current implementation state and finish the required code, test, and tasks.md work.',
     'Run the appropriate validation for the files you touched. If validation fails, fix the failure and validate again.',
-    'Write the completed marker only after the implementation is genuinely finished and validated. If you are blocked, write the failed marker with a short reason.',
+    'Write the completed marker only after the implementation is genuinely finished and validated. Use a failed marker only for external input or unrecoverable blockers; incomplete checklist work means continue implementing, not stop.',
     'A false idle without this marker is not completion; Auto Deliver will keep the run in implementation.',
     '',
     buildImplementationCompletionMarkerBlock(run),
@@ -2872,8 +2872,10 @@ async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void
           command: run.activeCommandId,
           stale: false,
         }]);
-        const projection = terminalize(run, 'needs_human', `implementation_marker_failed:${markerState.reason}`);
-        send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+        const projection = await dispatchImplementationMarkerReminder(run, `implementation_marker_failed:${markerState.reason}`);
+        if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
+          send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+        }
         return;
       }
       const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);

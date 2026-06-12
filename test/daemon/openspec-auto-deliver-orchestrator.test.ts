@@ -933,6 +933,51 @@ exec "${realGit}" "$@"
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
   });
 
+  it('continues implementation when the agent reports an incomplete failed marker', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-failed-implementation-marker-continues',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      2500,
+    );
+
+    expect(await writeLatestImplementationMarker({
+      status: 'failed',
+      error: 'remaining repair checklist gaps',
+    })).toBe(true);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    const reminderPrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver implementation is not complete yet for @openspec/changes/demo-change.')
+      && text.includes('Reason: implementation_marker_failed:remaining repair checklist gaps')
+      && text.includes('incomplete checklist work means continue implementing, not stop'),
+      2500,
+    );
+    expect(reminderPrompt).toContain('finish the required code, test, and tasks.md work');
+    expect(serverLinkMock.send.mock.calls.some((call) =>
+      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && call[0]?.projection?.terminalReason === 'implementation_marker_failed:remaining repair checklist gaps',
+    )).toBe(false);
+
+    expect(await writeLatestImplementationMarker()).toBe(true);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair',
+      2500,
+    );
+    expect(startP2pRunMock).toHaveBeenCalledTimes(1);
+  });
+
   it('escalates to needs_human after too many idle reminders without a completion marker', async () => {
     // Regression: a session that kept going idle without writing the completion
     // marker re-sent the "implementation is not complete yet" reminder forever
