@@ -64,6 +64,7 @@ const QWEN_BIN = 'qwen';
 const QWEN_COMPACT_SLASH_COMMAND = '/compress' as const;
 const TRANSIENT_RETRY_DELAY_MS = 250;
 const TRANSIENT_RETRY_MAX_ATTEMPTS = 1;
+const QWEN_RESULT_COMPLETION_FALLBACK_MS = 5_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const QWEN_COMPATIBLE_API_CLI_AUTH_TYPES = new Set([
   'openai',
@@ -846,12 +847,37 @@ export class QwenProvider implements TransportProvider {
     let stderrBuf = '';
     let retryScheduled = false;
     let reasoningFallbackScheduled = false;
+    let resultCompletionTimer: ReturnType<typeof setTimeout> | null = null;
 
     const sawVisibleTurnProgress = (): boolean => {
       return (state.currentText.length > 0 && !startsWithSyntheticApiError(state.currentText))
         || !!state.pendingFinalText
         || state.toolUseById.size > 0
         || state.emittedToolSignatures.size > 0;
+    };
+
+    const clearResultCompletionFallback = (): void => {
+      if (!resultCompletionTimer) return;
+      clearTimeout(resultCompletionTimer);
+      resultCompletionTimer = null;
+    };
+
+    const armResultCompletionFallback = (): void => {
+      if (!state.pendingFinalText) return;
+      clearResultCompletionFallback();
+      resultCompletionTimer = setTimeout(() => {
+        resultCompletionTimer = null;
+        if (completed || sawError || !state.pendingFinalText) return;
+        const finalText = state.pendingFinalText;
+        const messageId = state.currentMessageId ?? undefined;
+        const metadata = state.pendingFinalMetadata;
+        if (state.child === child) {
+          state.child = null;
+          void killProcessTree(child, { gracefulMs: 500 });
+        }
+        emitComplete(finalText, messageId, metadata);
+      }, QWEN_RESULT_COMPLETION_FALLBACK_MS);
+      resultCompletionTimer.unref?.();
     };
 
     const maybeRetryTransientError = async (messageText: string, _details?: unknown): Promise<boolean> => {
@@ -907,6 +933,7 @@ export class QwenProvider implements TransportProvider {
     const emitError = (messageText: string, details?: unknown): void => {
       if (sawError || completed) return;
       sawError = true;
+      clearResultCompletionFallback();
       this.clearStatus(sessionId, state);
       const errorCode = state.cancelled
         ? PROVIDER_ERROR_CODES.CANCELLED
@@ -919,6 +946,7 @@ export class QwenProvider implements TransportProvider {
     const emitComplete = (text: string, messageId?: string, metadata?: Record<string, unknown>): void => {
       if (completed || sawError) return;
       completed = true;
+      clearResultCompletionFallback();
       state.started = true;
       state.currentMessageId = null;
       state.currentText = '';
@@ -1197,6 +1225,7 @@ export class QwenProvider implements TransportProvider {
             ...(!assistantUsage && sanitizedResultUsage ? { usage: sanitizedResultUsage } : {}),
             ...(compactCompletionMetadata ?? {}),
           };
+          armResultCompletionFallback();
         }
       }
     });
@@ -1209,6 +1238,7 @@ export class QwenProvider implements TransportProvider {
 
     child.once('close', (code, signal) => {
       setTimeout(() => {
+        clearResultCompletionFallback();
         rl.close();
         if (state.child === child) state.child = null;
         if (state.cancelled) {

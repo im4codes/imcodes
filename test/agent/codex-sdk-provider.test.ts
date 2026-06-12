@@ -1570,6 +1570,33 @@ describe('CodexSdkProvider', () => {
     expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
   });
 
+  it('does not complete a turn from agentMessage completion alone', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-agent-message-complete', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('route-agent-message-complete', 'hello');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(completed).toEqual([]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(completed).toEqual([]);
+    await expect(provider.send('route-agent-message-complete', 'next')).rejects.toMatchObject({
+      code: 'PROVIDER_ERROR',
+      recoverable: true,
+    });
+  });
+
   it('does not duplicate a normal completion after idle status fallback', async () => {
     vi.useFakeTimers();
     const provider = new CodexSdkProvider();

@@ -1741,6 +1741,13 @@ async function dispatchPostSummaryPrompt(
   }
 }
 
+function settlePostSummaryRuntimeFromMarker(run: P2pRun, reason: string): void {
+  const transportRuntime = getTransportRuntime(run.initiatorSession);
+  if (typeof transportRuntime?.settleActiveDispatchFromExternalCompletion === 'function') {
+    transportRuntime.settleActiveDispatchFromExternalCompletion(reason);
+  }
+}
+
 async function isPostSummaryMarkerRetryReady(
   run: P2pRun,
   session: string,
@@ -1889,15 +1896,7 @@ async function runPostSummaryExecutionGate(
 
     const markerState = await readPostSummaryExecutionMarker(spec);
     if (markerState?.ok) {
-      const confirmationDelayMs = Math.min(
-        POST_SUMMARY_CONFIRMATION_DELAY_MS,
-        Math.max(0, deadlineAt - Date.now() - 1),
-      );
-      if (confirmationDelayMs > 0) {
-        await sleep(confirmationDelayMs);
-        if (run._cancelled || isTerminal(run.status)) return false;
-        if (!ensureRunDeadline(run, serverLink)) return false;
-      }
+      settlePostSummaryRuntimeFromMarker(run, 'p2p-post-summary-execution-marker-completed');
       const confirmation = await runPostSummaryExecutionConfirmationGate(run, serverLink, spec, markerState.marker, timeoutMs);
       if (!confirmation) return false;
       await appendPostSummaryExecutionAudit(run, spec, markerState.marker, attempt);
@@ -3936,6 +3935,9 @@ async function dispatchHop(
         const markerState = await readPostSummaryExecutionMarker(options.executionMarkerSpec);
         if (markerState?.ok || markerState?.failedByAgent) {
           executionMarkerFound = true;
+          settlePostSummaryRuntimeFromMarker(run, markerState.ok
+            ? 'p2p-inline-execution-marker-completed'
+            : 'p2p-inline-execution-marker-failed');
           logger.info(
             {
               runId: run.id,
@@ -3943,8 +3945,12 @@ async function dispatchHop(
               markerPath: options.executionMarkerSpec.markerPath,
               markerStatus: markerState.marker?.status,
             },
-            'P2P: inline execution marker found; waiting for final answer/idle before completing summary hop',
+            'P2P: inline execution marker found; completing summary hop from marker proof',
           );
+          idleWaiter.cancel();
+          await finishHop('completed');
+          pushState(run, serverLink);
+          return true;
         }
       }
 

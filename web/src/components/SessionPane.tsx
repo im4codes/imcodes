@@ -362,7 +362,7 @@ export function SessionPane({
           hasOlderHistory={timelineHasOlderHistory}
           onLoadOlder={loadOlderEvents}
           sessionId={sessionName}
-          sessionState={session.state}
+          sessionState={liveSessionState ?? undefined}
           onScrollBottomFn={setChatScrollFn}
           workdir={session.projectDir}
           onViewRepo={onViewRepo}
@@ -391,6 +391,7 @@ export function SessionPane({
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
           activeToolCall={activeToolCall}
+          activeTimelineTurn={activeTimelineTurn}
           now={thinkingNow}
           onSyncMemorySummaries={handleSyncMemorySummaries}
           syncMemorySummariesBusy={syncingMemorySummaries}

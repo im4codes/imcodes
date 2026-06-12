@@ -85,6 +85,7 @@ vi.mock('../../src/components/UsageFooter.js', () => ({
     <div
       data-testid="usage-footer"
       data-state={props.sessionState}
+      data-active-timeline-turn={String(!!props.activeTimelineTurn)}
       data-model={props.modelOverride ?? ''}
     >
       {props.quotaLabel ?? props.planLabel ?? 'footer'}
@@ -279,6 +280,40 @@ describe('SessionPane', () => {
       activeTransportTurn: true,
     }));
     expect(screen.getByRole('button', { name: 'send' }).getAttribute('data-active-transport-turn')).toBe('true');
+    expect(screen.getByTestId('usage-footer').getAttribute('data-active-timeline-turn')).toBe('true');
+  });
+
+  it('passes live timeline state to ChatView instead of stale outer session state', () => {
+    timelineEventsMock = [
+      { eventId: 'idle', sessionId: 'deck_test_brain', ts: 1, type: 'session.state', payload: { state: 'idle' } },
+      { eventId: 'running', sessionId: 'deck_test_brain', ts: 2, type: 'session.state', payload: { state: 'running' } },
+    ];
+
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'claude-code-sdk',
+          state: 'idle',
+          runtimeType: 'transport',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(chatViewSpy).toHaveBeenCalledWith(expect.objectContaining({
+      sessionState: 'running',
+    }));
   });
 
   it('keeps active transport turn through a pending optimistic user message tail', () => {

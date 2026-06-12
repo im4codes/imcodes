@@ -1440,6 +1440,29 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingCount).toBe(0);
   });
 
+  it('external completion settles the active turn and drains queued messages without waiting for provider callbacks', async () => {
+    runtime.send('first marker-backed workflow turn', 'cmd-first');
+    await flushDispatch();
+    runtime.send('queued continuation after marker', 'cmd-next');
+    expect(runtime.pendingCount).toBe(1);
+
+    expect(runtime.settleActiveDispatchFromExternalCompletion('test-marker-completed')).toBe(true);
+    await flushDispatch();
+
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.sending).toBe(true);
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued continuation after marker',
+      assembledMessage: 'queued continuation after marker',
+    }));
+
+    mock.fireError('sess-1', { code: 'CANCELLED', message: 'late cancellation from settled turn', recoverable: true });
+    expect(runtime.sending).toBe(true);
+    expect(runtime.getStatus()).not.toBe('idle');
+  });
+
   it('recoverable provider errors drain pending messages into the next turn', async () => {
     runtime.send('first');
     await flushDispatch();

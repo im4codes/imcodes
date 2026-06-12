@@ -25,13 +25,14 @@ interface MockP2pRun {
   error?: string | null;
 }
 
-const { getSessionMock, listSessionsMock, getSavedP2pConfigMock, getTransportRuntimeMock, serverLinkMock, transportSendMock, p2pRuns, startP2pRunMock, getP2pRunMock, listP2pRunsMock, cancelP2pRunMock } = vi.hoisted(() => ({
+const { getSessionMock, listSessionsMock, getSavedP2pConfigMock, getTransportRuntimeMock, serverLinkMock, transportSendMock, transportSettleExternalMock, p2pRuns, startP2pRunMock, getP2pRunMock, listP2pRunsMock, cancelP2pRunMock } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   listSessionsMock: vi.fn(),
   getSavedP2pConfigMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
   serverLinkMock: { send: vi.fn() },
   transportSendMock: vi.fn(() => 'sent'),
+  transportSettleExternalMock: vi.fn(() => true),
   p2pRuns: new Map<string, MockP2pRun>(),
   startP2pRunMock: vi.fn(),
   getP2pRunMock: vi.fn((id: string) => p2pRuns.get(id)),
@@ -408,6 +409,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     getP2pRunMock.mockClear();
     listP2pRunsMock.mockImplementation(() => [...p2pRuns.values()]);
     cancelP2pRunMock.mockClear();
+    transportSettleExternalMock.mockClear();
     startP2pRunMock.mockImplementation(async (opts: { launchOrigin?: unknown; userText?: string; initiatorSession?: string; locale?: string }) => {
       const id = `p2p-${p2pRuns.size + 1}`;
       const contextFilePath = join(projectDir, '.imc', 'discussions', `${id}.md`);
@@ -418,7 +420,10 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       return run;
     });
     getTransportRuntimeMock.mockReset();
-    getTransportRuntimeMock.mockImplementation(() => ({ send: transportSendMock }));
+    getTransportRuntimeMock.mockImplementation(() => ({
+      send: transportSendMock,
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+    }));
     clearOpenSpecAutoDeliverRunsForTests();
     getSessionMock.mockImplementation((name: string) => ({
       name,
@@ -930,6 +935,32 @@ exec "${realGit}" "$@"
       2500,
     );
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('advances implementation from a valid completion marker without waiting for idle', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-marker-advances-without-idle',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      2500,
+    );
+    expect(await writeLatestImplementationMarker()).toBe(true);
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair',
+      2500,
+    );
+    expect(startP2pRunMock).toHaveBeenCalledTimes(1);
+    expect(transportSettleExternalMock).toHaveBeenCalledWith('openspec-auto-deliver-implementation-marker-completed');
   });
 
   it('continues implementation when the agent reports an incomplete failed marker', async () => {

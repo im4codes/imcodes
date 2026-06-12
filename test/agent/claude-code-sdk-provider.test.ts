@@ -276,6 +276,34 @@ describe('ClaudeCodeSdkProvider', () => {
     });
   });
 
+  it('falls back to completing from result when the SDK iterator never closes', async () => {
+    vi.useFakeTimers();
+    sdkMock.setWaitForClose(true);
+    sdkMock.setNextMessages([
+      { type: 'result', session_id: 'session-result-stuck', subtype: 'success', is_error: false, result: 'Done', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-result-stuck', cwd: '/tmp/project', resumeId: 'session-result-stuck' });
+
+    const completed: AgentMessage[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+
+    await provider.send('route-result-stuck', 'hello');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(completed).toEqual([]);
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(completed).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(completed.map((msg) => msg.content)).toEqual(['Done']);
+    expect(completed[0]?.metadata).toMatchObject({ completionFallback: 'result-timeout' });
+    expect(sdkMock.runs[0]?.closed).toBe(true);
+  });
+
   it('emits cancelled on cancel()', async () => {
     sdkMock.setWaitForClose(true);
 

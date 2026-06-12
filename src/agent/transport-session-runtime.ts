@@ -269,6 +269,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _activeDispatchStaleRecoveryStarted = false;
   private _nextDispatchId = 0;
   private readonly _locallyCancelledDispatchIds = new Set<number>();
+  private _externalCompletionSettlementsToIgnore = 0;
 
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void;
@@ -300,6 +301,21 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.provider.onComplete((sid: string, message: AgentMessage) => {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
+        if (this._externalCompletionSettlementsToIgnore > 0) {
+          this._externalCompletionSettlementsToIgnore--;
+          logger.warn(
+            { sessionKey: this.sessionKey, status: this._status },
+            'transport runtime ignored late provider completion for externally completed dispatch',
+          );
+          return;
+        }
+        if (!this.hasActiveTurnWork()) {
+          logger.warn(
+            { sessionKey: this.sessionKey, status: this._status },
+            'transport runtime ignored provider completion without active turn',
+          );
+          return;
+        }
         if (this._activeDispatchCancelled) {
           this._sending = false;
           this._activeTurn?.reject(makeCancelledProviderError());
@@ -337,6 +353,21 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.provider.onError((sid: string, error: ProviderError) => {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
+        if (this._externalCompletionSettlementsToIgnore > 0) {
+          this._externalCompletionSettlementsToIgnore--;
+          logger.warn(
+            { sessionKey: this.sessionKey, status: this._status, errorCode: error.code },
+            'transport runtime ignored late provider error for externally completed dispatch',
+          );
+          return;
+        }
+        if (!this.hasActiveTurnWork()) {
+          logger.warn(
+            { sessionKey: this.sessionKey, status: this._status, errorCode: error.code },
+            'transport runtime ignored provider error without active turn',
+          );
+          return;
+        }
         this._sending = false;
         this._activeTurn?.reject(error);
         this._activeTurn = null;
@@ -540,6 +571,68 @@ export class TransportSessionRuntime implements SessionRuntime {
         'transport stale pending recovery cancel failed',
       );
     });
+    return true;
+  }
+
+  /**
+   * Some daemon workflows have their own durable completion proof outside the
+   * provider stream, such as an Auto Deliver or P2P marker file. Once that
+   * proof is accepted, waiting for a late SDK onComplete/onError can keep the
+   * session visually "working" and block queued workflow continuations. Settle
+   * the current dispatch locally, optionally nudge the provider to stop in the
+   * background, and then drain queued runtime sends through the normal
+   * one-turn-at-a-time path.
+   */
+  settleActiveDispatchFromExternalCompletion(reason = 'external-completion'): boolean {
+    if (!this.hasActiveTurnWork()) return false;
+    const dispatchId = this._activeDispatchId;
+    if (dispatchId !== null) this._locallyCancelledDispatchIds.add(dispatchId);
+    const providerSessionId = this._providerSessionId;
+    const providerStarted = this._activeDispatchProviderStarted;
+    const providerCanCancel = !!this.provider.cancel && !!providerSessionId;
+    if (providerStarted && providerCanCancel) this._externalCompletionSettlementsToIgnore += 1;
+
+    logger.warn(
+      {
+        sessionKey: this.sessionKey,
+        reason,
+        status: this._status,
+        activeDispatchCount: this._activeDispatchEntries.length,
+        pendingCount: this._pendingMessages.length,
+        providerStarted,
+      },
+      'transport runtime active dispatch externally completed; settling locally',
+    );
+
+    this._sending = false;
+    this._activeTurn?.resolve();
+    this._activeTurn = null;
+    this._activeDispatchEntries = [];
+    this._activeDispatchCancelled = false;
+    this._activeDispatchProviderStarted = false;
+    this._activeDispatchId = null;
+    this._activeDispatchStaleRecoveryStarted = false;
+
+    if (providerStarted && providerCanCancel) {
+      try {
+        const cancelResult = this.provider.cancel!(providerSessionId);
+        void Promise.resolve(cancelResult).catch((err) => {
+          logger.warn(
+            { err, sessionKey: this.sessionKey, providerSessionId, reason },
+            'transport runtime external completion provider cancel failed',
+          );
+        });
+      } catch (err) {
+        logger.warn(
+          { err, sessionKey: this.sessionKey, providerSessionId, reason },
+          'transport runtime external completion provider cancel threw',
+        );
+      }
+    }
+
+    if (!this._drainPending()) {
+      this.setStatus('idle');
+    }
     return true;
   }
 
@@ -776,6 +869,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchId = null;
     this._activeDispatchStaleRecoveryStarted = false;
     this._locallyCancelledDispatchIds.clear();
+    this._externalCompletionSettlementsToIgnore = 0;
     if (this._pendingMessages.length > 0) {
       logger.warn(
         { sessionKey: this.sessionKey, pendingCount: this._pendingMessages.length },

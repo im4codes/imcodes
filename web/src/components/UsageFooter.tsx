@@ -32,6 +32,8 @@ interface Props {
   statusText?: string | null;
   /** Whether the current live tail is an active tool call. */
   activeToolCall?: boolean;
+  /** Whether the current timeline tail still has an active transport turn. */
+  activeTimelineTurn?: boolean;
   /** Current timestamp for thinking timer (updated every second). */
   now?: number;
   /** Sends recent memory summaries into the current agent as sync-only context. */
@@ -45,7 +47,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled }: Props) {
   const { t } = useTranslation();
   // Wrench pill: tri-state toggle for "show developer details in chat timeline".
   // Sourced from usePref → SharedResource, so this UsageFooter and ChatView
@@ -77,6 +79,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   // etc. Skip the live-work UI entirely for these session types.
   const isAgentless = agentType === 'shell' || agentType === 'script';
   const hasActiveLiveWork = !isAgentless && (!!activeToolCall || !!activeThinkingTs);
+  const hasLiveTransportTurn = !isAgentless && !!activeTimelineTurn;
   const showLiveStatus = !isAgentless;
   const [quotaNow, setQuotaNow] = useState(() => Date.now());
   const [ctxBurning, setCtxBurning] = useState(false);
@@ -174,21 +177,21 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     ? null
     : hasActiveLiveWork
       ? (activeToolCall ? 'tool' : 'thinking')
-      : sessionState === 'running' || sessionState === 'queued'
+      : hasLiveTransportTurn || sessionState === 'running' || sessionState === 'queued'
         ? 'running'
         : statusText
           ? (/^(?:supervised|auto):/i.test(statusText) ? 'result' : 'waiting')
           : 'idle';
   const liveStatusText = useMemo(() => {
     if (isAgentless) return null;
-    if (hasActiveLiveWork || sessionState === 'running' || sessionState === 'queued') {
+    if (hasActiveLiveWork || hasLiveTransportTurn || sessionState === 'running' || sessionState === 'queued') {
       if (activeToolCall) return statusText || 'Tool running...';
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
       return t('session.state_running');
     }
     if (statusText) return statusText;
     return t('session.state_idle');
-  }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, isAgentless, now, sessionState, statusText, t]);
+  }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, hasLiveTransportTurn, isAgentless, now, sessionState, statusText, t]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result';
   // The weekly (7d) line is opt-in: it needs the daemon to read the local
   // Claude token. The 5h line needs no authorization (it comes from the SDK

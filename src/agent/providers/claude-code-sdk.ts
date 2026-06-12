@@ -54,6 +54,7 @@ const CLAUDE_BIN = 'claude';
 const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
 const FORCE_KILL_TIMEOUT_MS = 500;
+const RESULT_COMPLETION_FALLBACK_MS = 5_000;
 
 // Claude Code ships native scheduling tools (RemoteTrigger creates a claude.ai
 // routine; the Cron* tools manage them) that bypass IM.codes entirely. We
@@ -107,6 +108,9 @@ interface ClaudeSdkSessionState {
   rateLimits?: Record<string, ClaudeRateLimitInfo>;
   pendingComplete?: AgentMessage;
   pendingError?: ProviderError;
+  turnGeneration: number;
+  resultCompletionTimer: ReturnType<typeof setTimeout> | null;
+  resultCompletionGeneration?: number;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
   runtimeAgentToolCalls: Map<string, { canonicalKey: string; agentPath: string; agentName?: string; model?: string; prompt?: string }>;
   emittedToolStates: Map<string, string>;
@@ -282,6 +286,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   async disconnect(): Promise<void> {
     this.questions.releaseAll();
     for (const state of this.sessions.values()) {
+      this.clearResultCompletionFallback(state);
       try { state.currentQuery?.close(); } catch {}
       this.terminateChild(state);
     }
@@ -319,6 +324,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       lastAssistantUsage: existing?.lastAssistantUsage,
       rateLimits: existing?.rateLimits,
       pendingComplete: undefined,
+      turnGeneration: existing?.turnGeneration ?? 0,
+      resultCompletionTimer: null,
+      resultCompletionGeneration: undefined,
       toolCalls: new Map(),
       runtimeAgentToolCalls: new Map(),
       emittedToolStates: new Map(),
@@ -336,6 +344,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const state = this.sessions.get(sessionId);
     this.questions.release(state?.sessionName ?? sessionId);
     if (state) {
+      this.clearResultCompletionFallback(state);
       try { state.currentQuery?.close(); } catch {}
       this.terminateChild(state);
       this.sessions.delete(sessionId);
@@ -418,6 +427,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const state = this.sessions.get(sessionId);
     if (!state?.currentQuery) return;
     state.cancelled = true;
+    this.clearResultCompletionFallback(state);
     try {
       await Promise.race([
         state.currentQuery.interrupt(),
@@ -444,6 +454,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state.lastAssistantUsage = undefined;
     state.pendingComplete = undefined;
     state.pendingError = undefined;
+    this.clearResultCompletionFallback(state);
     state.toolCalls.clear();
     state.runtimeAgentToolCalls.clear();
     state.emittedToolStates.clear();
@@ -525,8 +536,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     };
 
     const q = query({ prompt, options: options as any });
+    const turnGeneration = ++state.turnGeneration;
     state.currentQuery = q;
-    void this.consumeQuery(sessionId, state, q, payload, allowResumeFallback);
+    void this.consumeQuery(sessionId, state, q, payload, allowResumeFallback, turnGeneration);
   }
 
   private async consumeQuery(
@@ -535,6 +547,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     q: ReturnType<typeof query>,
     payload: ProviderContextPayload,
     allowResumeFallback: boolean,
+    turnGeneration: number,
   ): Promise<void> {
     let pendingError: ProviderError | null = null;
     try {
@@ -552,6 +565,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         ? this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Claude turn cancelled', true, err)
         : this.normalizeError(err);
     } finally {
+      if (state.turnGeneration === turnGeneration) {
+        this.clearResultCompletionFallback(state);
+      }
       state.currentQuery = null;
       state.currentChild = null;
       const pendingComplete = state.pendingComplete;
@@ -823,8 +839,48 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           resumeId: state.resumeId,
         },
       };
+      this.armResultCompletionFallback(sessionId, state);
       return;
     }
+  }
+
+  private armResultCompletionFallback(sessionId: string, state: ClaudeSdkSessionState): void {
+    if (!state.currentQuery || !state.pendingComplete) return;
+    this.clearResultCompletionFallback(state);
+    const turnGeneration = state.turnGeneration;
+    state.resultCompletionGeneration = turnGeneration;
+    state.resultCompletionTimer = setTimeout(() => {
+      state.resultCompletionTimer = null;
+      if (!this.sessions.has(sessionId)) return;
+      if (state.turnGeneration !== turnGeneration || state.resultCompletionGeneration !== turnGeneration) return;
+      if (!state.currentQuery || !state.pendingComplete) return;
+
+      const pendingComplete = state.pendingComplete;
+      const q = state.currentQuery;
+      state.pendingComplete = undefined;
+      state.pendingError = undefined;
+      state.resultCompletionGeneration = undefined;
+      state.currentMessageId = null;
+      state.currentText = '';
+      pendingComplete.metadata = {
+        ...(pendingComplete.metadata ?? {}),
+        completionFallback: 'result-timeout',
+      };
+      try { q.close(); } catch {}
+      this.terminateChild(state);
+      state.currentQuery = null;
+      state.currentChild = null;
+      for (const cb of this.completeCallbacks) cb(sessionId, pendingComplete);
+    }, RESULT_COMPLETION_FALLBACK_MS);
+    state.resultCompletionTimer.unref?.();
+  }
+
+  private clearResultCompletionFallback(state: ClaudeSdkSessionState): void {
+    if (state.resultCompletionTimer) {
+      clearTimeout(state.resultCompletionTimer);
+      state.resultCompletionTimer = null;
+    }
+    state.resultCompletionGeneration = undefined;
   }
 
   private resolvePermissionMode(): PermissionMode {

@@ -903,6 +903,42 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(done.error).toContain('post_summary_execution_timeout');
   });
 
+  it('advances post-summary execution from matching markers without waiting for idle', async () => {
+    autoWriteExecutionMarkers = false;
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (prompt.includes('[P2P Discussion Task')) {
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+        if (prompt.includes('Execution proof required')) {
+          await writeExecutionMarkerFromPrompt(prompt, true);
+          return;
+        }
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
+      if (prompt.includes('Execution proof required')) {
+        await writeExecutionMarkerFromPrompt(prompt, true);
+        return;
+      }
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'marker completes without idle',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      1_000,
+    );
+
+    const done = await waitForStatus(run.id, ['completed'], 3000);
+    expect(done.status).toBe('completed');
+  });
+
   it('retries the post-summary execution prompt after idle until the marker appears', async () => {
     autoWriteExecutionMarkers = false;
     let executionAttempts = 0;

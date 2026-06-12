@@ -123,6 +123,7 @@ async function waitForSpawnCount(count: number): Promise<void> {
 
 describe('QwenProvider', () => {
   beforeEach(() => {
+    vi.useRealTimers();
     childProcessMock.execFile.mockClear();
     childProcessMock.spawn.mockClear();
     childProcessMock.spawned.length = 0;
@@ -1023,7 +1024,7 @@ describe('QwenProvider', () => {
     expect(runtime.pendingCount).toBe(0);
   });
 
-  it('does not drain queued messages until the qwen process closes', async () => {
+  it('drains queued messages from a terminal qwen result even when the process close is missing', async () => {
     const provider = new QwenProvider();
     await provider.connect({});
     const runtime = new TransportSessionRuntime(provider, 'sess-queue-close-gate');
@@ -1035,22 +1036,24 @@ describe('QwenProvider', () => {
     runtime.send('first');
     await waitForSpawnCount(1);
     const first = lastSpawn();
+    vi.useFakeTimers();
     first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-queue-close-1' } } })}\n`);
     first.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'done' })}\n`);
-    await flushIO();
+    await vi.advanceTimersByTimeAsync(0);
 
     expect(runtime.send('second')).toBe('queued');
     expect(runtime.pendingCount).toBe(1);
-    await flushIO();
-
-    // Result arrived, but the underlying CLI process is still alive.
-    // The important invariant is that this does not surface an "already busy"
-    // provider error while waiting for the underlying close.
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingCount).toBe(1);
     expect(errors).toEqual([]);
 
-    first.child.emit('close', 0, null);
-    await waitForSpawnCount(2);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(0);
 
+    expect(first.child.kill).toHaveBeenCalledWith('SIGTERM');
+    vi.useRealTimers();
+    await waitForSpawnCount(2);
     expect(childProcessMock.spawn).toHaveBeenCalledTimes(2);
     expect(runtime.pendingCount).toBe(0);
     expect(errors).toEqual([]);

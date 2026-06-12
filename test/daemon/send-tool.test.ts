@@ -4,6 +4,7 @@ import {
   SEND_MCP_DISPATCH_FEATURE_FLAG,
   clearSendIdempotencyCacheForTests,
   dispatchCronSend,
+  dispatchHookSend,
   dispatchSendMessage,
   dispatchSendStop,
   listSendTargets,
@@ -183,6 +184,51 @@ describe('send-tool', () => {
     expect(targets.items.map((item) => item.sessionName)).toEqual(['deck_alpha_brain', 'deck_alpha_w2']);
     expect(sent).toMatchObject({ status: 'accepted' });
     expect(dispatchMessage.mock.calls[0][0]).toMatchObject({ name: 'deck_alpha_w2' });
+  });
+
+  it('attributes MCP sends from team sub-sessions to the source member', async () => {
+    const sessions = [
+      session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Brain' }),
+      session({
+        name: 'deck_sub_cx1',
+        projectName: 'deck_sub_cx1',
+        role: 'w1',
+        label: 'Cx1',
+        parentSession: 'deck_alpha_brain',
+        userCreated: true,
+      }),
+    ];
+    const dispatchMessage = vi.fn().mockResolvedValue(undefined);
+
+    const result = await dispatchSendMessage({
+      ...caller,
+      userId: 'user-cx1',
+      sessionName: 'deck_sub_cx1',
+      projectName: 'deck_sub_cx1',
+    }, { target: 'deck_alpha_brain', message: 'reply from cx1' }, {
+      now: () => 12_345,
+      listSessions: () => sessions,
+      dispatchMessage,
+    });
+
+    expect(result.status).toBe('accepted');
+    if (result.status !== 'accepted') throw new Error('expected accepted');
+    expect(dispatchMessage.mock.calls[0][2]).toMatchObject({
+      messageId: result.messageId,
+      sharedActor: {
+        actorUserId: 'user-cx1',
+        actorDisplayName: 'Cx1',
+        effectiveActorRole: 'server-member',
+        origin: 'server-member',
+        actionId: result.messageId,
+        authorizedAt: 12_345,
+        queuedAt: 12_345,
+        snapshot: {
+          target: { kind: 'main', serverId: 'local', sessionName: 'deck_alpha_brain' },
+          effectiveRole: 'participant',
+        },
+      },
+    });
   });
 
   it('rejects cross-project targets with identity_rejected', async () => {
@@ -373,6 +419,41 @@ describe('send-tool', () => {
       expect.objectContaining({ target: 'deck_alpha_w1', status: 'delivered' }),
       expect.objectContaining({ target: 'deck_alpha_w2', status: 'failed', error: 'transport failed' }),
     ]);
+  });
+
+  it('attributes hook sends involving team sub-sessions to the source member', async () => {
+    const brain = session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Brain' });
+    const sub = session({
+      name: 'deck_sub_cc1',
+      projectName: 'deck_sub_cc1',
+      role: 'w1',
+      label: 'CC1',
+      parentSession: 'deck_alpha_brain',
+      userCreated: true,
+    });
+    const dispatchMessage = vi.fn().mockResolvedValue('queued');
+
+    const result = await dispatchHookSend({
+      from: 'deck_sub_cc1',
+      targetRecords: [brain],
+      message: 'hook reply',
+    }, {
+      now: () => 22_222,
+      getSession: (name) => (name === sub.name ? sub : name === brain.name ? brain : undefined),
+      dispatchMessage,
+    });
+
+    expect(result.queued).toEqual(['deck_alpha_brain']);
+    expect(dispatchMessage.mock.calls[0][2]).toMatchObject({
+      sharedActor: {
+        actorDisplayName: 'CC1',
+        effectiveActorRole: 'server-member',
+        origin: 'server-member',
+        snapshot: {
+          target: { kind: 'main', serverId: 'local', sessionName: 'deck_alpha_brain' },
+        },
+      },
+    });
   });
 
   it('adds no-reply callback instructions when reply is requested', async () => {

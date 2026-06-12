@@ -15,6 +15,7 @@ import { UsageFooter } from './UsageFooter.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
 import { useTimeline } from '../hooks/useTimeline.js';
+import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import { useQuickData } from './QuickInputPanel.js';
 import { useSharedGitChanges } from '../git-status-store.js';
@@ -267,6 +268,7 @@ export function SubSessionWindow({
   // Extract active agent status (e.g. "Reading file...")
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
   const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
+  const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(events), [events]);
   const liveSessionState = useMemo(
     () => getTailSessionState(events) ?? sub.state ?? null,
     [events, sub.state],
@@ -866,6 +868,7 @@ export function SubSessionWindow({
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
           activeToolCall={activeToolCall}
+          activeTimelineTurn={activeTimelineTurn}
           now={thinkingNow}
           onSyncMemorySummaries={handleSyncMemorySummaries}
           syncMemorySummariesBusy={syncingMemorySummaries}

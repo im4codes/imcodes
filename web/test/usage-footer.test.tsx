@@ -281,6 +281,28 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-live-status-inline.running .session-live-status-emoji.gear')).toBeTruthy();
   });
 
+  it('keeps live transport turns running even when the session snapshot is stale idle', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="idle"
+        activeTimelineTurn={true}
+      />,
+    );
+
+    const runningStatus = container.querySelector('.session-live-status-inline.running') as HTMLSpanElement | null;
+    expectRobotAvatar(runningStatus);
+    expect(runningStatus?.textContent).toContain('⚙️');
+    expect(runningStatus?.textContent).toContain('Agent working...');
+    expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
+  });
+
   it('shows tool-call icon when explicit running status text is present', () => {
     const { container } = render(
       <UsageFooter

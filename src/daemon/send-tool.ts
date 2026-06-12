@@ -5,6 +5,7 @@ import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-
 import { MEMORY_MCP_CAPS } from '../../shared/memory-mcp-contracts.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { isValidImcodesSessionName, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
+import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { getSession, listSessions } from '../store/session-store.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -107,6 +108,7 @@ export interface SendToolDeps {
 export interface SendDispatchMessageOptions {
   dispatchId: SendDispatchId;
   messageId: SendMessageId;
+  sharedActor?: SharedActorEnvelope;
 }
 
 export type SendDispatchMessageResult = 'sent' | 'queued' | void;
@@ -234,12 +236,17 @@ export async function dispatchSendMessage(
     files: fileRefs.files,
     replyTo: input.reply ? caller.sessionName : null,
   });
+  const callerRecord = allSessions.find((session) => session.name === caller.sessionName);
   const deliveries: SendMessageDelivery[] = [];
 
   for (const target of targets.targets) {
     const messageId = createSendMessageId();
     try {
-      await d.dispatchMessage(target, message, { dispatchId, messageId });
+      await d.dispatchMessage(target, message, {
+        dispatchId,
+        messageId,
+        ...buildServerMemberSharedActorOption(caller, callerRecord, target, messageId, now),
+      });
       deliveries.push({ target: target.name, messageId, status: 'delivered' });
     } catch (err) {
       deliveries.push({ target: target.name, status: 'failed', error: sanitizeMcpErrorMessage(err) });
@@ -364,11 +371,28 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
   const errors: string[] = [];
   const messages: SendMessageDelivery[] = [];
   const message = buildSendMessage(input.message, { files: fileRefs.files, replyTo: null });
+  const callerRecord = d.getSession(input.from) ?? undefined;
+  const now = d.now();
 
   for (const target of input.targetRecords) {
     const messageId = createSendMessageId();
     try {
-      const result = await d.dispatchMessage(target, message, { dispatchId, messageId });
+      const result = await d.dispatchMessage(target, message, {
+        dispatchId,
+        messageId,
+        ...buildServerMemberSharedActorOption(
+          {
+            userId: input.from,
+            sessionName: input.from,
+            projectName: callerRecord?.projectName ?? null,
+            projectRoot: input.projectRoot ?? callerRecord?.projectDir ?? null,
+          },
+          callerRecord,
+          target,
+          messageId,
+          now,
+        ),
+      });
       if (result === 'queued') queued.push(target.name);
       else delivered.push(target.name);
       messages.push({ target: target.name, messageId, status: 'delivered' });
@@ -501,6 +525,69 @@ function sanitizeFileReferences(files: string[] | undefined, projectRoot: string
   return { ok: true, files: refs };
 }
 
+function isSubSessionRecord(sessionName: string | null | undefined, record?: SessionRecord): boolean {
+  return Boolean(
+    record?.parentSession
+    || record?.userCreated === true && (record.name.startsWith('deck_sub_') || sessionName?.startsWith('deck_sub_'))
+    || sessionName?.startsWith('deck_sub_'),
+  );
+}
+
+function shouldAttachServerMemberActor(callerName: string | null, callerRecord: SessionRecord | undefined, target: SessionRecord): boolean {
+  return isSubSessionRecord(callerName, callerRecord) || isSubSessionRecord(target.name, target);
+}
+
+function formatServerMemberActorName(callerName: string, callerRecord?: SessionRecord): string {
+  const label = callerRecord?.label?.trim();
+  if (label) return label;
+  return callerRecord?.name || callerName;
+}
+
+function buildServerMemberSharedActorOption(
+  caller: SendRuntimeCaller,
+  callerRecord: SessionRecord | undefined,
+  target: SessionRecord,
+  actionId: string,
+  now: number,
+): { sharedActor: SharedActorEnvelope } | Record<string, never> {
+  if (!caller.sessionName || !isValidImcodesSessionName(caller.sessionName)) return {};
+  if (!shouldAttachServerMemberActor(caller.sessionName, callerRecord, target)) return {};
+  const actorDisplayName = formatServerMemberActorName(caller.sessionName, callerRecord);
+  const targetSnapshot = target.name.startsWith('deck_sub_')
+    ? {
+        kind: 'subsession' as const,
+        serverId: 'local',
+        subSessionId: target.name,
+        ...(target.label ? { subSessionDisplayName: target.label } : {}),
+      }
+    : {
+        kind: 'main' as const,
+        serverId: 'local',
+        sessionName: target.name,
+      };
+  return {
+    sharedActor: {
+      actorUserId: caller.userId || caller.sessionName,
+      actorDisplayName,
+      snapshot: {
+        target: targetSnapshot,
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: [],
+        primaryShareId: null,
+        authorizedAt: now,
+      },
+      primaryShareId: null,
+      effectiveActorRole: 'server-member',
+      actionId,
+      origin: 'server-member',
+      authorizedAt: now,
+      queuedAt: now,
+    },
+  };
+}
+
 function buildSendMessage(message: string, options: { files: string[]; replyTo: string | null }): string {
   let result = message;
   if (options.files.length > 0) {
@@ -522,9 +609,11 @@ async function dispatchSessionMessage(
     const { getTransportRuntime } = await import('../agent/session-manager.js');
     const runtime = getTransportRuntime(target.name);
     if (!runtime) throw new Error(`no transport runtime for session ${target.name}`);
-    const result = runtime.send(message, options.messageId);
+    const result = options.sharedActor
+      ? runtime.send(message, options.messageId, undefined, undefined, { sharedActor: options.sharedActor })
+      : runtime.send(message, options.messageId);
     if (result === 'sent') {
-      emitStructuredTransportUserMessage(target.name, message, options.messageId);
+      emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor);
     } else if (result === 'queued') {
       timelineEmitter.emit(target.name, 'session.state', {
         state: 'queued',
@@ -541,7 +630,12 @@ async function dispatchSessionMessage(
   await sendProcessSessionMessageForAutomation(target.name, message);
 }
 
-function emitStructuredTransportUserMessage(sessionName: string, message: string, messageId: SendMessageId): void {
+function emitStructuredTransportUserMessage(
+  sessionName: string,
+  message: string,
+  messageId: SendMessageId,
+  sharedActor?: SharedActorEnvelope,
+): void {
   timelineEmitter.emit(
     sessionName,
     'user.message',
@@ -550,6 +644,7 @@ function emitStructuredTransportUserMessage(sessionName: string, message: string
       allowDuplicate: true,
       commandId: messageId,
       clientMessageId: messageId,
+      ...(sharedActor ? { sharedActor } : {}),
     },
     { source: 'daemon', confidence: 'high', eventId: `transport-user:${messageId}` },
   );
