@@ -2206,7 +2206,10 @@ exec "${realGit}" "$@"
     await symlink(outsideResult, String(origin.authoritativeResultPath), 'file');
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.terminalReason === 'invalid_authoritative_result_path',
+    2500);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('invalid_authoritative_result_path');
     expect(transportSendMock.mock.calls.some((call) => String(call[0] ?? '').includes('Problem: invalid_authoritative_result_path'))).toBe(false);
