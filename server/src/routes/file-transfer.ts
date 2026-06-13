@@ -7,10 +7,16 @@ import { requireAuth } from '../security/authorization.js';
 import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
-import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../../shared/transport/file-transfer.js';
+import {
+  FILE_TRANSFER_LIMITS,
+  FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+  FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_MSG,
+} from '../../../shared/transport/file-transfer.js';
 import type {
   AttachmentRef,
   FileDownloadRequest,
+  FileDownloadStreamRequest,
   FileUploadFetchRequest,
   FileUploadRequest,
 } from '../../../shared/transport/file-transfer.js';
@@ -19,7 +25,7 @@ import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
-import { Readable } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
 export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -34,6 +40,7 @@ const MULTIPART_UPLOAD_OVERHEAD_BYTES = 1024 * 1024;
 const STAGED_UPLOAD_PREFIX = 'imcodes-staged-upload-';
 const STAGED_UPLOAD_FETCH_CLEANUP_GRACE_MS = 30_000;
 const UPLOAD_PROGRESS_STREAM_MIME = 'application/x-ndjson';
+const STAGED_DOWNLOAD_TTL_MS = FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS;
 const downloadTokens = new Map<string, {
   serverId: string;
   attachmentId: string;
@@ -52,6 +59,26 @@ const stagedUploads = new Map<string, {
   timer: ReturnType<typeof setTimeout>;
   deleteAfterFetchTimer?: ReturnType<typeof setTimeout>;
 }>();
+const stagedDownloads = new Map<string, {
+  serverId: string;
+  token: string;
+  stream: PassThrough;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout>;
+  started: boolean;
+}>();
+
+function deleteStagedDownload(downloadId: string, err?: Error): void {
+  const entry = stagedDownloads.get(downloadId);
+  if (!entry) return;
+  stagedDownloads.delete(downloadId);
+  clearTimeout(entry.timer);
+  if (err) {
+    entry.stream.destroy(err);
+  } else if (!entry.stream.destroyed) {
+    entry.stream.end();
+  }
+}
 
 function deleteStagedUpload(uploadId: string): void {
   const entry = stagedUploads.get(uploadId);
@@ -86,6 +113,13 @@ async function persistStagedUpload(file: File, filePath: string): Promise<number
 function buildStagedUploadUrl(requestUrl: string, serverId: string, uploadId: string, token: string): string {
   const url = new URL(requestUrl);
   url.pathname = `/api/server/${encodeURIComponent(serverId)}/upload-staged/${encodeURIComponent(uploadId)}`;
+  url.search = `token=${encodeURIComponent(token)}`;
+  return url.toString();
+}
+
+function buildStagedDownloadUrl(requestUrl: string, serverId: string, downloadId: string, token: string): string {
+  const url = new URL(requestUrl);
+  url.pathname = `/api/server/${encodeURIComponent(serverId)}/download-staged/${encodeURIComponent(downloadId)}`;
   url.search = `token=${encodeURIComponent(token)}`;
   return url.toString();
 }
@@ -160,6 +194,50 @@ fileTransferRoutes.get('/:id/upload-staged/:uploadId', async (c) => {
       'Cache-Control': 'no-store',
     },
   });
+});
+
+// ── PUT /api/server/:id/download-staged/:downloadId ─────────────────────────
+// Token-authenticated, relay-local sink for daemon → browser streaming
+// downloads. The daemon uploads raw bytes here; the browser GET response reads
+// the paired PassThrough, so large files never cross the daemon WS as base64.
+
+fileTransferRoutes.put('/:id/download-staged/:downloadId', async (c) => {
+  const serverId = c.req.param('id')!;
+  const downloadId = c.req.param('downloadId')!;
+  const token = c.req.query('token') ?? '';
+  const entry = stagedDownloads.get(downloadId);
+  if (!entry || entry.serverId !== serverId) return c.json({ error: 'not_found' }, 404);
+  if (Date.now() > entry.expiresAt) {
+    deleteStagedDownload(downloadId, new Error('expired'));
+    return c.json({ error: 'expired' }, 410);
+  }
+  if (!token || token !== entry.token) return c.json({ error: 'forbidden' }, 403);
+  if (entry.started) return c.json({ error: 'already_started' }, 409);
+
+  const contentLengthHeader = c.req.header('content-length');
+  const contentLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : Number.NaN;
+  if (Number.isFinite(contentLength) && contentLength > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
+    deleteStagedDownload(downloadId, new Error('file_too_large'));
+    return c.json({ error: 'file_too_large', maxBytes: FILE_TRANSFER_LIMITS.MAX_FILE_SIZE }, 413);
+  }
+  if (!c.req.raw.body) {
+    deleteStagedDownload(downloadId, new Error('empty_body'));
+    return c.json({ error: 'empty_body' }, 400);
+  }
+
+  entry.started = true;
+  try {
+    await pipeline(
+      Readable.fromWeb(c.req.raw.body as never),
+      entry.stream,
+    );
+    deleteStagedDownload(downloadId);
+    return c.json({ ok: true });
+  } catch (err) {
+    deleteStagedDownload(downloadId, err instanceof Error ? err : new Error(String(err)));
+    logger.warn({ serverId, downloadId, err }, 'Staged download stream failed');
+    return c.json({ error: 'download_stream_failed' }, 500);
+  }
 });
 
 // ── POST /api/server/:id/upload ─────────────────────────────────────────────
@@ -439,13 +517,68 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
   }
 
   const downloadId = randomHex(16);
-  const downloadMsg: FileDownloadRequest = {
-    type: 'file.download',
-    downloadId,
-    attachmentId,
-  };
+  const supportsStreamDownload = bridge.hasDaemonCapability(FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY);
 
   try {
+    if (supportsStreamDownload) {
+      const token = randomHex(32);
+      const stream = new PassThrough();
+      const timer = setTimeout(() => {
+        deleteStagedDownload(downloadId, new Error('download_timeout'));
+      }, STAGED_DOWNLOAD_TTL_MS);
+      timer.unref?.();
+      stagedDownloads.set(downloadId, {
+        serverId,
+        token,
+        stream,
+        expiresAt: Date.now() + STAGED_DOWNLOAD_TTL_MS,
+        timer,
+        started: false,
+      });
+
+      const streamMsg: FileDownloadStreamRequest = {
+        type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM,
+        downloadId,
+        attachmentId,
+        uploadUrl: buildStagedDownloadUrl(c.req.url, serverId, downloadId, token),
+      };
+      const result = await bridge.sendFileTransferRequest(
+        downloadId,
+        streamMsg as unknown as Record<string, unknown>,
+        FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+      );
+
+      if (result.type === 'file.download_error') {
+        deleteStagedDownload(downloadId, new Error(String(result.message ?? 'download_failed')));
+        const errMsg = result.message as string;
+        if (errMsg === 'not_found') return c.json({ error: 'not_found' }, 404);
+        if (errMsg === 'expired') return c.json({ error: 'handle_expired' }, 410);
+        return c.json({ error: 'download_failed', message: errMsg }, 500);
+      }
+
+      const mime = (result.mime as string) || 'application/octet-stream';
+      const filename = (result.filename as string) || attachmentId;
+      const size = typeof result.size === 'number' && Number.isFinite(result.size) && result.size >= 0
+        ? Math.trunc(result.size)
+        : undefined;
+      c.header('Content-Type', mime);
+      if (size !== undefined) c.header('Content-Length', String(size));
+      const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
+      const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
+      c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
+      c.header('Cache-Control', 'no-store');
+
+      return new Response(Readable.toWeb(stream) as ReadableStream, {
+        status: 200,
+        headers: c.res.headers,
+      });
+    }
+
+    const downloadMsg: FileDownloadRequest = {
+      type: 'file.download',
+      downloadId,
+      attachmentId,
+    };
     const result = await bridge.sendFileTransferRequest(
       downloadId,
       downloadMsg as unknown as Record<string, unknown>,
@@ -474,6 +607,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
 
     return c.body(content);
   } catch (err) {
+    deleteStagedDownload(downloadId, err instanceof Error ? err : new Error(String(err)));
     const msg = err instanceof Error ? err.message : String(err);
     if (msg === 'daemon_offline' || msg === 'daemon_disconnected' || msg === 'daemon_error') return c.json({ error: 'daemon_offline' }, 503);
     if (msg === 'timeout') return c.json({ error: 'download_timeout' }, 504);

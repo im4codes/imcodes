@@ -52,8 +52,14 @@ export const FILE_TRANSFER_LIMITS = {
 // ── Capability advertisement ────────────────────────────────────────────────
 
 export const FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY = 'file.transfer.upload_fetch.v1' as const;
+export const FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY = 'file.transfer.download_stream.v1' as const;
 
 // ── Server → Daemon messages ──────────────────────────────────────────────────
+
+export const FILE_TRANSFER_MSG = {
+  DOWNLOAD_STREAM: 'file.download_stream',
+  DOWNLOAD_STREAM_READY: 'file.download_stream_ready',
+} as const;
 
 export interface FileUploadRequest {
   type: 'file.upload';
@@ -79,6 +85,13 @@ export interface FileDownloadRequest {
   type: 'file.download';
   downloadId: string;
   attachmentId: string;
+}
+
+export interface FileDownloadStreamRequest {
+  type: 'file.download_stream';
+  downloadId: string;
+  attachmentId: string;
+  uploadUrl: string;
 }
 
 // ── Daemon → Server messages ──────────────────────────────────────────────────
@@ -111,6 +124,14 @@ export interface FileDownloadDone {
   size?: number;
 }
 
+export interface FileDownloadStreamReady {
+  type: 'file.download_stream_ready';
+  downloadId: string;
+  mime?: string;
+  filename?: string;
+  size?: number;
+}
+
 export interface FileDownloadError {
   type: 'file.download_error';
   downloadId: string;
@@ -122,12 +143,14 @@ export type FileTransferDaemonMessage =
   | FileUploadError
   | FileUploadProgress
   | FileDownloadDone
+  | FileDownloadStreamReady
   | FileDownloadError;
 
 export type FileTransferServerMessage =
   | FileUploadRequest
   | FileUploadFetchRequest
-  | FileDownloadRequest;
+  | FileDownloadRequest
+  | FileDownloadStreamRequest;
 
 // ── FileBrowser extensions ────────────────────────────────────────────────────
 

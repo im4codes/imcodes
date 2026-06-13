@@ -31,6 +31,7 @@ import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type Memo
 import { emitSessionInlineError } from './session-error.js';
 import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from './transport-resend-preservation.js';
+import { buildTransportPendingQueueSnapshot } from './transport-pending-snapshot.js';
 import {
   startSubSession,
   stopSubSession,
@@ -763,12 +764,13 @@ async function syncSubSessionIfNeeded(sessionName: string, serverLink: ServerLin
 
 function getSubSessionSyncOptions(sessionName: string): SubSessionSyncOptions | undefined {
   const runtime = getTransportRuntime(sessionName);
-  if (!runtime) return undefined;
+  const pendingQueue = buildTransportPendingQueueSnapshot(sessionName, runtime);
+  if (pendingQueue.source === 'empty') return undefined;
   return {
     transportQueue: {
-      pendingMessages: runtime.pendingMessages,
-      pendingEntries: runtime.pendingEntries,
-      pendingVersion: runtime.pendingVersion,
+      pendingMessages: pendingQueue.pendingMessages,
+      pendingEntries: pendingQueue.pendingEntries,
+      ...(typeof pendingQueue.pendingVersion === 'number' ? { pendingVersion: pendingQueue.pendingVersion } : {}),
     },
   };
 }
@@ -836,6 +838,7 @@ import {
   handleFileUpload,
   handleFileUploadFetch,
   handleFileDownload,
+  handleFileDownloadStream,
   tryCreateProjectFileHandle,
   lookupAttachment,
 } from './file-transfer-handler.js';
@@ -844,6 +847,7 @@ import { isFilePreviewPathAllowed, resolveCanonical } from './file-preview-path-
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { FS_READ_ERROR_CODES } from '../../shared/fs-read-error-codes.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
+import { FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';
@@ -1635,6 +1639,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case 'file.download':
       void handleFileDownload(cmd, serverLink);
+      break;
+    case FILE_TRANSFER_MSG.DOWNLOAD_STREAM:
+      void handleFileDownloadStream(cmd, serverLink);
       break;
     case TRANSPORT_MSG.LIST_SESSIONS:
       void handleListProviderSessions(cmd, serverLink);
@@ -3196,6 +3203,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       { source: 'daemon', confidence: 'high' },
     );
     emitAcceptedReceiptAck();
+    void syncSubSessionIfNeeded(sessionName, serverLink);
     // Best-effort resume for sessions that failed to launch or whose runtime
     // vanished outside the provider reconnect path. The resend queue drains on
     // successful relaunch, so the queued user message still delivers.
@@ -3279,6 +3287,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       { source: 'daemon', confidence: 'high' },
     );
     emitAcceptedReceiptAck();
+    void syncSubSessionIfNeeded(sessionName, serverLink);
     // Best-effort resume. Failure is logged but doesn't change the ack —
     // the next user send will re-enter this branch and try again, or a
     // manual /restart path can recover.

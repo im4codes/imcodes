@@ -23,6 +23,7 @@ import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { RESOURCE_EVENT_MSG, type ResourceTopic } from '../../../shared/resource-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
+import { FILE_TRANSFER_MSG } from '../../../shared/transport/file-transfer.js';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import {
@@ -4130,7 +4131,7 @@ export class WsBridge {
       if (requestId) this.resolveFileTransfer(requestId, msg);
       return;
     }
-    if (type === 'file.download_done' || type === 'file.download_error') {
+    if (type === 'file.download_done' || type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY || type === 'file.download_error') {
       const requestId = msg.downloadId as string | undefined;
       if (requestId) this.resolveFileTransfer(requestId, msg);
       return;
