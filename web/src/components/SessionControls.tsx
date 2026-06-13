@@ -194,6 +194,32 @@ function normalizeOpenSpecTaskStats(value: unknown): OpenSpecTaskStatsSummary | 
     unchecked: Math.min(unchecked, total - safeChecked),
   };
 }
+
+function collectOpenSpecTaskStats(entries: Array<Record<string, unknown>> | undefined): Map<string, OpenSpecTaskStatsSummary> {
+  const stats = new Map<string, OpenSpecTaskStatsSummary>();
+  for (const entry of entries ?? []) {
+    if (entry.isDir !== true || typeof entry.name !== 'string') continue;
+    const normalized = normalizeOpenSpecTaskStats(entry.openSpecTaskStats);
+    if (normalized) stats.set(entry.name, normalized);
+  }
+  return stats;
+}
+
+function openSpecTaskStatsCacheKey(changesPath: string, changeName: string): string {
+  return `${changesPath.replace(/[\\/]+$/, '')}/${changeName}`;
+}
+
+function mergeOpenSpecTaskStats(
+  changes: OpenSpecChangeListItem[],
+  stats: Map<string, OpenSpecTaskStatsSummary> | null,
+): OpenSpecChangeListItem[] {
+  if (!stats || stats.size === 0) return changes;
+  return changes.map((change) => {
+    const taskStats = stats.get(change.name);
+    return taskStats ? { ...change, taskStats } : change;
+  });
+}
+
 const TRANSPORT_QUEUE_HIDDEN_KEY_PREFIX = 'imcodes:transport-queue-hidden:';
 type LocalQueuedTransportEntry = {
   clientMessageId: string;
@@ -761,6 +787,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const openSpecAuditButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const openSpecProposeButtonRef = useRef<HTMLButtonElement | null>(null);
   const openSpecRequestIdRef = useRef<string | null>(null);
+  const openSpecTaskStatsRequestIdRef = useRef<string | null>(null);
+  const openSpecTaskStatsCacheRef = useRef<Map<string, OpenSpecTaskStatsSummary>>(new Map());
   const openSpecRequestTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1393,6 +1421,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecAutoLauncherChange(null);
     setOpenSpecAutoDetailsOpen(false);
     openSpecRequestIdRef.current = null;
+    openSpecTaskStatsRequestIdRef.current = null;
   }, [activeSession?.projectDir, clearOpenSpecRequestTimer]);
 
   // Close menus as soon as the pointer starts outside. On Android Chrome, waiting
@@ -1683,6 +1712,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const refreshOpenSpecChanges = useCallback(() => {
     clearOpenSpecRequestTimer();
     openSpecRequestIdRef.current = null;
+    openSpecTaskStatsRequestIdRef.current = null;
     if (!ws || !openSpecChangesPath) {
       setOpenSpecLoading(false);
       setOpenSpecChanges([]);
@@ -1693,7 +1723,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecError(null);
     let requestId: string;
     try {
-      requestId = ws.fsListDir(openSpecChangesPath, false, false, { includeOpenSpecTaskStats: true });
+      requestId = ws.fsListDir(openSpecChangesPath, false, false);
     } catch {
       setOpenSpecLoading(false);
       setOpenSpecChanges([]);
@@ -1704,6 +1734,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     openSpecRequestTimerRef.current = setTimeout(() => {
       if (openSpecRequestIdRef.current !== requestId) return;
       openSpecRequestIdRef.current = null;
+      openSpecTaskStatsRequestIdRef.current = null;
       openSpecRequestTimerRef.current = null;
       setOpenSpecLoading(false);
       setOpenSpecChanges([]);
@@ -1813,6 +1844,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               onClick={() => {
                 clearOpenSpecRequestTimer();
                 openSpecRequestIdRef.current = null;
+                openSpecTaskStatsRequestIdRef.current = null;
                 setOpenSpecLoading(false);
                 setOpenSpecOpen(false);
                 setOpenSpecAuditMenu(null);
@@ -1974,6 +2006,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         if (openSpecRequestIdRef.current) {
           clearOpenSpecRequestTimer();
           openSpecRequestIdRef.current = null;
+          openSpecTaskStatsRequestIdRef.current = null;
           setOpenSpecLoading(false);
           setOpenSpecChanges([]);
           setOpenSpecError(t('openspec.load_unavailable'));
@@ -1992,8 +2025,22 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         if (openSpecOpen) refreshOpenSpecChanges();
         return;
       }
+      if (msg.type !== 'fs.ls_response') return;
+      const statsRequestId = openSpecTaskStatsRequestIdRef.current;
+      if (statsRequestId && msg.requestId === statsRequestId) {
+        openSpecTaskStatsRequestIdRef.current = null;
+        if (msg.status !== 'ok') return;
+        const stats = collectOpenSpecTaskStats(msg.entries);
+        if (openSpecChangesPath && stats.size > 0) {
+          for (const [changeName, taskStats] of stats.entries()) {
+            openSpecTaskStatsCacheRef.current.set(openSpecTaskStatsCacheKey(openSpecChangesPath, changeName), taskStats);
+          }
+        }
+        setOpenSpecChanges((current) => mergeOpenSpecTaskStats(current, stats));
+        return;
+      }
       const requestId = openSpecRequestIdRef.current;
-      if (!requestId || msg.type !== 'fs.ls_response' || msg.requestId !== requestId) return;
+      if (!requestId || msg.requestId !== requestId) return;
       openSpecRequestIdRef.current = null;
       clearOpenSpecRequestTimer();
       setOpenSpecLoading(false);
@@ -2012,11 +2059,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         .filter((entry) => entry.isDir && !OPENSPEC_NON_CHANGE_DIR_NAMES.has(entry.name))
         .map((entry) => ({
           name: entry.name,
-          taskStats: normalizeOpenSpecTaskStats(entry.openSpecTaskStats),
+          taskStats: openSpecChangesPath
+            ? openSpecTaskStatsCacheRef.current.get(openSpecTaskStatsCacheKey(openSpecChangesPath, entry.name))
+            : undefined,
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
       setOpenSpecChanges(changes);
       setOpenSpecError(null);
+      if (ws && openSpecChangesPath && changes.length > 0) {
+        try {
+          openSpecTaskStatsRequestIdRef.current = ws.fsListDir(openSpecChangesPath, false, false, { includeOpenSpecTaskStats: true });
+        } catch {
+          openSpecTaskStatsRequestIdRef.current = null;
+        }
+      }
     });
   }, [clearOpenSpecRequestTimer, formatOpenSpecLoadError, openSpecOpen, persistP2pConfigToDaemon, p2pSavedConfig, refreshOpenSpecChanges, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, serverId, t, ws]);
 
@@ -3162,6 +3218,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   if (!next) {
                     clearOpenSpecRequestTimer();
                     openSpecRequestIdRef.current = null;
+                    openSpecTaskStatsRequestIdRef.current = null;
                     setOpenSpecLoading(false);
                     setOpenSpecAuditMenu(null);
                     setOpenSpecProposeMenuOpen(false);

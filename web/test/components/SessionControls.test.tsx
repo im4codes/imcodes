@@ -1255,7 +1255,7 @@ afterEach(() => {
 
     fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
 
-    expect(ws.fsListDir).toHaveBeenCalledWith('/repo/openspec/changes', false, false, { includeOpenSpecTaskStats: true });
+    expect(ws.fsListDir).toHaveBeenNthCalledWith(1, '/repo/openspec/changes', false, false);
 
     ws.emit({
       type: 'fs.ls_response',
@@ -1264,9 +1264,9 @@ afterEach(() => {
       resolvedPath: '/repo/openspec/changes',
       entries: [
         { name: 'archive', path: '/repo/openspec/changes/archive', isDir: true, hidden: false },
-        { name: 'change-b', path: '/repo/openspec/changes/change-b', isDir: true, hidden: false, openSpecTaskStats: { total: 3, checked: 3, unchecked: 0 } },
-        { name: 'change-c', path: '/repo/openspec/changes/change-c', isDir: true, hidden: false, openSpecTaskStats: { total: 0, checked: 0, unchecked: 0 } },
-        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false, openSpecTaskStats: { total: 2, checked: 1, unchecked: 1 } },
+        { name: 'change-b', path: '/repo/openspec/changes/change-b', isDir: true, hidden: false },
+        { name: 'change-c', path: '/repo/openspec/changes/change-c', isDir: true, hidden: false },
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
         { name: 'README.md', path: '/repo/openspec/changes/README.md', isDir: false, hidden: false },
       ],
     });
@@ -1274,6 +1274,22 @@ afterEach(() => {
 
     const changeButton = screen.getByRole('button', { name: 'change-a' });
     expect(changeButton.textContent).toContain('@');
+    expect(changeButton.textContent).not.toContain('1/2');
+    expect(ws.fsListDir).toHaveBeenNthCalledWith(2, '/repo/openspec/changes', false, false, { includeOpenSpecTaskStats: true });
+
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-b', path: '/repo/openspec/changes/change-b', isDir: true, hidden: false, openSpecTaskStats: { total: 3, checked: 3, unchecked: 0 } },
+        { name: 'change-c', path: '/repo/openspec/changes/change-c', isDir: true, hidden: false, openSpecTaskStats: { total: 0, checked: 0, unchecked: 0 } },
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false, openSpecTaskStats: { total: 2, checked: 1, unchecked: 1 } },
+      ],
+    });
+    await flushAsync();
+
     expect(changeButton.textContent).toContain('1/2');
     expect(screen.getByText('3/3')).toBeDefined();
     expect(screen.getByText('No tasks')).toBeDefined();
@@ -1282,6 +1298,57 @@ afterEach(() => {
     fireEvent.click(changeButton);
 
     expect(screen.getByRole('textbox').textContent).toBe('@openspec/changes/change-a');
+  });
+
+  it('renders cached OpenSpec task stats immediately while refreshing task stats in the background', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false, openSpecTaskStats: { total: 2, checked: 1, unchecked: 1 } },
+      ],
+    });
+    await flushAsync();
+
+    expect(screen.getByRole('button', { name: 'change-a' }).textContent).toContain('1/2');
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    expect(screen.getByRole('button', { name: 'change-a' }).textContent).toContain('1/2');
+    expect(ws.fsListDir).toHaveBeenLastCalledWith('/repo/openspec/changes', false, false, { includeOpenSpecTaskStats: true });
   });
 
   it('opens Auto Deliver launcher from each openspec change row without inserting a prompt', async () => {
