@@ -289,14 +289,15 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.provider.onDelta((sid: string, _delta: MessageDelta) => {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
-        if (!this.hasActiveTurnWork()) {
-          logger.warn(
-            { sessionKey: this.sessionKey, status: this._status },
-            'transport runtime ignored provider delta without active turn',
-          );
-          return;
-        }
         if (this._activeDispatchCancelled) return;
+        // A delta with no active turn is a late/stray callback from an
+        // already-settled turn (provider callbacks are not dispatch-id scoped).
+        // This is COSMETIC only: the relay forwards the delta TEXT independently
+        // of this runtime state, so nothing is dropped here — we merely avoid
+        // resurrecting the "working" animation for a turn that is already done.
+        // (Reply delivery is governed by onComplete/onError below, which must
+        // never silently drop a settlement.)
+        if (!this.hasActiveTurnWork()) return;
         this.setStatus('streaming');
       }),
       this.provider.onComplete((sid: string, message: AgentMessage) => {
@@ -311,11 +312,18 @@ export class TransportSessionRuntime implements SessionRuntime {
           return;
         }
         if (!this.hasActiveTurnWork()) {
+          // Late/out-of-band completion with no active turn to resolve (provider
+          // callbacks are not dispatch-id scoped, so hasActiveTurnWork() can lag
+          // reality after a settle/drain). Do NOT return early — that would DROP
+          // the message: skip recording it to history and stall queued work.
+          // Per "a transport turn must never silently complete" AND "never drop
+          // any update/text", fall through to the normal settle path so the
+          // message IS pushed to history and any queued message drains. The
+          // body's null-guarded `_activeTurn?.resolve()` is a safe no-op.
           logger.warn(
-            { sessionKey: this.sessionKey, status: this._status },
-            'transport runtime ignored provider completion without active turn',
+            { sessionKey: this.sessionKey, status: this._status, pendingCount: this._pendingMessages.length },
+            'transport runtime got provider completion without active turn; settling normally (not dropped)',
           );
-          return;
         }
         if (this._activeDispatchCancelled) {
           this._sending = false;
@@ -363,11 +371,24 @@ export class TransportSessionRuntime implements SessionRuntime {
           return;
         }
         if (!this.hasActiveTurnWork()) {
+          // Late/out-of-band error with no active turn to reject. If there is no
+          // queued work, keep the already-settled session idle instead of
+          // resurrecting a stale provider callback into a user-visible error. If
+          // queued work exists, fall through so recoverable/cancel errors can
+          // drain it through the normal path; unrecoverable errors still surface
+          // as terminal error without consuming the queue.
           logger.warn(
-            { sessionKey: this.sessionKey, status: this._status, errorCode: error.code },
-            'transport runtime ignored provider error without active turn',
+            { sessionKey: this.sessionKey, status: this._status, errorCode: error.code, pendingCount: this._pendingMessages.length },
+            'transport runtime got provider error without active turn',
           );
-          return;
+          if (this._pendingMessages.length === 0) {
+            this._activeDispatchCancelled = false;
+            this._activeDispatchProviderStarted = false;
+            this._activeDispatchId = null;
+            this._activeDispatchStaleRecoveryStarted = false;
+            if (this.isInProgressStatus(this._status) || this._status === 'error') this.setStatus('idle');
+            return;
+          }
         }
         this._sending = false;
         this._activeTurn?.reject(error);

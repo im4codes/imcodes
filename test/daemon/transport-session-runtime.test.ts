@@ -1877,6 +1877,112 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.getStatus()).toBe('idle');
   });
 
+  it('does NOT drop a provider completion that arrives with no active turn — records it and drains queued work', async () => {
+    // Regression: the broad `!hasActiveTurnWork()` guard used to `return` here,
+    // silently dropping the completion. Because provider callbacks are not
+    // dispatch-id scoped, the active-turn flags can be cleared (out-of-band
+    // settle / drain) while a real completion is still in flight and a message
+    // is still queued — dropping it stalls the queue so the agent stops replying.
+    runtime.send('first turn', 'cmd-first');
+    await flushDispatch();
+    runtime.send('queued follow-up', 'cmd-queued');
+    expect(runtime.pendingCount).toBe(1);
+    const sendCountBefore = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
+    const historyLenBefore = runtime.getHistory().length;
+
+    // Simulate the desync: active-turn state cleared while a turn is still
+    // resolving and a message remains queued.
+    const internal = runtime as unknown as {
+      _sending: boolean;
+      _activeTurn: unknown;
+      _activeDispatchEntries: unknown[];
+    };
+    internal._sending = false;
+    internal._activeTurn = null;
+    internal._activeDispatchEntries = [];
+
+    // The real completion now arrives with no active turn. It MUST NOT be
+    // dropped: the message is recorded to history AND the queued message drains.
+    mock.fireComplete('sess-1', { id: 'msg-real', content: 'real reply' });
+    await flushDispatch();
+
+    // The completion was recorded (not dropped). History also grows by the
+    // drained user message, so assert presence rather than an exact count.
+    expect(runtime.getHistory().some((m) => m.id === 'msg-real')).toBe(true);
+    expect(runtime.getHistory().length).toBeGreaterThan(historyLenBefore);
+    expect(runtime.pendingCount).toBe(0);
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(sendCountBefore + 1);
+    const drained = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(drained.userMessage).toBe('queued follow-up');
+  });
+
+  it('ignores a late provider error when no active turn or queued work remains', async () => {
+    runtime.send('first turn', 'cmd-first');
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.pendingCount).toBe(0);
+    const sendCountBefore = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    mock.fireError('sess-1', { code: 'PROVIDER_ERROR', message: 'late stray error', recoverable: false });
+    await flushDispatch();
+
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.pendingCount).toBe(0);
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(sendCountBefore);
+  });
+
+  it('drains queued work on recoverable provider error even when active-turn state was cleared', async () => {
+    runtime.send('first turn', 'cmd-first');
+    await flushDispatch();
+    runtime.send('queued follow-up', 'cmd-queued');
+    expect(runtime.pendingCount).toBe(1);
+    const sendCountBefore = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    const internal = runtime as unknown as {
+      _sending: boolean;
+      _activeTurn: unknown;
+      _activeDispatchEntries: unknown[];
+    };
+    internal._sending = false;
+    internal._activeTurn = null;
+    internal._activeDispatchEntries = [];
+
+    mock.fireError('sess-1', { code: 'PROVIDER_ERROR', message: 'recoverable late error', recoverable: true });
+    await flushDispatch();
+
+    expect(runtime.pendingCount).toBe(0);
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(sendCountBefore + 1);
+    const drained = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(drained.userMessage).toBe('queued follow-up');
+  });
+
+  it('preserves queued work on unrecoverable provider error when active-turn state was cleared', async () => {
+    runtime.send('first turn', 'cmd-first');
+    await flushDispatch();
+    runtime.send('queued follow-up', 'cmd-queued');
+    expect(runtime.pendingCount).toBe(1);
+    const sendCountBefore = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    const internal = runtime as unknown as {
+      _sending: boolean;
+      _activeTurn: unknown;
+      _activeDispatchEntries: unknown[];
+    };
+    internal._sending = false;
+    internal._activeTurn = null;
+    internal._activeDispatchEntries = [];
+
+    mock.fireError('sess-1', { code: 'PROVIDER_ERROR', message: 'fatal late error', recoverable: false });
+    await flushDispatch();
+
+    expect(runtime.getStatus()).toBe('error');
+    expect(runtime.pendingCount).toBe(1);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['cmd-queued']);
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(sendCountBefore);
+  });
+
   it('settles a stale in-progress status when no active turn or queued work exists', async () => {
     const internal = runtime as unknown as {
       _status: 'streaming';
