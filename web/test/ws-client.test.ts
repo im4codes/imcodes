@@ -382,7 +382,9 @@ describe('WsClient', () => {
       state: 'disconnected',
       reason: 'socket_closed',
     });
-    expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'lost guard' })).toThrow('WebSocket not connected');
+    // Stale-socket window: send() drops the message (no delivery) but must NOT
+    // throw — an uncaught throw here crashes the ChatView via the ErrorBoundary.
+    expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'lost guard' })).not.toThrow();
     await vi.advanceTimersByTimeAsync(0);
 
     const secondWs = lastWs!;
@@ -425,7 +427,11 @@ describe('WsClient', () => {
     });
     expect(handler).not.toHaveBeenCalledWith(expect.objectContaining({ event: 'disconnected' }));
     expect(JSON.parse(socket.send.mock.calls[0][0] as string)).toEqual({ type: 'ping' });
-    expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'guarded' })).toThrow('WebSocket not connected');
+    // During the probe window send() must NOT deliver (no extra socket.send)
+    // and must NOT throw (an uncaught throw here crashes the ChatView).
+    const callsBeforeGuarded = socket.send.mock.calls.length;
+    expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'guarded' })).not.toThrow();
+    expect(socket.send.mock.calls.length).toBe(callsBeforeGuarded);
 
     socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
     expect(client.connected).toBe(true);
@@ -638,9 +644,11 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
-  it('send() throws when not connected', () => {
+  it('send() is a safe no-op when not connected (does not throw)', () => {
+    // Fire-and-forget transport must never throw to React effects/listeners —
+    // an uncaught throw crashes the ChatView via the ErrorBoundary.
     const client = new WsClient('http://localhost:8787', 'srv-1');
-    expect(() => client.send({ type: 'ping' })).toThrow('WebSocket not connected');
+    expect(() => client.send({ type: 'ping' })).not.toThrow();
   });
 
   it('skips Claude weekly quota opt-in without throwing while disconnected', () => {
@@ -1514,9 +1522,10 @@ describe('WsClient', () => {
   describe('urgent send (stop / cancel high-priority path)', () => {
     // Pins the user-reported "stop button stopped working again" regression.
     // probeConnection() flips `_connected = false` for ~50-200 ms on every
-    // visibility/focus tick while it pings the server. During that window
-    // the regular `send()` rejects, and the stop-button code path silently
-    // swallowed the throw — so a stop tap landing in that window vanished.
+    // visibility/focus tick while it pings the server. During that window the
+    // regular `send()` is gated and drops the message (it no-ops rather than
+    // throwing — throwing crashed the ChatView), so a stop tap landing in that
+    // window would otherwise vanish.
     // sendUrgent / sendSessionCommandUrgent bypass the probe gate (still
     // checking the OS-level readyState). Caller HTTP-fallback handles the
     // genuinely-dead-socket case.
@@ -1536,8 +1545,10 @@ describe('WsClient', () => {
       // OPEN at the OS level (the exact regression window).
       (client as unknown as { _connected: boolean })._connected = false;
 
-      // Regular send() rejects — sanity check that the gate IS in place.
-      expect(() => client.send({ type: 'session.send', text: 'normal' })).toThrow('WebSocket not connected');
+      // Regular send() is gated during the probe window — no delivery — but
+      // must NOT throw (an uncaught throw crashes the ChatView).
+      expect(() => client.send({ type: 'session.send', text: 'normal' })).not.toThrow();
+      expect(sentMessages).toHaveLength(0);
 
       // sendUrgent goes through.
       expect(() => client.sendUrgent({ type: 'session.send', text: '/stop' })).not.toThrow();
@@ -1655,6 +1666,43 @@ describe('WsClient', () => {
       const client = new WsClient('http://localhost:8787', 'srv-1');
       expect(() => client.subscribeTerminal('s', false)).not.toThrow();
       expect(lastWs).toBeNull();
+    });
+  });
+
+  describe('send() never throws on a disconnected socket (ChatView crash guard)', () => {
+    // Regression: send() is called from React effects / document listeners
+    // (focus/visibility → requestSessionList, discussionList). When the socket
+    // is momentarily down, an uncaught "WebSocket not connected" throw bubbled
+    // to the ErrorBoundary and crashed the whole ChatView.
+    it('does not throw when never connected', () => {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      expect(client.connected).toBe(false);
+      expect(() => client.send({ type: 'get_sessions' })).not.toThrow();
+      expect(() => client.requestSessionList()).not.toThrow();
+      expect(() => client.discussionList()).not.toThrow();
+    });
+
+    it('does not throw after the socket closes', async () => {
+      const client = await connectClient();
+      expect(client.connected).toBe(true);
+      lastWs!.emit('close', { code: 1006 });
+      expect(client.connected).toBe(false);
+      expect(() => client.send({ type: 'get_sessions' })).not.toThrow();
+      expect(() => client.requestSessionList()).not.toThrow();
+      expect(() => client.discussionList()).not.toThrow();
+    });
+
+    it('still forwards to the socket while connected', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      client.send({ type: 'get_sessions' });
+      expect(lastWs!.send).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(lastWs!.send.mock.calls[0]![0] as string)).toMatchObject({ type: 'get_sessions' });
+    });
+
+    it('sendUrgent() STILL throws when disconnected (preserves HTTP fallback)', () => {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      expect(() => client.sendUrgent({ type: 'session.stop', sessionName: 's' })).toThrow(/not connected/i);
     });
   });
 });

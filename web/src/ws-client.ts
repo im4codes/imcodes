@@ -481,6 +481,18 @@ export class WsClient {
   }
 
   send(msg: object): void {
+    // Fire-and-forget transport: NEVER throw to the caller when the socket is
+    // momentarily down. `send()` is invoked from React effects, render paths,
+    // and document event listeners (focus/visibility → requestSessionList,
+    // discussionList, …); an uncaught "WebSocket not connected" throw there
+    // propagates to the ErrorBoundary and crashes the whole ChatView. Probe
+    // logic flips `_connected=false` on every tab resume even while readyState
+    // is OPEN, so this window is hit constantly. Recovery is handled by the
+    // reconnect loop + per-request timeouts; urgent delivery that needs HTTP
+    // fallback uses sendUrgent() (which still throws by design).
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
     const json = this.serializeOutboundMessage(msg);
     if (this.shouldStaggerNonCriticalMessage(msg)) {
       this.enqueueNonCriticalSend(json);
