@@ -886,13 +886,14 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
   const { t } = useTranslation();
   const isEdit = !!job;
   const existingAction = job ? parseAction(job.action) : null;
+  const hasExistingP2pAction = existingAction?.type === 'p2p';
 
   const [name, setName] = useState(job?.name ?? '');
   const [cronExpr, setCronExpr] = useState(job?.cron_expr ?? '');
   const [targetRole, setTargetRole] = useState(job?.target_role ?? 'brain');
   const [targetSessionName, setTargetSessionName] = useState<string | null>(job?.target_session_name ?? null);
   const [actionType, setActionType] = useState<'command' | 'p2p' | 'send'>(
-    existingAction?.type === 'p2p' || existingAction?.type === 'send' ? existingAction.type : 'command',
+    hasExistingP2pAction || existingAction?.type === 'send' ? existingAction.type : 'command',
   );
   const [command, setCommand] = useState(existingAction?.type === 'command' ? existingAction.command : '');
   const [p2pTopic, setP2pTopic] = useState(existingAction?.type === 'p2p' ? existingAction.topic : '');
@@ -1042,18 +1043,23 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
 
         <label style={labelStyle}>{t('cron.action_type')}</label>
         <div style={{ display: 'flex', gap: '16px', marginBottom: '12px' }}>
-          <label style={{ color: '#e2e8f0', fontSize: '14px', cursor: 'pointer' }}>
-            <input type="radio" name="actionType" checked={actionType === 'command'} onChange={() => setActionType('command')} style={{ marginRight: '6px' }} />
-            {t('cron.action_command')}
-          </label>
-          <label style={{ color: '#e2e8f0', fontSize: '14px', cursor: 'pointer' }}>
-            <input type="radio" name="actionType" checked={actionType === 'p2p'} onChange={() => setActionType('p2p')} style={{ marginRight: '6px' }} />
-            {t('cron.action_p2p')}
-          </label>
-          <label style={{ color: '#e2e8f0', fontSize: '14px', cursor: 'pointer' }}>
-            <input type="radio" name="actionType" checked={actionType === 'send'} onChange={() => setActionType('send')} style={{ marginRight: '6px' }} />
-            {t('common.send')}
-          </label>
+          {hasExistingP2pAction ? (
+            <label style={{ color: '#94a3b8', fontSize: '14px', cursor: 'not-allowed' }}>
+              <input type="radio" name="actionType" checked={actionType === 'p2p'} disabled style={{ marginRight: '6px' }} />
+              {t('cron.action_p2p')}
+            </label>
+          ) : (
+            <>
+              <label style={{ color: '#e2e8f0', fontSize: '14px', cursor: 'pointer' }}>
+                <input type="radio" name="actionType" checked={actionType === 'command'} onChange={() => setActionType('command')} style={{ marginRight: '6px' }} />
+                {t('cron.action_command')}
+              </label>
+              <label style={{ color: '#e2e8f0', fontSize: '14px', cursor: 'pointer' }}>
+                <input type="radio" name="actionType" checked={actionType === 'send'} onChange={() => setActionType('send')} style={{ marginRight: '6px' }} />
+                {t('common.send')}
+              </label>
+            </>
+          )}
         </div>
 
         {actionType === 'command' && (

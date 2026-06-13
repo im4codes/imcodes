@@ -387,12 +387,9 @@ describe('CronManager', () => {
     await waitFor(() => expect(apiFetch).toHaveBeenCalledWith('/api/cron/active-job', expect.objectContaining({ method: 'DELETE' })));
   });
 
-  it('creates p2p jobs with sub-session targets and session participant entries', async () => {
-    apiFetch
-      .mockResolvedValueOnce({ jobs: [] })
-      .mockResolvedValueOnce({ ok: true })
-      .mockResolvedValueOnce({ jobs: [] });
-    const { container } = render(
+  it('hides the p2p action entry when creating cron jobs', async () => {
+    apiFetch.mockResolvedValueOnce({ jobs: [] });
+    render(
       <CronManager
         serverId="srv-current"
         projectName="cd"
@@ -406,47 +403,13 @@ describe('CronManager', () => {
     await waitFor(() => expect(apiFetch).toHaveBeenCalledWith('/api/cron?serverId=srv-current&projectName=cd'));
     fireEvent.click(screen.getByTitle('cron.create'));
 
-    fireEvent.input(screen.getByPlaceholderText('cron.name_placeholder'), { target: { value: 'Daily audit' } });
-    fireEvent.input(screen.getByPlaceholderText('0 9 * * 1-5'), { target: { value: '0 10 * * 1-5' } });
-
-    const targetSelect = Array.from(container.querySelectorAll('select')).find((select) =>
-      Array.from(select.options).some((option) => option.value === 'sub:deck_sub_52123h2r'),
-    ) as HTMLSelectElement;
-    targetSelect.value = 'sub:deck_sub_52123h2r';
-    fireEvent.input(targetSelect);
-    fireEvent.change(targetSelect);
-    expect(targetSelect.value).toBe('sub:deck_sub_52123h2r');
-    fireEvent.click(screen.getByLabelText('cron.action_p2p'));
-    fireEvent.input(screen.getByPlaceholderText('cron.p2p_topic_placeholder'), { target: { value: 'Review risky changes' } });
-
-    const participantBoxes = container.querySelectorAll('form input[type="checkbox"]');
-    fireEvent.click(participantBoxes[1]);
-
-    const numberInput = container.querySelector('input[type="number"]') as HTMLInputElement;
-    fireEvent.input(numberInput, { target: { value: '3' } });
-
-    fireEvent.click(screen.getByText('cron.save'));
-
-    await waitFor(() => expect(apiFetch).toHaveBeenCalledWith('/api/cron', expect.objectContaining({ method: 'POST' })));
-    const createCall = apiFetch.mock.calls.find(([url]) => url === '/api/cron');
-    const payload = JSON.parse(String(createCall?.[1]?.body));
-    expect(payload).toMatchObject({
-      name: 'Daily audit',
-      cronExpr: '0 10 * * 1-5',
-      serverId: 'srv-current',
-      projectName: 'cd',
-      targetRole: 'brain',
-      action: {
-        type: 'p2p',
-        topic: 'Review risky changes',
-        rounds: 3,
-        participantEntries: [{ type: 'session', value: 'deck_sub_audit' }],
-      },
-    });
-    expect(typeof payload.timezone).toBe('string');
+    expect(screen.queryByLabelText('cron.action_p2p')).toBeNull();
+    expect(screen.getByLabelText('cron.action_command')).toBeDefined();
+    expect(screen.getByLabelText('common.send')).toBeDefined();
+    expect(screen.queryByPlaceholderText('cron.p2p_topic_placeholder')).toBeNull();
   });
 
-  it('edits jobs, toggles schedule modes, and maps cron validation errors', async () => {
+  it('edits legacy p2p jobs, keeps their action type read-only, and maps cron validation errors', async () => {
     apiFetch
       .mockResolvedValueOnce({ jobs: [cronJob({
         id: 'edit-job',
@@ -470,16 +433,21 @@ describe('CronManager', () => {
     expect(await screen.findByText('Editable p2p')).toBeDefined();
     fireEvent.click(screen.getByText('✎'));
 
+    const p2pAction = screen.getByLabelText('cron.action_p2p') as HTMLInputElement;
+    expect(p2pAction.disabled).toBe(true);
+    expect(screen.queryByLabelText('cron.action_command')).toBeNull();
+    const topicInput = screen.getByPlaceholderText('cron.p2p_topic_placeholder') as HTMLTextAreaElement;
+    expect(topicInput.value).toBe('Old topic');
+
     fireEvent.click(screen.getByText('cron.mode_advanced'));
     fireEvent.input(screen.getByPlaceholderText('0 9 * * 1-5'), { target: { value: 'bad cron' } });
-    fireEvent.click(screen.getByLabelText('cron.action_command'));
-    fireEvent.input(screen.getByPlaceholderText('cron.command_placeholder'), { target: { value: 'new command' } });
+    fireEvent.input(topicInput, { target: { value: 'Updated topic' } });
     fireEvent.click(screen.getByText('cron.save'));
 
     await waitFor(() => expect(screen.getByText('cron.invalid_cron')).toBeDefined());
     expect(apiFetch).toHaveBeenCalledWith('/api/cron/edit-job', expect.objectContaining({
       method: 'PUT',
-      body: expect.stringContaining('"command":"new command"'),
+      body: expect.stringContaining('"topic":"Updated topic"'),
     }));
   });
 
