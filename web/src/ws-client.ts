@@ -714,17 +714,23 @@ export class WsClient {
       return;
     }
     this.terminalSubscriptions.set(sessionName, raw);
-    this.queueTerminalSubscriptionSync(sessionName);
+    this.queueTerminalSubscriptionSync(sessionName, raw ? 0 : TERMINAL_SUBSCRIPTION_DEBOUNCE_MS, raw);
   }
 
   private queueTerminalSubscriptionSync(
     sessionName: string,
     minDelayMs = TERMINAL_SUBSCRIPTION_DEBOUNCE_MS,
+    urgent = false,
   ): void {
     const existing = this.terminalSubscriptionTimers.get(sessionName);
     if (existing) clearTimeout(existing);
     this.terminalSubscriptionTimers.delete(sessionName);
     if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    if (urgent) {
+      this.flushTerminalSubscription(sessionName);
+      return;
+    }
 
     const now = Date.now();
     const earliest = now + minDelayMs;

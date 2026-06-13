@@ -6844,6 +6844,57 @@ if [ "${targetVer}" != "latest" ] && [ "$INSTALLED_VER" != "${targetVer}" ]; the
   exit 0
 fi
 
+NEW_IMCODES_SCRIPT="$GLOBAL_ROOT/imcodes/dist/src/index.js"
+NEW_LAUNCHER="$GLOBAL_ROOT/imcodes/bin/imcodes-launch.sh"
+
+repair_cli_wrappers() {
+  if [ ! -f "$NEW_IMCODES_SCRIPT" ]; then
+    log "[step 3.6] $NEW_IMCODES_SCRIPT not found — skipping CLI wrapper repair"
+    return 0
+  fi
+
+  WRAPPER_TMP="$SCRIPT_DIR/imcodes-cli-wrapper"
+  {
+    printf '%s\\n' '#!/bin/sh'
+    printf 'exec "%s" "%s" "$@"\\n' "$NODE" "$NEW_IMCODES_SCRIPT"
+  } > "$WRAPPER_TMP" || {
+    log "[step 3.6] failed to write temporary CLI wrapper (non-fatal)"
+    return 0
+  }
+  chmod 755 "$WRAPPER_TMP" 2>/dev/null || true
+
+  USER_BIN="$HOME/.local/bin"
+  USER_SHIM="$USER_BIN/imcodes"
+  if mkdir -p "$USER_BIN" 2>/dev/null; then
+    if rm -f "$USER_SHIM" 2>/dev/null && cp "$WRAPPER_TMP" "$USER_SHIM" 2>/dev/null && chmod 755 "$USER_SHIM" 2>/dev/null; then
+      log "[step 3.6] refreshed CLI wrapper: $USER_SHIM"
+    else
+      log "[step 3.6] failed to refresh $USER_SHIM (non-fatal)"
+    fi
+  else
+    log "[step 3.6] failed to create $USER_BIN (non-fatal)"
+  fi
+
+  case "$(uname)" in
+    Linux|Darwin)
+      GLOBAL_SHIM="/usr/local/bin/imcodes"
+      if [ ! -d "/usr/local/bin" ]; then
+        log "[step 3.6] /usr/local/bin absent — skipped global CLI wrapper"
+      elif rm -f "$GLOBAL_SHIM" 2>/dev/null && cp "$WRAPPER_TMP" "$GLOBAL_SHIM" 2>/dev/null && chmod 755 "$GLOBAL_SHIM" 2>/dev/null; then
+        log "[step 3.6] refreshed CLI wrapper: $GLOBAL_SHIM"
+      elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+        if sudo install -m 755 "$WRAPPER_TMP" "$GLOBAL_SHIM" >> "$LOG" 2>&1; then
+          log "[step 3.6] refreshed CLI wrapper with sudo: $GLOBAL_SHIM"
+        else
+          log "[step 3.6] sudo install failed for $GLOBAL_SHIM (non-fatal)"
+        fi
+      else
+        log "[step 3.6] skipped $GLOBAL_SHIM: not writable and passwordless sudo unavailable"
+      fi
+      ;;
+  esac
+}
+
 # Downgrade guard — refuse to restart if installed < current daemon.
 # Catches: server broadcasts \`latest\` but npm's "latest" dist-tag
 # resolves to an older release than the operator's local dev build.
@@ -6876,7 +6927,9 @@ if [ "$CMP" = "1" ]; then
   exit 0
 fi
 if [ "$CMP" = "0" ]; then
-  log "[step 3] installed $INSTALLED_VER matches current — no restart needed"
+  log "[step 3] installed $INSTALLED_VER matches current — repairing CLI wrappers without restart"
+  log "[step 3.6] repairing CLI wrappers"
+  repair_cli_wrappers
   log "=== upgrade complete (no-op) ==="
   schedule_self_cleanup
   exit 0
@@ -6917,8 +6970,6 @@ log "[step 3] version comparator: installed > current → restart"
 # directly or have a non-standard launcher, neither of which we should
 # clobber.
 log "[step 3.5] regenerating launch chain"
-NEW_IMCODES_SCRIPT="$GLOBAL_ROOT/imcodes/dist/src/index.js"
-NEW_LAUNCHER="$GLOBAL_ROOT/imcodes/bin/imcodes-launch.sh"
 
 # Prefer the self-healing launcher (bin/imcodes-launch.sh) when the
 # freshly-installed package ships it. Older installs (pre-launcher) fall
@@ -6984,6 +7035,9 @@ elif [ "$(uname)" = "Darwin" ]; then
     log "[step 3.5] $PLIST absent — nothing to rewrite"
   fi
 fi
+
+log "[step 3.6] repairing CLI wrappers"
+repair_cli_wrappers
 
 log "[step 4] running restart command"
 # Wrap restartCmd in a subshell so its multi-line content captures all

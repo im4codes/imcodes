@@ -959,7 +959,7 @@ describe('WsBridge', () => {
       expect(daemonWs.sentStrings.filter((s) => s.includes('terminal.unsubscribe')).length).toBe(unsubBefore + 1);
     });
 
-    it('keeps same-mode resubscribe idempotent and upgrades raw mode without extra daemon subscribe', async () => {
+    it('keeps same-mode resubscribe idempotent and forwards effective raw mode changes', async () => {
       const { bridge, daemonWs } = await setupAuth();
 
       const browserWs = new MockWs();
@@ -992,12 +992,30 @@ describe('WsBridge', () => {
       const subscribesAfterUpgrade = daemonWs.sentStrings.filter((s) => {
         try { return (JSON.parse(s) as { type: string }).type === 'terminal.subscribe'; } catch { return false; }
       });
-      expect(subscribesAfterUpgrade).toHaveLength(1);
+      expect(subscribesAfterUpgrade).toHaveLength(2);
+      expect(JSON.parse(subscribesAfterUpgrade[1]!)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'sess-mode',
+        raw: true,
+      });
 
       browserWs.sent.length = 0;
       daemonWs.emit('message', packFrame('sess-mode', Buffer.from('abc')), true);
       await flushAsync();
       expect(browserWs.sent.some((s) => Buffer.isBuffer(s))).toBe(true);
+
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sess-mode', raw: false }));
+      await flushAsync();
+
+      const subscribesAfterDowngrade = daemonWs.sentStrings.filter((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'terminal.subscribe'; } catch { return false; }
+      });
+      expect(subscribesAfterDowngrade).toHaveLength(3);
+      expect(JSON.parse(subscribesAfterDowngrade[2]!)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'sess-mode',
+        raw: false,
+      });
     });
 
     it('forwards binary only to raw-enabled subscribers while text reaches all subscribers', async () => {

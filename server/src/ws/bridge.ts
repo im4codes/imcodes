@@ -4940,6 +4940,7 @@ export class WsBridge {
     if (existing === raw) return;
 
     const refs = this.getOrCreateSessionRefs(sessionName);
+    const effectiveRawBefore = refs.rawRefs > 0;
 
     if (existing === undefined) {
       subs.set(sessionName, raw);
@@ -4950,6 +4951,8 @@ export class WsBridge {
       if (refs.totalRefs === 1) {
         // First browser subscriber — tell daemon to start streaming
         this.sendToDaemon(rawMsg);
+      } else if (effectiveRawBefore !== (refs.rawRefs > 0)) {
+        this.sendToDaemon(JSON.stringify({ type: 'terminal.subscribe', session: sessionName, raw: refs.rawRefs > 0 }));
       }
       return;
     }
@@ -4958,6 +4961,9 @@ export class WsBridge {
     if (existing) refs.rawRefs = Math.max(0, refs.rawRefs - 1);
     if (raw) refs.rawRefs += 1;
     this.daemonSessionRefs.set(sessionName, refs);
+    if (effectiveRawBefore !== (refs.rawRefs > 0)) {
+      this.sendToDaemon(JSON.stringify({ type: 'terminal.subscribe', session: sessionName, raw: refs.rawRefs > 0 }));
+    }
   }
 
   private getOrCreateSessionRefs(sessionName: string): { totalRefs: number; rawRefs: number } {
@@ -4997,6 +5003,9 @@ export class WsBridge {
       this.sendToDaemon(JSON.stringify({ type: 'terminal.unsubscribe', session: sessionName }));
     } else {
       this.daemonSessionRefs.set(sessionName, refs);
+      if (wasRaw && refs.rawRefs === 0) {
+        this.sendToDaemon(JSON.stringify({ type: 'terminal.subscribe', session: sessionName, raw: false }));
+      }
     }
   }
 
