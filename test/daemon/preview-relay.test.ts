@@ -7,6 +7,7 @@ import {
   packPreviewBinaryFrame,
 } from '../../shared/preview-types.js';
 import { handlePreviewBinaryFrame, handlePreviewCommand } from '../../src/daemon/preview-relay.js';
+import { isStreamingResponse } from '../../shared/preview-stream-policy.js';
 
 const fetchMock = vi.fn();
 vi.stubGlobal('fetch', fetchMock);
@@ -159,6 +160,65 @@ describe('daemon preview relay', () => {
       expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
         type: types.PREVIEW_MSG.ERROR,
         requestId: 'req-stream',
+        code: types.PREVIEW_ERROR.LIMIT_EXCEEDED,
+      }));
+      // All body chunks were forwarded despite exceeding the 8-byte cap.
+      expect(serverLink.sendBinary).toHaveBeenCalledTimes(2);
+    } finally {
+      if (prev === undefined) delete process.env.PREVIEW_MAX_RESPONSE_BYTES;
+      else process.env.PREVIEW_MAX_RESPONSE_BYTES = prev;
+      vi.resetModules();
+    }
+  });
+
+  it('exempts a charset-qualified streaming (SSE) response from the cumulative byte cap (T-TE-charset.1)', async () => {
+    // The shared classifier strips `;charset=...` and lowercases via contentTypeOf,
+    // so a charset-qualified SSE content-type must still classify as streaming and
+    // therefore skip the cumulative byte-cap abort. Assert the classifier directly
+    // for explicitness, then exercise the daemon relay end-to-end.
+    expect(isStreamingResponse({ 'content-type': 'text/event-stream;charset=utf-8' })).toBe(true);
+    expect(isStreamingResponse({ 'content-type': 'application/x-ndjson; charset=utf-8' })).toBe(true);
+
+    const prev = process.env.PREVIEW_MAX_RESPONSE_BYTES;
+    process.env.PREVIEW_MAX_RESPONSE_BYTES = '8';
+    vi.resetModules();
+    try {
+      const relay = await import('../../src/daemon/preview-relay.js');
+      const types = await import('../../shared/preview-types.js');
+      const serverLink = createServerLink();
+      fetchMock.mockResolvedValue({
+        status: 200,
+        statusText: 'OK',
+        // charset-qualified SSE MIME → still streaming → byte cap must NOT apply.
+        headers: new Headers({ 'content-type': 'text/event-stream;charset=utf-8' }),
+        body: Readable.from([
+          Buffer.from('data: one two three four\n\n'), // > 8 bytes
+          Buffer.from('data: five six seven eight\n\n'),
+        ]),
+      });
+
+      relay.handlePreviewCommand({
+        type: types.PREVIEW_MSG.REQUEST,
+        requestId: 'req-stream-charset',
+        previewId: 'preview-stream-charset',
+        port: 3000,
+        method: 'GET',
+        path: '/events',
+        headers: {},
+        hasBody: false,
+      }, serverLink as never);
+
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: types.PREVIEW_MSG.RESPONSE_END,
+        requestId: 'req-stream-charset',
+      }));
+      // A cumulative size that would trip MAX_RESPONSE_BYTES for a non-stream is
+      // NOT a LIMIT_EXCEEDED for the charset-qualified SSE response.
+      expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+        type: types.PREVIEW_MSG.ERROR,
+        requestId: 'req-stream-charset',
         code: types.PREVIEW_ERROR.LIMIT_EXCEEDED,
       }));
       // All body chunks were forwarded despite exceeding the 8-byte cap.

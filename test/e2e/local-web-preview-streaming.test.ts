@@ -324,6 +324,67 @@ describe('E2E: Local Web Preview streaming protocols (real upstreams, real daemo
     expect(bridge.hasActivePreviewRelay(previewId)).toBe(false);
   });
 
+  // ── 1b. Charset-qualified SSE (T-TE-charset.2): `text/event-stream;charset=utf-8` ─
+  it('streams a real text/event-stream;charset=utf-8 end-to-end, incrementally, EXEMPT from the cumulative byte cap (T-TE-charset.2)', async () => {
+    // Identical to the SSE case above but the upstream qualifies the content-type
+    // with `;charset=utf-8`. The shared classifier strips the parameter via
+    // contentTypeOf, so this must still be treated as streaming on BOTH sides; if
+    // either side failed to strip the charset, the tiny byte cap would abort it and
+    // we would never see all 8 events + RESPONSE_END.
+    vi.stubEnv('PREVIEW_MAX_RESPONSE_BYTES', '16');
+
+    const TOTAL = 8;
+    const upstream = await startHttpUpstream((req, res) => {
+      if (!req.url?.startsWith('/events')) { res.writeHead(404).end(); return; }
+      res.writeHead(200, { 'content-type': 'text/event-stream;charset=utf-8', 'cache-control': 'no-cache' });
+      res.write('data: 0\n\n'); // first event flushed immediately
+      let i = 1;
+      const timer = setInterval(() => {
+        if (i >= TOTAL) { clearInterval(timer); res.end(); return; }
+        res.write(`data: ${i}\n\n`);
+        i += 1;
+      }, 10);
+      res.on('close', () => clearInterval(timer));
+    });
+    cleanups.push(() => upstream.close());
+
+    const { bridge, types, previewId, daemonToBridge, injectHttpRequest, WsBridge } = await setup();
+    cleanups.push(() => WsBridge.getAll().clear());
+
+    const requestId = 'sse-charset-1';
+    const relay = bridge.createPreviewRelay(requestId, previewId, 10_000);
+    // Cross-tier liveness (P1.4): a live relay must mark the preview non-idle.
+    expect(bridge.hasActivePreviewRelay(previewId)).toBe(true);
+    injectHttpRequest(requestId, upstream.port, '/events');
+
+    const started = await relay.start;
+    expect(started.status).toBe(200);
+    expect(String((started.headers as Record<string, string>)['content-type'])).toContain('text/event-stream');
+
+    const reader = started.body.getReader();
+    // First event arrives BEFORE the upstream has sent the rest (it withholds
+    // events 1..N behind a 10ms interval) — proving incremental, non-buffered flow.
+    const first = await reader.read();
+    expect(Buffer.from(first.value ?? []).toString()).toContain('data: 0');
+
+    let acc = Buffer.from(first.value ?? []);
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) acc = Buffer.concat([acc, Buffer.from(value)]);
+    }
+
+    const text = acc.toString();
+    for (let i = 0; i < TOTAL; i++) expect(text).toContain(`data: ${i}`);
+    expect(acc.byteLength).toBeGreaterThan(16); // genuinely exceeded the cap
+
+    // No LIMIT_EXCEEDED was reported by the daemon; the stream completed cleanly.
+    expect(daemonToBridge.some((m) => m.type === types.PREVIEW_MSG.ERROR && m.requestId === requestId)).toBe(false);
+    expect(daemonToBridge.some((m) => m.type === types.PREVIEW_MSG.RESPONSE_END && m.requestId === requestId)).toBe(true);
+    // Relay settled → preview is idle again.
+    expect(bridge.hasActivePreviewRelay(previewId)).toBe(false);
+  });
+
   // ── 2. NDJSON streaming logs ───────────────────────────────────────────────
   it('streams a real application/x-ndjson response end-to-end, EXEMPT from the cumulative byte cap', async () => {
     vi.stubEnv('PREVIEW_MAX_RESPONSE_BYTES', '16');

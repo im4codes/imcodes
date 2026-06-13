@@ -199,17 +199,43 @@ export function rewriteSetCookieHeader(params: {
   return rewritten.join('; ');
 }
 
-/** All hostnames treated as loopback for preview URL rewriting. */
-const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1', '0.0.0.0']);
+/**
+ * All hostnames treated as loopback for preview URL rewriting.
+ *
+ * SINGLE SOURCE OF TRUTH (run 8a975732-23a A17/A25). EXPORTED so the injected
+ * browser runtime patch (`server/src/preview/policy.ts`) can serialize THIS exact
+ * set into its script at build/inject time instead of hand-maintaining a literal
+ * copy — the injected script runs in the previewed page's global scope and cannot
+ * `import` at runtime, so divergence is prevented by serialization + an anti-drift
+ * test, not by a second copy. `0.0.0.0` is the dev-server wildcard-bind host,
+ * deliberately included for compatibility (not a standard loopback address).
+ */
+export const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1', '0.0.0.0']);
 
 export function isLoopbackHost(hostname: string): boolean {
   return LOOPBACK_HOSTS.has(hostname);
 }
 
+/**
+ * Default TCP port for a URL scheme when the URL carries no explicit port
+ * (run 8a975732-23a A25 / T-R-CC1-3): `http`/`ws` → 80, `https`/`wss` → 443.
+ *
+ * Used so `shouldRewritePreviewRedirect` does NOT mis-default an `https`/`wss`
+ * loopback URL without an explicit port to 80 (the old `Number(url.port || '80')`
+ * bug) and thereby fail the preview-port comparison. The injected runtime patch
+ * applies the identical mapping inline (it cannot import this; see policy.ts).
+ * Accepts a protocol with or without the trailing `:` (`URL.protocol` includes it).
+ */
+export function defaultPortForProtocol(protocol: string): number {
+  const scheme = (protocol.endsWith(':') ? protocol.slice(0, -1) : protocol).toLowerCase();
+  return scheme === 'https' || scheme === 'wss' ? 443 : 80;
+}
+
 export function shouldRewritePreviewRedirect(location: string, port: number): boolean {
   try {
     const url = new URL(location, `http://127.0.0.1:${port}`);
-    return isLoopbackHost(url.hostname) && Number(url.port || '80') === port;
+    const urlPort = url.port ? Number(url.port) : defaultPortForProtocol(url.protocol);
+    return isLoopbackHost(url.hostname) && urlPort === port;
   } catch {
     return false;
   }

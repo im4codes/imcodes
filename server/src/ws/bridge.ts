@@ -369,16 +369,26 @@ type PendingPreviewRequest = {
    */
   streaming: boolean;
   /**
-   * Unconsumed (enqueued-but-not-yet-read) bytes sitting in the ReadableStream's
-   * internal queue, tracked explicitly in BYTES (run 8a975732-23a P1.2 — MUST
-   * NOT use `controller.desiredSize` as a byte measure). Incremented on enqueue,
-   * decremented in the stream's `pull` (one chunk per consumed read). When it
-   * exceeds `MAX_PREVIEW_STREAM_BUFFER_BYTES` the stream is deterministically
-   * closed.
+   * Unconsumed (received-but-not-yet-delivered-to-consumer) bytes — the total
+   * byte size of `pendingChunks` (run 8a975732-23a P1.2 / N1 fix 394c114e-11f).
+   * Tracked explicitly in BYTES (MUST NOT use `controller.desiredSize` as a byte
+   * measure). Incremented when the daemon pushes a chunk; decremented when a chunk
+   * is actually handed off to the stream in `flushPreviewChunksToStream`
+   * (demand-driven) — NOT on the `pull` callback cadence, which under-fires under
+   * backlog (HWM=1: `pull` only fires when desiredSize>0) and would over-count →
+   * false LIMIT_EXCEEDED on a healthy bursty stream. When it exceeds
+   * `MAX_PREVIEW_STREAM_BUFFER_BYTES` the stream is deterministically closed.
    */
   unconsumedBytes: number;
-  /** FIFO of enqueued chunk byte-sizes, so `pull` can decrement `unconsumedBytes` exactly. */
-  chunkSizes: number[];
+  /**
+   * External FIFO of received-but-undelivered chunks. The daemon push path
+   * appends here (NOT directly to the ReadableStream's internal queue); the
+   * stream's `pull` and the push path drain from here via
+   * `flushPreviewChunksToStream`, keeping `unconsumedBytes` 1:1 with actual
+   * consumer demand. At most ~1 chunk may sit pre-buffered in the stream's
+   * internal queue (HWM=1) → effective memory bound = cap + one max chunk.
+   */
+  pendingChunks: Uint8Array[];
   timer: ReturnType<typeof setTimeout>;
   timerMode: 'start' | 'idle';
   resolveStart: (payload: PreviewStartPayload) => void;
@@ -5755,17 +5765,11 @@ export class WsBridge {
         controllerRef = controller;
       },
       pull: () => {
-        // A read drained one chunk from the internal queue — decrement the
-        // explicit unconsumed-byte counter by exactly that chunk's size (FIFO).
-        // Precise accounting: enqueue (pushPreviewResponseChunk) increments and
-        // pushes the size; pull consumes one. `pull` is invoked by the stream
-        // once per chunk pulled out as the consumer reads.
-        const active = this.pendingPreviewRequests.get(requestId);
-        if (!active) return;
-        const consumed = active.chunkSizes.shift();
-        if (consumed !== undefined) {
-          active.unconsumedBytes = Math.max(0, active.unconsumedBytes - consumed);
-        }
+        // Demand signal: the consumer read, freeing internal-queue room. Deliver
+        // from our external `pendingChunks` FIFO (decrementing unconsumedBytes 1:1
+        // as each chunk is handed off) — NOT a per-`pull` chunkSizes shift, which
+        // under-fires under backlog. See flushPreviewChunksToStream.
+        this.flushPreviewChunksToStream(requestId);
       },
       cancel: () => {
         this.abortPreviewRequest(requestId, PREVIEW_ERROR.ABORTED, true);
@@ -5797,7 +5801,7 @@ export class WsBridge {
       responseBytes: 0,
       streaming: false,
       unconsumedBytes: 0,
-      chunkSizes: [],
+      pendingChunks: [],
       timer,
       timerMode: 'start',
       resolveStart: (payload) => resolveStart({ ...payload, body: readable }),
@@ -5811,6 +5815,27 @@ export class WsBridge {
   }
 
   /**
+   * Deliver buffered chunks from the external `pendingChunks` FIFO into the
+   * ReadableStream, decrementing `unconsumedBytes` 1:1 as each chunk is handed
+   * off — the demand-driven replacement for the broken per-`pull` decrement
+   * (N1 / audit 394c114e-11f). Stops on backpressure (`desiredSize <= 0`) so at
+   * most ~1 chunk sits pre-buffered in the stream's internal queue (HWM=1).
+   * Re-invoked from both the stream's `pull` (a consumer read) and the daemon
+   * push path (to satisfy an already-parked read for the just-arrived chunk).
+   */
+  private flushPreviewChunksToStream(requestId: string): void {
+    const pending = this.pendingPreviewRequests.get(requestId);
+    if (!pending || !pending.controller || pending.terminalOutcome) return;
+    while (pending.pendingChunks.length > 0) {
+      const desired = pending.controller.desiredSize;
+      if (desired !== null && desired <= 0) break; // internal queue full → wait for next pull
+      const chunk = pending.pendingChunks.shift()!;
+      pending.unconsumedBytes = Math.max(0, pending.unconsumedBytes - chunk.byteLength);
+      pending.controller.enqueue(chunk);
+    }
+  }
+
+  /**
    * In-flight HTTP concurrency floor (run 8a975732-23a P0.4). Returns true if a
    * new request for `previewId` is allowed to be forwarded upstream (both the
    * per-preview and per-server in-flight ceilings have headroom). Pure read — it
@@ -5818,6 +5843,12 @@ export class WsBridge {
    * adds the pending entry. Callers reject with
    * `PREVIEW_INFLIGHT_REJECT_HTTP_STATUS` (503) + `PREVIEW_ERROR.INFLIGHT_LIMIT`
    * when this returns false. WS tunnels are NOT counted here.
+   *
+   * In-flight invariant (run 8a975732-23a A28): EVERY terminal —
+   * `completePreviewRequest` / `failPreviewRequest` / `abortPreviewRequest` /
+   * `rejectAllPendingPreviewRequests` / `terminatePreviewRelaysForPreview` —
+   * deletes the pending entry, so this Map's membership is exact and no stale
+   * terminal entry can inflate the count (count → 0 once all settle).
    */
   canAcceptPreviewInflight(previewId: string): boolean {
     if (this.pendingPreviewRequests.size >= PREVIEW_LIMITS.MAX_INFLIGHT_PREVIEW_HTTP_PER_SERVER) return false;
@@ -6046,8 +6077,11 @@ export class WsBridge {
     // explicit counter — NOT controller.desiredSize. A slow consumer + fast
     // stream that lets unconsumed bytes exceed MAX_PREVIEW_STREAM_BUFFER_BYTES
     // is deterministically closed (emit terminal, not silent).
+    // Buffer in the EXTERNAL FIFO (NOT directly into the ReadableStream's internal
+    // queue) so unconsumedBytes accounting stays 1:1 with actual consumer demand
+    // (N1 fix / 394c114e-11f). The cap is checked on the explicit byte counter.
     pending.unconsumedBytes += chunk.length;
-    pending.chunkSizes.push(chunk.length);
+    pending.pendingChunks.push(chunk);
     if (pending.unconsumedBytes > PREVIEW_LIMITS.MAX_PREVIEW_STREAM_BUFFER_BYTES) {
       this.failPreviewRequest({
         type: PREVIEW_MSG.ERROR,
@@ -6065,7 +6099,9 @@ export class WsBridge {
     // long-lived SSE (> preview_session_idle) is not idle-evicted (P1.3.2).
     // touch() is clamped by the absolute lifetime hard ceiling.
     LocalWebPreviewRegistry.get(this.serverId).touch(pending.previewId);
-    pending.controller.enqueue(chunk);
+    // Deliver to the consumer (drains pendingChunks subject to backpressure),
+    // satisfying an already-parked read for this just-arrived chunk.
+    this.flushPreviewChunksToStream(requestId);
   }
 
   private resetPreviewTimeout(requestId: string, timeoutMs: number, mode: 'start' | 'idle'): void {
@@ -6094,8 +6130,16 @@ export class WsBridge {
     clearTimeout(pending.timer);
     if (!pending.started) {
       pending.rejectStart(new Error(outcome));
-    } else {
-      pending.controller?.close();
+    } else if (pending.controller) {
+      // Drain any still-buffered chunks into the stream BEFORE closing, so a
+      // RESPONSE_END that races ahead of a slow consumer does not drop queued data
+      // (N1 metering fix — chunks live in pendingChunks, not the internal queue).
+      for (const chunk of pending.pendingChunks) {
+        pending.unconsumedBytes = Math.max(0, pending.unconsumedBytes - chunk.byteLength);
+        pending.controller.enqueue(chunk);
+      }
+      pending.pendingChunks = [];
+      pending.controller.close();
     }
     this.pendingPreviewRequests.delete(requestId);
   }
