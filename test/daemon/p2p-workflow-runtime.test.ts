@@ -10,7 +10,10 @@ import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
 import { TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
-import { FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../shared/transport/file-transfer.js';
+import {
+  FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+  FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+} from '../../shared/transport/file-transfer.js';
 import type {
   P2pBindRuntimeContext,
   P2pCompiledWorkflow,
@@ -197,6 +200,7 @@ describe('ServerLink P2P workflow hello', () => {
       GIT_REMOTE_CLONE_CAPABILITY_V1,
       TIMELINE_PROTOCOL_CAPABILITY,
       FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+      FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
     ]);
 
     link.updateP2pWorkflowCapabilities([
@@ -217,6 +221,7 @@ describe('ServerLink P2P workflow hello', () => {
       GIT_REMOTE_CLONE_CAPABILITY_V1,
       TIMELINE_PROTOCOL_CAPABILITY,
       FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+      FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
     ]));
   });
 
@@ -281,6 +286,7 @@ describe('ServerLink P2P workflow hello', () => {
         GIT_REMOTE_CLONE_CAPABILITY_V1,
         TIMELINE_PROTOCOL_CAPABILITY,
         FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+        FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
       ],
       timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
       timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,
@@ -355,6 +361,7 @@ describe('ServerLink P2P workflow hello', () => {
         GIT_REMOTE_CLONE_CAPABILITY_V1,
         TIMELINE_PROTOCOL_CAPABILITY,
         FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+        FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
       ]),
       timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
       timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,
