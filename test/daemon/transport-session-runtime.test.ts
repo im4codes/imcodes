@@ -333,7 +333,7 @@ describe('TransportSessionRuntime', () => {
       provider: 'mock',
       runningTurnId: 'turn-1',
       activeItemCount: 1,
-      agentMessageCompletionFallbackArmed: false,
+      customProviderField: false,
     };
     (mock.provider as TransportProvider).getSessionDiagnostics = vi.fn().mockReturnValue(providerDiagnostics);
 
@@ -1981,23 +1981,6 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingCount).toBe(1);
     expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['cmd-queued']);
     expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(sendCountBefore);
-  });
-
-  it('settles a stale in-progress status when no active turn or queued work exists', async () => {
-    const internal = runtime as unknown as {
-      _status: 'streaming';
-      _sending: boolean;
-      _activeTurn: unknown;
-      _activeDispatchEntries: PendingTransportMessage[];
-    };
-    internal._status = 'streaming';
-    internal._sending = false;
-    internal._activeTurn = null;
-    internal._activeDispatchEntries = [];
-
-    expect(runtime.settleInactiveInProgressStatus('test-inactive-streaming')).toBe(true);
-
-    expect(runtime.getStatus()).toBe('idle');
   });
 
   it('does not cancel a recently active turn with queued work', async () => {

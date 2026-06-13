@@ -59,8 +59,6 @@ function resolveTransportSessionListState(
 ): SessionListItem['state'] {
   if (!runtime) return record.state;
   runtime.drainPendingIfIdle?.('session-list');
-  runtime.settleInactiveInProgressStatus?.('session-list');
-  runtime.cancelStaleActiveTurnWithPending?.({ reason: 'session-list' });
   const status = runtime.getStatus();
   if (status === 'error') return 'error';
   if (status === 'streaming' || status === 'thinking' || status === 'tool_running' || status === 'permission') {

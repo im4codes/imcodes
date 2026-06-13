@@ -232,46 +232,6 @@ describe('buildSessionList', () => {
     ]));
   });
 
-  it('nudges a stale active transport runtime with queued messages before returning the list', async () => {
-    const store = await import('../../src/store/session-store.js');
-    store.upsertSession({
-      name: 'deck_codex_stale_pending_brain',
-      projectName: 'demo',
-      role: 'brain',
-      agentType: 'codex-sdk',
-      runtimeType: 'transport',
-      providerId: 'codex-sdk',
-      providerSessionId: 'sid-stale-pending',
-      state: 'running',
-      restarts: 0,
-      restartTimestamps: [],
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-    const cancelStaleActiveTurnWithPending = vi.fn(() => true);
-    getTransportRuntimeMock.mockReturnValue({
-      getStatus: () => 'streaming',
-      drainPendingIfIdle: vi.fn(() => false),
-      cancelStaleActiveTurnWithPending,
-      pendingMessages: ['queued while phantom active'],
-      pendingEntries: [{ clientMessageId: 'msg-stale-pending', text: 'queued while phantom active' }],
-      pendingVersion: 7,
-    });
-
-    const { buildSessionList } = await import('../../src/daemon/session-list.js');
-    const sessions = await buildSessionList();
-
-    expect(cancelStaleActiveTurnWithPending).toHaveBeenCalledWith({ reason: 'session-list' });
-    expect(sessions).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        name: 'deck_codex_stale_pending_brain',
-        state: 'running',
-        transportPendingMessages: ['queued while phantom active'],
-        transportPendingMessageVersion: 7,
-      }),
-    ]));
-  });
-
   it('surfaces resend queue entries when a transport runtime is missing', async () => {
     const store = await import('../../src/store/session-store.js');
     const { enqueueResend } = await import('../../src/daemon/transport-resend-queue.js');
@@ -305,52 +265,6 @@ describe('buildSessionList', () => {
         state: 'queued',
         transportPendingMessages: ['queued while offline'],
         transportPendingMessageEntries: [{ clientMessageId: 'cmd-offline', text: 'queued while offline' }],
-      }),
-    ]));
-  });
-
-  it('settles an inactive in-progress transport runtime before returning the list', async () => {
-    const store = await import('../../src/store/session-store.js');
-    store.upsertSession({
-      name: 'deck_codex_inactive_streaming_brain',
-      projectName: 'demo',
-      role: 'brain',
-      agentType: 'codex-sdk',
-      runtimeType: 'transport',
-      providerId: 'codex-sdk',
-      providerSessionId: 'sid-inactive-streaming',
-      state: 'running',
-      restarts: 0,
-      restartTimestamps: [],
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-    let status = 'streaming';
-    const settleInactiveInProgressStatus = vi.fn(() => {
-      status = 'idle';
-      return true;
-    });
-    getTransportRuntimeMock.mockReturnValue({
-      getStatus: () => status,
-      drainPendingIfIdle: vi.fn(() => false),
-      settleInactiveInProgressStatus,
-      cancelStaleActiveTurnWithPending: vi.fn(() => false),
-      pendingMessages: [],
-      pendingEntries: [],
-      pendingVersion: 3,
-    });
-
-    const { buildSessionList } = await import('../../src/daemon/session-list.js');
-    const sessions = await buildSessionList();
-
-    expect(settleInactiveInProgressStatus).toHaveBeenCalledWith('session-list');
-    expect(sessions).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        name: 'deck_codex_inactive_streaming_brain',
-        state: 'idle',
-        transportPendingMessages: [],
-        transportPendingMessageEntries: [],
-        transportPendingMessageVersion: 3,
       }),
     ]));
   });

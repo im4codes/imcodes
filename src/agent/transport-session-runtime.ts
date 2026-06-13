@@ -539,30 +539,6 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   /**
-   * Repair a stale presentation-only running status. A transport runtime can
-   * only be legitimately in-progress while it has an active turn, active
-   * dispatch entries, a send in flight, or queued work. If all of those are
-   * absent, `streaming`/`thinking` is a stale status bit and must not keep the
-   * UI showing "working".
-   */
-  settleInactiveInProgressStatus(reason = 'inactive-in-progress-observed'): boolean {
-    if (!this.isInProgressStatus(this._status)) return false;
-    if (this.hasActiveTurnWork() || this._pendingMessages.length > 0) return false;
-    logger.warn(
-      {
-        sessionKey: this.sessionKey,
-        reason,
-        status: this._status,
-        pendingVersion: this._pendingVersion,
-        lastActivityAt: this._lastActivityAt,
-      },
-      'transport runtime in-progress status had no active turn; settling to idle',
-    );
-    this.setStatus('idle');
-    return true;
-  }
-
-  /**
    * Queue-visible watchdog for the harder split-brain case: the provider/UI
    * has gone quiet, but the runtime never received onComplete/onError, so an
    * active dispatch pins `_sending=true` and queued user messages never drain.

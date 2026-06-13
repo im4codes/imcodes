@@ -1587,125 +1587,6 @@ describe('CodexSdkProvider', () => {
     expect(deltas.every((d) => !d.text.includes('First.Second'))).toBe(true);
   });
 
-  it('falls back to completing a quiet normal turn from idle thread status when turn/completed is missing', async () => {
-    vi.useFakeTimers();
-    vi.stubEnv('IMCODES_CODEX_AGENT_MESSAGE_COMPLETION_FALLBACK_MS', '60000');
-    const provider = new CodexSdkProvider();
-    await provider.connect({ binaryPath: 'codex' });
-    await provider.createSession({ sessionKey: 'route-idle-status-complete', cwd: '/tmp/project' });
-
-    const completed: string[] = [];
-    provider.onComplete((_sid, msg) => completed.push(msg.content));
-
-    await provider.send('route-idle-status-complete', 'hello');
-    const child = childProcessMock.children[0];
-    child.emits({
-      method: 'item/completed',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
-    });
-    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(completed).toEqual([]);
-    await vi.advanceTimersByTimeAsync(29_999);
-    expect(completed).toEqual([]);
-    await vi.advanceTimersByTimeAsync(1);
-    await vi.advanceTimersByTimeAsync(0);
-
-    vi.useRealTimers();
-    await waitForCondition(() => completed.length === 1);
-    expect(completed).toEqual(['Done']);
-    await provider.send('route-idle-status-complete', 'next');
-    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
-  });
-
-  it('falls back to completing a quiet turn from agentMessage completion when turn/completed is missing', async () => {
-    vi.useFakeTimers();
-    const provider = new CodexSdkProvider();
-    await provider.connect({ binaryPath: 'codex' });
-    await provider.createSession({ sessionKey: 'route-agent-message-complete', cwd: '/tmp/project' });
-
-    const completed: string[] = [];
-    provider.onComplete((_sid, msg) => completed.push(msg.content));
-
-    await provider.send('route-agent-message-complete', 'hello');
-    const child = childProcessMock.children[0];
-    child.emits({
-      method: 'item/completed',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
-    });
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(completed).toEqual([]);
-    expect(provider.getSessionDiagnostics('route-agent-message-complete')).toMatchObject({
-      runningTurnId: 'turn-1',
-      activeItemCount: 0,
-      agentMessageCompletionTurnId: 'turn-1',
-      agentMessageCompletionFallbackArmed: true,
-    });
-    await vi.advanceTimersByTimeAsync(4_999);
-    expect(completed).toEqual([]);
-    await vi.advanceTimersByTimeAsync(1);
-    await vi.advanceTimersByTimeAsync(0);
-
-    vi.useRealTimers();
-    await waitForCondition(() => completed.length === 1);
-    expect(completed).toEqual(['Done']);
-    expect(provider.getSessionDiagnostics('route-agent-message-complete')).toMatchObject({
-      runningTurnId: null,
-      activeItemCount: 0,
-      agentMessageCompletionTurnId: null,
-      agentMessageCompletionFallbackArmed: false,
-    });
-    await provider.send('route-agent-message-complete', 'next');
-    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
-  });
-
-  it('does not duplicate or reopen a turn after agentMessage fallback completion', async () => {
-    vi.useFakeTimers();
-    const provider = new CodexSdkProvider();
-    await provider.connect({ binaryPath: 'codex' });
-    await provider.createSession({ sessionKey: 'route-agent-message-no-duplicate', cwd: '/tmp/project' });
-
-    const completed: string[] = [];
-    provider.onComplete((_sid, msg) => completed.push(msg.content));
-    const deltas: string[] = [];
-    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
-
-    await provider.send('route-agent-message-no-duplicate', 'hello');
-    const child = childProcessMock.children[0];
-    child.emits({
-      method: 'item/completed',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
-    });
-    await vi.advanceTimersByTimeAsync(5_000);
-    await vi.advanceTimersByTimeAsync(0);
-
-    vi.useRealTimers();
-    await waitForCondition(() => completed.length === 1);
-    const deltasBeforeLateEvents = [...deltas];
-    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
-    child.emits({
-      method: 'item/started',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'cmd-late', type: 'commandExecution', command: 'echo late', status: 'inProgress' } },
-    });
-    child.emits({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg-late', delta: 'late' } });
-    child.emits({
-      method: 'item/started',
-      params: { threadId: 'thread-1', item: { id: 'cmd-late-no-turn', type: 'commandExecution', command: 'echo late', status: 'inProgress' } },
-    });
-    child.emits({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', itemId: 'msg-late-no-turn', delta: 'late without turn id' } });
-
-    expect(completed).toEqual(['Done']);
-    expect(deltas).toEqual(deltasBeforeLateEvents);
-    expect(provider.getSessionDiagnostics('route-agent-message-no-duplicate')).toMatchObject({
-      runningTurnId: null,
-      activeItemCount: 0,
-    });
-    await provider.send('route-agent-message-no-duplicate', 'next');
-    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
-  });
-
   it('exposes only safe allowlisted Codex session diagnostics', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({
@@ -1726,9 +1607,6 @@ describe('CodexSdkProvider', () => {
       'activeItemCount',
       'activeItemIds',
       'activeReason',
-      'agentMessageCompletionArmedAt',
-      'agentMessageCompletionFallbackArmed',
-      'agentMessageCompletionTurnId',
       'cancelTimerArmed',
       'cancelled',
       'compactHardTimeoutArmed',
@@ -1736,8 +1614,6 @@ describe('CodexSdkProvider', () => {
       'compactSettleArmed',
       'currentMessageId',
       'currentTextLength',
-      'idleStatusCompletionFallbackArmed',
-      'idleStatusCompletionTurnId',
       'loaded',
       'provider',
       'rawChecklistPollArmed',
@@ -1751,140 +1627,43 @@ describe('CodexSdkProvider', () => {
     expect(JSON.stringify(diagnostics)).not.toContain('/tmp/project');
   });
 
-  it('re-arms agentMessage completion fallback for a later agentMessage in the same turn', async () => {
-    vi.useFakeTimers();
+  it('completes a normal turn only from turn/completed; idle thread status mid-turn does not end it', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
-    await provider.createSession({ sessionKey: 'route-agent-message-rearm', cwd: '/tmp/project' });
+    await provider.createSession({ sessionKey: 'route-idle-not-completion', cwd: '/tmp/project' });
 
     const completed: string[] = [];
     provider.onComplete((_sid, msg) => completed.push(msg.content));
 
-    await provider.send('route-agent-message-rearm', 'hello');
+    await provider.send('route-idle-not-completion', 'hello');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-idle-not-completion')?.runningTurnId === 'turn-1',
+    );
+
     const child = childProcessMock.children[0];
-    child.emits({
-      method: 'item/completed',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'First' } },
-    });
-    await vi.advanceTimersByTimeAsync(4_000);
-    child.emits({
-      method: 'item/started',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-2', type: 'agentMessage', text: '' } },
-    });
-    child.emits({
-      method: 'item/completed',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-2', type: 'agentMessage', text: 'Second' } },
-    });
-    await vi.advanceTimersByTimeAsync(4_999);
-    expect(completed).toEqual([]);
-    await vi.advanceTimersByTimeAsync(1);
-    await vi.advanceTimersByTimeAsync(0);
-
-    vi.useRealTimers();
-    await waitForCondition(() => completed.length === 1);
-    expect(completed).toEqual(['Second']);
-  });
-
-  it('does not complete from agentMessage completion if another turn item starts before the fallback fires', async () => {
-    vi.useFakeTimers();
-    const provider = new CodexSdkProvider();
-    await provider.connect({ binaryPath: 'codex' });
-    await provider.createSession({ sessionKey: 'route-agent-message-continues', cwd: '/tmp/project' });
-
-    const completed: string[] = [];
-    provider.onComplete((_sid, msg) => completed.push(msg.content));
-
-    await provider.send('route-agent-message-continues', 'hello');
-    const child = childProcessMock.children[0];
+    // A thread that momentarily reports idle is NOT a turn-completion signal and
+    // must not end the turn (no idle timers, no guessing when the turn ends).
+    // Emit idle BEFORE the agent message: if idle wrongly completed the turn,
+    // the later turn/completed would be de-duped and 'Done' would never surface.
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
     child.emits({
       method: 'item/completed',
       params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
     });
-    await vi.advanceTimersByTimeAsync(1_000);
-    child.emits({
-      method: 'item/started',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'cmd-1', type: 'commandExecution', command: 'ls', status: 'inProgress' } },
-    });
-    await vi.advanceTimersByTimeAsync(5_000);
-    await vi.advanceTimersByTimeAsync(0);
+    // Once the stream-ordered agent message is processed (currentText='Done'),
+    // the idle event before it has also been processed — yet the turn is still
+    // running and nothing has completed.
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-idle-not-completion')?.currentTextLength === 4,
+    );
     expect(completed).toEqual([]);
+    expect(provider.getSessionDiagnostics('route-idle-not-completion')).toMatchObject({ runningTurnId: 'turn-1' });
 
-    child.emits({
-      method: 'item/completed',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'cmd-1', type: 'commandExecution', command: 'ls', status: 'completed', aggregatedOutput: 'ok' } },
-    });
+    // The explicit turn/completed event is the sole completion signal.
     child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
-    await vi.advanceTimersByTimeAsync(0);
-
-    vi.useRealTimers();
     await waitForCondition(() => completed.length === 1);
     expect(completed).toEqual(['Done']);
-  });
-
-  it('does not duplicate a normal completion after idle status fallback', async () => {
-    vi.useFakeTimers();
-    vi.stubEnv('IMCODES_CODEX_AGENT_MESSAGE_COMPLETION_FALLBACK_MS', '60000');
-    const provider = new CodexSdkProvider();
-    await provider.connect({ binaryPath: 'codex' });
-    await provider.createSession({ sessionKey: 'route-idle-status-no-duplicate', cwd: '/tmp/project' });
-
-    const completed: string[] = [];
-    provider.onComplete((_sid, msg) => completed.push(msg.content));
-
-    await provider.send('route-idle-status-no-duplicate', 'hello');
-    const child = childProcessMock.children[0];
-    child.emits({
-      method: 'item/completed',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
-    });
-    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(30_000);
-    await vi.advanceTimersByTimeAsync(0);
-
-    vi.useRealTimers();
-    await waitForCondition(() => completed.length === 1);
-    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
-
-    expect(completed).toEqual(['Done']);
-  });
-
-  it('does not complete from idle thread status while a turn item is still active', async () => {
-    vi.useFakeTimers();
-    const provider = new CodexSdkProvider();
-    await provider.connect({ binaryPath: 'codex' });
-    await provider.createSession({ sessionKey: 'route-idle-active-item', cwd: '/tmp/project' });
-
-    const completed: string[] = [];
-    provider.onComplete((_sid, msg) => completed.push(msg.content));
-
-    await provider.send('route-idle-active-item', 'hello');
-    const child = childProcessMock.children[0];
-    child.emits({
-      method: 'item/started',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: '' } },
-    });
-    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
-
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(30_000);
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(completed).toEqual([]);
-    await expect(provider.send('route-idle-active-item', 'next')).rejects.toMatchObject({
-      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-    });
-    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
-
-    vi.useRealTimers();
-    child.emits({
-      method: 'item/completed',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done after active item' } },
-    });
-    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
-    await waitForCondition(() => completed.length === 1);
-
-    expect(completed).toEqual(['Done after active item']);
+    expect(provider.getSessionDiagnostics('route-idle-not-completion')).toMatchObject({ runningTurnId: null });
   });
 
   it('resumes with stored thread id on existing session', async () => {

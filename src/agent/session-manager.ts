@@ -1024,8 +1024,6 @@ export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): Da
     const runtime = transportRuntimes.get(sessionName);
     const record = getSession(sessionName);
     runtime?.drainPendingIfIdle?.('transport-queue-diagnostics');
-    runtime?.settleInactiveInProgressStatus?.('transport-queue-diagnostics');
-    runtime?.cancelStaleActiveTurnWithPending?.({ reason: 'transport-queue-diagnostics', nowMs });
     const runtimeSnapshot = runtime?.getDiagnosticSnapshot(nowMs);
     const resendEntries = resendBySession.get(sessionName) ?? [];
     return {
