@@ -13,6 +13,14 @@ export interface FsEntry {
   mime?: string;
   /** Controlled download handle ID (only when includeMetadata requested). */
   downloadId?: string;
+  /** OpenSpec task checkbox summary, only when explicitly requested for openspec/changes. */
+  openSpecTaskStats?: OpenSpecTaskStats;
+}
+
+export interface OpenSpecTaskStats {
+  total: number;
+  checked: number;
+  unchecked: number;
 }
 
 export interface GitStatusEntry {

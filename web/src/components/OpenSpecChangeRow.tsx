@@ -3,6 +3,11 @@ import { useTranslation } from 'react-i18next';
 
 interface Props {
   changeName: string;
+  taskStats?: {
+    total: number;
+    checked: number;
+    unchecked: number;
+  };
   mobile: boolean;
   expanded: boolean;
   auditMenuOpen: boolean;
@@ -23,6 +28,7 @@ interface Props {
 
 export function OpenSpecChangeRow({
   changeName,
+  taskStats,
   mobile,
   expanded,
   auditMenuOpen,
@@ -43,6 +49,23 @@ export function OpenSpecChangeRow({
   const { t } = useTranslation();
   const actionsVisible = !mobile || expanded;
   const actionTitle = actionsDisabled ? disabledReason : undefined;
+  const taskStatus = taskStats
+    ? taskStats.total > 0
+      ? {
+        text: `${taskStats.checked}/${taskStats.total}`,
+        className: taskStats.unchecked === 0 ? 'openspec-change-task-badge-done' : 'openspec-change-task-badge-pending',
+        title: t('openspec.task_status_title', {
+          checked: taskStats.checked,
+          total: taskStats.total,
+          unchecked: taskStats.unchecked,
+        }),
+      }
+      : {
+        text: t('openspec.no_tasks'),
+        className: 'openspec-change-task-badge-empty',
+        title: t('openspec.no_tasks'),
+      }
+    : null;
 
   return (
     <div
@@ -57,6 +80,15 @@ export function OpenSpecChangeRow({
         >
           <span class="openspec-change-ref-prefix" aria-hidden="true">@</span>
           <span class="openspec-change-name-text">{changeName}</span>
+          {taskStatus && (
+            <span
+              class={`openspec-change-task-badge ${taskStatus.className}`}
+              title={taskStatus.title}
+              aria-hidden="true"
+            >
+              {taskStatus.text}
+            </span>
+          )}
         </button>
         <button
           type="button"

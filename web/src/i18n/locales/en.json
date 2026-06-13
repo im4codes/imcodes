@@ -1172,6 +1172,8 @@
     "title": "OpenSpec",
     "changes": "Changes",
     "empty": "No OpenSpec changes found",
+    "no_tasks": "No tasks",
+    "task_status_title": "{{checked}}/{{total}} tasks complete",
     "load_timeout": "OpenSpec changes took too long to load. Try again after the daemon reconnects.",
     "load_unavailable": "OpenSpec changes are unavailable until the daemon connection is ready.",
     "load_error": "Unable to scan OpenSpec changes",

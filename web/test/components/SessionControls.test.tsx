@@ -19,6 +19,8 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.title') return 'OpenSpec';
       if (key === 'openspec.changes') return 'changes';
       if (key === 'openspec.empty') return 'empty';
+      if (key === 'openspec.no_tasks') return 'No tasks';
+      if (key === 'openspec.task_status_title') return `${opts?.checked ?? 0}/${opts?.total ?? 0} tasks complete`;
       if (key === 'openspec.load_timeout') return 'openspec_timeout';
       if (key === 'openspec.load_unavailable') return 'openspec_unavailable';
       if (key === 'openspec.load_error') return 'openspec_error';
@@ -1253,7 +1255,7 @@ afterEach(() => {
 
     fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
 
-    expect(ws.fsListDir).toHaveBeenCalledWith('/repo/openspec/changes', false, false);
+    expect(ws.fsListDir).toHaveBeenCalledWith('/repo/openspec/changes', false, false, { includeOpenSpecTaskStats: true });
 
     ws.emit({
       type: 'fs.ls_response',
@@ -1262,8 +1264,9 @@ afterEach(() => {
       resolvedPath: '/repo/openspec/changes',
       entries: [
         { name: 'archive', path: '/repo/openspec/changes/archive', isDir: true, hidden: false },
-        { name: 'change-b', path: '/repo/openspec/changes/change-b', isDir: true, hidden: false },
-        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+        { name: 'change-b', path: '/repo/openspec/changes/change-b', isDir: true, hidden: false, openSpecTaskStats: { total: 3, checked: 3, unchecked: 0 } },
+        { name: 'change-c', path: '/repo/openspec/changes/change-c', isDir: true, hidden: false, openSpecTaskStats: { total: 0, checked: 0, unchecked: 0 } },
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false, openSpecTaskStats: { total: 2, checked: 1, unchecked: 1 } },
         { name: 'README.md', path: '/repo/openspec/changes/README.md', isDir: false, hidden: false },
       ],
     });
@@ -1271,6 +1274,9 @@ afterEach(() => {
 
     const changeButton = screen.getByRole('button', { name: 'change-a' });
     expect(changeButton.textContent).toContain('@');
+    expect(changeButton.textContent).toContain('1/2');
+    expect(screen.getByText('3/3')).toBeDefined();
+    expect(screen.getByText('No tasks')).toBeDefined();
     expect(screen.queryByRole('button', { name: 'archive' })).toBeNull();
 
     fireEvent.click(changeButton);

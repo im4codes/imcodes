@@ -1431,6 +1431,27 @@ describe('WsClient', () => {
       vi.useRealTimers();
     });
 
+    it('can request OpenSpec task stats for directory listings', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+      client.fsListDir('/repo/openspec/changes', false, false, { includeOpenSpecTaskStats: true });
+      await vi.advanceTimersByTimeAsync(300);
+      const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
+      expect(msg).toMatchObject({
+        type: 'fs.ls',
+        path: '/repo/openspec/changes',
+        includeFiles: false,
+        includeMetadata: false,
+        includeOpenSpecTaskStats: true,
+      });
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
     it('returns a unique UUID as requestId', async () => {
       const client = await connectClient();
       const id1 = client.fsListDir('/home/user/a');

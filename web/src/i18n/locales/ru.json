@@ -1171,6 +1171,8 @@
     "title": "OpenSpec",
     "changes": "Изменения",
     "empty": "Изменения OpenSpec не найдены",
+    "no_tasks": "Нет задач",
+    "task_status_title": "{{checked}}/{{total}} задач выполнено",
     "load_timeout": "Загрузка изменений OpenSpec заняла слишком много времени. Повторите попытку после переподключения daemon.",
     "load_unavailable": "Изменения OpenSpec недоступны, пока соединение с daemon не будет готово.",
     "load_error": "Не удалось просканировать изменения OpenSpec",

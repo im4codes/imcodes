@@ -135,6 +135,7 @@ import {
   type MemoryMcpToolFamilyGateView,
 } from '../../shared/memory-ws.js';
 import { buildMemoryProjectionFallbackSource } from '../../shared/memory-projection-source-fallback.js';
+import { parseOpenSpecTasksMarkdown } from '../../shared/openspec-auto-deliver-validators.js';
 import { FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { P2P_PRESET_DEFAULT_SUMMARY_PROMPT, P2P_WORKFLOW_SCHEMA_VERSION } from '../../shared/p2p-workflow-constants.js';
@@ -7552,6 +7553,12 @@ interface FsLsSnapshot {
   entries: Array<Record<string, unknown>>;
 }
 
+interface OpenSpecTaskStatsSummary {
+  total: number;
+  checked: number;
+  unchecked: number;
+}
+
 interface FsListRequestContext {
   readonly terminal: boolean;
   markTerminal(): void;
@@ -7607,6 +7614,41 @@ function getFsListCacheKey(realPath: string, includeFiles: boolean, includeMetad
     ? (allowDownloadHandles ? 'meta' : 'meta-no-downloads')
     : 'plain';
   return `${realPath}::${includeFiles ? 'files' : 'dirs'}::${metadataMode}`;
+}
+
+function shouldAttachOpenSpecTaskStats(realPath: string, includeOpenSpecTaskStats: boolean): boolean {
+  if (!includeOpenSpecTaskStats) return false;
+  const normalized = nodePath.normalize(realPath);
+  return nodePath.basename(normalized) === 'changes'
+    && nodePath.basename(nodePath.dirname(normalized)) === 'openspec';
+}
+
+async function readOpenSpecTaskStats(changePath: string): Promise<OpenSpecTaskStatsSummary> {
+  try {
+    const markdown = await fsReadFileRaw(nodePath.join(changePath, 'tasks.md'), 'utf8');
+    const parsed = parseOpenSpecTasksMarkdown(markdown);
+    return {
+      total: parsed.total,
+      checked: parsed.checked,
+      unchecked: parsed.unchecked,
+    };
+  } catch (error) {
+    const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code) : '';
+    if (code !== 'ENOENT') {
+      logger.debug({ changePath, error }, 'OpenSpec task stats read failed');
+    }
+    return { total: 0, checked: 0, unchecked: 0 };
+  }
+}
+
+async function attachOpenSpecTaskStats(entries: Array<Record<string, unknown>>): Promise<Array<Record<string, unknown>>> {
+  return await mapWithConcurrency(entries, 16, async (entry) => {
+    if (entry.isDir !== true || typeof entry.path !== 'string') return entry;
+    return {
+      ...entry,
+      openSpecTaskStats: await readOpenSpecTaskStats(entry.path),
+    };
+  });
 }
 
 function createFsListRequestContext(serverLink: ServerLink): FsListRequestContext {
@@ -7851,6 +7893,7 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   const requestId = cmd.requestId as string | undefined;
   const includeFiles = cmd.includeFiles === true;
   const includeMetadata = cmd.includeMetadata === true;
+  const includeOpenSpecTaskStats = cmd.includeOpenSpecTaskStats === true;
   if (!rawPath || !requestId) return;
 
   // Special sentinel paths bypass normal path resolution
@@ -7868,7 +7911,7 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   });
 
   try {
-    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, requestContext), deadline]);
+    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, includeOpenSpecTaskStats, requestContext), deadline]);
   } catch (err) {
     const msg = fsListErrorCode(err);
     if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT || msg === FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT) {
@@ -7885,7 +7928,15 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   }
 }
 
-async function handleFsListInner(resolved: string, rawPath: string, requestId: string, includeFiles: boolean, includeMetadata: boolean, requestContext: FsListRequestContext): Promise<void> {
+async function handleFsListInner(
+  resolved: string,
+  rawPath: string,
+  requestId: string,
+  includeFiles: boolean,
+  includeMetadata: boolean,
+  includeOpenSpecTaskStats: boolean,
+  requestContext: FsListRequestContext,
+): Promise<void> {
   // Windows drive picker — only triggered by the explicit `:drives:` path,
   // NOT by `~` (which always means the user's home directory on every OS).
   if (process.platform === 'win32' && rawPath === WINDOWS_DRIVES_PATH) {
@@ -7919,8 +7970,11 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
   }
 
   const snapshot = await getFsListSnapshot(canonical.realPath, includeFiles, includeMetadata, !canonical.usedFallback);
+  const entries = shouldAttachOpenSpecTaskStats(canonical.realPath, includeOpenSpecTaskStats)
+    ? await attachOpenSpecTaskStats(snapshot.entries)
+    : snapshot.entries;
 
-  requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries: snapshot.entries });
+  requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries });
 }
 
 const REPO_CONTEXT_CACHE_TTL_MS = 5_000;

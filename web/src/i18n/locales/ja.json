@@ -1171,6 +1171,8 @@
     "title": "OpenSpec",
     "changes": "変更",
     "empty": "OpenSpec の変更はありません",
+    "no_tasks": "タスクなし",
+    "task_status_title": "{{checked}}/{{total}} タスク完了",
     "load_timeout": "OpenSpec の変更の読み込みがタイムアウトしました。daemon の再接続後にもう一度試してください。",
     "load_unavailable": "daemon 接続の準備ができるまで OpenSpec の変更は利用できません。",
     "load_error": "OpenSpec の変更をスキャンできません",

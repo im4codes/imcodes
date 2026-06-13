@@ -1172,6 +1172,8 @@
     "title": "OpenSpec",
     "changes": "变更",
     "empty": "暂无 OpenSpec 变更",
+    "no_tasks": "无任务",
+    "task_status_title": "已完成 {{checked}}/{{total}} 个任务",
     "load_timeout": "OpenSpec 变更加载超时。请在 daemon 重连后重试。",
     "load_unavailable": "daemon 连接就绪前暂时无法加载 OpenSpec 变更。",
     "load_error": "无法扫描 OpenSpec 变更",

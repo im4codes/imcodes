@@ -168,6 +168,32 @@ interface Props {
 const MAX_UPLOAD_SIZE_MB = Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024));
 export const OPENSPEC_LIST_REQUEST_TIMEOUT_MS = 12_000;
 const OPENSPEC_NON_CHANGE_DIR_NAMES = new Set(['archive']);
+
+type OpenSpecTaskStatsSummary = {
+  total: number;
+  checked: number;
+  unchecked: number;
+};
+
+type OpenSpecChangeListItem = {
+  name: string;
+  taskStats?: OpenSpecTaskStatsSummary;
+};
+
+function normalizeOpenSpecTaskStats(value: unknown): OpenSpecTaskStatsSummary | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as { total?: unknown; checked?: unknown; unchecked?: unknown };
+  const total = typeof record.total === 'number' && Number.isFinite(record.total) ? Math.max(0, Math.trunc(record.total)) : null;
+  const checked = typeof record.checked === 'number' && Number.isFinite(record.checked) ? Math.max(0, Math.trunc(record.checked)) : null;
+  const unchecked = typeof record.unchecked === 'number' && Number.isFinite(record.unchecked) ? Math.max(0, Math.trunc(record.unchecked)) : null;
+  if (total === null || checked === null || unchecked === null) return undefined;
+  const safeChecked = Math.min(checked, total);
+  return {
+    total,
+    checked: safeChecked,
+    unchecked: Math.min(unchecked, total - safeChecked),
+  };
+}
 const TRANSPORT_QUEUE_HIDDEN_KEY_PREFIX = 'imcodes:transport-queue-hidden:';
 type LocalQueuedTransportEntry = {
   clientMessageId: string;
@@ -683,7 +709,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [p2pConfigInitialTab, setP2pConfigInitialTab] = useState<P2pConfigTab>('participants');
   const [p2pSavedConfig, setP2pSavedConfig] = useState<P2pSavedConfig | null>(null);
   const [openSpecOpen, setOpenSpecOpen] = useState(false);
-  const [openSpecChanges, setOpenSpecChanges] = useState<string[]>([]);
+  const [openSpecChanges, setOpenSpecChanges] = useState<OpenSpecChangeListItem[]>([]);
   const [openSpecLoading, setOpenSpecLoading] = useState(false);
   const [openSpecError, setOpenSpecError] = useState<string | null>(null);
   const [openSpecAuditMenu, setOpenSpecAuditMenu] = useState<string | null>(null);
@@ -1667,7 +1693,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecError(null);
     let requestId: string;
     try {
-      requestId = ws.fsListDir(openSpecChangesPath, false, false);
+      requestId = ws.fsListDir(openSpecChangesPath, false, false, { includeOpenSpecTaskStats: true });
     } catch {
       setOpenSpecLoading(false);
       setOpenSpecChanges([]);
@@ -1982,11 +2008,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         setOpenSpecError(formatOpenSpecLoadError(errorText));
         return;
       }
-      const changeNames = (msg.entries ?? [])
+      const changes = (msg.entries ?? [])
         .filter((entry) => entry.isDir && !OPENSPEC_NON_CHANGE_DIR_NAMES.has(entry.name))
-        .map((entry) => entry.name)
-        .sort((a, b) => a.localeCompare(b));
-      setOpenSpecChanges(changeNames);
+        .map((entry) => ({
+          name: entry.name,
+          taskStats: normalizeOpenSpecTaskStats(entry.openSpecTaskStats),
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      setOpenSpecChanges(changes);
       setOpenSpecError(null);
     });
   }, [clearOpenSpecRequestTimer, formatOpenSpecLoadError, openSpecOpen, persistP2pConfigToDaemon, p2pSavedConfig, refreshOpenSpecChanges, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, serverId, t, ws]);
@@ -3168,10 +3197,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 {!openSpecLoading && !openSpecError && openSpecChanges.length === 0 && (
                   <div class="p2p-menu-section-label openspec-section-meta">{t('openspec.empty')}</div>
                 )}
-                {!openSpecLoading && !openSpecError && openSpecChanges.map((changeName) => (
+                {!openSpecLoading && !openSpecError && openSpecChanges.map((change) => {
+                  const changeName = change.name;
+                  return (
                   <OpenSpecChangeRow
                     key={changeName}
                     changeName={changeName}
+                    taskStats={change.taskStats}
                     mobile={isOpenSpecMobile}
                     expanded={openSpecExpandedChange === changeName}
                     auditMenuOpen={openSpecAuditMenu === changeName}
@@ -3238,7 +3270,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                       minWidth,
                     )}
                   />
-                ))}
+                  );
+                })}
                 </div>
                 <OpenSpecAutoDeliverLauncher
                   open={!!openSpecAutoLauncherChange}

@@ -74,6 +74,10 @@ export interface P2pWorkflowRequestScope {
   cwd?: string;
 }
 
+export interface FsListDirOptions {
+  includeOpenSpecTaskStats?: boolean;
+}
+
 /** Snapshot of the most recent `daemon.hello` capability handshake the browser
  *  has observed. `observedAt` is the local clock at receipt — staleness is
  *  computed against `Date.now() - observedAt > P2P_CAPABILITY_FRESHNESS_TTL_MS`.
@@ -1236,9 +1240,16 @@ export class WsClient {
   }
 
   /** Request a directory listing from the daemon. Returns the requestId for matching the response. */
-  fsListDir(path: string, includeFiles = false, includeMetadata = false): string {
+  fsListDir(path: string, includeFiles = false, includeMetadata = false, options?: FsListDirOptions): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.ls', path, requestId, includeFiles, includeMetadata });
+    this.send({
+      type: 'fs.ls',
+      path,
+      requestId,
+      includeFiles,
+      includeMetadata,
+      ...(options?.includeOpenSpecTaskStats ? { includeOpenSpecTaskStats: true } : {}),
+    });
     return requestId;
   }
 
