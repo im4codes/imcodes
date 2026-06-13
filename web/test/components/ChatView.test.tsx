@@ -448,7 +448,7 @@ describe('ChatView', () => {
     expect(document.body.textContent).toContain('upload.daemon_offline');
   });
 
-  it('opens the fullscreen HTML preview in a new window and closes the overlay', () => {
+  it('opens HTML previews in a new window by default', () => {
     vi.useFakeTimers();
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, 'createObjectURL');
     const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, 'revokeObjectURL');
@@ -456,7 +456,7 @@ describe('ChatView', () => {
     const revokeObjectURL = vi.fn();
     Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL });
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL });
-    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue({} as Window);
 
     try {
       const wsListeners = new Set<(msg: any) => void>();
@@ -496,11 +496,6 @@ describe('ChatView', () => {
           });
         }
       });
-
-      const openButton = document.body.querySelector('.html-fullscreen-preview-open-window') as HTMLButtonElement | null;
-      expect(openButton).not.toBeNull();
-      expect(openButton?.disabled).toBe(false);
-      fireEvent.click(openButton!);
 
       expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
       expect(openSpy).toHaveBeenCalledWith('blob:html-preview', '_blank', 'noopener,noreferrer');
