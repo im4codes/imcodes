@@ -558,6 +558,33 @@ describe('ClaudeCodeSdkProvider', () => {
     ]);
   });
 
+  it('surfaces claude-agent-sdk thinking_tokens as a live thinking status with the running estimate', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-think', model: 'claude-opus-4-8' },
+      { type: 'system', subtype: 'thinking_tokens', session_id: 'session-think', estimated_tokens: 1234, estimated_tokens_delta: 1234 },
+      { type: 'system', subtype: 'thinking_tokens', session_id: 'session-think', estimated_tokens: 2680, estimated_tokens_delta: 1446 },
+      { type: 'result', session_id: 'session-think', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-think', cwd: '/tmp/project', resumeId: 'session-think' });
+
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    provider.onStatus?.((_sid, status) => statuses.push(status));
+
+    await provider.send('route-think', 'hello');
+    await flush();
+
+    // Each distinct estimate yields one live thinking status (emitStatus dedups
+    // by label, so equal estimates collapse). Compact format: 1234 -> 1.2k.
+    const thinking = statuses.filter((s) => s.status === 'thinking');
+    expect(thinking).toEqual([
+      { status: 'thinking', label: 'Thinking (1.2k tokens)' },
+      { status: 'thinking', label: 'Thinking (2.7k tokens)' },
+    ]);
+  });
+
   it('maps normalized provider payloads without re-assembling prompt state in the caller', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-payload', model: 'claude-sonnet-4-6' },

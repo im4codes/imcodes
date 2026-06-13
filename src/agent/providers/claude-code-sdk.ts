@@ -34,6 +34,7 @@ import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '..
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { claudeRateLimitsToQuotaMeta, type ClaudeRateLimitInfo } from '../claude-rate-limit.js';
 import { formatProviderQuotaLabel } from '../../../shared/provider-quota.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -68,6 +69,22 @@ const CLAUDE_TASK_SYSTEM_SUBTYPES = new Set([
   'task_updated',
   'task_notification',
 ]);
+
+function getClaudeMcpServers(config: SessionConfig): Record<string, unknown> {
+  const servers = getDefaultMcpServers(config);
+  const memoryServer = servers[IMCODES_MEMORY_MCP_SERVER_NAME];
+  if (!memoryServer) return servers;
+  return {
+    ...servers,
+    [IMCODES_MEMORY_MCP_SERVER_NAME]: {
+      ...memoryServer,
+      // Claude Agent SDK >=0.3 starts MCP servers in the background by default.
+      // IM.codes' managed memory/send/cron MCP is part of the turn-1 contract,
+      // so require it to be connected and included in the initial tool set.
+      alwaysLoad: true,
+    },
+  };
+}
 const CLAUDE_RUNTIME_SUBAGENT_SYSTEM_SUBTYPES = new Set([
   'subagent_notification',
   'subagent_status',
@@ -519,7 +536,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       ...(state.model ? { model: state.model } : {}),
       ...(state.settings ? { settings: state.settings } : {}),
       ...(state.effort ? { effort: state.effort } : {}),
-      mcpServers: getDefaultMcpServers({
+      mcpServers: getClaudeMcpServers({
         sessionKey: state.routeId,
         sessionName: state.sessionName,
         projectName: state.projectName,
@@ -671,6 +688,23 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           label: null,
         });
       }
+      return;
+    }
+
+    if (msg.type === 'system' && msg.subtype === 'thinking_tokens') {
+      // Live thinking-token progress (claude-agent-sdk >= 0.3.x). During the
+      // redacted-thinking phase the model emits no visible output — only this
+      // running estimate — so surface it as a `thinking` status to drive the
+      // footer/pill spinner. Approximate (not the billed output_tokens);
+      // emitStatus dedups by label so only meaningful changes propagate.
+      const estimated = typeof msg.estimated_tokens === 'number' && msg.estimated_tokens > 0
+        ? msg.estimated_tokens
+        : 0;
+      const compact = estimated >= 1000 ? `${Math.round(estimated / 100) / 10}k` : `${estimated}`;
+      this.emitStatus(sessionId, state, {
+        status: 'thinking',
+        label: estimated > 0 ? `Thinking (${compact} tokens)` : 'Thinking…',
+      });
       return;
     }
 
