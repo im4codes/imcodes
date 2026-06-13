@@ -48,6 +48,8 @@ describe('buildSessionList', () => {
     });
     const store = await import('../../src/store/session-store.js');
     for (const s of store.listSessions()) store.removeSession(s.name);
+    const resend = await import('../../src/daemon/transport-resend-queue.js');
+    resend.clearAllResend();
   });
 
   it('hydrates missing qwen display metadata from runtime config', async () => {
@@ -266,6 +268,43 @@ describe('buildSessionList', () => {
         state: 'running',
         transportPendingMessages: ['queued while phantom active'],
         transportPendingMessageVersion: 7,
+      }),
+    ]));
+  });
+
+  it('surfaces resend queue entries when a transport runtime is missing', async () => {
+    const store = await import('../../src/store/session-store.js');
+    const { enqueueResend } = await import('../../src/daemon/transport-resend-queue.js');
+    store.upsertSession({
+      name: 'deck_codex_missing_runtime_brain',
+      projectName: 'demo',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'sid-missing-runtime',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    enqueueResend('deck_codex_missing_runtime_brain', {
+      commandId: 'cmd-offline',
+      text: 'queued while offline',
+      queuedAt: Date.now(),
+    });
+    getTransportRuntimeMock.mockReturnValue(undefined);
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    const sessions = await buildSessionList();
+
+    expect(sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'deck_codex_missing_runtime_brain',
+        state: 'queued',
+        transportPendingMessages: ['queued while offline'],
+        transportPendingMessageEntries: [{ clientMessageId: 'cmd-offline', text: 'queued while offline' }],
       }),
     ]));
   });

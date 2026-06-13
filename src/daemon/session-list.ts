@@ -13,6 +13,7 @@ import { getCursorRuntimeConfig } from '../agent/cursor-runtime-config.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
+import { buildTransportPendingQueueSnapshot, type TransportPendingMessageEntry } from './transport-pending-snapshot.js';
 
 export interface SessionListItem extends SessionContextBootstrapState {
   name: string;
@@ -46,7 +47,7 @@ export interface SessionListItem extends SessionContextBootstrapState {
   userCreated?: boolean;
   transportConfig?: Record<string, unknown>;
   transportPendingMessages?: string[];
-  transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }>;
+  transportPendingMessageEntries?: TransportPendingMessageEntry[];
   /** Monotonic version of the pending-queue snapshot. Lets the UI ignore
    *  stale snapshots delivered out of order. See TransportSessionRuntime. */
   transportPendingMessageVersion?: number;
@@ -71,13 +72,23 @@ function resolveTransportSessionListState(
 
 function baseItem(s: SessionRecord): SessionListItem {
   const runtime = s.runtimeType === 'transport' ? getTransportRuntime(s.name) : undefined;
+  const runtimeState = resolveTransportSessionListState(s, runtime);
+  const pendingQueue = s.runtimeType === 'transport'
+    ? buildTransportPendingQueueSnapshot(s.name, runtime)
+    : { pendingMessages: [], pendingEntries: [], source: 'empty' as const };
+  const hasPendingQueue = pendingQueue.pendingMessages.length > 0 || pendingQueue.pendingEntries.length > 0;
+  const state = hasPendingQueue
+    ? runtime
+      ? (runtimeState === 'idle' ? 'queued' : runtimeState)
+      : 'queued'
+    : runtimeState;
   return {
     name: s.name,
     project: s.projectName,
     role: s.role,
     agentType: s.agentType,
     agentVersion: s.agentVersion,
-    state: resolveTransportSessionListState(s, runtime),
+    state,
     projectDir: s.projectDir,
     runtimeType: s.runtimeType,
     providerId: s.providerId,
@@ -108,9 +119,11 @@ function baseItem(s: SessionRecord): SessionListItem {
     label: s.label,
     userCreated: s.userCreated,
     transportConfig: s.transportConfig,
-    transportPendingMessages: runtime?.pendingMessages ?? [],
-    transportPendingMessageEntries: runtime?.pendingEntries ?? [],
-    transportPendingMessageVersion: runtime?.pendingVersion ?? 0,
+    transportPendingMessages: pendingQueue.pendingMessages,
+    transportPendingMessageEntries: pendingQueue.pendingEntries,
+    ...(typeof pendingQueue.pendingVersion === 'number'
+      ? { transportPendingMessageVersion: pendingQueue.pendingVersion }
+      : {}),
   };
 }
 

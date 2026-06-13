@@ -11,7 +11,7 @@ import logger from '../util/logger.js';
 export interface SubSessionSyncTransportQueueSnapshot {
   pendingMessages: string[];
   pendingEntries: Array<{ clientMessageId: string; text: string }>;
-  pendingVersion: number;
+  pendingVersion?: number;
 }
 
 export interface SubSessionSyncOptions {
@@ -105,7 +105,9 @@ export async function buildSubSessionSyncPayload(
     ...(transportQueue ? {
       transportPendingMessages: transportQueue.pendingMessages,
       transportPendingMessageEntries: transportQueue.pendingEntries,
-      transportPendingMessageVersion: transportQueue.pendingVersion,
+      ...(typeof transportQueue.pendingVersion === 'number'
+        ? { transportPendingMessageVersion: transportQueue.pendingVersion }
+        : {}),
     } : {}),
   };
 }

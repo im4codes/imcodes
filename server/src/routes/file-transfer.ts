@@ -517,7 +517,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
   }
 
   const downloadId = randomHex(16);
-  const supportsStreamDownload = bridge.hasDaemonCapability(FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY);
+  const supportsStreamDownload = bridge.hasDaemonCapability?.(FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY) === true;
 
   try {
     if (supportsStreamDownload) {
