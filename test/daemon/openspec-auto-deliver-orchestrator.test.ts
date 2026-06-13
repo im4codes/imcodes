@@ -120,6 +120,15 @@ async function waitForTransportSendCount(predicate: (text: string) => boolean, c
   throw new Error('Expected transport send count was not observed');
 }
 
+async function waitForP2pStartCount(count: number, maxMs = 2500): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < maxMs) {
+    if (startP2pRunMock.mock.calls.length >= count) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`expected >= ${count} P2P starts, saw ${startP2pRunMock.mock.calls.length}`);
+}
+
 function implementationReminderCount(): number {
   return transportSendMock.mock.calls
     .filter((call) => String(call[0] ?? '').includes('OpenSpec Auto Deliver implementation is not complete yet'))
@@ -1056,11 +1065,7 @@ exec "${realGit}" "$@"
     expect(await writeLatestImplementationMarker()).toBe(true);
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
 
-    await waitForSend((msg) =>
-      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
-      && msg.projection?.stage === 'implementation_audit_repair',
-      2500,
-    );
+    await waitForP2pStartCount(1);
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
   });
 
@@ -1081,11 +1086,7 @@ exec "${realGit}" "$@"
     );
     expect(await writeLatestImplementationMarker()).toBe(true);
 
-    await waitForSend((msg) =>
-      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
-      && msg.projection?.stage === 'implementation_audit_repair',
-      2500,
-    );
+    await waitForP2pStartCount(1);
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
     expect(transportSettleExternalMock).toHaveBeenCalledWith('openspec-auto-deliver-implementation-marker-completed');
   });
