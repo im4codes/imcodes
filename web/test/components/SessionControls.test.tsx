@@ -1336,6 +1336,12 @@ afterEach(() => {
 
     fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
     fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    await flushAsync();
+
+    expect(screen.getByRole('button', { name: 'change-a' }).textContent).toContain('1/2');
+    expect(screen.getByText('loading')).toBeDefined();
+    expect(ws.fsListDir).toHaveBeenLastCalledWith('/repo/openspec/changes', false, false);
+
     ws.emit({
       type: 'fs.ls_response',
       requestId: 'openspec-request',

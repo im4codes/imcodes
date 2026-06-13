@@ -180,6 +180,14 @@ type OpenSpecChangeListItem = {
   taskStats?: OpenSpecTaskStatsSummary;
 };
 
+type OpenSpecChangeListCacheEntry = {
+  changes: OpenSpecChangeListItem[];
+};
+
+function buildOpenSpecChangeListCacheKey(serverId: string | undefined, changesPath: string): string {
+  return `${serverId ?? 'local'}:${changesPath.replace(/[\\/]+$/, '')}`;
+}
+
 function normalizeOpenSpecTaskStats(value: unknown): OpenSpecTaskStatsSummary | undefined {
   if (!value || typeof value !== 'object') return undefined;
   const record = value as { total?: unknown; checked?: unknown; unchecked?: unknown };
@@ -789,6 +797,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const openSpecRequestIdRef = useRef<string | null>(null);
   const openSpecTaskStatsRequestIdRef = useRef<string | null>(null);
   const openSpecTaskStatsCacheRef = useRef<Map<string, OpenSpecTaskStatsSummary>>(new Map());
+  const openSpecChangeListCacheRef = useRef<Map<string, OpenSpecChangeListCacheEntry>>(new Map());
   const openSpecRequestTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1664,6 +1673,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!cwd) return null;
     return `${cwd.replace(/[\\/]+$/, '')}/openspec/changes`;
   }, [activeSession?.projectDir]);
+  const openSpecChangeListCacheKey = useMemo(() => (
+    openSpecChangesPath ? buildOpenSpecChangeListCacheKey(serverId, openSpecChangesPath) : null
+  ), [openSpecChangesPath, serverId]);
 
   const openOpenSpecChangeFolder = useCallback((changeName: string) => {
     if (!openSpecChangesPath) return;
@@ -1719,6 +1731,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setOpenSpecError(null);
       return;
     }
+    const cached = openSpecChangeListCacheKey
+      ? openSpecChangeListCacheRef.current.get(openSpecChangeListCacheKey)
+      : undefined;
+    if (cached) {
+      setOpenSpecChanges(cached.changes);
+    }
     setOpenSpecLoading(true);
     setOpenSpecError(null);
     let requestId: string;
@@ -1726,7 +1744,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       requestId = ws.fsListDir(openSpecChangesPath, false, false);
     } catch {
       setOpenSpecLoading(false);
-      setOpenSpecChanges([]);
+      if (!cached) setOpenSpecChanges([]);
       setOpenSpecError(t('openspec.load_unavailable'));
       return;
     }
@@ -1737,10 +1755,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       openSpecTaskStatsRequestIdRef.current = null;
       openSpecRequestTimerRef.current = null;
       setOpenSpecLoading(false);
-      setOpenSpecChanges([]);
+      if (!cached) setOpenSpecChanges([]);
       setOpenSpecError(t('openspec.load_timeout'));
     }, OPENSPEC_LIST_REQUEST_TIMEOUT_MS);
-  }, [clearOpenSpecRequestTimer, openSpecChangesPath, t, ws]);
+  }, [clearOpenSpecRequestTimer, openSpecChangeListCacheKey, openSpecChangesPath, t, ws]);
 
   const insertOpenSpecPrompt = useCallback((kind: 'audit_implementation' | 'audit_spec' | 'implement' | 'propose_from_discussion' | 'propose_from_description', reference?: string) => {
     const prompt = kind === 'audit_implementation'
@@ -2008,7 +2026,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           openSpecRequestIdRef.current = null;
           openSpecTaskStatsRequestIdRef.current = null;
           setOpenSpecLoading(false);
-          setOpenSpecChanges([]);
           setOpenSpecError(t('openspec.load_unavailable'));
         }
         return;
@@ -2036,7 +2053,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             openSpecTaskStatsCacheRef.current.set(openSpecTaskStatsCacheKey(openSpecChangesPath, changeName), taskStats);
           }
         }
-        setOpenSpecChanges((current) => mergeOpenSpecTaskStats(current, stats));
+        setOpenSpecChanges((current) => {
+          const next = mergeOpenSpecTaskStats(current, stats);
+          if (openSpecChangeListCacheKey && next.length > 0) {
+            openSpecChangeListCacheRef.current.set(openSpecChangeListCacheKey, { changes: next });
+          }
+          return next;
+        });
         return;
       }
       const requestId = openSpecRequestIdRef.current;
@@ -2047,11 +2070,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (msg.status === 'error') {
         const errorText = msg.error ?? null;
         if (errorText === FS_READ_ERROR_CODES.FORBIDDEN_PATH || /enoent|not found|no such file/i.test(errorText ?? '')) {
+          if (openSpecChangeListCacheKey) openSpecChangeListCacheRef.current.delete(openSpecChangeListCacheKey);
           setOpenSpecChanges([]);
           setOpenSpecError(null);
           return;
         }
-        setOpenSpecChanges([]);
         setOpenSpecError(formatOpenSpecLoadError(errorText));
         return;
       }
@@ -2065,6 +2088,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
       setOpenSpecChanges(changes);
+      if (openSpecChangeListCacheKey) {
+        openSpecChangeListCacheRef.current.set(openSpecChangeListCacheKey, { changes });
+      }
       setOpenSpecError(null);
       if (ws && openSpecChangesPath && changes.length > 0) {
         try {
@@ -2074,7 +2100,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         }
       }
     });
-  }, [clearOpenSpecRequestTimer, formatOpenSpecLoadError, openSpecOpen, persistP2pConfigToDaemon, p2pSavedConfig, refreshOpenSpecChanges, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, serverId, t, ws]);
+  }, [clearOpenSpecRequestTimer, formatOpenSpecLoadError, openSpecChangeListCacheKey, openSpecChangesPath, openSpecOpen, persistP2pConfigToDaemon, p2pSavedConfig, refreshOpenSpecChanges, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, serverId, t, ws]);
 
   useEffect(() => {
     if (!hasConfiguredP2pParticipants && isComboMode(p2pMode)) {
@@ -3246,7 +3272,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 {openSpecLoading && (
                   <div class="p2p-menu-section-label openspec-section-meta">{t('common.loading')}</div>
                 )}
-                {!openSpecLoading && openSpecError && (
+                {!openSpecLoading && openSpecError && openSpecChanges.length === 0 && (
                   <div class="p2p-menu-section-label openspec-section-meta openspec-section-error">
                     {openSpecError}
                   </div>
@@ -3254,7 +3280,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 {!openSpecLoading && !openSpecError && openSpecChanges.length === 0 && (
                   <div class="p2p-menu-section-label openspec-section-meta">{t('openspec.empty')}</div>
                 )}
-                {!openSpecLoading && !openSpecError && openSpecChanges.map((change) => {
+                {openSpecChanges.length > 0 && openSpecChanges.map((change) => {
                   const changeName = change.name;
                   return (
                   <OpenSpecChangeRow
