@@ -444,6 +444,9 @@ interface CodexSdkSessionState {
   rawChecklistScanPromise?: Promise<void>;
   rawChecklistPollTimer: ReturnType<typeof setTimeout> | null;
   rawChecklistPollUntil: number;
+  /** Set once a native codex>=0.139 `turn/plan/updated` event has rendered the
+   *  plan, so the legacy rollout-file scan is suppressed (no double-render). */
+  nativePlanEventSeen?: boolean;
 }
 
 function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
@@ -1105,6 +1108,34 @@ function rawChecklistToolFromFunctionCall(sessionId: string, item: Record<string
     status: 'complete',
     input,
     detail: { kind: 'plan', summary: 'Plan', input, meta: {}, raw: item },
+  };
+}
+
+/**
+ * codex >= 0.139 surfaces the running plan via a dedicated `turn/plan/updated`
+ * event ({ plan: [{ step, status }] }) instead of an `update_plan` function call
+ * in the rollout file. Map it to the SAME `update_plan` tool.call the legacy
+ * rollout scan emits so the shared timeline + web checklist render it
+ * identically. Older codex (no native event) keeps using the rollout scan.
+ */
+function planToolFromTurnPlanEvent(sessionId: string, turnId: string | undefined, rawPlan: unknown): ToolCallEvent | null {
+  const entries = Array.isArray(rawPlan) ? rawPlan : [];
+  const plan = entries
+    .map((entry) => {
+      const e = isRecord(entry) ? entry : {};
+      const content = (meaningfulString(e.step) ?? meaningfulString(e.content) ?? meaningfulString(e.text) ?? '').trim();
+      return { content, status: rawChecklistStatus(e.status) };
+    })
+    .filter((entry) => entry.content);
+  if (plan.length === 0) return null;
+  const input = { plan };
+  const allDone = plan.every((entry) => entry.status === 'completed');
+  return {
+    id: `codex-plan-${turnId ?? sessionId}`,
+    name: 'update_plan',
+    status: allDone ? 'complete' : 'running',
+    input,
+    detail: { kind: 'plan', summary: 'Plan', input, meta: {}, raw: { plan: entries } },
   };
 }
 
@@ -1887,6 +1918,7 @@ export class CodexSdkProvider implements TransportProvider {
         state.turnStartInFlight = false;
       });
       state.runningTurnId = result?.turn?.id;
+      state.nativePlanEventSeen = false;
       if (state.runningTurnId) {
         state.completedTurnIds.delete(state.runningTurnId);
       }
@@ -2247,6 +2279,10 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async scanRawChecklistHistory(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+    // codex >= 0.139 emits the plan natively via `turn/plan/updated`; once we've
+    // seen that for this session, skip the legacy rollout-file scrape so the
+    // plan is never rendered twice.
+    if (state.nativePlanEventSeen) return;
     const chunk = await this.readRawChecklistHistoryChunk(state);
     if (!chunk) return;
     const minTimestamp = state.rawChecklistStartedAt - CODEX_RAW_CHECKLIST_HISTORY_CLOCK_SKEW_MS;
@@ -2507,6 +2543,24 @@ export class CodexSdkProvider implements TransportProvider {
 
     if (method === 'rawResponseItem/completed') {
       this.handleRawResponseItem(params);
+      return;
+    }
+
+    if (method === 'turn/plan/updated') {
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const state = sessionId ? this.sessions.get(sessionId) : null;
+      if (!sessionId || !state) return;
+      const turnId = readParamTurnId(params);
+      if (turnId && state.runningTurnId && turnId !== state.runningTurnId) return;
+      // Native plan event (codex >= 0.139). Render it AND suppress the legacy
+      // rollout-file scan for this session so old (file-scrape) + new never
+      // double-render the same plan.
+      state.nativePlanEventSeen = true;
+      const tool = planToolFromTurnPlanEvent(sessionId, turnId ?? state.runningTurnId, params.plan);
+      if (tool) {
+        for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+      }
       return;
     }
 

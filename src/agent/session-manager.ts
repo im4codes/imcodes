@@ -1781,7 +1781,42 @@ export async function restoreTransportSessions(providerId: string): Promise<void
   await mapWithConcurrency(pending, TRANSPORT_RESTORE_CONCURRENCY, restoreOne);
 }
 
+/**
+ * Coalesces concurrent launches for the same session name. The runtime is only
+ * registered in `transportRuntimes` at the END of the async launch, so callers
+ * that dedup with `getTransportRuntime(name)` (e.g. `rebuildSubSessions`, which
+ * the server re-fires on every WS reconnect) all observe "no runtime yet" when
+ * they overlap and ALL launch. On an unstable WS this produces a launch storm
+ * (10-13x the same sub-session) that blocks the event loop, which starves
+ * heartbeats and triggers MORE reconnects+rebuilds — a vicious cycle that
+ * prevents real sessions (e.g. brain) from keeping a runtime. Serialize per
+ * session name so the second caller coalesces onto the first instead of
+ * duplicating it; the synchronous get→set window has no await so two concurrent
+ * callers cannot both observe "no in-flight".
+ */
+const transportLaunchInFlight = new Map<string, Promise<void>>();
+
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
+  const { name } = opts;
+  const inFlight = transportLaunchInFlight.get(name);
+  if (inFlight) {
+    await inFlight.catch(() => {});
+    // A non-fresh caller only needs the session up: if the prior launch
+    // registered a runtime, we're done. A fresh caller must proceed (it
+    // intentionally tears down + recreates).
+    if (!opts.fresh && transportRuntimes.has(name)) return;
+  }
+  const launch = launchTransportSessionInner(opts);
+  const tracked = launch.then(() => {}, () => {});
+  transportLaunchInFlight.set(name, tracked);
+  try {
+    await launch;
+  } finally {
+    if (transportLaunchInFlight.get(name) === tracked) transportLaunchInFlight.delete(name);
+  }
+}
+
+async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate } = opts;
   const existing = getSession(name);
   const inheritedClaudeResumeId = opts.ccSessionId ?? (!opts.fresh ? existing?.ccSessionId : undefined);

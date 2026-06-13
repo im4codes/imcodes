@@ -938,6 +938,67 @@ describe('CodexSdkProvider', () => {
     });
   });
 
+  it('surfaces codex>=0.139 native turn/plan/updated events as checklist tool events (new+old compatible)', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-native-plan', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-native-plan', 'make a plan');
+    const child = childProcessMock.children[0];
+    // 0.139 payload: { plan: [{ step, status }] } with camelCase `inProgress`.
+    child.emits({
+      method: 'turn/plan/updated',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        explanation: null,
+        plan: [
+          { step: 'Read notes.txt', status: 'completed' },
+          { step: 'Append a line', status: 'inProgress' },
+          { step: 'Summarize', status: 'pending' },
+        ],
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: 'codex-plan-turn-1',
+      name: 'update_plan',
+      status: 'running',
+      input: {
+        plan: [
+          { content: 'Read notes.txt', status: 'completed' },
+          { content: 'Append a line', status: 'in_progress' },
+          { content: 'Summarize', status: 'pending' },
+        ],
+      },
+      detail: { kind: 'plan', summary: 'Plan' },
+    });
+
+    // A follow-up update with all steps done reuses the SAME id (in-place
+    // update) and flips status to complete.
+    child.emits({
+      method: 'turn/plan/updated',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        plan: [
+          { step: 'Read notes.txt', status: 'completed' },
+          { step: 'Append a line', status: 'completed' },
+          { step: 'Summarize', status: 'completed' },
+        ],
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(2);
+    expect(tools[1]).toMatchObject({ id: 'codex-plan-turn-1', name: 'update_plan', status: 'complete' });
+  });
+
   it('surfaces raw update_plan calls from the Codex rollout when app-server omits the item', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-plan-'));
     try {
