@@ -63,16 +63,56 @@ const stagedDownloads = new Map<string, {
   serverId: string;
   token: string;
   stream: PassThrough;
+  ready: Promise<Record<string, unknown>>;
+  resolveReady: (msg: Record<string, unknown>) => void;
+  rejectReady: (err: Error) => void;
+  readySettled: boolean;
   expiresAt: number;
   timer: ReturnType<typeof setTimeout>;
   started: boolean;
 }>();
+
+function settleStagedDownloadReady(downloadId: string, settle: (entry: NonNullable<ReturnType<typeof stagedDownloads.get>>) => void): void {
+  const entry = stagedDownloads.get(downloadId);
+  if (!entry || entry.readySettled) return;
+  entry.readySettled = true;
+  settle(entry);
+}
+
+function resolveStagedDownloadReady(downloadId: string, msg: Record<string, unknown>): void {
+  settleStagedDownloadReady(downloadId, (entry) => entry.resolveReady(msg));
+}
+
+function rejectStagedDownloadReady(downloadId: string, err: Error): void {
+  settleStagedDownloadReady(downloadId, (entry) => entry.rejectReady(err));
+}
+
+function waitForStagedDownloadReady(entry: { ready: Promise<Record<string, unknown>> }): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('download_stream_not_ready')), FILE_TRANSFER_LIMITS.DOWNLOAD_STREAM_READY_TIMEOUT_MS);
+    timer.unref?.();
+    entry.ready.then(resolve, reject).finally(() => clearTimeout(timer));
+  });
+}
+
+function decodeRelayFilename(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
 
 function deleteStagedDownload(downloadId: string, err?: Error): void {
   const entry = stagedDownloads.get(downloadId);
   if (!entry) return;
   stagedDownloads.delete(downloadId);
   clearTimeout(entry.timer);
+  if (!entry.readySettled) {
+    entry.readySettled = true;
+    entry.rejectReady(err ?? new Error('download_stream_closed'));
+  }
   if (err) {
     entry.stream.destroy(err);
   } else if (!entry.stream.destroyed) {
@@ -226,6 +266,13 @@ fileTransferRoutes.put('/:id/download-staged/:downloadId', async (c) => {
   }
 
   entry.started = true;
+  resolveStagedDownloadReady(downloadId, {
+    type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY,
+    downloadId,
+    mime: c.req.header('content-type') || 'application/octet-stream',
+    filename: decodeRelayFilename(c.req.header('x-imcodes-filename')),
+    size: Number.isFinite(contentLength) && contentLength >= 0 ? Math.trunc(contentLength) : undefined,
+  });
   try {
     await pipeline(
       Readable.fromWeb(c.req.raw.body as never),
@@ -527,10 +574,20 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
         deleteStagedDownload(downloadId, new Error('download_timeout'));
       }, STAGED_DOWNLOAD_TTL_MS);
       timer.unref?.();
+      let resolveReady!: (msg: Record<string, unknown>) => void;
+      let rejectReady!: (err: Error) => void;
+      const ready = new Promise<Record<string, unknown>>((resolve, reject) => {
+        resolveReady = resolve;
+        rejectReady = reject;
+      });
       stagedDownloads.set(downloadId, {
         serverId,
         token,
         stream,
+        ready,
+        resolveReady,
+        rejectReady,
+        readySettled: false,
         expiresAt: Date.now() + STAGED_DOWNLOAD_TTL_MS,
         timer,
         started: false,
@@ -542,11 +599,21 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
         attachmentId,
         uploadUrl: buildStagedDownloadUrl(c.req.url, serverId, downloadId, token),
       };
-      const result = await bridge.sendFileTransferRequest(
+      void bridge.sendFileTransferRequest(
         downloadId,
         streamMsg as unknown as Record<string, unknown>,
         FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
-      );
+      ).then((result) => {
+        resolveStagedDownloadReady(downloadId, result);
+      }).catch((err) => {
+        const error = err instanceof Error ? err : new Error(String(err));
+        rejectStagedDownloadReady(downloadId, error);
+        deleteStagedDownload(downloadId, error);
+      });
+
+      const entry = stagedDownloads.get(downloadId);
+      if (!entry) return c.json({ error: 'download_failed' }, 500);
+      const result = await waitForStagedDownloadReady(entry);
 
       if (result.type === 'file.download_error') {
         deleteStagedDownload(downloadId, new Error(String(result.message ?? 'download_failed')));
@@ -611,6 +678,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg === 'daemon_offline' || msg === 'daemon_disconnected' || msg === 'daemon_error') return c.json({ error: 'daemon_offline' }, 503);
     if (msg === 'timeout') return c.json({ error: 'download_timeout' }, 504);
+    if (msg === 'download_stream_not_ready') return c.json({ error: 'download_stream_not_ready' }, 504);
     logger.error({ serverId, downloadId, err }, 'Download relay failed');
     return c.json({ error: 'download_failed' }, 500);
   }

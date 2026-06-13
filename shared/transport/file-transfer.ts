@@ -41,6 +41,8 @@ export const FILE_TRANSFER_LIMITS = {
   STAGED_UPLOAD_TTL_MS: 10 * 60 * 1000,
   /** Server waits this long for daemon download response (ms). */
   DOWNLOAD_TIMEOUT_MS: 300_000,
+  /** Server waits this long for download stream metadata before failing fast (ms). */
+  DOWNLOAD_STREAM_READY_TIMEOUT_MS: 15_000,
   /** Temporary uploaded files are cleaned after this duration (ms). 24 hours. */
   TEMP_TTL_MS: 24 * 60 * 60 * 1000,
   /** Project-file download handles expire after this duration (ms). 4 hours. */

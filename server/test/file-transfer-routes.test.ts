@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import {
   FILE_TRANSFER_LIMITS,
+  FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_MSG,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
 
@@ -288,5 +290,58 @@ describe('file-transfer upload route', () => {
         }),
       }),
     ]);
+  });
+});
+
+describe('file-transfer download route', () => {
+  beforeEach(() => {
+    sendFileTransferRequestMock.mockReset();
+    isDaemonConnectedMock.mockReset();
+    hasDaemonCapabilityMock.mockReset();
+    isDaemonConnectedMock.mockReturnValue(true);
+    hasDaemonCapabilityMock.mockReturnValue(true);
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+  });
+
+  it('starts the browser download when the daemon PUT starts even if bridge ready never resolves', async () => {
+    const app = makeApp();
+    let stagedPut: Promise<Response> | undefined;
+
+    sendFileTransferRequestMock.mockImplementationOnce((_requestId, message) => {
+      const downloadMessage = message as { type: string; uploadUrl: string };
+      expect(downloadMessage.type).toBe(FILE_TRANSFER_MSG.DOWNLOAD_STREAM);
+      const uploadUrl = new URL(downloadMessage.uploadUrl);
+      stagedPut = app.request(`${uploadUrl.pathname}${uploadUrl.search}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'text/plain',
+          'Content-Length': '5',
+          'x-imcodes-filename': encodeURIComponent('hello.txt'),
+        },
+        body: 'hello',
+      });
+      return new Promise(() => {});
+    });
+
+    const res = await app.request('/api/server/srv-1/uploads/abc123/download', {
+      headers: { Authorization: 'Bearer test' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/plain');
+    expect(res.headers.get('content-length')).toBe('5');
+    expect(res.headers.get('content-disposition')).toContain('hello.txt');
+    await expect(res.text()).resolves.toBe('hello');
+    await expect(stagedPut).resolves.toMatchObject({ status: 200 });
+    expect(sendFileTransferRequestMock).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM,
+        attachmentId: 'abc123',
+        uploadUrl: expect.stringContaining('/api/server/srv-1/download-staged/'),
+      }),
+      FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+    );
+    expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY);
   });
 });
