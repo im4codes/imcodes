@@ -238,6 +238,7 @@ interface AutoDeliverRun {
     roundIndex: number;
     generation: number;
   };
+  lastAcceptanceAudit?: NonNullable<AutoDeliverRun['activeAcceptanceAudit']>;
   latestVerdict?: OpenSpecAutoDeliverVerdict;
   moduleScores?: OpenSpecAutoDeliverModuleScore[];
   auditBeforeRepair?: OpenSpecAutoDeliverScoreSnapshot;
@@ -474,7 +475,7 @@ function humanInterventionSession(run: AutoDeliverRun): string {
   return run.targetImplementationSessionName || run.launchedFromSessionName || run.owningMainSessionName;
 }
 
-function humanInterventionMessage(run: AutoDeliverRun, reason: string): string {
+function humanInterventionMessage(run: AutoDeliverRun, reason: string, recoverable = false): string {
   return [
     `OpenSpec Auto Deliver needs human input for openspec/changes/${run.changeName}.`,
     '',
@@ -484,7 +485,9 @@ function humanInterventionMessage(run: AutoDeliverRun, reason: string): string {
     `Owning session: ${run.owningMainSessionName}`,
     `Implementation session: ${run.targetImplementationSessionName}`,
     '',
-    'Reply in this session with the next instruction. If this is a recoverable audit-fix gate, the daemon may automatically add one audit-fix round after the displayed wait unless you stop the run.',
+    recoverable
+      ? 'Reply in this session with the next instruction. This recoverable audit-fix gate will automatically add one audit-fix round after the displayed wait unless you stop the run.'
+      : 'Reply in this session with the next instruction. This stop will not automatically add another audit-fix round.',
   ].join('\n');
 }
 
@@ -494,7 +497,8 @@ function emitHumanInterventionPrompt(run: AutoDeliverRun, reason: string, option
   eventSuffix?: string;
 } = {}): void {
   const sessionName = humanInterventionSession(run);
-  const message = humanInterventionMessage(run, reason);
+  const recoverable = options.recoverable === true;
+  const message = humanInterventionMessage(run, reason, recoverable);
   const eventBase = `openspec-auto:${run.runId}:${options.eventSuffix ?? 'needs-human'}:${run.generation}`;
   timelineEmitter.emit(sessionName, 'assistant.text', {
     text: message,
@@ -511,10 +515,10 @@ function emitHumanInterventionPrompt(run: AutoDeliverRun, reason: string, option
     waitMs: options.waitMs ?? 5 * 60_000,
     questions: [{
       header: 'OpenSpec Auto Deliver',
-      question: options.recoverable
+      question: recoverable
         ? `Auto Deliver reached recoverable gate "${reason}". What should happen next in this session?`
         : `Auto Deliver stopped with reason "${reason}". What should happen next in this session?`,
-      options: options.recoverable
+      options: recoverable
         ? [
             {
               label: 'Let Auto Deliver add one audit-fix round',
@@ -741,6 +745,14 @@ function forgetRequestProjectionFingerprints(run: AutoDeliverRun): void {
 
 function effectiveMaxImplementationPrompts(run: AutoDeliverRun): number {
   return run.materializedLimits.maxImplementationPrompts ?? OPENSPEC_AUTO_DELIVER_DEFAULT_MAX_IMPLEMENTATION_PROMPTS;
+}
+
+function implementationPromptBudgetExhausted(run: AutoDeliverRun): boolean {
+  return run.implementationPromptCount >= effectiveMaxImplementationPrompts(run);
+}
+
+function hasCurrentFinalAcceptanceScore(run: AutoDeliverRun): boolean {
+  return run.finalAfterRepair?.generation === run.generation;
 }
 
 async function buildImplementationMarkerContract(
@@ -1122,7 +1134,7 @@ async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: 
   if (!transitionAllowed(run, 'implementation_prompt_dispatched')) {
     return terminalize(run, 'failed', 'invalid_transition_implementation_prompt');
   }
-  if (run.implementationPromptCount >= effectiveMaxImplementationPrompts(run)) {
+  if (implementationPromptBudgetExhausted(run)) {
     return terminalize(run, 'needs_human', 'implementation_prompt_limit_reached');
   }
   run.status = 'implementation_task_loop';
@@ -1351,6 +1363,17 @@ function implementationRepairPromptKey(run: AutoDeliverRun, reason: string): str
 async function dispatchImplementationRepairPrompt(run: AutoDeliverRun, reason: string): Promise<OpenSpecAutoDeliverProjection> {
   run.needsPostRepairAcceptanceAudit = true;
   run.postRepairAcceptanceStage = 'implementation_audit_repair';
+  if (implementationPromptBudgetExhausted(run)) {
+    if (!hasCurrentFinalAcceptanceScore(run)) {
+      run.evidence = mergeEvidence(run.evidence, [{
+        source: 'daemon',
+        summary: `Implementation prompt budget is exhausted before final acceptance scoring; dispatching final acceptance audit instead of stopping early: ${reason}.`,
+        stale: false,
+      }]);
+      return dispatchPostRepairAcceptanceAuditPrompt(run);
+    }
+    return terminalize(run, 'needs_human', 'implementation_prompt_limit_reached');
+  }
   const repairKey = implementationRepairPromptKey(run, reason);
   if (run.lastImplementationRepairPromptKey === repairKey) {
     run.evidence = mergeEvidence(run.evidence, [{
@@ -1366,6 +1389,7 @@ async function dispatchImplementationRepairPrompt(run: AutoDeliverRun, reason: s
     summary: `Dispatching implementation repair prompt from audit findings: ${reason}.`,
     stale: false,
   }]);
+  run.finalAfterRepair = undefined;
   return dispatchImplementationPrompt(run, reason);
 }
 
@@ -1672,6 +1696,7 @@ async function dispatchPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun): Pro
   run.status = stage;
   run.stage = stage;
   run.activeAcceptanceAudit = active;
+  run.lastAcceptanceAudit = active;
   run.activeCommandId = `${attemptId}:prompt`;
   const prompt = buildPostRepairAcceptanceAuditPrompt(run, metadata);
   await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
@@ -2419,6 +2444,35 @@ function activeRunForOwner(owner: string): AutoDeliverRun | undefined {
 function latestRunForSession(sessionName: string): AutoDeliverRun | undefined {
   const owner = resolveOpenSpecAutoDeliverOwningMainSession(sessionName);
   return activeRunForOwner(owner) ?? terminalRunByOwner.get(owner);
+}
+
+async function reconcilePromptLimitWithAcceptedFinalAudit(run: AutoDeliverRun): Promise<OpenSpecAutoDeliverProjection | null> {
+  if (run.status !== 'needs_human' || run.terminalReason !== 'implementation_prompt_limit_reached') return null;
+  const active = run.lastAcceptanceAudit;
+  if (!active || active.stage !== 'implementation_audit_repair') return null;
+  const metadata = acceptanceAuditMetadataFromActive(run, active);
+  const verdict = await consumeAuditResultFile(run, metadata, { requireRepairCompletion: true });
+  if (!verdict || verdict.verdict !== 'PASS') return null;
+  const activeRunId = activeRunByOwner.get(run.owningMainSessionName);
+  if (activeRunId && activeRunId !== run.runId) return null;
+
+  terminalRunByOwner.delete(run.owningMainSessionName);
+  activeRunByOwner.set(run.owningMainSessionName, run.runId);
+  run.status = active.stage;
+  run.stage = active.stage;
+  run.activeAcceptanceAudit = active;
+  run.activeCommandId = `${active.attemptId}:prompt`;
+  try {
+    await advanceAfterAuditVerdict(run, active.stage, verdict, {
+      roundIndex: active.roundIndex,
+      attemptId: active.attemptId,
+      generation: active.generation,
+      postRepairVerification: true,
+    });
+  } catch (error) {
+    terminalizeAndSend(run, 'failed', error instanceof Error ? error.message : 'post_repair_acceptance_audit_reconcile_failed');
+  }
+  return buildProjection(run);
 }
 
 function recordP2pCancelFailureDiagnostic(run: AutoDeliverRun, summary: string): void {
@@ -3456,6 +3510,11 @@ async function status(request: OpenSpecAutoDeliverStatusRequest): Promise<OpenSp
     }
     return bumpProjection(run);
   }
+  // Status is normally read-only, but this repair path intentionally reconciles
+  // a stale prompt-limit terminal state when the final acceptance result was
+  // already written and can safely drive the canonical terminal projection.
+  const reconciled = await reconcilePromptLimitWithAcceptedFinalAudit(run);
+  if (reconciled) return reconciled;
   return buildProjection(run);
 }
 

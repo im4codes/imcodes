@@ -1135,6 +1135,57 @@ exec "${realGit}" "$@"
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
   });
 
+  it('dispatches final acceptance scoring instead of stopping early when implementation prompt budget is spent', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-budget-spent-score-before-human',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+      materializedLimits: {
+        specAuditRepairRounds: 0,
+        implementationAuditRepairRounds: 1,
+        maxImplementationPrompts: 1,
+        maxElapsedMinutes: 60,
+      },
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('Implementation prompt: 1/1'),
+      2500,
+    );
+    await emitDeckDemoIdle();
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair',
+      2500,
+    );
+
+    await completeLatestDiscussion('completed', '# implementation audit discussion\n\nRepair before final scoring.');
+    const acceptancePrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change')
+      && text.includes('Previous audit discussion file:'),
+      2500,
+    );
+    expect(transportSendMock.mock.calls.some((call) =>
+      String(call[0] ?? '').includes('Audit findings to repair now:')
+      && String(call[0] ?? '').includes('Reason: implementation_audit_followup_repair'),
+    )).toBe(false);
+    expect(serverLinkMock.send.mock.calls.some((call) =>
+      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && call[0]?.projection?.terminalReason === 'implementation_prompt_limit_reached',
+    )).toBe(false);
+
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt);
+    await emitDeckDemoIdle();
+
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
+  });
+
   it('recreates a missing implementation marker contract instead of asking the user', async () => {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     await handleOpenSpecAutoDeliverCommand({
@@ -2440,6 +2491,11 @@ exec "${realGit}" "$@"
     expect(terminal?.projection.latestVerdict).toBe('BLOCKED');
     expect(terminal?.projection.moduleScores).toHaveLength(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.length);
     expect(terminal?.projection.auditResults).toHaveLength(1);
+    const humanMessage = timelineEmitter.getBufferedEvents('deck_demo_brain')
+      .map((event) => event.payload.text)
+      .find((text) => typeof text === 'string' && text.includes('Reason: implementation_audit_blocked'));
+    expect(humanMessage).toContain('This stop will not automatically add another audit-fix round.');
+    expect(humanMessage).not.toContain('the daemon may automatically add one audit-fix round');
   });
 
   it('rejects stale metadata and malformed or missing authoritative result files', async () => {
