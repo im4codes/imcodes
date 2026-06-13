@@ -4766,7 +4766,9 @@ afterEach(() => {
     expect(rows).toHaveLength(2);
     expect(within(rows[0]).getByText('alpha.txt')).toBeDefined();
     expect(within(rows[1]).getByText('beta.txt')).toBeDefined();
-    expect(screen.getAllByRole('progressbar').map((bar) => bar.getAttribute('aria-valuenow'))).toEqual(['24', '68']);
+    const progressBars = screen.getAllByRole('progressbar');
+    expect(progressBars.map((bar) => bar.getAttribute('aria-valuenow'))).toEqual(['24', '68']);
+    expect(progressBars.every((bar) => (bar as HTMLElement).style.gridColumn === '1 / -1')).toBe(true);
 
     await act(async () => {
       pendingUploads[1].resolve({ attachment: { daemonPath: '/tmp/beta.txt' } });
@@ -4789,6 +4791,50 @@ afterEach(() => {
     const badges = document.querySelectorAll('.attachment-badge');
     expect(badges[0].querySelector('.attachment-badge-name')?.textContent).toBe('alpha.txt');
     expect(badges[1].querySelector('.attachment-badge-name')?.textContent).toBe('beta.txt');
+  });
+
+  it('disables sending while an attachment upload is still in flight', async () => {
+    let resolveUpload: ((value: { attachment: { daemonPath: string } }) => void) | null = null;
+    uploadFileMock.mockImplementation(() => new Promise((resolve) => {
+      resolveUpload = resolve;
+    }));
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'send after upload';
+    fireEvent.input(input);
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [new File(['aaa'], 'pending.txt', { type: 'text/plain' })],
+        getData: () => '',
+      },
+    });
+
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
+    const sendBtn = screen.getByRole('button', { name: /send/i }) as HTMLButtonElement;
+    expect(sendBtn.disabled).toBe(true);
+    fireEvent.click(sendBtn);
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveUpload?.({ attachment: { daemonPath: '/tmp/pending.txt' } });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(sendBtn.disabled).toBe(false));
+    fireEvent.click(sendBtn);
+    expectSendPayload(ws, {
+      sessionName: 'my-session',
+      text: '#1:(/tmp/pending.txt) send after upload',
+    });
   });
 
   it('R3 v2 PR-ρ — removing a middle attachment renumbers the remaining tags consecutively', async () => {

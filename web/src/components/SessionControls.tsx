@@ -2390,6 +2390,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
     if (!activeSession) return;
+    if (uploading) {
+      showSendWarning(t('upload.uploading'));
+      return;
+    }
     const isP2pSend = (
       Array.isArray(payload.extra.p2pAtTargets) && payload.extra.p2pAtTargets.length > 0
       || (typeof payload.extra.p2pMode === 'string' && payload.extra.p2pMode.length > 0)
@@ -2482,7 +2486,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (options?.clearComposer) {
       clearComposerState();
     }
-  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, showStopFeedback, transportSendShouldQueue]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -3847,12 +3851,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
       {/* Upload progress bars */}
       {uploadRows.length > 0 && (
-        <div style={{ margin: '0 8px 4px', display: 'grid', gap: 4 }}>
+        <div style={{ margin: '0 8px 4px', display: 'grid', gap: 6 }}>
           {uploadRows.map((item) => (
             <div
               key={item.id}
               data-testid="composer-upload-row"
-              style={{ minHeight: 18, display: 'grid', gridTemplateColumns: 'minmax(72px, 0.9fr) minmax(80px, 1fr) 38px', alignItems: 'center', gap: 8 }}
+              style={{ minHeight: 24, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 38px', alignItems: 'center', columnGap: 8, rowGap: 4 }}
             >
               <span
                 title={item.name}
@@ -3866,7 +3870,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 aria-valuemin={0}
                 aria-valuemax={100}
                 aria-valuenow={item.progress}
-                style={{ height: 4, background: 'rgba(255,255,255,0.1)', borderRadius: 2, overflow: 'hidden' }}
+                style={{ gridColumn: '1 / -1', height: 4, background: 'rgba(255,255,255,0.1)', borderRadius: 2, overflow: 'hidden' }}
               >
                 <div
                   style={{
@@ -4259,7 +4263,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           <button
             class="btn btn-primary"
             onClick={handleSend}
-            disabled={inputDisabled || (!hasText && attachments.length === 0) || !connected}
+            disabled={inputDisabled || uploading || (!hasText && attachments.length === 0) || !connected}
           >
             {t('common.send')}
           </button>

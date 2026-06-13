@@ -844,7 +844,7 @@ describe('sub-session realtime state sync', () => {
         source: 'daemon',
         confidence: 'high',
         type: 'assistant.text',
-        payload: { text: 'working' },
+        payload: { text: 'working', streaming: true },
       },
     }));
     expect(captured[0]?.state).toBe('running');
