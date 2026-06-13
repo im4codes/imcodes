@@ -1,5 +1,5 @@
 /**
- * SessionSettingsDialog — edit label, description, cwd for main or sub sessions.
+ * SessionSettingsDialog — edit metadata and view cwd for main or sub sessions.
  */
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
@@ -527,7 +527,6 @@ export function SessionSettingsDialog({
 
   const [label, setLabel] = useState(initLabel);
   const [description, setDescription] = useState(initDesc);
-  const [cwd, setCwd] = useState(initCwd);
   const [agentType, setAgentType] = useState(type);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -543,7 +542,6 @@ export function SessionSettingsDialog({
   useEffect(() => {
     setLabel(initLabel);
     setDescription(initDesc);
-    setCwd(initCwd);
     setAgentType(type);
     setSupervision(initialSupervision);
   }, [initLabel, initDesc, initCwd, type, initialSupervision, sessionName, subSessionId]);
@@ -750,14 +748,11 @@ export function SessionSettingsDialog({
   const hasSessionChanges = useMemo(() => (
     label !== initLabel
     || description !== initDesc
-    || cwd !== initCwd
     || agentType !== type
     || JSON.stringify(nextTransportConfig ?? null) !== JSON.stringify(transportConfig ?? null)
   ), [
     agentType,
-    cwd,
     description,
-    initCwd,
     initDesc,
     initLabel,
     label,
@@ -900,7 +895,6 @@ export function SessionSettingsDialog({
       } = {};
       if (label !== initLabel) fields.label = label || null;
       if (description !== initDesc) fields.description = description || null;
-      if (cwd !== initCwd) fields.cwd = cwd || null;
       if (agentType !== type) {
         if (subSessionId) fields.type = agentType;
         else fields.agentType = agentType;
@@ -922,7 +916,6 @@ export function SessionSettingsDialog({
       onSaved({
         label: label || undefined,
         description: description || undefined,
-        cwd: cwd || undefined,
         type: agentType || undefined,
         transportConfig: nextTransportConfig,
       });
@@ -1424,10 +1417,10 @@ export function SessionSettingsDialog({
             <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.workingDir')}</div>
             <input
               class="input"
-              value={cwd}
-              onInput={(e) => setCwd((e.target as HTMLInputElement).value)}
-              style={{ width: '100%' }}
-              disabled={saving}
+              value={initCwd}
+              style={{ width: '100%', opacity: 0.7, cursor: 'not-allowed' }}
+              disabled
+              readOnly
               placeholder={t('session.workingDirPlaceholder')}
             />
           </div>

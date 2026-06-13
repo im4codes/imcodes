@@ -66,6 +66,68 @@ describe('SessionSettingsDialog supervision', () => {
     cleanup();
   });
 
+  it('shows the working directory as read-only and omits cwd when saving a main session', async () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const cwdInput = inputForLabel('workingDir');
+    expect(cwdInput.value).toBe('/proj');
+    expect(cwdInput.disabled).toBe(true);
+
+    fireEvent.input(inputForLabel('label'), { target: { value: 'Brain renamed' } });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
+        label: 'Brain renamed',
+      }));
+    });
+    expect(patchSessionMock.mock.calls[0]?.[2]).not.toHaveProperty('cwd');
+  });
+
+  it('shows the working directory as read-only and omits cwd when saving a sub-session', async () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_sub_abcd1234"
+        subSessionId="abcd1234"
+        label="Worker"
+        description=""
+        cwd="/proj/sub"
+        type="codex-sdk"
+        parentSession="deck_proj_brain"
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const cwdInput = inputForLabel('workingDir');
+    expect(cwdInput.value).toBe('/proj/sub');
+    expect(cwdInput.disabled).toBe(true);
+
+    fireEvent.input(inputForLabel('label'), { target: { value: 'Worker renamed' } });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(patchSubSessionMock).toHaveBeenCalledWith('srv-1', 'abcd1234', expect.objectContaining({
+        label: 'Worker renamed',
+      }));
+    });
+    expect(patchSubSessionMock.mock.calls[0]?.[2]).not.toHaveProperty('cwd');
+  });
+
   it('requires backend and model selection before enabling supervised mode', async () => {
     const onSaved = vi.fn();
     render(
