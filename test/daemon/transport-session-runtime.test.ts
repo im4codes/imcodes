@@ -329,6 +329,14 @@ describe('TransportSessionRuntime', () => {
   });
 
   it('diagnostic snapshot exposes active dispatch and pending queue state', async () => {
+    const providerDiagnostics = {
+      provider: 'mock',
+      runningTurnId: 'turn-1',
+      activeItemCount: 1,
+      agentMessageCompletionFallbackArmed: false,
+    };
+    (mock.provider as TransportProvider).getSessionDiagnostics = vi.fn().mockReturnValue(providerDiagnostics);
+
     runtime.send('first', 'cmd-first');
     await flushDispatch();
     runtime.send('second', 'cmd-second');
@@ -341,8 +349,10 @@ describe('TransportSessionRuntime', () => {
       activeDispatchCount: 1,
       stalePendingRecoveryActive: false,
       providerSessionBound: true,
+      providerDiagnostics,
       lastActivityAgeMs: 250,
     });
+    expect(mock.provider.getSessionDiagnostics).toHaveBeenCalledWith('sess-1');
     expect(snapshot.pendingVersion).toBeGreaterThanOrEqual(1);
   });
 

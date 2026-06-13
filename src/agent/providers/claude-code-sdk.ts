@@ -338,6 +338,42 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     return routeId;
   }
 
+  getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const activeReason = state.currentQuery
+      ? 'query'
+      : state.currentChild
+        ? 'child'
+        : state.pendingComplete
+          ? 'pending-complete'
+          : state.resultCompletionTimer
+            ? 'completion-fallback'
+            : null;
+    return {
+      provider: this.id,
+      routeId: state.routeId,
+      active: activeReason !== null,
+      activeReason,
+      started: state.started,
+      resumeId: state.resumeId,
+      currentMessageId: state.currentMessageId,
+      currentTextLength: state.currentText.length,
+      currentQueryActive: Boolean(state.currentQuery),
+      currentChildActive: Boolean(state.currentChild && !state.currentChild.killed),
+      completed: state.completed,
+      cancelled: state.cancelled,
+      pendingComplete: Boolean(state.pendingComplete),
+      pendingError: Boolean(state.pendingError),
+      resultCompletionFallbackArmed: Boolean(state.resultCompletionTimer),
+      resultCompletionGeneration: state.resultCompletionGeneration ?? null,
+      turnGeneration: state.turnGeneration,
+      toolCallCount: state.toolCalls.size,
+      runtimeAgentToolCallCount: state.runtimeAgentToolCalls.size,
+      subagentTaskCount: state.subagentTasks.size,
+    };
+  }
+
   async endSession(sessionId: string): Promise<void> {
     // Release any paused AskUserQuestion so a torn-down session never leaks a
     // pending timer / unresolved canUseTool promise. Keyed by sessionName.

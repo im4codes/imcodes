@@ -359,6 +359,40 @@ export class CopilotSdkProvider implements TransportProvider {
     };
   }
 
+  getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
+    const state = this.getSessionState(sessionId);
+    if (!state) return null;
+    const activeReason = state.busy
+      ? state.operation
+      : state.pendingApprovals.size > 0
+        ? 'approval'
+        : state.rotationInProgress
+          ? 'rotation'
+          : null;
+    return {
+      provider: this.id,
+      routeId: state.routeId,
+      active: activeReason !== null,
+      activeReason,
+      providerSessionId: state.sessionId,
+      busy: state.busy,
+      operation: state.operation,
+      currentMessageId: state.currentMessageId,
+      currentTextLength: state.currentText.length,
+      completionEmittedForCurrentTurn: state.completionEmittedForCurrentTurn,
+      cancelRequested: state.cancelRequested,
+      cancelErrorEmitted: state.cancelErrorEmitted,
+      compactCompletionEmitted: state.compactCompletionEmitted,
+      rotationInProgress: state.rotationInProgress,
+      backgroundTainted: state.backgroundTainted,
+      generation: state.generation,
+      pendingApprovalCount: state.pendingApprovals.size,
+      sessionSystemTextInjected: Boolean(state.sessionSystemTextInjected),
+      sessionSystemTextPending: Boolean(state.sessionSystemTextPending),
+      poisoned: this.poisonedSessionIds.has(state.sessionId),
+    };
+  }
+
   async disconnect(): Promise<void> {
     for (const state of this.sessions.values()) {
       state.unsubscribes.forEach((fn) => fn());

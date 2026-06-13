@@ -7,9 +7,11 @@ describe('isRunningTimelineEvent', () => {
     expect(isRunningTimelineEvent({ type: 'assistant.thinking' } as any)).toBe(true);
   });
 
-  it('keeps tool.call and assistant.text as running signals', () => {
+  it('keeps tool.call and streaming assistant.text as running signals', () => {
     expect(isRunningTimelineEvent({ type: 'tool.call' } as any)).toBe(true);
-    expect(isRunningTimelineEvent({ type: 'assistant.text' } as any)).toBe(true);
+    expect(isRunningTimelineEvent({ type: 'assistant.text', payload: { streaming: true } } as any)).toBe(true);
+    expect(isRunningTimelineEvent({ type: 'assistant.text', payload: { streaming: false } } as any)).toBe(false);
+    expect(isRunningTimelineEvent({ type: 'tool.result' } as any)).toBe(false);
   });
 
   it('treats assistant output after the latest idle as an active turn', () => {
@@ -55,10 +57,51 @@ describe('isRunningTimelineEvent', () => {
     ] as any)).toBe(false);
   });
 
+  it('does not revive an idle turn when a late tool result arrives after idle', () => {
+    expect(hasActiveTimelineTurn([
+      { type: 'tool.call', payload: { tool: 'Bash' } },
+      { type: 'session.state', payload: { state: 'idle' } },
+      { type: 'usage.update', payload: { model: 'gpt-5.5' } },
+      { type: 'tool.result', payload: { output: 'done' } },
+    ] as any)).toBe(false);
+  });
+
+  it('keeps a turn active when a tool result follows an unmatched tool call before idle', () => {
+    expect(hasActiveTimelineTurn([
+      { type: 'session.state', payload: { state: 'idle' } },
+      { type: 'tool.call', payload: { tool: 'Bash' } },
+      { type: 'tool.result', payload: { output: 'done' } },
+      { type: 'usage.update', payload: { model: 'gpt-5.5' } },
+    ] as any)).toBe(true);
+  });
+
+  it('keeps a turn active when a tool call is the latest running tail', () => {
+    expect(hasActiveTimelineTurn([
+      { type: 'session.state', payload: { state: 'idle' } },
+      { type: 'tool.call', payload: { tool: 'Bash' } },
+      { type: 'usage.update', payload: { model: 'gpt-5.5' } },
+    ] as any)).toBe(true);
+  });
+
   it('does not treat terminal non-running session states as active turns', () => {
     expect(hasActiveTimelineTurn([
       { type: 'assistant.text', payload: { text: 'done', streaming: false } },
       { type: 'session.state', payload: { state: 'stopped' } },
+    ] as any)).toBe(false);
+  });
+
+  it('ignores malformed tail events without crashing active-turn detection', () => {
+    expect(hasActiveTimelineTurn([
+      { type: 'tool.call', payload: { tool: 'Bash' } },
+      { type: 'session.state', payload: { state: 'idle' } },
+      { type: 'usage.update' },
+      { type: 'tool.result', payload: null },
+    ] as any)).toBe(false);
+
+    expect(hasActiveTimelineTurn([
+      { type: 'session.state', payload: null },
+      { type: 'user.message' },
+      { type: 'command.ack', payload: { ok: true } },
     ] as any)).toBe(false);
   });
 });

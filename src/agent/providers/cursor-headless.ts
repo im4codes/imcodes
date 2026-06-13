@@ -222,6 +222,35 @@ export class CursorHeadlessProvider implements TransportProvider {
     logger.info({ provider: this.id, resolved: resolved.executable }, 'Cursor headless provider connected');
   }
 
+  getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
+    const resolved = this.findSessionByAnyId(sessionId);
+    if (!resolved) return null;
+    const [routeId, state] = resolved;
+    const childActive = Boolean(state.child && !state.child.killed);
+    const pendingFinal = typeof state.pendingFinalText === 'string';
+    const activeReason = childActive
+      ? 'child'
+      : pendingFinal
+        ? 'pending-final'
+        : null;
+    return {
+      provider: this.id,
+      routeId,
+      active: activeReason !== null,
+      activeReason,
+      resumeId: state.resumeId,
+      childActive,
+      currentMessageId: state.currentMessageId,
+      currentTextLength: state.currentText.length,
+      pendingFinalTextLength: state.pendingFinalText?.length ?? 0,
+      pendingFinalMetadata: Boolean(state.pendingFinalMetadata),
+      cancelled: state.cancelled,
+      completed: state.completed,
+      emittedToolSignatureCount: state.emittedToolSignatures.size,
+      sessionSystemTextInjected: Boolean(state.sessionSystemTextInjected),
+    };
+  }
+
   getMemoryMcpStatus(): MemoryMcpProviderStatusView {
     if (this.mcpRegistration?.degraded) {
       return {

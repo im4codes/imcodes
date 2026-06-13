@@ -451,6 +451,13 @@ export interface TransportProvider {
    * The daemon status surface uses this instead of assuming provider readiness.
    */
   getMemoryMcpStatus?(): MemoryMcpProviderStatusView;
+
+  /**
+   * Return provider-owned live state for a bound session, if the provider can
+   * expose it safely. This is diagnostic-only and must not include prompts,
+   * user text, API keys, environment variables, or raw MCP configuration.
+   */
+  getSessionDiagnostics?(sessionId: string): Record<string, unknown> | null;
 }
 
 /** A single model entry returned by listModels(). */

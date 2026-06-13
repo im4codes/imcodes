@@ -61,6 +61,9 @@ const COMPACT_START_ACCEPT_TIMEOUT_MS = 15_000;
 const COMPACT_NO_SIGNAL_SETTLE_MS = 5_000;
 const COMPACT_HARD_TIMEOUT_MS = 120_000;
 const CODEX_IDLE_STATUS_COMPLETION_FALLBACK_MS = 30_000;
+const DEFAULT_CODEX_AGENT_MESSAGE_COMPLETION_FALLBACK_MS = 5_000;
+const MIN_CODEX_AGENT_MESSAGE_COMPLETION_FALLBACK_MS = 500;
+const MAX_CODEX_AGENT_MESSAGE_COMPLETION_FALLBACK_MS = 60_000;
 const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
@@ -99,6 +102,30 @@ const CODEX_RAW_CHECKLIST_HISTORY_TAIL_BYTES = 512 * 1024;
 const CODEX_RAW_CHECKLIST_HISTORY_CLOCK_SKEW_MS = 5_000;
 const CODEX_RAW_CHECKLIST_POLL_INTERVAL_MS = 2_000;
 const CODEX_RAW_CHECKLIST_POLL_WINDOW_MS = 20_000;
+
+function readBoundedIntegerEnv(
+  envName: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const raw = process.env[envName];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return fallback;
+  if (parsed < min) return min;
+  if (parsed > max) return max;
+  return parsed;
+}
+
+export function getCodexAgentMessageCompletionFallbackMs(): number {
+  return readBoundedIntegerEnv(
+    'IMCODES_CODEX_AGENT_MESSAGE_COMPLETION_FALLBACK_MS',
+    DEFAULT_CODEX_AGENT_MESSAGE_COMPLETION_FALLBACK_MS,
+    MIN_CODEX_AGENT_MESSAGE_COMPLETION_FALLBACK_MS,
+    MAX_CODEX_AGENT_MESSAGE_COMPLETION_FALLBACK_MS,
+  );
+}
 
 interface CodexRawSpawnAgentCall {
   sessionId: string;
@@ -384,12 +411,15 @@ interface CodexSdkSessionState {
   threadId?: string;
   loaded: boolean;
   runningTurnId?: string;
+  turnStartInFlight: boolean;
   runningCompact: boolean;
   currentMessageId: string | null;
   currentText: string;
-  pendingComplete?: AgentMessage;
   idleStatusCompletionTimer: ReturnType<typeof setTimeout> | null;
   idleStatusCompletionTurnId?: string;
+  agentMessageCompletionTimer: ReturnType<typeof setTimeout> | null;
+  agentMessageCompletionTurnId?: string;
+  agentMessageCompletionArmedAt?: number;
   activeItemIds: Set<string>;
   cancelled: boolean;
   cancelTimer: ReturnType<typeof setTimeout> | null;
@@ -1427,6 +1457,48 @@ export class CodexSdkProvider implements TransportProvider {
     };
   }
 
+  getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const activeReason = state.runningCompact
+      ? 'compact'
+      : state.runningTurnId
+        ? 'turn'
+        : state.turnStartInFlight
+          ? 'turn-start'
+          : state.activeItemIds.size > 0
+            ? 'item'
+            : state.cancelTimer
+              ? 'cancelling'
+              : null;
+    return {
+      provider: this.id,
+      routeId: state.routeId,
+      active: activeReason !== null,
+      activeReason,
+      threadId: state.threadId ?? null,
+      runningTurnId: state.runningTurnId ?? null,
+      turnStartInFlight: state.turnStartInFlight,
+      runningCompact: state.runningCompact,
+      loaded: state.loaded,
+      cancelled: state.cancelled,
+      currentMessageId: state.currentMessageId,
+      currentTextLength: state.currentText.length,
+      activeItemCount: state.activeItemIds.size,
+      activeItemIds: [...state.activeItemIds].slice(-20),
+      idleStatusCompletionTurnId: state.idleStatusCompletionTurnId ?? null,
+      idleStatusCompletionFallbackArmed: Boolean(state.idleStatusCompletionTimer),
+      agentMessageCompletionTurnId: state.agentMessageCompletionTurnId ?? null,
+      agentMessageCompletionFallbackArmed: Boolean(state.agentMessageCompletionTimer),
+      agentMessageCompletionArmedAt: state.agentMessageCompletionArmedAt ?? null,
+      compactObserved: state.compactObserved,
+      compactSettleArmed: Boolean(state.compactSettleTimer),
+      compactHardTimeoutArmed: Boolean(state.compactHardTimer),
+      cancelTimerArmed: Boolean(state.cancelTimer),
+      rawChecklistPollArmed: Boolean(state.rawChecklistPollTimer),
+    };
+  }
+
   async disconnect(): Promise<void> {
     await this.stopAppServer({ clearSessions: true });
   }
@@ -1445,12 +1517,15 @@ export class CodexSdkProvider implements TransportProvider {
       threadId: config.resumeId ?? existing?.threadId,
       loaded: false,
       runningTurnId: undefined,
+      turnStartInFlight: false,
       runningCompact: false,
       currentMessageId: null,
       currentText: '',
-      pendingComplete: undefined,
       idleStatusCompletionTimer: null,
       idleStatusCompletionTurnId: undefined,
+      agentMessageCompletionTimer: null,
+      agentMessageCompletionTurnId: undefined,
+      agentMessageCompletionArmedAt: undefined,
       activeItemIds: new Set(),
       cancelled: false,
       cancelTimer: null,
@@ -1574,8 +1649,8 @@ export class CodexSdkProvider implements TransportProvider {
 
     state.currentText = '';
     state.currentMessageId = null;
-    state.pendingComplete = undefined;
     this.clearIdleStatusCompletionFallback(state);
+    this.clearAgentMessageCompletionFallback(state);
     state.activeItemIds.clear();
     state.cancelled = false;
     this.clearCancelTimer(state);
@@ -1637,8 +1712,9 @@ export class CodexSdkProvider implements TransportProvider {
       if (state.runningTurnId !== turnId) return;
       this.clearStatus(sessionId, state);
       state.runningTurnId = undefined;
-      state.pendingComplete = undefined;
+      state.turnStartInFlight = false;
       this.clearIdleStatusCompletionFallback(state);
+      this.clearAgentMessageCompletionFallback(state);
       state.activeItemIds.clear();
       this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
@@ -1659,16 +1735,17 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearCancelTimer(state);
       this.clearCompactTimers(state);
       this.clearIdleStatusCompletionFallback(state);
+      this.clearAgentMessageCompletionFallback(state);
       this.clearRawChecklistPollTimer(state);
       if (!options.clearSessions) {
         this.clearStatus(sessionId, state);
         state.loaded = false;
         state.runningTurnId = undefined;
+        state.turnStartInFlight = false;
         state.runningCompact = false;
         state.compactObserved = false;
         state.currentMessageId = null;
         state.currentText = '';
-        state.pendingComplete = undefined;
         state.activeItemIds.clear();
         state.cancelled = false;
         state.lastStatusSignature = null;
@@ -1805,6 +1882,7 @@ export class CodexSdkProvider implements TransportProvider {
       await this.ensureThreadLoaded(sessionId, state, payload);
       await this.prepareGeneratedImageTracking(sessionId, state);
       const inputText = buildCodexTurnInput(payload, shouldInjectStableUpdate ? desiredSessionSystemText : undefined);
+      state.turnStartInFlight = true;
       const result = await this.request('turn/start', {
         threadId: state.threadId,
         input: [{ type: 'text', text: inputText }],
@@ -1814,6 +1892,8 @@ export class CodexSdkProvider implements TransportProvider {
         sandboxPolicy: { type: 'dangerFullAccess' },
         ...(state.model ? { model: state.model } : {}),
         ...(state.effort ? { effort: state.effort } : {}),
+      }).finally(() => {
+        state.turnStartInFlight = false;
       });
       state.runningTurnId = result?.turn?.id;
       if (state.runningTurnId) {
@@ -1829,7 +1909,9 @@ export class CodexSdkProvider implements TransportProvider {
       if (state.runningTurnId) this.armRawChecklistPolling(sessionId, state);
     } catch (err) {
       state.runningTurnId = undefined;
+      state.turnStartInFlight = false;
       this.clearIdleStatusCompletionFallback(state);
+      this.clearAgentMessageCompletionFallback(state);
       state.activeItemIds.clear();
       this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
@@ -1884,9 +1966,11 @@ export class CodexSdkProvider implements TransportProvider {
     } catch (err) {
       this.clearCompactTimers(state);
       this.clearIdleStatusCompletionFallback(state);
+      this.clearAgentMessageCompletionFallback(state);
       this.clearStatus(sessionId, state);
       state.runningCompact = false;
       state.runningTurnId = undefined;
+      state.turnStartInFlight = false;
       state.compactObserved = false;
       this.emitError(sessionId, this.normalizeError(err));
     }
@@ -2449,6 +2533,10 @@ export class CodexSdkProvider implements TransportProvider {
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
+      const turnId = readParamTurnId(params);
+      if (turnId && state.completedTurnIds.has(turnId)) return;
+      if (!state.runningTurnId && !state.turnStartInFlight) return;
+      if (turnId && state.runningTurnId && turnId !== state.runningTurnId) return;
       if (state.cancelled) return;
       this.deferIdleStatusCompletionFallback(sessionId, state);
       this.clearStatus(sessionId, state);
@@ -2476,18 +2564,22 @@ export class CodexSdkProvider implements TransportProvider {
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
+      const turnId = readParamTurnId(params);
+      if (turnId && (state.completedTurnIds.has(turnId) || state.completedCompactTurnIds.has(turnId))) return;
 
       const item = params.item as Record<string, any> | undefined;
       if (!item) return;
+      if (!state.runningTurnId && !state.turnStartInFlight && !state.runningCompact) return;
+      if (turnId && state.runningTurnId && turnId !== state.runningTurnId) return;
       this.trackCodexTurnItemActivity(sessionId, state, method, item);
 
       if (item.type === 'contextCompaction') {
         state.runningCompact = true;
         state.compactObserved = true;
         this.clearCompactSettleTimer(state);
-        state.runningTurnId = readParamTurnId(params) ?? state.runningTurnId;
+        state.runningTurnId = turnId ?? state.runningTurnId;
         if (method === 'item/completed') {
-          this.completeCompact(sessionId, state, readParamTurnId(params));
+          this.completeCompact(sessionId, state, turnId);
           return;
         }
         this.emitStatus(sessionId, state, {
@@ -2536,6 +2628,7 @@ export class CodexSdkProvider implements TransportProvider {
             };
             for (const cb of this.deltaCallbacks) cb(sessionId, delta);
           }
+          this.armAgentMessageCompletionFallback(sessionId, state, turnId);
         }
       }
       return;
@@ -2548,6 +2641,7 @@ export class CodexSdkProvider implements TransportProvider {
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       this.clearIdleStatusCompletionFallback(state);
+      this.clearAgentMessageCompletionFallback(state);
       const turn = params.turn ?? {};
       const status = turn.status;
       const turnId = readParamTurnId(params);
@@ -2567,6 +2661,8 @@ export class CodexSdkProvider implements TransportProvider {
         state.runningCompact = false;
         state.compactObserved = false;
         state.runningTurnId = undefined;
+        state.turnStartInFlight = false;
+        this.clearAgentMessageCompletionFallback(state);
         state.activeItemIds.clear();
         this.clearPendingSessionSystemTextUpdate(state);
         const error = this.normalizeError(turn.error?.message ?? 'Codex turn failed', turn.error);
@@ -2587,12 +2683,15 @@ export class CodexSdkProvider implements TransportProvider {
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
           state.activeItemIds.clear();
+          this.clearAgentMessageCompletionFallback(state);
           this.clearPendingSessionSystemTextUpdate(state);
           return;
         }
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
+        state.turnStartInFlight = false;
         state.activeItemIds.clear();
+        this.clearAgentMessageCompletionFallback(state);
         this.clearPendingSessionSystemTextUpdate(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
@@ -2608,11 +2707,12 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearRawChecklistPollTimer(state);
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
-        state.pendingComplete = undefined;
+        state.turnStartInFlight = false;
         state.currentMessageId = null;
         state.currentText = '';
         state.activeItemIds.clear();
         state.cancelled = false;
+        this.clearAgentMessageCompletionFallback(state);
         this.clearPendingSessionSystemTextUpdate(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
@@ -2626,6 +2726,7 @@ export class CodexSdkProvider implements TransportProvider {
   private async completeTurn(sessionId: string, state: CodexSdkSessionState, turnId?: string): Promise<void> {
     this.clearCancelTimer(state);
     this.clearIdleStatusCompletionFallback(state);
+    this.clearAgentMessageCompletionFallback(state);
     this.clearStatus(sessionId, state);
     this.queueRawChecklistHistoryScan(sessionId, state);
     this.clearRawChecklistPollTimer(state);
@@ -2639,6 +2740,7 @@ export class CodexSdkProvider implements TransportProvider {
     const generatedImageTracking = state.generatedImageTracking;
     const alreadyDetectedImagePaths = [...state.generatedImagePaths];
     state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
     state.activeItemIds.clear();
     state.generatedImageTracking = null;
     const newlyDetectedImagePaths = generatedImageTracking
@@ -2671,8 +2773,6 @@ export class CodexSdkProvider implements TransportProvider {
         ...(resumeId ? { resumeId } : {}),
       },
     };
-    state.pendingComplete = completed;
-    state.pendingComplete = undefined;
     for (const cb of this.completeCallbacks) cb(sessionId, completed);
   }
 
@@ -2716,10 +2816,12 @@ export class CodexSdkProvider implements TransportProvider {
   private completeCompact(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
+    this.clearAgentMessageCompletionFallback(state);
     this.clearRawChecklistPollTimer(state);
     this.clearStatus(sessionId, state);
     state.runningCompact = false;
     state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
     state.compactObserved = false;
     state.generatedImageTracking = null;
     this.rememberCompletedCompactTurn(state, turnId);
@@ -2891,14 +2993,15 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearCompactTimers(state);
     this.clearRawChecklistPollTimer(state);
     this.clearIdleStatusCompletionFallback(state);
+    this.clearAgentMessageCompletionFallback(state);
     this.clearStatus(sessionId, state);
     state.runningCompact = false;
     state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
     state.compactObserved = false;
     this.clearPendingSessionSystemTextUpdate(state);
     state.currentMessageId = null;
     state.currentText = '';
-    state.pendingComplete = undefined;
     state.activeItemIds.clear();
     this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex compact cancelled', true));
   }
@@ -2950,6 +3053,18 @@ export class CodexSdkProvider implements TransportProvider {
     state.idleStatusCompletionTurnId = undefined;
   }
 
+  private clearAgentMessageCompletionTimer(state: CodexSdkSessionState): void {
+    if (!state.agentMessageCompletionTimer) return;
+    clearTimeout(state.agentMessageCompletionTimer);
+    state.agentMessageCompletionTimer = null;
+  }
+
+  private clearAgentMessageCompletionFallback(state: CodexSdkSessionState): void {
+    this.clearAgentMessageCompletionTimer(state);
+    state.agentMessageCompletionTurnId = undefined;
+    state.agentMessageCompletionArmedAt = undefined;
+  }
+
   private armIdleStatusCompletionFallback(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
     const candidateTurnId = turnId ?? state.runningTurnId;
     if (!candidateTurnId || !state.runningTurnId) return;
@@ -2988,6 +3103,63 @@ export class CodexSdkProvider implements TransportProvider {
     state.idleStatusCompletionTimer.unref?.();
   }
 
+  private armAgentMessageCompletionFallback(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
+    const candidateTurnId = turnId ?? state.runningTurnId;
+    if (!candidateTurnId || !state.runningTurnId) return;
+    if (turnId && turnId !== state.runningTurnId) return;
+    if (state.runningCompact || state.cancelled) return;
+    if (state.activeItemIds.size > 0) return;
+
+    state.agentMessageCompletionTurnId = candidateTurnId;
+    state.agentMessageCompletionArmedAt = Date.now();
+    this.clearAgentMessageCompletionTimer(state);
+    const fallbackMs = getCodexAgentMessageCompletionFallbackMs();
+    state.agentMessageCompletionTimer = setTimeout(() => {
+      state.agentMessageCompletionTimer = null;
+      if (!this.sessions.has(sessionId)) {
+        state.agentMessageCompletionTurnId = undefined;
+        state.agentMessageCompletionArmedAt = undefined;
+        return;
+      }
+      const currentCandidateTurnId = state.agentMessageCompletionTurnId;
+      if (!currentCandidateTurnId || !state.runningTurnId) {
+        state.agentMessageCompletionTurnId = undefined;
+        state.agentMessageCompletionArmedAt = undefined;
+        return;
+      }
+      if (state.runningCompact || state.cancelled) {
+        state.agentMessageCompletionTurnId = undefined;
+        state.agentMessageCompletionArmedAt = undefined;
+        return;
+      }
+      if (currentCandidateTurnId !== state.runningTurnId) {
+        state.agentMessageCompletionTurnId = undefined;
+        state.agentMessageCompletionArmedAt = undefined;
+        return;
+      }
+      if (state.activeItemIds.size > 0) {
+        state.agentMessageCompletionTurnId = undefined;
+        state.agentMessageCompletionArmedAt = undefined;
+        return;
+      }
+      const armedAt = state.agentMessageCompletionArmedAt;
+      state.agentMessageCompletionTurnId = undefined;
+      state.agentMessageCompletionArmedAt = undefined;
+      logger.warn({
+        provider: this.id,
+        sessionId,
+        threadId: state.threadId,
+        turnId: currentCandidateTurnId,
+        fallbackMs,
+        elapsedMs: typeof armedAt === 'number' ? Math.max(0, Date.now() - armedAt) : undefined,
+        currentMessageId: state.currentMessageId,
+        currentTextLength: state.currentText.length,
+      }, 'Codex SDK completing quiet turn from agentMessage fallback');
+      void this.completeTurn(sessionId, state, currentCandidateTurnId);
+    }, fallbackMs);
+    state.agentMessageCompletionTimer.unref?.();
+  }
+
   private trackCodexTurnItemActivity(
     sessionId: string,
     state: CodexSdkSessionState,
@@ -2997,6 +3169,7 @@ export class CodexSdkProvider implements TransportProvider {
     const itemId = meaningfulString(item.id);
     if (itemId) {
       if (method === 'item/started') {
+        this.clearAgentMessageCompletionFallback(state);
         state.activeItemIds.add(itemId);
       } else {
         state.activeItemIds.delete(itemId);
@@ -3022,9 +3195,11 @@ export class CodexSdkProvider implements TransportProvider {
       if (!state.runningCompact) return;
       this.clearCompactTimers(state);
       this.clearIdleStatusCompletionFallback(state);
+      this.clearAgentMessageCompletionFallback(state);
       this.clearStatus(sessionId, state);
       state.runningCompact = false;
       state.runningTurnId = undefined;
+      state.turnStartInFlight = false;
       state.compactObserved = false;
       this.clearPendingSessionSystemTextUpdate(state);
       state.currentMessageId = null;

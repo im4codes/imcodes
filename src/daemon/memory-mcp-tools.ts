@@ -625,15 +625,15 @@ const schemas = {
     idempotencyKey: z.string().optional().describe('Optional retry key.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: z.object({
-    query: z.string().optional().describe('Optional target filter.'),
+    query: z.string().optional().describe('Optional case-insensitive target/display-label filter, for example "cc", "codex", "reviewer", or a session label mentioned when the user asks to involve another agent.'),
     limit: z.number().int().min(1).max(100).optional().describe('Optional result limit. Returns only sendable sibling sessions in the caller project; the caller itself and stopped sessions are excluded.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
     target: z.string().describe('Exact sibling target from send_list_targets. The caller session is not a valid target; if send_list_targets returns no items, direct send_message cannot succeed.'),
-    message: z.string().describe('Message text to send.'),
+    message: z.string().describe('Complete task/request text to send when inviting another session to audit, review, discuss, plan, implement, verify, or answer a question.'),
     files: z.array(z.string()).optional().describe('Project-root file path references; no bytes are transferred.'),
-    reply: z.boolean().optional().describe('Ask target to reply to the caller session.'),
-    broadcast: z.boolean().optional().describe('Broadcast within the caller project.'),
+    reply: z.boolean().optional().describe('Ask target to reply to the caller session. Set true for audit/review requests or discussion invites that should report back.'),
+    broadcast: z.boolean().optional().describe('Broadcast within the caller project. Use only when the user asks every/all available sessions, not for a singular named peer.'),
     idempotencyKey: z.string().optional().describe('Retry key for accepted send replay.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: z.object({

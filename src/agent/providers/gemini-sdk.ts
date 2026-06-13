@@ -436,6 +436,34 @@ export class GeminiSdkProvider implements TransportProvider {
     };
   }
 
+  getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const activeReason = state.promptInFlight
+      ? 'prompt'
+      : state.replaying
+        ? 'history-replay'
+        : null;
+    return {
+      provider: this.id,
+      routeId: state.routeId,
+      active: activeReason !== null,
+      activeReason,
+      acpSessionId: state.acpSessionId ?? null,
+      loaded: state.loaded,
+      modeApplied: state.modeApplied,
+      promptInFlight: state.promptInFlight,
+      replaying: state.replaying,
+      cancelled: state.cancelled,
+      currentMessageId: state.currentMessageId,
+      currentTextLength: state.currentText.length,
+      toolCallCount: state.toolCalls.size,
+      emittedToolSignatureCount: state.emittedToolSignatures.size,
+      sessionSystemTextInjected: Boolean(state.sessionSystemTextInjected),
+      lastTurnUsagePresent: Boolean(state.lastTurnUsage),
+    };
+  }
+
   async disconnect(): Promise<void> {
     this.teardownChild();
     this.acpToRoute.clear();

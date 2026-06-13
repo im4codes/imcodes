@@ -600,6 +600,36 @@ export class QwenProvider implements TransportProvider {
     };
   }
 
+  getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const childActive = Boolean(state.child && !state.child.killed);
+    const pendingFinal = typeof state.pendingFinalText === 'string';
+    const activeReason = childActive
+      ? 'child'
+      : pendingFinal
+        ? 'pending-final'
+        : null;
+    return {
+      provider: this.id,
+      routeId: sessionId,
+      active: activeReason !== null,
+      activeReason,
+      started: state.started,
+      conversationId: state.qwenConversationId,
+      childActive,
+      currentMessageId: state.currentMessageId,
+      currentTextLength: state.currentText.length,
+      pendingFinalTextLength: state.pendingFinalText?.length ?? 0,
+      pendingFinalMetadata: Boolean(state.pendingFinalMetadata),
+      cancelled: state.cancelled === true,
+      toolUseCount: state.toolUseById.size,
+      toolUseIndexCount: state.toolUseByIndex.size,
+      emittedToolSignatureCount: state.emittedToolSignatures.size,
+      sessionSystemTextInjected: Boolean(state.sessionSystemTextInjected),
+    };
+  }
+
   async disconnect(): Promise<void> {
     for (const [sessionId, state] of this.sessions) {
       if (state.child && !state.child.killed) {

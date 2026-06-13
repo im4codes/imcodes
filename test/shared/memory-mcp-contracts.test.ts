@@ -62,8 +62,25 @@ describe('memory MCP shared contracts', () => {
     expect(sendList.description).toContain('current caller session');
     expect(sendList.description).toContain('stopped sessions are excluded');
     expect(sendList.description).toContain('if this returns no items');
+    expect(sendList.description).toContain('ask CC to audit');
+    expect(sendList.description).toContain('invite a reviewer to discuss');
+    expect(sendList.description).toContain('display label');
+    expect(sendList.description).toContain('no such running peer session is available');
     expect(sendMessage.description).toContain('caller session is not a valid target');
     expect(sendMessage.description).toContain('empty send_list_targets result');
+    expect(sendMessage.description).toContain('asking a CC session to audit');
+    expect(sendMessage.description).toContain('does not start a structured Team/P2P discussion run');
+
+    const sendListQuery = sendList.inputSchema.properties?.query as { description?: string } | undefined;
+    const sendMessageText = sendMessage.inputSchema.properties?.message as { description?: string } | undefined;
+    const sendMessageReply = sendMessage.inputSchema.properties?.reply as { description?: string } | undefined;
+    const sendMessageBroadcast = sendMessage.inputSchema.properties?.broadcast as { description?: string } | undefined;
+    expect(sendListQuery?.description).toContain('cc');
+    expect(sendListQuery?.description).toContain('display labels');
+    expect(sendMessageText?.description).toContain('complete task/request text');
+    expect(sendMessageReply?.description).toContain('Set true');
+    expect(sendMessageReply?.description).toContain('discussion invites');
+    expect(sendMessageBroadcast?.description).toContain('every/all available sessions');
   });
 
   it('provides operational tool and parameter descriptions without secret/doc leakage', () => {

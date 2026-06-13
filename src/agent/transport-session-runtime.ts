@@ -72,6 +72,7 @@ export interface TransportRuntimeDiagnosticSnapshot {
   activeDispatchCount: number;
   stalePendingRecoveryActive: boolean;
   providerSessionBound: boolean;
+  providerDiagnostics?: Record<string, unknown>;
   lastActivityAt: number;
   lastActivityAgeMs: number;
 }
@@ -478,6 +479,18 @@ export class TransportSessionRuntime implements SessionRuntime {
   get activeDispatchEntries(): PendingTransportMessage[] { return this._activeDispatchEntries.map((entry) => ({ ...entry })); }
 
   getDiagnosticSnapshot(nowMs: number = Date.now()): TransportRuntimeDiagnosticSnapshot {
+    let providerDiagnostics: Record<string, unknown> | null | undefined;
+    if (this._providerSessionId) {
+      try {
+        providerDiagnostics = this.provider.getSessionDiagnostics?.(this._providerSessionId);
+      } catch (err) {
+        logger.warn({
+          provider: this.provider.id,
+          providerSessionId: this._providerSessionId,
+          err,
+        }, 'Transport provider diagnostics read failed');
+      }
+    }
     return {
       status: this._status,
       sending: this._sending,
@@ -486,6 +499,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       activeDispatchCount: this._activeDispatchEntries.length,
       stalePendingRecoveryActive: this._activeDispatchStaleRecoveryStarted,
       providerSessionBound: !!this._providerSessionId,
+      ...(providerDiagnostics ? { providerDiagnostics } : {}),
       lastActivityAt: this._lastActivityAt,
       lastActivityAgeMs: Math.max(0, nowMs - this._lastActivityAt),
     };
