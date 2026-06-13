@@ -2556,6 +2556,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleKeyDown = (e: KeyboardEvent) => {
     if (imeComposingRef.current || isImeComposingKeyEvent(e)) return;
 
+    // When @ picker is open, it owns Enter/Arrow/Escape. Keep this ahead of
+    // transport Escape cancel so closing picker layers never stops the chat.
+    if (atPickerOpen && (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Escape')) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
     if (
       e.key === 'Escape'
       && effectiveRuntimeType === 'transport'
@@ -2567,12 +2575,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return;
     }
 
-    // When @ picker is open, let it handle Enter/Arrow/Escape — don't send or navigate history
-    // AtPicker registers a document-level capture handler that fires BEFORE this bubble handler.
-    // AtPicker calls preventDefault + stopPropagation, so this code only runs if AtPicker didn't handle it.
-    if (atPickerOpen && (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Escape')) {
-      return;
-    }
     // Block Enter right after picker closes (prevents accidental send from the same Enter that selected)
     if (e.key === 'Enter' && (atJustClosedRef.current || atSelectionLockRef.current)) {
       e.preventDefault();

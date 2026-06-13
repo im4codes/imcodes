@@ -50,6 +50,12 @@ const MODES = ['audit', 'review', 'plan', 'brainstorm', 'discuss'] as const;
 
 const DEBOUNCE_MS = 200;
 
+function consumeEscapeKey(e: KeyboardEvent) {
+  e.preventDefault();
+  e.stopPropagation();
+  e.stopImmediatePropagation?.();
+}
+
 // ── Styles ─────────────────────────────────────────────────────────────────
 
 const containerStyle: Record<string, string | number> = {
@@ -344,7 +350,7 @@ export function AtPicker({
       if (configRoundsPicker) {
         const ALL_MODES = ['config', 'audit', 'review', 'plan', 'brainstorm', 'discuss'] as const;
         const currentModeIdx = Math.max(0, ALL_MODES.indexOf(configModeOverride as typeof ALL_MODES[number]));
-        if (e.key === 'Escape') { e.preventDefault(); setConfigRoundsPicker(false); setConfigPickerFocus('rounds'); return; }
+        if (e.key === 'Escape') { consumeEscapeKey(e); setConfigRoundsPicker(false); setConfigPickerFocus('rounds'); return; }
         const focusCycle: Array<'mode' | 'rounds' | 'combo'> = ['mode', 'rounds', 'combo'];
         const focusIdx = focusCycle.indexOf(configPickerFocus);
         if (e.key === 'ArrowUp') {
@@ -404,7 +410,7 @@ export function AtPicker({
 
       // Mode sub-picker
       if (modeAgent !== null) {
-        if (e.key === 'Escape') { e.preventDefault(); setModeAgent(null); return; }
+        if (e.key === 'Escape') { consumeEscapeKey(e); setModeAgent(null); return; }
         if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); setModeHighlight((h) => (h - 1 + MODES.length) % MODES.length); return; }
         if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); setModeHighlight((h) => (h + 1) % MODES.length); return; }
         if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); onSelectAgent(modeAgent, MODES[modeHighlight]); setModeAgent(null); return; }
@@ -413,7 +419,7 @@ export function AtPicker({
 
       // Category chooser
       if (category === 'choose') {
-        if (e.key === 'Escape') { e.preventDefault(); onClose(); return; }
+        if (e.key === 'Escape') { consumeEscapeKey(e); onClose(); return; }
         if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx((h) => (h + 1) % 3); return; }
         if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx((h) => (h + 2) % 3); return; }
         if (e.key === 'Enter') {
@@ -427,7 +433,7 @@ export function AtPicker({
 
       // Team discussion: ↑↓ pick combo, ←→ pick rounds, Enter launches directly.
       if (category === 'team') {
-        if (e.key === 'Escape') { e.preventDefault(); onClose(); return; }
+        if (e.key === 'Escape') { consumeEscapeKey(e); onClose(); return; }
         if (e.key === 'Backspace') { e.preventDefault(); setCategory('choose'); setHighlightIdx(1); return; }
         if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx((h) => Math.max(0, h - 1)); return; }
         if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx((h) => Math.min(teamComboOptions.length - 1, h + 1)); return; }
@@ -458,7 +464,7 @@ export function AtPicker({
       const agentsOff = regAllOffset + (hasAllRow ? 1 : 0);
       const count = category === 'files' ? fileResults.length : cfgRowCount + (hasAllRow ? 1 : 0) + agents.length;
       if (e.key === 'Escape') {
-        e.preventDefault();
+        consumeEscapeKey(e);
         setCategory('choose');
         setHighlightIdx(0);
         return;

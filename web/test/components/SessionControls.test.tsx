@@ -3624,6 +3624,40 @@ afterEach(() => {
     expect(ws.sendInput).not.toHaveBeenCalled();
   });
 
+  it('does not send direct cancel on Escape while the @ picker is open', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const getSelectionSpy = vi.spyOn(window, 'getSelection').mockImplementation(() => ({
+      anchorOffset: input.textContent?.length ?? 0,
+    }) as any);
+
+    try {
+      input.textContent = '@';
+      fireEvent.input(input);
+      expect(screen.getByText('files')).toBeDefined();
+
+      fireEvent.keyDown(input, { key: 'Escape' });
+
+      expect(gatherCancelCalls(ws)).toEqual([]);
+      expect(ws.sendInput).not.toHaveBeenCalled();
+    } finally {
+      getSelectionSpy.mockRestore();
+    }
+  });
+
   it('does not send direct cancel on Escape while a modal preview owns the keyboard', () => {
     const ws = makeWs();
     const dialog = document.createElement('div');
