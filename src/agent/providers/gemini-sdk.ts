@@ -46,6 +46,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
 import { randomUUID } from 'node:crypto';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join, dirname } from 'node:path';
 import {
   ClientSideConnection,
   ndJsonStream,
@@ -96,6 +99,7 @@ import type { TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getDefaultAcpMcpServers } from './getDefaultMcpServers.js';
+import { filterAcpJsonLines } from './acp-json-filter.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -639,8 +643,56 @@ export class GeminiSdkProvider implements TransportProvider {
 
   // ── ACP client-side glue ────────────────────────────────────────────────
 
+  /**
+   * Disable Gemini CLI's folder-trust gate in `~/.gemini/settings.json` so the
+   * daemon-driven `gemini --acp` automatically trusts every session cwd. Without
+   * this, an untrusted cwd makes Gemini skip project agents AND print a non-JSON
+   * "Skipping project agents due to untrusted folder." banner to stdout on a hot
+   * loop. `security.folderTrust.enabled` defaults to true; merge it to false,
+   * preserving all other settings, idempotently. Best-effort — a write failure
+   * must never block connect.
+   */
+  private async ensureGeminiFolderTrustDisabled(): Promise<void> {
+    const settingsPath = join(homedir(), '.gemini', 'settings.json');
+    try {
+      let settings: Record<string, unknown> = {};
+      try {
+        const parsed: unknown = JSON.parse(await readFile(settingsPath, 'utf8'));
+        if (parsed && typeof parsed === 'object') settings = parsed as Record<string, unknown>;
+      } catch {
+        // missing or invalid settings.json — start from an empty object
+      }
+      const security =
+        settings.security && typeof settings.security === 'object'
+          ? (settings.security as Record<string, unknown>)
+          : ((settings.security = {}) as Record<string, unknown>);
+      const folderTrust =
+        security.folderTrust && typeof security.folderTrust === 'object'
+          ? (security.folderTrust as Record<string, unknown>)
+          : ((security.folderTrust = {}) as Record<string, unknown>);
+      if (folderTrust.enabled === false) return; // already disabled — no churn
+      folderTrust.enabled = false;
+      await mkdir(dirname(settingsPath), { recursive: true });
+      await writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+      logger.info(
+        { provider: this.id, settingsPath },
+        'Gemini ACP: disabled folder-trust gate so daemon sessions auto-trust their cwd',
+      );
+    } catch (err) {
+      logger.warn(
+        { provider: this.id, settingsPath, err },
+        'Gemini ACP: could not disable folder-trust gate (continuing)',
+      );
+    }
+  }
+
   private async startAcpServer(config: ProviderConfig): Promise<void> {
     this.teardownChild();
+
+    // Auto-trust: a headless `gemini --acp` has no human to answer folder-trust
+    // prompts, so an untrusted session cwd makes Gemini skip project agents and
+    // emit a non-JSON notice. Disable the gate (read at gemini startup) up front.
+    await this.ensureGeminiFolderTrustDisabled();
 
     const binaryPath = this.resolveBinaryPath(config);
     const resolved = resolveExecutableForSpawn(binaryPath);
@@ -681,9 +733,22 @@ export class GeminiSdkProvider implements TransportProvider {
       this.initPromise = null;
     });
 
-    // `ndJsonStream` wants Web streams; convert the Node stdio streams.
+    // `ndJsonStream` wants Web streams; convert the Node stdio streams. Filter
+    // the agent's stdout first: Gemini CLI prints non-JSON notices (e.g. the
+    // folder-trust banner) to stdout, and the SDK's ndjson reader console.errors
+    // on every unparseable line — a hot loop that spams the log and starves the
+    // event loop. Drop non-JSON lines before they reach the parser.
     const writable = Writable.toWeb(child.stdin) as WritableStream<Uint8Array>;
-    const readable = Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>;
+    const readable = Readable.toWeb(
+      filterAcpJsonLines(child.stdout, (line, n) => {
+        if (n === 1 || n % 200 === 0) {
+          logger.debug(
+            { provider: this.id, droppedCount: n, sample: line.slice(0, 200) },
+            'Gemini ACP: dropped non-JSON stdout line',
+          );
+        }
+      }),
+    ) as ReadableStream<Uint8Array>;
     const stream = ndJsonStream(writable, readable);
 
     // Construct the ACP connection. The callback receives the Agent handle we

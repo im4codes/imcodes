@@ -67,6 +67,7 @@ import {
   type ReadTextFileResponse,
 } from '@agentclientprotocol/sdk';
 import { killProcessTree } from '../../util/kill-process-tree.js';
+import { filterAcpJsonLines } from './acp-json-filter.js';
 import type {
   TransportProvider,
   ProviderCapabilities,
@@ -453,9 +454,20 @@ export class KimiSdkProvider implements TransportProvider {
       this.initPromise = null;
     });
 
-    // `ndJsonStream` wants Web streams; convert the Node stdio streams.
+    // `ndJsonStream` wants Web streams; convert the Node stdio streams. Filter
+    // non-JSON lines out of the agent's stdout first so a chatty CLI can't make
+    // the SDK's ndjson reader console.error-spam on every unparseable line.
     const writable = Writable.toWeb(child.stdin) as WritableStream<Uint8Array>;
-    const readable = Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>;
+    const readable = Readable.toWeb(
+      filterAcpJsonLines(child.stdout, (line, n) => {
+        if (n === 1 || n % 200 === 0) {
+          logger.debug(
+            { provider: this.id, droppedCount: n, sample: line.slice(0, 200) },
+            'Kimi ACP: dropped non-JSON stdout line',
+          );
+        }
+      }),
+    ) as ReadableStream<Uint8Array>;
     const stream = ndJsonStream(writable, readable);
 
     // Construct the ACP connection. The callback receives the Agent handle we
