@@ -3650,9 +3650,9 @@ export function App() {
     };
   }, [auth, selectedServerId, selectedShareTarget, requestP2pStatusWithCachedRunConfirmation]);
 
-  // Subscribe to terminal for ALL sessions when connected.
-  // SDK/transport sessions must remain passively subscribed so shared timeline
-  // updates keep flowing even when their chat controls are not mounted.
+  // Subscribe to terminal streams for process-backed sessions when connected.
+  // Transport/SDK sessions have no PTY stream; their timeline updates are
+  // covered by the dedicated chat.subscribe effect below.
   const sessionNamesKey = sessions.map((s) => s.name).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
@@ -3701,7 +3701,7 @@ export function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, transportSessionKey]);
 
-  // Subscribe terminal for ALL sub-sessions in passive mode.
+  // Subscribe terminal for process-backed sub-sessions in passive mode.
   // Active sub-session windows upgrade themselves to raw:true while visible.
   const subSessionNamesKey = subSessions.map((s) => s.sessionName).sort().join(',');
   useEffect(() => {

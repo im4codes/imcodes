@@ -53,15 +53,25 @@ function isShellLikeTarget(target: RuntimeAwareTarget): boolean {
   return agentType === 'shell' || agentType === 'script';
 }
 
+function isPassiveTerminalTarget(target: RuntimeAwareTarget): boolean {
+  return !isTransportTarget(target) && !isShellLikeTarget(target);
+}
+
+function isActiveTerminalTarget(target: RuntimeAwareTarget, mode: TerminalSubscribeViewMode | undefined): boolean {
+  if (isTransportTarget(target)) return false;
+  if (isShellLikeTarget(target)) return mode === 'terminal';
+  return true;
+}
+
 export function listPassiveTerminalSubscriptionNames<T extends NamedSessionTarget>(targets: readonly T[]): string[] {
   return targets
-    .filter((target) => !isShellLikeTarget(target))
+    .filter(isPassiveTerminalTarget)
     .map((target) => target.name);
 }
 
 export function listPassiveTerminalSubSessionNames<T extends NamedSubSessionTarget>(targets: readonly T[]): string[] {
   return targets
-    .filter((target) => !isShellLikeTarget(target))
+    .filter(isPassiveTerminalTarget)
     .map((target) => target.sessionName);
 }
 
@@ -92,23 +102,25 @@ export function buildTerminalResubscribePlan(params: {
     subSessions,
   } = params;
 
+  const activeSession = activeName ? sessions.find((session) => session.name === activeName) : undefined;
+  const focusedSub = focusedSubId ? subSessions.find((sub) => sub.id === focusedSubId) : undefined;
+
   return [
-    ...(activeName && sessions.some((session) => session.name === activeName)
+    ...(activeName && activeSession && isActiveTerminalTarget(activeSession, activeMode)
       ? [{ name: activeName, mode: activeMode }]
       : []),
     ...(focusedSubId
       ? (() => {
-          const focusedSub = subSessions.find((sub) => sub.id === focusedSubId);
-          return focusedSub
+          return focusedSub && isActiveTerminalTarget(focusedSub, 'chat')
             ? [{ name: focusedSub.sessionName, mode: 'chat' as const }]
             : [];
         })()
       : []),
     ...sessions
-      .filter((session) => session.name !== activeName && !isShellLikeTarget(session))
+      .filter((session) => session.name !== activeName && isPassiveTerminalTarget(session))
       .map((session) => ({ name: session.name, mode: 'chat' as const })),
     ...subSessions
-      .filter((sub) => !isShellLikeTarget(sub))
+      .filter(isPassiveTerminalTarget)
       .map((sub) => ({ name: sub.sessionName, mode: 'chat' as const })),
   ];
 }

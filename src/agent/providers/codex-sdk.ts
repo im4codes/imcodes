@@ -763,6 +763,35 @@ function isRecord(value: unknown): value is Record<string, any> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
+function readAgentMessageText(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  if (!Array.isArray(value)) return undefined;
+  const parts: string[] = [];
+  for (const part of value) {
+    if (typeof part === 'string') {
+      parts.push(part);
+      continue;
+    }
+    if (!isRecord(part)) continue;
+    const text = part.text ?? part.content ?? part.value;
+    if (typeof text === 'string') parts.push(text);
+  }
+  return parts.length > 0 ? parts.join('') : undefined;
+}
+
+function readTurnCompletedAgentMessage(turn: Record<string, any>): { id: string; text: string } | undefined {
+  const items = Array.isArray(turn.items) ? turn.items : [];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (!isRecord(item) || item.type !== 'agentMessage') continue;
+    const text = readAgentMessageText(item.text) ?? readAgentMessageText(item.content);
+    if (typeof text !== 'string' || !text.trim()) continue;
+    const id = meaningfulString(item.id) ?? `${meaningfulString(turn.id) ?? 'turn'}:agent-message`;
+    return { id, text };
+  }
+  return undefined;
+}
+
 function readNestedRuntimeSubagentRecord(value: unknown): Record<string, any> | undefined {
   if (!isRecord(value)) return undefined;
   const record = value;
@@ -2642,7 +2671,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (!sessionId || !state) return;
       this.clearIdleStatusCompletionFallback(state);
       this.clearAgentMessageCompletionFallback(state);
-      const turn = params.turn ?? {};
+      const turn = isRecord(params.turn) ? params.turn : {};
       const status = turn.status;
       const turnId = readParamTurnId(params);
 
@@ -2716,6 +2745,14 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearPendingSessionSystemTextUpdate(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
+      }
+
+      if (!state.currentText) {
+        const completedAgentMessage = readTurnCompletedAgentMessage(turn);
+        if (completedAgentMessage) {
+          state.currentMessageId = completedAgentMessage.id;
+          state.currentText = completedAgentMessage.text;
+        }
       }
 
       await this.completeTurn(sessionId, state, turnId);

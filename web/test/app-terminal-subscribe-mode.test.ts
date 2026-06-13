@@ -23,20 +23,22 @@ describe('shouldSubscribeTerminalRaw', () => {
     expect(shouldSubscribeTerminalRaw(true, 'terminal')).toBe(true);
   });
 
-  it('REGRESSION GUARD: shell/script sessions must not enter passive terminal subscriptions and this test must not be deleted', () => {
+  it('REGRESSION GUARD: shell/script and transport sessions must not enter passive terminal subscriptions and this test must not be deleted', () => {
     expect(listPassiveTerminalSubscriptionNames([
       { name: 'deck_proc_brain', runtimeType: 'process' as const },
       { name: 'deck_sdk_brain', runtimeType: 'transport' as const },
+      { name: 'deck_codex_sdk_brain', agentType: 'codex-sdk' },
       { name: 'deck_shell_brain', runtimeType: 'process' as const, agentType: 'shell' },
       { name: 'deck_script_brain', runtimeType: 'process' as const, agentType: 'script' },
-    ])).toEqual(['deck_proc_brain', 'deck_sdk_brain']);
+    ])).toEqual(['deck_proc_brain']);
 
     expect(listPassiveTerminalSubSessionNames([
       { id: 'sub-proc', sessionName: 'deck_sub_proc', runtimeType: 'process' as const },
       { id: 'sub-sdk', sessionName: 'deck_sub_sdk', runtimeType: 'transport' as const },
+      { id: 'sub-cursor', sessionName: 'deck_sub_cursor', type: 'cursor-headless' },
       { id: 'sub-shell', sessionName: 'deck_sub_shell', runtimeType: 'process' as const, type: 'shell' },
       { id: 'sub-script', sessionName: 'deck_sub_script', runtimeType: 'process' as const, type: 'script' },
-    ])).toEqual(['deck_sub_proc', 'deck_sub_sdk']);
+    ])).toEqual(['deck_sub_proc']);
   });
 
   it('REGRESSION GUARD: copilot/cursor sdk sessions must remain in global transport subscriptions and this test must not be deleted', () => {
@@ -69,7 +71,7 @@ describe('shouldSubscribeTerminalRaw', () => {
     ])).toEqual(['deck_sub_codex_sdk', 'deck_sub_cursor']);
   });
 
-  it('REGRESSION GUARD: transport/sdk sessions must remain in daemon reconnect resubscribe plan and this test must not be deleted', () => {
+  it('REGRESSION GUARD: transport/sdk sessions must not enter terminal reconnect resubscribe plan and this test must not be deleted', () => {
     expect(buildTerminalResubscribePlan({
       activeName: 'deck_sdk_brain',
       activeMode: 'chat',
@@ -85,11 +87,26 @@ describe('shouldSubscribeTerminalRaw', () => {
         { id: 'sub-shell', sessionName: 'deck_sub_shell', runtimeType: 'process' as const, type: 'shell' },
       ],
     })).toEqual([
-      { name: 'deck_sdk_brain', mode: 'chat' },
-      { name: 'deck_sub_sdk', mode: 'chat' },
       { name: 'deck_proc_brain', mode: 'chat' },
-      { name: 'deck_sub_sdk', mode: 'chat' },
       { name: 'deck_sub_proc', mode: 'chat' },
+    ]);
+  });
+
+  it('keeps active shell terminal surfaces subscribed while omitting shell chat and transport surfaces', () => {
+    expect(buildTerminalResubscribePlan({
+      activeName: 'deck_shell_brain',
+      activeMode: 'terminal',
+      focusedSubId: 'sub-shell',
+      sessions: [
+        { name: 'deck_shell_brain', runtimeType: 'process' as const, agentType: 'shell' },
+        { name: 'deck_sdk_brain', runtimeType: 'transport' as const },
+      ],
+      subSessions: [
+        { id: 'sub-shell', sessionName: 'deck_sub_shell', runtimeType: 'process' as const, type: 'shell' },
+        { id: 'sub-sdk', sessionName: 'deck_sub_sdk', runtimeType: 'transport' as const },
+      ],
+    })).toEqual([
+      { name: 'deck_shell_brain', mode: 'terminal' },
     ]);
   });
 });

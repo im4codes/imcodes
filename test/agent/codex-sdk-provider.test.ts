@@ -1511,6 +1511,52 @@ describe('CodexSdkProvider', () => {
     expect(sessionInfo).toContainEqual({ resumeId: 'thread-1' });
   });
 
+  it('uses final agentMessage from turn/completed items when item/completed was not observed', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-turn-items-final', cwd: '/tmp/project' });
+
+    const deltas: string[] = [];
+    const completedMessages: any[] = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+    provider.onComplete((_sid, msg) => completedMessages.push(msg));
+
+    await provider.send('route-turn-items-final', 'hello');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: {
+          id: 'turn-1',
+          status: 'completed',
+          items: [
+            { id: 'cmd-1', type: 'commandExecution', command: 'echo ignored', status: 'completed' },
+            { id: 'msg-final', type: 'agentMessage', text: 'Final answer from completed turn.' },
+          ],
+          error: null,
+        },
+      },
+    });
+
+    await waitForCondition(() => completedMessages.length === 1);
+
+    expect(deltas).toEqual([]);
+    expect(completedMessages[0]).toMatchObject({
+      id: 'msg-final',
+      content: 'Final answer from completed turn.',
+      status: 'complete',
+    });
+    expect(provider.getSessionDiagnostics('route-turn-items-final')).toMatchObject({
+      runningTurnId: null,
+      currentTextLength: 'Final answer from completed turn.'.length,
+      activeItemCount: 0,
+    });
+
+    await provider.send('route-turn-items-final', 'next');
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
+  });
+
   it('resets the streaming accumulator across agentMessages so a second message is not prefixed with the first', async () => {
     // A turn with a tool round produces TWO agentMessage items. The second
     // message's deltas must start fresh, not carry the first message's text.
