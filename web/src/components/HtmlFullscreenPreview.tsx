@@ -14,7 +14,7 @@ interface HtmlFullscreenPreviewProps {
   onClose: () => void;
 }
 
-function openPreviewInNewWindow(preview: HtmlFullscreenPreviewState): boolean {
+export function openHtmlPreviewInNewWindow(preview: HtmlFullscreenPreviewState): boolean {
   if (preview.status !== 'ok' || typeof preview.content !== 'string') return false;
   if (typeof URL.createObjectURL !== 'function') return false;
   const result = createSafeHtmlPreviewDocument(preview.content);
@@ -22,7 +22,11 @@ function openPreviewInNewWindow(preview: HtmlFullscreenPreviewState): boolean {
 
   const url = URL.createObjectURL(new Blob([result.srcDoc], { type: 'text/html;charset=utf-8' }));
   try {
-    window.open(url, '_blank', 'noopener,noreferrer');
+    const opened = window.open(url, '_blank', 'noopener,noreferrer');
+    if (!opened) {
+      URL.revokeObjectURL(url);
+      return false;
+    }
     window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
     return true;
   } catch {
@@ -57,7 +61,7 @@ export function HtmlFullscreenPreview({ preview, onClose }: HtmlFullscreenPrevie
         type="button"
         class="html-fullscreen-preview-open-window"
         onClick={() => {
-          if (openPreviewInNewWindow(preview)) onClose();
+          if (openHtmlPreviewInNewWindow(preview)) onClose();
         }}
         disabled={!canOpenInNewWindow}
         title={t('chat.html_preview_open_new_window')}

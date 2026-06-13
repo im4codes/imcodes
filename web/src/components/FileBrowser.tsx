@@ -23,7 +23,7 @@ import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import { FileEditor, FileEditorContent } from './file-editor-lazy.js';
 const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
-import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
+import { HtmlFullscreenPreview, openHtmlPreviewInNewWindow, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { ImageLightbox } from './ImageLightbox.js';
 import { downloadAttachment, getApiBaseUrl } from '../api.js';
 import {
@@ -1545,7 +1545,10 @@ export function FileBrowser({
 
   useEffect(() => {
     if (!canRenderHtml || !isHtmlRenderMode || isEditing) return;
-    setHtmlFullscreenPreview({ status: 'ok', path: preview.path, content: preview.content });
+    const next = { status: 'ok' as const, path: preview.path, content: preview.content };
+    if (!openHtmlPreviewInNewWindow(next)) {
+      setHtmlFullscreenPreview(next);
+    }
     setPreviewViewMode('source');
     setShowDiff(false);
   }, [canRenderHtml, isEditing, isHtmlRenderMode, preview]);
@@ -1596,7 +1599,10 @@ export function FileBrowser({
             class="fb-diff-toggle"
             onClick={() => {
               previewTabOverridePathRef.current = preview.path;
-              setHtmlFullscreenPreview({ status: 'ok', path: preview.path, content: preview.content });
+              const next = { status: 'ok' as const, path: preview.path, content: preview.content };
+              if (!openHtmlPreviewInNewWindow(next)) {
+                setHtmlFullscreenPreview(next);
+              }
               setPreviewViewMode('source');
               setShowDiff(false);
             }}

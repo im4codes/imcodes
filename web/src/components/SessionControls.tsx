@@ -203,7 +203,7 @@ function normalizeOpenSpecTaskStats(value: unknown): OpenSpecTaskStatsSummary | 
   };
 }
 
-function collectOpenSpecTaskStats(entries: Array<Record<string, unknown>> | undefined): Map<string, OpenSpecTaskStatsSummary> {
+function collectOpenSpecTaskStats(entries: ReadonlyArray<{ isDir?: unknown; name?: unknown; openSpecTaskStats?: unknown }> | undefined): Map<string, OpenSpecTaskStatsSummary> {
   const stats = new Map<string, OpenSpecTaskStatsSummary>();
   for (const entry of entries ?? []) {
     if (entry.isDir !== true || typeof entry.name !== 'string') continue;

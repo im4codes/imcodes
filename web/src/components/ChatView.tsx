@@ -33,7 +33,7 @@ import { ChatMarkdown } from './ChatMarkdown.js';
 import { AgentTodoList } from './AgentTodoList.js';
 import { computeFollowThresholds } from './chat-follow-thresholds.js';
 import type { ChatLocalImagePreviewLoader, ChatLocalImagePreviewResult } from './ChatLocalImagePreview.js';
-import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
+import { HtmlFullscreenPreview, openHtmlPreviewInNewWindow, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { isLikelyDomainPath, renderChatPathActions, type ChatPathDownloadHandler } from '../chat-path-actions.js';
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
 import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
@@ -1536,7 +1536,8 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             : t('file_browser.preview_error', 'Preview unavailable');
           return { status: 'error', path: current.path, error };
         }
-        return { status: 'ok', path: current.path, content: msg.content ?? '' };
+        const next = { status: 'ok' as const, path: current.path, content: msg.content ?? '' };
+        return openHtmlPreviewInNewWindow(next) ? null : next;
       });
     });
   }, [t, ws]);
