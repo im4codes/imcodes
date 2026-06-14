@@ -41,13 +41,18 @@ export const FILE_TRANSFER_LIMITS = {
   STAGED_UPLOAD_TTL_MS: 10 * 60 * 1000,
   /** Server waits this long for daemon download response (ms). */
   DOWNLOAD_TIMEOUT_MS: 300_000,
-  /** Server waits this long for the daemon's download stream to START delivering
-   *  bytes before retrying via the base64 path (ms). Only large files take the
-   *  relay (small files return inline — see DOWNLOAD_INLINE_MAX_BYTES), and the
-   *  PUT *start* (first byte) is fast on any healthy relay even for big/slow
-   *  transfers, so this is deliberately short: don't stall the user when the
-   *  relay is wedged — fall back to base64 quickly. */
-  DOWNLOAD_STREAM_READY_TIMEOUT_MS: 2_500,
+  /** Per-attempt wait for the daemon's download stream to START delivering bytes
+   *  (ms). Long enough to catch a relay that becomes ready a few seconds in
+   *  (e.g. ~4s), NOT so short it abandons a relay that would have worked. Only
+   *  large files take the relay (small files return inline). Combined with
+   *  DOWNLOAD_STREAM_MAX_ATTEMPTS, the relay gets several chances before the
+   *  base64 fallback. */
+  DOWNLOAD_STREAM_READY_TIMEOUT_MS: 4_000,
+  /** How many times the server retries the streaming relay (each waiting
+   *  DOWNLOAD_STREAM_READY_TIMEOUT_MS) before falling back to base64. Retrying
+   *  with a fresh attempt recovers a relay whose first PUT wedged, while a ready
+   *  relay still returns as soon as bytes flow. */
+  DOWNLOAD_STREAM_MAX_ATTEMPTS: 2,
   /** Files at or below this size are returned INLINE (base64 over the daemon WS)
    *  in a single round-trip instead of through the streaming relay. The relay's
    *  PUT round-trip + readiness handshake adds latency that dominates for small

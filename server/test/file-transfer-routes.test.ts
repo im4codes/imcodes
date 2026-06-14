@@ -347,22 +347,18 @@ describe('file-transfer download route', () => {
 
   it('falls back to the base64 download when the streamed relay fails to deliver bytes', async () => {
     const app = makeApp();
-    // 1st WS call = DOWNLOAD_STREAM (relay) → reject to simulate a relay that
-    // never delivers (the production "stuck downloading" failure mode).
-    // 2nd WS call = file.download (legacy base64 fallback) → succeed.
-    sendFileTransferRequestMock
-      .mockImplementationOnce((_requestId: string, message: unknown) => {
-        expect((message as { type: string }).type).toBe(FILE_TRANSFER_MSG.DOWNLOAD_STREAM);
-        return Promise.reject(new Error('relay_upload_502'));
-      })
-      .mockImplementationOnce((_requestId: string, message: unknown) => {
-        expect((message as { type: string }).type).toBe('file.download');
-        return Promise.resolve({
-          content: Buffer.from('hello world').toString('base64'),
-          mime: 'text/plain',
-          filename: 'hello.txt',
-        });
+    // Every relay attempt rejects (relay wedged / never delivers); the base64
+    // file.download fallback then succeeds.
+    sendFileTransferRequestMock.mockImplementation((_requestId: string, message: unknown) => {
+      const type = (message as { type: string }).type;
+      if (type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM) return Promise.reject(new Error('relay_upload_502'));
+      expect(type).toBe('file.download');
+      return Promise.resolve({
+        content: Buffer.from('hello world').toString('base64'),
+        mime: 'text/plain',
+        filename: 'hello.txt',
       });
+    });
 
     const res = await app.request('/api/server/srv-1/uploads/abc123/download', {
       headers: { Authorization: 'Bearer test' },
@@ -372,8 +368,8 @@ describe('file-transfer download route', () => {
     expect(res.headers.get('content-type')).toContain('text/plain');
     expect(res.headers.get('content-disposition')).toContain('hello.txt');
     await expect(res.text()).resolves.toBe('hello world');
-    // Both the relay attempt and the base64 fallback were issued.
-    expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(2);
+    // All relay retries + the base64 fallback were issued.
+    expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(FILE_TRANSFER_LIMITS.DOWNLOAD_STREAM_MAX_ATTEMPTS + 1);
   });
 
   it('surfaces a genuine not_found from the relay without a pointless base64 retry', async () => {
@@ -394,21 +390,18 @@ describe('file-transfer download route', () => {
 
   it('falls back to base64 when the relay reports a transport error (not a missing handle)', async () => {
     const app = makeApp();
-    // 1st WS call = DOWNLOAD_STREAM → a relay/transport error (NOT not_found).
-    // 2nd WS call = file.download (base64 retry) → succeed.
-    sendFileTransferRequestMock
-      .mockImplementationOnce((_requestId: string, message: unknown) => {
-        expect((message as { type: string }).type).toBe(FILE_TRANSFER_MSG.DOWNLOAD_STREAM);
-        return Promise.resolve({ type: 'file.download_error', message: 'relay_upload_502' });
-      })
-      .mockImplementationOnce((_requestId: string, message: unknown) => {
-        expect((message as { type: string }).type).toBe('file.download');
-        return Promise.resolve({
-          content: Buffer.from('recovered').toString('base64'),
-          mime: 'text/plain',
-          filename: 'r.txt',
-        });
+    // Every relay attempt returns a transport error (NOT not_found); the base64
+    // file.download fallback then succeeds.
+    sendFileTransferRequestMock.mockImplementation((_requestId: string, message: unknown) => {
+      const type = (message as { type: string }).type;
+      if (type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM) return Promise.resolve({ type: 'file.download_error', message: 'relay_upload_502' });
+      expect(type).toBe('file.download');
+      return Promise.resolve({
+        content: Buffer.from('recovered').toString('base64'),
+        mime: 'text/plain',
+        filename: 'r.txt',
       });
+    });
 
     const res = await app.request('/api/server/srv-1/uploads/abc123/download', {
       headers: { Authorization: 'Bearer test' },
@@ -416,8 +409,8 @@ describe('file-transfer download route', () => {
 
     expect(res.status).toBe(200);
     await expect(res.text()).resolves.toBe('recovered');
-    // Relay error → base64 retry (2 WS calls), instead of a hard failure.
-    expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(2);
+    // Relay errors → retries → base64 fallback, instead of a hard failure.
+    expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(FILE_TRANSFER_LIMITS.DOWNLOAD_STREAM_MAX_ATTEMPTS + 1);
   });
 
   it('returns a small file INLINE (file.download_done over WS) in one round-trip — no relay PUT, no fallback', async () => {
