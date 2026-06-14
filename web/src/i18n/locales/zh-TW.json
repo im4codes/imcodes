@@ -342,7 +342,12 @@
         "fangsong": "仿宋",
         "microsoft-jhenghei": "微軟正黑體"
       }
-    }
+    },
+    "execution_clone_run": "用執行複製會話執行目前任務",
+    "execution_clone_run_with_template": "複製 {{name}} ×{{count}} 並行執行目前任務",
+    "execution_clone_run_no_template": "請先在 Team 設定啟用並選擇執行會話",
+    "execution_clone_run_empty": "請先輸入任務",
+    "execution_clone_run_offline": "重新連線後才能執行複製會話"
   },
   "session": {
     "restart": "↺ 重新啟動",

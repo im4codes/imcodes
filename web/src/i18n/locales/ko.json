@@ -342,7 +342,12 @@
         "fangsong": "FangSong",
         "microsoft-jhenghei": "Microsoft JhengHei"
       }
-    }
+    },
+    "execution_clone_run": "실행 클론으로 현재 작업 실행",
+    "execution_clone_run_with_template": "{{name}} 클론 {{count}}개로 현재 작업 병렬 실행",
+    "execution_clone_run_no_template": "Team 설정에서 실행 세션을 먼저 켜고 선택하세요",
+    "execution_clone_run_empty": "먼저 작업을 입력하세요",
+    "execution_clone_run_offline": "다시 연결한 뒤 실행 클론을 시작하세요"
   },
   "session": {
     "restart": "↺ 재시작",

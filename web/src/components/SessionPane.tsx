@@ -22,6 +22,7 @@ import type { WsClient } from '../ws-client.js';
 import type { SessionInfo, TerminalDiff } from '../types.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
@@ -45,7 +46,15 @@ export interface SessionPaneProps {
   serverId: string;
   session: SessionInfo;
   sessions: SessionInfo[];
-  subSessions: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
+  subSessions: Array<{
+    sessionName: string;
+    type: string;
+    label?: string | null;
+    state: string;
+    parentSession?: string | null;
+    executionTemplateEligible?: boolean;
+    executionTemplateIneligibleReason?: string;
+  }>;
   ws: WsClient | null;
   connected: boolean;
   /** Whether this pane is the currently active session (controls show/hide). */
@@ -138,6 +147,9 @@ export function SessionPane({
   const sessionName = session.name;
   const hasChatTimeline = session.agentType !== 'shell' && session.agentType !== 'script';
   const [syncingMemorySummaries, setSyncingMemorySummaries] = useState(false);
+  const [composerText, setComposerText] = useState('');
+  const [executionClonesBusy, setExecutionClonesBusy] = useState(false);
+  const executionRouting = useExecutionRouting(serverId ?? null);
 
   // ── Timeline ────────────────────────────────────────────────────────────────
   const {
@@ -288,6 +300,57 @@ export function SessionPane({
     }
   }, [effectiveViewMode]);
 
+  const executionTemplateDisplayName = useMemo(() => {
+    const template = executionRouting.templateSessionName;
+    if (!template) return null;
+    const sub = subSessions.find((item) => item.sessionName === template);
+    if (sub) return sub.label || sub.sessionName.split('_').pop() || sub.sessionName;
+    const main = sessions.find((item) => item.name === template);
+    if (main) return main.label || main.name.split('_').pop() || main.name;
+    return null;
+  }, [executionRouting.templateSessionName, sessions, subSessions]);
+  const hasValidExecutionTemplate = Boolean(
+    executionRouting.enabled
+    && executionRouting.templateSessionName
+    && executionTemplateDisplayName
+    && executionRouting.templateSessionName !== sessionName,
+  );
+  const executionCloneCount = executionRouting.limits.maxParallelClones;
+  const runExecutionClonesTitle = !connected || !ws
+    ? t('chat.execution_clone_run_offline')
+    : !hasValidExecutionTemplate
+      ? t('chat.execution_clone_run_no_template')
+      : !(composerText.trim() || inputRef.current?.textContent?.trim())
+        ? t('chat.execution_clone_run_empty')
+        : t('chat.execution_clone_run_with_template', {
+            count: executionCloneCount,
+            name: executionTemplateDisplayName,
+          });
+  const handleRunExecutionClones = useCallback(() => {
+    const text = (inputRef.current?.textContent ?? composerText).trim();
+    if (!ws || !connected || !hasValidExecutionTemplate || !executionRouting.templateSessionName || !text) return;
+    const commandId = globalThis.crypto?.randomUUID?.()
+      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    setExecutionClonesBusy(true);
+    try {
+      ws.sendExecutionClones({
+        sessionName,
+        text,
+        commandId,
+        dedicatedExecutionRouting: {
+          enabled: true,
+          templateSessionName: executionRouting.templateSessionName,
+          maxParallelClones: executionRouting.limits.maxParallelClones,
+          maxQueuedClones: executionRouting.limits.maxQueuedClones,
+          cloneHardTimeoutMs: executionRouting.limits.cloneHardTimeoutMs,
+          cloneRetentionMs: executionRouting.limits.cloneRetentionMs,
+        },
+      });
+    } finally {
+      window.setTimeout(() => setExecutionClonesBusy(false), 1200);
+    }
+  }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, sessionName, ws]);
+
   const handleSyncMemorySummaries = useCallback(async () => {
     if (!ws || !connected || syncingMemorySummaries) return;
     setSyncingMemorySummaries(true);
@@ -396,6 +459,17 @@ export function SessionPane({
           onSyncMemorySummaries={handleSyncMemorySummaries}
           syncMemorySummariesBusy={syncingMemorySummaries}
           syncMemorySummariesDisabled={!connected || !ws || syncingMemorySummaries}
+          onRunExecutionClones={handleRunExecutionClones}
+          runExecutionClonesBusy={executionClonesBusy}
+          runExecutionClonesDisabled={
+            executionClonesBusy
+            || !connected
+            || !ws
+            || !hasValidExecutionTemplate
+            || !(composerText.trim() || inputRef.current?.textContent?.trim())
+          }
+          runExecutionClonesTitle={runExecutionClonesTitle}
+          runExecutionClonesCount={executionCloneCount}
         />
       )}
 
@@ -462,6 +536,7 @@ export function SessionPane({
           pendingPrefillText={pendingPrefillText}
           onPendingPrefillApplied={onPendingPrefillApplied}
           onVersionSensitiveAction={onVersionSensitiveAction}
+          onComposerTextChange={setComposerText}
         />
       )}
     </div>

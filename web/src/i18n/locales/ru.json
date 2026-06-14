@@ -342,7 +342,12 @@
         "fangsong": "FangSong",
         "microsoft-jhenghei": "Microsoft JhengHei"
       }
-    }
+    },
+    "execution_clone_run": "Запустить текущую задачу через клоны выполнения",
+    "execution_clone_run_with_template": "Запустить текущую задачу через {{count}} клон(ов) {{name}}",
+    "execution_clone_run_no_template": "Сначала включите и выберите сессию выполнения в настройках Team",
+    "execution_clone_run_empty": "Сначала введите задачу",
+    "execution_clone_run_offline": "Переподключитесь перед запуском клонов"
   },
   "session": {
     "restart": "↺ Перезапустить",

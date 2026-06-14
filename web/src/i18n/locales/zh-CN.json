@@ -342,7 +342,12 @@
         "fangsong": "仿宋",
         "microsoft-jhenghei": "微软正黑体"
       }
-    }
+    },
+    "execution_clone_run": "用执行克隆运行当前任务",
+    "execution_clone_run_with_template": "克隆 {{name}} ×{{count}} 并行执行当前任务",
+    "execution_clone_run_no_template": "先在 Team 设置里启用并选择执行会话",
+    "execution_clone_run_empty": "请先输入任务",
+    "execution_clone_run_offline": "重连后才能运行执行克隆"
   },
   "session": {
     "restart": "↺ 重启",

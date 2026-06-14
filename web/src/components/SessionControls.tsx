@@ -175,6 +175,8 @@ interface Props {
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   /** Gate version-sensitive panels when the loaded frontend is stale. */
   onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
+  /** Reports the current composer text to parent surfaces (e.g. footer actions). */
+  onComposerTextChange?: (text: string) => void;
 }
 
 const MAX_UPLOAD_SIZE_MB = Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024));
@@ -734,7 +736,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -756,8 +758,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [p2pOpen, setP2pOpen] = useState(false);
   const [p2pConfigOpen, setP2pConfigOpen] = useState(false);
   const [p2pConfigInitialTab, setP2pConfigInitialTab] = useState<P2pConfigTab>('participants');
-  // Generic execution-session (🤖▾) dropdown open state.
-  const [execMenuOpen, setExecMenuOpen] = useState(false);
   const [p2pSavedConfig, setP2pSavedConfig] = useState<P2pSavedConfig | null>(null);
   const [openSpecOpen, setOpenSpecOpen] = useState(false);
   const [openSpecChanges, setOpenSpecChanges] = useState<OpenSpecChangeListItem[]>([]);
@@ -817,7 +817,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const thinkingRef = useRef<HTMLDivElement>(null);
   const p2pRef = useRef<HTMLDivElement>(null);
   const p2pDropdownRef = useRef<HTMLDivElement | null>(null);
-  const execMenuRef = useRef<HTMLDivElement>(null);
   const openSpecRef = useRef<HTMLDivElement>(null);
   const openSpecDropdownRef = useRef<HTMLDivElement | null>(null);
   const openSpecSubmenuRef = useRef<HTMLDivElement | null>(null);
@@ -913,6 +912,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   ), [incomingQueuedTransportEntries, optimisticQueuedEntries]);
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
+  const publishComposerText = useCallback((text: string) => {
+    onComposerTextChange?.(text);
+  }, [onComposerTextChange]);
   // History navigation state
   const histIdxRef = useRef(-1);   // -1 = not navigating; 0 = most recent
   const draftRef = useRef('');      // saved unsent text while navigating
@@ -965,6 +967,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!pendingPrefillText || !divRef.current) return;
     divRef.current.textContent = (divRef.current.textContent || '') + pendingPrefillText;
     setHasText(!!divRef.current.textContent.trim());
+    publishComposerText(divRef.current.textContent ?? '');
     divRef.current.dispatchEvent(new Event('input', { bubbles: true }));
     divRef.current.focus();
     try {
@@ -976,7 +979,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       sel?.addRange(range);
     } catch { /* ignore selection API failures */ }
     onPendingPrefillApplied?.();
-  }, [pendingPrefillText, onPendingPrefillApplied]);
+  }, [pendingPrefillText, onPendingPrefillApplied, publishComposerText]);
 
   const clearSendWarning = useCallback(() => {
     if (sendWarningTimerRef.current) {
@@ -1003,12 +1006,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (saved) {
       divRef.current.textContent = saved;
       setHasText(!!saved.trim());
+      publishComposerText(saved);
+    } else {
+      publishComposerText('');
     }
     return () => {
       const text = divRef.current?.textContent ?? '';
       if (draftKey) sessionStorage.setItem(draftKey, text);
     };
-  }, [draftKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [draftKey, publishComposerText]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     setHydratedAttachmentDraftKey(null);
@@ -1518,9 +1524,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (thinkingOpen && thinkingRef.current && !thinkingRef.current.contains(target)) {
         setThinkingOpen(false);
       }
-      if (execMenuOpen && execMenuRef.current && !execMenuRef.current.contains(target)) {
-        setExecMenuOpen(false);
-      }
       if (
         p2pOpen
         && p2pRef.current
@@ -1556,7 +1559,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       document.removeEventListener('touchstart', handleTouchStart, touchOptions);
       document.removeEventListener('mousedown', handleMouseDown, pointerOptions);
     };
-  }, [autoOpen, menuOpen, modelOpen, openSpecOpen, p2pOpen, thinkingOpen, execMenuOpen]);
+  }, [autoOpen, menuOpen, modelOpen, openSpecOpen, p2pOpen, thinkingOpen]);
 
   const quickAutoColor = quickSupervisionMode === SUPERVISION_MODE.SUPERVISED
     ? '#34d399'
@@ -1704,6 +1707,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       divRef.current.focus();
     }
     setHasText(!!text.trim());
+    publishComposerText(text);
     syncMobileComposerMetrics();
   };
 
@@ -1722,6 +1726,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       divRef.current.focus();
     }
     setHasText(true);
+    publishComposerText(divRef.current?.textContent ?? suffix);
     syncMobileComposerMetrics();
   };
 
@@ -1978,17 +1983,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
   const rootSession = activeSub?.parentSession || activeSession?.name || '';
 
-  // ── Generic execution-session (🤖▾) routing ─────────────────────────────
-  // Reads the SHARED dedicated-execution-routing preference (the same one Team
-  // Settings edits). The dropdown only DISPATCHES the generic execution prompt
-  // to the configured session, or opens the setting flow — it never mutates the
-  // preference itself. The "use" action is enabled only when a valid default
-  // execution session exists for the current project.
+  // ── Dedicated execution routing preference ──────────────────────────────
+  // Reads the SHARED preference (the same one Team Settings edits). Generic
+  // execution dispatch now lives in UsageFooter next to the summary-sync
+  // action; SessionControls still consumes the preference for P2P/Team and
+  // OpenSpec-specific execution surfaces.
   const executionRouting = useExecutionRouting(serverId ?? null);
   const configuredExecutionSession = executionRouting.templateSessionName;
-  // A configured session is a VALID default only when it still exists in the
-  // current project (as a sibling main/worker session or an in-scope
-  // sub-session) and is not the current calling session.
   const executionSessionDisplayName = useMemo(() => {
     if (!configuredExecutionSession) return null;
     const sub = (subSessions ?? []).find((s) => s.sessionName === configuredExecutionSession);
@@ -2002,19 +2003,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     && executionSessionDisplayName
     && configuredExecutionSession !== activeSession?.name,
   );
-
-  // Dispatch the GENERIC execution prompt to the configured execution session.
-  // This reuses the plain cross-session send (`ws.sendSessionMessage`) and MUST
-  // NOT inject any OpenSpec-specific wording — generic entry points stay generic
-  // (the entry point owns task semantics, not the routing layer).
-  const dispatchGenericExecution = useCallback(() => {
-    if (!ws || !configuredExecutionSession || !hasValidExecutionDefault) return;
-    const prompt = t(
-      'session.execution.genericPrompt',
-      'Please carry out the requested implementation/execution work in this session.',
-    );
-    ws.sendSessionMessage(configuredExecutionSession, prompt);
-  }, [ws, configuredExecutionSession, hasValidExecutionDefault, t]);
 
   // ── OpenSpec left-panel Execute dropdown routing (task 2.4) ──────────────
   // Unlike the GENERIC dropdown, the OpenSpec Execute dropdown is an ACTION +
@@ -2606,6 +2594,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       pendingConfigOverrideRef.current = null;
       if (divRef.current) divRef.current.textContent = '';
       setHasText(false);
+      publishComposerText('');
       setMobileComposerExpanded(false);
       setMobileComposerMultiline(false);
       setAttachments([]);
@@ -2688,7 +2677,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (options?.clearComposer) {
       clearComposerState();
     }
-  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -2701,6 +2690,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (editingQueuedMessageId === entry.clientMessageId || (!editingQueuedMessageId && getText() === entry.text)) {
       if (divRef.current) divRef.current.textContent = '';
       setHasText(false);
+      publishComposerText('');
       setMobileComposerExpanded(false);
       setMobileComposerMultiline(false);
     }
@@ -2717,7 +2707,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     } catch {
       /* ignore */
     }
-  }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, isLocalQueuedEntry, sendQueuedMessageMutation]);
+  }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, isLocalQueuedEntry, publishComposerText, sendQueuedMessageMutation]);
 
   const handleQueuedMessageRetry = useCallback((entry: LocalQueuedTransportEntry) => {
     if (entry.status !== 'failed') return;
@@ -4316,59 +4306,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           />
         </div>
 
-        {/* Generic execution-session (🤖▾) dropdown — distinct from the ⚡ quick
-            input trigger above. Dispatches the GENERIC execution prompt to the
-            configured execution session, or opens the Team Settings execution
-            routing section. It NEVER mutates the preference and NEVER adds
-            OpenSpec-specific wording. */}
-        {!compact && !isShellLike && activeSession && (
-          <div class="shortcuts-model exec-session-menu-wrap" ref={execMenuRef}>
-            <button
-              type="button"
-              class="qp-trigger exec-session-trigger"
-              title={t('openspec.auto.execution_session', 'Execution session')}
-              aria-label={t('openspec.auto.execution_session', 'Execution session')}
-              aria-haspopup="menu"
-              aria-expanded={execMenuOpen}
-              onClick={() => setExecMenuOpen((o) => !o)}
-            >
-              <span aria-hidden="true">🤖</span>
-              <span aria-hidden="true" style={{ fontSize: 9, marginLeft: 1 }}>▾</span>
-            </button>
-            {execMenuOpen && (
-              <div class="menu-dropdown" role="menu">
-                <button
-                  type="button"
-                  role="menuitem"
-                  class="menu-item"
-                  disabled={!hasValidExecutionDefault}
-                  data-testid="exec-menu-use-configured"
-                  onClick={() => {
-                    setExecMenuOpen(false);
-                    dispatchGenericExecution();
-                  }}
-                >
-                  {hasValidExecutionDefault && executionSessionDisplayName
-                    ? t('session.execution.useConfigured', 'use {{name}}', { name: executionSessionDisplayName })
-                    : t('session.execution.useConfiguredNone', 'use execution session')}
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  class="menu-item"
-                  data-testid="exec-menu-set-session"
-                  onClick={() => {
-                    setExecMenuOpen(false);
-                    openP2pConfigPanel('execution');
-                  }}
-                >
-                  {t('session.execution.setSession', 'set execution session…')}
-                </button>
-              </div>
-            )}
-          </div>
-        )}
-
         {/* @ mention picker */}
         {atPickerOpen && ws && activeSession && (
           <AtPicker
@@ -4511,6 +4448,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             onInput={() => {
               const currentText = divRef.current?.textContent ?? '';
               setHasText(!!currentText.trim());
+              publishComposerText(currentText);
               syncMobileComposerMetrics();
               if (sendWarning) clearSendWarning();
               if (atSelectionLockRef.current && currentText !== atSelectionSnapshotRef.current) {

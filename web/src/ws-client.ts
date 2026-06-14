@@ -897,6 +897,14 @@ export class WsClient {
     this.send({ type: command === 'cancel' ? DAEMON_COMMAND_TYPES.SESSION_CANCEL : `session.${command}`, ...payload });
   }
 
+  sendExecutionClones(payload: object = {}): void {
+    const sessionName = (payload as { sessionName?: unknown }).sessionName;
+    if (typeof sessionName === 'string' && sessionName.trim()) {
+      this.setP2pWorkflowRequestScope({ sessionName });
+    }
+    this.send({ type: DAEMON_COMMAND_TYPES.SESSION_EXECUTION_CLONES, ...payload });
+  }
+
   /**
    * Globally delete (hide) one timeline message for every viewer of this session.
    * The daemon re-emits the event with hidden:true — persisted (JSONL + SQLite) and

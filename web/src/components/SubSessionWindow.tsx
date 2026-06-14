@@ -26,6 +26,7 @@ import { extractLatestUsage } from '../usage-data.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
 import { resolveSubSessionRuntimeType } from '../runtime-type.js';
 import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
 import {
@@ -88,7 +89,15 @@ interface Props {
   /** Optional: called to pin this sub-session to the sidebar. Passes current viewMode. */
   onPin?: (viewMode: 'terminal' | 'chat') => void;
   sessions?: SessionInfo[];
-  subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
+  subSessions?: Array<{
+    sessionName: string;
+    type: string;
+    label?: string | null;
+    state: string;
+    parentSession?: string | null;
+    executionTemplateEligible?: boolean;
+    executionTemplateIneligibleReason?: string;
+  }>;
   serverId?: string;
   pendingPrefillText?: string | null;
   onPendingPrefillApplied?: () => void;
@@ -294,6 +303,9 @@ export function SubSessionWindow({
 
   const [quotes, setQuotes] = useState<string[]>([]);
   const [syncingMemorySummaries, setSyncingMemorySummaries] = useState(false);
+  const [composerText, setComposerText] = useState('');
+  const [executionClonesBusy, setExecutionClonesBusy] = useState(false);
+  const executionRouting = useExecutionRouting(serverId ?? null);
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
 
@@ -461,6 +473,57 @@ export function SubSessionWindow({
       ?? parent?.contextNamespace?.projectId
       ?? null;
   }, [sessions, sub.contextNamespace?.projectId, sub.parentSession]);
+
+  const executionTemplateDisplayName = useMemo(() => {
+    const template = executionRouting.templateSessionName;
+    if (!template) return null;
+    const candidateSub = subSessions?.find((item) => item.sessionName === template);
+    if (candidateSub) return candidateSub.label || candidateSub.sessionName.split('_').pop() || candidateSub.sessionName;
+    const main = sessions?.find((item) => item.name === template);
+    if (main) return main.label || main.name.split('_').pop() || main.name;
+    return null;
+  }, [executionRouting.templateSessionName, sessions, subSessions]);
+  const hasValidExecutionTemplate = Boolean(
+    executionRouting.enabled
+    && executionRouting.templateSessionName
+    && executionTemplateDisplayName
+    && executionRouting.templateSessionName !== sub.sessionName,
+  );
+  const executionCloneCount = executionRouting.limits.maxParallelClones;
+  const runExecutionClonesTitle = !connected || !ws
+    ? t('chat.execution_clone_run_offline')
+    : !hasValidExecutionTemplate
+      ? t('chat.execution_clone_run_no_template')
+      : !(composerText.trim() || inputRef.current?.textContent?.trim())
+        ? t('chat.execution_clone_run_empty')
+        : t('chat.execution_clone_run_with_template', {
+            count: executionCloneCount,
+            name: executionTemplateDisplayName,
+          });
+  const handleRunExecutionClones = useCallback(() => {
+    const text = (inputRef.current?.textContent ?? composerText).trim();
+    if (!ws || !connected || !hasValidExecutionTemplate || !executionRouting.templateSessionName || !text) return;
+    const commandId = globalThis.crypto?.randomUUID?.()
+      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    setExecutionClonesBusy(true);
+    try {
+      ws.sendExecutionClones({
+        sessionName: sub.sessionName,
+        text,
+        commandId,
+        dedicatedExecutionRouting: {
+          enabled: true,
+          templateSessionName: executionRouting.templateSessionName,
+          maxParallelClones: executionRouting.limits.maxParallelClones,
+          maxQueuedClones: executionRouting.limits.maxQueuedClones,
+          cloneHardTimeoutMs: executionRouting.limits.cloneHardTimeoutMs,
+          cloneRetentionMs: executionRouting.limits.cloneRetentionMs,
+        },
+      });
+    } finally {
+      window.setTimeout(() => setExecutionClonesBusy(false), 1200);
+    }
+  }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, sub.sessionName, ws]);
 
   const handleSyncMemorySummaries = useCallback(async () => {
     if (!ws || !connected || syncingMemorySummaries) return;
@@ -877,6 +940,17 @@ export function SubSessionWindow({
           onSyncMemorySummaries={handleSyncMemorySummaries}
           syncMemorySummariesBusy={syncingMemorySummaries}
           syncMemorySummariesDisabled={!connected || !ws || syncingMemorySummaries}
+          onRunExecutionClones={handleRunExecutionClones}
+          runExecutionClonesBusy={executionClonesBusy}
+          runExecutionClonesDisabled={
+            executionClonesBusy
+            || !connected
+            || !ws
+            || !hasValidExecutionTemplate
+            || !(composerText.trim() || inputRef.current?.textContent?.trim())
+          }
+          runExecutionClonesTitle={runExecutionClonesTitle}
+          runExecutionClonesCount={executionCloneCount}
         />
       )}
 
@@ -933,6 +1007,7 @@ export function SubSessionWindow({
         pendingPrefillText={pendingPrefillText}
         onPendingPrefillApplied={onPendingPrefillApplied}
         onVersionSensitiveAction={onVersionSensitiveAction}
+        onComposerTextChange={setComposerText}
       />
       </div>
 

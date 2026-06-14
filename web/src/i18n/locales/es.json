@@ -342,7 +342,12 @@
         "fangsong": "FangSong",
         "microsoft-jhenghei": "Microsoft JhengHei"
       }
-    }
+    },
+    "execution_clone_run": "Ejecutar la tarea actual con clones de ejecución",
+    "execution_clone_run_with_template": "Ejecutar la tarea actual con {{count}} clon(es) de {{name}}",
+    "execution_clone_run_no_template": "Activa y elige una sesión de ejecución en la configuración del equipo",
+    "execution_clone_run_empty": "Escribe una tarea primero",
+    "execution_clone_run_offline": "Vuelve a conectar antes de ejecutar clones"
   },
   "session": {
     "restart": "↺ Reiniciar",

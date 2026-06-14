@@ -40,6 +40,12 @@ interface Props {
   onSyncMemorySummaries?: () => void;
   syncMemorySummariesBusy?: boolean;
   syncMemorySummariesDisabled?: boolean;
+  /** Dispatches the current composer task to dedicated execution clones. */
+  onRunExecutionClones?: () => void;
+  runExecutionClonesBusy?: boolean;
+  runExecutionClonesDisabled?: boolean;
+  runExecutionClonesTitle?: string;
+  runExecutionClonesCount?: number;
 }
 
 const fmt = (n: number) =>
@@ -47,7 +53,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount }: Props) {
   const { t } = useTranslation();
   // Wrench pill: tri-state toggle for "show developer details in chat timeline".
   // Sourced from usePref → SharedResource, so this UsageFooter and ChatView
@@ -257,6 +263,21 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           </span>
         )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          {onRunExecutionClones && (
+            <button
+              type="button"
+              class={`shortcut-btn shortcut-btn-icon shortcut-btn-execution-clones${runExecutionClonesBusy ? ' is-busy' : ''}`}
+              title={runExecutionClonesTitle ?? t('chat.execution_clone_run')}
+              aria-label={runExecutionClonesTitle ?? t('chat.execution_clone_run')}
+              disabled={runExecutionClonesDisabled}
+              onClick={onRunExecutionClones}
+            >
+              <span aria-hidden="true">🤖</span>
+              {runExecutionClonesCount && runExecutionClonesCount > 1 ? (
+                <span class="shortcut-btn-mini-count" aria-hidden="true">×{runExecutionClonesCount}</span>
+              ) : null}
+            </button>
+          )}
           {onSyncMemorySummaries && (
             <button
               type="button"

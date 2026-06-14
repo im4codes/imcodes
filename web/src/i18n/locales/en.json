@@ -342,7 +342,12 @@
         "fangsong": "FangSong",
         "microsoft-jhenghei": "Microsoft JhengHei"
       }
-    }
+    },
+    "execution_clone_run": "Run current task with execution clones",
+    "execution_clone_run_with_template": "Run current task with {{count}} clone(s) of {{name}}",
+    "execution_clone_run_no_template": "Enable and select an execution session in Team settings first",
+    "execution_clone_run_empty": "Type a task first",
+    "execution_clone_run_offline": "Reconnect before running execution clones"
   },
   "session": {
     "restart": "↺ Restart",

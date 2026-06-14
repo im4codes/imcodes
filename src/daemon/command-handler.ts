@@ -152,9 +152,12 @@ import {
 } from './openspec-auto-deliver-orchestrator.js';
 import { SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
 import {
+  EXECUTION_CLONE_KIND,
+  EXECUTION_CLONE_PARENT_STAGES,
   parseDedicatedExecutionRoutingPreference,
   type DedicatedExecutionRoutingGlobalPreference,
 } from '../../shared/execution-clone.js';
+import { dispatchSendMessage } from './send-tool.js';
 import { getP2pConfigStoreScope, handleSessionGroupCloneCancel, handleSessionGroupCloneCommand } from './session-group-clone.js';
 import { buildDefaultP2pStaticPolicy } from '../../shared/p2p-workflow-policy.js';
 import {
@@ -1344,6 +1347,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case DAEMON_COMMAND_TYPES.SESSION_CANCEL:
       void handleSessionCancel(cmd, serverLink);
+      break;
+    case DAEMON_COMMAND_TYPES.SESSION_EXECUTION_CLONES:
+      void handleSessionExecutionClones(cmd, serverLink);
       break;
     case SESSION_GROUP_CLONE_MSG.START:
       void handleSessionGroupCloneCommand(cmd, serverLink);
@@ -2616,6 +2622,104 @@ export async function prepareAdvancedWorkflowLaunch(options: {
 
 function summarizeP2pWorkflowDiagnostics(diagnostics: P2pWorkflowDiagnostic[]): string {
   return diagnostics.map((diagnostic) => diagnostic.code).join(', ') || 'invalid_launch_envelope';
+}
+
+function buildGenericExecutionCloneWorkerPrompt(userTask: string, workerIndex: number, workerTotal: number): string {
+  return [
+    `You are execution clone worker ${workerIndex}/${workerTotal} for a generic execution request.`,
+    '',
+    'Execute the current user task independently in this cloned execution session.',
+    'Do not wait for other workers. If safe, make the needed changes directly; if the task is not safely splittable or you hit a blocker, report that clearly instead of inventing progress.',
+    'When finished, reply to the creator with a concise summary, files changed, tests run, and any blockers.',
+    '',
+    'Current user task:',
+    userTask,
+  ].join('\n');
+}
+
+async function handleSessionExecutionClones(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = (cmd.sessionName ?? cmd.session) as string | undefined;
+  const text = typeof cmd.text === 'string' ? cmd.text.trim() : '';
+  const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim()
+    ? cmd.commandId.trim()
+    : randomUUID();
+
+  const fail = (error: string) => {
+    if (!sessionName) return;
+    emitCommandAck(sessionName, commandId, 'error', error, serverLink);
+  };
+
+  if (!sessionName || !text) {
+    logger.warn('session.execution_clones: missing sessionName or text');
+    return;
+  }
+
+  const callerRecord = getSession(sessionName);
+  if (!callerRecord) {
+    fail('caller session not found');
+    return;
+  }
+
+  const routing = normalizeDedicatedExecutionRoutingPayload((cmd as any).dedicatedExecutionRouting);
+  if (!routing?.enabled || !routing.templateSessionName) {
+    fail('execution template is not configured');
+    return;
+  }
+  const templateSessionName = routing.templateSessionName;
+
+  const pref = {
+    ...routing.limits,
+    enabled: true,
+  };
+  const workerTotal = Math.max(1, pref.maxParallelClones);
+  const parentRunId = `generic-execution-${commandId}`;
+  const parentStage = EXECUTION_CLONE_PARENT_STAGES[0];
+  const owningMainSessionName = callerRecord.parentSession ?? callerRecord.name;
+  const projectName = callerRecord.projectName ?? getSession(owningMainSessionName)?.projectName ?? null;
+
+  const results = await Promise.allSettled(
+    Array.from({ length: workerTotal }, async (_, index) => dispatchSendMessage(
+      {
+        userId: 'web',
+        sessionName,
+        projectName,
+        projectRoot: callerRecord.projectDir ?? null,
+      },
+      {
+        target: templateSessionName,
+        message: buildGenericExecutionCloneWorkerPrompt(text, index + 1, workerTotal),
+        reply: true,
+        idempotencyKey: `${commandId}:${index + 1}`,
+        clone: {
+          kind: EXECUTION_CLONE_KIND,
+          ephemeral: true,
+          parentRunId,
+          parentStage,
+        },
+      },
+      {
+        resolveExecutionCloneLimits: () => pref,
+      },
+    )),
+  );
+
+  const accepted = results.filter((result) => (
+    result.status === 'fulfilled' && result.value.status === 'accepted'
+  )).length;
+  if (accepted > 0) {
+    emitCommandAck(sessionName, commandId, 'accepted', undefined, serverLink);
+    return;
+  }
+
+  const firstError = results.find((result) => result.status === 'fulfilled' && result.value.status === 'error');
+  if (firstError?.status === 'fulfilled' && firstError.value.status === 'error') {
+    fail(firstError.value.error);
+    return;
+  }
+  const rejected = results.find((result) => result.status === 'rejected');
+  fail(rejected?.status === 'rejected'
+    ? (rejected.reason instanceof Error ? rejected.reason.message : String(rejected.reason))
+    : 'execution clone dispatch failed');
 }
 
 async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {

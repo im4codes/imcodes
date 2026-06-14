@@ -408,6 +408,10 @@ html.native-ios-mac .chat-dl-btn {
 .shortcut-btn-memory-sync { font-size: 14px; line-height: 1; border-color: rgba(125,211,252,0.18); color: #93c5fd; }
 .shortcut-btn-memory-sync:hover:not(:disabled) { background: rgba(8,145,178,0.14); border-color: rgba(34,211,238,0.46); color: #bfdbfe; }
 .shortcut-btn-memory-sync.is-busy { animation: shortcut-btn-memory-sync-spin 0.9s linear infinite; }
+.shortcut-btn-execution-clones { position: relative; font-size: 13px; line-height: 1; border-color: rgba(168,85,247,0.32); color: #ddd6fe; }
+.shortcut-btn-execution-clones:hover:not(:disabled) { background: rgba(88,28,135,0.22); border-color: rgba(192,132,252,0.62); color: #f5f3ff; box-shadow: 0 0 12px rgba(168,85,247,0.14), inset 0 1px 0 rgba(255,255,255,0.05); }
+.shortcut-btn-execution-clones.is-busy { animation: shortcut-btn-tools-pulse 1.4s ease-in-out infinite; }
+.shortcut-btn-mini-count { position: absolute; right: -5px; bottom: -4px; padding: 0 3px; min-width: 12px; height: 12px; border-radius: 999px; background: rgba(88,28,135,0.95); border: 1px solid rgba(216,180,254,0.72); color: #f5f3ff; font-size: 8px; line-height: 10px; font-weight: 700; }
 @keyframes shortcut-btn-memory-sync-spin {
   to { transform: rotate(360deg); }
 }

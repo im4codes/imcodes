@@ -342,7 +342,12 @@
         "fangsong": "FangSong",
         "microsoft-jhenghei": "Microsoft JhengHei"
       }
-    }
+    },
+    "execution_clone_run": "実行クローンで現在のタスクを実行",
+    "execution_clone_run_with_template": "{{name}} のクローン {{count}} 個で現在のタスクを並列実行",
+    "execution_clone_run_no_template": "Team 設定で実行セッションを有効化して選択してください",
+    "execution_clone_run_empty": "先にタスクを入力してください",
+    "execution_clone_run_offline": "再接続してから実行クローンを起動してください"
   },
   "session": {
     "restart": "↺ 再起動",
