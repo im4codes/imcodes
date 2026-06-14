@@ -1769,7 +1769,10 @@ describe('p2p-workflow reverse-regression', () => {
       "Props.initialTab must include 'advanced' so callers can open directly on the canvas tab",
     ).toBe(true);
     expect(
-      /useState<'participants'\s*\|\s*'combos'\s*\|\s*'advanced'>/.test(file.text),
+      // Match the required members in order but allow the union to carry
+      // additional tabs after 'advanced' (e.g. 'execution') — the guarantee is
+      // that 'advanced' is a valid activeTab value, not that it is the last.
+      /useState<'participants'\s*\|\s*'combos'\s*\|\s*'advanced'(?:\s*\|\s*'[^']+')*>/.test(file.text),
       "activeTab useState type union must include 'advanced'",
     ).toBe(true);
 
