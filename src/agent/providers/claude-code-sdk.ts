@@ -183,6 +183,12 @@ type ClaudeTaskLifecycleMessage = SDKMessage & {
   [key: string]: unknown;
 };
 
+type ClaudeThinkingTokensMessage = {
+  type: 'system';
+  subtype: 'thinking_tokens';
+  estimated_tokens?: number;
+};
+
 function collectAssistantText(message: SDKMessage): string {
   if (message.type !== 'assistant' || !Array.isArray(message.message.content)) return '';
   return message.message.content
@@ -691,14 +697,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       return;
     }
 
-    if (msg.type === 'system' && msg.subtype === 'thinking_tokens') {
+    if (this.isClaudeThinkingTokensMessage(msg)) {
       // Live thinking-token progress (claude-agent-sdk >= 0.3.x). During the
       // redacted-thinking phase the model emits no visible output — only this
       // running estimate — so surface it as a `thinking` status to drive the
       // footer/pill spinner. Approximate (not the billed output_tokens);
       // emitStatus dedups by label so only meaningful changes propagate.
-      const estimated = typeof msg.estimated_tokens === 'number' && msg.estimated_tokens > 0
-        ? msg.estimated_tokens
+      const thinkingTokensMessage = msg as unknown as ClaudeThinkingTokensMessage;
+      const estimated = typeof thinkingTokensMessage.estimated_tokens === 'number' && thinkingTokensMessage.estimated_tokens > 0
+        ? thinkingTokensMessage.estimated_tokens
         : 0;
       const compact = estimated >= 1000 ? `${Math.round(estimated / 100) / 10}k` : `${estimated}`;
       this.emitStatus(sessionId, state, {
@@ -1551,6 +1558,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (msg.type !== 'system') return false;
     const subtype = (msg as { subtype?: unknown }).subtype;
     return typeof subtype === 'string' && CLAUDE_RUNTIME_SUBAGENT_SYSTEM_SUBTYPES.has(subtype);
+  }
+
+  private isClaudeThinkingTokensMessage(msg: SDKMessage): boolean {
+    return msg.type === 'system'
+      && (msg as { subtype?: unknown }).subtype === 'thinking_tokens';
   }
 
   private isToolBlock(block: unknown): block is ClaudeToolBlock {
