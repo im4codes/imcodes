@@ -42,17 +42,17 @@ export const FILE_TRANSFER_LIMITS = {
   /** Server waits this long for daemon download response (ms). */
   DOWNLOAD_TIMEOUT_MS: 300_000,
   /** Per-attempt wait for the daemon's download stream to START delivering bytes
-   *  (ms). Long enough to catch a relay that becomes ready a few seconds in
-   *  (e.g. ~4s), NOT so short it abandons a relay that would have worked. Only
-   *  large files take the relay (small files return inline). Combined with
-   *  DOWNLOAD_STREAM_MAX_ATTEMPTS, the relay gets several chances before the
-   *  base64 fallback. */
-  DOWNLOAD_STREAM_READY_TIMEOUT_MS: 4_000,
-  /** How many times the server retries the streaming relay (each waiting
-   *  DOWNLOAD_STREAM_READY_TIMEOUT_MS) before falling back to base64. Retrying
-   *  with a fresh attempt recovers a relay whose first PUT wedged, while a ready
-   *  relay still returns as soon as bytes flow. */
-  DOWNLOAD_STREAM_MAX_ATTEMPTS: 2,
+   *  (ms). Kept short so a wedged attempt is abandoned quickly and a fresh one
+   *  started — the relay is re-tried at this cadence rather than stalled on a
+   *  single long wait. A ready relay still returns the instant the first byte
+   *  lands (this is only the give-up-and-retry threshold). Only large files take
+   *  the relay (small files return inline). */
+  DOWNLOAD_STREAM_READY_TIMEOUT_MS: 2_000,
+  /** How many times the server tries the streaming relay (one fresh attempt
+   *  every DOWNLOAD_STREAM_READY_TIMEOUT_MS) before falling back to base64. With
+   *  the 2s cadence this spans ~8s of retries, recovering a relay that wedges on
+   *  early attempts but becomes ready a few seconds in. */
+  DOWNLOAD_STREAM_MAX_ATTEMPTS: 4,
   /** Files at or below this size are returned INLINE (base64 over the daemon WS)
    *  in a single round-trip instead of through the streaming relay. The relay's
    *  PUT round-trip + readiness handshake adds latency that dominates for small
