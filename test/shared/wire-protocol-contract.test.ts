@@ -74,6 +74,7 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       DAEMON_UPGRADE: 'daemon.upgrade',
       SERVER_DELETE: 'server.delete',
       SESSION_CANCEL: 'session.cancel',
+      SESSION_EXECUTION_CLONES: 'session.execution_clones',
       SESSION_UPDATE_TRANSPORT_CONFIG: 'session.update_transport_config',
       SUBSESSION_UPDATE_TRANSPORT_CONFIG: 'subsession.update_transport_config',
     });
