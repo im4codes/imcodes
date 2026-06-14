@@ -8,6 +8,7 @@ import { GeminiDriver } from './drivers/gemini.js';
 import type { AgentDriver } from './drivers/base.js';
 import type { AgentType } from './detect.js';
 import { isTransportAgent } from './detect.js';
+import { buildTransportResumeLaunchOpts } from './transport-resume-opts.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import { TransportSessionRuntime } from './transport-session-runtime.js';
 import { ensureProviderConnected, getProvider } from './provider-registry.js';
@@ -2172,6 +2173,51 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // queue has been fully transferred into the runtime. See the matching
   // change in `restoreTransportSessions` above for the full rationale.
   await drainTransportResendQueueIntoRuntime(runtime, name, 'launch');
+}
+
+const pendingResendRelaunches = new Set<string>();
+
+/**
+ * Ensure a transport session that has NO live, provider-bound runtime gets
+ * (re)launched so its transport resend queue drains. This mirrors the recovery
+ * the manual send path performs inline (command-handler: enqueueResend +
+ * `runExclusiveSessionRelaunch` → `resumeTransportRuntimeAfterLoss`).
+ *
+ * Callers that deliver OUTSIDE that send path MUST call this after enqueueing to
+ * resend — notably the Auto-Deliver orchestrator targeting a *deferred* transport
+ * sub-session. `rebuildSubSessions` defers sub-session runtimes until first send
+ * ("rebuild deferred until first send"), so a sub may have no runtime at all;
+ * without this, an Auto-Deliver prompt enqueued to resend would sit there forever
+ * because nothing ever creates the runtime to fire the drain. This is exactly why
+ * manual sends delivered but Auto-Deliver stuck in the queue.
+ *
+ * No-ops when the runtime is already bound. De-duped per session; the launch
+ * coalescing inside `launchTransportSession` (which drains the resend queue on
+ * success) is the final concurrency guard.
+ */
+export async function ensureTransportRuntimeForPendingResend(sessionName: string): Promise<void> {
+  if (pendingResendRelaunches.has(sessionName)) return;
+  const record = getSession(sessionName);
+  if (!record || !isTransportAgent(record.agentType as AgentType)) return;
+  const runtime = getTransportRuntime(sessionName);
+  if (runtime && runtime.providerSessionId) return; // already bound — nothing to recover
+  pendingResendRelaunches.add(sessionName);
+  try {
+    if (runtime) {
+      // Registered but unbound (half-dead — e.g. post-cancel / mid-init error):
+      // preserve its queued work into resend and stop it before relaunch.
+      const preservation = preserveTransportRuntimeQueuesToResend(sessionName, runtime);
+      if (preservation.preservedCount > 0) {
+        logger.info({ sessionName, ...preservation }, 'preserved transport runtime queues before pending-resend relaunch');
+      }
+      await stopTransportRuntimeSession(sessionName).catch(() => {});
+    }
+    await launchTransportSession(buildTransportResumeLaunchOpts(record));
+  } catch (err) {
+    logger.error({ err, sessionName }, 'ensureTransportRuntimeForPendingResend failed');
+  } finally {
+    pendingResendRelaunches.delete(sessionName);
+  }
 }
 
 export async function launchSession(opts: LaunchOpts): Promise<void> {

@@ -3,6 +3,7 @@
  * Commands arrive as JSON objects with a `type` field.
  */
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, stopTransportRuntimeSession, type ProjectConfig } from '../agent/session-manager.js';
+import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
@@ -714,28 +715,9 @@ async function resumeTransportRuntimeAfterLoss(record: SessionRecord): Promise<v
     }
   }
   await stopTransportRuntimeSession(record.name).catch(() => {});
-  await launchTransportSession({
-    name: record.name,
-    projectName: record.projectName,
-    role: record.role,
-    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' | 'kimi-sdk',
-    projectDir: record.projectDir,
-    label: record.label,
-    description: record.description,
-    requestedModel: record.requestedModel,
-    effort: record.effort,
-    transportConfig: record.transportConfig,
-    ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
-    // Thread resume ids back so the provider reuses the same conversation.
-    ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
-    ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
-    ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk' || record.agentType === 'kimi-sdk') && record.providerResumeId
-      ? { providerResumeId: record.providerResumeId } : {}),
-    ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
-    ...(record.agentType === 'qwen' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
-    ...(record.parentSession ? { parentSession: record.parentSession } : {}),
-    ...(record.userCreated ? { userCreated: true } : {}),
-  });
+  // Resume opts (provider resume ids threaded back) are built by the shared
+  // session-manager helper — also used by ensureTransportRuntimeForPendingResend.
+  await launchTransportSession(buildTransportResumeLaunchOpts(record));
 }
 
 function getSupportedEffortLevels(agentType: string | undefined): readonly TransportEffortLevel[] {

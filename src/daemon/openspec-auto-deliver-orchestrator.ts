@@ -5,7 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { getSession } from '../store/session-store.js';
-import { getTransportRuntime } from '../agent/session-manager.js';
+import { getTransportRuntime, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import {
@@ -338,6 +338,14 @@ function queueAutoDeliverPromptForTransportResend(
   });
   const queued = getResendEntries(run.targetImplementationSessionName);
   emitAutoDeliverQueuedState(run.targetImplementationSessionName, queued);
+  // Trigger the runtime (re)launch so the resend queue actually drains. Manual
+  // sends do this inline (command-handler); Auto-Deliver delivers outside that
+  // path, so without this an enqueued prompt for a transport session with no
+  // live runtime — notably a DEFERRED sub-session (rebuildSubSessions defers sub
+  // runtimes until first send) — would sit in resend until the next restart.
+  // No-ops when a bound runtime already exists; launchTransportSession drains
+  // the resend queue on success. This is the sub-session "对齐" with manual send.
+  void ensureTransportRuntimeForPendingResend(run.targetImplementationSessionName);
   run.evidence = mergeEvidence(run.evidence, [{
     source: 'daemon',
     summary: `Auto Deliver prompt queued for transport resend after send was not immediately available: ${reason}.`,

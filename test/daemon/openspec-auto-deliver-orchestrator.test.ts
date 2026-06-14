@@ -25,11 +25,12 @@ interface MockP2pRun {
   error?: string | null;
 }
 
-const { getSessionMock, listSessionsMock, getSavedP2pConfigMock, getTransportRuntimeMock, serverLinkMock, transportSendMock, transportSettleExternalMock, p2pRuns, startP2pRunMock, getP2pRunMock, listP2pRunsMock, cancelP2pRunMock } = vi.hoisted(() => ({
+const { getSessionMock, listSessionsMock, getSavedP2pConfigMock, getTransportRuntimeMock, ensureTransportRuntimeForPendingResendMock, serverLinkMock, transportSendMock, transportSettleExternalMock, p2pRuns, startP2pRunMock, getP2pRunMock, listP2pRunsMock, cancelP2pRunMock } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   listSessionsMock: vi.fn(),
   getSavedP2pConfigMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
+  ensureTransportRuntimeForPendingResendMock: vi.fn(async () => {}),
   serverLinkMock: { send: vi.fn() },
   transportSendMock: vi.fn(() => 'sent'),
   transportSettleExternalMock: vi.fn(() => true),
@@ -55,6 +56,7 @@ vi.mock('../../src/store/p2p-config-store.js', () => ({
 
 vi.mock('../../src/agent/session-manager.js', () => ({
   getTransportRuntime: getTransportRuntimeMock,
+  ensureTransportRuntimeForPendingResend: ensureTransportRuntimeForPendingResendMock,
 }));
 
 vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
@@ -448,6 +450,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
       send: transportSendMock,
       settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
     }));
+    ensureTransportRuntimeForPendingResendMock.mockClear();
     clearAllResend();
     clearOpenSpecAutoDeliverRunsForTests();
     getSessionMock.mockImplementation((name: string) => ({
@@ -2138,6 +2141,11 @@ exec "${realGit}" "$@"
       && String(call[0]?.projection?.evidence?.map((entry: { summary?: string }) => entry.summary).join('\n') ?? '')
         .includes('Auto Deliver prompt queued for transport resend'),
     )).toBe(true);
+    // Regression: queueing to resend MUST also trigger a runtime (re)launch so
+    // the queue actually drains — without this, Auto-Deliver to a transport
+    // session with no live runtime (notably a deferred sub-session) would sit
+    // in resend until the next restart while manual sends worked.
+    expect(ensureTransportRuntimeForPendingResendMock).toHaveBeenCalledWith('deck_demo_brain');
   });
 
   it('feeds final acceptance REWORK back into implementation repair before extending audit rounds', async () => {
