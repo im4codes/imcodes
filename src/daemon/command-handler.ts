@@ -117,7 +117,7 @@ import {
   recordRecentInjection,
   clearRecentInjectionHistory,
 } from '../context/recent-injection-history.js';
-import { CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
@@ -6068,46 +6068,6 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
     return;
   }
 
-  // ── Auto-upgrade cooldown ─────────────────────────────────────────────────
-  // Server pushes `daemon.upgrade` whenever it sees a new dev tag on the
-  // npm registry. With CI publishing every ~5 min during active dev work,
-  // four daemons each restarting on every tag = ~7 s offline × 4 boxes
-  // every few minutes, which a human operator perceives as "always
-  // offline". Bypassed when the operator names a specific targetVersion.
-  // Sentinel: ~/.imcodes/last-upgrade-at, updated by upgrade.sh.
-  try {
-    const { homedir: _homedir } = await import('os');
-    const { join: _join } = await import('path');
-    const { readFileSync: _readFile } = await import('fs');
-    const sentinelPath = _join(_homedir(), '.imcodes', 'last-upgrade-at');
-    const verdict = evaluateAutoUpgradeCooldown({
-      targetVersion,
-      cooldownMs: parseInt(
-        process.env.IMCODES_UPGRADE_COOLDOWN_MS ?? String(10 * 60 * 1000),
-        10,
-      ),
-      readSentinel: () => {
-        try { return _readFile(sentinelPath, 'utf8'); } catch { return null; }
-      },
-    });
-    if (verdict.onCooldown) {
-      logger.info({
-        targetVersion,
-        lastUpgradeAt: verdict.lastAt,
-        cooldownRemainingMs: verdict.remainingMs,
-      }, 'daemon.upgrade: auto-upgrade declined (cooldown active)');
-      try {
-        serverLink?.send({
-          type: DAEMON_MSG.UPGRADE_BLOCKED,
-          reason: 'cooldown_active',
-          cooldownRemainingMs: verdict.remainingMs,
-          lastUpgradeAt: verdict.lastAt,
-        });
-      } catch { /* ignore */ }
-      return;
-    }
-  } catch { /* defensive — never block the upgrade on a sentinel read error */ }
-
   const activeRuns = getActiveP2pRunsBlockingDaemonUpgrade();
   if (activeRuns.length > 0) {
     logger.warn({
@@ -6201,6 +6161,48 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
     } catch { /* ignore */ }
     return;
   }
+
+  // ── Auto-upgrade cooldown (LAST gate before upgrading) ────────────────────
+  // Server pushes `daemon.upgrade` whenever it sees a new dev tag on the npm
+  // registry. With CI publishing every ~5 min during active dev work, daemons
+  // restarting on every tag = repeated ~7 s offline windows, perceived as
+  // "always offline". Bypassed when the operator names a specific
+  // targetVersion. Sentinel: ~/.imcodes/last-upgrade-at, updated by upgrade.sh.
+  // Checked AFTER the active-work gates above: those are more important and
+  // must report their specific block reason rather than being preempted by a
+  // recent-upgrade cooldown.
+  try {
+    const { homedir: _homedir } = await import('os');
+    const { join: _join } = await import('path');
+    const { readFileSync: _readFile } = await import('fs');
+    const sentinelPath = _join(_homedir(), '.imcodes', 'last-upgrade-at');
+    const verdict = evaluateAutoUpgradeCooldown({
+      targetVersion,
+      cooldownMs: parseInt(
+        process.env.IMCODES_UPGRADE_COOLDOWN_MS ?? String(10 * 60 * 1000),
+        10,
+      ),
+      readSentinel: () => {
+        try { return _readFile(sentinelPath, 'utf8'); } catch { return null; }
+      },
+    });
+    if (verdict.onCooldown) {
+      logger.info({
+        targetVersion,
+        lastUpgradeAt: verdict.lastAt,
+        cooldownRemainingMs: verdict.remainingMs,
+      }, 'daemon.upgrade: auto-upgrade declined (cooldown active)');
+      try {
+        serverLink?.send({
+          type: DAEMON_MSG.UPGRADE_BLOCKED,
+          reason: 'cooldown_active',
+          cooldownRemainingMs: verdict.remainingMs,
+          lastUpgradeAt: verdict.lastAt,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
+  } catch { /* defensive — never block the upgrade on a sentinel read error */ }
 
   const { spawn } = await import('child_process');
   const { writeFileSync, readFileSync, mkdtempSync, existsSync } = await import('fs');
@@ -9255,8 +9257,14 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
   const { getProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
   let provider = getProvider(agentType);
 
-  // Auto-connect local providers if missing, so we can probe for models
-  if (!provider && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
+  // Passive list-models requests come from model pickers and page hydration.
+  // They must not start heavyweight provider runtimes; doing so on daemon
+  // startup/reconnect can spawn Codex app-server/Copilot/Cursor processes before
+  // the user has sent any message. Use a side-effect-free fallback unless the
+  // caller explicitly forces a live probe.
+  if (!provider && !force) return await loadPassiveTransportListModels(agentType);
+
+  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
     try {
       provider = await ensureProviderConnected(agentType, {});
     } catch (err) {
@@ -9266,6 +9274,51 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
 
   if (provider && typeof provider.listModels === 'function') {
     return await provider.listModels(force);
+  }
+  return { models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` };
+}
+
+function modelIdsToTransportModels(ids: readonly string[]): TransportListModelsResult['models'] {
+  return ids.map((id) => ({ id }));
+}
+
+async function loadPassiveTransportListModels(agentType: string): Promise<TransportListModelsResult> {
+  if (agentType === 'codex-sdk') {
+    const cfg = await getCodexRuntimeConfig({ probe: false }).catch(() => undefined);
+    const models = cfg?.models?.length
+      ? cfg.models.map((model) => ({
+        id: model.id,
+        ...(model.name ? { name: model.name } : {}),
+        ...(model.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
+      }))
+      : modelIdsToTransportModels(CODEX_MODEL_IDS);
+    return {
+      models,
+      defaultModel: cfg?.defaultModel ?? CODEX_MODEL_IDS[0],
+      ...(cfg?.planLabel ? { isAuthenticated: true } : {}),
+    };
+  }
+  if (agentType === 'claude-code-sdk') {
+    return {
+      models: modelIdsToTransportModels(CLAUDE_CODE_MODEL_IDS),
+      defaultModel: CLAUDE_CODE_MODEL_IDS[0],
+    };
+  }
+  if (agentType === 'qwen') {
+    return { models: modelIdsToTransportModels(QWEN_MODEL_IDS), defaultModel: QWEN_MODEL_IDS[0] };
+  }
+  if (agentType === 'gemini-sdk') {
+    return { models: modelIdsToTransportModels(GEMINI_MODEL_IDS), defaultModel: GEMINI_MODEL_IDS[0] };
+  }
+  if (agentType === 'copilot-sdk') {
+    const { COPILOT_FALLBACK_MODEL_IDS } = await import('../agent/copilot-runtime-config.js');
+    return {
+      models: modelIdsToTransportModels(COPILOT_FALLBACK_MODEL_IDS),
+      defaultModel: COPILOT_FALLBACK_MODEL_IDS[0],
+    };
+  }
+  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk') {
+    return { models: [] };
   }
   return { models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` };
 }
