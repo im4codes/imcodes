@@ -59,6 +59,11 @@ import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
 
 const DEFAULT_CODEX_SDK_STARTUP_MODEL = 'gpt-5.5';
 
+function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
+  return record.runtimeType === RUNTIME_TYPES.TRANSPORT
+    || isTransportAgent(record.agentType as AgentType);
+}
+
 function sanitizeCodexSdkStartupModel(value: string | null | undefined): string | undefined {
   const trimmed = value?.trim();
   if (!trimmed) return undefined;
@@ -372,21 +377,10 @@ export async function initOnStartup(): Promise<void> {
   } catch (err) {
     logger.warn({ err }, 'cleanupKnownTestTerminalSessions failed — daemon continues');
   }
-  // Fire-and-forget: preload the transformers.js feature-extraction pipeline
-  // so the first "Related history" semantic search doesn't pay the cold-load
-  // cost (hundreds of ms to a few seconds). `isEmbeddingAvailable` swallows
-  // errors internally, so a failure here just leaves the first real query to
-  // attempt the load and fall back to plain SQL search.
-  void (async () => {
-    try {
-      const { isEmbeddingAvailable } = await import('../context/embedding.js');
-      const startedAt = Date.now();
-      const ready = await isEmbeddingAvailable();
-      logger.info({ ready, elapsedMs: Date.now() - startedAt }, 'Embedding pipeline warmup');
-    } catch (err) {
-      logger.debug({ err }, 'Embedding pipeline warmup failed (non-fatal)');
-    }
-  })();
+  // Embedding warmup is intentionally scheduled by daemon lifecycle after the
+  // ServerLink startup grace window. Loading transformers here can occupy the
+  // Node main thread long enough for the server auth handshake to time out on
+  // session-heavy hosts.
 }
 
 /** Extract a UUID from tmux pane start command (supports --session-id and --resume). */
@@ -458,7 +452,7 @@ export async function restoreFromStore(): Promise<void> {
   // 1. Restart store sessions missing from tmux; start jsonl-watcher for live ones
   logger.debug({ totalSessions: all.length, liveTmux: live.length }, 'restoreFromStore: starting reconciliation');
   for (const s of all) {
-    if (s.runtimeType === RUNTIME_TYPES.TRANSPORT) {
+    if (isStoredTransportSession(s)) {
       // Handled by restoreTransportSessions() after provider connects
       continue;
     }
@@ -687,7 +681,7 @@ export async function restoreFromStore(): Promise<void> {
  */
 export async function restartSession(record: SessionRecord): Promise<boolean> {
   // Transport sessions are managed by the provider — no tmux restart logic applies.
-  if (record.runtimeType === RUNTIME_TYPES.TRANSPORT) {
+  if (isStoredTransportSession(record)) {
     logger.info({ session: record.name }, 'Skipping restart for transport session');
     return false;
   }
@@ -743,7 +737,7 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
  */
 export async function respawnSession(record: SessionRecord): Promise<boolean> {
   // Transport sessions have no tmux pane to respawn — not applicable.
-  if (record.runtimeType === RUNTIME_TYPES.TRANSPORT) {
+  if (isStoredTransportSession(record)) {
     logger.info({ session: record.name }, 'Skipping respawn for transport session');
     return false;
   }
@@ -1015,7 +1009,7 @@ export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): Da
     ...resendQueues.map((queue) => queue.sessionName),
   ]);
   for (const session of storeSessions()) {
-    if (session.runtimeType === RUNTIME_TYPES.TRANSPORT || isTransportAgent(session.agentType as AgentType)) {
+    if (isStoredTransportSession(session)) {
       sessionNames.add(session.name);
     }
   }
@@ -1065,16 +1059,26 @@ export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): Da
  * How many transport sessions to restore concurrently on startup / reconnect.
  * Each restore is ~1s of mostly-I/O wait (a 2.5s-timeout context bootstrap plus
  * the provider's resume RPC), so a sequential restore of ~30 sessions takes
- * ~30s of wall-clock before they are usable again. A handful in flight overlaps
- * those waits and turns that into a few seconds. Kept modest so we don't fire a
- * burst of git / provider RPCs at once. Override with
+ * ~30s of wall-clock before they are usable again. On hosts with 100+
+ * persisted transport sessions, however, overlapping restore work starves
+ * ServerLink heartbeats during daemon startup. Keep the default serial and let
+ * deployments that want more parallelism opt in with
  * IMCODES_TRANSPORT_RESTORE_CONCURRENCY.
  */
 const TRANSPORT_RESTORE_CONCURRENCY = (() => {
   const raw = Number(process.env.IMCODES_TRANSPORT_RESTORE_CONCURRENCY);
-  return Number.isFinite(raw) && raw >= 1 ? Math.trunc(raw) : 6;
+  return Number.isFinite(raw) && raw >= 1 ? Math.trunc(raw) : 1;
+})();
+const TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS = (() => {
+  const raw = Number(process.env.IMCODES_TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS);
+  return Number.isFinite(raw) && raw >= 0 ? Math.trunc(raw) : 75;
 })();
 const transportErrorRecoveryTimestamps = new Map<string, number[]>();
+
+function pauseBetweenTransportRestores(index: number): Promise<void> {
+  if (index <= 0) return new Promise((resolve) => setImmediate(resolve));
+  return new Promise((resolve) => setTimeout(resolve, TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS));
+}
 
 function buildTransportSessionEnv(
   sessionName: string,
@@ -1115,7 +1119,7 @@ async function recoverTransportRuntimeAfterError(
 
   const recovery = (async () => {
     const record = getSession(sessionName);
-    if (!record || record.runtimeType !== RUNTIME_TYPES.TRANSPORT || !isTransportAgent(record.agentType as AgentType)) {
+    if (!record || !isStoredTransportSession(record)) {
       return false;
     }
 
@@ -1486,7 +1490,10 @@ export function getTransportRuntime(name: string): TransportSessionRuntime | und
  * Called after provider auto-reconnect succeeds (restoreFromStore runs before provider connects).
  * Skips sessions that already have a runtime (rebuilt by oc-session-sync).
  */
-export async function restoreTransportSessions(providerId: string): Promise<void> {
+export async function restoreTransportSessions(
+  providerId: string,
+  options: { onlyWithPendingResend?: boolean } = {},
+): Promise<void> {
   const all = storeSessions();
   const qwenRuntime = providerId === 'qwen' ? await getQwenRuntimeConfig().catch(() => null) : null;
   // Restore with BOUNDED CONCURRENCY rather than one-at-a-time. Each session's
@@ -1501,11 +1508,13 @@ export async function restoreTransportSessions(providerId: string): Promise<void
   // the main thread anyway; every store write is keyed by session name.
   type Restorable = SessionRecord & { providerId: string; providerSessionId: string };
   const pending = all.filter((s): s is Restorable =>
-    s.runtimeType === RUNTIME_TYPES.TRANSPORT
+    isStoredTransportSession(s)
     && s.providerId === providerId
-    && !!s.providerSessionId,
+    && !!s.providerSessionId
+    && (!options.onlyWithPendingResend || getResendCount(s.name) > 0),
   );
-  const restoreOne = async (s: Restorable): Promise<void> => {
+  const restoreOne = async (s: Restorable, index: number): Promise<void> => {
+    await pauseBetweenTransportRestores(index);
     if (transportRuntimes.has(s.name)) return; // already rebuilt by oc-sync
     try {
       const provider = getProvider(s.providerId);
@@ -1778,7 +1787,14 @@ export async function restoreTransportSessions(providerId: string): Promise<void
   };
   // restoreOne swallows its own errors above, so mapWithConcurrency never
   // rejects — one bad session can't abort the rest of the restore.
+  logger.info({
+    providerId,
+    count: pending.length,
+    concurrency: TRANSPORT_RESTORE_CONCURRENCY,
+    interSessionDelayMs: TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS,
+  }, 'Restoring transport session runtimes');
   await mapWithConcurrency(pending, TRANSPORT_RESTORE_CONCURRENCY, restoreOne);
+  logger.info({ providerId, count: pending.length }, 'Transport session runtime restore completed');
 }
 
 /**
