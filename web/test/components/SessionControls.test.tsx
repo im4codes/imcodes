@@ -5882,83 +5882,23 @@ afterEach(() => {
     });
   });
 
-  // ── dedicated-execution-clone-sessions: generic 🤖▾ execution dropdown ─────
-  describe('generic execution-session dropdown', () => {
-    const execSub = {
-      id: 'exec-1',
-      sessionName: 'deck_sub_exec',
-      label: 'exec worker',
-      type: 'codex-sdk',
-      state: 'idle',
-      parentSession: 'deck_proj_brain',
-    } as any;
-
-    function renderWithExecRouting(template: string | null, ws = makeWs()) {
-      getUserPrefMock.mockImplementation(async (key: unknown) => {
-        if (typeof key === 'string' && key.startsWith('exec_routing.template:')) {
-          return template;
-        }
-        return null;
-      });
+  // ── dedicated-execution-clone-sessions: generic launcher moved to footer ─────
+  describe('generic execution-clone launcher placement', () => {
+    it('does not render the old input-side 🤖 execution dropdown', async () => {
+      getUserPrefMock.mockResolvedValue(null);
       render(
         <SessionControls
-          ws={ws as any}
+          ws={makeWs() as any}
           activeSession={makeSession({ name: 'deck_proj_brain', role: 'brain' })}
           quickData={makeQuickData() as any}
           serverId="srv-exec"
-          subSessions={[execSub] as any}
+          subSessions={[] as any}
         />,
       );
-      return ws;
-    }
-
-    it('renders the 🤖 trigger with the localized Execution session tooltip', async () => {
-      renderWithExecRouting(null);
       await flushAsync();
-      const trigger = screen.getByLabelText('execution_session');
-      expect(trigger).toBeDefined();
-      expect(trigger.textContent).toContain('🤖');
-    });
-
-    it('shows exactly two menu items and disables use when no valid default exists', async () => {
-      renderWithExecRouting(null);
-      await flushAsync();
-      fireEvent.click(screen.getByLabelText('execution_session'));
-      const useItem = screen.getByTestId('exec-menu-use-configured') as HTMLButtonElement;
-      const setItem = screen.getByTestId('exec-menu-set-session');
-      expect(useItem.disabled).toBe(true);
-      expect(setItem).toBeDefined();
-      // No "use current session" / "clear execution session" entries.
-      const menu = screen.getByRole('menu');
-      expect(within(menu).getAllByRole('menuitem')).toHaveLength(2);
-    });
-
-    it('dispatches the generic (non-OpenSpec) prompt to the configured session on "use"', async () => {
-      const ws = renderWithExecRouting('deck_sub_exec');
-      await flushAsync();
-      fireEvent.click(screen.getByLabelText('execution_session'));
-      const useItem = screen.getByTestId('exec-menu-use-configured') as HTMLButtonElement;
-      expect(useItem.disabled).toBe(false);
-      fireEvent.click(useItem);
-      expect(ws.sendSessionMessage).toHaveBeenCalledTimes(1);
-      const [target, prompt] = ws.sendSessionMessage.mock.calls[0];
-      expect(target).toBe('deck_sub_exec');
-      // Generic entry point: the prompt must NOT carry OpenSpec semantics.
-      expect(String(prompt).toLowerCase()).not.toContain('openspec');
-      expect(String(prompt).toLowerCase()).not.toContain('requirement');
-    });
-
-    it('opens the execution settings tab WITHOUT dispatching when choosing "set execution session"', async () => {
-      const ws = renderWithExecRouting('deck_sub_exec');
-      await flushAsync();
-      fireEvent.click(screen.getByLabelText('execution_session'));
-      fireEvent.click(screen.getByTestId('exec-menu-set-session'));
-      // No execution dispatched by the settings action.
-      expect(ws.sendSessionMessage).not.toHaveBeenCalled();
-      // The Team settings panel opened (execution tab); its title is rendered.
-      await waitFor(() => {
-        expect(screen.getByText('settings_title')).toBeDefined();
-      });
+      expect(screen.queryByLabelText('execution_session')).toBeNull();
+      expect(screen.queryByTestId('exec-menu-use-configured')).toBeNull();
+      expect(screen.queryByTestId('exec-menu-set-session')).toBeNull();
     });
   });
 });

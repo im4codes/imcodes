@@ -69,6 +69,48 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
+  it('renders the execution-clone launcher before summary sync and calls its handler', () => {
+    const onRunExecutionClones = vi.fn();
+    const onSyncMemorySummaries = vi.fn();
+    const { container } = render(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+        sessionName="deck_test_brain"
+        onRunExecutionClones={onRunExecutionClones}
+        runExecutionClonesTitle="Run clones"
+        runExecutionClonesCount={3}
+        onSyncMemorySummaries={onSyncMemorySummaries}
+      />,
+    );
+
+    const cloneButton = screen.getByLabelText('Run clones');
+    const syncButton = screen.getByLabelText('chat.memory_summary_sync');
+    const buttons = Array.from(container.querySelectorAll('button'));
+    expect(buttons.indexOf(cloneButton as HTMLButtonElement)).toBeLessThan(buttons.indexOf(syncButton as HTMLButtonElement));
+    expect(cloneButton.textContent).toContain('🤖');
+    expect(cloneButton.textContent).toContain('×3');
+
+    fireEvent.click(cloneButton);
+    expect(onRunExecutionClones).toHaveBeenCalledTimes(1);
+    expect(onSyncMemorySummaries).not.toHaveBeenCalled();
+  });
+
+  it('disables the execution-clone launcher when requested', () => {
+    const onRunExecutionClones = vi.fn();
+    render(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+        sessionName="deck_test_brain"
+        onRunExecutionClones={onRunExecutionClones}
+        runExecutionClonesTitle="No task"
+        runExecutionClonesDisabled
+      />,
+    );
+
+    const cloneButton = screen.getByLabelText('No task') as HTMLButtonElement;
+    expect(cloneButton.disabled).toBe(true);
+  });
+
   it('keeps the robot status row visible without hosting the repo branch summary', () => {
     const { container } = render(
       <UsageFooter
