@@ -1917,7 +1917,12 @@ export class CodexSdkProvider implements TransportProvider {
       }).finally(() => {
         state.turnStartInFlight = false;
       });
-      state.runningTurnId = result?.turn?.id;
+      // Extract the app-server-assigned turn id defensively — provider versions
+      // have shifted the field shape (turn.id / turnId / turn.turnId). Never
+      // clobber an id already learned from streamed items/deltas with undefined,
+      // or the turn-id guards below would start dropping live assistant text.
+      const startedTurnId = readParamTurnId((result ?? {}) as Record<string, any>);
+      if (startedTurnId) state.runningTurnId = startedTurnId;
       state.nativePlanEventSeen = false;
       if (state.runningTurnId) {
         state.completedTurnIds.delete(state.runningTurnId);
@@ -2569,11 +2574,16 @@ export class CodexSdkProvider implements TransportProvider {
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
+      if (state.cancelled) return;
       const turnId = readParamTurnId(params);
       if (turnId && state.completedTurnIds.has(turnId)) return;
-      if (!state.runningTurnId && !state.turnStartInFlight) return;
-      if (turnId && state.runningTurnId && turnId !== state.runningTurnId) return;
-      if (state.cancelled) return;      this.clearStatus(sessionId, state);
+      // NEVER drop live assistant text. If our turn bookkeeping lags the
+      // app-server (turn/start's result carried no turn id, so runningTurnId was
+      // never set, or this delta's turnId is shaped differently), adopt the
+      // delta's turnId and render anyway — a real text update must always reach
+      // the UI. Only a genuinely-completed turn (above) or an explicit cancel skips.
+      if (turnId && !state.runningTurnId) state.runningTurnId = turnId;
+      this.clearStatus(sessionId, state);
       // Reset the streaming accumulator when a new agentMessage item starts so
       // its deltas don't render prefixed with the previous message's full text
       // (multi-message turns occur after every tool round). Guards the case
@@ -2603,8 +2613,12 @@ export class CodexSdkProvider implements TransportProvider {
 
       const item = params.item as Record<string, any> | undefined;
       if (!item) return;
-      if (!state.runningTurnId && !state.turnStartInFlight && !state.runningCompact) return;
-      if (turnId && state.runningTurnId && turnId !== state.runningTurnId) return;
+      // NEVER drop a real provider item. If our turn bookkeeping lags the
+      // app-server (turn/start's result carried no turn id, or this event's
+      // turnId is shaped differently), adopt the event's turnId and process it
+      // anyway rather than silently dropping tool calls / reasoning / final
+      // assistant text. Completed turns (above) and explicit cancels still skip.
+      if (turnId && !state.runningTurnId) state.runningTurnId = turnId;
       this.trackCodexTurnItemActivity(sessionId, state, method, item);
 
       if (item.type === 'contextCompaction') {

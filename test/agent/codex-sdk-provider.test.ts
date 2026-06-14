@@ -1648,6 +1648,62 @@ describe('CodexSdkProvider', () => {
     expect(deltas.every((d) => !d.text.includes('First.Second'))).toBe(true);
   });
 
+  it('never drops an agentMessage delta whose turnId differs from runningTurnId (provider field-shape drift)', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-mismatch-delta', cwd: '/tmp/project' });
+
+    const deltas: string[] = [];
+    provider.onDelta((_sid, d) => deltas.push(d.delta));
+
+    await provider.send('route-mismatch-delta', 'hello');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-mismatch-delta')?.runningTurnId === 'turn-1',
+    );
+
+    const child = childProcessMock.children[0];
+    // turnId 'turn-XYZ' differs from the tracked 'turn-1' (e.g. codex shifted the
+    // turn-id field shape). Live text MUST still render, not be silently dropped.
+    child.emits({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', turnId: 'turn-XYZ', itemId: 'm1', delta: 'Mismatch text' },
+    });
+    await waitForCondition(() => deltas.some((d) => d.includes('Mismatch text')));
+    expect(deltas.at(-1)).toBe('Mismatch text');
+  });
+
+  it('never drops an agentMessage delta when runningTurnId is unset (turn/start result had no turn id) and backfills it', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-unset-turnid', cwd: '/tmp/project' });
+
+    const deltas: string[] = [];
+    provider.onDelta((_sid, d) => deltas.push(d.delta));
+
+    await provider.send('route-unset-turnid', 'hello');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-unset-turnid')?.runningTurnId === 'turn-1',
+    );
+
+    // Simulate turn/start having returned no usable turn id (provider field-shape
+    // drift): clear runningTurnId + turnStartInFlight, mimicking result?.turn?.id === undefined.
+    const state = (provider as unknown as {
+      sessions: Map<string, { runningTurnId?: string; turnStartInFlight: boolean }>;
+    }).sessions.get('route-unset-turnid')!;
+    state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
+
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'm1', delta: 'Live text' },
+    });
+    await waitForCondition(() => deltas.some((d) => d.includes('Live text')));
+    expect(deltas.at(-1)).toBe('Live text');
+    // The delta's turnId was adopted so the rest of the turn lifecycle still works.
+    expect(provider.getSessionDiagnostics('route-unset-turnid')).toMatchObject({ runningTurnId: 'turn-1' });
+  });
+
   it('exposes only safe allowlisted Codex session diagnostics', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({
