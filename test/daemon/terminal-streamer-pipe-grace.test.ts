@@ -168,4 +168,20 @@ describe('TerminalStreamer — pipe-stop grace window', () => {
     // by destroy itself synchronously, but at most once per session.)
     expect(mockStopPipeNative.mock.calls.length).toBeLessThanOrEqual(1);
   });
+
+  it('streamer.destroyAsync() waits for active pipe cleanup before resolving', async () => {
+    const session = 'destroy-awaits-cleanup';
+    const cleanup = vi.fn().mockResolvedValue(undefined);
+    const stream = { on: vi.fn(), destroy: vi.fn() };
+    mockStartPipe.mockResolvedValueOnce({ stream, cleanup });
+
+    streamer.subscribe({ sessionName: session, send: vi.fn() });
+    await flush();
+
+    await streamer.destroyAsync();
+
+    expect(stream.destroy).toHaveBeenCalled();
+    expect(cleanup).toHaveBeenCalled();
+    expect(mockStopPipeNative).toHaveBeenCalledWith(session);
+  });
 });

@@ -1240,6 +1240,13 @@ export async function shutdown(exitCode = 0): Promise<void> {
   }
 
   try {
+    const { terminalStreamer } = await import('./terminal-streamer.js');
+    await terminalStreamer.destroyAsync();
+  } catch (err) {
+    logger.warn({ err }, 'Daemon shutdown terminal streamer drain failed');
+  }
+
+  try {
     const { stopAcceptingMasterCompactions, drainMasterCompactions } = await import('./master-compaction-registry.js');
     const { awaitCompressionIdle, stopAcceptingCompression } = await import('../context/summary-compressor.js');
     if (contextMaterializationTimer) {
