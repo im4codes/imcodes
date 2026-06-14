@@ -41,9 +41,148 @@ function resolveEmbeddingCacheDir(): string {
   return join(homedir(), '.imcodes', 'embedding-cache');
 }
 
-// Lazy-loaded pipeline singleton
-let pipelineInstance: any = null;
-let loadingPromise: Promise<any> | null = null;
+// ── Engine abstraction ──────────────────────────────────────────────────────
+// The raw transformers.js model load + feature-extraction inference is
+// synchronous native CPU work. Running it on the daemon main thread froze the
+// event loop for tens of seconds on loaded hosts and starved the server link.
+// So the actual load/inference lives behind an EmbeddingEngine:
+//   - WorkerEngine   (production): runs in a worker thread (embedding-worker.ts).
+//   - InProcessEngine (tests / fallback): the original in-process path, so the
+//     existing `vi.mock('@huggingface/transformers')` unit tests keep working.
+// All sticky-failure / server-fallback / status POLICY stays in this module.
+
+interface EmbeddingEngine {
+  /** Load the model. Rejects with `.code` preserved on failure. */
+  load(): Promise<void>;
+  embed(text: string): Promise<Float32Array>;
+  embedBatch(texts: string[]): Promise<(Float32Array | null)[]>;
+  dispose(): void;
+}
+
+const USE_WORKER_ENGINE = !(process.env.VITEST || process.env.NODE_ENV === 'test');
+
+// Test seam: unit tests run in-process (so `@huggingface/transformers` mocks
+// apply); a focused integration test overrides this to exercise the real
+// worker path. null → follow USE_WORKER_ENGINE.
+let forcedEngineKindForTests: 'worker' | 'inprocess' | null = null;
+
+let engine: EmbeddingEngine | null = null;
+function getEngine(): EmbeddingEngine {
+  if (!engine) {
+    const useWorker = forcedEngineKindForTests
+      ? forcedEngineKindForTests === 'worker'
+      : USE_WORKER_ENGINE;
+    engine = useWorker ? new WorkerEmbeddingEngine() : new InProcessEmbeddingEngine();
+  }
+  return engine;
+}
+
+/** Test-only: force a specific engine and reset load state. */
+export function __setEmbeddingEngineKindForTests(kind: 'worker' | 'inprocess' | null): void {
+  _resetEmbeddingStateForTests();
+  forcedEngineKindForTests = kind;
+}
+
+// In-process engine: the original transformers.js path, kept verbatim so the
+// `@huggingface/transformers`-mocking unit tests still exercise real code, and
+// as a fallback when a worker cannot be spawned.
+class InProcessEmbeddingEngine implements EmbeddingEngine {
+  private pipe: ((text: string, opts: unknown) => Promise<{ data: ArrayLike<number> }>) | null = null;
+
+  async load(): Promise<void> {
+    const { pipeline, env } = await import('@huggingface/transformers');
+    const cacheDir = resolveEmbeddingCacheDir();
+    if (cacheDir) (env as { cacheDir?: string }).cacheDir = cacheDir;
+    logger.info({ model: EMBEDDING_MODEL, dtype: EMBEDDING_DTYPE, cacheDir: (env as { cacheDir?: string }).cacheDir }, 'Loading embedding model...');
+    this.pipe = (await pipeline('feature-extraction', EMBEDDING_MODEL, {
+      dtype: EMBEDDING_DTYPE,
+      session_options: { intraOpNumThreads: 1, interOpNumThreads: 1 },
+    })) as unknown as typeof this.pipe;
+    logger.info({ model: EMBEDDING_MODEL, dim: EMBEDDING_DIM }, 'Embedding model loaded');
+  }
+
+  async embed(text: string): Promise<Float32Array> {
+    if (!this.pipe) throw new Error('embedding pipeline not loaded');
+    const result = await this.pipe(text, { pooling: 'mean', normalize: true });
+    return result.data instanceof Float32Array ? result.data : Float32Array.from(result.data);
+  }
+
+  async embedBatch(texts: string[]): Promise<(Float32Array | null)[]> {
+    const out: (Float32Array | null)[] = [];
+    for (const text of texts) {
+      try { out.push(await this.embed(text)); } catch { out.push(null); }
+    }
+    return out;
+  }
+
+  dispose(): void { this.pipe = null; }
+}
+
+// Worker engine: tiny request/response RPC to embedding-worker.ts. Self-heals a
+// crashed worker by dropping the handle so the next load() respawns it.
+class WorkerEmbeddingEngine implements EmbeddingEngine {
+  private worker: import('node:worker_threads').Worker | null = null;
+  private nextId = 1;
+  private readonly pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+
+  private async ensureWorker(): Promise<import('node:worker_threads').Worker> {
+    if (this.worker) return this.worker;
+    const { Worker } = await import('node:worker_threads');
+    // Spawn the plain-ESM bootstrap (NOT the .ts directly): a worker thread
+    // doesn't inherit tsx's loader, so a raw .ts worker can't resolve our
+    // `.js`-suffixed TS imports. The bootstrap registers tsx then imports the
+    // real worker (.ts in dev, compiled .js in prod). Matches the other
+    // *-worker-bootstrap.mjs workers; copy-worker-bootstraps.mjs ships it.
+    const workerUrl = new URL('./embedding-worker-bootstrap.mjs', import.meta.url);
+    const worker = new Worker(workerUrl, {
+      workerData: { cacheDir: resolveEmbeddingCacheDir() },
+    });
+    worker.unref();
+    worker.on('message', (msg: { id: number; ok: boolean; result?: unknown; error?: string; code?: string | null }) => {
+      const p = this.pending.get(msg.id);
+      if (!p) return;
+      this.pending.delete(msg.id);
+      if (msg.ok) p.resolve(msg.result);
+      else {
+        const err = new Error(msg.error ?? 'embedding worker error') as Error & { code?: string };
+        if (msg.code) err.code = msg.code;
+        p.reject(err);
+      }
+    });
+    const onDead = (err: Error) => {
+      this.worker = null;
+      for (const [id, p] of this.pending) { this.pending.delete(id); p.reject(err); }
+    };
+    worker.on('error', (err) => onDead(err instanceof Error ? err : new Error(String(err))));
+    worker.on('exit', (code) => { if (code !== 0 || this.pending.size) onDead(new Error(`embedding_worker_exit:${code}`)); });
+    this.worker = worker;
+    return worker;
+  }
+
+  private async request<T>(message: { type: string; text?: string; texts?: string[] }): Promise<T> {
+    const worker = await this.ensureWorker();
+    const id = this.nextId++;
+    return new Promise<T>((resolve, reject) => {
+      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+      worker.postMessage({ id, ...message });
+    });
+  }
+
+  async load(): Promise<void> { await this.request<true>({ type: 'warmup' }); }
+  embed(text: string): Promise<Float32Array> { return this.request<Float32Array>({ type: 'embed', text }); }
+  embedBatch(texts: string[]): Promise<(Float32Array | null)[]> { return this.request<(Float32Array | null)[]>({ type: 'embedBatch', texts }); }
+
+  dispose(): void {
+    const w = this.worker;
+    this.worker = null;
+    for (const [id, p] of this.pending) { this.pending.delete(id); p.reject(new Error('embedding worker disposed')); }
+    if (w) void w.terminate();
+  }
+}
+
+// Load lifecycle state (engine-agnostic).
+let engineReady = false;
+let loadingPromise: Promise<void> | null = null;
 /** Sticky flag set when semantic search is permanently unavailable for this
  *  process. Two failure modes set it:
  *
@@ -101,38 +240,15 @@ const STICKY_FAILURE_CODES: ReadonlySet<string> = new Set([
   'ERR_DLOPEN_FAILED',
 ]);
 
-async function getPipeline(): Promise<any> {
-  if (pipelineInstance) return pipelineInstance;
+async function ensureEngineLoaded(): Promise<void> {
+  if (engineReady) return;
   if (unavailable) throw new Error(`embedding model unavailable (${unavailableReason ?? 'unknown'})`);
   if (loadingPromise) return loadingPromise;
 
   loadingPromise = (async () => {
     try {
-      const { pipeline, env } = await import('@huggingface/transformers');
-      const cacheDir = resolveEmbeddingCacheDir();
-      if (cacheDir) env.cacheDir = cacheDir;
-      logger.info({ model: EMBEDDING_MODEL, dtype: EMBEDDING_DTYPE, cacheDir: env.cacheDir }, 'Loading embedding model...');
-      const p = await pipeline('feature-extraction', EMBEDDING_MODEL, {
-        dtype: EMBEDDING_DTYPE,
-        // Cap onnxruntime's native thread pools. By default ORT sizes its
-        // intra-op pool to the host core count (24 on the 215 server), and
-        // every native thread anchors its own ~64 MB glibc malloc arena that
-        // glibc never returns to the OS. Measured on 215 (2026-05-31, 24
-        // cores): RSS plateaued at ~1.1 GB — ~730 MB of resident anonymous
-        // arenas — while V8 heapUsed was only ~247 MB, so forced GC could
-        // never move it. This model is tiny (384-dim q8 MiniLM, ~19 ms
-        // warmup); one thread is ample and removes the arena-per-thread
-        // multiplier at the source. Pairs with MALLOC_ARENA_MAX=2 in the
-        // systemd unit (see bind-flow.ts / setup-flow.ts), which is the
-        // global backstop for the same problem across sharp/libuv too.
-        session_options: {
-          intraOpNumThreads: 1,
-          interOpNumThreads: 1,
-        },
-      });
-      logger.info({ model: EMBEDDING_MODEL, dim: EMBEDDING_DIM }, 'Embedding model loaded');
-      pipelineInstance = p;
-      return p;
+      await getEngine().load();
+      engineReady = true;
     } catch (err) {
       loadingPromise = null;
       const code = (err as { code?: string } | null)?.code;
@@ -175,7 +291,9 @@ async function getPipeline(): Promise<any> {
 
 /** Test-only: reset the sticky-disable state so each test starts fresh. */
 export function _resetEmbeddingStateForTests(): void {
-  pipelineInstance = null;
+  try { engine?.dispose(); } catch { /* ignore */ }
+  engine = null;
+  engineReady = false;
   loadingPromise = null;
   unavailable = false;
   unavailableReason = null;
@@ -200,7 +318,7 @@ export function getEmbeddingUnavailableReason(): string | null {
 export type { EmbeddingStatus } from '../../shared/embedding-status.js';
 
 export function getEmbeddingStatus(): import('../../shared/embedding-status.js').EmbeddingStatus {
-  if (pipelineInstance) return { state: 'ready', reason: null };
+  if (engineReady) return { state: 'ready', reason: null };
   if (loadingPromise) return { state: 'loading', reason: null };
   if (!unavailable) return { state: 'idle', reason: null };
 
@@ -229,9 +347,8 @@ export function getEmbeddingStatus(): import('../../shared/embedding-status.js')
  */
 export async function generateEmbedding(text: string): Promise<Float32Array | null> {
   try {
-    const pipe = await getPipeline();
-    const result = await pipe(text, { pooling: 'mean', normalize: true });
-    return result.data as Float32Array;
+    await ensureEngineLoaded();
+    return await getEngine().embed(text);
   } catch {
     // Local failed. If it's sticky-disabled (deterministic per-host),
     // try the server fallback. Transient local failures fall through to
@@ -251,17 +368,8 @@ export async function generateEmbedding(text: string): Promise<Float32Array | nu
 export async function generateEmbeddings(texts: string[]): Promise<(Float32Array | null)[]> {
   if (texts.length === 0) return [];
   try {
-    const pipe = await getPipeline();
-    const results: (Float32Array | null)[] = [];
-    for (const text of texts) {
-      try {
-        const result = await pipe(text, { pooling: 'mean', normalize: true });
-        results.push(result.data as Float32Array);
-      } catch {
-        results.push(null);
-      }
-    }
-    return results;
+    await ensureEngineLoaded();
+    return await getEngine().embedBatch(texts);
   } catch {
     // Local pipeline dead. Fall back to server one-at-a-time when the
     // local failure is deterministic. Server doesn't have a batch endpoint
@@ -290,7 +398,7 @@ export async function generateEmbeddings(texts: string[]): Promise<(Float32Array
  */
 export async function isEmbeddingAvailable(): Promise<boolean> {
   try {
-    await getPipeline();
+    await ensureEngineLoaded();
     return true;
   } catch {
     return false;
