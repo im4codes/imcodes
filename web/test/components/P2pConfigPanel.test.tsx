@@ -1850,4 +1850,81 @@ describe('P2pConfigPanel', () => {
       expect(screen.queryByTestId('p2p-allowed-executables-remove-/usr/bin/jq')).toBeNull();
     });
   });
+
+  // ── dedicated-execution-clone-sessions 2.6: daemon-authoritative template
+  //    eligibility in the execution-routing tab ─────────────────────────────
+  describe('execution routing daemon eligibility', () => {
+    function renderExecTab(extra: {
+      sessions?: any[];
+      subSessions?: any[];
+      activeSession?: string;
+    } = {}) {
+      // Enable routing globally so the template <select> is interactive.
+      getUserPrefMock.mockImplementation(async (key: string) => {
+        if (key === 'exec_routing.global.v1') return JSON.stringify({ enabled: true });
+        return null;
+      });
+      const props = {
+        sessions: extra.sessions ?? [
+          { name: 'deck_proj_brain', agentType: 'claude-code-sdk', state: 'running', role: 'brain' },
+        ],
+        subSessions: extra.subSessions ?? [],
+        activeSession: extra.activeSession ?? 'deck_proj_brain',
+        serverId: 'srv-main',
+        initialTab: 'execution' as const,
+        onClose: vi.fn(),
+        onSave: vi.fn(),
+        daemonCapabilitySource: freshCapabilitySource(),
+      };
+      return render(<P2pConfigPanel {...(props as any)} />);
+    }
+
+    it('lists a daemon-eligible sub-session as a selectable option and excludes the brain', async () => {
+      renderExecTab({
+        subSessions: [
+          { sessionName: 'deck_sub_ok', type: 'codex-sdk', label: 'okworker', state: 'idle', parentSession: 'deck_proj_brain', executionTemplateEligible: true },
+        ],
+      });
+      await flush();
+      const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
+      const options = Array.from(select.querySelectorAll('option'));
+      const ok = options.find((o) => o.value === 'deck_sub_ok');
+      expect(ok).toBeDefined();
+      expect(ok!.disabled).toBe(false);
+      // The orchestrator/brain session is never offered as a template.
+      expect(options.some((o) => o.value === 'deck_proj_brain')).toBe(false);
+    });
+
+    it('renders a daemon-ineligible sub-session as a DISABLED option (not hidden)', async () => {
+      renderExecTab({
+        subSessions: [
+          { sessionName: 'deck_sub_no', type: 'codex-sdk', label: 'badworker', state: 'idle', parentSession: 'deck_proj_brain', executionTemplateEligible: false, executionTemplateIneligibleReason: 'template_ineligible' },
+        ],
+      });
+      await flush();
+      const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
+      const opt = Array.from(select.querySelectorAll('option')).find((o) => o.value === 'deck_sub_no');
+      // The ineligible session is rendered (not silently hidden) but disabled,
+      // so the user can see it exists and is not selectable. (The reason code is
+      // localized into the option label at runtime; the test translator does not
+      // interpolate, so we assert the structural disabled state here.)
+      expect(opt).toBeDefined();
+      expect(opt!.disabled).toBe(true);
+    });
+
+    it('excludes the current calling session from the template options', async () => {
+      renderExecTab({
+        activeSession: 'deck_sub_self',
+        subSessions: [
+          { sessionName: 'deck_sub_self', type: 'codex-sdk', label: 'self', state: 'idle', parentSession: 'deck_proj_brain', executionTemplateEligible: true },
+          { sessionName: 'deck_sub_other', type: 'codex-sdk', label: 'other', state: 'idle', parentSession: 'deck_proj_brain', executionTemplateEligible: true },
+        ],
+      });
+      await flush();
+      const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
+      const values = Array.from(select.querySelectorAll('option')).map((o) => o.value);
+      expect(values).not.toContain('deck_sub_self');
+      expect(values).toContain('deck_sub_other');
+    });
+  });
 });

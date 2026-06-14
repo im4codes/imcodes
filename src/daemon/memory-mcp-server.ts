@@ -10,6 +10,9 @@ import {
 } from './memory-mcp-caller.js';
 import { registerMemoryMcpTools, type MemoryMcpToolDeps } from './memory-mcp-tools.js';
 import { loadStore, type SessionRecord } from '../store/session-store.js';
+import { isDaemonCapabilityAdvertised } from './server-link.js';
+import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
+import { resolveExecutionCloneLimitsForParentRun } from './execution-clone-limits-resolver.js';
 
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
@@ -60,33 +63,69 @@ async function postHookSend(port: number, body: Record<string, unknown>, hookPat
   });
 }
 
-function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryMcpToolDeps): MemoryMcpToolDeps {
-  if (toolDeps.sendDeps?.dispatchMessage) return toolDeps;
+/**
+ * Compose the production stdio-MCP send defaults onto the (possibly test-injected)
+ * `toolDeps`, PER FIELD. Every send-dep field independently preserves an injected
+ * value and falls back to the daemon-backed default when absent. This MUST NOT be
+ * all-or-nothing: a caller that supplies ONLY a custom `dispatchMessage` still
+ * gets the default `cancelSession` (so `send_stop` is not `internal_error`), the
+ * capability resolver, and the run-authoritative limit resolver (so a model-driven
+ * clone create still enforces per-run caps). Exported for unit-testing the
+ * production seam without a full stdio harness.
+ */
+export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryMcpToolDeps): MemoryMcpToolDeps {
   return {
     ...toolDeps,
     sendDeps: {
       ...toolDeps.sendDeps,
-      dispatchMessage: async (target: SessionRecord, message: string) => {
-        const port = await resolveLiveHookPort();
-        if (!port) throw new Error('daemon hook server is unavailable');
-        if (!caller.sessionName) throw new Error('send_message requires a scoped caller');
-        await postHookSend(port, {
-          from: caller.sessionName,
-          to: target.name,
-          message,
-          depth: 0,
-        });
-      },
-      cancelSession: async (target: SessionRecord) => {
-        const port = await resolveLiveHookPort();
-        if (!port) throw new Error('daemon hook server is unavailable');
-        if (!caller.sessionName) throw new Error('send_stop requires a scoped caller');
-        const res = await postHookSend(port, {
-          from: caller.sessionName,
-          to: target.name,
-        }, '/stop');
-        return (res as { stopped?: boolean }).stopped !== false;
-      },
+      // Production stdio MCP consults the daemon's static capability
+      // advertisement for the execution-clone send/destroy gate instead of
+      // defaulting to enabled. An explicitly-injected override (tests) wins —
+      // the `??` is on the FUNCTION, so an injected fn returning `false` still
+      // wins (we never fall back on a false RESULT, only an absent fn).
+      isExecutionCloneCapabilityEnabled:
+        toolDeps.sendDeps?.isExecutionCloneCapabilityEnabled
+        ?? (() => isDaemonCapabilityAdvertised(EXECUTION_CLONE_CAPABILITY_V1)),
+      // N2 (the standalone-MCP watershed): inject the run-authoritative limit
+      // resolver so a model-driven `send_message.clone` on this stdio path
+      // enforces the SAME tighter per-run limits the programmatic Team path
+      // does — instead of always defaulting to cap=3/60min. Compose with any
+      // explicitly-injected resolver (tests) rather than clobbering it; the
+      // per-call `??` preserves the fallback even when an injected resolver
+      // returns `undefined` for a given run. Keyed by the validated `parentRunId`.
+      resolveExecutionCloneLimits: (parentRunId: string) =>
+        toolDeps.sendDeps?.resolveExecutionCloneLimits?.(parentRunId)
+        ?? resolveExecutionCloneLimitsForParentRun(parentRunId),
+      // Per-field default: an injected `dispatchMessage` (tests) wins; otherwise
+      // POST the daemon hook /send default.
+      dispatchMessage:
+        toolDeps.sendDeps?.dispatchMessage
+        ?? (async (target: SessionRecord, message: string) => {
+          const port = await resolveLiveHookPort();
+          if (!port) throw new Error('daemon hook server is unavailable');
+          if (!caller.sessionName) throw new Error('send_message requires a scoped caller');
+          await postHookSend(port, {
+            from: caller.sessionName,
+            to: target.name,
+            message,
+            depth: 0,
+          });
+        }),
+      // Per-field default: an injected `cancelSession` (tests) wins; otherwise
+      // POST the daemon hook /stop default. Required so `send_stop` from this
+      // stdio path force-stops a target instead of returning `internal_error`.
+      cancelSession:
+        toolDeps.sendDeps?.cancelSession
+        ?? (async (target: SessionRecord) => {
+          const port = await resolveLiveHookPort();
+          if (!port) throw new Error('daemon hook server is unavailable');
+          if (!caller.sessionName) throw new Error('send_stop requires a scoped caller');
+          const res = await postHookSend(port, {
+            from: caller.sessionName,
+            to: target.name,
+          }, '/stop');
+          return (res as { stopped?: boolean }).stopped !== false;
+        }),
     },
   };
 }

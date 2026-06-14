@@ -87,7 +87,15 @@ import {
   type P2pRun,
 } from './p2p-orchestrator.js';
 import { resolveConfiguredP2pTargets } from './p2p-target-selection.js';
-import { enqueueResend, getResendEntries } from './transport-resend-queue.js';
+import { enqueueResend, getResendEntries, removeResendEntries } from './transport-resend-queue.js';
+import type { ExecutionCloneParentStage } from '../../shared/execution-clone.js';
+
+/**
+ * Parent stage owning the Auto Deliver IMPLEMENTATION prompt's task semantics.
+ * Typed against {@link ExecutionCloneParentStage} so it cannot drift from the
+ * shared tuple. Reference to the shared union, not a second string definition.
+ */
+const AUTO_DELIVER_IMPLEMENTATION_STAGE: ExecutionCloneParentStage = 'auto_deliver_implementation';
 
 type AutoDeliverRunStatus = Extract<OpenSpecAutoDeliverStage,
   'proposed' | 'spec_audit_repair' | 'implementation_task_loop' | 'implementation_audit_repair' | 'commit_push' | 'passed' | 'needs_human' | 'failed' | 'stopped'>;
@@ -260,6 +268,22 @@ interface AutoDeliverRun {
   autoCommitPushCandidateFiles?: string[];
   requestIds: Map<string, OpenSpecAutoDeliverProjection>;
   serverLink: ServerLink;
+  /**
+   * @deprecated post-v1 — DEAD FIELD. Auto Deliver dedicated-execution routing is
+   * deferred (see design.md "Deferred (post-v1)"). Auto Deliver is a daemon-side
+   * state machine with NO launch-payload channel, so there is no producer that
+   * ever populates this field — it is always `undefined`. `applyExecutionRoutingToImplementationPrompt`
+   * ignores it and the appendix injection is gated off, so the implementation
+   * prompt is always BYTE-IDENTICAL to current behavior. v1 ships the P2P/Team
+   * final-execution routing path only. Re-enable (and populate this field from a
+   * non-payload daemon-side routing source) when that path is added post-v1.
+   */
+  dedicatedExecutionRouting?: {
+    enabled: boolean;
+    templateSessionName: string | null;
+    /** Optional already-stored recent summary attached (bounded) to the worker hand-off. NEVER raw history. */
+    recentSummary?: string | null;
+  };
 }
 
 type ImplementationMarkerContract = NonNullable<AutoDeliverRun['activeImplementationMarker']>;
@@ -269,6 +293,18 @@ type LaunchResult =
   | { ok: false; error: string; projection?: OpenSpecAutoDeliverProjection };
 
 const runsById = new Map<string, AutoDeliverRun>();
+
+/**
+ * Look up a live OpenSpec auto-deliver run by id. Symmetric to
+ * `getP2pRun(id)` in `p2p-orchestrator.ts`. Used by the execution-clone
+ * limits resolver as a run-authoritative source for run-level clone limits
+ * (registry-PRESENCE → tighten cap). Registry-absence here is NOT a terminal
+ * signal — `undefined` only means "no auto-deliver run with that id".
+ */
+export function getOpenSpecAutoDeliverRun(runId: string): AutoDeliverRun | undefined {
+  return runsById.get(runId);
+}
+
 const activeRunByOwner = new Map<string, string>();
 const terminalRunByOwner = new Map<string, AutoDeliverRun>();
 const requestProjectionByFingerprint = new Map<string, OpenSpecAutoDeliverProjection>();
@@ -301,7 +337,7 @@ async function awaitTransportRuntime(sessionName: string): Promise<ReturnType<ty
   return runtime;
 }
 
-type AutoDeliverPromptSendMode = 'sent' | 'queued' | 'resend_queued';
+type AutoDeliverPromptSendMode = 'sent' | 'queued' | 'resend_queued' | 'skipped_terminal';
 
 function runtimeProviderSessionId(runtime: NonNullable<ReturnType<typeof getTransportRuntime>>): string | null | undefined {
   if (!('providerSessionId' in runtime)) return undefined;
@@ -331,6 +367,7 @@ function queueAutoDeliverPromptForTransportResend(
   commandId: string,
   reason: string,
 ): AutoDeliverPromptSendMode {
+  if (isOpenSpecAutoDeliverTerminalStage(run.status)) return 'skipped_terminal';
   const enqueueResult = enqueueResend(run.targetImplementationSessionName, {
     text: prompt,
     commandId,
@@ -367,6 +404,7 @@ async function sendAutoDeliverPromptToImplementationSession(
   commandId: string,
 ): Promise<AutoDeliverPromptSendMode> {
   const runtime = await awaitTransportRuntime(run.targetImplementationSessionName);
+  if (isOpenSpecAutoDeliverTerminalStage(run.status)) return 'skipped_terminal';
   if (!runtime) {
     return queueAutoDeliverPromptForTransportResend(run, prompt, commandId, 'missing_transport_runtime');
   }
@@ -402,6 +440,54 @@ async function sendAutoDeliverPromptToImplementationSession(
       commandId,
       error instanceof Error ? error.message : 'transport_send_failed',
     );
+  }
+}
+
+function autoDeliverCommandIdPrefix(run: AutoDeliverRun): string {
+  return `${run.runId}:`;
+}
+
+function purgeQueuedAutoDeliverPrompts(run: AutoDeliverRun, reason: string): void {
+  const prefix = autoDeliverCommandIdPrefix(run);
+  const runtime = getTransportRuntime(run.targetImplementationSessionName);
+  let runtimeRemoved = 0;
+  const runtimeWithPurge = runtime as (typeof runtime & {
+    removePendingMessagesByCommandIdPrefix?: (prefix: string) => unknown[];
+  });
+  if (typeof runtimeWithPurge?.removePendingMessagesByCommandIdPrefix === 'function') {
+    runtimeRemoved = runtimeWithPurge.removePendingMessagesByCommandIdPrefix(prefix).length;
+  } else if (Array.isArray(runtime?.pendingEntries) && typeof runtime?.removePendingMessage === 'function') {
+    for (const entry of runtime.pendingEntries) {
+      if (entry.clientMessageId.startsWith(prefix) && runtime.removePendingMessage(entry.clientMessageId)) {
+        runtimeRemoved += 1;
+      }
+    }
+  }
+
+  const resendRemoved = removeResendEntries(
+    run.targetImplementationSessionName,
+    (entry) => entry.commandId.startsWith(prefix),
+  );
+
+  if (runtimeRemoved > 0) {
+    timelineEmitter.emit(run.targetImplementationSessionName, 'session.state', {
+      state: runtime?.pendingCount && runtime.pendingCount > 0 ? 'queued' : 'idle',
+      pendingCount: runtime?.pendingCount ?? 0,
+      pendingMessages: runtime?.pendingMessages ?? [],
+      pendingMessageEntries: runtime?.pendingEntries ?? [],
+      pendingMessageVersion: runtime?.pendingVersion,
+    }, { source: 'daemon', confidence: 'high' });
+  }
+  if (resendRemoved > 0) {
+    const queued = getResendEntries(run.targetImplementationSessionName);
+    emitAutoDeliverQueuedState(run.targetImplementationSessionName, queued);
+  }
+  if (runtimeRemoved + resendRemoved > 0) {
+    run.evidence = mergeEvidence(run.evidence, [{
+      source: 'daemon',
+      summary: `Dropped ${runtimeRemoved + resendRemoved} stale Auto Deliver queued prompt(s) after ${reason}.`,
+      stale: false,
+    }]);
   }
 }
 const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON = 'implementation_audit_followup_repair';
@@ -623,6 +709,11 @@ function terminalizeAndSend(
   return projection;
 }
 
+function sendTerminalProjectionIfNeeded(run: AutoDeliverRun, projection: OpenSpecAutoDeliverProjection): void {
+  if (!isOpenSpecAutoDeliverTerminalStage(projection.status)) return;
+  send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+}
+
 function isTransportRuntimeBusyForIdleAdvance(run: AutoDeliverRun): boolean {
   const runtime = getTransportRuntime(run.targetImplementationSessionName);
   if (!runtime) return false;
@@ -761,6 +852,15 @@ function implementationPromptBudgetExhausted(run: AutoDeliverRun): boolean {
 
 function hasCurrentFinalAcceptanceScore(run: AutoDeliverRun): boolean {
   return run.finalAfterRepair?.generation === run.generation;
+}
+
+function hasCurrentFinalAcceptanceAuditResult(run: AutoDeliverRun): boolean {
+  const prefix = `${run.runId}:post_repair_acceptance_audit:${run.generation}:`;
+  return (run.auditResults ?? []).some((result) =>
+    result.stage === 'implementation_audit_repair'
+    && result.generation === run.generation
+    && result.attemptId.startsWith(prefix)
+  );
 }
 
 async function buildImplementationMarkerContract(
@@ -1033,6 +1133,29 @@ function buildImplementationRepairBlock(run: AutoDeliverRun, repairReason?: stri
   ].filter((line): line is string => line !== undefined).join('\n');
 }
 
+/**
+ * Apply dedicated-execution routing to an Auto Deliver IMPLEMENTATION prompt.
+ *
+ * v1 SCOPE: DEFERRED for Auto Deliver. Auto Deliver is a daemon-side state
+ * machine with NO launch-payload channel, so {@link AutoDeliverRun.dedicatedExecutionRouting}
+ * is ALWAYS undefined in practice — there is no producer that ever populates it.
+ * Injecting the dedicated-execution appendix here would instruct the model to
+ * delegate implementation work to execution clones that are never created
+ * (no `orchestrateCloneWorkers` wiring exists on the Auto Deliver path), so the
+ * appendix is GATED OFF: this returns `base` BYTE-IDENTICAL.
+ *
+ * Generic/OpenSpec-apply/Auto-Deliver dedicated-execution routing is deferred
+ * post-v1 (see design.md "Deferred (post-v1)"); v1 ships the P2P/Team
+ * final-execution path only. When a non-payload daemon-side routing source is
+ * added for daemon-initiated runs, re-enable the appendix + recent-context
+ * injection here behind that source.
+ */
+function applyExecutionRoutingToImplementationPrompt(_run: AutoDeliverRun, base: string): string {
+  // Deferred post-v1: no routing channel for Auto Deliver — emit the base prompt
+  // unchanged so the model is never told to delegate to a clone that cannot exist.
+  return base;
+}
+
 function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): string {
   const reference = openSpecChangeReference(run);
   const remaining = uncheckedTaskLabels(run.taskStats);
@@ -1045,7 +1168,7 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
   const remainingBlock = remaining.length > 0
     ? remaining.map((label) => `- ${label}`).join('\n')
     : '- Re-read tasks.md and verify every task remains checked.';
-  return [
+  const body = [
     basePrompt,
     '',
     repairPreamble,
@@ -1073,6 +1196,7 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
     '',
     buildImplementationCompletionMarkerBlock(run),
   ].filter((line): line is string => line !== null).join('\n');
+  return applyExecutionRoutingToImplementationPrompt(run, body);
 }
 
 function buildImplementationCompletionMarkerBlock(run: AutoDeliverRun): string {
@@ -1153,6 +1277,7 @@ async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: 
   run.activeImplementationMarker = await buildImplementationMarkerContract(run, run.implementationPromptCount);
   const prompt = buildImplementationPrompt(run, repairReason);
   const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
+  if (sendMode === 'skipped_terminal') return buildProjection(run);
   if (sendMode === 'sent') {
     run.activeImplementationPromptAwaitingDispatch = false;
     scheduleImplementationMarkerPoll(run);
@@ -1172,6 +1297,7 @@ async function readImplementationCompletionMarker(run: AutoDeliverRun): Promise<
 }
 
 function settleImplementationRuntimeFromMarker(run: AutoDeliverRun, reason: string): void {
+  purgeQueuedAutoDeliverPrompts(run, reason);
   const runtime = getTransportRuntime(run.targetImplementationSessionName);
   if (typeof runtime?.settleActiveDispatchFromExternalCompletion === 'function') {
     runtime.settleActiveDispatchFromExternalCompletion(reason);
@@ -1252,7 +1378,7 @@ async function advanceAfterImplementationMarkerPoll(run: AutoDeliverRun): Promis
 
 function buildImplementationMarkerReminderPrompt(run: AutoDeliverRun, reason: string): string {
   const reference = openSpecChangeReference(run);
-  return [
+  const body = [
     formatOpenSpecPromptTemplate('implement', reference),
     '',
     `OpenSpec Auto Deliver implementation is not complete yet for ${reference}.`,
@@ -1270,6 +1396,7 @@ function buildImplementationMarkerReminderPrompt(run: AutoDeliverRun, reason: st
     '',
     buildImplementationCompletionMarkerBlock(run),
   ].join('\n');
+  return applyExecutionRoutingToImplementationPrompt(run, body);
 }
 
 async function ensureImplementationMarkerContractForReminder(
@@ -1341,6 +1468,7 @@ async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason:
   run.activeImplementationPromptAwaitingDispatch = true;
   const prompt = buildImplementationMarkerReminderPrompt(run, reason);
   const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
+  if (sendMode === 'skipped_terminal') return buildProjection(run);
   if (sendMode === 'sent') {
     run.activeImplementationPromptAwaitingDispatch = false;
     scheduleImplementationMarkerPoll(run);
@@ -1372,7 +1500,7 @@ async function dispatchImplementationRepairPrompt(run: AutoDeliverRun, reason: s
   run.needsPostRepairAcceptanceAudit = true;
   run.postRepairAcceptanceStage = 'implementation_audit_repair';
   if (implementationPromptBudgetExhausted(run)) {
-    if (!hasCurrentFinalAcceptanceScore(run)) {
+    if (!hasCurrentFinalAcceptanceScore(run) && !hasCurrentFinalAcceptanceAuditResult(run)) {
       run.evidence = mergeEvidence(run.evidence, [{
         source: 'daemon',
         summary: `Implementation prompt budget is exhausted before final acceptance scoring; dispatching final acceptance audit instead of stopping early: ${reason}.`,
@@ -1380,7 +1508,7 @@ async function dispatchImplementationRepairPrompt(run: AutoDeliverRun, reason: s
       }]);
       return dispatchPostRepairAcceptanceAuditPrompt(run);
     }
-    return terminalize(run, 'needs_human', 'implementation_prompt_limit_reached');
+    return terminalize(run, 'needs_human', `implementation_prompt_limit_reached:${reason}`);
   }
   const repairKey = implementationRepairPromptKey(run, reason);
   if (run.lastImplementationRepairPromptKey === repairKey) {
@@ -1415,7 +1543,8 @@ async function dispatchSpecRepairPrompt(run: AutoDeliverRun, reason: string): Pr
     stale: false,
   }]);
   const prompt = buildSpecRepairPrompt(run, reason);
-  await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
+  const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
+  if (sendMode === 'skipped_terminal') return buildProjection(run);
   run.latestMessage = `spec_repair_prompt_dispatched:${reason}`;
   return broadcastProjection(run);
 }
@@ -1707,7 +1836,8 @@ async function dispatchPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun): Pro
   run.lastAcceptanceAudit = active;
   run.activeCommandId = `${attemptId}:prompt`;
   const prompt = buildPostRepairAcceptanceAuditPrompt(run, metadata);
-  await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
+  const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
+  if (sendMode === 'skipped_terminal') return buildProjection(run);
   run.latestMessage = 'post_repair_acceptance_audit_dispatched';
   return broadcastProjection(run);
 }
@@ -1722,7 +1852,8 @@ async function dispatchPostRepairAcceptanceAuditResultRepairPrompt(
   run.activeCommandId = `${active.attemptId}:result-file-repair:${repairAttemptNumber}`;
   const metadata = acceptanceAuditMetadataFromActive(run, active);
   const prompt = buildPostRepairAcceptanceAuditResultRepairPrompt(run, metadata, reason, repairAttemptNumber);
-  await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
+  const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
+  if (sendMode === 'skipped_terminal') return buildProjection(run);
   run.latestMessage = 'post_repair_result_file_repair_prompt_dispatched';
   return broadcastProjection(run);
 }
@@ -2085,7 +2216,8 @@ async function dispatchAutoCommitPushPrompt(run: AutoDeliverRun): Promise<OpenSp
   run.stage = 'commit_push';
   run.activeCommandId = `${run.runId}:auto-commit-push:${run.generation}`;
   const prompt = buildAutoCommitPushPrompt(run, files);
-  await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
+  const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
+  if (sendMode === 'skipped_terminal') return buildProjection(run);
   run.latestMessage = 'auto_commit_push_prompt_dispatched';
   run.evidence = mergeEvidence(run.evidence, [{
     source: 'daemon',
@@ -2352,7 +2484,8 @@ async function dispatchAuditResultFileRepairPrompt(
 ): Promise<boolean> {
   const commandId = `${metadata.attemptId}:authoritative-result-file-repair:${repairAttemptNumber}`;
   const prompt = buildAuditResultFileRepairPrompt(run, metadata, p2pRun, reason, repairAttemptNumber);
-  await sendAutoDeliverPromptToImplementationSession(run, prompt, commandId);
+  const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, commandId);
+  if (sendMode === 'skipped_terminal') return false;
   run.latestMessage = 'authoritative_result_file_repair_prompt_dispatched';
   broadcastProjection(run);
   return true;
@@ -2524,6 +2657,7 @@ function trackActiveAuditCancellation(run: AutoDeliverRun, active: NonNullable<A
 
 function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 'passed' | 'needs_human' | 'failed' | 'stopped'>, reason: string): OpenSpecAutoDeliverProjection {
   const previousStage = run.stage;
+  purgeQueuedAutoDeliverPrompts(run, reason);
   if (run.activeAudit) {
     const active = run.activeAudit;
     clearAuditPollTimer(run.runId);
@@ -2754,7 +2888,7 @@ async function advanceAfterAuditVerdict(
     }
     if (stage === 'implementation_audit_repair') {
       run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', reason);
-      await dispatchImplementationRepairPrompt(run, reason);
+      sendTerminalProjectionIfNeeded(run, await dispatchImplementationRepairPrompt(run, reason));
       return;
     }
     scheduleAuditFixRetry(run, stage, reason);
@@ -2815,7 +2949,7 @@ async function advanceAfterAuditVerdict(
       return;
     }
     run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', 'implementation_audit_rework_requires_repair');
-    await dispatchImplementationRepairPrompt(run, 'implementation_audit_rework_requires_repair');
+    sendTerminalProjectionIfNeeded(run, await dispatchImplementationRepairPrompt(run, 'implementation_audit_rework_requires_repair'));
     return;
   }
 
@@ -2838,18 +2972,18 @@ async function advanceAfterAuditVerdict(
     ]);
     if (currentRunChangedFiles.length > 0 && verdict.repairs_applied.length === 0) {
       run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', 'audit_pass_with_changed_files_without_repairs');
-      await dispatchImplementationRepairPrompt(run, 'audit_pass_with_changed_files_without_repairs');
+      sendTerminalProjectionIfNeeded(run, await dispatchImplementationRepairPrompt(run, 'audit_pass_with_changed_files_without_repairs'));
       return;
     }
     const finalFailure = validateFinalPass(run, verdict, currentRunChangedFiles);
     if (finalFailure) {
       run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', finalFailure);
-      await dispatchImplementationRepairPrompt(run, finalFailure);
+      sendTerminalProjectionIfNeeded(run, await dispatchImplementationRepairPrompt(run, finalFailure));
       return;
     }
     if (!postRepairVerification) {
       run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON);
-      await dispatchImplementationRepairPrompt(run, OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON);
+      sendTerminalProjectionIfNeeded(run, await dispatchImplementationRepairPrompt(run, OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_FOLLOWUP_REPAIR_REASON));
       return;
     }
     run.finalAfterRepair = scoreSnapshotFromAuditResult(auditResult, 'final_after_repair', 'final_audit_passed');
@@ -3407,6 +3541,12 @@ async function launch(request: OpenSpecAutoDeliverLaunchRequest, serverLink: Ser
     evidence: [],
     requestIds: new Map(),
     serverLink,
+    // Dedicated-execution routing (OFF by default). The implementation prompt
+    // is byte-identical to current behavior unless this is set to an enabled
+    // config with a valid template target.
+    // TODO: thread from launch payload — the web→server→daemon Auto Deliver
+    // launch-payload plumbing for this routing config is not yet wired; until
+    // then it stays undefined (disabled) and is set explicitly by callers/tests.
   };
   runsById.set(run.runId, run);
   activeRunByOwner.set(owner, run.runId);
@@ -3639,3 +3779,20 @@ export function dropOpenSpecAutoDeliverImplementationMarkerForTests(runId: strin
   delete run.activeImplementationMarker;
   return true;
 }
+
+/**
+ * Test-only access to the pure prompt builders + the implementation parent
+ * stage so prompt-routing injection can be asserted directly (without driving
+ * the whole orchestrator). These builders are pure (no I/O) and read only
+ * `run` fields. `AutoDeliverRunForTests` is the run shape they consume.
+ */
+export type AutoDeliverRunForTests = AutoDeliverRun;
+export const __executionRoutingTesting__ = {
+  AUTO_DELIVER_IMPLEMENTATION_STAGE,
+  buildImplementationPrompt: (run: AutoDeliverRun, repairReason?: string): string =>
+    buildImplementationPrompt(run, repairReason),
+  buildImplementationMarkerReminderPrompt: (run: AutoDeliverRun, reason: string): string =>
+    buildImplementationMarkerReminderPrompt(run, reason),
+  buildSpecRepairPrompt: (run: AutoDeliverRun, repairReason: string): string =>
+    buildSpecRepairPrompt(run, repairReason),
+} as const;

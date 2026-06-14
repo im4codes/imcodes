@@ -6,7 +6,28 @@ import { getClaudeSdkRuntimeConfig } from '../agent/sdk-runtime-config.js';
 import { getClaudeUsageQuota } from '../agent/claude-usage-quota.js';
 import { getSession, type SessionRecord } from '../store/session-store.js';
 import type { ServerLink } from './server-link.js';
+import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
 import logger from '../util/logger.js';
+
+/**
+ * Runtime-identity fields that MUST NOT replicate to Postgres for an execution
+ * clone. Kept as an explicit, decoupled list (mirrors the shared
+ * transport-identity denylist) so this module never depends on the in-progress
+ * `execution-clone.ts` daemon helper. If that module later exports a
+ * `buildScrubbedSyncOverrides`, this can be swapped to reuse it.
+ */
+const CLONE_PAYLOAD_IDENTITY_FIELDS = [
+  'ccSessionId',
+  'codexSessionId',
+  'geminiSessionId',
+  'opencodeSessionId',
+  'providerSessionId',
+  'providerResumeId',
+] as const satisfies readonly (keyof SessionRecord)[];
+
+function isExecutionClone(metadata: ExecutionCloneMetadata | null | undefined): boolean {
+  return metadata?.kind === EXECUTION_CLONE_KIND;
+}
 
 export interface SubSessionSyncTransportQueueSnapshot {
   pendingMessages: string[];
@@ -66,22 +87,35 @@ export async function buildSubSessionSyncPayload(
   const usageQuota = isClaudeSdkSession(r.agentType) ? await getClaudeUsageQuota().catch(() => null) : null;
   const transportQueue = options?.transportQueue ?? null;
 
+  // Execution clones inherit runtime CONFIG but NEVER runtime IDENTITY. Null out
+  // every identity field so stale identity never replicates to Postgres (and
+  // never survives a conflict upsert — see createSubSession's clone-aware CASE).
+  const cloneMetadata = r.executionCloneMetadata ?? null;
+  const isClone = isExecutionClone(cloneMetadata);
+  const identity = (field: (typeof CLONE_PAYLOAD_IDENTITY_FIELDS)[number]): string | null =>
+    isClone ? null : ((r[field] as string | undefined) ?? null);
+
   return {
     type: 'subsession.sync',
     id,
     state: r.state ?? null,
     sessionType: r.agentType,
     cwd: r.projectDir ?? null,
-    shellBin: null,
-    ccSessionId: r.ccSessionId ?? null,
-    geminiSessionId: r.geminiSessionId ?? null,
+    // shell/script launch binary is CONFIG (not identity): send the real value so
+    // the server `sub_sessions.shell_bin` column stays aligned and an inherited
+    // shellBin survives cross-device restore. Execution clones may sync their
+    // copied shellBin too (identity ids are still scrubbed via `identity()`).
+    shellBin: (r.agentType === 'shell' || r.agentType === 'script') ? (r.shellBin ?? null) : null,
+    ccSessionId: identity('ccSessionId'),
+    geminiSessionId: identity('geminiSessionId'),
+    executionCloneMetadata: cloneMetadata,
     parentSession: r.parentSession ?? null,
     ccPresetId: r.ccPreset ?? null,
     description: r.description ?? null,
     label: r.label ?? null,
     runtimeType: r.runtimeType ?? null,
     providerId: r.providerId ?? null,
-    providerSessionId: r.providerSessionId ?? null,
+    providerSessionId: identity('providerSessionId'),
     requestedModel: r.requestedModel ?? null,
     activeModel: r.activeModel ?? r.modelDisplay ?? null,
     contextNamespace: r.contextNamespace ?? null,

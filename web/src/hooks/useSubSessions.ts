@@ -26,6 +26,7 @@ import {
 } from '../transport-queue.js';
 import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
 import { getAutoSessionLabelPrefix } from '../agent-display.js';
+import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
@@ -35,6 +36,19 @@ export interface SubSession extends SubSessionData {
   transportPendingMessageEntries?: import('../transport-queue.js').TransportPendingMessageEntry[] | null;
   /** Newest pending-queue version applied. Drops stale snapshots. */
   transportPendingMessageVersion?: number | null;
+}
+
+/**
+ * True when a sub-session record is an ephemeral execution clone — identified by
+ * its projected `executionCloneKind` discriminant (the canonical
+ * {@link EXECUTION_CLONE_KIND} value) or, defensively, by carrying a
+ * `parentRunId`. Execution clones must never render as flat top-level peers;
+ * they are grouped under their parent run. See {@link SessionTree}.
+ */
+export function isExecutionCloneSubSession(
+  sub: Pick<SubSessionData, 'executionCloneKind' | 'parentRunId'>,
+): boolean {
+  return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
 }
 
 function isCodexFamily(agentType: string | null | undefined): boolean {

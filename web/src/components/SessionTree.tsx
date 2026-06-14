@@ -19,6 +19,7 @@ import { useTranslation } from 'react-i18next';
 import type { SessionInfo } from '../types.js';
 import { isTransportRuntime } from '../runtime-type.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
+import { isExecutionCloneSubSession } from '../hooks/useSubSessions.js';
 import { formatLabel } from '../format-label.js';
 import { getAgentBadgeConfig } from '../agent-display.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
@@ -56,6 +57,42 @@ interface Props {
 function getSessionLabel(s: SessionInfo): string {
   if (s.label) return formatLabel(s.label);
   return s.role === 'brain' ? s.project : `W${s.name.split('_w')[1] ?? '?'}`;
+}
+
+/** Collapse-state key for an execution-clone group under a given parent run. */
+function cloneGroupKey(parentSession: string, parentRunId: string): string {
+  return `clonegroup:${parentSession}:${parentRunId}`;
+}
+
+/**
+ * Split a main session's children into ordinary sub-sessions (rendered flat)
+ * and execution-clone groups keyed by `parentRunId` (rendered collapsed under a
+ * per-run group section). Execution clones must NEVER appear as flat top-level
+ * peers — they are always nested inside their run group.
+ */
+function splitChildren(children: SubSession[]): {
+  normalSubs: SubSession[];
+  cloneGroups: Array<{ parentRunId: string; clones: SubSession[] }>;
+} {
+  const normalSubs: SubSession[] = [];
+  const groupsByRun = new Map<string, SubSession[]>();
+  const order: string[] = [];
+  for (const sub of children) {
+    if (isExecutionCloneSubSession(sub)) {
+      // `parentRunId` may be absent on a clone identified only by kind; bucket
+      // those under a stable sentinel so they still group rather than going flat.
+      const runId = sub.parentRunId || 'unknown';
+      const existing = groupsByRun.get(runId);
+      if (existing) existing.push(sub);
+      else { groupsByRun.set(runId, [sub]); order.push(runId); }
+    } else {
+      normalSubs.push(sub);
+    }
+  }
+  return {
+    normalSubs,
+    cloneGroups: order.map((parentRunId) => ({ parentRunId, clones: groupsByRun.get(parentRunId)! })),
+  };
 }
 
 // ── State dot ────────────────────────────────────────────────────────────────
@@ -192,6 +229,10 @@ function SessionTreeInner({
 }: Props) {
   const { t } = useTranslation();
   const [collapsed, setCollapsed] = useState<Set<string>>(() => loadCollapsed(serverId));
+  // Execution-clone groups default to COLLAPSED; this set tracks the ones the
+  // user has explicitly EXPANDED (ephemeral — not persisted across reloads,
+  // since clones are short-lived).
+  const [openCloneGroups, setOpenCloneGroups] = useState<Set<string>>(() => new Set());
   const resizable = typeof height === 'number' && !!onResizeHeight;
   const { height: liveHeight, onMouseDown: onResizeMouseDown, onTouchStart: onResizeTouchStart } = useVerticalResize({
     height: height ?? 0,
@@ -212,6 +253,14 @@ function SessionTreeInner({
       return next;
     });
   }, [serverId, sessions]);
+
+  const toggleCloneGroup = (key: string) => {
+    setOpenCloneGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  };
 
   const toggleCollapse = (name: string) => {
     setCollapsed((prev) => {
@@ -298,7 +347,34 @@ function SessionTreeInner({
         const children = subSessionsByParent.unparented.length > 0
           ? [...parentedChildren, ...subSessionsByParent.unparented]
           : parentedChildren;
+        // Execution clones never render as flat peers — split them into per-run
+        // groups; ordinary sub-sessions still render flat as before.
+        const { normalSubs, cloneGroups } = splitChildren(children);
         const isCollapsed = collapsed.has(session.name);
+
+        // Render a single sub-session node (shared by the flat list and the
+        // execution-clone groups).
+        const renderSubNode = (sub: SubSession) => {
+          const subLabel = sub.label ? formatLabel(sub.label) : sub.type;
+          const subUnread = unreadCounts.get(sub.sessionName) ?? 0;
+          const subIdleFlashToken = idleFlashTokens?.get(sub.sessionName) ?? 0;
+          return (
+            <SessionNode
+              key={sub.id}
+              label={subLabel}
+              agentType={sub.type}
+              state={sub.state}
+              isActive={false}
+              isTransport={false}
+              isSub={true}
+              unread={subUnread}
+              idleFlashToken={subIdleFlashToken}
+              sharedState={sharedSubSessionStates?.get(sub.id) ?? sharedSubSessionStates?.get(sub.sessionName)}
+              inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
+              onClick={() => onSelectSubSession(sub)}
+            />
+          );
+        };
 
         return (
           <div key={session.name} role="treeitem" aria-expanded={!isCollapsed && children.length > 0}>
@@ -335,26 +411,37 @@ function SessionTreeInner({
               )}
             </div>
 
-            {/* Sub-session nodes (indented) — hidden when collapsed */}
-            {!isCollapsed && children.map((sub) => {
-              const subLabel = sub.label ? formatLabel(sub.label) : sub.type;
-              const subUnread = unreadCounts.get(sub.sessionName) ?? 0;
-              const subIdleFlashToken = idleFlashTokens?.get(sub.sessionName) ?? 0;
+            {/* Ordinary sub-session nodes (indented) — hidden when collapsed */}
+            {!isCollapsed && normalSubs.map((sub) => renderSubNode(sub))}
+
+            {/* Execution-clone groups: collapsed per-parent-run sections. Never
+                flat peers. Each group toggles independently of the main row. */}
+            {!isCollapsed && cloneGroups.map((group) => {
+              const groupKey = cloneGroupKey(session.name, group.parentRunId);
+              // Default state for clone groups is COLLAPSED. We track EXPANDED
+              // groups in a separate set so the default (no entry) reads as
+              // collapsed without seeding the shared `collapsed` set.
+              const isGroupCollapsed = !openCloneGroups.has(groupKey);
               return (
-                <SessionNode
-                  key={sub.id}
-                  label={subLabel}
-                  agentType={sub.type}
-                  state={sub.state}
-                  isActive={false}
-                  isTransport={false}
-                  isSub={true}
-                  unread={subUnread}
-                  idleFlashToken={subIdleFlashToken}
-                  sharedState={sharedSubSessionStates?.get(sub.id) ?? sharedSubSessionStates?.get(sub.sessionName)}
-                  inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
-                  onClick={() => onSelectSubSession(sub)}
-                />
+                <div key={groupKey} class="session-tree-clone-group" role="group">
+                  <button
+                    class="session-tree-toggle session-tree-clone-group-toggle"
+                    onClick={(e) => { e.stopPropagation(); toggleCloneGroup(groupKey); }}
+                    title={isGroupCollapsed ? t('sidebar.expand_all', 'Expand all') : t('sidebar.collapse_all', 'Collapse all')}
+                    aria-expanded={!isGroupCollapsed}
+                  >
+                    <span aria-hidden="true">{isGroupCollapsed ? '▸' : '▾'}</span>
+                    <span class="session-tree-clone-group-label">
+                      {t('session.executionGroup.title', 'Execution workers (run {{run}})', {
+                        run: group.parentRunId === 'unknown'
+                          ? t('session.executionGroup.unknownRun', 'pending')
+                          : group.parentRunId.slice(0, 8),
+                      })}
+                    </span>
+                    <span class="session-tree-clone-group-count">{group.clones.length}</span>
+                  </button>
+                  {!isGroupCollapsed && group.clones.map((sub) => renderSubNode(sub))}
+                </div>
               );
             })}
           </div>

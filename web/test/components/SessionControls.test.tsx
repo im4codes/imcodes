@@ -316,6 +316,7 @@ const makeWs = (overrides: { capabilitySnapshot?: { daemonId: string; capabiliti
   return {
     send: vi.fn(),
     sendSessionCommand: vi.fn(),
+    sendSessionMessage: vi.fn(),
     // Urgent variant for stop / cancel — bypasses the probe-state gate.
     // Stop must reach the server even during a brief WS probe (`_connected
     // = false` for ~50-200ms after focus/visibility ticks).
@@ -2153,6 +2154,145 @@ afterEach(() => {
 
     expect(screen.getByRole('textbox').textContent).toBe('generate openspec change from description below and write proposal design specs tasks');
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('OpenSpec Execute dropdown pins the saved template, lists eligible sessions, sets/clears the preference, and dispatches the OpenSpec prompt to the chosen session', async () => {
+    const ws = makeWs();
+    // Saved per-project execution template for serverId "srv-exec" → the worker
+    // sub-session "deck_sub_pinned". The dropdown must PIN it first.
+    getUserPrefMock.mockImplementation(async (key: unknown) => {
+      if (key === 'exec_routing.template:srv-exec') return 'deck_sub_pinned';
+      return null;
+    });
+
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        serverId="srv-exec"
+        sessions={[
+          makeSession({ name: 'my-session', role: 'w1', agentType: 'codex' }),
+          // Main/brain session is excluded from the Execute selector.
+          mainSession,
+        ]}
+        subSessions={[
+          { sessionName: 'deck_sub_pinned', type: 'codex', label: 'pinned', state: 'idle', parentSession: 'my-session', executionTemplateEligible: true },
+          { sessionName: 'deck_sub_other', type: 'codex', label: 'other', state: 'idle', parentSession: 'my-session', executionTemplateEligible: true },
+          // Ineligible sub-session — must NOT appear.
+          { sessionName: 'deck_sub_blocked', type: 'codex', label: 'blocked', state: 'idle', parentSession: 'my-session', executionTemplateEligible: false },
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    await flushAsync();
+
+    // Open the OpenSpec panel with a single change so the Execute target resolves.
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    // Open the Execute dropdown.
+    fireEvent.click(screen.getByTestId('openspec-execute-trigger'));
+    const menu = screen.getByTestId('openspec-execute-menu');
+
+    // Pinned saved template appears FIRST as a dispatch item.
+    const pinned = within(menu).getByTestId('openspec-execute-pinned');
+    expect(pinned).toBeDefined();
+    const dispatchButtons = menu.querySelectorAll('[data-testid^="openspec-execute-session-"], [data-testid="openspec-execute-pinned"]');
+    expect(dispatchButtons[0]).toBe(pinned);
+
+    // Eligible non-current/non-main sessions are listed; the pinned one is not
+    // duplicated below, and the ineligible/main sessions are excluded.
+    expect(within(menu).getByTestId('openspec-execute-session-deck_sub_other')).toBeDefined();
+    expect(within(menu).queryByTestId('openspec-execute-session-deck_sub_pinned')).toBeNull();
+    expect(within(menu).queryByTestId('openspec-execute-session-deck_sub_blocked')).toBeNull();
+    expect(within(menu).queryByTestId('openspec-execute-session-deck_my-project_brain')).toBeNull();
+
+    // Choosing the pinned session dispatches the OpenSpec implement prompt to it
+    // (and closes the panel). Cross-session routing must NOT inject into the
+    // composer.
+    fireEvent.click(pinned);
+    expect(ws.sendSessionMessage).toHaveBeenCalledWith(
+      'deck_sub_pinned',
+      'implement @openspec/changes/change-a, keep openspec artifacts aligned while coding',
+    );
+    expect(screen.getByRole('textbox').textContent).toBe('');
+
+    // Re-open the OpenSpec panel, then the Execute submenu, and set a DIFFERENT
+    // session as the shared default → persists the SAME per-project
+    // execution-template preference (no OpenSpec-only key).
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+    fireEvent.click(screen.getByTestId('openspec-execute-trigger'));
+    fireEvent.click(screen.getByTestId('openspec-execute-set-deck_sub_other'));
+    await flushAsync();
+    expect(saveUserPrefMock).toHaveBeenCalledWith('exec_routing.template:srv-exec', 'deck_sub_other');
+
+    // Re-open the Execute submenu and CLEAR the default (allowed HERE, unlike
+    // the generic dropdown) → writes the empty sentinel to the SAME key.
+    fireEvent.click(screen.getByTestId('openspec-execute-trigger'));
+    fireEvent.click(screen.getByTestId('openspec-execute-clear'));
+    await flushAsync();
+    expect(saveUserPrefMock).toHaveBeenCalledWith('exec_routing.template:srv-exec', '');
+  });
+
+  it('OpenSpec Execute dropdown dispatches to a non-default eligible session for the current change', async () => {
+    const ws = makeWs();
+    getUserPrefMock.mockResolvedValue(null); // no saved default
+
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        serverId="srv-exec"
+        sessions={[makeSession({ name: 'my-session', role: 'w1', agentType: 'codex' })]}
+        subSessions={[
+          { sessionName: 'deck_sub_worker', type: 'codex', label: 'worker', state: 'idle', parentSession: 'my-session', executionTemplateEligible: true },
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-z', path: '/repo/openspec/changes/change-z', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByTestId('openspec-execute-trigger'));
+    const menu = screen.getByTestId('openspec-execute-menu');
+    // No saved default → no pinned item.
+    expect(within(menu).queryByTestId('openspec-execute-pinned')).toBeNull();
+
+    fireEvent.click(within(menu).getByTestId('openspec-execute-session-deck_sub_worker'));
+    expect(ws.sendSessionMessage).toHaveBeenCalledWith(
+      'deck_sub_worker',
+      'implement @openspec/changes/change-z, keep openspec artifacts aligned while coding',
+    );
   });
 
   it('shows openspec propose even when there are no existing changes', async () => {
@@ -5697,6 +5837,86 @@ afterEach(() => {
     expectSendPayload(ws, {
       sessionName: 'kimi-sdk-session',
       text: '/model moonshot-v1-auto,thinking',
+    });
+  });
+
+  // ── dedicated-execution-clone-sessions: generic 🤖▾ execution dropdown ─────
+  describe('generic execution-session dropdown', () => {
+    const execSub = {
+      id: 'exec-1',
+      sessionName: 'deck_sub_exec',
+      label: 'exec worker',
+      type: 'codex-sdk',
+      state: 'idle',
+      parentSession: 'deck_proj_brain',
+    } as any;
+
+    function renderWithExecRouting(template: string | null, ws = makeWs()) {
+      getUserPrefMock.mockImplementation(async (key: unknown) => {
+        if (typeof key === 'string' && key.startsWith('exec_routing.template:')) {
+          return template;
+        }
+        return null;
+      });
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: 'deck_proj_brain', role: 'brain' })}
+          quickData={makeQuickData() as any}
+          serverId="srv-exec"
+          subSessions={[execSub] as any}
+        />,
+      );
+      return ws;
+    }
+
+    it('renders the 🤖 trigger with the localized Execution session tooltip', async () => {
+      renderWithExecRouting(null);
+      await flushAsync();
+      const trigger = screen.getByLabelText('execution_session');
+      expect(trigger).toBeDefined();
+      expect(trigger.textContent).toContain('🤖');
+    });
+
+    it('shows exactly two menu items and disables use when no valid default exists', async () => {
+      renderWithExecRouting(null);
+      await flushAsync();
+      fireEvent.click(screen.getByLabelText('execution_session'));
+      const useItem = screen.getByTestId('exec-menu-use-configured') as HTMLButtonElement;
+      const setItem = screen.getByTestId('exec-menu-set-session');
+      expect(useItem.disabled).toBe(true);
+      expect(setItem).toBeDefined();
+      // No "use current session" / "clear execution session" entries.
+      const menu = screen.getByRole('menu');
+      expect(within(menu).getAllByRole('menuitem')).toHaveLength(2);
+    });
+
+    it('dispatches the generic (non-OpenSpec) prompt to the configured session on "use"', async () => {
+      const ws = renderWithExecRouting('deck_sub_exec');
+      await flushAsync();
+      fireEvent.click(screen.getByLabelText('execution_session'));
+      const useItem = screen.getByTestId('exec-menu-use-configured') as HTMLButtonElement;
+      expect(useItem.disabled).toBe(false);
+      fireEvent.click(useItem);
+      expect(ws.sendSessionMessage).toHaveBeenCalledTimes(1);
+      const [target, prompt] = ws.sendSessionMessage.mock.calls[0];
+      expect(target).toBe('deck_sub_exec');
+      // Generic entry point: the prompt must NOT carry OpenSpec semantics.
+      expect(String(prompt).toLowerCase()).not.toContain('openspec');
+      expect(String(prompt).toLowerCase()).not.toContain('requirement');
+    });
+
+    it('opens the execution settings tab WITHOUT dispatching when choosing "set execution session"', async () => {
+      const ws = renderWithExecRouting('deck_sub_exec');
+      await flushAsync();
+      fireEvent.click(screen.getByLabelText('execution_session'));
+      fireEvent.click(screen.getByTestId('exec-menu-set-session'));
+      // No execution dispatched by the settings action.
+      expect(ws.sendSessionMessage).not.toHaveBeenCalled();
+      // The Team settings panel opened (execution tab); its title is rendered.
+      await waitFor(() => {
+        expect(screen.getByText('settings_title')).toBeDefined();
+      });
     });
   });
 });

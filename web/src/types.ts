@@ -71,6 +71,12 @@ export interface SessionInfo {
   transportPendingMessageVersion?: number;
   /** Passive, share-scoped state supplied by share-aware server/bootstrap paths. */
   sharedState?: SharedStateSummary | null;
+  /** DAEMON-AUTHORITATIVE: whether this session may serve as an execution-clone
+   *  template. The UI renders this flag rather than recomputing eligibility. */
+  executionTemplateEligible?: boolean;
+  /** DAEMON-AUTHORITATIVE: ineligibility reason (meaningful only when
+   *  `executionTemplateEligible === false`). */
+  executionTemplateIneligibleReason?: string;
 }
 
 export interface ServerInfo {

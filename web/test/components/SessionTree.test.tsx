@@ -91,4 +91,44 @@ describe('SessionTree', () => {
     expect(screen.getByText('Child session')).toBeDefined();
     expect(localStorage.getItem('rcc_tree_collapsed:srv-2')).toBeNull();
   });
+
+  it('groups execution clones under a collapsed per-run section instead of flat rows', () => {
+    const withClones = [
+      ...subSessions,
+      {
+        id: 'clone-1',
+        sessionName: 'deck_sub_clone1',
+        label: 'Worker clone A',
+        type: 'codex-sdk',
+        state: 'running',
+        parentSession: 'deck_main_brain',
+        executionCloneKind: 'execution_clone',
+        parentRunId: 'run-abcdef123456',
+      },
+    ] as any;
+    render(
+      <SessionTree
+        serverId="srv-clone"
+        sessions={sessions}
+        subSessions={withClones}
+        activeSession={null}
+        unreadCounts={new Map()}
+        onSelectSession={vi.fn()}
+        onSelectSubSession={vi.fn()}
+      />,
+    );
+
+    // The ordinary sub-session renders flat.
+    expect(screen.getByText('Child session')).toBeDefined();
+    // The clone is hidden by default (group collapsed) — NOT a flat peer.
+    expect(screen.queryByText('Worker clone A')).toBeNull();
+    // The group header is shown. The test translator does not interpolate, so
+    // the label renders the raw fallback string; query by that.
+    const groupHeader = screen.getByText('Execution workers (run {{run}})');
+    expect(groupHeader).toBeDefined();
+
+    // Expanding the group (click its toggle) reveals the clone node.
+    fireEvent.click(groupHeader.closest('button')!);
+    expect(screen.getByText('Worker clone A')).toBeDefined();
+  });
 });

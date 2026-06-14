@@ -37,6 +37,16 @@ import { sendSubSessionSync } from './subsession-sync.js';
 import { getPaneCwd } from '../agent/tmux.js';
 import { GitRemoteCloneError, cloneGitRemoteToDirectory } from './git-remote-clone.js';
 import { normalizeOptionalGitRemoteUrl } from '../../shared/git-remote-url.js';
+import { cloneTransportConfigWithoutRuntimeIdentity } from '../../shared/transport-identity-scrub.js';
+
+// Re-export the transport-identity scrub helpers (now living in shared/) so any
+// existing importers of this module continue to resolve them here.
+export {
+  CLONE_TRANSPORT_IDENTITY_KEY_NORMALIZED,
+  cloneTransportConfigWithoutRuntimeIdentity,
+  isCloneTransportIdentityKey,
+  scrubCloneTransportIdentity,
+} from '../../shared/transport-identity-scrub.js';
 
 const OPERATION_RETENTION_MS = 10 * 60 * 1000;
 
@@ -70,54 +80,6 @@ interface CreatedResources {
 const operationsByIdempotencyKey = new Map<string, CloneOperationSnapshot>();
 const activeTargetReservations = new Set<string>();
 const cancelledOperationIds = new Set<string>();
-const CLONE_TRANSPORT_IDENTITY_KEY_NORMALIZED = new Set([
-  'bindexistingkey',
-  'ccsessionid',
-  'codexsessionid',
-  'conversationid',
-  'geminisessionid',
-  'opencodesessionid',
-  'providersessionid',
-  'providerresumeid',
-  'resumeid',
-  'sessionid',
-  'sessionkey',
-  'threadid',
-]);
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value);
-}
-
-function isCloneTransportIdentityKey(key: string): boolean {
-  const normalized = key.replace(/[-_]/g, '').toLowerCase();
-  return CLONE_TRANSPORT_IDENTITY_KEY_NORMALIZED.has(normalized)
-    || normalized.endsWith('sessionid')
-    || normalized.endsWith('sessionkey')
-    || normalized.endsWith('resumeid')
-    || normalized.endsWith('threadid');
-}
-
-function scrubCloneTransportIdentity(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => scrubCloneTransportIdentity(item));
-  }
-  if (!isPlainRecord(value)) return value;
-
-  const cleaned: Record<string, unknown> = {};
-  for (const [key, nestedValue] of Object.entries(value)) {
-    if (isCloneTransportIdentityKey(key)) continue;
-    cleaned[key] = scrubCloneTransportIdentity(nestedValue);
-  }
-  return cleaned;
-}
-
-function cloneTransportConfigWithoutRuntimeIdentity(config: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
-  if (!isPlainRecord(config)) return null;
-  const cleaned = scrubCloneTransportIdentity(config);
-  return isPlainRecord(cleaned) ? cleaned : null;
-}
-
 function pruneOperations(now = Date.now()): void {
   for (const [key, operation] of operationsByIdempotencyKey.entries()) {
     if (now - operation.updatedAt > OPERATION_RETENTION_MS) operationsByIdempotencyKey.delete(key);

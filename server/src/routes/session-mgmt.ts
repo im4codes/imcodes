@@ -75,7 +75,8 @@ sessionMgmtRoutes.get(`/:id/${WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT}`, async (c)
   try {
     const [allSessions, subSessions] = await Promise.all([
       getDbSessionsByServer(c.env.DB, serverId),
-      getSubSessionsByServer(c.env.DB, serverId),
+      // Session-mgmt snapshot listing: exclude ephemeral execution clones (default).
+      getSubSessionsByServer(c.env.DB, serverId, { includeExecutionClones: false }),
     ]);
     const sessions = allSessions.filter((s) => !s.name.startsWith('deck_sub_'));
     const normalizedSessions = normalizeWorkerSessionRows(sessions);

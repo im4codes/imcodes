@@ -642,7 +642,17 @@
       "deny": "拒绝",
       "tool": "{{tool}} 需要审批"
     },
-    "workingDirPlaceholder": "~/projects/myapp"
+    "workingDirPlaceholder": "~/projects/myapp",
+    "execution": {
+      "genericPrompt": "请在本会话中执行所请求的实现/执行工作。",
+      "useConfigured": "使用 {{name}}",
+      "useConfiguredNone": "使用执行会话",
+      "setSession": "设置执行会话…"
+    },
+    "executionGroup": {
+      "title": "执行工作会话（运行 {{run}}）",
+      "unknownRun": "待定"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ 升级 Daemon",
@@ -1183,6 +1193,16 @@
     "implement_action": "实现",
     "achieve_action": "完成",
     "propose_action": "Propose",
+    "execute": {
+      "action": "执行",
+      "dispatch_heading": "在以下会话执行当前变更",
+      "dispatch_to": "{{name}}",
+      "default_heading": "默认执行会话",
+      "set_default": "将 {{name}} 设为默认",
+      "clear_default": "清除默认执行会话",
+      "no_change": "展开一个变更以选择其执行目标。",
+      "no_sessions": "本项目暂无可用的执行会话。"
+    },
     "auto": {
       "action": "Auto",
       "kicker": "自动交付",
@@ -1453,7 +1473,27 @@
     "passkey_verify_wrong_account": "你验证的是另一个账号的 Passkey，请使用当前账号绑定的 Passkey。",
     "passkey_verify_no_passkeys": "当前账号还没有绑定 Passkey。",
     "native_status_verifying_passkey": "正在验证 Passkey…",
-    "native_status_saving_password": "正在保存密码登录…"
+    "native_status_saving_password": "正在保存密码登录…",
+    "executionRouting": {
+      "title": "执行路由",
+      "enableLabel": "使用专用执行会话",
+      "enableHint": "启用后，实现/执行工作将从下方模板会话复制出的短生命克隆 worker 中运行，而不是在编排器中运行。保存此选项仅保存偏好设置，不会启动任何执行。",
+      "templateLabel": "执行模板会话",
+      "templateNone": "未选择",
+      "templateHint": "克隆会继承该会话的提供商、模型和工具，但绝不会继承其身份或历史记录。仅列出本项目中符合条件的非主会话。",
+      "noCandidates": "本项目暂无符合条件的模板会话。请启动一个 worker 或子会话作为模板。",
+      "reselectRequired": "路由已启用，但本项目尚未选择有效的模板。请在下方选择一个执行模板会话。",
+      "ineligibleOption": "{{name}} — {{reason}}",
+      "ineligibleReason": {
+        "capacity_full": "已达容量上限",
+        "template_ineligible": "不可用作模板",
+        "clone_of_clone_forbidden": "已是执行克隆",
+        "worker_clone_forbidden": "工作会话不能作为模板",
+        "cron_clone_forbidden": "定时会话不能作为模板",
+        "target_not_found": "未找到会话",
+        "destroy_forbidden": "不允许"
+      }
+    }
   },
   "admin": {
     "title": "管理面板",

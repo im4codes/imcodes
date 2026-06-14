@@ -116,6 +116,19 @@ import {
   sanitizeP2pLaunchOriginForProjection,
   type P2pLaunchOrigin,
 } from './p2p-launch-admission.js';
+import { appendExecutionRoutingAppendix } from './execution-routing-appendix.js';
+import { buildExecutionRoutingRecentContextBlock } from './execution-routing-handoff.js';
+import { orchestrateCloneWorkers, WorkerTimeoutError } from './execution-clone-orchestration.js';
+import { defaultDedicatedExecutionRoutingPreference } from '../../shared/execution-clone.js';
+import type { ExecutionCloneParentStage, DedicatedExecutionRoutingGlobalPreference } from '../../shared/execution-clone.js';
+
+/**
+ * Parent stage owning the Team FINAL-EXECUTION prompt's task semantics. Typed
+ * against {@link ExecutionCloneParentStage} so it cannot drift from the shared
+ * tuple (compile error if the member is ever removed). This is a reference to
+ * the shared constant union, not a second definition of the string.
+ */
+const TEAM_FINAL_EXECUTION_STAGE: ExecutionCloneParentStage = 'team_final_execution';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -170,6 +183,24 @@ export interface StartP2pRunOptions {
    * caller must restate them here explicitly.
    */
   finalSummaryExtraInstruction?: string;
+  /**
+   * Dedicated-execution routing config for this run. OFF by default
+   * (`undefined` → disabled). When enabled with a valid `templateSessionName`,
+   * the FINAL-EXECUTION prompt gets the routing appendix. Threaded through to
+   * `P2pRun.dedicatedExecutionRouting`.
+   */
+  dedicatedExecutionRouting?: {
+    enabled: boolean;
+    templateSessionName: string | null;
+    /**
+     * Resolved (clamped) per-run clone limits. When present, these are consumed
+     * by the orchestrator clone pool so a configured non-default cap (e.g.
+     * `maxParallelClones`) is actually enforced. Absent → canonical defaults.
+     */
+    limits?: DedicatedExecutionRoutingGlobalPreference;
+    /** Optional already-stored recent summary attached (bounded) to the worker hand-off. NEVER raw history. */
+    recentSummary?: string | null;
+  };
 }
 
 export interface SharedP2pRunScope {
@@ -326,6 +357,34 @@ export interface P2pRun {
     timestamp: number;
   }>;
   helperDiagnostics: P2pHelperDiagnostic[];
+  /**
+   * Dedicated-execution routing config for this run (OFF by default). When
+   * `enabled` is true AND `templateSessionName` is a valid target, the Team
+   * FINAL-EXECUTION prompt gets the generic routing appendix telling the model
+   * to delegate execution to an ephemeral clone of the configured session
+   * instead of implementing in the orchestrator session. `undefined` →
+   * disabled → all existing prompts are byte-identical. NEVER carries OpenSpec
+   * task wording — that is owned only by the OpenSpec entry point.
+   */
+  dedicatedExecutionRouting?: {
+    enabled: boolean;
+    templateSessionName: string | null;
+    /**
+     * Resolved (clamped) per-run clone limits threaded from the launch payload.
+     * Consumed by {@link tryRunFinalExecutionViaClones} so a configured
+     * non-default cap is enforced by the clone pool. Absent → canonical
+     * defaults (the disabled/legacy path stays byte-identical).
+     */
+    limits?: DedicatedExecutionRoutingGlobalPreference;
+    /**
+     * Optional recent-memory summary for the run/session. When routing is
+     * enabled and this is present, a bounded slice (via
+     * {@link buildExecutionRoutingRecentContextBlock}) is attached to the
+     * worker hand-off prompt for continuity. MUST be an already-stored summary,
+     * NEVER raw provider history.
+     */
+    recentSummary?: string | null;
+  };
   /** Internal: set to true when cancel requested */
   _cancelled: boolean;
 }
@@ -394,11 +453,47 @@ export interface PostSummaryExecutionPromptSpec extends P2pExecutionMarkerSpec {
   markerPath: string;
 }
 
-function buildPostSummaryExecutionBasePrompt(run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>): string {
+function buildPostSummaryExecutionBasePrompt(
+  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale' | 'dedicatedExecutionRouting'>,
+): string {
   const template = P2P_POST_SUMMARY_EXECUTE_TEMPLATES[run.locale ?? ''] ?? P2P_POST_SUMMARY_EXECUTE_TEMPLATES.en;
-  return template
+  const base = template
     .replaceAll('{{discussionFile}}', run.contextFilePath)
     .replaceAll('{{request}}', run.userText);
+  return applyExecutionRoutingToFinalExecutionPrompt(base, run.dedicatedExecutionRouting);
+}
+
+/**
+ * Apply dedicated-execution routing to the Team FINAL-EXECUTION prompt.
+ *
+ * OFF by default: when `routing` is undefined or disabled (or has no valid
+ * template target) BOTH the recent-context block and the routing appendix are
+ * empty, so the returned prompt is BYTE-IDENTICAL to `base`. Only the
+ * final-execution prompt calls this — audit/summary/plan/spec-repair prompts
+ * never do, so they never receive the appendix (task 5.5).
+ *
+ * When enabled with a valid target:
+ *  - a bounded recent-context slice (already-stored summary only, never raw
+ *    history) is inserted as continuity content, then
+ *  - the GENERIC routing/delegation appendix is appended idempotently. The
+ *    appendix carries NO OpenSpec/task wording (task 5.4).
+ */
+function applyExecutionRoutingToFinalExecutionPrompt(
+  base: string,
+  routing: P2pRun['dedicatedExecutionRouting'],
+): string {
+  const enabled = routing?.enabled ?? false;
+  const templateTarget = routing?.templateSessionName ?? null;
+  let prompt = base;
+  if (enabled) {
+    const recentContext = buildExecutionRoutingRecentContextBlock(routing?.recentSummary ?? null);
+    if (recentContext.length > 0) prompt = `${prompt}\n\n${recentContext}`;
+  }
+  return appendExecutionRoutingAppendix(prompt, {
+    enabled,
+    parentStage: TEAM_FINAL_EXECUTION_STAGE,
+    templateTarget,
+  });
 }
 
 function buildPostSummaryExecutionProofBlock(
@@ -435,7 +530,7 @@ ${failureMarker}
 }
 
 function buildInlinePostSummaryExecutionInstruction(
-  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>,
+  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale' | 'dedicatedExecutionRouting'>,
   markerSpec: PostSummaryExecutionPromptSpec,
 ): string {
   return `After writing the required summary or plan, continue in the same turn and directly execute the user's original request. Do not wait for a separate follow-up prompt.
@@ -478,7 +573,7 @@ ${buildPostSummaryExecutionProofBlock(markerSpec, options)}`;
 }
 
 export function buildPostSummaryExecutionPrompt(
-  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>,
+  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale' | 'dedicatedExecutionRouting'>,
   markerSpec?: PostSummaryExecutionPromptSpec,
   options: { attempt?: number; deadlineAt?: number } = {},
 ): string {
@@ -1298,6 +1393,13 @@ export async function startP2pRun(...args:
     })(),
     routingHistory: [],
     helperDiagnostics: [],
+    // Dedicated-execution routing (OFF by default). Threaded from the launch
+    // options; `undefined` keeps the final-execution prompt byte-identical.
+    // The daemon command-handler reads + normalizes the launch-payload
+    // `dedicatedExecutionRouting` field (task 2.7) and passes it here via
+    // StartP2pRunOptions; other callers (Auto Deliver, supervision, cron,
+    // tests) pass it explicitly. Absent → disabled.
+    ...(opts.dedicatedExecutionRouting ? { dedicatedExecutionRouting: opts.dedicatedExecutionRouting } : {}),
     _cancelled: false,
     // Audit:V-1 / N-H1 / N2 / R3 PR-α — store the bound workflow ON THE RUN
     // so v1b dangerous-node executors can recheck against the live policy at
@@ -1936,6 +2038,187 @@ async function runPostSummaryExecutionGate(
   return false;
 }
 
+/**
+ * True iff the run has dedicated execution routing enabled with a valid
+ * (non-empty) template target. Used to GATE the orchestrator-programmatic clone
+ * path: when this is false the existing in-session gate runs UNCHANGED, so the
+ * disabled path is byte-identical.
+ */
+function finalExecutionCloneRoutingActive(run: P2pRun): boolean {
+  const routing = run.dedicatedExecutionRouting;
+  return (routing?.enabled ?? false)
+    && typeof routing?.templateSessionName === 'string'
+    && routing.templateSessionName.trim().length > 0;
+}
+
+/**
+ * Build the worker hand-off prompt for a clone executing the Team final
+ * request. This is the SAME base execution prompt + marker proof the in-session
+ * gate uses, MINUS the routing/self-delegation appendix — the clone IS the
+ * worker, so it must do the work directly, not be told to delegate again. The
+ * optional recent-context block (bounded summary, never raw history) is
+ * attached for continuity.
+ */
+function buildFinalExecutionCloneWorkerPrompt(
+  run: P2pRun,
+  spec: PostSummaryExecutionRuntimeSpec,
+): string {
+  const template = P2P_POST_SUMMARY_EXECUTE_TEMPLATES[run.locale ?? ''] ?? P2P_POST_SUMMARY_EXECUTE_TEMPLATES.en;
+  let base = template
+    .replaceAll('{{discussionFile}}', run.contextFilePath)
+    .replaceAll('{{request}}', run.userText);
+  const recentContext = buildExecutionRoutingRecentContextBlock(run.dedicatedExecutionRouting?.recentSummary ?? null);
+  if (recentContext.length > 0) base = `${base}\n\n${recentContext}`;
+  const langLine = buildP2pLanguageInstruction(run.locale);
+  const proof = buildPostSummaryExecutionProofBlock(spec);
+  const body = `${base}\n\n${proof}`;
+  return langLine ? `${body}\n\n${langLine}` : body;
+}
+
+/**
+ * Orchestrator-programmatic Team final-execution path (tasks 6.1 / 6.2).
+ *
+ * Returns:
+ *  - `'disabled'` when dedicated routing is OFF / has no valid template — the
+ *    caller MUST fall through to the existing in-session execution gate
+ *    (`runPostSummaryExecutionGate`), keeping the disabled path byte-identical;
+ *  - `true`  when the clone worker completed the execution (marker confirmed);
+ *  - `false` when the clone worker failed/timed out (the run is failed here).
+ *
+ * When active, the final-execution work is routed to an ephemeral clone of the
+ * configured template via {@link orchestrateCloneWorkers}: the orchestrator
+ * dispatches the worker prompt to the clone, COLLECTS the execution marker
+ * before integration, then the clone is DESTROYED (on completion, failure, OR
+ * timeout) by the worker pool. Fail-closed: an invalid/missing template makes
+ * `createExecutionClone` throw, which fails the run (no fallback to running the
+ * work in the orchestrator session).
+ */
+async function tryRunFinalExecutionViaClones(
+  run: P2pRun,
+  serverLink: ServerLink | null,
+  spec: PostSummaryExecutionRuntimeSpec,
+  timeoutMs: number,
+): Promise<'disabled' | boolean> {
+  if (!finalExecutionCloneRoutingActive(run)) return 'disabled';
+  const templateSessionName = run.dedicatedExecutionRouting!.templateSessionName!.trim();
+  const deadlineAt = Date.now() + Math.max(1, timeoutMs);
+
+  run.runPhase = 'executing_original_request';
+  run.activePhase = 'execution';
+  run.hopStartedAt = Date.now();
+  run.executionAttempt = 1;
+  run.executionCycleCurrent = spec.cycleIndex;
+  run.executionCycleTotal = spec.cycleTotal;
+  run.executionMarkerPath = spec.markerPath;
+  pushState(run, serverLink);
+
+  const workerPrompt = buildFinalExecutionCloneWorkerPrompt(run, spec);
+
+  let orchestration;
+  try {
+    orchestration = await orchestrateCloneWorkers<P2pExecutionMarker>({
+      parentRunId: run.id,
+      parentStage: TEAM_FINAL_EXECUTION_STAGE,
+      templateSessionName,
+      ownerSessionName: run.initiatorSession,
+      owningMainSessionName: run.mainSession,
+      pref: {
+        // Consume the run's RESOLVED (clamped) clone limits when present so a
+        // configured non-default cap (e.g. maxParallelClones) is enforced by the
+        // pool; fall back to the canonical defaults only when absent. A single
+        // final-execution task needs only one slot, but the cap/queue bounds are
+        // passed so the pool enforces them uniformly.
+        ...(run.dedicatedExecutionRouting?.limits ?? defaultDedicatedExecutionRoutingPreference()),
+        enabled: true,
+      },
+      tasks: [{ id: `${run.id}.cycle${spec.cycleIndex}.final-execution`, prompt: workerPrompt }],
+      dispatch: async (cloneTarget, prompt) => {
+        await dispatchP2pPromptToSession({
+          run,
+          session: cloneTarget,
+          prompt,
+          allowDuplicate: true,
+          reason: 'final_execution_clone_dispatch',
+        });
+      },
+      collect: async (cloneTarget) => {
+        const marker = await collectFinalExecutionCloneMarker(run, cloneTarget, spec, deadlineAt);
+        if (marker === 'timeout') throw new WorkerTimeoutError('final_execution_clone_marker_timeout');
+        return marker;
+      },
+      outcomeOf: (marker) => (marker.status === 'completed' ? 'completed' : 'failed'),
+    });
+  } catch (err) {
+    // Fail-closed: invalid/missing template (or any non-capacity create
+    // failure). No fallback to the orchestrator session.
+    const reason = err instanceof Error ? err.message : String(err);
+    logger.warn({ runId: run.id, templateSessionName, err }, 'P2P: final-execution clone routing failed (fail-closed)');
+    failRun(run, POST_SUMMARY_EXECUTION_FAILED_ERROR_TYPE, `final_execution_clone_failed:${reason}`, serverLink);
+    return false;
+  }
+
+  if (run._cancelled || isTerminal(run.status)) return false;
+
+  const result = orchestration.results[0];
+  if (!result || result.outcome !== 'completed' || !result.collected) {
+    const reasonType = result?.outcome === 'timeout'
+      ? 'timed_out'
+      : POST_SUMMARY_EXECUTION_FAILED_ERROR_TYPE;
+    const reason = result?.outcome === 'timeout'
+      ? POST_SUMMARY_EXECUTION_TIMEOUT_REASON
+      : (result?.error ?? 'final_execution_clone_no_result');
+    failRun(run, reasonType, reason, serverLink);
+    return false;
+  }
+
+  // Collect-before-integration: append the worker's execution evidence into the
+  // discussion before continuing (the clone is already destroyed by the pool).
+  await appendPostSummaryExecutionAudit(
+    run,
+    spec,
+    result.collected,
+    1,
+    `P2P Original Request Execution (clone worker, cycle ${spec.cycleIndex}/${spec.cycleTotal})`,
+  );
+  logger.info(
+    { runId: run.id, cloneTarget: result.cloneTarget, cycleIndex: spec.cycleIndex },
+    'P2P: final-execution clone worker completed',
+  );
+  return true;
+}
+
+/**
+ * Poll a clone worker's execution marker until it appears or the deadline
+ * elapses. Returns the parsed marker, or `'timeout'` when the deadline passes
+ * with no terminal marker. An agent-written `failed` marker is returned (the
+ * caller maps it to a failed outcome). The marker spec's `markerPath` is shared
+ * with the worker prompt so the clone writes exactly where the orchestrator
+ * reads.
+ */
+async function collectFinalExecutionCloneMarker(
+  run: P2pRun,
+  cloneTarget: string,
+  spec: PostSummaryExecutionRuntimeSpec,
+  deadlineAt: number,
+): Promise<P2pExecutionMarker | 'timeout'> {
+  while (Date.now() < deadlineAt) {
+    if (run._cancelled || isTerminal(run.status)) return 'timeout';
+    const markerState = await readPostSummaryExecutionMarker(spec);
+    if (markerState?.ok) return markerState.marker;
+    if (markerState && !markerState.ok && markerState.failedByAgent) {
+      // Agent reported failure — surface a synthetic failed marker so the
+      // outcome classifier maps it to `failed` (clone still destroyed).
+      return { ...buildP2pExecutionMarker(spec, 'failed'), error: markerState.reason };
+    }
+    await sleep(Math.min(IDLE_POLL_MS, Math.max(1, deadlineAt - Date.now())));
+  }
+  logger.warn(
+    { runId: run.id, cloneTarget, markerPath: spec.markerPath },
+    'P2P: final-execution clone worker marker timed out',
+  );
+  return 'timeout';
+}
+
 function scheduleRoundHopArtifactCleanup(roundHops: P2pHopRuntime[]): void {
   if (roundHops.length === 0) return;
   if (ROUND_HOP_CLEANUP_DELAY_MS <= 0) {
@@ -2118,13 +2401,23 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       run.summaryPhase = summaryOk ? 'completed' : 'failed';
       if (run._cancelled || isTerminal(run.status)) return;
       if (inlineExecutionSpec) {
-        const executionOk = await runPostSummaryExecutionGate(run, serverLink, {
-          cycleIndex: inlineExecutionSpec.cycleIndex,
-          cycleTotal: inlineExecutionSpec.cycleTotal,
-          timeoutMs: run.timeoutMs * 3,
-          spec: inlineExecutionSpec,
-          initialPromptAlreadyDispatched: true,
-        });
+        // Dedicated-execution routing (tasks 6.1/6.2): when enabled with a
+        // valid template, route the final-execution work to an ephemeral clone
+        // worker (collect-before-integration, destroy after). When DISABLED,
+        // `tryRunFinalExecutionViaClones` returns 'disabled' and the existing
+        // in-session gate below runs UNCHANGED — byte-identical.
+        const cloneOutcome = await tryRunFinalExecutionViaClones(
+          run, serverLink, inlineExecutionSpec, run.timeoutMs * 3,
+        );
+        const executionOk = cloneOutcome === 'disabled'
+          ? await runPostSummaryExecutionGate(run, serverLink, {
+            cycleIndex: inlineExecutionSpec.cycleIndex,
+            cycleTotal: inlineExecutionSpec.cycleTotal,
+            timeoutMs: run.timeoutMs * 3,
+            spec: inlineExecutionSpec,
+            initialPromptAlreadyDispatched: true,
+          })
+          : cloneOutcome;
         if (run._cancelled || isTerminal(run.status)) return;
         if (!executionOk) return;
       }
@@ -3687,13 +3980,21 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   if (run._cancelled || isTerminal(run.status)) return;
 
   if (inlineExecutionSpec) {
-    const executionOk = await runPostSummaryExecutionGate(run, serverLink, {
-      cycleIndex: inlineExecutionSpec.cycleIndex,
-      cycleTotal: inlineExecutionSpec.cycleTotal,
-      timeoutMs: run.timeoutMs * 3,
-      spec: inlineExecutionSpec,
-      initialPromptAlreadyDispatched: true,
-    });
+    // Dedicated-execution routing (tasks 6.1/6.2): clone-worker path when
+    // enabled with a valid template; otherwise 'disabled' → the existing
+    // in-session gate runs UNCHANGED (byte-identical disabled path).
+    const cloneOutcome = await tryRunFinalExecutionViaClones(
+      run, serverLink, inlineExecutionSpec, run.timeoutMs * 3,
+    );
+    const executionOk = cloneOutcome === 'disabled'
+      ? await runPostSummaryExecutionGate(run, serverLink, {
+        cycleIndex: inlineExecutionSpec.cycleIndex,
+        cycleTotal: inlineExecutionSpec.cycleTotal,
+        timeoutMs: run.timeoutMs * 3,
+        spec: inlineExecutionSpec,
+        initialPromptAlreadyDispatched: true,
+      })
+      : cloneOutcome;
     if (!executionOk || run._cancelled || isTerminal(run.status)) return;
   }
 

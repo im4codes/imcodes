@@ -83,6 +83,23 @@ export function getResendCount(sessionName: string): number {
   return queues.get(sessionName)?.length ?? 0;
 }
 
+/** Drop queued entries matching a predicate. Returns the number removed. */
+export function removeResendEntries(
+  sessionName: string,
+  predicate: (entry: ResendEntry) => boolean,
+): number {
+  const list = queues.get(sessionName);
+  if (!list || list.length === 0) return 0;
+  const kept = list.filter((entry) => !predicate(entry));
+  const removed = list.length - kept.length;
+  if (kept.length === 0) {
+    queues.delete(sessionName);
+  } else if (removed > 0) {
+    queues.set(sessionName, kept);
+  }
+  return removed;
+}
+
 /** Drop every queued entry for a session. Used by /stop, /clear, session delete. */
 export function clearResend(sessionName: string): void {
   queues.delete(sessionName);

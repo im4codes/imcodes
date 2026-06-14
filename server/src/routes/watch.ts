@@ -404,7 +404,8 @@ watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
   const bridge = WsBridge.get(serverId);
   const [dbMainSessions, subSessions, tabPrefs] = await Promise.all([
     getDbSessionsByServer(c.env.DB, serverId),
-    getSubSessionsByServer(c.env.DB, serverId),
+    // Watch listing surface: exclude ephemeral execution clones (default).
+    getSubSessionsByServer(c.env.DB, serverId, { includeExecutionClones: false }),
     loadTabPreferences(c.env.DB, userId),
   ]);
 

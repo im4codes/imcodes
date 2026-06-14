@@ -378,6 +378,20 @@ export async function initOnStartup(): Promise<void> {
   } catch (err) {
     logger.warn({ err }, 'cleanupKnownTestTerminalSessions failed — daemon continues');
   }
+  // Execution clones are ephemeral and their parent runs live in daemon memory
+  // (not reattachable after a restart). Sweep ALL execution clones on startup so
+  // no orphan worker is resurrected by the health poller. Dynamic import avoids a
+  // static init-time cycle (execution-clone → subsession-manager → session-manager).
+  try {
+    const { sweepExecutionClones, destroyExecutionClone } = await import('../daemon/execution-clone.js');
+    await sweepExecutionClones(Date.now(), {
+      isCloneParentTerminal: () => true, // every clone is orphaned after restart → sweep all
+      isRunning: () => false,
+      destroy: (target, reason) => destroyExecutionClone({ target, reason, bypassAuth: true }),
+    });
+  } catch (err) {
+    logger.warn({ err }, 'execution-clone startup sweep failed — daemon continues');
+  }
   // Embedding warmup is intentionally scheduled by daemon lifecycle after the
   // ServerLink startup grace window. Loading transformers here can occupy the
   // Node main thread long enough for the server auth handshake to time out on

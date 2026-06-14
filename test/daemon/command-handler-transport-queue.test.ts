@@ -3504,6 +3504,8 @@ describe('handleWebCommand transport queue behavior', () => {
         tools: [
           MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
           MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+          MEMORY_MCP_TOOL_NAMES.SEND_STOP,
+          MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
         ],
       }),
       expect.objectContaining({
@@ -3517,6 +3519,18 @@ describe('handleWebCommand transport queue behavior', () => {
         ],
       }),
     ]));
+  });
+
+  it('includes send_stop in the SEND tool-family gate (item 17)', async () => {
+    handleWebCommand({ type: MEMORY_WS.MCP_STATUS_QUERY, requestId: 'mcp-status-send-stop' }, serverLink as any);
+    await flushAsync();
+
+    const response = serverLink.send.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((message) => message.type === MEMORY_WS.MCP_STATUS_RESPONSE);
+    const toolFamilies = response?.toolFamilies as Array<Record<string, unknown>>;
+    const sendFamily = toolFamilies.find((family) => family.family === MEMORY_MCP_TOOL_FAMILY.SEND);
+    expect(sendFamily?.tools).toContain(MEMORY_MCP_TOOL_NAMES.SEND_STOP);
   });
 
   it('reports disconnected managed providers as unknown instead of assuming MCP readiness', async () => {

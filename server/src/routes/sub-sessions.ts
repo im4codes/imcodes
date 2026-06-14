@@ -34,7 +34,9 @@ subSessionRoutes.get('/:id/sub-sessions', async (c) => {
   const access = await resolveSubSessionRouteAccess(c, serverId, userId);
   if (!access.ok) return access.response;
 
-  const subSessions = await getSubSessionsByServer(c.env.DB, serverId);
+  // Normal sub-session listing surface: execution clones are excluded (default)
+  // so ephemeral clone workers never clutter the normal sub-session list.
+  const subSessions = await getSubSessionsByServer(c.env.DB, serverId, { includeExecutionClones: false });
   return c.json({ subSessions });
 });
 

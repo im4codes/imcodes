@@ -5,6 +5,7 @@ import type {
   SharedActorEnvelope,
   ShareTarget,
 } from '../../../shared/tab-sharing.js';
+import { EXECUTION_CLONE_KIND } from '../../../shared/execution-clone.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -796,13 +797,92 @@ export interface DbSubSession {
   active_model: string | null;
   effort: string | null;
   transport_config: Record<string, unknown> | string | null;
+  execution_clone_metadata: Record<string, unknown> | string | null;
+  /**
+   * Projected from `execution_clone_metadata` by {@link projectSubSessionRow}.
+   * Present only for execution-clone rows; lets the grouped execution-detail
+   * view discriminate clones and group them by `parentRunId`. Never persisted
+   * as its own column.
+   */
+  executionCloneKind?: typeof EXECUTION_CLONE_KIND;
+  /** Projected parent run id from `execution_clone_metadata`; clones only. */
+  parentRunId?: string;
 }
 
-export async function getSubSessionsByServer(db: Database, serverId: string): Promise<DbSubSession[]> {
-  return db.query<DbSubSession>(
+/**
+ * Coerce the `execution_clone_metadata` JSONB column (which the driver may hand
+ * back as a parsed object OR a raw JSON string) into a plain record, or null.
+ */
+function coerceExecutionCloneMetadata(
+  raw: Record<string, unknown> | string | null | undefined,
+): Record<string, unknown> | null {
+  if (raw == null) return null;
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+  if (typeof raw === 'object' && !Array.isArray(raw)) return raw;
+  return null;
+}
+
+/**
+ * Pure predicate: is this sub-session row a dedicated execution clone? True only
+ * when `execution_clone_metadata.kind === EXECUTION_CLONE_KIND`. Tolerant of the
+ * column arriving as either a parsed object or a JSON string.
+ */
+export function isExecutionCloneRow(row: Pick<DbSubSession, 'execution_clone_metadata'>): boolean {
+  const meta = coerceExecutionCloneMetadata(row.execution_clone_metadata);
+  return meta?.kind === EXECUTION_CLONE_KIND;
+}
+
+/**
+ * Pure projection: derive `executionCloneKind` / `parentRunId` from
+ * `execution_clone_metadata` onto a copy of the row. Non-clone rows are returned
+ * with the projected fields absent. Existing fields are preserved verbatim.
+ */
+export function projectSubSessionRow(row: DbSubSession): DbSubSession {
+  const meta = coerceExecutionCloneMetadata(row.execution_clone_metadata);
+  if (meta?.kind !== EXECUTION_CLONE_KIND) return row;
+  const parentRunId = typeof meta.parentRunId === 'string' ? meta.parentRunId : undefined;
+  return {
+    ...row,
+    executionCloneKind: EXECUTION_CLONE_KIND,
+    ...(parentRunId !== undefined ? { parentRunId } : {}),
+  };
+}
+
+export interface GetSubSessionsOptions {
+  /**
+   * When false (default), execution clones
+   * (`execution_clone_metadata.kind === 'execution_clone'`) are EXCLUDED so they
+   * never clutter the normal session/sub-session listing surfaces. Set true only
+   * for the grouped execution-detail projection, which groups by `parentRunId`.
+   */
+  includeExecutionClones?: boolean;
+}
+
+export async function getSubSessionsByServer(
+  db: Database,
+  serverId: string,
+  opts?: GetSubSessionsOptions,
+): Promise<DbSubSession[]> {
+  const rows = await db.query<DbSubSession>(
     'SELECT * FROM sub_sessions WHERE server_id = $1 AND closed_at IS NULL ORDER BY sort_order ASC NULLS LAST, created_at ASC',
     [serverId],
   );
+  const includeClones = opts?.includeExecutionClones === true;
+  const result: DbSubSession[] = [];
+  for (const row of rows) {
+    if (!includeClones && isExecutionCloneRow(row)) continue;
+    result.push(projectSubSessionRow(row));
+  }
+  return result;
 }
 
 export async function getSubSessionByProviderSessionId(
@@ -843,12 +923,18 @@ export async function createSubSession(
   activeModel: string | null = null,
   effort: string | null = null,
   transportConfig: Record<string, unknown> | null = null,
+  executionCloneMetadata: Record<string, unknown> | null = null,
 ): Promise<DbSubSession> {
   const now = Date.now();
+  // Clone-aware identity upsert: when the INCOMING row is an execution clone
+  // (its execution_clone_metadata.kind === 'execution_clone'), the runtime
+  // identity columns are written from EXCLUDED (expected NULL) WITHOUT the
+  // COALESCE fallback to the prior row — so stale identity never survives a
+  // conflict for a clone. Non-clone rows keep the existing COALESCE behavior.
   await db.execute(
-    `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, runtime_type, provider_id, provider_session_id, description, created_at, updated_at, cc_preset_id, requested_model, active_model, effort, transport_config)
-     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb)
-     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = COALESCE(EXCLUDED.label, sub_sessions.label), closed_at = NULL, cc_session_id = COALESCE(EXCLUDED.cc_session_id, sub_sessions.cc_session_id), gemini_session_id = COALESCE(EXCLUDED.gemini_session_id, sub_sessions.gemini_session_id), parent_session = COALESCE(EXCLUDED.parent_session, sub_sessions.parent_session), runtime_type = COALESCE(EXCLUDED.runtime_type, sub_sessions.runtime_type), provider_id = COALESCE(EXCLUDED.provider_id, sub_sessions.provider_id), provider_session_id = COALESCE(EXCLUDED.provider_session_id, sub_sessions.provider_session_id), description = COALESCE(EXCLUDED.description, sub_sessions.description), updated_at = EXCLUDED.updated_at, cc_preset_id = COALESCE(EXCLUDED.cc_preset_id, sub_sessions.cc_preset_id), requested_model = COALESCE(EXCLUDED.requested_model, sub_sessions.requested_model), active_model = COALESCE(EXCLUDED.active_model, sub_sessions.active_model), effort = COALESCE(EXCLUDED.effort, sub_sessions.effort), transport_config = CASE WHEN EXCLUDED.transport_config = '{}'::jsonb THEN sub_sessions.transport_config ELSE EXCLUDED.transport_config END`,
+    `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, runtime_type, provider_id, provider_session_id, description, created_at, updated_at, cc_preset_id, requested_model, active_model, effort, transport_config, execution_clone_metadata)
+     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, $21::jsonb)
+     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = COALESCE(EXCLUDED.label, sub_sessions.label), closed_at = NULL, cc_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.cc_session_id ELSE COALESCE(EXCLUDED.cc_session_id, sub_sessions.cc_session_id) END, gemini_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.gemini_session_id ELSE COALESCE(EXCLUDED.gemini_session_id, sub_sessions.gemini_session_id) END, parent_session = COALESCE(EXCLUDED.parent_session, sub_sessions.parent_session), runtime_type = COALESCE(EXCLUDED.runtime_type, sub_sessions.runtime_type), provider_id = COALESCE(EXCLUDED.provider_id, sub_sessions.provider_id), provider_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.provider_session_id ELSE COALESCE(EXCLUDED.provider_session_id, sub_sessions.provider_session_id) END, description = COALESCE(EXCLUDED.description, sub_sessions.description), updated_at = EXCLUDED.updated_at, cc_preset_id = COALESCE(EXCLUDED.cc_preset_id, sub_sessions.cc_preset_id), requested_model = COALESCE(EXCLUDED.requested_model, sub_sessions.requested_model), active_model = COALESCE(EXCLUDED.active_model, sub_sessions.active_model), effort = COALESCE(EXCLUDED.effort, sub_sessions.effort), transport_config = CASE WHEN EXCLUDED.transport_config = '{}'::jsonb THEN sub_sessions.transport_config ELSE EXCLUDED.transport_config END, execution_clone_metadata = EXCLUDED.execution_clone_metadata`,
     [
       id,
       serverId,
@@ -870,6 +956,7 @@ export async function createSubSession(
       activeModel,
       effort,
       JSON.stringify(transportConfig ?? {}),
+      executionCloneMetadata == null ? null : JSON.stringify(executionCloneMetadata),
     ],
   );
   return {
@@ -895,6 +982,7 @@ export async function createSubSession(
     active_model: activeModel,
     effort,
     transport_config: transportConfig ?? {},
+    execution_clone_metadata: executionCloneMetadata,
   };
 }
 

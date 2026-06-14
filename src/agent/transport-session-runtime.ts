@@ -853,6 +853,24 @@ export class TransportSessionRuntime implements SessionRuntime {
     return removed ?? null;
   }
 
+  removePendingMessagesByCommandIdPrefix(prefix: string): PendingTransportMessage[] {
+    if (!prefix || this._pendingMessages.length === 0) return [];
+    const removed: PendingTransportMessage[] = [];
+    const kept: PendingTransportMessage[] = [];
+    for (const entry of this._pendingMessages) {
+      if (entry.clientMessageId.startsWith(prefix)) {
+        removed.push(entry);
+      } else {
+        kept.push(entry);
+      }
+    }
+    if (removed.length > 0) {
+      this._pendingMessages = kept;
+      this._pendingVersion++;
+    }
+    return removed;
+  }
+
   async cancel(): Promise<void> {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');

@@ -14,6 +14,7 @@ import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
 import { buildTransportPendingQueueSnapshot, type TransportPendingMessageEntry } from './transport-pending-snapshot.js';
+import { validateExecutionTemplateCandidate } from './execution-clone.js';
 
 export interface SessionListItem extends SessionContextBootstrapState {
   name: string;
@@ -51,6 +52,41 @@ export interface SessionListItem extends SessionContextBootstrapState {
   /** Monotonic version of the pending-queue snapshot. Lets the UI ignore
    *  stale snapshots delivered out of order. See TransportSessionRuntime. */
   transportPendingMessageVersion?: number;
+  /** DAEMON-AUTHORITATIVE: whether this session may be used as an execution
+   *  template (clone source). The UI renders this rather than recomputing
+   *  eligibility client-side. Base eligibility is caller-independent — the
+   *  "clone yourself" exclusion is the calling session's concern in the UI. */
+  executionTemplateEligible: boolean;
+  /** Ineligibility reason code (an `EXECUTION_CLONE_ERROR_CODES` value) set ONLY
+   *  when `executionTemplateEligible` is false. Absent when eligible. */
+  executionTemplateIneligibleReason?: string;
+}
+
+/**
+ * DAEMON-AUTHORITATIVE static template eligibility for a session-list item.
+ *
+ * Pure projection helper (extracted so it can be unit-tested without the heavy
+ * `buildSessionList` runtime deps). A session is eligible as an execution
+ * template when it is NOT a main/brain session, in an allowed state (idle/
+ * running — not stopped/error), NOT itself an execution clone, and carries a
+ * cloneable launch configuration (a non-blank `projectDir` + a supported
+ * `agentType`, the minimum the clone launch-spec builder needs).
+ *
+ * Calls the SAME {@link validateExecutionTemplateCandidate} predicate the
+ * create path uses (via `validateExecutionCloneRequest`), passing NO caller
+ * name so the caller-specific "clone yourself" exclusion is intentionally NOT
+ * applied here — that is the calling session's concern in the UI, layered on
+ * top of this base eligibility. UI eligibility therefore equals create-time
+ * template validation.
+ */
+export function computeExecutionTemplateEligibility(
+  record: SessionRecord,
+): { eligible: true } | { eligible: false; reason: string } {
+  const validation = validateExecutionTemplateCandidate(record);
+  if (!validation.ok) {
+    return { eligible: false, reason: validation.code };
+  }
+  return { eligible: true };
 }
 
 function resolveTransportSessionListState(
@@ -80,6 +116,10 @@ function baseItem(s: SessionRecord): SessionListItem {
       ? (runtimeState === 'idle' ? 'queued' : runtimeState)
       : 'queued'
     : runtimeState;
+  // DAEMON-AUTHORITATIVE template eligibility. Computed from the persisted
+  // record (not the resolved transport `state` above) so it stays deterministic
+  // and matches the clone-create gate's view of the session.
+  const eligibility = computeExecutionTemplateEligibility(s);
   return {
     name: s.name,
     project: s.projectName,
@@ -122,6 +162,10 @@ function baseItem(s: SessionRecord): SessionListItem {
     ...(typeof pendingQueue.pendingVersion === 'number'
       ? { transportPendingMessageVersion: pendingQueue.pendingVersion }
       : {}),
+    executionTemplateEligible: eligibility.eligible,
+    ...(eligibility.eligible
+      ? {}
+      : { executionTemplateIneligibleReason: eligibility.reason }),
   };
 }
 

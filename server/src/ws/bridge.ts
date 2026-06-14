@@ -4340,6 +4340,7 @@ export class WsBridge {
           ((msg.activeModel as string) || (msg.modelDisplay as string)) || null,
           (msg.effort as string) || null,
           (msg.transportConfig as Record<string, unknown>) || null,
+          (msg.executionCloneMetadata as Record<string, unknown>) || null,
         );
         // Notify browsers so sub-session appears immediately without page refresh
         const hasTransportPendingMessages = Object.prototype.hasOwnProperty.call(msg, 'transportPendingMessages');

@@ -17,6 +17,7 @@ import {
 } from '../../shared/p2p-workflow-constants.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
+import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
 import { TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
 import {
@@ -150,11 +151,27 @@ const LOOP_PROBE_MS = 1_000;
 const EVENT_LOOP_STALL_THRESHOLD_MS = 3_000; // probe overdue by >3 s ⇒ loop stalled
 const DAEMON_STATIC_CAPABILITIES = [
   SESSION_GROUP_CLONE_CAPABILITY_V1,
+  // Distinct from session-group-clone — gates the dedicated execution-clone
+  // MCP send/destroy path (managed ephemeral clones). The two features version
+  // and negotiate independently.
+  EXECUTION_CLONE_CAPABILITY_V1,
   GIT_REMOTE_CLONE_CAPABILITY_V1,
   TIMELINE_PROTOCOL_CAPABILITY,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
 ] as const;
+
+/**
+ * Whether `cap` is part of the daemon's static capability advertisement
+ * (`DAEMON_STATIC_CAPABILITIES`). This is the single source of truth consulted
+ * by the production stdio memory MCP server so the execution-clone send/destroy
+ * gate reflects what the daemon actually advertises to the server instead of
+ * defaulting to enabled. Dynamic (P2P-workflow) capabilities are NOT included
+ * here — they are negotiated separately and not part of the static set.
+ */
+export function isDaemonCapabilityAdvertised(cap: string): boolean {
+  return (DAEMON_STATIC_CAPABILITIES as readonly string[]).includes(cap);
+}
 
 export interface ServerLinkOpts {
   workerUrl: string;

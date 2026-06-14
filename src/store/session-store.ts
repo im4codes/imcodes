@@ -7,6 +7,7 @@ import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
+import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
 
 const DEBOUNCE_MS = 500;
 
@@ -103,6 +104,11 @@ export interface SessionRecord extends SessionContextBootstrapState {
   ccPreset?: string;
   /** Context window override carried by a provider preset (e.g. MiniMax 200K). */
   presetContextWindow?: number;
+  /** Shell/script launch binary (e.g. "/bin/bash", "fish"). CONFIG, not identity —
+   *  inherited by execution clones and synced to the server `sub_sessions.shell_bin`
+   *  column. Only meaningful for `shell`/`script` agent sessions. Host-normalized at
+   *  launch so a cross-OS path is dropped rather than executed. */
+  shellBin?: string | null;
   /** Human-readable label for UI display (e.g. "OC:main", "discord:#general"). */
   label?: string;
   /** True for sessions created by the user (not auto-synced from provider).
@@ -124,6 +130,14 @@ export interface SessionRecord extends SessionContextBootstrapState {
    *  1 turn = 1 inner array (regardless of how many IDs it carries).
    *  Wiped on `/clear` / fresh-restart alongside the runtime state. */
   recentInjectionHistory?: string[][];
+  /** Execution-clone metadata. Present ONLY for ephemeral execution-clone
+   *  sub-sessions (`kind: 'execution_clone'`). First-class field — NEVER stored
+   *  inside `transportConfig` (the transport-identity scrubber would strip
+   *  identity-like keys). Read by the health-poller clone-skip, the clone GC
+   *  sweep, the daemon→server metadata sync, and authorized status surfaces.
+   *  Persisted in the FIRST session-store upsert so a crash between create and
+   *  sync still leaves a sweepable record. */
+  executionCloneMetadata?: ExecutionCloneMetadata;
 }
 
 export interface SessionStore {
@@ -323,7 +337,28 @@ export function getSession(name: string): SessionRecord | undefined {
 }
 
 export function upsertSession(record: SessionRecord): void {
-  store.sessions[record.name] = { ...record, updatedAt: Date.now() };
+  const existing = store.sessions[record.name];
+  // Sticky execution-clone marker (P0). `upsertSession` REPLACES the whole
+  // record, but incidental record rebuilds — sub-session launch, provider-id
+  // capture by watchers, model/state/quota refresh, server→daemon reconcile —
+  // construct a fresh SessionRecord and OMIT `executionCloneMetadata`. Without
+  // this guard the clone loses its `kind: execution_clone` marker right after
+  // launch, which silently disables the health-poller skip, the GC sweep, the
+  // per-run cap count, the daemon→server identity scrub, and destroy authz.
+  // Preserve the marker from the existing clone record when the incoming record
+  // omits it. Legitimate metadata mutations (completedAt / cleanupState /
+  // destroyRequestedAt) pass the field explicitly and still overwrite; nothing
+  // demotes a clone except destroy (`removeSession`), so preserve-if-omitted is
+  // safe and is the single robust fix across every upsert site.
+  const executionCloneMetadata = record.executionCloneMetadata
+    ?? (existing?.executionCloneMetadata?.kind === EXECUTION_CLONE_KIND
+      ? existing.executionCloneMetadata
+      : undefined);
+  store.sessions[record.name] = {
+    ...record,
+    ...(executionCloneMetadata !== undefined ? { executionCloneMetadata } : {}),
+    updatedAt: Date.now(),
+  };
   scheduleWrite();
 }
 

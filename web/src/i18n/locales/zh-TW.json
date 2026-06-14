@@ -642,7 +642,17 @@
       "deny": "拒絕",
       "tool": "{{tool}} 需要核准"
     },
-    "workingDirPlaceholder": "~/projects/myapp"
+    "workingDirPlaceholder": "~/projects/myapp",
+    "execution": {
+      "genericPrompt": "請在本工作階段中執行所要求的實作／執行工作。",
+      "useConfigured": "使用 {{name}}",
+      "useConfiguredNone": "使用執行工作階段",
+      "setSession": "設定執行工作階段…"
+    },
+    "executionGroup": {
+      "title": "執行工作階段（執行 {{run}}）",
+      "unknownRun": "待定"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ 升級 Daemon",
@@ -1183,6 +1193,16 @@
     "implement_action": "實作",
     "achieve_action": "完成",
     "propose_action": "Propose",
+    "execute": {
+      "action": "執行",
+      "dispatch_heading": "在以下工作階段執行目前變更",
+      "dispatch_to": "{{name}}",
+      "default_heading": "預設執行工作階段",
+      "set_default": "將 {{name}} 設為預設",
+      "clear_default": "清除預設執行工作階段",
+      "no_change": "展開一個變更以選擇其執行目標。",
+      "no_sessions": "此專案尚無可用的執行工作階段。"
+    },
     "auto": {
       "action": "Auto",
       "kicker": "自動交付",
@@ -1453,7 +1473,27 @@
     "passkey_verify_wrong_account": "你驗證的是另一個帳號的 Passkey，請使用目前帳號綁定的 Passkey。",
     "passkey_verify_no_passkeys": "目前帳號尚未綁定 Passkey。",
     "native_status_verifying_passkey": "正在驗證 Passkey…",
-    "native_status_saving_password": "正在儲存密碼登入…"
+    "native_status_saving_password": "正在儲存密碼登入…",
+    "executionRouting": {
+      "title": "執行路由",
+      "enableLabel": "使用專用執行會話",
+      "enableHint": "啟用後，實作/執行工作將從下方模板會話複製出的短生命複製 worker 中執行，而不是在編排器中執行。儲存此選項僅儲存偏好設定，不會啟動任何執行。",
+      "templateLabel": "執行模板會話",
+      "templateNone": "未選擇",
+      "templateHint": "複製會繼承該會話的提供者、模型和工具，但絕不會繼承其身份或歷史紀錄。僅列出本專案中符合條件的非主會話。",
+      "noCandidates": "本專案暫無符合條件的模板會話。請啟動一個 worker 或子會話作為模板。",
+      "reselectRequired": "路由已啟用，但本專案尚未選擇有效的模板。請在下方選擇一個執行模板會話。",
+      "ineligibleOption": "{{name}} — {{reason}}",
+      "ineligibleReason": {
+        "capacity_full": "已達容量上限",
+        "template_ineligible": "不可用作範本",
+        "clone_of_clone_forbidden": "已是執行複本",
+        "worker_clone_forbidden": "工作階段不能作為範本",
+        "cron_clone_forbidden": "排程階段不能作為範本",
+        "target_not_found": "找不到工作階段",
+        "destroy_forbidden": "不允許"
+      }
+    }
   },
   "admin": {
     "title": "管理面板",

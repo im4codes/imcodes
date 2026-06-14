@@ -642,7 +642,17 @@
       "deny": "거부",
       "tool": "{{tool}} 승인 필요"
     },
-    "workingDirPlaceholder": "~/projects/myapp"
+    "workingDirPlaceholder": "~/projects/myapp",
+    "execution": {
+      "genericPrompt": "이 세션에서 요청한 구현/실행 작업을 수행해 주세요.",
+      "useConfigured": "{{name}} 사용",
+      "useConfiguredNone": "실행 세션 사용",
+      "setSession": "실행 세션 설정…"
+    },
+    "executionGroup": {
+      "title": "실행 워커 (실행 {{run}})",
+      "unknownRun": "대기 중"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ Daemon 업그레이드",
@@ -1182,6 +1192,16 @@
     "implement_action": "구현",
     "achieve_action": "완료",
     "propose_action": "제안",
+    "execute": {
+      "action": "실행",
+      "dispatch_heading": "현재 변경을 실행할 세션",
+      "dispatch_to": "{{name}}",
+      "default_heading": "기본 실행 세션",
+      "set_default": "{{name}}을(를) 기본으로 설정",
+      "clear_default": "기본 실행 세션 지우기",
+      "no_change": "변경을 펼쳐 실행 대상을 선택하세요.",
+      "no_sessions": "이 프로젝트에는 사용할 수 있는 실행 세션이 아직 없습니다."
+    },
     "auto": {
       "action": "Auto",
       "kicker": "자동 전달",
@@ -1451,7 +1471,27 @@
     "passkey_verify_wrong_account": "이 패스키는 다른 계정에 속합니다. 현재 계정에 등록된 패스키로 확인하세요.",
     "passkey_verify_no_passkeys": "이 계정에는 등록된 패스키가 없습니다.",
     "native_status_verifying_passkey": "패스키 확인 중…",
-    "native_status_saving_password": "비밀번호 로그인 저장 중…"
+    "native_status_saving_password": "비밀번호 로그인 저장 중…",
+    "executionRouting": {
+      "title": "실행 라우팅",
+      "enableLabel": "전용 실행 세션 사용",
+      "enableHint": "활성화하면 구현/실행 작업이 오케스트레이터가 아니라 아래 템플릿 세션에서 복제된 수명이 짧은 클론 워커로 전달됩니다. 이를 저장해도 설정만 저장되며 실행을 시작하지 않습니다.",
+      "templateLabel": "실행 템플릿 세션",
+      "templateNone": "선택 안 함",
+      "templateHint": "클론은 이 세션의 제공자, 모델, 도구를 상속하지만 신원이나 기록은 절대 상속하지 않습니다. 이 프로젝트의 적격한 비메인 세션만 표시됩니다.",
+      "noCandidates": "이 프로젝트에 아직 적격한 템플릿 세션이 없습니다. 템플릿으로 사용할 워커나 서브 세션을 시작하세요.",
+      "reselectRequired": "라우팅이 활성화되었지만 이 프로젝트에 유효한 템플릿이 선택되지 않았습니다. 아래에서 실행 템플릿 세션을 선택하세요.",
+      "ineligibleOption": "{{name}} — {{reason}}",
+      "ineligibleReason": {
+        "capacity_full": "용량 한도 도달",
+        "template_ineligible": "템플릿으로 사용할 수 없음",
+        "clone_of_clone_forbidden": "이미 실행 클론임",
+        "worker_clone_forbidden": "워커는 템플릿이 될 수 없음",
+        "cron_clone_forbidden": "예약된 세션은 템플릿이 될 수 없음",
+        "target_not_found": "세션을 찾을 수 없음",
+        "destroy_forbidden": "허용되지 않음"
+      }
+    }
   },
   "admin": {
     "title": "관리자 패널",

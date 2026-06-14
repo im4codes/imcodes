@@ -295,6 +295,33 @@ const TIMELINE_STATUS_KEYS = [
   'pageMalformed',
   'error',
 ] as const;
+// dedicated-execution-clone-sessions — generic execution dropdown + grouped
+// execution-detail strings (must exist in every locale).
+const EXECUTION_ROUTING_KEYS = [
+  'settings.executionRouting.ineligibleOption',
+  'settings.executionRouting.ineligibleReason.capacity_full',
+  'settings.executionRouting.ineligibleReason.template_ineligible',
+  'settings.executionRouting.ineligibleReason.clone_of_clone_forbidden',
+  'settings.executionRouting.ineligibleReason.worker_clone_forbidden',
+  'settings.executionRouting.ineligibleReason.cron_clone_forbidden',
+  'settings.executionRouting.ineligibleReason.target_not_found',
+  'settings.executionRouting.ineligibleReason.destroy_forbidden',
+  'session.execution.genericPrompt',
+  'session.execution.useConfigured',
+  'session.execution.useConfiguredNone',
+  'session.execution.setSession',
+  'session.executionGroup.title',
+  'session.executionGroup.unknownRun',
+  // OpenSpec left-panel Execute dropdown (task 2.4).
+  'openspec.execute.action',
+  'openspec.execute.dispatch_heading',
+  'openspec.execute.dispatch_to',
+  'openspec.execute.default_heading',
+  'openspec.execute.set_default',
+  'openspec.execute.clear_default',
+  'openspec.execute.no_change',
+  'openspec.execute.no_sessions',
+] as const;
 const CHAT_FONT_KEYS = [
   'dialogLabel',
   'typeLabel',
@@ -417,6 +444,38 @@ describe('generic i18n coverage guard', () => {
       for (const key of TIMELINE_STATUS_KEYS) {
         expect(messages.chat?.timelineStatus?.[key], `${locale}: chat.timelineStatus.${key}`).toEqual(expect.any(String));
         expect(messages.chat?.timelineStatus?.[key]?.trim().length, `${locale}: chat.timelineStatus.${key}`).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('keeps execution-routing dropdown + grouping keys present in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      for (const key of EXECUTION_ROUTING_KEYS) {
+        const value = readPath(messages, key);
+        expect(value, `${locale}:${key}`).toEqual(expect.any(String));
+        expect((value as string | undefined)?.trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('keeps execution-routing dropdown labels localized outside English', () => {
+    const english = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as unknown;
+    // Interpolation-only entries (e.g. ineligibleOption "{{name}} — {{reason}}")
+    // are intentionally identical across locales, so assert on entries with real
+    // prose that must differ from English.
+    const keys = [
+      'session.execution.setSession',
+      'session.executionGroup.unknownRun',
+      // OpenSpec Execute dropdown prose (task 2.4) — interpolation-only entries
+      // like `openspec.execute.dispatch_to` are intentionally excluded here.
+      'openspec.execute.action',
+      'openspec.execute.clear_default',
+    ] as const;
+    for (const locale of SUPPORTED_LOCALES.filter((item) => item !== 'en')) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      for (const key of keys) {
+        expect(readPath(messages, key), `${locale}:${key}`).not.toBe(readPath(english, key));
       }
     }
   });

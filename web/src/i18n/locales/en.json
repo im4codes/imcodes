@@ -642,7 +642,17 @@
       "deny": "Deny",
       "tool": "{{tool}} wants approval"
     },
-    "workingDirPlaceholder": "~/projects/myapp"
+    "workingDirPlaceholder": "~/projects/myapp",
+    "execution": {
+      "genericPrompt": "Please carry out the requested implementation/execution work in this session.",
+      "useConfigured": "use {{name}}",
+      "useConfiguredNone": "use execution session",
+      "setSession": "set execution session…"
+    },
+    "executionGroup": {
+      "title": "Execution workers (run {{run}})",
+      "unknownRun": "pending"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ Upgrade Daemon",
@@ -1183,6 +1193,16 @@
     "implement_action": "Implement",
     "achieve_action": "Achieve",
     "propose_action": "Propose",
+    "execute": {
+      "action": "Execute",
+      "dispatch_heading": "Execute current change in",
+      "dispatch_to": "{{name}}",
+      "default_heading": "Default execution session",
+      "set_default": "Set {{name}} as default",
+      "clear_default": "Clear default execution session",
+      "no_change": "Open a change to choose its execution target.",
+      "no_sessions": "No eligible execution sessions in this project yet."
+    },
     "auto": {
       "action": "Auto",
       "kicker": "Auto Deliver",
@@ -1453,7 +1473,27 @@
     "passkey_verify_wrong_account": "That passkey belongs to a different account. Verify with the passkey registered to this account.",
     "passkey_verify_no_passkeys": "No passkeys are registered for this account.",
     "native_status_verifying_passkey": "Verifying passkey…",
-    "native_status_saving_password": "Saving password login…"
+    "native_status_saving_password": "Saving password login…",
+    "executionRouting": {
+      "title": "Execution routing",
+      "enableLabel": "Use a dedicated execution session",
+      "enableHint": "When enabled, implementation/execution work is dispatched to short-lived clone workers copied from the template session below, instead of running in the orchestrator. Saving this only stores the preference; it does not start any execution.",
+      "templateLabel": "Execution template session",
+      "templateNone": "None selected",
+      "templateHint": "Clones inherit this session’s provider, model, and tooling but never its identity or history. Only eligible non-main sessions in this project are listed.",
+      "noCandidates": "No eligible template sessions in this project yet. Start a worker or sub-session to use as a template.",
+      "reselectRequired": "Routing is enabled but no valid template is selected for this project. Pick an execution template session below.",
+      "ineligibleOption": "{{name}} — {{reason}}",
+      "ineligibleReason": {
+        "capacity_full": "at capacity",
+        "template_ineligible": "not a usable template",
+        "clone_of_clone_forbidden": "already an execution clone",
+        "worker_clone_forbidden": "workers cannot be templates",
+        "cron_clone_forbidden": "scheduled session cannot be a template",
+        "target_not_found": "session not found",
+        "destroy_forbidden": "not allowed"
+      }
+    }
   },
   "admin": {
     "title": "Admin Panel",

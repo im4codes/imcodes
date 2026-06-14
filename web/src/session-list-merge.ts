@@ -68,6 +68,13 @@ export interface IncomingSessionListEntry {
   transportPendingMessageEntries?: unknown;
   transportPendingMessageVersion?: unknown;
   sharedState?: SessionInfo['sharedState'];
+  /** DAEMON-AUTHORITATIVE: whether this session may serve as an execution-clone
+   *  template. Computed by the daemon; the UI renders it rather than recomputing
+   *  eligibility client-side. */
+  executionTemplateEligible?: boolean;
+  /** DAEMON-AUTHORITATIVE: reason the session is NOT eligible as an execution
+   *  template (only meaningful when `executionTemplateEligible === false`). */
+  executionTemplateIneligibleReason?: string;
 }
 
 export function isSubSessionName(sessionName: string): boolean {
@@ -185,5 +192,8 @@ export function mergeSessionListEntry(
     transportPendingMessageEntries: nextPendingEntries,
     transportPendingMessageVersion: nextPendingVersion,
     sharedState: incoming.sharedState ?? existing?.sharedState,
+    executionTemplateEligible: incoming.executionTemplateEligible ?? existing?.executionTemplateEligible,
+    executionTemplateIneligibleReason:
+      incoming.executionTemplateIneligibleReason ?? existing?.executionTemplateIneligibleReason,
   };
 }

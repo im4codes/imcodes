@@ -17,7 +17,9 @@ export async function resolveCoveredSessionNames(
   names.add(target.kind === 'main' ? target.sessionName : `deck_sub_${target.subSessionId}`);
   if (target.kind !== 'main') return [...names];
 
-  const subSessions = await getSubSessionsByServer(db, target.serverId);
+  // Share coverage must not auto-cover execution clones just because their
+  // parent main session is shared; clones are excluded (default).
+  const subSessions = await getSubSessionsByServer(db, target.serverId, { includeExecutionClones: false });
   for (const subSession of subSessions) {
     if (subSession.parent_session === target.sessionName) {
       names.add(`deck_sub_${subSession.id}`);

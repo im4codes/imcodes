@@ -642,7 +642,17 @@
       "deny": "Denegar",
       "tool": "{{tool}} requiere aprobación"
     },
-    "workingDirPlaceholder": "~/projects/myapp"
+    "workingDirPlaceholder": "~/projects/myapp",
+    "execution": {
+      "genericPrompt": "Realiza el trabajo de implementación/ejecución solicitado en esta sesión.",
+      "useConfigured": "usar {{name}}",
+      "useConfiguredNone": "usar sesión de ejecución",
+      "setSession": "configurar sesión de ejecución…"
+    },
+    "executionGroup": {
+      "title": "Trabajadores de ejecución (ejecución {{run}})",
+      "unknownRun": "pendiente"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ Actualizar Daemon",
@@ -1182,6 +1192,16 @@
     "implement_action": "Implementar",
     "achieve_action": "Completar",
     "propose_action": "Proponer",
+    "execute": {
+      "action": "Ejecutar",
+      "dispatch_heading": "Ejecutar el cambio actual en",
+      "dispatch_to": "{{name}}",
+      "default_heading": "Sesión de ejecución predeterminada",
+      "set_default": "Establecer {{name}} como predeterminada",
+      "clear_default": "Borrar la sesión de ejecución predeterminada",
+      "no_change": "Abre un cambio para elegir su destino de ejecución.",
+      "no_sessions": "Aún no hay sesiones de ejecución aptas en este proyecto."
+    },
     "auto": {
       "action": "Auto",
       "kicker": "Entrega automática",
@@ -1452,7 +1472,27 @@
     "passkey_verify_wrong_account": "Esa passkey pertenece a otra cuenta. Verifica con la passkey registrada en esta cuenta.",
     "passkey_verify_no_passkeys": "No hay passkeys registradas para esta cuenta.",
     "native_status_verifying_passkey": "Verificando passkey…",
-    "native_status_saving_password": "Guardando acceso con contraseña…"
+    "native_status_saving_password": "Guardando acceso con contraseña…",
+    "executionRouting": {
+      "title": "Enrutamiento de ejecución",
+      "enableLabel": "Usar una sesión de ejecución dedicada",
+      "enableHint": "Cuando está activado, el trabajo de implementación/ejecución se envía a trabajadores clon de corta duración copiados de la sesión plantilla de abajo, en lugar de ejecutarse en el orquestador. Guardar esto solo almacena la preferencia; no inicia ninguna ejecución.",
+      "templateLabel": "Sesión plantilla de ejecución",
+      "templateNone": "Ninguna seleccionada",
+      "templateHint": "Los clones heredan el proveedor, el modelo y las herramientas de esta sesión, pero nunca su identidad ni su historial. Solo se listan las sesiones no principales elegibles de este proyecto.",
+      "noCandidates": "Aún no hay sesiones plantilla elegibles en este proyecto. Inicia un trabajador o subsesión para usarlo como plantilla.",
+      "reselectRequired": "El enrutamiento está activado pero no hay una plantilla válida seleccionada para este proyecto. Elige una sesión plantilla de ejecución abajo.",
+      "ineligibleOption": "{{name}} — {{reason}}",
+      "ineligibleReason": {
+        "capacity_full": "sin capacidad",
+        "template_ineligible": "no es una plantilla válida",
+        "clone_of_clone_forbidden": "ya es un clon de ejecución",
+        "worker_clone_forbidden": "los trabajadores no pueden ser plantillas",
+        "cron_clone_forbidden": "una sesión programada no puede ser plantilla",
+        "target_not_found": "sesión no encontrada",
+        "destroy_forbidden": "no permitido"
+      }
+    }
   },
   "admin": {
     "title": "Panel de administración",

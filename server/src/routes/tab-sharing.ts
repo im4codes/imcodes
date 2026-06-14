@@ -208,7 +208,9 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
   if (!server) return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
 
   const mainRows = await getDbSessionsByServer(c.env.DB, target.serverId);
-  const subRows = await getSubSessionsByServer(c.env.DB, target.serverId);
+  // Tab-sharing shared sub-session list: execution clones must NEVER leak into a
+  // share's sub-session list, so they are excluded (default).
+  const subRows = await getSubSessionsByServer(c.env.DB, target.serverId, { includeExecutionClones: false });
   const subSessions = target.kind === 'server'
     ? subRows
     : target.kind === 'main'

@@ -151,6 +151,10 @@ import {
   handleOpenSpecAutoDeliverCommand,
 } from './openspec-auto-deliver-orchestrator.js';
 import { SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
+import {
+  parseDedicatedExecutionRoutingPreference,
+  type DedicatedExecutionRoutingGlobalPreference,
+} from '../../shared/execution-clone.js';
 import { getP2pConfigStoreScope, handleSessionGroupCloneCancel, handleSessionGroupCloneCommand } from './session-group-clone.js';
 import { buildDefaultP2pStaticPolicy } from '../../shared/p2p-workflow-policy.js';
 import {
@@ -385,6 +389,58 @@ function prepareProcessPreferenceProviderText(input: {
   }
   processPreferenceContextSignatures.set(input.sessionName, signature);
   return prependPreferenceProviderContext(input.providerText, context);
+}
+
+/**
+ * Tolerant normalizer for the launch-payload `dedicatedExecutionRouting` field
+ * (task 2.7 daemon receive-end). Returns the run-level routing object
+ * `{ enabled, templateSessionName, limits, recentSummary? }` ONLY when the
+ * payload is a well-formed object; otherwise returns `undefined` so the run
+ * keeps its default (disabled → byte-identical final-execution prompt, no
+ * clones).
+ *
+ * `enabled` is true only when the raw value is strictly the boolean `true`.
+ * `templateSessionName` is a non-empty trimmed string or null. `recentSummary`
+ * is carried only when it is a non-empty string (an already-stored summary; the
+ * hand-off builder re-bounds it). The bounded clone limits the web sends
+ * (`maxParallelClones`, `maxQueuedClones`, `cloneHardTimeoutMs`,
+ * `cloneRetentionMs`) are resolved+clamped via
+ * {@link parseDedicatedExecutionRoutingPreference} so a forged/out-of-range
+ * limit can never widen the cap — absent/invalid fields fall back to the
+ * canonical defaults. Routing is meaningful only when enabled with a valid
+ * template, but the object is still threaded when present so the orchestrator's
+ * own enable/template guards remain the single source of truth.
+ */
+function normalizeDedicatedExecutionRoutingPayload(
+  raw: unknown,
+): {
+  enabled: boolean;
+  templateSessionName: string | null;
+  limits: DedicatedExecutionRoutingGlobalPreference;
+  recentSummary?: string | null;
+} | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const record = raw as Record<string, unknown>;
+  const enabled = record.enabled === true;
+  const rawTemplate = record.templateSessionName;
+  const templateSessionName = typeof rawTemplate === 'string' && rawTemplate.trim().length > 0
+    ? rawTemplate
+    : null;
+  // When neither enabled nor a template is present, there is nothing to thread —
+  // return undefined so the run stays default-disabled (byte-identical).
+  if (!enabled && templateSessionName === null) return undefined;
+  const rawSummary = record.recentSummary;
+  const recentSummary = typeof rawSummary === 'string' && rawSummary.length > 0 ? rawSummary : null;
+  // Resolve the bounded limits from the same payload. The shared parser clamps
+  // every numeric field into its [MIN,MAX] bound and ignores any retired/legacy
+  // keys, so the daemon never trusts a raw client-supplied cap.
+  const limits = parseDedicatedExecutionRoutingPreference(record);
+  return {
+    enabled,
+    templateSessionName,
+    limits,
+    ...(recentSummary !== null ? { recentSummary } : {}),
+  };
 }
 
 function loadPreferenceProviderContext(input: {
@@ -2766,6 +2822,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const p2pAdvancedRunTimeoutMinutes = (cmd as any).p2pAdvancedRunTimeoutMinutes as number | undefined;
   const p2pContextReducer = (cmd as any).p2pContextReducer as P2pContextReducerConfig | undefined;
   const p2pModeField = (cmd as any).p2pMode as string | undefined;
+  // Dedicated-execution routing (OFF by default). Read from the launch payload
+  // and normalized; `undefined`/absent keeps the run's final-execution prompt
+  // byte-identical (no clones). This is the daemon receive-end of task 2.7 — the
+  // web populates the payload; here it is validated and threaded into the run.
+  const dedicatedExecutionRouting = normalizeDedicatedExecutionRoutingPayload(
+    (cmd as any).dedicatedExecutionRouting,
+  );
   const p2pAtTargets = (cmd as any).p2pAtTargets as Array<{ session: string; mode: string }> | undefined;
   const explicitTargets = directTargetSession
     ? [{ session: directTargetSession, mode: resolveSingleTargetMode(directTargetSession, directTargetMode, p2pSessionConfig) }]
@@ -2976,6 +3039,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           kind: 'manual',
           commandId: effectiveId,
         },
+        ...(dedicatedExecutionRouting ? { dedicatedExecutionRouting } : {}),
         ...(compiledFromEnvelope
           ? {
               advanced: {
@@ -10115,6 +10179,8 @@ function sendMcpToolFamilyGate(): MemoryMcpToolFamilyGateView {
     tools: [
       MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
       MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+      MEMORY_MCP_TOOL_NAMES.SEND_STOP,
+      MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
     ],
   };
 }

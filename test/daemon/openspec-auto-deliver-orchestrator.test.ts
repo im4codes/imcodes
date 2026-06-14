@@ -73,7 +73,7 @@ import {
   handleOpenSpecAutoDeliverDaemonRestartCleanup,
   handleOpenSpecAutoDeliverCommand,
 } from '../../src/daemon/openspec-auto-deliver-orchestrator.js';
-import { clearAllResend, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
+import { clearAllResend, enqueueResend, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { getAutoDeliverP2pLock } from '../../src/daemon/p2p-launch-admission.js';
 
@@ -2146,6 +2146,115 @@ exec "${realGit}" "$@"
     // session with no live runtime (notably a deferred sub-session) would sit
     // in resend until the next restart while manual sends worked.
     expect(ensureTransportRuntimeForPendingResendMock).toHaveBeenCalledWith('deck_demo_brain');
+  });
+
+  it('drops stale queued Auto Deliver implementation prompts once final acceptance passes', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-final-pass-drops-stale-queued-prompts');
+    const origin = await completeAcceptanceAuditFromPrompt(acceptancePrompt);
+    const runId = String(origin.runId);
+    enqueueResend('deck_demo_brain', {
+      commandId: `${runId}:implementation:stale`,
+      text: 'OpenSpec Auto Deliver implementation repair for @openspec/changes/demo-change.\n\nSTALE',
+      queuedAt: Date.now(),
+    });
+
+    await emitDeckDemoIdle();
+
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'passed',
+      2500,
+    );
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
+    expect(getResendEntries('deck_demo_brain')).toEqual([]);
+  });
+
+  it('does not re-dispatch the same final acceptance audit forever when budget is exhausted after a PASS safety failure', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await initializeGitWithRemote();
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-final-pass-budget-exhausted-safety-failure',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+      materializedLimits: {
+        specAuditRepairRounds: 0,
+        implementationAuditRepairRounds: 1,
+        maxImplementationPrompts: 1,
+        maxElapsedMinutes: 480,
+      },
+    }, serverLinkMock as never);
+
+    await emitDeckDemoIdle();
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair',
+      2500,
+    );
+    await completeLatestDiscussion('completed', '# implementation audit discussion\n\nRepair implementation before final scoring.');
+    const acceptancePrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
+      2500,
+    );
+    await mkdir(join(projectDir, 'src'), { recursive: true });
+    await writeFile(join(projectDir, 'src', 'new-feature.ts'), 'export const added = true;\n', 'utf8');
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
+      repairs_applied: [{ files: ['src/other.ts'], reason: 'Verified unrelated repair evidence.' }],
+    });
+
+    await emitDeckDemoIdle();
+
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'needs_human',
+      2500,
+    );
+    expect(terminal?.projection.terminalReason).toBe('implementation_prompt_limit_reached:audit_pass_with_uncovered_changed_files');
+    expect(transportSendCount((text) =>
+      text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
+    )).toBe(1);
+
+    await emitDeckDemoIdle();
+    expect(transportSendCount((text) =>
+      text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
+    )).toBe(1);
+  });
+
+  it('removes stale runtime-pending Auto Deliver implementation prompts once final acceptance passes', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-final-pass-drops-runtime-pending-prompts');
+    const origin = await completeAcceptanceAuditFromPrompt(acceptancePrompt);
+    const runId = String(origin.runId);
+    const pending = [{
+      clientMessageId: `${runId}:implementation:stale`,
+      text: 'OpenSpec Auto Deliver implementation repair for @openspec/changes/demo-change.\n\nSTALE',
+    }];
+    const removePendingMessage = vi.fn((clientMessageId: string) => {
+      const index = pending.findIndex((entry) => entry.clientMessageId === clientMessageId);
+      if (index < 0) return null;
+      const [removed] = pending.splice(index, 1);
+      return removed;
+    });
+    getTransportRuntimeMock.mockImplementation(() => ({
+      send: transportSendMock,
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+      get pendingCount() { return pending.length; },
+      get pendingMessages() { return pending.map((entry) => entry.text); },
+      get pendingEntries() { return pending.map((entry) => ({ ...entry })); },
+      pendingVersion: 1,
+      removePendingMessage,
+    }));
+
+    await emitDeckDemoIdle();
+
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'passed',
+      2500,
+    );
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
+    expect(removePendingMessage).toHaveBeenCalledWith(`${runId}:implementation:stale`);
+    expect(pending).toEqual([]);
   });
 
   it('feeds final acceptance REWORK back into implementation repair before extending audit rounds', async () => {

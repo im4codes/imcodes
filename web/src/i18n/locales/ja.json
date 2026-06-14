@@ -642,7 +642,17 @@
       "deny": "拒否",
       "tool": "{{tool}} の承認が必要"
     },
-    "workingDirPlaceholder": "~/projects/myapp"
+    "workingDirPlaceholder": "~/projects/myapp",
+    "execution": {
+      "genericPrompt": "このセッションで、要求された実装／実行作業を行ってください。",
+      "useConfigured": "{{name}} を使用",
+      "useConfiguredNone": "実行セッションを使用",
+      "setSession": "実行セッションを設定…"
+    },
+    "executionGroup": {
+      "title": "実行ワーカー（実行 {{run}}）",
+      "unknownRun": "保留中"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ Daemonをアップグレード",
@@ -1182,6 +1192,16 @@
     "implement_action": "実装",
     "achieve_action": "完了",
     "propose_action": "提案",
+    "execute": {
+      "action": "実行",
+      "dispatch_heading": "現在の変更を実行するセッション",
+      "dispatch_to": "{{name}}",
+      "default_heading": "既定の実行セッション",
+      "set_default": "{{name}} を既定に設定",
+      "clear_default": "既定の実行セッションをクリア",
+      "no_change": "変更を開いて実行対象を選択してください。",
+      "no_sessions": "このプロジェクトには利用可能な実行セッションがまだありません。"
+    },
     "auto": {
       "action": "Auto",
       "kicker": "自動デリバリー",
@@ -1451,7 +1471,27 @@
     "passkey_verify_wrong_account": "そのパスキーは別のアカウントに紐づいています。このアカウントに登録されたパスキーを使ってください。",
     "passkey_verify_no_passkeys": "このアカウントにはパスキーが登録されていません。",
     "native_status_verifying_passkey": "パスキーを確認中…",
-    "native_status_saving_password": "パスワードログインを保存中…"
+    "native_status_saving_password": "パスワードログインを保存中…",
+    "executionRouting": {
+      "title": "実行ルーティング",
+      "enableLabel": "専用の実行セッションを使用",
+      "enableHint": "有効にすると、実装/実行作業はオーケストレーターではなく、下のテンプレートセッションから複製された短命のクローンワーカーにディスパッチされます。これを保存しても設定が保存されるだけで、実行は開始されません。",
+      "templateLabel": "実行テンプレートセッション",
+      "templateNone": "未選択",
+      "templateHint": "クローンはこのセッションのプロバイダー・モデル・ツールを継承しますが、アイデンティティや履歴は決して継承しません。このプロジェクト内の適格な非メインセッションのみが表示されます。",
+      "noCandidates": "このプロジェクトにはまだ適格なテンプレートセッションがありません。テンプレートとして使うワーカーまたはサブセッションを起動してください。",
+      "reselectRequired": "ルーティングは有効ですが、このプロジェクトに有効なテンプレートが選択されていません。下で実行テンプレートセッションを選択してください。",
+      "ineligibleOption": "{{name}} — {{reason}}",
+      "ineligibleReason": {
+        "capacity_full": "容量上限に達しています",
+        "template_ineligible": "テンプレートとして使用できません",
+        "clone_of_clone_forbidden": "すでに実行クローンです",
+        "worker_clone_forbidden": "ワーカーはテンプレートにできません",
+        "cron_clone_forbidden": "スケジュールされたセッションはテンプレートにできません",
+        "target_not_found": "セッションが見つかりません",
+        "destroy_forbidden": "許可されていません"
+      }
+    }
   },
   "admin": {
     "title": "管理パネル",

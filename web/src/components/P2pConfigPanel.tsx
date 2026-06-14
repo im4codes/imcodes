@@ -5,6 +5,7 @@
 import { useState, useEffect, useMemo, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { usePref } from '../hooks/usePref.js';
+import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
 import { p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { P2pComboManager } from './P2pComboManager.js';
@@ -55,6 +56,10 @@ interface SessionRow {
   agentType: string;
   state: string;
   role?: string | null;
+  /** DAEMON-AUTHORITATIVE execution-template eligibility (optional; absent on
+   *  legacy daemons). When present it overrides client-side recomputation. */
+  executionTemplateEligible?: boolean;
+  executionTemplateIneligibleReason?: string;
 }
 
 interface SubSessionRow {
@@ -63,6 +68,9 @@ interface SubSessionRow {
   label?: string | null;
   parentSession?: string | null;
   state: string;
+  /** DAEMON-AUTHORITATIVE execution-template eligibility (optional). */
+  executionTemplateEligible?: boolean;
+  executionTemplateIneligibleReason?: string;
 }
 
 /** Daemon capability snapshot view used by the panel to gate advanced launch.
@@ -112,7 +120,7 @@ interface Props {
   activeSession?: string | null;
   /** Active server ID — P2P participant names are server-local, so saved config must be too. */
   serverId?: string | null;
-  initialTab?: 'participants' | 'combos' | 'advanced';
+  initialTab?: 'participants' | 'combos' | 'advanced' | 'execution';
   onClose: () => void;
   onSave: (config: P2pSavedConfig) => void;
   onPersistDaemonConfig?: (scopeSession: string, config: P2pSavedConfig) => Promise<{ ok: boolean; error?: string }> | { ok: boolean; error?: string };
@@ -453,7 +461,7 @@ export function P2pConfigPanel({
 }: Props) {
   const { t } = useTranslation();
   const [agentFlavorFilter, setAgentFlavorFilter] = useState<AgentFlavorFilter>('sdk');
-  const [activeTab, setActiveTab] = useState<'participants' | 'combos' | 'advanced'>(initialTab);
+  const [activeTab, setActiveTab] = useState<'participants' | 'combos' | 'advanced' | 'execution'>(initialTab);
   const { customCombos, saveCustomCombos } = useP2pCustomCombos();
   const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth < 768);
 
@@ -496,6 +504,66 @@ export function P2pConfigPanel({
   }
 
   const visibleEligible = allEligible.filter((entry) => entry.flavor === agentFlavorFilter);
+
+  // ── Dedicated execution routing (clone) preference ──────────────────────
+  // GLOBAL enabled flag + per-project template session. Reading/saving here
+  // only persists the preference; it NEVER dispatches an execution.
+  const executionRouting = useExecutionRouting(serverId ?? null);
+  // Eligibility is DAEMON-AUTHORITATIVE: the daemon computes
+  // `executionTemplateEligible` (+ an ineligibility reason code) per session and
+  // the UI renders that rather than recomputing eligibility client-side.
+  //
+  // Candidate population (matches the pre-existing template scoping):
+  //   - Sub-sessions in scope are the real templates → daemon flag applied; a
+  //     missing flag (legacy daemon that doesn't project it onto sub-sessions)
+  //     falls back to eligible so an old daemon doesn't hide every candidate.
+  //   - Sibling/worker MAIN sessions appear only when the daemon explicitly
+  //     marks them eligible (`=== true`); the orchestrator/scope session itself
+  //     is never listed.
+  // shell/script types and the current calling session are always excluded.
+  const executionTemplateScan = useMemo(() => {
+    const eligible: Array<{ key: string; shortName: string }> = [];
+    const ineligible: Array<{ key: string; shortName: string; reason?: string }> = [];
+    const seenExec = new Set<string>();
+    const pushEligible = (key: string, shortName: string) => {
+      if (seenExec.has(key)) return;
+      seenExec.add(key);
+      eligible.push({ key, shortName });
+    };
+    const pushIneligible = (key: string, shortName: string, reason?: string) => {
+      if (seenExec.has(key)) return;
+      seenExec.add(key);
+      ineligible.push({ key, shortName, reason });
+    };
+    // Sibling main/worker sessions: include only when the daemon authoritatively
+    // marks eligible. The scope (orchestrator) session is never a template.
+    for (const s of sessions) {
+      if (EXCLUDED_TYPES.has(s.agentType)) continue;
+      if (s.name === scopeSession) continue;
+      if (activeSession && s.name === activeSession) continue;
+      const shortName = s.name.split('_').pop() || s.name;
+      if (s.executionTemplateEligible === true) pushEligible(s.name, shortName);
+      else if (s.executionTemplateEligible === false) pushIneligible(s.name, shortName, s.executionTemplateIneligibleReason);
+      // undefined (legacy main-session flag absent) → not surfaced as a template.
+    }
+    // Sub-sessions in scope: the primary template source.
+    for (const s of subSessions) {
+      if (EXCLUDED_TYPES.has(s.type)) continue;
+      if (scopeSession && s.parentSession && s.parentSession !== scopeSession) continue;
+      if (activeSession && s.sessionName === activeSession) continue;
+      const shortName = s.label || s.sessionName;
+      if (s.executionTemplateEligible === false) pushIneligible(s.sessionName, shortName, s.executionTemplateIneligibleReason);
+      else pushEligible(s.sessionName, shortName); // true OR legacy-undefined
+    }
+    return { eligible, ineligible };
+  }, [sessions, subSessions, scopeSession, activeSession]);
+  const executionTemplateCandidates = executionTemplateScan.eligible;
+  const executionTemplateIneligible = executionTemplateScan.ineligible;
+  const selectedTemplate = executionRouting.templateSessionName;
+  // "reselect required" when routing is enabled but the saved template is
+  // missing or no longer a valid (daemon-eligible) candidate in the project.
+  const templateReselectRequired = executionRouting.enabled
+    && (!selectedTemplate || !executionTemplateCandidates.some((c) => c.key === selectedTemplate));
 
   // Local config state: per-session enabled + mode
   const [sessionCfg, setSessionCfg] = useState<P2pSessionConfig>({});
@@ -1061,6 +1129,14 @@ export function P2pConfigPanel({
               <span class="p2p-alpha-badge">{t('p2p.alpha_badge', 'Alpha')}</span>
             </span>
           </button>
+          <button
+            type="button"
+            style={tabStyle(activeTab === 'execution')}
+            onClick={() => setActiveTab('execution')}
+            data-testid="p2p-tab-execution"
+          >
+            {t('settings.executionRouting.title')}
+          </button>
         </div>
 
         {/* Body */}
@@ -1229,6 +1305,95 @@ export function P2pConfigPanel({
                     customCombos={customCombos}
                     onCustomCombosChange={saveCustomCombos}
                   />
+                </div>
+              </>
+            ) : activeTab === 'execution' ? (
+              /*
+               * Dedicated execution routing (clone) tab. Toggling/selecting
+               * here only persists the preference — it never dispatches an
+               * execution. The template select lists only eligible non-main
+               * sessions of the current project (the current session is
+               * excluded; shell/script and brain/host are already filtered).
+               */
+              <>
+                <div style={sectionCardStyle} data-testid="exec-routing-section">
+                  <div style={{ ...sectionLabelStyle, marginTop: 0 }}>
+                    {t('settings.executionRouting.title')}
+                  </div>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      style={checkboxStyle}
+                      checked={executionRouting.enabled}
+                      data-testid="exec-routing-enabled"
+                      onChange={(e) => {
+                        void executionRouting.setEnabled((e.target as HTMLInputElement).checked);
+                      }}
+                    />
+                    <span style={{ fontSize: 13, color: '#e2e8f0', fontWeight: 600 }}>
+                      {t('settings.executionRouting.enableLabel')}
+                    </span>
+                  </label>
+                  <div style={{ fontSize: 11, color: '#64748b', marginTop: 6, lineHeight: 1.5 }}>
+                    {t('settings.executionRouting.enableHint')}
+                  </div>
+
+                  <div style={{ ...sectionLabelStyle, marginBottom: 6 }}>
+                    {t('settings.executionRouting.templateLabel')}
+                  </div>
+                  <select
+                    style={{ ...selectStyle, width: '100%', minWidth: 0, fontSize: 13, padding: '6px 8px' }}
+                    value={selectedTemplate ?? ''}
+                    disabled={!executionRouting.enabled}
+                    data-testid="exec-routing-template"
+                    onChange={(ev) => {
+                      const v = (ev.target as HTMLSelectElement).value;
+                      void executionRouting.setTemplateSessionName(v || null);
+                    }}
+                  >
+                    <option value="">{t('settings.executionRouting.templateNone')}</option>
+                    {executionTemplateCandidates.map((c) => (
+                      <option key={c.key} value={c.key}>
+                        {c.shortName}
+                      </option>
+                    ))}
+                    {/* Daemon-authoritative ineligible sessions are shown
+                        (disabled) with their reason so the user understands
+                        why a session is not selectable, instead of it silently
+                        vanishing. The reason is an EXECUTION_CLONE error code;
+                        localize it, falling back to the raw code. */}
+                    {executionTemplateIneligible.map((c) => {
+                      const reasonText = c.reason
+                        ? t(`settings.executionRouting.ineligibleReason.${c.reason}`, c.reason)
+                        : '';
+                      return (
+                        <option key={c.key} value={c.key} disabled>
+                          {reasonText
+                            ? t('settings.executionRouting.ineligibleOption', '{{name}} — {{reason}}', {
+                                name: c.shortName,
+                                reason: reasonText,
+                              })
+                            : c.shortName}
+                        </option>
+                      );
+                    })}
+                  </select>
+                  {executionTemplateCandidates.length === 0 && (
+                    <div style={{ fontSize: 11, color: '#64748b', marginTop: 6 }}>
+                      {t('settings.executionRouting.noCandidates')}
+                    </div>
+                  )}
+                  {templateReselectRequired && (
+                    <div
+                      style={{ fontSize: 11, color: '#fbbf24', marginTop: 6, lineHeight: 1.5 }}
+                      data-testid="exec-routing-reselect"
+                    >
+                      {t('settings.executionRouting.reselectRequired')}
+                    </div>
+                  )}
+                  <div style={{ fontSize: 11, color: '#64748b', marginTop: 6, lineHeight: 1.5 }}>
+                    {t('settings.executionRouting.templateHint')}
+                  </div>
                 </div>
               </>
             ) : (

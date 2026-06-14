@@ -23,8 +23,15 @@ describe('test session guard', () => {
     expect(isKnownTestSessionName('deck_test_p2p_workflow_abc123_brain')).toBe(true);
     expect(isKnownTestSessionName('imcodes-test-p2p-workflow-abc123')).toBe(true);
     expect(isKnownTestSessionName('deck_sub_e2e_mcp_abc123')).toBe(true);
+    // Execution-clone lifecycle TEST sessions (deck_sub_* clone family).
+    expect(isKnownTestSessionName('deck_sub_execclone_abc123')).toBe(true);
+    expect(isKnownTestSessionName('deck_sub_e2e_execclone_run1')).toBe(true);
     expect(isKnownTestSessionName('deck_realproj_brain')).toBe(false);
     expect(isKnownTestSessionName('deck_performance_real_brain')).toBe(false);
+    // A REAL execution clone (random hex id from subSessionName) must NEVER be
+    // matched as test-like — that would delete a live clone on startup.
+    expect(isKnownTestSessionName('deck_sub_0123456789ab')).toBe(false);
+    expect(isKnownTestSessionName('deck_sub_clone01')).toBe(false);
   });
 
   it('matches known leaked project names and temp e2e paths', () => {
@@ -47,6 +54,8 @@ describe('test session guard', () => {
     expect(isKnownTestProjectDir('/tmp/imcodes-test-preview-dist-abc123/project')).toBe(true);
     expect(isKnownTestProjectDir('/tmp/imcodes-test-p2p-workflow-abc123/project')).toBe(true);
     expect(isKnownTestProjectDir('/tmp/imc_p2p_wf_test_abc123/project')).toBe(true);
+    expect(isKnownTestProjectDir('/tmp/execclone-abc123/project')).toBe(true);
+    expect(isKnownTestProjectDir('/tmp/imc_execclone_abc123/project')).toBe(true);
     expect(isKnownTestProjectDir('/Users/me/src/myapp')).toBe(false);
     expect(isKnownTestProjectDir('/tmp/stormcenter-real/project')).toBe(false);
   });
@@ -68,6 +77,23 @@ describe('test session guard', () => {
       name: 'deck_sub_real',
       cwd: '/Users/me/project',
       parentSession: 'deck_cd_brain',
+    })).toBe(false);
+  });
+
+  it('matches execution-clone test sub-sessions by name or temp cwd', () => {
+    // Recognized directly by the clone-test naming family.
+    expect(isKnownTestSessionLike({ name: 'deck_sub_execclone_run1' })).toBe(true);
+    // Recognized via a temp clone cwd even when the name is a bare clone id.
+    expect(isKnownTestSessionLike({
+      name: 'deck_sub_abcd1234',
+      cwd: '/tmp/execclone-run1',
+    })).toBe(true);
+    // A REAL execution clone (random hex id, real project cwd, real parent) is
+    // NOT test-like and must survive startup cleanup.
+    expect(isKnownTestSessionLike({
+      name: 'deck_sub_0123456789ab',
+      cwd: '/Users/me/project',
+      parentSession: 'deck_realproj_brain',
     })).toBe(false);
   });
 });

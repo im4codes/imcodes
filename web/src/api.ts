@@ -806,6 +806,14 @@ export interface SubSessionData {
   transportPendingMessages?: string[] | null;
   transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> | null;
   transportPendingMessageVersion?: number | null;
+  /** Execution-clone discriminant projection (the canonical
+   *  `EXECUTION_CLONE_KIND` value) when this sub-session is an ephemeral
+   *  execution clone. Absent for ordinary sub-sessions. Drives grouped
+   *  execution-detail rendering — clones never render as flat top-level peers. */
+  executionCloneKind?: string | null;
+  /** The owning parent execution run id for an execution clone. Clones sharing a
+   *  `parentRunId` are grouped together in the execution-detail view. */
+  parentRunId?: string | null;
 }
 
 export async function listSubSessions(serverId: string): Promise<SubSessionData[]> {

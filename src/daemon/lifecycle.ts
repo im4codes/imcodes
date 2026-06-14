@@ -11,6 +11,8 @@ import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { isExecutionClone, sweepExecutionClones, destroyExecutionClone, resolveExecutionCloneRetentionMs } from './execution-clone.js';
+import { EXECUTION_CLONE_TIMELINE } from '../../shared/execution-clone.js';
 import { startLatencyTracer } from './latency-tracer.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import { timelineStore } from './timeline-store.js';
@@ -1370,43 +1372,117 @@ let gcTimer: ReturnType<typeof setInterval> | null = null;
 let eventLoopDelayTimer: ReturnType<typeof setInterval> | null = null;
 let hookServer: http.Server | null = null;
 
+/** Mark an execution clone whose tmux pane has died as completed so the GC
+ *  retention reap can later remove it. Execution clones are NEVER respawned —
+ *  a dead clone pane means the worker ended. Retention is the configured
+ *  duration persisted at create (`resolveExecutionCloneRetentionMs`), falling
+ *  back to the parser default for old/rolling records. */
+function completeExecutionCloneOnPaneDeath(s: SessionRecord): void {
+  const meta = s.executionCloneMetadata;
+  if (!meta || meta.completedAt || meta.cleanupState === 'destroying' || meta.cleanupState === 'destroyed') return;
+  const now = Date.now();
+  upsertSession({
+    ...s,
+    state: 'stopped',
+    updatedAt: now,
+    executionCloneMetadata: {
+      ...meta,
+      completedAt: now,
+      retentionExpiresAt: now + resolveExecutionCloneRetentionMs(meta),
+      cleanupState: 'collecting',
+    },
+  });
+  timelineEmitter.emit(s.name, EXECUTION_CLONE_TIMELINE.TERMINAL, {
+    sessionName: s.name,
+    parentRunId: meta.parentRunId,
+    reason: 'pane_death',
+  });
+}
+
+/** Per-session health check. Exported so the execution-clone respawn-skip and
+ *  the sweep can be asserted deterministically without the 30s tick (task 3.9). */
+export async function checkSessionHealth(s: SessionRecord): Promise<void> {
+  if (s.state === 'stopped' || s.state === 'error') return;
+  // Execution clones are ephemeral: NEVER auto-respawn (this is the real
+  // destroy-safety mechanism — teardown is not atomic). On pane death, mark for
+  // the retention reap instead of resurrecting the worker.
+  if (isExecutionClone(s)) {
+    if (s.runtimeType === 'transport' || isTransportAgent(s.agentType)) return; // no pane; bounded by hard-timeout / orchestrator / restart sweep
+    try {
+      const exists = await sessionExists(s.name);
+      if (!exists || !(await isPaneAlive(s.name))) completeExecutionCloneOnPaneDeath(s);
+    } catch { /* ignore */ }
+    return;
+  }
+  // Transport sessions have no tmux pane — skip tmux health checks.
+  // Belt-and-suspenders: also check agentType so records persisted before
+  // the runtimeType field existed (or written by an older daemon) don't
+  // fall through and trigger a tmux restart loop on transport sessions.
+  if (s.runtimeType === 'transport' || isTransportAgent(s.agentType)) return;
+  // Sub-sessions: auto-restart dead panes, mark stopped if tmux session gone entirely
+  if (s.name.startsWith('deck_sub_')) {
+    try {
+      const exists = await sessionExists(s.name);
+      if (!exists) {
+        logger.info({ session: s.name }, 'Sub-session gone, marking stopped');
+        upsertSession({ ...s, state: 'stopped', updatedAt: Date.now() });
+      } else if (!(await isPaneAlive(s.name))) {
+        logger.warn({ session: s.name }, 'Sub-session pane dead, respawning');
+        await respawnSession(s);
+      }
+    } catch { /* ignore */ }
+    return;
+  }
+  try {
+    const exists = await sessionExists(s.name);
+    if (!exists) {
+      logger.warn({ session: s.name }, 'Session missing, attempting restart');
+      await restartSession(s);
+    } else if (!(await isPaneAlive(s.name))) {
+      logger.warn({ session: s.name }, 'Pane dead, respawning');
+      await respawnSession(s);
+    }
+  } catch (err) {
+    logger.warn({ session: s.name, err }, 'Health check error');
+  }
+}
+
+/** Sweep expired execution clones on each health tick (task 3.6). Three branches:
+ *  (1) creator-gone orphan sweep — the orchestrator session that created the clone
+ *  is gone/stopped/errored, so no owner remains to collect the worker's results;
+ *  (2) running clones past their hard timeout are stopped+destroyed; (3) completed
+ *  clones past their retention window are reaped. This is a creator-gone orphan
+ *  sweep + retention/hardTimeout backstop, NOT a full parent-run-terminal sweep:
+ *  registry absence is ambiguous (runs are DELETED on completion) so it can never
+ *  prove terminality and is never used here. Creator liveness is the only positive
+ *  terminal signal and covers all parent stages. Daemon restart sweeps ALL clones
+ *  (see initOnStartup). */
+export async function runExecutionCloneSweep(now: number): Promise<void> {
+  await sweepExecutionClones(now, {
+    // Positive terminal signal: the clone's creator session is provably gone.
+    // Unknown/alive creator → protect (fall back to retention/hardTimeout).
+    isCloneParentTerminal: (rec) => {
+      const creator = rec.executionCloneMetadata?.createdBySessionName;
+      if (!creator) return false; // no creator info → protect
+      const s = getSession(creator);
+      return !s || s.state === 'stopped' || s.state === 'error';
+    },
+    isRunning: (r) => !r.executionCloneMetadata?.completedAt && r.state !== 'stopped' && r.state !== 'error',
+    destroy: (target, reason) => destroyExecutionClone({ target, reason, bypassAuth: true }),
+  });
+}
+
 /** Periodically check all running sessions; restart any that have disappeared or died. */
 function startHealthPoller(): void {
   healthTimer = setInterval(async () => {
     const sessions = listSessions();
     for (const s of sessions) {
-      if (s.state === 'stopped' || s.state === 'error') continue;
-      // Transport sessions have no tmux pane — skip tmux health checks.
-      // Belt-and-suspenders: also check agentType so records persisted before
-      // the runtimeType field existed (or written by an older daemon) don't
-      // fall through and trigger a tmux restart loop on transport sessions.
-      if (s.runtimeType === 'transport' || isTransportAgent(s.agentType)) continue;
-      // Sub-sessions: auto-restart dead panes, mark stopped if tmux session gone entirely
-      if (s.name.startsWith('deck_sub_')) {
-        try {
-          const exists = await sessionExists(s.name);
-          if (!exists) {
-            logger.info({ session: s.name }, 'Sub-session gone, marking stopped');
-            upsertSession({ ...s, state: 'stopped', updatedAt: Date.now() });
-          } else if (!(await isPaneAlive(s.name))) {
-            logger.warn({ session: s.name }, 'Sub-session pane dead, respawning');
-            await respawnSession(s);
-          }
-        } catch { /* ignore */ }
-        continue;
-      }
-      try {
-        const exists = await sessionExists(s.name);
-        if (!exists) {
-          logger.warn({ session: s.name }, 'Session missing, attempting restart');
-          await restartSession(s);
-        } else if (!(await isPaneAlive(s.name))) {
-          logger.warn({ session: s.name }, 'Pane dead, respawning');
-          await respawnSession(s);
-        }
-      } catch (err) {
-        logger.warn({ session: s.name, err }, 'Health check error');
-      }
+      await checkSessionHealth(s);
+    }
+    try {
+      await runExecutionCloneSweep(Date.now());
+    } catch (err) {
+      logger.warn({ err }, 'Execution-clone sweep error');
     }
   }, HEALTH_POLL_MS);
 }

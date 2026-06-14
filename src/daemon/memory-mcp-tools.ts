@@ -30,6 +30,7 @@ import {
   type MCPFeatureFlagValues,
 } from '../../shared/memory-mcp-feature-flags.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
+import { EXECUTION_CLONE_KIND, EXECUTION_CLONE_PARENT_STAGES, isExecutionCloneParentStage } from '../../shared/execution-clone.js';
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
 import { memoryGetSources } from '../context/memory-read-tools.js';
 import { getMemorySourcesOrchestrated, type GetSourcesOrchestratorResult, type OrchestratorDeps } from './memory-get-sources-orchestrator.js';
@@ -38,7 +39,7 @@ import type { MemorySearchQuery } from '../context/memory-search.js';
 import { saveObservation, savePreference } from '../context/memory-write-tools.js';
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
-import { dispatchSendMessage, dispatchSendStop, listSendTargets, type SendToolDeps } from './send-tool.js';
+import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
 import { cronMcpCreate, cronMcpDelete, cronMcpList, cronMcpUpdate, type CronMcpClientOptions } from './cron-mcp-client.js';
 import { registerMemoryShortRef, resolveMemoryShortRef } from '../context/memory-short-ref.js';
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
@@ -149,6 +150,35 @@ function stringArrayArg(args: Record<string, unknown>, key: string): string[] | 
   const value = args[key];
   if (!Array.isArray(value)) return undefined;
   return value.filter((item): item is string => typeof item === 'string');
+}
+
+/** Allowed keys on a strict `send_message.clone` object — anything else is forged. */
+const CLONE_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set(['kind', 'ephemeral', 'parentRunId', 'parentStage']);
+
+/**
+ * Parse + strictly validate a `send_message.clone` argument. Returns `undefined`
+ * when absent, a typed {@link SendMessageCloneRequest} when valid, or the
+ * sentinel `'invalid'` when malformed (forged kind, `ttlMs`/extra keys, missing
+ * fields, bad parent stage). Mirrors the strict zod schema for the direct
+ * in-process handler path.
+ */
+function parseCloneArg(value: unknown): SendMessageCloneRequest | undefined | 'invalid' {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) return 'invalid';
+  const record = value as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (!CLONE_ARG_ALLOWED_KEYS.has(key)) return 'invalid';
+  }
+  if (record.kind !== EXECUTION_CLONE_KIND) return 'invalid';
+  if (record.ephemeral !== true) return 'invalid';
+  if (typeof record.parentRunId !== 'string' || record.parentRunId.trim().length === 0) return 'invalid';
+  if (!isExecutionCloneParentStage(record.parentStage)) return 'invalid';
+  return {
+    kind: EXECUTION_CLONE_KIND,
+    ephemeral: true,
+    parentRunId: record.parentRunId,
+    parentStage: record.parentStage,
+  };
 }
 
 function parseExpiresAt(value: unknown): number | null | undefined {
@@ -479,7 +509,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
       await refreshSendSessionStore(deps);
-      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'broadcast', 'idempotencyKey']);
+      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'broadcast', 'idempotencyKey', 'clone']);
+      const clone = parseCloneArg(args.clone);
+      if (clone === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'clone request is invalid');
       return dispatchSendMessage(caller, {
         target: stringArg(args, 'target'),
         message: stringArg(args, 'message'),
@@ -487,10 +519,22 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         reply: boolArg(args, 'reply'),
         broadcast: boolArg(args, 'broadcast'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
+        ...(clone ? { clone } : {}),
       }, {
         ...deps.sendDeps,
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
         exactTargetOnly: true,
+      }) as unknown as Promise<ToolResult>;
+    },
+    [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: async (input) => {
+      await refreshSendSessionStore(deps);
+      const args = pickAllowedMcpArgs(input, ['target', 'idempotencyKey']);
+      return dispatchDestroyExecutionClone(caller, {
+        target: stringArg(args, 'target'),
+        idempotencyKey: stringArg(args, 'idempotencyKey'),
+      }, {
+        ...deps.sendDeps,
+        isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
       }) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: async (input) => {
@@ -635,6 +679,16 @@ const schemas = {
     reply: z.boolean().optional().describe('Ask target to reply to the caller session. Set true for audit/review requests or discussion invites that should report back.'),
     broadcast: z.boolean().optional().describe('Broadcast within the caller project. Use only when the user asks every/all available sessions, not for a singular named peer.'),
     idempotencyKey: z.string().optional().describe('Retry key for accepted send replay.'),
+    clone: z.object({
+      kind: z.literal(EXECUTION_CLONE_KIND).describe('Must be "execution_clone".'),
+      ephemeral: z.literal(true).describe('Must be true — execution clones are always ephemeral.'),
+      parentRunId: z.string().min(1).describe('Non-empty id of the parent run that owns this clone.'),
+      parentStage: z.enum(EXECUTION_CLONE_PARENT_STAGES).describe('Execution entry-point stage creating the clone.'),
+    }).strict().optional().describe('Optional execution-clone request. When present, the message is routed to a freshly created ephemeral clone of the target template, not the target directly; the result includes clone.target. broadcast is not allowed.'),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: z.object({
+    target: z.string().describe('Exact execution-clone session name returned by the original clone send (result.clone.target).'),
+    idempotencyKey: z.string().optional().describe('Optional retry key for accepted destroy replay.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: z.object({
     target: z.string().optional().describe('Exact sibling target from send_list_targets to force-stop. Required unless broadcast is true. The caller session is not a valid target.'),
