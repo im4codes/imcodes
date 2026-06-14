@@ -48,6 +48,21 @@ describe('evaluateAutoUpgradeCooldown', () => {
     expect(v.onCooldown).toBe(false);
   });
 
+  it('rejects a corrupt `date +%s%3N` sentinel instead of misreading it as a 1970 timestamp', () => {
+    // BSD/macOS `date` has no %N, so `date +%s%3N` emits "<10-digit seconds>3N"
+    // (literal `3N`), e.g. "17813679103N". `parseInt` would read 17813679103 →
+    // a 1970-era ms value → "cooldown long expired" → upgrade thrash loop. It
+    // must be treated as garbage (no usable sentinel), not a valid timestamp.
+    const v = evaluateAutoUpgradeCooldown({
+      targetVersion: undefined,
+      now: NOW,
+      cooldownMs: COOLDOWN,
+      readSentinel: () => '17813679103N',
+    });
+    expect(v.onCooldown).toBe(false);
+    expect(v.lastAt).toBeNull();
+  });
+
   it('lets through when last upgrade was OUTSIDE the cooldown window', () => {
     const v = evaluateAutoUpgradeCooldown({
       targetVersion: undefined,

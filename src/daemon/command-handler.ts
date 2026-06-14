@@ -5882,7 +5882,14 @@ export function evaluateAutoUpgradeCooldown(
   let raw: string | null = null;
   try { raw = input.readSentinel(); } catch { /* sentinel unreadable */ }
   if (!raw) return { onCooldown: false, remainingMs: 0, lastAt: null };
-  const lastAt = parseInt(raw.trim(), 10);
+  const trimmed = raw.trim();
+  // Require a pure epoch-ms integer. `parseInt` silently accepts trailing
+  // garbage — e.g. the corrupt "17813679103N" that BSD/macOS `date +%s%3N`
+  // writes (no %N support) — and would misread it as a 1970-era timestamp,
+  // making the cooldown look long-expired and driving an auto-upgrade thrash
+  // loop. Anything that isn't all digits is treated as "no usable sentinel".
+  if (!/^\d+$/.test(trimmed)) return { onCooldown: false, remainingMs: 0, lastAt: null };
+  const lastAt = parseInt(trimmed, 10);
   if (!Number.isFinite(lastAt)) return { onCooldown: false, remainingMs: 0, lastAt: null };
   const ageMs = now - lastAt;
   // Negative age (clock skew, sentinel from the future) → ignore the
@@ -7109,9 +7116,13 @@ else
   # consults this on the new daemon's next auto-upgrade attempt to
   # rate-limit dev-tag-poll-driven restarts. Survives restart by
   # design (the very transition we are throttling against).
-  # date +%s%3N = epoch ms (matches Date.now in JS). Best-effort: a
-  # missing sentinel means no cooldown applies.
-  date +%s%3N > "$HOME/.imcodes/last-upgrade-at" 2>/dev/null || true
+  # Epoch ms (matches Date.now in JS). MUST stay portable: BSD/macOS \`date\`
+  # has no %N, so \`date +%s%3N\` emits a bogus "<seconds>3N" there and corrupts
+  # the sentinel — which made the cooldown never apply and drove a macOS
+  # auto-upgrade thrash loop (stuck upgrade.sh + endless daemon restarts).
+  # seconds*1000 is ms-granular enough for a multi-minute cooldown and works on
+  # both GNU and BSD date. Best-effort: a missing sentinel means no cooldown.
+  printf '%s\n' "$(( $(date +%s) * 1000 ))" > "$HOME/.imcodes/last-upgrade-at" 2>/dev/null || true
   log "[step 5] cooldown sentinel updated: $HOME/.imcodes/last-upgrade-at"
 fi
 
