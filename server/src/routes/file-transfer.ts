@@ -570,6 +570,11 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
     if (supportsStreamDownload) {
       const token = randomHex(32);
       const stream = new PassThrough();
+      // Guard against an uncaught 'error' if the sink is destroyed while still
+      // unconsumed (relay failure / timeout before we hand the stream to the
+      // Response). Once consumed, Readable.toWeb propagates errors to the client
+      // too — this extra listener just prevents the process-level throw.
+      stream.on('error', () => {});
       const timer = setTimeout(() => {
         deleteStagedDownload(downloadId, new Error('download_timeout'));
       }, STAGED_DOWNLOAD_TTL_MS);
@@ -604,7 +609,21 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
         streamMsg as unknown as Record<string, unknown>,
         FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
       ).then((result) => {
-        resolveStagedDownloadReady(downloadId, result);
+        // Readiness == bytes ACTUALLY flowing, which the download-staged PUT
+        // handler signals (resolveStagedDownloadReady near the PUT above). The
+        // daemon sends DOWNLOAD_STREAM_READY over WS *optimistically* and only
+        // then opens the PUT — resolving readiness here would return 200 + an
+        // empty PassThrough before the PUT delivers, leaving the browser stuck
+        // in "downloading" forever if that PUT never lands. So only fail-fast
+        // here on an explicit daemon error; let the PUT (or the readiness
+        // timeout → base64 fallback) settle the success case.
+        if (result && (result as { type?: string }).type === 'file.download_error') {
+          // Resolve (not reject) with the error result so the await below maps
+          // not_found→404 / expired→410. base64 would fail identically for a
+          // genuine missing/expired handle, so we must NOT fall back here —
+          // only true relay failures (WS reject / no bytes / timeout) fall back.
+          resolveStagedDownloadReady(downloadId, result as Record<string, unknown>);
+        }
       }).catch((err) => {
         const error = err instanceof Error ? err : new Error(String(err));
         rejectStagedDownloadReady(downloadId, error);
@@ -612,42 +631,64 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
       });
 
       const entry = stagedDownloads.get(downloadId);
-      if (!entry) return c.json({ error: 'download_failed' }, 500);
-      const result = await waitForStagedDownloadReady(entry);
+      if (entry) {
+        try {
+          const result = await waitForStagedDownloadReady(entry);
 
-      if (result.type === 'file.download_error') {
-        deleteStagedDownload(downloadId, new Error(String(result.message ?? 'download_failed')));
-        const errMsg = result.message as string;
-        if (errMsg === 'not_found') return c.json({ error: 'not_found' }, 404);
-        if (errMsg === 'expired') return c.json({ error: 'handle_expired' }, 410);
-        return c.json({ error: 'download_failed', message: errMsg }, 500);
+          if (result.type === 'file.download_error') {
+            // Genuine daemon error (missing/expired handle) — the base64 path
+            // would fail identically, so surface it directly without falling back.
+            deleteStagedDownload(downloadId, new Error(String(result.message ?? 'download_failed')));
+            const errMsg = result.message as string;
+            if (errMsg === 'not_found') return c.json({ error: 'not_found' }, 404);
+            if (errMsg === 'expired') return c.json({ error: 'handle_expired' }, 410);
+            return c.json({ error: 'download_failed', message: errMsg }, 500);
+          }
+
+          const mime = (result.mime as string) || 'application/octet-stream';
+          const filename = (result.filename as string) || attachmentId;
+          const size = typeof result.size === 'number' && Number.isFinite(result.size) && result.size >= 0
+            ? Math.trunc(result.size)
+            : undefined;
+          c.header('Content-Type', mime);
+          if (size !== undefined) c.header('Content-Length', String(size));
+          const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
+          const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
+          c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
+          c.header('Cache-Control', 'no-store');
+
+          return new Response(Readable.toWeb(stream) as ReadableStream, {
+            status: 200,
+            headers: c.res.headers,
+          });
+        } catch (readyErr) {
+          // The relay never delivered bytes (no PUT arrived, the PUT failed, or
+          // it timed out). Clean up the staged sink and fall through to the
+          // legacy base64 download so the user still gets the file instead of an
+          // endless "downloading" spinner. The streamed path stays primary; this
+          // is graceful degradation, not a permanent detour.
+          deleteStagedDownload(downloadId, readyErr instanceof Error ? readyErr : new Error(String(readyErr)));
+          logger.warn(
+            { serverId, downloadId, err: readyErr },
+            'Streamed download relay not ready — falling back to base64 download',
+          );
+        }
       }
-
-      const mime = (result.mime as string) || 'application/octet-stream';
-      const filename = (result.filename as string) || attachmentId;
-      const size = typeof result.size === 'number' && Number.isFinite(result.size) && result.size >= 0
-        ? Math.trunc(result.size)
-        : undefined;
-      c.header('Content-Type', mime);
-      if (size !== undefined) c.header('Content-Length', String(size));
-      const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
-      const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
-      c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
-      c.header('Cache-Control', 'no-store');
-
-      return new Response(Readable.toWeb(stream) as ReadableStream, {
-        status: 200,
-        headers: c.res.headers,
-      });
+      // fall through to the legacy base64 path below (relay-failure fallback)
     }
 
+    // Legacy base64 download: the path for daemons without stream capability AND
+    // the fallback when the stream relay above failed to deliver. Use a fresh id
+    // because the stream attempt (if any) already consumed `downloadId` for its
+    // WS request, whose RPC may still be pending.
+    const legacyDownloadId = supportsStreamDownload ? randomHex(16) : downloadId;
     const downloadMsg: FileDownloadRequest = {
       type: 'file.download',
-      downloadId,
+      downloadId: legacyDownloadId,
       attachmentId,
     };
     const result = await bridge.sendFileTransferRequest(
-      downloadId,
+      legacyDownloadId,
       downloadMsg as unknown as Record<string, unknown>,
       FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
     );

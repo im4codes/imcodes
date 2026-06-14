@@ -344,4 +344,51 @@ describe('file-transfer download route', () => {
     );
     expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY);
   });
+
+  it('falls back to the base64 download when the streamed relay fails to deliver bytes', async () => {
+    const app = makeApp();
+    // 1st WS call = DOWNLOAD_STREAM (relay) → reject to simulate a relay that
+    // never delivers (the production "stuck downloading" failure mode).
+    // 2nd WS call = file.download (legacy base64 fallback) → succeed.
+    sendFileTransferRequestMock
+      .mockImplementationOnce((_requestId: string, message: unknown) => {
+        expect((message as { type: string }).type).toBe(FILE_TRANSFER_MSG.DOWNLOAD_STREAM);
+        return Promise.reject(new Error('relay_upload_502'));
+      })
+      .mockImplementationOnce((_requestId: string, message: unknown) => {
+        expect((message as { type: string }).type).toBe('file.download');
+        return Promise.resolve({
+          content: Buffer.from('hello world').toString('base64'),
+          mime: 'text/plain',
+          filename: 'hello.txt',
+        });
+      });
+
+    const res = await app.request('/api/server/srv-1/uploads/abc123/download', {
+      headers: { Authorization: 'Bearer test' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/plain');
+    expect(res.headers.get('content-disposition')).toContain('hello.txt');
+    await expect(res.text()).resolves.toBe('hello world');
+    // Both the relay attempt and the base64 fallback were issued.
+    expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('surfaces a genuine not_found from the relay without a pointless base64 retry', async () => {
+    const app = makeApp();
+    sendFileTransferRequestMock.mockImplementationOnce((_requestId: string, message: unknown) => {
+      expect((message as { type: string }).type).toBe(FILE_TRANSFER_MSG.DOWNLOAD_STREAM);
+      return Promise.resolve({ type: 'file.download_error', message: 'not_found' });
+    });
+
+    const res = await app.request('/api/server/srv-1/uploads/abc123/download', {
+      headers: { Authorization: 'Bearer test' },
+    });
+
+    expect(res.status).toBe(404);
+    // A genuine missing-handle error must NOT trigger a base64 fallback.
+    expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(1);
+  });
 });
