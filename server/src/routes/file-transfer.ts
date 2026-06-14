@@ -1,7 +1,7 @@
 /**
  * File transfer routes: upload and download via HTTP, relayed to daemon over WS.
  */
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
 import { requireAuth } from '../security/authorization.js';
 import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
@@ -162,6 +162,26 @@ function buildStagedDownloadUrl(requestUrl: string, serverId: string, downloadId
   url.pathname = `/api/server/${encodeURIComponent(serverId)}/download-staged/${encodeURIComponent(downloadId)}`;
   url.search = `token=${encodeURIComponent(token)}`;
   return url.toString();
+}
+
+/**
+ * Send a `file.download_done` (base64 inline) daemon result to the browser as a
+ * binary attachment response. Shared by the inline small-file fast path, the
+ * legacy (no-stream-capability) path, and the relay-failure fallback — repo
+ * rule: never copy code.
+ */
+function respondBase64Download(c: Context, result: Record<string, unknown>, attachmentId: string): Response {
+  const content = Buffer.from(result.content as string, 'base64');
+  const mime = (result.mime as string) || 'application/octet-stream';
+  const filename = (result.filename as string) || attachmentId;
+  c.header('Content-Type', mime);
+  c.header('Content-Length', String(content.length));
+  // RFC 5987: non-ASCII filenames must use filename*=UTF-8'' encoding. Include
+  // both for maximum client compatibility.
+  const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
+  const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
+  c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
+  return c.body(content);
 }
 
 function wantsUploadProgressStream(accept: string | undefined): boolean {
@@ -617,11 +637,17 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
         // in "downloading" forever if that PUT never lands. So only fail-fast
         // here on an explicit daemon error; let the PUT (or the readiness
         // timeout → base64 fallback) settle the success case.
-        if (result && (result as { type?: string }).type === 'file.download_error') {
+        const resultType = result && (result as { type?: string }).type;
+        if (resultType === 'file.download_error') {
           // Resolve (not reject) with the error result so the await below maps
           // not_found→404 / expired→410. base64 would fail identically for a
           // genuine missing/expired handle, so we must NOT fall back here —
           // only true relay failures (WS reject / no bytes / timeout) fall back.
+          resolveStagedDownloadReady(downloadId, result as Record<string, unknown>);
+        } else if (resultType === 'file.download_done') {
+          // Small file the daemon returned INLINE (base64 over WS) instead of via
+          // the relay — the content is fully present, so settle readiness with it
+          // and the await below returns it directly (no relay round-trip).
           resolveStagedDownloadReady(downloadId, result as Record<string, unknown>);
         }
       }).catch((err) => {
@@ -643,6 +669,13 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
             if (errMsg === 'not_found') return c.json({ error: 'not_found' }, 404);
             if (errMsg === 'expired') return c.json({ error: 'handle_expired' }, 410);
             return c.json({ error: 'download_failed', message: errMsg }, 500);
+          }
+
+          if (result.type === 'file.download_done') {
+            // Small file returned inline — no relay/PassThrough involved. Drop the
+            // unused staged sink and return the bytes directly (the fast path).
+            deleteStagedDownload(downloadId);
+            return respondBase64Download(c, result, attachmentId);
           }
 
           const mime = (result.mime as string) || 'application/octet-stream';
@@ -700,20 +733,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
       return c.json({ error: 'download_failed', message: errMsg }, 500);
     }
 
-    // Decode base64 content and return as binary response
-    const content = Buffer.from(result.content as string, 'base64');
-    const mime = (result.mime as string) || 'application/octet-stream';
-    const filename = (result.filename as string) || attachmentId;
-
-    c.header('Content-Type', mime);
-    c.header('Content-Length', String(content.length));
-    // RFC 5987: non-ASCII filenames must use filename*=UTF-8'' encoding.
-    // Always include both for maximum client compatibility.
-    const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
-    const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
-    c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
-
-    return c.body(content);
+    return respondBase64Download(c, result, attachmentId);
   } catch (err) {
     deleteStagedDownload(downloadId, err instanceof Error ? err : new Error(String(err)));
     const msg = err instanceof Error ? err.message : String(err);

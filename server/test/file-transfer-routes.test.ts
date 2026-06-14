@@ -391,4 +391,31 @@ describe('file-transfer download route', () => {
     // A genuine missing-handle error must NOT trigger a base64 fallback.
     expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(1);
   });
+
+  it('returns a small file INLINE (file.download_done over WS) in one round-trip — no relay PUT, no fallback', async () => {
+    const app = makeApp();
+    // The daemon returns small files inline over the WS RPC instead of streaming
+    // through the relay. The server must return those bytes directly — the fast
+    // path that makes tiny files instant instead of waiting on the relay.
+    sendFileTransferRequestMock.mockImplementationOnce((_requestId: string, message: unknown) => {
+      expect((message as { type: string }).type).toBe(FILE_TRANSFER_MSG.DOWNLOAD_STREAM);
+      return Promise.resolve({
+        type: 'file.download_done',
+        content: Buffer.from('hi there').toString('base64'),
+        mime: 'text/plain',
+        filename: 'note.txt',
+      });
+    });
+
+    const res = await app.request('/api/server/srv-1/uploads/abc123/download', {
+      headers: { Authorization: 'Bearer test' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/plain');
+    expect(res.headers.get('content-disposition')).toContain('note.txt');
+    await expect(res.text()).resolves.toBe('hi there');
+    // Exactly one WS call: no relay PUT and no base64 fallback round-trip.
+    expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(1);
+  });
 });

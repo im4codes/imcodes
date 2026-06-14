@@ -41,8 +41,19 @@ export const FILE_TRANSFER_LIMITS = {
   STAGED_UPLOAD_TTL_MS: 10 * 60 * 1000,
   /** Server waits this long for daemon download response (ms). */
   DOWNLOAD_TIMEOUT_MS: 300_000,
-  /** Server waits this long for download stream metadata before failing fast (ms). */
-  DOWNLOAD_STREAM_READY_TIMEOUT_MS: 15_000,
+  /** Server waits this long for the daemon's download stream to start delivering
+   *  bytes before falling back to the base64 path (ms). Only large files take the
+   *  relay (small files return inline — see DOWNLOAD_INLINE_MAX_BYTES), and the
+   *  PUT-start is fast on a healthy relay, so this is sized for "relay is broken,
+   *  fall back quickly" rather than "wait for a slow transfer". */
+  DOWNLOAD_STREAM_READY_TIMEOUT_MS: 8_000,
+  /** Files at or below this size are returned INLINE (base64 over the daemon WS)
+   *  in a single round-trip instead of through the streaming relay. The relay's
+   *  PUT round-trip + readiness handshake adds latency that dominates for small
+   *  files (and is pure overhead if the relay is unhealthy), so it is reserved
+   *  for genuinely large files where avoiding base64-over-WS bloat matters.
+   *  1 MiB raw ≈ 1.37 MiB base64. */
+  DOWNLOAD_INLINE_MAX_BYTES: 1024 * 1024,
   /** Temporary uploaded files are cleaned after this duration (ms). 24 hours. */
   TEMP_TTL_MS: 24 * 60 * 60 * 1000,
   /** Project-file download handles expire after this duration (ms). 4 hours. */

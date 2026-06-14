@@ -204,9 +204,44 @@ describe('file-transfer local handle hardening', () => {
     });
   });
 
-  it('streams downloads to the relay upload URL without sending base64 content over WS', async () => {
+  it('returns small files inline (file.download_done) instead of using the relay', async () => {
+    const filePath = path.join(rootDir, 'project', 'small.txt');
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, 'hello inline');
+
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const handle = transfer.createProjectFileHandle(filePath, 'small.txt', 'text/plain', 'hello inline'.length);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const inline = createServerLinkMock();
+
+    await transfer.handleFileDownloadStream(
+      {
+        type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM,
+        downloadId: 'download-inline',
+        attachmentId: handle.id,
+        uploadUrl: 'https://relay.example/download-staged/download-inline?token=secret',
+      },
+      inline.serverLink as never,
+    );
+
+    // Small file → single inline reply over WS, NO relay PUT.
+    expect(inline.sent).toEqual([
+      expect.objectContaining({
+        type: 'file.download_done',
+        downloadId: 'download-inline',
+        content: Buffer.from('hello inline').toString('base64'),
+        mime: 'text/plain',
+        filename: 'small.txt',
+      }),
+    ]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('streams LARGE downloads to the relay upload URL without sending base64 content over WS', async () => {
     const filePath = path.join(rootDir, 'project', 'large.bin');
-    const content = Buffer.alloc(64 * 1024, 7);
+    // Must exceed the inline threshold so it takes the relay path, not inline.
+    const content = Buffer.alloc(FILE_TRANSFER_LIMITS.DOWNLOAD_INLINE_MAX_BYTES + 1024, 7);
     await mkdir(path.dirname(filePath), { recursive: true });
     await writeFile(filePath, content);
 

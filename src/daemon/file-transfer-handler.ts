@@ -437,6 +437,26 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
 
 // ── Download ────────────────────────────────────────────────────────────────
 
+/**
+ * Read a download target fully and send it back INLINE as base64 over the daemon
+ * WS (`file.download_done`). Shared by the legacy `file.download` path and the
+ * small-file fast path of `handleFileDownloadStream` — for small files a single
+ * inline round-trip is far faster than the relay's PUT + readiness handshake
+ * (repo rule: never copy code).
+ */
+async function sendInlineDownload(serverLink: ServerLink, downloadId: string, target: DownloadTarget): Promise<void> {
+  const buffer = await readFile(target.readPath);
+  const response: FileDownloadDone = {
+    type: 'file.download_done',
+    downloadId,
+    content: buffer.toString('base64'),
+    mime: target.mime,
+    filename: target.filename,
+    size: buffer.length,
+  };
+  serverLink.send(response);
+}
+
 export async function handleFileDownload(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const msg = cmd as unknown as FileDownloadRequest;
   const { downloadId, attachmentId } = msg;
@@ -445,18 +465,7 @@ export async function handleFileDownload(cmd: Record<string, unknown>, serverLin
   try {
     target = await resolveDownloadTarget(attachmentId, serverLink, downloadId);
     if (!target) return;
-    const buffer = await readFile(target.readPath);
-    const content = buffer.toString('base64');
-
-    const response: FileDownloadDone = {
-      type: 'file.download_done',
-      downloadId,
-      content,
-      mime: target.mime,
-      filename: target.filename,
-      size: buffer.length,
-    };
-    serverLink.send(response);
+    await sendInlineDownload(serverLink, downloadId, target);
   } catch (err) {
     sendDownloadError(serverLink, downloadId, attachmentId, target?.entry, err);
   }
@@ -473,6 +482,16 @@ export async function handleFileDownloadStream(cmd: Record<string, unknown>, ser
     }
     target = await resolveDownloadTarget(attachmentId, serverLink, downloadId);
     if (!target) return;
+
+    // Small files: skip the relay and reply inline in a single round-trip. The
+    // relay's PUT + readiness handshake is pure latency for these (and times out
+    // entirely if the relay is unhealthy), so only genuinely large files stream.
+    // The server returns the inline bytes immediately on receiving this.
+    if (typeof target.size === 'number' && target.size >= 0
+        && target.size <= FILE_TRANSFER_LIMITS.DOWNLOAD_INLINE_MAX_BYTES) {
+      await sendInlineDownload(serverLink, downloadId, target);
+      return;
+    }
 
     const ready: FileDownloadStreamReady = {
       type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY,
