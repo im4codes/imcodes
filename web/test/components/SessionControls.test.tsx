@@ -3374,6 +3374,48 @@ afterEach(() => {
     expect(screen.queryByText('queued then drained')).toBeNull();
   });
 
+  it('drops an incoming queued entry once its message reaches the timeline even if the snapshot still lists it', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          // Daemon snapshot still lists the message as pending — the stale
+          // snapshot the resend / auto-deliver "queued" emit leaves until idle.
+          transportPendingMessages: ['stuck message'],
+          transportPendingMessageEntries: [{ clientMessageId: 'stuck-1', text: 'stuck message' }],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('stuck message')).toBeDefined();
+
+    // The message reaches the timeline → delivered, no longer queued.
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'um-stuck-1',
+          sessionId: 'qwen-session',
+          type: 'user.message',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: { text: 'stuck message', commandId: 'stuck-1' },
+        },
+      });
+    });
+
+    // The daemon pending snapshot (prop) STILL lists it, but the timeline is
+    // authoritative — the zombie queued entry is gone.
+    expect(screen.queryByText('stuck message')).toBeNull();
+  });
+
   it('clears a local queued entry when reconnect snapshot advances to an empty queue', () => {
     const ws = makeWs();
     const view = render(

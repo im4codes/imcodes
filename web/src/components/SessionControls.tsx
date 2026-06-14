@@ -791,6 +791,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     });
   }, [queuedHiddenStorageKey]);
   const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<LocalQueuedTransportEntry[] | null>(null);
+  // Command ids that have reached the timeline (a `user.message` event) and are
+  // therefore NO LONGER queued — the timeline is the authoritative truth for
+  // "delivered". The displayed queue filters these out so a delivered message
+  // can never linger as an undismissable "Queued" zombie even when a stale
+  // daemon `session.state` snapshot still lists it as pending (e.g. the resend /
+  // auto-deliver "queued" emit that isn't superseded until the turn goes idle).
+  // Only DELIVERED ids are added, so in-flight sends (no user.message yet) are
+  // never hidden. Per-session: reset on session switch (the timeline replay
+  // rebuilds it). Bounded to the most recent ids to cap long-session growth.
+  const [settledQueuedIds, setSettledQueuedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [mobileComposerMultiline, setMobileComposerMultiline] = useState(false);
   const [mobileComposerExpanded, setMobileComposerExpanded] = useState(false);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
@@ -847,16 +857,31 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     ? activeSession.transportPendingMessageVersion
     : undefined;
   const queuedTransportEntries = useMemo<LocalQueuedTransportEntry[]>(() => {
-    if (optimisticQueuedEntries === null) return incomingQueuedTransportEntries;
-    if (optimisticQueuedEntries.length === 0) return [];
-    if (incomingQueuedTransportEntries.length === 0) return optimisticQueuedEntries;
-    const byId = new Map<string, LocalQueuedTransportEntry>();
-    for (const entry of incomingQueuedTransportEntries) byId.set(entry.clientMessageId, { ...entry, status: 'queued' });
-    for (const entry of optimisticQueuedEntries) {
-      byId.set(entry.clientMessageId, entry);
+    let merged: LocalQueuedTransportEntry[];
+    if (optimisticQueuedEntries === null) merged = incomingQueuedTransportEntries;
+    else if (optimisticQueuedEntries.length === 0) merged = [];
+    else if (incomingQueuedTransportEntries.length === 0) merged = optimisticQueuedEntries;
+    else {
+      const byId = new Map<string, LocalQueuedTransportEntry>();
+      for (const entry of incomingQueuedTransportEntries) byId.set(entry.clientMessageId, { ...entry, status: 'queued' });
+      for (const entry of optimisticQueuedEntries) {
+        byId.set(entry.clientMessageId, entry);
+      }
+      merged = [...byId.values()];
     }
-    return [...byId.values()];
-  }, [incomingQueuedTransportEntries, optimisticQueuedEntries]);
+    // Authoritative override: a message that reached the timeline is delivered,
+    // so drop it from the queue even if a stale daemon snapshot still lists it.
+    if (settledQueuedIds.size === 0) return merged;
+    const filtered = merged.filter((entry) => !settledQueuedIds.has(entry.clientMessageId));
+    return filtered.length === merged.length ? merged : filtered;
+  }, [incomingQueuedTransportEntries, optimisticQueuedEntries, settledQueuedIds]);
+
+  // Settled ids are per-session — reset on session switch. The timeline replay
+  // for the newly-active session re-emits its user.message events, rebuilding the
+  // set, so a delivered-but-stale-queued message clears again after a switch.
+  useEffect(() => {
+    setSettledQueuedIds(new Set());
+  }, [activeSession?.name]);
 
   const clearOpenSpecRequestTimer = useCallback(() => {
     if (openSpecRequestTimerRef.current) {
@@ -1416,6 +1441,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             ? event.payload.clientMessageId
             : '';
         removeLocalQueuedEntry(commandId, typeof event.payload.text === 'string' ? event.payload.text : undefined);
+        // Record the delivered id so a stale daemon pending snapshot can't keep
+        // showing it as queued (the incoming snapshot is not under our control,
+        // unlike the optimistic set cleared above).
+        if (commandId) {
+          setSettledQueuedIds((prev) => {
+            if (prev.has(commandId)) return prev;
+            const ids = [...prev, commandId];
+            return new Set(ids.length > 500 ? ids.slice(-500) : ids);
+          });
+        }
       } else if (event.type === 'session.state') {
         const hasPendingSnapshot = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries')
           || Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessages');
