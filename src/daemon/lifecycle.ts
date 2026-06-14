@@ -127,6 +127,13 @@ let ctx: DaemonContext | null = null;
 
 const WORKER_SESSION_SYNC_TIMEOUT_MS = 5_000;
 const STARTUP_WORKER_SESSION_SYNC_TIMEOUT_MS = 1_500;
+const SERVER_LINK_STARTUP_GRACE_MS = 12_000;
+const STARTUP_BACKGROUND_STAGGER_MS = 2_000;
+const STARTUP_TRANSPORT_RESTORE_DELAY_MS = 45_000;
+
+function yieldToDaemonEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
 
 async function persistSessionToWorker(
   workerUrl: string,
@@ -492,12 +499,10 @@ export async function startup(): Promise<DaemonContext> {
   //
   // Both calls walk every JSONL file in ~/.imcodes/timeline. With a backlog
   // of 50–100 oversized sessions (~5 MB each) the synchronous pre-R3 path
-  // blocked the daemon main thread for 5–20 s before `ready`. We now run
-  // them in the background, yielding the event loop between sessions, so
-  // the daemon comes up immediately and chip away at retention while WS /
-  // session restore proceeds in parallel. Both methods swallow internal
-  // errors; the surrounding handler logs anything that escapes.
-  void (async () => {
+  // blocked the daemon main thread for 5–20 s before `ready`. Keep this as
+  // delayed background retention so the ServerLink auth/proof window gets
+  // first claim on the event loop on session-heavy hosts.
+  const runTimelineStartupRetention = async (): Promise<void> => {
     try {
       const start = Date.now();
       await timelineStore.cleanup();
@@ -506,10 +511,13 @@ export async function startup(): Promise<DaemonContext> {
     } catch (err) {
       logger.warn({ err }, 'TimelineStore: startup cleanup/truncateAll background failed');
     }
-  })();
+  };
 
   // Archive stale local memory projections (recent_summary with no hits after 30 days)
-  pruneLocalMemory();
+  const runStartupMemoryPruning = async (): Promise<void> => {
+    await yieldToDaemonEventLoop();
+    pruneLocalMemory();
+  };
 
   const creds = await loadCredentials();
 
@@ -571,22 +579,11 @@ export async function startup(): Promise<DaemonContext> {
     logger.error({ err }, 'AckOutbox init failed — daemon continues (acks will be best-effort)');
   }
 
-  // Warm up the transformers.js embedding model in the background so the
-  // first user send after daemon start doesn't pay the ~16s cold-load latency
-  // inside prependLocalMemory(). Fire-and-forget — the recall path falls
-  // through safely if this is still in flight when the first message arrives.
-  void (async () => {
-    try {
-      const { generateEmbedding } = await import('../context/embedding.js');
-      const t0 = Date.now();
-      await generateEmbedding('warmup');
-      logger.info({ ms: Date.now() - t0 }, 'Embedding model warmed up');
-    } catch (err) {
-      // Non-fatal: semantic recall falls back to substring match if the
-      // model never loads.
-      logger.warn({ err }, 'Embedding model warmup failed — semantic recall will be lazy');
-    }
-  })();
+  // Do not warm the transformers.js embedding model during daemon startup.
+  // On session-heavy hosts the native model load can occupy the Node main
+  // thread long enough for ServerLink heartbeat/proof windows to go silent.
+  // Semantic recall already lazy-loads the model on first use and falls back
+  // safely if the model is unavailable.
 
   const skillReviewWorker = new LocalSkillReviewWorker();
   const liveContextIngestion = new LiveContextIngestion({
@@ -603,6 +600,7 @@ export async function startup(): Promise<DaemonContext> {
   });
 
   let serverLink: ServerLink | null = null;
+  let scheduleServerLinkRestoreBroadcast: (() => void) | null = null;
   if (creds) {
     serverLink = new ServerLink({ workerUrl: workerUrl!, serverId, token });
     serverLink.onMessage((msg) => {
@@ -611,7 +609,6 @@ export async function startup(): Promise<DaemonContext> {
     serverLink.onBinaryMessage((data) => {
       handlePreviewBinaryFrame(data, serverLink!);
     });
-    serverLink.connect();
 
     // Expose to the global error handlers in src/index.ts so uncaught
     // exceptions can be surfaced to browsers via daemon.error broadcasts.
@@ -621,80 +618,83 @@ export async function startup(): Promise<DaemonContext> {
 
     // Broadcast cached repo detections after connect so browsers that missed
     // the initial repo.detected push (e.g. connected late, reconnected) get the data.
-    setTimeout(() => {
-      if (!serverLink) return;
-      for (const session of listSessions()) {
-        const dir = session.projectDir;
-        if (!dir) continue;
-        const cacheKey = RepoCache.buildKey(dir, 'detect');
-        const cached = repoCache.get(cacheKey);
-        if (cached) {
-          try { serverLink.send({ type: 'repo.detected', projectDir: dir, context: cached }); } catch { /* ignore */ }
+    scheduleServerLinkRestoreBroadcast = () => {
+      const timer = setTimeout(() => {
+        if (!serverLink) return;
+        for (const session of listSessions()) {
+          const dir = session.projectDir;
+          if (!dir) continue;
+          const cacheKey = RepoCache.buildKey(dir, 'detect');
+          const cached = repoCache.get(cacheKey);
+          if (cached) {
+            try { serverLink.send({ type: 'repo.detected', projectDir: dir, context: cached }); } catch { /* ignore */ }
+          }
         }
-      }
-      // Re-broadcast active P2P runs so browsers get state after reconnect
-      for (const run of listP2pRuns()) {
-        if (P2P_TERMINAL_RUN_STATUSES.has(run.status)) continue;
-        try { serverLink.send({ type: 'p2p.run_save', run: serializeP2pRun(run) }); } catch { /* ignore */ }
-      }
-      // Re-sync all sub-sessions (including idle ones) so server DB and
-      // frontend stay in sync. The previous `state === 'running'` filter
-      // left idle sub-sessions with `state: 'unknown'` in the web sidebar
-      // after WS reconnect, which rendered as a stuck gray dot that only
-      // flipped to the correct color when the next live state transition
-      // happened — sometimes never, for genuinely-quiet sessions.
-      // Only skip terminal states that should have been cleaned up already.
-      for (const session of listSessions()) {
-        if (!session.name.startsWith('deck_sub_')) continue;
-        if (session.state === 'stopped') continue;
-        const sessionType = typeof session.agentType === 'string' && session.agentType ? session.agentType : null;
-        if (!sessionType) {
-          logger.warn({ sessionName: session.name }, 'Skipping subsession.sync during lifecycle restore without agentType');
-          continue;
+        // Re-broadcast active P2P runs so browsers get state after reconnect
+        for (const run of listP2pRuns()) {
+          if (P2P_TERMINAL_RUN_STATUSES.has(run.status)) continue;
+          try { serverLink.send({ type: 'p2p.run_save', run: serializeP2pRun(run) }); } catch { /* ignore */ }
         }
-        const id = session.name.slice('deck_sub_'.length);
-        const transportRuntime = getTransportRuntime(session.name);
-        try {
-          serverLink.send({
-            type: 'subsession.sync',
-            id,
-            // Including state here fixes "sidebar sub-session dot stuck
-            // gray after reconnect" — see buildSubSessionSync for the
-            // equivalent fix on the regular sync path.
-            state: session.state ?? null,
-            sessionType,
-            cwd: session.projectDir || null,
-            label: session.label ?? null,
-            ccSessionId: session.ccSessionId ?? null,
-            geminiSessionId: session.geminiSessionId ?? null,
-            parentSession: session.parentSession ?? null,
-            ccPresetId: session.ccPreset ?? null,
-            description: session.description ?? null,
-            runtimeType: session.runtimeType ?? null,
-            providerId: session.providerId ?? null,
-            providerSessionId: session.providerSessionId ?? null,
-            qwenModel: session.qwenModel ?? null,
-            qwenAuthType: session.qwenAuthType ?? null,
-            qwenAvailableModels: session.qwenAvailableModels ?? null,
-            codexAvailableModels: session.codexAvailableModels ?? null,
-            requestedModel: session.requestedModel ?? null,
-            activeModel: session.activeModel ?? session.modelDisplay ?? null,
-            modelDisplay: session.modelDisplay ?? null,
-            planLabel: session.planLabel ?? null,
-            quotaLabel: session.quotaLabel ?? null,
-            quotaUsageLabel: session.quotaUsageLabel ?? null,
-            quotaMeta: session.quotaMeta ?? null,
-            effort: session.effort ?? null,
-            transportConfig: session.transportConfig ?? null,
-            ...(transportRuntime ? {
-              transportPendingMessages: transportRuntime.pendingMessages,
-              transportPendingMessageEntries: transportRuntime.pendingEntries,
-              transportPendingMessageVersion: transportRuntime.pendingVersion,
-            } : {}),
-          });
-        } catch { /* ignore */ }
-      }
-    }, 3_000); // delay to ensure WS auth handshake completes first
+        // Re-sync all sub-sessions (including idle ones) so server DB and
+        // frontend stay in sync. The previous `state === 'running'` filter
+        // left idle sub-sessions with `state: 'unknown'` in the web sidebar
+        // after WS reconnect, which rendered as a stuck gray dot that only
+        // flipped to the correct color when the next live state transition
+        // happened — sometimes never, for genuinely-quiet sessions.
+        // Only skip terminal states that should have been cleaned up already.
+        for (const session of listSessions()) {
+          if (!session.name.startsWith('deck_sub_')) continue;
+          if (session.state === 'stopped') continue;
+          const sessionType = typeof session.agentType === 'string' && session.agentType ? session.agentType : null;
+          if (!sessionType) {
+            logger.warn({ sessionName: session.name }, 'Skipping subsession.sync during lifecycle restore without agentType');
+            continue;
+          }
+          const id = session.name.slice('deck_sub_'.length);
+          const transportRuntime = getTransportRuntime(session.name);
+          try {
+            serverLink.send({
+              type: 'subsession.sync',
+              id,
+              // Including state here fixes "sidebar sub-session dot stuck
+              // gray after reconnect" — see buildSubSessionSync for the
+              // equivalent fix on the regular sync path.
+              state: session.state ?? null,
+              sessionType,
+              cwd: session.projectDir || null,
+              label: session.label ?? null,
+              ccSessionId: session.ccSessionId ?? null,
+              geminiSessionId: session.geminiSessionId ?? null,
+              parentSession: session.parentSession ?? null,
+              ccPresetId: session.ccPreset ?? null,
+              description: session.description ?? null,
+              runtimeType: session.runtimeType ?? null,
+              providerId: session.providerId ?? null,
+              providerSessionId: session.providerSessionId ?? null,
+              qwenModel: session.qwenModel ?? null,
+              qwenAuthType: session.qwenAuthType ?? null,
+              qwenAvailableModels: session.qwenAvailableModels ?? null,
+              codexAvailableModels: session.codexAvailableModels ?? null,
+              requestedModel: session.requestedModel ?? null,
+              activeModel: session.activeModel ?? session.modelDisplay ?? null,
+              modelDisplay: session.modelDisplay ?? null,
+              planLabel: session.planLabel ?? null,
+              quotaLabel: session.quotaLabel ?? null,
+              quotaUsageLabel: session.quotaUsageLabel ?? null,
+              quotaMeta: session.quotaMeta ?? null,
+              effort: session.effort ?? null,
+              transportConfig: session.transportConfig ?? null,
+              ...(transportRuntime ? {
+                transportPendingMessages: transportRuntime.pendingMessages,
+                transportPendingMessageEntries: transportRuntime.pendingEntries,
+                transportPendingMessageVersion: transportRuntime.pendingVersion,
+              } : {}),
+            });
+          } catch { /* ignore */ }
+        }
+      }, 3_000); // delay to ensure WS auth handshake completes first
+      timer.unref?.();
+    };
   }
 
   // Wire session events → ServerLink so the browser sees them
@@ -748,6 +748,7 @@ export async function startup(): Promise<DaemonContext> {
     let sessionsBackfilled = 0;
     for (const session of listSessions()) {
       sessionsSeen += 1;
+      if (sessionsSeen > 1) await yieldToDaemonEventLoop();
       // SQLite projection is the sole chat-history read source — no JSONL
       // `read()` fallback. That synchronous main-thread read was an event-loop
       // saturation amplifier under load (and JSONL is now write/backup-only).
@@ -819,7 +820,8 @@ export async function startup(): Promise<DaemonContext> {
       const pushableSessions = persistableSessions.filter((session) => allowedNames.has(session.name));
       const suppressedCount = persistableSessions.length - pushableSessions.length;
       let pushFailures = 0;
-      for (const s of pushableSessions) {
+      for (const [index, s] of pushableSessions.entries()) {
+        if (index > 0) await yieldToDaemonEventLoop();
         try {
           await persistSessionToWorker(workerUrl!, serverId, token, s.name, s);
         } catch (err) {
@@ -1036,7 +1038,27 @@ export async function startup(): Promise<DaemonContext> {
 
   logger.info('Daemon started');
 
-  void autoReconnectProviders();
+  if (serverLink) {
+    serverLink.connect();
+    scheduleServerLinkRestoreBroadcast?.();
+  }
+
+  const startupBackgroundBaseDelayMs = creds ? SERVER_LINK_STARTUP_GRACE_MS : 0;
+  scheduleDaemonStartupBackgroundTask(
+    'timeline retention startup cleanup',
+    runTimelineStartupRetention,
+    startupBackgroundBaseDelayMs,
+  );
+  scheduleDaemonStartupBackgroundTask(
+    'startup local memory pruning',
+    runStartupMemoryPruning,
+    startupBackgroundBaseDelayMs + STARTUP_BACKGROUND_STAGGER_MS,
+  );
+  scheduleDaemonStartupBackgroundTask(
+    'transport provider auto-reconnect',
+    autoReconnectProviders,
+    startupBackgroundBaseDelayMs + STARTUP_TRANSPORT_RESTORE_DELAY_MS,
+  );
   if (creds && startupWorkerSessionSyncOutcome && startupWorkerSessionSyncOutcome.retryable) {
     workerSessionSyncRetrier?.stop();
     workerSessionSyncRetrier = createWorkerSessionSyncRetrier({
@@ -1049,9 +1071,17 @@ export async function startup(): Promise<DaemonContext> {
     });
     workerSessionSyncRetrier.start(startupWorkerSessionSyncOutcome.reason ?? 'startup_sync_failed');
   }
-  scheduleDaemonStartupBackgroundTask('shared-context startup timeline backfill', backfillLiveContextFromTimeline, 2_000);
+  scheduleDaemonStartupBackgroundTask(
+    'shared-context startup timeline backfill',
+    backfillLiveContextFromTimeline,
+    startupBackgroundBaseDelayMs + STARTUP_BACKGROUND_STAGGER_MS * 4,
+  );
   if (pushLocalSessionsToWorkerOnStartup) {
-    scheduleDaemonStartupBackgroundTask('startup local main session DB push', pushLocalSessionsToWorkerOnStartup, 4_000);
+    scheduleDaemonStartupBackgroundTask(
+      'startup local main session DB push',
+      pushLocalSessionsToWorkerOnStartup,
+      startupBackgroundBaseDelayMs + STARTUP_BACKGROUND_STAGGER_MS * 5,
+    );
   }
 
   return ctx;
@@ -1101,11 +1131,17 @@ async function autoReconnectProviders(): Promise<void> {
     const { connectProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
     const { restoreTransportSessions } = await import('../agent/session-manager.js');
 
+    let restoredProviderCount = 0;
     for (const providerId of ['qwen', 'gemini-sdk', 'claude-code-sdk', 'codex-sdk', 'cursor-headless', 'copilot-sdk'] as const) {
-      if (!listSessions().some((s) => s.runtimeType === 'transport' && s.providerId === providerId)) continue;
+      if (!listSessions().some((s) =>
+        (s.runtimeType === 'transport' || isTransportAgent(s.agentType))
+        && s.providerId === providerId,
+      )) continue;
+      if (restoredProviderCount > 0) await yieldToDaemonEventLoop();
       try {
+        restoredProviderCount += 1;
         await ensureProviderConnected(providerId, {});
-        await restoreTransportSessions(providerId);
+        await restoreTransportSessions(providerId, { onlyWithPendingResend: true });
       } catch (err) {
         logger.warn({ err, providerId }, 'Local transport provider auto-connect failed');
       }
@@ -1127,7 +1163,7 @@ async function autoReconnectProviders(): Promise<void> {
           });
           logger.info('OpenClaw gateway reconnected');
           try {
-            await restoreTransportSessions('openclaw');
+            await restoreTransportSessions('openclaw', { onlyWithPendingResend: true });
           } catch (e) {
             logger.warn({ err: e }, 'Failed to restore transport sessions after provider connect');
           }

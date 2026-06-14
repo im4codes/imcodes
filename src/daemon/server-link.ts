@@ -120,10 +120,16 @@ const MAX_BACKOFF_MS = 5_000;
  * reconfiguring) the OS layer waits ~75 s on macOS or up to ~127 s on
  * Linux (`tcp_syn_retries=6`) before giving up. During that window
  * neither `error` nor `close` fires, so the backoff cursor doesn't
- * advance and the daemon looks frozen. 8 s is short enough to keep the
- * client responsive without aborting genuinely slow handshakes.
+ * advance and the daemon looks frozen. The cap keeps the client
+ * responsive without aborting genuinely slow handshakes.
+ *
+ * Raised 8s → 20s: on a heavily loaded host (e.g. big test suites on the
+ * same box) the WS upgrade + the daemon dispatching its own `open` event can
+ * legitimately take well over 8 s. The old 8 s cap fired mid-handshake and
+ * turned local CPU pressure into a reconnect storm (each retry adds more
+ * load). 20 s still bounds a truly hung SYN.
  */
-const CONNECT_TIMEOUT_MS = 8_000;
+const CONNECT_TIMEOUT_MS = 20_000;
 /**
  * Audit fix (94b9b837-822 / A6) — ±20% jitter ratio on scheduled
  * reconnects. Without jitter, multiple daemons behind a single NAT or
@@ -132,7 +138,16 @@ const CONNECT_TIMEOUT_MS = 8_000;
  */
 const RECONNECT_JITTER_RATIO = 0.4;
 const WATCHDOG_MS = 15_000;           // check connection health every 15s
-const PONG_TIMEOUT_MS = 10_000;       // if no pong within 10s, connection is dead
+const SILENT_CONNECTION_RECYCLE_MS = 2 * 60_000;
+// Event-loop stall guard. Under heavy local load the daemon's event loop can
+// freeze for tens of seconds. The silence-based reconnects measure
+// `now - lastPong`, which during a freeze blames the SERVER for the daemon's
+// own inability to READ inbound frames — force-reconnecting then drops a
+// healthy socket and the reconnect (TLS + auth + resubscribe) piles more load
+// on the already-stalled box. A lightweight 1 s probe detects the freeze so the
+// silence checks stand down until inbound can actually be read again.
+const LOOP_PROBE_MS = 1_000;
+const EVENT_LOOP_STALL_THRESHOLD_MS = 3_000; // probe overdue by >3 s ⇒ loop stalled
 const DAEMON_STATIC_CAPABILITIES = [
   SESSION_GROUP_CLONE_CAPABILITY_V1,
   GIT_REMOTE_CLONE_CAPABILITY_V1,
@@ -199,6 +214,9 @@ export class ServerLink {
   private statsTimer?: ReturnType<typeof setInterval>;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private watchdogTimer?: ReturnType<typeof setInterval>;
+  private loopProbeTimer?: ReturnType<typeof setInterval>;
+  /** Wall-clock of the last event-loop probe tick; 0 when not running. */
+  private lastLoopProbeAt = 0;
   private pongTimer?: ReturnType<typeof setTimeout>;
   /** A6 connect-timeout watchdog. Cleared on open/close/error. */
   private connectTimeoutTimer?: ReturnType<typeof setTimeout>;
@@ -431,12 +449,6 @@ export class ServerLink {
       // since the daemon must never die from transient disconnects.
       // Callers that need delivery confirmation should check isConnected()
       // or await a response event before acting on `send()`.
-      return false;
-    }
-    const now = Date.now();
-    const silenceMs = this.getOpenSocketSilenceMs(now);
-    if (silenceMs > HEARTBEAT_MS + PONG_TIMEOUT_MS) {
-      this.recycleSilentConnection('send_silent_connection', silenceMs);
       return false;
     }
     try {
@@ -755,11 +767,14 @@ export class ServerLink {
   }
 
   private startHeartbeat(): void {
+    // Runs for the lifetime of a connection so silence checks can tell a real
+    // server outage from the daemon's own event-loop stalls.
+    this.startLoopProbe();
     this.heartbeatTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
         const now = Date.now();
         const silenceMs = this.getOpenSocketSilenceMs(now);
-        if (silenceMs > HEARTBEAT_MS + PONG_TIMEOUT_MS) {
+        if (silenceMs > SILENT_CONNECTION_RECYCLE_MS) {
           this.recycleSilentConnection('heartbeat_silent_connection', silenceMs);
           return;
         }
@@ -782,11 +797,12 @@ export class ServerLink {
   private stopHeartbeat(): void {
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = undefined; }
     if (this.statsTimer) { clearInterval(this.statsTimer); this.statsTimer = undefined; }
+    this.stopLoopProbe();
   }
 
   /** Watchdog: periodically verifies the connection is truly alive.
-   *  If no message received within PONG_TIMEOUT after a heartbeat ping,
-   *  the connection is considered dead and forcibly recycled. */
+   *  A short missed-ack window is tolerated because the worker can update
+   *  heartbeat state without returning a timely heartbeat_ack under load. */
   private startWatchdog(): void {
     this.watchdogTimer = setInterval(() => {
       if (this.stopping) return;
@@ -799,8 +815,11 @@ export class ServerLink {
         return;
       }
 
-      const silenceMs = Date.now() - this.lastPong;
-      if (silenceMs > HEARTBEAT_MS + PONG_TIMEOUT_MS) {
+      // Use the stall-aware silence (returns 0 during/just-after a local
+      // event-loop freeze) so a busy daemon doesn't force-reconnect a healthy
+      // socket it simply couldn't read from.
+      const silenceMs = this.getOpenSocketSilenceMs();
+      if (silenceMs > SILENT_CONNECTION_RECYCLE_MS) {
         // Haven't received anything for heartbeat interval + timeout — dead connection
         logger.warn({ silenceMs }, 'ServerLink watchdog: connection silent, forcing reconnect');
         this.forceReconnect('watchdog_silent_connection');
@@ -816,7 +835,42 @@ export class ServerLink {
   private getOpenSocketSilenceMs(now = Date.now()): number {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return 0;
     if (this.lastPong <= 0) return 0;
+    // If the event-loop probe is itself overdue, the daemon is mid- or
+    // just-out-of a local stall and could not read inbound frames — the
+    // silence is ours, not the server's. Report none so the silence-based
+    // reconnects stand down; the probe resets `lastPong` on recovery, so
+    // genuine server silence is still caught on the next clean interval.
+    if (this.lastLoopProbeAt > 0 && now - this.lastLoopProbeAt > LOOP_PROBE_MS + EVENT_LOOP_STALL_THRESHOLD_MS) {
+      return 0;
+    }
     return Math.max(0, now - this.lastPong);
+  }
+
+  /** Lightweight ticker that detects event-loop freezes (see LOOP_PROBE_MS). */
+  private startLoopProbe(): void {
+    this.stopLoopProbe();
+    this.lastLoopProbeAt = Date.now();
+    this.loopProbeTimer = setInterval(() => {
+      const now = Date.now();
+      const prev = this.lastLoopProbeAt;
+      this.lastLoopProbeAt = now;
+      if (prev <= 0) return;
+      const drift = now - prev - LOOP_PROBE_MS;
+      if (drift > EVENT_LOOP_STALL_THRESHOLD_MS && this.lastPong > 0) {
+        // The loop was frozen for ~drift ms; inbound couldn't be read. Don't let
+        // that window count as server silence — reset the proof baseline so the
+        // next interval judges fresh, post-recovery liveness instead of
+        // force-reconnecting a healthy socket.
+        this.lastPong = now;
+        logger.warn({ driftMs: drift }, 'ServerLink: event-loop stall detected — deferring silence-based reconnect');
+      }
+    }, LOOP_PROBE_MS);
+    try { (this.loopProbeTimer as { unref?: () => void }).unref?.(); } catch { /* ignore */ }
+  }
+
+  private stopLoopProbe(): void {
+    if (this.loopProbeTimer) { clearInterval(this.loopProbeTimer); this.loopProbeTimer = undefined; }
+    this.lastLoopProbeAt = 0;
   }
 
   private recycleSilentConnection(reason: string, silenceMs: number): void {

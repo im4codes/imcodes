@@ -176,7 +176,7 @@ describe('ServerLink', () => {
     });
   });
 
-  it('recycles an OPEN socket when heartbeat proof stops arriving', async () => {
+  it('does not recycle an OPEN socket on one missed heartbeat proof window', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);
     link.connect();
@@ -189,13 +189,68 @@ describe('ServerLink', () => {
     mockWsInstance.close.mockClear();
     recordDaemonServerLinkStatusMock.mockClear();
 
-    await vi.advanceTimersByTimeAsync(20_001);
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(mockWsInstance.close).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(100_001);
 
     expect(mockWsInstance.close).toHaveBeenCalled();
     expect(recordDaemonServerLinkStatusMock).toHaveBeenCalledWith(expect.objectContaining({
       state: 'disconnected',
       lastError: 'heartbeat_silent_connection',
     }));
+  });
+
+  it('treats silence during a local event-loop stall as the daemon, not the server, but still recycles on genuine silence', () => {
+    vi.useFakeTimers();
+    // Capture the interval callbacks so we can drive them manually with full
+    // control over Date.now(). advanceTimersByTime couples the timer clock to
+    // Date.now() and so cannot model "wall clock advanced but timers did not
+    // fire" — which is exactly an event-loop freeze.
+    const intervals: Array<{ fn: () => void; ms: number }> = [];
+    const realSetInterval = globalThis.setInterval;
+    vi.spyOn(globalThis, 'setInterval').mockImplementation(((fn: () => void, ms?: number) => {
+      intervals.push({ fn, ms: ms ?? 0 });
+      return realSetInterval(fn, ms);
+    }) as typeof setInterval);
+
+    vi.setSystemTime(1_000);
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    openHandler?.(); // lastPong = 1000, loop-probe baseline = 1000
+
+    const LOOP_PROBE_MS = 1_000;
+    const WATCHDOG_MS = 15_000;
+    const SILENT_CONNECTION_RECYCLE_MS = 2 * 60_000;
+    const probe = intervals.find((i) => i.ms === LOOP_PROBE_MS)?.fn;
+    const watchdog = intervals.find((i) => i.ms === WATCHDOG_MS)?.fn;
+    expect(probe).toBeDefined();
+    expect(watchdog).toBeDefined();
+    mockWsInstance.close.mockClear();
+
+    // ── Freeze: wall clock jumps far past the recycle threshold, but no timer
+    // fired during the freeze. The probe is overdue → silence is local → the
+    // watchdog must NOT recycle a healthy socket.
+    vi.setSystemTime(1_000 + 199_000);
+    watchdog?.();
+    expect(mockWsInstance.close).not.toHaveBeenCalled();
+
+    // ── Recovery: probe runs late, detects the stall, resets the proof baseline.
+    probe?.(); // lastPong := 200000
+
+    // ── Genuine server silence: probe stays fresh (1s ticks, no drift) while no
+    // inbound arrives for longer than the recycle threshold → real outage.
+    let t = 200_000;
+    while (t < 200_000 + SILENT_CONNECTION_RECYCLE_MS + 2_000) {
+      t += LOOP_PROBE_MS;
+      vi.setSystemTime(t);
+      probe?.();
+    }
+    watchdog?.();
+    expect(mockWsInstance.close).toHaveBeenCalled();
   });
 
   it('accepts Blob binary messages from Node WebSocket without throwing', async () => {
