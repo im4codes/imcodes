@@ -392,6 +392,34 @@ describe('file-transfer download route', () => {
     expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(1);
   });
 
+  it('falls back to base64 when the relay reports a transport error (not a missing handle)', async () => {
+    const app = makeApp();
+    // 1st WS call = DOWNLOAD_STREAM → a relay/transport error (NOT not_found).
+    // 2nd WS call = file.download (base64 retry) → succeed.
+    sendFileTransferRequestMock
+      .mockImplementationOnce((_requestId: string, message: unknown) => {
+        expect((message as { type: string }).type).toBe(FILE_TRANSFER_MSG.DOWNLOAD_STREAM);
+        return Promise.resolve({ type: 'file.download_error', message: 'relay_upload_502' });
+      })
+      .mockImplementationOnce((_requestId: string, message: unknown) => {
+        expect((message as { type: string }).type).toBe('file.download');
+        return Promise.resolve({
+          content: Buffer.from('recovered').toString('base64'),
+          mime: 'text/plain',
+          filename: 'r.txt',
+        });
+      });
+
+    const res = await app.request('/api/server/srv-1/uploads/abc123/download', {
+      headers: { Authorization: 'Bearer test' },
+    });
+
+    expect(res.status).toBe(200);
+    await expect(res.text()).resolves.toBe('recovered');
+    // Relay error → base64 retry (2 WS calls), instead of a hard failure.
+    expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(2);
+  });
+
   it('returns a small file INLINE (file.download_done over WS) in one round-trip — no relay PUT, no fallback', async () => {
     const app = makeApp();
     // The daemon returns small files inline over the WS RPC instead of streaming

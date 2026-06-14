@@ -662,38 +662,38 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
           const result = await waitForStagedDownloadReady(entry);
 
           if (result.type === 'file.download_error') {
-            // Genuine daemon error (missing/expired handle) — the base64 path
-            // would fail identically, so surface it directly without falling back.
-            deleteStagedDownload(downloadId, new Error(String(result.message ?? 'download_failed')));
             const errMsg = result.message as string;
+            deleteStagedDownload(downloadId, new Error(String(errMsg ?? 'download_failed')));
+            // Only a genuine missing/expired handle is fatal — base64 would fail
+            // identically. ANY other error is a relay/transport failure, so fall
+            // through to the base64 retry below (don't stall, don't hard-fail).
             if (errMsg === 'not_found') return c.json({ error: 'not_found' }, 404);
             if (errMsg === 'expired') return c.json({ error: 'handle_expired' }, 410);
-            return c.json({ error: 'download_failed', message: errMsg }, 500);
-          }
-
-          if (result.type === 'file.download_done') {
+            logger.warn({ serverId, downloadId, errMsg }, 'Streamed download relay error — retrying via base64 download');
+            // fall through (no return)
+          } else if (result.type === 'file.download_done') {
             // Small file returned inline — no relay/PassThrough involved. Drop the
             // unused staged sink and return the bytes directly (the fast path).
             deleteStagedDownload(downloadId);
             return respondBase64Download(c, result, attachmentId);
+          } else {
+            const mime = (result.mime as string) || 'application/octet-stream';
+            const filename = (result.filename as string) || attachmentId;
+            const size = typeof result.size === 'number' && Number.isFinite(result.size) && result.size >= 0
+              ? Math.trunc(result.size)
+              : undefined;
+            c.header('Content-Type', mime);
+            if (size !== undefined) c.header('Content-Length', String(size));
+            const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
+            const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
+            c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
+            c.header('Cache-Control', 'no-store');
+
+            return new Response(Readable.toWeb(stream) as ReadableStream, {
+              status: 200,
+              headers: c.res.headers,
+            });
           }
-
-          const mime = (result.mime as string) || 'application/octet-stream';
-          const filename = (result.filename as string) || attachmentId;
-          const size = typeof result.size === 'number' && Number.isFinite(result.size) && result.size >= 0
-            ? Math.trunc(result.size)
-            : undefined;
-          c.header('Content-Type', mime);
-          if (size !== undefined) c.header('Content-Length', String(size));
-          const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
-          const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
-          c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
-          c.header('Cache-Control', 'no-store');
-
-          return new Response(Readable.toWeb(stream) as ReadableStream, {
-            status: 200,
-            headers: c.res.headers,
-          });
         } catch (readyErr) {
           // The relay never delivered bytes (no PUT arrived, the PUT failed, or
           // it timed out). Clean up the staged sink and fall through to the
