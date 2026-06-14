@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import type { ChildProcess } from 'node:child_process';
 
 export function normalizeTransportCwd(cwd?: string): string | undefined {
@@ -88,21 +89,75 @@ export function resolveBinaryWithWindowsFallbacks(name: string, windowsCandidate
   return resolveBinaryOnWindows(name);
 }
 
+/** Common per-user `claude` install locations on macOS/Linux, checked when the
+ *  daemon's (systemd/launchd) PATH is too sparse to contain `claude`. */
+function getUnixClaudeInstallCandidates(): string[] {
+  const home = process.env.HOME;
+  return uniqueNonEmpty([
+    home ? path.join(home, '.local', 'bin', 'claude') : undefined,
+    home ? path.join(home, '.claude', 'local', 'claude') : undefined,
+    home ? path.join(home, '.npm-global', 'bin', 'claude') : undefined,
+    '/usr/local/bin/claude',
+    '/opt/homebrew/bin/claude',
+  ]);
+}
+
+/** Locate the native `claude` binary that ships inside our own
+ *  `@anthropic-ai/claude-agent-sdk` dependency. The SDK publishes the binary in
+ *  a platform-specific sibling package (e.g. `@anthropic-ai/claude-agent-sdk-linux-x64`),
+ *  so we resolve it from our dependency tree rather than trusting PATH — a daemon
+ *  started by systemd/launchd has a sparse PATH that usually lacks `claude`. */
+function resolveBundledClaudeBinary(): string | undefined {
+  const platformPkg = `@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}`;
+  const req = createRequire(import.meta.url);
+  // 1) Resolve the platform package directly.
+  try {
+    const pkgJson = req.resolve(`${platformPkg}/package.json`);
+    const candidate = path.join(path.dirname(pkgJson), 'claude');
+    if (existsSync(candidate)) return candidate;
+  } catch {
+    // platform package not resolvable from here — try via the main package
+  }
+  // 2) Resolve the main SDK, then its sibling platform package.
+  try {
+    const mainPkgJson = req.resolve('@anthropic-ai/claude-agent-sdk/package.json');
+    const scopeDir = path.dirname(path.dirname(mainPkgJson)); // .../node_modules/@anthropic-ai
+    const candidate = path.join(scopeDir, `claude-agent-sdk-${process.platform}-${process.arch}`, 'claude');
+    if (existsSync(candidate)) return candidate;
+  } catch {
+    // give up — caller falls back to per-user locations / PATH
+  }
+  return undefined;
+}
+
 /** Resolve a CLI path suitable for passing to an SDK option like
  *  `pathToClaudeCodeExecutable`.
  *
- *  On Windows, npm global installs usually expose `claude.cmd`, but SDKs that
- *  spawn the path directly without `shell: true` need either a real `.exe` or
- *  the underlying `.js` entrypoint. This helper converts npm shims to their
- *  script path and also searches common per-user install locations when the
- *  daemon service PATH is sparse. */
+ *  Windows: npm global installs expose `claude.cmd`; SDKs that spawn the path
+ *  without `shell: true` need the underlying `.js`/`.exe`, so we convert shims
+ *  and search common install dirs.
+ *
+ *  macOS/Linux: a daemon launched by systemd/launchd has a sparse PATH that
+ *  usually lacks `claude`, which made the SDK fail with "Claude Code native
+ *  binary not found at claude". So for the default name we resolve the binary
+ *  bundled with our `@anthropic-ai/claude-agent-sdk` dependency, then common
+ *  per-user install locations, and only fall back to a bare PATH lookup last.
+ *  An explicit caller-provided name/path is always honoured as-is. */
 export function resolveClaudeCodePathForSdk(name = 'claude'): string {
-  if (process.platform !== 'win32') return name;
-  const resolved = resolveBinaryWithWindowsFallbacks(name, getWindowsClaudeInstallCandidates(name));
-  if (/\.(cmd|bat)$/i.test(resolved)) {
-    return parseNpmCmdShim(resolved) ?? resolved;
+  if (process.platform === 'win32') {
+    const resolved = resolveBinaryWithWindowsFallbacks(name, getWindowsClaudeInstallCandidates(name));
+    if (/\.(cmd|bat)$/i.test(resolved)) {
+      return parseNpmCmdShim(resolved) ?? resolved;
+    }
+    return resolved;
   }
-  return resolved;
+  if (name !== 'claude') return name;
+  const bundled = resolveBundledClaudeBinary();
+  if (bundled) return bundled;
+  for (const candidate of getUnixClaudeInstallCandidates()) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return name;
 }
 
 /** Result of resolving a binary that may be an npm .cmd shim.

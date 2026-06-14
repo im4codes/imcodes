@@ -29,6 +29,34 @@ describe('normalizeTransportCwd', () => {
   });
 });
 
+describe('resolveClaudeCodePathForSdk (macOS/Linux bundled-binary resolution)', () => {
+  it('resolves the SDK-bundled claude binary to an absolute path (not bare "claude") so a sparse-PATH daemon works', () => {
+    if (process.platform === 'win32') return; // Windows path is covered by its own tests
+    const platformBinary = path.join(
+      'node_modules', '@anthropic-ai', `claude-agent-sdk-${process.platform}-${process.arch}`, 'claude',
+    );
+    const resolved = resolveClaudeCodePathForSdk('claude');
+    if (fs.existsSync(platformBinary)) {
+      // The bundled binary is installed (it is in this repo) → MUST resolve to an
+      // absolute existing path, never bare 'claude' (which a systemd/launchd
+      // daemon's sparse PATH cannot find). Regression guard for the old
+      // non-Windows pass-through.
+      expect(path.isAbsolute(resolved)).toBe(true);
+      expect(fs.existsSync(resolved)).toBe(true);
+      expect(path.basename(resolved)).toBe('claude');
+    } else {
+      // Platform binary genuinely not installed here → PATH fallback is acceptable.
+      expect(resolved).toBe('claude');
+    }
+  });
+
+  it('honours an explicit caller-provided binary path/name unchanged', () => {
+    if (process.platform === 'win32') return;
+    expect(resolveClaudeCodePathForSdk('/custom/bin/claude')).toBe('/custom/bin/claude');
+    expect(resolveClaudeCodePathForSdk('claude-canary')).toBe('claude-canary');
+  });
+});
+
 describe('parseNpmCmdShim', () => {
   let tmpDir: string;
   beforeEach(() => {
