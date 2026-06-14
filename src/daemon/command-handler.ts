@@ -9284,7 +9284,7 @@ function modelIdsToTransportModels(ids: readonly string[]): TransportListModelsR
 
 async function loadPassiveTransportListModels(agentType: string): Promise<TransportListModelsResult> {
   if (agentType === 'codex-sdk') {
-    const cfg = await getCodexRuntimeConfig({ probe: false }).catch(() => undefined);
+    const cfg = await getCodexRuntimeConfig(false).catch(() => undefined);
     const models = cfg?.models?.length
       ? cfg.models.map((model) => ({
         id: model.id,
