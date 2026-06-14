@@ -1,7 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import type { TimelineEvent } from '../../src/daemon/timeline-event.js';
 import type { MaterializationSkillReviewJob } from '../../src/context/materialization-coordinator.js';
+
+const scheduleMarkdownMemoryIngestMock = vi.hoisted(() => vi.fn());
+
+vi.mock('../../src/context/md-ingest-worker.js', () => ({
+  scheduleMarkdownMemoryIngest: scheduleMarkdownMemoryIngestMock,
+}));
+
 import {
   closeLiveContextMaterializationAdmission,
   LiveContextIngestion,
@@ -49,6 +56,7 @@ describe('LiveContextIngestion', () => {
 
   beforeEach(async () => {
     reopenLiveContextMaterializationAdmission();
+    scheduleMarkdownMemoryIngestMock.mockReset();
     tempDir = await createIsolatedSharedContextDb('live-context-ingestion');
   });
 
@@ -362,6 +370,22 @@ describe('LiveContextIngestion', () => {
       totalRecords: 1,
       stagedEventCount: 0,
       dirtyTargetCount: 0,
+    });
+    expect(scheduleMarkdownMemoryIngestMock).not.toHaveBeenCalled();
+  });
+
+  it('schedules markdown memory ingestion for live events only', async () => {
+    const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 100, { text: 'Live event should refresh md memory' }));
+
+    expect(scheduleMarkdownMemoryIngestMock).toHaveBeenCalledTimes(1);
+    expect(scheduleMarkdownMemoryIngestMock).toHaveBeenCalledWith({
+      projectDir: session.projectDir,
+      namespace,
     });
   });
 

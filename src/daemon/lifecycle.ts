@@ -41,6 +41,7 @@ import { closeLiveContextMaterializationAdmission, LiveContextIngestion } from '
 import { LocalSkillReviewWorker } from '../context/skill-review-worker.js';
 import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { pruneLocalMemory } from '../context/memory-pruning.js';
+import { getResendCount } from './transport-resend-queue.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { DAEMON_VERSION } from '../util/version.js';
@@ -128,11 +129,24 @@ let ctx: DaemonContext | null = null;
 const WORKER_SESSION_SYNC_TIMEOUT_MS = 5_000;
 const STARTUP_WORKER_SESSION_SYNC_TIMEOUT_MS = 1_500;
 const SERVER_LINK_STARTUP_GRACE_MS = 12_000;
-const STARTUP_BACKGROUND_STAGGER_MS = 2_000;
+const STARTUP_CONTEXT_REPLICATION_DELAY_MS = 90_000;
+const STARTUP_TIMELINE_RETENTION_DELAY_MS = 120_000;
+const STARTUP_MEMORY_PRUNING_DELAY_MS = 150_000;
+const STARTUP_CONTEXT_BACKFILL_DELAY_MS = 180_000;
+const STARTUP_SESSION_DB_PUSH_DELAY_MS = 210_000;
 const STARTUP_TRANSPORT_RESTORE_DELAY_MS = 45_000;
+const STARTUP_CONTEXT_BACKFILL_PAUSE_MS = 25;
+const STARTUP_CONTEXT_BACKFILL_PAUSE_EVERY = 5;
 
 function yieldToDaemonEventLoop(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
+}
+
+function pauseDaemonBackgroundWork(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
 }
 
 async function persistSessionToWorker(
@@ -590,10 +604,24 @@ export async function startup(): Promise<DaemonContext> {
     sessionLookup: getSession,
     skillReviewScheduler: skillReviewWorker,
     shouldIngestTimelineEvent: (event, session) => !isP2pParticipantMemoryNoise(event, session, listP2pRuns()),
-    resolveBootstrap: (session) => resolveTransportContextBootstrap({
-      projectDir: session.projectDir,
-      transportConfig: getSession(session.name)?.transportConfig ?? session.transportConfig ?? {},
-    }),
+    resolveBootstrap: (session) => {
+      const latest = getSession(session.name) ?? session;
+      if (latest.contextNamespace) {
+        return Promise.resolve({
+          namespace: latest.contextNamespace,
+          diagnostics: latest.contextNamespaceDiagnostics ?? ['namespace:persisted-session'],
+          ...(latest.contextRemoteProcessedFreshness ? { remoteProcessedFreshness: latest.contextRemoteProcessedFreshness } : {}),
+          ...(latest.contextLocalProcessedFreshness ? { localProcessedFreshness: latest.contextLocalProcessedFreshness } : {}),
+          ...(latest.contextRetryExhausted !== undefined ? { retryExhausted: latest.contextRetryExhausted } : {}),
+          ...(latest.contextSharedPolicyOverride ? { sharedPolicyOverride: latest.contextSharedPolicyOverride } : {}),
+        });
+      }
+      return resolveTransportContextBootstrap({
+        projectDir: latest.projectDir,
+        transportConfig: latest.transportConfig ?? {},
+        startupMemoryAlreadyInjected: true,
+      });
+    },
     onError: (err, event) => {
       logger.warn({ err, session: event.sessionId, type: event.type }, 'Live context ingestion failed');
     },
@@ -764,9 +792,16 @@ export async function startup(): Promise<DaemonContext> {
       }
       if (history.length === 0) continue;
       sessionsBackfilled += 1;
-      void liveContextIngestion.backfillSessionFromEvents(session.name, history).catch((err) => {
+      try {
+        await liveContextIngestion.backfillSessionFromEvents(session.name, history);
+      } catch (err) {
         logger.warn({ err, session: session.name }, 'Shared-context timeline backfill failed');
-      });
+      }
+      if (sessionsBackfilled % STARTUP_CONTEXT_BACKFILL_PAUSE_EVERY === 0) {
+        await pauseDaemonBackgroundWork(STARTUP_CONTEXT_BACKFILL_PAUSE_MS);
+      } else {
+        await yieldToDaemonEventLoop();
+      }
     }
     logger.info(
       { sessionsSeen, sessionsBackfilled, elapsedMs: Date.now() - startedAt },
@@ -844,9 +879,13 @@ export async function startup(): Promise<DaemonContext> {
         );
       }
     };
-    void replicatePendingProcessedContext({ workerUrl: workerUrl!, serverId, token }).catch((err) => {
-      logger.warn({ err }, 'Initial processed-context replication failed');
-    });
+    scheduleDaemonStartupBackgroundTask(
+      'initial processed-context replication',
+      async () => {
+        await replicatePendingProcessedContext({ workerUrl: workerUrl!, serverId, token });
+      },
+      STARTUP_CONTEXT_REPLICATION_DELAY_MS,
+    );
   }
 
   async function persistBinding(platform: string, channelId: string, botId: string, bindingType: string, target: string): Promise<boolean> {
@@ -1047,12 +1086,12 @@ export async function startup(): Promise<DaemonContext> {
   scheduleDaemonStartupBackgroundTask(
     'timeline retention startup cleanup',
     runTimelineStartupRetention,
-    startupBackgroundBaseDelayMs,
+    startupBackgroundBaseDelayMs + STARTUP_TIMELINE_RETENTION_DELAY_MS,
   );
   scheduleDaemonStartupBackgroundTask(
     'startup local memory pruning',
     runStartupMemoryPruning,
-    startupBackgroundBaseDelayMs + STARTUP_BACKGROUND_STAGGER_MS,
+    startupBackgroundBaseDelayMs + STARTUP_MEMORY_PRUNING_DELAY_MS,
   );
   scheduleDaemonStartupBackgroundTask(
     'transport provider auto-reconnect',
@@ -1074,13 +1113,13 @@ export async function startup(): Promise<DaemonContext> {
   scheduleDaemonStartupBackgroundTask(
     'shared-context startup timeline backfill',
     backfillLiveContextFromTimeline,
-    startupBackgroundBaseDelayMs + STARTUP_BACKGROUND_STAGGER_MS * 4,
+    startupBackgroundBaseDelayMs + STARTUP_CONTEXT_BACKFILL_DELAY_MS,
   );
   if (pushLocalSessionsToWorkerOnStartup) {
     scheduleDaemonStartupBackgroundTask(
       'startup local main session DB push',
       pushLocalSessionsToWorkerOnStartup,
-      startupBackgroundBaseDelayMs + STARTUP_BACKGROUND_STAGGER_MS * 5,
+      startupBackgroundBaseDelayMs + STARTUP_SESSION_DB_PUSH_DELAY_MS,
     );
   }
 
@@ -1135,7 +1174,8 @@ async function autoReconnectProviders(): Promise<void> {
     for (const providerId of ['qwen', 'gemini-sdk', 'claude-code-sdk', 'codex-sdk', 'cursor-headless', 'copilot-sdk'] as const) {
       if (!listSessions().some((s) =>
         (s.runtimeType === 'transport' || isTransportAgent(s.agentType))
-        && s.providerId === providerId,
+        && s.providerId === providerId
+        && getResendCount(s.name) > 0,
       )) continue;
       if (restoredProviderCount > 0) await yieldToDaemonEventLoop();
       try {

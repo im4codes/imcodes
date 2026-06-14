@@ -30,6 +30,11 @@ export interface CodexRuntimeConfig {
   probeError?: string;
 }
 
+type CodexRuntimeConfigOptions = boolean | {
+  force?: boolean;
+  probe?: boolean;
+};
+
 interface RateLimitWindow {
   usedPercent?: number;
   windowDurationMins?: number;
@@ -427,11 +432,27 @@ async function readCodexModelsViaSingleton(): Promise<CodexModelInfo[] | undefin
   }
 }
 
-export async function getCodexRuntimeConfig(force = false): Promise<CodexRuntimeConfig> {
+export async function getCodexRuntimeConfig(options: CodexRuntimeConfigOptions = false): Promise<CodexRuntimeConfig> {
+  const force = typeof options === 'boolean' ? options : options.force === true;
+  const probe = typeof options === 'boolean' ? true : options.probe !== false;
   const now = Date.now();
   if (!force && cache && cache.expiresAt > now) return cache.value;
+  if (!probe && cache) return cache.value;
 
   const authPlanType = await readCodexPlanTypeFromAuthFile().catch(() => undefined);
+  if (!probe) {
+    const models = fallbackCodexModels();
+    const defaultModel = models.find((model) => model.isDefault)?.id ?? models[0]?.id;
+    const value: CodexRuntimeConfig = {
+      ...(authPlanType ? { planLabel: capitalize(authPlanType) } : {}),
+      availableModels: models.map((model) => model.id),
+      models,
+      ...(defaultModel ? { defaultModel } : {}),
+    };
+    cache = { expiresAt: now + CACHE_TTL_MS, value };
+    return value;
+  }
+
   let discoveredModels: CodexModelInfo[] | undefined;
   let modelProbeError: string | undefined;
   try {

@@ -1988,7 +1988,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       effectiveSkipCreate = true;
     }
     sdkDisplay = mergeCodexDisplayMetadata(
-      await getCodexRuntimeConfig().catch(() => ({})),
+      await getCodexRuntimeConfig({ probe: false }).catch(() => ({})),
       existing,
     );
   } else if (agentType === 'cursor-headless' || agentType === 'copilot-sdk' || agentType === 'kimi-sdk') {
@@ -2293,7 +2293,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   let familyDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'> | undefined;
   if (agentType === 'codex') {
     familyDisplay = mergeCodexDisplayMetadata(
-      await getCodexRuntimeConfig().catch(() => ({})),
+      await getCodexRuntimeConfig({ probe: false }).catch(() => ({})),
       getSession(name),
     );
   } else if (agentType === 'claude-code' && !opts.ccPreset) {

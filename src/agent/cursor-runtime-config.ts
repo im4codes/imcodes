@@ -20,6 +20,31 @@ export interface CursorRuntimeConfig {
 let cached: { expiresAt: number; value: CursorRuntimeConfig } | null = null;
 let inFlightProbe: Promise<CursorRuntimeConfig> | null = null;
 
+export type CursorRuntimeConfigOptions = boolean | {
+  force?: boolean;
+  /**
+   * When false, never spawn cursor-agent. Return cached data when present,
+   * otherwise a safe empty config. Passive UI/session-list refreshes must not
+   * wake a heavyweight CLI probe on daemon startup.
+   */
+  probe?: boolean;
+};
+
+function normalizeOptions(options: CursorRuntimeConfigOptions): { force: boolean; probe: boolean } {
+  if (typeof options === 'boolean') return { force: options, probe: true };
+  return {
+    force: options.force === true,
+    probe: options.probe !== false,
+  };
+}
+
+function emptyRuntimeConfig(): CursorRuntimeConfig {
+  return {
+    availableModels: [],
+    isAuthenticated: false,
+  };
+}
+
 /** Strip ANSI escape codes that the cursor CLI emits when stdout is a TTY.
  *  Works on a best-effort basis — we only need clean lines for parsing. */
 function stripAnsi(text: string): string {
@@ -80,9 +105,11 @@ async function execFileStdout(file: string, args: string[]): Promise<string> {
 /** Fetch the current Cursor runtime config (available models + auth state).
  *  Cached for {@link CACHE_TTL_MS} unless `force` is true. Never throws —
  *  returns a safe default when the CLI is missing or errors. */
-export async function getCursorRuntimeConfig(force = false): Promise<CursorRuntimeConfig> {
+export async function getCursorRuntimeConfig(options: CursorRuntimeConfigOptions = false): Promise<CursorRuntimeConfig> {
+  const { force, probe } = normalizeOptions(options);
   const now = Date.now();
   if (!force && cached && cached.expiresAt > now) return cached.value;
+  if (!probe) return cached?.value ?? emptyRuntimeConfig();
   // Share a single in-flight probe across concurrent callers. The two
   // `cursor-agent` exec calls take up to PROBE_TIMEOUT_MS (10s) each — without
   // this dedupe, every cache-miss caller (session-list, command-handler,

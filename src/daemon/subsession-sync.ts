@@ -58,7 +58,7 @@ export async function buildSubSessionSyncPayload(
     : isClaudeSdkSession(r.agentType)
       ? await getClaudeSdkRuntimeConfig().catch(() => ({}))
       : isCodexFamilySession(r.agentType)
-        ? mergeCodexDisplayMetadata(await getCodexRuntimeConfig().catch(() => ({})), r)
+        ? mergeCodexDisplayMetadata(await getCodexRuntimeConfig({ probe: false }).catch(() => ({})), r)
         : {};
 
   // Option B (best-effort, ≤1 fetch / 30min): proactive 5h+weekly quota for a

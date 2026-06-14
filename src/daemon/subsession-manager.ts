@@ -8,7 +8,7 @@ import type { AgentType } from '../agent/detect.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { timelineStore } from './timeline-store.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { upsertSession, getSession, removeSession } from '../store/session-store.js';
+import { upsertSession, getSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { resolveStructuredSessionBootstrap } from '../agent/structured-session-bootstrap.js';
@@ -325,27 +325,41 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
     const sessionName = subSessionName(sub.id);
     const projectName = parentProjectName(sub, sessionName);
     if (isTransportAgent(sub.type)) {
+      const existing = getSession(sessionName);
       const existingRuntime = getTransportRuntime(sessionName);
-      if (!existingRuntime) {
-      await launchTransportSession({
+      const now = Date.now();
+      const nextRecord: SessionRecord = {
+        ...existing,
         name: sessionName,
         projectName,
         role: 'w1',
         agentType: sub.type,
-          projectDir: sub.cwd ?? process.cwd(),
-        description: sub.description ?? undefined,
-        label: sub.label ?? undefined,
-        bindExistingKey: sub.providerSessionId ?? undefined,
-        skipCreate: !!sub.providerSessionId,
-        parentSession: sub.parentSession ?? undefined,
-        requestedModel: sub.requestedModel ?? undefined,
-        effort: sub.effort ?? undefined,
-        transportConfig: sub.transportConfig ?? undefined,
-        // Without this the daemon-restart rebuild path rewrites SessionRecord
-        // without ccPreset — Qwen then spawns with no --model / no preset
-        // settings and reverts to the OAuth `coder-model` placeholder.
-        ...(sub.ccPreset ? { ccPreset: sub.ccPreset } : {}),
-      }).catch((e) => logger.warn({ err: e, sessionName }, 'Failed to rebuild transport sub-session'));
+        projectDir: sub.cwd ?? existing?.projectDir ?? process.cwd(),
+        state: existingRuntime ? (existing?.state ?? 'idle') : 'idle',
+        runtimeType: 'transport',
+        providerId: sub.providerId ?? sub.type,
+        restarts: existing?.restarts ?? 0,
+        restartTimestamps: existing?.restartTimestamps ?? [],
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+        label: sub.label ?? existing?.label,
+        parentSession: sub.parentSession ?? existing?.parentSession,
+        requestedModel: sub.requestedModel ?? existing?.requestedModel,
+        activeModel: sub.activeModel ?? existing?.activeModel,
+        providerSessionId: sub.providerSessionId ?? existing?.providerSessionId,
+        ccSessionId: sub.ccSessionId ?? existing?.ccSessionId,
+        codexSessionId: sub.codexSessionId ?? existing?.codexSessionId,
+        effort: sub.effort ?? existing?.effort,
+        transportConfig: sub.transportConfig ?? existing?.transportConfig,
+        description: sub.description ?? existing?.description,
+        ccPreset: sub.ccPreset ?? existing?.ccPreset,
+      };
+      upsertSession(nextRecord);
+      if (!existingRuntime) {
+        logger.info(
+          { sessionName, agentType: sub.type, providerId: nextRecord.providerId },
+          'Transport sub-session rebuild deferred until first send',
+        );
       }
       continue;
     }

@@ -1,7 +1,7 @@
 import type { ContextTargetRef, LocalContextEvent } from '../../shared/context-types.js';
 import type { TimelineEvent } from '../daemon/timeline-event.js';
 import type { SessionRecord } from '../store/session-store.js';
-import { listProcessedProjections } from '../store/context-store.js';
+import { hasProcessedProjectionsInNamespace } from '../store/context-store.js';
 import type { TransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { MaterializationCoordinator, type MaterializationCoordinatorOptions } from './materialization-coordinator.js';
 import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
@@ -32,6 +32,10 @@ export interface LiveContextIngestionOptions extends MaterializationCoordinatorO
   resolveBootstrap: (record: SessionRecord) => Promise<TransportContextBootstrap>;
   shouldIngestTimelineEvent?: (event: TimelineEvent, session: SessionRecord) => boolean;
   onError?: (error: unknown, event: TimelineEvent) => void;
+}
+
+interface GetBootstrapOptions {
+  scheduleMarkdownIngest?: boolean;
 }
 
 type BootstrapCacheEntry = {
@@ -101,7 +105,7 @@ export class LiveContextIngestion {
   async backfillSessionFromEvents(sessionName: string, events: TimelineEvent[]): Promise<void> {
     const session = this.sessionLookup(sessionName);
     if (!session || events.length === 0) return;
-    const bootstrap = await this.getBootstrap(session);
+    const bootstrap = await this.getBootstrap(session, { scheduleMarkdownIngest: false });
     const target = toSessionTarget(session.name, bootstrap);
     if (this.hasAnyActivity(target)) return;
 
@@ -172,14 +176,19 @@ export class LiveContextIngestion {
     }
   }
 
-  private async getBootstrap(session: SessionRecord): Promise<TransportContextBootstrap> {
+  private async getBootstrap(
+    session: SessionRecord,
+    options: GetBootstrapOptions = {},
+  ): Promise<TransportContextBootstrap> {
     const cached = this.bootstrapCache.get(session.name);
     if (cached && cached.recordUpdatedAt === session.updatedAt && cached.expiresAt > Date.now()) {
       return cached.value;
     }
     const value = await this.resolveBootstrap(session);
     rememberMemoryConfigProjectDir(value.namespace, session.projectDir);
-    scheduleMarkdownMemoryIngest({ projectDir: session.projectDir, namespace: value.namespace });
+    if (options.scheduleMarkdownIngest !== false) {
+      scheduleMarkdownMemoryIngest({ projectDir: session.projectDir, namespace: value.namespace });
+    }
     this.bootstrapCache.set(session.name, {
       recordUpdatedAt: session.updatedAt,
       expiresAt: Date.now() + BOOTSTRAP_CACHE_MS,
@@ -195,7 +204,7 @@ export class LiveContextIngestion {
   }
 
   private hasAnyActivity(target: ContextTargetRef): boolean {
-    return this.hasDirtyTarget(target) || listProcessedProjections(target.namespace).length > 0;
+    return this.hasDirtyTarget(target) || hasProcessedProjectionsInNamespace(target.namespace);
   }
 }
 

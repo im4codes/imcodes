@@ -167,9 +167,9 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   // Option B (best-effort, ≤1 fetch / 30min): proactive 5h+weekly quota pulled
   // from /api/oauth/usage. null → fall back to the SDK rate_limit_event quota.
   const claudeUsageQuota = needsClaudeSdkHydration ? await getClaudeUsageQuota().catch(() => null) : null;
-  const codexRuntime = needsCodexHydration ? await getCodexRuntimeConfig().catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig) : null;
-  const copilotRuntime = needsCopilotHydration ? await getCopilotRuntimeConfig().catch(() => null) : null;
-  const cursorRuntime = needsCursorHydration ? await getCursorRuntimeConfig().catch(() => null) : null;
+  const codexRuntime = needsCodexHydration ? await getCodexRuntimeConfig({ probe: false }).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig) : null;
+  const copilotRuntime = needsCopilotHydration ? await getCopilotRuntimeConfig({ probe: false }).catch(() => null) : null;
+  const cursorRuntime = needsCursorHydration ? await getCursorRuntimeConfig({ probe: false }).catch(() => null) : null;
 
   // Collect preset-pinned models for all qwen sessions that have a ccPreset.
   // Doing this once (before the map) avoids per-session dynamic imports inside

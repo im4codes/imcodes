@@ -25,11 +25,13 @@ import {
   listArchivedEventsForTarget,
   listPinnedNotes,
   listProcessedProjections,
+  getLatestRecentSummaryUpdatedAtForTarget,
+  getLatestMasterSummaryUpdatedAt,
+  listLatestRecentSummarySessions,
   pruneArchiveIfDue,
-  queryProcessedProjections,
   recordCompressionRun,
   recordContextEvent,
-  countStagedTokens,
+  estimateStagedTokenUpperBound,
   setReplicationState,
   updateContextJob,
   writeProcessedProjection,
@@ -613,23 +615,12 @@ export class MaterializationCoordinator {
   }
 
   async materializeDueMasterSummaries(now = Date.now()): Promise<ProcessedContextProjection[]> {
-    const latestBySession = new Map<string, { sessionName: string; namespace: ContextNamespace; updatedAt: number }>();
-    for (const projection of queryProcessedProjections({ projectionClass: 'recent_summary', includeArchived: true, limit: 1000 })) {
-      const sessionName = typeof projection.content.sessionName === 'string' ? projection.content.sessionName : undefined;
-      if (!sessionName) continue;
-      const key = `${serializeContextNamespace(projection.namespace)}::${sessionName}`;
-      const existing = latestBySession.get(key);
-      if (!existing || projection.updatedAt > existing.updatedAt) {
-        latestBySession.set(key, { sessionName, namespace: projection.namespace, updatedAt: projection.updatedAt });
-      }
-    }
-
     const due: ProcessedContextProjection[] = [];
-    for (const item of latestBySession.values()) {
+    for (const item of listLatestRecentSummarySessions(1000)) {
       const itemMemoryConfig = this.resolveMemoryConfig(item.namespace);
       const idleMs = Math.max(0, itemMemoryConfig.masterIdleHours) * 60 * 60 * 1000;
-      const lastMaster = findLatestMasterSummary(item.sessionName, item.namespace);
-      if (lastMaster && lastMaster.updatedAt >= item.updatedAt) continue;
+      const lastMasterUpdatedAt = getLatestMasterSummaryUpdatedAt(item.sessionName, item.namespace);
+      if (lastMasterUpdatedAt !== undefined && lastMasterUpdatedAt >= item.updatedAt) continue;
       if (idleMs > 0 && now - item.updatedAt < idleMs) continue;
       const projection = await materializeMasterSummary(item.sessionName, item.namespace, now, itemMemoryConfig);
       if (projection) due.push(projection);
@@ -716,7 +707,7 @@ export class MaterializationCoordinator {
   private selectTrigger(dirtyTarget: ContextDirtyTarget, now: number): ContextJobTrigger | undefined {
     const thresholds = this.thresholdsForTarget(dirtyTarget.target);
     if (this.isRateLimited(dirtyTarget.target, now)) return undefined;
-    const tokenSum = countStagedTokens(dirtyTarget.target);
+    const tokenSum = estimateStagedTokenUpperBound(dirtyTarget.target);
     // Force-fire bypasses the event-count floor: this is a memory-safety valve
     // for runaway single/few-event batches with very large tool outputs.
     if (tokenSum >= thresholds.maxBatchTokens) return 'threshold';
@@ -748,17 +739,7 @@ export class MaterializationCoordinator {
   }
 
   private getLatestSummaryUpdatedAt(target: ContextTargetRef): number | undefined {
-    const projections = listProcessedProjections(target.namespace, 'recent_summary');
-    for (const projection of projections) {
-      const targetKind = typeof projection.content.targetKind === 'string' ? projection.content.targetKind : undefined;
-      const sessionName = typeof projection.content.sessionName === 'string' ? projection.content.sessionName : undefined;
-      if (target.kind === 'project') {
-        if (targetKind === 'project') return projection.updatedAt;
-        continue;
-      }
-      if (targetKind === 'session' && sessionName === target.sessionName) return projection.updatedAt;
-    }
-    return undefined;
+    return getLatestRecentSummaryUpdatedAtForTarget(target);
   }
 
   private configForTarget(target: ContextTargetRef): MemoryConfig {
@@ -881,8 +862,7 @@ function mergeMasterSourceIds(prior: string[], incoming: string[]): string[] {
 }
 
 function findNamespaceForSessionSummaries(sessionName: string): ContextNamespace | undefined {
-  return queryProcessedProjections({ projectionClass: 'recent_summary', includeArchived: true, limit: 1000 })
-    .find((projection) => projection.content.sessionName === sessionName)?.namespace;
+  return listLatestRecentSummarySessions(1000).find((item) => item.sessionName === sessionName)?.namespace;
 }
 
 function findLatestMasterSummary(sessionName: string, namespace: ContextNamespace): ProcessedContextProjection | undefined {

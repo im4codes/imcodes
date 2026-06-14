@@ -7,7 +7,7 @@ import type {
 } from '../../shared/context-types.js';
 import {
   getReplicationState,
-  listProcessedProjections,
+  listProcessedProjectionsByIds,
   listReplicationStates,
   setReplicationState,
   listAllProcessedProjectionsByNamespace,
@@ -135,9 +135,7 @@ function resolveStates(namespaces?: ContextNamespace[]): ContextReplicationState
 }
 
 function selectPendingProjections(namespace: ContextNamespace, pendingIds: string[]): ProcessedContextProjection[] {
-  const wanted = new Set(pendingIds);
-  return listProcessedProjections(namespace)
-    .filter((projection) => wanted.has(projection.id))
+  return listProcessedProjectionsByIds(namespace, pendingIds)
     .map((projection) => ({
       ...projection,
       // Legacy rows created before post-1.1 origin metadata are backfilled at

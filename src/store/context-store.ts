@@ -469,6 +469,8 @@ function ensureDb(): DatabaseSyncInstance {
       ON context_observations(projection_id);
     CREATE INDEX IF NOT EXISTS idx_context_observations_scope_state
       ON context_observations(scope, state, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_context_observations_namespace_state
+      ON context_observations(namespace_id, state, updated_at DESC);
 
     CREATE TABLE IF NOT EXISTS observation_promotion_audit (
       id TEXT PRIMARY KEY,
@@ -2209,6 +2211,18 @@ export function countStagedTokens(target: ContextTargetRef): number {
   return listContextEvents(target).reduce((sum, event) => sum + countTokens(event.content ?? ''), 0);
 }
 
+export function estimateStagedTokenUpperBound(target: ContextTargetRef): number {
+  const database = ensureDb();
+  const targetKey = serializeContextTarget(target);
+  const row = database.prepare(`
+    SELECT coalesce(sum(length(coalesce(content, ''))), 0) AS chars
+      FROM context_staged_events
+     WHERE target_key = ?
+  `).get(targetKey) as { chars?: number } | undefined;
+  const chars = Number(row?.chars ?? 0);
+  return Number.isFinite(chars) && chars > 0 ? Math.ceil(chars) : 0;
+}
+
 export function recordContextEvent(input: Omit<LocalContextEvent, 'id' | 'createdAt'> & Partial<Pick<LocalContextEvent, 'id' | 'createdAt'>>): LocalContextEvent {
   const database = ensureDb();
   const event: LocalContextEvent = {
@@ -2708,6 +2722,33 @@ export function listContextObservations(filters: {
     .filter((row) => !filters.class || row.class === filters.class)
     .filter((row) => !filters.state || (states ? states.has(row.state) : row.state === state))
     .filter((row) => !filters.projectionId || row.projectionId === filters.projectionId);
+}
+
+export function listStartupContextObservations(namespaceIds: readonly string[], limit: number): ContextObservationRow[] {
+  const ids = [...new Set(namespaceIds.filter((id) => typeof id === 'string' && id.length > 0))];
+  const safeLimit = Math.max(0, Math.min(100, Math.floor(limit)));
+  if (ids.length === 0 || safeLimit === 0) return [];
+  const database = ensureDb();
+  const rows: ContextObservationRow[] = [];
+  const chunkSize = 500;
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(',');
+    const chunkRows = database.prepare(`
+      SELECT *
+        FROM context_observations
+       WHERE namespace_id IN (${placeholders})
+         AND state IN ('active', 'promoted')
+         AND projection_id IS NULL
+         AND class <> 'skill_candidate'
+       ORDER BY updated_at DESC, id ASC
+       LIMIT ?
+    `).all(...chunk, safeLimit) as Array<Record<string, unknown>>;
+    rows.push(...chunkRows.map(observationRowFromDb));
+  }
+  return rows
+    .sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id))
+    .slice(0, safeLimit);
 }
 
 export function getContextObservationById(id: string): ContextObservationRow | null {
@@ -3219,6 +3260,140 @@ export function listProcessedProjections(namespace: ContextNamespace, projection
     lastUsedAt: typeof row.last_used_at === 'number' ? row.last_used_at : undefined,
     status: typeof row.status === 'string' ? row.status as ProcessedContextProjectionStatus : 'active',
   })).filter((projection) => !isMemoryNoiseSummary(projection.summary));
+}
+
+export function hasProcessedProjectionsInNamespace(namespace: ContextNamespace): boolean {
+  const database = ensureDb();
+  const namespaceKey = serializeContextNamespace(namespace);
+  const rows = database.prepare(`
+    SELECT summary
+      FROM context_processed_local
+     WHERE namespace_key = ?
+     ORDER BY updated_at DESC
+  `).all(namespaceKey) as Array<{ summary?: string }>;
+  return rows.some((row) => !isMemoryNoiseSummary(row.summary));
+}
+
+export function listProcessedProjectionsByIds(namespace: ContextNamespace, projectionIds: readonly string[]): ProcessedContextProjection[] {
+  if (projectionIds.length === 0) return [];
+  const database = ensureDb();
+  const namespaceKey = serializeContextNamespace(namespace);
+  const orderedIds = [...new Set(projectionIds.filter((id) => typeof id === 'string' && id.length > 0))];
+  const byId = new Map<string, ProcessedContextProjection>();
+  const chunkSize = 500;
+  for (let i = 0; i < orderedIds.length; i += chunkSize) {
+    const chunk = orderedIds.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(',');
+    const rows = database.prepare(
+      `SELECT * FROM context_processed_local WHERE namespace_key = ? AND id IN (${placeholders})`,
+    ).all(namespaceKey, ...chunk) as Array<Record<string, unknown>>;
+    for (const row of rows) {
+      const projection = processedProjectionFromRow(row, namespace);
+      if (!isMemoryNoiseSummary(projection.summary)) byId.set(projection.id, projection);
+    }
+  }
+  return orderedIds.flatMap((id) => {
+    const projection = byId.get(id);
+    return projection ? [projection] : [];
+  });
+}
+
+export function getLatestRecentSummaryUpdatedAtForTarget(target: ContextTargetRef): number | undefined {
+  const database = ensureDb();
+  const namespaceKey = serializeContextNamespace(target.namespace);
+  let rows: Array<Record<string, unknown>>;
+  if (target.kind === 'project') {
+    rows = database.prepare(`
+        SELECT updated_at, summary
+          FROM context_processed_local
+         WHERE namespace_key = ?
+           AND class = 'recent_summary'
+           AND status NOT IN ('archived', 'archived_dedup')
+           AND json_extract(content_json, '$.targetKind') = 'project'
+         ORDER BY updated_at DESC
+      `).all(namespaceKey) as Array<Record<string, unknown>>;
+  } else {
+    const sessionName = target.sessionName;
+    if (!sessionName) return undefined;
+    rows = database.prepare(`
+        SELECT updated_at, summary
+          FROM context_processed_local
+         WHERE namespace_key = ?
+           AND class = 'recent_summary'
+           AND status NOT IN ('archived', 'archived_dedup')
+           AND json_extract(content_json, '$.targetKind') = 'session'
+           AND json_extract(content_json, '$.sessionName') = ?
+         ORDER BY updated_at DESC
+      `).all(namespaceKey, sessionName) as Array<Record<string, unknown>>;
+  }
+  for (const row of rows as Array<{ updated_at: unknown; summary: unknown }>) {
+    if (isMemoryNoiseSummary(typeof row.summary === 'string' ? row.summary : undefined)) continue;
+    const updatedAt = Number(row.updated_at);
+    if (Number.isFinite(updatedAt)) return updatedAt;
+  }
+  return undefined;
+}
+
+export interface LatestRecentSummarySession {
+  sessionName: string;
+  namespace: ContextNamespace;
+  updatedAt: number;
+}
+
+export function listLatestRecentSummarySessions(limit = 1000): LatestRecentSummarySession[] {
+  const safeLimit = Math.max(0, Math.min(5000, Math.floor(limit)));
+  if (safeLimit === 0) return [];
+  const database = ensureDb();
+  const rows = database.prepare(`
+    SELECT namespace_key,
+           summary,
+           json_extract(content_json, '$.sessionName') AS session_name,
+           updated_at
+      FROM context_processed_local
+     WHERE class = 'recent_summary'
+       AND status NOT IN ('archived', 'archived_dedup')
+       AND json_extract(content_json, '$.sessionName') IS NOT NULL
+     ORDER BY updated_at DESC
+  `).all() as Array<Record<string, unknown>>;
+  const result: LatestRecentSummarySession[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (isMemoryNoiseSummary(typeof row.summary === 'string' ? row.summary : undefined)) continue;
+    const sessionName = typeof row.session_name === 'string' ? row.session_name : undefined;
+    const updatedAt = Number(row.updated_at);
+    if (!sessionName || !Number.isFinite(updatedAt)) continue;
+    const namespaceKey = String(row.namespace_key);
+    const key = `${namespaceKey}\0${sessionName}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({
+      sessionName,
+      namespace: parseNamespaceKey(namespaceKey),
+      updatedAt,
+    });
+    if (result.length >= safeLimit) break;
+  }
+  return result;
+}
+
+export function getLatestMasterSummaryUpdatedAt(sessionName: string, namespace: ContextNamespace): number | undefined {
+  const database = ensureDb();
+  const namespaceKey = serializeContextNamespace(namespace);
+  const rows = database.prepare(`
+    SELECT updated_at, summary
+      FROM context_processed_local
+     WHERE namespace_key = ?
+       AND class = 'master_summary'
+       AND status NOT IN ('archived', 'archived_dedup')
+       AND json_extract(content_json, '$.sessionName') = ?
+     ORDER BY updated_at DESC
+  `).all(namespaceKey, sessionName) as Array<{ updated_at?: number; summary?: string }>;
+  for (const row of rows) {
+    if (isMemoryNoiseSummary(row.summary)) continue;
+    const updatedAt = Number(row.updated_at);
+    if (Number.isFinite(updatedAt)) return updatedAt;
+  }
+  return undefined;
 }
 
 /** Returns a map of namespace_key → projection IDs for all local projections. */

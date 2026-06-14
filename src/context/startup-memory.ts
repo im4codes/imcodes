@@ -5,8 +5,8 @@ import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.
 import { MEMORY_DEFAULTS } from '../../shared/memory-defaults.js';
 import {
   listContextNamespaces,
-  listContextObservations,
   LEGACY_DAEMON_LOCAL_USER_ID,
+  listStartupContextObservations,
   type ContextNamespaceRow,
   type ContextObservationRow,
 } from '../store/context-store.js';
@@ -339,11 +339,7 @@ export function selectStartupObservationItems(
       .map((row) => [row.id, row]),
   );
   if (allowedRows.size === 0) return [];
-  return listContextObservations({
-    state: ['active', 'promoted'],
-  })
-    .filter((observation) => !observation.projectionId)
-    .filter((observation) => observation.class !== 'skill_candidate')
+  return listStartupContextObservations([...allowedRows.keys()], limit)
     .map((observation) => {
       const row = allowedRows.get(observation.namespaceId);
       return row ? observationToItem(observation, row) : undefined;

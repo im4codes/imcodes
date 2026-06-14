@@ -41,6 +41,14 @@ describe('getCopilotRuntimeConfig', () => {
     loggerMock.default.debug.mockReset();
   });
 
+  it('returns a passive fallback without starting the Copilot SDK when probing is disabled', async () => {
+    const config = await getCopilotRuntimeConfig({ probe: false });
+    expect(config.availableModels).toEqual([...COPILOT_FALLBACK_MODEL_IDS]);
+    expect(config.models).toEqual(COPILOT_FALLBACK_MODEL_IDS.map((id) => ({ id })));
+    expect(config.isAuthenticated).toBe(false);
+    expect(sdkMock.clientFactory).not.toHaveBeenCalled();
+  });
+
   it('returns the SDK-reported models, auth status and cli version', async () => {
     const stop = vi.fn().mockResolvedValue(undefined);
     sdkMock.clientFactory.mockReturnValue({

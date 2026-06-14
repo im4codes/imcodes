@@ -317,6 +317,14 @@ import { timelineStore } from '../../src/daemon/timeline-store.js';
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+async function waitForAsync(predicate: () => boolean, attempts = 25): Promise<void> {
+  for (let i = 0; i < attempts; i += 1) {
+    if (predicate()) return;
+    await flushAsync();
+  }
+  if (!predicate()) throw new Error('Timed out waiting for async condition');
+}
+
 function timelineEvent(overrides: Record<string, unknown> = {}) {
   return {
     eventId: 'evt',
@@ -2033,6 +2041,45 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(reasonByRequestId.get('detail-oversized')).toBe(TIMELINE_DETAIL_ERROR_REASONS.OVERSIZED);
     expect(reasonByRequestId.get('detail-cross-session')).toBe(TIMELINE_DETAIL_ERROR_REASONS.MISSING);
     expect(reasonByRequestId.get('detail-internal')).toBe(TIMELINE_DETAIL_ERROR_REASONS.INTERNAL_ERROR);
+  });
+
+  it('serves passive transport.list_models without connecting a missing local provider', async () => {
+    getProviderMock.mockReturnValue(undefined);
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'codex-sdk', requestId: 'passive-models' }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).type === 'transport.models_response'
+        && (call[0] as Record<string, unknown>).requestId === 'passive-models'
+    )));
+
+    expect(ensureProviderConnectedMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      agentType: 'codex-sdk',
+      requestId: 'passive-models',
+      models: expect.arrayContaining([expect.objectContaining({ id: 'gpt-5.5' })]),
+    }));
+  });
+
+  it('allows forced transport.list_models to connect a missing local provider', async () => {
+    const listModels = vi.fn().mockResolvedValue({ models: [{ id: 'live-model' }] });
+    getProviderMock.mockReturnValue(undefined);
+    ensureProviderConnectedMock.mockResolvedValue({ listModels });
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'codex-sdk', requestId: 'forced-models', force: true }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).type === 'transport.models_response'
+        && (call[0] as Record<string, unknown>).requestId === 'forced-models'
+    )));
+
+    expect(ensureProviderConnectedMock).toHaveBeenCalledWith('codex-sdk', {});
+    expect(listModels).toHaveBeenCalledWith(true);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      agentType: 'codex-sdk',
+      requestId: 'forced-models',
+      models: [{ id: 'live-model' }],
+    }));
   });
 
   it('coalesces concurrent transport.list_models requests for the same agent/provider and preserves request ids', async () => {
