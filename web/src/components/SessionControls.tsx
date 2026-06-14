@@ -1342,8 +1342,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         setOptimisticQueuedEntries((prev) => {
           if (!prev) return prev;
           const next = prev.filter((entry) => {
+            // Clear by commandId when it matches.
             if (commandId && entry.clientMessageId === commandId) return false;
-            if (!commandId && normalizedText && normalizeQueuedText(entry.text) === normalizedText) return false;
+            // ALSO fall back to a text match even when a (mismatched) commandId
+            // is present. The daemon's user.message events don't reliably echo
+            // the web's clientMessageId — there are multiple emit paths, drains
+            // merge several queued messages into one turn, and the resend queue
+            // can re-id — so id-only matching left already-delivered messages
+            // stuck as an undismissable "Queued" zombie. If a message with this
+            // exact text reached the timeline, it is no longer queued.
+            if (normalizedText && normalizeQueuedText(entry.text) === normalizedText) return false;
             return true;
           });
           return next.length > 0 ? next : null;
