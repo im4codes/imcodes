@@ -1212,6 +1212,107 @@ async function recoverTransportRuntimeAfterError(
 }
 
 /** Wire up onStatusChange and onDrain callbacks for a transport runtime. */
+/**
+ * Drain the transport resend queue for `sessionName`, re-sending each queued
+ * user message through `runtime` and emitting a `user.message` timeline event on
+ * a successful 'sent'. TTL-expired entries are dropped with a single
+ * user-visible summary (audit 0419d1ac-1f4).
+ *
+ * Single source of truth for the re-send + emit logic (repo rule: never copy
+ * code). Three callers:
+ *   - `restoreTransportSessions` — drain after a daemon-restart reconnect.
+ *   - the launch path — drain after a fresh `launchTransportSession`.
+ *   - `runtime.onProviderSessionReady` — drain when the provider session binds.
+ *     This closes the window where Auto-Deliver enqueues a prompt to resend
+ *     (because `awaitTransportRuntime` timed out mid-relaunch, or the provider
+ *     session was nulled on disconnect) and the one-shot launch/restore drains
+ *     have already run — without this the entry would sit in resend until the
+ *     next restart. Manual sends never hit this because the user resends.
+ *
+ * `await`ed by the launch/restore callers so their relaunch lock is not released
+ * until the queue has transferred into the runtime (R-Drain fix, audit
+ * cae1de69-826). Idempotent: `drainResend` deletes the queue synchronously
+ * before dispatch, so the overlapping launch + provider-ready drains re-deliver
+ * each entry at most once.
+ */
+async function drainTransportResendQueueIntoRuntime(
+  runtime: TransportSessionRuntime,
+  sessionName: string,
+  context: 'reconnect' | 'launch' | 'provider-ready',
+): Promise<void> {
+  const pendingCount = getResendCount(sessionName);
+  if (pendingCount === 0) return;
+  logger.info({ session: sessionName, pendingCount, context }, 'Draining transport resend queue');
+  try {
+    await drainResend(
+      sessionName,
+      (entry) => {
+        const attachments = entry.attachments ?? [];
+        const sharedMetadata = entry.sharedActor ? { sharedActor: entry.sharedActor } : undefined;
+        const result = entry.messagePreamble
+          ? (sharedMetadata
+              ? runtime.send(
+                entry.text,
+                entry.commandId,
+                attachments.length > 0 ? attachments : undefined,
+                entry.messagePreamble,
+                sharedMetadata,
+              )
+              : runtime.send(
+                entry.text,
+                entry.commandId,
+                attachments.length > 0 ? attachments : undefined,
+                entry.messagePreamble,
+              ))
+          : (attachments.length > 0
+              ? (sharedMetadata
+                  ? runtime.send(entry.text, entry.commandId, attachments, undefined, sharedMetadata)
+                  : runtime.send(entry.text, entry.commandId, attachments))
+              : (sharedMetadata
+                  ? runtime.send(entry.text, entry.commandId, undefined, undefined, sharedMetadata)
+                  : runtime.send(entry.text, entry.commandId)));
+        if (result === 'sent') {
+          timelineEmitter.emit(
+            sessionName,
+            'user.message',
+            {
+              text: entry.text,
+              allowDuplicate: true,
+              commandId: entry.commandId,
+              clientMessageId: entry.commandId,
+              ...(attachments.length > 0 ? { attachments } : {}),
+              ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+            },
+            { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
+          );
+        }
+        return result;
+      },
+      // N-R6 fix (audit 0419d1ac-1f4) — surface a single user-visible summary
+      // when one or more queued messages were dropped for exceeding
+      // RESEND_EXPIRY_MS. The web client's queued reconciliation has already
+      // added these commandIds to `settledCommandIdsRef`, so a per-entry
+      // `command.ack error` would be swallowed by `markOptimisticFailed`'s
+      // settle guard. The `assistant.text` summary is the only path the user sees.
+      ({ expiredCount }) => {
+        const minutes = Math.round((5 * 60 * 1000) / 60_000); // RESEND_EXPIRY_MS / minute
+        timelineEmitter.emit(
+          sessionName,
+          'assistant.text',
+          {
+            text: `⚠️ ${expiredCount} 条排队消息超过 ${minutes} 分钟未送达，已丢弃。请重新发送。`,
+            streaming: false,
+            memoryExcluded: true,
+          },
+          { source: 'daemon', confidence: 'high' },
+        );
+      },
+    );
+  } catch (err) {
+    logger.warn({ err, session: sessionName, context }, 'transport resend drain failed');
+  }
+}
+
 function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: string): void {
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   runtime.onStatusChange = (status) => {
@@ -1269,6 +1370,14 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       pendingMessageEntries: runtime.pendingEntries,
       pendingMessageVersion: runtime.pendingVersion,
     }, { source: 'daemon', confidence: 'high' });
+  };
+  runtime.onProviderSessionReady = () => {
+    // The provider session just bound (initialize/reconnect completed). Drain
+    // any messages enqueued to resend while the runtime was not yet ready —
+    // notably Auto-Deliver prompts that took the resend path because
+    // `awaitTransportRuntime` raced the relaunch. Fire-and-forget: the launch/
+    // restore drains are the awaited ones; this is the mid-life safety net.
+    void drainTransportResendQueueIntoRuntime(runtime, sessionName, 'provider-ready');
   };
   runtime.onStartupMemoryInjected = () => {
     const existing = getSession(sessionName);
@@ -1711,76 +1820,7 @@ export async function restoreTransportSessions(
       // `transportRuntimes.set` and `drainResend`, which WOULD reintroduce
       // a real race window letting msg-2 arrive at `handleSend` while
       // `_sending` is still false.
-      const pendingCount = getResendCount(s.name);
-      if (pendingCount > 0) {
-        logger.info({ session: s.name, pendingCount }, 'Draining transport resend queue after reconnect');
-        try {
-          await drainResend(s.name, (entry) => {
-            const attachments = entry.attachments ?? [];
-            const sharedMetadata = entry.sharedActor ? { sharedActor: entry.sharedActor } : undefined;
-            const result = entry.messagePreamble
-              ? (sharedMetadata
-                  ? runtime.send(
-                    entry.text,
-                    entry.commandId,
-                    attachments.length > 0 ? attachments : undefined,
-                    entry.messagePreamble,
-                    sharedMetadata,
-                  )
-                  : runtime.send(
-                    entry.text,
-                    entry.commandId,
-                    attachments.length > 0 ? attachments : undefined,
-                    entry.messagePreamble,
-                  ))
-              : (attachments.length > 0
-                  ? (sharedMetadata
-                      ? runtime.send(entry.text, entry.commandId, attachments, undefined, sharedMetadata)
-                      : runtime.send(entry.text, entry.commandId, attachments))
-                  : (sharedMetadata
-                      ? runtime.send(entry.text, entry.commandId, undefined, undefined, sharedMetadata)
-                      : runtime.send(entry.text, entry.commandId)));
-            if (result === 'sent') {
-              timelineEmitter.emit(
-                s.name,
-                'user.message',
-                {
-                  text: entry.text,
-                  allowDuplicate: true,
-                  commandId: entry.commandId,
-                  clientMessageId: entry.commandId,
-                  ...(attachments.length > 0 ? { attachments } : {}),
-                  ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-                },
-                { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
-              );
-            }
-            return result;
-          },
-          // N-R6 fix (audit 0419d1ac-1f4) — surface a single user-visible
-          // summary when one or more queued messages were dropped because
-          // they exceeded RESEND_EXPIRY_MS. The web client's queued
-          // reconciliation has already added these commandIds to
-          // `settledCommandIdsRef`, so a per-entry `command.ack error`
-          // would be swallowed by `markOptimisticFailed`'s settle guard.
-          // The `assistant.text` summary is the only path the user sees.
-          ({ expiredCount }) => {
-            const minutes = Math.round((5 * 60 * 1000) / 60_000); // RESEND_EXPIRY_MS / minute
-            timelineEmitter.emit(
-              s.name,
-              'assistant.text',
-              {
-                text: `⚠️ ${expiredCount} 条排队消息超过 ${minutes} 分钟未送达，已丢弃。请重新发送。`,
-                streaming: false,
-                memoryExcluded: true,
-              },
-              { source: 'daemon', confidence: 'high' },
-            );
-          });
-        } catch (err) {
-          logger.warn({ err, session: s.name }, 'transport resend drain failed');
-        }
-      }
+      await drainTransportResendQueueIntoRuntime(runtime, s.name, 'reconnect');
     } catch (err) {
       logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
     }
@@ -2131,72 +2171,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // `runExclusiveSessionRelaunch`) does not resolve until the resend
   // queue has been fully transferred into the runtime. See the matching
   // change in `restoreTransportSessions` above for the full rationale.
-  const pendingResendCount = getResendCount(name);
-  if (pendingResendCount > 0) {
-    logger.info({ session: name, pendingCount: pendingResendCount }, 'Draining transport resend queue after launch');
-    try {
-      await drainResend(name, (entry) => {
-        const attachments = entry.attachments ?? [];
-        const sharedMetadata = entry.sharedActor ? { sharedActor: entry.sharedActor } : undefined;
-        const result = entry.messagePreamble
-          ? (sharedMetadata
-              ? runtime.send(
-                entry.text,
-                entry.commandId,
-                attachments.length > 0 ? attachments : undefined,
-                entry.messagePreamble,
-                sharedMetadata,
-              )
-              : runtime.send(
-                entry.text,
-                entry.commandId,
-                attachments.length > 0 ? attachments : undefined,
-                entry.messagePreamble,
-              ))
-          : (attachments.length > 0
-              ? (sharedMetadata
-                  ? runtime.send(entry.text, entry.commandId, attachments, undefined, sharedMetadata)
-                  : runtime.send(entry.text, entry.commandId, attachments))
-              : (sharedMetadata
-                  ? runtime.send(entry.text, entry.commandId, undefined, undefined, sharedMetadata)
-                  : runtime.send(entry.text, entry.commandId)));
-        if (result === 'sent') {
-          timelineEmitter.emit(
-            name,
-            'user.message',
-            {
-              text: entry.text,
-              allowDuplicate: true,
-              commandId: entry.commandId,
-              clientMessageId: entry.commandId,
-              ...(attachments.length > 0 ? { attachments } : {}),
-              ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-            },
-            { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
-          );
-        }
-        return result;
-      },
-      // N-R6 fix (audit 0419d1ac-1f4) — same TTL-expired summary as the
-      // restoreTransportSessions caller above. See that callsite for the
-      // full rationale.
-      ({ expiredCount }) => {
-        const minutes = Math.round((5 * 60 * 1000) / 60_000);
-        timelineEmitter.emit(
-          name,
-          'assistant.text',
-          {
-            text: `⚠️ ${expiredCount} 条排队消息超过 ${minutes} 分钟未送达，已丢弃。请重新发送。`,
-            streaming: false,
-            memoryExcluded: true,
-          },
-          { source: 'daemon', confidence: 'high' },
-        );
-      });
-    } catch (err) {
-      logger.warn({ err, session: name }, 'transport resend drain (launch) failed');
-    }
-  }
+  await drainTransportResendQueueIntoRuntime(runtime, name, 'launch');
 }
 
 export async function launchSession(opts: LaunchOpts): Promise<void> {

@@ -170,6 +170,52 @@ describe('TransportSessionRuntime', () => {
     expect(() => fresh.send('hi')).toThrow(/not initialized/i);
   });
 
+  // Regression: the daemon drains the transport resend queue from this hook so
+  // messages enqueued while the runtime was not yet ready (notably Auto-Deliver
+  // prompts that took the `missing_transport_runtime` resend path) get delivered
+  // instead of sitting in resend until the next restart.
+  describe('onProviderSessionReady (transport resend-drain hook)', () => {
+    it('fires after initialize() once the provider session is bound and send-ready', async () => {
+      const fresh = new TransportSessionRuntime(mock.provider, 'deck_test_ready');
+      let fired = false;
+      let sessionIdAtFire: string | null = null;
+      fresh.onProviderSessionReady = () => {
+        fired = true;
+        // Must observe a bound providerSessionId — the daemon's drain calls
+        // runtime.send() synchronously, which throws if not yet initialized.
+        sessionIdAtFire = fresh.providerSessionId;
+      };
+      expect(fired).toBe(false);
+      await fresh.initialize(defaultConfig);
+      expect(fired).toBe(true);
+      expect(sessionIdAtFire).toBe('sess-1');
+    });
+
+    it('initialize() succeeds when no ready callback is registered', async () => {
+      const fresh = new TransportSessionRuntime(mock.provider, 'deck_test_nocb');
+      await expect(fresh.initialize(defaultConfig)).resolves.toBeUndefined();
+      expect(fresh.providerSessionId).toBe('sess-1');
+    });
+
+    it('setProviderSessionId fires the hook only on the null→set transition', () => {
+      const fresh = new TransportSessionRuntime(mock.provider, 'deck_test_setid');
+      let fireCount = 0;
+      fresh.onProviderSessionReady = () => { fireCount += 1; };
+      fresh.setProviderSessionId('restored-1');
+      expect(fireCount).toBe(1);
+      // Already set → no transition → no re-fire (avoids redundant drains).
+      fresh.setProviderSessionId('restored-2');
+      expect(fireCount).toBe(1);
+    });
+
+    it('swallows a throwing ready callback so initialize() still resolves', async () => {
+      const fresh = new TransportSessionRuntime(mock.provider, 'deck_test_throw');
+      fresh.onProviderSessionReady = () => { throw new Error('boom'); };
+      await expect(fresh.initialize(defaultConfig)).resolves.toBeUndefined();
+      expect(fresh.providerSessionId).toBe('sess-1');
+    });
+  });
+
   it('send() returns "sent" when idle', async () => {
     expect(runtime.send('hi')).toBe('sent');
     await flushDispatch();

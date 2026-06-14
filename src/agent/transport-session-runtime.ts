@@ -275,6 +275,11 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void;
   private _onSessionInfoChange?: (info: SessionInfoUpdate) => void;
+  /** Fired when the provider session binds (a non-null providerSessionId is
+   *  established) and the runtime is fully configured. The daemon uses this to
+   *  drain the transport resend queue for messages enqueued while the runtime
+   *  was not yet ready — notably Auto-Deliver prompts. */
+  private _onProviderSessionReady?: () => void;
   private _onApprovalRequest?: (request: ApprovalRequest) => void;
   /** Fired exactly once per runtime lifetime, after startup memory is accepted
    *  by the provider on the first dispatch. Session-manager persists the flag
@@ -457,10 +462,31 @@ export class TransportSessionRuntime implements SessionRuntime {
   set onStartupMemoryInjected(cb: () => void) { this._onStartupMemoryInjected = cb; }
   /** Register a callback for provider session metadata updates. */
   set onSessionInfoChange(cb: (info: SessionInfoUpdate) => void) { this._onSessionInfoChange = cb; }
+  /** Register a callback fired when the provider session binds (becomes ready
+   *  to accept sends). See `_onProviderSessionReady`. */
+  set onProviderSessionReady(cb: () => void) { this._onProviderSessionReady = cb; }
   set onApprovalRequest(cb: (request: ApprovalRequest) => void) { this._onApprovalRequest = cb; }
 
   /** Set providerSessionId directly (restore from store without initialize). */
-  setProviderSessionId(id: string): void { this._providerSessionId = id; }
+  setProviderSessionId(id: string): void {
+    const wasUnset = !this._providerSessionId;
+    this._providerSessionId = id;
+    if (wasUnset && id) this._notifyProviderSessionReady();
+  }
+
+  /** Fire the provider-session-ready callback. Safe to call repeatedly — the
+   *  daemon's drain is idempotent (the resend queue is cleared before dispatch),
+   *  so an overlapping launch drain + this hook re-deliver each entry at most
+   *  once. */
+  private _notifyProviderSessionReady(): void {
+    const cb = this._onProviderSessionReady;
+    if (!cb) return;
+    try {
+      cb();
+    } catch (err) {
+      logger.warn({ err }, 'onProviderSessionReady callback threw');
+    }
+  }
   setDescription(desc: string): void { this._description = clampUserSessionText(desc); }
   setSystemPrompt(prompt: string): void { this._systemPrompt = clampUserSessionText(prompt); }
   /**
@@ -730,6 +756,14 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._startupMemoryTimelineEmitted = false;
       this._startupMemoryInjected = false;
     }
+    // Provider session is now bound and the runtime is fully configured
+    // (systemPrompt/description/identity/context all set above), so it can
+    // accept sends. Notify listeners — the daemon drains the transport resend
+    // queue here so messages enqueued while the runtime was still initializing
+    // (notably Auto-Deliver prompts that took the `missing_transport_runtime` /
+    // `transport_runtime_not_initialized` resend path) are delivered instead of
+    // sitting in resend until the next restart.
+    this._notifyProviderSessionReady();
   }
 
   /**
