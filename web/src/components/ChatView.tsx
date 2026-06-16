@@ -1306,6 +1306,8 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   highlightElRef.current = highlightEl;
   const [ctxMenu, setCtxMenu] = useState<SelectionMenu | null>(null);
   const ctxMenuRef = useRef<HTMLDivElement>(null);
+  const [revealingOlder, setRevealingOlder] = useState(false);
+  const revealingOlderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Timestamp when ctx menu was opened — clicks within 400ms are synthetic (from long-press release)
   const menuOpenedAtRef = useRef(0);
   // Zoomed text modal — opened by double-tap on a chat bubble on touch devices.
@@ -1740,8 +1742,17 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   );
 
   useEffect(() => {
+    if (revealingOlderTimerRef.current) {
+      clearTimeout(revealingOlderTimerRef.current);
+      revealingOlderTimerRef.current = null;
+    }
+    setRevealingOlder(false);
     setRenderItemLimit(CHAT_INITIAL_RENDER_ITEM_LIMIT);
   }, [sessionId]);
+
+  useEffect(() => () => {
+    if (revealingOlderTimerRef.current) clearTimeout(revealingOlderTimerRef.current);
+  }, []);
 
   const markProgrammaticScroll = () => {
     // Bounded one-shot: skip exactly one upcoming synthetic scroll event.
@@ -1749,6 +1760,16 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     // Watchdog: if the synthetic event is throttled or never fires, release
     // the guard after 200ms so legitimate user input never gets swallowed.
     programmaticIgnoreUntilRef.current = Date.now() + 200;
+  };
+
+  const revealHiddenOlderItems = () => {
+    if (revealingOlderTimerRef.current) clearTimeout(revealingOlderTimerRef.current);
+    setRevealingOlder(true);
+    setRenderItemLimit((limit) => limit + CHAT_RENDER_ITEM_INCREMENT);
+    revealingOlderTimerRef.current = setTimeout(() => {
+      revealingOlderTimerRef.current = null;
+      setRevealingOlder(false);
+    }, 450);
   };
 
   // Pure motion + optional policy. Default `engageFollow=true` preserves the
@@ -2130,10 +2151,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       const now = Date.now();
       if (now - lastLoadOlderAtRef.current >= LOAD_OLDER_COOLDOWN_MS) {
         lastLoadOlderAtRef.current = now;
-        scrollAnchorRef.current = { scrollHeight };
         if (hiddenRenderedItemCount > 0) {
-          setRenderItemLimit((limit) => limit + CHAT_RENDER_ITEM_INCREMENT);
+          revealHiddenOlderItems();
         } else {
+          scrollAnchorRef.current = { scrollHeight };
           onLoadOlder?.();
         }
       }
@@ -2649,23 +2670,28 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               <div class="chat-tool-chooser-footnote">{t('chat.tool_chooser_footnote')}</div>
             </div>
           )}
-          {!loading && !preview && viewItems.length > 0 && (hiddenRenderedItemCount > 0 || (onLoadOlder && hasOlderHistory)) && (
+          {!loading && !preview && viewItems.length > 0 && (loadingOlder || revealingOlder) && (
+            <div class="chat-load-older-status" role="status" aria-live="polite">
+              <span class="chat-refreshing-spinner" aria-hidden="true" />
+              <span>{t('chat.loading_older')}</span>
+            </div>
+          )}
+          {!loading && !preview && viewItems.length > 0 && (hiddenRenderedItemCount > 0 || (!loadingOlder && onLoadOlder && hasOlderHistory)) && (
             <div style={{ textAlign: 'center', padding: '8px 0' }}>
               <button
                 class="btn btn-sm"
                 style={{ fontSize: 11, opacity: 0.7 }}
                 onClick={() => {
                   const el = scrollRef.current;
-                  if (el) scrollAnchorRef.current = { scrollHeight: el.scrollHeight };
                   if (hiddenRenderedItemCount > 0) {
-                    setRenderItemLimit((limit) => limit + CHAT_RENDER_ITEM_INCREMENT);
+                    revealHiddenOlderItems();
                   } else {
+                    if (el) scrollAnchorRef.current = { scrollHeight: el.scrollHeight };
                     onLoadOlder?.();
                   }
                 }}
-                disabled={hiddenRenderedItemCount === 0 && loadingOlder}
               >
-                {hiddenRenderedItemCount === 0 && loadingOlder ? t('chat.loading_older') : t('chat.load_older')}
+                {t('chat.load_older')}
               </button>
             </div>
           )}

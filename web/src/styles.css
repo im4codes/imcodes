@@ -2048,6 +2048,7 @@ html.native-ios-mac .chat-dl-btn {
 .chat-mode { display: inline-block; background: #1e1338; color: #a78bfa; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
 .chat-system { text-align: center; color: #475569; font-size: 11px; padding: 4px 0; }
 .chat-loading { text-align: center; color: #475569; padding: 24px; }
+.chat-load-older-status { align-self: center; display: inline-flex; align-items: center; gap: 6px; margin: 4px auto 6px; padding: 4px 9px; border-radius: 999px; background: rgba(15, 23, 42, 0.78); border: 1px solid rgba(71, 85, 105, 0.72); color: #cbd5e1; font-size: 11px; line-height: 1; }
 .chat-history-overlay { position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); z-index: 4; min-height: 24px; max-width: min(92%, 560px); border-radius: 999px; background: rgba(15, 23, 42, 0.82); border: 1px solid rgba(51, 65, 85, 0.82); box-shadow: 0 8px 24px rgba(2, 6, 23, 0.28); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 5px 9px; pointer-events: none; color: #94a3b8; }
 .chat-history-overlay:not(.has-steps) { width: 24px; height: 24px; padding: 0; }
 .chat-history-overlay-label { font-size: 10px; color: #cbd5e1; white-space: nowrap; flex-shrink: 0; }

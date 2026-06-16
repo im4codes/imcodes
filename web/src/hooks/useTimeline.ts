@@ -1211,6 +1211,20 @@ function hasStructuredOlderPage(msg: TimelineEventsServerMessage): boolean {
   return msg.hasMore === true && getOlderTimelineCursor(msg) !== null;
 }
 
+function buildFallbackOlderCursor(events: readonly TimelineEvent[], epoch: number): TimelineCursor | null {
+  let earliest: TimelineEvent | null = null;
+  for (const event of events) {
+    if (typeof event.ts !== 'number' || !Number.isFinite(event.ts)) continue;
+    if (!earliest || event.ts < earliest.ts) earliest = event;
+  }
+  if (!earliest) return null;
+  return {
+    epoch: epoch > 0 ? epoch : earliest.epoch,
+    beforeTs: earliest.ts,
+    direction: TIMELINE_CURSOR_DIRECTIONS.OLDER,
+  };
+}
+
 function supportsTimelineProtocol(ws: WsClient): boolean {
   const method = (ws as { supportsTimelineProtocolRevision?: (minRevision?: number) => boolean }).supportsTimelineProtocolRevision;
   return typeof method === 'function' && method.call(ws, TIMELINE_PROTOCOL_REVISION);
@@ -2264,8 +2278,9 @@ export function useTimeline(
     const key = cacheKeyRef.current;
     const cached = key ? getCachedEvents(key) : undefined;
     if (!cached || cached.length === 0) return;
-    const cursor = olderCursorRef.current;
+    const cursor = olderCursorRef.current ?? buildFallbackOlderCursor(cached, epochRef.current);
     if (!cursor) return;
+    olderCursorRef.current = cursor;
     loadingOlderRef.current = true;
     setHistoryStatus({
       phase: 'older',

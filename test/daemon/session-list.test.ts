@@ -269,6 +269,43 @@ describe('buildSessionList', () => {
     ]));
   });
 
+  it('does not surface expired resend queue entries as pending work', async () => {
+    const store = await import('../../src/store/session-store.js');
+    const { enqueueResend, RESEND_EXPIRY_MS } = await import('../../src/daemon/transport-resend-queue.js');
+    store.upsertSession({
+      name: 'deck_codex_expired_resend_brain',
+      projectName: 'demo',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'sid-expired-resend',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    enqueueResend('deck_codex_expired_resend_brain', {
+      commandId: 'cmd-expired',
+      text: 'expired queued while offline',
+      queuedAt: Date.now() - RESEND_EXPIRY_MS - 1,
+    });
+    getTransportRuntimeMock.mockReturnValue(undefined);
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    const sessions = await buildSessionList();
+
+    expect(sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'deck_codex_expired_resend_brain',
+        state: 'running',
+        transportPendingMessages: [],
+        transportPendingMessageEntries: [],
+      }),
+    ]));
+  });
+
   it('preset-backed qwen sessions surface preset model + BYO tier, dropping OAuth labels', async () => {
     const store = await import('../../src/store/session-store.js');
     // Persisted record looks like an OAuth qwen session (e.g. created before

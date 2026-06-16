@@ -31,7 +31,9 @@ import type {
 import type { MemoryContextTimelinePayload, MemoryContextTimelinePreferenceItem } from '../shared/timeline/types.js';
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from '../daemon/memory-context-timeline.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
-import { searchLocalMemorySemantic, type MemorySearchResultItem } from '../context/memory-search.js';
+import { type MemorySearchResultItem } from '../context/memory-search.js';
+import { searchLocalMemorySemanticFrontOfTurn } from '../context/memory-recall-client.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { isTemplatePrompt, isTemplateOriginSummary, isImperativeCommand } from '../../shared/template-prompt-patterns.js';
 import { applyRecallCapRule } from '../../shared/memory-scoring.js';
 import {
@@ -44,7 +46,6 @@ import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/p
 import { clampUserSessionText } from '../../shared/user-session-text-caps.js';
 import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
 import { buildTransportStartupMemory, type TransportContextBootstrap } from './runtime-context-bootstrap.js';
-import { recordMemoryHits } from '../store/context-store.js';
 import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
@@ -1045,7 +1046,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       }).authority;
       const startupMemory = isSlashControl ? null : (this._startupMemory ?? (
         !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
-          ? buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
+          ? await buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
           : null
       ));
       const memoryRecallResult = isSlashControl
@@ -1123,7 +1124,10 @@ export class TransportSessionRuntime implements SessionRuntime {
       if (dispatchResult.payload?.memoryRecall) {
         const hitIds = dispatchResult.payload.memoryRecall.items.map((item) => item.id);
         if (hitIds.length > 0) {
-          try { recordMemoryHits(hitIds); } catch { /* non-fatal */ }
+          // Best-effort hit telemetry — fire-and-forget to the worker (queues /
+          // drops when cold). Dropping a memory-hit record on a cold worker is
+          // acceptable: hot telemetry is fire-and-forget and failure is non-fatal.
+          getContextStoreClient().fireAndForget('recordMemoryHits', [hitIds]);
         }
         this.emitMemoryContextEvent(dispatchResult.payload.memoryRecall, clientMessageId);
       } else if (memoryRecallResult.statusPayload) {
@@ -1506,13 +1510,17 @@ export class TransportSessionRuntime implements SessionRuntime {
     try {
       // Broaden candidate pool — the cap rule trims to 3 (up to 5 if all
       // results are strong). See shared/memory-scoring.ts.
-      const result = await searchLocalMemorySemantic({
+      const recallQuery = {
         query,
         namespace: this._contextNamespace,
         currentEnterpriseId: this._contextNamespace?.enterpriseId,
         repo: this._contextNamespace?.projectId ?? this.resolveAuthoredContextRepository(),
         limit: 10,
-      });
+      };
+      // Front-of-turn recall runs in the context-store worker (bounded L3 RPC),
+      // off the daemon main thread. Falls back to the in-process path when the
+      // worker is not warm / unavailable so recall never blocks the turn.
+      const result = await searchLocalMemorySemanticFrontOfTurn(recallQuery);
       if (options?.isCancelled?.()) {
         logger.debug({ sessionKey: this.sessionKey, query }, 'transport message recall result ignored after timeout');
         return { artifact: null };

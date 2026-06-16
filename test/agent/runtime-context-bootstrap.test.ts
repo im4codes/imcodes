@@ -515,7 +515,7 @@ describe('resolveTransportContextBootstrap', () => {
     expect(result.startupMemory?.items.map((item) => item.id)).not.toContain('cloud-other-scope');
   });
 
-  it('buildTransportStartupMemory keeps up to 20 durable plus 30 recent memories', () => {
+  it('buildTransportStartupMemory keeps up to 20 durable plus 30 recent memories', async () => {
     const now = Date.now();
     const namespace = {
       scope: 'personal' as const,
@@ -544,7 +544,7 @@ describe('resolveTransportContextBootstrap', () => {
       });
     }
 
-    const startup = buildTransportStartupMemory(namespace);
+    const startup = await buildTransportStartupMemory(namespace);
 
     expect(startup?.items).toHaveLength(50);
     expect(startup?.items.filter((item) => item.projectionClass === 'durable_memory_candidate')).toHaveLength(20);
@@ -552,7 +552,7 @@ describe('resolveTransportContextBootstrap', () => {
     expect(startup?.items.slice(0, 20).every((item) => item.projectionClass === 'durable_memory_candidate')).toBe(true);
   });
 
-  it('buildTransportStartupMemory mixes important and recent startup memories with durable entries first', () => {
+  it('buildTransportStartupMemory mixes important and recent startup memories with durable entries first', async () => {
     const now = Date.now();
     const namespace = {
       scope: 'personal' as const,
@@ -577,7 +577,7 @@ describe('resolveTransportContextBootstrap', () => {
       updatedAt: now - 50,
     });
 
-    const startup = buildTransportStartupMemory(namespace);
+    const startup = await buildTransportStartupMemory(namespace);
 
     expect(startup?.items.map((item) => ({ summary: item.summary, projectionClass: item.projectionClass }))).toEqual([
       { summary: 'Important architecture memory', projectionClass: 'durable_memory_candidate' },
@@ -587,7 +587,7 @@ describe('resolveTransportContextBootstrap', () => {
     expect(startup?.injectedText).toContain('[recent] Recent startup memory');
   });
 
-  it('injects only active or promoted observations as a lightweight startup index', () => {
+  it('injects only active or promoted observations as a lightweight startup index', async () => {
     const namespace = {
       scope: 'personal' as const,
       projectId: 'github.com/acme/repo',
@@ -632,7 +632,7 @@ describe('resolveTransportContextBootstrap', () => {
       now: 400,
     });
 
-    const startup = buildTransportStartupMemory(namespace);
+    const startup = await buildTransportStartupMemory(namespace);
 
     expect(startup?.items).toEqual([
       expect.objectContaining({
@@ -688,7 +688,7 @@ describe('resolveTransportContextBootstrap', () => {
       }],
     }, null, 2));
 
-    const startup = buildTransportStartupMemory({
+    const startup = await buildTransportStartupMemory({
       scope: 'personal',
       projectId: 'github.com/acme/repo',
     }, { projectDir: tempProjectDir, skillsFeatureEnabled: true });
@@ -707,7 +707,7 @@ describe('resolveTransportContextBootstrap', () => {
     expect(startup?.injectedText).not.toContain('Run tests before final handoff.');
   });
 
-  it('buildTransportStartupMemory filters by full namespace instead of project id only', () => {
+  it('buildTransportStartupMemory filters by full namespace instead of project id only', async () => {
     const now = Date.now();
     writeProcessedProjection({
       namespace: {
@@ -737,12 +737,12 @@ describe('resolveTransportContextBootstrap', () => {
       updatedAt: now - 40,
     });
 
-    const personalStartup = buildTransportStartupMemory({
+    const personalStartup = await buildTransportStartupMemory({
       scope: 'personal',
       projectId: 'github.com/acme/repo',
       userId: 'user-1',
     });
-    const sharedStartup = buildTransportStartupMemory({
+    const sharedStartup = await buildTransportStartupMemory({
       scope: 'project_shared',
       projectId: 'github.com/acme/repo',
       enterpriseId: 'ent-1',

@@ -29,6 +29,7 @@ import {
   isMcpFeatureEnabled,
   type MCPFeatureFlagValues,
 } from '../../shared/memory-mcp-feature-flags.js';
+import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import { EXECUTION_CLONE_KIND, EXECUTION_CLONE_PARENT_STAGES, isExecutionCloneParentStage } from '../../shared/execution-clone.js';
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
@@ -194,6 +195,13 @@ function parseExpiresAt(value: unknown): number | null | undefined {
 
 function sanitizeCaughtError(err: unknown): ToolResult {
   return error(MCP_ERROR_REASONS.INTERNAL_ERROR, sanitizeMcpErrorMessage(err));
+}
+
+function localUnavailableToolFields(result: Pick<MemoryMcpSearchResult, 'degradedReasons'>): { reason: string; degradedReasons: string[] } {
+  const degradedReasons = result.degradedReasons && result.degradedReasons.length > 0
+    ? result.degradedReasons
+    : [MEMORY_MCP_DEGRADED_REASON.LOCAL_CONTEXT_STORE_UNAVAILABLE];
+  return { reason: degradedReasons[0] ?? MEMORY_MCP_DEGRADED_REASON.LOCAL_CONTEXT_STORE_UNAVAILABLE, degradedReasons };
 }
 
 async function refreshSendSessionStore(deps: MemoryMcpToolDeps): Promise<void> {
@@ -388,7 +396,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         const items = result.items
           .filter((item) => item.projectId === projectId)
           .map((item) => compactSearchHit(item, scopedCaller.namespace));
-        return { status: 'ok', items };
+        return {
+          status: 'ok',
+          ...(result.localUnavailable ? localUnavailableToolFields(result) : {}),
+          items,
+        };
       } catch (err) {
         return sanitizeCaughtError(err);
       }
@@ -414,7 +426,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         const items = result.items
           .filter((item) => item.projectId === projectId)
           .map((item) => compactSearchHit(item, scopedCaller.namespace));
-        return { status: 'ok', items };
+        return {
+          status: 'ok',
+          ...(result.localUnavailable ? localUnavailableToolFields(result) : {}),
+          items,
+        };
       } catch (err) {
         return sanitizeCaughtError(err);
       }
@@ -470,7 +486,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       try {
         if (observationId) {
-          return { status: 'ok', ...memoryGetSources({ observationId, kind: 'observation' }, scopedCaller) };
+          return { status: 'ok', ...(await memoryGetSources({ observationId, kind: 'observation' }, scopedCaller)) };
         }
         const result = await orchestrator(projectionId!, scopedCaller);
         if (result.status === 'error') {
@@ -486,15 +502,15 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return sanitizeCaughtError(err);
       }
     },
-    [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: (input) => {
+    [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.observationStore, MEMORY_MCP_DISABLED_FLAGS.OBSERVATION_STORE);
       if (gate) return gate;
-      return saveObservationTool(pickAllowedMcpArgs(input, ['content', 'tags', 'turnId', 'idempotencyKey']), memoryCaller()) as unknown as ToolResult;
+      return await saveObservationTool(pickAllowedMcpArgs(input, ['content', 'tags', 'turnId', 'idempotencyKey']), memoryCaller()) as unknown as ToolResult;
     },
-    [MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE]: (input) => {
+    [MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.preferences, MEMORY_MCP_DISABLED_FLAGS.PREFERENCES);
       if (gate) return gate;
-      return savePreferenceTool(pickAllowedMcpArgs(input, ['text', 'idempotencyKey']), memoryCaller()) as unknown as ToolResult;
+      return await savePreferenceTool(pickAllowedMcpArgs(input, ['text', 'idempotencyKey']), memoryCaller()) as unknown as ToolResult;
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: async (input) => {
       await refreshSendSessionStore(deps);

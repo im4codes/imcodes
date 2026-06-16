@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import { TIMELINE_HISTORY_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
-import { TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS, TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
+import { TIMELINE_CURSOR_DIRECTIONS, TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS, TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 
 import { TimelinePreferredReadError } from '../../src/daemon/timeline-store.js';
 
@@ -314,7 +314,7 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
 
     expect(readByTypesPreferredMock).toHaveBeenCalledTimes(2);
     expect(readByTypesPreferredMock.mock.calls[0][0]).toBe('deck_hist');
-    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({ limit: 2, afterTs: undefined, beforeTs: undefined });
+    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({ limit: 3, afterTs: undefined, beforeTs: undefined });
     expect(readByTypesPreferredMock.mock.calls[1][0]).toBe('deck_hist');
     expect(readByTypesPreferredMock.mock.calls[1][1]).toEqual(['session.state']);
     expect(readByTypesPreferredMock.mock.calls[1][2]).toEqual({ limit: 100, afterTs: 1009, beforeTs: undefined });
@@ -327,6 +327,40 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
       events: [
         expect.objectContaining({ eventId: 'u1' }),
         expect.objectContaining({ eventId: 's1' }),
+        expect.objectContaining({ eventId: 'a1' }),
+      ],
+    }));
+  });
+
+  it('keeps older pagination open when a sentinel content event proves more history exists', async () => {
+    readByTypesPreferredMock.mockImplementation(async (_session: string, types: string[]) => (
+      types.includes('session.state')
+        ? []
+        : [
+          { eventId: 'older-sentinel', sessionId: 'deck_more_history', ts: 900, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'older' } },
+          { eventId: 'u1', sessionId: 'deck_more_history', ts: 1000, seq: 2, epoch: 1, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'hello' } },
+          { eventId: 'a1', sessionId: 'deck_more_history', ts: 1010, seq: 3, epoch: 1, source: 'daemon', confidence: 'high', type: 'assistant.text', payload: { text: 'world', streaming: false } },
+        ]
+    ));
+
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_more_history',
+      requestId: 'hist-more',
+      limit: 2,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({ limit: 3, afterTs: undefined, beforeTs: undefined });
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: 'deck_more_history',
+      requestId: 'hist-more',
+      status: TIMELINE_RESPONSE_STATUS.OK,
+      hasMore: true,
+      nextCursor: { epoch: 99, beforeTs: 1000, direction: TIMELINE_CURSOR_DIRECTIONS.OLDER },
+      events: [
+        expect.objectContaining({ eventId: 'u1' }),
         expect.objectContaining({ eventId: 'a1' }),
       ],
     }));
@@ -400,7 +434,7 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
 
     expect(readByTypesPreferredMock).toHaveBeenCalledTimes(2);
     expect(readByTypesPreferredMock.mock.calls[0][0]).toBe('deck_state_storm');
-    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({ limit: 2, afterTs: undefined, beforeTs: undefined });
+    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({ limit: 3, afterTs: undefined, beforeTs: undefined });
     expect(readByTypesPreferredMock.mock.calls[1][0]).toBe('deck_state_storm');
     expect(readByTypesPreferredMock.mock.calls[1][1]).toEqual(['session.state']);
     expect(readByTypesPreferredMock.mock.calls[1][2]).toEqual({ limit: 100, afterTs: 1009, beforeTs: undefined });
@@ -475,7 +509,7 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     }, serverLink as any);
     await flushAsync();
 
-    expect(readByTypesPreferredMock).toHaveBeenCalledWith('deck_oc', expect.arrayContaining(['user.message', 'assistant.text']), { limit: 5, afterTs: 900, beforeTs: undefined });
+    expect(readByTypesPreferredMock).toHaveBeenCalledWith('deck_oc', expect.arrayContaining(['user.message', 'assistant.text']), { limit: 6, afterTs: 900, beforeTs: undefined });
     expect(exportOpenCodeSessionMock).toHaveBeenCalledWith('/tmp/project', 'oc-1');
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
       type: TIMELINE_MESSAGES.HISTORY,

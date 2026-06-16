@@ -190,6 +190,50 @@ describe('ChatView', () => {
     expect(screen.getByText('message-0')).toBeTruthy();
   });
 
+  it('reveals locally cached older messages at the top without preserving the previous anchor', async () => {
+    const events = Array.from({ length: CHAT_INITIAL_RENDER_ITEM_LIMIT + 10 }, (_, index) => ({
+      eventId: `user-${index}`,
+      type: 'user.message',
+      ts: 1_700_000_000_000 + index,
+      payload: { text: `message-${index}` },
+    }));
+
+    const { container } = render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_large_anchor_brain"
+      />,
+    );
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    let scrollTopValue = 0;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', {
+      configurable: true,
+      get: () => (container.textContent?.includes('message-0') ? 1800 : 1200),
+    });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 200 });
+
+    await waitFor(() => {
+      expect(scrollTopValue).toBe(1200);
+    });
+
+    scrollTopValue = 0;
+    fireEvent.wheel(scrollEl, { deltaY: -20 });
+    fireEvent.scroll(scrollEl);
+
+    expect(screen.getByText('chat.loading_older')).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.getByText('message-0')).toBeTruthy();
+    });
+    expect(scrollTopValue).toBe(0);
+  });
+
   it('collapses sent user messages longer than ten hard lines by default', () => {
     const longText = Array.from({ length: 11 }, (_, index) => `sent-line-${index + 1}`).join('\n');
 
@@ -713,6 +757,28 @@ describe('ChatView', () => {
 
     expect(container.querySelector('.chat-refreshing-spinner')).not.toBeNull();
     expect(container.querySelector('.chat-history-overlay')).not.toBeNull();
+  });
+
+  it('shows a top loading indicator while fetching older messages', () => {
+    const { container } = render(
+      <ChatView
+        events={[{
+          eventId: 'evt-1',
+          type: 'assistant.text',
+          ts: 1000,
+          payload: { text: 'hello world' },
+        }] as any}
+        loading={false}
+        loadingOlder
+        hasOlderHistory
+        onLoadOlder={vi.fn()}
+        sessionId="deck_loading_older_brain"
+      />,
+    );
+
+    expect(screen.getByRole('status').textContent).toContain('chat.loading_older');
+    expect(container.querySelector('.chat-load-older-status .chat-refreshing-spinner')).not.toBeNull();
+    expect(screen.queryByText('chat.load_older')).toBeNull();
   });
 
   it('renders history fetch progress as a bottom overlay instead of footer layout content', () => {

@@ -24,9 +24,9 @@ describe('memory-search output formats', () => {
     const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
-    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'fix the flaky CI test', createdAt: 100 });
-    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'added utimes call to set correct mtime', createdAt: 101 });
-    coordinator.ingestEvent({ target, eventType: 'decision', content: 'use HFS+ mtime workaround on macOS', createdAt: 102 });
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'fix the flaky CI test', createdAt: 100 });
+    await coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'added utimes call to set correct mtime', createdAt: 101 });
+    await coordinator.ingestEvent({ target, eventType: 'decision', content: 'use HFS+ mtime workaround on macOS', createdAt: 102 });
     await coordinator.materializeTarget(target, 'manual', 500);
     return searchLocalMemory({});
   }

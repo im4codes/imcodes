@@ -28,7 +28,8 @@ import {
 } from '../../shared/skill-store.js';
 import { skillRegistryEntryToSource } from '../../shared/skill-registry-types.js';
 import { sanitizeSkillEnvelopeContent } from '../../shared/skill-envelope.js';
-import { getProcessedProjectionById } from '../store/context-store.js';
+import type { ProcessedContextProjection } from '../../shared/context-types.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { incrementCounter } from '../util/metrics.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { getSkillRegistrySnapshot, upsertUserSkillRegistryEntry } from './skill-registry.js';
@@ -201,7 +202,12 @@ export class LocalSkillReviewWorker implements MaterializationSkillReviewSchedul
   }
 
   private async writeSkill(job: MaterializationSkillReviewJob): Promise<void> {
-    const projection = getProcessedProjectionById(job.projectionId);
+    // Read off the daemon main thread via the context-store worker when warm;
+    // falls back to the in-process read (worker not ready / test).
+    const projection = await getContextStoreClient().run<ProcessedContextProjection | undefined>(
+      'getProcessedProjectionById',
+      [job.projectionId],
+    );
     if (!projection) throw new Error(`skill review projection not found: ${job.projectionId}`);
     const candidateText = [
       '# Learned workflow',

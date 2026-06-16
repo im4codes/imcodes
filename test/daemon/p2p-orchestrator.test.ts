@@ -450,6 +450,63 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(fakeRuntime.cancel).not.toHaveBeenCalled();
   });
 
+  it('removes its queued transport prompt when a P2P hop times out before drain', async () => {
+    const pending: Array<{ clientMessageId: string; text: string }> = [];
+    const removePendingMessage = vi.fn((clientMessageId: string) => {
+      const index = pending.findIndex((entry) => entry.clientMessageId === clientMessageId);
+      if (index < 0) return null;
+      const [removed] = pending.splice(index, 1);
+      return removed;
+    });
+    const fakeRuntime = {
+      send: vi.fn((prompt: string, commandId?: string) => {
+        pending.push({ clientMessageId: commandId ?? 'missing-command-id', text: prompt });
+        return 'queued';
+      }),
+      get pendingCount() { return pending.length; },
+      pendingVersion: 1,
+      get pendingMessages() { return pending.map((entry) => entry.text); },
+      get pendingEntries() { return pending.map((entry) => ({ ...entry })); },
+      removePendingMessage,
+      drainPendingIfIdle: vi.fn().mockReturnValue(false),
+      getDiagnosticSnapshot: vi.fn().mockReturnValue({
+        status: 'thinking',
+        sending: true,
+        pendingCount: 1,
+        pendingVersion: 1,
+        activeDispatchCount: 1,
+        stalePendingRecoveryActive: false,
+        providerSessionBound: true,
+        lastActivityAt: Date.now() - 1_000,
+        lastActivityAgeMs: 1_000,
+      }),
+      cancelStaleActiveTurnWithPending: vi.fn().mockReturnValue(false),
+      cancel: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) =>
+      session === 'deck_proj_w1' ? fakeRuntime as any : undefined,
+    );
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'queued transport p2p prompt should not survive timeout',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      180,
+    );
+
+    await waitForStatus(run.id, ['completed', 'timed_out'], 3_000);
+
+    const commandId = fakeRuntime.send.mock.calls[0]?.[1];
+    expect(commandId).toMatch(new RegExp(`^p2p:${run.id}:`));
+    expect(removePendingMessage).toHaveBeenCalledWith(commandId);
+    expect(pending).toEqual([]);
+  });
+
   it('does not cancel an active P2P transport turn just because discussion output has not appeared yet', async () => {
     const cancelStaleActiveTurnWithPending = vi.fn().mockReturnValue(false);
     const fakeRuntime = {

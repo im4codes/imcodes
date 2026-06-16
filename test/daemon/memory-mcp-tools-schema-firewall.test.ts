@@ -3,6 +3,7 @@ import type { ContextNamespace } from '../../shared/context-types.js';
 import { MCP_FEATURE_FLAGS_BY_NAME } from '../../shared/memory-mcp-feature-flags.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME, type MemoryFeatureFlag } from '../../shared/feature-flags.js';
 import { MEMORY_MCP_DISABLED_FLAGS, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
+import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { resetMemoryShortRefsForTests } from '../../src/context/memory-short-ref.js';
@@ -50,7 +51,7 @@ describe('memory MCP tool schema firewall', () => {
     const listMemorySummaries = vi.fn(async () => ({
       items: [],
     }));
-    const saveObservation = vi.fn(() => ({ status: 'ok', observationId: 'obs-1', fingerprint: 'fp', state: 'candidate' }));
+    const saveObservation = vi.fn(async () => ({ status: 'ok', observationId: 'obs-1', fingerprint: 'fp', state: 'candidate' }));
     const handlers = createMemoryMcpToolHandlers(caller(), {
       searchMemory,
       listMemorySummaries,
@@ -114,7 +115,7 @@ describe('memory MCP tool schema firewall', () => {
 
   it('short-circuits memory disabled gates before backend calls', async () => {
     const searchMemory = vi.fn();
-    const savePreference = vi.fn(() => ({ status: 'ok' }));
+    const savePreference = vi.fn(async () => ({ status: 'ok' }));
     const enabled = (flag: MemoryFeatureFlag) => flag !== MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch && flag !== MEMORY_FEATURE_FLAGS_BY_NAME.preferences;
     const handlers = createMemoryMcpToolHandlers(caller(), {
       searchMemory,
@@ -132,6 +133,25 @@ describe('memory MCP tool schema firewall', () => {
     });
     expect(searchMemory).not.toHaveBeenCalled();
     expect(savePreference).not.toHaveBeenCalled();
+  });
+
+  it('surfaces the first local degraded reason instead of hardcoding context-store unavailable', async () => {
+    const searchMemory = vi.fn(async () => ({
+      items: [],
+      localUnavailable: true,
+      degradedReasons: [MEMORY_MCP_DEGRADED_REASON.SEMANTIC_EMBEDDING_UNAVAILABLE],
+    }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      searchMemory,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]({ query: 'semantic recall' })).resolves.toMatchObject({
+      status: 'ok',
+      reason: MEMORY_MCP_DEGRADED_REASON.SEMANTIC_EMBEDDING_UNAVAILABLE,
+      degradedReasons: [MEMORY_MCP_DEGRADED_REASON.SEMANTIC_EMBEDDING_UNAVAILABLE],
+      items: [],
+    });
   });
 
   it('recovers the project namespace from the stored session before searching memory', async () => {
@@ -475,7 +495,7 @@ describe('memory MCP tool schema firewall', () => {
 
   it('wraps unexpected tool exceptions as sanitized structured MCP errors', async () => {
     const handlers = createMemoryMcpToolHandlers(caller(), {
-      savePreference: vi.fn(() => {
+      savePreference: vi.fn(async () => {
         throw new Error('failed with token=secret-token and https://example.test/api/server/srv-1/cron');
       }),
       isMemoryFeatureEnabled: () => true,

@@ -70,12 +70,27 @@ export function getResendEntries(sessionName: string): ResendEntry[] {
   return [...(queues.get(sessionName) ?? [])];
 }
 
+/** Non-mutating snapshot of non-expired entries for UI / diagnostics. */
+export function getFreshResendEntries(sessionName: string, nowMs: number = Date.now()): ResendEntry[] {
+  return (queues.get(sessionName) ?? []).filter((entry) => nowMs - entry.queuedAt <= RESEND_EXPIRY_MS);
+}
+
 /** Non-mutating snapshot of every resend queue for daemon status diagnostics. */
 export function listResendQueues(): Array<{ sessionName: string; entries: ResendEntry[] }> {
   return [...queues.entries()].map(([sessionName, entries]) => ({
     sessionName,
     entries: [...entries],
   }));
+}
+
+/** Non-mutating snapshot of every queue, excluding TTL-expired zombie entries. */
+export function listFreshResendQueues(nowMs: number = Date.now()): Array<{ sessionName: string; entries: ResendEntry[] }> {
+  return [...queues.entries()]
+    .map(([sessionName, entries]) => ({
+      sessionName,
+      entries: entries.filter((entry) => nowMs - entry.queuedAt <= RESEND_EXPIRY_MS),
+    }))
+    .filter((queue) => queue.entries.length > 0);
 }
 
 /** Number of entries currently queued for a session. */

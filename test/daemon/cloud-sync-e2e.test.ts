@@ -210,7 +210,7 @@ describe('personal memory cloud sync e2e', () => {
     setReplicationState(ns1, { pendingProjectionIds: [], lastReplicatedAt: 1000 });
     setReplicationState(ns2, { pendingProjectionIds: [], lastReplicatedAt: 2000 });
 
-    const requeued = requeueAllForReplication();
+    const requeued = await requeueAllForReplication();
 
     expect(requeued).toBe(3);
     expect(getReplicationState(ns1)?.pendingProjectionIds).toEqual([p1.id]);
@@ -235,7 +235,7 @@ describe('personal memory cloud sync e2e', () => {
     expect(before.replicatedProjections).toBe(0);
 
     // Re-queue
-    requeueAllForReplication();
+    await requeueAllForReplication();
 
     // Now: both projections get sent
     const after = await replicatePendingProcessedContext(CREDS);
@@ -324,7 +324,7 @@ describe('personal memory cloud sync e2e', () => {
 
     // Toggle on + requeue (what command-handler does now)
     setContextModelRuntimeConfig({ enablePersonalMemorySync: true });
-    const requeued = requeueAllForReplication();
+    const requeued = await requeueAllForReplication();
 
     expect(requeued).toBe(2);
     expect(getReplicationState(ns)?.pendingProjectionIds).toContain(p1.id);
@@ -365,8 +365,8 @@ describe('personal memory cloud sync e2e', () => {
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
-  it('requeueAllForReplication returns 0 when no local projections exist', () => {
-    const requeued = requeueAllForReplication();
+  it('requeueAllForReplication returns 0 when no local projections exist', async () => {
+    const requeued = await requeueAllForReplication();
     expect(requeued).toBe(0);
     expect(listReplicationStates()).toEqual([]);
   });

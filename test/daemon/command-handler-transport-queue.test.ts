@@ -259,7 +259,13 @@ vi.mock('../../src/context/memory-search.js', () => ({
   searchLocalMemorySemantic: searchLocalMemorySemanticMock,
 }));
 
-vi.mock('../../src/store/context-store.js', () => ({
+// Spread the real module so the worker-client's in-process cold fallback
+// (`buildContextStoreOpHandlers`, reached via `getContextStoreClient().run(...)`
+// when no worker is spawned) can resolve every allowlisted L1 op export. The
+// asserted store functions remain mock spies; only they are dispatched by the
+// ops these tests exercise.
+vi.mock('../../src/store/context-store.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/store/context-store.js')>()),
   deleteContextObservation: deleteContextObservationMock,
   getProcessedProjectionStats: getProcessedProjectionStatsMock,
   queryPendingContextEvents: queryPendingContextEventsMock,
@@ -270,6 +276,32 @@ vi.mock('../../src/store/context-store.js', () => ({
   promoteContextObservation: promoteContextObservationMock,
   writeContextObservation: writeContextObservationMock,
 }));
+
+// Route the command handlers' context-store client through the in-process
+// op-handler map (the bounded cold fallback) instead of spawning a real
+// worker thread, so `run`/`fireAndForget` reach the mocked store spies these
+// tests assert on rather than a separate worker-thread module graph.
+vi.mock('../../src/store/context-store-worker-client.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/store/context-store-worker-client.js')>();
+  const { buildContextStoreOpHandlers } = await import('../../src/store/context-store-op-handlers.js');
+  let handlers: Map<string, (args: unknown[]) => unknown> | null = null;
+  const dispatch = (op: string, args: unknown[] = []): unknown => {
+    if (!handlers) handlers = buildContextStoreOpHandlers().handlers;
+    const handler = handlers.get(op);
+    if (!handler) throw new Error(`no in-process handler for op: ${op}`);
+    return handler(args);
+  };
+  const fakeClient = {
+    get isReady() { return false; },
+    async run(op: string, args: unknown[] = []) { return dispatch(op, args); },
+    fireAndForget(op: string, args: unknown[] = []) { dispatch(op, args); },
+    fireAndForgetCount: 0,
+  };
+  return {
+    ...actual,
+    getContextStoreClient: () => fakeClient,
+  };
+});
 
 vi.mock('../../src/util/logger.js', () => ({
   default: {

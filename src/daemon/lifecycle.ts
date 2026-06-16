@@ -43,6 +43,9 @@ import { closeLiveContextMaterializationAdmission, LiveContextIngestion } from '
 import { LocalSkillReviewWorker } from '../context/skill-review-worker.js';
 import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { pruneLocalMemory } from '../context/memory-pruning.js';
+import { backfillProjectionEmbeddings } from '../context/projection-embedding-maintenance.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import { setArchiveBackfillSchedulingEnabled } from '../store/archive-backfill-scheduling.js';
 import { getResendCount } from './transport-resend-queue.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { isTransportAgent } from '../agent/detect.js';
@@ -136,6 +139,10 @@ const STARTUP_TIMELINE_RETENTION_DELAY_MS = 120_000;
 const STARTUP_MEMORY_PRUNING_DELAY_MS = 150_000;
 const STARTUP_CONTEXT_BACKFILL_DELAY_MS = 180_000;
 const STARTUP_SESSION_DB_PUSH_DELAY_MS = 210_000;
+// Lowest-priority startup task: backfill persisted projection embeddings so the
+// L3 semantic-recall rerank reads precomputed BLOBs instead of re-embedding on
+// the hot path. Runs after everything else has settled.
+const STARTUP_EMBEDDING_BACKFILL_DELAY_MS = 240_000;
 const STARTUP_TRANSPORT_RESTORE_DELAY_MS = 45_000;
 const STARTUP_CONTEXT_BACKFILL_PAUSE_MS = 25;
 const STARTUP_CONTEXT_BACKFILL_PAUSE_EVERY = 5;
@@ -532,7 +539,19 @@ export async function startup(): Promise<DaemonContext> {
   // Archive stale local memory projections (recent_summary with no hits after 30 days)
   const runStartupMemoryPruning = async (): Promise<void> => {
     await yieldToDaemonEventLoop();
-    pruneLocalMemory();
+    // `pruneLocalMemory` already routes through the worker (in-process fallback
+    // when cold), so call it directly — no second client hop needed.
+    await pruneLocalMemory();
+  };
+
+  const runStartupEmbeddingBackfill = async (): Promise<void> => {
+    await yieldToDaemonEventLoop();
+    // One-time, low-priority, bounded backfill. Best-effort: the function never
+    // throws and quietly no-ops when the embedding model is unavailable.
+    const result = await backfillProjectionEmbeddings();
+    if (result.filled > 0 || result.remaining > 0) {
+      logger.info(result, 'projection embedding backfill completed (background)');
+    }
   };
 
   const creds = await loadCredentials();
@@ -544,6 +563,16 @@ export async function startup(): Promise<DaemonContext> {
   const serverId = creds?.serverId ?? '';
   const token = creds?.token ?? '';
   configureSharedContextRuntime(creds ? { workerUrl: workerUrl!, serverId, token } : null);
+  // Warm the context-store worker at boot so front-of-turn recall + store access
+  // run off the daemon main thread. Skipped under test (the in-process path is
+  // used there, matching the embedding engine's test behavior); recall callers
+  // fall back to in-process automatically until the worker reports ready.
+  if (!(process.env.VITEST || process.env.NODE_ENV === 'test')) {
+    getContextStoreClient().start();
+    // The worker is now the single long-lived DB owner — let it (not the
+    // main-thread connection) run the archive-backfill timer.
+    setArchiveBackfillSchedulingEnabled(false);
+  }
   if (creds) {
     try {
       const runtimeConfig = await fetchBackendSharedContextRuntimeConfig({ workerUrl: workerUrl!, serverId, token });
@@ -1124,6 +1153,11 @@ export async function startup(): Promise<DaemonContext> {
       startupBackgroundBaseDelayMs + STARTUP_SESSION_DB_PUSH_DELAY_MS,
     );
   }
+  scheduleDaemonStartupBackgroundTask(
+    'startup projection embedding backfill',
+    runStartupEmbeddingBackfill,
+    startupBackgroundBaseDelayMs + STARTUP_EMBEDDING_BACKFILL_DELAY_MS,
+  );
 
   return ctx;
 }
@@ -1513,7 +1547,10 @@ function startContextReplicationPoller(workerUrl: string | undefined, serverId: 
 
 function startContextMaterializationPoller(liveContextIngestion: LiveContextIngestion): void {
   contextMaterializationTimer = setInterval(() => {
-    void liveContextIngestion.flushDueTargets().catch((err) => {
+    void (async () => {
+      await liveContextIngestion.flushAllRetryBuffers();
+      await liveContextIngestion.flushDueTargets();
+    })().catch((err) => {
       logger.warn({ err }, 'Context materialization poll failed');
     });
   }, CONTEXT_MATERIALIZATION_POLL_MS);

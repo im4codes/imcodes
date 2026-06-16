@@ -1,6 +1,6 @@
 import type { PendingTransportMessage } from '../agent/transport-session-runtime.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
-import { getResendEntries } from './transport-resend-queue.js';
+import { getFreshResendEntries } from './transport-resend-queue.js';
 
 export interface TransportPendingMessageEntry {
   clientMessageId: string;
@@ -62,7 +62,7 @@ export function buildTransportPendingQueueSnapshot(
     };
   }
 
-  const resendEntries = getResendEntries(sessionName);
+  const resendEntries = getFreshResendEntries(sessionName);
   if (resendEntries.length > 0) {
     return {
       pendingMessages: resendEntries.map((entry) => entry.text),

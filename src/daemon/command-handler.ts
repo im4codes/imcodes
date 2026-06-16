@@ -189,24 +189,17 @@ import {
   type TransportEffortLevel,
 } from '../../shared/effort-levels.js';
 import { upsertSavedP2pConfig } from '../store/p2p-config-store.js';
-import {
-  deleteContextObservation,
-  ensureContextNamespace,
-  getProcessedProjectionStats,
-  getProcessedProjectionById,
-  listMemoryProjectSummaries,
-  listContextNamespaces,
-  listContextObservations,
-  queryPendingContextEvents,
-  promoteContextObservation,
-  queryProcessedProjections,
-  recordMemoryHits,
-  updateProcessedProjectionSummary,
-  upsertPinnedNote,
-  updateContextObservationText,
-  writeContextObservation,
-  writeProcessedProjection,
+import type {
+  ContextNamespaceRow,
+  ContextObservationRow,
+  ObservationPromotionAuditRow,
+  PinnedNote,
+  ProcessedProjectionQuery,
+  ProcessedProjectionStats,
+  ProjectionSourceRow,
+  WriteProcessedProjectionInput,
 } from '../store/context-store.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
 import {
   isKnownTestProjectName,
@@ -218,6 +211,11 @@ import {
   SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
 } from '../../shared/shared-context-runtime-config.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
+import {
+  searchLocalMemoryAuthorizedForManagement,
+  searchLocalMemorySemanticForManagement,
+  searchLocalMemorySemanticFrontOfTurn,
+} from '../context/memory-recall-client.js';
 import { getCompressionQueueState, resumeAcceptingCompression, stopAcceptingCompression } from '../context/summary-compressor.js';
 import { closeLiveContextMaterializationAdmission, reopenLiveContextMaterializationAdmission } from '../context/live-context-ingestion.js';
 import { getInflightMasterCompactionCount, resumeAcceptingMasterCompactions, stopAcceptingMasterCompactions } from './master-compaction-registry.js';
@@ -261,6 +259,7 @@ import { incrementCounter } from '../util/metrics.js';
 import { computeMemoryFingerprint } from '../../shared/memory-fingerprint.js';
 import { isMemoryScope, isOwnerPrivateMemoryScope, isSharedProjectionScope, type MemoryScope } from '../../shared/memory-scope.js';
 import { isObservationClass } from '../../shared/memory-observation.js';
+import type { ContextObservationInput } from '../../shared/memory-observation.js';
 import { SKILL_MAX_BYTES } from '../../shared/skill-envelope.js';
 import { MD_INGEST_FEATURE_FLAG } from '../../shared/md-ingest.js';
 import { MEMORY_MANAGEMENT_ERROR_CODES, type MemoryManagementErrorCode } from '../../shared/memory-management.js';
@@ -278,7 +277,13 @@ import {
   shouldHideTimelineUserMessageForSessionControl,
   shouldResetProcessPreferenceContextForSessionControl,
 } from '../../shared/session-control-commands.js';
-import type { ContextMemoryStatsView, ContextNamespace } from '../../shared/context-types.js';
+import type {
+  ContextMemoryProjectView,
+  ContextMemoryStatsView,
+  ContextNamespace,
+  ContextPendingEventView,
+  ProcessedContextProjection,
+} from '../../shared/context-types.js';
 import { publishRuntimeMemoryCacheInvalidation } from '../context/runtime-memory-cache-bus.js';
 import { assertManagedSkillPathSync, ManagedSkillPathError } from '../context/managed-skill-path.js';
 import {
@@ -446,11 +451,11 @@ function normalizeDedicatedExecutionRoutingPayload(
   };
 }
 
-function loadPreferenceProviderContext(input: {
+async function loadPreferenceProviderContext(input: {
   enabled: boolean;
   userId: string;
   currentRecords: readonly PreferenceIngestRecord[];
-}): string {
+}): Promise<string> {
   if (!input.enabled) return '';
   const records: PreferenceProviderContextRecord[] = input.currentRecords.map((record) => ({
     text: record.text,
@@ -464,10 +469,11 @@ function loadPreferenceProviderContext(input: {
     '',
   ].join('\u0000');
   try {
-    for (const observation of listContextObservations({
-      scope: PREFERENCE_INGEST_SCOPE,
-      class: PREFERENCE_INGEST_OBSERVATION_CLASS,
-    })) {
+    const observations = await getContextStoreClient().run<ContextObservationRow[]>(
+      'listContextObservations',
+      [{ scope: PREFERENCE_INGEST_SCOPE, class: PREFERENCE_INGEST_OBSERVATION_CLASS }],
+    );
+    for (const observation of observations) {
       if (observation.state !== PREFERENCE_INGEST_OBSERVATION_STATE) continue;
       const preferenceText = typeof observation.content.text === 'string'
         ? observation.content.text
@@ -496,22 +502,23 @@ function schedulePreferencePersistence(input: {
   sendOrigin: SendOrigin;
 }): void {
   if (input.records.length === 0) return;
-  setTimeout(() => {
+  setTimeout(async () => {
+    const client = getContextStoreClient();
     try {
-      const namespace = ensureContextNamespace({
-        scope: PREFERENCE_INGEST_SCOPE,
-        userId: input.userId,
-        name: 'preferences',
-      });
+      const namespace = await client.run<ContextNamespaceRow>(
+        'ensureContextNamespace',
+        [{ scope: PREFERENCE_INGEST_SCOPE, userId: input.userId, name: 'preferences' }],
+      );
       for (const record of input.records) {
-        const alreadyPersisted = listContextObservations({
-          namespaceId: namespace.id,
-          class: PREFERENCE_INGEST_OBSERVATION_CLASS,
-        }).some((observation) => (
+        const existing = await client.run<ContextObservationRow[]>(
+          'listContextObservations',
+          [{ namespaceId: namespace.id, class: PREFERENCE_INGEST_OBSERVATION_CLASS }],
+        );
+        const alreadyPersisted = existing.some((observation) => (
           observation.fingerprint === record.fingerprint
           && observation.content.idempotencyKey === record.idempotencyKey
         ));
-        writeContextObservation({
+        const observationInput: ContextObservationInput = {
           namespaceId: namespace.id,
           scope: PREFERENCE_INGEST_SCOPE,
           class: PREFERENCE_INGEST_OBSERVATION_CLASS,
@@ -527,7 +534,8 @@ function schedulePreferencePersistence(input: {
           text: record.text,
           sourceEventIds: [input.commandId],
           state: PREFERENCE_INGEST_OBSERVATION_STATE,
-        });
+        };
+        await client.run<ContextObservationRow>('writeContextObservation', [observationInput]);
         incrementCounter(alreadyPersisted ? 'mem.preferences.duplicate_ignored' : 'mem.preferences.persisted', {
           sendOrigin: input.sendOrigin,
         });
@@ -3261,7 +3269,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     incrementCounter(event.counter, { sendOrigin: event.sendOrigin });
   }
   const displayText = preferenceIngest.providerText;
-  const preferenceMessagePreamble = loadPreferenceProviderContext({
+  const preferenceMessagePreamble = await loadPreferenceProviderContext({
     enabled: preferenceFeatureEnabled,
     userId: preferenceUserId,
     currentRecords: preferenceIngest.records,
@@ -3968,7 +3976,7 @@ async function sendProcessSessionMessage(
       relatedToEventId: userEvent.eventId,
     });
     if (memoryContext.hitIds && memoryContext.hitIds.length > 0) {
-      try { recordMemoryHits(memoryContext.hitIds); } catch { /* non-fatal */ }
+      getContextStoreClient().fireAndForget('recordMemoryHits', [memoryContext.hitIds]);
     }
   }
 
@@ -4826,6 +4834,7 @@ interface TimelineHistoryBuildResult {
   payloadBytes: number;
   droppedEvents: number;
   truncatedEvents: number;
+  hasMore: boolean;
   readMs: number;
   synthesizeMs: number;
   sanitizeMs: number;
@@ -4845,6 +4854,7 @@ function timelineHistoryErrorResult(source: string, errorReason: TimelineRequest
     payloadBytes: 2,
     droppedEvents: 0,
     truncatedEvents: 0,
+    hasMore: false,
     readMs: 0,
     synthesizeMs: 0,
     sanitizeMs: 0,
@@ -4907,7 +4917,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     substantive = await timelineStore.readByTypesPreferred(
       params.sessionName,
       [...TIMELINE_HISTORY_CONTENT_TYPES],
-      { limit: params.limit, afterTs: params.afterTs, beforeTs: params.beforeTs },
+      { limit: params.limit + 1, afterTs: params.afterTs, beforeTs: params.beforeTs },
     );
   } catch (err) {
     if (err instanceof TimelinePreferredReadError) {
@@ -4936,7 +4946,8 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
 
   // Content-aware limit: session.state events don't count toward the budget.
   // This prevents idle↔running oscillation storms from crowding out user.message events.
-  const trimmedSubstantive = substantive.length > params.limit ? substantive.slice(substantive.length - params.limit) : substantive;
+  let hasMoreHistory = substantive.length > params.limit;
+  const trimmedSubstantive = hasMoreHistory ? substantive.slice(substantive.length - params.limit) : substantive;
   let trimmed: TimelineEvent[];
   if (trimmedSubstantive.length > 0 && stateEvents.length > 0) {
     const cutoffTs = trimmedSubstantive[0]!.ts;
@@ -4963,12 +4974,14 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
         const synthesized = buildTimelineEventsFromOpenCodeExport(params.sessionName, exportData, timelineEmitter.epoch)
           .filter((event) => synthesizedAfterTs === undefined || event.ts > synthesizedAfterTs)
           .filter((event) => params.beforeTs === undefined || event.ts < params.beforeTs);
-        const synthesizedTrimmed = synthesized.length > params.limit ? synthesized.slice(synthesized.length - params.limit) : synthesized;
+        const synthesizedHasMore = synthesized.length > params.limit;
+        const synthesizedTrimmed = synthesizedHasMore ? synthesized.slice(synthesized.length - params.limit) : synthesized;
         if (
           !hasSubstantiveTimelineHistory(trimmed)
           || countSubstantiveTimelineEvents(synthesizedTrimmed) > countSubstantiveTimelineEvents(trimmed)
         ) {
           trimmed = synthesizedTrimmed;
+          hasMoreHistory = synthesizedHasMore;
         }
       } catch (err) {
         logger.debug({ err, sessionHash: hashSessionName(params.sessionName), opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
@@ -4991,6 +5004,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     payloadBytes: sanitized.payloadBytes,
     droppedEvents: sanitized.droppedEvents,
     truncatedEvents: sanitized.truncatedEvents,
+    hasMore: hasMoreHistory || sanitized.droppedEvents > 0,
     readMs,
     synthesizeMs,
     sanitizeMs: Date.now() - tSanitize,
@@ -5024,6 +5038,7 @@ async function buildTimelineHistoryWithWorker(params: TimelineHistoryRequestPara
     payloadBytes: result.payloadBytes,
     droppedEvents: result.droppedEvents,
     truncatedEvents: result.truncatedEvents,
+    hasMore: result.hasMore === true || result.droppedEvents > 0,
     readMs: result.readMs,
     synthesizeMs: 0,
     sanitizeMs: result.sanitizeMs,
@@ -5071,6 +5086,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   const tStart = Date.now();
   try {
     const result = await getTimelineHistoryResult(params);
+    const hasMore = result.hasMore || result.droppedEvents > 0;
     const sent = sendTimelineMessage(serverLink, {
       type: timelineHistoryResponseTypeForRequest(cmd),
       sessionName,
@@ -5082,7 +5098,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
       source: result.source,
       payloadBytes: result.payloadBytes,
       payloadTruncated: result.droppedEvents > 0 || result.truncatedEvents > 0,
-      hasMore: result.droppedEvents > 0,
+      hasMore,
       nextCursor: buildTimelineNextCursor(result.events, timelineEmitter.epoch),
       cursorReset: result.cursorReset,
       droppedEvents: result.droppedEvents,
@@ -9725,7 +9741,7 @@ async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown
   // any that were previously "replicated" while sync was off get sent.
   if (normalized.enablePersonalMemorySync && !wasSyncEnabled) {
     const { requeueAllForReplication } = await import('../context/processed-context-replication.js');
-    requeueAllForReplication();
+    await requeueAllForReplication();
   }
 }
 
@@ -9764,14 +9780,14 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   const query = typeof cmd.query === 'string' ? cmd.query.trim() : '';
   const limit = Math.max(1, Math.min(100, typeof cmd.limit === 'number' ? cmd.limit : 20));
   const includeArchived = cmd.includeArchived === true;
-  const baseStats = getProcessedProjectionStats({
+  const baseStats = await getContextStoreClient().run<ProcessedProjectionStats>('getProcessedProjectionStats', [{
     scope: 'personal',
     userId: ownerUserId,
     includeLegacyPersonalOwner: true,
     projectId: projectId || undefined,
     projectionClass,
     includeArchived,
-  });
+  }]);
 
   let records: Array<{
     id: string;
@@ -9791,17 +9807,36 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   let matchedRecords: number;
 
   if (query) {
-    const { searchLocalMemorySemantic } = await import('../context/memory-search.js');
-    const semantic = await searchLocalMemorySemantic({
+    const semanticQuery: Parameters<typeof searchLocalMemorySemanticForManagement>[0] = {
       query,
       scope: 'personal',
       userId: ownerUserId,
       includeLegacyPersonalOwner: true,
       repo: projectId || undefined,
-      projectionClass,
+      // `projectionClass` is already validated to the 3 classes at its declaration.
+      projectionClass: projectionClass as Parameters<typeof searchLocalMemorySemanticForManagement>[0]['projectionClass'],
       limit,
       includeArchived,
-    });
+    };
+    // R5 management semantic read goes through the worker (bounded L3 RPC) too,
+    // off the daemon main thread. Unlike R1, unavailable/timeout errors are
+    // reported explicitly to the management surface instead of becoming a
+    // successful empty recall.
+    let semantic: Awaited<ReturnType<typeof searchLocalMemorySemanticForManagement>>;
+    try {
+      semantic = await searchLocalMemorySemanticForManagement(semanticQuery);
+    } catch (error) {
+      logger.warn({ error }, 'personal memory semantic query unavailable');
+      serverLink.send({
+        type: MEMORY_WS.PERSONAL_RESPONSE,
+        requestId,
+        stats: { ...baseStats, matchedRecords: 0, localUnavailable: true },
+        records: [],
+        pendingRecords: [],
+        projects: [],
+      });
+      return;
+    }
     records = semantic.items
       .filter((item) => item.type === 'processed' && item.scope === 'personal' && personalOwnerMatchesManagementUser(item.userId, ownerUserId))
       .map((item) => ({
@@ -9819,7 +9854,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
       }));
     matchedRecords = records.length;
   } else {
-    records = queryProcessedProjections({
+    const queryArgs: ProcessedProjectionQuery = {
       scope: 'personal',
       userId: ownerUserId,
       includeLegacyPersonalOwner: true,
@@ -9827,7 +9862,8 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
       projectionClass,
       limit,
       includeArchived,
-    }).map((projection) => ({
+    };
+    records = (await getContextStoreClient().run<ProcessedContextProjection[]>('queryProcessedProjections', [queryArgs])).map((projection) => ({
       id: projection.id,
       scope: projection.namespace.scope as 'personal',
       projectId: projection.namespace.projectId ?? '',
@@ -9852,22 +9888,24 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     ...baseStats,
     matchedRecords,
   };
-  const pendingRecords = queryPendingContextEvents({
-    scope: 'personal',
+  const pendingArgs = {
+    scope: 'personal' as const,
     userId: ownerUserId,
     includeLegacyPersonalOwner: true,
     projectId: projectId || undefined,
     query: query || undefined,
     limit,
-  });
-  const projects = listMemoryProjectSummaries({
+  };
+  const pendingRecords = await getContextStoreClient().run<ContextPendingEventView[]>('queryPendingContextEvents', [pendingArgs]);
+  const summaryArgs: ProcessedProjectionQuery = {
     scope: 'personal',
     userId: ownerUserId,
     includeLegacyPersonalOwner: true,
     projectId: projectId || undefined,
     projectionClass,
     includeArchived,
-  });
+  };
+  const projects = await getContextStoreClient().run<ContextMemoryProjectView[]>('listMemoryProjectSummaries', [summaryArgs]);
   serverLink.send({
     type: MEMORY_WS.PERSONAL_RESPONSE,
     requestId,
@@ -9991,8 +10029,9 @@ function preferenceOwnerFromObservation(observation: { content: Record<string, u
   return typeof parts[1] === 'string' && parts[1].trim() ? parts[1] : DAEMON_LOCAL_PREFERENCE_USER_ID;
 }
 
-function observationNamespace(namespaceId: string): ContextNamespace | undefined {
-  return listContextNamespaces().find((namespace) => namespace.id === namespaceId);
+async function observationNamespace(namespaceId: string): Promise<ContextNamespace | undefined> {
+  const namespaces = await getContextStoreClient().run<ContextNamespaceRow[]>('listContextNamespaces', []);
+  return namespaces.find((namespace) => namespace.id === namespaceId);
 }
 
 function personalOwnerMatchesManagementUser(namespaceUserId: string | undefined, ownerUserId: string): boolean {
@@ -10060,18 +10099,18 @@ async function validateProjectScopedManagementBinding(
   return { projectDir, canonicalRepoId, binding };
 }
 
-function observationVisibleToManagementContext(
+async function observationVisibleToManagementContext(
   observation: { scope: MemoryScope; namespaceId: string },
   ctx: AuthenticatedMemoryManagementContext,
-): boolean {
-  return managementContextCanAccessNamespace(observationNamespace(observation.namespaceId), ctx);
+): Promise<boolean> {
+  return managementContextCanAccessNamespace(await observationNamespace(observation.namespaceId), ctx);
 }
 
-function observationMutableByManagementContext(
+async function observationMutableByManagementContext(
   observation: { scope: MemoryScope; namespaceId: string; content: Record<string, unknown> },
   ctx: AuthenticatedMemoryManagementContext,
-): boolean {
-  const namespace = observationNamespace(observation.namespaceId);
+): Promise<boolean> {
+  const namespace = await observationNamespace(observation.namespaceId);
   if (!managementContextCanAccessNamespace(namespace, ctx)) return false;
   if (isOwnerPrivateMemoryScope(observation.scope)) return true;
   if (isSharedProjectionScope(observation.scope)) {
@@ -10519,10 +10558,10 @@ async function handleMemoryPreferencesQuery(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_RESPONSE, requestId, records: [], featureEnabled: true, ...memoryManagementContextError() });
     return;
   }
-  const records = listContextObservations({
+  const records = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [{
     scope: PREFERENCE_INGEST_SCOPE,
     class: PREFERENCE_INGEST_OBSERVATION_CLASS,
-  })
+  }]))
     .filter((observation) => observation.state === PREFERENCE_INGEST_OBSERVATION_STATE)
     .map((observation) => {
       const userId = preferenceOwnerFromObservation(observation);
@@ -10567,8 +10606,9 @@ async function handleMemoryPreferenceCreate(cmd: Record<string, unknown>, server
   try {
     const scopeKey = `${PREFERENCE_INGEST_SCOPE}:${userId}`;
     const fingerprint = computeMemoryFingerprint({ kind: 'preference', content: text, scopeKey });
-    const namespace = ensureContextNamespace({ scope: PREFERENCE_INGEST_SCOPE, userId, name: 'preferences' });
-    const row = writeContextObservation({
+    const namespaceArgs = { scope: PREFERENCE_INGEST_SCOPE, userId, name: 'preferences' };
+    const namespace = await getContextStoreClient().run<ContextNamespaceRow>('ensureContextNamespace', [namespaceArgs]);
+    const observationArgs = {
       namespaceId: namespace.id,
       scope: PREFERENCE_INGEST_SCOPE,
       class: PREFERENCE_INGEST_OBSERVATION_CLASS,
@@ -10584,7 +10624,8 @@ async function handleMemoryPreferenceCreate(cmd: Record<string, unknown>, server
       text,
       sourceEventIds: [`manual-pref:${requestId || fingerprint}`],
       state: PREFERENCE_INGEST_OBSERVATION_STATE,
-    });
+    };
+    const row = await getContextStoreClient().run<ContextObservationRow>('writeContextObservation', [observationArgs]);
     incrementCounter('mem.preferences.persisted', { sendOrigin: 'interactive_user' });
     publishRuntimeMemoryCacheInvalidation({ kind: 'preference', userId });
     serverLink.send({ type: MEMORY_WS.PREF_CREATE_RESPONSE, requestId, success: true, id: row.id });
@@ -10615,10 +10656,10 @@ async function handleMemoryPreferenceUpdate(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PREFERENCE_TEXT) });
     return;
   }
-  const existingPreference = listContextObservations({
+  const existingPreference = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [{
     scope: PREFERENCE_INGEST_SCOPE,
     class: PREFERENCE_INGEST_OBSERVATION_CLASS,
-  }).find((observation) => observation.id === id);
+  }])).find((observation) => observation.id === id);
   if (!existingPreference) {
     serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_NOT_FOUND) });
     return;
@@ -10631,7 +10672,7 @@ async function handleMemoryPreferenceUpdate(cmd: Record<string, unknown>, server
   try {
     const scopeKey = `${PREFERENCE_INGEST_SCOPE}:${ctx.userId}`;
     const fingerprint = computeMemoryFingerprint({ kind: 'preference', content: text, scopeKey });
-    const row = updateContextObservationText({
+    const updateArgs = {
       observationId: id,
       text,
       observationClass: PREFERENCE_INGEST_OBSERVATION_CLASS,
@@ -10639,7 +10680,8 @@ async function handleMemoryPreferenceUpdate(cmd: Record<string, unknown>, server
       ownerUserId: ctx.userId,
       createdByUserId: trustedRecordCreatedByUserIdFromContent(existingPreference.content, ctx.userId),
       updatedByUserId: ctx.actorId,
-    });
+    };
+    const row = await getContextStoreClient().run<ContextObservationRow | null>('updateContextObservationText', [updateArgs]);
     if (!row) {
       serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_NOT_FOUND) });
       return;
@@ -10668,10 +10710,10 @@ async function handleMemoryPreferenceDelete(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_ID) });
     return;
   }
-  const existingPreference = listContextObservations({
+  const existingPreference = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [{
     scope: PREFERENCE_INGEST_SCOPE,
     class: PREFERENCE_INGEST_OBSERVATION_CLASS,
-  }).find((observation) => observation.id === id);
+  }])).find((observation) => observation.id === id);
   if (!existingPreference) {
     serverLink.send({ type: MEMORY_WS.PREF_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_NOT_FOUND) });
     return;
@@ -10681,7 +10723,7 @@ async function handleMemoryPreferenceDelete(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_FORBIDDEN_OWNER) });
     return;
   }
-  const success = deleteContextObservation(id);
+  const success = await getContextStoreClient().run<boolean>('deleteContextObservation', [id]);
   if (success) publishRuntimeMemoryCacheInvalidation({ kind: 'preference', userId: ctx.userId });
   serverLink.send({ type: MEMORY_WS.PREF_DELETE_RESPONSE, requestId, success });
 }
@@ -10960,30 +11002,40 @@ async function handleMemoryObservationsQuery(cmd: Record<string, unknown>, serve
     return;
   }
   const limit = Math.max(1, Math.min(200, typeof cmd.limit === 'number' ? cmd.limit : 50));
-  const records = listContextObservations({
+  const observationsArgs = {
     scope,
     class: isObservationClass(observationClass) ? observationClass : undefined,
-  }).filter((observation) => observationVisibleToManagementContext(observation, ctx)).slice(0, limit).map((observation) => {
-    const namespace = observationNamespace(observation.namespaceId);
-    const ownerUserId = trustedRecordOwnerUserIdFromContent(observation.content, namespace);
-    const createdByUserId = recordCreatedByUserIdFromContent(observation.content, ownerUserId);
-    return {
-      id: observation.id,
-      scope: observation.scope,
-      class: observation.class,
-      origin: observation.origin,
-      state: observation.state,
-      ownerUserId,
-      createdByUserId,
-      updatedByUserId: recordUpdatedByUserIdFromContent(observation.content) ?? createdByUserId,
-      text: observationText(observation.content),
-      fingerprint: observation.fingerprint,
-      namespaceId: observation.namespaceId,
-      projectionId: observation.projectionId,
-      createdAt: observation.createdAt,
-      updatedAt: observation.updatedAt,
-    };
-  });
+  };
+  const client = getContextStoreClient();
+  const observations = await client.run<ContextObservationRow[]>('listContextObservations', [observationsArgs]);
+  const namespacesById = new Map<string, ContextNamespaceRow>();
+  for (const namespace of await client.run<ContextNamespaceRow[]>('listContextNamespaces', [])) {
+    namespacesById.set(namespace.id, namespace);
+  }
+  const records = observations
+    .filter((observation) => managementContextCanAccessNamespace(namespacesById.get(observation.namespaceId), ctx))
+    .slice(0, limit)
+    .map((observation) => {
+      const namespace = namespacesById.get(observation.namespaceId);
+      const ownerUserId = trustedRecordOwnerUserIdFromContent(observation.content, namespace);
+      const createdByUserId = recordCreatedByUserIdFromContent(observation.content, ownerUserId);
+      return {
+        id: observation.id,
+        scope: observation.scope,
+        class: observation.class,
+        origin: observation.origin,
+        state: observation.state,
+        ownerUserId,
+        createdByUserId,
+        updatedByUserId: recordUpdatedByUserIdFromContent(observation.content) ?? createdByUserId,
+        text: observationText(observation.content),
+        fingerprint: observation.fingerprint,
+        namespaceId: observation.namespaceId,
+        projectionId: observation.projectionId,
+        createdAt: observation.createdAt,
+        updatedAt: observation.updatedAt,
+      };
+    });
   serverLink.send({ type: MEMORY_WS.OBSERVATION_RESPONSE, requestId, records, featureEnabled: observationStoreFeatureEnabled() });
 }
 
@@ -11014,7 +11066,7 @@ async function handleMemoryObservationUpdate(cmd: Record<string, unknown>, serve
     return;
   }
   try {
-    const observation = listContextObservations().find((candidate) => candidate.id === observationId);
+    const observation = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [])).find((candidate) => candidate.id === observationId);
     if (!observation) {
       serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_NOT_FOUND) });
       return;
@@ -11023,7 +11075,7 @@ async function handleMemoryObservationUpdate(cmd: Record<string, unknown>, serve
       serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_FROM_SCOPE_MISMATCH) });
       return;
     }
-    if (!observationMutableByManagementContext(observation, ctx)) {
+    if (!(await observationMutableByManagementContext(observation, ctx))) {
       incrementCounter('mem.observation.unauthorized_promotion_attempt', { source: 'memory_management' });
       serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_MUTATION_FORBIDDEN) });
       return;
@@ -11033,9 +11085,9 @@ async function handleMemoryObservationUpdate(cmd: Record<string, unknown>, serve
       content: text,
       scopeKey: `${observation.scope}:${observation.namespaceId}`,
     });
-    const namespace = observationNamespace(observation.namespaceId);
+    const namespace = await observationNamespace(observation.namespaceId);
     const ownerUserId = trustedRecordOwnerUserIdFromContent(observation.content, namespace);
-    const row = updateContextObservationText({
+    const updateArgs = {
       observationId,
       text,
       observationClass: observation.class,
@@ -11043,7 +11095,8 @@ async function handleMemoryObservationUpdate(cmd: Record<string, unknown>, serve
       ownerUserId,
       createdByUserId: trustedRecordCreatedByUserIdFromContent(observation.content, ownerUserId),
       updatedByUserId: ctx.actorId,
-    });
+    };
+    const row = await getContextStoreClient().run<ContextObservationRow | null>('updateContextObservationText', [updateArgs]);
     if (!row) {
       serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_NOT_FOUND) });
       return;
@@ -11081,7 +11134,7 @@ async function handleMemoryObservationDelete(cmd: Record<string, unknown>, serve
     return;
   }
   try {
-    const observation = listContextObservations().find((candidate) => candidate.id === observationId);
+    const observation = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [])).find((candidate) => candidate.id === observationId);
     if (!observation) {
       serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_NOT_FOUND) });
       return;
@@ -11090,16 +11143,17 @@ async function handleMemoryObservationDelete(cmd: Record<string, unknown>, serve
       serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_FROM_SCOPE_MISMATCH) });
       return;
     }
-    if (!observationMutableByManagementContext(observation, ctx)) {
+    if (!(await observationMutableByManagementContext(observation, ctx))) {
       incrementCounter('mem.observation.unauthorized_promotion_attempt', { source: 'memory_management' });
       serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_MUTATION_FORBIDDEN) });
       return;
     }
-    const success = deleteContextObservation(observationId);
+    const success = await getContextStoreClient().run<boolean>('deleteContextObservation', [observationId]);
     if (success) {
-      publishRuntimeMemoryCacheInvalidation({ kind: 'observation', observationId, namespace: observationNamespace(observation.namespaceId) });
+      const namespace = await observationNamespace(observation.namespaceId);
+      publishRuntimeMemoryCacheInvalidation({ kind: 'observation', observationId, namespace });
       if (observation.projectionId) {
-        publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: observation.projectionId, namespace: observationNamespace(observation.namespaceId) });
+        publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: observation.projectionId, namespace });
       }
     }
     serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success });
@@ -11139,12 +11193,12 @@ async function handleMemoryObservationPromote(cmd: Record<string, unknown>, serv
   }
   const toScope = toScopeRaw;
   try {
-    const observation = listContextObservations().find((candidate) => candidate.id === observationId);
+    const observation = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [])).find((candidate) => candidate.id === observationId);
     if (!observation) {
       serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_NOT_FOUND) });
       return;
     }
-    if (!observationVisibleToManagementContext(observation, ctx)) {
+    if (!(await observationVisibleToManagementContext(observation, ctx))) {
       incrementCounter('mem.observation.unauthorized_promotion_attempt', { source: 'memory_management' });
       serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PROMOTION_REQUIRES_AUTHORIZATION) });
       return;
@@ -11163,7 +11217,8 @@ async function handleMemoryObservationPromote(cmd: Record<string, unknown>, serv
       serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_FROM_SCOPE_MISMATCH) });
       return;
     }
-    const audit = promoteContextObservation({ observationId, actorId, toScope, reason, action: 'web_ui_promote', actorRole: ctx.role, expectedFromScope });
+    const promoteArgs = { observationId, actorId, toScope, reason, action: 'web_ui_promote' as const, actorRole: ctx.role, expectedFromScope };
+    const audit = await getContextStoreClient().run<ObservationPromotionAuditRow>('promoteContextObservation', [promoteArgs]);
     publishRuntimeMemoryCacheInvalidation({ kind: 'observation', observationId });
     serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: true, audit });
   } catch (error) {
@@ -11179,7 +11234,6 @@ async function handleMemoryObservationPromote(cmd: Record<string, unknown>, serv
 }
 
 async function handleMemorySearch(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const { searchLocalMemoryAuthorized } = await import('../context/memory-search.js');
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   if (!isMemoryFeatureEnabled(MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch)) {
     serverLink.send({
@@ -11221,22 +11275,32 @@ async function handleMemorySearch(cmd: Record<string, unknown>, serverLink: Serv
   ];
   if (searchBinding.workspaceId) authorizedNamespaces.push({ scope: 'workspace_shared', workspaceId: searchBinding.workspaceId, enterpriseId: searchBinding.orgId });
   if (searchBinding.orgId) authorizedNamespaces.push({ scope: 'org_shared', enterpriseId: searchBinding.orgId });
-  const result = searchLocalMemoryAuthorized({
-    query: typeof cmd.query === 'string' ? cmd.query : undefined,
-    authorizedNamespaces,
-    projectionClass: typeof cmd.projectionClass === 'string'
-      ? cmd.projectionClass as 'recent_summary' | 'durable_memory_candidate'
-      : undefined,
-    eventType: typeof cmd.eventType === 'string' ? cmd.eventType : undefined,
-    limit: typeof cmd.limit === 'number' ? cmd.limit : 50,
-    offset: typeof cmd.offset === 'number' ? cmd.offset : 0,
-  });
-  serverLink.send({
-    type: MEMORY_WS.SEARCH_RESPONSE,
-    requestId,
-    items: result.items,
-    stats: result.stats,
-  });
+  try {
+    const result = await searchLocalMemoryAuthorizedForManagement({
+      query: typeof cmd.query === 'string' ? cmd.query : undefined,
+      authorizedNamespaces,
+      projectionClass: typeof cmd.projectionClass === 'string'
+        ? cmd.projectionClass as 'recent_summary' | 'durable_memory_candidate'
+        : undefined,
+      eventType: typeof cmd.eventType === 'string' ? cmd.eventType : undefined,
+      limit: typeof cmd.limit === 'number' ? cmd.limit : 50,
+      offset: typeof cmd.offset === 'number' ? cmd.offset : 0,
+    });
+    serverLink.send({
+      type: MEMORY_WS.SEARCH_RESPONSE,
+      requestId,
+      items: result.items,
+      stats: result.stats,
+    });
+  } catch (error) {
+    logger.warn({ error }, 'memory quick search unavailable');
+    serverLink.send({
+      type: MEMORY_WS.SEARCH_RESPONSE,
+      requestId,
+      items: [],
+      stats: { total: 0, disabled: false, localUnavailable: true },
+    });
+  }
 }
 
 async function handleMemoryArchive(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -11255,13 +11319,12 @@ async function handleMemoryArchive(cmd: Record<string, unknown>, serverLink: Ser
     serverLink.send({ type: MEMORY_WS.ARCHIVE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
     return;
   }
-  const projection = getProcessedProjectionById(id);
+  const projection = await getContextStoreClient().run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [id]);
   if (!projection || !projectionMutableByManagementContext(projection, ctx)) {
     serverLink.send({ type: MEMORY_WS.ARCHIVE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN) });
     return;
   }
-  const { archiveMemory } = await import('../store/context-store.js');
-  const success = archiveMemory(id);
+  const success = await getContextStoreClient().run<boolean>('archiveMemory', [id]);
   if (success) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: id, namespace: projection.namespace });
   serverLink.send({ type: MEMORY_WS.ARCHIVE_RESPONSE, requestId, success });
 }
@@ -11282,13 +11345,12 @@ async function handleMemoryRestore(cmd: Record<string, unknown>, serverLink: Ser
     serverLink.send({ type: MEMORY_WS.RESTORE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
     return;
   }
-  const projection = getProcessedProjectionById(id);
+  const projection = await getContextStoreClient().run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [id]);
   if (!projection || !projectionMutableByManagementContext(projection, ctx)) {
     serverLink.send({ type: MEMORY_WS.RESTORE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN) });
     return;
   }
-  const { restoreArchivedMemory } = await import('../store/context-store.js');
-  const success = restoreArchivedMemory(id);
+  const success = await getContextStoreClient().run<boolean>('restoreArchivedMemory', [id]);
   if (success) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: id, namespace: projection.namespace });
   serverLink.send({ type: MEMORY_WS.RESTORE_RESPONSE, requestId, success });
 }
@@ -11332,7 +11394,7 @@ async function handleMemoryCreate(cmd: Record<string, unknown>, serverLink: Serv
   const namespace: ContextNamespace = { scope: 'personal', projectId: canonicalRepoId, userId: ctx.userId };
   try {
     const fingerprint = computeMemoryFingerprint({ kind: 'note', content: text, scopeKey: `personal:${ctx.userId}:${canonicalRepoId}` });
-    const projection = writeProcessedProjection({
+    const writeArgs: WriteProcessedProjectionInput = {
       namespace,
       class: projectionClass,
       sourceEventIds: [`manual-memory:${requestId || fingerprint}`],
@@ -11348,7 +11410,8 @@ async function handleMemoryCreate(cmd: Record<string, unknown>, serverLink: Serv
         updatedByUserId: ctx.actorId,
       },
       origin: 'user_note',
-    });
+    };
+    const projection = await getContextStoreClient().run<ProcessedContextProjection>('writeProcessedProjection', [writeArgs]);
     publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: projection.id, namespace });
     serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: true, id: projection.id });
   } catch (error) {
@@ -11378,7 +11441,7 @@ async function handleMemoryUpdate(cmd: Record<string, unknown>, serverLink: Serv
     serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
     return;
   }
-  const projection = getProcessedProjectionById(id);
+  const projection = await getContextStoreClient().run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [id]);
   if (!projection) {
     serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MEMORY_NOT_FOUND) });
     return;
@@ -11389,13 +11452,14 @@ async function handleMemoryUpdate(cmd: Record<string, unknown>, serverLink: Serv
   }
   try {
     const ownerUserId = trustedRecordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ctx.userId;
-    const updated = updateProcessedProjectionSummary({
+    const summaryArgs = {
       projectionId: id,
       summary: text,
       ownerUserId,
       createdByUserId: trustedRecordCreatedByUserIdFromContent(projection.content, ownerUserId),
       updatedByUserId: ctx.actorId,
-    });
+    };
+    const updated = await getContextStoreClient().run<ProcessedContextProjection | null>('updateProcessedProjectionSummary', [summaryArgs]);
     if (!updated) {
       serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MEMORY_NOT_FOUND) });
       return;
@@ -11424,7 +11488,7 @@ async function handleMemoryPin(cmd: Record<string, unknown>, serverLink: ServerL
     serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
     return;
   }
-  const projection = getProcessedProjectionById(id);
+  const projection = await getContextStoreClient().run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [id]);
   if (!projection) {
     serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MEMORY_NOT_FOUND) });
     return;
@@ -11434,12 +11498,13 @@ async function handleMemoryPin(cmd: Record<string, unknown>, serverLink: ServerL
     return;
   }
   try {
-    const pinned = upsertPinnedNote({
+    const pinnedArgs = {
       id: `projection:${projection.id}`,
       namespaceKey: serializeContextNamespace(projection.namespace),
       content: projection.summary,
-      origin: 'manual_pin',
-    });
+      origin: 'manual_pin' as const,
+    };
+    const pinned = await getContextStoreClient().run<PinnedNote>('upsertPinnedNote', [pinnedArgs]);
     publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: projection.id, namespace: projection.namespace });
     serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: true, id: pinned.id });
   } catch (error) {
@@ -11491,8 +11556,7 @@ async function handleMemoryGetSourcesRequest(cmd: Record<string, unknown>, serve
   }
 
   try {
-    const { getProcessedProjectionById, listProjectionSources } = await import('../store/context-store.js');
-    const projection = getProcessedProjectionById(projectionId);
+    const projection = await getContextStoreClient().run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [projectionId]);
     if (!projection || !expectedProjectId || projection.namespace.projectId !== expectedProjectId) {
       // Isomorphic with missing/cross-project rows. The cloud route already
       // authenticates the caller, but the daemon still enforces project scope
@@ -11510,7 +11574,8 @@ async function handleMemoryGetSourcesRequest(cmd: Record<string, unknown>, serve
     }
 
     const projectionNamespaceKey = serializeContextNamespace(projection.namespace);
-    const sources = listProjectionSources(projectionId).map((source) => {
+    const projectionSources = await getContextStoreClient().run<ProjectionSourceRow[]>('listProjectionSources', [projectionId]);
+    const sources = projectionSources.map((source) => {
       // Same defense memoryGetSources applies: only surface event content
       // when the underlying event's namespace matches the projection's.
       // The daemon's SQLite is single-user, but a corrupt row from a past
@@ -11578,13 +11643,12 @@ async function handleMemoryDelete(cmd: Record<string, unknown>, serverLink: Serv
     serverLink.send({ type: MEMORY_WS.DELETE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
     return;
   }
-  const projection = getProcessedProjectionById(id);
+  const projection = await getContextStoreClient().run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [id]);
   if (!projection || !projectionMutableByManagementContext(projection, ctx)) {
     serverLink.send({ type: MEMORY_WS.DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN) });
     return;
   }
-  const { deleteMemory } = await import('../store/context-store.js');
-  const success = deleteMemory(id);
+  const success = await getContextStoreClient().run<boolean>('deleteMemory', [id]);
   if (success) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: id, namespace: projection.namespace });
   serverLink.send({ type: MEMORY_WS.DELETE_RESPONSE, requestId, success });
 }
@@ -11631,17 +11695,21 @@ async function prependLocalMemory(
     };
   }
   try {
-    const { searchLocalMemorySemantic } = await import('../context/memory-search.js');
     const recallContext = await resolveProcessRecallQueryContext(sessionName);
     // Broaden the candidate pool — the cap rule trims to 3 (or up to 5 for
     // all-strong results). We need enough candidates to survive filtering.
-    const searchResult = await searchLocalMemorySemantic({
+    const recallQuery = {
       query,
       namespace: recallContext.namespace,
       currentEnterpriseId: recallContext.currentEnterpriseId,
       repo: recallContext.repo,
       limit: 10,
-    });
+    };
+    // Front-of-turn recall for PROCESS sessions runs in the context-store worker
+    // (bounded L3 RPC), off the daemon main thread — same as the transport path
+    // (Req "Bounded front-of-turn L3 recall"). In-process fallback only when the
+    // worker is not warm / unavailable, so recall never blocks the turn.
+    const searchResult = await searchLocalMemorySemanticFrontOfTurn(recallQuery);
     if (typeof options?.deadlineAt === 'number' && Date.now() > options.deadlineAt) {
       return {
         text: prompt,

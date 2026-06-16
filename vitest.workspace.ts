@@ -8,6 +8,17 @@ export default defineWorkspace([
       exclude: ['test/e2e/**', 'test/**/*.integration.test.ts', '**/node_modules/**'],
       environment: 'node',
       globals: false,
+      // The context-store-worker-isolation change adds real-Worker-thread tests
+      // (context-store-worker / context-store-production-owner / memory-recall-l3-*
+      // / materialization warm-worker e2e) that spawn threads + do real SQLite work,
+      // raising the suite's steady-state CPU contention. Under full-suite parallel
+      // load that contention can starve slow-but-correct tests (multi-MB JSONL
+      // replay, stdio MCP server, etc.) past vitest's tight 5000ms default — they
+      // pass in isolation but intermittently time out in the full run. A
+      // contention-tolerant default keeps parallel-load starvation from failing a
+      // correct test while genuine hangs (>>20s) still fail. Heavy real-worker
+      // cases keep their explicit per-test overrides (20_000/30_000), which win.
+      testTimeout: 20000,
     },
   },
   './web/vitest.config.ts',

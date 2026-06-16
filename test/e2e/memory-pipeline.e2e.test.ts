@@ -85,7 +85,7 @@ describe('memory pipeline e2e', () => {
       const id = `evt-e2e-${i}`;
       const content = `记忆 pipeline original content ${i}`;
       original.set(id, content);
-      coordinator.ingestEvent({ id, target, eventType: i % 2 === 0 ? 'user.message' : 'assistant.text', content, createdAt: 100 + i });
+      await coordinator.ingestEvent({ id, target, eventType: i % 2 === 0 ? 'user.message' : 'assistant.text', content, createdAt: 100 + i });
     }
 
     const first = await coordinator.materializeTarget(target, 'manual', 1000);
@@ -95,15 +95,15 @@ describe('memory pipeline e2e', () => {
     expect(listContextEvents(target)).toEqual([]);
 
     for (const id of projection.sourceEventIds) {
-      expect(chatGetEvent(id, bobCaller)?.content).toBe(original.get(id));
+      expect((await chatGetEvent(id, bobCaller))?.content).toBe(original.get(id));
     }
-    const sources = memoryGetSources(projection.id, bobCaller);
+    const sources = await memoryGetSources(projection.id, bobCaller);
     expect(sources.sourceEventCount).toBe(12);
     expect(sources.sources).toHaveLength(12);
-    expect(chatSearchFts('记忆', 20, bobCaller).map((row) => row.id)).toContain('evt-e2e-0');
+    expect((await chatSearchFts('记忆', 20, bobCaller)).map((row) => row.id)).toContain('evt-e2e-0');
 
     for (let i = 12; i < 16; i += 1) {
-      coordinator.ingestEvent({ id: `evt-e2e-${i}`, target, eventType: 'assistant.text', content: `overlap source ${i}`, createdAt: 200 + i });
+      await coordinator.ingestEvent({ id: `evt-e2e-${i}`, target, eventType: 'assistant.text', content: `overlap source ${i}`, createdAt: 200 + i });
     }
     const second = await coordinator.materializeTarget(target, 'manual', 2000);
     expect(second.summaryProjection?.id).toBe(projection.id);
@@ -119,6 +119,6 @@ describe('memory pipeline e2e', () => {
     expect(getArchivedEvent('evt-e2e-0')?.content).toBe(original.get('evt-e2e-0'));
     expect(getArchivedEvent('evt-e2e-uncited')).toBeUndefined();
 
-    expect(() => chatGetEvent('evt-e2e-0', createMemoryToolCaller({ userId: 'alice', namespace: { ...namespace, userId: 'alice' } }))).toThrow(/private|originating|bound/i);
+    await expect(chatGetEvent('evt-e2e-0', createMemoryToolCaller({ userId: 'alice', namespace: { ...namespace, userId: 'alice' } }))).rejects.toThrow(/private|originating|bound/i);
   });
 });

@@ -111,6 +111,7 @@ import ruLocale from '../../web/src/i18n/locales/ru.json' with { type: 'json' };
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { getFreshResendEntries, removeResendEntries } from './transport-resend-queue.js';
 import {
   evaluateP2pLaunchAdmission,
   sanitizeP2pLaunchOriginForProjection,
@@ -971,30 +972,129 @@ async function dispatchP2pPromptToSession(args: {
   prompt: string;
   allowDuplicate?: boolean;
   reason: string;
-}): Promise<'sent' | 'queued' | 'tmux'> {
+}): Promise<P2pPromptDispatchResult> {
   const transportRuntime = await getOrRestoreP2pTransportRuntime(args.session);
   if (transportRuntime) {
-    timelineEmitter.emit(args.session, 'user.message', {
-      text: args.prompt,
-      ...(args.allowDuplicate ? { allowDuplicate: true } : {}),
-      memoryExcluded: true,
-      p2pRunId: args.run.id,
-      p2pDiscussionId: args.run.discussionId,
-      p2pPhase: args.run.activePhase,
-    });
-    const result = transportRuntime.send(args.prompt);
+    const commandId = buildP2pPromptCommandId(args.run, args.session, args.reason);
+    const result = transportRuntime.send(args.prompt, commandId);
+    if (result === 'sent') {
+      timelineEmitter.emit(args.session, 'user.message', {
+        text: args.prompt,
+        commandId,
+        clientMessageId: commandId,
+        ...(args.allowDuplicate ? { allowDuplicate: true } : {}),
+        memoryExcluded: true,
+        p2pRunId: args.run.id,
+        p2pDiscussionId: args.run.discussionId,
+        p2pPhase: args.run.activePhase,
+      }, { source: 'daemon', confidence: 'high', eventId: `p2p-user:${commandId}` });
+    }
     if (result === 'queued') {
       emitP2pTransportQueuedState(args.run, args.session, transportRuntime, args.reason);
       transportRuntime.drainPendingIfIdle(`p2p-${args.reason}-post-send`);
     }
-    return result;
+    return { mode: result, commandId };
   }
   const record = getSession(args.session);
   if (record?.runtimeType === 'transport') {
     throw new Error(`missing_transport_runtime:${args.session}`);
   }
   await sendKeysDelayedEnter(args.session, args.prompt);
-  return 'tmux';
+  return { mode: 'tmux' };
+}
+
+interface P2pPromptDispatchResult {
+  mode: 'sent' | 'queued' | 'tmux';
+  commandId?: string;
+}
+
+function p2pCommandIdPrefix(run: P2pRun): string {
+  return `p2p:${run.id}:`;
+}
+
+function sanitizeP2pCommandSegment(value: string): string {
+  const sanitized = value.replace(/[^a-zA-Z0-9_.-]+/g, '_').replace(/^_+|_+$/g, '');
+  return (sanitized || 'prompt').slice(0, 80);
+}
+
+function buildP2pPromptCommandId(run: P2pRun, session: string, reason: string): string {
+  return [
+    p2pCommandIdPrefix(run),
+    sanitizeP2pCommandSegment(reason),
+    sanitizeP2pCommandSegment(session),
+    `r${Math.max(1, run.currentRound)}`,
+    sanitizeP2pCommandSegment(run.activePhase ?? 'phase'),
+    randomUUID().slice(0, 8),
+  ].join(':');
+}
+
+function isP2pRunPromptEntry(run: P2pRun, entry: { clientMessageId?: string; commandId?: string; text?: string }): boolean {
+  const id = entry.clientMessageId ?? entry.commandId ?? '';
+  if (id.startsWith(p2pCommandIdPrefix(run))) return true;
+  return typeof entry.text === 'string' && entry.text.includes(`[P2P Discussion Task — run ${run.id}]`);
+}
+
+function emitP2pQueueSnapshot(session: string, runtime: ReturnType<typeof getTransportRuntime> | undefined): void {
+  const resendEntries = runtime ? [] : getFreshResendEntries(session);
+  timelineEmitter.emit(session, 'session.state', {
+    state: runtime?.pendingCount || resendEntries.length > 0 ? 'queued' : 'idle',
+    pendingCount: runtime?.pendingCount ?? resendEntries.length,
+    pendingMessages: runtime?.pendingMessages ?? resendEntries.map((entry) => entry.text),
+    pendingMessageEntries: runtime?.pendingEntries ?? resendEntries.map((entry) => ({
+      clientMessageId: entry.commandId,
+      text: entry.text,
+      ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+    })),
+    ...(typeof runtime?.pendingVersion === 'number' ? { pendingMessageVersion: runtime.pendingVersion } : {}),
+  }, { source: 'daemon', confidence: 'high' });
+}
+
+function purgeQueuedP2pPromptByCommandId(run: P2pRun, session: string, commandId: string | undefined, reason: string): void {
+  if (!commandId) return;
+  const runtime = getTransportRuntime(session);
+  let runtimeRemoved = 0;
+  if (typeof runtime?.removePendingMessage === 'function' && runtime.removePendingMessage(commandId)) {
+    runtimeRemoved = 1;
+  }
+  const resendRemoved = removeResendEntries(session, (entry) => entry.commandId === commandId);
+  if (runtimeRemoved + resendRemoved === 0) return;
+  emitP2pQueueSnapshot(session, runtime);
+  logger.warn({ runId: run.id, session, commandId, reason, runtimeRemoved, resendRemoved }, 'P2P: dropped stale queued prompt');
+}
+
+function purgeQueuedP2pPrompts(run: P2pRun, reason: string): void {
+  const sessions = new Set<string>([
+    run.initiatorSession,
+    run.currentTargetSession ?? '',
+    ...run.activeTargetSessions,
+    ...run.allTargets.map((target) => target.session),
+  ].filter(Boolean));
+
+  for (const session of sessions) {
+    const runtime = getTransportRuntime(session);
+    let runtimeRemoved = 0;
+    const runtimeWithBulkPurge = runtime as (typeof runtime & {
+      removePendingMessagesByCommandIdPrefix?: (prefix: string) => unknown[];
+    });
+    if (typeof runtimeWithBulkPurge?.removePendingMessagesByCommandIdPrefix === 'function') {
+      runtimeRemoved += runtimeWithBulkPurge.removePendingMessagesByCommandIdPrefix(p2pCommandIdPrefix(run)).length;
+    }
+    if (Array.isArray(runtime?.pendingEntries) && typeof runtime?.removePendingMessage === 'function') {
+      for (const entry of runtime.pendingEntries) {
+        if (isP2pRunPromptEntry(run, entry) && runtime.removePendingMessage(entry.clientMessageId)) {
+          runtimeRemoved += 1;
+        }
+      }
+    }
+
+    const resendRemoved = removeResendEntries(session, (entry) => isP2pRunPromptEntry(run, {
+      commandId: entry.commandId,
+      text: entry.text,
+    }));
+    if (runtimeRemoved + resendRemoved === 0) continue;
+    emitP2pQueueSnapshot(session, runtime);
+    logger.warn({ runId: run.id, session, reason, runtimeRemoved, resendRemoved }, 'P2P: dropped stale queued prompts for terminal run');
+  }
 }
 
 async function getOrRestoreP2pTransportRuntime(sessionName: string): Promise<ReturnType<typeof getTransportRuntime>> {
@@ -4135,6 +4235,7 @@ async function dispatchHop(
     let sizeBefore = 0;
     try { sizeBefore = (await stat(watchPath)).size; } catch {}
     let queuedDispatch = false;
+    let queuedCommandId: string | undefined;
 
     try {
       const dispatchResult = await dispatchP2pPromptToSession({
@@ -4143,7 +4244,8 @@ async function dispatchHop(
         prompt,
         reason: sectionHeader ? 'discussion_section_prompt' : 'discussion_prompt',
       });
-      queuedDispatch = dispatchResult === 'queued';
+      queuedDispatch = dispatchResult.mode === 'queued';
+      queuedCommandId = dispatchResult.commandId;
     } catch (err) {
       if (attempt < MAX_RETRIES) {
         logger.warn({ runId: run.id, session, attempt }, 'P2P: dispatch failed, will retry');
@@ -4400,6 +4502,9 @@ async function dispatchHop(
     }
 
     logger.warn({ runId: run.id, session }, 'P2P: hop timed out');
+    if (queuedDispatch) {
+      purgeQueuedP2pPromptByCommandId(run, session, queuedCommandId, 'hop_timeout');
+    }
     await finishHop('timed_out', 'timed_out');
     if (required) failRun(run, 'timed_out', session, serverLink);
     else pushState(run, serverLink);
@@ -4572,6 +4677,7 @@ function transition(run: P2pRun, status: P2pRunStatus, serverLink: ServerLink | 
   }
   if (P2P_TERMINAL_RUN_STATUSES.has(status)) {
     run.completedAt = run.completedAt ?? new Date().toISOString();
+    purgeQueuedP2pPrompts(run, `terminal_${status}`);
     if (run.advancedP2pEnabled) {
       void cleanupRoundHopArtifacts(run.hopStates);
     } else {
@@ -4596,6 +4702,7 @@ function failRun(run: P2pRun, errorType: string, message: string, serverLink: Se
   if (run.activePhase === 'summary') {
     run.summaryPhase = 'failed';
   }
+  purgeQueuedP2pPrompts(run, `${status}_${errorType}`);
   if (run.advancedP2pEnabled) {
     void cleanupRoundHopArtifacts(run.hopStates);
   } else {

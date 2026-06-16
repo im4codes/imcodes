@@ -1,8 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   enqueueResend,
+  getFreshResendEntries,
   getResendEntries,
   getResendCount,
+  listFreshResendQueues,
   listResendQueues,
   clearResend,
   clearAllResend,
@@ -46,6 +48,18 @@ describe('transport-resend-queue', () => {
 
     expect(getResendEntries('alpha').map((entry) => entry.commandId)).toEqual(['ca']);
     expect(getResendEntries('beta').map((entry) => entry.commandId)).toEqual(['cb']);
+  });
+
+  it('fresh snapshots hide TTL-expired resend entries without mutating the queue', () => {
+    const now = Date.now();
+    enqueueResend('s1', { text: 'expired', commandId: 'c-expired', queuedAt: now - RESEND_EXPIRY_MS - 1 });
+    enqueueResend('s1', { text: 'fresh', commandId: 'c-fresh', queuedAt: now });
+    enqueueResend('s2', { text: 'also expired', commandId: 'c-expired-2', queuedAt: now - RESEND_EXPIRY_MS - 1 });
+
+    expect(getFreshResendEntries('s1', now).map((entry) => entry.commandId)).toEqual(['c-fresh']);
+    expect(listFreshResendQueues(now).map((queue) => queue.sessionName)).toEqual(['s1']);
+    expect(getResendEntries('s1').map((entry) => entry.commandId)).toEqual(['c-expired', 'c-fresh']);
+    expect(getResendCount('s2')).toBe(1);
   });
 
   it('drops the oldest entry once MAX_RESEND_ENTRIES is exceeded', () => {

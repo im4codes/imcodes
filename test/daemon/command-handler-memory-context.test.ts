@@ -31,6 +31,7 @@ const {
   upsertPinnedNoteMock,
   deleteMemoryMock,
   listSessionsMock,
+  recallClientControl,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
@@ -55,6 +56,11 @@ const {
   upsertPinnedNoteMock: vi.fn(),
   deleteMemoryMock: vi.fn(),
   listSessionsMock: vi.fn(() => []),
+  // Controls the fake context-store client's production-owner mode. Default
+  // false → the recall façades take the in-process fallback (this suite's
+  // existing expectations). One test flips it true to exercise the owner-mode
+  // bounded-empty path (no in-process recall).
+  recallClientControl: { isProductionOwner: false },
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -65,10 +71,15 @@ vi.mock('../../src/store/session-store.js', () => ({
 }));
 
 
-vi.mock('../../src/store/context-store.js', () => ({
+// Spread the real module so the worker-client's in-process cold fallback
+// (`buildContextStoreOpHandlers`, which the command handlers now reach via
+// `getContextStoreClient().run(...)` when no worker is spawned) can resolve
+// every allowlisted L1 op export. The asserted store functions remain mock
+// spies; only they are dispatched by the ops these tests exercise.
+vi.mock('../../src/store/context-store.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/store/context-store.js')>()),
   deleteContextObservation: deleteContextObservationMock,
   ensureContextNamespace: vi.fn(),
-  LEGACY_DAEMON_LOCAL_USER_ID: 'daemon-local',
   getProcessedProjectionStats: getProcessedProjectionStatsMock,
   getProcessedProjectionById: getProcessedProjectionByIdMock,
   listMemoryProjectSummaries: listMemoryProjectSummariesMock,
@@ -87,6 +98,39 @@ vi.mock('../../src/store/context-store.js', () => ({
   deleteMemory: deleteMemoryMock,
   writeContextObservation: vi.fn(),
 }));
+
+// Route the command handlers' context-store client through the in-process
+// op-handler map (the bounded cold fallback) instead of spawning a real
+// worker thread. `run` already cold-falls-back this way; this also makes
+// `fireAndForget` (e.g. recordMemoryHits) dispatch in-process so it reaches
+// the mocked store spies these tests assert on, rather than a separate
+// worker-thread module graph the mocks don't touch.
+vi.mock('../../src/store/context-store-worker-client.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/store/context-store-worker-client.js')>();
+  const { buildContextStoreOpHandlers } = await import('../../src/store/context-store-op-handlers.js');
+  let handlers: Map<string, (args: unknown[]) => unknown> | null = null;
+  const dispatch = (op: string, args: unknown[] = []): unknown => {
+    if (!handlers) handlers = buildContextStoreOpHandlers().handlers;
+    const handler = handlers.get(op);
+    if (!handler) throw new Error(`no in-process handler for op: ${op}`);
+    return handler(args);
+  };
+  const fakeClient = {
+    get isReady() { return false; },
+    // !started (default) branch: the front-of-turn recall façades take the
+    // in-process fallback (the sync `searchLocalMemorySemanticMock` this suite
+    // asserts on). When `recallClientControl.isProductionOwner` is flipped true,
+    // the façades return bounded empty WITHOUT calling the in-process reader.
+    get isProductionOwner() { return recallClientControl.isProductionOwner; },
+    async run(op: string, args: unknown[] = []) { return dispatch(op, args); },
+    fireAndForget(op: string, args: unknown[] = []) { dispatch(op, args); },
+    fireAndForgetCount: 0,
+  };
+  return {
+    ...actual,
+    getContextStoreClient: () => fakeClient,
+  };
+});
 
 vi.mock('../../src/agent/session-manager.js', () => ({
   startProject: vi.fn(),
@@ -199,6 +243,22 @@ vi.mock('../../src/context/memory-search.js', () => ({
   searchLocalMemorySemantic: searchLocalMemorySemanticMock,
 }));
 
+
+vi.mock('../../src/context/memory-recall-client.js', () => ({
+  searchLocalMemorySemanticFrontOfTurn: vi.fn(async (query) => {
+    if (recallClientControl.isProductionOwner) {
+      return {
+        items: [],
+        stats: { totalRecords: 0, matchedRecords: 0, recentSummaryCount: 0, durableCandidateCount: 0, projectCount: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 },
+      };
+    }
+    return searchLocalMemorySemanticMock(query);
+  }),
+  searchLocalMemoryForManagement: vi.fn(async (query) => searchLocalMemorySemanticMock(query)),
+  searchLocalMemorySemanticForManagement: vi.fn(async (query) => searchLocalMemorySemanticMock(query)),
+  searchLocalMemoryAuthorizedForManagement: vi.fn(async (query) => searchLocalMemorySemanticMock(query)),
+}));
+
 vi.mock('../../src/repo/detector.js', () => ({
   detectRepo: detectRepoMock,
   parseRemoteUrl: vi.fn((url: string) => {
@@ -264,6 +324,7 @@ describe('handleWebCommand memory context timeline', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    recallClientControl.isProductionOwner = false; // default tests/CLI path
     process.env.IMCODES_MEMORY_FEATURE_CONFIG_PATH = join(tmpdir(), `imcodes-memory-feature-${process.pid}-${Date.now()}-${Math.random()}.json`);
     process.env.IMCODES_MEM_FEATURE_NAMESPACE_REGISTRY = 'true';
     process.env.IMCODES_MEM_FEATURE_OBSERVATION_STORE = 'true';
@@ -1255,6 +1316,52 @@ describe('handleWebCommand memory context timeline', () => {
     expect(response?.records).toHaveLength(1);
   });
 
+  it('returns explicit localUnavailable response when personal semantic management search degrades', async () => {
+    getProcessedProjectionStatsMock.mockReturnValue({
+      totalRecords: 2,
+      matchedRecords: 2,
+      recentSummaryCount: 2,
+      durableCandidateCount: 0,
+      projectCount: 1,
+      stagedEventCount: 0,
+      dirtyTargetCount: 0,
+      pendingJobCount: 0,
+    });
+    searchLocalMemorySemanticMock.mockRejectedValueOnce(new Error('context-store worker unavailable'));
+
+    handleWebCommand({
+      type: MEMORY_WS.PERSONAL_QUERY,
+      requestId: 'personal-search-degraded',
+      canonicalRepoId: 'github.com/acme/repo',
+      query: 'matching',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-bob',
+        userId: 'user-bob',
+        role: 'user',
+        source: 'server_bridge',
+        requestId: 'personal-search-degraded',
+        boundProjects: [{ canonicalRepoId: 'github.com/acme/repo' }],
+      },
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.PERSONAL_RESPONSE,
+      requestId: 'personal-search-degraded',
+      records: [],
+      pendingRecords: [],
+      projects: [],
+      stats: expect.objectContaining({
+        totalRecords: 2,
+        matchedRecords: 0,
+        localUnavailable: true,
+      }),
+    }));
+    expect(queryPendingContextEventsMock).not.toHaveBeenCalled();
+    expect(listMemoryProjectSummariesMock).not.toHaveBeenCalled();
+  });
+
   it('emits a linked memory.context event for injected related history', async () => {
     handleWebCommand({
       type: 'session.send',
@@ -1432,6 +1539,63 @@ describe('handleWebCommand memory context timeline', () => {
       }),
     );
     expect(recordMemoryHitsMock).not.toHaveBeenCalled();
+  });
+
+  it('returns empty process recall in production-owner mode without running the in-process semantic reader', async () => {
+    // Production single-owner mode + worker not warm: the front-of-turn façade
+    // returns bounded empty rather than opening a main-thread in-process reader.
+    recallClientControl.isProductionOwner = true;
+    // Make the in-process mock conspicuous: if it were (incorrectly) called, it
+    // would surface a match and emit `status: 'matched'` + record a hit.
+    searchLocalMemorySemanticMock.mockResolvedValue({
+      items: [{
+        id: 'must-not-appear',
+        type: 'processed',
+        projectId: 'codedeck',
+        scope: 'personal',
+        summary: 'In-process read must not run in owner mode',
+        createdAt: 1,
+        relevanceScore: 0.99,
+      }],
+      stats: {
+        totalRecords: 1,
+        matchedRecords: 1,
+        recentSummaryCount: 1,
+        durableCandidateCount: 0,
+        projectCount: 1,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
+      },
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Investigate websocket reconnect behavior in production owner mode',
+      commandId: 'cmd-memory-owner-empty',
+    }, serverLink as any);
+
+    await flushAsync();
+
+    // The owner-mode façade short-circuits to empty: the in-process reader is
+    // never touched, no hit is recorded, and the original prompt is sent as-is.
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    expect(recordMemoryHitsMock).not.toHaveBeenCalled();
+    expect(sendKeysDelayedEnterMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      'Investigate websocket reconnect behavior in production owner mode',
+      undefined,
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      'memory.context',
+      expect.objectContaining({
+        relatedToEventId: 'evt-user-1',
+        status: 'no_matches',
+        items: [],
+      }),
+    );
   });
 
   it('emits a recently-injected status when matches were found but all were filtered by recency', async () => {

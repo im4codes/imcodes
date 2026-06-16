@@ -1,6 +1,6 @@
 import { lstat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { ContextNamespace } from '../../shared/context-types.js';
+import type { ContextNamespace, ProcessedContextProjection } from '../../shared/context-types.js';
 import type { MemoryScope } from '../../shared/memory-scope.js';
 import {
   MD_INGEST_FEATURE_FLAG,
@@ -20,7 +20,8 @@ import {
   getPersistedMemoryFeatureFlagValues,
   getRuntimeMemoryFeatureFlagValues,
 } from '../store/memory-feature-config-store.js';
-import { writeProcessedProjection } from '../store/context-store.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import { ensureProjectionEmbeddingForProjection } from './projection-embedding-maintenance.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { serializeContextNamespace } from './context-keys.js';
@@ -99,10 +100,10 @@ export async function runMarkdownMemoryIngest(input: {
         isSymlink: stat.isSymbolicLink(),
       });
       for (const section of result.sections) {
-        writeProcessedProjection({
+        const projectionInput = {
           id: `md-ingest:${scopeKey}:${relativePath}:${section.fingerprint}`,
           namespace,
-          class: 'durable_memory_candidate',
+          class: 'durable_memory_candidate' as const,
           sourceEventIds: [`md-ingest:${relativePath}:${section.fingerprint}`],
           summary: section.text,
           content: {
@@ -118,7 +119,15 @@ export async function runMarkdownMemoryIngest(input: {
           origin: MD_INGEST_ORIGIN,
           createdAt: input.now,
           updatedAt: input.now,
-        });
+        };
+        // Off the daemon main thread via the context-store worker when warm;
+        // falls back to the in-process write (worker not ready / test).
+        const projection = await getContextStoreClient().run<ProcessedContextProjection>(
+          'writeProcessedProjection',
+          [projectionInput],
+        );
+        // Best-effort write-time embedding so recall reads a precomputed BLOB.
+        void ensureProjectionEmbeddingForProjection(projection);
         observationsWritten += 1;
       }
     } catch (error) {

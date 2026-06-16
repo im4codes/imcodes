@@ -57,8 +57,8 @@ describe('MaterializationCoordinator retry behavior', () => {
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
 
-    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'do stuff', createdAt: 100 });
-    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'done', createdAt: 101 });
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'do stuff', createdAt: 100 });
+    await coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'done', createdAt: 101 });
     await coordinator.materializeTarget(target, 'manual', 500);
 
     // Raw events should STILL exist (kept for retry)
@@ -79,8 +79,8 @@ describe('MaterializationCoordinator retry behavior', () => {
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200, minIntervalMs: 0 },
     });
 
-    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'fix the bug', createdAt: 100 });
-    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'fixed it', createdAt: 101 });
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'fix the bug', createdAt: 100 });
+    await coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'fixed it', createdAt: 101 });
 
     // Attempt 1: fails — no projection written, raw events kept
     await coordinator.materializeTarget(target, 'manual', 200);
@@ -111,8 +111,8 @@ describe('MaterializationCoordinator retry behavior', () => {
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200, minIntervalMs: 0 },
     });
 
-    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'keep trying', createdAt: 100 });
-    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'ok', createdAt: 101 });
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'keep trying', createdAt: 100 });
+    await coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'ok', createdAt: 101 });
 
     // Round-2 audit (0699ea64-3e6 finding android#1): the comparison
     // `priorFailures >= MAX_SDK_RETRY_ATTEMPTS` used to NOT count the
@@ -167,8 +167,8 @@ describe('MaterializationCoordinator retry behavior', () => {
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200, minIntervalMs: 0 },
     });
 
-    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'first ask', createdAt: 100 });
-    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'first reply', createdAt: 101 });
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'first ask', createdAt: 100 });
+    await coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'first reply', createdAt: 101 });
     await coordinator.materializeTarget(target, 'manual', 200);
 
     let projections = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId });
@@ -178,8 +178,8 @@ describe('MaterializationCoordinator retry behavior', () => {
     // Second batch: backend goes down for good. Run through the whole retry
     // budget + abandonment.
     forceFail = true;
-    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'second ask', createdAt: 300 });
-    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'second reply', createdAt: 301 });
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'second ask', createdAt: 300 });
+    await coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'second reply', createdAt: 301 });
     await coordinator.materializeTarget(target, 'manual', 400);
     await coordinator.materializeTarget(target, 'schedule', 500);
     await coordinator.materializeTarget(target, 'schedule', 600);

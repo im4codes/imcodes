@@ -171,6 +171,20 @@ function codexRunForSession(sessionName: string, mode?: 'start' | 'resume') {
   });
 }
 
+/** Poll until the codex run for this session/mode is registered (or 5s elapses),
+ *  so a single `flush()` can't be starved past the assertion under full-suite CPU
+ *  contention (real context-store Worker threads delay setTimeout(0) macrotasks).
+ *  Preserves the original initial flush, then keeps flushing ONLY if the async
+ *  send→provider→run-registration chain hasn't completed yet — uncontended runs
+ *  are unchanged (the run is present after the first flush, the loop exits at once). */
+async function settleCodexRun(sessionName: string, mode: 'start' | 'resume') {
+  await flush();
+  const deadline = Date.now() + 5_000;
+  while (!codexRunForSession(sessionName, mode) && Date.now() < deadline) {
+    await flush();
+  }
+}
+
 describe('sdk transport session restore', () => {
   let tempDir: string;
 
@@ -448,7 +462,7 @@ describe('sdk transport session restore', () => {
     expect(runtime?.providerSessionId).toBe('route-cx-restore');
 
     runtime!.send('What token did I ask you to remember?');
-    await flush();
+    await settleCodexRun('deck_sdk_cx_brain', 'resume');
 
     expect(codexRunForSession('deck_sdk_cx_brain', 'resume')).toMatchObject({ mode: 'resume', id: 'codex-thread-restore' });
     expect(mocks.store.get('deck_sdk_cx_brain')?.state).toBe('idle');
@@ -476,7 +490,7 @@ describe('sdk transport session restore', () => {
     const runtime = getTransportRuntime('deck_sdk_cx_launch_opus_brain');
     expect(runtime).toBeDefined();
     runtime!.send('launch with sanitized model');
-    await flush();
+    await settleCodexRun('deck_sdk_cx_launch_opus_brain', 'start');
 
     expect(codexRunForSession('deck_sdk_cx_launch_opus_brain', 'start')).toMatchObject({
       mode: 'start',
@@ -513,7 +527,7 @@ describe('sdk transport session restore', () => {
     const runtime = getTransportRuntime('deck_sdk_cx_opus_brain');
     expect(runtime).toBeDefined();
     runtime!.send('resume with sanitized model');
-    await flush();
+    await settleCodexRun('deck_sdk_cx_opus_brain', 'resume');
 
     expect(codexRunForSession('deck_sdk_cx_opus_brain', 'resume')).toMatchObject({
       mode: 'resume',

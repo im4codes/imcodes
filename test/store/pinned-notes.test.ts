@@ -30,7 +30,7 @@ describe('pinned notes store integration', () => {
       compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
-    coordinator.ingestEvent({ id: 'evt-pinned', target, eventType: 'assistant.text', content: 'completed the requested change', createdAt: 110 });
+    await coordinator.ingestEvent({ id: 'evt-pinned', target, eventType: 'assistant.text', content: 'completed the requested change', createdAt: 110 });
     const result = await coordinator.materializeTarget(target, 'manual', 200);
 
     expect(result.summaryProjection?.summary).toContain(`## User-Pinned Notes\n${pinned}\n\n`);

@@ -6,6 +6,14 @@ import {
 } from './memory-scope.js';
 import type { ContextNamespace as LegacyContextNamespace } from './context-types.js';
 
+/**
+ * Legacy owner id used for daemon-local personal memory rows that predate
+ * authenticated user identity. Shared so daemon caller modules and the
+ * context store agree on the sentinel without importing it from
+ * `context-store.ts`.
+ */
+export const LEGACY_DAEMON_LOCAL_USER_ID = 'daemon-local';
+
 export type MemoryNamespaceVisibility = 'owner_private' | 'shared_authorized';
 
 export interface MemoryNamespaceInput {
@@ -331,4 +339,19 @@ export function contextBindingVisibleToRuntime(
   // Workspace/org membership authorization is enforced by the caller/server
   // layer; this helper only prevents project/session identity drift.
   return true;
+}
+
+/**
+ * Parse a `scope::enterprise::workspace::user::project` namespace key back into a
+ * {@link LegacyContextNamespace}. Pure string parsing — no database access.
+ */
+export function parseNamespaceKey(namespaceKey: string): LegacyContextNamespace {
+  const [scope, enterpriseId, workspaceId, userId, projectId] = namespaceKey.split('::');
+  return {
+    scope: scope as LegacyContextNamespace['scope'],
+    enterpriseId: enterpriseId || undefined,
+    workspaceId: workspaceId || undefined,
+    userId: userId || undefined,
+    projectId,
+  };
 }

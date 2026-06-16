@@ -42,6 +42,7 @@ export interface TimelineHistoryWorkerSuccess extends TimelineHistoryWorkerIdent
   payloadBytes: number;
   droppedEvents: number;
   truncatedEvents: number;
+  hasMore?: boolean;
   readMs: number;
   sanitizeMs: number;
 }

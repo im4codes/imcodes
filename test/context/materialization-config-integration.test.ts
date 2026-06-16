@@ -93,8 +93,8 @@ describe('MaterializationCoordinator config integration', () => {
     const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
-    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'test', createdAt: 100 });
-    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'done', createdAt: 101 });
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'test', createdAt: 100 });
+    await coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'done', createdAt: 101 });
 
     const result = await coordinator.materializeTarget(target, 'manual', 500);
 
@@ -117,15 +117,15 @@ describe('MaterializationCoordinator config integration', () => {
       thresholds: { eventCount: 1 },
     });
 
-    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'first', createdAt: 100 });
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'first', createdAt: 100 });
     await coordinator.materializeTarget(target, 'manual', 100);
 
     // Within 20s cooldown — rate limited
-    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'second', createdAt: 10_000 });
-    expect(coordinator.canMaterializeTarget(target, 10_000)).toBe(false);
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'second', createdAt: 10_000 });
+    expect(await coordinator.canMaterializeTarget(target, 10_000)).toBe(false);
 
     // After 20s cooldown — allowed
-    expect(coordinator.canMaterializeTarget(target, 20_200)).toBe(true);
+    expect(await coordinator.canMaterializeTarget(target, 20_200)).toBe(true);
   });
 
   it('resolves memory config per namespace during automatic materialization', async () => {
@@ -157,8 +157,8 @@ describe('MaterializationCoordinator config integration', () => {
     });
 
     const otherTarget: ContextTargetRef = { namespace: otherNamespace, kind: 'session', sessionName: 'deck_other_brain' };
-    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'repo turn', createdAt: 100 });
-    coordinator.ingestEvent({ target: otherTarget, eventType: 'user.turn', content: 'other turn', createdAt: 200 });
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'repo turn', createdAt: 100 });
+    await coordinator.ingestEvent({ target: otherTarget, eventType: 'user.turn', content: 'other turn', createdAt: 200 });
 
     await coordinator.materializeTarget(target, 'manual', 300);
     await coordinator.materializeTarget(otherTarget, 'manual', 400);

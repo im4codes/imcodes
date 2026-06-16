@@ -30,6 +30,7 @@
     "dev": "tsx src/index.ts",
     "start": "node dist/index.ts",
     "test": "vitest run",
+    "lint:no-sync-context-store": "node scripts/lint-no-sync-context-store.mjs",
     "test:unit": "vitest run --project daemon",
     "test:server": "vitest run --project server",
     "test:web": "vitest run --project web",

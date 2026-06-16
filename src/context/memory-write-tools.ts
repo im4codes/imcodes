@@ -10,9 +10,11 @@ import {
 } from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import type { CanonicalNamespaceInput } from '../../shared/memory-namespace.js';
+import type { ContextObservationInput } from '../../shared/memory-observation.js';
 import { serializeContextNamespace } from './context-keys.js';
 import type { MemoryToolCaller } from './memory-read-tools.js';
-import { ensureContextNamespace, writeContextObservation, type ContextNamespaceRow, type ContextObservationRow } from '../store/context-store.js';
+import type { ContextNamespaceRow, ContextObservationRow } from '../store/context-store.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 
 export interface SaveObservationOk {
   status: 'ok';
@@ -33,7 +35,7 @@ export type SavePreferenceResult = SavePreferenceOk | MemoryMcpErrorResult;
 
 export interface MemoryWriteToolDeps {
   ensureContextNamespace?: (input: CanonicalNamespaceInput | ContextNamespace, now?: number) => ContextNamespaceRow;
-  writeContextObservation?: typeof writeContextObservation;
+  writeContextObservation?: (input: ContextObservationInput) => ContextObservationRow;
   now?: () => number;
 }
 
@@ -64,7 +66,7 @@ function observationNamespaceFor(caller: MemoryToolCaller): ContextNamespace {
   };
 }
 
-export function saveObservation(input: unknown, caller: MemoryToolCaller, deps: MemoryWriteToolDeps = {}): SaveObservationResult {
+export async function saveObservation(input: unknown, caller: MemoryToolCaller, deps: MemoryWriteToolDeps = {}): Promise<SaveObservationResult> {
   const args = pickAllowedMcpArgs(input, ['content', 'tags', 'turnId', 'idempotencyKey']);
   const content = readString(args, 'content')?.trim();
   if (!content) {
@@ -85,17 +87,20 @@ export function saveObservation(input: unknown, caller: MemoryToolCaller, deps: 
   const namespace = observationNamespaceFor(caller);
   const scopeKey = serializeContextNamespace(namespace);
   const fingerprint = computeMemoryFingerprint({ kind: 'note', content, scopeKey });
-  const ensureNamespace = deps.ensureContextNamespace ?? ensureContextNamespace;
-  const writeObservation = deps.writeContextObservation ?? writeContextObservation;
+  const ensureNamespace = deps.ensureContextNamespace;
+  const writeObservation = deps.writeContextObservation;
   const now = deps.now?.();
-  const namespaceRow = ensureNamespace(namespace, now);
+  const client = getContextStoreClient();
+  const namespaceRow = ensureNamespace
+    ? await client.callOrElse('ensureContextNamespace', [namespace, now], () => ensureNamespace(namespace, now))
+    : await client.run<ContextNamespaceRow>('ensureContextNamespace', [namespace, now]);
   const turnId = readString(args, 'turnId')?.trim();
   const idempotencyKey = readString(args, 'idempotencyKey')?.trim();
-  const row = writeObservation({
+  const observationInput = {
     namespaceId: namespaceRow.id,
-    scope: 'user_private',
-    class: 'note',
-    origin: 'agent_learned',
+    scope: 'user_private' as const,
+    class: 'note' as const,
+    origin: 'agent_learned' as const,
     fingerprint,
     content: attachMemoryMcpSourceProvenance({
       text: content,
@@ -107,9 +112,12 @@ export function saveObservation(input: unknown, caller: MemoryToolCaller, deps: 
     }, caller),
     text: content,
     sourceEventIds: turnId ? [turnId] : undefined,
-    state: 'candidate',
+    state: 'candidate' as const,
     now,
-  });
+  };
+  const row = writeObservation
+    ? await client.callOrElse('writeContextObservation', [observationInput], () => writeObservation(observationInput))
+    : await client.run<ContextObservationRow>('writeContextObservation', [observationInput]);
   return {
     status: 'ok',
     observationId: row.id,
@@ -118,7 +126,7 @@ export function saveObservation(input: unknown, caller: MemoryToolCaller, deps: 
   };
 }
 
-export function savePreference(input: unknown, caller: MemoryToolCaller, deps: MemoryWriteToolDeps = {}): SavePreferenceResult {
+export async function savePreference(input: unknown, caller: MemoryToolCaller, deps: MemoryWriteToolDeps = {}): Promise<SavePreferenceResult> {
   const args = pickAllowedMcpArgs(input, ['text', 'idempotencyKey']);
   const text = readString(args, 'text')?.trim();
   if (!text) {
@@ -135,13 +143,16 @@ export function savePreference(input: unknown, caller: MemoryToolCaller, deps: M
   };
   const scopeKey = `${PREFERENCE_INGEST_SCOPE}:${caller.userId}`;
   const fingerprint = computeMemoryFingerprint({ kind: 'preference', content: text, scopeKey });
-  const ensureNamespace = deps.ensureContextNamespace ?? ensureContextNamespace;
-  const writeObservation = deps.writeContextObservation ?? writeContextObservation;
+  const ensureNamespace = deps.ensureContextNamespace;
+  const writeObservation = deps.writeContextObservation;
   const now = deps.now?.();
-  const namespaceRow = ensureNamespace(namespaceInput, now);
+  const client = getContextStoreClient();
+  const namespaceRow = ensureNamespace
+    ? await client.callOrElse('ensureContextNamespace', [namespaceInput, now], () => ensureNamespace(namespaceInput, now))
+    : await client.run<ContextNamespaceRow>('ensureContextNamespace', [namespaceInput, now]);
   const idempotencyKey = readString(args, 'idempotencyKey')?.trim()
     ?? ['pref:mcp:v1', caller.userId, scopeKey, fingerprint].join('\u0000');
-  const row: ContextObservationRow = writeObservation({
+  const observationInput = {
     namespaceId: namespaceRow.id,
     scope: PREFERENCE_INGEST_SCOPE,
     class: PREFERENCE_INGEST_OBSERVATION_CLASS,
@@ -158,7 +169,10 @@ export function savePreference(input: unknown, caller: MemoryToolCaller, deps: M
     sourceEventIds: [idempotencyKey],
     state: PREFERENCE_INGEST_OBSERVATION_STATE,
     now,
-  });
+  };
+  const row: ContextObservationRow = writeObservation
+    ? await client.callOrElse('writeContextObservation', [observationInput], () => writeObservation(observationInput))
+    : await client.run<ContextObservationRow>('writeContextObservation', [observationInput]);
   return {
     status: 'ok',
     observationId: row.id,

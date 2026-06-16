@@ -14,7 +14,7 @@ import { timelineEmitter } from './timeline-emitter.js';
 import { buildMemoryContextTimelinePayload } from './memory-context-timeline.js';
 import { AGENT_SEND_DOCS } from './imcodes-workflow-docs.js';
 import type { MemorySearchResultItem } from '../context/memory-search.js';
-import { selectStartupMemoryItems } from '../context/startup-memory.js';
+import { selectStartupMemoryForBootstrap } from '../context/memory-recall-client.js';
 import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
 import logger from '../util/logger.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
@@ -137,7 +137,7 @@ export async function readProcessedMemoryItems(projectName: string): Promise<Mem
   const normalizedProjectName = projectName.trim();
   if (!normalizedProjectName) return [];
   try {
-    return selectStartupMemoryItems({ scope: 'personal', projectId: normalizedProjectName });
+    return await selectStartupMemoryForBootstrap({ scope: 'personal', projectId: normalizedProjectName });
   } catch (error) {
     incrementCounter('mem.startup.silent_failure', { source: 'startup-memory-select' });
     warnOncePerHour('mem.startup.silent_failure.startup-memory-select', { projectName: normalizedProjectName, error: error instanceof Error ? error.message : String(error) });

@@ -46,12 +46,12 @@ describe('memory-search semantic ranking', () => {
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
 
-    coordinator.ingestEvent({ target: targetA, eventType: 'user.turn', content: 'fix download filename bug', createdAt: 100 });
-    coordinator.ingestEvent({ target: targetA, eventType: 'assistant.text', content: 'resolved filename encoding for downloads', createdAt: 101 });
+    await coordinator.ingestEvent({ target: targetA, eventType: 'user.turn', content: 'fix download filename bug', createdAt: 100 });
+    await coordinator.ingestEvent({ target: targetA, eventType: 'assistant.text', content: 'resolved filename encoding for downloads', createdAt: 101 });
     await coordinator.materializeTarget(targetA, 'manual', 500);
 
-    coordinator.ingestEvent({ target: targetB, eventType: 'user.turn', content: 'fix websocket reconnect bug', createdAt: 200 });
-    coordinator.ingestEvent({ target: targetB, eventType: 'assistant.text', content: 'resolved websocket reconnect race condition', createdAt: 201 });
+    await coordinator.ingestEvent({ target: targetB, eventType: 'user.turn', content: 'fix websocket reconnect bug', createdAt: 200 });
+    await coordinator.ingestEvent({ target: targetB, eventType: 'assistant.text', content: 'resolved websocket reconnect race condition', createdAt: 201 });
     await coordinator.materializeTarget(targetB, 'manual', 600);
 
     const projections = queryProcessedProjections({ projectId: namespace.projectId, limit: 10 });

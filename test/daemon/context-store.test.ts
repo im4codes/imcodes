@@ -33,6 +33,7 @@ import {
   writeProcessedProjection,
 } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+import { getCounter, resetMetricsForTests } from '../../src/util/metrics.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -43,6 +44,7 @@ describe('context-store', () => {
   let target: ContextTargetRef;
 
   beforeEach(async () => {
+    resetMetricsForTests();
     tempDir = await createIsolatedSharedContextDb('context-store');
     namespace = { scope: 'personal', projectId: 'repo', userId: 'user-1' };
     target = { namespace, kind: 'session', sessionName: 'deck_repo_brain' };
@@ -65,6 +67,153 @@ describe('context-store', () => {
         newestEventAt: 20,
       }),
     ]);
+  });
+
+  it('treats duplicate staged event ids as idempotent without inflating dirty counts or token estimates', () => {
+    const stagedId = 'evt-idempotent-duplicate';
+    const originalContent = 'first';
+    const duplicateContent = 'duplicate content must not inflate the target';
+
+    const first = recordContextEvent({
+      id: stagedId,
+      target,
+      eventType: 'user.turn',
+      content: originalContent,
+      createdAt: 10,
+    });
+    const tokenEstimateBeforeDuplicate = estimateStagedTokenUpperBound(target);
+
+    const duplicate = recordContextEvent({
+      id: stagedId,
+      target,
+      eventType: 'assistant.turn',
+      content: duplicateContent,
+      createdAt: 20,
+    });
+
+    expect(duplicate.id).toBe(first.id);
+    expect(listContextEvents(target)).toEqual([first]);
+    expect(listDirtyTargets(namespace)).toEqual([
+      expect.objectContaining({
+        target,
+        eventCount: 1,
+        oldestEventAt: 10,
+        newestEventAt: 10,
+      }),
+    ]);
+    expect(estimateStagedTokenUpperBound(target)).toBe(tokenEstimateBeforeDuplicate);
+    expect(tokenEstimateBeforeDuplicate).toBe(originalContent.length);
+  });
+
+  it('does not flag a duplicate-id mismatch when the replayed event_type and content match', () => {
+    const stagedId = 'evt-duplicate-id-match';
+
+    const first = recordContextEvent({
+      id: stagedId,
+      target,
+      eventType: 'user.turn',
+      content: 'identical replay payload',
+      createdAt: 10,
+    });
+    const duplicate = recordContextEvent({
+      id: stagedId,
+      target,
+      eventType: 'user.turn',
+      content: 'identical replay payload',
+      createdAt: 20,
+    });
+
+    // Idempotent: first row kept, no double dirty/staged count.
+    expect(duplicate.id).toBe(first.id);
+    expect(listContextEvents(target)).toEqual([first]);
+    expect(listDirtyTargets(namespace)).toEqual([
+      expect.objectContaining({ target, eventCount: 1, oldestEventAt: 10, newestEventAt: 10 }),
+    ]);
+    // Matching replay is a normal idempotent no-op — the mismatch counter must stay at 0.
+    expect(getCounter('mem.ingest.duplicate_id_mismatch', { source: 'recordContextEvent' })).toBe(0);
+  });
+
+  it('flags a duplicate-id mismatch (metric) when a replayed stable id carries a different event_type or content but stays idempotent', () => {
+    const stagedId = 'evt-duplicate-id-mismatch';
+
+    const first = recordContextEvent({
+      id: stagedId,
+      target,
+      eventType: 'user.turn',
+      content: 'original payload',
+      createdAt: 10,
+    });
+    const duplicate = recordContextEvent({
+      id: stagedId,
+      target,
+      eventType: 'assistant.turn',
+      content: 'conflicting payload for the same stable id',
+      createdAt: 20,
+    });
+
+    // Still idempotent: first row kept, dirty count NOT double-incremented.
+    expect(duplicate.id).toBe(first.id);
+    expect(listContextEvents(target)).toEqual([first]);
+    expect(listDirtyTargets(namespace)).toEqual([
+      expect.objectContaining({ target, eventCount: 1, oldestEventAt: 10, newestEventAt: 10 }),
+    ]);
+    // Observability: the contract violation is counted exactly once.
+    expect(getCounter('mem.ingest.duplicate_id_mismatch', { source: 'recordContextEvent' })).toBe(1);
+  });
+
+  it('rolls back the staged insert when the dirty-target upsert fails', () => {
+    const seedContent = 'seed';
+    const seed = recordContextEvent({
+      id: 'evt-rollback-seed',
+      target,
+      eventType: 'user.turn',
+      content: seedContent,
+      createdAt: 10,
+    });
+    expect(listDirtyTargets(namespace)[0]).toEqual(expect.objectContaining({ eventCount: 1 }));
+
+    const dbPath = process.env.IMCODES_CONTEXT_DB_PATH;
+    expect(dbPath).toBeTruthy();
+    const sqlite = new DatabaseSync(dbPath!);
+    try {
+      sqlite.exec(`
+        CREATE TRIGGER context_dirty_targets_injected_update_failure
+        BEFORE UPDATE ON context_dirty_targets
+        BEGIN
+          SELECT RAISE(ABORT, 'injected dirty-target upsert failure');
+        END;
+      `);
+    } finally {
+      sqlite.close();
+    }
+
+    try {
+      expect(() => recordContextEvent({
+        id: 'evt-rollback-current',
+        target,
+        eventType: 'assistant.turn',
+        content: 'insert should be rolled back',
+        createdAt: 20,
+      })).toThrow(/injected dirty-target upsert failure/);
+
+      expect(listContextEvents(target)).toEqual([seed]);
+      expect(listDirtyTargets(namespace)).toEqual([
+        expect.objectContaining({
+          target,
+          eventCount: 1,
+          oldestEventAt: 10,
+          newestEventAt: 10,
+        }),
+      ]);
+      expect(estimateStagedTokenUpperBound(target)).toBe(seedContent.length);
+    } finally {
+      const cleanup = new DatabaseSync(dbPath!);
+      try {
+        cleanup.exec('DROP TRIGGER IF EXISTS context_dirty_targets_injected_update_failure');
+      } finally {
+        cleanup.close();
+      }
+    }
   });
 
   it('dedupes pending jobs per target/job type and tracks triggers', () => {

@@ -51,7 +51,7 @@ import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
 import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
 import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup.js';
-import { clearResend, drainResend, getResendCount, getResendEntries, listResendQueues } from '../daemon/transport-resend-queue.js';
+import { clearResend, drainResend, getResendCount, getResendEntries, listFreshResendQueues } from '../daemon/transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
@@ -1017,7 +1017,7 @@ function previewTransportQueueText(text: string): string {
 }
 
 export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): DaemonTransportQueuesSnapshot {
-  const resendQueues = listResendQueues();
+  const resendQueues = listFreshResendQueues(nowMs);
   const resendBySession = new Map(resendQueues.map((queue) => [queue.sessionName, queue.entries]));
   const sessionNames = new Set<string>([
     ...transportRuntimes.keys(),

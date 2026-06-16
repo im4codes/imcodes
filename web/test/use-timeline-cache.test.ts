@@ -1723,6 +1723,85 @@ describe('useTimeline global cache bounds', () => {
     expect(sendTimelinePageRequest).not.toHaveBeenCalled();
   });
 
+  it('synthesizes an older page cursor from cached events when the history response lacks nextCursor', async () => {
+    const sessionName = `deck_fallback_older_cursor_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    let requestSeq = 0;
+    let lastRequestId = '';
+    const sendTimelineHistoryRequest = vi.fn(() => {
+      requestSeq += 1;
+      lastRequestId = `history-${requestSeq}`;
+      return lastRequestId;
+    });
+    const sendTimelinePageRequest = vi.fn(() => {
+      requestSeq += 1;
+      lastRequestId = `page-${requestSeq}`;
+      return lastRequestId;
+    });
+
+    __setTimelineCacheForTests(sessionName, [{
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }]);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+      sendTimelinePageRequest,
+      supportsTimelineProtocolRevision: vi.fn(() => true),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, ws);
+      return h('button', {
+        type: 'button',
+        'data-testid': 'fallback-older',
+        onClick: timeline.loadOlderEvents,
+      }, 'older');
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+    });
+    const initialRequestId = lastRequestId;
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: initialRequestId,
+        epoch: 7,
+        events: [],
+        status: TIMELINE_RESPONSE_STATUS.PARTIAL,
+        hasMore: true,
+      } as ServerMessage);
+    });
+    sendTimelineHistoryRequest.mockClear();
+
+    await act(async () => {
+      screen.getByTestId('fallback-older').click();
+    });
+
+    expect(sendTimelinePageRequest).toHaveBeenCalledWith(
+      sessionName,
+      { epoch: 7, beforeTs: 1000, direction: TIMELINE_CURSOR_DIRECTIONS.OLDER },
+      300,
+    );
+    expect(sendTimelineHistoryRequest).not.toHaveBeenCalled();
+  });
+
   it('does not let bounded preview history overwrite a full cached event', async () => {
     const sessionName = `deck_full_cache_preview_${Date.now()}`;
     const eventId = `${sessionName}-tool-result`;

@@ -2148,6 +2148,70 @@ exec "${realGit}" "$@"
     expect(ensureTransportRuntimeForPendingResendMock).toHaveBeenCalledWith('deck_demo_brain');
   });
 
+  it('nudges stale active transport turns when a final acceptance audit prompt is queued', async () => {
+    await startFastImplementationAudit('req-final-acceptance-queued-stale-active');
+    await completeLatestDiscussion();
+    await waitForTransportSend((text) =>
+      text.includes('Audit findings to repair now:')
+      && text.includes('Reason: implementation_audit_followup_repair'),
+      2500,
+    );
+    expect(await writeLatestImplementationMarker()).toBe(true);
+    transportSendMock.mockClear();
+
+    let runtimeStatus = 'idle';
+    let sending = false;
+    let activeDispatchCount = 0;
+    const pending: Array<{ clientMessageId: string; text: string }> = [];
+    const cancelStaleActiveTurnWithPending = vi.fn(() => true);
+    getTransportRuntimeMock.mockImplementation(() => ({
+      providerSessionId: 'provider-demo',
+      getStatus: () => runtimeStatus,
+      get sending() { return sending; },
+      get activeDispatchEntries() {
+        return activeDispatchCount > 0 ? [{ clientMessageId: 'active', text: 'active turn' }] : [];
+      },
+      get pendingCount() { return pending.length; },
+      get pendingEntries() { return pending.map((entry) => ({ ...entry })); },
+      get pendingMessages() { return pending.map((entry) => entry.text); },
+      pendingVersion: 1,
+      drainPendingIfIdle: vi.fn(() => false),
+      cancelStaleActiveTurnWithPending,
+      getDiagnosticSnapshot: () => ({
+        status: runtimeStatus,
+        sending,
+        pendingCount: pending.length,
+        activeDispatchCount,
+      }),
+      send: vi.fn((text: string, commandId?: string) => {
+        transportSendMock(text, commandId);
+        pending.push({ clientMessageId: commandId ?? 'queued-final-audit', text });
+        runtimeStatus = 'streaming';
+        sending = true;
+        activeDispatchCount = 1;
+        return 'queued' as const;
+      }),
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+    }));
+
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
+      2500,
+    );
+
+    const start = Date.now();
+    while (cancelStaleActiveTurnWithPending.mock.calls.length === 0 && Date.now() - start < 1000) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(cancelStaleActiveTurnWithPending).toHaveBeenCalledWith(expect.objectContaining({
+      reason: 'openspec-auto-deliver-implementation_audit_repair',
+    }));
+    expect(transportSendCount((text) => text.includes('Problem: missing_authoritative_json'))).toBe(0);
+    expect(serverLinkMock.send.mock.calls.some((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toBe(false);
+  });
+
   it('drops stale queued Auto Deliver implementation prompts once final acceptance passes', async () => {
     const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-final-pass-drops-stale-queued-prompts');
     const origin = await completeAcceptanceAuditFromPrompt(acceptancePrompt);
@@ -2169,7 +2233,7 @@ exec "${realGit}" "$@"
     expect(getResendEntries('deck_demo_brain')).toEqual([]);
   });
 
-  it('does not re-dispatch the same final acceptance audit forever when budget is exhausted after a PASS safety failure', async () => {
+  it('does not continue implementation after final acceptance PASS when changed-file coverage is documented outside repairs_applied', async () => {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     await initializeGitWithRemote();
     await handleOpenSpecAutoDeliverCommand({
@@ -2207,10 +2271,10 @@ exec "${realGit}" "$@"
 
     const terminal = await waitForSend((msg) =>
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
-      && msg.projection?.status === 'needs_human',
+      && msg.projection?.status === 'passed',
       2500,
     );
-    expect(terminal?.projection.terminalReason).toBe('implementation_prompt_limit_reached:audit_pass_with_uncovered_changed_files');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
     expect(transportSendCount((text) =>
       text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'),
     )).toBe(1);
@@ -2389,6 +2453,46 @@ exec "${realGit}" "$@"
     const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
+  });
+
+  it('continues after a final acceptance result-file repair even when the idle event is missed', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-result-file-repair-poll-after-idle-miss');
+    const origin = parseAutoDeliverMetadataBlock(acceptancePrompt);
+    await emitDeckDemoIdle();
+    await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
+      && text.includes('Problem: missing_authoritative_json'),
+      2500,
+    );
+
+    const unresolved = 'test/live-context-ingestion.test.ts — prove retry-buffer ordering after schema-only JSON repair';
+    await writeFile(String(origin.authoritativeResultPath), JSON.stringify(auditPayload({
+      auto_deliver: origin,
+      verdict: 'REWORK',
+      required_changes: [unresolved],
+      repair_completion: repairCompletion({
+        status: 'incomplete',
+        previous_items_complete: false,
+        completed_items: [],
+        incomplete_items: [unresolved],
+        summary: 'Result-file schema was repaired, but implementation repair remains incomplete.',
+      }),
+      module_scores: OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.map((module) => ({
+        module,
+        score: module === 'tests' ? 5 : 8,
+        max_score: 10,
+        summary: `${module} final acceptance`,
+      })),
+    }), null, 2), 'utf8');
+
+    const repairPrompt = await waitForTransportSend((text) =>
+      text.includes('Audit findings to repair now:')
+      && text.includes('Reason: quality_gate_low_score:tests=5')
+      && text.includes(unresolved),
+      2500,
+    );
+    expect(repairPrompt).toContain('Previous implementation audit verdict: REWORK');
+    expect(transportSendCount((text) => text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file'))).toBe(1);
   });
 
   it('requests authoritative result file repair for verdict payload format errors', async () => {

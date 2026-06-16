@@ -312,6 +312,7 @@ const auditPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const auditFixRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const implementationReminderTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const implementationMarkerPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const acceptanceResultFilePollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let timelineUnsubscribe: (() => void) | null = null;
 const execFileAsync = promisify(execFile);
 const OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS = process.env.NODE_ENV === 'test' ? 50 : 15_000;
@@ -320,6 +321,7 @@ const OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS = process.env.NODE_ENV === '
 // this interval so a fast-flapping idle cannot spam the agent.
 const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_REMINDER_MIN_INTERVAL_MS = process.env.NODE_ENV === 'test' ? 40 : 30_000;
 const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_POLL_MS = process.env.NODE_ENV === 'test' ? 20 : 1_000;
+const OPENSPEC_AUTO_DELIVER_ACCEPTANCE_RESULT_FILE_POLL_MS = process.env.NODE_ENV === 'test' ? 50 : 1_000;
 // A transport runtime can be briefly absent while a session reconnects or its SDK
 // transport is restored (e.g. a relaunch) — it comes back on its own. Wait this
 // long for it to reappear before treating it as genuinely gone, so a healthy
@@ -526,6 +528,30 @@ function clearImplementationMarkerPollTimer(runId: string): void {
   implementationMarkerPollTimers.delete(runId);
 }
 
+function clearAcceptanceResultFilePollTimer(runId: string): void {
+  const timer = acceptanceResultFilePollTimers.get(runId);
+  if (timer) clearTimeout(timer);
+  acceptanceResultFilePollTimers.delete(runId);
+}
+
+function schedulePostRepairAcceptanceResultFilePoll(run: AutoDeliverRun): void {
+  clearAcceptanceResultFilePollTimer(run.runId);
+  if (!run.activeAcceptanceAudit || !run.activeCommandId || run.status !== run.activeAcceptanceAudit.stage) return;
+  acceptanceResultFilePollTimers.set(run.runId, setTimeout(() => {
+    acceptanceResultFilePollTimers.delete(run.runId);
+    const current = runsById.get(run.runId);
+    if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
+    if (!current.activeAcceptanceAudit || !current.activeCommandId || current.status !== current.activeAcceptanceAudit.stage) return;
+    if (isTransportRuntimeBusyForIdleAdvance(current)) {
+      schedulePostRepairAcceptanceResultFilePoll(current);
+      return;
+    }
+    void advanceAfterPostRepairAcceptanceAuditIdle(current).catch((error) => {
+      terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'post_repair_acceptance_result_file_poll_failed');
+    });
+  }, OPENSPEC_AUTO_DELIVER_ACCEPTANCE_RESULT_FILE_POLL_MS));
+}
+
 function scheduleImplementationMarkerPoll(run: AutoDeliverRun): void {
   clearImplementationMarkerPollTimer(run.runId);
   if (run.status !== 'implementation_task_loop' || !run.activeCommandId || !run.activeImplementationMarker) return;
@@ -719,16 +745,50 @@ function isTransportRuntimeBusyForIdleAdvance(run: AutoDeliverRun): boolean {
   if (!runtime) return false;
   const snapshot = runtime as {
     getStatus?: () => string;
+    getDiagnosticSnapshot?: (nowMs?: number) => {
+      status?: string;
+      sending?: boolean;
+      pendingCount?: number;
+      activeDispatchCount?: number;
+    };
+    drainPendingIfIdle?: (reason?: string) => boolean;
+    cancelStaleActiveTurnWithPending?: (options?: { reason?: string; nowMs?: number; staleMs?: number }) => boolean;
     sending?: boolean;
+    pendingCount?: number;
+    pendingEntries?: Array<{ clientMessageId?: string; commandId?: string }>;
     activeDispatchEntries?: unknown[];
   };
-  const status = typeof snapshot.getStatus === 'function' ? snapshot.getStatus() : undefined;
-  return status === 'streaming'
+  const reason = `openspec-auto-deliver-${run.status}`;
+  if (snapshot.drainPendingIfIdle?.(reason)) return true;
+
+  const nowMs = Date.now();
+  const diagnostic = snapshot.getDiagnosticSnapshot?.(nowMs);
+  const status = diagnostic?.status ?? (typeof snapshot.getStatus === 'function' ? snapshot.getStatus() : undefined);
+  const sending = diagnostic?.sending ?? snapshot.sending === true;
+  const rawPendingCount = diagnostic?.pendingCount ?? snapshot.pendingCount ?? 0;
+  const pendingCount = Array.isArray(snapshot.pendingEntries)
+    ? snapshot.pendingEntries.filter((entry) => {
+      const commandId = typeof entry.clientMessageId === 'string'
+        ? entry.clientMessageId
+        : typeof entry.commandId === 'string'
+          ? entry.commandId
+          : undefined;
+      if (!commandId || !commandId.startsWith(autoDeliverCommandIdPrefix(run))) return true;
+      if (commandId !== run.activeCommandId) return false;
+      return run.status !== 'implementation_task_loop' || run.activeImplementationPromptAwaitingDispatch === true;
+    }).length
+    : rawPendingCount;
+  const activeDispatchCount = diagnostic?.activeDispatchCount
+    ?? (Array.isArray(snapshot.activeDispatchEntries) ? snapshot.activeDispatchEntries.length : 0);
+  const inProgress = status === 'streaming'
     || status === 'thinking'
     || status === 'tool_running'
-    || status === 'permission'
-    || snapshot.sending === true
-    || (Array.isArray(snapshot.activeDispatchEntries) && snapshot.activeDispatchEntries.length > 0);
+    || status === 'permission';
+  const busy = inProgress || sending || activeDispatchCount > 0 || pendingCount > 0;
+  if (busy && pendingCount > 0 && (inProgress || sending || activeDispatchCount > 0)) {
+    snapshot.cancelStaleActiveTurnWithPending?.({ reason, nowMs });
+  }
+  return busy;
 }
 
 function enforceElapsedLimit(run: AutoDeliverRun): OpenSpecAutoDeliverProjection | null {
@@ -1838,6 +1898,7 @@ async function dispatchPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun): Pro
   const prompt = buildPostRepairAcceptanceAuditPrompt(run, metadata);
   const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
   if (sendMode === 'skipped_terminal') return buildProjection(run);
+  if (sendMode === 'sent' || sendMode === 'queued') schedulePostRepairAcceptanceResultFilePoll(run);
   run.latestMessage = 'post_repair_acceptance_audit_dispatched';
   return broadcastProjection(run);
 }
@@ -1854,6 +1915,7 @@ async function dispatchPostRepairAcceptanceAuditResultRepairPrompt(
   const prompt = buildPostRepairAcceptanceAuditResultRepairPrompt(run, metadata, reason, repairAttemptNumber);
   const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
   if (sendMode === 'skipped_terminal') return buildProjection(run);
+  if (sendMode === 'sent' || sendMode === 'queued') schedulePostRepairAcceptanceResultFilePoll(run);
   run.latestMessage = 'post_repair_result_file_repair_prompt_dispatched';
   return broadcastProjection(run);
 }
@@ -2665,6 +2727,7 @@ function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 
     run.activeAudit = undefined;
   }
   run.activeAcceptanceAudit = undefined;
+  clearAcceptanceResultFilePollTimer(run.runId);
   clearAuditFixRetryTimer(run.runId);
   clearImplementationReminderTimer(run.runId);
   clearImplementationMarkerPollTimer(run.runId);
@@ -2970,12 +3033,24 @@ async function advanceAfterAuditVerdict(
         stale: false,
       },
     ]);
-    if (currentRunChangedFiles.length > 0 && verdict.repairs_applied.length === 0) {
+    // Changed-file coverage is a pre-final safety gate. Once the final
+    // post-repair acceptance audit has PASSed with no unchecked tasks or
+    // required_changes, the audit verdict is authoritative; requiring
+    // repairs_applied to enumerate every working-tree file can create an
+    // unproductive PASS -> implementation prompt -> PASS loop for broad,
+    // intentional changes that are covered in audit evidence/tasks instead of
+    // one repair summary entry per file.
+    const requireChangedFileRepairCoverage = !postRepairVerification;
+    if (requireChangedFileRepairCoverage && currentRunChangedFiles.length > 0 && verdict.repairs_applied.length === 0) {
       run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', 'audit_pass_with_changed_files_without_repairs');
       sendTerminalProjectionIfNeeded(run, await dispatchImplementationRepairPrompt(run, 'audit_pass_with_changed_files_without_repairs'));
       return;
     }
-    const finalFailure = validateFinalPass(run, verdict, currentRunChangedFiles);
+    const finalFailure = validateFinalPass(
+      run,
+      verdict,
+      requireChangedFileRepairCoverage ? currentRunChangedFiles : [],
+    );
     if (finalFailure) {
       run.auditBeforeRepair = scoreSnapshotFromAuditResult(auditResult, 'audit_before_repair', finalFailure);
       sendTerminalProjectionIfNeeded(run, await dispatchImplementationRepairPrompt(run, finalFailure));
@@ -3764,6 +3839,10 @@ export function clearOpenSpecAutoDeliverRunsForTests(): void {
   auditFixRetryTimers.clear();
   for (const timer of implementationReminderTimers.values()) clearTimeout(timer);
   implementationReminderTimers.clear();
+  for (const timer of implementationMarkerPollTimers.values()) clearTimeout(timer);
+  implementationMarkerPollTimers.clear();
+  for (const timer of acceptanceResultFilePollTimers.values()) clearTimeout(timer);
+  acceptanceResultFilePollTimers.clear();
   for (const run of runsById.values()) {
     releaseAutoDeliverP2pLock(run.owningMainSessionName, run.runId);
   }
