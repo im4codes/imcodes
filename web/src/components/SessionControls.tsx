@@ -801,6 +801,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     });
   }, [queuedHiddenStorageKey]);
   const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<LocalQueuedTransportEntry[] | null>(null);
+  const failedQueuedCommandIdsRef = useRef<Set<string>>(new Set());
+  const queuedMutationRollbackRef = useRef<Map<string, { type: 'edit' | 'undo'; entry: LocalQueuedTransportEntry }>>(new Map());
   // Command ids that have reached the timeline (a `user.message` event) and are
   // therefore NO LONGER queued — the timeline is the authoritative truth for
   // "delivered". The displayed queue filters these out so a delivered message
@@ -1403,19 +1405,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         const normalizedText = typeof text === 'string' ? normalizeQueuedText(text) : '';
         setOptimisticQueuedEntries((prev) => {
           if (!prev) return prev;
-          const next = prev.filter((entry) => {
-            // Clear by commandId when it matches.
-            if (commandId && entry.clientMessageId === commandId) return false;
-            // ALSO fall back to a text match even when a (mismatched) commandId
-            // is present. The daemon's user.message events don't reliably echo
-            // the web's clientMessageId — there are multiple emit paths, drains
-            // merge several queued messages into one turn, and the resend queue
-            // can re-id — so id-only matching left already-delivered messages
-            // stuck as an undismissable "Queued" zombie. If a message with this
-            // exact text reached the timeline, it is no longer queued.
-            if (normalizedText && normalizeQueuedText(entry.text) === normalizedText) return false;
-            return true;
-          });
+          const matchIndex = prev.findIndex((entry) => commandId && entry.clientMessageId === commandId);
+          const fallbackIndex = matchIndex >= 0
+            ? matchIndex
+            : prev.findIndex((entry) => normalizedText && normalizeQueuedText(entry.text) === normalizedText);
+          if (fallbackIndex < 0) return prev;
+          const next = prev.filter((_, index) => index !== fallbackIndex);
           return next.length > 0 ? next : null;
         });
       };
@@ -1435,9 +1430,26 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
       if (msg.type === 'command.ack') {
         if (msg.session && msg.session !== activeSession.name) return;
+        const rollback = queuedMutationRollbackRef.current.get(msg.commandId);
         if (msg.status === 'error' || msg.status === 'conflict') {
-          markLocalQueuedEntry(msg.commandId, 'failed');
+          if (rollback) {
+            setOptimisticQueuedEntries((prev) => {
+              const source = prev ?? incomingQueuedTransportEntries;
+              if (rollback.type === 'edit') {
+                return source.map((entry) => (
+                  entry.clientMessageId === rollback.entry.clientMessageId ? rollback.entry : entry
+                ));
+              }
+              if (source.some((entry) => entry.clientMessageId === rollback.entry.clientMessageId)) return source;
+              return [...source, rollback.entry];
+            });
+            queuedMutationRollbackRef.current.delete(msg.commandId);
+          } else {
+            markLocalQueuedEntry(msg.commandId, 'failed');
+          }
         } else {
+          failedQueuedCommandIdsRef.current.delete(msg.commandId);
+          if (rollback) queuedMutationRollbackRef.current.delete(msg.commandId);
           markLocalQueuedEntry(msg.commandId, 'queued');
         }
         return;
@@ -2636,20 +2648,30 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       ...extra,
       commandId,
     };
+    const markSendFailed = (err: unknown) => {
+      console.warn('session.send HTTP fallback failed', err);
+      failedQueuedCommandIdsRef.current.add(commandId);
+      setOptimisticQueuedEntries((prev) => {
+        if (!prev) return prev;
+        let changed = false;
+        const next = prev.map((entry) => {
+          if (entry.clientMessageId !== commandId || entry.status === 'failed') return entry;
+          changed = true;
+          return { ...entry, status: 'failed' as const };
+        });
+        return changed ? next : prev;
+      });
+    };
     if (!ws) {
       if (!serverId) return null;
-      void sendSessionViaHttp(serverId, payload).catch((fallbackErr) => {
-        console.warn('session.send HTTP fallback failed', fallbackErr);
-      });
+      void sendSessionViaHttp(serverId, payload).catch(markSendFailed);
       return commandId;
     }
     try {
       ws.sendSessionCommand('send', payload);
     } catch (err) {
       if (!serverId) throw err;
-      void sendSessionViaHttp(serverId, payload).catch((fallbackErr) => {
-        console.warn('session.send HTTP fallback failed', fallbackErr);
-      });
+      void sendSessionViaHttp(serverId, payload).catch(markSendFailed);
     }
     return commandId;
   }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, makeCommandId, serverId, showStopFeedback, ws]);
@@ -2663,7 +2685,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       commandId,
       ...payload,
     });
-    return true;
+    return commandId;
   }, [activeSession, ws]);
 
   const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
@@ -2703,20 +2725,26 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return;
     }
     if (editingQueuedMessageId && effectiveRuntimeType === 'transport') {
+      const previousEntry = queuedTransportEntries.find((entry) => entry.clientMessageId === editingQueuedMessageId);
+      let mutationCommandId: string | false = false;
       try {
-        if (!sendQueuedMessageMutation('session.edit_queued_message', {
+        mutationCommandId = sendQueuedMessageMutation('session.edit_queued_message', {
           clientMessageId: editingQueuedMessageId,
           text: payload.text,
-        })) return;
+        });
+        if (!mutationCommandId) return;
       } catch {
         return;
       }
+      if (previousEntry) {
+        queuedMutationRollbackRef.current.set(mutationCommandId, { type: 'edit', entry: previousEntry });
+      }
       setEditingQueuedMessageId(null);
       setOptimisticQueuedEntries((prev) => {
-        const source = prev ?? incomingQueuedTransportEntries;
-        return source.map((entry) => (
-          entry.clientMessageId === editingQueuedMessageId
-            ? { ...entry, text: payload.text }
+      const source = prev ?? incomingQueuedTransportEntries;
+      return source.map((entry) => (
+        entry.clientMessageId === editingQueuedMessageId
+          ? { ...entry, text: payload.text }
             : entry
         ));
       });
@@ -2741,7 +2769,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setOptimisticQueuedEntries((prev) => {
         const source = prev ?? incomingQueuedTransportEntries;
         if (source.some((entry) => entry.clientMessageId === commandId)) return source;
-        return [...source, { clientMessageId: commandId, text: payload.text, status: localFailure ? 'failed' : 'sending' }];
+        return [...source, {
+          clientMessageId: commandId,
+          text: payload.text,
+          status: localFailure || failedQueuedCommandIdsRef.current.has(commandId) ? 'failed' : 'sending',
+        }];
       });
     }
     // Snapshot attachments before clearComposer wipes them so the optimistic
@@ -2765,7 +2797,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (options?.clearComposer) {
       clearComposerState();
     }
-  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -2783,18 +2815,27 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setMobileComposerMultiline(false);
     }
     if (editingQueuedMessageId === entry.clientMessageId) setEditingQueuedMessageId(null);
+    if (isLocalQueuedEntry(entry)) {
+      setOptimisticQueuedEntries((prev) => {
+        const source = prev ?? incomingQueuedTransportEntries;
+        return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
+      });
+      return;
+    }
+    let mutationCommandId: string | false = false;
+    try {
+      mutationCommandId = sendQueuedMessageMutation('session.undo_queued_message', {
+        clientMessageId: entry.clientMessageId,
+      });
+    } catch {
+      return;
+    }
+    if (!mutationCommandId) return;
+    queuedMutationRollbackRef.current.set(mutationCommandId, { type: 'undo', entry: { ...entry, status: 'queued' } });
     setOptimisticQueuedEntries((prev) => {
       const source = prev ?? incomingQueuedTransportEntries;
       return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
     });
-    if (isLocalQueuedEntry(entry)) return;
-    try {
-      sendQueuedMessageMutation('session.undo_queued_message', {
-        clientMessageId: entry.clientMessageId,
-      });
-    } catch {
-      /* ignore */
-    }
   }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, isLocalQueuedEntry, publishComposerText, sendQueuedMessageMutation]);
 
   const handleQueuedMessageRetry = useCallback((entry: LocalQueuedTransportEntry) => {
@@ -2809,7 +2850,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOptimisticQueuedEntries((prev) => {
       const source = prev ?? [];
       const next = source.filter((item) => item.clientMessageId !== entry.clientMessageId);
-      next.push({ clientMessageId: commandId, text: entry.text, status: 'sending' });
+      next.push({
+        clientMessageId: commandId,
+        text: entry.text,
+        status: failedQueuedCommandIdsRef.current.has(commandId) ? 'failed' : 'sending',
+      });
       return next;
     });
   }, [sendSessionMessage]);

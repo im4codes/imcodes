@@ -36,9 +36,10 @@ export function synthesizeTransportPendingMessageEntries(
 
 /**
  * Extract a pending-queue version from a daemon event/snapshot payload.
- * Returns `undefined` when absent (legacy daemon, or the resend/relaunch
- * paths that emit unversioned snapshots) — callers treat `undefined` as
- * "always apply", preserving pre-versioning behavior.
+ * Returns `undefined` when absent (legacy daemon, or a stale resend/relaunch
+ * snapshot from older daemons). Once the UI has observed a versioned baseline,
+ * unversioned snapshots are no longer allowed to overwrite it because they
+ * cannot be ordered against already-drained messages.
  */
 export function extractTransportPendingVersion(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
@@ -56,7 +57,7 @@ export function extractTransportPendingVersion(value: unknown): number | undefin
  * queue desync.
  *
  * Rules:
- *   - `next === undefined`  → apply (unversioned legacy/resend snapshot)
+ *   - `next === undefined`  → apply only before a versioned baseline exists
  *   - `prev === undefined`  → apply (no baseline yet)
  *   - `next === 0`          → apply (a fresh runtime restarts the sequence at
  *                             0; accept it and let callers reset the baseline)
@@ -66,7 +67,7 @@ export function shouldApplyTransportQueueSnapshot(
   prev: number | undefined,
   next: number | undefined,
 ): boolean {
-  if (next === undefined) return true;
+  if (next === undefined) return prev === undefined;
   if (prev === undefined) return true;
   if (next === 0) return true;
   return next >= prev;

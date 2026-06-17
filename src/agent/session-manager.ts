@@ -1295,11 +1295,27 @@ async function drainTransportResendQueueIntoRuntime(
               allowDuplicate: true,
               commandId: entry.commandId,
               clientMessageId: entry.commandId,
+              pendingMessageVersion: runtime.pendingVersion,
               ...(attachments.length > 0 ? { attachments } : {}),
               ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
             },
             { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
           );
+          timelineEmitter.emit(sessionName, 'session.state', {
+            state: 'running',
+            pendingCount: runtime.pendingCount,
+            pendingMessages: runtime.pendingMessages,
+            pendingMessageEntries: runtime.pendingEntries,
+            pendingMessageVersion: runtime.pendingVersion,
+          }, { source: 'daemon', confidence: 'high' });
+        } else if (result === 'queued') {
+          timelineEmitter.emit(sessionName, 'session.state', {
+            state: 'queued',
+            pendingCount: runtime.pendingCount,
+            pendingMessages: runtime.pendingMessages,
+            pendingMessageEntries: runtime.pendingEntries,
+            pendingMessageVersion: runtime.pendingVersion,
+          }, { source: 'daemon', confidence: 'high' });
         }
         return result;
       },
@@ -1316,6 +1332,18 @@ async function drainTransportResendQueueIntoRuntime(
           'assistant.text',
           {
             text: `⚠️ ${expiredCount} 条排队消息超过 ${minutes} 分钟未送达，已丢弃。请重新发送。`,
+            streaming: false,
+            memoryExcluded: true,
+          },
+          { source: 'daemon', confidence: 'high' },
+        );
+      },
+      ({ failedCount }) => {
+        timelineEmitter.emit(
+          sessionName,
+          'assistant.text',
+          {
+            text: `⚠️ ${failedCount} 条排队消息重连后仍未能送达，已停止自动重发。请重新发送。`,
             streaming: false,
             memoryExcluded: true,
           },

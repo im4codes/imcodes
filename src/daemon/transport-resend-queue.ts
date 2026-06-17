@@ -143,6 +143,7 @@ export type ResendDispatcher = (entry: ResendEntry) => Promise<unknown> | unknow
  * trail.
  */
 export type ResendExpireCallback = (info: { expiredCount: number }) => void;
+export type ResendDispatchFailureCallback = (info: { failedCount: number }) => void;
 
 /**
  * Drain and dispatch. The internal queue is cleared BEFORE calling `dispatch`
@@ -161,6 +162,7 @@ export async function drainResend(
   sessionName: string,
   dispatch: ResendDispatcher,
   onExpired?: ResendExpireCallback,
+  onDispatchFailed?: ResendDispatchFailureCallback,
 ): Promise<number> {
   const list = queues.get(sessionName);
   if (!list || list.length === 0) return 0;
@@ -169,6 +171,7 @@ export async function drainResend(
   const now = Date.now();
   let dispatched = 0;
   let expiredCount = 0;
+  let failedCount = 0;
   for (const entry of list) {
     if (now - entry.queuedAt > RESEND_EXPIRY_MS) {
       expiredCount += 1;
@@ -186,6 +189,7 @@ export async function drainResend(
         'transport resend delivered after reconnect',
       );
     } catch (err) {
+      failedCount += 1;
       logger.warn(
         { err, sessionName, commandId: entry.commandId },
         'transport resend dispatch failed — dropping entry to avoid loops',
@@ -197,6 +201,13 @@ export async function drainResend(
       onExpired({ expiredCount });
     } catch (err) {
       logger.warn({ err, sessionName, expiredCount }, 'drainResend: onExpired callback threw');
+    }
+  }
+  if (failedCount > 0 && onDispatchFailed) {
+    try {
+      onDispatchFailed({ failedCount });
+    } catch (err) {
+      logger.warn({ err, sessionName, failedCount }, 'drainResend: onDispatchFailed callback threw');
     }
   }
   return dispatched;
