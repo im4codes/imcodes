@@ -283,8 +283,8 @@ describe('extractTransportPendingVersion', () => {
 });
 
 describe('shouldApplyTransportQueueSnapshot', () => {
-  it('applies unversioned snapshots (legacy / resend path)', () => {
-    expect(shouldApplyTransportQueueSnapshot(5, undefined)).toBe(true);
+  it('applies unversioned snapshots only before a versioned baseline exists', () => {
+    expect(shouldApplyTransportQueueSnapshot(5, undefined)).toBe(false);
     expect(shouldApplyTransportQueueSnapshot(undefined, undefined)).toBe(true);
   });
   it('applies when there is no baseline yet', () => {

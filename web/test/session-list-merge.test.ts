@@ -462,7 +462,7 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
     expect(merged.transportPendingMessageVersion).toBe(0);
   });
 
-  it('applies snapshots from a legacy daemon that omits the version (backward compatible)', () => {
+  it('rejects unversioned queue snapshots after a versioned baseline exists', () => {
     const merged = mergeSessionListEntry({
       ...BASE_INCOMING,
       state: 'queued',
@@ -470,7 +470,7 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
       transportPendingMessageEntries: [{ clientMessageId: 'mL', text: 'legacy one' }],
       // no transportPendingMessageVersion
     }, existing);
-    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'mL', text: 'legacy one' }]);
+    expect(merged.transportPendingMessageEntries).toEqual(existing.transportPendingMessageEntries);
     // Baseline unchanged when the snapshot is unversioned.
     expect(merged.transportPendingMessageVersion).toBe(7);
   });
