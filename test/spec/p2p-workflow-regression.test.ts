@@ -2809,7 +2809,7 @@ describe('p2p-workflow reverse-regression', () => {
       'P2P must dispatch transport prompts through a queue-aware helper',
     ).toBe(true);
     expect(
-      /const\s+result\s*=\s*transportRuntime\.send\(args\.prompt\)/.test(orchestrator.text)
+      /const\s+result\s*=\s*transportRuntime\.send\(args\.prompt(,\s*commandId)?\)/.test(orchestrator.text)
         && /if\s*\(result\s*===\s*'queued'\)/.test(orchestrator.text),
       'P2P must inspect transportRuntime.send() and handle queued results explicitly',
     ).toBe(true);
@@ -2824,7 +2824,7 @@ describe('p2p-workflow reverse-regression', () => {
     const dispatchWindow = orchestrator.text.slice(dispatchAnchor, dispatchAnchor + 14500);
     expect(
       /const\s+dispatchResult\s*=\s*await\s+dispatchP2pPromptToSession\(/.test(dispatchWindow)
-        && /queuedDispatch\s*=\s*dispatchResult\s*===\s*'queued'/.test(dispatchWindow),
+        && /queuedDispatch\s*=\s*dispatchResult\.mode\s*===\s*'queued'/.test(dispatchWindow),
       'dispatchHop must remember whether the P2P prompt entered the transport pending queue',
     ).toBe(true);
     expect(
