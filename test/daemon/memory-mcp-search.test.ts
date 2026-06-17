@@ -3,7 +3,6 @@ import { listMcpMemorySummaries, searchMcpMemoryRecall } from '../../src/daemon/
 import { ensureContextNamespace, writeContextObservation, writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { projectionOwnerCache } from '../../src/daemon/memory-projection-owner-cache.js';
-import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
 
 const generateEmbeddingMock = vi.hoisted(() => vi.fn(async () => new Float32Array([1])));
 
@@ -281,7 +280,7 @@ describe('memory MCP recall search', () => {
     }
   });
 
-  it('reports embedding unavailable separately from local context-store unavailable', async () => {
+  it('falls back to exact local recall when semantic embedding is unavailable', async () => {
     const tempDir = await createIsolatedSharedContextDb('memory-mcp-search-embedding-unavailable');
     try {
       writeProcessedProjection({
@@ -295,7 +294,7 @@ describe('memory MCP recall search', () => {
       generateEmbeddingMock.mockResolvedValueOnce(null);
 
       const result = await searchMcpMemoryRecall({
-        query: 'semantic unavailable',
+        query: 'local recall',
         namespace: { scope: 'personal', projectId: 'repo-1', userId: 'daemon-local' },
         repo: 'repo-1',
         includeLegacyPersonalOwner: true,
@@ -304,11 +303,9 @@ describe('memory MCP recall search', () => {
         credentials: null,
       });
 
-      expect(result).toMatchObject({
-        items: [],
-        localUnavailable: true,
-        degradedReasons: [MEMORY_MCP_DEGRADED_REASON.SEMANTIC_EMBEDDING_UNAVAILABLE],
-      });
+      expect(result.localUnavailable).toBeUndefined();
+      expect(result.items.map((item) => item.summary)).toContain('Only local recall memory');
+      expect(result.items.every((item) => item.source === 'local')).toBe(true);
     } finally {
       await cleanupIsolatedSharedContextDb(tempDir);
     }

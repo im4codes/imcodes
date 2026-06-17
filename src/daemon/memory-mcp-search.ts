@@ -2,7 +2,7 @@ import type { ContextNamespace, ProcessedContextClass } from '../../shared/conte
 import type { ObservationClass, ObservationState } from '../../shared/memory-observation.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
-import type { MemorySearchQuery } from '../context/memory-search.js';
+import type { MemorySearchQuery, MemorySearchResultItem } from '../context/memory-search.js';
 import { searchLocalMemoryForManagement, searchLocalMemorySemanticForManagement } from '../context/memory-recall-client.js';
 import { projectionOwnerCache } from './memory-projection-owner-cache.js';
 
@@ -259,30 +259,49 @@ async function searchLocalRecall(
   // R5 MCP recall via the context-store worker. Do not reuse the R1
   // front-of-turn facade: local unavailable/timeout must be reported as
   // degraded metadata by the caller rather than silently returning empty.
-  const result = await searchLocalMemorySemanticForManagement(query);
-  return result.items
-    .map((item) => ({
-      recordKind: item.type === 'observation' ? 'observation' as const : 'projection' as const,
-      projectionId: item.id,
-      ...(item.type === 'observation' ? { observationId: item.id } : {}),
-      summary: item.summary,
-      projectionClass: item.projectionClass,
-      observationClass: item.observationClass,
-      observationState: item.observationState,
-      matchKind: item.matchKind,
-      projectId: item.projectId,
-      scope: item.scope,
-      createdAt: item.createdAt,
-      updatedAt: item.updatedAt,
-      relevanceScore: item.relevanceScore,
-      source: 'local' as const,
-      // Local-source hits live in this daemon's own SQLite file, so they are
-      // implicitly owned by this server. Stamping the local daemon's bound
-      // serverId here keeps the hit shape uniform with cloud results — every
-      // hit a consumer sees can be routed (eventually) to the right daemon
-      // without per-source-type branching downstream.
-      ...(localServerId ? { originServerId: localServerId } : {}),
-    }));
+  try {
+    const result = await searchLocalMemorySemanticForManagement(query);
+    return mapLocalSearchItems(result.items, localServerId);
+  } catch (error) {
+    if (localMemoryDegradedReason(error) !== MEMORY_MCP_DEGRADED_REASON.SEMANTIC_EMBEDDING_UNAVAILABLE) {
+      throw error;
+    }
+    // MCP `search_memory` is also used for exact/source lookup workflows. A
+    // cold or unavailable embedding model should degrade semantic ranking, not
+    // make freshly persisted exact text undiscoverable. Fall back to the R5
+    // bounded substring worker while preserving the stronger failure behavior
+    // for real context-store outages.
+    const fallback = await searchLocalMemoryForManagement(query);
+    return mapLocalSearchItems(fallback.items, localServerId);
+  }
+}
+
+function mapLocalSearchItems(
+  items: MemorySearchResultItem[],
+  localServerId: string | undefined,
+): MemoryMcpSearchHit[] {
+  return items.map((item) => ({
+    recordKind: item.type === 'observation' ? 'observation' as const : 'projection' as const,
+    projectionId: item.id,
+    ...(item.type === 'observation' ? { observationId: item.id } : {}),
+    summary: item.summary,
+    projectionClass: item.projectionClass,
+    observationClass: item.observationClass,
+    observationState: item.observationState,
+    matchKind: item.matchKind,
+    projectId: item.projectId,
+    scope: item.scope,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    relevanceScore: item.relevanceScore,
+    source: 'local' as const,
+    // Local-source hits live in this daemon's own SQLite file, so they are
+    // implicitly owned by this server. Stamping the local daemon's bound
+    // serverId here keeps the hit shape uniform with cloud results — every
+    // hit a consumer sees can be routed (eventually) to the right daemon
+    // without per-source-type branching downstream.
+    ...(localServerId ? { originServerId: localServerId } : {}),
+  }));
 }
 
 async function listLocalMemorySummaries(
