@@ -75,7 +75,14 @@ export function ChatLocalImagePreview({ path, loadImagePreview }: Props) {
           }}
         />
       </span>
-      {lightboxOpen && <ImageLightbox src={preview.dataUrl} alt={preview.alt} onClose={() => setLightboxOpen(false)} />}
+      {lightboxOpen && (
+        <ImageLightbox
+          src={preview.dataUrl}
+          alt={preview.alt}
+          fileName={basename(preview.alt)}
+          onClose={() => setLightboxOpen(false)}
+        />
+      )}
     </>
   );
 }

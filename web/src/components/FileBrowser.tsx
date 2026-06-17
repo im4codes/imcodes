@@ -479,7 +479,7 @@ export function FileBrowser({
   const [previewViewMode, setPreviewViewMode] = useState<HtmlPreviewViewMode>(() => (
     initialPreviewViewMode ?? (autoPreviewPreferDiff ? 'diff' : 'source')
   ));
-  const [lightbox, setLightbox] = useState<string | null>(null);
+  const [lightbox, setLightbox] = useState<{ src: string; fileName?: string } | null>(null);
   const [htmlFullscreenPreview, setHtmlFullscreenPreview] = useState<HtmlFullscreenPreviewState | null>(null);
   const closeHtmlFullscreenPreview = useCallback(() => {
     setHtmlFullscreenPreview(null);
@@ -1726,7 +1726,15 @@ export function FileBrowser({
         )}
         {preview.status === 'image' && (
           <div class="fb-preview-image">
-            <img src={preview.dataUrl} alt={preview.path.split(/[/\\]/).pop() ?? ''} onClick={() => setLightbox(preview.dataUrl)} style={{ cursor: 'zoom-in' }} />
+            <img
+              src={preview.dataUrl}
+              alt={preview.path.split(/[/\\]/).pop() ?? ''}
+              onClick={() => setLightbox({
+                src: preview.dataUrl,
+                fileName: preview.path.split(/[/\\]/).pop() || undefined,
+              })}
+              style={{ cursor: 'zoom-in' }}
+            />
           </div>
         )}
         {preview.status === 'office' && (
@@ -2013,7 +2021,7 @@ export function FileBrowser({
   ) : null;
 
   const lightboxOverlay = lightbox ? (
-    <ImageLightbox src={lightbox} onClose={() => setLightbox(null)} />
+    <ImageLightbox src={lightbox.src} fileName={lightbox.fileName} onClose={() => setLightbox(null)} />
   ) : null;
 
   if (layout === 'panel') {

@@ -3578,6 +3578,11 @@ html.native-ios-mac .chat-dl-btn {
 .fb-lightbox { position: fixed; inset: 0; z-index: 9999; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; cursor: zoom-out; padding: calc(var(--sat, 0px) + 12px) calc(env(safe-area-inset-right, 0px) + 12px) calc(env(safe-area-inset-bottom, 0px) + 12px) calc(env(safe-area-inset-left, 0px) + 12px); box-sizing: border-box; }
 .fb-lightbox img { max-width: min(92vw, 100%); max-height: min(92vh, 100%); object-fit: contain; border-radius: 6px; cursor: default; }
 .fb-lightbox-close { position: absolute; top: calc(var(--sat, 0px) + 16px); right: calc(env(safe-area-inset-right, 0px) + 16px); background: rgba(255,255,255,0.15); border: none; color: #fff; font-size: 20px; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.fb-lightbox-actions { position: absolute; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 18px); transform: translateX(-50%); display: inline-flex; align-items: center; gap: 8px; padding: 6px; border-radius: 999px; background: rgba(15, 23, 42, 0.82); border: 1px solid rgba(148, 163, 184, 0.24); box-shadow: 0 12px 32px rgba(0,0,0,0.35); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
+.fb-lightbox-action { min-width: 82px; height: 32px; padding: 0 13px; border: 1px solid rgba(148, 163, 184, 0.24); border-radius: 999px; background: rgba(30, 41, 59, 0.95); color: #e2e8f0; font-size: 12px; cursor: pointer; }
+.fb-lightbox-action:hover:not(:disabled) { background: rgba(51, 65, 85, 0.98); border-color: rgba(125, 211, 252, 0.42); }
+.fb-lightbox-action:disabled { cursor: wait; opacity: 0.72; }
+.fb-lightbox-action.is-error { color: #fecaca; border-color: rgba(248, 113, 113, 0.38); }
 .fb-preview-code { margin: 0; padding: 10px 12px; font-size: 12px; line-height: 1.5; font-family: 'Menlo', 'Monaco', 'Consolas', monospace; overflow: auto; background: #0f172a; color: #e2e8f0; white-space: pre; tab-size: 2; }
 .fb-preview-md { padding: 12px 16px; font-size: 13px; line-height: 1.6; color: #e2e8f0; overflow: auto; max-width: 100%; }
 .fb-preview-md h1, .fb-preview-md h2, .fb-preview-md h3 { margin: 0.8em 0 0.4em; color: #f1f5f9; }
