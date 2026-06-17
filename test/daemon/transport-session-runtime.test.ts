@@ -134,6 +134,8 @@ const flushDispatch = async () => {
   await Promise.resolve();
   await Promise.resolve();
   await new Promise((resolve) => setTimeout(resolve, 0));
+  await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
 };
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
