@@ -147,6 +147,9 @@ interface Props {
   subSessions?: Array<{
     sessionName: string;
     type: string;
+    /** Provider/env preset name (e.g. a custom-API preset). Optional/graceful —
+     *  shown in the OpenSpec Execute candidate label when present. */
+    ccPresetId?: string | null;
     label?: string | null;
     state: string;
     parentSession?: string | null;
@@ -185,6 +188,12 @@ const OPENSPEC_NON_CHANGE_DIR_NAMES = new Set(['archive']);
 // Agent types never offered as execution-clone templates (no cloneable runtime).
 // Mirrors `EXCLUDED_TYPES` in P2pConfigPanel's execution-template scan.
 const OPENSPEC_EXEC_EXCLUDED_TYPES = new Set(['shell', 'script']);
+
+/** OpenSpec Execute candidate label: session short name + SDK (agent type) +
+ *  preset name, so identical-looking workers (w2…wN) are distinguishable. */
+function formatExecLabel(shortName: string, sdk?: string | null, preset?: string | null): string {
+  return [shortName, sdk || null, preset || null].filter(Boolean).join(' · ');
+}
 
 type OpenSpecTaskStatsSummary = {
   total: number;
@@ -765,8 +774,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [openSpecError, setOpenSpecError] = useState<string | null>(null);
   const [openSpecAuditMenu, setOpenSpecAuditMenu] = useState<string | null>(null);
   const [openSpecProposeMenuOpen, setOpenSpecProposeMenuOpen] = useState(false);
-  // OpenSpec left-panel Execute dropdown (task 2.4) open state.
-  const [openSpecExecMenuOpen, setOpenSpecExecMenuOpen] = useState(false);
+  // Per-change OpenSpec Execute dropdown: holds the change name whose Execute
+  // menu is open (null = none), mirroring the per-change audit menu state.
+  const [openSpecExecuteMenu, setOpenSpecExecuteMenu] = useState<string | null>(null);
   const [openSpecExpandedChange, setOpenSpecExpandedChange] = useState<string | null>(null);
   const [openSpecFolderPath, setOpenSpecFolderPath] = useState<string | null>(null);
   const [openSpecAutoLauncherChange, setOpenSpecAutoLauncherChange] = useState<string | null>(null);
@@ -823,7 +833,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const openSpecButtonRef = useRef<HTMLButtonElement | null>(null);
   const openSpecAuditButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const openSpecProposeButtonRef = useRef<HTMLButtonElement | null>(null);
-  const openSpecExecuteButtonRef = useRef<HTMLButtonElement | null>(null);
+  const openSpecExecuteButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const openSpecRequestIdRef = useRef<string | null>(null);
   const openSpecTaskStatsRequestIdRef = useRef<string | null>(null);
   const openSpecTaskStatsCacheRef = useRef<Map<string, OpenSpecTaskStatsSummary>>(new Map());
@@ -1542,7 +1552,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         setOpenSpecOpen(false);
         setOpenSpecAuditMenu(null);
         setOpenSpecProposeMenuOpen(false);
-        setOpenSpecExecMenuOpen(false);
+        setOpenSpecExecuteMenu(null);
         setOpenSpecAutoLauncherChange(null);
       }
     };
@@ -1755,7 +1765,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecFolderPath(`${openSpecChangesPath}/${changeName}`);
     setOpenSpecAuditMenu(null);
     setOpenSpecProposeMenuOpen(false);
-    setOpenSpecExecMenuOpen(false);
+    setOpenSpecExecuteMenu(null);
     setOpenSpecAutoLauncherChange(null);
     setOpenSpecOpen(false);
   }, [openSpecChangesPath]);
@@ -1763,7 +1773,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const openOpenSpecAutoLauncher = useCallback((changeName: string) => {
     setOpenSpecAuditMenu(null);
     setOpenSpecProposeMenuOpen(false);
-    setOpenSpecExecMenuOpen(false);
+    setOpenSpecExecuteMenu(null);
     setOpenSpecAutoLauncherChange(changeName);
   }, []);
 
@@ -1942,7 +1952,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 setOpenSpecOpen(false);
                 setOpenSpecAuditMenu(null);
                 setOpenSpecProposeMenuOpen(false);
-                setOpenSpecExecMenuOpen(false);
+                setOpenSpecExecuteMenu(null);
               }}
             >
               ✕
@@ -2018,66 +2028,144 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   // the UI renders the flag and never recomputes eligibility client-side. This
   // mirrors the P2pConfigPanel template scan.
   const openSpecExecutionTemplateScan = useMemo(() => {
-    const eligible: Array<{ sessionName: string; shortName: string }> = [];
+    const eligible: Array<{ sessionName: string; shortName: string; sdk: string; preset: string | null }> = [];
     const seen = new Set<string>();
-    const push = (sessionName: string, shortName: string) => {
+    const push = (sessionName: string, shortName: string, sdk: string, preset: string | null) => {
       if (seen.has(sessionName)) return;
       seen.add(sessionName);
-      eligible.push({ sessionName, shortName });
+      eligible.push({ sessionName, shortName, sdk, preset });
     };
-    // Sibling main/worker sessions: include only when the daemon authoritatively
-    // marks them eligible. The current/orchestrator session is never a template.
+    // GROUP-SCOPED: execution targets may ONLY be sessions of the CURRENT session's
+    // group. Worker (non-brain) MAIN sessions of the SAME project — filtered by
+    // project so other groups' workers never leak in — plus sub-sessions attached
+    // to this group (below). The current/orchestrator session is never a template.
     for (const s of sessions ?? []) {
       if (OPENSPEC_EXEC_EXCLUDED_TYPES.has(s.agentType)) continue;
       if (s.name === activeSession?.name) continue;
       if (s.role === 'brain') continue;
+      if (s.project !== activeSession?.project) continue; // same project group only
       if (s.executionTemplateEligible === true) {
-        push(s.name, s.label || s.name.split('_').pop() || s.name);
+        push(s.name, s.label || s.name.split('_').pop() || s.name, s.agentType, s.ccPreset ?? null);
       }
     }
-    // Sub-sessions in scope: the primary template source. A missing flag (legacy
-    // daemon that doesn't project it onto sub-sessions) falls back to eligible so
-    // an old daemon doesn't hide every candidate.
+    // Attached sub-sessions of THIS group only (strict parentSession === group root;
+    // a sub-session with no/other parent is NOT in the current group and is excluded).
     for (const s of subSessions ?? []) {
       if (OPENSPEC_EXEC_EXCLUDED_TYPES.has(s.type)) continue;
       if (s.sessionName === activeSession?.name) continue;
-      if (rootSession && s.parentSession && s.parentSession !== rootSession) continue;
+      if (!rootSession || s.parentSession !== rootSession) continue;
       if (s.executionTemplateEligible === false) continue;
-      push(s.sessionName, s.label || s.sessionName.split('_').pop() || s.sessionName);
+      push(s.sessionName, s.label || s.sessionName.split('_').pop() || s.sessionName, s.type, s.ccPresetId ?? null);
     }
     return eligible;
-  }, [sessions, subSessions, activeSession?.name, rootSession]);
+  }, [sessions, subSessions, activeSession?.name, activeSession?.project, rootSession]);
 
   // The pinned/default item: the saved template, but only when it still resolves
   // to a valid (display-resolvable, non-current) session in this project.
   const openSpecPinnedExecutionSession = useMemo(() => {
     if (!hasValidExecutionDefault || !configuredExecutionSession || !executionSessionDisplayName) return null;
-    return { sessionName: configuredExecutionSession, shortName: executionSessionDisplayName };
-  }, [hasValidExecutionDefault, configuredExecutionSession, executionSessionDisplayName]);
+    const main = (sessions ?? []).find((s) => s.name === configuredExecutionSession);
+    const sub = (subSessions ?? []).find((s) => s.sessionName === configuredExecutionSession);
+    return {
+      sessionName: configuredExecutionSession,
+      shortName: executionSessionDisplayName,
+      sdk: main?.agentType ?? sub?.type ?? '',
+      preset: main?.ccPreset ?? sub?.ccPresetId ?? null,
+    };
+  }, [hasValidExecutionDefault, configuredExecutionSession, executionSessionDisplayName, sessions, subSessions]);
 
   // Eligible sessions to list BELOW the pinned default (de-duplicated against it).
   const openSpecExecutionCandidates = useMemo(() => (
     openSpecExecutionTemplateScan.filter((c) => c.sessionName !== openSpecPinnedExecutionSession?.sessionName)
   ), [openSpecExecutionTemplateScan, openSpecPinnedExecutionSession]);
 
-  // The "current OpenSpec change" the Execute dropdown acts on. Per spec, when no
-  // specific requirement/task is selected the prompt targets the current change:
-  // we resolve it from the expanded change, else the sole change in the list.
-  const openSpecExecuteChange = useMemo(() => {
-    if (openSpecExpandedChange) return openSpecExpandedChange;
-    if (openSpecChanges.length === 1) return openSpecChanges[0]?.name ?? null;
-    return null;
-  }, [openSpecExpandedChange, openSpecChanges]);
-
-  // Dispatch the OpenSpec implement prompt for the current change to `target`.
+  // Dispatch the OpenSpec implement prompt for `changeNameArg` to `target`.
   // This is OpenSpec-specific wording (reuses `openspec.implement_prompt`), in
   // contrast to the generic dispatch above. Reuses the plain cross-session send.
-  const dispatchOpenSpecExecution = useCallback((target: string) => {
-    if (!ws || !openSpecChangesPath || !openSpecExecuteChange) return;
-    const reference = toComposerReference(`${openSpecChangesPath}/${openSpecExecuteChange}`);
+  // The change is now always known per-row (passed in by the Execute button).
+  const dispatchOpenSpecExecution = useCallback((target: string, changeNameArg: string) => {
+    if (!ws || !openSpecChangesPath || !changeNameArg) return;
+    const reference = toComposerReference(`${openSpecChangesPath}/${changeNameArg}`);
     const prompt = t('openspec.implement_prompt', { reference });
     ws.sendSessionMessage(target, prompt);
-  }, [ws, openSpecChangesPath, openSpecExecuteChange, toComposerReference, t]);
+  }, [ws, openSpecChangesPath, toComposerReference, t]);
+
+  // Build the per-change Execute dropdown content. Same dispatch/set-default/
+  // clear menu the global footer used to render, but the change is bound per
+  // row so there is no "no change selected" state and no disabled guards.
+  const buildOpenSpecExecuteMenuContent = useCallback((changeName: string): ComponentChildren => (
+    <div role="menu" data-testid={`openspec-execute-menu-${changeName}`}>
+      <div class="p2p-menu-section-label">{t('openspec.execute.dispatch_heading')}</div>
+      {openSpecPinnedExecutionSession && (
+        <button
+          type="button"
+          role="menuitem"
+          class="menu-item openspec-execute-pinned"
+          data-testid="openspec-execute-pinned"
+          onClick={() => {
+            dispatchOpenSpecExecution(openSpecPinnedExecutionSession.sessionName, changeName);
+            setOpenSpecExecuteMenu(null);
+            setOpenSpecOpen(false);
+          }}
+        >
+          <span aria-hidden="true">★ </span>
+          {t('openspec.execute.dispatch_to', { name: formatExecLabel(openSpecPinnedExecutionSession.shortName, openSpecPinnedExecutionSession.sdk, openSpecPinnedExecutionSession.preset) })}
+        </button>
+      )}
+      {openSpecExecutionCandidates.map((candidate) => (
+        <button
+          key={candidate.sessionName}
+          type="button"
+          role="menuitem"
+          class="menu-item"
+          data-testid={`openspec-execute-session-${candidate.sessionName}`}
+          onClick={() => {
+            dispatchOpenSpecExecution(candidate.sessionName, changeName);
+            setOpenSpecExecuteMenu(null);
+            setOpenSpecOpen(false);
+          }}
+        >
+          {t('openspec.execute.dispatch_to', { name: formatExecLabel(candidate.shortName, candidate.sdk, candidate.preset) })}
+        </button>
+      ))}
+      {!openSpecPinnedExecutionSession && openSpecExecutionCandidates.length === 0 && (
+        <div class="p2p-menu-section-label openspec-section-meta" data-testid="openspec-execute-empty">
+          {t('openspec.execute.no_sessions')}
+        </div>
+      )}
+      <div class="openspec-execute-divider" role="separator" />
+      <div class="p2p-menu-section-label">{t('openspec.execute.default_heading')}</div>
+      {openSpecExecutionCandidates.map((candidate) => (
+        <button
+          key={`set-${candidate.sessionName}`}
+          type="button"
+          role="menuitem"
+          class="menu-item"
+          data-testid={`openspec-execute-set-${candidate.sessionName}`}
+          onClick={() => {
+            void executionRouting.setTemplateSessionName(candidate.sessionName);
+            setOpenSpecExecuteMenu(null);
+          }}
+        >
+          {t('openspec.execute.set_default', { name: formatExecLabel(candidate.shortName, candidate.sdk, candidate.preset) })}
+        </button>
+      ))}
+      {openSpecPinnedExecutionSession && (
+        <button
+          type="button"
+          role="menuitem"
+          class="menu-item openspec-execute-clear"
+          data-testid="openspec-execute-clear"
+          onClick={() => {
+            void executionRouting.setTemplateSessionName(null);
+            setOpenSpecExecuteMenu(null);
+          }}
+        >
+          {t('openspec.execute.clear_default')}
+        </button>
+      )}
+    </div>
+  ), [t, openSpecPinnedExecutionSession, openSpecExecutionCandidates, dispatchOpenSpecExecution, executionRouting]);
 
   const hasConfiguredP2pParticipants = useMemo(() => {
     if (!p2pSavedConfig?.sessions) return false;
@@ -3444,7 +3532,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     setOpenSpecLoading(false);
                     setOpenSpecAuditMenu(null);
                     setOpenSpecProposeMenuOpen(false);
-                    setOpenSpecExecMenuOpen(false);
+                    setOpenSpecExecuteMenu(null);
                   }
                   if (next) refreshOpenSpecChanges();
                   return next;
@@ -3501,11 +3589,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     onToggleExpanded={() => {
                       setOpenSpecAuditMenu(null);
                       setOpenSpecProposeMenuOpen(false);
+                      setOpenSpecExecuteMenu(null);
                       setOpenSpecAutoLauncherChange(null);
                       setOpenSpecExpandedChange((current) => current === changeName ? null : changeName);
                     }}
                     onToggleAuditMenu={() => {
                       setOpenSpecProposeMenuOpen(false);
+                      setOpenSpecExecuteMenu(null);
                       setOpenSpecAutoLauncherChange(null);
                       setOpenSpecAuditMenu((current) => current === changeName ? null : changeName);
                     }}
@@ -3549,6 +3639,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                       openSpecAuditButtonRefs.current.get(changeName) ?? null,
                       minWidth,
                     )}
+                    executeMenuOpen={openSpecExecuteMenu === changeName}
+                    onToggleExecuteMenu={() => {
+                      setOpenSpecAuditMenu(null);
+                      setOpenSpecProposeMenuOpen(false);
+                      setOpenSpecAutoLauncherChange(null);
+                      setOpenSpecExecuteMenu((current) => current === changeName ? null : changeName);
+                    }}
+                    executeButtonRef={(el) => {
+                      if (el) openSpecExecuteButtonRefs.current.set(changeName, el);
+                      else openSpecExecuteButtonRefs.current.delete(changeName);
+                    }}
+                    renderExecuteSubmenu={(content, minWidth) => renderOpenSpecSubmenu(
+                      content,
+                      openSpecExecuteButtonRefs.current.get(changeName) ?? null,
+                      minWidth,
+                    )}
+                    executeMenuContent={buildOpenSpecExecuteMenuContent(changeName)}
                   />
                   );
                 })}
@@ -3568,121 +3675,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   onViewCurrent={() => setOpenSpecAutoDetailsOpen(true)}
                 />
                 <div class="openspec-dropdown-footer">
-                  {/* OpenSpec left-panel Execute dropdown (task 2.4). Pins the
-                      valid saved execution template first, lists eligible
-                      non-current/non-main sub-sessions below it, can SET or
-                      CLEAR the SAME shared default execution session, and
-                      dispatches the OpenSpec implement prompt for the current
-                      change to a chosen session. Clearing is allowed HERE
-                      (unlike the generic dropdown) per design Decision 2. */}
-                  <div class="openspec-change-action-wrap openspec-footer-action-wrap">
-                    <button
-                      class="btn btn-secondary openspec-change-action-btn"
-                      style={{ width: '100%', justifyContent: 'center' }}
-                      ref={(el) => {
-                        openSpecExecuteButtonRef.current = el;
-                      }}
-                      disabled={openSpecAutoActive}
-                      title={openSpecAutoActive ? openSpecAutoActionLockReason : undefined}
-                      aria-haspopup="menu"
-                      aria-expanded={openSpecExecMenuOpen}
-                      data-testid="openspec-execute-trigger"
-                      onClick={() => {
-                        if (openSpecAutoActive) return;
-                        setOpenSpecAuditMenu(null);
-                        setOpenSpecProposeMenuOpen(false);
-                        setOpenSpecAutoLauncherChange(null);
-                        setOpenSpecExecMenuOpen((open) => !open);
-                      }}
-                    >
-                      {t('openspec.execute.action')}
-                      <span aria-hidden="true" style={{ fontSize: 9, marginLeft: 4 }}>▾</span>
-                    </button>
-                    {openSpecExecMenuOpen && renderOpenSpecSubmenu(
-                      <div role="menu" data-testid="openspec-execute-menu">
-                        <div class="p2p-menu-section-label">{t('openspec.execute.dispatch_heading')}</div>
-                        {!openSpecExecuteChange && (
-                          <div class="p2p-menu-section-label openspec-section-meta" data-testid="openspec-execute-no-change">
-                            {t('openspec.execute.no_change')}
-                          </div>
-                        )}
-                        {openSpecPinnedExecutionSession && (
-                          <button
-                            type="button"
-                            role="menuitem"
-                            class="menu-item openspec-execute-pinned"
-                            disabled={!openSpecExecuteChange}
-                            data-testid="openspec-execute-pinned"
-                            onClick={() => {
-                              if (!openSpecExecuteChange) return;
-                              dispatchOpenSpecExecution(openSpecPinnedExecutionSession.sessionName);
-                              setOpenSpecExecMenuOpen(false);
-                              setOpenSpecOpen(false);
-                            }}
-                          >
-                            <span aria-hidden="true">★ </span>
-                            {t('openspec.execute.dispatch_to', { name: openSpecPinnedExecutionSession.shortName })}
-                          </button>
-                        )}
-                        {openSpecExecutionCandidates.map((candidate) => (
-                          <button
-                            key={candidate.sessionName}
-                            type="button"
-                            role="menuitem"
-                            class="menu-item"
-                            disabled={!openSpecExecuteChange}
-                            data-testid={`openspec-execute-session-${candidate.sessionName}`}
-                            onClick={() => {
-                              if (!openSpecExecuteChange) return;
-                              dispatchOpenSpecExecution(candidate.sessionName);
-                              setOpenSpecExecMenuOpen(false);
-                              setOpenSpecOpen(false);
-                            }}
-                          >
-                            {t('openspec.execute.dispatch_to', { name: candidate.shortName })}
-                          </button>
-                        ))}
-                        {!openSpecPinnedExecutionSession && openSpecExecutionCandidates.length === 0 && (
-                          <div class="p2p-menu-section-label openspec-section-meta" data-testid="openspec-execute-empty">
-                            {t('openspec.execute.no_sessions')}
-                          </div>
-                        )}
-                        <div class="openspec-execute-divider" role="separator" />
-                        <div class="p2p-menu-section-label">{t('openspec.execute.default_heading')}</div>
-                        {openSpecExecutionCandidates.map((candidate) => (
-                          <button
-                            key={`set-${candidate.sessionName}`}
-                            type="button"
-                            role="menuitem"
-                            class="menu-item"
-                            data-testid={`openspec-execute-set-${candidate.sessionName}`}
-                            onClick={() => {
-                              void executionRouting.setTemplateSessionName(candidate.sessionName);
-                              setOpenSpecExecMenuOpen(false);
-                            }}
-                          >
-                            {t('openspec.execute.set_default', { name: candidate.shortName })}
-                          </button>
-                        ))}
-                        {openSpecPinnedExecutionSession && (
-                          <button
-                            type="button"
-                            role="menuitem"
-                            class="menu-item openspec-execute-clear"
-                            data-testid="openspec-execute-clear"
-                            onClick={() => {
-                              void executionRouting.setTemplateSessionName(null);
-                              setOpenSpecExecMenuOpen(false);
-                            }}
-                          >
-                            {t('openspec.execute.clear_default')}
-                          </button>
-                        )}
-                      </div>,
-                      openSpecExecuteButtonRef.current,
-                      240,
-                    )}
-                  </div>
                   <div class="openspec-change-action-wrap openspec-footer-action-wrap">
                     <button
                       class="btn btn-secondary openspec-change-action-btn"
@@ -3696,7 +3688,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                         if (openSpecAutoActive) return;
                         setOpenSpecAuditMenu(null);
                         setOpenSpecAutoLauncherChange(null);
-                        setOpenSpecExecMenuOpen(false);
+                        setOpenSpecExecuteMenu(null);
                         setOpenSpecProposeMenuOpen((open) => !open);
                       }}
                     >

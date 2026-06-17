@@ -2186,7 +2186,8 @@ afterEach(() => {
     );
     await flushAsync();
 
-    // Open the OpenSpec panel with a single change so the Execute target resolves.
+    // Open the OpenSpec panel with a single change. Execute is now a per-change
+    // row action, so the trigger lives inside that change's row.
     fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
     ws.emit({
       type: 'fs.ls_response',
@@ -2199,9 +2200,10 @@ afterEach(() => {
     });
     await flushAsync();
 
-    // Open the Execute dropdown.
-    fireEvent.click(screen.getByTestId('openspec-execute-trigger'));
-    const menu = screen.getByTestId('openspec-execute-menu');
+    // Open the change row's Execute dropdown (per-change trigger + menu).
+    const row = screen.getByTestId('openspec-change-row-change-a');
+    fireEvent.click(within(row).getByTestId('openspec-execute-trigger-change-a'));
+    const menu = screen.getByTestId('openspec-execute-menu-change-a');
 
     // Pinned saved template appears FIRST as a dispatch item.
     const pinned = within(menu).getByTestId('openspec-execute-pinned');
@@ -2216,9 +2218,9 @@ afterEach(() => {
     expect(within(menu).queryByTestId('openspec-execute-session-deck_sub_blocked')).toBeNull();
     expect(within(menu).queryByTestId('openspec-execute-session-deck_my-project_brain')).toBeNull();
 
-    // Choosing the pinned session dispatches the OpenSpec implement prompt to it
-    // (and closes the panel). Cross-session routing must NOT inject into the
-    // composer.
+    // Choosing the pinned session dispatches THIS change's OpenSpec implement
+    // prompt to it (and closes the panel). Cross-session routing must NOT inject
+    // into the composer.
     fireEvent.click(pinned);
     expect(ws.sendSessionMessage).toHaveBeenCalledWith(
       'deck_sub_pinned',
@@ -2226,8 +2228,8 @@ afterEach(() => {
     );
     expect(screen.getByRole('textbox').textContent).toBe('');
 
-    // Re-open the OpenSpec panel, then the Execute submenu, and set a DIFFERENT
-    // session as the shared default → persists the SAME per-project
+    // Re-open the OpenSpec panel, then the row's Execute submenu, and set a
+    // DIFFERENT session as the shared default → persists the SAME per-project
     // execution-template preference (no OpenSpec-only key).
     fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
     ws.emit({
@@ -2240,14 +2242,14 @@ afterEach(() => {
       ],
     });
     await flushAsync();
-    fireEvent.click(screen.getByTestId('openspec-execute-trigger'));
+    fireEvent.click(within(screen.getByTestId('openspec-change-row-change-a')).getByTestId('openspec-execute-trigger-change-a'));
     fireEvent.click(screen.getByTestId('openspec-execute-set-deck_sub_other'));
     await flushAsync();
     expect(saveUserPrefMock).toHaveBeenCalledWith('exec_routing.template:srv-exec', 'deck_sub_other');
 
     // Re-open the Execute submenu and CLEAR the default (allowed HERE, unlike
     // the generic dropdown) → writes the empty sentinel to the SAME key.
-    fireEvent.click(screen.getByTestId('openspec-execute-trigger'));
+    fireEvent.click(within(screen.getByTestId('openspec-change-row-change-a')).getByTestId('openspec-execute-trigger-change-a'));
     fireEvent.click(screen.getByTestId('openspec-execute-clear'));
     await flushAsync();
     expect(saveUserPrefMock).toHaveBeenCalledWith('exec_routing.template:srv-exec', '');
@@ -2283,8 +2285,9 @@ afterEach(() => {
     });
     await flushAsync();
 
-    fireEvent.click(screen.getByTestId('openspec-execute-trigger'));
-    const menu = screen.getByTestId('openspec-execute-menu');
+    const row = screen.getByTestId('openspec-change-row-change-z');
+    fireEvent.click(within(row).getByTestId('openspec-execute-trigger-change-z'));
+    const menu = screen.getByTestId('openspec-execute-menu-change-z');
     // No saved default → no pinned item.
     expect(within(menu).queryByTestId('openspec-execute-pinned')).toBeNull();
 

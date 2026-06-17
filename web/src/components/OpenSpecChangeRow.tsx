@@ -24,6 +24,11 @@ interface Props {
   onAuto: () => void;
   renderAuditSubmenu: (content: ComponentChildren, minWidth: number) => ComponentChildren;
   auditButtonRef: (el: HTMLButtonElement | null) => void;
+  executeMenuOpen: boolean;
+  onToggleExecuteMenu: () => void;
+  executeButtonRef: (el: HTMLButtonElement | null) => void;
+  renderExecuteSubmenu: (content: ComponentChildren, minWidth: number) => ComponentChildren;
+  executeMenuContent: ComponentChildren;
 }
 
 export function OpenSpecChangeRow({
@@ -45,6 +50,11 @@ export function OpenSpecChangeRow({
   onAuto,
   renderAuditSubmenu,
   auditButtonRef,
+  executeMenuOpen,
+  onToggleExecuteMenu,
+  executeButtonRef,
+  renderExecuteSubmenu,
+  executeMenuContent,
 }: Props) {
   const { t } = useTranslation();
   const actionsVisible = !mobile || expanded;
@@ -183,6 +193,26 @@ export function OpenSpecChangeRow({
         >
           {t('openspec.implement_action')}
         </button>
+        <div class="openspec-change-action-wrap">
+          <button
+            type="button"
+            class="btn btn-secondary openspec-change-action-btn"
+            ref={executeButtonRef}
+            disabled={actionsDisabled}
+            title={actionTitle}
+            aria-haspopup="menu"
+            aria-expanded={executeMenuOpen}
+            data-testid={`openspec-execute-trigger-${changeName}`}
+            onClick={() => {
+              if (actionsDisabled) return;
+              onToggleExecuteMenu();
+            }}
+          >
+            {t('openspec.execute.action')}
+            <span aria-hidden="true" style={{ fontSize: 9, marginLeft: 4 }}>▾</span>
+          </button>
+          {executeMenuOpen && renderExecuteSubmenu(executeMenuContent, 240)}
+        </div>
         <button
           type="button"
           class="btn btn-secondary openspec-change-action-btn"
