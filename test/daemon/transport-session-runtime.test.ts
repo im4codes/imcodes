@@ -138,6 +138,16 @@ const flushDispatch = async () => {
   await new Promise((resolve) => setTimeout(resolve, 0));
 };
 
+const waitForProviderSendCount = async (provider: ReturnType<typeof makeMockProvider>['provider'], count: number) => {
+  const send = provider.send as ReturnType<typeof vi.fn>;
+  for (let i = 0; i < 50; i += 1) {
+    await flushDispatch();
+    if (send.mock.calls.length >= count) return;
+  }
+  expect(send.mock.calls.length).toBeGreaterThanOrEqual(count);
+};
+
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 describe('TransportSessionRuntime', () => {
@@ -236,7 +246,7 @@ describe('TransportSessionRuntime', () => {
 
   it('send() returns "queued" when busy', async () => {
     runtime.send('first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     expect(runtime.send('second', 'msg-queued-2')).toBe('queued');
     expect(runtime.pendingCount).toBe(1);
     expect(runtime.pendingMessages).toEqual(['second']);
@@ -386,7 +396,7 @@ describe('TransportSessionRuntime', () => {
     (mock.provider as TransportProvider).getSessionDiagnostics = vi.fn().mockReturnValue(providerDiagnostics);
 
     runtime.send('first', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('second', 'cmd-second');
 
     const snapshot = runtime.getDiagnosticSnapshot(runtime.lastActivityAt + 250);
@@ -602,7 +612,7 @@ describe('TransportSessionRuntime', () => {
 
   it('keeps queued preference context in messagePreamble without changing user-visible text', async () => {
     runtime.send('first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     const preferencePreamble = `${PREFERENCE_CONTEXT_START}\n- Use pnpm\n${PREFERENCE_CONTEXT_END}`;
     expect(runtime.send('second', 'msg-queued-2', undefined, preferencePreamble)).toBe('queued');
 
@@ -616,7 +626,7 @@ describe('TransportSessionRuntime', () => {
     ]);
 
     mock.fireComplete('sess-1');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 2);
 
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
     expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
@@ -1495,7 +1505,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('cancel() delegates to provider.cancel without queueing behind pending messages', async () => {
     runtime.send('first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued1', 'msg-q1');
     runtime.send('queued2', 'msg-q2');
     expect(runtime.pendingCount).toBe(2);
@@ -1556,7 +1566,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('can edit and remove queued messages by clientMessageId', async () => {
     runtime.send('first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued1', 'msg-q1');
     runtime.send('queued2', 'msg-q2');
 
@@ -1577,13 +1587,13 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('drains the edited queued text into the next turn', async () => {
     runtime.send('first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued1', 'msg-q1');
 
     expect(runtime.editPendingMessage('msg-q1', 'edited queued1')).toBe(true);
 
     mock.fireComplete('sess-1');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 2);
 
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
     expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
@@ -1595,13 +1605,13 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('cancelled turns drain pending messages into the next turn', async () => {
     runtime.send('first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued1', 'msg-q1');
     runtime.send('queued2', 'msg-q2');
 
     runtime.cancel();
     mock.fireError('sess-1', { code: 'CANCELLED', message: 'cancelled', recoverable: true });
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 2);
 
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
     expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
@@ -1613,7 +1623,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('external completion settles the active turn and drains queued messages without waiting for provider callbacks', async () => {
     runtime.send('first marker-backed workflow turn', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued continuation after marker', 'cmd-next');
     expect(runtime.pendingCount).toBe(1);
 
@@ -1636,7 +1646,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('recoverable provider errors drain pending messages into the next turn', async () => {
     runtime.send('first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued after empty response', 'msg-q1');
 
     mock.fireError('sess-1', {
@@ -1644,7 +1654,7 @@ ${PREFERENCE_CONTEXT_END}`;
       message: 'Qwen exited without producing a response',
       recoverable: true,
     });
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 2);
 
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
     expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
@@ -1720,7 +1730,7 @@ ${PREFERENCE_CONTEXT_END}`;
   it('T5 (N1 contract): _drainPending sets `_sending=true` before invoking the onDrain callback', async () => {
     // Establish active turn so subsequent sends queue.
     runtime.send('first', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued-a', 'cmd-a');
     runtime.send('queued-b', 'cmd-b');
     expect(runtime.pendingCount).toBe(2);
@@ -1742,7 +1752,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('T6 (G1 contract): onDrain receives per-entry PendingTransportMessage[] with original clientMessageIds intact', async () => {
     runtime.send('first', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued-a', 'cmd-a');
     runtime.send('queued-b', 'cmd-b');
     runtime.send('queued-c', 'cmd-c');
@@ -1767,7 +1777,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('preserves shared actor metadata on queued entries and drain callbacks without injecting it into provider text', async () => {
     runtime.send('first', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('shared queued', 'cmd-shared', undefined, undefined, { sharedActor: sharedActorFixture });
     expect(runtime.pendingEntries).toEqual([
       expect.objectContaining({
@@ -1783,7 +1793,7 @@ ${PREFERENCE_CONTEXT_END}`;
     };
 
     mock.fireComplete('sess-1');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 2);
 
     expect(received).toEqual([
       expect.objectContaining({
@@ -1800,7 +1810,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('T5b (N1 contract): synchronous re-entrant runtime.send from onDrain listener queues into pending, never starts a parallel turn', async () => {
     runtime.send('first', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued', 'cmd-queued');
 
     const earlierProviderSendCalls = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
@@ -1812,7 +1822,7 @@ ${PREFERENCE_CONTEXT_END}`;
     };
 
     mock.fireComplete('sess-1');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, earlierProviderSendCalls + 1);
 
     expect(reentrantResult).toBe('queued');
     // The re-entrant entry now sits in _pendingMessages, separate from the
@@ -1824,7 +1834,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('drains defensively instead of entering idle when pending messages remain without an active turn', async () => {
     runtime.send('first', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued-after-invariant-break', 'cmd-queued');
     expect(runtime.pendingCount).toBe(1);
 
@@ -1838,7 +1848,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
     const before = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
     internal.setStatus('idle');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, before + 1);
 
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.sending).toBe(true);
@@ -1849,7 +1859,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('drainPendingIfIdle sends queued messages when an idle runtime still has pending work', async () => {
     runtime.send('first', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued-after-idle', 'cmd-queued-idle');
     expect(runtime.pendingCount).toBe(1);
 
@@ -1864,7 +1874,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
     const before = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
     expect(runtime.drainPendingIfIdle('test-idle-pending')).toBe(true);
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, before + 1);
 
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.sending).toBe(true);
@@ -1875,7 +1885,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('cancels a stale active turn once so queued messages drain through the normal cancel callback', async () => {
     runtime.send('first', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued-after-stale-active', 'cmd-queued-stale');
     expect(runtime.pendingCount).toBe(1);
 
@@ -1901,7 +1911,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
     const beforeDrainSendCount = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
     mock.fireError('sess-1', { code: 'CANCELLED', message: 'cancelled stale turn', recoverable: true });
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, beforeDrainSendCount + 1);
 
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.sending).toBe(true);
@@ -1913,7 +1923,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('ignores late provider deltas after a turn has already settled', async () => {
     runtime.send('first', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     mock.fireDelta('sess-1');
     expect(runtime.getStatus()).toBe('streaming');
     mock.fireComplete('sess-1');
@@ -1932,7 +1942,7 @@ ${PREFERENCE_CONTEXT_END}`;
     // settle / drain) while a real completion is still in flight and a message
     // is still queued — dropping it stalls the queue so the agent stops replying.
     runtime.send('first turn', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued follow-up', 'cmd-queued');
     expect(runtime.pendingCount).toBe(1);
     const sendCountBefore = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
@@ -1952,7 +1962,7 @@ ${PREFERENCE_CONTEXT_END}`;
     // The real completion now arrives with no active turn. It MUST NOT be
     // dropped: the message is recorded to history AND the queued message drains.
     mock.fireComplete('sess-1', { id: 'msg-real', content: 'real reply' });
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, sendCountBefore + 1);
 
     // The completion was recorded (not dropped). History also grows by the
     // drained user message, so assert presence rather than an exact count.
@@ -1966,7 +1976,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('ignores a late provider error when no active turn or queued work remains', async () => {
     runtime.send('first turn', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     mock.fireComplete('sess-1');
     await flushDispatch();
     expect(runtime.getStatus()).toBe('idle');
@@ -1983,7 +1993,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('drains queued work on recoverable provider error even when active-turn state was cleared', async () => {
     runtime.send('first turn', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued follow-up', 'cmd-queued');
     expect(runtime.pendingCount).toBe(1);
     const sendCountBefore = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
@@ -1998,7 +2008,7 @@ ${PREFERENCE_CONTEXT_END}`;
     internal._activeDispatchEntries = [];
 
     mock.fireError('sess-1', { code: 'PROVIDER_ERROR', message: 'recoverable late error', recoverable: true });
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, sendCountBefore + 1);
 
     expect(runtime.pendingCount).toBe(0);
     expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(sendCountBefore + 1);
@@ -2008,7 +2018,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('preserves queued work on unrecoverable provider error when active-turn state was cleared', async () => {
     runtime.send('first turn', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued follow-up', 'cmd-queued');
     expect(runtime.pendingCount).toBe(1);
     const sendCountBefore = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
@@ -2033,7 +2043,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
   it('does not cancel a recently active turn with queued work', async () => {
     runtime.send('first', 'cmd-first');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued-while-live', 'cmd-queued-live');
     const lastActivityAt = runtime.lastActivityAt;
 
