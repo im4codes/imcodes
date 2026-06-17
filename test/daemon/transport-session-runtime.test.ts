@@ -149,6 +149,16 @@ const waitForProviderSendCount = async (provider: ReturnType<typeof makeMockProv
   expect(send.mock.calls.length).toBeGreaterThanOrEqual(count);
 };
 
+const waitForBootstrapResolverCount = async (resolvers: Array<() => void>, count: number) => {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    await flushDispatch();
+    if (resolvers.length >= count) return;
+    await sleep(10);
+  }
+  expect(resolvers.length).toBeGreaterThanOrEqual(count);
+};
+
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
@@ -1551,8 +1561,9 @@ ${PREFERENCE_CONTEXT_END}`;
     runtime.cancel();
     resolveBootstraps[0]?.();
     await flushDispatch();
+    await waitForBootstrapResolverCount(resolveBootstraps, 2);
     resolveBootstraps[1]?.();
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
 
     expect(mock.provider.cancel).not.toHaveBeenCalled();
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
