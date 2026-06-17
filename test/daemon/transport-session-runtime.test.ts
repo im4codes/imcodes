@@ -1630,7 +1630,7 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingCount).toBe(1);
 
     expect(runtime.settleActiveDispatchFromExternalCompletion('test-marker-completed')).toBe(true);
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 2);
 
     expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
     expect(runtime.pendingCount).toBe(0);
