@@ -140,9 +140,11 @@ const flushDispatch = async () => {
 
 const waitForProviderSendCount = async (provider: ReturnType<typeof makeMockProvider>['provider'], count: number) => {
   const send = provider.send as ReturnType<typeof vi.fn>;
-  for (let i = 0; i < 50; i += 1) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
     await flushDispatch();
     if (send.mock.calls.length >= count) return;
+    await sleep(10);
   }
   expect(send.mock.calls.length).toBeGreaterThanOrEqual(count);
 };
@@ -2065,7 +2067,7 @@ ${PREFERENCE_CONTEXT_END}`;
     runtime.setDescription(oversized);
     runtime.setSystemPrompt(oversized);
     runtime.send('hi after oversize set', 'cap-after-set');
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, 1);
     const sentAfter = mock.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
     const systemText = String(sentAfter.systemText ?? '');
     // The description+systemPrompt contributions both should be exactly 300
@@ -2080,7 +2082,7 @@ ${PREFERENCE_CONTEXT_END}`;
     const fresh = new TransportSessionRuntime(freshProvider.provider, 'deck_cap_brain');
     await fresh.initialize({ ...defaultConfig, description: oversized, systemPrompt: oversized });
     fresh.send('hi after init', 'cap-after-init');
-    await flushDispatch();
+    await waitForProviderSendCount(freshProvider.provider, 1);
     const sentInit = freshProvider.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
     const initSystemText = String(sentInit.systemText ?? '');
     const initXCount = (initSystemText.match(/X/g) ?? []).length;
@@ -2114,7 +2116,7 @@ ${PREFERENCE_CONTEXT_END}`;
       systemPrompt: oversized,
     });
     fresh.send('hello identity', 'identity-1');
-    await flushDispatch();
+    await waitForProviderSendCount(freshProvider.provider, 1);
     const sent = freshProvider.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
     const systemText = String(sent.systemText ?? '');
 
