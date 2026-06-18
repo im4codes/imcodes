@@ -269,6 +269,26 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
   });
 
+  it('places front-queued ask answers before ordinary pending messages when busy', async () => {
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    expect(runtime.send('ordinary queued 1', 'msg-queued-1')).toBe('queued');
+    expect(runtime.send('ordinary queued 2', 'msg-queued-2')).toBe('queued');
+    expect(runtime.send('selected option', 'msg-ask-answer', undefined, undefined, { queuePlacement: 'front' })).toBe('queued');
+
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual([
+      'msg-ask-answer',
+      'msg-queued-1',
+      'msg-queued-2',
+    ]);
+    expect(runtime.pendingMessages).toEqual([
+      'selected option',
+      'ordinary queued 1',
+      'ordinary queued 2',
+    ]);
+  });
+
   it('queues re-entrant sends from onStatusChange while a dispatch is starting', async () => {
     let reentrantResult: 'sent' | 'queued' | null = null;
     let triggered = false;

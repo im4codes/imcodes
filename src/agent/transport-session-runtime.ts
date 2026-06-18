@@ -63,6 +63,14 @@ export interface PendingTransportMessage {
 
 export interface TransportSendMetadata {
   sharedActor?: SharedActorEnvelope;
+  /**
+   * Where to place this message when a provider turn is already active.
+   * `front` is reserved for out-of-band dialog answers (ask.answer):
+   * they must be delivered before ordinary queued user messages, otherwise
+   * the provider-side question window can time out while the answer sits at
+   * the tail of the FIFO queue.
+   */
+  queuePlacement?: 'normal' | 'front';
 }
 
 export interface TransportRuntimeDiagnosticSnapshot {
@@ -800,7 +808,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     };
 
     if (this.hasActiveTurnWork()) {
-      this._pendingMessages.push(entry);
+      if (metadata?.queuePlacement === 'front') {
+        this._pendingMessages.unshift(entry);
+      } else {
+        this._pendingMessages.push(entry);
+      }
       this._pendingVersion++;
       return 'queued';
     }

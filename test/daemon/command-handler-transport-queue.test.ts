@@ -697,6 +697,54 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-queued', status: 'accepted' });
   });
 
+  it('queues ask.answer at the front when no provider pending-question resolver accepts it', async () => {
+    const send = vi.fn(() => 'queued');
+    getProviderMock.mockReturnValue({ id: 'mock-provider' });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send,
+      pendingCount: 3,
+      pendingMessages: ['selected option', 'queued msg', 'queued msg 2'],
+      pendingEntries: [
+        { clientMessageId: 'ask-answer-id', text: 'selected option' },
+        { clientMessageId: 'cmd-queued', text: 'queued msg' },
+        { clientMessageId: 'cmd-queued-2', text: 'queued msg 2' },
+      ],
+      pendingVersion: 7,
+    });
+
+    handleWebCommand({
+      type: 'ask.answer',
+      sessionName: 'deck_transport_brain',
+      answer: 'selected option',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(send).toHaveBeenCalledWith(
+      'selected option',
+      undefined,
+      undefined,
+      undefined,
+      { queuePlacement: 'front' },
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      {
+        state: 'queued',
+        pendingCount: 3,
+        pendingMessages: ['selected option', 'queued msg', 'queued msg 2'],
+        pendingMessageEntries: [
+          { clientMessageId: 'ask-answer-id', text: 'selected option' },
+          { clientMessageId: 'cmd-queued', text: 'queued msg' },
+          { clientMessageId: 'cmd-queued-2', text: 'queued msg 2' },
+        ],
+        pendingMessageVersion: 7,
+      },
+      expect.any(Object),
+    );
+  });
+
   it('dispatches /clear as a fresh claude-code-sdk relaunch', async () => {
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',

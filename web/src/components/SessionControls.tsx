@@ -3929,7 +3929,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             aria-label={t('p2p.settings_button')}
           >
             <span class="p2p-settings-icon" aria-hidden="true">⚙</span>
-            <span class="p2p-settings-label">{t('p2p.settings_button')}</span>
           </button>
           {p2pOpen && renderP2pDropdown(
             <>

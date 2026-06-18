@@ -5443,9 +5443,31 @@ async function handleAskAnswer(cmd: Record<string, unknown>, serverLink: ServerL
       // (confirming the answer was received) and persists it across a refresh.
       emitTransportUserMessageEvent(sessionName, answer);
     } else {
-      // Timed out / already self-continued: deliver as an ordinary message,
-      // which echoes the answer through handleSend.
-      await handleSend({ sessionName, text: answer }, serverLink);
+      const runtime = getTransportRuntime(sessionName);
+      if (runtime?.providerSessionId) {
+        // If the provider cannot resolve the question in place, this answer is
+        // still semantically tied to the currently visible dialog. Do not append
+        // it behind unrelated pending user messages: put it at the front of the
+        // transport queue so it is the next provider-visible turn. This fixes
+        // the askquestion failure mode where a queued backlog caused the chosen
+        // option to arrive too late and the dialog reported "no answer".
+        const result = runtime.send(answer, undefined, undefined, undefined, { queuePlacement: 'front' });
+        if (result === 'sent') {
+          emitTransportUserMessageEvent(sessionName, answer);
+        } else {
+          timelineEmitter.emit(sessionName, 'session.state', {
+            state: 'queued',
+            pendingCount: runtime.pendingCount,
+            pendingMessages: runtime.pendingMessages,
+            pendingMessageEntries: runtime.pendingEntries,
+            pendingMessageVersion: runtime.pendingVersion,
+          }, { source: 'daemon', confidence: 'high' });
+        }
+      } else {
+        // Timed out / already self-continued and no live runtime snapshot is
+        // available: fall back to the ordinary transport-aware send path.
+        await handleSend({ sessionName, text: answer }, serverLink);
+      }
     }
     return;
   }
