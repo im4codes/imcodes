@@ -169,7 +169,11 @@ function ChatPathActions({
         )}
       </span>
       {showImagePreview && resolvedHandlers.onImagePreview && (
-        <ChatLocalImagePreview path={path} loadImagePreview={resolvedHandlers.onImagePreview} />
+        <ChatLocalImagePreview
+          path={path}
+          loadImagePreview={resolvedHandlers.onImagePreview}
+          onDownload={resolvedHandlers.onDownload}
+        />
       )}
     </>
   );

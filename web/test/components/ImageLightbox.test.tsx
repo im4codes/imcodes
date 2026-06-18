@@ -10,6 +10,24 @@ vi.mock('react-i18next', () => ({
 
 const originalCreateObjectURL = URL.createObjectURL;
 const originalRevokeObjectURL = URL.revokeObjectURL;
+const originalInnerWidth = window.innerWidth;
+const originalMatchMedia = window.matchMedia;
+const originalMaxTouchPoints = navigator.maxTouchPoints;
+
+function setMobilePointer() {
+  Object.defineProperty(navigator, 'maxTouchPoints', {
+    configurable: true,
+    value: 5,
+  });
+  Object.defineProperty(window, 'innerWidth', {
+    configurable: true,
+    value: 390,
+  });
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    value: () => ({ matches: true }),
+  });
+}
 
 describe('ImageLightbox', () => {
   afterEach(() => {
@@ -21,6 +39,18 @@ describe('ImageLightbox', () => {
       configurable: true,
       value: undefined,
     });
+    Object.defineProperty(navigator, 'maxTouchPoints', {
+      configurable: true,
+      value: originalMaxTouchPoints,
+    });
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: originalInnerWidth,
+    });
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: originalMatchMedia,
+    });
     Object.defineProperty(URL, 'createObjectURL', {
       configurable: true,
       value: originalCreateObjectURL,
@@ -31,20 +61,10 @@ describe('ImageLightbox', () => {
     });
   });
 
-  it('reveals image actions on long press and supports system save/copy', async () => {
+  it('reveals image actions on mobile long press and supports linked download/copy', async () => {
     vi.useFakeTimers();
-    const saveWrite = vi.fn().mockResolvedValue(undefined);
-    const saveClose = vi.fn().mockResolvedValue(undefined);
-    const showSaveFilePicker = vi.fn().mockResolvedValue({
-      createWritable: vi.fn().mockResolvedValue({
-        write: saveWrite,
-        close: saveClose,
-      }),
-    });
-    Object.defineProperty(globalThis, 'showSaveFilePicker', {
-      configurable: true,
-      value: showSaveFilePicker,
-    });
+    setMobilePointer();
+    const onDownload = vi.fn().mockResolvedValue(undefined);
     const clipboardWrite = vi.fn().mockResolvedValue(undefined);
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
       blob: () => Promise.resolve(new Blob(['image'], { type: 'image/png' })),
@@ -62,6 +82,7 @@ describe('ImageLightbox', () => {
       <ImageLightbox
         src="data:image/png;base64,aW1n"
         alt="screens/result.png"
+        onDownload={onDownload}
         onClose={vi.fn()}
       />,
     );
@@ -76,16 +97,12 @@ describe('ImageLightbox', () => {
     expect(actions).not.toBeNull();
     vi.useRealTimers();
 
-    const saveButton = container.querySelector('.fb-lightbox-action') as HTMLButtonElement;
-    fireEvent.click(saveButton);
+    const downloadButton = container.querySelector('.fb-lightbox-action') as HTMLButtonElement;
+    fireEvent.click(downloadButton);
     await waitFor(() => {
-      expect(showSaveFilePicker).toHaveBeenCalledWith(expect.objectContaining({
-        suggestedName: 'result.png',
-      }));
-      expect(saveWrite).toHaveBeenCalledTimes(1);
-      expect(saveClose).toHaveBeenCalledTimes(1);
+      expect(onDownload).toHaveBeenCalledTimes(1);
     });
-    expect(saveButton.textContent).toBe('image_saved');
+    expect(downloadButton.textContent).toBe('image_downloaded');
 
     const copyButton = container.querySelectorAll('.fb-lightbox-action')[1] as HTMLButtonElement;
     fireEvent.click(copyButton);
@@ -96,7 +113,8 @@ describe('ImageLightbox', () => {
     expect(copyButton.textContent).toBe('image_copied');
   });
 
-  it('falls back to blob URL saving when the system picker is unavailable', async () => {
+  it('falls back to blob URL download when no linked download handler is provided', async () => {
+    setMobilePointer();
     const createObjectURL = vi.fn(() => 'blob:image-preview');
     const revokeObjectURL = vi.fn();
     Object.defineProperty(URL, 'createObjectURL', {
@@ -130,10 +148,38 @@ describe('ImageLightbox', () => {
       expect(createObjectURL).toHaveBeenCalledTimes(1);
       expect(anchorClick).toHaveBeenCalledTimes(1);
     });
-    expect(saveButton.textContent).toBe('image_saved');
+    expect(saveButton.textContent).toBe('image_downloaded');
   });
 
-  it('also reveals image actions from the image context menu', () => {
+  it('keeps the native desktop image context menu', () => {
+    Object.defineProperty(navigator, 'maxTouchPoints', {
+      configurable: true,
+      value: 0,
+    });
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 1200,
+    });
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: () => ({ matches: false }),
+    });
+    const { container } = render(
+      <ImageLightbox
+        src="data:image/png;base64,aW1n"
+        alt="result.png"
+        onClose={vi.fn()}
+      />,
+    );
+
+    const image = container.querySelector('.fb-lightbox img') as HTMLImageElement;
+    fireEvent.contextMenu(image);
+
+    expect(container.querySelector('.fb-lightbox-actions')).toBeNull();
+  });
+
+  it('reveals image actions from the mobile image context menu', () => {
+    setMobilePointer();
     const { container } = render(
       <ImageLightbox
         src="data:image/png;base64,aW1n"

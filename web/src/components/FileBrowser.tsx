@@ -479,7 +479,7 @@ export function FileBrowser({
   const [previewViewMode, setPreviewViewMode] = useState<HtmlPreviewViewMode>(() => (
     initialPreviewViewMode ?? (autoPreviewPreferDiff ? 'diff' : 'source')
   ));
-  const [lightbox, setLightbox] = useState<{ src: string; fileName?: string } | null>(null);
+  const [lightbox, setLightbox] = useState<{ src: string; fileName?: string; onDownload?: () => void | Promise<void> } | null>(null);
   const [htmlFullscreenPreview, setHtmlFullscreenPreview] = useState<HtmlFullscreenPreviewState | null>(null);
   const closeHtmlFullscreenPreview = useCallback(() => {
     setHtmlFullscreenPreview(null);
@@ -1553,6 +1553,45 @@ export function FileBrowser({
     setShowDiff(false);
   }, [canRenderHtml, isEditing, isHtmlRenderMode, preview]);
 
+  const downloadCurrentPreview = useCallback(async () => {
+    if (!serverId || preview.status === 'idle' || !('downloadId' in preview) || !preview.downloadId) return;
+    setDownloadError(null);
+    try {
+      await downloadAttachment(serverId, preview.downloadId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
+      // Stale handle: silently re-request file to get a fresh downloadId, then auto-retry.
+      if (isStaleHandle && 'path' in preview) {
+        try {
+          const freshId = await new Promise<string>((resolve, reject) => {
+            const requestId = ws.fsReadFile(preview.path);
+            const timer = setTimeout(() => reject(new Error('timeout')), 10_000);
+            const off = ws.onMessage((m) => {
+              if (m.type !== 'fs.read_response' || !('requestId' in m) || m.requestId !== requestId) return;
+              off();
+              clearTimeout(timer);
+              if ('downloadId' in m && typeof m.downloadId === 'string') resolve(m.downloadId);
+              else reject(new Error('no_handle'));
+            });
+          });
+          setPreview((prev) => {
+            if (prev.status === 'idle' || !('path' in prev)) return prev;
+            return { ...prev, downloadId: freshId } as typeof prev;
+          });
+          await downloadAttachment(serverId, freshId);
+          return;
+        } catch { /* retry failed — fall through to show error */ }
+      }
+      if (msg.includes('daemon_offline') || msg.includes('503')) setDownloadError(t('upload.daemon_offline'));
+      else if (isStaleHandle) setDownloadError(t('upload.download_expired'));
+      else if (msg.includes('504') || msg.includes('timeout')) setDownloadError(t('upload.download_timeout'));
+      else setDownloadError(t('upload.download_failed'));
+      setTimeout(() => setDownloadError(null), 5000);
+      throw err;
+    }
+  }, [preview, serverId, t, ws]);
+
   const previewPane = hasInlinePreview ? (
     <div class="fb-preview">
       <div class="fb-preview-header">
@@ -1631,38 +1670,7 @@ export function FileBrowser({
             title={downloadError || t('upload.download_file')}
             style={downloadError ? { color: '#ef4444' } : undefined}
             onClick={() => {
-              setDownloadError(null);
-              void downloadAttachment(serverId, preview.downloadId!).catch(async (err) => {
-                const msg = err instanceof Error ? err.message : String(err);
-                const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
-                // Stale handle: silently re-request file to get a fresh downloadId, then auto-retry
-                if (isStaleHandle && 'path' in preview) {
-                  try {
-                    const freshId = await new Promise<string>((resolve, reject) => {
-                      const requestId = ws.fsReadFile(preview.path);
-                      const timer = setTimeout(() => reject(new Error('timeout')), 10_000);
-                      const off = ws.onMessage((m) => {
-                        if (m.type !== 'fs.read_response' || !('requestId' in m) || m.requestId !== requestId) return;
-                        off();
-                        clearTimeout(timer);
-                        if ('downloadId' in m && typeof m.downloadId === 'string') resolve(m.downloadId);
-                        else reject(new Error('no_handle'));
-                      });
-                    });
-                    setPreview((prev) => {
-                      if (prev.status === 'idle' || !('path' in prev)) return prev;
-                      return { ...prev, downloadId: freshId } as typeof prev;
-                    });
-                    await downloadAttachment(serverId, freshId);
-                    return; // success on retry
-                  } catch { /* retry failed — fall through to show error */ }
-                }
-                if (msg.includes('daemon_offline') || msg.includes('503')) setDownloadError(t('upload.daemon_offline'));
-                else if (isStaleHandle) setDownloadError(t('upload.download_expired'));
-                else if (msg.includes('504') || msg.includes('timeout')) setDownloadError(t('upload.download_timeout'));
-                else setDownloadError(t('upload.download_failed'));
-                setTimeout(() => setDownloadError(null), 5000);
-              });
+              void downloadCurrentPreview().catch(() => undefined);
             }}
           >
             {downloadError || t('upload.download_file')}
@@ -1732,6 +1740,7 @@ export function FileBrowser({
               onClick={() => setLightbox({
                 src: preview.dataUrl,
                 fileName: preview.path.split(/[/\\]/).pop() || undefined,
+                onDownload: serverId && preview.downloadId ? downloadCurrentPreview : undefined,
               })}
               style={{ cursor: 'zoom-in' }}
             />
@@ -2021,7 +2030,12 @@ export function FileBrowser({
   ) : null;
 
   const lightboxOverlay = lightbox ? (
-    <ImageLightbox src={lightbox.src} fileName={lightbox.fileName} onClose={() => setLightbox(null)} />
+    <ImageLightbox
+      src={lightbox.src}
+      fileName={lightbox.fileName}
+      onDownload={lightbox.onDownload}
+      onClose={() => setLightbox(null)}
+    />
   ) : null;
 
   if (layout === 'panel') {
