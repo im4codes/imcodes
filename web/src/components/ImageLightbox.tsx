@@ -9,6 +9,15 @@ interface Props {
 }
 
 type ClipboardItemConstructor = new (items: Record<string, Blob>) => unknown;
+type SaveFilePicker = (options?: {
+  suggestedName?: string;
+  types?: Array<{ description?: string; accept: Record<string, string[]> }>;
+}) => Promise<{
+  createWritable: () => Promise<{
+    write: (data: Blob) => Promise<void> | void;
+    close: () => Promise<void> | void;
+  }>;
+}>;
 
 const IMAGE_LONG_PRESS_MS = 520;
 
@@ -22,14 +31,71 @@ function getMimeTypeFromDataUrl(src: string): string | null {
   return match?.[1] ?? null;
 }
 
-function downloadImage(src: string, fileName: string) {
+function extensionForMimeType(mimeType: string | null): string {
+  switch (mimeType) {
+    case 'image/jpeg':
+      return '.jpg';
+    case 'image/webp':
+      return '.webp';
+    case 'image/gif':
+      return '.gif';
+    case 'image/svg+xml':
+      return '.svg';
+    case 'image/png':
+    default:
+      return '.png';
+  }
+}
+
+function ensureImageFileName(fileName: string, mimeType: string | null): string {
+  return /\.[A-Za-z0-9]{2,5}$/.test(fileName) ? fileName : `${fileName}${extensionForMimeType(mimeType)}`;
+}
+
+function saveBlobViaAnchor(blob: Blob, fileName: string) {
+  const objectUrl = URL.createObjectURL(blob);
+  const revokeObjectURL = URL.revokeObjectURL;
   const link = document.createElement('a');
-  link.href = src;
+  link.href = objectUrl;
   link.download = fileName;
   link.rel = 'noopener';
   document.body.appendChild(link);
   link.click();
   link.remove();
+  if (typeof revokeObjectURL === 'function') {
+    setTimeout(() => revokeObjectURL.call(URL, objectUrl), 0);
+  }
+}
+
+async function readImageBlob(src: string): Promise<Blob> {
+  const response = await fetch(src);
+  return response.blob();
+}
+
+async function saveImage(src: string, fileName: string) {
+  const inferredMimeType = getMimeTypeFromDataUrl(src);
+  const suggestedName = ensureImageFileName(fileName, inferredMimeType);
+  const showSaveFilePicker = (globalThis as typeof globalThis & { showSaveFilePicker?: SaveFilePicker }).showSaveFilePicker;
+  if (showSaveFilePicker) {
+    try {
+      const mimeType = inferredMimeType || 'image/png';
+      const handle = await showSaveFilePicker({
+        suggestedName,
+        types: [{
+          description: 'Image',
+          accept: { [mimeType]: [extensionForMimeType(mimeType)] },
+        }],
+      });
+      const blob = await readImageBlob(src);
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+    }
+  }
+  const blob = await readImageBlob(src);
+  saveBlobViaAnchor(blob, ensureImageFileName(fileName, blob.type || inferredMimeType));
 }
 
 async function copyImageToClipboard(src: string) {
@@ -55,6 +121,7 @@ export function ImageLightbox({ src, alt = '', fileName, onClose }: Props) {
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const suppressNextImageClickRef = useRef(false);
   const [actionsVisible, setActionsVisible] = useState(false);
+  const [saveState, setSaveState] = useState<'idle' | 'busy' | 'done' | 'error'>('idle');
   const [copyState, setCopyState] = useState<'idle' | 'busy' | 'done' | 'error'>('idle');
   const resolvedFileName = fileName || defaultImageFileName(alt);
 
@@ -87,9 +154,16 @@ export function ImageLightbox({ src, alt = '', fileName, onClose }: Props) {
     }, IMAGE_LONG_PRESS_MS);
   };
 
-  const handleDownload = (e: Event) => {
+  const handleSave = (e: Event) => {
     e.stopPropagation();
-    downloadImage(src, resolvedFileName);
+    setSaveState('busy');
+    saveImage(src, resolvedFileName)
+      .then(() => {
+        setSaveState('done');
+      })
+      .catch(() => {
+        setSaveState('error');
+      });
   };
 
   const handleCopy = (e: Event) => {
@@ -109,6 +183,13 @@ export function ImageLightbox({ src, alt = '', fileName, onClose }: Props) {
     : copyState === 'error'
       ? t('chat.image_copy_failed')
       : t('chat.image_copy');
+  const saveLabel = saveState === 'busy'
+    ? t('chat.image_saving')
+    : saveState === 'done'
+      ? t('chat.image_saved')
+      : saveState === 'error'
+        ? t('chat.image_save_failed')
+        : t('chat.image_save');
 
   return (
     <div
@@ -158,8 +239,13 @@ export function ImageLightbox({ src, alt = '', fileName, onClose }: Props) {
       />
       {actionsVisible && (
         <div class="fb-lightbox-actions" onClick={(e) => e.stopPropagation()}>
-          <button type="button" class="fb-lightbox-action" onClick={handleDownload}>
-            {t('chat.image_download')}
+          <button
+            type="button"
+            class={`fb-lightbox-action${saveState === 'error' ? ' is-error' : ''}`}
+            onClick={handleSave}
+            disabled={saveState === 'busy'}
+          >
+            {saveLabel}
           </button>
           <button
             type="button"
