@@ -55,18 +55,22 @@ function PdfPreview({ data }: { data: string }) {
     if (!container) return;
     let cancelled = false;
     let pdfDoc: any = null;
+    let renderGeneration = 0;
 
     async function renderPages(width: number) {
       if (cancelled || !pdfDoc || !container || width < 10) return;
+      const generation = ++renderGeneration;
       container.innerHTML = '';
       const dpr = window.devicePixelRatio || 1;
       const maxPages = Math.min(pdfDoc.numPages, 20);
       for (let i = 1; i <= maxPages; i++) {
         const page = await pdfDoc.getPage(i);
+        if (cancelled || generation !== renderGeneration) return;
         const baseViewport = page.getViewport({ scale: 1 });
         const scale = (width / baseViewport.width) * dpr;
         const viewport = page.getViewport({ scale });
         const canvas = document.createElement('canvas');
+        canvas.dataset.pdfPageNumber = String(i);
         canvas.width = viewport.width;
         canvas.height = viewport.height;
         canvas.style.width = `${width}px`;
@@ -77,9 +81,10 @@ function PdfPreview({ data }: { data: string }) {
         canvas.style.boxShadow = '0 1px 4px rgba(0,0,0,0.3)';
         const ctx = canvas.getContext('2d')!;
         await page.render({ canvasContext: ctx, viewport, canvas } as any).promise;
-        if (cancelled) return;
+        if (cancelled || generation !== renderGeneration) return;
         container.appendChild(canvas);
       }
+      if (cancelled || generation !== renderGeneration) return;
       if (pdfDoc.numPages > maxPages) {
         const note = document.createElement('div');
         note.style.cssText = 'text-align:center;color:#64748b;padding:12px;font-size:12px';
@@ -119,6 +124,7 @@ function PdfPreview({ data }: { data: string }) {
 
     return () => {
       cancelled = true;
+      renderGeneration += 1;
       observer.disconnect();
       clearTimeout(resizeTimer);
     };
