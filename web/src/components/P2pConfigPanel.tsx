@@ -70,6 +70,11 @@ interface SubSessionRow {
   label?: string | null;
   parentSession?: string | null;
   state: string;
+  ccPresetId?: string | null;
+  requestedModel?: string | null;
+  activeModel?: string | null;
+  modelDisplay?: string | null;
+  qwenModel?: string | null;
   executionCloneKind?: string | null;
   parentRunId?: string | null;
   /** DAEMON-AUTHORITATIVE execution-template eligibility (optional). */
@@ -142,6 +147,12 @@ type AgentFlavorFilter = 'sdk' | 'cli';
 
 function isExecutionCloneCandidate(sub: Pick<SubSessionRow, 'executionCloneKind' | 'parentRunId'>): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
+}
+
+function formatExecutionTemplateLabel(sub: SubSessionRow): string {
+  const shortName = sub.label || sub.sessionName.split('_').pop() || sub.sessionName;
+  const model = sub.modelDisplay || sub.activeModel || sub.requestedModel || sub.qwenModel || null;
+  return [shortName, sub.type || null, sub.ccPresetId || null, model].filter(Boolean).join(' · ');
 }
 
 export interface P2pWorkflowLaunchContextInput {
@@ -529,18 +540,18 @@ export function P2pConfigPanel({
   //     non-templates for this setting and are hidden rather than shown disabled.
   // shell/script types and the current calling session are always excluded.
   const executionTemplateScan = useMemo(() => {
-    const eligible: Array<{ key: string; shortName: string }> = [];
-    const ineligible: Array<{ key: string; shortName: string; reason?: string }> = [];
+    const eligible: Array<{ key: string; label: string }> = [];
+    const ineligible: Array<{ key: string; label: string; reason?: string }> = [];
     const seenExec = new Set<string>();
-    const pushEligible = (key: string, shortName: string) => {
+    const pushEligible = (key: string, label: string) => {
       if (seenExec.has(key)) return;
       seenExec.add(key);
-      eligible.push({ key, shortName });
+      eligible.push({ key, label });
     };
-    const pushIneligible = (key: string, shortName: string, reason?: string) => {
+    const pushIneligible = (key: string, label: string, reason?: string) => {
       if (seenExec.has(key)) return;
       seenExec.add(key);
-      ineligible.push({ key, shortName, reason });
+      ineligible.push({ key, label, reason });
     };
     // Main sessions are never execution-template sessions for this setting.
     // Sub-sessions in scope: the primary template source.
@@ -549,9 +560,9 @@ export function P2pConfigPanel({
       if (scopeSession && s.parentSession !== scopeSession) continue;
       if (activeSession && s.sessionName === activeSession) continue;
       if (isExecutionCloneCandidate(s)) continue;
-      const shortName = s.label || s.sessionName;
-      if (s.executionTemplateEligible === false) pushIneligible(s.sessionName, shortName, s.executionTemplateIneligibleReason);
-      else pushEligible(s.sessionName, shortName); // true OR legacy-undefined
+      const optionLabel = formatExecutionTemplateLabel(s);
+      if (s.executionTemplateEligible === false) pushIneligible(s.sessionName, optionLabel, s.executionTemplateIneligibleReason);
+      else pushEligible(s.sessionName, optionLabel); // true OR legacy-undefined
     }
     return { eligible, ineligible };
   }, [subSessions, scopeSession, activeSession]);
@@ -1352,7 +1363,7 @@ export function P2pConfigPanel({
                     <option value="">{t('settings.executionRouting.templateNone')}</option>
                     {executionTemplateCandidates.map((c) => (
                       <option key={c.key} value={c.key}>
-                        {c.shortName}
+                        {c.label}
                       </option>
                     ))}
                     {/* Daemon-authoritative ineligible sessions are shown
@@ -1367,11 +1378,11 @@ export function P2pConfigPanel({
                       return (
                         <option key={c.key} value={c.key} disabled>
                           {reasonText
-                            ? t('settings.executionRouting.ineligibleOption', '{{name}} — {{reason}}', {
-                                name: c.shortName,
-                                reason: reasonText,
-                              })
-                            : c.shortName}
+	                            ? t('settings.executionRouting.ineligibleOption', '{{name}} — {{reason}}', {
+	                                name: c.label,
+	                                reason: reasonText,
+	                              })
+	                            : c.label}
                         </option>
                       );
                     })}

@@ -1882,7 +1882,7 @@ describe('P2pConfigPanel', () => {
     it('lists a daemon-eligible sub-session as a selectable option and excludes the brain', async () => {
       renderExecTab({
         subSessions: [
-          { sessionName: 'deck_sub_ok', type: 'codex-sdk', label: 'okworker', state: 'idle', parentSession: 'deck_proj_brain', executionTemplateEligible: true },
+          { sessionName: 'deck_sub_ok', type: 'codex-sdk', label: 'okworker', state: 'idle', parentSession: 'deck_proj_brain', ccPresetId: 'fast', modelDisplay: 'gpt-5.4', executionTemplateEligible: true },
         ],
       });
       await flush();
@@ -1891,6 +1891,7 @@ describe('P2pConfigPanel', () => {
       const ok = options.find((o) => o.value === 'deck_sub_ok');
       expect(ok).toBeDefined();
       expect(ok!.disabled).toBe(false);
+      expect(ok!.textContent).toBe('okworker · codex-sdk · fast · gpt-5.4');
       // The orchestrator/brain session is never offered as a template.
       expect(options.some((o) => o.value === 'deck_proj_brain')).toBe(false);
     });
