@@ -32,6 +32,7 @@ import {
 import { TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
+import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -2194,6 +2195,36 @@ describe('WsBridge', () => {
       expect(msg.transportPendingMessageEntries).toEqual([]);
       expect(msg.transportPendingMessageVersion).toBe(7);
       expect(msg.state).toBe('idle');
+    });
+
+    it('projects execution clone discriminants to browsers without leaking full metadata', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.sync',
+        id: 'clone-123',
+        sessionType: 'codex-sdk',
+        cwd: '/home/user/project',
+        label: 'clone-worker',
+        parentSession: 'deck_myapp_brain',
+        executionCloneMetadata: {
+          kind: EXECUTION_CLONE_KIND,
+          parentRunId: 'run-clone-parent',
+          sourceTemplateSessionName: 'deck_sub_template',
+          createdBySessionName: 'deck_myapp_brain',
+        },
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings.length).toBeGreaterThan(0);
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('subsession.created');
+      expect(msg.id).toBe('clone-123');
+      expect(msg.executionCloneKind).toBe(EXECUTION_CLONE_KIND);
+      expect(msg.parentRunId).toBe('run-clone-parent');
+      expect(msg.executionCloneMetadata).toBeUndefined();
+      expect(msg.sourceTemplateSessionName).toBeUndefined();
+      expect(msg.createdBySessionName).toBeUndefined();
     });
 
     it('infers transport runtime for sdk subsession.sync payloads that omit runtimeType', async () => {

@@ -50,11 +50,13 @@ import type {
   P2pContextReducerConfig,
   P2pContextReducerMode,
 } from '@shared/p2p-advanced.js';
+import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 
 interface SessionRow {
   name: string;
   agentType: string;
   state: string;
+  project?: string | null;
   role?: string | null;
   /** DAEMON-AUTHORITATIVE execution-template eligibility (optional; absent on
    *  legacy daemons). When present it overrides client-side recomputation. */
@@ -68,6 +70,8 @@ interface SubSessionRow {
   label?: string | null;
   parentSession?: string | null;
   state: string;
+  executionCloneKind?: string | null;
+  parentRunId?: string | null;
   /** DAEMON-AUTHORITATIVE execution-template eligibility (optional). */
   executionTemplateEligible?: boolean;
   executionTemplateIneligibleReason?: string;
@@ -135,6 +139,10 @@ const SESSION_MODES = ['audit', 'review', 'plan', 'brainstorm', 'discuss', 'skip
 const ROUND_OPTIONS = [1, 2, 3, 5] as const;
 const DEFAULT_P2P_ROUNDS = 1;
 type AgentFlavorFilter = 'sdk' | 'cli';
+
+function isExecutionCloneCandidate(sub: Pick<SubSessionRow, 'executionCloneKind' | 'parentRunId'>): boolean {
+  return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
+}
 
 export interface P2pWorkflowLaunchContextInput {
   sessionName?: string;
@@ -479,6 +487,9 @@ export function P2pConfigPanel({
     }
     return activeSession;
   })();
+  const scopeProject = scopeSession
+    ? (sessions.find((s) => s.name === scopeSession)?.project ?? null)
+    : null;
 
   const allEligible: Array<{ key: string; shortName: string; agentType: string; flavor: AgentFlavorFilter }> = [];
   const seen = new Set<string>();
@@ -513,13 +524,15 @@ export function P2pConfigPanel({
   // `executionTemplateEligible` (+ an ineligibility reason code) per session and
   // the UI renders that rather than recomputing eligibility client-side.
   //
-  // Candidate population (matches the pre-existing template scoping):
+  // Candidate population:
   //   - Sub-sessions in scope are the real templates → daemon flag applied; a
   //     missing flag (legacy daemon that doesn't project it onto sub-sessions)
   //     falls back to eligible so an old daemon doesn't hide every candidate.
+  //     Execution clones are structural non-templates and are never listed.
   //   - Sibling/worker MAIN sessions appear only when the daemon explicitly
-  //     marks them eligible (`=== true`); the orchestrator/scope session itself
-  //     is never listed.
+  //     marks them eligible (`=== true`) AND they are in the same project; the
+  //     orchestrator/scope session, brain sessions, cross-project sessions, and
+  //     other structural non-templates are hidden rather than shown disabled.
   // shell/script types and the current calling session are always excluded.
   const executionTemplateScan = useMemo(() => {
     const eligible: Array<{ key: string; shortName: string }> = [];
@@ -539,24 +552,28 @@ export function P2pConfigPanel({
     // marks eligible. The scope (orchestrator) session is never a template.
     for (const s of sessions) {
       if (EXCLUDED_TYPES.has(s.agentType)) continue;
+      if (s.role === 'brain') continue;
       if (s.name === scopeSession) continue;
       if (activeSession && s.name === activeSession) continue;
+      if (scopeProject && s.project !== scopeProject) continue;
       const shortName = s.name.split('_').pop() || s.name;
       if (s.executionTemplateEligible === true) pushEligible(s.name, shortName);
-      else if (s.executionTemplateEligible === false) pushIneligible(s.name, shortName, s.executionTemplateIneligibleReason);
+      // false/undefined main-session flags are structural noise for this menu:
+      // hide rather than render dozens of "brain — unavailable" disabled rows.
       // undefined (legacy main-session flag absent) → not surfaced as a template.
     }
     // Sub-sessions in scope: the primary template source.
     for (const s of subSessions) {
       if (EXCLUDED_TYPES.has(s.type)) continue;
-      if (scopeSession && s.parentSession && s.parentSession !== scopeSession) continue;
+      if (scopeSession && s.parentSession !== scopeSession) continue;
       if (activeSession && s.sessionName === activeSession) continue;
+      if (isExecutionCloneCandidate(s)) continue;
       const shortName = s.label || s.sessionName;
       if (s.executionTemplateEligible === false) pushIneligible(s.sessionName, shortName, s.executionTemplateIneligibleReason);
       else pushEligible(s.sessionName, shortName); // true OR legacy-undefined
     }
     return { eligible, ineligible };
-  }, [sessions, subSessions, scopeSession, activeSession]);
+  }, [sessions, subSessions, scopeSession, activeSession, scopeProject]);
   const executionTemplateCandidates = executionTemplateScan.eligible;
   const executionTemplateIneligible = executionTemplateScan.ineligible;
   const selectedTemplate = executionRouting.templateSessionName;

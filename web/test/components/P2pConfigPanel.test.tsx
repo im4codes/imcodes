@@ -1926,5 +1926,52 @@ describe('P2pConfigPanel', () => {
       expect(values).not.toContain('deck_sub_self');
       expect(values).toContain('deck_sub_other');
     });
+
+    it('hides structural main-session ineligible rows instead of rendering multiple disabled brain options', async () => {
+      renderExecTab({
+        sessions: [
+          { name: 'deck_proj_brain', agentType: 'claude-code-sdk', state: 'running', role: 'brain', project: 'proj-a', executionTemplateEligible: false, executionTemplateIneligibleReason: 'template_main_forbidden' },
+          { name: 'deck_other_brain', agentType: 'claude-code-sdk', state: 'running', role: 'brain', project: 'proj-a', executionTemplateEligible: false, executionTemplateIneligibleReason: 'template_main_forbidden' },
+          { name: 'deck_third_brain', agentType: 'codex-sdk', state: 'running', role: 'brain', project: 'proj-a', executionTemplateEligible: false, executionTemplateIneligibleReason: 'template_main_forbidden' },
+        ],
+      });
+      await flush();
+      const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
+      const options = Array.from(select.querySelectorAll('option'));
+      expect(options.some((o) => o.value === 'deck_other_brain')).toBe(false);
+      expect(options.some((o) => o.value === 'deck_third_brain')).toBe(false);
+      expect(options.some((o) => o.textContent?.includes('brain'))).toBe(false);
+    });
+
+    it('only lists daemon-eligible main workers from the same project as the scoped brain', async () => {
+      renderExecTab({
+        sessions: [
+          { name: 'deck_proj_brain', agentType: 'claude-code-sdk', state: 'running', role: 'brain', project: 'proj-a' },
+          { name: 'deck_proj_worker', agentType: 'codex-sdk', state: 'running', role: 'worker', project: 'proj-a', executionTemplateEligible: true },
+          { name: 'deck_other_worker', agentType: 'codex-sdk', state: 'running', role: 'worker', project: 'proj-b', executionTemplateEligible: true },
+          { name: 'deck_proj_blocked', agentType: 'codex-sdk', state: 'running', role: 'worker', project: 'proj-a', executionTemplateEligible: false, executionTemplateIneligibleReason: 'template_ineligible' },
+        ],
+      });
+      await flush();
+      const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
+      const options = Array.from(select.querySelectorAll('option'));
+      expect(options.some((o) => o.value === 'deck_proj_worker' && !o.disabled)).toBe(true);
+      expect(options.some((o) => o.value === 'deck_other_worker')).toBe(false);
+      expect(options.some((o) => o.value === 'deck_proj_blocked')).toBe(false);
+    });
+
+    it('excludes execution-clone sub-sessions from template options', async () => {
+      renderExecTab({
+        subSessions: [
+          { sessionName: 'deck_sub_clone', type: 'codex-sdk', label: 'clone', state: 'idle', parentSession: 'deck_proj_brain', executionCloneKind: 'execution_clone', parentRunId: 'run-abc', executionTemplateEligible: true },
+          { sessionName: 'deck_sub_worker', type: 'codex-sdk', label: 'worker', state: 'idle', parentSession: 'deck_proj_brain', executionTemplateEligible: true },
+        ],
+      });
+      await flush();
+      const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
+      const values = Array.from(select.querySelectorAll('option')).map((o) => o.value);
+      expect(values).not.toContain('deck_sub_clone');
+      expect(values).toContain('deck_sub_worker');
+    });
   });
 });

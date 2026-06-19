@@ -57,6 +57,7 @@ import {
   type MemoryFeatureFlagResolutionLayers,
   type MemoryFeatureFlagValues,
 } from '../../../shared/feature-flags.js';
+import { EXECUTION_CLONE_KIND } from '../../../shared/execution-clone.js';
 import {
   MSG_COMMAND_ACK,
   MSG_COMMAND_FAILED,
@@ -4346,6 +4347,18 @@ export class WsBridge {
         const hasTransportPendingMessages = Object.prototype.hasOwnProperty.call(msg, 'transportPendingMessages');
         const hasTransportPendingMessageEntries = Object.prototype.hasOwnProperty.call(msg, 'transportPendingMessageEntries');
         const hasTransportPendingMessageVersion = Object.prototype.hasOwnProperty.call(msg, 'transportPendingMessageVersion');
+        const executionCloneMetadata = (msg.executionCloneMetadata && typeof msg.executionCloneMetadata === 'object')
+          ? msg.executionCloneMetadata as Record<string, unknown>
+          : null;
+        const isExecutionClone = executionCloneMetadata?.kind === EXECUTION_CLONE_KIND;
+        const executionCloneProjection = isExecutionClone
+          ? {
+              executionCloneKind: EXECUTION_CLONE_KIND,
+              ...(typeof executionCloneMetadata.parentRunId === 'string'
+                ? { parentRunId: executionCloneMetadata.parentRunId }
+                : {}),
+            }
+          : {};
         this.broadcastToBrowsers(JSON.stringify({
           type: 'subsession.created',
           id: msg.id,
@@ -4365,6 +4378,7 @@ export class WsBridge {
           ...(hasTransportPendingMessages ? { transportPendingMessages: msg.transportPendingMessages } : {}),
           ...(hasTransportPendingMessageEntries ? { transportPendingMessageEntries: msg.transportPendingMessageEntries } : {}),
           ...(hasTransportPendingMessageVersion ? { transportPendingMessageVersion: msg.transportPendingMessageVersion } : {}),
+          ...executionCloneProjection,
           qwenModel: msg.qwenModel || null,
           qwenAuthType: msg.qwenAuthType || null,
           qwenAvailableModels: msg.qwenAvailableModels || null,

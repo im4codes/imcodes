@@ -129,6 +129,52 @@ describe('sub-session metadata via subsession.created', () => {
     expect(s.quotaUsageLabel).toBeNull();
     expect(s.qwenModel).toBeNull();
   });
+
+  it('stores execution-clone projection from subsession.created', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'clone1',
+      sessionName: 'deck_sub_clone1',
+      sessionType: 'codex-sdk',
+      parentSession: 'deck_proj_brain',
+      executionCloneKind: 'execution_clone',
+      parentRunId: 'run-parent-1',
+    }));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].executionCloneKind).toBe('execution_clone');
+    expect(captured[0].parentRunId).toBe('run-parent-1');
+  });
+
+  it('updates execution-clone projection on an existing subsession.created rebroadcast', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'clone2',
+      sessionName: 'deck_sub_clone2',
+      sessionType: 'codex-sdk',
+      parentSession: 'deck_proj_brain',
+    }));
+    expect(captured[0].executionCloneKind).toBeNull();
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'clone2',
+      executionCloneKind: 'execution_clone',
+      parentRunId: 'run-parent-2',
+    }));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].executionCloneKind).toBe('execution_clone');
+    expect(captured[0].parentRunId).toBe('run-parent-2');
+  });
 });
 
 describe('sub-session metadata via subsession.sync', () => {
@@ -179,6 +225,30 @@ describe('sub-session metadata via subsession.sync', () => {
     const before = [...captured];
     act(() => send({ type: 'subsession.sync', id: 'unknown123', modelDisplay: 'nope' }));
     expect(captured).toEqual(before);
+  });
+
+  it('merges execution-clone projection from subsession.sync into existing sub-session', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'sync-clone',
+      sessionName: 'deck_sub_sync_clone',
+      sessionType: 'codex-sdk',
+      parentSession: 'deck_proj_brain',
+    }));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'sync-clone',
+      executionCloneKind: 'execution_clone',
+      parentRunId: 'run-sync-clone',
+    }));
+
+    expect(captured[0].executionCloneKind).toBe('execution_clone');
+    expect(captured[0].parentRunId).toBe('run-sync-clone');
   });
 
 

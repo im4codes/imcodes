@@ -4865,6 +4865,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           name: s.name,
           agentType: s.agentType,
           state: s.state,
+          project: s.project,
           role: s.role,
           executionTemplateEligible: s.executionTemplateEligible,
           executionTemplateIneligibleReason: s.executionTemplateIneligibleReason,

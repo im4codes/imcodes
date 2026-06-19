@@ -308,6 +308,8 @@ export function useSubSessions(
                 ...(m.effort != null && { effort: m.effort }),
                 ...(m.contextNamespace !== undefined && { contextNamespace: m.contextNamespace }),
                 ...(m.contextNamespaceDiagnostics !== undefined && { contextNamespaceDiagnostics: m.contextNamespaceDiagnostics }),
+                ...(m.executionCloneKind !== undefined && { executionCloneKind: m.executionCloneKind }),
+                ...(m.parentRunId !== undefined && { parentRunId: m.parentRunId }),
                 ...(m.transportConfig !== undefined && {
                   transportConfig: mergeTransportConfigPreservingSupervision(
                     m.transportConfig,
@@ -352,6 +354,8 @@ export function useSubSessions(
               effort: m.effort ?? null,
               contextNamespace: m.contextNamespace ?? null,
               contextNamespaceDiagnostics: m.contextNamespaceDiagnostics ?? null,
+              executionCloneKind: m.executionCloneKind ?? null,
+              parentRunId: m.parentRunId ?? null,
               transportConfig: m.transportConfig ?? null,
               transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages),
               transportPendingMessageEntries: normalizeTransportPendingEntries(
@@ -399,6 +403,8 @@ export function useSubSessions(
               ...(m.effort !== undefined ? { effort: m.effort } : {}),
               ...(m.contextNamespace !== undefined ? { contextNamespace: m.contextNamespace } : {}),
               ...(m.contextNamespaceDiagnostics !== undefined ? { contextNamespaceDiagnostics: m.contextNamespaceDiagnostics } : {}),
+              ...(m.executionCloneKind !== undefined ? { executionCloneKind: m.executionCloneKind } : {}),
+              ...(m.parentRunId !== undefined ? { parentRunId: m.parentRunId } : {}),
               ...(m.transportConfig !== undefined ? {
                 transportConfig: mergeTransportConfigPreservingSupervision(
                   m.transportConfig,
