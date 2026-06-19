@@ -28,6 +28,11 @@ import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
+import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+
+function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
+  return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
+}
 
 type ViewMode = 'terminal' | 'chat';
 
@@ -52,6 +57,8 @@ export interface SessionPaneProps {
     label?: string | null;
     state: string;
     parentSession?: string | null;
+    executionCloneKind?: string | null;
+    parentRunId?: string | null;
     executionTemplateEligible?: boolean;
     executionTemplateIneligibleReason?: string;
   }>;
@@ -304,11 +311,9 @@ export function SessionPane({
     const template = executionRouting.templateSessionName;
     if (!template) return null;
     const sub = subSessions.find((item) => item.sessionName === template);
-    if (sub) return sub.label || sub.sessionName.split('_').pop() || sub.sessionName;
-    const main = sessions.find((item) => item.name === template);
-    if (main) return main.label || main.name.split('_').pop() || main.name;
+    if (sub && !isExecutionCloneTemplateLike(sub)) return sub.label || sub.sessionName.split('_').pop() || sub.sessionName;
     return null;
-  }, [executionRouting.templateSessionName, sessions, subSessions]);
+  }, [executionRouting.templateSessionName, subSessions]);
   const hasValidExecutionTemplate = Boolean(
     executionRouting.enabled
     && executionRouting.templateSessionName

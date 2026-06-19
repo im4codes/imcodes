@@ -1943,7 +1943,7 @@ describe('P2pConfigPanel', () => {
       expect(options.some((o) => o.textContent?.includes('brain'))).toBe(false);
     });
 
-    it('only lists daemon-eligible main workers from the same project as the scoped brain', async () => {
+    it('hides main worker sessions even when daemon marks them eligible', async () => {
       renderExecTab({
         sessions: [
           { name: 'deck_proj_brain', agentType: 'claude-code-sdk', state: 'running', role: 'brain', project: 'proj-a' },
@@ -1955,7 +1955,7 @@ describe('P2pConfigPanel', () => {
       await flush();
       const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
       const options = Array.from(select.querySelectorAll('option'));
-      expect(options.some((o) => o.value === 'deck_proj_worker' && !o.disabled)).toBe(true);
+      expect(options.some((o) => o.value === 'deck_proj_worker')).toBe(false);
       expect(options.some((o) => o.value === 'deck_other_worker')).toBe(false);
       expect(options.some((o) => o.value === 'deck_proj_blocked')).toBe(false);
     });

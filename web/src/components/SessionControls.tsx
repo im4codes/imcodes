@@ -79,6 +79,11 @@ import {
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
 import { shouldHideOptimisticUserMessageForSessionControl } from '@shared/session-control-commands.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
+import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+
+function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
+  return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
+}
 
 interface Props {
   ws: WsClient | null;
@@ -153,6 +158,8 @@ interface Props {
     label?: string | null;
     state: string;
     parentSession?: string | null;
+    executionCloneKind?: string | null;
+    parentRunId?: string | null;
     executionTemplateEligible?: boolean;
     executionTemplateIneligibleReason?: string;
   }>;
@@ -2015,11 +2022,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const executionSessionDisplayName = useMemo(() => {
     if (!configuredExecutionSession) return null;
     const sub = (subSessions ?? []).find((s) => s.sessionName === configuredExecutionSession);
-    if (sub) return sub.label || sub.sessionName.split('_').pop() || sub.sessionName;
-    const main = (sessions ?? []).find((s) => s.name === configuredExecutionSession);
-    if (main) return main.label || main.name.split('_').pop() || main.name;
+    if (sub && !isExecutionCloneTemplateLike(sub)) return sub.label || sub.sessionName.split('_').pop() || sub.sessionName;
     return null;
-  }, [configuredExecutionSession, sessions, subSessions]);
+  }, [configuredExecutionSession, subSessions]);
   const hasValidExecutionDefault = Boolean(
     configuredExecutionSession
     && executionSessionDisplayName
@@ -2047,44 +2052,34 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       seen.add(sessionName);
       eligible.push({ sessionName, shortName, sdk, preset });
     };
-    // GROUP-SCOPED: execution targets may ONLY be sessions of the CURRENT session's
-    // group. Worker (non-brain) MAIN sessions of the SAME project — filtered by
-    // project so other groups' workers never leak in — plus sub-sessions attached
-    // to this group (below). The current/orchestrator session is never a template.
-    for (const s of sessions ?? []) {
-      if (OPENSPEC_EXEC_EXCLUDED_TYPES.has(s.agentType)) continue;
-      if (s.name === activeSession?.name) continue;
-      if (s.role === 'brain') continue;
-      if (s.project !== activeSession?.project) continue; // same project group only
-      if (s.executionTemplateEligible === true) {
-        push(s.name, s.label || s.name.split('_').pop() || s.name, s.agentType, s.ccPreset ?? null);
-      }
-    }
+    // GROUP-SCOPED: execution targets are attached non-main sub-sessions only.
+    // Main sessions (brain/orchestrator/worker `wN`) are not execution templates.
     // Attached sub-sessions of THIS group only (strict parentSession === group root;
     // a sub-session with no/other parent is NOT in the current group and is excluded).
     for (const s of subSessions ?? []) {
       if (OPENSPEC_EXEC_EXCLUDED_TYPES.has(s.type)) continue;
       if (s.sessionName === activeSession?.name) continue;
       if (!rootSession || s.parentSession !== rootSession) continue;
+      if (isExecutionCloneTemplateLike(s)) continue;
       if (s.executionTemplateEligible === false) continue;
       push(s.sessionName, s.label || s.sessionName.split('_').pop() || s.sessionName, s.type, s.ccPresetId ?? null);
     }
     return eligible;
-  }, [sessions, subSessions, activeSession?.name, activeSession?.project, rootSession]);
+  }, [subSessions, activeSession?.name, rootSession]);
 
   // The pinned/default item: the saved template, but only when it still resolves
   // to a valid (display-resolvable, non-current) session in this project.
   const openSpecPinnedExecutionSession = useMemo(() => {
     if (!hasValidExecutionDefault || !configuredExecutionSession || !executionSessionDisplayName) return null;
-    const main = (sessions ?? []).find((s) => s.name === configuredExecutionSession);
     const sub = (subSessions ?? []).find((s) => s.sessionName === configuredExecutionSession);
+    if (!sub || isExecutionCloneTemplateLike(sub)) return null;
     return {
       sessionName: configuredExecutionSession,
       shortName: executionSessionDisplayName,
-      sdk: main?.agentType ?? sub?.type ?? '',
-      preset: main?.ccPreset ?? sub?.ccPresetId ?? null,
+      sdk: sub.type,
+      preset: sub.ccPresetId ?? null,
     };
-  }, [hasValidExecutionDefault, configuredExecutionSession, executionSessionDisplayName, sessions, subSessions]);
+  }, [hasValidExecutionDefault, configuredExecutionSession, executionSessionDisplayName, subSessions]);
 
   // Eligible sessions to list BELOW the pinned default (de-duplicated against it).
   const openSpecExecutionCandidates = useMemo(() => (

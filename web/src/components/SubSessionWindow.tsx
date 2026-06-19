@@ -43,6 +43,11 @@ import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
 import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
+import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+
+function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
+  return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
+}
 
 type GetMaximizeBounds = () => WorkspaceBounds | null;
 
@@ -95,6 +100,8 @@ interface Props {
     label?: string | null;
     state: string;
     parentSession?: string | null;
+    executionCloneKind?: string | null;
+    parentRunId?: string | null;
     executionTemplateEligible?: boolean;
     executionTemplateIneligibleReason?: string;
   }>;
@@ -478,11 +485,9 @@ export function SubSessionWindow({
     const template = executionRouting.templateSessionName;
     if (!template) return null;
     const candidateSub = subSessions?.find((item) => item.sessionName === template);
-    if (candidateSub) return candidateSub.label || candidateSub.sessionName.split('_').pop() || candidateSub.sessionName;
-    const main = sessions?.find((item) => item.name === template);
-    if (main) return main.label || main.name.split('_').pop() || main.name;
+    if (candidateSub && !isExecutionCloneTemplateLike(candidateSub)) return candidateSub.label || candidateSub.sessionName.split('_').pop() || candidateSub.sessionName;
     return null;
-  }, [executionRouting.templateSessionName, sessions, subSessions]);
+  }, [executionRouting.templateSessionName, subSessions]);
   const hasValidExecutionTemplate = Boolean(
     executionRouting.enabled
     && executionRouting.templateSessionName
