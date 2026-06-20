@@ -38,6 +38,7 @@ import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot, shouldPersis
 import { replicatePendingProcessedContext } from '../context/processed-context-replication.js';
 import { configureSharedContextRuntime } from '../context/shared-context-runtime.js';
 import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runtime-config.js';
+import { observeTransportQueueRevision } from './transport-queue-revision.js';
 import { setContextModelRuntimeConfig } from '../context/context-model-config.js';
 import { closeLiveContextMaterializationAdmission, LiveContextIngestion } from '../context/live-context-ingestion.js';
 import { LocalSkillReviewWorker } from '../context/skill-review-worker.js';
@@ -746,7 +747,7 @@ export async function startup(): Promise<DaemonContext> {
               ...(transportRuntime ? {
                 transportPendingMessages: transportRuntime.pendingMessages,
                 transportPendingMessageEntries: transportRuntime.pendingEntries,
-                transportPendingMessageVersion: transportRuntime.pendingVersion,
+                transportPendingMessageVersion: observeTransportQueueRevision(session.name, transportRuntime.pendingVersion),
               } : {}),
             });
           } catch { /* ignore */ }

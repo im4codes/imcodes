@@ -149,10 +149,9 @@ import { isP2pDiscussionVisibleInSubSessionBar } from './p2p-discussion-scope.js
 import {
   extractTransportPendingMessages,
   extractTransportPendingVersion,
+  hasExplicitTransportPendingSnapshot,
   mergeTransportPendingEntriesForIdleState,
   mergeTransportPendingEntriesForRunningState,
-  mergeTransportPendingMessagesForIdleState,
-  mergeTransportPendingMessagesForRunningState,
   nextTransportQueueVersion,
   normalizeTransportPendingEntries,
   removeTransportPendingEntryForUserMessage,
@@ -2957,15 +2956,19 @@ export function App() {
         // Sync session state from live timeline events (running/idle)
         if (event.type === 'session.state' && !event.sessionId.startsWith('deck_sub_')) {
           const liveState = String(event.payload.state ?? '');
-          const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessages');
+          const hasPendingSnapshot = hasExplicitTransportPendingSnapshot(event.payload);
           const incomingVersion = extractTransportPendingVersion(event.payload.pendingMessageVersion);
           if (liveState === 'queued') {
-            const pendingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
+            const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessageEntries');
+            const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages');
+            const parsedPendingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
             const pendingEntries = normalizeTransportPendingEntries(
               event.payload.pendingMessageEntries,
-              pendingMessages,
+              parsedPendingMessages,
               event.sessionId,
+              { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
             );
+            const pendingMessages = hasPendingEntriesField ? pendingEntries.map((entry) => entry.text) : parsedPendingMessages;
             setSessions((prev) => prev.map((s) => {
               if (s.name !== event.sessionId) return s;
               // Drop a stale `queued` snapshot wholesale: it would otherwise
@@ -2986,33 +2989,34 @@ export function App() {
           } else if (liveState === 'running') {
             setSessions((prev) => prev.map((s) => {
               if (s.name !== event.sessionId) return s;
-              const incomingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
+              const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessageEntries');
+              const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages');
+              const parsedIncomingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
               const incomingEntries = normalizeTransportPendingEntries(
                 event.payload.pendingMessageEntries,
-                incomingMessages,
+                parsedIncomingMessages,
                 event.sessionId,
+                { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
               );
+              const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
               const applyPending = shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
-                hasExplicitSnapshot: hasPendingMessagesField,
-                isExplicitEmpty: hasPendingMessagesField && incomingMessages.length === 0 && incomingEntries.length === 0,
+                hasExplicitSnapshot: hasPendingSnapshot,
+                isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
               });
               return {
                 ...s,
                 state: 'running' as SessionInfo['state'],
                 transportPendingMessages: applyPending
-                  ? mergeTransportPendingMessagesForRunningState(
-                      s.transportPendingMessages,
-                      event.payload.pendingMessages,
-                      hasPendingMessagesField,
-                    )
+                  ? incomingMessages
                   : (s.transportPendingMessages ?? []),
                 transportPendingMessageEntries: applyPending
                   ? mergeTransportPendingEntriesForRunningState(
                       s.transportPendingMessageEntries,
                       event.payload.pendingMessageEntries,
                       event.payload.pendingMessages,
-                      hasPendingMessagesField,
+                      hasPendingSnapshot,
                       event.sessionId,
+                      hasPendingEntriesField,
                     )
                   : (s.transportPendingMessageEntries ?? []),
                 transportPendingMessageVersion: applyPending
@@ -3023,33 +3027,34 @@ export function App() {
           } else if (liveState === 'idle') {
             setSessions((prev) => prev.map((s) => {
               if (s.name !== event.sessionId) return s;
-              const incomingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
+              const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessageEntries');
+              const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages');
+              const parsedIncomingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
               const incomingEntries = normalizeTransportPendingEntries(
                 event.payload.pendingMessageEntries,
-                incomingMessages,
+                parsedIncomingMessages,
                 event.sessionId,
+                { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
               );
+              const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
               const applyPending = shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
-                hasExplicitSnapshot: hasPendingMessagesField,
-                isExplicitEmpty: hasPendingMessagesField && incomingMessages.length === 0 && incomingEntries.length === 0,
+                hasExplicitSnapshot: hasPendingSnapshot,
+                isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
               });
               return {
                 ...s,
                 state: liveState as SessionInfo['state'],
                 transportPendingMessages: applyPending
-                  ? mergeTransportPendingMessagesForIdleState(
-                      s.transportPendingMessages,
-                      event.payload.pendingMessages,
-                      hasPendingMessagesField,
-                    )
+                  ? incomingMessages
                   : (s.transportPendingMessages ?? []),
                 transportPendingMessageEntries: applyPending
                   ? mergeTransportPendingEntriesForIdleState(
                       s.transportPendingMessageEntries,
                       event.payload.pendingMessageEntries,
                       event.payload.pendingMessages,
-                      hasPendingMessagesField,
+                      hasPendingSnapshot,
                       event.sessionId,
+                      hasPendingEntriesField,
                     )
                   : (s.transportPendingMessageEntries ?? []),
                 transportPendingMessageVersion: applyPending

@@ -121,10 +121,14 @@ export function mergeSessionListEntry(
     incoming.transportPendingMessageEntries,
     parsedMessages,
     incoming.name,
+    {
+      hasEntriesField: hasPendingEntriesField,
+      hasMessagesField: hasPendingMessagesField,
+    },
   );
-  const normalizedMessages = parsedMessages.length > 0
-    ? parsedMessages
-    : normalizedEntries.map((entry) => entry.text);
+  const normalizedMessages = hasPendingEntriesField
+    ? normalizedEntries.map((entry) => entry.text)
+    : parsedMessages;
 
   // Monotonic version guard: a `session_list` heartbeat can be built before
   // a drain but delivered after it. If this snapshot's queue version is older

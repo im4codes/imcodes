@@ -2099,8 +2099,8 @@ function markTransportCancelIdle(sessionName: string, error?: string): void {
     pendingMessages: runtime?.pendingMessages ?? [],
     pendingMessageEntries: runtime?.pendingEntries ?? [],
     pendingMessageVersion: runtime
-      ? (typeof runtime.pendingVersion === 'number' ? observeTransportQueueRevision(sessionName, runtime.pendingVersion) : 0)
-      : (getTransportQueueRevision(sessionName) ?? 0),
+      ? observeTransportQueueRevision(sessionName, runtime.pendingVersion)
+      : (getTransportQueueRevision(sessionName) ?? observeTransportQueueRevision(sessionName, undefined)),
     ...(error ? { error } : {}),
   }, { source: 'daemon', confidence: 'high' });
 }

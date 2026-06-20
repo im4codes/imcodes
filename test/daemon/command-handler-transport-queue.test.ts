@@ -1012,7 +1012,7 @@ describe('handleWebCommand transport queue behavior', () => {
         pendingCount: 3,
         pendingMessages: ['a', 'b', 'c'],
         pendingMessageEntries: [],
-        pendingMessageVersion: 0,
+        pendingMessageVersion: expect.any(Number),
       },
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );

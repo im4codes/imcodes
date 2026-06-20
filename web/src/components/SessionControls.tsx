@@ -894,11 +894,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return filtered.length === merged.length ? merged : filtered;
   }, [incomingQueuedTransportEntries, optimisticQueuedEntries, settledQueuedIds]);
 
-  // Settled ids are per-session — reset on session switch. The timeline replay
-  // for the newly-active session re-emits its user.message events, rebuilding the
-  // set, so a delivered-but-stale-queued message clears again after a switch.
+  // Settled ids and optimistic queue overlays are scoped to the active session.
+  // Reset the local overlay on switch; canonical session/app state remains
+  // responsible for retaining or clearing authoritative pending entries.
   useEffect(() => {
     setSettledQueuedIds(new Set());
+    setOptimisticQueuedEntries(null);
+    setEditingQueuedMessageId(null);
+    queuedMutationRollbackRef.current.clear();
+    failedQueuedCommandIdsRef.current.clear();
   }, [activeSession?.name]);
 
   const clearOpenSpecRequestTimer = useCallback(() => {
@@ -1412,10 +1416,21 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         const normalizedText = typeof text === 'string' ? normalizeQueuedText(text) : '';
         setOptimisticQueuedEntries((prev) => {
           if (!prev) return prev;
-          const matchIndex = prev.findIndex((entry) => commandId && entry.clientMessageId === commandId);
+          const matchIndex = commandId
+            ? prev.findIndex((entry) => entry.clientMessageId === commandId)
+            : -1;
           const fallbackIndex = matchIndex >= 0
             ? matchIndex
-            : prev.findIndex((entry) => normalizedText && normalizeQueuedText(entry.text) === normalizedText);
+            : (() => {
+                // If a stable id/command id was provided but did not match, do
+                // not fall back to text: duplicate prompts would remove the
+                // wrong queued card and leave the real one stuck.
+                if (commandId || !normalizedText) return -1;
+                const matches = prev
+                  .map((entry, index) => ({ entry, index }))
+                  .filter(({ entry }) => normalizeQueuedText(entry.text) === normalizedText);
+                return matches.length === 1 ? matches[0].index : -1;
+              })();
           if (fallbackIndex < 0) return prev;
           const next = prev.filter((_, index) => index !== fallbackIndex);
           return next.length > 0 ? next : null;

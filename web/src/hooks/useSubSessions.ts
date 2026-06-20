@@ -13,12 +13,12 @@ import type { WsClient } from '../ws-client.js';
 import { isRunningTimelineEvent } from '../timeline-running.js';
 import { mergeTransportConfigPreservingSupervision } from '@shared/supervision-config.js';
 import {
+  buildTransportPendingSyncPatch,
   extractTransportPendingMessages,
   extractTransportPendingVersion,
+  hasExplicitTransportPendingSnapshot,
   mergeTransportPendingEntriesForIdleState,
   mergeTransportPendingEntriesForRunningState,
-  mergeTransportPendingMessagesForIdleState,
-  mergeTransportPendingMessagesForRunningState,
   nextTransportQueueVersion,
   normalizeTransportPendingEntries,
   removeTransportPendingEntryForUserMessage,
@@ -57,49 +57,6 @@ function isCodexFamily(agentType: string | null | undefined): boolean {
 
 function toSessionName(id: string): string {
   return `deck_sub_${id}`;
-}
-
-function hasTransportPendingSyncSnapshot(value: Record<string, unknown>): boolean {
-  return Object.prototype.hasOwnProperty.call(value, 'transportPendingMessages')
-    || Object.prototype.hasOwnProperty.call(value, 'transportPendingMessageEntries')
-    || Object.prototype.hasOwnProperty.call(value, 'transportPendingMessageVersion');
-}
-
-function buildTransportPendingSyncPatch(
-  existing: Pick<SubSession, 'transportPendingMessages' | 'transportPendingMessageEntries' | 'transportPendingMessageVersion'>,
-  value: Record<string, unknown>,
-  scopeKey: string,
-): Partial<SubSession> {
-  if (!hasTransportPendingSyncSnapshot(value)) return {};
-  const incomingVersion = extractTransportPendingVersion(value.transportPendingMessageVersion);
-  const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(value, 'transportPendingMessages');
-  const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(value, 'transportPendingMessageEntries');
-  const pendingMessages = extractTransportPendingMessages(value.transportPendingMessages);
-  const pendingEntries = normalizeTransportPendingEntries(
-    value.transportPendingMessageEntries,
-    pendingMessages,
-    scopeKey,
-  );
-  if (!shouldApplyTransportQueueSnapshotForPayload(existing.transportPendingMessageVersion ?? undefined, incomingVersion, {
-    hasExplicitSnapshot: hasPendingMessagesField || hasPendingEntriesField,
-    isExplicitEmpty: (hasPendingMessagesField || hasPendingEntriesField) && pendingMessages.length === 0 && pendingEntries.length === 0,
-  })) {
-    return {};
-  }
-  return {
-    ...(hasPendingMessagesField
-      ? { transportPendingMessages: pendingMessages }
-      : {}),
-    ...(hasPendingMessagesField || hasPendingEntriesField
-      ? {
-          transportPendingMessageEntries: pendingEntries,
-        }
-      : {}),
-    transportPendingMessageVersion: nextTransportQueueVersion(
-      existing.transportPendingMessageVersion ?? undefined,
-      incomingVersion,
-    ),
-  };
 }
 
 function mergeLoadedSubSession(s: SubSessionData, existing?: SubSession): SubSession {
@@ -361,11 +318,25 @@ export function useSubSessions(
               executionCloneKind: m.executionCloneKind ?? null,
               parentRunId: m.parentRunId ?? null,
               transportConfig: m.transportConfig ?? null,
-              transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages),
+              transportPendingMessages: Object.prototype.hasOwnProperty.call(m, 'transportPendingMessageEntries')
+                ? normalizeTransportPendingEntries(
+                    m.transportPendingMessageEntries,
+                    extractTransportPendingMessages(m.transportPendingMessages),
+                    toSessionName(m.id),
+                    {
+                      hasEntriesField: true,
+                      hasMessagesField: Object.prototype.hasOwnProperty.call(m, 'transportPendingMessages'),
+                    },
+                  ).map((entry) => entry.text)
+                : extractTransportPendingMessages(m.transportPendingMessages),
               transportPendingMessageEntries: normalizeTransportPendingEntries(
                 m.transportPendingMessageEntries,
                 extractTransportPendingMessages(m.transportPendingMessages),
                 toSessionName(m.id),
+                {
+                  hasEntriesField: Object.prototype.hasOwnProperty.call(m, 'transportPendingMessageEntries'),
+                  hasMessagesField: Object.prototype.hasOwnProperty.call(m, 'transportPendingMessages'),
+                },
               ),
               transportPendingMessageVersion: extractTransportPendingVersion(m.transportPendingMessageVersion),
             }];
@@ -477,9 +448,9 @@ export function useSubSessions(
       }
 
       if (!sessionName || !sessionName.startsWith('deck_sub_')) return;
-      const hasPendingMessagesField = msg.type === 'timeline.event'
+      const hasPendingSnapshot = msg.type === 'timeline.event'
         && msg.event.type === 'session.state'
-        && Object.prototype.hasOwnProperty.call(msg.event.payload ?? {}, 'pendingMessages');
+        && hasExplicitTransportPendingSnapshot(msg.event.payload);
       const pendingEntriesPayload = msg.type === 'timeline.event' && msg.event.type === 'session.state'
         ? msg.event.payload.pendingMessageEntries
         : undefined;
@@ -490,16 +461,24 @@ export function useSubSessions(
         ? extractTransportPendingVersion(msg.event.payload.pendingMessageVersion)
         : undefined;
       if (state === 'queued') {
-        const pendingMessages = msg.type === 'timeline.event' && msg.event.type === 'session.state'
+        const hasPendingEntriesField = msg.type === 'timeline.event'
+          && msg.event.type === 'session.state'
+          && Object.prototype.hasOwnProperty.call(msg.event.payload, 'pendingMessageEntries');
+        const hasPendingMessagesField = msg.type === 'timeline.event'
+          && msg.event.type === 'session.state'
+          && Object.prototype.hasOwnProperty.call(msg.event.payload, 'pendingMessages');
+        const parsedPendingMessages = msg.type === 'timeline.event' && msg.event.type === 'session.state'
           ? extractTransportPendingMessages(pendingMessagesPayload)
           : [];
         const pendingEntries = msg.type === 'timeline.event' && msg.event.type === 'session.state'
           ? normalizeTransportPendingEntries(
               pendingEntriesPayload,
-              pendingMessages,
+              parsedPendingMessages,
               sessionName,
+              { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
             )
           : [];
+        const pendingMessages = hasPendingEntriesField ? pendingEntries.map((entry) => entry.text) : parsedPendingMessages;
         setSubSessions((prev) => {
           const idx = prev.findIndex((s) => s.sessionName === sessionName);
           if (idx === -1) return prev;
@@ -520,15 +499,21 @@ export function useSubSessions(
         });
         return;
       }
-      if (state === 'running' && hasPendingMessagesField) {
+      if (state === 'running' && hasPendingSnapshot) {
         setSubSessions((prev) => {
           const idx = prev.findIndex((s) => s.sessionName === sessionName);
           if (idx === -1) return prev;
-          const incomingMessages = extractTransportPendingMessages(pendingMessagesPayload);
-          const incomingEntries = normalizeTransportPendingEntries(pendingEntriesPayload, incomingMessages, sessionName);
+          const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(msg.event.payload, 'pendingMessageEntries');
+          const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(msg.event.payload, 'pendingMessages');
+          const parsedIncomingMessages = extractTransportPendingMessages(pendingMessagesPayload);
+          const incomingEntries = normalizeTransportPendingEntries(pendingEntriesPayload, parsedIncomingMessages, sessionName, {
+            hasEntriesField: hasPendingEntriesField,
+            hasMessagesField: hasPendingMessagesField,
+          });
+          const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
           const applyPending = shouldApplyTransportQueueSnapshotForPayload(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion, {
-            hasExplicitSnapshot: hasPendingMessagesField,
-            isExplicitEmpty: hasPendingMessagesField && incomingMessages.length === 0 && incomingEntries.length === 0,
+            hasExplicitSnapshot: hasPendingSnapshot,
+            isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
           });
           if (!applyPending) {
             if (prev[idx].state === 'running') return prev;
@@ -540,17 +525,14 @@ export function useSubSessions(
           next[idx] = {
             ...next[idx],
             state: 'running',
-            transportPendingMessages: mergeTransportPendingMessagesForRunningState(
-              next[idx].transportPendingMessages,
-              msg.event.payload.pendingMessages,
-              true,
-            ),
+            transportPendingMessages: incomingMessages,
             transportPendingMessageEntries: mergeTransportPendingEntriesForRunningState(
               next[idx].transportPendingMessageEntries,
               msg.event.payload.pendingMessageEntries,
               msg.event.payload.pendingMessages,
-              true,
+              hasPendingSnapshot,
               sessionName,
+              hasPendingEntriesField,
             ),
             transportPendingMessageVersion: nextTransportQueueVersion(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion),
           };
@@ -563,27 +545,34 @@ export function useSubSessions(
         const idx = prev.findIndex((s) => s.sessionName === sessionName);
         if (idx === -1) return prev;
         // For idle, only fold in the pending snapshot when it isn't stale.
-        const incomingMessages = extractTransportPendingMessages(pendingMessagesPayload);
-        const incomingEntries = normalizeTransportPendingEntries(pendingEntriesPayload, incomingMessages, sessionName);
+        const hasPendingEntriesField = msg.type === 'timeline.event'
+          && msg.event.type === 'session.state'
+          && Object.prototype.hasOwnProperty.call(msg.event.payload, 'pendingMessageEntries');
+        const hasPendingMessagesField = msg.type === 'timeline.event'
+          && msg.event.type === 'session.state'
+          && Object.prototype.hasOwnProperty.call(msg.event.payload, 'pendingMessages');
+        const parsedIncomingMessages = extractTransportPendingMessages(pendingMessagesPayload);
+        const incomingEntries = normalizeTransportPendingEntries(pendingEntriesPayload, parsedIncomingMessages, sessionName, {
+          hasEntriesField: hasPendingEntriesField,
+          hasMessagesField: hasPendingMessagesField,
+        });
+        const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
         const applyIdlePending = state === 'idle'
           && shouldApplyTransportQueueSnapshotForPayload(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion, {
-            hasExplicitSnapshot: hasPendingMessagesField,
-            isExplicitEmpty: hasPendingMessagesField && incomingMessages.length === 0 && incomingEntries.length === 0,
+            hasExplicitSnapshot: hasPendingSnapshot,
+            isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
           });
         const nextPendingMessages = applyIdlePending
-          ? mergeTransportPendingMessagesForIdleState(
-              prev[idx].transportPendingMessages,
-              pendingMessagesPayload,
-              hasPendingMessagesField,
-            )
+          ? incomingMessages
           : prev[idx].transportPendingMessages ?? [];
         const nextPendingEntries = applyIdlePending
           ? mergeTransportPendingEntriesForIdleState(
               prev[idx].transportPendingMessageEntries,
               pendingEntriesPayload,
               pendingMessagesPayload,
-              hasPendingMessagesField,
+              hasPendingSnapshot,
               sessionName,
+              hasPendingEntriesField,
             )
           : prev[idx].transportPendingMessageEntries ?? [];
         const nextVersion = applyIdlePending

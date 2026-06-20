@@ -62,14 +62,14 @@ describe('transport-resend-queue user-visible signals (audit 0419d1ac-1f4)', () 
 
   it('resend mutations advance a session queue revision', async () => {
     const first = enqueueResend('s-version', { text: 'first', commandId: 'c1', queuedAt: Date.now() });
-    expect(first.pendingVersion).toBe(0);
+    expect(first.pendingVersion).toBe(1);
     const second = enqueueResend('s-version', { text: 'second', commandId: 'c2', queuedAt: Date.now() });
-    expect(second.pendingVersion).toBe(1);
-    expect(getTransportQueueRevision('s-version')).toBe(1);
+    expect(second.pendingVersion).toBe(2);
+    expect(getTransportQueueRevision('s-version')).toBe(2);
 
     await drainResend('s-version', () => 'sent');
     expect(getResendEntries('s-version')).toEqual([]);
-    expect(getTransportQueueRevision('s-version')).toBe(2);
+    expect(getTransportQueueRevision('s-version')).toBe(3);
   });
 
   it('resend pending snapshots carry the queue revision', () => {
