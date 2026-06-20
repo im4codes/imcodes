@@ -22,7 +22,7 @@ import {
   nextTransportQueueVersion,
   normalizeTransportPendingEntries,
   removeTransportPendingEntryForUserMessage,
-  shouldApplyTransportQueueSnapshot,
+  shouldApplyTransportQueueSnapshotForPayload,
 } from '../transport-queue.js';
 import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
 import { getAutoSessionLabelPrefix } from '../agent-display.js';
@@ -72,23 +72,27 @@ function buildTransportPendingSyncPatch(
 ): Partial<SubSession> {
   if (!hasTransportPendingSyncSnapshot(value)) return {};
   const incomingVersion = extractTransportPendingVersion(value.transportPendingMessageVersion);
-  if (!shouldApplyTransportQueueSnapshot(existing.transportPendingMessageVersion ?? undefined, incomingVersion)) {
-    return {};
-  }
   const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(value, 'transportPendingMessages');
   const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(value, 'transportPendingMessageEntries');
   const pendingMessages = extractTransportPendingMessages(value.transportPendingMessages);
+  const pendingEntries = normalizeTransportPendingEntries(
+    value.transportPendingMessageEntries,
+    pendingMessages,
+    scopeKey,
+  );
+  if (!shouldApplyTransportQueueSnapshotForPayload(existing.transportPendingMessageVersion ?? undefined, incomingVersion, {
+    hasExplicitSnapshot: hasPendingMessagesField || hasPendingEntriesField,
+    isExplicitEmpty: (hasPendingMessagesField || hasPendingEntriesField) && pendingMessages.length === 0 && pendingEntries.length === 0,
+  })) {
+    return {};
+  }
   return {
     ...(hasPendingMessagesField
       ? { transportPendingMessages: pendingMessages }
       : {}),
     ...(hasPendingMessagesField || hasPendingEntriesField
       ? {
-          transportPendingMessageEntries: normalizeTransportPendingEntries(
-            value.transportPendingMessageEntries,
-            pendingMessages,
-            scopeKey,
-          ),
+          transportPendingMessageEntries: pendingEntries,
         }
       : {}),
     transportPendingMessageVersion: nextTransportQueueVersion(
@@ -500,7 +504,10 @@ export function useSubSessions(
           const idx = prev.findIndex((s) => s.sessionName === sessionName);
           if (idx === -1) return prev;
           // Drop a stale `queued` snapshot wholesale (mirror app.tsx).
-          if (!shouldApplyTransportQueueSnapshot(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion)) return prev;
+          if (!shouldApplyTransportQueueSnapshotForPayload(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion, {
+            hasExplicitSnapshot: true,
+            isExplicitEmpty: pendingMessages.length === 0 && pendingEntries.length === 0,
+          })) return prev;
           const next = [...prev];
           next[idx] = {
             ...next[idx],
@@ -517,7 +524,12 @@ export function useSubSessions(
         setSubSessions((prev) => {
           const idx = prev.findIndex((s) => s.sessionName === sessionName);
           if (idx === -1) return prev;
-          const applyPending = shouldApplyTransportQueueSnapshot(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion);
+          const incomingMessages = extractTransportPendingMessages(pendingMessagesPayload);
+          const incomingEntries = normalizeTransportPendingEntries(pendingEntriesPayload, incomingMessages, sessionName);
+          const applyPending = shouldApplyTransportQueueSnapshotForPayload(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion, {
+            hasExplicitSnapshot: hasPendingMessagesField,
+            isExplicitEmpty: hasPendingMessagesField && incomingMessages.length === 0 && incomingEntries.length === 0,
+          });
           if (!applyPending) {
             if (prev[idx].state === 'running') return prev;
             const sameNext = [...prev];
@@ -551,8 +563,13 @@ export function useSubSessions(
         const idx = prev.findIndex((s) => s.sessionName === sessionName);
         if (idx === -1) return prev;
         // For idle, only fold in the pending snapshot when it isn't stale.
+        const incomingMessages = extractTransportPendingMessages(pendingMessagesPayload);
+        const incomingEntries = normalizeTransportPendingEntries(pendingEntriesPayload, incomingMessages, sessionName);
         const applyIdlePending = state === 'idle'
-          && shouldApplyTransportQueueSnapshot(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion);
+          && shouldApplyTransportQueueSnapshotForPayload(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion, {
+            hasExplicitSnapshot: hasPendingMessagesField,
+            isExplicitEmpty: hasPendingMessagesField && incomingMessages.length === 0 && incomingEntries.length === 0,
+          });
         const nextPendingMessages = applyIdlePending
           ? mergeTransportPendingMessagesForIdleState(
               prev[idx].transportPendingMessages,

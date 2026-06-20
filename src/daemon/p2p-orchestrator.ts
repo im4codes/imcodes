@@ -15,6 +15,7 @@ import { detectStatusAsync } from '../agent/detect.js';
 import { getSession } from '../store/session-store.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../agent/session-manager.js';
+import { getTransportQueueRevision, observeTransportQueueRevision } from './transport-queue-revision.js';
 import {
   P2P_BASELINE_PROMPT,
   getLegacyExecutionRoundCount,
@@ -1045,7 +1046,9 @@ function emitP2pQueueSnapshot(session: string, runtime: ReturnType<typeof getTra
       text: entry.text,
       ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
     })),
-    ...(typeof runtime?.pendingVersion === 'number' ? { pendingMessageVersion: runtime.pendingVersion } : {}),
+    ...(runtime
+      ? { pendingMessageVersion: observeTransportQueueRevision(session, runtime.pendingVersion) }
+      : (typeof getTransportQueueRevision(session) === 'number' ? { pendingMessageVersion: getTransportQueueRevision(session) } : {})),
   }, { source: 'daemon', confidence: 'high' });
 }
 
@@ -1145,7 +1148,7 @@ function emitP2pTransportQueuedState(
       session,
       reason,
       pendingCount: runtime.pendingCount,
-      pendingVersion: runtime.pendingVersion,
+      pendingVersion: observeTransportQueueRevision(session, runtime.pendingVersion),
     },
     'P2P: transport prompt queued behind active turn',
   );
@@ -1154,7 +1157,7 @@ function emitP2pTransportQueuedState(
     pendingCount: runtime.pendingCount,
     pendingMessages: runtime.pendingMessages,
     pendingMessageEntries: runtime.pendingEntries,
-    pendingMessageVersion: runtime.pendingVersion,
+    pendingMessageVersion: observeTransportQueueRevision(session, runtime.pendingVersion),
   }, { source: 'daemon', confidence: 'high' });
 }
 

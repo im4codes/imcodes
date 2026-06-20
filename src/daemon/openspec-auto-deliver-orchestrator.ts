@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { getSession } from '../store/session-store.js';
 import { getTransportRuntime, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
+import { getTransportQueueRevision, observeTransportQueueRevision } from './transport-queue-revision.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import {
@@ -376,7 +377,7 @@ function queueAutoDeliverPromptForTransportResend(
     queuedAt: Date.now(),
   });
   const queued = getResendEntries(run.targetImplementationSessionName);
-  emitAutoDeliverQueuedState(run.targetImplementationSessionName, queued);
+  emitAutoDeliverQueuedState(run.targetImplementationSessionName, queued, enqueueResult.pendingVersion);
   // Trigger the runtime (re)launch so the resend queue actually drains. Manual
   // sends do this inline (command-handler); Auto-Deliver delivers outside that
   // path, so without this an enqueued prompt for a transport session with no
@@ -431,7 +432,9 @@ async function sendAutoDeliverPromptToImplementationSession(
           commandId: entry.clientMessageId,
           text: entry.text,
         })),
-        typeof runtime.pendingVersion === 'number' ? runtime.pendingVersion : undefined,
+        typeof runtime.pendingVersion === 'number'
+          ? observeTransportQueueRevision(run.targetImplementationSessionName, runtime.pendingVersion)
+          : undefined,
       );
     }
     return result;
@@ -477,12 +480,12 @@ function purgeQueuedAutoDeliverPrompts(run: AutoDeliverRun, reason: string): voi
       pendingCount: runtime?.pendingCount ?? 0,
       pendingMessages: runtime?.pendingMessages ?? [],
       pendingMessageEntries: runtime?.pendingEntries ?? [],
-      pendingMessageVersion: runtime?.pendingVersion,
+      pendingMessageVersion: runtime ? observeTransportQueueRevision(run.targetImplementationSessionName, runtime.pendingVersion) : getTransportQueueRevision(run.targetImplementationSessionName),
     }, { source: 'daemon', confidence: 'high' });
   }
   if (resendRemoved > 0) {
     const queued = getResendEntries(run.targetImplementationSessionName);
-    emitAutoDeliverQueuedState(run.targetImplementationSessionName, queued);
+    emitAutoDeliverQueuedState(run.targetImplementationSessionName, queued, getTransportQueueRevision(run.targetImplementationSessionName));
   }
   if (runtimeRemoved + resendRemoved > 0) {
     run.evidence = mergeEvidence(run.evidence, [{

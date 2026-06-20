@@ -156,7 +156,7 @@ import {
   nextTransportQueueVersion,
   normalizeTransportPendingEntries,
   removeTransportPendingEntryForUserMessage,
-  shouldApplyTransportQueueSnapshot,
+  shouldApplyTransportQueueSnapshotForPayload,
 } from './transport-queue.js';
 import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
@@ -2971,7 +2971,10 @@ export function App() {
               // Drop a stale `queued` snapshot wholesale: it would otherwise
               // both resurrect drained entries AND wrongly downgrade a session
               // that has since moved past queued.
-              if (!shouldApplyTransportQueueSnapshot(s.transportPendingMessageVersion, incomingVersion)) return s;
+              if (!shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
+                hasExplicitSnapshot: true,
+                isExplicitEmpty: pendingMessages.length === 0 && pendingEntries.length === 0,
+              })) return s;
               return {
                 ...s,
                 state: 'queued' as SessionInfo['state'],
@@ -2983,7 +2986,16 @@ export function App() {
           } else if (liveState === 'running') {
             setSessions((prev) => prev.map((s) => {
               if (s.name !== event.sessionId) return s;
-              const applyPending = shouldApplyTransportQueueSnapshot(s.transportPendingMessageVersion, incomingVersion);
+              const incomingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
+              const incomingEntries = normalizeTransportPendingEntries(
+                event.payload.pendingMessageEntries,
+                incomingMessages,
+                event.sessionId,
+              );
+              const applyPending = shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
+                hasExplicitSnapshot: hasPendingMessagesField,
+                isExplicitEmpty: hasPendingMessagesField && incomingMessages.length === 0 && incomingEntries.length === 0,
+              });
               return {
                 ...s,
                 state: 'running' as SessionInfo['state'],
@@ -3011,7 +3023,16 @@ export function App() {
           } else if (liveState === 'idle') {
             setSessions((prev) => prev.map((s) => {
               if (s.name !== event.sessionId) return s;
-              const applyPending = shouldApplyTransportQueueSnapshot(s.transportPendingMessageVersion, incomingVersion);
+              const incomingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
+              const incomingEntries = normalizeTransportPendingEntries(
+                event.payload.pendingMessageEntries,
+                incomingMessages,
+                event.sessionId,
+              );
+              const applyPending = shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
+                hasExplicitSnapshot: hasPendingMessagesField,
+                isExplicitEmpty: hasPendingMessagesField && incomingMessages.length === 0 && incomingEntries.length === 0,
+              });
               return {
                 ...s,
                 state: liveState as SessionInfo['state'],

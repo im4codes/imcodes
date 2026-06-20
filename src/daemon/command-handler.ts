@@ -33,6 +33,7 @@ import { emitSessionInlineError } from './session-error.js';
 import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from './transport-resend-preservation.js';
 import { buildTransportPendingQueueSnapshot } from './transport-pending-snapshot.js';
+import { observeTransportQueueRevision, getTransportQueueRevision } from './transport-queue-revision.js';
 import {
   startSubSession,
   stopSubSession,
@@ -2097,7 +2098,9 @@ function markTransportCancelIdle(sessionName: string, error?: string): void {
     pendingCount: runtime?.pendingCount ?? 0,
     pendingMessages: runtime?.pendingMessages ?? [],
     pendingMessageEntries: runtime?.pendingEntries ?? [],
-    pendingMessageVersion: runtime?.pendingVersion ?? 0,
+    pendingMessageVersion: runtime
+      ? (typeof runtime.pendingVersion === 'number' ? observeTransportQueueRevision(sessionName, runtime.pendingVersion) : 0)
+      : (getTransportQueueRevision(sessionName) ?? 0),
     ...(error ? { error } : {}),
   }, { source: 'daemon', confidence: 'high' });
 }
@@ -3357,6 +3360,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           text: e.text,
           ...(e.sharedActor ? { sharedActor: e.sharedActor } : {}),
         })),
+        pendingMessageVersion: enqueueResult.pendingVersion,
       },
       { source: 'daemon', confidence: 'high' },
     );
@@ -3441,6 +3445,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           text: e.text,
           ...(e.sharedActor ? { sharedActor: e.sharedActor } : {}),
         })),
+        pendingMessageVersion: enqueueResultMissingSid.pendingVersion,
       },
       { source: 'daemon', confidence: 'high' },
     );
@@ -3771,7 +3776,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           pendingCount: transportRuntime.pendingCount,
           pendingMessages: transportRuntime.pendingMessages,
           pendingMessageEntries: transportRuntime.pendingEntries,
-          pendingMessageVersion: transportRuntime.pendingVersion,
+          pendingMessageVersion: observeTransportQueueRevision(sessionName, transportRuntime.pendingVersion),
         }, { source: 'daemon', confidence: 'high' });
       }
       // Clear fresh-start flag — the new conversation is now active
@@ -4058,7 +4063,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
       pendingMessageEntries: runtime.pendingEntries,
-      pendingMessageVersion: runtime.pendingVersion,
+      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
@@ -4095,7 +4100,7 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
       pendingMessageEntries: runtime.pendingEntries,
-      pendingMessageVersion: runtime.pendingVersion,
+      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
@@ -5460,7 +5465,7 @@ async function handleAskAnswer(cmd: Record<string, unknown>, serverLink: ServerL
             pendingCount: runtime.pendingCount,
             pendingMessages: runtime.pendingMessages,
             pendingMessageEntries: runtime.pendingEntries,
-            pendingMessageVersion: runtime.pendingVersion,
+            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
           }, { source: 'daemon', confidence: 'high' });
         }
       } else {

@@ -53,6 +53,7 @@ import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type
 import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup.js';
 import { clearResend, drainResend, getResendCount, getResendEntries, listFreshResendQueues } from '../daemon/transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
+import { getTransportQueueRevision, observeTransportQueueRevision } from '../daemon/transport-queue-revision.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
@@ -1158,6 +1159,7 @@ async function recoverTransportRuntimeAfterError(
           pendingCount,
           pendingMessages: queued.map((entry) => entry.text),
           pendingMessageEntries: queued.map((entry) => ({ clientMessageId: entry.commandId, text: entry.text })),
+          pendingMessageVersion: getTransportQueueRevision(sessionName) ?? observeTransportQueueRevision(sessionName, undefined),
         }, { source: 'daemon', confidence: 'high' });
       }
       return false;
@@ -1176,6 +1178,7 @@ async function recoverTransportRuntimeAfterError(
         pendingCount,
         pendingMessages: queued.map((entry) => entry.text),
         pendingMessageEntries: queued.map((entry) => ({ clientMessageId: entry.commandId, text: entry.text })),
+        pendingMessageVersion: getTransportQueueRevision(sessionName) ?? observeTransportQueueRevision(sessionName, undefined),
       }, { source: 'daemon', confidence: 'high' });
     }
 
@@ -1295,7 +1298,7 @@ async function drainTransportResendQueueIntoRuntime(
               allowDuplicate: true,
               commandId: entry.commandId,
               clientMessageId: entry.commandId,
-              pendingMessageVersion: runtime.pendingVersion,
+              pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
               ...(attachments.length > 0 ? { attachments } : {}),
               ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
             },
@@ -1306,7 +1309,7 @@ async function drainTransportResendQueueIntoRuntime(
             pendingCount: runtime.pendingCount,
             pendingMessages: runtime.pendingMessages,
             pendingMessageEntries: runtime.pendingEntries,
-            pendingMessageVersion: runtime.pendingVersion,
+            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
           }, { source: 'daemon', confidence: 'high' });
         } else if (result === 'queued') {
           timelineEmitter.emit(sessionName, 'session.state', {
@@ -1314,7 +1317,7 @@ async function drainTransportResendQueueIntoRuntime(
             pendingCount: runtime.pendingCount,
             pendingMessages: runtime.pendingMessages,
             pendingMessageEntries: runtime.pendingEntries,
-            pendingMessageVersion: runtime.pendingVersion,
+            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
           }, { source: 'daemon', confidence: 'high' });
         }
         return result;
@@ -1351,6 +1354,13 @@ async function drainTransportResendQueueIntoRuntime(
         );
       },
     );
+    timelineEmitter.emit(sessionName, 'session.state', {
+      state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+      pendingCount: runtime.pendingCount,
+      pendingMessages: runtime.pendingMessages,
+      pendingMessageEntries: runtime.pendingEntries,
+      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
+    }, { source: 'daemon', confidence: 'high' });
   } catch (err) {
     logger.warn({ err, session: sessionName, context }, 'transport resend drain failed');
   }
@@ -1372,7 +1382,7 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       payload.pendingCount = runtime.pendingCount;
       payload.pendingMessages = runtime.pendingMessages;
       payload.pendingMessageEntries = runtime.pendingEntries;
-      payload.pendingMessageVersion = runtime.pendingVersion;
+      payload.pendingMessageVersion = observeTransportQueueRevision(sessionName, runtime.pendingVersion);
     }
     timelineEmitter.emit(sessionName, 'session.state', payload, { source: 'daemon', confidence: 'high' });
     if (status === 'error') {
@@ -1384,7 +1394,7 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     // events AND the cleared session.state below so the UI advances its
     // baseline even if one of those events is lost on a weak network — a
     // stale pre-drain snapshot can then never resurrect these entries.
-    const drainedVersion = runtime.pendingVersion;
+    const drainedVersion = observeTransportQueueRevision(sessionName, runtime.pendingVersion);
     for (const entry of messages) {
       timelineEmitter.emit(
         sessionName,
@@ -1411,7 +1421,7 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
       pendingMessageEntries: runtime.pendingEntries,
-      pendingMessageVersion: runtime.pendingVersion,
+      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
     }, { source: 'daemon', confidence: 'high' });
   };
   runtime.onProviderSessionReady = () => {
@@ -1838,7 +1848,7 @@ export async function restoreTransportSessions(
         pendingCount: runtime.pendingCount,
         pendingMessages: runtime.pendingMessages,
         pendingMessageEntries: runtime.pendingEntries,
-        pendingMessageVersion: runtime.pendingVersion,
+        pendingMessageVersion: observeTransportQueueRevision(s.name, runtime.pendingVersion),
       }, { source: 'daemon', confidence: 'high' });
       logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId, freshAfterCancel }, 'Restored transport session runtime');
 

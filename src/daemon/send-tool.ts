@@ -31,6 +31,7 @@ import type { SessionRecord } from '../store/session-store.js';
 import { getSession, listSessions } from '../store/session-store.js';
 import { isExecutionClone } from './execution-clone.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { observeTransportQueueRevision } from './transport-queue-revision.js';
 
 export const SEND_MCP_DISPATCH_FEATURE_FLAG = IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG;
 export const SEND_TOOL_ERROR_REASONS = {
@@ -1113,7 +1114,7 @@ async function dispatchSessionMessage(
         pendingCount: runtime.pendingCount,
         pendingMessages: runtime.pendingMessages,
         pendingMessageEntries: runtime.pendingEntries,
-        pendingMessageVersion: runtime.pendingVersion,
+        pendingMessageVersion: observeTransportQueueRevision(target.name, runtime.pendingVersion),
       }, { source: 'daemon', confidence: 'high' });
     }
     return result;

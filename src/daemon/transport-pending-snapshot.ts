@@ -1,6 +1,10 @@
 import type { PendingTransportMessage } from '../agent/transport-session-runtime.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getFreshResendEntries } from './transport-resend-queue.js';
+import {
+  getTransportQueueRevision,
+  observeTransportQueueRevision,
+} from './transport-queue-revision.js';
 
 export interface TransportPendingMessageEntry {
   clientMessageId: string;
@@ -54,10 +58,11 @@ export function buildTransportPendingQueueSnapshot(
     const pendingEntries = runtimeEntries.length > 0
       ? runtimeEntries
       : synthesizeEntriesFromMessages(sessionName, pendingMessages);
+    const pendingVersion = observeTransportQueueRevision(sessionName, runtime?.pendingVersion);
     return {
       pendingMessages,
       pendingEntries,
-      ...(typeof runtime?.pendingVersion === 'number' ? { pendingVersion: runtime.pendingVersion } : {}),
+      pendingVersion,
       source: 'runtime',
     };
   }
@@ -71,14 +76,18 @@ export function buildTransportPendingQueueSnapshot(
         text: entry.text,
         ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
       })),
+      pendingVersion: getTransportQueueRevision(sessionName) ?? observeTransportQueueRevision(sessionName, undefined),
       source: 'resend',
     };
   }
 
+  const pendingVersion = typeof runtime?.pendingVersion === 'number'
+    ? observeTransportQueueRevision(sessionName, runtime.pendingVersion)
+    : getTransportQueueRevision(sessionName);
   return {
     pendingMessages: [],
     pendingEntries: [],
-    ...(typeof runtime?.pendingVersion === 'number' ? { pendingVersion: runtime.pendingVersion } : {}),
+    ...(typeof pendingVersion === 'number' ? { pendingVersion } : {}),
     source: 'empty',
   };
 }

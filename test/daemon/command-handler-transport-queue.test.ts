@@ -671,7 +671,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
-      {
+      expect.objectContaining({
         state: 'queued',
         pendingCount: 2,
         pendingMessages: ['queued msg', 'queued msg 2'],
@@ -679,7 +679,8 @@ describe('handleWebCommand transport queue behavior', () => {
           { clientMessageId: 'cmd-queued', text: 'queued msg', sharedActor },
           { clientMessageId: 'cmd-queued-2', text: 'queued msg 2' },
         ],
-      },
+        pendingMessageVersion: expect.any(Number),
+      }),
       expect.any(Object),
     );
     expect(emitMock).not.toHaveBeenCalledWith(
@@ -730,7 +731,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
-      {
+      expect.objectContaining({
         state: 'queued',
         pendingCount: 3,
         pendingMessages: ['selected option', 'queued msg', 'queued msg 2'],
@@ -740,7 +741,7 @@ describe('handleWebCommand transport queue behavior', () => {
           { clientMessageId: 'cmd-queued-2', text: 'queued msg 2' },
         ],
         pendingMessageVersion: 7,
-      },
+      }),
       expect.any(Object),
     );
   });
@@ -3155,12 +3156,13 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
-      {
+      expect.objectContaining({
         state: 'queued',
         pendingCount: 1,
         pendingMessages: ['edited queued'],
         pendingMessageEntries: [{ clientMessageId: 'cmd-queued', text: 'edited queued' }],
-      },
+        pendingMessageVersion: expect.any(Number),
+      }),
       expect.any(Object),
     );
   });
@@ -3189,7 +3191,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
-      { state: 'queued', pendingCount: 0, pendingMessages: [], pendingMessageEntries: [] },
+      expect.objectContaining({ state: 'queued', pendingCount: 0, pendingMessages: [], pendingMessageEntries: [], pendingMessageVersion: expect.any(Number) }),
       expect.any(Object),
     );
   });

@@ -28,7 +28,7 @@ import {
   extractTransportPendingVersion,
   nextTransportQueueVersion,
   normalizeTransportPendingEntries,
-  shouldApplyTransportQueueSnapshot,
+  shouldApplyTransportQueueSnapshotForPayload,
 } from './transport-queue.js';
 
 /**
@@ -133,7 +133,10 @@ export function mergeSessionListEntry(
   const incomingVersion = extractTransportPendingVersion(incoming.transportPendingMessageVersion);
   const existingVersion = existing?.transportPendingMessageVersion;
   const applyPendingSnapshot = hasExplicitPendingSnapshot
-    && shouldApplyTransportQueueSnapshot(existingVersion, incomingVersion);
+    && shouldApplyTransportQueueSnapshotForPayload(existingVersion, incomingVersion, {
+      hasExplicitSnapshot: true,
+      isExplicitEmpty: normalizedMessages.length === 0 && normalizedEntries.length === 0,
+    });
 
   const nextPendingMessages = applyPendingSnapshot
     ? normalizedMessages

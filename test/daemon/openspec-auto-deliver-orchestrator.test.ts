@@ -740,7 +740,7 @@ exec "${realGit}" "$@"
         session === 'deck_demo_brain'
         && type === 'session.state'
         && (payload as Record<string, unknown>).state === 'queued'
-        && (payload as Record<string, unknown>).pendingMessageVersion === 1
+        && typeof (payload as Record<string, unknown>).pendingMessageVersion === 'number'
         && Array.isArray((payload as Record<string, unknown>).pendingMessageEntries)
       )).toBe(true);
 

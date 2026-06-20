@@ -73,6 +73,25 @@ export function shouldApplyTransportQueueSnapshot(
   return next >= prev;
 }
 
+export function shouldApplyTransportQueueSnapshotForPayload(
+  prev: number | undefined,
+  next: number | undefined,
+  options: {
+    hasExplicitSnapshot: boolean;
+    isExplicitEmpty: boolean;
+  },
+): boolean {
+  if (shouldApplyTransportQueueSnapshot(prev, next)) return true;
+  // Legacy/resend daemons may still emit an explicit empty snapshot without a
+  // version. Applying such a clear cannot resurrect stale messages, but
+  // ignoring it leaves already-dropped queue cards stuck in the UI. Do not apply
+  // field-absent heartbeats here: callers must prove this was an explicit empty
+  // pending snapshot.
+  return next === undefined
+    && options.hasExplicitSnapshot
+    && options.isExplicitEmpty;
+}
+
 /**
  * Fold an applied snapshot's version into the stored baseline. A fresh
  * runtime (`next === 0`) resets the baseline; an unversioned snapshot

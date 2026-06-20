@@ -22,6 +22,10 @@
 import logger from '../util/logger.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
+import {
+  bumpTransportQueueRevision,
+  clearAllTransportQueueRevisions,
+} from './transport-queue-revision.js';
 
 /** Queued entry age limit. Matches hook-server.ts QUEUE_EXPIRY_MS (5 minutes). */
 export const RESEND_EXPIRY_MS = 5 * 60 * 1000;
@@ -49,7 +53,7 @@ const queues = new Map<string, ResendEntry[]>();
  * Append an entry. If the queue is already at MAX_RESEND_ENTRIES the oldest
  * entry is discarded (FIFO) so newly-typed messages always take priority.
  */
-export function enqueueResend(sessionName: string, entry: ResendEntry): { accepted: true; droppedOldest: boolean } {
+export function enqueueResend(sessionName: string, entry: ResendEntry): { accepted: true; droppedOldest: boolean; pendingVersion: number } {
   const list = queues.get(sessionName) ?? [];
   let droppedOldest = false;
   if (list.length >= MAX_RESEND_ENTRIES) {
@@ -62,7 +66,7 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): { accept
   }
   list.push(entry);
   queues.set(sessionName, list);
-  return { accepted: true, droppedOldest };
+  return { accepted: true, droppedOldest, pendingVersion: bumpTransportQueueRevision(sessionName) };
 }
 
 /** Non-mutating snapshot of the queue for UI / diagnostics. */
@@ -112,17 +116,20 @@ export function removeResendEntries(
   } else if (removed > 0) {
     queues.set(sessionName, kept);
   }
+  if (removed > 0) bumpTransportQueueRevision(sessionName);
   return removed;
 }
 
 /** Drop every queued entry for a session. Used by /stop, /clear, session delete. */
 export function clearResend(sessionName: string): void {
+  if (queues.has(sessionName)) bumpTransportQueueRevision(sessionName);
   queues.delete(sessionName);
 }
 
 /** Drop every queued entry everywhere. Test helper. */
 export function clearAllResend(): void {
   queues.clear();
+  clearAllTransportQueueRevisions();
 }
 
 export type ResendDispatcher = (entry: ResendEntry) => Promise<unknown> | unknown;
@@ -167,6 +174,7 @@ export async function drainResend(
   const list = queues.get(sessionName);
   if (!list || list.length === 0) return 0;
   queues.delete(sessionName);
+  bumpTransportQueueRevision(sessionName);
 
   const now = Date.now();
   let dispatched = 0;

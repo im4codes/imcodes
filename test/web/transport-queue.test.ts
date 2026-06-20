@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   removeTransportPendingEntryForUserMessage,
   shouldApplyTransportQueueSnapshot,
+  shouldApplyTransportQueueSnapshotForPayload,
 } from '../../web/src/transport-queue.js';
 
 describe('transport queue reconciliation', () => {
@@ -11,6 +12,21 @@ describe('transport queue reconciliation', () => {
     expect(shouldApplyTransportQueueSnapshot(3, 2)).toBe(false);
     expect(shouldApplyTransportQueueSnapshot(3, 3)).toBe(true);
     expect(shouldApplyTransportQueueSnapshot(3, 4)).toBe(true);
+  });
+
+  it('applies only explicit empty unversioned clear after a versioned baseline', () => {
+    expect(shouldApplyTransportQueueSnapshotForPayload(3, undefined, {
+      hasExplicitSnapshot: true,
+      isExplicitEmpty: true,
+    })).toBe(true);
+    expect(shouldApplyTransportQueueSnapshotForPayload(3, undefined, {
+      hasExplicitSnapshot: false,
+      isExplicitEmpty: true,
+    })).toBe(false);
+    expect(shouldApplyTransportQueueSnapshotForPayload(3, undefined, {
+      hasExplicitSnapshot: true,
+      isExplicitEmpty: false,
+    })).toBe(false);
   });
 
   it('text fallback consumes only one matching pending entry', () => {
