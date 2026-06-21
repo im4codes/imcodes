@@ -263,6 +263,24 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     const previous = inFlightMessages.get(sessionName);
     if (previous && previous.messageId !== delta.messageId) {
       clearPendingStreamUpdate(previous.eventId);
+      // A new message started mid-turn (codex emits multiple agentMessage items
+      // per turn, one per tool round). FINALIZE the previous message now —
+      // emit it as streaming:false so it is written to the timeline store.
+      // Without this, only the LAST message of the turn (finalized by
+      // onComplete) is persisted; every earlier message stays streaming:true,
+      // never hits disk, and vanishes on refresh/reconnect — the user sees a
+      // push notification and live ctx updates but a blank/partial timeline.
+      if (previous.text) {
+        timelineEmitter.emit(sessionName, 'assistant.text', {
+          text: previous.text,
+          streaming: false,
+        }, { source: 'daemon', confidence: 'high', eventId: previous.eventId });
+        void appendTransportEvent(sessionName, {
+          type: 'assistant.text',
+          sessionId: sessionName,
+          text: previous.text,
+        });
+      }
     }
     inFlightMessages.set(sessionName, {
       messageId: delta.messageId,
@@ -692,4 +710,19 @@ async function pushProviderSessions(providerId: string): Promise<void> {
 /** @internal Exported for tests only — see test/daemon/transport-relay-usage-payload.test.ts. */
 export const __testing__ = {
   normalizeUsageUpdatePayload,
+  /**
+   * Clear all module-global per-session relay state. Tests reuse session names
+   * across cases; without this, a prior test's in-flight message leaks and the
+   * next test's first delta (different messageId) triggers a finalize emit.
+   * Production never needs this — onComplete/onError clear inFlightMessages,
+   * and an orphaned leftover finalizing on the next turn is the desired
+   * behavior (the orphan message gets persisted).
+   */
+  resetRelayState(): void {
+    for (const eventId of [...pendingStreamUpdates.keys()]) clearPendingStreamUpdate(eventId);
+    inFlightMessages.clear();
+    pendingFileLikeTools.clear();
+    completedFileLikeTools.clear();
+    askQuestionToolIds.clear();
+  },
 };
