@@ -716,6 +716,33 @@ describe('qwen transport flow e2e', () => {
     );
     expect(queuedStateAfterDrain).toBeUndefined();
 
+    const explicitEmptyRunningState = drainedEvents.find((e) =>
+      e.session === SESSION
+      && e.type === 'session.state'
+      && e.payload.state === 'running'
+      && Array.isArray(e.payload.pendingMessageEntries)
+      && e.payload.pendingMessageEntries.length === 0
+      && Array.isArray(e.payload.pendingMessages)
+      && e.payload.pendingMessages.length === 0
+      && typeof e.payload.pendingMessageVersion === 'number'
+    );
+    expect(explicitEmptyRunningState).toBeDefined();
+
+    const postDrainSessionListStart = serverLink.send.mock.calls.length;
+    handleWebCommand({ type: 'get_sessions' }, serverLink);
+    await flushAsync();
+
+    const postDrainSessionList = serverLink.send.mock.calls
+      .slice(postDrainSessionListStart)
+      .find(([msg]: [Record<string, unknown>]) => msg.type === 'session_list')?.[0] as
+        | { sessions?: Array<Record<string, unknown>> }
+        | undefined;
+    const postDrainSession = postDrainSessionList?.sessions?.find((session) => session.name === SESSION);
+    expect(postDrainSession).toEqual(expect.objectContaining({
+      transportPendingMessages: [],
+      transportPendingMessageEntries: [],
+      transportPendingMessageVersion: expect.any(Number),
+    }));
 
     const idleStateEvents = mocks.emitted.filter((e) =>
       e.session === SESSION

@@ -2824,6 +2824,63 @@ afterEach(() => {
     expect(screen.getByText('queued second')).toBeDefined();
   });
 
+  it('does not resurrect stale pendingMessages when a versioned empty entries snapshot is present', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          runtimeType: 'transport',
+          transportPendingMessages: ['stale queued'],
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 12,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(document.querySelector('.controls-queued-hint')).toBeFalsy();
+    expect(screen.queryByText('stale queued')).toBeNull();
+  });
+
+  it('clears a legacy queued card by unique text when the delivered timeline message has the real id', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessages: ['legacy stale send'],
+          transportPendingMessageEntries: [],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByText('legacy stale send')).toBeDefined();
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'transport-user:real-command-id',
+          sessionId: 'qwen-session',
+          type: 'user.message',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: { text: 'legacy stale send', commandId: 'real-command-id' },
+        },
+      });
+    });
+
+    expect(screen.queryByText('legacy stale send')).toBeNull();
+  });
+
   it('treats partial queued transport entries as authoritative', () => {
     const ws = makeWs();
     render(

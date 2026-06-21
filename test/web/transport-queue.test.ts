@@ -110,4 +110,17 @@ describe('transport queue reconciliation', () => {
     expect(result.changed).toBe(false);
     expect(result.entries.map((entry) => entry.clientMessageId)).toEqual(['queued-a']);
   });
+
+  it('allows a real delivered id to clear a single matching legacy queued entry by text', () => {
+    const result = removeTransportPendingEntryForUserMessage(
+      [{ clientMessageId: 'session-a:legacy:0:same text', text: 'same text' }],
+      ['same text'],
+      { clientMessageId: 'real-command-id', text: 'same text' },
+      'session-a',
+    );
+
+    expect(result.changed).toBe(true);
+    expect(result.entries).toEqual([]);
+    expect(result.messages).toEqual([]);
+  });
 });

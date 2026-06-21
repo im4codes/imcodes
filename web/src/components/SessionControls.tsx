@@ -884,7 +884,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           // Keep legacy messages visible when older state lacks structured
           // entries, but do not synthesize tails for partial structured entries.
           hasEntriesField: Array.isArray(activeSession?.transportPendingMessageEntries)
-            && activeSession.transportPendingMessageEntries.length > 0,
+            && (activeSession.transportPendingMessageEntries.length > 0
+              || typeof activeSession.transportPendingMessageVersion === 'number'),
           hasMessagesField: Array.isArray(activeSession?.transportPendingMessages),
         },
       )
@@ -1508,14 +1509,32 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           : typeof event.payload.clientMessageId === 'string'
             ? event.payload.clientMessageId
             : '';
-        removeLocalQueuedEntry(commandId, typeof event.payload.text === 'string' ? event.payload.text : undefined);
+        const deliveredText = typeof event.payload.text === 'string' ? event.payload.text : undefined;
+        removeLocalQueuedEntry(commandId, deliveredText);
         // Record the delivered id so a stale daemon pending snapshot can't keep
         // showing it as queued (the incoming snapshot is not under our control,
-        // unlike the optimistic set cleared above).
-        if (commandId) {
+        // unlike the optimistic set cleared above).  Legacy snapshots synthesize
+        // ids from text, so also settle the single matching legacy id when the
+        // authoritative timeline echo carries a newer real command/client id.
+        const idsToSettle = commandId ? [commandId] : [];
+        const normalizedDeliveredText = typeof deliveredText === 'string' ? normalizeQueuedText(deliveredText) : '';
+        if (normalizedDeliveredText) {
+          const legacyTextMatches = incomingQueuedTransportEntries
+            .filter((entry) => isLegacyTransportPendingMessageId(entry.clientMessageId, activeSession.name)
+              && normalizeQueuedText(entry.text) === normalizedDeliveredText)
+            .map((entry) => entry.clientMessageId);
+          if (legacyTextMatches.length === 1) idsToSettle.push(legacyTextMatches[0]);
+        }
+        if (idsToSettle.length > 0) {
           setSettledQueuedIds((prev) => {
-            if (prev.has(commandId)) return prev;
-            const ids = [...prev, commandId];
+            let changed = false;
+            const ids = [...prev];
+            for (const id of idsToSettle) {
+              if (!id || prev.has(id)) continue;
+              ids.push(id);
+              changed = true;
+            }
+            if (!changed) return prev;
             return new Set(ids.length > 500 ? ids.slice(-500) : ids);
           });
         }
@@ -1539,7 +1558,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         });
       }
     });
-  }, [activeSession, ws]);
+  }, [activeSession, incomingQueuedTransportEntries, ws]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);

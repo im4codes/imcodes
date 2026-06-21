@@ -178,15 +178,29 @@ export function removeTransportPendingEntryForUserMessage(
   const normalizedText = typeof payload.text === 'string'
     ? normalizeTransportPendingText(payload.text)
     : '';
-  const matchIndex = candidateIdSet.size > 0
+  const idMatchIndex = candidateIdSet.size > 0
     ? entries.findIndex((entry) => candidateIdSet.has(entry.clientMessageId))
-    : (() => {
-        if (!normalizedText) return -1;
-        const matches = entries
-          .map((entry, index) => ({ entry, index }))
-          .filter(({ entry }) => normalizeTransportPendingText(entry.text) === normalizedText);
-        return matches.length === 1 ? matches[0].index : -1;
-      })();
+    : -1;
+  const textFallbackIndex = (() => {
+    if (!normalizedText) return -1;
+    const matches = entries
+      .map((entry, index) => ({ entry, index }))
+      .filter(({ entry }) => normalizeTransportPendingText(entry.text) === normalizedText);
+    if (matches.length !== 1) return -1;
+    const match = matches[0];
+    // Stable ids normally win.  However, legacy snapshots synthesize ids from
+    // text (`session:legacy:*`) and can survive across client/daemon upgrades; a
+    // later authoritative user.message carries the real command/client id, so an
+    // id-only match leaves the old yellow queue card stuck beside the delivered
+    // user bubble.  Allow text fallback only for those synthetic legacy ids (or
+    // when no id was provided at all), preserving the duplicate-text safety for
+    // real structured queue entries.
+    if (candidateIdSet.size === 0 || isLegacyTransportPendingMessageId(match.entry.clientMessageId, scopeKey)) {
+      return match.index;
+    }
+    return -1;
+  })();
+  const matchIndex = idMatchIndex >= 0 ? idMatchIndex : textFallbackIndex;
   if (matchIndex < 0) return { messages, entries, changed: false };
   const nextEntries = entries.filter((_, index) => index !== matchIndex);
   return {
